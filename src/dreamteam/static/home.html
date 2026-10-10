@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DreamTeam — сессии</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/home.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='10' cy='12' r='6' fill='%236366f1'/><circle cx='22' cy='12' r='6' fill='%2322c55e'/><circle cx='16' cy='22' r='6' fill='%23f59e0b'/></svg>">
+</head>
+<body class="home-page">
+  <header class="topbar">
+    <a class="brand" href="/">
+      <span class="logo" aria-hidden="true"><i></i><i></i><i></i></span>
+      <div class="brand-text">
+        <div class="brand-name">DreamTeam</div>
+        <div class="swarm-name" data-i18n="tagline"></div>
+      </div>
+    </a>
+    <nav class="home-tabs" role="tablist">
+      <button type="button" role="tab" data-htab="sessions" class="active"><span data-i18n="tab_sessions"></span></button>
+      <button type="button" role="tab" data-htab="settings"><span data-i18n="tab_settings"></span></button>
+    </nav>
+    <div class="spacer"></div>
+    <button class="icon-btn" id="lang-btn" type="button" data-i18n-title="language">RU</button>
+    <button class="icon-btn" id="theme-btn" type="button" data-i18n-title="theme">◐</button>
+    <span class="conn" id="conn" role="status"></span>
+  </header>
+
+  <main class="home">
+    <section id="pane-sessions" class="home-pane">
+      <div class="home-hero">
+        <div class="hero-text">
+          <h1 data-i18n="sessions_title"></h1>
+          <p class="muted" data-i18n="sessions_hint"></p>
+        </div>
+        <button class="btn primary big" id="new-session-btn" type="button">＋ <span data-i18n="new_session"></span></button>
+      </div>
+      <div class="session-tools">
+        <input class="search" id="session-search" type="search" data-i18n-placeholder="search_sessions">
+        <div class="chips" id="session-filter">
+          <button type="button" data-filter="all" class="active" data-i18n="f_all"></button>
+          <button type="button" data-filter="running" data-i18n="f_running"></button>
+          <button type="button" data-filter="stopped" data-i18n="f_stopped"></button>
+        </div>
+      </div>
+      <div class="sessions-grid" id="sessions"></div>
+      <div class="empty-state hidden" id="sessions-empty">
+        <div class="empty-art" aria-hidden="true"><span class="logo big"><i></i><i></i><i></i></span></div>
+        <h2 data-i18n="empty_title"></h2>
+        <p class="muted" data-i18n="empty_hint"></p>
+        <button class="btn primary big" type="button" data-new-session>＋ <span data-i18n="new_session"></span></button>
+      </div>
+    </section>
+
+    <section id="pane-settings" class="home-pane hidden">
+      <div class="settings-layout">
+        <nav class="settings-nav" id="settings-nav"></nav>
+        <form class="settings-form" id="settings-form" autocomplete="off" novalidate>
+          <div class="settings-loading muted" data-i18n="loading"></div>
+        </form>
+      </div>
+      <div class="save-bar hidden" id="save-bar">
+        <span class="save-msg" id="save-msg"></span>
+        <div class="spacer"></div>
+        <button class="btn" type="button" id="settings-reset" data-i18n="discard"></button>
+        <button class="btn primary" type="button" id="settings-save" data-i18n="save"></button>
+      </div>
+    </section>
+  </main>
+
+  <div class="modal-backdrop hidden" id="modal-backdrop">
+    <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
+  </div>
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  <script src="/static/home.js"></script>
+</body>
+</html>

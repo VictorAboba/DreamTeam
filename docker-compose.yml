@@ -1,0 +1,22 @@
+# Run DreamTeam inside Docker: SWARM_DIR=./dreamteam-home docker compose up --build
+# (or simply: dreamteam sandbox ./dreamteam-home)
+services:
+  dreamteam:
+    build: .
+    image: dreamteam:latest
+    ports:
+      - "127.0.0.1:${PORT:-8765}:8765"
+    volumes:
+      - "${SWARM_DIR:-./myswarm}:/swarm"
+    environment:
+      - ANTHROPIC_API_KEY
+      - ANTHROPIC_BASE_URL
+      - ANTHROPIC_AUTH_TOKEN
+      - OPENAI_API_KEY
+      - OPENROUTER_API_KEY
+      # the URL the board is reached at from the host (shown as the MCP URL, written to hub.json)
+      - DREAMTEAM_PUBLIC_URL=http://127.0.0.1:${PORT:-8765}
+    # the hub always listens on 8765 inside the container, whatever dreamteam.toml says.
+    # SWARM_DIR is a DreamTeam home (sessions page); for a single project made by `dreamteam init` use
+    # command: ["run", "/swarm", "--host", "0.0.0.0", "--port", "8765", "--no-console"]
+    command: ["serve", "/swarm", "--host", "0.0.0.0", "--port", "8765", "--no-console", "--no-browser"]

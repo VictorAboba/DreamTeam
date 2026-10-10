@@ -1,0 +1,11 @@
+# `docker compose up --build` sends the repo root as the build context: only what the Dockerfile
+# copies goes in (no .venv, .git, swarm projects with their databases and dreamteam.toml keys).
+# `dreamteam sandbox` assembles its own clean context (docker.build_context).
+*
+!pyproject.toml
+!README.md
+!Dockerfile
+!src/
+**/__pycache__
+**/*.pyc
+**/.dreamteam
