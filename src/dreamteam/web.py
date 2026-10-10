@@ -20,7 +20,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__
+from . import __version__, roles
 from .db import loads
 from .hub_mcp import LOOPBACK_HOSTS, MCPHttpEndpoint
 from .httpjson import JSONResponse, json_text
@@ -175,6 +175,23 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1") -> Starlette:
     async def state(request: Request):
         return JSONResponse(swarm.snapshot())
 
+    async def role_catalog(request: Request):
+        # the visible roles in the swarm's language (the hire dialog, the TUI's /roles); not in the snapshot,
+        # which is polled after every event while the descriptions are several KB. "names": the spellings a hire
+        # resolves to the role (roles.find_role: its id and a built-in role's name in either language); "hidden":
+        # the roles not offered, which a hire by name still resolves
+        found = roles.catalog(swarm.config.roles, swarm.language, include_hidden=True)
+
+        def view(r: roles.Role) -> dict[str, Any]:
+            names = [r.name]
+            if r.builtin:  # its id and its name in either language
+                names += [r.key, *(roles.ROLE_PRESETS[lang][r.key][0] for lang in roles.ROLE_PRESETS)]
+            return {"key": r.key, "name": r.name, "description": r.description, "instructions": r.instructions,
+                    "model": r.model, "builtin": r.builtin, "names": list(dict.fromkeys(names))}
+
+        return JSONResponse({"language": swarm.language, "roles": [view(r) for r in found if not r.hidden],
+                             "hidden": [view(r) for r in found if r.hidden]})
+
     async def hub_info(request: Request):
         # identity of this hub process: `dreamteam` commands compare it with hub.json (stale file, pid reuse)
         return JSONResponse({"pid": os.getpid(), "project": str(swarm.config.project_dir),
@@ -302,6 +319,7 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1") -> Starlette:
     routes = [
         Route("/", index),
         Route("/api/state", state),
+        Route("/api/roles", role_catalog),
         Route("/api/hub", hub_info),
         Route("/api/tasks/{task_id:int}", task_detail),
         Route("/api/messages", messages),

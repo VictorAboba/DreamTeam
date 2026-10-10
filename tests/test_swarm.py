@@ -15,11 +15,14 @@ from typing import Any, Callable
 
 import pytest
 
+from dreamteam import prompts, roles
 from dreamteam import swarm as swarm_module
 from dreamteam.config import Config
+from dreamteam.db import loads
 from dreamteam.llm.scripted import ScriptedLLM
-from dreamteam.models import USER, AgentStatus, Status
+from dreamteam.models import USER, AgentStatus, Status, ToolError
 from dreamteam.swarm import Swarm
+from dreamteam.workspace import scratch_rel
 
 Policy = Callable[[Swarm, str, str, list[dict], list[dict]], Any]
 
@@ -37,7 +40,10 @@ def make_config(tmp_path: Path, **overrides: Any) -> Config:
                                "cache_read_price": 0, "cache_write_price": 0}},
     }
     for section, values in overrides.items():
-        raw.setdefault(section, {}).update(values)
+        if isinstance(values, list):  # [[roles]]
+            raw[section] = values
+        else:
+            raw.setdefault(section, {}).update(values)
     return Config.from_dict(tmp_path / "project", raw)
 
 
@@ -77,10 +83,13 @@ def last_text(messages: list[dict]) -> str:
 
 # ------------------------------------------------------------------------------------------------
 def worker_policy(created: dict[str, bool], written: set[int]) -> Policy:
-    """A tiny but complete agent: plans, claims, writes files, completes, declares the goal done."""
+    """A tiny but complete agent: reviews the others' work first, plans, claims, writes files, completes,
+    declares the goal done."""
 
     def policy(swarm: Swarm, name: str, system: str, messages: list[dict], tools: list[dict]) -> Any:
         board = swarm.board
+        for task in board.reviews_of(name):  # independent review: the agents review each other
+            return call("task_review", task_id=task.id, approve=True, comment="checked")
         for task in board.open_tasks_of(name):
             if task.status != Status.IN_PROGRESS:
                 continue
@@ -124,6 +133,12 @@ async def test_swarm_reaches_goal_with_scripted_agents(tmp_path):
         tasks = swarm.board.list(include_closed=True)
         assert [t.status for t in tasks] == [Status.DONE] * 3
         assert tasks[0].tags == ["planning"] and tasks[0].goal
+        # independent review: every task, the planning task included, was approved by the other agent
+        approvals = {e["data"]["task"]["id"]: (e["actor"], e["data"]["task"]["assignee"])
+                     for e in swarm.bus.recent(types=("task.updated",), limit=1000)
+                     if e["data"]["changes"].get("status") == [Status.REVIEW, Status.DONE]}
+        assert sorted(approvals) == [1, 2, 3]
+        assert all(reviewer in names and reviewer != executor for reviewer, executor in approvals.values())
         assert (swarm.workspace.root / "out" / "hello.txt").read_text(encoding="utf-8").endswith("was here")
         assert (swarm.workspace.root / "out" / "world.txt").exists()
         notes = [r["kind"] for r in swarm.db.all("SELECT kind FROM notifications WHERE recipient = ?", (USER,))]
@@ -280,6 +295,104 @@ async def test_hire_and_retire(tmp_path):
         assert swarm.board.get(task.id).assignee is None
         assert "Grace Hopper" not in swarm.runtimes
         assert swarm.member("Grace Hopper")["status"] == AgentStatus.RETIRED
+    finally:
+        await swarm.stop()
+        swarm.close()
+
+
+# ---------------------------------------------------------------- role catalog, goal split, scratch folder
+async def test_starting_team_comes_from_the_role_catalog(tmp_path):
+    """starting_roles names catalog roles in either language (docs/SPEC.md §17.3): member i gets the canonical
+    name in its language and the role's description right after "Your role: …"; the others are generalists.
+    Every prompt names the member's own scratch folder."""
+    swarm = make_swarm(tmp_path, lambda *a: call("wait"),
+                       swarm={"starting_roles": ["developer", "Тестировщик"], "start_agents": 3})
+    await swarm.start(run_agents=False)
+    try:
+        members = swarm.members()
+        assert [m["role"] for m in members] == ["Developer", "Tester", "Generalist"]
+        for m, rid in zip(members, ("developer", "tester", "generalist")):
+            name, description = roles.ROLE_PRESETS["en"][rid]
+            assert f"Your role: {name}.\n{description}\n\n## The swarm\n" in m["system_prompt"]
+            assert f"`{scratch_rel(m['name'])}`" in m["system_prompt"]
+    finally:
+        await swarm.stop()
+        swarm.close()
+
+
+async def test_role_model_instructions_and_frozen_prompts(tmp_path):
+    """Model precedence: the explicit profile > the role's > the default. The catalog's instructions come before
+    the hirer's. A catalog edit reaches new members only; existing prompts stay byte-identical."""
+    fast = {"provider": "scripted", "model": "fast-model"}
+    swarm = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"starting_roles": ["tester"], "start_agents": 1},
+                       models={"fast": fast},
+                       roles=[{"name": "tester", "model": "fast", "instructions": "Use pytest."}])
+    await swarm.start(run_agents=False)
+    try:
+        first = swarm.members()[0]
+        assert (first["role"], first["model"], first["instructions"]) == ("Tester", "fast", "")
+        assert prompts.t("en", "instructions", text="Use pytest.") in first["system_prompt"]
+        name = await swarm.hire(USER, "тестировщик", "Focus on the CLI.", model="default")
+        member = swarm.member(name)
+        # the agents row keeps the hirer's own instructions; the catalog's live in the frozen prompt
+        assert (member["role"], member["model"], member["instructions"]) == ("Tester", "default", "Focus on the CLI.")
+        assert prompts.t("en", "instructions", text="Use pytest.\n\nFocus on the CLI.") in member["system_prompt"]
+        before = {m["name"]: m["system_prompt"] for m in swarm.members()}
+        cfg = make_config(tmp_path, models={"fast": fast},
+                          roles=[{"name": "tester", "description": "You test the CLI only."}])
+        swarm.reconfigure(dataclasses.replace(cfg, project_dir=swarm.project_dir))
+        newer = await swarm.hire(USER, "Tester")
+        assert "Your role: Tester.\nYou test the CLI only.\n\n## The swarm" in swarm.member(newer)["system_prompt"]
+        assert swarm.member(newer)["model"] == "default"            # the role has no profile of its own any more
+        assert {m["name"]: m["system_prompt"] for m in swarm.members() if m["name"] in before} == before
+        # a role of one's own: the hirer's instructions are all the member gets
+        own = await swarm.hire(USER, "Data  engineer", "Build the ETL.")
+        assert swarm.member(own)["role"] == "Data engineer"
+        assert "Your role: Data engineer.\n" + prompts.t("en", "instructions", text="Build the ETL.") in \
+            swarm.member(own)["system_prompt"]
+    finally:
+        await swarm.stop()
+        swarm.close()
+
+
+async def test_kickoff_names_the_team_and_hiring_notices_carry_the_canonical_role(tmp_path):
+    swarm = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"starting_roles": ["architect"], "start_agents": 2})
+    await swarm.start(run_agents=False)
+    try:
+        a, b = [m["name"] for m in swarm.members()]
+        swarm.set_goal(USER, "Ship it")
+        team = f"{a} — Architect; {b} — Generalist"
+        for name in (a, b):
+            row = swarm.db.one("SELECT text, data FROM notifications WHERE recipient = ? AND kind = 'n_kickoff'",
+                               (name,))
+            assert loads(row["data"])["team"] == team and f"\nTeam: {team}.\n" in row["text"]
+        hired = await swarm.hire(a, "reviewer", "")
+        assert swarm.member(hired)["role"] == "Reviewer"
+        joined = swarm.db.one("SELECT data FROM notifications WHERE recipient = ? AND kind = 'u_member_joined'",
+                              (USER,))
+        assert loads(joined["data"])["role"] == "Reviewer"
+        welcome = swarm.db.one("SELECT text FROM notifications WHERE recipient = ? AND kind = 'n_hired'", (hired,))
+        assert 'hired you as "Reviewer"' in welcome["text"]
+        assert f"`{scratch_rel(hired)}`" in swarm.member(hired)["system_prompt"]
+    finally:
+        await swarm.stop()
+        swarm.close()
+
+
+async def test_set_goal_splits_a_multi_line_goal(tmp_path):
+    """Every goal goes through Swarm.set_goal: the first line is the title, the rest opens the description, so
+    the goal line of every wake-up is one line; the planning task still holds the whole text."""
+    swarm = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"start_agents": 1})
+    await swarm.start(run_agents=False)
+    try:
+        name = swarm.members()[0]["name"]
+        goal = swarm.set_goal(USER, "Snake\nPython\n\n- tests")
+        assert (goal["title"], goal["description"]) == ("Snake", "Python\n\n- tests")
+        assert swarm.board.get(1).description.endswith("\n\nSnake\nPython\n\n- tests")
+        assert "\nGlobal goal: Snake [active]\n" in swarm.render_wake(name)
+        assert swarm.set_goal(USER, "", "A\nB")["title"] == "A"
+        with pytest.raises(ToolError, match="title is empty"):
+            swarm.set_goal(USER, " \n ")
     finally:
         await swarm.stop()
         swarm.close()

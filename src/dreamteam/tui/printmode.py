@@ -27,12 +27,16 @@ LOST_LIMIT = 60.0        # seconds without the hub before giving up
 TICK = 0.5               # deadlines are checked at least this often
 EVENTS_PAGE = 2000       # /api/events page size when catching up after a (re)connect
 FINAL_STATE_TIMEOUT = 5.0
-AUTO_REPLY_MAX = 50      # a safety net against an endless question / auto-answer ping-pong
+AUTO_REPLY_MAX = 50      # a safety net against an endless question / auto-answer ping-pong (not approvals)
 PROGRESS_SKIP = ("agent.status", "agent.usage", "agent.activity", "trace.")  # fallback feed: too noisy
 
 AUTO_REPLY = {
     "ru": "Пользователь недоступен (неинтерактивный режим): прими решение сам и продолжай работу.",
     "en": "The user is not available (non-interactive mode): decide yourself and continue.",
+}
+AUTO_REVIEW = {
+    "ru": "Принято автоматически: пользователь недоступен (неинтерактивный режим), задачу никто не проверял.",
+    "en": "Approved automatically: the user is not available (non-interactive mode); nobody reviewed the task.",
 }
 TEXTS = {
     "ru": {
@@ -45,6 +49,7 @@ TEXTS = {
         "no_sessions": "Нет сессий, которые можно продолжить.",
         "unknown_session": "Неизвестная сессия «{sid}».",
         "session": "Сессия {sid}: {title}",
+        "folder": "Папка сессии: {path}",
         "error": "Ошибка: {error}",
     },
     "en": {
@@ -57,6 +62,7 @@ TEXTS = {
         "no_sessions": "There is no session to continue.",
         "unknown_session": "Unknown session '{sid}'.",
         "session": "Session {sid}: {title}",
+        "folder": "Session folder: {path}",
         "error": "Error: {error}",
     },
 }
@@ -200,8 +206,9 @@ class _PrintRun:
     def __init__(self, conn: Connection, prompt: str, *, session: str | None, continue_last: bool,
                  title: str | None, overrides: dict | None, output_format: str, verbose: bool,
                  timeout: float | None, auto_reply: bool, lang: str | None, out: TextIO, err: TextIO,
-                 on_session: Callable[[str], Any] | None = None):
+                 on_session: Callable[[str], Any] | None = None, workspace: str | None = None):
         self.client = conn.client
+        self.workspace = workspace
         self.on_session = on_session
         self.prompt = prompt
         self.session = session
@@ -220,6 +227,7 @@ class _PrintRun:
         self.goal: dict | None = None
         self.last_event = 0                 # newest journaled event id already handled
         self.seen_messages: set[int] = set()
+        self.auto_reviewed: set[tuple[int, Any]] = set()
         self.replies = 0
         self.started = time.monotonic()
         self._progress: _Progress | None = None
@@ -269,11 +277,15 @@ class _PrintRun:
             await self.attach(None)
             return
         if not (self.session or self.continue_last):
-            title = self.title or " ".join(self.prompt.split())[:60]
-            summary = await client.create_session(title, self.prompt, overrides=self.overrides, start=True)
+            title = self.title or ""  # "": the hub derives it from the goal's first line
+            summary = await client.create_session(title, self.prompt, overrides=self.overrides, start=True,
+                                                  workspace=self.workspace)
             self.started_session(summary["id"])
             self.lang = summary.get("language") or self.lang
             self.progress(_text(self.text_lang, "session", sid=self.sid, title=summary.get("title", "")))
+            if self.workspace:
+                folder = (summary.get("workspace_result") or {}).get("to") or self.workspace
+                self.progress(_text(self.text_lang, "folder", path=folder))
             return
         sessions = await client.sessions()
         if self.session:
@@ -301,6 +313,9 @@ class _PrintRun:
         state = await client.state(sid)
         self.state = state
         self.lang = (state.get("swarm") or {}).get("language") or self.lang
+        for task in state.get("tasks") or []:  # reviews that were already waiting for the user
+            if isinstance(task, dict):
+                await self.on_task(task)
         goal = (state.get("swarm") or {}).get("goal")
         if not goal:
             ok, text = await client.act(sid, "set_goal", {"title": self.prompt})
@@ -438,6 +453,8 @@ class _PrintRun:
         data = ev.get("data") or {}
         if etype == "message.sent" and isinstance(data.get("message"), dict):
             await self.on_message(data["message"])
+        elif etype == "task.updated" and isinstance(data.get("task"), dict):
+            await self.on_task(data["task"])
         elif etype == "goal.completed":
             self.goal = data.get("goal") if isinstance(data.get("goal"), dict) else self.goal
             raise _Finished("done")
@@ -459,6 +476,22 @@ class _PrintRun:
             "to": [sender], "text": AUTO_REPLY.get(self.lang, AUTO_REPLY["en"]), "reply_to": mid})
         if not ok:
             log.warning("auto-reply to %s failed: %s", sender, text)
+
+    async def on_task(self, task: dict) -> None:
+        """A task waiting for the user's review would block the run: with auto-replies on, approve it (the
+        counterpart of AUTO_REPLY for questions; --no-auto-reply leaves it waiting). Approvals do not count
+        against AUTO_REPLY_MAX: an approval settles the task (no ping-pong), and a one-agent run sends every
+        task, the planning task included, to the user."""
+        if task.get("status") != "review" or task.get("reviewer") != USER or not isinstance(task.get("id"), int):
+            return
+        key = (task["id"], task.get("updated_at"))
+        if key in self.auto_reviewed or not self.auto_reply:
+            return
+        self.auto_reviewed.add(key)
+        ok, text = await self.client.act(self.sid, "task_review", {
+            "task_id": task["id"], "approve": True, "comment": AUTO_REVIEW.get(self.lang, AUTO_REVIEW["en"])})
+        if not ok:
+            log.warning("auto-approval of task #%s failed: %s", task["id"], text)
 
     # ---- result ---------------------------------------------------------------------------------
     async def report(self, status: str, reason: str) -> int:
@@ -497,18 +530,21 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
                     title: str | None = None, overrides: dict | None = None, output_format: str = "text",
                     verbose: bool = False, timeout: float | None = None, auto_reply: bool = True,
                     lang: str | None = None, out: TextIO | None = None, err: TextIO | None = None,
-                    on_session: Callable[[str], Any] | None = None) -> int:
+                    on_session: Callable[[str], Any] | None = None, workspace: str | None = None) -> int:
     """Run `prompt` as a goal (a new session), or as the next instruction to an existing session
     (`session` / `continue_last`), follow the session until it ends and print the result.
 
     `out` / `err` default to sys.stdout / sys.stderr at call time; `lang` sets the language of the
     error lines and the progress feed (default: the session's language). `on_session(sid)` is called with
-    the session the run works in, once it is created or started (main_print stops it at the end)."""
+    the session the run works in, once it is created or started (main_print stops it at the end). `workspace`:
+    the absolute folder a new session works in (docs/SPEC.md §17.2: an empty or missing folder gets the files, one
+    with files is adopted; a git repository with uncommitted changes is refused, an error)."""
     if output_format not in OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {', '.join(OUTPUT_FORMATS)}")
     run = _PrintRun(conn, prompt, session=session, continue_last=continue_last, title=title, overrides=overrides,
                     output_format=output_format, verbose=verbose, timeout=timeout, auto_reply=auto_reply,
-                    lang=lang, out=out or sys.stdout, err=err or sys.stderr, on_session=on_session)
+                    lang=lang, out=out or sys.stdout, err=err or sys.stderr, on_session=on_session,
+                    workspace=workspace)
     status, reason = "error", ""
     try:
         try:
@@ -536,4 +572,4 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     return await run.report(status, reason)
 
 
-__all__ = ["run_print", "AUTO_REPLY", "EXIT_CODES", "OUTPUT_FORMATS"]
+__all__ = ["run_print", "AUTO_REPLY", "AUTO_REVIEW", "EXIT_CODES", "OUTPUT_FORMATS"]

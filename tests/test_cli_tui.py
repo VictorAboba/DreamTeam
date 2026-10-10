@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import socket
 import sys
 from pathlib import Path
@@ -73,6 +74,26 @@ def test_tui_options_reach_main_tui(monkeypatch, tmp_path):
     seen.clear()
     assert cli.main(["-c", "--home", str(tmp_path)]) == 0
     assert seen["continue_last"] is True
+
+
+def test_team_option_reaches_the_new_session(monkeypatch, tmp_path, capsys):
+    from dreamteam.tui.commands import session_overrides
+
+    seen: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: seen.update(**kw) or 0)
+    monkeypatch.setattr(tui, "main_print", lambda home, prompt, **kw: seen.update(**kw) or 0)
+    monkeypatch.setattr(cli, "_piped_stdin", lambda: "")
+    assert cli.main(["--home", str(tmp_path), "Snake", "--team", "architect, developer*2"]) == 0
+    assert {k: v for k, v in seen["overrides"].items() if v is not None} == {"team": "architect, developer*2"}
+    assert session_overrides(seen["overrides"]) == (
+        {"swarm": {"starting_roles": ["architect", "developer", "developer"], "start_agents": 3}}, None)
+    seen.clear()
+    assert cli.main(["-p", "Snake", "--home", str(tmp_path), "--team", "tester", "--agents", "2"]) == 0
+    assert session_overrides(seen["overrides"])[0] == {"swarm": {"starting_roles": ["tester"], "start_agents": 2}}
+    seen.clear()
+    assert cli.main(["-p", "Snake", "--home", str(tmp_path), "--team", "tester*0"]) == 2   # checked before anything
+    assert seen == {} and "--team: 'tester*0': the count must be a whole number" in capsys.readouterr().err
 
 
 def test_tui_needs_a_terminal(monkeypatch, tmp_path, capsys):
@@ -148,3 +169,88 @@ def test_print_mode_end_to_end(monkeypatch, tmp_path, capsys):
                       .read_text(encoding="utf-8"))
     assert meta["title"] == "Snake"
     assert not (home / ".dreamteam" / "hub.json").exists()  # the in-process launcher removed its hub file
+
+
+def test_workspace_option_reaches_the_session_creation(monkeypatch, tmp_path, capsys):
+    """`--workspace DIR` (tui, -p, serve --goal): the folder of the session that run creates, as an absolute path
+    (relative to the current directory); refused with -c/-r, for a file, and for serve without --goal."""
+    home = str(tmp_path / "home")
+    seen: dict[str, Any] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: seen.update(kw) or 0)
+    assert cli.main(["--home", home, "Сделай змейку", "--workspace", "proj"]) == 0
+    assert seen["workspace"] == str(tmp_path / "proj") and seen["initial_prompt"] == "Сделай змейку"
+    seen.clear()
+    assert cli.main(["tui", "--home", home, "--workspace", "~/some-project"]) == 0
+    assert seen["workspace"] == os.path.normpath(os.path.expanduser("~/some-project"))
+    seen.clear()
+    assert cli.main(["--home", home]) == 0 and seen["workspace"] is None
+
+    monkeypatch.setattr(tui, "main_print", lambda home, prompt, **kw: seen.update(kw) or 0)
+    monkeypatch.setattr(cli, "_piped_stdin", lambda: "")
+    assert cli.main(["-p", "Почини тесты", "--home", home, "--workspace", str(tmp_path / "repo")]) == 0
+    assert seen["workspace"] == str(tmp_path / "repo")
+
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: pytest.fail("must be refused"))
+    monkeypatch.setattr(tui, "main_print", lambda *a, **kw: pytest.fail("must be refused"))
+    capsys.readouterr()
+    assert cli.main(["-c", "--home", home, "--workspace", "proj"]) == 2
+    assert cli.main(["-p", "x", "-r", "001-a", "--home", home, "--workspace", "proj"]) == 2
+    assert "/cd" in capsys.readouterr().err
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    assert cli.main(["--home", home, "--workspace", "notes.txt"]) == 2
+    assert "is a file" in capsys.readouterr().err
+
+    calls: dict[str, Any] = {}
+
+    async def serve_home(home_dir, host, port, **kw):
+        calls.update(home=home_dir, **kw)
+        return 0
+
+    monkeypatch.setattr(cli, "_serve_home", serve_home)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **kw: None)
+    assert cli.main(["serve", "--home", home, "--workspace", "proj", "--no-browser"]) == 2
+    assert "--workspace needs --goal" in capsys.readouterr().err and not calls
+    assert cli.main(["serve", "--home", home, "--goal", "Сделай змейку", "--workspace", "proj", "--no-browser",
+                     "--no-console"]) == 0
+    assert calls["workspace"] == str(tmp_path / "proj") and calls["goal"] == "Сделай змейку"
+
+    parser = cli.build_parser()
+    subcommands = parser._subparsers._group_actions[0].choices
+    assert "--workspace" in subcommands["tui"].format_help() and "--workspace" in subcommands["serve"].format_help()
+
+
+def test_print_mode_with_a_workspace_folder(monkeypatch, tmp_path, capsys):
+    """`dreamteam -p GOAL --workspace DIR`: the new session works in DIR (created when missing)."""
+    home = tmp_path / "home"
+    home.mkdir()
+    st.write_raw(home, {
+        "swarm": {"name": "Home", "language": "en", "start_agents": 1, "max_agents": 2, "max_cost_usd": 1.0},
+        "agents": {"stagger_seconds": 0},
+        "server": {"port": free_port()},
+        "workspace": {"git": False},
+        "mcp": {"library_dir": str(tmp_path / "library")},
+        "models": {"default": {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0}},
+    })
+
+    def policy(system, messages, tools):
+        seen = [m.get("content") or "" for m in messages if m["role"] in ("user", "tool")]
+        if any("marked as achieved" in t or "already marked" in t for t in seen[-1:]):
+            return {"tool_calls": [{"name": "wait", "arguments": {}}]}
+        if any("snake" in t for t in seen):
+            return {"tool_calls": [{"name": "goal_complete", "arguments": {"summary": "Done."}}]}
+        return {"tool_calls": [{"name": "wait", "arguments": {}}]}
+
+    real = tui.main_print
+    monkeypatch.setattr(tui, "main_print", lambda home, prompt, **kw: real(
+        home, prompt, llm_factory=lambda profile, agent: ScriptedLLM(policy, profile), **kw))
+    monkeypatch.setattr(cli, "_piped_stdin", lambda: "")
+    project = tmp_path / "projects" / "snake"
+    code = cli.main(["-p", "Write a snake game", "--home", str(home), "--workspace", str(project), "--verbose",
+                     "--timeout", "60"])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert f"Session folder: {project}" in captured.err
+    meta = json.loads(next((home / "sessions").glob("*/session.json")).read_text(encoding="utf-8"))
+    assert meta["workspace"] == {"path": str(project), "adopted": False} and project.is_dir()

@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..board import MAX_POST, UNSET
-from ..models import PRIORITIES, Status, Task, ToolError
+from ..models import PRIORITIES, USER, Status, Task, ToolError
 from . import ToolContext, tool
 from .fmt import goal_line, post_line, task_detail, task_line, trim
 
@@ -157,8 +157,12 @@ async def task_create(ctx: ToolContext, args: dict[str, Any]) -> str:
     audience=("llm", "external"),
 )
 async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
+    before = ctx.swarm.board.get(args["task_id"])
     task = ctx.swarm.board.claim(ctx.actor, args["task_id"])
-    return f"You now work on {task_line(task)}"
+    text = f"You now work on {task_line(task)}"
+    if before.reviewer == ctx.actor and task.reviewer is None:
+        text += "\nYou were its reviewer; since you execute it now, another member will review it."
+    return text
 
 
 @tool(
@@ -255,10 +259,17 @@ def _diff(old: Task, new: Task) -> list[str]:
     required=["task_id", "result"],
 )
 async def task_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
+    before = ctx.swarm.board.get(args["task_id"])
     task = ctx.swarm.board.complete(ctx.actor, args["task_id"], args["result"])
-    if task.status == Status.REVIEW:
+    if task.status != Status.REVIEW:
+        return f"Task #{task.id} is done."
+    if task.reviewer == before.reviewer:  # the task's own reviewer
         return f"Task #{task.id} was sent to {task.reviewer} for review."
-    return f"Task #{task.id} is done."
+    if task.reviewer == USER:
+        return (f"Task #{task.id} was sent to the user for review: nobody else in the team can review it. You will "
+                "be told the verdict; meanwhile take the next task or call wait.")
+    return (f"Task #{task.id} was sent to {task.reviewer} for review: a member other than you checks it, and you "
+            "will be told the verdict.")
 
 
 @tool(

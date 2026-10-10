@@ -39,6 +39,7 @@
   </header>
 
   <div class="stopped-banner hidden" id="stopped-banner"><span data-i18n="session_stopped"></span><button class="btn small primary" id="start-session-btn" type="button" data-i18n="start_session"></button></div>
+  <div class="paused-banner hidden" id="workspace-banner" role="alert"></div>
   <div class="paused-banner hidden" id="paused-banner"></div>
   <div class="conn-banner hidden" id="conn-banner" role="alert"></div>
 
@@ -58,6 +59,7 @@
       <section class="tab-pane board-pane" id="pane-board"><div class="board" id="board"></div></section>
       <section class="tab-pane hidden" id="pane-feed"><div class="feed" id="feed"></div></section>
       <section class="tab-pane hidden" id="pane-files">
+        <div class="files-head" id="workspace-info"></div>
         <div class="files">
           <div class="file-tree"><div class="crumbs" id="crumbs"></div><div id="file-list"></div></div>
           <div class="file-view"><div class="file-path" id="file-path"></div><pre id="file-content"></pre></div>

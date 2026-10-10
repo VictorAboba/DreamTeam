@@ -9,7 +9,9 @@ import re
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
+
+from . import roles
 
 CONFIG_FILE = "dreamteam.toml"
 
@@ -110,6 +112,21 @@ class SwarmSettings:
     goal: str = ""
     goal_description: str = ""
     starting_roles: list[str] = field(default_factory=list)
+    # a finished task of an agent goes to review by another member (or the user when nobody else can);
+    # false: a task without an explicit reviewer is done at once (docs/SPEC.md §4 "Independent review")
+    independent_review: bool = True
+
+
+@dataclass
+class RoleSettings:
+    """One [[roles]] entry (docs/SPEC.md §17.3): `name` is a built-in role's id (or its ru/en name; the entry then
+    customizes it) or the name of an own role."""
+
+    name: str = ""
+    description: str = ""
+    instructions: str = ""
+    model: str | None = None
+    hidden: bool = False
 
 
 @dataclass
@@ -163,7 +180,7 @@ class TracingSettings:
 # TOML section of each settings class (error messages)
 _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSettings": "server",
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
-               "TracingSettings": "tracing", "ModelProfile": "models"}
+               "TracingSettings": "tracing", "ModelProfile": "models", "RoleSettings": "roles"}
 # numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm)
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
                       "max_parallel_llm_calls", "max_tokens", "timeout", "max_timeout"})
@@ -250,6 +267,47 @@ def make_profile(name: str, spec: dict[str, Any]) -> ModelProfile:
     return _fill(ModelProfile, spec, f"models.{name}")
 
 
+def parse_roles(raw: Any, profiles: Iterable[str]) -> list[RoleSettings]:
+    """The checked [[roles]] entries (docs/SPEC.md §17.3), normalized: a built-in role by its id, texts stripped,
+    `model = ""` as None. `profiles`: the names of the model profiles a role may use."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("[[roles]] must be a list of role tables (write each role as a [[roles]] table)")
+    if len(raw) > roles.MAX_ROLES:
+        raise ValueError(f"At most {roles.MAX_ROLES} roles")
+    profiles = set(profiles)
+    seen: dict[str, int] = {}
+    out: list[RoleSettings] = []
+    for i, item in enumerate(raw, 1):
+        where = f"roles.{i}"
+        entry = _fill(RoleSettings, item, where)
+        name = roles.normalize(entry.name)
+        if not name:
+            raise ValueError(f"[{where}] name is empty")
+        if len(name) > roles.NAME_LIMIT:
+            raise ValueError(f"[{where}] name must be at most {roles.NAME_LIMIT} characters")
+        if "," in name or "*" in name:  # they separate the items of a team (--team, /team)
+            raise ValueError(f"[{where}] name cannot contain ',' or '*'")
+        key = roles.role_key(name)
+        if key in seen:
+            raise ValueError(f"[{where}] the role '{name}' is listed twice (also as role {seen[key]})")
+        seen[key] = i
+        for text in ("description", "instructions"):
+            if len(getattr(entry, text).strip()) > roles.TEXT_LIMIT:
+                raise ValueError(f"[{where}] {text} must be at most {roles.TEXT_LIMIT} characters")
+        builtin = roles.preset_id(name)
+        description = entry.description.strip()
+        if not builtin and not description and not entry.hidden:
+            raise ValueError(f"[{where}] '{name}': a role of your own needs a description")
+        model = entry.model or None
+        if model is not None and model not in profiles:
+            raise ValueError(f"[{where}] '{name}' uses the model profile '{model}', which is not defined in [models]")
+        out.append(RoleSettings(name=builtin or name, description=description,
+                                instructions=entry.instructions.strip(), model=model, hidden=entry.hidden))
+    return out
+
+
 @dataclass
 class Config:
     project_dir: Path
@@ -261,6 +319,13 @@ class Config:
     mcp: MCPSettings = field(default_factory=MCPSettings)
     tracing: TracingSettings = field(default_factory=TracingSettings)
     models: dict[str, ModelProfile] = field(default_factory=lambda: {"default": ModelProfile()})
+    # Not settings keys: a launcher session that works in another folder (sessions.py, session.json
+    # "workspace"). None = `<project>/workspace`. `workspace_adopted`: the folder was the user's before
+    # (its git repository configuration is never touched).
+    workspace_path: Path | None = None
+    workspace_adopted: bool = False
+    # [[roles]]: the role catalog's entries (docs/SPEC.md §17.3), checked and normalized by parse_roles
+    roles: list[RoleSettings] = field(default_factory=list)
 
     @property
     def data_dir(self) -> Path:
@@ -268,7 +333,7 @@ class Config:
 
     @property
     def workspace_dir(self) -> Path:
-        return self.project_dir / "workspace"
+        return self.workspace_path if self.workspace_path is not None else self.project_dir / "workspace"
 
     @property
     def library_dir(self) -> Path:
@@ -303,6 +368,7 @@ class Config:
             raise ValueError("[mcp] must be a table")
         mcp_raw = dict(mcp_raw)
         external = mcp_raw.pop("external", None) or {}
+        roles_raw = raw.pop("roles", None)  # checked once the model profiles are known
         cfg = cls(
             project_dir=Path(project_dir).resolve(),
             swarm=_fill(SwarmSettings, raw.pop("swarm", None)),
@@ -319,6 +385,7 @@ class Config:
             cfg.models = {name: make_profile(name, spec) for name, spec in models_raw.items()}
         if cfg.agents.default_model not in cfg.models:
             raise ValueError(f"agents.default_model = '{cfg.agents.default_model}' is not defined in [models]")
+        cfg.roles = parse_roles(roles_raw, cfg.models)
         if cfg.swarm.language not in ("ru", "en"):
             raise ValueError("swarm.language must be 'ru' or 'en'")
         return cfg
@@ -391,7 +458,8 @@ start_agents = 3              # сколько агентов стартует
 max_agents = 8                # максимум агентов (агенты могут нанимать новых)
 max_cost_usd = 5.0            # бюджет роя в долларах; при исчерпании рой встаёт на паузу
 goal = {toml_string(goal)}          # глобальная задача (можно задать позже в веб-интерфейсе)
-starting_roles = []           # роли стартовых агентов, например ["Аналитик", "Разработчик"]
+starting_roles = []           # стартовая команда по порядку, например ["architect", "developer", "developer", "tester"]; недостающим до start_agents — «Универсал»
+independent_review = true     # задачу агента принимает другой агент (или вы, если больше некому); false — без ревьюера задача сразу готова
 
 [agents]
 default_model = "default"
@@ -425,5 +493,15 @@ retention_days = 0            # 0 — хранить всегда
 # [mcp.external.fetch]
 # command = ["uvx", "mcp-server-fetch"]
 # description = "Загрузка веб-страниц"
+
+# Каталог ролей. Встроенные роли (generalist «Универсал», developer «Разработчик», tester «Тестировщик»,
+# reviewer «Ревьюер», analyst «Аналитик», architect «Архитектор», writer «Технический писатель»,
+# researcher «Исследователь») можно изменить или скрыть, а также добавить свои:
+# [[roles]]
+# name = "tester"              # встроенная роль: меняются только указанные поля
+# model = "fast"
+# [[roles]]
+# name = "Дата-инженер"
+# description = "Ты строишь конвейеры данных: ..."
 
 {models}'''

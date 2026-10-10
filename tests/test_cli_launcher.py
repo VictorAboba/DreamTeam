@@ -17,7 +17,9 @@ from pathlib import Path
 import pytest
 
 from dreamteam import cli
+from dreamteam import console as console_module
 from dreamteam import docker as docker_module
+from dreamteam import sessions as sessions_module
 from dreamteam import settings as st
 from dreamteam.config import Config
 from dreamteam.sessions import SessionManager
@@ -69,6 +71,94 @@ def test_sessions_and_traces_without_hub(tmp_path, capsys):
     assert cli.main(["status", "--home", str(home)]) == 0
     out = capsys.readouterr().out
     assert "001-offline [stopped]" in out and "Hub: not running" in out
+
+
+def test_sessions_rm_without_a_hub(tmp_path, capsys, monkeypatch):
+    home = make_home(tmp_path, free_port())
+    manager = SessionManager(home)
+    for title in ("One", "Two", "Three"):
+        asyncio.run(manager.create(title, "", start=False))
+    sessions = home / "sessions"
+    capsys.readouterr()
+    # without a terminal to confirm in, nothing is deleted unless --yes
+    monkeypatch.setattr(cli, "_stdin_is_terminal", lambda: False)
+    assert cli.main(["sessions", "rm", "001-one", "--home", str(home)]) == 1
+    assert "pass --yes" in capsys.readouterr().err and (sessions / "001-one").is_dir()
+    # an unknown id: nothing is deleted
+    assert cli.main(["sessions", "rm", "001-one", "nope", "--home", str(home), "--yes"]) == 1
+    err = capsys.readouterr().err
+    assert "Unknown session: nope" in err and "003-three" in err and (sessions / "001-one").is_dir()
+    # in a terminal it asks: "n" keeps the sessions, "y" deletes them (a repeated id once)
+    monkeypatch.setattr(cli, "_stdin_is_terminal", lambda: True)
+    answers = iter(["n", "y"])
+    monkeypatch.setattr("builtins.input", lambda prompt="": next(answers))
+    assert cli.main(["sessions", "rm", "001-one", "002-two", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert "001-one [stopped] One" in out and "Nothing deleted" in out and (sessions / "002-two").is_dir()
+    assert cli.main(["sessions", "delete", "001-one", "002-two", "001-one", "--home", str(home)]) == 0
+    out = capsys.readouterr().out
+    assert out.count("Deleted session 001-one.") == 1 and "Deleted session 002-two." in out
+    assert [s["id"] for s in SessionManager(home).list()] == ["003-three"]
+    assert sorted(p.name for p in sessions.iterdir()) == ["003-three"]  # no renamed-away leftovers
+    # listing still takes a DIR; `rm` without ids prints the usage; a folder that is not a home is refused
+    assert cli.main(["sessions", str(home)]) == 0 and "003-three [stopped]" in capsys.readouterr().out
+    assert cli.main(["sessions", "rm", "--home", str(home)]) == 2
+    assert "sessions rm ID" in capsys.readouterr().err
+    assert cli.main(["sessions", "rm", "x", "--yes", "--home", str(tmp_path / "nothing")]) == 1
+    assert "not a DreamTeam home" in capsys.readouterr().err and not (tmp_path / "nothing").exists()
+    with pytest.raises(SystemExit):
+        cli.main(["sessions", "rm", "003-three", "--force"])
+
+
+def test_sessions_rm_refusals_without_a_hub(tmp_path, capsys, monkeypatch):
+    from dreamteam.sessions import SessionError
+
+    home = make_home(tmp_path, free_port())
+    for title in ("One", "Two"):
+        asyncio.run(SessionManager(home).create(title, "", start=False))
+    sessions = home / "sessions"
+    capsys.readouterr()
+    # another DreamTeam process runs this home's sessions without a hub that answers (`dreamteam mcp --no-web`):
+    # nothing is deleted behind its back; the marker of a process that is gone is removed
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        marker = home / ".dreamteam" / f"launcher-{holder.pid}.pid"
+        marker.parent.mkdir(exist_ok=True)
+        marker.write_text(str(holder.pid), encoding="utf-8")
+        assert cli.main(["sessions", "rm", "001-one", "--yes", "--home", str(home)]) == 1
+        err = capsys.readouterr().err
+        assert "another DreamTeam process" in err and f"process {holder.pid}" in err and (sessions / "001-one").is_dir()
+    finally:
+        holder.kill()
+        holder.wait(10)
+    dead = home / ".dreamteam" / f"launcher-{holder.pid}.pid"
+    assert dead.exists()
+    # a refusal of the home is printed once (not "Could not delete session X: Could not delete session X: ...")
+    async def busy(self, sid):
+        raise SessionError(f"Could not delete session {sid}: its files are in use (WinError 32).", 409)
+
+    monkeypatch.setattr(SessionManager, "delete", busy)
+    assert cli.main(["sessions", "rm", "001-one", "--yes", "--home", str(home)]) == 1
+    err = capsys.readouterr().err
+    assert err.count("Could not delete session 001-one") == 1 and "files are in use" in err
+    assert not dead.exists()  # the stale marker went away on the way
+    monkeypatch.undo()
+    # Ctrl+C at the question deletes nothing
+    monkeypatch.setattr(cli, "_stdin_is_terminal", lambda: True)
+
+    def interrupt(prompt=""):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("builtins.input", interrupt)
+    assert cli.main(["sessions", "rm", "001-one", "--home", str(home)]) == 130
+    assert "Nothing deleted" in capsys.readouterr().out and (sessions / "001-one").is_dir()
+    # the main session of a project home is refused before the question
+    listed = SessionManager.list
+    monkeypatch.setattr(SessionManager, "list",
+                        lambda self: [{**s, "legacy": s["id"] == "002-two"} for s in listed(self)])
+    assert cli.main(["sessions", "rm", "001-one", "002-two", "--home", str(home)]) == 1
+    err = capsys.readouterr().err
+    assert "002-two is the project's own session" in err and (sessions / "001-one").is_dir()
 
 
 def test_serve_home_hub_end_to_end(tmp_path, capsys, monkeypatch):
@@ -140,13 +230,34 @@ def test_serve_home_hub_end_to_end(tmp_path, capsys, monkeypatch):
         # the console refuses a stopped session (each of its commands would get 409) and a dead URL
         assert (await asyncio.to_thread(cli.main, ["console", "--home", str(home), "--session", "002-later"])) == 1
         assert (await asyncio.to_thread(cli.main, ["console", "--url", f"http://127.0.0.1:{free_port()}"])) == 1
+        # ...but not a stopped session whose folder is gone: /cd is what fixes it, and the console can do that; the
+        # hub found through the home's hub.json is on this computer (relative /cd paths), whatever its address
+        usb = tmp_path / "usb" / "work"
+        created = await asyncio.to_thread(_post, base + "/api/sessions", {"title": "Usb", "goal": "Later",
+                                                                         "start": False, "workspace": str(usb)})
+        usb_sid = created["session"]["id"]
+        sessions_module._rmtree(tmp_path / "usb")  # (git objects are read-only on Windows)
+        consoles: list[tuple] = []
+        monkeypatch.setattr(console_module, "run_console",
+                            lambda url, lang, stop=None, local=None: consoles.append((url, local)))
+        assert (await asyncio.to_thread(cli.main, ["console", "--home", str(home), "--session", usb_sid])) == 0
+        assert consoles == [(f"{base}/s/{usb_sid}", True)]
+        await asyncio.to_thread(urllib.request.urlopen, urllib.request.Request(
+            f"{base}/api/sessions/{usb_sid}?confirm={usb_sid}", method="DELETE"))
+        # `sessions rm` deletes through the running hub, which stops a running session first
+        await asyncio.to_thread(_post, base + "/api/sessions/002-later/start", {})
+        assert (await asyncio.to_thread(cli.main, ["sessions", "rm", "--yes", "002-later", "--home", str(home)])) == 0
+        listed = await asyncio.to_thread(lambda: json.loads(urllib.request.urlopen(base + "/api/sessions").read()))
+        assert [s["id"] for s in listed["sessions"]] == ["001-poetry"] and not (home / "sessions" / "002-later").exists()
         stop.set()
         assert await asyncio.wait_for(task, 30) == 0
 
     asyncio.run(scenario())
     out, err = capsys.readouterr()
     assert "Session 002-later is stopped" in err and "No DreamTeam hub answers" in err
+    assert "cannot start: its folder" in err and "/cd <folder>" in err
     assert "001-poetry [running] Poetry" in out and "No traces." in out
+    assert "Deleted session 002-later." in out
     assert not cli.hub_file(home).exists()
     manager = SessionManager(home)
     assert manager.meta("001-poetry")["autostart"] is True  # resumed at the next start
@@ -405,3 +516,75 @@ def test_console_session_command(capsys):
     con.hub = Hub(None)  # `dreamteam run`: no launcher session
     con.handle("/session")
     assert "отдельный рой" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------------- goal split, --team
+def test_team_option_is_a_tui_option_checked_before_anything_starts(tmp_path, monkeypatch, capsys):
+    from dreamteam import tui
+
+    commands = [name for action in cli.build_parser()._subparsers._group_actions for name in action.choices]
+    monkeypatch.setattr(cli, "_interactive", lambda: False)
+    assert cli._default_command(["--team", "tester"], commands) == ["tui", "--team", "tester"]
+    seen: dict = {}
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: seen.update(kw) or 0)
+    monkeypatch.setattr(tui, "main_print", lambda home, prompt, **kw: seen.update(kw) or 0)
+    assert cli.main(["--home", str(tmp_path), "Сделай змейку", "--team", "architect, developer*2"]) == 0
+    assert seen["overrides"]["team"] == "architect, developer*2"  # the TUI turns it into swarm.starting_roles
+    seen.clear()
+    assert cli.main(["--home", str(tmp_path), "Сделай змейку"]) == 0
+    assert "team" not in seen["overrides"]
+    seen.clear()
+    assert cli.main(["-p", "Сделай змейку", "--home", str(tmp_path), "--team", "tester*2"]) == 0
+    assert seen["overrides"]["team"] == "tester*2"
+    seen.clear()
+    capsys.readouterr()
+    for argv, why in ((["--team", "developer*0"], "'developer*0': the count must be a whole number from 1 to 50"),
+                      (["--team", " , "], "The team is empty"),
+                      (["-p", "x", "--team", "x*51"], "'x*51': the count must be a whole number from 1 to 50")):
+        assert cli.main(["--home", str(tmp_path), *argv]) == 2
+        assert capsys.readouterr().err.strip() == f"dreamteam: --team: {why}"
+    assert not seen  # neither the TUI nor print mode ran
+
+
+def test_help_explains_the_goal_split_and_the_team():
+    choices = next(iter(cli.build_parser()._subparsers._group_actions)).choices
+    tui_help = " ".join(choices["tui"].format_help().split())
+    assert "its first line becomes the title, the rest the description" in tui_help
+    assert '--team TEAM starting team of a new session: roles in order, ROLE*N for several' in tui_help
+    assert "with this goal (first line: the title)" in " ".join(choices["serve"].format_help().split())
+
+
+async def test_run_keeps_a_multi_line_goal_across_restarts(tmp_path, monkeypatch):
+    """`dreamteam run --goal` sets the goal unless the same one is active: the stored title is the goal's first
+    line, so a multi-line --goal must not reset the goal (and plan it again) at every restart."""
+    from dreamteam import web as web_module
+    from dreamteam.db import Database
+
+    async def no_server(swarm, host, port, on_started=None):  # the web server is not what this is about
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(web_module, "serve", no_server)
+    monkeypatch.setattr(cli, "_port_free", lambda host, port: True)
+    config = Config.from_dict(tmp_path / "proj", {
+        "swarm": {"name": "Run", "language": "en", "start_agents": 0, "max_agents": 2, "max_cost_usd": 0},
+        "agents": {"stagger_seconds": 0}, "workspace": {"git": False}, "mcp": {"library_dir": str(tmp_path / "lib")},
+        "models": {"default": {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0}},
+    })
+
+    async def run(goal: str) -> dict:
+        stop = asyncio.Event()
+        stop.set()  # stops right after the start, where the goal is set or kept
+        assert await cli._serve_swarm(config.project_dir, config, "127.0.0.1", 1, goal, False, False, stop=stop) == 0
+        db = Database(config.data_dir / "swarm.db")
+        try:
+            return db.get("goal")
+        finally:
+            db.close()
+
+    goal = "Snake game\nPython, pygame\n\n- tests"
+    first = await run(goal)
+    assert (first["title"], first["description"]) == ("Snake game", "Python, pygame\n\n- tests")
+    assert await run(goal) == first  # kept: same updated_at
+    changed = await run("Tetris\nPython")
+    assert changed["title"] == "Tetris" and changed["updated_at"] >= first["updated_at"]

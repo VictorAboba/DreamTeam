@@ -6,6 +6,10 @@ configuration is the home's global settings deep-merged with the session's `over
 A home that was used as a single-swarm project before sessions existed (`<home>/.dreamteam/swarm.db`)
 shows up as the session `main` that lives in the home directory itself.
 
+A session can work in another folder than its own `workspace/` (session.json "workspace"): an empty one gets
+the session's files moved into it, a folder that already holds files (the user's project) is adopted as it is
+(see `SessionManager.set_workspace`).
+
 The manager keeps at most one `Swarm` object per session: *running* sessions are started (agents work);
 a stopped session can be *loaded* without starting, so the web UI can show its board and traces.
 """
@@ -13,7 +17,9 @@ a stopped session can be *loaded* without starting, so the web UI can show its b
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
+import errno
 import json
 import logging
 import os
@@ -21,18 +27,23 @@ import re
 import shutil
 import sqlite3
 import stat
+import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable
 
 from .config import Config
 from .db import loads
+from .goal_text import shorten_title, split_goal
 from .models import USER
 from .settings import (
     apply_update, deep_merge, ensure_home, profile_renames, public_view, read_raw, settings_path, validate, write_raw,
 )
+from .workspace import SCRATCH_DIR, commit_paths, init_repo, looks_like_git_dir, repo_state, tracked
 
 if TYPE_CHECKING:
     from .swarm import Swarm
@@ -46,6 +57,12 @@ OVERRIDE_SECTIONS = ("swarm", "agents", "shell", "workspace", "mcp", "tracing")
 SESSION_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}\Z")  # \Z: "$" would accept a trailing newline
 TITLE_LIMIT = 200
 TRASH_PREFIX = ".deleted-"  # a session directory being deleted (never a valid session id)
+WORKSPACE_DIR = "workspace"  # a session's own (default) workspace folder inside its directory
+MOVE_JOURNAL = "workspace-move.json"  # in the session's .dreamteam/ while its workspace moves (kept if it failed)
+LEGACY_WORKSPACE_TEXT = (
+    "The main session lives in the home directory itself, and `dreamteam run` can still open that directory as a "
+    "single-swarm project, which would not know about another folder: its workspace cannot be moved. Create a new "
+    "session in the other folder instead.")
 
 _TRANSLIT = dict(zip(
     "абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґ",
@@ -97,10 +114,260 @@ def _rmtree(path: Path) -> None:
 
     if not path.exists():
         return
+    target = str(path)
+    if sys.platform == "win32" and not target.startswith("\\\\?\\"):
+        # the extended-length form: a renamed-away session (.deleted-<id>-<ns>) is longer than the original, and
+        # its deepest files (git objects) may pass the 260-character limit of plain Windows paths
+        full = os.path.abspath(target)
+        target = "\\\\?\\UNC\\" + full[2:] if full.startswith("\\\\") else "\\\\?\\" + full
     if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=on_error)
+        shutil.rmtree(target, onexc=on_error)
     else:
-        shutil.rmtree(path, onerror=lambda func, target, info: on_error(func, target, info[1]))
+        shutil.rmtree(target, onerror=lambda func, target, info: on_error(func, target, info[1]))
+
+
+# ---- workspace folders ---------------------------------------------------------------------------------
+def _path_key(path: Path) -> str:
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _same_path(a: Path, b: Path) -> bool:
+    return _path_key(a) == _path_key(b)
+
+
+def _within(path: Path, parent: Path) -> bool:
+    """`path` is `parent` or inside it (both resolved; case-insensitive where the file system is)."""
+    p, q = _path_key(path), _path_key(parent)
+    return p == q or p.startswith(q if q.endswith(os.sep) else q + os.sep)
+
+
+def _remove(path: Path) -> None:
+    """Delete a file or a directory tree; OSError when something is left."""
+    if path.is_dir() and not path.is_symlink():
+        _rmtree(path)
+    elif os.path.lexists(path):
+        try:
+            path.unlink()
+        except PermissionError:  # a read-only file on Windows
+            os.chmod(path, stat.S_IWRITE)
+            path.unlink()
+    if os.path.lexists(path):
+        raise OSError(f"could not remove {path} completely (a file in it is in use?)")
+
+
+def _cross_device(exc: OSError) -> bool:
+    return exc.errno == errno.EXDEV or getattr(exc, "winerror", None) == 17  # ERROR_NOT_SAME_DEVICE
+
+
+def _move_path(src: Path, dst: Path, done: list[tuple[Path, Path, bool]] | None = None) -> None:
+    """Move one file or directory: a rename on the same volume, else a copy and a delete (a failed copy is
+    removed again, so the original stays the only one). A `dst` that exists is never touched (FileExistsError,
+    nothing moved). `done` gets (src, dst, copied) as soon as `dst` holds the entry — after the rename, or after
+    the copy and before the original is deleted — so an undo puts back only what this move made."""
+    if os.path.lexists(dst):  # (os.rename would replace a file there on POSIX; a copy would merge into it)
+        raise FileExistsError(errno.EEXIST, "a file or folder of that name is already there", str(dst))
+    try:
+        os.rename(src, dst)
+    except OSError as exc:
+        if not _cross_device(exc):
+            raise
+    else:
+        if done is not None:
+            done.append((src, dst, False))
+        return
+    try:
+        if src.is_dir() and not src.is_symlink():
+            shutil.copytree(src, dst, symlinks=True)
+        else:
+            shutil.copy2(src, dst, follow_symlinks=False)
+    except BaseException:
+        if os.path.lexists(dst):  # the partial copy (dst did not exist before)
+            try:
+                _remove(dst)
+            except OSError:
+                log.warning("could not remove the partial copy %s", dst)
+        raise
+    if done is not None:
+        done.append((src, dst, True))
+    _remove(src)
+
+
+def _move_back(moved: Path, original: Path, copied: bool = False) -> None:
+    """Undo `_move_path(original, moved)`. `copied`: it was a copy and a delete, and the original may have been
+    only partly deleted (the rest is put back from the copy). After a rename, something at `original` is not this
+    move's: it is left alone (FileExistsError: the moved entry stays where it is, reported)."""
+    if not os.path.lexists(moved):
+        return  # it never arrived: the original is intact
+    if not os.path.lexists(original):
+        _move_path(moved, original)
+        return
+    if not copied:
+        raise FileExistsError(errno.EEXIST, "something else is there now", str(original))
+    if moved.is_dir() and not moved.is_symlink():
+        shutil.copytree(moved, original, symlinks=True, dirs_exist_ok=True)
+    _remove(moved)  # (a file's original is still whole: it is deleted at once or not at all)
+
+
+def _check_writable(folder: Path, shown: Path) -> None:
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".dreamteam-probe-", dir=folder)
+        os.close(fd)
+        os.unlink(probe)
+    except OSError as exc:
+        raise SessionError(f"Cannot write to {shown}: {exc.strerror or exc}. Choose a folder you can write to.") \
+            from None
+
+
+@dataclass
+class _Plan:
+    """What changing a session's workspace will do, decided (and checked) before anything changes."""
+    target: Path                 # the new folder (resolved)
+    old: Path                    # the current folder
+    mode: str                    # "moved" | "adopted" | "unchanged"
+    default: bool                # the target is the session's own workspace/ folder
+    adopted: bool                # stored as "adopted": the folder was the user's (its repo config is never touched)
+    git: str                     # "moved" | "existing" | "initialized" | "disabled" | "none"
+    move_all: bool = False       # move every entry of `old` (else only the MCP servers' folders)
+    mcp: list[str] = field(default_factory=list)  # forged/imported MCP servers whose folders go along
+    old_exists: bool = True
+    old_is_default: bool = False
+    # leaving a folder of the user: the `mcp/<name>` folders its repository tracks (the agents committed them
+    # there), whose removal is committed there after the move so that the user's repository stays clean
+    old_tracked: list[str] = field(default_factory=list)
+
+    def result(self, git: str | None = None) -> dict[str, Any]:
+        # old_kept: the previous folder still holds its files (an adopt, or the user's folder left as it was)
+        kept = str(self.old) if self.mode != "unchanged" and not self.move_all and self.old_exists else None
+        return {"mode": self.mode, "from": str(self.old), "to": str(self.target), "git": git or self.git,
+                "mcp_moved": list(self.mcp) if self.mode != "unchanged" else [], "old_kept": kept,
+                "old_missing": not self.old_exists, "old_changed": None}
+
+
+class _Undo:
+    """What a workspace change did so far, to put everything back when a later step fails. Only what the change
+    itself made is recorded: an entry that was already in the target is never moved back or deleted."""
+
+    def __init__(self) -> None:
+        self.created: list[Path] = []                 # directories made, in creation order
+        self.moved: list[tuple[Path, Path, bool]] = []  # (from, to, copied) once `to` holds it, in order
+        self.removed_old: Path | None = None          # the emptied default folder that was removed
+        self.git_dir: Path | None = None              # a repository created by the change
+        self.gitignore: Path | None = None            # a .gitignore created with it
+
+    def run(self) -> list[str]:
+        """Undo in reverse order; returns what could not be undone (empty: everything is back)."""
+        problems: list[str] = []
+        for path in (self.git_dir, self.gitignore):
+            if path is not None and os.path.lexists(path):
+                try:
+                    _remove(path)
+                except OSError as exc:
+                    problems.append(f"{path}: {exc}")
+        if self.removed_old is not None:
+            try:
+                self.removed_old.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                problems.append(f"{self.removed_old}: {exc}")
+        for original, moved, copied in reversed(self.moved):
+            try:
+                _move_back(moved, original, copied)
+            except OSError as exc:
+                problems.append(f"{moved} (belongs in {original}): {exc}")
+        for folder in reversed(self.created):
+            try:
+                folder.rmdir()
+            except OSError:
+                pass  # not empty (something could not be moved back: listed above) or already gone
+        return problems
+
+
+def _repo_refusal(folder: Path, state: dict[str, Any], *, starting: str | None = None) -> SessionError | None:
+    """Why the agents cannot work with git in a folder of the user (`repo_state(folder)`), or None. `starting`: the
+    session about to start in a folder it adopted before (else the folder is about to be adopted)."""
+    where = f"{folder} (the folder session {starting} works in)" if starting else str(folder)
+    first = "before starting the session" if starting else "first"
+    if state["error"]:
+        return SessionError(f"Git cannot read the repository in {where}: {state['error'][:500]}", 409)
+    if state["git_dir"]:
+        return SessionError(f"{where} is a git repository's own database (a .git folder or a bare repository), not "
+                            "a folder of files: choose the folder of its work tree.", 409 if starting else 400)
+    toplevel = state["toplevel"]
+    if toplevel is None:
+        return None  # no repository: one is created, as for a new workspace
+    try:
+        top = Path(toplevel).resolve()
+    except (OSError, ValueError, RuntimeError):
+        top = Path(toplevel)
+    if not _same_path(top, folder):
+        if starting:
+            return SessionError(f"{where} is inside the git repository {top}: with git on, DreamTeam would create a "
+                                f"repository inside it. Move the session to {top} or to a folder outside it (/cd), "
+                                "or turn git off for this session.", 409)
+        return SessionError(f"{folder} is inside the git repository {top}: choose the repository's own folder {top}, "
+                            "or a folder outside it.")
+    if state["branch"] is None:
+        return SessionError(f"The git repository in {where} is in a detached HEAD state: check out a branch {first} "
+                            "(the agents' commits go to the current branch).", 409)
+    if state["operation"]:
+        return SessionError(f"A {state['operation']} is in progress in the git repository in {where}: finish or abort "
+                            f"it {first} (the agents' next commit would conclude it in their name).", 409)
+    if state["changes"]:
+        shown = "; ".join(state["changes"][:5]) + ("; ..." if len(state["changes"]) > 5 else "")
+        return SessionError(
+            f"The git repository in {where} has uncommitted changes or untracked files ({len(state['changes'])}: "
+            f"{shown}). Commit or stash them {first}: the agents commit with `git add -A`, which would mix your "
+            "changes into their commits.", 409)
+    return None
+
+
+async def _in_thread(fn: Callable[..., Any], *args: Any) -> Any:
+    """Blocking file work in a thread that a cancellation cannot abandon halfway (a move whose undo would run
+    while it still moves files): the caller waits for it to end before the CancelledError goes on."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        while not work.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({work})
+        if not work.cancelled():
+            work.exception()  # retrieved (the caller undoes the work whatever happened)
+        raise
+
+
+def _home_relative(workspace: Any) -> str | None:
+    """The "in_home" entry of a stored workspace: the folder relative to the home (posix) when it lies inside the
+    home, so that it is found again where the home is mounted elsewhere (the Docker sandbox) or was moved."""
+    relative = workspace.get("in_home") if isinstance(workspace, dict) else None
+    if not isinstance(relative, str) or not relative.strip():
+        return None
+    parts = PurePosixPath(relative.replace("\\", "/")).parts
+    if not parts or parts[0] == "/" or ".." in parts or ":" in parts[0]:
+        return None  # only a plain relative path inside the home
+    return "/".join(parts)
+
+
+def external_workspaces(home: str | Path) -> list[tuple[str, str]]:
+    """(session id, folder) of the sessions of a home that work in a folder outside the home (read from their
+    session.json without opening anything; for the Docker sandbox, which mounts only the home: a folder inside
+    the home is stored relative to it as well, and is found there)."""
+    home = Path(home)
+    found = []
+    sessions = home / SESSIONS_DIR
+    candidates = [(p.name, p / SESSION_FILE) for p in sorted(sessions.iterdir())] if sessions.is_dir() else []
+    for sid, path in candidates:
+        if sid == LEGACY_ID or not SESSION_ID.match(sid):
+            continue
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        workspace = meta.get("workspace") if isinstance(meta, dict) else None
+        stored = workspace.get("path") if isinstance(workspace, dict) else None
+        if not isinstance(stored, str) or not stored.strip() or _home_relative(workspace):
+            continue
+        found.append((sid, stored))
+    return found
 
 
 def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
@@ -155,6 +422,16 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
     return stats
 
 
+def pending_goal(meta: dict[str, Any]) -> dict[str, str] | None:
+    """The goal a session was created with and that its first start has not set yet ({title, description}), split
+    as set_goal will split it (a session.json written before the split may hold a multi-line title)."""
+    pending = meta.get("pending_goal")
+    if not isinstance(pending, dict):
+        return None
+    title, description = split_goal(str(pending.get("title") or ""), str(pending.get("description") or ""))
+    return {"title": title, "description": description} if title else None
+
+
 class SessionManager:
     def __init__(self, home: str | Path, *, llm_factory: Callable | None = None,
                  language: str = "ru", provider: str = "anthropic"):
@@ -170,6 +447,9 @@ class SessionManager:
         self.running: set[str] = set()
         self.hub_url: str | None = None        # base URL of the web server (no trailing /), set by launcher.serve
         self._locks: dict[str, asyncio.Lock] = {}  # kept after a delete: a waiter may still hold the old lock
+        # one workspace change at a time in the whole home (taken inside a session's lock, from the final check of
+        # the new folder until session.json names it): two sessions never take the same folder
+        self._claims = asyncio.Lock()
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
 
     # ---- change notifications ------------------------------------------------------------------
@@ -359,6 +639,11 @@ class SessionManager:
             raise SessionError(f"Session '{sid}' is damaged: {exc}", 500) from None
         if not isinstance(meta, dict):
             raise SessionError(f"Session '{sid}' is damaged: {SESSION_FILE} is not a JSON object.", 500)
+        workspace = meta.get("workspace")
+        if workspace is not None and not (isinstance(workspace, dict) and isinstance(workspace.get("path"), str)
+                                          and workspace["path"].strip()):
+            raise SessionError(f"Session '{sid}' is damaged: \"workspace\" in {SESSION_FILE} must be "
+                               "{\"path\": \"<folder>\", \"adopted\": true|false}.", 500)
         meta.setdefault("overrides", {})
         meta.setdefault("autostart", False)
         meta["id"] = sid
@@ -404,8 +689,328 @@ class SessionManager:
         return validate(self.dir_of(sid), self._merged(raw, overrides))
 
     def config_for(self, sid: str) -> Config:
-        """The effective configuration of a session (global settings + its overrides)."""
-        return self._config_from(self.raw, sid)
+        """The effective configuration of a session (global settings + its overrides, and its workspace folder)."""
+        cfg = self._config_from(self.raw, sid)
+        if sid != LEGACY_ID:
+            self._apply_workspace(cfg, sid, self.meta(sid))
+        return cfg
+
+    # ---- workspace folder -----------------------------------------------------------------------
+    def default_workspace(self, sid: str) -> Path:
+        """The session's own workspace folder (inside its directory; created on demand)."""
+        return self.dir_of(sid) / WORKSPACE_DIR
+
+    def _workspace_entry(self, sid: str, meta: dict[str, Any]) -> tuple[Path, str | None, bool]:
+        """(folder, the path as shown or None for the default folder, adopted). A folder inside the home is found
+        relative to it ("in_home": the home may be mounted elsewhere, e.g. in the Docker sandbox, or moved). A stored
+        path that is not absolute here (a Windows path read inside a Linux container) maps to a folder that does
+        not exist in the session."""
+        workspace = meta.get("workspace") if sid != LEGACY_ID else None
+        if not isinstance(workspace, dict):
+            return self.default_workspace(sid), None, False
+        relative = _home_relative(workspace)
+        if relative is not None:
+            folder = self.home / relative
+            return folder, str(folder), bool(workspace.get("adopted"))
+        stored = str(workspace["path"])
+        folder = Path(stored)
+        if not folder.is_absolute():
+            folder = self.dir_of(sid) / ".unavailable-workspace"
+        return folder, stored, bool(workspace.get("adopted"))
+
+    def _workspace_meta(self, target: Path, adopted: bool) -> dict[str, Any]:
+        """session.json "workspace" for a folder (resolved): its absolute path, plus the path relative to the home
+        when it lies inside the home."""
+        entry: dict[str, Any] = {"path": str(target), "adopted": adopted}
+        try:
+            home = self.home.resolve()
+            if _within(target, home):
+                entry["in_home"] = PurePosixPath(*Path(os.path.relpath(target, home)).parts).as_posix()
+        except (OSError, ValueError):
+            pass
+        return entry
+
+    def _apply_workspace(self, cfg: Config, sid: str, meta: dict[str, Any]) -> Config:
+        folder, stored, adopted = self._workspace_entry(sid, meta)
+        cfg.workspace_path = None if stored is None else folder
+        cfg.workspace_adopted = adopted
+        return cfg
+
+    def workspace_of(self, sid: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        """The folder the session works in: {"path", "default" (its own workspace/), "adopted" (a folder that
+        held files before, e.g. the user's project), "exists"}."""
+        meta = self.meta(sid) if meta is None else meta
+        folder, stored, adopted = self._workspace_entry(sid, meta)
+        return {"path": str(folder) if stored is None else stored, "default": stored is None, "adopted": adopted,
+                "exists": folder.is_dir()}
+
+    def _journal(self, sid: str) -> Path:
+        return self.dir_of(sid) / ".dreamteam" / MOVE_JOURNAL
+
+    def _check_journal(self, sid: str, meta: dict[str, Any]) -> None:
+        """A workspace move that could not finish (or be undone) leaves its journal: refuse to work until the files
+        are put together again."""
+        path = self._journal(sid)
+        if not path.exists():
+            return
+        try:
+            info = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            info = {}
+        info = info if isinstance(info, dict) else {}
+        uses = self.workspace_of(sid, meta)["path"]
+        raise SessionError(
+            f"Moving the workspace of session {sid} from {info.get('from', '?')} to {info.get('to', '?')} did not "
+            f"finish: some of its files may be in one folder and some in the other. The session uses {uses}: put "
+            f"the files together there, then delete {path}.", 409)
+
+    def _check_workspace_ready(self, sid: str, meta: dict[str, Any]) -> None:
+        """Before a start: a folder outside the session is never created silently (a deleted project, an unplugged
+        drive, a host path inside the Docker sandbox): the agents would work in an empty stand-in."""
+        self._check_journal(sid, meta)
+        info = self.workspace_of(sid, meta)
+        if info["default"] or info["exists"]:
+            return
+        what = "is not a folder" if Path(info["path"]).exists() else "does not exist"
+        raise SessionError(
+            f"The workspace folder of session {sid} {what}: {info['path']}. Bring it back (e.g. reconnect the drive), "
+            f"or move the session to another folder: /cd <folder> (/cd --default for its own folder) in `dreamteam` "
+            f"or `dreamteam console --session {sid}`, session_cd in MCP.", 409)
+
+    def _check_adopted_repo(self, sid: str, folder: Path, mcp: list[str]) -> None:
+        """Before a start in a folder the session adopted, with git on: the same rules as when it was adopted, since
+        the user may have worked in it meanwhile (or git was off then). Its repository must be clean (the agents
+        commit with `git add -A`; the session's own `mcp/<name>` folders are left out: they are the agents' work, and
+        so is `.scratch/`, which no commit takes and whose marker the start writes again if an agent removed it),
+        on a branch, with no merge or rebase halfway, and not inside another repository (a folder that is in no
+        repository gets one at the start, as when it was adopted). Blocking (git): run it in a thread."""
+        git_exe = shutil.which("git")
+        if git_exe is None:
+            return
+        state = repo_state(folder, git_exe, exclude=[*(f"mcp/{name}" for name in mcp), SCRATCH_DIR])
+        refusal = _repo_refusal(folder, state, starting=sid)
+        if refusal is not None:
+            raise refusal
+
+    def _forged_servers(self, sid: str) -> list[str]:
+        """MCP servers whose files live in the session's workspace (forged there or imported from the library)."""
+        db = self.dir_of(sid) / ".dreamteam" / "swarm.db"
+        if not db.exists():
+            return []
+        try:
+            conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
+        except sqlite3.Error:
+            return []
+        try:
+            rows = conn.execute("SELECT name FROM mcp_servers WHERE origin != 'config' AND status != 'removed'"
+                                " ORDER BY name").fetchall()
+        except sqlite3.Error as exc:
+            log.debug("cannot list the MCP servers of %s: %s", sid, exc)
+            return []
+        finally:
+            conn.close()
+        return [str(r[0]) for r in rows]
+
+    def _other_workspaces(self, sid: str | None) -> list[tuple[str, Path]]:
+        found = []
+        for other in self.ids():
+            if other == sid:
+                continue
+            try:
+                folder, _stored, _adopted = self._workspace_entry(other, self.meta(other))
+                found.append((other, folder.resolve()))
+            except (SessionError, OSError, RuntimeError):
+                continue  # a damaged session: its own summary shows the error
+        return found
+
+    def _plan(self, sid: str | None, path: Any, *, git_on: bool, mcp: list[str] | None = None) -> _Plan:
+        """Check a new workspace folder for a session (sid None: a session about to be created) and decide what
+        to do; SessionError (400 bad target, 409 conflict) before anything changes. Blocking (git): run it in a
+        thread."""
+        meta = self.meta(sid) if sid is not None else {}
+        if sid is not None:
+            old, old_stored, old_adopted = self._workspace_entry(sid, meta)
+            default = self.default_workspace(sid)
+        else:
+            old, old_stored, old_adopted, default = None, None, False, None
+        if path is None:
+            if default is None:
+                raise SessionError("Give the folder for the new session.")
+            target = default
+        else:
+            if not isinstance(path, (str, os.PathLike)):
+                raise SessionError("The folder must be a string path.")
+            text = os.fspath(path)
+            if not isinstance(text, str) or not text.strip():
+                raise SessionError("Give a folder path.")
+            target = Path(text.strip())
+            if not target.is_absolute():
+                raise SessionError(f"The folder must be an absolute path, got '{text.strip()}' (clients resolve "
+                                   "relative paths against their own current directory).")
+        try:
+            target = target.resolve()  # symlinks and junctions: the checks below see the real folder
+            home = self.home.resolve()
+            sessions = self.sessions_dir.resolve()
+            user_home = Path.home().resolve()
+            old_real = old.resolve() if old is not None else None
+            default_real = default.resolve() if default is not None else None
+            session_dir = self.dir_of(sid).resolve() if sid is not None else None
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise SessionError(f"Cannot use the folder {path}: {exc}") from None
+        is_default = default_real is not None and _same_path(target, default_real)
+        if target.parent == target:
+            raise SessionError(f"{target} is the root of a drive or of the file system; choose a folder inside it.")
+        if _same_path(target, user_home):
+            raise SessionError(f"{target} is your home folder itself; choose a folder inside it, e.g. "
+                               f"{target / 'my-project'}.")
+        if _within(user_home, target):
+            raise SessionError(f"{target} contains your home folder {user_home}; choose a folder inside it.")
+        if _same_path(target, home) or _within(home, target):
+            raise SessionError(f"{target} is the DreamTeam home or contains it; choose a folder outside {home}.")
+        if _within(target, home / ".dreamteam"):
+            raise SessionError(f"{target} is inside DreamTeam's own data folder {home / '.dreamteam'}.")
+        if _within(target, sessions) and not is_default:
+            raise SessionError(f"{target} is inside the DreamTeam sessions folder {sessions}; choose a folder "
+                               "outside it (or --default for the session's own folder).")
+        if session_dir is not None and _within(target, session_dir / ".dreamteam"):
+            raise SessionError(f"{target} is inside the session's data folder.")
+        if any(part.casefold() == ".git" for part in target.parts) or looks_like_git_dir(target):
+            raise SessionError(f"{target} is a git repository's own database (a .git folder or a bare repository), "
+                               "not a folder of files: choose the folder of its work tree.")
+        libraries = [self.config.library_dir]
+        if sid is not None:
+            with contextlib.suppress(ValueError):
+                libraries.append(self._config_from(self.raw, sid).library_dir)
+        for library in libraries:
+            try:
+                library = library.resolve()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if _within(target, library) or _within(library, target):
+                raise SessionError(f"{target} is DreamTeam's shared MCP library {library}, or inside it or contains "
+                                   "it (every session imports its servers from there); choose another folder.")
+        if old_real is not None and _same_path(target, old_real):
+            git = "existing" if (target / ".git").exists() else ("disabled" if not git_on else "none")
+            return _Plan(target=target, old=old_real, mode="unchanged", default=is_default,
+                         adopted=old_adopted, git=git)
+        if old_real is not None and _within(target, old_real):
+            raise SessionError(f"{target} is inside the session's current folder {old_real}; choose a folder "
+                               "outside it.")
+        if old_real is not None and (_within(old_real, target) or _within(session_dir, target)):
+            raise SessionError(f"{target} contains the session's current folder {old_real}; choose a folder that "
+                               "does not.")
+        for other, folder in self._other_workspaces(sid):
+            if _within(target, folder) or _within(folder, target):
+                how = "is the folder" if _same_path(target, folder) else \
+                    ("is inside the folder" if _within(target, folder) else "contains the folder")
+                raise SessionError(f"{target} {how} of session {other} ({folder}); two sessions cannot share files.",
+                                   409)
+        if target.exists() and not target.is_dir():
+            raise SessionError(f"{target} is a file, not a folder.")
+        if target.is_dir():
+            try:
+                empty = next(target.iterdir(), None) is None
+            except OSError as exc:
+                raise SessionError(f"Cannot read the folder {target}: {exc.strerror or exc}.") from None
+            _check_writable(target, target)
+        else:
+            empty = True
+            parent = target.parent
+            while not parent.exists() and parent.parent != parent:
+                parent = parent.parent
+            if not parent.is_dir():
+                why = "is not a folder" if parent.exists() else "does not exist"
+                raise SessionError(f"{target} cannot be created: {parent} {why}.")
+            _check_writable(parent, target)
+        old_exists = old_real is not None and old_real.is_dir()
+        git_exe = shutil.which("git")
+        plan = _Plan(target=target, old=old_real if old_real is not None else target, mode="moved",
+                     default=is_default, adopted=False, git="none", old_exists=old_exists,
+                     old_is_default=old_stored is None and old is not None)
+        carried = [name for name in (mcp or []) if old_exists and (old_real / "mcp" / name).is_dir()]
+        if old_adopted and carried and git_exe:  # leaving the user's folder: did the agents commit the servers there?
+            plan.old_tracked = tracked(old_real, [f"mcp/{name}" for name in carried], git_exe)
+        if empty and not old_adopted:
+            # the session's own files (its default folder, or a folder they were moved to) move along
+            plan.move_all = True
+            plan.mcp = carried
+            if old_exists and (old_real / ".git").exists():
+                plan.git = "moved"
+            else:
+                plan.git = "disabled" if not git_on else ("initialized" if git_exe else "none")
+            return plan
+        # A folder with files (adopted as it is), or an empty one after the user's own folder: the user's files stay
+        # where they are; only the session's MCP servers come along.
+        plan.mode = "moved" if empty else "adopted"
+        plan.adopted = not empty and not is_default
+        plan.mcp = carried
+        conflicts = [name for name in carried if os.path.lexists(target / "mcp" / name)]
+        if carried and (conflicts or os.path.lexists(target / "mcp") and not (target / "mcp").is_dir()):
+            names = ", ".join(f"mcp/{n}" for n in conflicts) or "mcp (a file)"
+            raise SessionError(f"{target} already has {names}, where the session's MCP servers would go. Rename or "
+                               "remove it there first, or choose another folder.", 409)
+        if not git_on:
+            plan.git = "disabled"
+        elif not git_exe:
+            plan.git = "none"
+        elif empty or is_default:
+            plan.git = "existing" if (target / ".git").exists() else "initialized"
+        else:
+            # the session's own servers (absent there: checked above) are left out, as at every start: a folder it
+            # worked in before may track them, and their move brings them back (else it could never return there)
+            state = repo_state(target, git_exe, exclude=[f"mcp/{name}" for name in carried])
+            refusal = _repo_refusal(target, state)
+            if refusal is not None:
+                raise refusal
+            plan.git = "initialized" if state["toplevel"] is None else "existing"
+        return plan
+
+    def _carry_out(self, sid: str | None, plan: _Plan, undo: _Undo) -> str:
+        """Do what the plan says (blocking: run it in a thread). Returns the git outcome; on an exception `undo`
+        knows how to put everything back."""
+        if sid is not None:
+            journal = self._journal(sid)
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            journal.write_text(json.dumps({"from": str(plan.old), "to": str(plan.target), "mode": plan.mode,
+                                           "started_at": time.time()}, ensure_ascii=False), encoding="utf-8")
+        missing = []
+        folder = plan.target
+        while not folder.exists():
+            missing.append(folder)
+            folder = folder.parent
+        for folder in reversed(missing):
+            folder.mkdir()
+            undo.created.append(folder)
+        if plan.move_all:
+            if plan.old_exists:
+                # .git last: until the end, the old folder stays a complete repository of what has not moved yet
+                for entry in sorted(plan.old.iterdir(), key=lambda p: (p.name.casefold() == ".git", p.name)):
+                    # (a name that appeared in the target meanwhile: FileExistsError, and it is never touched)
+                    _move_path(entry, plan.target / entry.name, undo.moved)
+                if plan.old_is_default:  # the session's own folder goes away (it is recreated on demand)
+                    try:
+                        plan.old.rmdir()
+                        undo.removed_old = plan.old
+                    except OSError:
+                        pass
+        elif plan.mcp:
+            mcp_dir = plan.target / "mcp"
+            if not mcp_dir.exists():
+                mcp_dir.mkdir()
+                undo.created.append(mcp_dir)
+            for name in plan.mcp:
+                _move_path(plan.old / "mcp" / name, mcp_dir / name, undo.moved)
+        if plan.git == "initialized":
+            if os.path.lexists(plan.target / ".git"):  # not ours: never initialized over, nor removed by the undo
+                raise SessionError(f"A git repository appeared in {plan.target} meanwhile; check the folder and "
+                                   "try again.", 409)
+            if not os.path.lexists(plan.target / ".gitignore"):
+                undo.gitignore = plan.target / ".gitignore"
+            undo.git_dir = plan.target / ".git"
+            error = init_repo(plan.target, adopted=plan.adopted)
+            if error:
+                raise OSError(f"git init in {plan.target} failed: {error}")
+        return plan.git
 
     def config_view(self, sid: str) -> dict[str, Any]:
         """settings.public_view of a session's effective settings (no API keys); the global settings when its
@@ -465,10 +1070,9 @@ class SessionManager:
         else:
             stats = read_stats(db_path)
         limits = stats.pop("limits") or {}
-        pending = meta.get("pending_goal")
-        if stats["goal"] is None and isinstance(pending, dict):
-            stats["goal"] = {"title": pending.get("title", ""), "description": pending.get("description", ""),
-                             "status": "pending", "summary": ""}
+        pending = pending_goal(meta)
+        if stats["goal"] is None and pending:
+            stats["goal"] = {**pending, "status": "pending", "summary": ""}
         profile = cfg.agents.default_model
         model = cfg.models.get(profile)
         return {
@@ -480,7 +1084,7 @@ class SessionManager:
             "max_cost_usd": _number(limits.get("max_cost_usd", cfg.swarm.max_cost_usd)),
             "max_agents": int(_number(limits.get("max_agents", cfg.swarm.max_agents))),
             "overrides": meta.get("overrides") or {}, "config_error": config_error,
-            "url": f"/s/{sid}/", **stats,
+            "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta), **stats,
         }
 
     def list(self) -> list[dict[str, Any]]:
@@ -517,12 +1121,20 @@ class SessionManager:
         return sid[:64].rstrip("-")
 
     async def create(self, title: str, goal: str = "", description: str = "", *,
-                     overrides: dict[str, Any] | None = None, start: bool = True, actor: str = USER) -> dict[str, Any]:
-        """Create a session (and start it with the goal unless start=False). Returns its summary."""
-        title = (_one_line(title) or _one_line(goal)[:60] or "Session")[:TITLE_LIMIT].strip()
-        goal, description = _text(goal).strip(), _text(description).strip()
+                     overrides: dict[str, Any] | None = None, start: bool = True, actor: str = USER,
+                     workspace: str | os.PathLike | None = None) -> dict[str, Any]:
+        """Create a session (and start it with the goal unless start=False). Returns its summary.
+        `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
+        an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
+        "workspace_result" (set_workspace's result, mode "created" for a new folder)."""
+        # the goal split as set_goal splits it: its first line also names the session (cut at a word)
+        goal_title, goal_description = split_goal(_text(goal), _text(description))
+        title = (_one_line(title) or shorten_title(goal_title, 60) or "Session")[:TITLE_LIMIT].strip()
         self._refresh_settings()
         overrides = self._validated_overrides(overrides)
+        if workspace is not None:  # checked before anything is created
+            git_on = validate(self.sessions_dir / "new", self._merged(self.raw, overrides)).workspace.git
+            await asyncio.to_thread(self._plan, None, workspace, git_on=git_on)
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         for _attempt in range(100):  # another process (a second launcher, the CLI) may take the same id
             sid = self._new_id(title)
@@ -534,16 +1146,32 @@ class SessionManager:
                 continue
         else:
             raise SessionError("Could not choose a session id.", 500)
-        (path / "workspace").mkdir(exist_ok=True)
+        (path / WORKSPACE_DIR).mkdir(exist_ok=True)
         meta: dict[str, Any] = {"title": title, "created_at": time.time(), "overrides": overrides,
                                 "autostart": False}
-        if goal:  # set at the first start, when the members exist
-            meta["pending_goal"] = {"title": goal, "description": description, "actor": actor}
+        if goal_title:  # set at the first start, when the members exist
+            meta["pending_goal"] = {"title": goal_title, "description": goal_description, "actor": actor}
         self._write_meta(sid, meta)
+        result = None
+        if workspace is not None:
+            try:
+                result = await self._set_workspace(sid, workspace, creating=True)
+            except BaseException:
+                await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
+                raise
+            if result["mode"] == "moved":
+                result["mode"] = "created"
+            elif result["old_kept"]:  # adopted: the session's own folder was never used
+                with contextlib.suppress(OSError):
+                    self.default_workspace(sid).rmdir()
+                result["old_kept"] = None
         self._changed(sid, "created")
         if start:
             await self.start(sid)
-        return self.summary(sid)
+        summary = self.summary(sid)
+        if result is not None:
+            summary["workspace_result"] = result
+        return summary
 
     def _load_locked(self, sid: str) -> "Swarm":
         """The session's Swarm, constructed if needed. The caller holds the session's lock."""
@@ -568,8 +1196,10 @@ class SessionManager:
             swarm.tracer.recover()
         except Exception:
             log.exception("session %s: could not close its interrupted traces", sid)
+        meta = self.meta(sid)
         swarm.session_id = sid
-        swarm.session_title = self.meta(sid).get("title") or sid
+        swarm.session_title = meta.get("title") or sid
+        swarm.session_pending_goal = pending_goal(meta)
         if self.hub_url:
             swarm.hub_url = f"{self.hub_url}/s/{sid}/mcp"
         self.swarms[sid] = swarm
@@ -587,36 +1217,58 @@ class SessionManager:
     async def start(self, sid: str) -> "Swarm":
         self._check(sid)
         async with self._lock(sid):
-            # loaded under the lock: a swarm fetched before waiting could have been unloaded meanwhile
-            swarm = self._load_locked(sid)
-            if sid not in self.running:
-                try:
-                    await swarm.start()
-                except Exception:
-                    log.exception("session %s failed to start", sid)
-                    try:
-                        await swarm.stop()  # whatever started before the failure
-                    except Exception:
-                        log.exception("cleanup after the failed start of %s", sid)
-                    await self._unload(sid)
-                    raise
-                self.running.add(sid)
-                meta = self.meta(sid)
-                meta["autostart"] = True
-                pending = meta.get("pending_goal")
-                if not isinstance(pending, dict) or not str(pending.get("title") or "").strip():
-                    meta.pop("pending_goal", None)
-                elif not swarm.goal():
-                    try:  # the goal first, then forget it: a failure keeps it for the next start
-                        swarm.set_goal(pending.get("actor") or USER, str(pending["title"]),
-                                       str(pending.get("description") or ""))
-                        meta.pop("pending_goal", None)
-                    except Exception:
-                        log.exception("could not set the goal of session %s", sid)
-                else:
-                    meta.pop("pending_goal", None)
-                self._write_meta(sid, meta)
+            swarm = await self._start_locked(sid)
         self._changed(sid, "started")
+        return swarm
+
+    async def _start_locked(self, sid: str) -> "Swarm":
+        """Start the session (if it is not running). The caller holds the session's lock."""
+        # loaded under the lock: a swarm fetched before waiting could have been unloaded meanwhile
+        swarm = self._load_locked(sid)
+        if sid not in self.running:
+            if sid != LEGACY_ID:
+                self._check_workspace_ready(sid, self.meta(sid))
+                cfg = swarm.config  # what this start will use (the loaded swarm got any new settings)
+                if cfg.workspace_adopted and cfg.workspace.git:
+                    servers = [r["name"] for r in swarm.db.all("SELECT name FROM mcp_servers WHERE origin != 'config'")]
+                    await asyncio.to_thread(self._check_adopted_repo, sid, cfg.workspace_dir, servers)
+            try:
+                await swarm.start()
+            except Exception:
+                log.exception("session %s failed to start", sid)
+                try:
+                    await swarm.stop()  # whatever started before the failure
+                except Exception:
+                    log.exception("cleanup after the failed start of %s", sid)
+                await self._unload(sid)
+                raise
+            self.running.add(sid)
+            meta = self.meta(sid)
+            meta["autostart"] = True
+            pending = meta.get("pending_goal")
+            if not isinstance(pending, dict) or not str(pending.get("title") or "").strip():
+                meta.pop("pending_goal", None)
+            elif not swarm.goal():
+                try:  # the goal first, then forget it: a failure keeps it for the next start
+                    swarm.set_goal(pending.get("actor") or USER, str(pending["title"]),
+                                   str(pending.get("description") or ""))
+                    meta.pop("pending_goal", None)
+                except Exception:
+                    log.exception("could not set the goal of session %s", sid)
+            else:
+                meta.pop("pending_goal", None)
+            notice = meta.pop("workspace_notice", None)
+            if isinstance(notice, dict) and notice.get("key") in ("n_workspace_moved", "n_workspace_changed"):
+                try:  # news for the agents' next wake-up, not a reason to wake everybody; an external member (an
+                    # MCP client polling wait_for_events) gets it at its next poll
+                    for member in swarm.members():
+                        if member["kind"] in ("llm", "external"):
+                            swarm.notify(member["name"], notice["key"], wake=member["kind"] == "external",
+                                         path=str(notice.get("path", "")), old=str(notice.get("old", "")))
+                except Exception:
+                    log.exception("could not tell the members of session %s about its new folder", sid)
+            self._write_meta(sid, meta)
+            swarm.session_pending_goal = pending_goal(meta)
         return swarm
 
     async def stop(self, sid: str, *, remember: bool = False) -> None:
@@ -671,7 +1323,7 @@ class SessionManager:
                 raise SessionError("The main session uses the global settings directly; edit them instead.")
             clean = self.clean_overrides(overrides)
             try:
-                config = self._config_from(self.raw, sid, clean)
+                config = self._apply_workspace(self._config_from(self.raw, sid, clean), sid, meta)
             except SessionError:
                 raise
             except ValueError as exc:
@@ -690,10 +1342,190 @@ class SessionManager:
         self._changed(sid, "updated")
         return self.summary(sid)
 
-    async def delete(self, sid: str) -> None:
+    async def set_workspace(self, sid: str, path: str | os.PathLike | None, *,
+                            expect: str | None = None) -> dict[str, Any]:
+        """Make the session work in another folder (`path` absolute; None: its own default `workspace/`).
+
+        * An empty or missing folder: the session's files (with the git history and the forged MCP servers)
+          move there; the old folder is left empty (its own default folder is removed, recreated on demand).
+          After a folder the session adopted (the user's), the user's files stay: the new folder starts as a
+          fresh workspace and only the session's MCP servers move.
+        * A folder with files (e.g. the user's project) is adopted: the agents work with its files and commit to
+          its current branch. Refused (409) when its repository has uncommitted changes or untracked files, is in
+          a detached HEAD, in the middle of a merge or rebase, or cannot be read; a folder inside a repository but
+          not its root, or a repository's own database (a .git folder, a bare repository), is refused (400); a
+          folder that is not a repository gets one (git init, .gitignore if missing, an initial commit). Its git
+          configuration is never modified. The session's old folder stays as it is; the session's MCP servers
+          (`mcp/<name>/`) move along (409 when the folder already has one of them).
+        * Refused before anything changes (400): relative paths, a drive or file system root, the user's home and
+          the DreamTeam home (or a folder containing one), anything in `sessions/` but the session's own folder,
+          its data folder, the shared MCP library, a folder inside the current one or containing it, a file, a
+          folder that cannot be written; 409: a folder another session uses (or inside it / containing it). The
+          current folder itself is a no-op ("unchanged").
+        `expect`: the mode the user agreed to ("moved" or "adopted"); 409 when the folder turns out otherwise (e.g.
+        files appeared in a folder that was empty when the user was asked).
+        A running session is stopped first and started again afterwards (also after a failure, which undoes
+        everything moved so far). Workspace changes of the sessions of a home run one at a time. Returns {"mode":
+        "moved"|"adopted"|"unchanged", "from", "to", "git": "moved"|"existing"|"initialized"|"disabled"|"none",
+        "mcp_moved": [names], "old_kept": folder|None, "old_missing": bool, "old_changed": None|{"paths",
+        "commit", "error"}, "restarted": bool, "start_error": text|None}."""
+        self._check(sid)
+        if sid == LEGACY_ID:
+            raise SessionError(LEGACY_WORKSPACE_TEXT, 409)
+        if expect not in (None, "moved", "adopted"):
+            raise SessionError("expect must be \"moved\" or \"adopted\".")
+        return await self._set_workspace(sid, path, expect=expect)
+
+    @staticmethod
+    def _check_expected(sid: str, plan: _Plan, expect: str | None, first: _Plan | None = None) -> None:
+        """The folder must still be what the caller (the user) agreed to, and what the first check found."""
+        wanted = expect or (first.mode if first is not None else None)
+        if wanted is None or plan.mode == wanted:
+            return
+        if plan.mode == "adopted":
+            what = "now holds files: the session would work with them instead of moving its own files there"
+        elif plan.mode == "moved":
+            what = "is now empty or missing: the session's files would move there instead of adopting it"
+        else:
+            what = "is now the session's folder already"
+        raise SessionError(f"The folder {plan.target} {what}. Nothing was changed; check the folder and try again "
+                           f"(session {sid}).", 409)
+
+    async def _set_workspace(self, sid: str, path: Any, *, creating: bool = False,
+                             expect: str | None = None) -> dict[str, Any]:
+        notify = not creating
+        async with self._lock(sid):
+            self._check(sid)  # deleted while this call waited for the lock
+            meta = self.meta(sid)
+            self._check_journal(sid, meta)
+            try:
+                git_on = self.config_for(sid).workspace.git
+            except SessionError:
+                raise
+            except ValueError as exc:
+                raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
+            first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid))
+            if first.mode == "unchanged":
+                return {**first.result(), "restarted": False, "start_error": None}
+            self._check_expected(sid, first, expect)
+            was_loaded, was_running = sid in self.swarms, sid in self.running
+            try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now
+                await self._unload(sid)
+            except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
+                log.exception("error stopping session %s before moving its workspace", sid)
+            if was_loaded and notify:
+                self._changed(sid, "stopped")
+            try:
+                async with self._claims:  # no other session takes a folder until this one's session.json names it
+                    plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating)
+            except BaseException:
+                if was_running:
+                    with contextlib.suppress(Exception):
+                        await self._start_locked(sid)
+                    if notify and sid in self.running:
+                        self._changed(sid, "started")
+                raise
+            log.info("session %s now works in %s (%s, git %s)", sid, plan.target, plan.mode, git)
+            if notify:
+                self._changed(sid, "updated")
+            result = {**plan.result(git), "old_changed": old_changed, "restarted": False, "start_error": None}
+            if was_running:
+                try:
+                    await self._start_locked(sid)
+                    result["restarted"] = True
+                except Exception as exc:  # the move stands; the session stays stopped and says why
+                    log.exception("session %s did not start again after moving its workspace", sid)
+                    result["start_error"] = str(exc) if isinstance(exc, SessionError) else \
+                        f"{type(exc).__name__}: {exc}"
+        if was_running and result["restarted"] and notify:
+            self._changed(sid, "started")
+        return result
+
+    async def _change_folder(self, sid: str, path: Any, git_on: bool, first: _Plan, expect: str | None,
+                             creating: bool) -> tuple[_Plan, str, dict[str, Any] | None]:
+        """The change itself, with the session unloaded and the home's workspace claims held: the final check, the
+        moves, session.json. Returns (plan, git outcome, what changed in the user's folder it left); raises with
+        everything put back (or, when that failed too, an error that says where the files are)."""
+        # checked again with nothing running: an agent may have forged a server, the folder may have changed, and
+        # another session may have taken the folder meanwhile (it is in its session.json now)
+        plan = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid))
+        if plan.mode == "unchanged":
+            raise SessionError(f"The folder of session {sid} changed meanwhile; try again.", 409)
+        self._check_expected(sid, plan, expect, first)
+        undo = _Undo()
+        try:
+            git = await _in_thread(self._carry_out, sid, plan, undo)
+            meta = self.meta(sid)  # read again: a rename may have happened meanwhile
+            if plan.default:
+                meta.pop("workspace", None)
+            else:
+                meta["workspace"] = self._workspace_meta(plan.target, plan.adopted)
+            if not creating:  # the members hear of it at their next wake-up (the next start delivers it)
+                meta["workspace_notice"] = {"key": "n_workspace_moved" if plan.move_all else "n_workspace_changed",
+                                            "path": str(plan.target), "old": str(plan.old)}
+            self._write_meta(sid, meta)
+        except BaseException as exc:
+            problems = await _in_thread(undo.run)
+            if not problems:
+                with contextlib.suppress(OSError):
+                    self._journal(sid).unlink()
+            if not isinstance(exc, Exception):
+                raise
+            raise self._move_error(sid, plan, exc, problems, creating=creating) from None
+        with contextlib.suppress(OSError):
+            self._journal(sid).unlink()
+        old_changed = None
+        if plan.old_tracked:  # the agents' commits put the session's MCP servers into the user's repository
+            old_changed = {"paths": list(plan.old_tracked), "commit": None, "error": "git is off for this session"}
+            if git_on:
+                message = (f"Remove {', '.join(plan.old_tracked)}: the MCP servers of DreamTeam session {sid} "
+                           "moved with it to another folder")
+                try:
+                    old_changed["commit"], old_changed["error"] = await asyncio.to_thread(
+                        commit_paths, plan.old, plan.old_tracked, message)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    old_changed["error"] = str(exc)
+            if old_changed["error"]:
+                log.warning("session %s: the removal of %s in %s is not committed: %s", sid, plan.old_tracked,
+                            plan.old, old_changed["error"])
+        return plan, git, old_changed
+
+    def _move_error(self, sid: str, plan: _Plan, exc: Exception, problems: list[str], *,
+                    creating: bool = False) -> SessionError:
+        if isinstance(exc, SessionError):
+            reason = str(exc)
+        elif isinstance(exc, OSError) and exc.strerror:
+            reason = exc.strerror + (f": {exc.filename}" if exc.filename else "")
+        else:
+            reason = str(exc) or type(exc).__name__
+        if creating:  # the new session is removed: only the target can hold leftovers
+            if problems:
+                return SessionError(
+                    f"Could not create the session in {plan.target} ({reason}); the session was not created, and "
+                    f"some of what was made in that folder could not be removed: {'; '.join(problems[:10])}. "
+                    "Remove it by hand.", 500)
+            return SessionError(f"Could not create the session in {plan.target} ({reason}); the session was not "
+                                "created and the folder is as it was.",
+                                exc.status if isinstance(exc, SessionError) else 500)
+        if problems:
+            return SessionError(
+                f"Could not change the folder of session {sid} to {plan.target} ({reason}), and some files could "
+                f"not be put back: {'; '.join(problems[:10])}. The session still uses {plan.old}; move those files "
+                f"back there by hand, then delete {self._journal(sid)}.", 500)
+        in_use = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32, 33)
+        status = exc.status if isinstance(exc, SessionError) else (409 if in_use or isinstance(exc, FileExistsError)
+                                                                   else 500)
+        return SessionError(
+            f"Could not change the folder of session {sid} to {plan.target} ({reason})"
+            + ("; a file is in use: close the programs that use it and try again" if in_use else "")
+            + f". Nothing was changed: the session still works in {plan.old}.", status)
+
+    async def delete(self, sid: str) -> str | None:
         """Stop the session and delete its directory (board, messages, workspace, traces). The directory is
         first renamed away, so a session whose files are in use stays intact (409) instead of being
-        half-deleted."""
+        half-deleted. A workspace folder outside the directory (set_workspace) is never deleted: it is the
+        user's folder. Returns that folder (read under the session's lock, so a workspace change that ran just
+        before is taken into account), else None."""
         self._check(sid)
         if sid == LEGACY_ID:
             raise SessionError("The main session lives in the home directory itself and cannot be deleted "
@@ -704,6 +1536,11 @@ class SessionManager:
                 await self._unload(sid)
             except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
                 log.exception("error stopping session %s before deleting it", sid)
+            try:
+                workspace = self.workspace_of(sid)
+                kept = None if workspace["default"] else workspace["path"]
+            except SessionError:  # a damaged session.json: it can still be deleted
+                kept = None
             path = self.dir_of(sid)
             trash = self.sessions_dir / f"{TRASH_PREFIX}{sid}-{time.time_ns()}"
             for attempt in range(10):
@@ -719,6 +1556,7 @@ class SessionManager:
                     await asyncio.sleep(0.2)
         self._changed(sid, "deleted")
         await asyncio.to_thread(self._purge_trash)
+        return kept
 
     def _purge_trash(self) -> None:
         """Remove renamed-away session directories (also ones a previous delete could not finish)."""
@@ -738,13 +1576,17 @@ class SessionManager:
                 if self.meta(sid).get("autostart"):
                     await self.start(sid)
                     started.append(sid)
+            except SessionError as exc:  # e.g. its workspace folder is missing: the message says what to do
+                log.warning("could not resume session %s: %s", sid, exc)
             except Exception:
                 log.exception("could not resume session %s", sid)
         return started
 
     async def shutdown(self) -> None:
         """Stop every loaded session, keeping the running ones marked for resume()."""
-        for sid in list(self.swarms):
+        # also sessions in the middle of an operation (a start, a workspace move that starts them again)
+        busy = [sid for sid, lock in self._locks.items() if lock.locked() and sid not in self.swarms]
+        for sid in list(self.swarms) + busy:
             try:
                 async with self._lock(sid):
                     await self._unload(sid)

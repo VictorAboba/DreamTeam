@@ -4,6 +4,8 @@ Swarm, for each audience (llm agents, external MCP members, the user)."""
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import hashlib
 import json
 import re
 import subprocess
@@ -14,8 +16,9 @@ from typing import Any
 
 import pytest
 
-from dreamteam import prompts, triggers
-from dreamteam.config import Config
+from dreamteam import prompts, roles, triggers
+from dreamteam.config import Config, RoleSettings
+from dreamteam.db import loads
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentKind, AgentStatus, Status
 from dreamteam.shell import resolve_shell
@@ -188,7 +191,8 @@ def test_descriptions_exist_in_both_languages_and_name_only_real_tools():
     texts = [("system", prompts.SYSTEM_EN), ("system", prompts.SYSTEM_RU)]
     texts += [(key, text) for lang in prompts.TEXTS for key, text in prompts.TEXTS[lang].items()]
     for key, text in texts:
-        for ident in re.findall(r"`([a-z_]+)", text):
+        # `tool`, `status`, `param` or a trigger call `done(1, 5)`; multi-word code (`git add`) is not a tool
+        for ident in re.findall(r"`([a-z_]+)(?=[`(])", text):
             if ident in REGISTRY:
                 assert ident in (user_tools if key.startswith("u_") else llm_tools), (key, ident)
             else:
@@ -206,6 +210,14 @@ def test_schemas_for_is_deterministic_and_returns_copies():
     assert [s["name"] for s in schemas_for("llm", "ru")] == [s["name"] for s in schemas_for("llm", "en")]
     # agent kinds see exactly their audience
     assert {s["name"] for s in schemas_for("user", "en")} == {n for n, a in SPEC_AUDIENCE.items() if "U" in a}
+
+
+def test_llm_tool_schemas_are_unchanged():
+    """An LLM tool's schema is part of every existing agent's frozen prefix (thinking blocks bind to it):
+    change it only with a deliberate migration, then update the digest."""
+    data = [schemas_for("llm", lang) for lang in ("en", "ru")]
+    digest = hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    assert digest == "e3c5cbc798e3aafddcd44284bb515d9655e68b953e6ca707f67063dcad7cda85"
 
 
 def test_tool_order_does_not_depend_on_import_order():
@@ -514,10 +526,77 @@ async def test_claim_complete_and_review_flow(swarm):
     assert await ok(swarm, b, "task_review", {"task_id": 1, "approve": True}) == f"Task #1 is now done (assignee: {a})."
     assert "n_unblocked" not in notifications(swarm, ext)
     await ok(swarm, ext, "task_claim", {"task_id": 2})
-    assert await ok(swarm, ext, "task_complete", {"task_id": 2, "result": "ok"}) == "Task #2 is done."
+    # no reviewer: the board picks an agent that neither created (the user did) nor did it; both are idle and free
+    picked = min(a, b)
+    assert await ok(swarm, ext, "task_complete", {"task_id": 2, "result": "ok"}) == \
+        f"Task #2 was sent to {picked} for review: a member other than you checks it, and you will be told the verdict."
     # the user may complete and review anything
     await ok(swarm, USER, "task_create", {"title": "Mine", "goal": "g"})
     assert await ok(swarm, USER, "task_complete", {"task_id": 3, "result": "did it myself"}) == "Task #3 is done."
+
+
+async def test_task_complete_texts_in_independent_mode(swarm):
+    """The result of task_complete says where the work went (SPEC §4 "Independent review")."""
+    a, b = llm_members(swarm)
+    ext = await join(swarm)
+    # the task's own reviewer: the text is unchanged
+    await ok(swarm, USER, "task_create", {"title": "Explicit", "goal": "g", "reviewer": ext})
+    await ok(swarm, a, "task_claim", {"task_id": 1})
+    assert await ok(swarm, a, "task_complete", {"task_id": 1, "result": "r"}) == f"Task #1 was sent to {ext} for review."
+    # no reviewer: the board picks another agent (here the creator, the only one left)
+    await ok(swarm, a, "task_create", {"title": "Picked", "goal": "g"})
+    await ok(swarm, b, "task_claim", {"task_id": 2})
+    assert await ok(swarm, b, "task_complete", {"task_id": 2, "result": "r"}) == \
+        f"Task #2 was sent to {a} for review: a member other than you checks it, and you will be told the verdict."
+    assert "n_review_requested" in notifications(swarm, a)
+    await ok(swarm, a, "task_review", {"task_id": 2, "approve": True})
+    # nobody else can review (external members are never picked): the user
+    await ok(swarm, USER, "retire_agent", {"name": a})
+    await ok(swarm, USER, "task_create", {"title": "Alone", "goal": "g"})
+    await ok(swarm, b, "task_claim", {"task_id": 3})
+    assert await ok(swarm, b, "task_complete", {"task_id": 3, "result": "r"}) == (
+        "Task #3 was sent to the user for review: nobody else in the team can review it. You will be told the "
+        "verdict; meanwhile take the next task or call wait.")
+    assert swarm.board.get(3).reviewer == USER and "u_review_fallback" in notifications(swarm, USER)
+    assert "your own work is reviewed by someone else (the user)" in await err(
+        swarm, b, "task_review", {"task_id": 3, "approve": True})
+    assert await ok(swarm, USER, "task_review", {"task_id": 3, "approve": True}) == \
+        f"Task #3 is now done (assignee: {b})."
+
+
+async def test_claiming_as_designated_reviewer_says_so(swarm):
+    a, b = llm_members(swarm)
+    await ok(swarm, USER, "task_create", {"title": "Review me", "goal": "g", "reviewer": a})
+    text = await ok(swarm, a, "task_claim", {"task_id": 1})
+    assert text == ("You now work on #1 [in_progress] Review me @" + a + "\n    goal: g\n"
+                    "You were its reviewer; since you execute it now, another member will review it.")
+    assert swarm.board.get(1).reviewer is None
+    assert (await ok(swarm, a, "task_complete", {"task_id": 1, "result": "r"})).startswith(
+        f"Task #1 was sent to {b} for review: a member other than you")
+    await ok(swarm, USER, "task_create", {"title": "Plain", "goal": "g"})
+    assert "You were its reviewer" not in await ok(swarm, b, "task_claim", {"task_id": 2})
+
+
+async def test_goal_complete_waits_for_reviews(swarm):
+    a, b = llm_members(swarm)
+    await ok(swarm, USER, "set_goal", {"title": "Ship"})                       # planning task #1
+    await ok(swarm, a, "task_claim", {"task_id": 1})
+    await ok(swarm, a, "task_complete", {"task_id": 1, "result": "planned"})   # reviewed by b
+    text = await err(swarm, a, "goal_complete", {"summary": "done"})
+    assert text.startswith(f"Error: Tasks are still waiting for review: #1 ({b}). The goal can be completed only "
+                           "after every task is reviewed: call `wait`")
+    assert swarm.goal()["status"] == "active" and "u_goal_done" not in notifications(swarm, USER)
+    await ok(swarm, USER, "task_review", {"task_id": 1, "approve": True})
+    assert (await ok(swarm, a, "goal_complete", {"summary": "done"})).startswith("The global goal is marked as achieved")
+    # without independent review a task in review does not hold the goal back (the switch applies at once)
+    await ok(swarm, USER, "swarm_control", {"reopen_goal_comment": "one more thing"})
+    await ok(swarm, USER, "task_create", {"title": "More", "goal": "g", "reviewer": b})
+    await ok(swarm, a, "task_claim", {"task_id": 2})
+    await ok(swarm, a, "task_complete", {"task_id": 2, "result": "r"})
+    assert "waiting for review" in await err(swarm, a, "goal_complete", {"summary": "done again"})
+    swarm.config.swarm.independent_review = False
+    text = await ok(swarm, a, "goal_complete", {"summary": "done again"})
+    assert "1 task(s) are still open (#2)" in text
 
 
 async def test_task_comment_and_discussion(swarm):
@@ -634,17 +713,62 @@ async def test_agents_and_status_show_the_budget_honestly(swarm):
     assert "pending" not in await ok(swarm, ext, "swarm_status")
 
 
+async def test_agents_lists_the_role_catalog(swarm):
+    """The `agents` output carries the role catalog (docs/SPEC.md §17.3): what hire_agent offers, in the caller's
+    language, with the first sentence of each description; hidden roles are not offered."""
+    a = llm_members(swarm)[0]
+    text = await ok(swarm, a, "agents")
+    assert ("\nRole catalog (hire_agent role=<name>; a catalog role brings its description and model profile, and "
+            "instructions may then be empty; any other name is a new role you describe in instructions):\n") in text
+    assert ("\n- Generalist: You take whichever task is most useful now: code, texts, analysis, research or "
+            "checks.\n") in text
+    assert "\n- Researcher: " in text and "(model" not in text
+    swarm.config.models["fast"] = dataclasses.replace(swarm.config.models["default"], name="fast")
+    swarm.config.roles = [RoleSettings(name="tester", model="fast"), RoleSettings(name="researcher", hidden=True),
+                          RoleSettings(name="Data engineer", description="You build data pipelines. Mostly ETL.")]
+    text = await ok(swarm, a, "agents")
+    assert "\n- Tester (model fast): You check that what others built really works" in text
+    assert "Researcher" not in text
+    assert text.endswith("\n- Data engineer: You build data pipelines.")
+    swarm.db.execute("UPDATE agents SET language = 'ru' WHERE name = ?", (a,))
+    assert "\n- Универсал: Ты берёшь ту задачу, которая сейчас полезнее всего" in await ok(swarm, a, "agents")
+
+
 async def test_hire_and_retire(swarm):
     a, b = llm_members(swarm)
     text = await ok(swarm, a, "hire_agent", {"role": "QA engineer", "instructions": "Test it", "name": "Grace Hopper"})
-    assert text.startswith('Hired Grace Hopper as "QA engineer".')
+    assert text.startswith('Hired Grace Hopper as "QA engineer". "QA engineer" is a new role (not in the role '
+                           'catalog): your instructions are all they know about it.')
     member = swarm.member("Grace Hopper")
     assert member["hired_by"] == a and member["kind"] == AgentKind.LLM and "n_hired" in notifications(swarm, "Grace Hopper")
     assert "Unknown model profile 'gpt'" in await err(swarm, a, "hire_agent", {"role": "x", "instructions": "y",
                                                                               "model": "gpt"})
     assert "already taken" in await err(swarm, a, "hire_agent", {"role": "x", "instructions": "y",
                                                                 "name": "Grace Hopper"})
-    assert "Missing required" in await err(swarm, a, "hire_agent", {"role": "Dev"})
+    assert "Missing required" in await err(swarm, a, "hire_agent", {"role": "Dev"})   # the schema is unchanged...
+    assert REGISTRY["hire_agent"].allow_empty == {"instructions"}   # ...but "" passes: a catalog role needs none
+    text = await err(swarm, a, "hire_agent", {"role": "Dev", "instructions": ""})
+    assert text.startswith("Error: 'Dev' is not in the role catalog: describe the new role's responsibilities in "
+                           "instructions, or pick a catalog role (`agents` lists them).")
+    assert "Similar catalog roles: Tester." in await err(swarm, a, "hire_agent", {"role": "Testr", "instructions": ""})
+    text = await ok(swarm, a, "hire_agent", {"role": " tester ", "instructions": "", "name": "Alan Turing"})
+    assert text == ('Hired Alan Turing as "Tester". They got the catalog description of the role; model profile '
+                    'default. They are woken now: assign them a task (task_update assignee) or leave ready tasks for '
+                    'them to claim; no welcome message is needed.')
+    assert swarm.member("Alan Turing")["role"] == "Tester"
+    assert ("n_hired", "Tester") in [(r["kind"], loads(r["data"])["role"]) for r in swarm.db.all(
+        "SELECT kind, data FROM notifications WHERE recipient = 'Alan Turing'")]
+    await ok(swarm, a, "retire_agent", {"name": "Alan Turing"})
+    # the user (the board's hire form, the TUI, the console) gets texts about the user's own tools
+    text = await err(swarm, USER, "hire_agent", {"role": "Dev", "instructions": ""})
+    assert text == ("Error: 'Dev' is not in the role catalog: describe the new role in the instructions (in the "
+                    "terminal: /hire Dev | instructions), or pick a catalog role (the list of the board's hire form, "
+                    "/roles in the terminal).")
+    assert await ok(swarm, USER, "hire_agent", {"role": "tester", "instructions": "", "name": "Ada King"}) ==         'Hired Ada King as "Tester" (catalog role, model profile default).'
+    assert await ok(swarm, USER, "hire_agent", {"role": "Data analyst", "instructions": "Charts", "name": "Ed Codd"}) ==         ('Hired Ed Codd as "Data analyst": a new role, not in the role catalog; your instructions are all they know '
+         'about it. Similar catalog roles: Analyst.')
+    for hired in ("Ada King", "Ed Codd"):
+        await ok(swarm, USER, "retire_agent", {"name": hired})
     # retire: hirer or self or the user
     assert "Only the user, Grace Hopper or whoever hired them" in await err(swarm, b, "retire_agent",
                                                                              {"name": "Grace Hopper"})
@@ -686,8 +810,10 @@ async def test_goal_complete(swarm):
 async def test_join_swarm(swarm):
     """SPEC §12-13: the MCP client acts as the user until it joins; then it is an external member."""
     a = llm_members(swarm)[0]
-    text = await ok(swarm, USER, "join_swarm", {"role": "Reviewer", "name": "Claude Code", "instructions": "review"})
+    text = await ok(swarm, USER, "join_swarm", {"role": "reviewer", "name": "Claude Code", "instructions": "review"})
     assert text.startswith('You joined the swarm as Claude Code (role: Reviewer). Pass as_agent="Claude Code"')
+    # an external member has no system prompt: the catalog's description of its role comes with the result
+    assert text.endswith("\nYour role (Reviewer): " + roles.ROLE_PRESETS["en"]["reviewer"][1])
     member = swarm.member("Claude Code")
     assert member["kind"] == AgentKind.EXTERNAL and member["hired_by"] == USER and member["system_prompt"] == ""
     assert "Claude Code" not in swarm.runtimes
@@ -757,6 +883,10 @@ async def test_set_goal_is_for_the_user(swarm):
     assert "not available to swarm agents" in await err(swarm, a, "set_goal", {"title": "x"})
     assert "not available to external members" in await err(swarm, ext, "set_goal", {"title": "x"})
     assert swarm.goal()["title"] == "Build a CLI"
+    # a goal typed as one text: its first line is the title, the other lines open the description
+    text = await ok(swarm, USER, "set_goal", {"title": "Snake game\nPython, pygame\n\n- score", "description": "Tests"})
+    assert text == "Goal set. Global goal [active]: Snake game\n  Python, pygame - score Tests"
+    assert (swarm.goal()["title"], swarm.goal()["description"]) == ("Snake game", "Python, pygame\n\n- score\n\nTests")
 
 
 async def test_swarm_control(swarm):

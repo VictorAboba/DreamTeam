@@ -24,8 +24,8 @@ from dreamteam.tools import REGISTRY, tools_for
 SRC = Path(prompts.__file__).resolve().parent
 LANGS = ("en", "ru")
 SYSTEMS = {"en": prompts.SYSTEM_EN, "ru": prompts.SYSTEM_RU}
-SYSTEM_KW = dict(name="Ann Lee", swarm="Swarm X", role="Tester", instructions="Check {curly} things",
-                 shell="bash", max_agents=7)
+SYSTEM_KW = dict(name="Ann Lee", swarm="Swarm X", role="Tester", role_description="Checks things.",
+                 instructions="Check {curly} things", shell="bash", scratch=".scratch/ann.lee/", max_agents=7)
 _FMT = string.Formatter()
 _CODE_IDENT = re.compile(r"`([a-z_]+)`")
 
@@ -51,7 +51,7 @@ def test_languages_have_the_same_keys_placeholders_and_tool_names():
 
 def test_system_prompts_have_the_same_placeholders_and_tool_names():
     assert placeholders(prompts.SYSTEM_EN) == placeholders(prompts.SYSTEM_RU) == {
-        "name", "swarm", "role", "instructions", "shell", "max_agents"}
+        "name", "swarm", "role", "role_description", "instructions", "shell", "scratch", "max_agents"}
     assert code_idents(prompts.SYSTEM_EN) == code_idents(prompts.SYSTEM_RU)
 
 
@@ -60,6 +60,9 @@ def test_planning_task_and_default_role_exist_in_both_languages():
         title, goal, description = prompts.PLANNING_TASK[lang]
         assert title and goal and description and len(title) <= 200
         assert "depends_on" in description
+        # contract-first planning: the shared contracts are written once, to CONTRACTS.md
+        assert "CONTRACTS.md" in description and "CONTRACTS.md" in goal
+        assert "`agents`" in description  # hiring picks a role from the role catalog
         assert prompts.DEFAULT_ROLE[lang]
 
 
@@ -80,11 +83,22 @@ def test_texts_reference_only_real_tools():
 def test_system_prompt_renders_all_fields():
     for lang in LANGS:
         text = prompts.system_prompt(lang, **SYSTEM_KW)
-        for value in ("Ann Lee", "Swarm X", "Tester", "Check {curly} things", "bash", "7"):
+        for value in ("Ann Lee", "Swarm X", "Tester", "Checks things.", "Check {curly} things", "bash",
+                      ".scratch/ann.lee/", "7"):
             assert value in text, (lang, value)
         assert not re.search(r"\{[a-z_]+\}", text.replace("{curly}", ""))
+        # the role's description follows the role line, before the member's own instructions
+        first, second, third = text.splitlines()[:3]
+        assert first.endswith("Tester.") and second == "Checks things."
+        assert third == prompts.TEXTS[lang]["instructions"].format(text="Check {curly} things").strip()
         bare = prompts.system_prompt(lang, **{**SYSTEM_KW, "instructions": ""})
         assert prompts.TEXTS[lang]["instructions"].split("{")[0] not in bare
+        # callers that pass neither a role description nor a scratch folder (older callers, tests) still render
+        old = {k: v for k, v in SYSTEM_KW.items() if k not in ("role_description", "scratch")}
+        text = prompts.system_prompt(lang, **{**old, "instructions": ""})
+        assert not re.search(r"\{[a-z_]+\}", text) and ".scratch/" in text
+        # no empty description line: the role line, one blank line, then the first section
+        assert text.splitlines()[1:3] == ["", SYSTEMS[lang].splitlines()[2]]
 
 
 def test_unknown_language_falls_back_to_english():
@@ -172,6 +186,7 @@ def test_texts_steer_agents_to_the_right_tools(lang):
         "n_all_done": {"goal_complete"},
         "n_goal_reopened": {"goal_complete"},
         "n_review_requested": {"task_review", "task_get"},
+        "n_review_reminder": {"task_review"},  # an idle reviewer is reminded with the tool that settles it
         "n_review_rejected": {"task_complete"},
         "n_assigned": {"task_claim"},
         "n_unblocked": {"task_claim"},
@@ -181,6 +196,11 @@ def test_texts_steer_agents_to_the_right_tools(lang):
         assert tools <= code_idents(texts[key]), (key, code_idents(texts[key]))
     # a new member must not greet the hirer: a greeting is a message that wakes someone for nothing
     assert "send_message" not in code_idents(texts["n_hired"])
+    # git hygiene: temporary files go to the member's own scratch folder, commits are made for the agents
+    for snippet in ("`.scratch/`", "`{scratch}`", "`git add`", "`git commit`"):
+        assert snippet in SYSTEMS[lang], snippet
+    # independent review: the wake-up lists the reviews waiting, and reviews come before one's own work
+    assert "task_review" in system and "{tasks}" in texts["my_reviews"]
 
 
 # ------------------------------------------------------------------- end to end, in Russian
@@ -220,6 +240,8 @@ async def test_russian_swarm_gets_russian_guidance_and_reaches_the_goal(tmp_path
         if messages[-1]["role"] == "user":
             seen.append((name, messages[-1]["content"]))
         board = swarm.board
+        for task in board.reviews_of(name):  # independent review: reviews come before one's own work
+            return _call("task_review", task_id=task.id, approve=True, comment="Проверено")
         for task in board.open_tasks_of(name):
             if task.status != Status.IN_PROGRESS:
                 continue
@@ -254,16 +276,27 @@ async def test_russian_swarm_gets_russian_guidance_and_reaches_the_goal(tmp_path
         await _until(lambda: (swarm.goal() or {}).get("status") == "done")
         planning = swarm.board.get(1)
         assert planning.title == prompts.PLANNING_TASK["ru"][0] and planning.status == Status.DONE
-        # every agent ran on its own frozen Russian system prompt
+        # every task, the planning task included, was approved by a member who did not do it
+        approved = {}
+        for e in swarm.bus.recent(types=("task.updated",), limit=1000):
+            if e["data"]["changes"].get("status") == [Status.REVIEW, Status.DONE]:
+                approved[e["data"]["task"]["id"]] = (e["actor"], e["data"]["task"]["assignee"])
+        assert sorted(approved) == [1, 2, 3]
+        assert all(reviewer != executor and reviewer != USER for reviewer, executor in approved.values())
+        assert not swarm.board.list(status=Status.REVIEW)
+        # every agent ran on its own frozen Russian system prompt, in the catalog's generalist role
         for member in swarm.members():
             assert systems[member["name"]] == {member["system_prompt"]}
-            assert member["system_prompt"].startswith(f"Ты — {member['name']}, участник роя ИИ-агентов «Рой»")
+            assert member["system_prompt"].startswith(f"Ты — {member['name']}, участник роя ИИ-агентов «Рой». "
+                                                      "Твоя роль: Универсал.")
         texts = [text for _, text in seen]
         wakes = [t for t in texts if t.startswith("===")]
         assert wakes and all(t.startswith(("=== Пробуждение", "=== Новые события")) for t in wakes)
+        team = "; ".join(f"{m['name']} — Универсал" for m in swarm.members())
         kickoff = prompts.t("ru", "n_kickoff", by=USER, title="Конвертер CSV в JSON", description="с тестами",
-                            task_id=1, task_title=planning.title)
+                            team=team, task_id=1, task_title=planning.title)
         assert any(kickoff in t for t in wakes)
+        assert any(f"Задача #1 «{planning.title}» ждёт твоего ревью" in t for t in wakes)  # n_review_requested
         nudges = [t for t in texts if t.startswith(prompts.TEXTS["ru"]["nudge"].split("{")[0])]
         assert nudges and all("`task_complete`" in t for t in nudges)
     finally:

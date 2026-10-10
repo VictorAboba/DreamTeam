@@ -21,9 +21,9 @@ def test_templates_parse(tmp_path):
 
 def test_prompts_render():
     for lang in ("ru", "en"):
-        text = prompts.system_prompt(lang, name="A B", swarm="S", role="R", instructions="do",
-                                     shell="bash", max_agents=5)
-        assert "A B" in text
+        text = prompts.system_prompt(lang, name="A B", swarm="S", role="R", role_description="Does R.",
+                                     instructions="do", shell="bash", scratch=".scratch/a.b/", max_agents=5)
+        assert "A B" in text and "Does R." in text and "`.scratch/a.b/`" in text
         for key in prompts.TEXTS["en"]:
             assert key in prompts.TEXTS[lang], key
 

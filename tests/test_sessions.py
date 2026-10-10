@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import socket
+import sys
 import threading
 import tomllib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -18,7 +19,9 @@ import pytest
 from dreamteam import settings as st
 from dreamteam.config import Config, render_template
 from dreamteam.llm.scripted import ScriptedLLM
-from dreamteam.sessions import LEGACY_ID, TRASH_PREFIX, SessionError, SessionManager, read_stats, slugify
+from dreamteam.models import USER
+from dreamteam.sessions import (LEGACY_ID, TRASH_PREFIX, SessionError, SessionManager, pending_goal, read_stats,
+                                slugify)
 
 
 def _raw(tmp_path: Path) -> dict[str, Any]:
@@ -204,11 +207,62 @@ async def test_session_lifecycle(tmp_path):
 
 async def test_pending_goal_set_at_first_start(tmp_path):
     manager = _manager(_home(tmp_path))
-    summary = await manager.create("Later", "Do it later", start=False)
+    summary = await manager.create("Later", "Do it later", "Step by step", start=False)
     assert summary["goal"]["status"] == "pending"
+    # the board of a session that never started shows the goal it will get (not "no goal yet")
+    viewed = (await manager.load(summary["id"])).snapshot()["swarm"]
+    assert viewed["goal"] is None and viewed["session"]["status"] == "stopped"
+    assert viewed["session"]["pending_goal"] == {"title": "Do it later", "description": "Step by step"}
     swarm = await manager.start(summary["id"])
     assert swarm.goal()["title"] == "Do it later"
     assert "pending_goal" not in manager.meta(summary["id"])
+    started = swarm.snapshot()["swarm"]
+    assert started["goal"]["title"] == "Do it later" and started["session"]["pending_goal"] is None
+    await manager.shutdown()
+
+
+async def test_a_multi_line_goal_names_the_session_and_is_stored_split(tmp_path):
+    manager = _manager(_home(tmp_path))
+    summary = await manager.create("", "Snake game\nPython, tests", start=False)
+    assert summary["title"] == "Snake game"
+    assert summary["goal"] == {"title": "Snake game", "description": "Python, tests", "status": "pending",
+                               "summary": ""}
+    assert manager.meta(summary["id"])["pending_goal"] == {"title": "Snake game", "description": "Python, tests",
+                                                           "actor": USER}
+    swarm = await manager.start(summary["id"])
+    assert (swarm.goal()["title"], swarm.goal()["description"]) == ("Snake game", "Python, tests")
+    # the explicit description follows the goal's other lines; an explicit title names the session
+    summary = await manager.create("Mine", "\n# Snake\nPython\n", "Tests required", start=False)
+    assert summary["title"] == "Mine"
+    assert manager.meta(summary["id"])["pending_goal"]["description"] == "Python\n\nTests required"
+    # a long first line: the session title is cut at a word, the goal keeps the whole line
+    long = " ".join(["word"] * 40)
+    summary = await manager.create("", long, start=False)
+    assert summary["title"] == " ".join(["word"] * 12) + "…" and summary["goal"]["title"] == long
+    assert "pending_goal" not in manager.meta((await manager.create("", " \n ", start=False))["id"])
+    await manager.shutdown()
+
+
+def test_pending_goal_of_an_older_session_json_is_split():
+    assert pending_goal({"pending_goal": {"title": "Snake\nPython", "description": "Tests", "actor": USER}}) == {
+        "title": "Snake", "description": "Python\n\nTests"}
+    assert pending_goal({"pending_goal": {"title": "", "description": "Snake\nPython"}}) == {
+        "title": "Snake", "description": "Python"}
+    assert pending_goal({"pending_goal": {"title": " \n", "description": ""}}) is None
+    assert pending_goal({"pending_goal": "Snake"}) is None and pending_goal({}) is None
+
+
+async def test_the_role_catalog_is_global_and_a_session_overrides_only_its_team(tmp_path):
+    home = _home(tmp_path)
+    st.write_raw(home, dict(_raw(tmp_path), roles=[{"name": "tester", "instructions": "Use pytest."}]))
+    manager = _manager(home)
+    with pytest.raises(SessionError, match=r"Sessions cannot override \[roles\]"):
+        await manager.create("Team", "Goal", overrides={"roles": [{"name": "tester", "hidden": True}]})
+    summary = await manager.create("Team", "Goal", overrides={"swarm": {"starting_roles": ["Тестировщик"],
+                                                                        "start_agents": 2}})
+    swarm = manager.swarms[summary["id"]]
+    assert sorted(m["role"] for m in swarm.members()) == ["Generalist", "Tester"]  # en swarm: canonical en names
+    assert [r.name for r in swarm.config.roles] == ["tester"]  # every session gets the global catalog
     await manager.shutdown()
 
 
@@ -377,6 +431,63 @@ def test_apply_update_env_names_keys_and_renames(tmp_path):
     assert "model" not in st.apply_update(raw, {"models": view["models"]})["models"]["fast"]
     with pytest.raises(ValueError):
         st.apply_update(raw, ["not", "an", "object"])
+
+
+ROLES = [{"name": "Тестировщик", "model": "fast", "instructions": "Пиши тесты на pytest."},
+         {"name": "Дата-инженер", "description": "Ты строишь конвейеры данных.\nВторая строка: \"кавычки\" и \\."},
+         {"name": "researcher", "hidden": True}]
+
+
+def test_roles_round_trip_through_the_settings_file(tmp_path):
+    home = _home(tmp_path)
+    raw = dict(_raw(tmp_path), roles=ROLES)
+    text = st.dump_toml(raw)
+    assert text.count("[[roles]]") == 3 and text.index("[[roles]]") > text.index("[models.fast]")  # after the tables
+    assert tomllib.loads(text) == raw
+    st.write_raw(home, raw)
+    assert st.read_raw(home) == raw
+    cfg = Config.load(home)
+    assert [(r.name, r.model, r.hidden) for r in cfg.roles] == [
+        ("tester", "fast", False), ("Дата-инженер", None, False), ("researcher", None, True)]
+    view = st.public_view(raw)
+    assert list(view)[-2:] == ["roles", "models"]
+    assert view["roles"] == [  # stored entries, normalized: a built-in role by its id
+        {"name": "tester", "description": "", "instructions": "Пиши тесты на pytest.", "model": "fast", "hidden": False},
+        {"name": "Дата-инженер", "description": ROLES[1]["description"], "instructions": "", "model": None,
+         "hidden": False},
+        {"name": "researcher", "description": "", "instructions": "", "model": None, "hidden": True}]
+    assert st.public_view(_raw(tmp_path))["roles"] == []
+
+
+def test_apply_update_roles(tmp_path):
+    raw = dict(_raw(tmp_path), roles=ROLES)
+    view = st.public_view(raw)
+    view["roles"][1] = {"name": "  Data   engineer ", "description": "Builds pipelines.", "instructions": "",
+                        "model": None, "hidden": False}
+    new = st.apply_update(raw, {"roles": view["roles"]})
+    assert new["roles"] == [  # the complete list; unset fields are not stored
+        {"name": "tester", "instructions": "Пиши тесты на pytest.", "model": "fast"},
+        {"name": "Data engineer", "description": "Builds pipelines."}, {"name": "researcher", "hidden": True}]
+    assert [r.name for r in Config.from_dict(tmp_path, new).roles] == ["tester", "Data engineer", "researcher"]
+    # a role follows the rename of its model profile
+    models = st.public_view(new)["models"]
+    models["cheap"] = dict(models.pop("fast"), renamed_from="fast")
+    renamed = st.apply_update(new, {"models": models})
+    assert renamed["roles"][0]["model"] == "cheap"
+    Config.from_dict(tmp_path, renamed)
+    assert "roles" not in st.apply_update(new, {"roles": []})  # every customization removed
+    assert st.apply_update(new, {"swarm": view["swarm"]})["roles"] == new["roles"]  # other sections keep them
+    with pytest.raises(ValueError, match="must be a list of roles"):
+        st.apply_update(raw, {"roles": {"name": "tester"}})
+    with pytest.raises(ValueError, match="Role 2 must be an object"):
+        st.apply_update(raw, {"roles": [{"name": "tester"}, "developer"]})
+    # the catalog's rules are the validation's (config.parse_roles)
+    with pytest.raises(ValueError, match=r"\[roles\.1\] 'QA': a role of your own needs a description"):
+        st.validate(tmp_path, st.apply_update(raw, {"roles": [{"name": "QA", "description": ""}]}))
+    deleted = st.public_view(raw)["models"]
+    deleted.pop("fast")
+    with pytest.raises(ValueError, match=r"\[roles\.1\] 'Тестировщик' uses the model profile 'fast', which is not"):
+        st.validate(tmp_path, st.apply_update(raw, {"models": deleted}))
 
 
 async def test_check_profile_never_returns_the_key():
@@ -665,3 +776,49 @@ async def test_config_view_survives_invalid_overrides(tmp_path):
     with pytest.raises(SessionError) as err:
         manager.config_view("nope")
     assert err.value.status == 404
+
+
+async def test_workspace_folder_in_summaries_and_a_shutdown_during_a_move(tmp_path):
+    """The summary names the folder a session works in; a server shutdown waits for a workspace move (which starts
+    the session again) and keeps the session marked for resume, which then runs it in its new folder."""
+    home = _home(tmp_path)
+    manager = _manager(home)
+    sid = (await manager.create("Folder", start=True))["id"]
+    own = home.resolve() / "sessions" / sid / "workspace"
+    assert manager.summary(sid)["workspace"] == {"path": str(own), "default": True, "adopted": False, "exists": True}
+    assert manager.config_for(sid).workspace_path is None and manager.config_for(sid).workspace_dir == own
+    target = tmp_path / "moved"
+    move = asyncio.create_task(manager.set_workspace(sid, str(target)))
+    await asyncio.sleep(0)  # the move holds the session's lock now
+    await manager.shutdown()
+    result = await move
+    assert result["mode"] == "moved" and result["restarted"] and not manager.running and not manager.swarms
+    assert manager.meta(sid)["autostart"] is True
+    again = _manager(home)
+    assert await again.resume() == [sid]
+    assert again.swarms[sid].workspace.root == target.resolve()
+    view = again.settings_view()
+    view["agents"]["max_steps_per_turn"] = 7
+    await again.update_settings({"agents": view["agents"]})  # reconfigured: still in its folder
+    assert again.swarms[sid].config.workspace_dir == target.resolve()
+    assert again.swarms[sid].config.agents.max_steps_per_turn == 7
+    await again.shutdown()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the 260-character limit of plain paths is a Windows one")
+def test_trash_with_paths_longer_than_windows_allows_is_removed(tmp_path):
+    """A session renamed away (.deleted-<id>-<ns>) gets longer paths than it had; its deepest files (git
+    objects) can pass 260 characters, which plain Windows paths cannot reach."""
+    from dreamteam import sessions as sessions_module
+
+    trash = tmp_path / f"{TRASH_PREFIX}001-x-{'9' * 19}"
+    long_form = "\\\\?\\" + str(trash)  # creating such a tree needs the extended-length form too
+    deep = os.path.join(long_form, *(["d" * 40] * 7))
+    os.makedirs(deep)
+    leaf = os.path.join(deep, "o" * 38)
+    with open(leaf, "w", encoding="utf-8") as f:
+        f.write("blob")
+    os.chmod(leaf, 0o444)  # git objects are read-only
+    assert len(leaf) - 4 > 260
+    sessions_module._rmtree(trash)
+    assert not os.path.exists(long_form)

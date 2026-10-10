@@ -113,6 +113,21 @@ def env_passthrough(config: Config) -> list[str]:
 CONTAINER_PORT = 8765
 
 
+def outside_home_warning(home: Path) -> list[str]:
+    """Lines warning about the sessions of a home that work in a folder outside it: only the home is mounted
+    into the container, so they cannot start there (empty when there are none). A folder inside the home is
+    stored relative to it as well (session.json "in_home"), so it is found where the container mounts the home."""
+    from .sessions import external_workspaces
+
+    found = external_workspaces(home)
+    if not found:
+        return []
+    return ([f"Warning: only {home} is mounted into the container; these sessions work in a folder outside it "
+             "and cannot start there:"]
+            + [f"  {sid}: {folder}" for sid, folder in found]
+            + ["  Move them into the home first (/cd <folder inside the home>, or /cd --default)."])
+
+
 def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | None = None,
                     image: str = IMAGE, docker: str = "docker", tty: bool = False,
                     home: bool | None = None) -> list[str]:
@@ -149,6 +164,10 @@ def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | N
         if profile.base_url and any(h in profile.base_url for h in ("localhost", "127.0.0.1")):
             print(f"Note: model profile '{profile.name}' uses {profile.base_url}; inside Docker use "
                   "http://host.docker.internal:<port> instead.", file=sys.stderr)
+    is_home = home if home is not None else (project_dir / "sessions").is_dir()
+    if is_home:
+        for line in outside_home_warning(project_dir):
+            print(line, file=sys.stderr)
     from .cli import _stdin_is_terminal  # (NUL claims to be a tty on Windows: `docker run -it` would refuse it)
 
     cmd = sandbox_command(project_dir, port, config, goal, image, docker=_docker(), tty=_stdin_is_terminal(),

@@ -49,6 +49,10 @@ def i18n_blocks() -> dict[str, set[str]]:
     return out
 
 
+# the kinds of session folder (summary / state "workspace": default, adopted, else moved) and their tooltips
+WORKSPACE_KINDS_KEYS = {f"ws_{k}{h}" for k in ("default", "adopted", "moved") for h in ("", "_hint")}
+
+
 def test_i18n_languages_have_the_same_keys():
     blocks = i18n_blocks()
     assert set(blocks) == {"ru", "en"}
@@ -61,6 +65,7 @@ def test_every_literal_key_used_by_the_ui_is_translated():
     used = set(re.findall(r"\bt\(\"([a-z0-9_]+)\"\s*[,)]", APP_JS))
     used |= set(re.findall(r'data-i18n(?:-placeholder|-title)?="([a-z0-9_]+)"', INDEX))
     used |= set(re.findall(r"t\(rail \? \"(\w+)\" : \"(\w+)\"\)", APP_JS)[0])
+    used |= WORKSPACE_KINDS_KEYS  # workspaceHtml(): t("ws_" + kind), t("ws_" + kind + "_hint")
     missing = sorted(k for k in used if k not in keys)
     assert not missing, missing
     assert {"goal_field", "discussion", "reply", "write_post", "disconnected"} <= used
@@ -153,11 +158,15 @@ def test_home_i18n_is_complete():
     used |= set(re.findall(r'\bfield\("([a-z0-9_]+)"', HOME_JS))                     # settings field labels
     used |= set(re.findall(r'\bhint: "([a-z0-9_]+)"', HOME_JS))
     sections = set(re.findall(r'\["\w+", "(s_\w+)"\]', HOME_JS))
-    assert len(sections) == 8
+    assert len(sections) == 9 and "s_roles" in sections
     used |= sections | {s + "_hint" for s in sections}
     used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending")}  # sessionState() + pending goal
+    used |= WORKSPACE_KINDS_KEYS  # workspaceLine(): t("ws_" + kind), t("ws_" + kind + "_hint")
     assert {"new_session", "delete_text", "p_key_saved", "p_key_env_drop", "p_model_required", "discard_new",
-            "started", "stopped", "p_model_ok", "create_open"} <= used
+            "started", "stopped", "p_model_ok", "create_open", "f_team", "team_over_max", "r_err_model", "sw_review",
+            "sw_review_hint", "f_goal_hint", "f_model_hint"} <= used
+    # the starting team is a composer now: the old number field and the comma list are gone
+    assert not {"f_start_agents", "f_roles", "f_roles_ph", "f_roles_hint", "sw_start", "sw_roles"} & keys
     missing = sorted(k for k in used if k not in keys)
     assert not missing, missing
 
@@ -377,6 +386,118 @@ def test_drop_actions():
     """)
     assert out["r"] == [{"status": "in_progress"}, None, None, {"status": "cancelled"}, {"error": "review_drop"},
                         {"status": "todo"}, None, None]
+    out = run_js(r"""
+      const t = (status) => ({ id: 1, status });
+      out.r = [app.dropAction(t("review"), "done"), app.dropAction(t("review"), "in_progress"),
+               app.dropAction(t("review"), "todo"), app.dropAction(t("review"), "closed"), app.dropAction(t("review"), "review")];
+    """)
+    # review -> done approves, a return needs a reason (the card opens), closing cancels as before
+    assert out["r"] == [{"review": True}, {"open": True}, {"open": True}, {"status": "cancelled"}, None]
+
+
+@needs_node
+def test_review_on_the_board():
+    out = run_js(r"""
+      app.S.lang = "en";
+      app.S.state = { swarm: { independent_review: true }, agents: [{ name: "Ann Lee", role: "Dev", status: "idle" }], tasks: [] };
+      const t = (reviewer) => ({ id: 4, title: "T", status: "review", priority: 1, assignee: "Ann Lee", reviewer, tags: [],
+                                 blocked_by: [], comments: 0 });
+      out.cardUser = app.cardHtml(t("user"));
+      out.cardAgent = app.cardHtml(t("Bob Stone"));
+      out.opts = app.memberOptions("", true, "X");
+      out.auto = app.reviewerNone();
+      app.S.state.swarm.independent_review = false;
+      out.none = app.reviewerNone();
+      out.reviewUser = app.taskReviewHtml(t("user"));
+      out.reviewAgent = app.taskReviewHtml(t("Bob Stone"));
+      // a return without a reason makes no call
+      app.S.openTaskId = 4;
+      el("review-comment", { value: "  ", focus: () => { out.focused = true; } });
+      const toasts = [];
+      el("toasts", { children: [], appendChild: (box) => toasts.push(box.textContent) });
+      document.createElement = () => ({ className: "", textContent: "", remove() {}, addEventListener() {} });
+      await app.reviewTask(false);
+      out.afterEmpty = calls.length;
+      out.toasts = toasts.slice();
+      elements["review-comment"].value = "Add tests for the parser";
+      await app.reviewTask(false);
+      // dragging a card from Review to Done approves it
+      app.S.state.tasks = [t("user")];
+      app.moveTask(4, "done");
+      out.calls = calls.map((c) => [c.url, c.body]);
+    """)
+    assert '<span class="badge warn">👁 waits for your review</span>' in out["cardUser"]
+    assert '<span class="chip plain">👁 Bob Stone</span>' in out["cardAgent"] and "badge warn" not in out["cardAgent"]
+    assert out["opts"].startswith('<option value="" selected>X</option>')
+    assert out["auto"] == "— (the board picks)" and out["none"] == "— none —"
+    assert "The task waits for your review" in out["reviewUser"] and "instead of the reviewer" not in out["reviewUser"]
+    assert "Task waits for review · Reviewer: Bob Stone" in out["reviewAgent"]
+    assert "You can approve or return it instead of the reviewer." in out["reviewAgent"]
+    assert out["afterEmpty"] == 0 and out["focused"] is True and out["toasts"] == ["Write in the comment what to fix."]
+    assert out["calls"] == [
+        ["/api/act/task_review", {"task_id": 4, "approve": False, "comment": "Add tests for the parser"}],
+        ["/api/act/task_review", {"task_id": 4, "approve": True}],
+    ]
+
+
+@needs_node
+def test_goal_and_hire_dialogs():
+    out = run_js(r"""
+      app.S.lang = "en";
+      app.S.state = { swarm: { goal: { title: "Old", description: "", status: "active" }, session: null, models: ["default", "fast"] } };
+      const handlers = {};
+      const on = (id) => el(id, { addEventListener: (type, fn) => { handlers[id + ":" + type] = fn; } });
+      el("modal"); el("modal-backdrop");
+      // the goal dialog: the title is a textarea whose first line is the title; the text goes to the hub unchanged
+      on("g-save"); el("g-title"); el("g-desc");
+      app.goalModal();
+      out.goalHtml = elements.modal.innerHTML;
+      elements["g-title"].value = "  Snake game\nArrow keys, score  ";
+      elements["g-desc"].value = "pytest";
+      await handlers["g-save:click"]();
+      // the hire dialog: the role catalog of the session
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
+        const data = url.endsWith("/api/roles")
+          ? { language: "en", roles: [{ key: "tester", name: "Tester", description: "You check <things>.", instructions: "",
+                                        model: "fast", builtin: true, names: ["Tester", "tester", "Тестировщик"] }],
+              hidden: [{ key: "researcher", name: "Researcher", description: "You find things out.", instructions: "",
+                         model: null, builtin: true, names: ["Researcher", "researcher", "Исследователь"] }] }
+          : { ok: true, result: "Hired" };
+        return { ok: true, json: async () => data, text: async () => "" };
+      };
+      on("h-role"); on("h-save"); el("h-role-desc"); el("h-instr"); el("h-model"); el("h-name");
+      await app.hireModal();
+      out.hireHtml = elements.modal.innerHTML;
+      const preview = (role) => { elements["h-role"].value = role; handlers["h-role:input"](); return elements["h-role-desc"].innerHTML; };
+      out.previews = [preview("tester"), preview(" TESTER "), preview("QA engineer"), preview(""),
+                      preview("тестировщик"), preview("Исследователь")];
+      elements["h-role"].value = "Tester";
+      await handlers["h-save:click"]();
+      Object.assign(elements["h-model"], { value: "fast" });
+      Object.assign(elements["h-instr"], { value: " write the tests " });
+      Object.assign(elements["h-name"], { value: "Grace Hopper" });
+      await handlers["h-save:click"]();
+      out.calls = calls.filter((c) => c.url.includes("/api/")).map((c) => [c.url, c.body]);
+    """)
+    goal = out["goalHtml"]
+    assert '<textarea id="g-title" rows="3"></textarea>' in goal and "<input id=\"g-title\"" not in goal
+    assert "the first line is the title, the other lines the description" in goal
+    hire = out["hireHtml"]
+    assert '<input id="h-role" list="h-roles"' in hire and '<datalist id="h-roles"><option value="Tester"></option>' in hire
+    assert '<select id="h-model"><option value="">— the role&#39;s or the session&#39;s profile</option>' in hire
+    assert "optional for a catalog role" in hire
+    known, upper, unknown, empty, other_language, hidden = out["previews"]
+    assert known == upper == other_language == 'You check &lt;things&gt;. <span class="badge plain">role profile: fast</span>'
+    assert hidden == "You find things out." and "Researcher" not in hire   # resolved by the hire, not offered
+    assert unknown == "A new role, not in the catalog: describe its responsibilities in the instructions." and empty == ""
+    assert out["calls"] == [
+        ["/api/act/set_goal", {"title": "Snake game\nArrow keys, score", "description": "pytest"}],
+        ["/api/roles", None],
+        ["/api/act/hire_agent", {"role": "Tester", "instructions": ""}],   # instructions stay a required parameter
+        ["/api/act/hire_agent", {"role": "Tester", "instructions": "write the tests", "model": "fast",
+                                 "name": "Grace Hopper"}],
+    ]
 
 
 @needs_node
@@ -767,11 +888,13 @@ def test_home_settings_default_profile_validation_and_overrides():
       // text that does not parse yet survives a re-render (language switch) as typed
       home.H.view.mcp.external = home.readInput({ dataset: { type: "json", label: "X" }, value: '{"a": <b>' });
       out.jsonField = home.field("mcp_external", "mcp.external", "json");
-      // new-session overrides against the SAVED defaults
-      const ov = (form) => home.sessionOverrides(settings, Object.assign({ lang: "ru", start: "3", max: "8", budget: "5", roles: "Dev",
+      // new-session overrides against the SAVED defaults (the team: rows of the composer)
+      const ov = (form) => home.sessionOverrides(settings, Object.assign({ lang: "ru", max: "8", budget: "5",
+                                                                             team: home.teamRows(["Dev"], 3),
                                                                              model: "default", steps: "40", approval: false }, form));
       out.same = ov({});
-      out.changed = ov({ lang: "en", start: "", budget: "0", roles: "", model: "def", steps: "12", approval: true });
+      out.changed = ov({ lang: "en", budget: "0", team: [{ role: "generalist", count: 2 }], model: "def", steps: "12",
+                         approval: true });
     """)
     assert out["afterTyping"] == "default"
     assert out["default"] == "main" and out["models"] == ["main", "default2"] and out["renamed"] == "default"
@@ -781,8 +904,199 @@ def test_home_settings_default_profile_validation_and_overrides():
     assert out["jsonError"] == "Invalid JSON in “External MCP servers (JSON)”."
     assert ">{&quot;a&quot;: &lt;b&gt;</textarea>" in out["jsonField"]
     assert out["same"] == {"swarm": {"language": "ru", "start_agents": 3, "max_agents": 8, "max_cost_usd": 5}}
-    assert out["changed"] == {"swarm": {"language": "en", "max_agents": 8, "max_cost_usd": 0, "starting_roles": []},
+    assert out["changed"] == {"swarm": {"language": "en", "start_agents": 2, "starting_roles": [], "max_agents": 8,
+                                        "max_cost_usd": 0},
                               "agents": {"default_model": "def", "max_steps_per_turn": 12}, "mcp": {"require_approval": True}}
+
+
+TEAM_CASES = [([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 2), (["Разработчик"], 1),
+              (["Tester", " tester ", "QA  lead", "generalist"], 5), (["generalist", "Developer"], 2), ([], 0)]
+
+
+def role_presets() -> list[dict]:
+    from dreamteam import roles
+    return roles.presets_view()
+
+
+@needs_node
+def test_home_team_composer_matches_roles_py():
+    from dreamteam import roles
+
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.rolePresets = JSON.parse(process.env.DT_PRESETS);
+      const cases = JSON.parse(process.env.DT_CASES);
+      out.rows = cases.map(([r, n]) => home.teamRows(r, n).map((x) => [x.role, x.count]));
+      out.values = cases.map(([r, n]) => { const v = home.teamValue(home.teamRows(r, n)); return [v.starting_roles, v.start_agents]; });
+      out.mixed = home.teamValue([{ role: "generalist", count: 1 }, { role: "Developer", count: 2 }, { role: "Универсал", count: 2 }]);
+      out.summaries = JSON.parse(process.env.DT_TEXTS).map((s) => home.roleSummary(s));
+    """, env={"DT_PRESETS": json.dumps(role_presets()), "DT_CASES": json.dumps(TEAM_CASES),
+              "DT_TEXTS": json.dumps(TEXTS_TO_SUMMARIZE)})
+    assert out["rows"] == [[list(r) for r in roles.team_rows(*case)] for case in TEAM_CASES]
+    assert out["values"] == [list(roles.team_value(roles.team_rows(*case))) for case in TEAM_CASES]
+    assert out["mixed"] == {"starting_roles": ["generalist", "developer", "developer"], "start_agents": 5}
+    assert out["summaries"] == [roles.summary(text) for text in TEXTS_TO_SUMMARIZE]
+
+
+TEXTS_TO_SUMMARIZE = ["Hello world. Next.", "A" * 300, "word " * 100, "Short", "Ends with dots… then more", "x. y",
+                      "  spaced   out text.  More "]
+
+
+@needs_node
+def test_home_new_session_composer():
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.rolePresets = JSON.parse(process.env.DT_PRESETS);
+      home.H.original = { swarm: { language: "en", start_agents: 3, max_agents: 4, max_cost_usd: 5, starting_roles: ["architect"] },
+                          agents: { default_model: "default" }, mcp: {}, models: { default: { model: "m" } },
+                          roles: [{ name: "tester", model: "fast" }, { name: "researcher", hidden: true },
+                                  { name: "Data engineer", description: "You build data pipelines. Fast." }] };
+      el("modal"); el("modal-backdrop");
+      await home.newSessionModal();
+      out.html = elements.modal.innerHTML;
+      out.rows = JSON.parse(JSON.stringify(home.H.teams.ns));
+      const fire = (type, attrs, value) => home.onTeamEvent({ type, target: { closest: () => ({ dataset: attrs, value }) } });
+      const ns = (kind, row) => ({ team: kind, composer: "ns", row: String(row) });
+      fire("click", ns("inc", 1));                                  // generalist 2 -> 3
+      fire("click", { team: "add", composer: "ns" });               // the first visible role not used yet
+      fire("change", ns("role", 2), "tester");
+      fire("change", ns("role", 0), home.CUSTOM_ROLE);              // "Other role…"
+      fire("input", ns("custom", 0), "Data  engineer");
+      fire("input", ns("count", 2), "7");
+      out.edited = JSON.parse(JSON.stringify(home.H.teams.ns));
+      out.tooMany = home.teamError(home.H.teams.ns, "8");
+      out.ok = home.teamError(home.H.teams.ns, "20");
+      // "," and "*" separate the items of a team (roles.parse_team): not part of an own role's name
+      out.badName = home.teamError([{ role: "developer*2", count: 1, custom: true }], "8");
+      out.badComma = home.teamError([{ role: "architect, developer", count: 1, custom: true }], "8");
+      out.overrides = home.sessionOverrides(home.H.original, { lang: "en", max: "20", budget: "5", team: home.H.teams.ns });
+      fire("click", ns("del", 2)); fire("click", ns("del", 1)); fire("click", ns("del", 0));
+      out.empty = home.teamError(home.H.teams.ns, "8");
+      fire("click", { team: "add", composer: "ns" });
+      out.afterAdd = JSON.parse(JSON.stringify(home.H.teams.ns));
+      out.untouched = home.sessionOverrides(home.H.original, { lang: "en", max: "4", budget: "5",
+                                                               team: home.teamRows(["architect"], 3) });
+      // the saved list holds more roles than start_agents (a hand edit, or the old UI): a generalist added in
+      // the modal must not let the session take the hidden third role
+      const longer = { swarm: { start_agents: 2, starting_roles: ["Аналитик", "Разработчик", "Тестировщик"] } };
+      const longerRows = home.teamRows(longer.swarm.starting_roles, 2);
+      out.longerUntouched = home.sessionOverrides(longer, { lang: "en", team: longerRows });
+      out.longerAdded = home.sessionOverrides(longer, { lang: "en", team: [...longerRows, { role: "generalist", count: 1 }] });
+      out.longerFewer = home.sessionOverrides(longer, { lang: "en", team: [longerRows[0]] });
+      out.composer = home.teamComposer("ns");
+    """, env={"DT_PRESETS": json.dumps(role_presets())})
+    html = out["html"]
+    assert 'id="ns-start"' not in html and 'id="ns-roles"' not in html
+    assert '<div class="team full" id="team-ns">' in html and "Agents in all: 3" in html
+    assert 'the first line is the goal&#39;s title, the other lines its description' in html
+    assert 'id="ns-goal" rows="4"' in html and "roles with a profile of their own keep it" in html
+    assert "Snake game in Python\nArrow keys" in html  # the placeholder shows a two-line goal
+    assert out["rows"] == [{"role": "architect", "count": 1}, {"role": "generalist", "count": 2}]
+    assert out["edited"] == [{"role": "Data  engineer", "count": 1, "custom": True}, {"role": "generalist", "count": 3},
+                             {"role": "tester", "count": 7, "custom": False}]
+    assert out["tooMany"] == "The starting team has 11 agents, more than the maximum (8)." and out["ok"] is None
+    assert out["badName"] == "Role name “developer*2”: at most 60 characters, no “,” or “*”."
+    assert out["badComma"] == "Role name “architect, developer”: at most 60 characters, no “,” or “*”."
+    assert out["overrides"] == {"swarm": {"language": "en", "start_agents": 11, "max_agents": 20, "max_cost_usd": 5,
+                                          "starting_roles": ["Data engineer", "generalist", "generalist", "generalist",
+                                                             "tester", "tester", "tester", "tester", "tester", "tester",
+                                                             "tester"]}}
+    assert out["empty"] == "Add at least one role to the starting team."
+    assert out["afterAdd"] == [{"role": "generalist", "count": 1}]   # nothing used yet: the first visible role
+    assert out["untouched"] == {"swarm": {"language": "en", "start_agents": 3, "max_agents": 4, "max_cost_usd": 5}}
+    assert out["longerUntouched"] == {"swarm": {"language": "en", "start_agents": 2}}
+    assert out["longerAdded"] == {"swarm": {"language": "en", "start_agents": 3,
+                                            "starting_roles": ["analyst", "developer"]}}  # + an implicit generalist
+    assert out["longerFewer"] == {"swarm": {"language": "en", "start_agents": 1}}  # the saved list's first role
+    composer = out["composer"]
+    # the saved catalog: names in the UI language, the role's model, a hidden role not offered, own roles after
+    assert ">Generalist</option>" in composer and "model: fast" not in composer and ">Data engineer</option>" in composer
+    assert ">Researcher" not in composer and 'value="__custom__"' in composer
+    assert composer.index(">Generalist<") < composer.index(">Data engineer<")
+
+
+@needs_node
+def test_home_settings_roles_and_team():
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.rolePresets = JSON.parse(process.env.DT_PRESETS);
+      for (const id of ["settings-form", "settings-nav", "profiles", "save-bar", "save-msg", "add-profile", "roles", "team-defaults"]) el(id);
+      const settings = {
+        swarm: { name: "S", language: "en", start_agents: 3, max_agents: 8, max_cost_usd: 5, starting_roles: [],
+                 independent_review: true },
+        agents: { default_model: "default" }, shell: {}, workspace: {}, server: {}, tracing: {}, mcp: { external: {} },
+        models: { default: { provider: "openai", model: "a", api_key_set: false }, fast: { provider: "openai", model: "b", api_key_set: false } },
+        roles: [{ name: "tester", model: "fast", instructions: "Use pytest." }, { name: "researcher", hidden: true },
+                { name: "Data engineer", description: "You build data pipelines." }],
+      };
+      home.H.view = JSON.parse(JSON.stringify(settings)); home.H.original = JSON.parse(JSON.stringify(settings));
+      home.renderSettings(true);
+      out.form = elements["settings-form"].innerHTML;
+      out.cards = elements["roles"].innerHTML;
+      out.untouched = home.collectSettings();
+      // the composer of the defaults writes back only what changed: the canonical default keeps starting_roles []
+      const fire = (type, attrs, value) => home.onSettingsInput({ type, target: { closest: () => ({ dataset: attrs, value }), dataset: {} } });
+      const click = (attrs) => home.onSettingsClick({ type: "click", target: { closest: (sel) => (sel === "[data-team]" ? { dataset: attrs } : null) } });
+      click({ team: "inc", composer: "defaults", row: "0" });
+      out.changedTeam = [home.H.view.swarm.starting_roles, home.H.view.swarm.start_agents];
+      click({ team: "dec", composer: "defaults", row: "0" });
+      out.backTeam = [home.H.view.swarm.starting_roles, home.H.view.swarm.start_agents];
+      // role cards: edit a built-in, hide one, add an own role
+      const card = (id) => home.H.roleCards.find((c) => (c.builtin ? c.id : c.name) === id);
+      const edit = (c, field, value) => home.onSettingsInput({ type: "input", target: { value, dataset: { rc: field },
+        closest: (sel) => (sel === ".role-card" ? { dataset: { roleUid: c.uid }, querySelector: () => null } : null) } });
+      const press = (c, attr) => home.onSettingsClick({ type: "click", target: {
+        closest: (sel) => (sel === "button" ? { dataset: { [attr]: "" } } : sel === ".role-card" ? { dataset: { roleUid: c.uid } } : null) } });
+      edit(card("developer"), "description", "You write the code. Always with tests.");
+      edit(card("architect"), "description", home.H.rolePresets.find((p) => p.id === "architect").description.ru);  // a built-in text: no change
+      press(card("writer"), "rcHide");
+      press(card("tester"), "rcReset");
+      home.onSettingsClick({ type: "click", target: { closest: (sel) => (sel === "button" ? { dataset: { roleAdd: "" } } : null) } });
+      const fresh = home.H.roleCards[home.H.roleCards.length - 1];
+      out.entries = () => { try { return home.collectSettings().roles; } catch (e) { return e.message; } };
+      out.errors = [];
+      out.errors.push(out.entries());                                   // the new card has no name
+      edit(fresh, "name", "Data Engineer"); out.errors.push(out.entries());
+      edit(fresh, "name", "Тестировщик"); out.errors.push(out.entries());
+      edit(fresh, "name", "QA, lead"); out.errors.push(out.entries());
+      edit(fresh, "name", "QA lead"); out.errors.push(out.entries());
+      edit(fresh, "description", "You lead the testing."); edit(fresh, "model", "gone"); out.errors.push(out.entries());
+      home.H.profiles.find((p) => p.name === "fast").name = "quick";  // a profile renamed in the same edit
+      edit(fresh, "model", "fast");
+      out.saved = home.collectSettings();
+      out.composer = home.teamComposer("defaults");
+      out.cardsAfter = home.H.roleCards.map(home.roleCard).join("");
+    """, env={"DT_PRESETS": json.dumps(role_presets())})
+    form = out["form"]
+    assert form.index('id="s-models"') < form.index('id="s-roles"') < form.index('id="s-swarm"')
+    assert 'data-path="swarm.independent_review"' in form and "Independent review of tasks" in form
+    assert "a task without a reviewer is then done at once" in form
+    assert 'data-path="swarm.start_agents"' not in form and 'data-path="swarm.starting_roles"' not in form
+    assert '<div class="team full" id="team-defaults">' in form and "Agents in all: 3" in form
+    cards = out["cards"]
+    assert cards.count('class="role-card"') == 8 and cards.count('class="role-card hidden-role"') == 1  # 8 + 1 own role
+    assert "ru: Тестировщик" in cards and ">changed</span>" in cards and "Use pytest." in cards
+    assert out["untouched"]["roles"] == [{"name": "tester", "instructions": "Use pytest.", "model": "fast"},
+                                         {"name": "researcher", "hidden": True},
+                                         {"name": "Data engineer", "description": "You build data pipelines."}]
+    assert out["untouched"]["swarm"]["starting_roles"] == [] and out["untouched"]["swarm"]["start_agents"] == 3
+    assert out["changedTeam"] == [[], 4] and out["backTeam"] == [[], 3]
+    assert out["errors"] == ["Enter the role name.", "Two roles are named “Data Engineer”.",
+                             "“Тестировщик” is a built-in role: edit its card instead.",
+                             "Role name “QA, lead”: at most 60 characters, no “,” or “*”.",
+                             "Describe the role “QA lead”.",
+                             "Role “QA lead” uses the profile “gone”, which does not exist."]
+    assert out["saved"]["roles"] == [
+        {"name": "developer", "description": "You write the code. Always with tests."},
+        {"name": "writer", "hidden": True}, {"name": "researcher", "hidden": True},
+        {"name": "Data engineer", "description": "You build data pipelines."},
+        {"name": "QA lead", "description": "You lead the testing.", "model": "fast"},
+    ]
+    composer = out["composer"]
+    assert ">QA lead</option>" in composer and ">Technical writer" not in composer  # the edited catalog
+    assert ">Reset</button>" in out["cardsAfter"] and ">Show</button>" in out["cardsAfter"]
 
 
 @needs_node
@@ -809,6 +1123,146 @@ def test_home_polling_keeps_the_session_dom_and_busy_buttons():
     """)
     assert out["writes"] == 1
     assert out["during"] is True and out["after"] is False
+
+
+@needs_node
+def test_home_card_shows_the_session_folder_and_delete_keeps_an_outside_one():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      const card = (id, workspace) => home.sessionCard({ id, title: "T", status: "stopped", workspace,
+                                                         tasks: { total: 0, done: 0 }, agents: { total: 0, working: 0 } });
+      // its own folder is created on demand: "exists: false" is not a missing folder
+      out.own = card("own", { path: "/home/u/DreamTeam/sessions/own/workspace", default: true, adopted: false, exists: false });
+      out.project = card("proj", { path: "/home/u/code/my-app", default: false, adopted: true, exists: true });
+      out.moved = card("moved", { path: "D:\\work\\snake", default: false, adopted: false, exists: true });
+      out.missing = card("gone", { path: "/media/usb/app", default: false, adopted: true, exists: false });
+      out.evil = card("evil", { path: E, default: false, adopted: true, exists: false });
+      out.none = card("old", undefined);
+      out.long = card("long", { path: "C:\\Users\\someone\\DreamTeam\\sessions\\001-a-very-long-session-title\\workspace",
+                               default: true, adopted: false, exists: true });
+      out.short = [home.shortPath("C:\\Users\\kuzmi\\DreamTeam\\sessions\\001-snake-game\\workspace", 40),
+                   home.shortPath("/a/b", 40), home.shortPath("x".repeat(60), 20)];
+      out.search = home.filterSessions([{ id: "a", title: "A", workspace: { path: "/home/u/code/My-App" } }, { id: "b", title: "B" }],
+                                       "all", "my-app").map((s) => s.id);
+      home.H.lang = "ru";
+      out.ru = card("proj", { path: "/p", default: false, adopted: true, exists: true }) + card("own", { path: "/o", default: true, exists: true });
+      home.H.lang = "en";
+      // delete: the dialog and the toast say that a folder outside the session stays
+      const toasts = [];
+      document.createElement = () => ({ className: "", textContent: "", remove() {} });
+      el("toasts", { appendChild: (box) => toasts.push(box.textContent) });
+      el("modal"); el("modal-backdrop");
+      let confirmDelete = null;
+      el("confirm-delete", { addEventListener: (type, fn) => { confirmDelete = fn; } });
+      answers.confirm = true;
+      home.H.sessions = [{ id: "proj", title: "Proj", status: "stopped", workspace: { path: "/home/u/code/my-app", default: false, adopted: true, exists: true } },
+                         { id: "own", title: "Own", status: "stopped", workspace: { path: "/x/own/workspace", default: true, adopted: false, exists: true } },
+                         { id: "evil", title: "Evil", status: "stopped", workspace: { path: E, default: false, adopted: false, exists: true } }];
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, method: opts && opts.method });
+        return { ok: true, json: async () => (url.startsWith("/api/sessions/proj") ? { ok: true, workspace_kept: "/home/u/code/my-app" } : { ok: true }) };
+      };
+      home.deleteModal("evil"); out.delEvil = elements.modal.innerHTML;
+      home.deleteModal("own"); out.delOwn = elements.modal.innerHTML;
+      home.deleteModal("proj"); out.delProj = elements.modal.innerHTML; await confirmDelete();
+      home.deleteModal("own"); await confirmDelete();  // (the list reloaded after a delete is empty here)
+      out.toasts = toasts;
+      out.calls = calls.filter((c) => c.method === "DELETE").map((c) => c.url);
+    """, env={"EVIL": EVIL})
+    own = out["own"]
+    # the path is an ltr run inside an rtl box: a path too long for the card loses its start, not its end
+    assert '<div class="sc-folder"' in own and '<code><bdi dir="ltr">/home/u/DreamTeam/sessions/own/workspace</bdi></code>' in own
+    assert '<span class="badge plain">own folder</span>' in own and "sc-warn" not in own
+    assert "The session&#39;s own folder in the DreamTeam home" in own  # the tooltip explains the kind
+    assert '<span class="badge ">project folder</span>' in out["project"] and "sc-warn" not in out["project"]
+    assert "Deleting the session keeps the folder" in out["project"]
+    assert '<bdi dir="ltr">D:\\work\\snake</bdi>' in out["moved"] and '<span class="badge ">moved</span>' in out["moved"]
+    missing = out["missing"]
+    assert '<span class="badge err">missing</span>' in missing and '<div class="sc-warn">' in missing
+    assert "/cd FOLDER or /cd --default" in missing
+    assert_escaped(out["evil"], at_least=2)  # the shown path and the tooltip
+    assert "sc-folder" not in out["none"]  # an old hub without "workspace": no folder line
+    # a long path is cut at the front (on a separator) and shown whole in the tooltip
+    assert '<bdi dir="ltr">…\\sessions\\001-a-very-long-session-title\\workspace</bdi>' in out["long"]
+    assert "Session folder: C:\\Users\\someone\\DreamTeam\\sessions\\001-a-very-long-session-title\\workspace" in out["long"]
+    assert out["short"] == ["…\\sessions\\001-snake-game\\workspace", "/a/b", "…" + "x" * 19]
+    assert out["search"] == ["a"]
+    assert "папка проекта" in out["ru"] and "своя папка" in out["ru"]
+    assert "Its folder /home/u/code/my-app stays where it is" in out["delProj"] and "workspace files" not in out["delProj"]
+    assert "workspace files" in out["delOwn"] and "stays where it is" not in out["delOwn"]
+    assert_escaped(out["delEvil"])
+    assert out["toasts"] == ["Session deleted. The folder /home/u/code/my-app stays where it is.", "Session deleted"]
+    assert out["calls"] == ["/api/sessions/proj?confirm=proj", "/api/sessions/own?confirm=own"]
+
+
+@needs_node
+def test_board_shows_the_session_folder_and_a_missing_one():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      app.S.lang = "en";
+      for (const id of ["back-link", "stopped-banner", "paused-banner", "workspace-banner", "goal-status", "mcp-badge",
+                        "triggers-badge", "team-unread"])
+        el(id, { classList: classList(["hidden"]) });
+      for (const id of ["swarm-name", "mcp-hint", "pause-btn", "budget-bar", "goal-btn", "workspace-info", "file-list", "crumbs",
+                        "file-path", "file-content", 'tabs > button[data-tab="files"]'])
+        el(id);
+      const state = (workspace) => ({ swarm: { name: "S", goal: null, limits: { max_cost_usd: 0, max_agents: 3 }, spent_usd: 0,
+                                               mcp_url: "http://h/mcp", session: { id: "s", title: "S", status: "stopped" }, workspace },
+                                      agents: [], mcp: [], triggers: [] });
+      // a folder outside the session that is gone: a banner on every tab, the Files tab lists nothing (no API call)
+      app.S.state = state({ path: E, default: false, adopted: true, exists: false });
+      app.renderHeader();
+      out.bannerShown = !elements["workspace-banner"].classList.contains("hidden");
+      out.banner = elements["workspace-banner"].textContent;
+      out.info = elements["workspace-info"].innerHTML;
+      calls.length = 0;
+      await app.openDir("src");
+      out.missingCalls = calls.length;
+      out.missingDir = app.S.fileDir;
+      // the project folder (adopted): path, badge, tooltip on the Files tab; no banner
+      app.S.state = state({ path: "/home/u/code/my-app", default: false, adopted: true, exists: true });
+      app.renderHeader();
+      out.bannerHidden = elements["workspace-banner"].classList.contains("hidden");
+      out.project = elements["workspace-info"].innerHTML;
+      out.tabTitle = elements['tabs > button[data-tab="files"]'].title;
+      out.own = app.workspaceHtml({ path: "/x/sessions/s/workspace", default: true, adopted: false, exists: false });
+      out.moved = app.workspaceHtml({ path: "/data/s", default: false, adopted: false, exists: true });
+      out.none = app.workspaceHtml(undefined);
+      out.kinds = [{ path: "/a", default: true }, { path: "/a", adopted: true }, { path: "/a" }, {}, null].map(app.workspaceKind);
+      // after /cd the Files tab starts again from the root of the new folder
+      app.S.tab = "files"; app.S.fileDir = "src"; app.S.openFile = "src/a.py";
+      app.syncWorkspace();                                      // the first state: remembered, nothing reset
+      out.first = [app.S.fileDir, app.S.openFile];
+      app.S.state.swarm.workspace = { path: "/home/u/code/other", default: false, adopted: true, exists: true };
+      calls.length = 0;
+      app.syncWorkspace();
+      await new Promise((r) => setImmediate(r));
+      out.second = [app.S.fileDir, app.S.openFile, elements["file-path"].textContent, calls.map((c) => c.url)];
+      calls.length = 0;
+      app.syncWorkspace();                                      // unchanged: nothing reloaded
+      out.third = calls.length;
+    """, env={"EVIL": EVIL})
+    assert out["bannerShown"] is True
+    assert out["banner"].startswith("The session folder is missing: " + EVIL)  # textContent: shown as text
+    assert "/cd FOLDER or /cd --default" in out["banner"]
+    info = out["info"]
+    assert_escaped(info)
+    assert '<span class="badge err"' in info and ">missing</span>" in info and "/cd" not in info  # the banner says it
+    assert out["missingCalls"] == 0 and out["missingDir"] == "."
+    assert out["bannerHidden"] is True
+    project = out["project"]
+    assert '<code class="ws-path" id="ws-path" title="Click to copy">/home/u/code/my-app</code>' in project
+    assert ">project folder</span>" in project and "commit to the current branch" in project and "badge err" not in project
+    assert out["tabTitle"] == "Session folder: /home/u/code/my-app"
+    assert '<span class="badge plain"' in out["own"] and ">own folder</span>" in out["own"] and "badge err" not in out["own"]
+    assert ">moved</span>" in out["moved"] and "badge err" not in out["moved"]
+    assert out["none"] == ""
+    assert out["kinds"] == ["default", "adopted", "moved", None, None]
+    assert out["first"] == ["src", "src/a.py"]
+    assert out["second"] == [".", None, "Select a file on the left", ["/api/files?path=."]]
+    assert out["third"] == 0
 
 
 # ------------------------------------------------------------------------------------------------ API contract
@@ -913,6 +1367,7 @@ async def test_api_provides_every_field_the_ui_reads(tmp_path):
         sw = state["swarm"]
         assert {"name", "language", "paused", "pause_reason", "limits", "spent_usd", "goal", "mcp_url", "models"} <= set(sw)
         assert {"max_cost_usd", "max_agents"} <= set(sw["limits"]) and sw["models"] == ["default"]
+        assert sw["workspace"] == {"path": str(swarm.workspace.root), "default": True, "adopted": False, "exists": True}
         assert {"title", "description", "status", "summary"} <= set(sw["goal"])
         task_keys = {"id", "title", "goal", "description", "status", "assignee", "reviewer", "created_by", "parent_id",
                      "depends_on", "priority", "tags", "result", "created_at", "updated_at", "blocked_by", "comments"}
@@ -1048,6 +1503,13 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             assert view["models"]["secret"]["api_key_hint"] == "…2222"
             assert all({"id", "label", "provider", "model", "models"} <= set(p) for p in data["providers"])
             assert data["path"].endswith("dreamteam.toml")
+            # the role catalog: the presets (role cards, composer) and the merged catalog (TUI /roles, /team)
+            assert [p["id"] for p in data["role_presets"]][:2] == ["generalist", "developer"]
+            assert len(data["role_presets"]) == 8
+            assert all(set(p["name"]) == set(p["description"]) == {"ru", "en"} for p in data["role_presets"])
+            catalog_fields = {"key", "builtin", "customized", "hidden", "name", "description", "instructions", "model"}
+            assert all(catalog_fields <= set(r) for r in data["role_catalog"]) and view["roles"] == []
+            assert {"starting_roles", "start_agents", "independent_review"} <= set(view["swarm"])
 
             # a session created with the form's overrides
             overrides = {"swarm": {"language": "en", "start_agents": 1, "max_agents": 3, "max_cost_usd": 1.5},
@@ -1058,8 +1520,11 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             session = resp.json()["session"]
             sid = session["id"]
             card_fields = {"id", "title", "status", "paused", "legacy", "dir", "created_at", "last_activity", "model",
-                           "model_profile", "max_cost_usd", "spent_usd", "config_error", "goal", "tasks", "agents", "url"}
+                           "model_profile", "max_cost_usd", "spent_usd", "config_error", "goal", "tasks", "agents", "url",
+                           "workspace"}
             assert card_fields <= set(session) and session["url"] == f"/s/{sid}/"
+            folder_fields = {"path", "default", "adopted", "exists"}  # the folder line of the card / the Files tab
+            assert set(session["workspace"]) == folder_fields and session["workspace"]["default"] is True
             assert {"title", "description", "status"} <= set(session["goal"])
             assert {"total", "done"} <= set(session["tasks"]) and {"total", "working"} <= set(session["agents"])
             assert session["max_cost_usd"] == 1.5 and session["title"] == "<b>T</b>"
@@ -1068,8 +1533,16 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             # the board of the session: chrome fields, traces and their details
             assert "/static/traces.js" in c.get(f"/s/{sid}/").text
             state = c.get(f"/s/{sid}/api/state").json()
-            assert state["swarm"]["session"] == {"id": sid, "title": "<b>T</b>", "status": "running"}
+            assert state["swarm"]["session"] == {"id": sid, "title": "<b>T</b>", "status": "running",
+                                                 "pending_goal": None}
+            assert state["swarm"]["independent_review"] is True   # the board's "the board picks" reviewer option
+            roles_view = c.get(f"/s/{sid}/api/roles").json()      # the board's hire dialog
+            assert roles_view["language"] == "en"
+            assert all({"key", "name", "description", "model"} <= set(r) for r in roles_view["roles"])
             assert state["swarm"]["mcp_url"] in (None, f"http://127.0.0.1:8765/s/{sid}/mcp")
+            board_folder = state["swarm"]["workspace"]
+            assert set(board_folder) == folder_fields and board_folder["default"] is True and board_folder["exists"] is True
+            assert Path(board_folder["path"]).resolve() == Path(session["workspace"]["path"]).resolve()
             deadline = time.monotonic() + 20
             traces: list[dict] = []
             while time.monotonic() < deadline:
@@ -1120,6 +1593,23 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             assert blocked.status_code == 409 and blocked.json()["result"].startswith("The session is stopped")
             assert c.get(f"/s/{sid}/api/traces").status_code == 200  # still viewable
             assert c.delete(f"/api/sessions/{sid}?confirm={sid}").json() == {"ok": True}
+
+            # a session working in a folder of its own choosing: the card shows it, deleting keeps it
+            project = tmp_path / "my-project"
+            resp = _json_post(c, "/api/sessions", {"title": "Outside", "goal": "g", "start": False,
+                                                   "workspace": str(project)})
+            assert resp.status_code == 201, resp.text
+            other = resp.json()["session"]
+            assert resp.json()["result"]["mode"] == "created"
+            folder = other["workspace"]
+            assert folder["default"] is False and folder["adopted"] is False and folder["exists"] is True
+            assert Path(folder["path"]).resolve() == project.resolve()
+            listed = next(s for s in c.get("/api/sessions").json()["sessions"] if s["id"] == other["id"])
+            assert listed["workspace"] == folder
+            board = c.get(f"/s/{other['id']}/api/state").json()["swarm"]["workspace"]
+            assert board == {**folder, "path": board["path"]} and Path(board["path"]).resolve() == project.resolve()
+            gone = c.delete(f"/api/sessions/{other['id']}?confirm={other['id']}").json()
+            assert gone == {"ok": True, "workspace_kept": folder["path"]} and project.is_dir()
         finally:
             c.portal.call(c.manager.shutdown)
 
@@ -1138,6 +1628,12 @@ def test_settings_saved_by_the_ui_keep_and_remove_keys_as_shown(tmp_path):
               home.H.view = data.settings; home.H.original = JSON.parse(JSON.stringify(data.settings)); home.H.providers = data.providers;
               home.renderSettings(true);
               const card = (name) => home.H.profiles.find((p) => p.name === name);
+              home.H.rolePresets = data.role_presets;
+              home.renderSettings(true);
+              const tester = home.H.roleCards.find((c) => c.id === "tester");
+              tester.model = "default"; tester.instructions = "Use pytest.";               // a built-in role customized
+              home.H.roleCards.push({ uid: "own", builtin: false, name: "Data engineer", description: "Pipelines.",
+                                      instructions: "", model: null, hidden: false });      // and an own role
               card("default").name = "main-model";                                        // rename the default profile
               card("secret").cleared = true; card("secret").newKey = "";                  // "Remove key"
               card("envkey").keyMode = "env"; card("envkey").data.api_key_env = "MY_ENV";  // use a variable instead
@@ -1159,6 +1655,10 @@ def test_settings_saved_by_the_ui_keep_and_remove_keys_as_shown(tmp_path):
             assert "api_key" not in models["envkey"] and models["envkey"]["api_key_env"] == "MY_ENV"
             assert "api_key" not in models["reuse"]                # a new card does not inherit a deleted key
             assert raw["agents"]["default_model"] == "main-model"
+            # the role follows the rename of its profile (the server maps renamed_from)
+            assert raw["roles"] == [{"name": "tester", "instructions": "Use pytest.", "model": "main-model"},
+                                    {"name": "Data engineer", "description": "Pipelines."}]
+            assert resp.json()["role_catalog"][2]["model"] == "main-model"
             view = resp.json()["settings"]
             assert view["models"]["secret"]["api_key_set"] is False and view["models"]["main-model"]["api_key_set"] is True
         finally:

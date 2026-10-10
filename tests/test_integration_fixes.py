@@ -60,7 +60,8 @@ async def asgi_get(app: Any, path: str, query: str = "") -> tuple[int, Any]:
 
 async def team(tmp_path: Path, *names: str, **overrides: Any):
     """A started swarm without running agents, with LLM members of these exact names."""
-    swarm, rec = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"start_agents": 0}, **overrides)
+    swarm, rec = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"start_agents": 0, **overrides.pop("swarm", {})},
+                            **overrides)
     await swarm.start(run_agents=False)
     for name in names:
         await swarm.hire(USER, "Developer", name=name)
@@ -164,8 +165,9 @@ def window_policy(state: dict, *, count_output: bool):
     return policy
 
 
+@pytest.mark.parametrize("room", [6000, 4000])
 @pytest.mark.parametrize("count_output", [False, True])
-async def test_agent_compacts_when_context_tokens_is_the_real_window(tmp_path, count_output):
+async def test_agent_compacts_when_context_tokens_is_the_real_window(tmp_path, count_output, room):
     state = {"W": 10**9, "max_out": 2000, "reads": 0, "rejected": 0, "summaries": 0}
     models = {"default": {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0,
                           "cache_read_price": 0, "cache_write_price": 0, "max_tokens": state["max_out"]}}
@@ -176,7 +178,9 @@ async def test_agent_compacts_when_context_tokens_is_the_real_window(tmp_path, c
         agent = swarm.members()[0]["name"]
         (swarm.workspace.root / "big.txt").write_text("x" * 2000, encoding="utf-8")
         runtime = swarm.runtimes[agent]
-        state["W"] = runtime._fixed_tokens() + 6000
+        # room for a few reads beyond the fixed prompt; with 4000 a fresh compaction fills more than 3/4 of the
+        # limit, so the anti-thrash rule of _needs_compaction applies: it must not let the prompt outgrow the window
+        state["W"] = runtime._fixed_tokens() + room
         swarm.config.model(None).context_tokens = state["W"]  # the profile's context_tokens = the window
         swarm.notify(agent, "n_restart")
         await run_until(lambda: state["reads"] >= 16 and swarm.member(agent)["status"] == AgentStatus.IDLE, 30)
@@ -234,7 +238,8 @@ async def test_each_new_in_progress_task_gets_a_nudge_and_a_stalled_agent_is_wok
                   7: call("task_complete", task_id=ids["b"], result="B done")}
         return script.get(n, call("wait"))
 
-    swarm, rec = make_swarm(tmp_path, policy)
+    # about nudges: with independent review a single agent would send both tasks to the user
+    swarm, rec = make_swarm(tmp_path, policy, swarm={"independent_review": False})
     ids["a"] = swarm.board.create(USER, "Task A", goal="a").id
     ids["b"] = swarm.board.create(USER, "Task B", goal="b").id
     await swarm.start()
@@ -305,8 +310,9 @@ def test_fake_swarm_resolves_names_and_goals_like_the_real_swarm(tmp_path):
 
 
 # ------------------------------------------------------------------------------- retiring a reviewer
-async def test_retiring_the_reviewer_returns_tasks_in_review_to_their_assignee(tmp_path):
-    swarm, _ = await team(tmp_path, "Anna Smith", "Boris Ivanov")
+async def test_retiring_the_reviewer_without_independent_review_returns_tasks_to_their_assignee(tmp_path):
+    # the independent counterpart (the review goes to the next pick) is in tests/test_review.py
+    swarm, _ = await team(tmp_path, "Anna Smith", "Boris Ivanov", swarm={"independent_review": False})
     try:
         board = swarm.board
         t = board.create(USER, "Build", goal="built", assignee="Anna Smith", reviewer="Boris Ivanov")
@@ -328,7 +334,8 @@ async def test_retiring_the_reviewer_returns_tasks_in_review_to_their_assignee(t
 
 
 async def test_a_task_done_is_quiet_news_for_its_creator_unless_the_creator_must_act(tmp_path):
-    swarm, _ = await team(tmp_path, "Anna Smith", "Boris Ivanov")
+    # pins the quiet n_task_closed of a task done: with independent review Part 1 would wake Anna as its reviewer
+    swarm, _ = await team(tmp_path, "Anna Smith", "Boris Ivanov", swarm={"independent_review": False})
     try:
         board = swarm.board
         swarm.render_wake("Anna Smith")  # deliver the hiring notifications

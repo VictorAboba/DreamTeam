@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import re
 import time
+from dataclasses import replace
 from typing import Any, Callable, Iterable
 
-from . import prompts
+from . import prompts, roles
 from .db import Database, dumps, loads
-from .models import USER, Status, Task, ToolError
+from .models import USER, AgentKind, AgentStatus, Status, Task, ToolError
 
 log = logging.getLogger(__name__)
 
@@ -105,6 +106,12 @@ def _check_post(text: Any) -> str:
     return body
 
 
+def _reviewer_is_assignee(reviewer: str, task: str) -> ToolError:
+    return ToolError(f"{reviewer} is the assignee of {task}: a task is reviewed by someone other than its assignee. "
+                     "Choose another member or 'user', or leave the reviewer empty (a reviewer is picked when the "
+                     "task is completed).")
+
+
 def _clip(text: str, limit: int = NOTIFY_TEXT_LIMIT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
@@ -198,6 +205,48 @@ class Board:
         self._fill(tasks)
         return tasks
 
+    @property
+    def independent_review(self) -> bool:
+        """[swarm] independent_review (default true): an agent never approves work it executed (SPEC §4). Read on
+        every call, so reconfiguration and session overrides apply at once."""
+        return bool(getattr(getattr(self.swarm.config, "swarm", None), "independent_review", True))
+
+    def reviews_of(self, name: str) -> list[Task]:
+        """Tasks waiting for `name`'s review (status review, reviewer == name): priority desc, id asc, filled."""
+        tasks = self._query(["reviewer = ?", "status = ?"], [name, Status.REVIEW])
+        self._fill(tasks)
+        return tasks
+
+    def pick_reviewer(self, task: Task, exclude: Iterable[str] = ()) -> str:
+        """The reviewer the board chooses for `task` (SPEC §4 "Independent review"): an active LLM member other than
+        its assignee and `exclude`; members who did not create the task first, then the reviewer role, then idle
+        ones, then the fewest open tasks + pending reviews, then by name. USER when nobody qualifies. External
+        members are never picked (they may be offline), only designated."""
+        banned = {task.assignee, *exclude} - {None}
+        pool = [m for m in self.swarm.members() if m["kind"] == AgentKind.LLM and m["name"] not in banned]
+        if not pool:
+            return USER
+        load: dict[str, int] = {}
+        for row in self.db.all(f"SELECT assignee, reviewer, status FROM tasks WHERE status IN ({_qmarks(len(_OPEN))})",
+                               _OPEN):
+            if row["assignee"]:
+                load[row["assignee"]] = load.get(row["assignee"], 0) + 1
+            if row["status"] == Status.REVIEW and row["reviewer"]:
+                load[row["reviewer"]] = load.get(row["reviewer"], 0) + 1
+        rank = {AgentStatus.IDLE: 0, AgentStatus.WORKING: 1}
+        best = min(pool, key=lambda m: (m["name"] == task.created_by, self._role_rank(m), rank.get(m["status"], 2),
+                                        load.get(m["name"], 0), m["name"]))
+        return best["name"]
+
+    @staticmethod
+    def _role_rank(member: dict) -> int:
+        """0 for a member in the catalog's reviewer role («Ревьюер»/Reviewer), which is preferred for reviews; 1
+        otherwise (testers are not preferred: their own test tasks would starve)."""
+        return 0 if roles.role_key(member.get("role")) == "reviewer" else 1
+
+    def _valid_reviewer(self, task: Task, name: str | None) -> bool:
+        return name is not None and name != task.assignee and (name == USER or self.swarm.is_member(name))
+
     def counts(self) -> dict[str, int]:
         counts = {s: 0 for s in Status.ALL}
         for row in self.db.all("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"):
@@ -230,6 +279,8 @@ class Board:
         tags = _norm_tags(tags)
         assignee = self._resolve_opt(assignee)
         reviewer = self._resolve_opt(reviewer)
+        if self.independent_review and reviewer is not None and reviewer != USER and reviewer == assignee:
+            raise _reviewer_is_assignee(reviewer, "the task")
         with self.db.transaction():
             deps = self._check_deps(depends_on or [])
             parent = self._check_parent(parent_id)
@@ -258,7 +309,10 @@ class Board:
             if old.status != Status.TODO:
                 raise ToolError(f"Task #{old.id} has status '{old.status}'; only 'todo' tasks can be claimed.")
             self._raise_if_blocked(old.id, old.depends_on)
-            return {"assignee": actor, "status": Status.IN_PROGRESS}
+            values: dict[str, Any] = {"assignee": actor, "status": Status.IN_PROGRESS}
+            if old.reviewer == actor and self.independent_review:
+                values["reviewer"] = None  # the designated reviewer executes it now: someone else will review it
+            return values
 
         _, task, _ = self._mutate(actor, task_id, plan)
         return task
@@ -272,15 +326,21 @@ class Board:
                                        depends_on=depends_on)
             values.update(self._plan_assignment(actor, old, assignee, status,
                                                 values.get("depends_on", old.depends_on)))
+            if self.independent_review:
+                self._plan_review_fields(actor, old, values)
             return values
 
         old, task, changes = self._mutate(actor, task_id, plan)
         if changes:
             self._notify_assignment(actor, old, task, changes)
-            if "reviewer" in changes and task.status == Status.REVIEW:
+            if task.status == Status.REVIEW and ("reviewer" in changes or old.status != Status.REVIEW):
                 # the task already waits for review: the new reviewer must learn about it now
-                self._notify_member(task.reviewer, actor, "n_review_requested", id=task.id, title=task.title,
-                                    by=actor)
+                self._request_review(actor, task, auto=False)
+            if old.status == Status.REVIEW and task.status == Status.DONE:
+                # the user set done: an approval, which wakes the assignee like any verdict
+                self._notify_member(task.assignee, actor, "n_review_approved", id=task.id,
+                                    title=task.title, by=actor, comment="")
+            self._review_dropped(actor, old, task)
             self._on_status_change(actor, old.status, task)
         return task
 
@@ -298,12 +358,16 @@ class Board:
                                 "Wait for task_review.")
             if old.status in Status.TERMINAL:
                 raise ToolError(f"Task #{old.id} is already {old.status}.")
-            to_review = old.reviewer is not None and old.reviewer != actor
-            return {"result": text, "status": Status.REVIEW if to_review else Status.DONE}
+            if actor == USER or not self.independent_review:
+                to_review = old.reviewer is not None and old.reviewer != actor
+                return {"result": text, "status": Status.REVIEW if to_review else Status.DONE}
+            # an agent's work always goes to review, never by its executor (old.assignee == actor here)
+            reviewer = old.reviewer if self._valid_reviewer(old, old.reviewer) else self.pick_reviewer(old)
+            return {"result": text, "status": Status.REVIEW, "reviewer": reviewer}
 
-        old, task, _ = self._mutate(actor, task_id, plan)
+        old, task, changes = self._mutate(actor, task_id, plan)
         if task.status == Status.REVIEW:
-            self._notify_member(task.reviewer, actor, "n_review_requested", id=task.id, title=task.title, by=actor)
+            self._request_review(actor, task, auto="reviewer" in changes)
         else:
             self._on_status_change(actor, old.status, task)
         return task
@@ -317,6 +381,11 @@ class Board:
         def plan(old: Task) -> dict[str, Any]:
             if old.status != Status.REVIEW:
                 raise ToolError(f"Task #{old.id} has status '{old.status}', it is not waiting for review.")
+            if actor != USER and actor == old.assignee and self.independent_review:
+                # also for a row written while the switch was off with the executor as its reviewer
+                other = old.reviewer if old.reviewer not in (USER, actor) else None
+                raise ToolError(f"You are the assignee of task #{old.id}: your own work is reviewed by someone else "
+                                f"({other or 'the user'}). Wait for the verdict; you will be notified.")
             if actor != USER and actor != old.reviewer:
                 raise ToolError(f"Only the reviewer of task #{old.id} ({old.reviewer or 'nobody'}) or the user can "
                                 "review it.")
@@ -327,26 +396,38 @@ class Board:
 
         old, task, _ = self._mutate(actor, task_id, plan)
         key = "n_review_approved" if approved else "n_review_rejected"
+        # every verdict wakes the assignee: task_complete told it that it will be told the verdict, so an
+        # executor that ended its turn with `wait` is waiting for exactly this (a rejection must be fixed now)
         self._notify_member(task.assignee, actor, key, id=task.id, title=task.title, by=actor,
                             comment=_clip(comment))
         self._on_status_change(actor, old.status, task)
         if comment:
             # the assignee already got the comment inside the review notification
             self._post(actor, task, comment, None, skip={task.assignee})
+        self._review_dropped(actor, old, task)
         return task
 
     def post(self, actor: str, task_id: int, text: str, reply_to: int | None = None) -> dict:
         return self._post(actor, self._load(task_id), text, reply_to)
 
     def release_all(self, name: str, actor: str) -> list[int]:
-        """`name` leaves: its open tasks go back to todo unassigned (their ids are returned), and open tasks it
-        was to review lose their reviewer; one waiting in review goes back to its assignee, who is told to
-        complete it again (otherwise it would wait for a review that never comes)."""
+        """`name` leaves (it is still an active member while this runs): its open tasks go back to todo
+        unassigned (their ids are returned). With independent review, its tasks waiting in review stay there
+        without an assignee (done work: the review goes on, they are not returned), and the reviews it was to
+        do go to the next pick, or USER. Without it, open tasks it was to review lose their reviewer, and one
+        waiting in review goes back to its assignee, who is told to complete it again."""
+        independent = self.independent_review
         updates: list[tuple[Task, dict[str, Any]]] = []
         with self.db.transaction():
             olds = self._query(["assignee = ?", f"status IN ({_qmarks(len(_OPEN))})"], [name, *_OPEN])
             for old in olds:
-                values: dict[str, Any] = {"assignee": None, "status": Status.TODO}
+                if independent and old.status == Status.REVIEW:
+                    values: dict[str, Any] = {"assignee": None}
+                    if old.reviewer == name:  # only a row written while the switch was off
+                        values["reviewer"] = self.pick_reviewer(old, exclude={name})
+                    updates.append((old, values))
+                    continue
+                values = {"assignee": None, "status": Status.TODO}
                 if old.reviewer == name:
                     values["reviewer"] = None
                 updates.append((old, values))
@@ -355,7 +436,10 @@ class Board:
             for old in reviewed:
                 values = {"reviewer": None}
                 if old.status == Status.REVIEW:
-                    values["status"] = Status.IN_PROGRESS if old.assignee else Status.TODO
+                    if independent:
+                        values["reviewer"] = self.pick_reviewer(old, exclude={name})
+                    else:
+                        values["status"] = Status.IN_PROGRESS if old.assignee else Status.TODO
                 updates.append((old, values))
             for old, values in updates:
                 self._write(old.id, values)
@@ -363,10 +447,32 @@ class Board:
             changes = {f: [getattr(old, f), v] for f, v in values.items() if getattr(old, f) != v}
             task = self.get(old.id)
             self.swarm.bus.emit("task.updated", actor, task=task.to_dict(), changes=changes)
-            if old.status == Status.REVIEW and old.assignee and old.assignee != name:
+            if old.status == Status.REVIEW and values.get("reviewer"):  # re-picked
+                # the review comes from its executor; from the member that left when the executor has gone too
+                self._request_review(old.assignee or old.reviewer, task, auto=True,
+                                     handed_over_from=None if old.assignee else old.reviewer)
+            elif not independent and old.status == Status.REVIEW and old.assignee and old.assignee != name:
                 self._notify_member(old.assignee, actor, "n_reviewer_left", id=task.id, title=task.title,
                                     reviewer=name)
-        return [t.id for t in olds]
+        return [t.id for t in olds if not (independent and t.status == Status.REVIEW)]
+
+    def hand_over_review(self, task_id: int, exclude: Iterable[str]) -> Task | None:
+        """The reviewer of a task in review did not review it (ignored the reminder, or its runtime is in error):
+        give the review to the next pick, or USER when nobody else qualifies (SPEC §4 "Independent review").
+        Scheduler-driven: the task.updated event has no actor. None when the task is no longer in review."""
+        def plan(old: Task) -> dict[str, Any]:
+            if old.status != Status.REVIEW or not old.reviewer:
+                return {}
+            return {"reviewer": self.pick_reviewer(old, exclude={*exclude, old.reviewer})}
+
+        old, task, changes = self._mutate(None, task_id, plan)
+        if not changes:
+            return None
+        # the review comes from its executor, or from the reviewer that let it lapse when the executor has left
+        self._request_review(task.assignee or old.reviewer, task, auto=True, handed_over_from=old.reviewer)
+        self._notify_member(old.reviewer, "", "n_review_reassigned", wake=False, id=task.id, title=task.title,
+                            reviewer=task.reviewer)
+        return task
 
     # --- update planning -----------------------------------------------------------------------------
 
@@ -423,6 +529,33 @@ class Board:
         if release:
             values["assignee"] = None
         return values
+
+    def _plan_review_fields(self, actor: str, old: Task, values: dict[str, Any]) -> None:
+        """Independent review on an update: the assignee of a task never becomes its reviewer, and a task in
+        review keeps its executor as assignee (only the user may reassign it) and always has a reviewer. Raises,
+        or adjusts `values` in place."""
+        status = values.get("status", old.status)
+        assignee = values.get("assignee", old.assignee)
+        reviewer = values.get("reviewer", old.reviewer)
+        in_review = old.status == Status.REVIEW and status == Status.REVIEW
+        if in_review and "assignee" in values and actor != USER:
+            # otherwise the executor could hand its task to the reviewer and be picked to review it itself
+            raise ToolError(f"Task #{old.id} is waiting for review, so its assignee cannot change now: the reviewer "
+                            f"approves it or returns it to {old.assignee or 'the board'}.")
+        if in_review and "reviewer" in values and reviewer is None:
+            raise ToolError(f"Task #{old.id} is waiting for review, so it needs a reviewer: pass another member or "
+                            "'user' instead of clearing it.")
+        if reviewer is None or reviewer == USER or reviewer != assignee:
+            return
+        if "reviewer" in values:
+            raise _reviewer_is_assignee(reviewer, f"task #{old.id}")
+        if "assignee" not in values:
+            return  # a row written while the switch was off: complete() and review() handle it
+        # the assignee changed to the designated reviewer
+        if in_review:  # only the user gets here
+            values["reviewer"] = self.pick_reviewer(replace(old, assignee=assignee), exclude={old.assignee} - {None})
+        else:
+            values["reviewer"] = None
 
     def _check_transition(self, actor: str, old: Task, new: str, new_assignee: str | None,
                           deps: list[int]) -> None:
@@ -550,7 +683,7 @@ class Board:
         params = [dumps(v) if c in _JSON_FIELDS else v for c, v in cols.items()]
         self.db.execute(sql, [*params, task_id])
 
-    def _mutate(self, actor: str, task_id: Any,
+    def _mutate(self, actor: str | None, task_id: Any,
                 plan: Callable[[Task], dict[str, Any]]) -> tuple[Task, Task, dict[str, list[Any]]]:
         """Atomic read-modify-write; emits one `task.updated` if anything changed."""
         with self.db.transaction():
@@ -647,10 +780,36 @@ class Board:
     # --- notifications -------------------------------------------------------------------------------
 
     def _notify_member(self, name: str | None, actor: str, key: str, **kw: Any) -> None:
-        """Task notifications go to active members only: never the actor, never USER (the UI shows tasks)."""
+        """Task notifications go to active members only: never the actor, never USER (the UI shows tasks; only
+        the reviews the user owns are announced to it, by _request_review)."""
         if not name or name == actor or name == USER or not self.swarm.is_member(name):
             return
         self.swarm.notify(name, key, **kw)
+
+    def _request_review(self, by: str, task: Task, auto: bool, handed_over_from: str | None = None) -> None:
+        """`task` waits for its reviewer: tell them. `auto`: the board chose the reviewer just now (USER chosen
+        by the board means that nobody else qualifies). `handed_over_from`: the reviewer the board took the review
+        from (it let the review lapse, or it left while the executor had left too): the user, when the board chose
+        it, is told that no agent took the review over rather than who finished the task."""
+        if task.reviewer == USER:
+            if auto and handed_over_from:
+                self.swarm.notify(USER, "u_review_handed_over", id=task.id, title=task.title,
+                                  reviewer=handed_over_from)
+            elif by != USER:
+                self.swarm.notify(USER, "u_review_fallback" if auto else "u_review_requested",
+                                  by=by, id=task.id, title=task.title)
+            return
+        self._notify_member(task.reviewer, by, "n_review_requested", id=task.id, title=task.title, by=by)
+
+    def _review_dropped(self, actor: str, old: Task, task: Task) -> None:
+        """The review `old.reviewer` was asked for is no longer theirs (settled or moved by someone else, or the
+        task left review): news for their next wake-up, so they do not start a review that is not needed."""
+        if old.status != Status.REVIEW or not old.reviewer or old.reviewer == actor:
+            return
+        if task.status == Status.REVIEW and task.reviewer == old.reviewer:
+            return
+        self._notify_member(old.reviewer, actor, "n_review_cancelled", wake=False, id=task.id, title=task.title,
+                            by=actor)
 
     def _notify_assignment(self, actor: str, old: Task, task: Task, changes: dict[str, list[Any]]) -> None:
         if "assignee" in changes:

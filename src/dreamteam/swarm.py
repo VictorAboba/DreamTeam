@@ -13,12 +13,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
-from . import prompts
+from . import prompts, roles
 from .agent import AgentRuntime
 from .board import Board
 from .config import Config, ModelProfile
 from .db import Database, dumps, loads, utf8_safe
 from .events import EventBus
+from .goal_text import split_goal
 from .llm import create_llm
 from .llm.base import LLMClient, Usage, cost_of
 from .mailbox import Mailbox
@@ -28,7 +29,7 @@ from .names import generate_name
 from .shell import resolve_shell
 from .tracing import EXTERNAL_IDLE_SECONDS, Tracer
 from .triggers import TriggerEngine
-from .workspace import Workspace
+from .workspace import Workspace, scratch_rel
 
 log = logging.getLogger(__name__)
 
@@ -95,6 +96,8 @@ class Swarm:
                              max_payload_chars=config.tracing.max_payload_chars)
         self.session_id: str | None = None  # set by sessions.SessionManager
         self.session_title: str | None = None
+        # the goal given when the session was created; it becomes the real goal at its first start
+        self.session_pending_goal: dict | None = None
         self._last_prune = 0.0
         self.language = config.swarm.language
         self.llm_semaphore = asyncio.Semaphore(max(1, config.agents.max_parallel_llm_calls))
@@ -111,6 +114,10 @@ class Swarm:
         self._considering: dict[str, tuple[float, frozenset[int], frozenset[int]]] = {}
         self._all_done_key: tuple | None = None
         self._stall_woken: dict[str, frozenset[int]] = {}  # agent -> stalled task ids it was woken about
+        # reviewer -> (ids of the reviews it was reminded about, or that waited while it was in error; since when)
+        self._review_reminded: dict[str, tuple[frozenset[int], float]] = {}
+        self._review_lapsed: dict[int, set[str]] = {}  # task in review -> reviewers it was taken from (hand-over)
+        self._user_reviews_key: frozenset[int] | None = None  # the user's reviews it was last told about
         self._notes_shown: dict[str, str] = {}  # agent -> digest of the notes last put into its context
         self._missing_profiles: set[str] = set()  # members' profiles gone from the settings (warned once)
         self.stopping = False  # stop() runs or ran: long polls (wait_for_events) end without touching the db
@@ -130,9 +137,8 @@ class Swarm:
         await self.forge.start()
         existing = self.members(include_retired=True)
         if not existing:
-            roles = list(self.config.swarm.starting_roles)
-            for i in range(max(0, self.config.swarm.start_agents)):
-                role = roles[i] if i < len(roles) else prompts.DEFAULT_ROLE[self.language]
+            # member i gets starting_roles[i], the rest are generalists (the role catalog resolves the names)
+            for role in roles.starting_team(self.config.swarm.starting_roles, self.config.swarm.start_agents):
                 self._create_member(USER, role, kind=AgentKind.LLM)
         self._started = True
         self._run_agents = run_agents
@@ -156,10 +162,11 @@ class Swarm:
                 if m["kind"] != AgentKind.LLM:
                     continue
                 runtime = self.runtimes.get(m["name"])
-                # woken once: open work under an active goal, or an activation the restart cut short
-                # (e.g. a reply to the user or a review in progress, which leave nothing pending)
+                # woken once: open work or reviews waiting for it under an active goal, or an activation the
+                # restart cut short (e.g. a reply to the user or a review in progress, which leave nothing pending)
                 if ((runtime is not None and runtime.interrupted)
-                        or (goal_active and (self.board.open_tasks_of(m["name"]) or self.has_pending(m["name"])))):
+                        or (goal_active and (self.board.open_tasks_of(m["name"]) or self.board.reviews_of(m["name"])
+                                             or self.has_pending(m["name"])))):
                     self.notify(m["name"], "n_restart")
 
     async def stop(self) -> None:
@@ -180,13 +187,24 @@ class Swarm:
             await runtime.stop()  # also closes its LLM client
         self.runtimes.clear()
         await self.forge.stop()
+        await self.workspace.settle()  # a commit a stopped agent started finishes before the files may move
         self._started = False
 
     def reconfigure(self, config: Config) -> None:
-        """Hot-apply new settings (docs/SPEC.md §16.1). The project directory, the swarm
+        """Hot-apply new settings (docs/SPEC.md §16.1). The project directory, the workspace folder, the swarm
         language and the agents' frozen system prompts stay; LLM clients are rebuilt on their next call."""
         if config.project_dir != self.project_dir:
             config = dataclasses.replace(config, project_dir=self.project_dir)
+        if (config.workspace_path, config.workspace_adopted) != (self.config.workspace_path,
+                                                                 self.config.workspace_adopted):
+            # the workspace (its root, the forged MCP servers' folders) moves only with a restart (sessions.py)
+            config = dataclasses.replace(config, workspace_path=self.config.workspace_path,
+                                         workspace_adopted=self.config.workspace_adopted)
+        if self._started and self.config.workspace_adopted and config.workspace.git != self.config.workspace.git:
+            # a folder of the user: its repository is checked (clean, on a branch) when the session starts, so git
+            # is switched on or off there at the next start only (sessions.py), never under running agents
+            config = dataclasses.replace(config, workspace=dataclasses.replace(config.workspace,
+                                                                               git=self.config.workspace.git))
         old = self.config
         self.config = config
         self._missing_profiles.clear()
@@ -238,7 +256,8 @@ class Swarm:
 
     def members(self, include_retired: bool = False) -> list[dict]:
         sql = "SELECT * FROM agents" + ("" if include_retired else " WHERE status != 'retired'")
-        return [dict(r) for r in self.db.all(sql + " ORDER BY created_at, name")]
+        # rowid breaks ties: members created within one tick of the clock keep their hiring order
+        return [dict(r) for r in self.db.all(sql + " ORDER BY created_at, rowid")]
 
     def is_member(self, name: str) -> bool:
         m = self.member(name)
@@ -359,6 +378,10 @@ class Swarm:
             mine = self.board.open_tasks_of(name)
             lines.append(prompts.t(lang, "my_tasks", tasks="; ".join(t.short() for t in mine))
                          if mine else prompts.t(lang, "my_tasks_none"))
+            reviews = self.board.reviews_of(name)
+            if reviews:
+                lines.append(prompts.t(lang, "my_reviews", tasks="; ".join(
+                    f"#{t.id} {t.title} ({t.assignee or '-'})" for t in reviews)))
             ready = self.board.ready_unassigned()[:8]
             if ready:
                 lines.append(prompts.t(lang, "ready", tasks="; ".join(f"#{t.id} {t.title}" for t in ready)))
@@ -386,11 +409,13 @@ class Swarm:
         return self.db.get("goal")
 
     def set_goal(self, actor: str, title: str, description: str = "") -> dict:
-        title = (title or "").strip()
+        # every goal comes through here: the first line of a multi-line title is the title, the rest opens the
+        # description (goal_text.split_goal), so the goal line of every wake-up stays one line
+        title, description = split_goal(title, description)
         if not title:
             raise ToolError("The goal title is empty.")
         previous = self.goal()
-        goal = {"title": title, "description": (description or "").strip(), "status": "active", "summary": "",
+        goal = {"title": title, "description": description, "status": "active", "summary": "",
                 "set_by": actor, "updated_at": time.time()}
         self.db.set("goal", goal)
         self.bus.emit("goal.set", actor, goal=goal)
@@ -406,14 +431,17 @@ class Swarm:
 
     def _kickoff(self, actor: str, goal: dict, planning) -> None:
         stagger = max(0.0, self.config.agents.stagger_seconds)
-        llm_members = [m for m in self.members() if m["kind"] == AgentKind.LLM]
+        members = self.members()
+        llm_members = [m for m in members if m["kind"] == AgentKind.LLM]
+        # who has which role: the planner sees the team without a tool call
+        team = "; ".join(f"{m['name']} — {m['role']}" for m in members)
         for i, m in enumerate(llm_members):
             if planning is not None:
                 # the kickoff is everybody's offer of the planning task: no "ready task" nudge about it
                 # before (stagger) or after the kickoff
                 self._nudged.setdefault(planning.id, set()).add(m["name"])
                 self.notify_later(i * stagger, m["name"], "n_kickoff", by=actor, title=goal["title"],
-                                  description=goal.get("description", ""), task_id=planning.id,
+                                  description=goal.get("description", ""), team=team, task_id=planning.id,
                                   task_title=planning.title)
             else:
                 self.notify_later(i * stagger, m["name"], "n_goal_updated", by=actor, title=goal["title"],
@@ -469,18 +497,31 @@ class Swarm:
 
     def _create_member(self, by: str, role: str, instructions: str = "", model: str | None = None,
                        name: str | None = None, language: str | None = None, kind: str = AgentKind.LLM) -> str:
-        role = " ".join((role or "").split())
+        role = roles.normalize(role)
         if not role:
             raise ToolError("The role is empty.")
         language = language or self.language
         if language not in ("ru", "en"):
             raise ToolError("language must be 'ru' or 'en'.")
+        # a catalog role (docs/SPEC.md §17.3) is stored by its canonical name in the member's language ("tester" ->
+        # "Tester"/«Тестировщик») and brings its description, instructions and model profile; any other name is a
+        # new role that only the hirer's instructions describe
+        entry = roles.find_role(self.config.roles, role, language)
+        if entry is not None:
+            role = entry.name
         profile_name = None
         if kind == AgentKind.LLM:
+            # model precedence: the explicit profile > the role's > agents.default_model
+            wanted = model or (entry.model if entry else None)
+            if not model and wanted and wanted not in self.config.models:
+                # the settings validation forbids it; a missing profile must not make the role unhirable
+                log.warning("role '%s' uses the missing model profile '%s'; using the default", role, wanted)
+                wanted = None
             try:
-                profile_name = self.config.model(model).name
+                profile_name = self.config.model(wanted).name
             except KeyError:
-                raise ToolError(f"Unknown model profile '{model}'. Profiles: {', '.join(self.config.models)}") from None
+                profiles = ", ".join(self.config.models)
+                raise ToolError(f"Unknown model profile '{wanted}'. Profiles: {profiles}") from None
         if name:
             name = self._validate_name(name)
         else:
@@ -488,9 +529,14 @@ class Swarm:
             name = generate_name(taken, language)
         system = ""
         if kind == AgentKind.LLM:
+            # the catalog's instructions of the role come before the hirer's; the agents row keeps the hirer's own
+            extra = entry.instructions if entry else ""
             system = prompts.system_prompt(
-                language, name=name, swarm=self.config.swarm.name, role=role, instructions=instructions.strip(),
+                language, name=name, swarm=self.config.swarm.name, role=role,
+                role_description=entry.description if entry else "",
+                instructions="\n\n".join(t for t in (extra, instructions.strip()) if t),
                 shell=resolve_shell(self.config.shell.program)[0], max_agents=self.limits()["max_agents"],
+                scratch=scratch_rel(name),
             )
         now = time.time()
         self.db.execute(
@@ -514,6 +560,7 @@ class Swarm:
         if kind == AgentKind.LLM and self.budget_exceeded():
             raise ToolError("The budget is exhausted; hiring is not possible.")
         name = self._create_member(by, role, instructions, model, name, language, kind)
+        role = (self.member(name) or {}).get("role") or role  # canonical: "tester" -> "Tester"
         if by != USER:
             self.notify(USER, "u_member_joined", name=name, role=role, by=by, wake=False)
         if kind == AgentKind.LLM:
@@ -615,8 +662,8 @@ class Swarm:
             if m["kind"] == AgentKind.LLM:
                 runtime = self.runtimes.get(m["name"])
                 # an agent whose activation the pause cut short continues it even with nothing pending
-                if (self.board.open_tasks_of(m["name"]) or self.has_pending(m["name"])
-                        or (runtime is not None and runtime.interrupted)):
+                if (self.board.open_tasks_of(m["name"]) or self.board.reviews_of(m["name"])
+                        or self.has_pending(m["name"]) or (runtime is not None and runtime.interrupted)):
                     self.notify(m["name"], "n_resumed")
                 elif runtime is not None:
                     runtime.wake()  # paused -> idle
@@ -648,7 +695,9 @@ class Swarm:
                 if not self.paused:
                     self._nudge_idle()
                     self._wake_stalled()
+                    self._remind_reviewers()
                     self._check_all_done()
+                    self._remind_user_reviews()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -677,10 +726,13 @@ class Swarm:
                 del self._considering[name]
         if len(self._considering) >= len(ready):
             return  # every ready task is already being considered by someone
+        independent = self.board.independent_review
         for m in sorted(idle, key=lambda m: m.get("last_active") or 0):
             name = m["name"]
             if now - self._last_nudge.get(name, 0) < self.config.agents.idle_nudge_seconds:
                 continue
+            if independent and self.board.reviews_of(name):
+                continue  # its reviews come first: it is reminded of them (_remind_reviewers), not offered more work
             fresh = [t for t in ready if name not in self._nudged.get(t.id, set())][:6]
             if not fresh:
                 continue
@@ -709,6 +761,70 @@ class Swarm:
             self._stall_woken[name] = stalled
             self.notify(name, "n_stalled", tasks=", ".join(f"#{t.id}" for t in still))
 
+    def _remind_reviewers(self) -> None:
+        """Liveness of reviews: an idle LLM reviewer whose reviews wait longer than agents.idle_nudge_seconds is
+        reminded once per set of task ids; when the same set still waits idle_nudge_seconds after the reminder
+        (or the reviewer has been in error that long), the reviews are handed to another member or to the user.
+        A review never goes back to a member it was taken from, so two idle members cannot pass it back and forth:
+        once every agent let it lapse, it is the user's."""
+        if not self.board.independent_review:
+            return
+        reviews: dict[str, list] = {}  # reviewer -> its tasks in review (one query for the whole team)
+        for t in self.board.list(status=Status.REVIEW):
+            reviews.setdefault(t.reviewer or "", []).append(t)
+        in_review = {t.id for tasks in reviews.values() for t in tasks}
+        self._review_lapsed = {k: v for k, v in self._review_lapsed.items() if k in in_review}
+        if not in_review:
+            self._review_reminded.clear()
+            return
+        now, wait = time.time(), self.config.agents.idle_nudge_seconds
+        idle = {m["name"] for m in self._idle_llm_members()}
+        for m in self.members():
+            if m["kind"] != AgentKind.LLM:
+                continue
+            name = m["name"]
+            due = [t for t in reviews.get(name, []) if now - (t.updated_at or 0) >= wait]
+            key = frozenset(t.id for t in due)
+            seen = self._review_reminded.get(name)
+            if not key:
+                self._review_reminded.pop(name, None)
+                continue
+            if seen is None or seen[0] != key:
+                if m["status"] == AgentStatus.ERROR:
+                    self._review_reminded[name] = (key, now)  # it cannot act: start the clock only
+                elif name in idle:
+                    self._review_reminded[name] = (key, now)
+                    self.notify(name, "n_review_reminder", tasks="; ".join(f"#{t.id} {t.title}" for t in due))
+                continue
+            stuck = ((m["status"] == AgentStatus.ERROR and now - seen[1] >= 2 * wait)
+                     or (name in idle and now - seen[1] >= wait))
+            if stuck:
+                for t in due:
+                    lapsed = self._review_lapsed.setdefault(t.id, set())
+                    lapsed.add(name)
+                    self.board.hand_over_review(t.id, exclude=lapsed)
+                self._review_reminded.pop(name, None)
+
+    def _remind_user_reviews(self) -> None:
+        """Only the user's reviews keep the swarm going: tell the user once per set of such tasks."""
+        goal = self.goal()
+        reviews = self.board.list(status=Status.REVIEW) if goal and goal.get("status") == "active" else []
+        waiting = [t for t in reviews if t.reviewer == USER]
+        if not waiting:
+            self._user_reviews_key = None
+            return
+        llm = [m for m in self.members() if m["kind"] == AgentKind.LLM]
+        actionable = [t for t in self.board.list(status=Status.TODO)  # claimable or assigned, not blocked
+                      if not t.blocked_by and t.assignee != USER]
+        if (any(m["status"] == AgentStatus.WORKING or self.has_pending(m["name"]) for m in llm)
+                or actionable or self.board.list(status=Status.IN_PROGRESS)
+                or any(t.reviewer != USER for t in reviews)):
+            return
+        key = frozenset(t.id for t in waiting)
+        if key != self._user_reviews_key:
+            self._user_reviews_key = key
+            self.notify(USER, "u_reviews_waiting", tasks=", ".join(f"#{t.id}" for t in waiting))
+
     def _check_all_done(self) -> None:
         goal = self.goal()
         if not goal or goal.get("status") != "active":
@@ -730,6 +846,13 @@ class Swarm:
         self.notify(idle[0]["name"], "n_all_done")
 
     # ---- snapshot -----------------------------------------------------------------------------
+    def workspace_info(self) -> dict:
+        """The folder the members work in: {"path", "default" (the project's own workspace/), "adopted" (a
+        folder of the user that a session adopted), "exists"} (the same shape as a session summary's)."""
+        root = self.workspace.root
+        return {"path": str(root), "default": self.config.workspace_path is None,
+                "adopted": bool(self.config.workspace_adopted), "exists": root.is_dir()}
+
     def snapshot(self) -> dict:
         # Polled by the UI after every event: a fixed number of queries, whatever the team size.
         tasks = self.board.list(include_closed=True)
@@ -753,16 +876,20 @@ class Swarm:
                 "unread": unread.get(m["name"], 0),
             })
         pause = self.db.get("paused") or {}
+        goal = self.goal()
         return {
             "swarm": {
                 "name": self.config.swarm.name, "language": self.language, "paused": bool(pause.get("paused")),
                 "pause_reason": pause.get("reason", ""), "limits": self.limits(),
-                "spent_usd": round(self.spent_usd(), 4), "goal": self.goal(), "counts": counts,
+                "spent_usd": round(self.spent_usd(), 4), "goal": goal, "counts": counts,
                 "mcp_url": self.hub_url, "models": list(self.config.models),
                 "session": None if self.session_id is None else {
                     "id": self.session_id, "title": self.session_title or self.session_id,
-                    "status": "running" if self._started else "stopped"},
+                    "status": "running" if self._started else "stopped",
+                    "pending_goal": None if goal else self.session_pending_goal},
                 "tracing": bool(self.tracer.enabled),
+                "independent_review": self.board.independent_review,
+                "workspace": self.workspace_info(),
             },
             "tasks": [t.to_dict() for t in tasks],
             "agents": members,

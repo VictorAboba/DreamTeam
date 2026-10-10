@@ -34,6 +34,7 @@ RECONNECT_NOW = (1001, 1012)   # going away / session restarted: reconnect witho
 RECONNECT_NOW_DELAY = 0.05     # ...almost: a server that keeps closing must not spin the loop
 ACT_TIMEOUT = 660.0        # tools may block (wait_for_events: up to 600 s)
 SESSION_TIMEOUT = 120.0    # creating / starting / stopping a session starts or stops a whole swarm
+MOVE_TIMEOUT = 900.0       # moving a session's folder: a stop, the files (copied across drives), a start
 START_TIMEOUT = 120.0      # the in-process launcher must listen within this (it resumes sessions first)
 HUB_WAIT = 2.0             # the configured port is busy: how long a hub of this home may take to show up
 HUB_POLL = 0.2
@@ -164,10 +165,19 @@ class HubClient:
         return await self._get(f"/api/sessions/{urllib.parse.quote(sid, safe='')}")
 
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
-                             start: bool = True) -> dict:
+                             start: bool = True, workspace: str | None = None) -> dict:
+        """POST /api/sessions -> the new session's summary. `workspace`: an absolute folder the session works in
+        (docs/SPEC.md §17.2); the summary then has "workspace_result" (the hub's "result")."""
         body = {"title": title, "goal": goal, "description": description, "overrides": overrides or {},
                 "start": start}
-        return (await self._call("POST", "/api/sessions", body=body, timeout=SESSION_TIMEOUT))["session"]
+        if workspace:
+            body["workspace"] = workspace
+        data = await self._call("POST", "/api/sessions", body=body,
+                                timeout=MOVE_TIMEOUT if workspace else SESSION_TIMEOUT)
+        summary = data["session"]
+        if isinstance(data.get("result"), dict):
+            summary = {**summary, "workspace_result": data["result"]}
+        return summary
 
     async def _session_action(self, sid: str, action: str) -> dict:
         path = f"/api/sessions/{urllib.parse.quote(sid, safe='')}/{action}"
@@ -179,6 +189,24 @@ class HubClient:
     async def stop_session(self, sid: str) -> dict:
         return await self._session_action(sid, "stop")
 
+    async def delete_session(self, sid: str) -> Any:
+        """DELETE /api/sessions/{sid}?confirm={sid}: stop the session and delete its directory. The hub's answer:
+        {"ok": true} plus "workspace_kept" for a folder outside the session (it stays)."""
+        return await self._call("DELETE", f"/api/sessions/{urllib.parse.quote(sid, safe='')}",
+                                params={"confirm": sid}, timeout=SESSION_TIMEOUT)
+
+    async def set_workspace(self, sid: str, path: str | None, expect: str | None = None) -> dict:
+        """POST /api/sessions/{sid}/workspace: make the session work in the absolute folder `path` (None: back to
+        its own folder). An empty or missing folder gets its files, one with files is adopted; a running session
+        is stopped and started again. `expect` ("moved" | "adopted"): what the user agreed to (409 when the folder
+        turned out otherwise). -> {"session": summary, "result": {"mode", "from", "to", "git", "mcp_moved",
+        "old_kept", ...}} (docs/SPEC.md §17.2)."""
+        body: dict = {"default": True} if path is None else {"path": path}
+        if expect:
+            body["expect"] = expect
+        return await self._call("POST", f"/api/sessions/{urllib.parse.quote(sid, safe='')}/workspace", body=body,
+                                timeout=MOVE_TIMEOUT)
+
     async def settings(self) -> dict:
         return await self._get("/api/settings")
 
@@ -188,6 +216,11 @@ class HubClient:
     # ---- session level (sid=None: the hub itself is one swarm) ----------------------------------
     async def state(self, sid: str | None) -> dict:
         return await self._get(f"{self.session_base(sid)}/api/state")
+
+    async def roles(self, sid: str | None) -> dict:
+        """GET /api/roles: {"language", "roles": [{key, name, description, instructions, model, builtin}]}, the
+        visible role catalog in the swarm's language (docs/SPEC.md §17.3)."""
+        return await self._get(f"{self.session_base(sid)}/api/roles")
 
     async def act(self, sid: str | None, tool: str, args: dict | None = None) -> tuple[bool, str]:
         """Run a tool as the user: (ok, result text). A refused call that still answers in the act shape
@@ -323,6 +356,7 @@ class Connection:
     manager: "SessionManager | None" = None   # set when owned
     _server: asyncio.Task | None = field(default=None, repr=False)
     _hub_file: bool = field(default=False, repr=False)
+    _marker: Path | None = field(default=None, repr=False)   # cli.write_launcher_marker of an owned launcher
     _closed: bool = field(default=False, repr=False)
 
     @property
@@ -344,10 +378,11 @@ class Connection:
                 if not server.done():
                     server.cancel()  # serve_launcher shuts the web server and every session down
                 await asyncio.gather(server, return_exceptions=True)
-                if self._hub_file:
-                    from .. import cli
+                from .. import cli
 
+                if self._hub_file:
                     cli._remove_hub_file(self.home)
+                cli.remove_launcher_marker(self._marker)
 
 
 def _free_port(host: str = "127.0.0.1") -> int:
@@ -434,6 +469,7 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
         manager = SessionManager(home, llm_factory=llm_factory)
     except (ValueError, OSError) as exc:
         raise HubError(0, f"Invalid settings in {home}: {exc}") from None
+    marker = cli.write_launcher_marker(home)  # the sessions of this home run here (also without the web UI)
     configured: tuple[str, int] | None = None
     if web:
         bind_port = manager.config.server.port if port is None else port
@@ -473,6 +509,7 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
             if server is None:  # busy, or lost the race for it
                 other = await _wait_for_hub(home)
                 if other:
+                    cli.remove_launcher_marker(marker)
                     return await _attach(home, other)
         for _ in range(3):  # an ephemeral port can be taken between the probe and the bind: retry
             if server is not None:
@@ -486,12 +523,13 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
             await _stop_task(server)
         if hub_written:
             cli._remove_hub_file(home)
+        cli.remove_launcher_marker(marker)
         raise
 
     bind_host, bind_port = chosen
     base = f"http://{display_host(bind_host)}:{bind_port}"
     conn = Connection(HubClient(base), base, home, owned=True, manager=manager, _server=server,
-                      _hub_file=hub_written)
+                      _hub_file=hub_written, _marker=marker)
     try:
         await conn.client.hub_info()
     except BaseException as exc:

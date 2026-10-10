@@ -405,6 +405,11 @@ class MCPForge:
                 await self._drop_connection(row["name"])
                 self.db.execute("DELETE FROM mcp_servers WHERE name = ?", (row["name"],))
                 self.swarm.bus.emit("mcp.status", None, name=row["name"], status=REMOVED)
+        # forged and imported servers live in the workspace (server_dir), which a session can move elsewhere
+        for row in self.db.all("SELECT name, cwd FROM mcp_servers WHERE origin != ?", (ORIGIN_CONFIG,)):
+            cwd = str(self.server_dir(row["name"]))
+            if row["cwd"] != cwd:
+                self.db.execute("UPDATE mcp_servers SET cwd = ? WHERE name = ?", (cwd, row["name"]))
 
     async def stop(self) -> None:
         self._stopped = True

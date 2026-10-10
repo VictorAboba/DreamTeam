@@ -6,13 +6,18 @@ import pytest
 
 from dreamteam import prompts
 from dreamteam.board import MAX_POST, NOTIFY_TEXT_LIMIT, UNSET, Board, find_mentions, normalize_status
+from dreamteam.db import loads
 from dreamteam.models import USER, AgentKind, AgentStatus, Status, Task, ToolError
+from dreamteam.swarm import QUIET_KEY
 
 ANNA, BOB, CARL, DINA = "Anna Smith", "Bob Brown", "Carl Clark", "Dina Evans"
 
 
 @pytest.fixture
 def swarm(fake_swarm):
+    # these tests pin the opt-out semantics ([swarm] independent_review = false); tests/test_review.py covers
+    # the default
+    fake_swarm.config.swarm.independent_review = False
     fake_swarm.board = Board(fake_swarm)
     fake_swarm.add_member(ANNA, language="en")
     fake_swarm.add_member(BOB, language="en")
@@ -32,6 +37,12 @@ def events(swarm, type_: str) -> list[dict]:
 
 def keys_for(swarm, name: str) -> list[str]:
     return [k for k, _ in swarm.notifications_for(name)]
+
+
+def quiet_flags(swarm, name: str) -> list[tuple[str, bool]]:
+    """(kind, sent with wake=False) of `name`'s stored notifications, oldest first."""
+    rows = swarm.db.all("SELECT kind, data FROM notifications WHERE recipient = ? ORDER BY id", (name,))
+    return [(r["kind"], bool(loads(r["data"], {}).get(QUIET_KEY))) for r in rows]
 
 
 def clear(swarm) -> None:
@@ -616,7 +627,8 @@ def test_complete_reviewer_is_actor_or_user(swarm, board):
     board.claim(BOB, t2.id)
     clear(swarm)
     assert board.complete(BOB, t2.id, "res").status == Status.REVIEW
-    assert swarm.notified == []  # the user sees reviews in the UI
+    # the user is told about a review it owns (in both modes)
+    assert swarm.notified == [(USER, "u_review_requested", {"by": BOB, "id": t2.id, "title": "t2"})]
 
 
 def test_complete_errors(swarm, board):
@@ -703,10 +715,13 @@ def test_review_approve(swarm, board):
     t = _in_review(board)
     dependent = board.create(ANNA, "dep", depends_on=[t.id], assignee=DINA)
     clear(swarm)
+    swarm.signals.clear()
     upd = board.review(CARL, t.id, True)
     assert upd.status == Status.DONE
     assert swarm.notifications_for(BOB) == [("n_review_approved", {"id": t.id, "title": "t", "by": CARL,
                                                                      "comment": ""})]
+    # an approval wakes the assignee: it may be waiting for the verdict
+    assert quiet_flags(swarm, BOB)[-1] == ("n_review_approved", False) and BOB in swarm.signals
     assert swarm.notifications_for(DINA) == [("n_unblocked", {"id": dependent.id, "title": "dep"})]
     assert keys_for(swarm, ANNA) == ["n_task_closed"]
     assert board.discussion(t.id) == []
@@ -719,6 +734,7 @@ def test_review_reject_posts_comment(swarm, board):
     assert upd.status == Status.IN_PROGRESS
     assert swarm.notifications_for(BOB) == [("n_review_rejected", {"id": t.id, "title": "t", "by": CARL,
                                                                      "comment": "Tests are missing"})]
+    assert quiet_flags(swarm, BOB)[-1] == ("n_review_rejected", False)   # a rejection wakes the assignee
     posts = board.discussion(t.id)
     assert [(p["author"], p["text"]) for p in posts] == [(CARL, "Tests are missing")]
     # the creator follows the discussion; the assignee already got the comment in the review notice
@@ -991,10 +1007,12 @@ def test_new_reviewer_of_task_in_review_is_notified(swarm, board):
     clear(swarm)
     board.update(ANNA, t.id, reviewer=CARL)
     assert swarm.notifications_for(CARL) == [("n_review_requested", {"id": t.id, "title": "t", "by": ANNA})]
-    assert swarm.notifications_for(DINA) == []
+    # the replaced reviewer gets quiet news
+    assert swarm.notifications_for(DINA) == [("n_review_cancelled", {"id": t.id, "title": "t", "by": ANNA})]
     clear(swarm)
     board.update(ANNA, t.id, reviewer=USER)
-    assert swarm.notified == []  # the user sees reviews in the UI
+    assert swarm.notified == [(USER, "u_review_requested", {"by": ANNA, "id": t.id, "title": "t"}),
+                              (CARL, "n_review_cancelled", {"id": t.id, "title": "t", "by": ANNA})]
 
 
 def test_user_reopen_to_open_status_wakes_assignee(swarm, board):
