@@ -22,7 +22,9 @@ from typing import Any
 from .config import CONFIG_FILE, Config, ModelProfile, env_var_name, make_profile, render_template, toml_string
 
 HOME_ENV = "DREAMTEAM_HOME"
-SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "tracing", "models")
+# `roles` is a list of tables ([[roles]], the role catalog: docs/SPEC.md §17.3); the others are tables
+SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "tracing", "roles", "models")
+_ROLE_FIELDS = ("name", "description", "instructions", "model", "hidden")
 _PUBLIC_KEY_FIELDS = ("api_key_set", "api_key_hint", "api_key_env_set")
 # A hidden secret in the public view (`env` values of [mcp.external.*]): the mask plus the key hint.
 # An update that sends a mask back keeps the stored value.
@@ -169,8 +171,14 @@ def _value(value: Any) -> str:
     raise ValueError(f"Unsupported settings value: {value!r}")
 
 
+def _table_list(value: Any) -> bool:
+    """A non-empty list of tables: written as an array of tables (`[[roles]]` blocks)."""
+    return isinstance(value, list) and bool(value) and all(isinstance(v, dict) for v in value)
+
+
 def dump_toml(data: dict[str, Any]) -> str:
-    """Serialize nested dicts as TOML tables (None values are omitted)."""
+    """Serialize nested dicts as TOML tables (None values are omitted); a top-level list of tables is written
+    as an array of tables after all tables."""
     out: list[str] = []
 
     def table(prefix: list[str], body: dict[str, Any]) -> None:
@@ -191,7 +199,7 @@ def dump_toml(data: dict[str, Any]) -> str:
             if k not in inline:
                 table(prefix + [k], v)
 
-    top_scalars = {k: v for k, v in data.items() if v is not None and not isinstance(v, dict)}
+    top_scalars = {k: v for k, v in data.items() if v is not None and not isinstance(v, dict) and not _table_list(v)}
     for k, v in top_scalars.items():
         out.append(f"{_key(k)} = {_value(v)}")
     if top_scalars:
@@ -199,6 +207,13 @@ def dump_toml(data: dict[str, Any]) -> str:
     for name in sorted((k for k, v in data.items() if isinstance(v, dict)),
                        key=lambda n: SECTIONS.index(n) if n in SECTIONS else len(SECTIONS)):
         table([name], data[name])
+    # after every table: a key written below `[[roles]]` would belong to the last role
+    for name, items in data.items():
+        if _table_list(items):
+            for item in items:
+                out.append(f"[[{_key(name)}]]")
+                out.extend(f"{_key(k)} = {_value(v)}" for k, v in item.items() if v is not None)
+                out.append("")
     return "\n".join(out).rstrip() + "\n"
 
 
@@ -236,16 +251,20 @@ def _mask(value: Any) -> str:
 def public_view(raw: dict[str, Any]) -> dict[str, Any]:
     """Settings for the UI: every section filled with defaults, API keys replaced by
     api_key_set / api_key_hint, api_key_env_set tells whether the named variable exists. Values of
-    `env` tables of external MCP servers (usually tokens) are masked too."""
+    `env` tables of external MCP servers (usually tokens) are masked too. `roles`: the [[roles]] entries as
+    stored, normalized (a built-in role by its id)."""
     cfg = validate(".", raw)
     view: dict[str, Any] = {}
-    for name in SECTIONS[:-1]:
+    for name in SECTIONS:
+        if name in ("roles", "models"):
+            continue
         view[name] = dataclasses.asdict(getattr(cfg, name))
     view["swarm"].pop("goal", None)
     view["swarm"].pop("goal_description", None)
     for spec in (view["mcp"].get("external") or {}).values():
         if isinstance(spec, dict) and isinstance(spec.get("env"), dict):
             spec["env"] = {k: _mask(v) if v not in (None, "") else v for k, v in spec["env"].items()}
+    view["roles"] = [{k: getattr(role, k) for k in _ROLE_FIELDS} for role in cfg.roles]
     models: dict[str, Any] = {}
     for name, profile in cfg.models.items():
         data = dataclasses.asdict(profile)
@@ -306,13 +325,31 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     """New raw settings from a UI update. Sections present in `update` replace the stored ones; `models`
     is the complete list of profiles (missing ones are deleted). For each profile `api_key` absent or
     null keeps the stored key (of the same profile, or of `renamed_from`), "" removes it, a string sets it.
-    A renamed default profile stays the default; masked MCP `env` values keep their stored values."""
+    A renamed default profile stays the default; masked MCP `env` values keep their stored values.
+    `roles` is the complete list of [[roles]] entries ([] removes every customization); a role's model profile
+    follows a rename. Their rules are checked by `validate` (config.parse_roles)."""
     if not isinstance(update, dict):
         raise ValueError("The settings update must be an object")
     result = copy.deepcopy(raw)
     for name, section in update.items():
         if name not in SECTIONS:
             raise ValueError(f"Unknown settings section: {name}")
+        if name == "roles":
+            if not isinstance(section, list):
+                raise ValueError("Section roles must be a list of roles")
+            entries = []
+            for i, item in enumerate(section, 1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Role {i} must be an object")
+                # unset fields are not stored: an untouched field of a built-in role keeps the built-in value
+                entries.append({k: (" ".join(v.split()) if k == "name" and isinstance(v, str) else v)
+                                for k, v in copy.deepcopy(item).items()
+                                if v is not None and v != "" and not (k == "hidden" and v is False)})
+            if entries:
+                result["roles"] = entries
+            else:
+                result.pop("roles", None)
+            continue
         if not isinstance(section, dict):
             raise ValueError(f"Section {name} must be an object")
         section = copy.deepcopy(section)
@@ -365,6 +402,9 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     default = agents.get("default_model", "default") if isinstance(agents, dict) else None
     if default in renames:
         result["agents"] = {**agents, "default_model": renames[default]}
+    for role in result.get("roles") if isinstance(result.get("roles"), list) else ():
+        if isinstance(role, dict) and isinstance(role.get("model"), str) and role["model"] in renames:
+            role["model"] = renames[role["model"]]
     return result
 
 

@@ -106,7 +106,8 @@ def kill_tree(proc: subprocess.Popen) -> None:
         pass
 
 
-def _run_blocking(argv: list[str], cwd: Path, timeout: float, env: dict[str, str] | None) -> tuple[int | None, bytes]:
+def _run_blocking(argv: list[str], cwd: Path, timeout: float, env: dict[str, str] | None,
+                  started: list[subprocess.Popen] | None = None) -> tuple[int | None, bytes]:
     kwargs: dict = {}
     if sys.platform == "win32":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -116,6 +117,8 @@ def _run_blocking(argv: list[str], cwd: Path, timeout: float, env: dict[str, str
         argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs,
     )
+    if started is not None:
+        started.append(proc)
     try:
         out, _ = proc.communicate(timeout=timeout)
         return proc.returncode, out or b""
@@ -135,6 +138,24 @@ async def run_shell(command: str, *, cwd: Path, timeout: float, program: str = "
     if name in ("powershell", "pwsh"):
         command = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                    "$OutputEncoding = [System.Text.Encoding]::UTF8; " + command)
-    code, raw = await asyncio.to_thread(_run_blocking, prefix + [command], cwd, timeout, env)
+    started: list[subprocess.Popen] = []
+    work = asyncio.ensure_future(asyncio.to_thread(_run_blocking, prefix + [command], cwd, timeout, env, started))
+    try:
+        code, raw = await asyncio.shield(work)
+    except asyncio.CancelledError:
+        # the caller (an agent) was stopped: its command must not go on writing into the workspace meanwhile
+        # (the session may be deleted or its workspace moved right after the stop)
+        killed = False
+        for _attempt in range(20):  # the process may start only now: kill it once it exists
+            if started and not killed:
+                await asyncio.to_thread(kill_tree, started[0])
+                killed = True
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({work}, timeout=1)
+            if work.done():
+                if not work.cancelled():
+                    work.exception()  # retrieved: the caller is gone anyway
+                break
+        raise
     text = decode(raw, name).replace("\r\n", "\n")
     return code, truncate_middle(text, max_output)

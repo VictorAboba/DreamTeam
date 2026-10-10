@@ -93,6 +93,8 @@ class Task:
         bits = [f"#{self.id} [{self.status}] {self.title}"]
         if self.assignee:
             bits.append(f"@{self.assignee}")
+        if self.status == Status.REVIEW and self.reviewer:
+            bits.append(f"review:{self.reviewer}")
         if self.priority != 1:
             bits.append(f"({PRIORITIES.get(self.priority, self.priority)})")
         if self.tags:

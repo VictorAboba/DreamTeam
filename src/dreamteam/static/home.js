@@ -17,16 +17,34 @@ const I18N = {
     started: "Сессия «{title}» запущена", stopped: "Сессия «{title}» остановлена", deleted: "Сессия удалена",
     delete_title: "Удалить сессию?",
     delete_text: "Сессия «{title}» будет удалена вместе с доской задач, перепиской, файлами workspace, MCP-серверами сессии и трейсами. Это действие необратимо.",
+    delete_text_kept: "Сессия «{title}» будет удалена вместе с доской задач, перепиской, MCP-серверами сессии и трейсами. Её папка {path} с файлами останется на месте. Это действие необратимо.",
+    deleted_kept: "Сессия удалена. Папка {path} осталась на месте.",
+    ws_label: "Папка сессии", ws_default: "своя папка", ws_adopted: "папка проекта", ws_moved: "перенесена", ws_missing_badge: "папки нет",
+    ws_default_hint: "Собственная папка сессии в домашней папке DreamTeam; удаляется вместе с сессией.",
+    ws_adopted_hint: "Существующая папка (ваш проект): агенты работают с её файлами и коммитят в текущую ветку её репозитория. При удалении сессии папка остаётся.",
+    ws_moved_hint: "Сессия перенесена в эту папку (/cd). При удалении сессии папка остаётся.",
+    ws_missing: "Папка не найдена — сессия не запустится. Перенесите её в другую папку: /cd ПАПКА или /cd --default в dreamteam tui.",
     cancel: "Отмена", create_open: "Создать и открыть", create: "Создать",
     ns_title: "Новая сессия", ns_lead: "Рой получит цель, сам создаст план (задачу планирования) и распределит работу между агентами.",
-    f_title: "Название", f_title_ph: "Например: Игра «Змейка»", f_goal: "Цель", f_goal_ph: "Что должен сделать рой? Чем конкретнее, тем лучше.",
+    f_title: "Название", f_title_ph: "Например: Игра «Змейка». По умолчанию — первая строка цели", f_goal: "Цель",
+    f_goal_ph: "Игра «Змейка» на Python\nУправление стрелками, счёт и рекорды, тесты на pytest",
+    f_goal_hint: "первая строка — заголовок цели, остальные строки — её описание (перед «Подробностями»)",
     f_desc: "Подробности", f_desc_ph: "Требования, ограничения, критерии готовности, ссылки…",
-    f_model: "Модель", f_lang: "Язык агентов", f_start_agents: "Агентов на старте", f_max_agents: "Максимум агентов",
-    f_budget: "Бюджет, $", f_roles: "Стартовые роли", f_roles_ph: "Аналитик, Разработчик, Тестировщик", f_roles_hint: "через запятую; остальные получат роль по умолчанию",
+    f_model: "Модель", f_model_hint: "роли со своим профилем используют его", f_lang: "Язык агентов", f_max_agents: "Максимум агентов",
+    f_budget: "Бюджет, $",
+    f_team: "Стартовая команда",
+    f_team_hint: "Первым будится агент из первой строки — обычно он берёт задачу планирования. Описание роли попадает в системный промпт агента.",
+    team_total: "Всего агентов: {n}", team_add: "Добавить роль", team_remove: "Убрать", team_custom: "Своя роль…",
+    team_custom_ph: "Название роли",
+    team_custom_hint: "Этой роли нет в каталоге: агент получит только её название. Описание можно задать в Настройках → Роли.",
+    team_model: "модель: {model}", team_hidden: "(скрыта)", team_empty: "Добавьте в стартовую команду хотя бы одну роль.",
+    team_over_max: "В стартовой команде {n} агентов — больше максимума ({max}).",
     f_more: "Дополнительно", f_steps: "Шагов за пробуждение", f_approval: "Подтверждать MCP-серверы агентов", f_start_now: "Запустить сразу",
     goal_required: "Укажите цель сессии.", creating: "Создаю сессию…",
     // settings
     s_models: "Модели и эндпоинты", s_models_hint: "Профили подключения к LLM. Агенты используют профиль по умолчанию; при найме агента можно указать другой профиль (например, дешёвый «fast»).",
+    s_roles: "Роли",
+    s_roles_hint: "Каталог ролей: из него собирается стартовая команда, и по нему агенты нанимают новых участников. Описание роли попадает в системный промпт агента при его создании; уже работающих агентов изменения не касаются.",
     s_swarm: "Новые сессии по умолчанию", s_swarm_hint: "Значения для новых сессий; при создании сессии их можно изменить.",
     s_agents: "Агенты", s_agents_hint: "Поведение ReAct-цикла агентов.",
     s_shell: "Консоль", s_shell_hint: "Команды, которые агенты выполняют в workspace.",
@@ -50,8 +68,20 @@ const I18N = {
     p_live_ok: "Ответ за {ms} мс: «{reply}» (стоимость ${cost}).", p_live_bad: "Запрос не прошёл: {error}",
     p_add: "Добавить профиль", p_add_from: "Пресет:", unsaved_check: "Проверка использует несохранённые значения формы.",
     default_marker: "основной", none_opt: "—",
-    sw_name: "Имя роя", sw_lang: "Язык промптов агентов", sw_start: "Агентов на старте", sw_max: "Максимум агентов",
-    sw_budget: "Бюджет сессии, $", sw_budget_hint: "0 — без лимита", sw_roles: "Стартовые роли",
+    sw_name: "Имя роя", sw_lang: "Язык промптов агентов", sw_max: "Максимум агентов",
+    sw_budget: "Бюджет сессии, $", sw_budget_hint: "0 — без лимита",
+    sw_review: "Независимое ревью задач",
+    sw_review_hint: "Задачу агента принимает другой агент, а если больше некому — вы. Выключите для дешёвых прогонов: тогда задача без ревьюера сразу готова.",
+    r_builtin: "встроенная", r_custom: "своя", r_customized: "изменена", r_hidden: "скрыта", r_name: "Название",
+    r_name_ph: "Например: Дата-инженер", r_other_lang: "en: {name}", r_desc: "Описание",
+    r_desc_hint: "что делает роль, что производит, как проверяет результат, что оставляет другим",
+    r_desc_both: "Изменённое описание встроенной роли действует для агентов на обоих языках.",
+    r_instr: "Дополнительные инструкции", r_instr_hint: "добавляются к инструкциям каждого агента этой роли",
+    r_model: "Профиль модели", r_model_default: "— профиль сессии по умолчанию", r_reset: "Сбросить", r_hide: "Скрыть",
+    r_show: "Показать", r_delete: "Удалить роль", r_add: "Добавить роль", r_err_name: "Укажите название роли.",
+    r_err_name_bad: "Название роли «{name}»: не длиннее 60 символов, без «,» и «*».", r_err_dup: "Две роли с названием «{name}».",
+    r_err_builtin: "«{name}» — встроенная роль: измените её карточку.", r_err_desc: "Опишите роль «{name}».",
+    r_err_model: "Роль «{name}» использует профиль «{model}», которого нет.",
     ag_steps: "Шагов за пробуждение", ag_context: "Окно контекста по умолчанию", ag_tool_out: "Лимит вывода инструмента (симв.)",
     ag_stagger: "Пауза между стартами агентов, с", ag_nudge: "Напоминание простаивающим, с", ag_parallel: "Параллельных вызовов LLM",
     sh_program: "Оболочка", sh_timeout: "Таймаут по умолчанию, с", sh_max_timeout: "Максимальный таймаут, с",
@@ -87,15 +117,33 @@ const I18N = {
     started: "Session “{title}” started", stopped: "Session “{title}” stopped", deleted: "Session deleted",
     delete_title: "Delete the session?",
     delete_text: "Session “{title}” will be deleted with its task board, messages, workspace files, session MCP servers and traces. This cannot be undone.",
+    delete_text_kept: "Session “{title}” will be deleted with its task board, messages, session MCP servers and traces. Its folder {path} stays where it is, with its files. This cannot be undone.",
+    deleted_kept: "Session deleted. The folder {path} stays where it is.",
+    ws_label: "Session folder", ws_default: "own folder", ws_adopted: "project folder", ws_moved: "moved", ws_missing_badge: "missing",
+    ws_default_hint: "The session's own folder in the DreamTeam home; deleted with the session.",
+    ws_adopted_hint: "An existing folder (your project): the agents work with its files and commit to the current branch of its repository. Deleting the session keeps the folder.",
+    ws_moved_hint: "The session was moved to this folder (/cd). Deleting the session keeps the folder.",
+    ws_missing: "The folder is missing: the session cannot start. Move it to another folder: /cd FOLDER or /cd --default in dreamteam tui.",
     cancel: "Cancel", create_open: "Create and open", create: "Create",
     ns_title: "New session", ns_lead: "The swarm gets the goal, makes a plan (a planning task) and shares the work between agents.",
-    f_title: "Title", f_title_ph: "e.g. Snake game", f_goal: "Goal", f_goal_ph: "What should the swarm achieve? The more concrete, the better.",
+    f_title: "Title", f_title_ph: "e.g. Snake game. Default: the goal's first line", f_goal: "Goal",
+    f_goal_ph: "Snake game in Python\nArrow keys, score and high scores, pytest tests",
+    f_goal_hint: "the first line is the goal's title, the other lines its description (put before the details)",
     f_desc: "Details", f_desc_ph: "Requirements, constraints, definition of done, links…",
-    f_model: "Model", f_lang: "Agents' language", f_start_agents: "Agents at start", f_max_agents: "Max agents",
-    f_budget: "Budget, $", f_roles: "Starting roles", f_roles_ph: "Analyst, Developer, Tester", f_roles_hint: "comma-separated; the rest get the default role",
+    f_model: "Model", f_model_hint: "roles with a profile of their own keep it", f_lang: "Agents' language", f_max_agents: "Max agents",
+    f_budget: "Budget, $",
+    f_team: "Starting team",
+    f_team_hint: "The agent of the first row is woken first and usually takes the planning task. The role description goes into the agent's system prompt.",
+    team_total: "Agents in all: {n}", team_add: "Add a role", team_remove: "Remove", team_custom: "Other role…",
+    team_custom_ph: "Role name",
+    team_custom_hint: "This role is not in the catalog: the agent gets only its name. Describe it in Settings → Roles.",
+    team_model: "model: {model}", team_hidden: "(hidden)", team_empty: "Add at least one role to the starting team.",
+    team_over_max: "The starting team has {n} agents, more than the maximum ({max}).",
     f_more: "More", f_steps: "Steps per wake-up", f_approval: "Require approval of agents' MCP servers", f_start_now: "Start right away",
     goal_required: "Enter the session goal.", creating: "Creating the session…",
     s_models: "Models and endpoints", s_models_hint: "LLM connection profiles. Agents use the default profile; a hired agent can use another one (e.g. a cheap “fast”).",
+    s_roles: "Roles",
+    s_roles_hint: "The role catalog: starting teams are built from it and agents hire new members by it. A role description goes into an agent's system prompt when the agent is created; agents already working are not affected.",
     s_swarm: "Defaults for new sessions", s_swarm_hint: "Values for new sessions; you can change them when creating a session.",
     s_agents: "Agents", s_agents_hint: "Behaviour of the agents' ReAct loop.",
     s_shell: "Console", s_shell_hint: "Commands agents run in the workspace.",
@@ -119,8 +167,20 @@ const I18N = {
     p_live_ok: "Answered in {ms} ms: “{reply}” (cost ${cost}).", p_live_bad: "The request failed: {error}",
     p_add: "Add profile", p_add_from: "Preset:", unsaved_check: "The check uses the unsaved form values.",
     default_marker: "default", none_opt: "—",
-    sw_name: "Swarm name", sw_lang: "Agents' prompt language", sw_start: "Agents at start", sw_max: "Max agents",
-    sw_budget: "Session budget, $", sw_budget_hint: "0 — no limit", sw_roles: "Starting roles",
+    sw_name: "Swarm name", sw_lang: "Agents' prompt language", sw_max: "Max agents",
+    sw_budget: "Session budget, $", sw_budget_hint: "0 — no limit",
+    sw_review: "Independent review of tasks",
+    sw_review_hint: "An agent's task is approved by another agent, or by you when there is nobody else. Turn it off for cheap runs: a task without a reviewer is then done at once.",
+    r_builtin: "built-in", r_custom: "your own", r_customized: "changed", r_hidden: "hidden", r_name: "Name",
+    r_name_ph: "e.g. Data engineer", r_other_lang: "ru: {name}", r_desc: "Description",
+    r_desc_hint: "what the role does, what it produces, how it checks its work, what it leaves to others",
+    r_desc_both: "A changed description of a built-in role is used for agents in both languages.",
+    r_instr: "Extra instructions", r_instr_hint: "added to the instructions of every agent of this role",
+    r_model: "Model profile", r_model_default: "— the session's default profile", r_reset: "Reset", r_hide: "Hide",
+    r_show: "Show", r_delete: "Delete role", r_add: "Add a role", r_err_name: "Enter the role name.",
+    r_err_name_bad: "Role name “{name}”: at most 60 characters, no “,” or “*”.", r_err_dup: "Two roles are named “{name}”.",
+    r_err_builtin: "“{name}” is a built-in role: edit its card instead.", r_err_desc: "Describe the role “{name}”.",
+    r_err_model: "Role “{name}” uses the profile “{model}”, which does not exist.",
     ag_steps: "Steps per wake-up", ag_context: "Default context window", ag_tool_out: "Tool output limit (chars)",
     ag_stagger: "Delay between agent starts, s", ag_nudge: "Nudge idle agents after, s", ag_parallel: "Parallel LLM calls",
     sh_program: "Shell", sh_timeout: "Default timeout, s", sh_max_timeout: "Max timeout, s",
@@ -147,6 +207,7 @@ const H = {
   lang: "ru", tab: "sessions", sessions: null, filter: "all", search: "",
   view: null, original: null, providers: [], path: "", profiles: [], defaultUid: null,
   dirty: false, ws: null, wsRetry: 0, reloadTimer: null, uid: 0, busy: new Set(), settingsError: null,
+  rolePresets: [], roleCards: [], teams: {},   // the role catalog (Settings → Roles) and the team composers
 };
 // profile names the settings accept (settings.apply_update)
 const PROFILE_NAME = /^[A-Za-z0-9_-]+$/;
@@ -293,8 +354,37 @@ function filterSessions(all, filter, search) {
     if (filter === "running" && s.status !== "running") return false;
     if (filter === "stopped" && s.status === "running") return false;
     if (!q) return true;
-    return [s.title, s.id, s.goal && s.goal.title, s.goal && s.goal.description].join(" ").toLowerCase().includes(q);
+    return [s.title, s.id, s.goal && s.goal.title, s.goal && s.goal.description, s.workspace && s.workspace.path]
+      .join(" ").toLowerCase().includes(q);
   });
+}
+
+/** "default" (the session's own folder), "adopted" (an existing folder, e.g. the user's project) or "moved"
+ * (a folder the session was moved to with /cd); null without the summary's `workspace`. */
+function workspaceKind(ws) {
+  if (!ws || typeof ws !== "object" || !ws.path) return null;
+  return ws.default ? "default" : ws.adopted ? "adopted" : "moved";
+}
+/** A folder outside the session that does not exist: the session cannot start (its own folder is created on demand). */
+function workspaceMissing(ws) { return !!(workspaceKind(ws) && !ws.default && !ws.exists); }
+
+/** A long path cut at the front ("…\sessions\001-x\workspace"): the end of a path tells folders apart. */
+function shortPath(path, max = 52) {
+  const text = String(path ?? "");
+  if (text.length <= max) return text;
+  const tail = text.slice(-(max - 1));
+  const cut = tail.search(/[\\/]/);
+  return "…" + (cut > 0 && cut < tail.length - 1 ? tail.slice(cut) : tail);
+}
+
+function workspaceLine(ws) {
+  const kind = workspaceKind(ws);
+  if (!kind) return "";
+  const missing = workspaceMissing(ws);
+  const label = missing ? t("ws_missing_badge") : t("ws_" + kind);
+  const badge = `<span class="badge ${missing ? "err" : kind === "default" ? "plain" : ""}">${esc(label)}</span>`;
+  return `<div class="sc-folder" title="${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}">📁 <code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</div>
+    ${missing ? `<div class="sc-warn">⚠ ${esc(t("ws_missing"))}</div>` : ""}`;
 }
 
 function sessionCard(s) {
@@ -324,6 +414,7 @@ function sessionCard(s) {
       ${s.model ? `<span title="${esc(t("model"))}: ${esc(s.model_profile)}">🧠 ${esc(s.model)}</span>` : ""}
       <span title="${esc(t("created"))}: ${esc(ago(s.created_at))}">🕒 ${esc(ago(s.last_activity || s.created_at))}</span>
     </div>
+    ${workspaceLine(s.workspace)}
     ${error ? `<div class="sc-error">${esc(error)}</div>` : ""}
     <div class="sc-actions">
       <a class="btn primary small" href="/s/${encodeURIComponent(s.id)}/">${esc(t("open"))}</a>
@@ -357,8 +448,10 @@ function stopSession(sid, button) { return sessionAction(sid, "stop", button); }
 
 function deleteModal(sid) {
   const s = findSession(sid);
+  // a folder outside the session (the user's project, or one it was moved to) is never deleted
+  const kept = workspaceKind(s.workspace) && !s.workspace.default ? s.workspace.path : null;
   openModal(`<div class="modal-head"><h3>${esc(t("delete_title"))}</h3></div>
-    <p>${esc(t("delete_text", { title: s.title }))}</p>
+    <p>${esc(kept ? t("delete_text_kept", { title: s.title, path: kept }) : t("delete_text", { title: s.title }))}</p>
     <div class="modal-actions">
       <button class="btn" type="button" data-close>${esc(t("cancel"))}</button>
       <button class="btn primary danger-fill" type="button" id="confirm-delete">🗑 ${esc(t("delete"))}</button>
@@ -368,10 +461,349 @@ function deleteModal(sid) {
   btn.addEventListener("click", async () => {
     btn.disabled = true;
     try {
-      await api("DELETE", `/api/sessions/${encodeURIComponent(sid)}?confirm=${encodeURIComponent(sid)}`);
-      closeModal(); toast(t("deleted")); loadSessions();
+      const data = await api("DELETE", `/api/sessions/${encodeURIComponent(sid)}?confirm=${encodeURIComponent(sid)}`);
+      closeModal();
+      toast(data && data.workspace_kept ? t("deleted_kept", { path: data.workspace_kept }) : t("deleted"));
+      loadSessions();
     } catch (e) { btn.disabled = false; toast(e.message, true); }
   });
+}
+
+// ---- role catalog, starting team -------------------------------------------------------------------
+// Twins of roles.py over H.rolePresets (GET /api/settings "role_presets"). The composer is a view over
+// swarm.starting_roles + swarm.start_agents (SPEC §17.3): rows [{role, count}] in member order, a row's role is
+// a preset id or an own role's name as written; trailing generalists stay implicit ([] + 3 = three generalists).
+const DEFAULT_ROLE_ID = "generalist";
+const CUSTOM_ROLE = "__custom__";   // the composer's "Other role…" option
+const ROLE_NAME_MAX = 60;           // roles.NAME_LIMIT
+const TEAM_ROW_MAX = 50;            // agents in one row of the composer
+
+/** A role name with its whitespace collapsed (roles.normalize). */
+function normRole(name) { return String(name ?? "").split(/\s+/).filter(Boolean).join(" "); }
+function presetOf(id) { return (H.rolePresets || []).find((p) => p.id === id) || null; }
+/** The id of the built-in role named `name` (its id or its name in either language, any case), else null. */
+function presetIdOf(name) {
+  const q = normRole(name).toLowerCase();
+  if (!q) return null;
+  const p = (H.rolePresets || []).find((x) => x.id === q || Object.values(x.name || {}).some((n) => String(n).toLowerCase() === q));
+  return p ? p.id : null;
+}
+/** The role of a composer row / a starting_roles entry: a preset id, else the name as written. */
+function roleKeyOf(name) { return presetIdOf(name) || normRole(name); }
+/** The catalog key of a role name (roles.role_key): a preset id, else the lower-cased name. */
+function roleMatchKey(name) { return presetIdOf(name) || normRole(name).toLowerCase(); }
+/** The first sentence of a description, else the text cut at a word (roles.summary). */
+function roleSummary(text, limit = 200) {
+  text = normRole(text);
+  const end = /[.!?…](?=\s|$)/.exec(text);
+  if (end && end.index + 1 <= limit) return text.slice(0, end.index + 1);
+  if (text.length <= limit) return text;
+  const space = text.lastIndexOf(" ", limit - 1);
+  const cut = space >= Math.floor(limit / 4) ? space : limit - 1;
+  return text.slice(0, cut).replace(/[ ,;:\-–—]+$/, "") + "…";
+}
+/** Rows [{role, count}] of a starting team (roles.team_rows): starting_roles[:start_agents] in order, the rest
+ * generalists; consecutive equal roles form one row. */
+function teamRows(startingRoles, startAgents) {
+  const n = Math.max(0, Math.floor(Number(startAgents) || 0));
+  const list = (startingRoles || []).slice(0, n).map((r) => roleKeyOf(r) || DEFAULT_ROLE_ID);
+  while (list.length < n) list.push(DEFAULT_ROLE_ID);
+  const rows = [];
+  for (const role of list) {
+    const last = rows[rows.length - 1];
+    if (last && last.role === role) last.count++;
+    else rows.push({ role, count: 1 });
+  }
+  return rows;
+}
+/** {starting_roles, start_agents} of rows (roles.team_value): trailing generalists stay implicit. */
+function teamValue(rows) {
+  const roles = [];
+  for (const row of rows || []) {
+    for (let i = 0; i < Math.max(0, Math.floor(Number(row.count) || 0)); i++) roles.push(roleKeyOf(row.role) || DEFAULT_ROLE_ID);
+  }
+  const total = roles.length;
+  while (roles.length && roles[roles.length - 1] === DEFAULT_ROLE_ID) roles.pop();
+  return { starting_roles: roles, start_agents: total };
+}
+/** The catalog for [[roles]] entries in the UI language (roles.catalog, hidden roles flagged): the presets with
+ * their entries applied, then the own roles. `value` is what a composer row stores. */
+function catalogOf(entries) {
+  const byKey = new Map();
+  const own = [];
+  for (const e of entries || []) {
+    const key = roleMatchKey(e && e.name);
+    if (!key || byKey.has(key)) continue;
+    byKey.set(key, e);
+    if (!presetIdOf(e.name)) own.push([key, e]);
+  }
+  const lang = H.lang;
+  const out = (H.rolePresets || []).map((p) => {
+    const e = byKey.get(p.id) || {};
+    return { key: p.id, value: p.id, name: p.name[lang] || p.name.en, builtin: true, hidden: !!e.hidden, model: e.model || null,
+             description: String(e.description || "").trim() || p.description[lang] || p.description.en };
+  });
+  for (const [key, e] of own) {
+    out.push({ key, value: normRole(e.name), name: normRole(e.name), builtin: false, hidden: !!e.hidden, model: e.model || null,
+               description: String(e.description || "").trim() });
+  }
+  return out;
+}
+/** The new-session modal offers the SAVED catalog; the settings composer the edited one (a role added in the
+ * same edit can be used). */
+function teamCatalog(id) {
+  if (id === "ns") return catalogOf(savedDefaults().roles);
+  return catalogOf((H.roleCards || []).map((c) => ({ name: c.builtin ? c.id : c.name, description: c.description ?? "",
+                                                      model: c.model, hidden: c.hidden })));
+}
+function findCatalogRole(catalog, role) { const key = roleMatchKey(role); return key ? catalog.find((r) => r.key === key) || null : null; }
+function teamTotal(rows) { return (rows || []).reduce((n, r) => n + (Number(r.count) || 0), 0); }
+
+function teamComposer(id) { return `<div class="team full" id="team-${id}">${teamInner(id)}</div>`; }
+function teamInner(id) {
+  const rows = H.teams[id] || [];
+  const catalog = teamCatalog(id);
+  const attrs = (kind, i) => `data-team="${kind}" data-composer="${id}" data-row="${i}"`;
+  const rowHtml = rows.map((row, i) => {
+    const role = row.custom ? null : findCatalogRole(catalog, row.role);
+    const options = catalog.filter((r) => !r.hidden || (role && r.key === role.key)).map((r) =>
+      `<option value="${esc(r.value)}"${role && r.key === role.key ? " selected" : ""}>${esc(r.name)}${r.hidden ? " " + esc(t("team_hidden")) : ""}</option>`);
+    options.push(`<option value="${CUSTOM_ROLE}"${role ? "" : " selected"}>${esc(t("team_custom"))}</option>`);
+    const desc = role ? `<div class="team-desc" title="${esc(role.description)}">${esc(roleSummary(role.description))}</div>`
+      : `<div class="team-desc hint">${esc(t("team_custom_hint"))}</div>`;
+    return `<div class="team-row">
+      <select ${attrs("role", i)}>${options.join("")}</select>
+      ${role ? "" : `<input type="text" ${attrs("custom", i)} maxlength="${ROLE_NAME_MAX}" value="${esc(row.role)}" placeholder="${esc(t("team_custom_ph"))}">`}
+      <span class="team-count"><button class="btn small" type="button" ${attrs("dec", i)}>−</button><input type="number" min="1" max="${TEAM_ROW_MAX}" ${attrs("count", i)} value="${Number(row.count) || 1}"><button class="btn small" type="button" ${attrs("inc", i)}>+</button></span>
+      ${role && role.model ? `<span class="team-model">${esc(t("team_model", { model: role.model }))}</span>` : ""}
+      <button class="icon-btn small" type="button" ${attrs("del", i)} title="${esc(t("team_remove"))}" aria-label="${esc(t("team_remove"))}">✕</button>
+      ${desc}
+    </div>`;
+  }).join("");
+  return `<div class="team-head"><span>${esc(t("f_team"))}</span><span class="team-total" id="team-total-${id}">${esc(t("team_total", { n: teamTotal(rows) }))}</span></div>
+    ${rowHtml}
+    <div><button class="btn small" type="button" data-team="add" data-composer="${id}">＋ ${esc(t("team_add"))}</button></div>
+    <p class="field-hint">${esc(t("f_team_hint"))}</p>`;
+}
+function renderTeam(id) { const box = $("#team-" + id); if (box) box.innerHTML = teamInner(id); }
+
+/** The error of a composer's rows (shown in the form's error line), or null. */
+function teamError(rows, max) {
+  if (!rows || !rows.length) return t("team_empty");
+  if (rows.some((r) => r.custom && !normRole(r.role))) return t("r_err_name");
+  const bad = rows.find((r) => r.custom && /[,*]/.test(r.role));   // "," and "*" separate the items of a team
+  if (bad) return t("r_err_name_bad", { name: normRole(bad.role) });
+  const n = teamTotal(rows);
+  const limit = Number(String(max ?? "").trim());
+  if (String(max ?? "").trim() !== "" && Number.isFinite(limit) && n > limit) return t("team_over_max", { n, max: limit });
+  return null;
+}
+
+/** Composer events (input / change / click on [data-team]); true when the event was one. */
+function onTeamEvent(e) {
+  const el = e.target && e.target.closest ? e.target.closest("[data-team]") : null;
+  if (!el || !el.dataset || !el.dataset.team) return false;
+  const id = el.dataset.composer;
+  const rows = H.teams[id];
+  if (!rows) return true;
+  const kind = el.dataset.team;
+  const i = Number(el.dataset.row);
+  const row = rows[i];
+  const clamp = (n) => Math.max(1, Math.min(TEAM_ROW_MAX, Math.floor(n)));
+  if (e.type === "click") {
+    if (kind === "add") {
+      const used = new Set(rows.filter((r) => !r.custom).map((r) => roleMatchKey(r.role)));
+      const next = teamCatalog(id).find((r) => !r.hidden && !used.has(r.key));
+      rows.push({ role: next ? next.value : DEFAULT_ROLE_ID, count: 1 });
+    } else if (!row) return true;
+    else if (kind === "inc" || kind === "dec") row.count = clamp((Number(row.count) || 1) + (kind === "inc" ? 1 : -1));
+    else if (kind === "del") rows.splice(i, 1);
+    else return true;
+    renderTeam(id);
+  } else if (kind === "role" && e.type === "change" && row) {
+    if (el.value === CUSTOM_ROLE) { row.custom = true; row.role = ""; } else { row.custom = false; row.role = el.value; }
+    renderTeam(id);
+    if (row.custom) $(`#team-${id} [data-team="custom"][data-row="${i}"]`)?.focus();
+  } else if (kind === "custom" && e.type === "input" && row) {
+    row.role = el.value;
+  } else if (kind === "count" && e.type === "input" && row) {
+    const n = Number(el.value);
+    if (!Number.isFinite(n) || String(el.value).trim() === "") return true;   // being typed
+    row.count = clamp(n);
+  } else return true;
+  const total = $("#team-total-" + id);
+  if (total) total.textContent = t("team_total", { n: teamTotal(rows) });
+  teamChanged(id);
+  return true;
+}
+/** The settings composer writes its value back, except when it equals the canonical value of the saved team:
+ * then the original raw values stay (an untouched default never churns the file: [] stays []). */
+function teamChanged(id) {
+  if (id !== "defaults" || !H.view) return;
+  const o = (H.original && H.original.swarm) || {};
+  const value = teamValue(H.teams.defaults);
+  const same = JSON.stringify(value) === JSON.stringify(teamValue(teamRows(o.starting_roles, o.start_agents)));
+  H.view.swarm = H.view.swarm || {};
+  H.view.swarm.starting_roles = same ? clone(o.starting_roles || []) : value.starting_roles;
+  H.view.swarm.start_agents = same ? o.start_agents : value.start_agents;
+  markDirty();
+}
+
+// ---- settings: role cards (Settings → Roles) ----------------------------------------------------------
+/** Cards of the role catalog from the stored [[roles]] entries: one per built-in role (description null = the
+ * built-in text in the UI language), then the own roles in entry order. No presets (an older server): none. */
+function makeRoleCards(entries) {
+  if (!(H.rolePresets || []).length) return [];
+  const byKey = new Map();
+  for (const e of entries || []) { const key = roleMatchKey(e && e.name); if (key && !byKey.has(key)) byKey.set(key, e); }
+  const cards = H.rolePresets.map((p) => {
+    const e = byKey.get(p.id) || {};
+    return { uid: "r" + (++H.uid), builtin: true, id: p.id, description: e.description || null,
+             instructions: e.instructions || "", model: e.model || null, hidden: !!e.hidden };
+  });
+  for (const e of entries || []) {
+    if (!e || !normRole(e.name) || presetIdOf(e.name)) continue;
+    cards.push({ uid: "r" + (++H.uid), builtin: false, name: normRole(e.name), description: e.description || "",
+                 instructions: e.instructions || "", model: e.model || null, hidden: !!e.hidden });
+  }
+  return cards;
+}
+/** The description of a built-in card when it really replaces the built-in one (not one of its texts), else "". */
+function changedDescription(card) {
+  const preset = presetOf(card.id);
+  const desc = String(card.description ?? "").trim();
+  return desc && preset && !Object.values(preset.description).some((d) => String(d).trim() === desc) ? desc : "";
+}
+function roleCustomized(card) {
+  return card.builtin && !!(changedDescription(card) || String(card.instructions || "").trim() || card.model || card.hidden);
+}
+function roleCardName(card) {
+  const preset = card.builtin ? presetOf(card.id) : null;
+  return preset ? preset.name[H.lang] || preset.name.en : normRole(card.name);
+}
+function roleHeadInner(card) {
+  const preset = card.builtin ? presetOf(card.id) : null;
+  const badges = [`<span class="badge plain">${esc(t(card.builtin ? "r_builtin" : "r_custom"))}</span>`,
+                  roleCustomized(card) ? `<span class="badge">${esc(t("r_customized"))}</span>` : "",
+                  card.hidden ? `<span class="badge warn">${esc(t("r_hidden"))}</span>` : ""].join("");
+  const actions = card.builtin
+    ? `${roleCustomized(card) ? `<button class="btn small" type="button" data-rc-reset>${esc(t("r_reset"))}</button>` : ""}
+       <button class="btn small" type="button" data-rc-hide>${esc(t(card.hidden ? "r_show" : "r_hide"))}</button>`
+    : `<button class="icon-btn small" type="button" data-rc-del title="${esc(t("r_delete"))}" aria-label="${esc(t("r_delete"))}">🗑</button>`;
+  const name = preset ? `<span class="role-name">${esc(roleCardName(card))}</span>`
+    : `<input class="role-name" type="text" data-rc="name" maxlength="${ROLE_NAME_MAX}" value="${esc(card.name)}" placeholder="${esc(t("r_name_ph"))}" title="${esc(t("r_name"))}">`;
+  const otherLang = H.lang === "ru" ? "en" : "ru";   // the name of a built-in role in the other language
+  const other = preset ? `<span class="muted role-other">${esc(t("r_other_lang", { name: preset.name[otherLang] }))}</span>` : "";
+  return `${name}${other}${badges}<span class="spacer"></span>${actions}`;
+}
+/** <option>s of a role's model profile: the session default, then the current profiles. A profile renamed in this
+ * edit shows under its new name (the server follows the rename); an unknown one stays visible until fixed. */
+function roleModelOptions(model) {
+  const names = (H.profiles || []).map((p) => p.name);
+  const renamed = model ? (H.profiles || []).find((p) => p.original === model && p.name !== model) : null;
+  const shown = renamed ? renamed.name : model || "";
+  const opts = [`<option value=""${shown ? "" : " selected"}>${esc(t("r_model_default"))}</option>`]
+    .concat(names.map((n) => `<option value="${esc(n)}"${n === shown ? " selected" : ""}>${esc(n)}</option>`));
+  if (shown && !names.includes(shown)) opts.push(`<option value="${esc(shown)}" selected>${esc(shown)}</option>`);
+  return opts.join("");
+}
+function roleCard(card) {
+  const head = `<div class="role-head">${roleHeadInner(card)}</div>`;
+  if (card.builtin && card.hidden) return `<div class="role-card hidden-role" data-role-uid="${card.uid}">${head}</div>`;
+  const preset = card.builtin ? presetOf(card.id) : null;
+  const desc = preset && card.description === null ? preset.description[H.lang] || preset.description.en : card.description || "";
+  return `<div class="role-card" data-role-uid="${card.uid}">${head}
+    <div class="settings-grid">
+      <label class="field full"><span>${esc(t("r_desc"))} <span class="hint">${esc(t("r_desc_hint"))}</span></span>
+        <textarea rows="5" data-rc="description">${esc(desc)}</textarea>${preset ? `<span class="field-hint">${esc(t("r_desc_both"))}</span>` : ""}</label>
+      <label class="field"><span>${esc(t("r_model"))}</span><select data-rc="model">${roleModelOptions(card.model)}</select></label>
+    </div>
+    <details class="more"${card.moreOpen ? " open" : ""}><summary>${esc(t("f_more"))}</summary>
+      <label class="field"><span>${esc(t("r_instr"))} <span class="hint">${esc(t("r_instr_hint"))}</span></span>
+        <textarea rows="3" data-rc="instructions">${esc(card.instructions || "")}</textarea></label>
+    </details>
+  </div>`;
+}
+function renderRoles() {
+  const box = $("#roles");
+  if (!box) return;
+  // keep the "More" sections the user opened (a click on a card re-renders the list)
+  $$(".role-card", box).forEach((el) => {
+    const card = H.roleCards.find((c) => c.uid === el.dataset.roleUid);
+    const more = el.querySelector("details.more");
+    if (card && more) card.moreOpen = more.open;
+  });
+  box.innerHTML = H.roleCards.map(roleCard).join("");
+}
+/** Role card events: typing in a card (true when the event was one; the card is not re-rendered while typed in). */
+function onRoleCardEvent(e) {
+  const el = e.target;
+  const cardEl = el && el.closest ? el.closest(".role-card") : null;
+  const uid = cardEl && cardEl.dataset && cardEl.dataset.roleUid;
+  if (!uid) return false;
+  const card = H.roleCards.find((c) => c.uid === uid);
+  const field = el.dataset && el.dataset.rc;
+  if (!card || !field) return true;
+  if (field === "name") card.name = el.value;
+  else if (field === "description") card.description = el.value;
+  else if (field === "instructions") card.instructions = el.value;
+  else if (field === "model") card.model = el.value || null;
+  if (card.builtin) { const head = cardEl.querySelector(".role-head"); if (head) head.innerHTML = roleHeadInner(card); }
+  renderTeam("defaults");
+  markDirty();
+  return true;
+}
+/** Role card buttons: add, reset, hide / show, delete (true when the click was one of them). */
+function onRoleCardClick(e) {
+  const btn = e.target && e.target.closest ? e.target.closest("button") : null;
+  const ds = (btn && btn.dataset) || {};
+  if ("roleAdd" in ds) {
+    const card = { uid: "r" + (++H.uid), builtin: false, name: "", description: "", instructions: "", model: null, hidden: false };
+    H.roleCards.push(card);
+    renderRoles(); renderTeam("defaults"); markDirty();
+    $(`.role-card[data-role-uid="${card.uid}"] .role-name`)?.focus();
+    return true;
+  }
+  const cardEl = e.target && e.target.closest ? e.target.closest(".role-card") : null;
+  const uid = cardEl && cardEl.dataset && cardEl.dataset.roleUid;
+  if (!uid) return false;
+  const card = H.roleCards.find((c) => c.uid === uid);
+  if (!card) return true;
+  if ("rcReset" in ds) Object.assign(card, { description: null, instructions: "", model: null, hidden: false });
+  else if ("rcHide" in ds) card.hidden = !card.hidden;
+  else if ("rcDel" in ds) H.roleCards = H.roleCards.filter((c) => c !== card);
+  else return true;
+  renderRoles(); renderTeam("defaults"); markDirty();
+  return true;
+}
+/** The [[roles]] entries of the cards (PUT /api/settings "roles"): a built-in role only with what changed (by id),
+ * an own role with its name and description. Throws the first client-side error (shown in the save bar). */
+function roleEntries(cards) {
+  const profiles = new Set((H.profiles || []).map((p) => p.name));
+  const renamed = new Set((H.profiles || []).filter((p) => p.original && p.original !== p.name).map((p) => p.original));
+  const seen = new Set();
+  const out = [];
+  for (const card of cards || []) {
+    const instructions = String(card.instructions || "").trim();
+    const model = card.model || null;
+    const entry = { name: card.builtin ? card.id : normRole(card.name) };
+    if (!card.builtin) {
+      const name = entry.name;
+      if (!name) throw new Error(t("r_err_name"));
+      if (name.length > ROLE_NAME_MAX || /[,*]/.test(name)) throw new Error(t("r_err_name_bad", { name }));
+      if (presetIdOf(name)) throw new Error(t("r_err_builtin", { name }));
+      if (seen.has(name.toLowerCase())) throw new Error(t("r_err_dup", { name }));
+      seen.add(name.toLowerCase());
+      entry.description = String(card.description || "").trim();
+      if (!entry.description && !card.hidden) throw new Error(t("r_err_desc", { name }));
+    } else if (changedDescription(card)) entry.description = changedDescription(card);
+    if (model && !profiles.has(model) && !renamed.has(model)) throw new Error(t("r_err_model", { name: roleCardName(card), model }));
+    if (instructions) entry.instructions = instructions;
+    if (model) entry.model = model;
+    if (card.hidden) entry.hidden = true;
+    if (!card.builtin || Object.keys(entry).length > 1) out.push(entry);
+  }
+  return out;
 }
 
 // ---- new session -----------------------------------------------------------------------------------
@@ -382,6 +814,7 @@ async function newSessionModal() {
   if (!H.original) { try { await loadSettings(); } catch (e) { /* the form still works with blanks */ } }
   const v = savedDefaults();
   const sw = v.swarm || {};
+  H.teams.ns = teamRows(sw.starting_roles, sw.start_agents ?? 3);
   const profiles = Object.entries(v.models || {});
   const def = (v.agents || {}).default_model || "default";
   const modelOpts = profiles.map(([name, p]) =>
@@ -391,17 +824,15 @@ async function newSessionModal() {
     <form class="new-session" id="ns-form" novalidate>
       <div class="form-grid">
         <label class="field full"><span>${esc(t("f_title"))}</span><input id="ns-title" maxlength="120" placeholder="${esc(t("f_title_ph"))}"></label>
-        <label class="field full"><span>🎯 ${esc(t("f_goal"))} *</span><textarea id="ns-goal" rows="3" placeholder="${esc(t("f_goal_ph"))}"></textarea></label>
+        <label class="field full"><span>🎯 ${esc(t("f_goal"))} * <span class="hint">${esc(t("f_goal_hint"))}</span></span><textarea id="ns-goal" rows="4" placeholder="${esc(t("f_goal_ph"))}"></textarea></label>
         <label class="field full"><span>${esc(t("f_desc"))}</span><textarea id="ns-desc" rows="3" placeholder="${esc(t("f_desc_ph"))}"></textarea></label>
-        <label class="field two"><span>${esc(t("f_model"))}</span><select id="ns-model">${modelOpts}</select></label>
+        <label class="field two"><span>${esc(t("f_model"))} <span class="hint">${esc(t("f_model_hint"))}</span></span><select id="ns-model">${modelOpts}</select></label>
         <label class="field"><span>${esc(t("f_lang"))}</span><select id="ns-lang">
           <option value="ru"${sw.language === "ru" ? " selected" : ""}>Русский</option>
           <option value="en"${sw.language === "en" ? " selected" : ""}>English</option></select></label>
-        <label class="field"><span>${esc(t("f_start_agents"))}</span><input id="ns-start" type="number" min="0" max="50" value="${esc(sw.start_agents ?? 3)}"></label>
         <label class="field"><span>${esc(t("f_max_agents"))}</span><input id="ns-max" type="number" min="1" max="200" value="${esc(sw.max_agents ?? 8)}"></label>
         <label class="field"><span>${esc(t("f_budget"))}</span><input id="ns-budget" type="number" min="0" step="0.5" value="${esc(sw.max_cost_usd ?? 5)}"></label>
-        <label class="field full"><span>${esc(t("f_roles"))} <span class="hint">${esc(t("f_roles_hint"))}</span></span>
-          <input id="ns-roles" placeholder="${esc(t("f_roles_ph"))}" value="${esc((sw.starting_roles || []).join(", "))}"></label>
+        ${teamComposer("ns")}
       </div>
       <details class="more"><summary>${esc(t("f_more"))}</summary>
         <div class="form-grid">
@@ -417,21 +848,28 @@ async function newSessionModal() {
       </div>
     </form>`);
   $("#ns-goal").focus();
+  for (const type of ["input", "change", "click"]) $("#ns-form .team").addEventListener(type, onTeamEvent);
   $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = "🚀 " + t(e.target.checked ? "create_open" : "create"); });
   $("#ns-form").addEventListener("submit", submitNewSession);
 }
 
 /** Session overrides (sessions.create) for the values of the new-session form, relative to the saved
- * defaults `v`. Empty number fields keep the default; starting roles are sent when they differ (even emptied). */
+ * defaults `v`. Empty number fields keep the default; the team (composer rows) always gives start_agents, and
+ * starting_roles when they differ from the saved team. */
 function sessionOverrides(v, form) {
   const num = (x) => { const s = String(x ?? "").trim(); if (s === "") return null; const n = Number(s); return Number.isFinite(n) ? n : null; };
   const sw = v.swarm || {};
   const swarm = { language: form.lang };
-  for (const [key, value] of [["start_agents", num(form.start)], ["max_agents", num(form.max)], ["max_cost_usd", num(form.budget)]]) {
+  if (form.team) {
+    // starting_roles is sent only when the saved list, at the new size, would give another team (the saved list
+    // may hold more roles than its start_agents: those would fill a larger team)
+    const team = teamValue(form.team), effective = teamValue(teamRows(sw.starting_roles, team.start_agents));
+    swarm.start_agents = team.start_agents;
+    if (JSON.stringify(team.starting_roles) !== JSON.stringify(effective.starting_roles)) swarm.starting_roles = team.starting_roles;
+  }
+  for (const [key, value] of [["max_agents", num(form.max)], ["max_cost_usd", num(form.budget)]]) {
     if (value !== null) swarm[key] = value;
   }
-  const roles = String(form.roles || "").split(",").map((r) => r.trim()).filter(Boolean);
-  if (roles.join("\n") !== (sw.starting_roles || []).join("\n")) swarm.starting_roles = roles;
   const overrides = { swarm };
   const agents = {};
   const steps = num(form.steps);
@@ -446,9 +884,11 @@ async function submitNewSession(e) {
   e.preventDefault();
   const goal = $("#ns-goal").value.trim();
   if (!goal) { $("#ns-error").textContent = t("goal_required"); $("#ns-goal").focus(); return; }
+  const teamErr = teamError(H.teams.ns, $("#ns-max").value);
+  if (teamErr) { $("#ns-error").textContent = teamErr; return; }
   const overrides = sessionOverrides(savedDefaults(), {
-    lang: $("#ns-lang").value, start: $("#ns-start").value, max: $("#ns-max").value, budget: $("#ns-budget").value,
-    roles: $("#ns-roles").value, model: $("#ns-model").value, steps: $("#ns-steps").value, approval: $("#ns-approval").checked,
+    lang: $("#ns-lang").value, max: $("#ns-max").value, budget: $("#ns-budget").value, team: H.teams.ns,
+    model: $("#ns-model").value, steps: $("#ns-steps").value, approval: $("#ns-approval").checked,
   });
   const run = $("#ns-run").checked;
   const btn = $("#ns-submit");
@@ -482,12 +922,13 @@ async function loadSettings() {
   const data = await api("GET", "/api/settings");
   H.view = data.settings; H.original = clone(data.settings);
   H.providers = data.providers || []; H.path = data.path || "";
+  H.rolePresets = data.role_presets || [];
   H.settingsError = null;
   renderSettings(true);
 }
 
 const SECTIONS = [
-  ["models", "s_models"], ["swarm", "s_swarm"], ["agents", "s_agents"], ["shell", "s_shell"],
+  ["models", "s_models"], ["roles", "s_roles"], ["swarm", "s_swarm"], ["agents", "s_agents"], ["shell", "s_shell"],
   ["workspace", "s_workspace"], ["mcp", "s_mcp"], ["tracing", "s_tracing"], ["server", "s_server"],
 ];
 
@@ -497,6 +938,8 @@ function renderSettings(fromServer) {
     // the default profile is tracked by card, not by name: renaming must not move the star
     const def = H.profiles.find((p) => p.name === H.view.agents.default_model) || H.profiles[0];
     H.defaultUid = def ? def.uid : null;
+    H.roleCards = makeRoleCards(H.view.roles);
+    H.teams.defaults = teamRows((H.view.swarm || {}).starting_roles, (H.view.swarm || {}).start_agents);
     H.dirty = false;
   }
   const v = H.view;
@@ -507,13 +950,15 @@ function renderSettings(fromServer) {
         <select id="add-preset">${H.providers.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("")}</select>
         <button class="btn" type="button" id="add-profile">＋ ${esc(t("p_add"))}</button></div>
       <p class="field-hint">${esc(t("p_key_note"))} <code>${esc(H.path)}</code></p>`)}
+    ${section("roles", `<div class="roles" id="roles"></div>
+      <div class="add-role"><button class="btn" type="button" data-role-add>＋ ${esc(t("r_add"))}</button></div>`)}
     ${section("swarm", grid([
       field("sw_name", "swarm.name", "str"),
       field("sw_lang", "swarm.language", "select", { options: [["ru", "Русский"], ["en", "English"]] }),
-      field("sw_start", "swarm.start_agents", "int", { min: 0 }),
       field("sw_max", "swarm.max_agents", "int", { min: 1 }),
       field("sw_budget", "swarm.max_cost_usd", "float", { min: 0, step: 0.5, hint: "sw_budget_hint" }),
-      field("sw_roles", "swarm.starting_roles", "list", { full: true, placeholder: t("f_roles_ph") }),
+      teamComposer("defaults"),
+      field("sw_review", "swarm.independent_review", "bool", { full: true, hint: "sw_review_hint" }),
     ]))}
     ${section("agents", grid([
       field("ag_steps", "agents.max_steps_per_turn", "int", { min: 1 }),
@@ -551,6 +996,7 @@ function renderSettings(fromServer) {
       field("sv_resume", "server.resume_sessions", "bool", { full: true }),
     ]))}`;
   renderProfiles();
+  renderRoles();
   $("#add-profile").addEventListener("click", addProfile);
   updateSaveBar();
 }
@@ -575,7 +1021,7 @@ function field(labelKey, path, type, opts = {}) {
   const hint = opts.hint ? ` <span class="hint">${esc(t(opts.hint))}</span>` : "";
   const attrs = `data-path="${esc(path)}" data-type="${type}"`;
   if (type === "bool") {
-    return `<label class="check${cls}"><input type="checkbox" ${attrs}${value ? " checked" : ""}> ${esc(t(labelKey))}</label>`;
+    return `<label class="check${cls}"><input type="checkbox" ${attrs}${value ? " checked" : ""}> <span>${esc(t(labelKey))}${hint}</span></label>`;
   }
   let input;
   if (type === "select") {
@@ -608,6 +1054,7 @@ function readInput(el) {
 
 function onSettingsInput(e) {
   const el = e.target;
+  if (onTeamEvent(e) || onRoleCardEvent(e)) return;
   if (el.dataset.path) { setPath(el.dataset.path, readInput(el)); markDirty(); return; }
   const card = el.closest(".profile-card");
   if (card && el.dataset.pf) {
@@ -817,6 +1264,7 @@ async function checkProfile(p, live, button) {
 function onSettingsClick(e) {
   const nav = e.target.closest("[data-nav]");
   if (nav) { e.preventDefault(); $("#s-" + nav.dataset.nav)?.scrollIntoView({ behavior: "smooth", block: "start" }); return; }
+  if (onTeamEvent(e) || onRoleCardClick(e)) return;
   const card = e.target.closest(".profile-card");
   if (!card) return;
   const p = H.profiles.find((x) => x.uid === card.dataset.uid);
@@ -874,6 +1322,12 @@ function collectSettings() {
   v.models = models;
   const def = H.profiles.find((p) => p.uid === H.defaultUid) || H.profiles[0];
   v.agents = Object.assign({}, v.agents, { default_model: def ? def.name : undefined });
+  if ((H.rolePresets || []).length) v.roles = roleEntries(H.roleCards);   // (an older server: left as loaded)
+  const saved = (H.original && H.original.swarm) || {};
+  if (H.teams.defaults && JSON.stringify(teamValue(H.teams.defaults)) !== JSON.stringify(teamValue(teamRows(saved.starting_roles, saved.start_agents)))) {
+    const err = teamError(H.teams.defaults, (v.swarm || {}).max_agents);
+    if (err) throw new Error(err);
+  }
   return v;
 }
 
@@ -885,6 +1339,7 @@ async function saveSettings() {
   try {
     const r = await api("PUT", "/api/settings", { settings: payload });
     H.view = r.settings; H.original = clone(r.settings);
+    if (r.role_presets) H.rolePresets = r.role_presets;
     renderSettings(true);
     const applied = r.applied_to || [];
     toast(applied.length ? t("saved_applied", { list: applied.join(", ") }) : t("saved"));
@@ -980,9 +1435,13 @@ if (typeof module !== "undefined" && module.exports) {
   // pure helpers, exported for the Node-based UI tests (tests/test_ui.py); the browser runs init() instead
   module.exports = {
     I18N, H, esc, t, ago, money, sessionState, sessionCard, filterSessions, renderSessions, sessionOverrides,
+    workspaceKind, workspaceMissing, shortPath, workspaceLine,
     makeProfile, profileCard, profilePayload, collectSettings, presetData, uniqueName, redactKey, field, readInput,
     renderSettings, checkProfile, onSettingsInput, onSettingsClick, leaveSettings, closeModal, openModal,
-    deleteModal, newSessionModal, startSession, stopSession, setTab, loadSettingsPane,
+    deleteModal, newSessionModal, startSession, stopSession, setTab, loadSettingsPane, submitNewSession,
+    // role catalog and starting team
+    normRole, presetIdOf, roleKeyOf, roleSummary, teamRows, teamValue, catalogOf, teamComposer, teamError, onTeamEvent,
+    makeRoleCards, roleCard, roleEntries, onRoleCardEvent, onRoleCardClick, CUSTOM_ROLE,
   };
 } else if (typeof document !== "undefined") {
   init();

@@ -28,7 +28,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
-from .. import prompts
+from .. import prompts, roles
 from . import theme
 from .i18n import t, tn
 
@@ -598,8 +598,8 @@ def _ev_task_updated(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | 
         body.append(f" {ctx.sym['dot']} {ctx.t('task_waiting')}", style="dim")
     elif status == "review":
         reviewer = task.get("reviewer") if "reviewer" in task else new("reviewer")
-        label = ctx.t("task_review") + (f" ({first_name(reviewer)})" if reviewer else "")
-        body.append(f" {ctx.sym['dash']} {label}", style=theme.WARN)
+        label, style = _review_label(ctx, reviewer)
+        body.append(f" {ctx.sym['dash']} {label}", style=style)
     elif status == "done":
         if task.get("result"):
             rows.append(_task_result(ctx, task.get("result"), ""))
@@ -613,6 +613,13 @@ def _ev_task_updated(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | 
         body.append(f" {ctx.sym['dot']} {ctx.t('task_back_todo')}", style="dim")
     line = _task_line(ctx, task, body, status)
     return Group(line, *rows) if rows else line
+
+
+def _review_label(ctx: RenderContext, reviewer: Any) -> tuple[str, str]:
+    """The label of a task in review: "in review (Carl)", or "waits for your review" (bold) for the viewer."""
+    if reviewer and reviewer == ctx.me:
+        return ctx.t("task_review_you"), f"bold {theme.WARN}"
+    return ctx.t("task_review") + (f" ({first_name(reviewer)})" if reviewer else ""), theme.WARN
 
 
 def _task_result(ctx: RenderContext, result: Any, style: str) -> RenderableType:
@@ -653,6 +660,9 @@ def _ev_message(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 
 
 _QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined"})  # the goal panel / hire line say it
+# the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user
+_WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
+                         "u_review_handed_over", "u_reviews_waiting"})
 
 
 def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -667,7 +677,7 @@ def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | 
         return None
     if kind == "u_agent_error":  # normal/verbose show the agent.activity error line instead
         return error(ctx, clean(text)) if ctx.quiet else None
-    style = theme.WARN if kind in ("u_budget", "u_mcp_pending") else ""
+    style = theme.WARN if kind in _WARN_NOTES else ""
     return _line(ctx, ctx.sym["bell"], style, Text(clean(text).strip() or kind, style=style))
 
 
@@ -1140,7 +1150,8 @@ def _board_row(ctx: RenderContext, task: dict) -> Table:
     if task.get("assignee"):
         body.append(f" {s['dash']} {first_name(task.get('assignee'))}", style=theme.agent_style(task.get("assignee")))
     if status == "review" and task.get("reviewer"):
-        body.append(f" {s['dot']} {ctx.t('task_review')} ({first_name(task.get('reviewer'))})", style=theme.WARN)
+        label, style = _review_label(ctx, task.get("reviewer"))
+        body.append(f" {s['dot']} {label}", style=style)
     priority = _int(task.get("priority"), 1)
     if priority >= 2:
         body.append(f" {s['dot']} {_status_label(ctx, 'p', priority)}",
@@ -1196,6 +1207,8 @@ def task_detail(ctx: RenderContext, data: dict) -> RenderableType:
     add("td_created_by", _who(ctx, task.get("created_by")) if task.get("created_by") else None)
     add("td_updated", _clock(task.get("updated_at"), True) if task.get("updated_at") else None, "dim")
     rows.append(Padding(meta, (0, 0, 0, 2)))
+    if status == "review":  # the user may settle any review (instead of the reviewer, too)
+        rows.append(Padding(Text(ctx.t("td_review_hint", id=clean(task.get("id"))), style=theme.WARN), (0, 0, 0, 2)))
     for key, field in (("td_goal", "goal"), ("td_description", "description")):
         if task.get(field):
             rows += [Text(""), Text(ctx.t(key), style="bold"), Padding(_markdown(ctx, task.get(field)), (0, 0, 0, 2))]
@@ -1431,6 +1444,42 @@ def models_table(ctx: RenderContext, settings: dict) -> RenderableType:
     return _out(ctx, table)
 
 
+def roles_table(ctx: RenderContext, catalog: list[dict]) -> RenderableType:
+    """/roles: the role catalog [{key, name, description, model, builtin}] (GET /api/roles "roles"): the name, the
+    model profile of the role and the first sentence of its description."""
+    items = [_d(r) for r in _list(catalog) if isinstance(r, dict)]
+    if not items:
+        return _out(ctx, info(ctx, ctx.t("no_roles")))
+    wide = ctx.width >= 80
+    table = _table(ctx, ctx.t("roles_title"))
+    table.add_column(ctx.t("col_role"), overflow="fold")
+    if wide:
+        table.add_column(ctx.t("col_model"), overflow="fold", style="dim")
+    table.add_column(ctx.t("col_description"), overflow="fold")
+    for role in items:
+        row: list[RenderableType] = [Text(clean(role.get("name")) or clean(role.get("key")) or "?", style="bold")]
+        if wide:
+            row.append(Text(clean(role.get("model"))))
+        row.append(Text(roles.summary(clean(role.get("description"))), style="dim"))
+        table.add_row(*row)
+    return _out(ctx, Group(table, Text(ctx.t("roles_hint"), style="dim")))
+
+
+def role_detail(ctx: RenderContext, role: dict) -> RenderableType:
+    """/roles Role: a panel with the role's name, its full description, extra instructions and model profile."""
+    role = _d(role)
+    title = Text(clean(role.get("name")) or clean(role.get("key")) or "?", style=f"bold {theme.ACCENT}")
+    if role.get("builtin"):
+        title.append(f" {ctx.sym['dot']} {ctx.t('builtin_role')}", style="dim")
+    rows: list[RenderableType] = [_markdown(ctx, role.get("description") or "—")]
+    if role.get("instructions"):
+        rows += [Text(""), Text(ctx.t("role_instructions", text=clean(role.get("instructions"))), style="dim")]
+    if role.get("model"):
+        rows += [Text(""), Text(ctx.t("role_model", model=clean(role.get("model"))), style="dim")]
+    return _out(ctx, Panel(Group(*rows), title=title, title_align="left", box=_box(ctx), border_style=theme.ACCENT,
+                           padding=(0, 1)))
+
+
 def _key_state(ctx: RenderContext, profile: dict) -> Text:
     env = clean(profile.get("api_key_env"))
     if profile.get("api_key_set"):
@@ -1444,15 +1493,15 @@ def _key_state(ctx: RenderContext, profile: dict) -> Text:
 
 
 def status_report(ctx: RenderContext, info: dict) -> RenderableType:  # `info` shadows info() here
-    """`/status`: version, home, web, session, goal, models, language, agents, tracing (keys of `info`;
+    """`/status`: version, home, web, session, workspace, goal, models, language, agents, tracing (keys of `info`;
     others are listed after them as they are). Values may be plain or structured: session / goal dicts,
     agents {total, working}, models [{name, model, default}], budget {spent, limit}, booleans."""
     data = _d(info)
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style="dim", no_wrap=True)
     grid.add_column(overflow="fold")
-    order = ("version", "home", "web", "hub", "session", "goal", "models", "model", "language", "agents",
-             "budget", "tracing", "verbosity", "connected")
+    order = ("version", "home", "web", "hub", "session", "workspace", "goal", "models", "model", "language",
+             "agents", "budget", "tracing", "verbosity", "connected")
     for key in order + tuple(k for k in data if k not in order):
         if key not in data or data[key] is None:
             continue

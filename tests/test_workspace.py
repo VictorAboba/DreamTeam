@@ -74,10 +74,12 @@ def test_format_size():
 async def test_init_creates_repo_gitignore_and_initial_commit(ws):
     assert (ws.root / ".git").is_dir()
     ignore = (ws.root / ".gitignore").read_text(encoding="utf-8")
-    for entry in ("node_modules/", ".venv/", "__pycache__/", "*.pyc", ".DS_Store"):
+    for entry in ("node_modules/", ".venv/", "__pycache__/", "*.pyc", ".DS_Store", ".scratch/"):
         assert entry in ignore.splitlines()
     assert git_log(ws.root, "%s") == ["Initialize workspace"]
     assert ws.git_enabled
+    # the agents' scratch folder exists from the start, with its self-ignoring marker
+    assert (ws.root / ".scratch" / ".gitignore").read_text(encoding="utf-8") == workspace_mod.SCRATCH_GITIGNORE
     status = subprocess.run(["git", "-C", str(ws.root), "status", "--porcelain"], capture_output=True)
     assert status.stdout.strip() == b""
 

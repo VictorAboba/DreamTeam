@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from starlette.testclient import TestClient
 
+from dreamteam import roles
 from dreamteam import settings as st
 from dreamteam.launcher import create_launcher_app
 from dreamteam.launcher_mcp import build_launcher_server, call_launcher_tool, list_launcher_tools
@@ -120,6 +121,60 @@ def test_settings_api(client):
     assert c.get("/api/sessions", headers={"host": "evil.example"}).status_code == 403
 
 
+def test_settings_api_carries_the_role_catalog(client):
+    c = client
+    data = c.get("/api/settings").json()
+    assert [p["id"] for p in data["role_presets"]] == list(roles.PRESET_IDS)
+    assert data["role_presets"][2]["name"] == {"ru": "Тестировщик", "en": "Tester"}
+    assert data["settings"]["roles"] == [] and [r["key"] for r in data["role_catalog"]] == list(roles.PRESET_IDS)
+    sid = _post(c, "/api/sessions", {"title": "Roles", "goal": "Do it"}).json()["session"]["id"]
+    settings = data["settings"]
+    settings["roles"] = [{"name": "Тестировщик", "instructions": "Use pytest."},
+                         {"name": "Data engineer", "description": "Builds data pipelines."},
+                         {"name": "researcher", "hidden": True}]
+    resp = c.put("/api/settings", content=json.dumps({"settings": settings}),
+                 headers={"content-type": "application/json"})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["settings"]["roles"][0] == {"name": "tester", "description": "", "instructions": "Use pytest.",
+                                            "model": None, "hidden": False}
+    assert body["applied_to"] == [sid] and [r["key"] for r in body["role_catalog"]][-1] == "data engineer"
+    assert c.get("/api/settings").json()["role_catalog"] == body["role_catalog"]
+    assert [r.name for r in c.manager.swarms[sid].config.roles] == ["tester", "Data engineer", "researcher"]
+    # the session's catalog: the visible roles in its language, also while it is stopped
+    for state in ("running", "stopped"):
+        if state == "stopped":
+            assert _post(c, f"/api/sessions/{sid}/stop", {}).json()["session"]["status"] == "stopped"
+        listed = c.get(f"/s/{sid}/api/roles").json()
+        assert listed["language"] == "en"
+        names = [r["name"] for r in listed["roles"]]
+        assert names[:2] == ["Generalist", "Developer"] and names[-1] == "Data engineer" and "Researcher" not in names
+        tester = next(r for r in listed["roles"] if r["key"] == "tester")
+        assert set(tester) == {"key", "name", "description", "instructions", "model", "builtin", "names"}
+        assert tester["instructions"] == "Use pytest." and tester["builtin"] is True and tester["name"] == "Tester"
+        # every spelling a hire resolves (roles.find_role), and the hidden roles, which a hire still resolves
+        assert tester["names"] == ["Tester", "tester", "Тестировщик"]
+        assert listed["roles"][-1]["names"] == ["Data engineer"]
+        assert [(r["key"], r["names"]) for r in listed["hidden"]] == [("researcher", ["Researcher", "researcher",
+                                                                                       "Исследователь"])]
+    # an own role without a description: 400 with the [roles.N] text, nothing saved
+    resp = c.put("/api/settings", content=json.dumps({"settings": dict(settings, roles=[{"name": "QA"}])}),
+                 headers={"content-type": "application/json"})
+    assert resp.status_code == 400 and "[roles.1] 'QA': a role of your own needs a description" in resp.json()["error"]
+    assert "QA" not in json.dumps(st.read_raw(c.manager.home)["roles"])
+    resp = c.put("/api/settings", content=json.dumps({"settings": {"roles": {"name": "tester"}}}),
+                 headers={"content-type": "application/json"})
+    assert resp.status_code == 400 and "list of roles" in resp.json()["error"]
+
+
+def test_a_session_without_a_title_is_named_after_its_goal(client):
+    resp = _post(client, "/api/sessions", {"goal": "Line one\nLine two", "start": False})
+    assert resp.status_code == 201, resp.text
+    session = resp.json()["session"]
+    assert session["title"] == "Line one" and session["id"].endswith("-line-one")
+    assert session["goal"] == {"title": "Line one", "description": "Line two", "status": "pending", "summary": ""}
+
+
 def test_launcher_websocket_reports_changes(client):
     c = client
     with c.websocket_connect("ws://127.0.0.1:8765/ws") as ws:
@@ -163,6 +218,41 @@ async def test_launcher_mcp_tools(tmp_path):
     text, err = await call_launcher_tool(manager, "session_start", {"session": "nope"})
     assert err
     await manager.shutdown()
+
+
+async def test_launcher_mcp_create_with_a_team(tmp_path):
+    manager = _manager(tmp_path)
+    try:
+        create = next(t for t in list_launcher_tools(manager) if t.name == "session_create")
+        props = create.input_schema["properties"]
+        assert props["team"]["type"] == "array" and props["team"]["items"] == {"type": "string"}
+        assert "the first line becomes its title" in props["goal"]["description"]
+        text, err = await call_launcher_tool(manager, "session_create", {
+            "goal": "Build it\nWith tests", "team": [" architect ", "Разработчик", "developer"]})
+        assert not err, text
+        sid = manager.ids()[0]
+        assert manager.meta(sid)["overrides"]["swarm"] == {"starting_roles": ["architect", "Разработчик", "developer"],
+                                                           "start_agents": 3}
+        assert manager.summary(sid)["title"] == "Build it"
+        assert sorted(m["role"] for m in manager.swarms[sid].members()) == ["Architect", "Developer", "Developer"]
+        # start_agents wins over the team's size; [] is no team
+        text, err = await call_launcher_tool(manager, "session_create", {
+            "goal": "Two", "team": ["tester"], "start_agents": 2, "start": False})
+        assert not err, text
+        assert manager.meta(manager.ids()[1])["overrides"]["swarm"] == {"start_agents": 2, "starting_roles": ["tester"]}
+        text, err = await call_launcher_tool(manager, "session_create", {"goal": "Three", "team": [], "start": False})
+        assert not err and manager.meta(manager.ids()[2])["overrides"] == {}
+        for bad, why in (("tester", "team must be a list of role names"), (["tester", " "], "list of role names"),
+                         (["tester", 3], "list of role names"), (["x" * 61], "longer than 60 characters"),
+                         (["tester"] * 201, "at most 200 agents"),
+                         # the --team syntax is not taken as a role name: one item per agent
+                         (["architect", "developer*2"], "'developer*2': a role name cannot contain ',' or '*'"),
+                         (["architect, developer"], "repeat a name for several agents")):
+            text, err = await call_launcher_tool(manager, "session_create", {"goal": "Bad", "team": bad})
+            assert err and why in text, text
+        assert len(manager.ids()) == 3  # nothing was created for a bad team
+    finally:
+        await manager.shutdown()
 
 
 def test_session_api_posts_must_be_json(client):
@@ -395,3 +485,101 @@ def test_session_detail_answers_for_invalid_overrides(client):
     assert data["session"]["config_error"] and data["config"]["swarm"]["max_agents"] == 3
     assert "sk-hidden" not in resp.text
     assert c.get("/api/sessions/nope").status_code == 404
+
+
+def _git(root: Path, *args: str) -> str:
+    import subprocess
+
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8",
+                          check=True).stdout
+
+
+def test_session_workspace_rest(client, tmp_path):
+    """POST /api/sessions/{sid}/workspace moves a session or adopts a folder; the summary shows the folder; a
+    deleted session keeps a folder outside it."""
+    import shutil
+
+    c = client
+    sid = _post(c, "/api/sessions", {"title": "Folder", "goal": "Work", "start": False}).json()["session"]["id"]
+    info = c.get(f"/api/sessions/{sid}").json()["session"]["workspace"]
+    assert info["default"] is True and info["adopted"] is False and info["path"].endswith("workspace")
+    target = tmp_path / "out" / "proj"
+    resp = _post(c, f"/api/sessions/{sid}/workspace", {"path": str(target)})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["result"]["mode"] == "moved" and data["result"]["to"] == str(target.resolve())
+    assert data["session"]["workspace"] == {"path": str(target.resolve()), "default": False, "adopted": False,
+                                            "exists": True}
+    listed = {s["id"]: s for s in c.get("/api/sessions").json()["sessions"]}
+    assert listed[sid]["workspace"]["path"] == str(target.resolve())
+    unchanged = _post(c, f"/api/sessions/{sid}/workspace", {"path": str(target)}).json()["result"]
+    assert unchanged["mode"] == "unchanged"
+    for body, status in (({"path": "relative/dir"}, 400), ({"path": 5}, 400), ({}, 400), ({"default": "yes"}, 400),
+                         ({"path": str(tmp_path / "home")}, 400), ({"path": str(target), "expect": "sideways"}, 400),
+                         ({"path": str(target), "expect": 3}, 400)):
+        resp = _post(c, f"/api/sessions/{sid}/workspace", body)
+        assert resp.status_code == status and resp.json()["error"], (body, resp.text)
+    assert _post(c, "/api/sessions/nope/workspace", {"path": str(target)}).status_code == 404
+    other = _post(c, "/api/sessions", {"title": "Other", "goal": "x", "start": False}).json()["session"]["id"]
+    resp = _post(c, f"/api/sessions/{other}/workspace", {"path": str(target)})
+    assert resp.status_code == 409 and sid in resp.json()["error"]
+    full = tmp_path / "full"  # the user agreed to a move into an empty folder, but it holds files: refused
+    full.mkdir()
+    (full / "a.txt").write_text("a", encoding="utf-8")
+    resp = _post(c, f"/api/sessions/{other}/workspace", {"path": str(full), "expect": "moved"})
+    assert resp.status_code == 409 and "now holds files" in resp.json()["error"]
+    if shutil.which("git"):  # a repository with uncommitted work is refused
+        project = tmp_path / "dirty"
+        project.mkdir()
+        _git(project, "init", "-q")
+        (project / "wip.txt").write_text("work in progress", encoding="utf-8")
+        resp = _post(c, f"/api/sessions/{other}/workspace", {"path": str(project)})
+        assert resp.status_code == 409 and "wip.txt" in resp.json()["error"]
+    back = _post(c, f"/api/sessions/{sid}/workspace", {"default": True}).json()
+    assert back["result"]["mode"] == "moved" and back["session"]["workspace"]["default"] is True
+    assert _post(c, f"/api/sessions/{sid}/workspace", {"path": str(target)}).status_code == 200
+    resp = c.delete(f"/api/sessions/{sid}?confirm={sid}")
+    assert resp.json() == {"ok": True, "workspace_kept": str(target.resolve())} and target.is_dir()
+    assert c.delete(f"/api/sessions/{other}?confirm={other}").json() == {"ok": True}
+
+    # created right in a folder
+    folder = tmp_path / "new-home-for-a-session"
+    resp = _post(c, "/api/sessions", {"title": "There", "goal": "Go", "start": False, "workspace": str(folder)})
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["result"]["mode"] == "created" and "workspace_result" not in resp.json()["session"]
+    assert resp.json()["session"]["workspace"]["path"] == str(folder.resolve()) and folder.is_dir()
+    for body in ({"goal": "x", "workspace": "relative"}, {"goal": "x", "workspace": 7}):
+        assert _post(c, "/api/sessions", body).status_code == 400
+    assert len(c.get("/api/sessions").json()["sessions"]) == 1  # nothing half-created
+    plain = _post(c, "/api/sessions", {"title": "Plain", "goal": "x", "start": False})
+    assert plain.status_code == 201 and "result" not in plain.json()
+
+
+async def test_launcher_mcp_session_cd(tmp_path):
+    manager = _manager(tmp_path)
+    try:
+        names = [t.name for t in list_launcher_tools(manager)]
+        assert "session_cd" in names[:5]
+        text, err = await call_launcher_tool(manager, "session_create", {"title": "Cd", "goal": "Work",
+                                                                         "start": False})
+        assert not err, text
+        sid = manager.ids()[0]
+        target = tmp_path / "mcp-target"
+        text, err = await call_launcher_tool(manager, "session_cd", {"session": sid, "path": str(target)})
+        assert not err and "Moved" in text and str(target.resolve()) in text, text
+        text, err = await call_launcher_tool(manager, "sessions_list", {})
+        assert not err and f"folder: {target.resolve()}" in text
+        for args, words in (({"session": sid, "path": "relative"}, "absolute"), ({"session": sid}, "path is required"),
+                            ({"session": "nope", "path": str(target)}, "Unknown session")):
+            text, err = await call_launcher_tool(manager, "session_cd", args)
+            assert err and words in text, text
+        text, err = await call_launcher_tool(manager, "session_cd", {"session": sid, "path": "default"})
+        assert not err and manager.summary(sid)["workspace"]["default"] is True, text
+        project = tmp_path / "project"
+        project.mkdir()
+        (project / "app.py").write_text("print('hi')\n", encoding="utf-8")
+        text, err = await call_launcher_tool(manager, "session_create", {"title": "P", "goal": "Improve app.py",
+                                                                         "start": False, "workspace": str(project)})
+        assert not err and "works with the files in" in text and str(project.resolve()) in text, text
+    finally:
+        await manager.shutdown()

@@ -553,13 +553,17 @@ class AgentRuntime:
     def _fixed_tokens(self) -> int:
         return estimate_tokens(self.tools) + estimate_tokens(self.system_prompt)
 
+    def _prompt_room(self) -> int:
+        """The largest prompt that fits the context limit with room for the answer (vLLM counts prompt +
+        max_tokens against the window)."""
+        limit = self._context_limit()
+        return limit - min(max(int(self.llm.profile.max_tokens or 0), 0), limit // 4)
+
     def _compaction_budget(self) -> int:
         """Prompt size that triggers a compaction: the context limit minus room for the answer and for the
         compaction request itself. When context_tokens is the model's real window (local models; vLLM counts
         prompt + max_tokens against it), the summary call must still fit, or the agent could never compact."""
-        limit = self._context_limit()
-        reserve = min(max(int(self.llm.profile.max_tokens or 0), 0), limit // 4)
-        return limit - reserve - estimate_tokens(prompts.t(self.language, "compaction_request"))
+        return self._prompt_room() - estimate_tokens(prompts.t(self.language, "compaction_request"))
 
     def _needs_compaction(self) -> bool:
         if len(self.history) < 3:
@@ -574,8 +578,13 @@ class AgentRuntime:
         if self._compaction_floor > limit * 3 // 4:
             # A fresh compaction already fills (nearly) all of the limit (system prompt + tool schemas +
             # summary): compacting again before the history grew by half a limit would only throw work away.
-            # Below that the limit holds: context_tokens may be the model's real window.
-            limit = self._compaction_floor + limit // 2
+            # While a compaction still gets under the room of the context limit, never past that room, though:
+            # context_tokens may then be the model's real window, where a larger prompt fails every request (a
+            # summary call that no longer fits there falls back to a compaction without the LLM, see _compact).
+            # A floor above the room means that context_tokens is not the real window (those requests worked).
+            room = self._prompt_room()
+            grown = self._compaction_floor + limit // 2
+            limit = grown if self._compaction_floor >= room else min(grown, room)
         return base + estimate_tokens(recent) > limit
 
     async def _compact(self) -> None:

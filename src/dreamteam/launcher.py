@@ -23,7 +23,7 @@ from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__
+from . import __version__, roles
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
 from .sessions import SessionError
@@ -285,18 +285,21 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
         if request.method == "GET":
             return JSONResponse({"sessions": manager.list()})
         body = await _json_body(request)
-        problem = _body_error(body, strings=("title", "goal", "description"), objects=("overrides",), flags=("start",))
+        problem = _body_error(body, strings=("title", "goal", "description", "workspace"), objects=("overrides",),
+                              flags=("start",))
         if problem:
             return JSONResponse({"error": problem}, status_code=400)
         try:
             summary = await manager.create(body.get("title") or "", body.get("goal") or "",
                                            body.get("description") or "", overrides=body.get("overrides") or {},
-                                           start=body.get("start") is not False)
+                                           start=body.get("start") is not False,
+                                           workspace=body.get("workspace") or None)
         except (SessionError, ValueError) as exc:
             return _error(exc)
         except Exception as exc:  # e.g. the swarm failed to start: show it in the UI
             return _failure("session create", exc)
-        return JSONResponse({"session": summary}, status_code=201)
+        result = summary.pop("workspace_result", None)
+        return JSONResponse({"session": summary, **({"result": result} if result else {})}, status_code=201)
 
     async def session_item(request: Request):
         sid = request.path_params["sid"]
@@ -313,13 +316,39 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
             if request.method == "DELETE":
                 if request.query_params.get("confirm") != sid:
                     return JSONResponse({"error": "Pass ?confirm=<session id> to delete a session."}, status_code=400)
-                await manager.delete(sid)
-                return JSONResponse({"ok": True})
+                # a folder outside the session (the user's project, or one it was moved to) is never deleted; delete
+                # names it as it was under the session's lock (a /cd of the session may have run just before)
+                kept = await manager.delete(sid)
+                return JSONResponse({"ok": True, **({"workspace_kept": kept} if kept else {})})
         except (SessionError, ValueError) as exc:
             return _error(exc)
         except Exception as exc:
             return _failure(f"session {sid} {request.method}", exc)
         return JSONResponse({"error": "Method not allowed"}, status_code=405)
+
+    async def session_workspace(request: Request):
+        """Move the session to another folder or adopt one: {"path": "<absolute>"} or {"default": true}."""
+        sid = request.path_params["sid"]
+        body = await _json_body(request)
+        problem = _body_error(body, strings=("path", "expect"), flags=("default",))
+        if problem:
+            return JSONResponse({"error": problem}, status_code=400)
+        if body.get("expect") not in (None, "moved", "adopted"):
+            return JSONResponse({"error": "\"expect\" must be \"moved\" or \"adopted\"."}, status_code=400)
+        if body.get("default") is True:
+            path = None
+        elif body.get("path"):
+            path = body["path"]
+        else:
+            return JSONResponse({"error": "Body must be {\"path\": \"<absolute folder>\"} or {\"default\": true}."},
+                                status_code=400)
+        try:
+            result = await manager.set_workspace(sid, path, expect=body.get("expect"))
+            return JSONResponse({"session": manager.summary(sid), "result": result})
+        except (SessionError, ValueError) as exc:
+            return _error(exc)
+        except Exception as exc:
+            return _failure(f"session {sid} workspace", exc)
 
     async def session_action(request: Request):
         sid, action = request.path_params["sid"], request.path_params["action"]
@@ -337,16 +366,21 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
             log.exception("session %s %s failed", sid, action)
             return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
 
+    def role_views() -> dict[str, Any]:
+        # the built-in roles (both languages) and the catalog they make with the stored [[roles]] entries
+        return {"role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(manager.config.roles)}
+
     async def settings(request: Request):
         if request.method == "GET":
-            return JSONResponse({"settings": manager.settings_view(), "providers": PROVIDER_CHOICES,
+            view = manager.settings_view()  # first: it picks up a hand-edited file into manager.config
+            return JSONResponse({"settings": view, "providers": PROVIDER_CHOICES, **role_views(),
                                  "path": str(settings_path(manager.home)), "home": str(manager.home)})
         body = await _json_body(request)
         update = body.get("settings") if isinstance(body, dict) else None
         if not isinstance(update, dict):
             return JSONResponse({"error": "Body must be {\"settings\": {...}}."}, status_code=400)
         try:
-            return JSONResponse(await manager.update_settings(update))
+            return JSONResponse({**await manager.update_settings(update), **role_views()})
         except (SessionError, ValueError) as exc:
             return _error(exc)
         except Exception as exc:  # e.g. the settings file is locked by an editor
@@ -407,6 +441,7 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
         Route("/api/hub", hub_info),
         Route("/api/sessions", sessions, methods=["GET", "POST"]),
         Route("/api/sessions/{sid}", session_item, methods=["GET", "PATCH", "DELETE"]),
+        Route("/api/sessions/{sid}/workspace", session_workspace, methods=["POST"]),
         Route("/api/sessions/{sid}/{action}", session_action, methods=["POST"]),
         Route("/api/settings", settings, methods=["GET", "PUT"]),
         Route("/api/settings/check", settings_check, methods=["POST"]),

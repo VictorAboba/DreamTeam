@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..shell import resolve_shell, run_shell, scrubbed_env
+from ..workspace import agent_git_env, scratch_rel
 from . import ToolContext, tool
 
 _PATH = {"type": "string", "description": "Path relative to the workspace root, e.g. src/app.py"}
@@ -109,7 +110,12 @@ async def shell(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
     cfg = swarm.config.shell
     timeout = min(max(args.get("timeout") or cfg.timeout, 1), cfg.max_timeout)
-    env = scrubbed_env(swarm.config, {"DREAMTEAM_AGENT": ctx.actor, "DREAMTEAM_WORKSPACE": str(swarm.workspace.root)})
+    swarm.workspace.ensure_scratch(ctx.actor)  # .scratch/<slug>/ exists for redirects like `> .scratch/...`
+    root = swarm.workspace.root
+    # git in the shell: the workspace repository (GIT_DIR & co. dropped) and the member as author and committer
+    env = agent_git_env(scrubbed_env(swarm.config, {"DREAMTEAM_AGENT": ctx.actor, "DREAMTEAM_WORKSPACE": str(root),
+                                                    "DREAMTEAM_SCRATCH": str(root / scratch_rel(ctx.actor))}),
+                        ctx.actor)
     code, output = await run_shell(
         args["command"], cwd=swarm.workspace.root, timeout=timeout, program=cfg.program,
         env=env, max_output=ctx.output_cap,

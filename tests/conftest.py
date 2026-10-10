@@ -16,6 +16,7 @@ from dreamteam.board import Board
 from dreamteam.config import Config
 from dreamteam.db import Database, dumps, loads
 from dreamteam.events import EventBus
+from dreamteam.goal_text import split_goal
 from dreamteam.models import USER, AgentKind, AgentStatus, ToolError
 from dreamteam.swarm import QUIET_KEY, resolve_member_in
 
@@ -118,11 +119,11 @@ class FakeSwarm:
         return self.db.get("goal")
 
     def set_goal(self, actor: str, title: str, description: str = "") -> dict:
-        # validates and plans like Swarm.set_goal (no agents are kicked off: there are no runtimes)
-        title = (title or "").strip()
+        # validates, splits and plans like Swarm.set_goal (no agents are kicked off: there are no runtimes)
+        title, description = split_goal(title, description)
         if not title:
             raise ToolError("The goal title is empty.")
-        goal = {"title": title, "description": (description or "").strip(), "status": "active", "summary": "",
+        goal = {"title": title, "description": description, "status": "active", "summary": "",
                 "set_by": actor, "updated_at": time.time()}
         self.db.set("goal", goal)
         self.bus.emit("goal.set", actor, goal=goal)

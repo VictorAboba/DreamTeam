@@ -32,7 +32,10 @@ src/dreamteam/
   events.py      EventBus                                            (exists)
   names.py       generate_name                                       (exists)
   prompts.py     system_prompt(), t(), PLANNING_TASK, DEFAULT_ROLE   (exists)
-  board.py       Board          — tasks, goal field, discussion
+  roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team (§17.3); imports nothing
+                 from the package
+  goal_text.py   split_goal, shorten_title: a goal typed as one text -> title + description (§3)
+  board.py       Board          — tasks, goal field, discussion, independent review (§4)
   mailbox.py     Mailbox        — direct messages
   workspace.py   Workspace      — shared files, git, locks
   shell.py       run_shell, scrubbed_env
@@ -69,8 +72,11 @@ tests/  conftest.py (FakeSwarm fixture) + test_*.py
 A **home** (launcher, §17–18; `~/DreamTeam` by default) on disk:
 ```
 <home>/dreamteam.toml               global settings (§17.1); dreamteam.toml.bak = the previous version
-<home>/sessions/<id>/session.json   {"title", "created_at", "overrides", "autostart", "pending_goal"?}
-<home>/sessions/<id>/workspace/     the session's shared files
+<home>/sessions/<id>/session.json   {"title", "created_at", "overrides", "autostart", "pending_goal"?,
+                                     "workspace"?: {"path", "adopted", "in_home"?}, "workspace_notice"?} (§17.2)
+<home>/sessions/<id>/workspace/     the session's shared files (unless "workspace" names another folder)
+<home>/sessions/<id>/.dreamteam/workspace-move.json  only while a workspace move runs, or after one whose
+                                    undo failed (§17.2 "Workspace folder")
 <home>/sessions/<id>/.dreamteam/    the session's swarm.db and logs/ (a project directory as below)
 <home>/sessions/.deleted-<id>-<ns>/ a session being deleted (renamed away first, then removed)
 <home>/.dreamteam/hub.json          the running launcher (same format as below; "project" = the home)
@@ -83,6 +89,7 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 ```
 <project>/dreamteam.toml
 <project>/workspace/            shared files (git repo), workspace/mcp/<name>/server.py
+<project>/workspace/.scratch/<slug>/  each member's temporary files, never committed (§7 "Scratch folder")
 <project>/.dreamteam/swarm.db   sqlite
 <project>/.dreamteam/hub.json   {"base_url": "...", "mcp_url": "...", "pid": 123, "project": "<abs path>"}
                                 written once the server listens; other commands trust it only if GET /api/hub
@@ -94,11 +101,14 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 
 * `tasks`: id, title, **goal** (why the task exists / success criterion), description, status,
   assignee, reviewer, created_by, parent_id, depends_on (json int list), priority (0 low,1 normal,
-  2 high,3 critical), tags (json str list), result, created_at, updated_at.
+  2 high,3 critical), tags (json str list), result, created_at, updated_at. A task in `review` keeps its
+  executor as `assignee` (NULL only when the executor left the swarm, §4.1); there is no
+  separate executor column.
 * `comments`: the per-task **discussion**: id, task_id, author, text, reply_to (comment id | null), ts.
-* `agents`: name, kind (`llm`|`external`), role, instructions, model (profile name), language,
-  status (`idle`|`working`|`paused`|`error`|`retired`), hired_by, created_at, last_active,
-  cost_usd, tokens_in, tokens_out, notes, system_prompt (frozen at creation), context_tokens.
+* `agents`: name, kind (`llm`|`external`), role (a catalog role by its canonical name in the member's language,
+  §17.3), instructions (the hirer's own; a catalog role's instructions are only in the system prompt), model
+  (profile name), language, status (`idle`|`working`|`paused`|`error`|`retired`), hired_by, created_at,
+  last_active, cost_usd, tokens_in, tokens_out, notes, system_prompt (frozen at creation), context_tokens.
 * `history`: agent, seq, msg (json neutral message, §6.1) — append-only per agent except compaction.
 * `messages` + `inbox(message_id, recipient, read_at)`.
 * `notifications`: id, ts, recipient, kind (prompt key), text (rendered), data (json), delivered_at.
@@ -125,10 +135,14 @@ class Swarm:
                  llm_factory: Callable[[ModelProfile, str], LLMClient] | None = None): ...
         # a failure after the database was opened (a corrupt swarm.db...) closes it before re-raising
     async def start(self, run_agents: bool = True) -> None
-        # tracer.recover() and prune first (§16.1); LLM agents with open tasks (goal active) or whose last
-        # activation was cut short (the stored history ends mid-activation) get `n_restart`; hire() respects run_agents
+        # tracer.recover() and prune first (§16.1); the very first start creates the starting team:
+        # roles.starting_team(swarm.starting_roles, swarm.start_agents), member i gets starting_roles[i], the rest
+        # (and blank entries) are generalists (§17.3); LLM agents with open tasks, reviews waiting for them or
+        # pending events (goal active), or whose last activation was cut short (the stored history ends
+        # mid-activation), get `n_restart`; hire() respects run_agents
     async def stop(self) -> None
-        # wakes every wait_signal() waiter (stopping=True), closes external trace sessions, stops the runtimes
+        # wakes every wait_signal() waiter (stopping=True), closes external trace sessions, stops the runtimes,
+        # then waits for git commands still running in threads (workspace.settle(), §7)
     def close(self) -> None                              # closes the database
     def reconfigure(self, config: Config) -> None        # hot-apply new settings (§16.1)
 
@@ -162,7 +176,14 @@ class Swarm:
     # goal
     def goal(self) -> dict | None
     def set_goal(self, actor: str, title: str, description: str = "") -> dict
-        # empty title -> ToolError; an empty board gets a planning task; agents are kicked off staggered
+        # every goal comes through here (the set_goal tool, a session's pending goal, swarm.goal of
+        # dreamteam.toml, `run --goal`): title/description pass through goal_text.split_goal (the first
+        # non-empty line is the title, at most 200 chars; the other lines open the description, followed by
+        # `description`; an empty title takes the text from the description), and the goal dict stores the split
+        # values, so the goal line of every wake-up is one line; empty title -> ToolError("The goal title is
+        # empty."); an empty board gets a planning task (PLANNING_TASK, body = its text + title + description);
+        # agents are kicked off staggered: `n_kickoff` {by, title, description, team, task_id, task_title}, with
+        # team = "Name — Role; ..." of all members, or `n_goal_updated` when the board was not empty
     def complete_goal(self, actor: str, summary: str) -> dict
         # ToolError when there is no goal, it is already done, or the summary is empty; notifies USER u_goal_done
     def reopen_goal(self, actor: str, comment: str = "") -> dict
@@ -172,6 +193,17 @@ class Swarm:
     # team
     async def hire(self, by: str, role: str, instructions: str = "", model: str | None = None,
                    name: str | None = None, language: str | None = None, kind: str = "llm") -> str
+        # the role is resolved in the role catalog (roles.find_role, §17.3) in the member's language: a catalog
+        # role is stored by its canonical name ("tester" -> "Tester" / «Тестировщик») and brings its description,
+        # instructions and model profile; any other name is a new role that only `instructions` describe.
+        # Model profile: explicit `model` (unknown -> ToolError) > the role's `model` (a profile missing from
+        # the settings logs a warning and falls back) > agents.default_model. The frozen system prompt
+        # (LLM members only) is prompts.system_prompt(language, name, swarm, role, role_description,
+        # instructions, shell, scratch, max_agents): role_description = the catalog description, instructions =
+        # the catalog's then the hirer's (blank line between), scratch = workspace.scratch_rel(name) (§7). The
+        # agents row keeps only the hirer's instructions. u_member_joined (quiet, when `by` is not USER) and
+        # n_hired carry the canonical role. The tool's guard (a new role needs instructions) is in `hire_agent`
+        # (§12), not here: the starting team and programmatic hires need none
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
 
     # budget / control
@@ -183,27 +215,39 @@ class Swarm:
     paused: bool; pause_reason: str
     def pause(self, actor: str, reason: str) -> None
     def resume(self, actor: str) -> None
-        # n_resumed to LLM agents with open tasks, pending events or an activation the pause cut short
-        # (runtime.interrupted); a reply owed to the user by that activation is still forwarded
+        # n_resumed to LLM agents with open tasks, reviews waiting for them, pending events or an activation the
+        # pause cut short (runtime.interrupted); a reply owed to the user by that activation is still forwarded
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient
         # a member's profile (agents.model) that no longer exists in the settings (renamed or deleted) falls back
         # to the default profile with a warning, instead of crashing that agent at every activation
     def snapshot(self) -> dict                           # §14.1
+    def workspace_info(self) -> dict                     # {"path", "default", "adopted", "exists"} (§14.1, §17.2)
 ```
 
 Tests use `tests/conftest.py::FakeSwarm`, which implements the subset: `config, db, bus, language,
 member, members, is_member, kind_of, resolve_member, language_of, notify, signal, has_pending,
 board, mail, workspace, triggers, goal, set_goal, complete_goal` (attributes may be None until a test
 wires them), and records notifications in `fake.notified: list[tuple[recipient, key, kw]]`. Its
-resolve_member is the real `resolve_member_in`; set_goal / complete_goal validate and notify like the
-real ones (the planning task is created when a real Board is wired).
+resolve_member is the real `resolve_member_in`; set_goal / complete_goal validate, split the goal and notify
+like the real ones (the planning task is created when a real Board is wired).
 
 Scheduler (every 3 s): expires file locks, prunes old traces (every 6 h) and closes idle external trace
-sessions (§16); unless paused, offers ready unassigned tasks to idle LLM agents (`n_ready`), never more agents considering offers than there are ready tasks, and the kickoff
-counts as everyone's offer of the planning task; wakes once (`n_stalled`) an idle agent whose
-activation ended with plain text while holding in_progress tasks even after the nudge (§6.2); sends
-`n_all_done` to one idle agent when every task is finished but the goal is open. `reconfigure()` applies
-new settings to a running swarm, lifts a budget pause the new budget allows and retries agents in ERROR.
+sessions (§16); unless paused, in this order:
+1. `_nudge_idle`: offers ready unassigned tasks to idle LLM agents (`n_ready`), never more agents considering
+   offers than there are ready tasks, and the kickoff counts as everyone's offer of the planning task; with
+   independent review on, a member with reviews waiting for it is not offered more work (it is reminded of them
+   instead);
+2. `_wake_stalled`: wakes once (`n_stalled`) an idle agent whose activation ended with plain text while holding
+   in_progress tasks even after the nudge (§6.2);
+3. `_remind_reviewers` (independent review only): review reminder and hand-over (§4.1 "Liveness");
+4. `_check_all_done`: sends `n_all_done` to one idle agent when every task is finished but the goal is open
+   (`review` is an open status, so it waits for every review);
+5. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
+   (§4.1 "Liveness").
+
+`reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
+agents in ERROR; a changed role catalog (§17.3) and `[swarm] independent_review` apply at once (new hires use the
+new catalog; existing members keep their frozen prompts).
 
 ## 4. Board (board.py)
 
@@ -233,11 +277,21 @@ class Board:
     def participants(self, task_id: int) -> set[str]   # creator, assignee, reviewer, posters (no USER filtering)
     def ready_unassigned(self) -> list[Task]           # todo, no assignee, no blockers
     def open_tasks_of(self, name: str) -> list[Task]   # assignee == name and status open
-    def release_all(self, name: str, actor: str) -> list[int]   # open tasks of name -> todo, assignee None
-        # (their ids are returned); open tasks name was to review lose the reviewer, and one in `review`
-        # goes back to in_progress (todo without assignee) with `n_reviewer_left` {reviewer} to its assignee
+    def release_all(self, name: str, actor: str) -> list[int]   # name leaves; see §4.1
+        # independent review off: open tasks of name -> todo, assignee None (their ids are returned); open tasks
+        # name was to review lose the reviewer, and one in `review` goes back to in_progress (todo without
+        # assignee) with `n_reviewer_left` {reviewer} to its assignee
     def counts(self) -> dict[str, int]                 # per status
+
+    # independent review (below)
+    independent_review: bool                           # property: [swarm] independent_review, read on every call
+    def reviews_of(self, name: str) -> list[Task]      # status review and reviewer == name; priority desc, id asc
+    def pick_reviewer(self, task: Task, exclude: Iterable[str] = ()) -> str   # a member name or USER
+    def hand_over_review(self, task_id: int, exclude: Iterable[str]) -> Task | None
+        # the reviewer did not review: the next pick (excluding `exclude` and the current reviewer), else USER;
+        # None when the task is no longer in review
 ```
+`Task.short()` (board listings, wake-ups) shows `review:<reviewer>` after `@assignee` while the task is in review.
 
 Rules (USER may do anything; "member" = agent of any kind):
 * `create`: title non-empty (<= 200 chars). `assignee`/`reviewer` resolved via `swarm.resolve_member`
@@ -252,19 +306,30 @@ Rules (USER may do anything; "member" = agent of any kind):
   and removed assignee `n_unassigned` (never notify the actor themself).
   status transitions for members: assignee may set `in_progress` (only without blockers), `waiting`,
   `todo` (= release: assignee cleared), `failed`; creator or assignee may set `cancelled`; creator may
-  reopen a terminal task to `todo`. `done`/`review` only via `complete`/`review` (USER may set `done`).
+  reopen a terminal task to `todo`. `done`/`review` only via `complete`/`review` (USER may set `done`; on a
+  task in review that is an approval: the assignee gets `n_review_approved` with comment "").
+  The review fields (`assignee` and `reviewer` of a task in review, a reviewer equal to the assignee) follow
+  §4.1 below.
 * `complete`: actor must be the assignee (or USER); status must be open and not `review`.
-  result non-empty. If reviewer set and reviewer != actor → status `review`, notify reviewer
-  `n_review_requested`; else `done`.
-* `review`: actor is reviewer (or USER), status `review`. approve → `done`, notify assignee
-  `n_review_approved`; reject → `in_progress` (or `todo` when the task has no assignee), notify assignee
-  `n_review_rejected`. A non-empty comment is validated first and also posted to the discussion.
-  Changing the reviewer of a task in review notifies the new reviewer (`n_review_requested`).
+  result non-empty. With independent review on, an agent's completion always goes to `review` (reviewer
+  chosen below). Otherwise (switch off, or USER completes): if reviewer set and reviewer != actor → status
+  `review`, else `done`. A task entering review notifies its reviewer: `n_review_requested` {by, id, title},
+  or USER `u_review_requested` / `u_review_fallback` (below).
+* `review`: actor is reviewer (or USER), status `review`. approve → `done`, the assignee gets
+  `n_review_approved`, which wakes it (`task_complete` told it that it will be told the verdict, so an
+  executor that ended its turn with `wait` waits for exactly this); reject → `in_progress` (or `todo` when the task has no assignee), the
+  assignee gets `n_review_rejected` (wakes it: it must fix the work). A non-empty comment is validated first and
+  also posted to the discussion (the assignee is skipped there: the notification carries it). When someone
+  other than the reviewer settles it (USER), the reviewer gets a quiet `n_review_cancelled` {by, id, title}.
+  Changing the reviewer of a task in review (`update`) notifies the new reviewer (`n_review_requested`, or
+  USER `u_review_requested` when the actor is not USER) and the old one quietly (`n_review_cancelled`).
 * Side effects whenever a task becomes `done`: each open task that depends on it and now has no
   blockers → notify its assignee `n_unblocked` (if assignee and != actor). Whenever a task becomes
   terminal: notify creator `n_task_closed` (if creator is a member, != actor); it wakes the creator only
-  when the task failed / was cancelled or the creator has a `waiting` task, otherwise wake=False. USER is never notified
-  about tasks (the UI shows them) except via discussion mentions/posts.
+  when the task failed / was cancelled or the creator has a `waiting` task, otherwise wake=False. Task
+  notifications go to active members only (never the actor). USER is not notified about tasks (the UI shows them)
+  except via discussion mentions/posts and about the reviews it owns (`u_review_requested`, `u_review_fallback`,
+  `u_review_handed_over`, `u_reviews_waiting`, below).
 * `post` (discussion): text non-empty (<= 20000 chars); reply_to must be a post of the same task.
   Recipients = participants ∪ {members mentioned as `@Full Name` (case-insensitive, match against
   member names)} − {actor}. Mentioned members get `n_mention`, other recipients `n_discussion`.
@@ -272,6 +337,105 @@ Rules (USER may do anything; "member" = agent of any kind):
   Emits `task.comment` {task_id, post}. Text in notifications truncated to 1500 chars.
 * Events: `task.created` {task}, `task.updated` {task, changes: {field: [old, new]}}, `task.comment`.
   `task` payloads are `Task.to_dict()`.
+
+### 4.1 Independent review
+
+With `[swarm] independent_review = true` (the default, §17.1) an agent never approves work it executed. The
+**executor** of a task in `review` is its `assignee`: agents cannot change the assignee of a task in review (R2),
+so it is the member that called `task_complete`; it is NULL only when the executor left the swarm. The creator
+(e.g. the planner) may review, but members who neither created nor executed the task are preferred, and the user
+reviews when no other member can. `false` keeps the legacy rules above (a task without a reviewer is done at once).
+`Board.independent_review` reads `swarm.config.swarm.independent_review` on every call, so `reconfigure()` and
+session overrides apply at once; turning it off leaves tasks already in review alone (their reviewers still review
+them). Tool descriptions and system prompts are mode-neutral (§12 R0), so no frozen prompt or tools array depends on
+the switch. A resumed session follows the current setting too: its existing members' completions go to review, and
+the tool results and notifications explain it.
+
+- **Valid reviewer** of a task: not None, not its assignee, and USER or an active member (an external member only
+  when designated explicitly).
+- **Reviewer selection** `pick_reviewer(task, exclude=())`: the pool is the active LLM members other than
+  `task.assignee` and `exclude` (external members are never picked: they may be offline). The first by the key
+  `(is the task's creator, role rank: 0 for the catalog's reviewer role (roles.role_key == "reviewer",
+  «Ревьюер»/Reviewer) else 1, status rank: idle 0 / working 1 / other 2, open tasks held + reviews pending,
+  name)`; USER when the pool is empty. So the creator reviews only when no third member exists (in a two-agent
+  team the planner reviews the other agent's tasks); testers are not preferred (their own test tasks would starve).
+- **Operations** (the last column: the switch off):
+
+  | operation | independent review on | off |
+  |---|---|---|
+  | `create(..., assignee, reviewer)` | reviewer == assignee != USER → R1 | unchanged |
+  | `claim` by the designated reviewer | the claim also clears the reviewer (same mutation; another one is picked at completion; the tool result says so) | unchanged |
+  | `update` reviewer | a reviewer equal to the (new) assignee, not USER → R1; in review: clearing it → R3, another valid reviewer is notified and the old one quietly cancelled | no R1 / R3; the notifications as on |
+  | `update` assignee | in review: an agent → R2; USER may (reassigning to the reviewer re-picks the reviewer, excluding the new and the old assignee); not in review: a new assignee equal to the reviewer clears the reviewer | unchanged |
+  | `update(USER, status=done)` in review | done; `n_review_approved` (comment "") to the assignee, quiet `n_review_cancelled` to the reviewer | same |
+  | `complete` by an agent | always `review`: reviewer = the task's own if valid, else `pick_reviewer(task)` | `review` only with a reviewer other than the actor, else `done` |
+  | `complete` by USER | as with the switch off | — |
+  | `review` by an agent | the task's assignee → R4 (checked before "only the reviewer", also for a row written while the switch was off with reviewer == assignee) | no R4 |
+  | `release_all(name)` | name's tasks in review: assignee NULL, they stay in review and are not in the returned ids (a reviewer equal to name, a legacy row, is re-picked); name's other open tasks: `todo`, unassigned (returned). Reviews name was to do: re-picked with `exclude={name}`, the new reviewer is notified (by = the executor, else the actor); open tasks not in review just lose the reviewer. No `n_reviewer_left` | as in the method comment above |
+
+  A task in review whose executor left is approved or returned as usual; a return makes it `todo` (claimable). The
+  executor can still withdraw its work while it waits (`task_update status=in_progress|todo|failed|cancelled`,
+  allowed for the holder): the reviewer's review is then cancelled quietly.
+- **Error texts** (English, like all board errors):
+  - R1: `"{reviewer} is the assignee of task #{id}: a task is reviewed by someone other than its assignee. Choose
+    another member or 'user', or leave the reviewer empty (a reviewer is picked when the task is completed)."`
+    (`create` says "the task");
+  - R2: `"Task #{id} is waiting for review, so its assignee cannot change now: the reviewer approves it or returns
+    it to {assignee or 'the board'}."`;
+  - R3: `"Task #{id} is waiting for review, so it needs a reviewer: pass another member or 'user' instead of
+    clearing it."`;
+  - R4: `"You are the assignee of task #{id}: your own work is reviewed by someone else ({reviewer or 'the
+    user'}). Wait for the verdict; you will be notified."` ("the user" also when the stored reviewer is the
+    actor itself).
+- **Notifications** (texts in prompts.py, ru/en; "quiet" = `wake=False`, §3 `notify`):
+
+  | when | to | key {placeholders} | wakes |
+  |---|---|---|---|
+  | a task enters review, or gets a new reviewer while in review; the reviewer is a member | the reviewer (never the actor) | `n_review_requested` {by, id, title} | yes |
+  | same; the reviewer is USER, set explicitly (or kept from the task) | USER (unless USER is the actor) | `u_review_requested` {by, id, title} | yes |
+  | same; the board chose USER because nobody else qualifies (a pick at `complete`, a re-pick in `release_all` while the executor is still a member) | USER | `u_review_fallback` {by, id, title} | yes |
+  | same; the board chose USER at a hand-over, or at a re-pick in `release_all` when the executor has left too | USER | `u_review_handed_over` {id, title, reviewer} (`reviewer`: the member the review was taken from) | yes |
+  | the review a member was asked for is settled or moved by someone else, or the task left review | the old reviewer | `n_review_cancelled` {by, id, title} | no |
+  | a review handed over (Liveness) | the old reviewer | `n_review_reassigned` {id, title, reviewer} | no |
+  | an idle reviewer's reviews wait (Liveness) | the reviewer | `n_review_reminder` {tasks} | yes |
+  | only the user's reviews keep the swarm going (Liveness) | USER | `u_reviews_waiting` {tasks} | yes |
+  | approved (`task_review`, or USER sets `done`) | the assignee | `n_review_approved` {by, id, title, comment} | yes |
+  | returned | the assignee | `n_review_rejected` {by, id, title, comment} | yes |
+  | switch off: the reviewer left | the assignee | `n_reviewer_left` {id, title, reviewer} | yes |
+
+  `by` of a review request is the actor; for a re-pick or a hand-over it is the executor, or, when the executor
+  has left, the member the review was taken from (never USER: the user did not send it).
+- **Liveness** (scheduler, §3):
+  - The wake-up text lists the reviews waiting for the member (`my_reviews`, §6.3); `start()` and `resume()` wake a
+    member whose only pending work is a review; with the switch on, an idle member with reviews is not offered
+    ready tasks.
+  - `_remind_reviewers` (switch on): a member's reviews are *due* when their task was last updated at least
+    `agents.idle_nudge_seconds` ago. An idle LLM member (status idle, a runtime, nothing pending) gets
+    `n_review_reminder` once per set of due task ids. When the same set is still due `idle_nudge_seconds` after
+    the reminder and the member is idle, or `2 × idle_nudge_seconds` after the set became due while the member is
+    in `error` (no reminder: it cannot act), every due review is handed over:
+    `Board.hand_over_review(task_id, exclude=lapsed)`, `lapsed` being every member the task's review was already
+    taken from (kept in memory while the task is in review, `Swarm._review_lapsed`). A review therefore never
+    returns to a member it was taken from, and goes to the user once every agent let it lapse; a stalled set costs
+    at most a reminder and a hand-over. A working member is neither reminded nor handed over.
+  - `hand_over_review(task_id, exclude)`: reviewer = `pick_reviewer(task, exclude={*exclude, current reviewer})`,
+    else USER; `task.updated` with actor None (scheduler-driven); the new reviewer is asked (`n_review_requested`
+    by the executor, else by the old reviewer) or USER gets `u_review_handed_over` (the old reviewer did not review
+    it and no other agent can take it over); the old reviewer gets the quiet `n_review_reassigned`.
+  - `_remind_user_reviews` (both modes): the goal is active, at least one task waits for USER's review, no LLM
+    member is working or has pending events, no `todo` task is actionable (not blocked and not assigned to USER),
+    no task is `in_progress` and no review waits for anyone but USER → USER gets `u_reviews_waiting` {tasks:
+    "#3, #5"} once per set of such tasks. Blocked `todo` tasks (the tests of an implementation that waits for the
+    user) do not suppress it. The user never answering only leaves the session idle (no cost).
+  - Goal completion: `review` is an open status, so `n_all_done` waits for every review, and `goal_complete`
+    (§12) is refused while any task is in review (switch on).
+  - The planning task is reviewed like any task; in a one-agent team that asks the user to approve the plan, which
+    blocks nothing (no task depends on it).
+  - Known limitation: an explicitly designated external (MCP) reviewer that went offline is neither reminded nor
+    handed over (only LLM members are); the user can approve or return the task, or name another reviewer.
+- **The user** can always approve or return a task in review (`task_review` as USER; the web card, `/approve N
+  [comment]` and `/reject N what to fix` in the TUI and the console) or set it `done` (`task_update`); print mode
+  (`-p`) approves the user's reviews itself while auto-replies are on (docs/TUI.md).
 
 ## 5. Mailbox (mailbox.py)
 
@@ -313,7 +477,8 @@ at most 40000 chars, never an earlier summary). The old history is archived for 
 transaction. Without a usable LLM summary (a context-overflow error or another non-retryable 400 for
 the compaction request, or an overflow of the main call) the agent compacts without the LLM: notes +
 a digest of its latest steps + the kept texts. The system prompt is frozen in `agents.system_prompt` at
-creation; the tool list for an agent kind is constant (agent-built MCP tools go through `mcp_call`).
+creation; the tool list for an agent kind is constant (agent-built MCP tools go through `mcp_call`), and so are
+the tools' schemas (§12 R0). New rules reach existing members only through tool results and notifications.
 
 ### 6.2 Loop
 ```python
@@ -334,7 +499,10 @@ class AgentRuntime:
   limit (`profile.context_tokens` or `agents.context_tokens`) − min(max_tokens, limit/4) − the
   compaction request, so the summary call still fits when the limit is the model's real window; when a
   fresh compaction already fills more than 3/4 of the budget, the next one waits until the history grew
-  by half a budget (no thrashing). Then `async with
+  by half a budget (no thrashing), but, while a fresh compaction still gets under the limit − min(max_tokens,
+  limit/4), never past that (the window may be real: a larger prompt would fail every request; a summary call
+  that no longer fits there falls back to the compaction without the LLM; a compaction above it means the limit
+  is not the real window). Then `async with
   swarm.llm_semaphore: llm.complete(system, history, tools)`, record usage, append assistant message,
   emit `agent.activity` events (thinking summary / text / tool call / tool result, truncated 2000
   chars), execute tool calls sequentially via `tools.call_tool`, append results; after tools, if
@@ -361,8 +529,9 @@ class AgentRuntime:
 ### 6.3 Wake-up text (render_wake)
 `wake_header` (or `incoming_header`), `reasons:` then one bullet per undelivered notification text and
 per unread message (`msg` template, recipients list with the agent shown as `you`), then (not for
-incoming) goal line, `my_tasks`, `ready` (up to 8), notes: in full only when they changed since they
-were last put into the agent's context (a wake-up or a compaction; once more after a restart),
+incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, `my_reviews` (only when
+tasks wait for its review: `#id title (assignee or -)`), `ready` (up to 8), notes: in full only when they changed
+since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
 otherwise the one-line `notes_unchanged`, since the history is append-only.
 
 ## 7. Workspace (workspace.py) and shell (shell.py)
@@ -371,14 +540,23 @@ otherwise the one-line `notes_unchanged`, since the history is append-only.
 class Workspace:
     root: Path                                   # config.workspace_dir
     def __init__(self, swarm): ...
-    async def init(self) -> None                 # mkdir; if git enabled+available: init repo, .gitignore, initial commit
+    async def init(self) -> None                 # mkdir; ensure_scratch() (with or without git); if git
+                                                 # enabled+available: init repo, .gitignore, initial commit
+    def ensure_scratch(self, actor: str | None = None) -> None
+        # `.scratch/` with its marker `.scratch/.gitignore` (rewritten when missing or changed) and, for `actor`,
+        # the member's folder scratch_rel(actor); synchronous, best effort (an OSError is logged); a `.scratch`
+        # that is a file or a link/junction resolving elsewhere is left alone, and a marker that is a link is
+        # never written through
     def resolve(self, path: str) -> Path         # inside root (no escape, no .git); ToolError otherwise
     def rel(self, p: Path) -> str                # posix relative path
     def read(self, path: str, offset: int = 1, limit: int = 400) -> str   # lines offset..offset+limit-1, header "[path: lines a-b of N]"; binary -> ToolError
     async def write(self, actor: str, path: str, content: str) -> str
     async def edit(self, actor: str, path: str, old: str, new: str, replace_all: bool = False) -> str
         # old must occur exactly once unless replace_all; ToolError with hints otherwise
-    def list(self, path: str = ".", depth: int = 2) -> str   # tree text, dirs end with "/", skips .git, sizes
+    def list(self, path: str = ".", depth: int = 2) -> str   # tree text, dirs end with "/", skips .git, sizes;
+        # folders named `.scratch` are shown collapsed like the NO_EXPAND ones (".scratch/ (2 entries)"), so the
+        # agents' temporary files do not inflate every listing; list(".scratch/<slug>") lists them; tree() (the
+        # web file tree) shows them
     def tree(self, path: str = ".", depth: int = 4) -> list[dict]   # for the web UI: [{"path","type","size","mtime"}]
     def read_raw(self, path: str, max_bytes: int = 2_000_000) -> tuple[str, bool]  # (text, truncated) for UI
     def lock(self, actor: str, path: str, minutes: float | None = None) -> str
@@ -387,14 +565,107 @@ class Workspace:
     def check_writable(self, actor: str, path: str) -> None
     def release_all(self, actor: str) -> int
     def expire_locks(self) -> int
-    async def autocommit(self, actor: str, message: str) -> str | None   # commit hash or None; author = actor
+    async def autocommit(self, actor: str, message: str) -> str | None
+        # commits everything except `.scratch/` as `actor`; commit hash or None (nothing outside .scratch changed)
     def mtime(self, path: str) -> float | None
     def exists(self, path: str) -> bool
 ```
 Writes/edits check locks, create parent dirs, write UTF-8, emit `file.changed` {path, op} (the actor is
-the event's top-level `actor`), then commit that path. Lock events: `file.locked` {path, owner, expires_at,
-refreshed}, `file.unlocked` {path, owner, forced} or {path, owner, expired: true}. `init()` also writes
-repo-local git settings (core.autocrlf=false, a default identity) so agents can run git themselves.
+the event's top-level `actor`), then commit that path; a path under `.scratch/` is written and emits
+`file.changed` but is never committed, and the result says so (`Created .scratch/anna.smith/c.py (1 line, 9 B)
+(in .scratch/: not committed).`). Lock events: `file.locked` {path, owner, expires_at, refreshed},
+`file.unlocked` {path, owner, forced} or {path, owner, expired: true}. Unless the folder is adopted (below),
+`init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false and a
+default identity), so that git commands run from the shell behave like the autocommits (line endings, no
+signing); an agent's own commits carry its identity from the shell environment (`agent_git_env`, below).
+
+The whole-tree autocommit (after every `shell` call): `ensure_scratch()` (an agent may have deleted the marker),
+`git status --porcelain -z` (`porcelain_entries`), `git reset -q -- .scratch` when something under `.scratch/` is
+staged (a manual `git add -f`; it only resets index entries to HEAD), nothing more when nothing outside `.scratch/`
+changed, else `git add -A --ignore-errors -- . :(exclude).scratch` (with pathspec magic, `literal=False`) and a
+commit of the index without a pathspec (a merge an agent left in progress concludes as before). Path commits of
+`write`/`edit` keep literal pathspecs (`-- rel`).
+
+#### Scratch folder
+Agents put temporary files (experiments, check scripts, test output, downloads) into **`.scratch/`** at the
+workspace root, each in a folder of its own, `scratch_rel(name)` = `.scratch/<email_slug(name)>/` (e.g.
+`.scratch/anna.smirnova/`; members work in parallel). Its path is in a new member's system prompt (`{scratch}`,
+§3 `hire`) and in the `shell` environment (`DREAMTEAM_SCRATCH`). Nothing under `.scratch/` is ever committed, by
+three independent layers:
+
+| layer | what | where it applies |
+|---|---|---|
+| A. self-ignoring marker | `.scratch/.gitignore` = `SCRATCH_GITIGNORE` (a comment and `*`: git ignores the folder, the marker included), written by `ensure_scratch` | every workspace: a repository DreamTeam created, an adopted repository of the user, a folder without git |
+| B. autocommit exclusion | the whole-tree autocommit stages `-- . :(exclude).scratch` and resets anything staged under `.scratch/`; path commits of a path under `.scratch/` are skipped (and `ensure_scratch` runs, so a marker overwritten by `write_file` / `edit_file` is put back at once) | every repository; holds even without the marker or when `.scratch` is a file or a link |
+| C. `DEFAULT_GITIGNORE` | the root `.gitignore` that `init_repo` writes has the line `.scratch/` | only repositories whose `.gitignore` DreamTeam created |
+
+| workspace | `.scratch/` + marker | root `.gitignore` | repository config |
+|---|---|---|---|
+| new session folder (`init_repo` by DreamTeam) | created at `init()` | DreamTeam's, with `.scratch/` | `_configure_repo` |
+| workspace created before `.scratch/` existed | created at the next `init()` | unchanged (the marker covers it) | `_configure_repo`, as before |
+| adopted repository of the user | created at `init()` (untracked, self-ignored: `git status` stays clean, so a later adopt or start check does not see it) | never touched | never touched |
+| adopted folder without a repository | created at `init()` | written by `init_repo` only when missing | never touched |
+| `workspace.git = false` or no git | created (harmless) | none | none |
+
+Edge cases: `.scratch/` is never emptied by DreamTeam (the user can inspect it); a move with `/cd` carries it
+along, leaving an adopted folder leaves it there, deleting a session deletes it only with the session's own
+folder. Something an agent commits by hand stays in history; a file under `.scratch/` that the user's repository
+already tracks stays tracked, and the agents' changes to it are never autocommitted (known limitation). The
+start check of an adopted repository (§17.2) leaves `.scratch/` out like the session's own `mcp/<name>` folders:
+a marker an agent removed in its last command (`?? .scratch/`) does not refuse the start, which writes it again.
+`.scratch2` and the like are ordinary paths (the exclude matches whole path components).
+
+The root is `config.workspace_dir`: `<project>/workspace`, or `config.workspace_path` when a session works in
+another folder (§17.2 "Workspace folder"). Then:
+- `init()` never creates a missing root (FileNotFoundError): a folder outside the session (the user's project,
+  an unplugged drive, a host path inside the Docker sandbox) is not replaced by an empty stand-in.
+- `adopted` (= `config.workspace_adopted`, the folder was the user's): `init()` never writes the repo-local
+  settings, not even into a repository it initialized there. Every git call of the workspace passes its identity
+  and settings per command (`-c user.name=<actor> -c user.email=… -c core.autocrlf=false -c commit.gpgsign=false
+  -c core.quotepath=false -c safe.directory=<root>`), so autocommits never need the repository's config. In an
+  adopted folder `-c core.autocrlf=false` is left out: the user's own line-ending settings apply to the agents'
+  commits as to the user's (Git for Windows sets `core.autocrlf=true` system-wide; overriding it would commit
+  CRLF rewrites of the user's LF files and make a clean checkout look modified). `Workspace.resolve` refuses any
+  path with a `.git` component, so the agents never write into the repository database.
+- `async settle(timeout=GIT_TIMEOUT)`: waits for git commands whose caller was cancelled (they run in threads);
+  `Swarm.stop()` calls it, so no commit is still writing when a stopped session's files move or are deleted.
+
+Module helpers (synchronous, for code without a swarm, e.g. sessions.py; run them in a thread):
+```python
+SCRATCH_DIR = ".scratch"                             # the agents' temporary files: never committed
+SCRATCH_GITIGNORE: str                               # the marker's content: a comment and "*"
+DEFAULT_GITIGNORE: str                               # the root .gitignore of init_repo; ends with ".scratch/"
+GIT_LOCATION_VARS: frozenset[str]                    # GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ... (agent_git_env)
+def git_identity(actor) -> tuple[str, str]           # (name, e-mail) of commits for actor: (actor or "DreamTeam",
+                                                     # "<email_slug>@dreamteam.local"); autocommits and the shell
+def scratch_rel(actor) -> str                        # ".scratch/<email_slug(actor)>/"
+def in_scratch(rel) -> bool                          # `.scratch` or inside it (case-insensitive on Windows)
+def agent_git_env(env, actor) -> dict[str, str]      # a new env: GIT_LOCATION_VARS dropped, GIT_AUTHOR_NAME/EMAIL
+                                                     # and GIT_COMMITTER_NAME/EMAIL = git_identity(actor)
+def porcelain_entries(data: bytes) -> list[tuple[str, str]]   # (XY, path) of `git status --porcelain -z`; a
+                                                     # rename or copy yields its new and its old path
+def git_env() -> dict[str, str]                      # os.environ without GIT_*, GIT_TERMINAL_PROMPT=0
+def git_argv(git, root, actor, args, safe_directory=None, *, adopted=False, literal=True) -> list[str]
+    # identity from git_identity(actor); adopted: no core.autocrlf override; literal=False: pathspec magic such as
+    # `:(exclude)` works (only the autocommit's fixed pathspecs use it; Workspace._git(..., literal=) passes it on)
+def run_git(root, *args, actor=None, git=None, safe_directory=None, timeout=GIT_TIMEOUT, adopted=False,
+            literal=True) -> CompletedProcess
+def init_repo(root, git=None, *, adopted=False) -> str | None   # git init + .gitignore if missing + initial
+    # commit of what is there (with the user's line endings when adopted); None = ok, else git's error text
+def looks_like_git_dir(folder) -> bool                 # a repository database itself (HEAD + objects/ + refs/)
+def repo_state(root, git=None, exclude=()) -> dict     # what an existing folder is to git (the user's config
+    # applies, read-only, safe.directory=*): {"toplevel": work tree root containing root | None, "git_dir": a bare
+    # repository or a .git folder, "branch": current branch | None (detached), "operation": "merge" | "rebase" |
+    # "cherry-pick" | "revert" | "bisect" ... stopped halfway (GIT_OPERATIONS: MERGE_HEAD, CHERRY_PICK_HEAD,
+    # REVERT_HEAD, rebase-merge/, rebase-apply/, sequencer/, BISECT_LOG in the git dir) | None, "changes":
+    # `git status --porcelain --untracked-files=normal --ignore-submodules=none` lines (the user's
+    # status.showUntrackedFiles or submodule settings cannot hide what `git add -A` would commit; `exclude`:
+    # folders relative to root left out, e.g. the session's own `mcp/<name>`), "error": str | None}
+def tracked(root, paths, git=None) -> list[str]        # which of `paths` hold files the repository tracks
+def commit_paths(root, paths, message, git=None) -> (commit | None, error | None)
+    # commit only the current state of `paths` (e.g. their removal) as DreamTeam, other changes left as they are;
+    # refused on a detached HEAD or while an operation is in progress
+```
 
 ```python
 async def run_shell(command: str, *, cwd: Path, timeout: float, program: str = "auto",
@@ -405,7 +676,16 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
     # os.environ minus secrets (model api_key_env vars, *_API_KEY, *_TOKEN, *SECRET*, *PASSWORD*)
     # except config.shell.pass_env; plus PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
 ```
-Kills the whole process tree on timeout (Windows: `taskkill /T /F`; POSIX: process group).
+The `shell` tool first calls `workspace.ensure_scratch(actor)` (so `> .scratch/<slug>/out.txt` works), then runs
+the command with `agent_git_env(scrubbed_env(config, {DREAMTEAM_AGENT: actor, DREAMTEAM_WORKSPACE: root,
+DREAMTEAM_SCRATCH: root/scratch_rel(actor)}), actor)`: git in the shell always works on the workspace repository,
+and a commit an agent makes anyway (its system prompt forbids history-changing git commands) is authored and
+committed by that member, with the same identity as its autocommits; the identity is set after `scrubbed_env`, so
+it also beats `shell.pass_env` and inherited values. Other `GIT_*` variables (e.g. `GIT_SSH_COMMAND`) pass through.
+MCP servers and the user's TUI `!` commands keep their own environment.
+Kills the whole process tree on timeout (Windows: `taskkill /T /F`; POSIX: process group), and also when the
+awaiting caller is cancelled (a stopped agent): its command must not go on writing into the workspace after
+the swarm stopped.
 
 ## 8. Triggers (triggers.py)
 
@@ -523,7 +803,9 @@ class MCPConnection:      # one running stdio MCP server, owned by a dedicated a
 
 class MCPForge:
     def __init__(self, swarm): ...
-    async def start(self) -> None     # register config.mcp.external servers (origin "config"); no processes yet
+    async def start(self) -> None     # register config.mcp.external servers (origin "config"); no processes yet;
+                                      # refresh the stored cwd of forged/imported servers (server_dir: the
+                                      # workspace may have moved, §17.2)
     async def stop(self) -> None
     async def create(self, actor: str, name: str, description: str, code: str, *, scope: str = "swarm",
                      task_id: int | None = None, requirements: list[str] | None = None,
@@ -611,8 +893,8 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `task_discussion` | task_id, since_id? | LEU |
 | `send_message` | to (string or array), text, reply_to? | LEU |
 | `read_messages` | with?, limit?, include_read? | LEU |
-| `agents` | — | LEU |
-| `hire_agent` | role, instructions, model?, name? | LEU |
+| `agents` | — (the roster, then the role catalog) | LEU |
+| `hire_agent` | role, instructions ("" for a catalog role), model?, name? | LEU |
 | `retire_agent` | name?, reason? | LEU |
 | `update_notes` | content | L |
 | `wait` | reason? | L |
@@ -625,14 +907,14 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `edit_file` | path, old_text, new_text, replace_all? | LE |
 | `list_files` | path?, depth? | LEU |
 | `lock_file` | path, minutes?, unlock? | LE |
-| `shell` | command, timeout? | LE |
+| `shell` | command, timeout? (its environment: §7 after `scrubbed_env`) | LE |
 | `mcp_create` | name, description, code, scope?, task_id?, requirements? | LE |
 | `mcp_list` | query? | LEU |
 | `mcp_tools` | server | LEU |
 | `mcp_call` | server, tool, arguments? | LE |
 | `join_swarm` | role, name?, instructions? | EU (the user via MCP only, before joining; creates kind "external") |
 | `wait_for_events` | timeout? (s, default 50, max 600; an error at once when the swarm stops meanwhile) | EU |
-| `set_goal` | title, description? | U |
+| `set_goal` | title (a multi-line title is split: §3 `set_goal`), description? | U |
 | `swarm_status` | — | EU |
 | `swarm_control` | action (pause/resume), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
 | `mcp_approve` | name, approve, comment? | U |
@@ -641,6 +923,42 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
 `ctx.runtime.note_sent_to_user()` when USER is a recipient.
+
+**R0: LLM tool schemas are part of every agent's frozen prefix.** `AgentRuntime.__init__` builds its tools from
+`schemas_for("llm", language)` (from the code, not the database), and Anthropic thinking blocks bind to the exact
+prefix, so a changed name, description, parameter, `required` list or enum of a tool with the `llm` audience would
+change the prefix of every existing agent of a resumed session. Such a change needs a deliberate migration;
+tests/test_tools.py (`test_llm_tool_schemas_are_unchanged`) pins the SHA-256 digest of `schemas_for("llm", lang)`
+for en and ru. New behaviour reaches agents through tool results, notifications, the `agents` output and the system
+prompts of new members. `allow_empty` is validation only, not part of the schema. Tools of the `user`/`external`
+audiences only (e.g. `set_goal`) are not in the LLM tools array.
+
+Results and checks of the review and role-catalog flows:
+- `task_claim` by the task's designated reviewer (independent review, §4.1) adds "You were its reviewer; since
+  you execute it now, another member will review it."
+- `task_complete` says where the task went: `Task #N is done.`; `Task #N was sent to X for review.` (the task's
+  own reviewer); `... was sent to the user for review: nobody else in the team can review it. You will be told the
+  verdict; meanwhile take the next task or call wait.`; or `... was sent to X for review: a member other than you
+  checks it, and you will be told the verdict.` (picked by the board).
+- `goal_complete` (switch on) is refused while tasks are in review: ``Tasks are still waiting for review: #N
+  (reviewer), .... The goal can be completed only after every task is reviewed: call `wait` ...``. The "already
+  achieved" check comes first.
+- `agents` appends, in the caller's language, `Role catalog (hire_agent role=<name>; a catalog role brings its
+  description and model profile, and instructions may then be empty; any other name is a new role you describe
+  in instructions):` and one line per visible role, `- <name>[ (model <profile>)]: <roles.summary(description)>`.
+- `hire_agent` resolves `role` in the catalog (swarm language). `instructions` stays required in the schema
+  (R0), so a missing one is still "Missing required argument(s)"; `""` is accepted (`allow_empty`). An unknown
+  role with empty instructions: ``'X' is not in the role catalog: describe the new role's responsibilities in
+  instructions, or pick a catalog role (`agents` lists them).`` plus up to three similar catalog roles
+  (`roles.close_roles`). Results start with `Hired <name> as "<canonical role>".`, then either `They got the
+  catalog description of the role; model profile P.` or `"X" is a new role (not in the role catalog): your
+  instructions are all they know about it.`, then `They are woken now: ...`. The user (the board's hire form, the
+  TUI, the console: `ctx.is_user`) gets texts about the user's own tools instead: the error says to describe the
+  new role in the instructions (`/hire X | instructions` in the terminal) or pick a catalog role (the hire form's
+  list, `/roles`), and the result is `Hired <name> as "<role>" (catalog role, model profile P).` or `Hired <name>
+  as "<role>": a new role, not in the role catalog; your instructions are all they know about it.`
+- `join_swarm` shows the canonical role and, for a catalog role, appends `\nYour role (<role>): <description>`
+  (an external member has no system prompt).
 
 ## 13. Hub MCP (hub_mcp.py)
 
@@ -684,6 +1002,7 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/` | static/index.html |
 | GET `/static/{file}` | static files |
 | GET `/api/state` | snapshot (§14.1 below) |
+| GET `/api/roles` | `{"language": swarm language, "roles": [{key, name, description, instructions, model, builtin, names}], "hidden": [same]}`: the visible roles of the catalog in the swarm's language (§17.3; the board's hire dialog, the TUI's `/roles`), and the hidden ones, which a hire by name still resolves; `names`: every spelling `roles.find_role` resolves to the role (its name and id, a built-in role's name in either language); also for a stopped session; not in the snapshot (several KB) |
 | GET `/api/hub` | {pid, project, name, version}: identity of this hub process (checked against hub.json) |
 | GET `/api/tasks/{id}` | {task, discussion: [...], events: [...]} |
 | GET `/api/messages?with=Name&limit=&since=` | conversation USER↔Name; without `with`: all recent messages |
@@ -701,8 +1020,13 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 ```json
 {"swarm": {"name","language","paused","pause_reason","limits":{"max_cost_usd","max_agents"},
            "spent_usd","goal": {...}|null, "counts": {status: n}, "mcp_url", "models": [profile names],
-           "session": {"id","title","status": "running"|"stopped"}|null,   // null outside a SessionManager
-           "tracing": bool},
+           "session": {"id","title","status": "running"|"stopped",
+                       "pending_goal": {"title","description"}|null}|null,   // null outside a SessionManager;
+                                       // pending_goal: the goal a never-started session gets at its first start
+           "tracing": bool,
+           "independent_review": bool,   // Board.independent_review, read live (§4.1)
+           "workspace": {"path","default","adopted","exists"}},   // Swarm.workspace_info(): the folder the
+                                       // members work in (same shape as a session summary's "workspace", §17.2)
  "tasks": [Task.to_dict() + {"blocked_by","comments"}],
  "agents": [{"name","kind","role","status","model","language","cost_usd","tokens_in","tokens_out","hired_by",
              "created_at","last_active","instructions","context_tokens","open_tasks":[ids],"unread"}],
@@ -717,7 +1041,9 @@ commands of a **home** are in §18.3.
 ```
 dreamteam init [DIR] [--lang ru|en] [--provider anthropic|openai|openrouter|ollama|vllm] [--name N] [--goal G] [--force]
 dreamteam run [DIR] [--goal G] [--host H] [--port P] [--no-console] [--open]
-    # one swarm, its board at / (web.serve); refuses when a hub already runs for DIR
+    # one swarm, its board at / (web.serve); refuses when a hub already runs for DIR; --goal sets the goal
+    # unless the stored one is active with the same title (compared with split_goal(G)[0], so a multi-line
+    # --goal does not reset the goal at every restart)
 ```
 `console`, `mcp`, `status` and `sandbox` work with a project as well as with a home (§18.3).
 
@@ -858,11 +1184,19 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
 ### 17.1 Settings (settings.py, config.py)
 - The **home** is `$DREAMTEAM_HOME`, else `~/DreamTeam` (`default_home()`); the CLI flags `--home` / DIR
   override both. Its settings file is `<home>/dreamteam.toml` (`settings_path(home)`) with the sections
-  `SECTIONS = swarm, agents, server, shell, workspace, mcp, tracing, models` (same format as a project's
-  `dreamteam.toml`).
+  `SECTIONS = swarm, agents, server, shell, workspace, mcp, tracing, roles, models` (same format as a project's
+  `dreamteam.toml`; `roles` is an array of tables, `[[roles]]`, the role catalog of §17.3).
 - `ensure_home(home, language="ru", provider="anthropic")` creates the directory, `sessions/` and the settings
   file from the template; `read_raw(home)`; `validate(home, raw) -> Config` (ValueError with a readable text);
-  `dump_toml(data)`; `deep_merge(base, override)`.
+  `dump_toml(data)` (a top-level non-empty list of tables is written as `[[name]]` blocks after every table,
+  None values skipped); `deep_merge(base, override)`.
+- `[swarm] independent_review` (bool, default true; a non-bool is a ValueError naming `[swarm]
+  independent_review`): an agent's finished task is approved by another member, or by the user when nobody else
+  can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
+  true` with a comment, after the `starting_roles` comment (which names the starting team rule, §17.3), and a
+  commented `[[roles]]` example before the model profiles.
+- `[[roles]]` → `Config.roles: list[RoleSettings]` (`RoleSettings(name, description="", instructions="",
+  model=None, hidden=False)`), checked by `config.parse_roles(raw, profiles)` after the model profiles (§17.3).
 - `config.Config.from_dict` checks every field against its type (bool / int / float / str / list[str] /
   tables; integral floats become ints, bools are not numbers, no NaN/inf, counts and sizes >= 1, port <= 65535;
   None = the default) with messages like `[agents] max_steps_per_turn must be ...`; API keys are never echoed.
@@ -877,8 +1211,15 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   - in model profiles, `api_key` is null and comes with `api_key_set`, `api_key_hint` (`…abcd`) and
     `api_key_env_set` (true/false, or null when there is no env name); `api_key_env` is a variable name or
     null (a key pasted there is never shown);
-  - values of `mcp.external.<server>.env` are masked as `SECRET_MASK + hint` (`••••…abcd`).
+  - values of `mcp.external.<server>.env` are masked as `SECRET_MASK + hint` (`••••…abcd`);
+  - `roles`: the stored `[[roles]]` entries `[{name, description, instructions, model, hidden}]`, normalized
+    (a built-in role by its id, e.g. «Тестировщик» → `tester`); `[]` when there are none.
 - `apply_update(raw, update)` (a dict of sections; ValueError for bad input):
+  - `roles` is the complete list of entries: not a list → "Section roles must be a list of roles", an item that
+    is not an object → "Role N must be an object"; names get their whitespace collapsed; fields that are null,
+    `""` or `hidden: false` are not stored (an untouched field of a built-in role keeps the built-in value);
+    `[]` removes every customization; a role's `model` follows a profile rename; the rules themselves are
+    checked by `validate` (`[roles.N] ...`);
   - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays;
   - masked `mcp.external.*.env` values get their stored value back (same server first, then a renamed one);
     an unknown mask is a ValueError;
@@ -906,33 +1247,46 @@ settings; ValueError when they are invalid):
   is `f"{hub_url}/s/{sid}/mcp"`), `sessions_dir`.
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
-  `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True)`,
-  `async load(sid)`, `async start(sid)`, `async stop(sid, *, remember=False)`, `async unload_idle(sid)`,
-  `update(sid, *, title=None, overrides=None)`, `async delete(sid)`, `async resume()`, `async shutdown()`,
-  `copy_overrides(sid)`; module functions `read_stats(db_path, conn=None)` and `slugify(title)`.
+  `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
+  workspace=None)`, `async load(sid)`, `async start(sid)`, `async stop(sid, *, remember=False)`,
+  `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None)`, `async delete(sid)`, `async resume()`,
+  `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
+  `async set_workspace(sid, path, *, expect=None)`; module functions `read_stats(db_path, conn=None)`,
+  `slugify(title)` and `external_workspaces(home)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
 - `SessionError(message, status)` (a ValueError) carries an HTTP status: 400 bad input or invalid settings,
-  404 unknown session, 409 conflict (deleting `main`, files in use), 500 damaged or cannot be opened.
+  404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
+  a folder of another session, a folder that changed since the user was asked, a missing workspace folder at
+  start), 500 damaged or cannot be opened.
 - Session ids are `NNN-slug` from the title (Cyrillic and Ukrainian transliterated, accents dropped; e.g.
   `001-snake-game`) and match `^[a-z0-9][a-z0-9-]{0,63}\Z`. `main` is the legacy session: a home that was a
   single-swarm project (`<home>/.dreamteam/swarm.db`) lives in the home itself, uses the global settings
   directly (including a `swarm.goal`), cannot get overrides and cannot be deleted from the UI;
-  `sessions/main/` is ignored. Titles are one line, at most 200 chars (default: the goal's first 60 chars,
-  else "Session").
+  `sessions/main/` is ignored. Titles are one line, at most 200 chars (default: the goal's first line,
+  shortened to 60 characters at a word by `goal_text.shorten_title`, else "Session"; an empty `title` lets the
+  server derive it).
 - Effective config of a session = the global settings without `swarm.goal` / `goal_description`, deep-merged
   with its `overrides`. Overrides may only touch the sections swarm, agents, shell, workspace, mcp and tracing
-  (not models or server); they are validated at create and update time (`update` applies them to a loaded
-  swarm at once via `reconfigure`). `config_view(sid)` is the public view of the effective settings (the
-  global ones when the overrides are invalid now).
-- `create` stores the goal as `pending_goal`; the first `start` sets it once the members exist (a failure
-  keeps it). `start` marks `autostart`; an explicit `stop` clears it (`remember=True`, used at shutdown, keeps
-  it), and `resume()` starts the marked sessions. `stop` unloads the swarm (stop + close its database).
+  (`OVERRIDE_SECTIONS`; not models, server or roles: the role catalog is global, and a session chooses its
+  starting team with `swarm.starting_roles` / `start_agents`); they are validated at create and update time
+  (`update` applies them to a loaded swarm at once via `reconfigure`). `config_view(sid)` is the public view of
+  the effective settings (the global ones when the overrides are invalid now).
+- `create` splits the goal as `set_goal` does (`goal_text.split_goal(goal, description)`) and stores it already
+  split as `pending_goal` {title, description, actor} (only with a non-empty title); the first `start` sets it
+  once the members exist (a failure keeps it). Module function `pending_goal(meta)` → {title, description} | None
+  splits again on read (a `session.json` written before the split may hold a multi-line title); the summary and
+  the snapshot's `session.pending_goal` use it. `start` marks `autostart`; an explicit `stop` clears it
+  (`remember=True`, used at shutdown, keeps it), and `resume()` starts the marked sessions. `stop` unloads the
+  swarm (stop + close its database).
 - `load(sid)` constructs the swarm without starting it (a stopped session is viewable) and closes the traces a
-  crashed process left running (`tracer.recover()`). Load, start, stop and delete run under a per-session lock
-  and re-check that the session still exists (404).
+  crashed process left running (`tracer.recover()`). Load, start, stop, delete and set_workspace run under a
+  per-session lock and re-check that the session still exists (404). `shutdown()` also waits for sessions in the
+  middle of such an operation (e.g. a workspace move that starts the session again) and then stops them.
 - `delete(sid)` renames the directory to `sessions/.deleted-<sid>-<ns>` first (a session whose files are open
-  stays intact: 409), then removes it in a thread; leftovers are purged at the next delete.
+  stays intact: 409), then removes it in a thread; leftovers are purged at the next delete. A workspace folder
+  outside the session directory is never deleted (it is the user's folder): `delete` returns it (read under the
+  session's lock, so a `set_workspace` that ran just before counts), else None.
 - `update_settings(update)`: `apply_update` + validation; every session must still produce a valid config,
   except damaged sessions and sessions whose overrides were already invalid (skipped); a session override that
   pins a renamed profile follows the rename, one whose profile was deleted falls back to the default (an
@@ -949,8 +1303,167 @@ settings; ValueError when they are invalid):
    "model_profile","model","max_cost_usd","max_agents","overrides","config_error","url":"/s/{sid}/",
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
-   "spent_usd","paused","pause_reason","last_activity"}
+   "spent_usd","paused","pause_reason","last_activity",
+   "workspace":{"path","default","adopted","exists"}}
   ```
+  `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
+  on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
+  `exists` = it is a folder now.
+
+#### Workspace folder
+A session works in `<session dir>/workspace` (`default_workspace(sid)`) unless its `session.json` has
+`"workspace": {"path": "<absolute path>", "adopted": bool, "in_home"?: "<relative path>"}` (absent = the default
+folder; any other shape makes the session damaged, 500). `in_home` (posix, no `..`) is stored for a folder inside
+the home, e.g. `projects/x`: the folder is then found relative to the home wherever the home is mounted (the
+Docker sandbox's `/swarm`) or moved, and `path` is only informative. `config_for(sid)` sets
+`Config.workspace_path` / `workspace_adopted` from it (`data_dir` stays in the session directory); a stored path
+that is not absolute on this system (a Windows path read inside a Linux container) maps to a folder that does not
+exist. `Swarm.reconfigure` keeps the workspace of a loaded swarm (it changes only through `set_workspace`, which
+restarts the swarm) and, for a started swarm in an adopted folder, its `workspace.git` (a change applies at the
+next start, which checks the folder).
+
+`async set_workspace(sid, path, *, expect=None)` (`path` absolute, None = the default folder) returns
+`{"mode": "moved"|"adopted"|"unchanged", "from", "to", "git": "moved"|"existing"|"initialized"|"disabled"|"none",
+"mcp_moved": [names], "old_kept": path|null, "old_missing": bool, "old_changed": null|{"paths", "commit",
+"error"}, "restarted": bool, "start_error": str|null}`:
+- **Checks first** (nothing changes before they pass; symlinks and junctions are resolved). 400: not a string,
+  empty, a relative path (clients resolve relative paths themselves), a drive or file system root, the user's
+  home itself or a folder containing it, the DreamTeam home or a folder containing it, anything in
+  `<home>/.dreamteam/`, anything in `<home>/sessions/` except this session's own default folder, the session's
+  data folder, a repository database (a path with a `.git` component, a bare repository, a folder with `HEAD`,
+  `objects/` and `refs/`; whether git is on or not), the shared MCP library (`mcp.library_dir`, the global one and
+  the session's) or a folder inside or containing it, a folder inside the current workspace or containing it (or
+  containing the session directory), an existing file, a folder that cannot be created or written (a temporary
+  probe file). 409: a folder another session works in, or inside / containing one (the legacy `main` works in
+  `<home>/workspace`). The current folder itself: `"unchanged"`, nothing happens. 404 unknown session; 409 for
+  `main` (see below).
+- `expect` (`"moved"` | `"adopted"`, anything else 400): the mode the user agreed to; the TUI and the console send
+  the one their question announced. 409 when the folder turns out otherwise (e.g. files appeared in a folder that
+  was empty when the user was asked); nothing changes.
+- **Empty or missing target → move** (`"moved"`): every entry of the current folder (files, `.git` last,
+  `mcp/`) is moved into it (a rename per entry; a copy and a delete across volumes); parents are created; the
+  session's own default folder is removed afterwards (recreated on demand), another old folder is left empty.
+  `git`: `"moved"` when the folder had a repository, else a repository is initialized there (`"initialized"`;
+  `"disabled"` when `workspace.git` is off, `"none"` without git). After an *adopted* folder (the user's), an empty
+  target starts a fresh workspace instead: the user's files stay where they are (`old_kept`), only the
+  session's MCP servers move, and a repository is initialized.
+- **Target with files → adopt** (`"adopted"`, stored `adopted: true`): the agents work with its files and their
+  commits go to the current branch of its repository. With `workspace.git` on and git installed: refused (409)
+  when the repository has uncommitted changes or untracked, not ignored files (`repo_state`, §7: `git status
+  --porcelain --untracked-files=normal`, whatever the user's status settings; the agents commit with
+  `git add -A`; the `mcp/<name>` folders of the session's own servers, absent there, are left out as at every
+  start: a folder the session worked in before may track them, and their move brings them back), is in a
+  detached HEAD, has a merge, rebase, cherry-pick, revert or bisect stopped halfway (the
+  agents' next commit would conclude it), or git cannot read it; refused (400) when the folder is inside a
+  repository but not its root; a folder that is not in a repository gets one (`init_repo`: git init, `.gitignore`
+  if missing, an initial commit of the files there; `"initialized"`). The repository's configuration is never
+  modified (no `_configure_repo`, §7), and the agents' commits there follow the user's line-ending settings. The
+  old folder stays as it was (`old_kept`). The session's forged and imported MCP servers (`mcp_servers` rows with
+  another origin than `config`, folders `<old>/mcp/<name>/`) move to `<target>/mcp/<name>/` (409 before anything
+  changes when one of those exists there). Adopting the session's own default folder (which still holds its old
+  files) is a plain switch back (stored without "workspace", not adopted, no git checks).
+- **Leaving an adopted folder** (for an empty folder or the default one): the user's files stay, only the
+  session's MCP servers move along. Those of them that the user's repository tracks (`tracked`: the agents'
+  `git add -A` committed them there) would leave deletions behind, so with git on DreamTeam commits just their
+  removal there (`commit_paths`, author DreamTeam, "Remove mcp/<name>: ..."), and the repository stays clean.
+  `old_changed` = `{"paths": ["mcp/<name>", ...], "commit": hash|null, "error": why not|null}` (no commit on a
+  detached HEAD, during a merge or rebase, or with git off for the session: the result says to commit the removal
+  or restore the folders); null when nothing of the user's folder changed.
+- **One change at a time per home**: under the session's lock the target is checked and a loaded session is
+  unloaded; then, under a home-wide lock (also taken by `create(workspace=)`), the target is checked again with
+  nothing running (an agent may have forged a server meanwhile, the folder may have changed, another session may
+  have taken it: its `session.json` names it by then; another mode than the first check found is a 409, as with
+  `expect`), the change is carried out and `session.json` is written. Two sessions never take one folder.
+- **A loaded session** is unloaded first (stop + close, as `stop`, autostart kept; events `stopped`, then
+  `updated`, then `started` after the restart of a session that was running). A restart that fails after a
+  successful change leaves the session stopped and is reported in `start_error`.
+- **Failures**: `.dreamteam/workspace-move.json` (`{"from","to","mode","started_at"}`) is written before the first
+  change. Any failure undoes everything done so far in reverse, removes the journal, starts a session that was
+  running again and raises SessionError: 409 when a file is in use or a name appeared in the target meanwhile,
+  else 500, naming the folder the session still uses. The undo touches only what the change made: a move is
+  recorded once its destination holds the entry; a destination that exists is never replaced or merged into
+  (FileExistsError, also across volumes); an entry is put back only where nothing new appeared meanwhile (else it
+  is reported); created folders are removed only when empty; `.git` / `.gitignore` only when the change created
+  them (a `.git` that appears in the target meanwhile is a 409, never initialized over). When the undo cannot
+  finish, the error (500) lists the files left in the target and the journal stays: `start` and `set_workspace`
+  then refuse (409) naming both folders and the journal to delete once the files are together.
+- The members hear of it at the next start: `n_workspace_moved` {path, old}, or `n_workspace_changed` {path, old}
+  after an adopt or a fresh start (session.json `workspace_notice` until then); quietly for LLM members (their
+  next wake-up), with a wake-up for external members (an MCP client's `wait_for_events` returns it).
+- **Start** (and `resume()`, which logs the error and goes on): a session whose (non-default) folder does not
+  exist or is not a folder does not start: SessionError 409 naming the path and how to fix it (`/cd <folder>` or
+  `/cd --default` in `dreamteam` or `dreamteam console --session <id>`, `session_cd` in MCP); `Workspace.init`
+  never creates it. Viewing it (`load`) still works. An adopted folder with git on is checked again before every
+  start (the user may have worked there while the session was stopped, or git was off at the adopt): 409 for
+  uncommitted changes or untracked files (the session's own `mcp/<name>` folders and `.scratch/` are left out), a
+  detached HEAD, an operation in progress, an unreadable repository, or a folder inside another repository (a folder in no
+  repository gets one at the start, as at an adopt).
+- **Legacy `main`**: refused (409, `LEGACY_WORKSPACE_TEXT`): `dreamteam run` can still open the home as a
+  single-swarm project, which reads only `dreamteam.toml` and would work in `<home>/workspace` again.
+- `create(..., workspace=path)`: the same checks before anything is created (with the overrides' `workspace.git`),
+  then the session is created in its own folder and `set_workspace` runs before the first start. A failure removes
+  the new session; its error names only the folder (and what could not be removed there), never the removed
+  session. The returned summary then has `"workspace_result"`: the result with mode `"created"` for an
+  empty/missing folder or `"adopted"` (`old_kept` null: the unused default folder is removed).
+- `external_workspaces(home)` → `[(sid, stored path)]` of the sessions whose folder is outside the home (no
+  `in_home`; read from the `session.json` files, nothing opened): `dreamteam sandbox` warns about them (only the
+  home is mounted).
+
+### 17.3 Role catalog (roles.py)
+A leaf module (no package imports; config.py uses it to check `[[roles]]`). The catalog is global: the settings
+of a home or a project, never a session override (§17.2).
+- **Built-in roles** `ROLE_PRESETS: {language: {id: (name, description)}}`, in catalog order (`PRESET_IDS`):
+  generalist «Универсал»/Generalist, developer «Разработчик»/Developer, tester «Тестировщик»/Tester, reviewer
+  «Ревьюер»/Reviewer, analyst «Аналитик»/Analyst, architect «Архитектор»/Architect, writer «Технический
+  писатель»/Technical writer, researcher «Исследователь»/Researcher. `DEFAULT_ROLE_ID = "generalist"`
+  (`prompts.DEFAULT_ROLE` is its name). The descriptions are addressed to the agent ("You ...", the same in both
+  languages): they go into a new member's system prompt right after "Your role: <name>.". The architect and the
+  developer name the contracts file `CONTRACTS.md`, the one the planning task asks for.
+- **`[[roles]]` entries** (`RoleSettings`): `name` (required: a built-in role's id or its name in either language
+  customizes that role, only with the fields given; any other name is a role of the user's own), `description`
+  (a non-empty one replaces a built-in description in both languages; required for an own role unless it is
+  hidden), `instructions` (added for every member of the role), `model` (a profile of `[models]`; `""` = none),
+  `hidden` (not offered: not in the team composer, not listed to agents; it still resolves). Deleting the entry
+  of a built-in role resets it. `parse_roles` checks: a list of tables, at most 100 (`MAX_ROLES`); names 1–60
+  characters (`NAME_LIMIT`) without `,` or `*` (they separate the items of a team), unique by `role_key`; texts at
+  most 4000 characters (`TEXT_LIMIT`); errors `[[roles]] must be a list of role tables (write each role as a
+  [[roles]] table)`, `At most 100 roles`, `[roles.N] name is empty`, `... the role 'X' is listed twice (also as
+  role J)`, `... 'X': a role of your own needs a description`, `... 'X' uses the model profile 'M', which is not
+  defined in [models]` (and unknown keys or types as for the other sections). Stored normalized: a built-in role
+  by its id, texts stripped, `model = ""` as None.
+- **Merge and resolution**: `catalog(entries, language, *, include_hidden=False) -> list[Role]` = the built-in
+  roles in `PRESET_IDS` order with their entries applied, then the own roles in entry order; `Role(key, name,
+  description, instructions="", model=None, builtin=False, customized=False, hidden=False)`, `key` = preset id or
+  the casefolded name. `normalize(name)` collapses whitespace; `preset_id(name)` matches an id or a built-in name
+  in either language, any case; `role_key(name)` = preset id or casefolded name; `find_role(entries, name,
+  language)` (hidden roles too; None = a new role); `close_roles(entries, name, language, n=3)` (difflib, cutoff
+  0.6, over the visible names, the preset ids and the other language's names; names in `language`);
+  `summary(text, limit=200)` (the first sentence, else a cut at a word with "…").
+- **Into an agent** (§3 `hire`): the canonical name in the member's language ("Tester" hired in a ru swarm becomes
+  «Тестировщик»), the description into the frozen system prompt, the role's instructions before the hirer's, its
+  model profile unless the hirer names one. A catalog edit reaches only members hired afterwards (also in running
+  sessions, through `reconfigure`); existing members keep their prompts. Agents see the catalog in the `agents`
+  output (§12), a new member's system prompt names it, and the kickoff lists the team (`Team: Name — Role; ...`).
+- **Starting team** (no field of its own): `swarm.starting_roles` (ordered; a name repeated per agent; preset ids,
+  built-in names in either language or own role names) and `swarm.start_agents`.
+  `starting_team(starting_roles, start_agents)`: member i gets `starting_roles[i]`; members beyond the list and
+  blank entries are generalists; roles beyond `start_agents` are ignored (`[]` + 3 = three generalists). A name
+  not in the catalog is an own role without a description. UIs show the team as rows:
+  - `team_rows(starting_roles, start_agents) -> [(role, count)]`: consecutive equal roles grouped, order kept (the
+    same role may appear in two rows); a row's role is a preset id or an own role's name as written (its
+    `role_key` is the catalog key);
+  - `team_value(rows) -> (starting_roles, start_agents)`: expanded, built-in names stored as ids, trailing
+    generalists dropped (`[("generalist", 3)]` → `([], 3)`), so an untouched default never changes the settings;
+  - `parse_team(text) -> list[str]` (`--team`, `/team`): `"architect, developer*2, tester"` → `["architect",
+    "developer", "developer", "tester"]` (names kept as typed, normalized); ValueError `'developer*0': the count
+    must be a whole number from 1 to 50`, `'*2': the role name is empty`, `'<item>': a role name cannot be longer
+    than 60 characters`, `The team is empty`, `A team has at most 200 agents`.
+- **Views**: `presets_view()` → `[{id, name: {ru, en}, description: {ru, en}}]`; `catalog_view(entries)` →
+  `[{key, builtin, customized, hidden, name: {ru, en}, description: {ru, en}, instructions, model}]` (hidden roles
+  included; an own role has the same text under both languages). Served by `GET /api/settings` (§18.1); the
+  visible roles of one swarm by `GET /api/roles` (§14).
+- **Compatibility**: no `[[roles]]` → the 8 built-in roles; existing `starting_roles` keep working (built-in names
+  now bring their description); no database change.
 
 ## 18. Launcher: web, MCP, CLI, UI
 
@@ -965,13 +1478,14 @@ settings; ValueError when they are invalid):
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
 | GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher"}` |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
-| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true}` → `{"session": summary}` (201) |
+| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?}` → `{"session": summary}` (201); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
 | GET `/api/sessions/{sid}` | `{"session": summary, "config": manager.config_view(sid)}` |
 | PATCH `/api/sessions/{sid}` | body `{title?, overrides?}` → `{"session"}` |
-| DELETE `/api/sessions/{sid}?confirm={sid}` | `{"ok": true}`; 400 without a matching confirm |
+| DELETE `/api/sessions/{sid}?confirm={sid}` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm |
+| POST `/api/sessions/{sid}/workspace` | body `{"path": "<absolute>"}` or `{"default": true}`, optionally `"expect": "moved"\|"adopted"` (the mode the user agreed to, §17.2) → `{"session": summary, "result": set_workspace result}`; 400 bad body or target, 404 unknown session, 409 dirty repository, MCP name conflict, a folder of another session, a folder that is not what `expect` says, a file in use, `main` |
 | POST `/api/sessions/{sid}/start` / `/stop` | `{"session"}`; another action → 404 |
-| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "path": str(settings file), "home"}` |
-| PUT `/api/settings` | body `{"settings": {...sections}}` → `{"settings","applied_to"}` |
+| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home"}` (a hand edit of the file is picked up first) |
+| PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` text for a bad role (nothing saved) |
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
 | `/mcp` | launcher MCP (§18.2) |
@@ -1005,8 +1519,19 @@ settings; ValueError when they are invalid):
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
-  start_agents?, max_agents?, max_cost_usd?, model?, start?=true)` (unset values come from the global settings;
-  the board URL is shown only when a web server runs), `session_start(session)` and `session_stop(session)`.
+  start_agents?, max_agents?, team?, max_cost_usd?, model?, start?=true, workspace?)` (unset values come from the
+  global settings; the board URL is shown only when a web server runs; `goal`: one line, or several, split as in
+  §17.2; `team`: role names in order, a name repeated per agent (§17.3) → `swarm.starting_roles` (normalized) and
+  `start_agents = len(team)` unless `start_agents` is given, `[]` = no team; not a list of non-blank strings →
+  "team must be a list of role names, e.g. [...]", more than 200 → "A team has at most 200 agents.", a name over
+  60 characters → "'<name>': a role name cannot be longer than 60 characters.", a name with `,` or `*` (the
+  `--team` syntax) → "'<name>': a role name cannot contain ',' or '*'; give one item per agent and repeat a name
+  for several agents, e.g. [...]."; `workspace`: an absolute folder, §17.2),
+  `session_start(session)`, `session_stop(session)` and `session_cd(session, path)` (`set_workspace`; `path`
+  absolute or `"default"`; the result in words by `workspace_text(result)`, worded as the TUI and the console
+  word it: "Moved the session's files to X" only when they moved, "The session now works in X" after a folder of
+  the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
+  shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`).
 - Every hub tool (§13) with an extra optional `session` property. Without it the call goes to
   `manager.default_session()`; when there is none, the error lists the sessions. An unknown or stopped session
   is an error result (`session_start` is suggested).
@@ -1021,9 +1546,12 @@ settings; ValueError when they are invalid):
 ```
 dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|stream-json] [--timeout S]
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
-          [--max-agents N] [--budget USD] [--title T] [--host H] [--port P]
-dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T]] [--no-console] [--no-browser]
+          [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR] [--host H]
+          [--port P]
+dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]] [--no-console]
+          [--no-browser]
 dreamteam sessions [DIR | --home H]
+dreamteam sessions rm SID [SID ...] [--yes] [--home H]
 dreamteam traces [AGENT] [--home H] [--session SID] [--id N] [--span N [--context]] [--status S] [--limit N] [--json]
 dreamteam console [DIR | --home H | --url URL] [--session SID] [--lang ru|en]
 dreamteam mcp [DIR | --home H] [--no-web]
@@ -1032,30 +1560,67 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
 ```
 - Default command (`_default_command`): `dreamteam` alone runs `tui` when stdin and stdout are terminals,
   else `serve`. Options only: `tui` when one of them is a TUI option (`-p -c -r --output-format --model
-  --budget --agents --max-agents --verbose --timeout --no-auto-reply --lang`), `serve` when one is serve-only
-  (`--no-console --no-browser --goal`) or there is no terminal, else `tui`. A first word that is not a command
+  --budget --agents --team --max-agents --verbose --timeout --no-auto-reply --lang`), `serve` when one is
+  serve-only (`--no-console --no-browser --goal`) or there is no terminal, else `tui`. A first word that is not a command
   is the TUI prompt (`dreamteam "Сделай змейку"`), except a near-miss of a command name (difflib, 0.75), which
   argparse reports.
 - `tui` (docs/TUI.md): `tui.main_tui` (interactive; refuses without a terminal, exit 2) or with `-p`
   `tui.main_print` (text piped into stdin — a pipe or a file, never a terminal or NUL — is appended to the
   prompt; no prompt → exit 2). `-r` without an id opens the session picker (`/sessions`). The flags `--model`,
-  `--agents`, `--max-agents`, `--budget`, `--title` become the overrides of a session the TUI creates.
+  `--agents`, `--max-agents`, `--budget`, `--title` become the overrides of a session the TUI creates. The
+  prompt is the goal: its first line becomes the title, the rest the description (split by the hub, §17.2).
+  `--team "architect, developer*2, tester"` (also with `-p`) is checked with `roles.parse_team` before anything
+  starts (`dreamteam: --team: <error>` on stderr, exit 2) and reaches the TUI as the raw text (`overrides["team"]`,
+  only when given), which turns it into `swarm.starting_roles` of the sessions it creates (`start_agents` = the
+  team's size unless `--agents` is given). With auto-replies on, `-p` also approves the tasks that wait for the
+  user's review (print mode `AUTO_REVIEW`, docs/TUI.md); with `--no-auto-reply` they wait.
+- `--workspace DIR` (`tui`, `-p`, and `serve` with `--goal`): the folder the session created by that run works in
+  (`create(..., workspace=)`, §17.2: an empty or missing folder becomes its workspace; a folder with files is
+  adopted, its repository must be clean). `~` and a relative DIR are resolved against the current directory
+  (`os.path.abspath`); the hub checks the rest. Exit 2 for a file, with `-c` / `-r` (an existing session moves
+  with `/cd`), and for `serve` without `--goal`. The TUI applies it to the first session it creates (and says so
+  under the welcome box); `-p` names the folder on stderr with `--verbose`; `serve` prints the result
+  (`launcher_mcp.workspace_text`) on stderr.
 - The directory: `--home`, else DIR, else the current directory when it has `dreamteam.toml`, else the default
   home (`serve` never takes the current directory: `--home`, DIR or the default home). It is a launcher **home**
   when `--home` is given, when it has `sessions/` next to `dreamteam.toml`, or when it is the default home;
   otherwise it is a single-swarm project (§15). `serve`, `mcp` and `sandbox` create a home on demand; the
   listing commands (`sessions`, `status`, `traces`) never create one.
+- `sessions rm SID...` (also `delete`, `del`, `remove`) deletes sessions as the sessions page does: through the
+  running hub (`DELETE /api/sessions/{sid}?confirm={sid}`, which stops a running session first), else with a
+  `SessionManager` of the home — unless another live DreamTeam process may run the home's sessions without a
+  hub that answers: a `hub.json` of a live process (or of a Docker sandbox), or a launcher marker
+  `<home>/.dreamteam/launcher-<pid>.pid` that `serve`, `mcp` and the TUI's in-process launcher keep while they
+  run (markers of dead processes are removed). Then nothing is deleted (exit 1). All ids are checked first (an
+  unknown one or the project's own `main` session: nothing is deleted, exit 1). It shows the sessions and asks
+  `[y/N]` in a terminal (Ctrl+C: exit 130); without one it needs `--yes` (exit 1). Before deleting without a hub
+  it looks for a hub again. A workspace folder outside the session is kept and named in the output. The words
+  of `sessions` are `[DIR]` or `rm SID...`, in any order with the options.
 - `hub.json` lives in `<home>/.dreamteam/hub.json`, written once the port listens (before the resume) and
   removed at exit (only by the process that wrote it). `running_hub(dir)` trusts it only when `GET /api/hub`
   confirms the pid and the directory.
 - `serve`: refuses when a hub already runs for the home (opening that one in the browser unless
   `--no-browser`) or when the port is busy;
-  `--goal` creates and starts a session and opens its board; the terminal console attaches to the running
-  session when stdin is a real terminal (on Windows the NUL device is not one). Settings errors and unusable
-  homes are messages, not tracebacks.
+  `--goal` creates and starts a session (its first line becomes the title unless `--title`) and opens its board;
+  the terminal console attaches to the running session when stdin is a real terminal (on Windows the NUL device
+  is not one). Settings errors and unusable homes are messages, not tracebacks.
 - `console`: with a launcher hub it works against `{base}/s/{sid}` (`--session`, else the running one); it
-  refuses a stopped session and a URL where no hub answers. Commands include `/trace [Name|#id]`,
-  `/span N [ctx]` and `/session` (the current session; another one is `dreamteam console --session ID`).
+  refuses a URL where no hub answers and a stopped session, except a stopped session whose folder outside it
+  does not exist (it cannot start, and `/cd` is what fixes it: the console attaches and says so). Commands include `/trace [Name|#id]`,
+  `/span N [ctx]` and `/session` (the current session; another one is `dreamteam console --session ID`),
+  `/approve N [comment]` and `/reject N what to fix` (a task in review; the comment is free text taken as typed,
+  without one pair of quotes around all of it, as in the TUI; a name instead of N approves or rejects
+  an MCP server) and `/hire Role [| instructions]` (instructions `""` when omitted: a catalog role needs none).
+  `/cd` prints the session folder (`GET {hub}/api/sessions/{sid}` → `workspace`); `/cd PATH` or `/cd --default`
+  prints the question worded as in the TUI (`console.cd_preview`, docs/TUI.md §4.5) ending in `[y/N]`: the next
+  line `y`/`yes`/`д`/`да` moves the session (`POST {hub}/api/sessions/{sid}/workspace`) and prints the result
+  (`console.cd_result_lines`), `n`/`нет`/an empty line cancels, any other line cancels and is handled as usual.
+  `--yes` (`-y`) at either end skips the question. `~` and relative paths (and a Windows path rooted without a
+  drive, `\projects\app`, which gets the current drive as with `--workspace`) are resolved against the console's
+  current directory only when the hub runs on this computer (`Console(..., local=)`): the console inside `serve`
+  and a hub found through the home's `hub.json` are local whatever their address, a `--url` one when its address
+  is a loopback one; otherwise only absolute paths. A single-swarm hub (no `/s/{sid}` in the base URL) has no
+  `/cd`.
 - `mcp`: a running hub (for a home: the launcher) → a stdio proxy to its `/mcp` that hands on its
   instructions; otherwise a home gets the in-process launcher (SessionManager, the web UI when its port is free,
   resumed sessions) with the stdio launcher MCP, and a project the in-process swarm (§13).
@@ -1064,7 +1629,10 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   that never started prints "No traces." without creating its database).
 - `status` of a home lists the sessions (from the hub, or read from the home); of a project, `swarm_status`.
 - `sandbox` refuses when a hub runs for the directory; the container runs `serve /swarm` for a home and
-  `run /swarm` for a project.
+  `run /swarm` for a project. Only the directory is mounted: for a home, `docker.outside_home_warning(home)`
+  prints a warning listing the sessions whose workspace folder is outside it (`external_workspaces`): they
+  cannot start in the container (their start reports the missing folder). A folder inside the home is found in
+  the container (session.json `in_home`, §17.2).
 - `run [DIR]` stays the single-swarm server of a project (§15); it does not serve the launcher.
 
 ### 18.4 UI
@@ -1074,16 +1642,38 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     card per session.
     - Card: title (link to the board), goal (or «ждёт запуска» for a pending goal), status badge (running /
       paused / stopped / goal done), task progress bar, agents (working), spent/budget, model, last activity,
-      the error of a damaged session.
+      the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
+      and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved with /cd); a folder
+      outside the session that does not exist gets the badge «папки нет» and a warning that the session cannot
+      start until it is moved with `/cd`), the error of a damaged session. The search also matches the path.
     - Card buttons: «Открыть», «Запустить» / «Остановить» (disabled while the request runs), delete (not for
-      the legacy `main`) with a confirmation dialog naming the session.
-  - New-session modal: title; goal (required); description; model profile (from the saved settings);
-    language, agents at start, max agents, budget; starting roles (comma list); under «Дополнительно» steps
-    per wake-up and MCP approval; «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that
-    differ from the saved defaults are sent as overrides. A stray click or Escape asks before discarding a
-    typed goal.
-  - Settings tab: sections «Модели и эндпоинты», «Новые сессии по умолчанию», «Агенты», «Консоль»,
-    «Workspace», «MCP», «Трейсы», «Сервер», with a section navigation.
+      the legacy `main`) with a confirmation dialog naming the session; for a folder outside the session the
+      dialog says the folder stays, and the toast names it (`workspace_kept` of the DELETE answer). The web UI
+      never changes the folder (`/cd`, MCP `session_cd` or REST do).
+  - New-session modal: title (default: the goal's first line, derived by the server); goal (required,
+    multi-line: the first line is the title, the other lines its description, explained by a hint);
+    description; model profile (from the saved settings; a role with its own profile keeps it); language, max
+    agents, budget; the starting team composer (below; from the saved catalog); under «Дополнительно» steps per
+    wake-up and MCP approval; «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
+    from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). A stray
+    click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
+    settings page has it; sessions can still override it through the API).
+  - Team composer (new-session modal and the settings' defaults): one row per group of the starting team (§17.3
+    `team_rows`; JS twins `teamRows` / `teamValue`): a role select over the visible catalog plus «Своя роль…» (a
+    name not in the catalog), −/+ count (1..50), the role's first sentence (full description as tooltip) and its
+    model profile, ✕; «Добавить роль»; the total. An empty team, an own role name with `,` or `*` (they separate
+    team items) or more agents than the max is refused in the form; an untouched default is never written back.
+    The new-session modal sends `starting_roles` only when the saved list, at the new size, would give another
+    team (the saved list may hold more roles than its `start_agents`: they would fill a larger team).
+  - Settings tab: sections «Модели и эндпоинты», «Роли», «Новые сессии по умолчанию» (with the team composer and
+    the switch «Независимое ревью задач», `swarm.independent_review`), «Агенты», «Консоль», «Workspace», «MCP»,
+    «Трейсы», «Сервер», with a section navigation.
+    - Roles: a card per catalog role (from `role_presets` and `settings.roles`). A built-in role: its name in
+      both languages (read-only), «встроенная» / «изменена» marks, «Сбросить» and «Скрыть» / «Показать»;
+      description (a changed one applies to agents of both languages), model profile, extra instructions. An own
+      role: an editable name, the same fields, delete. Saved as `settings.roles` (only what differs from the
+      built-in texts); client checks (names, duplicates, a description for an own role, a known profile) are
+      shown in the save bar.
     - Model profiles: one card per profile. Fields: name, provider, base_url, key (mode «Переменная
       окружения» with its state on the server, or «Ключ»: a password input that is never filled from the
       server, «сохранён …abcd», a button to remove it), model (input + datalist filled by «Загрузить список»),
@@ -1102,6 +1692,24 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     server), with `""` when the page is served at `/` (`dreamteam run`).
   - Topbar: «← Все сессии» link to `/` and the session title; a stopped banner with «Запустить сессию»
     (POST `/api/sessions/{sid}/start`, then reload). Actions on a stopped session show the stopped message.
+    A folder outside the session that does not exist (snapshot `swarm.workspace`) adds a banner naming the
+    path and the fix (`/cd FOLDER` or `/cd --default`).
+  - Reviews (§4.1): a card waiting for the user's review has the badge «ждёт вашего ревью», another one in review
+    names its reviewer; the task card's «Принять» / «Вернуть» (a return needs a comment: what to fix; for a
+    task another member reviews, the card says the user may decide instead). Dragging a task from «review» to
+    «done» approves it, to another column opens the card for the return reason, and dropping onto «review» is
+    refused (a task goes there by `task_complete`). With independent review on, the empty reviewer option reads
+    «— (выберет доска)».
+  - Hire dialog: the role input offers the visible catalog (`GET api/roles`) and shows the matched role's
+    description and model profile (matched as the hire resolves it: any of its `names`, hidden roles included),
+    or that a typed name is a new role to describe in the instructions; the
+    model select starts with «— профиль роли или сессии» (`model` is sent only when chosen); instructions are
+    optional for a catalog role (sent as "").
+  - Goal modal: the goal is a textarea with the split hint (first line = title), sent unchanged (the hub splits).
+  - Tab «Файлы»: above the tree, the session folder (`swarm.workspace`): its absolute path (click to copy) and
+    the badge «своя папка» / «папка проекта» / «перенесена» / «папки нет»; the tab button's tooltip is the
+    path. A missing folder is not listed (no `/api/files` call). When the path (or its existence) changes
+    after a `/cd`, the tab starts again from the root of the new folder.
   - Tab «Трейсы»: agent filter, status filter (all statuses, «Только с ошибками» = failed), refresh and
     «Статистика»; the list of traces on the left (newest first, «Показать ещё» pages with `before`) and the
     trace detail on the right.

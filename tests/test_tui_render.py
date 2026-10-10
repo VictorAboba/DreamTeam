@@ -108,6 +108,16 @@ SETTINGS = {"agents": {"default_model": "default"},
                                    "api_key_hint": "…abcd", "api_key": None},
                        "local": {"provider": "openai", "model": "qwen", "base_url": "http://localhost:11434/v1",
                                  "api_key_env": "OLLAMA_KEY", "api_key_env_set": False, "api_key_set": False}}}
+ROLES = [  # GET /api/roles "roles"
+    {"key": "generalist", "name": "Универсал", "builtin": True, "instructions": "", "model": None,
+     "description": "Ты берёшь ту задачу, которая сейчас полезнее всего: код, тексты, анализ. Перед завершением ты сам "
+                    "проверяешь результат."},
+    {"key": "tester", "name": "Тестировщик", "builtin": True, "instructions": "Пиши тесты на pytest.", "model": "fast",
+     "description": "Ты проверяешь, что сделанное другими действительно работает. Код, который ты написал сам, ты не "
+                    "тестируешь."},
+    {"key": "дата-инженер", "name": "Дата-инженер", "builtin": False, "instructions": "", "model": None,
+     "description": "Ты строишь конвейеры данных " + "и проверяешь их " * 30},
+]
 COMMANDS = [{"name": "/help", "args": "", "description": {"ru": "справка", "en": "help"}},
             ("/new", "[цель]", "новая сессия"),
             {"name": "board", "args": "", "description": "доска задач"},
@@ -122,6 +132,8 @@ def realistic_events() -> list[dict]:
         ev("task.updated", ANNA, task=t3, changes={"status": ["todo", "in_progress"], "assignee": [None, ANNA]}),
         ev("task.updated", ANNA, task=task(3, status="review", assignee=ANNA, reviewer=BORIS),
            changes={"status": ["in_progress", "review"]}),
+        ev("task.updated", ANNA, task=task(3, status="review", assignee=ANNA, reviewer="user"),
+           changes={"status": ["in_progress", "review"], "reviewer": [None, "user"]}),
         ev("task.updated", BORIS, task=task(3, status="done", assignee=ANNA, result="Готово: parser.py\nподробности"),
            changes={"status": ["review", "done"], "result": [None, "Готово"]}),
         ev("task.updated", ANNA, task=task(3, status="failed", assignee=ANNA, result="Не вышло"),
@@ -140,6 +152,8 @@ def realistic_events() -> list[dict]:
         ev("notification", None, recipient="user", kind="u_agent_error", text="У агента Анна ошибка: boom"),
         ev("notification", None, recipient="user", kind="u_goal_done", text="Цель достигнута"),
         ev("notification", None, recipient=ANNA, kind="n_ready", text="Есть задачи к работе"),
+        ev("notification", None, recipient="user", kind="u_review_fallback",
+           text="Анна завершила задачу #3 «Парсер», а проверить её сейчас больше некому: /approve 3"),
         ev("goal.set", "user", goal={"title": "Калькулятор", "description": "CLI **калькулятор**", "status": "active",
                                      "summary": "", "set_by": "user", "updated_at": NOW}),
         ev("goal.completed", ANNA, goal={"title": "Калькулятор", "description": "", "status": "done",
@@ -208,6 +222,8 @@ def all_renderables(c: RenderContext) -> list:
         render.sessions_table(c, SESSIONS, current="001-calc"), render.sessions_table(c, []),
         render.cost_table(c, STATE), render.cost_table(c, {}),
         render.models_table(c, SETTINGS),
+        render.roles_table(c, ROLES), render.roles_table(c, []), render.role_detail(c, ROLES[1]),
+        render.role_detail(c, {}),
         render.status_report(c, status_info()),
         render.traces_list(c, [TRACE, {**TRACE, "id": 13, "kind": "external", "status": "running"}]),
         render.traces_list(c, []),
@@ -474,6 +490,11 @@ def test_task_lines():
     review = ev("task.updated", ANNA, task=task(3, status="review", assignee=ANNA, reviewer=BORIS),
                 changes={"status": ["in_progress", "review"]})
     assert plain(render.event(c, review)) == "◑ #3 Парсер — на ревью (Борис)"
+    yours = ev("task.updated", ANNA, task=task(3, status="review", assignee=ANNA, reviewer="user"),
+               changes={"status": ["in_progress", "review"], "reviewer": [None, "user"]})
+    assert plain(render.event(c, yours)) == "◑ #3 Парсер — ждёт вашего ревью"
+    assert plain(render.event(ctx(lang="en"), yours)) == "◑ #3 Парсер — waits for your review"
+    assert f"bold {theme.WARN}" in str(render._review_label(c, "user")[1])
     done = ev("task.updated", BORIS, task=task(3, status="done", assignee=ANNA, result="Готово: parser.py\nещё"),
               changes={"status": ["review", "done"]})
     assert plain(render.event(c, done)) == "☒ #3 Парсер — Анна\n  ⎿  Готово: parser.py"
@@ -567,7 +588,8 @@ def test_quiet_shows_only_user_messages_goal_errors_approvals_and_pause():
     shown = {(e["type"], (e.get("data") or {}).get("kind")) for e in realistic_events()
              if render.event(q, e) is not None}
     assert shown == {("message.sent", None), ("notification", "u_mcp_pending"), ("notification", "u_budget"),
-                     ("notification", "u_agent_error"), ("goal.set", None), ("goal.completed", None),
+                     ("notification", "u_agent_error"), ("notification", "u_review_fallback"),
+                     ("goal.set", None), ("goal.completed", None),
                      ("goal.reopened", None), ("swarm.paused", None), ("swarm.resumed", None),
                      ("swarm.limits", None), ("_connection", None), ("trigger.fired", None)}
     # ...the trigger.fired among them is the one with errors: errors show at every verbosity
@@ -728,6 +750,8 @@ def test_board_and_summary():
     assert "  ☐ #3 Тесты · критичный · ждёт #2" in out
     assert "  ◐ #2 Код — Борис" in out
     assert "  ◑ #4 Ревью — Борис · на ревью (Анна)" in out
+    yours = plain(render.board(ctx(lang="en"), [task(7, "Docs", "review", assignee=BORIS, reviewer="user")]))
+    assert "  ◑ #7 Docs — Борис · waits for your review" in yours
     assert "  ☒ #1 План — Анна · высокий · 💬2" in out
     assert "Закрыто (2)" in out and "  ✗ #5 Старое" in out and "  ✗ #6 Сломалось — Анна" in out
     assert out.index("К работе") < out.index("В работе") < out.index("Ревью (1)") < out.index("Готово") < \
@@ -758,6 +782,45 @@ def test_task_detail():
     verbose = plain(render.task_detail(ctx("verbose"), task_data()))
     assert "История" in verbose and "статус: К работе → В работе" in verbose
     assert plain(render.task_detail(ctx(), {"error": "Task #9 not found"})) == "⚠ Task #9 not found"
+    assert "/approve" not in out  # a done task: nothing to settle
+    review = task_data()
+    review["task"] = {**review["task"], "status": "review", "reviewer": "user"}
+    out = plain(render.task_detail(ctx(lang="en"), review))
+    assert "Approve: /approve 2 [comment] · return: /reject 2 what to fix" in out
+    assert out.index("Status") < out.index("/approve 2") < out.index("Task goal")
+
+
+def test_review_notices_for_the_user_are_one_warning_line():
+    c = ctx(lang="en")
+    budget = ev("notification", None, recipient="user", kind="u_budget", text="The budget is spent")
+    warn = re.search(r"38;2;\d+;\d+;\d+", to_ansi(render.event(c, budget), 200)).group(0)  # the warning colour
+    for kind in ("u_review_requested", "u_review_fallback", "u_review_handed_over", "u_reviews_waiting"):
+        note = ev("notification", None, recipient="user", kind=kind,
+                  text="Anna finished task #3 \"Parser\": /approve 3 [comment] or /reject 3 <what to fix>.")
+        out = plain(render.event(c, note), 200)
+        assert out == "🔔 Anna finished task #3 \"Parser\": /approve 3 [comment] or /reject 3 <what to fix>.", kind
+        assert warn in to_ansi(render.event(c, note), 200), kind
+        assert render.event(ctx("quiet", "en"), note) is not None   # the user has to act: shown even when quiet
+    other = ev("notification", None, recipient=BORIS, kind="n_review_requested", text="Review task #3")
+    assert render.event(c, other) is None and "Review task #3" in plain(render.event(ctx("verbose", "en"), other))
+
+
+def test_role_catalog_views():
+    c = ctx(width=100)
+    out = plain(render.roles_table(c, ROLES))
+    assert out.startswith("Каталог ролей")
+    assert "Тестировщик" in out and "fast" in out and "Дата-инженер" in out
+    assert "Ты проверяешь, что сделанное другими действительно работает." in out
+    assert "Код, который ты написал сам" not in out                       # only the first sentence
+    assert out.endswith("/roles Роль — полное описание · /hire Роль — нанять · изменить каталог: /settings")
+    assert "fast" not in plain(render.roles_table(ctx(width=60), ROLES), 60)  # narrow: no model column
+    assert plain(render.roles_table(ctx(lang="en"), [])) == "  ⎿  The role catalog is empty."
+    detail = plain(render.role_detail(c, ROLES[1]))
+    assert detail.startswith("╭─ Тестировщик · встроенная ─")
+    for needle in ("Код, который ты написал сам", "Доп. инструкции: Пиши тесты на pytest.", "профиль модели: fast"):
+        assert needle in detail, needle
+    own = plain(render.role_detail(ctx(lang="en"), ROLES[2]))
+    assert own.startswith("╭─ Дата-инженер ─") and "built-in" not in own and "model profile" not in own
 
 
 def test_tables():
@@ -789,6 +852,11 @@ def test_status_report():
         assert expected in out, expected
     done = status_info() | {"goal": {"title": "Калькулятор", "status": "done"}}
     assert "Цель           Калькулятор · цель достигнута" in plain(render.status_report(ctx(), done))
+    # the session folder (/cd): a text row right after the session
+    folder = status_info() | {"workspace": "C:/proj/app (папка проекта: агенты коммитят в её текущую ветку)"}
+    out = plain(render.status_report(ctx(), folder))
+    assert "Папка сессии   C:/proj/app (папка проекта: агенты коммитят в её текущую ветку)" in out
+    assert out.index("Сессия ") < out.index("Папка сессии") < out.index("Цель ")
 
 
 def test_traces():
@@ -866,7 +934,9 @@ def test_welcome_tips_help_shortcuts():
     assert "Welcome to DreamTeam!" in out and "web:  off" in out and "session:" not in out
     out = plain(render.tips(ctx(), False))
     assert out.split("\n")[0].strip() == "Советы для начала:"
-    assert [line.strip()[:2] for line in out.split("\n")[1:]] == ["1.", "2.", "3.", "4."]
+    # (a long tip wraps: its next lines are indented under its text)
+    assert [line.strip()[:2] for line in out.split("\n")[1:] if line.strip()[:1].isdigit()] == ["1.", "2.", "3.", "4."]
+    assert "Первая строка станет заголовком цели" in out
     assert "/sessions" in plain(render.tips(ctx(), True)) and "/sessions" not in out
     out = plain(render.help_view(ctx(), COMMANDS))
     assert out.split("\n")[0] == "Команды"

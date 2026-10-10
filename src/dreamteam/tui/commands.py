@@ -4,10 +4,12 @@ session id, the render context and the argument text); hub errors are reported b
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+from .. import roles
 from . import render
 from .client import HubError
 from .i18n import t
@@ -20,6 +22,10 @@ Handler = Callable[["CommandContext"], Awaitable[None]]
 
 TRACES_LIMIT = 20
 CONTEXT_PAGE = 30
+TEAM_RESET = ("-", "default", "reset", "сброс")   # /team: back to the starting team of the settings
+# "/approve 12", "/reject #12 ...": a task in review. Agent-built MCP servers are named like mcp_forge.NAME_RE
+# (they start with a letter) and external servers are never pending, so a number is never an MCP server.
+_TASK_REF = re.compile(r"#?\d+")
 
 # CLI flags that become session overrides of a new session (the sections of the launcher's modal)
 FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
@@ -123,6 +129,51 @@ def _int_arg(text: str) -> int:
     return int(value)
 
 
+def _task_ref(text: str) -> tuple[int | None, str]:
+    """(task id, the rest) of "12 the rest" / "#12 the rest"; (None, "") when the first word is not a task. The rest
+    is free text taken as typed, without one pair of quotes around all of it ("12 'needs tests'")."""
+    head, _, rest = text.strip().partition(" ")
+    if not _TASK_REF.fullmatch(head):
+        return None, ""
+    rest = rest.strip()
+    if len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "'\"":
+        rest = rest[1:-1].strip()
+    return int(head.lstrip("#")), rest
+
+
+async def _role_catalog(c: "CommandContext") -> list[dict] | None:
+    """The visible role catalog [{key, name, description, instructions, model, builtin}]: the attached session's
+    (in its language), else the launcher's settings (in the UI language); None without either."""
+    if c.app.attached:
+        return list((await c.client.roles(c.sid)).get("roles") or [])
+    if c.client.mode != "launcher":
+        return None
+    return _localized(c.lang, (await c.client.settings()).get("role_catalog"))
+
+
+def _localized(lang: str, catalog: Any) -> list[dict]:
+    """GET /api/settings "role_catalog" (names and descriptions in both languages) in `lang`, hidden roles dropped."""
+    def pick(value: Any) -> str:
+        return str((value.get(lang) or value.get("en") or "") if isinstance(value, dict) else value or "")
+    return [{"key": r.get("key"), "name": pick(r.get("name")), "description": pick(r.get("description")),
+             "instructions": r.get("instructions") or "", "model": r.get("model"), "builtin": bool(r.get("builtin"))}
+            for r in catalog or [] if isinstance(r, dict) and not r.get("hidden")]
+
+
+def _team_text(c: "CommandContext", rows: list[tuple[str, int]], catalog: list[dict]) -> str:
+    """The rows of a starting team as "Архитектор ×1 · Разработчик ×2", the roles named in the UI language."""
+    names = {r.get("key"): r.get("name") for r in catalog}
+    times = "×" if c.ctx.unicode else "x"
+
+    def name(role: str) -> str:
+        key = roles.role_key(role)
+        if names.get(key):
+            return str(names[key])
+        preset = roles.ROLE_PRESETS.get(c.lang, roles.ROLE_PRESETS["en"]).get(key)
+        return preset[0] if preset else role
+    return f" {c.ctx.sym['dot']} ".join(f"{name(role)} {times}{count}" for role, count in rows)
+
+
 # ---- handlers -------------------------------------------------------------------------------------
 async def _help(c: CommandContext) -> None:
     c.print(render.help_view(c.ctx, [cmd.help_row(c.lang) for cmd in COMMANDS]))
@@ -146,12 +197,19 @@ async def _resume(c: CommandContext) -> None:
         await c.app.open_picker()
 
 
+async def _delete(c: CommandContext) -> None:
+    if c.args:
+        await c.app.delete_session(c.args.split()[0])
+    else:
+        await c.app.open_picker(deleting=True)
+
+
 async def _goal(c: CommandContext) -> None:
     if not c.args:
         state = await c.state()
         c.print(render.goal_panel(c.ctx, (state.get("swarm") or {}).get("goal")))
         return
-    await c.act("set_goal", {"title": c.args})  # the whole text, as /new takes it; goal.set prints the panel
+    await c.act("set_goal", {"title": c.args})  # the whole text: the hub splits it (first line = title)
 
 
 async def _board(c: CommandContext) -> None:
@@ -169,6 +227,54 @@ async def _agents(c: CommandContext) -> None:
     c.print(render.agents_table(c.ctx, state.get("agents") or []))
 
 
+async def _roles(c: CommandContext) -> None:
+    catalog = await _role_catalog(c)
+    if catalog is None:
+        c.error(c.t("no_session"))
+        return
+    name = c.args.strip()
+    if not name:
+        c.print(render.roles_table(c.ctx, catalog))
+        return
+    key, typed = roles.role_key(name), roles.normalize(name).casefold()
+    role = next((r for r in catalog
+                 if r.get("key") == key or roles.normalize(r.get("name")).casefold() == typed), None)
+    if role is None:
+        c.error(c.t("unknown_role", name=name))
+        return
+    c.print(render.role_detail(c.ctx, role))
+
+
+async def _team(c: CommandContext) -> None:
+    """The starting team of the sessions this window creates next (like --team); the settings stay as they are."""
+    arg = c.args.strip()
+    swarm = c.app.overrides.get("swarm") or {}
+    if arg.casefold() in TEAM_RESET:
+        swarm.pop("starting_roles", None)
+        swarm.pop("start_agents", None)
+        if not swarm:
+            c.app.overrides.pop("swarm", None)
+        c.info(c.t("team_reset"))
+        return
+    view = await c.client.settings()
+    catalog = _localized(c.lang, view.get("role_catalog"))
+    if not arg:
+        own = {k: swarm[k] for k in ("starting_roles", "start_agents") if k in swarm}
+        team = {**((view.get("settings") or {}).get("swarm") or {}), **own}
+        rows = roles.team_rows(team.get("starting_roles"), team.get("start_agents") or 0)
+        c.info(c.t("team_set" if own else "team_line", team=_team_text(c, rows, catalog),
+                   n=sum(n for _, n in rows)))
+        return
+    try:
+        team = roles.parse_team(arg)
+    except ValueError as exc:
+        c.error(c.t("team_bad", error=exc))
+        return
+    swarm = c.app.overrides.setdefault("swarm", {})
+    swarm["starting_roles"], swarm["start_agents"] = team, len(team)
+    c.info(c.t("team_set", team=_team_text(c, roles.team_rows(team, len(team)), catalog), n=len(team)))
+
+
 async def _to(c: CommandContext) -> None:
     name = resolve_member(c.args, c.app.members)
     if name is None:
@@ -182,7 +288,8 @@ async def _hire(c: CommandContext) -> None:
     role, instructions = _split(c.args)
     if not role:
         raise UsageError
-    await c.act("hire_agent", {"role": role, "instructions": instructions or role}, report=True)
+    # instructions stay a required parameter of the tool: "" is fine for a catalog role
+    await c.act("hire_agent", {"role": role, "instructions": instructions}, report=True)
 
 
 async def _trace(c: CommandContext) -> None:
@@ -215,6 +322,10 @@ async def _files(c: CommandContext) -> None:
     except HubError as exc:
         data = {"error": c.app.hub_error(exc)}
     c.print(render.files_view(c.ctx, data))
+
+
+async def _cd(c: CommandContext) -> None:
+    await c.app.change_folder(c.args)
 
 
 async def _cost(c: CommandContext) -> None:
@@ -261,10 +372,21 @@ async def _max(c: CommandContext) -> None:
 
 
 async def _approve(c: CommandContext) -> None:
+    task_id, comment = _task_ref(c.args)
+    if task_id is not None:
+        await c.act("task_review", {"task_id": task_id, "approve": True, "comment": comment}, report=True)
+        return
     await c.app.decide_mcp(c.args.split()[0], True)
 
 
 async def _reject(c: CommandContext) -> None:
+    task_id, comment = _task_ref(c.args)
+    if task_id is not None:
+        if not comment:  # a return without a reason gives the agent nothing to act on
+            c.error(c.t("review_reason_required", id=task_id))
+            return
+        await c.act("task_review", {"task_id": task_id, "approve": False, "comment": comment}, report=True)
+        return
     try:
         parts = shlex.split(c.args)
     except ValueError:
@@ -310,18 +432,22 @@ async def _exit(c: CommandContext) -> None:
 COMMANDS: tuple[Command, ...] = (
     Command("help", _help, aliases=("?",)),
     Command("new", _new, args=True, launcher=True),
+    Command("team", _team, args=True, launcher=True),
     Command("sessions", _sessions, launcher=True),
     Command("resume", _resume, args=True, launcher=True),
+    Command("delete", _delete, args=True, launcher=True),
     Command("goal", _goal, args=True, session=True),
     Command("board", _board, session=True),
     Command("task", _task, args=True, required=True, session=True),
     Command("agents", _agents, session=True),
+    Command("roles", _roles, args=True),
     Command("to", _to, args=True, required=True, session=True),
     Command("hire", _hire, args=True, required=True, session=True),
     Command("trace", _trace, args=True, session=True),
     Command("span", _span, args=True, required=True, session=True),
     Command("files", _files, args=True, session=True),
     Command("cat", _files, args=True, required=True, session=True),
+    Command("cd", _cd, args=True, launcher=True),   # without a session: the folder of the next new one
     Command("cost", _cost, session=True),
     Command("status", _status),
     Command("model", _model, args=True, launcher=True),
@@ -398,19 +524,27 @@ async def execute(app: "TUI", text: str) -> bool:
 def session_overrides(options: dict | None) -> tuple[dict[str, dict], str | None]:
     """CLI options of a new session -> (overrides by section, title). Flat keys (model, agents,
     max_agents, budget, language) map to swarm.start_agents / swarm.max_agents / swarm.max_cost_usd /
-    agents.default_model / swarm.language; dict values are taken as sections as they are."""
+    agents.default_model / swarm.language; `team` ("architect, developer*2", checked by the CLI with
+    roles.parse_team) sets swarm.starting_roles, and swarm.start_agents unless `agents` gives it; dict values
+    are taken as sections as they are."""
     sections: dict[str, dict] = {}
     title: str | None = None
+    team: list[str] | None = None
     for key, value in (options or {}).items():
         if value is None or value == "":
             continue
         if key == "title":
             title = str(value)
+        elif key == "team":
+            team = roles.parse_team(", ".join(map(str, value)) if isinstance(value, (list, tuple)) else value)
+            sections.setdefault("swarm", {})["starting_roles"] = team
         elif isinstance(value, dict):
             sections.setdefault(key, {}).update(value)
         elif key in FLAT_OVERRIDES:
             section, field = FLAT_OVERRIDES[key]
             sections.setdefault(section, {})[field] = value
+    if team is not None:
+        sections["swarm"].setdefault("start_agents", len(team))   # --agents N wins over the team's size
     return sections, title
 
 

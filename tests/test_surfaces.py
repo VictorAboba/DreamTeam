@@ -694,7 +694,7 @@ def test_serve_swarm_exits_although_console_blocks_in_input(tmp_path, monkeypatc
     never = threading.Event()
     calls: list[str] = []
 
-    def blocking_console(base, lang, stop=None):
+    def blocking_console(base, lang, stop=None, local=None):
         calls.append(base)
         never.wait()   # like input() with nobody typing
 
@@ -834,6 +834,33 @@ def test_console_commands_reach_the_hub(capsys):
         ("swarm_control", {"max_cost_usd": 7.5}),
         ("mcp_approve", {"name": "csv_tools", "approve": False, "comment": "не нужен"}),
     ]
+
+
+def test_console_settles_reviews_and_hires_from_the_catalog(capsys):
+    con = console_module.Console("http://127.0.0.1:9", "ru")
+    hub = StubHub(MEMBERS)
+    con.hub = hub
+    con.handle("/approve 5 ok")
+    con.handle("/reject #5 'нет тестов'")
+    con.handle("/reject 5")                       # a return needs a reason: no call
+    assert "/reject N <что исправить>" in capsys.readouterr().out
+    con.handle("/approve calc")                   # a name is still an MCP server
+    # the reason is free text: an apostrophe or quotes inside it are kept, as in the TUI
+    con.handle("/reject 12 don't use global state")
+    con.handle("/approve 12 it's fine, the \"total\"  line too")
+    con.handle("/hire Тестировщик")               # a catalog role: instructions "" (the parameter stays required)
+    con.handle("/hire QA | гоняй тесты")
+    assert hub.acts == [
+        ("task_review", {"task_id": 5, "approve": True, "comment": "ok"}),
+        ("task_review", {"task_id": 5, "approve": False, "comment": "нет тестов"}),
+        ("mcp_approve", {"name": "calc", "approve": True, "comment": ""}),
+        ("task_review", {"task_id": 12, "approve": False, "comment": "don't use global state"}),
+        ("task_review", {"task_id": 12, "approve": True, "comment": "it's fine, the \"total\"  line too"}),
+        ("hire_agent", {"role": "Тестировщик", "instructions": ""}),
+        ("hire_agent", {"role": "QA", "instructions": "гоняй тесты"}),
+    ]
+    assert "/approve имя|N [комментарий]  /reject имя|N [что исправить]" in console_module.HELP["ru"]
+    assert "/hire Role [| instructions] — hire an agent (a catalog role or a new one)" in console_module.HELP["en"]
 
 
 def test_console_strips_terminal_escapes(monkeypatch):

@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from ..models import USER, AgentKind, ToolError
+from .. import roles
+from ..models import USER, AgentKind, Status, ToolError
 from . import ToolContext, tool
 from .fmt import ago, budget_line, goal_line
 
@@ -35,6 +36,15 @@ async def agents(ctx: ToolContext, args: dict[str, Any]) -> str:
             f"tasks: {', '.join('#' + str(i) for i in open_ids) or 'none'}, ${m.get('cost_usd') or 0:.2f}, "
             f"active {ago(m.get('last_active'))}"
         )
+    # the role catalog (docs/SPEC.md §17.3), in the caller's language: what hire_agent offers
+    catalog = roles.catalog(swarm.config.roles, swarm.language_of(ctx.actor))
+    if catalog:
+        lines.append("Role catalog (hire_agent role=<name>; a catalog role brings its description and model profile, "
+                     "and instructions may then be empty; any other name is a new role you describe in "
+                     "instructions):")
+        for role in catalog:
+            model = f" (model {role.model})" if role.model else ""
+            lines.append(f"- {role.name}{model}: {roles.summary(role.description)}")
     return "\n".join(lines)
 
 
@@ -51,14 +61,40 @@ async def agents(ctx: ToolContext, args: dict[str, Any]) -> str:
         "name": {"type": "string", "description": "Human first and last name (generated if omitted)"},
     },
     required=["role", "instructions"],
+    allow_empty=("instructions",),  # validation only (the schema is unchanged): "" for a catalog role
 )
 async def hire_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
-    name = await ctx.swarm.hire(
-        ctx.actor, args["role"], args["instructions"], model=args.get("model") or None,
-        name=args.get("name") or None,
-    )
-    return (f"Hired {name} as \"{args['role'].strip()}\". They are woken now: assign them a task (task_update "
-            "assignee) or leave ready tasks for them to claim; no welcome message is needed.")
+    swarm = ctx.swarm
+    role = roles.normalize(args["role"])
+    instructions = (args.get("instructions") or "").strip()
+    # a catalog role brings its description and model profile; any other name is a new role, which only the
+    # instructions describe (the guard is here, not in Swarm.hire: the starting team needs no instructions)
+    entry = roles.find_role(swarm.config.roles, role, swarm.language)
+    close = [] if entry else roles.close_roles(swarm.config.roles, role, swarm.language)
+    similar = f" Similar catalog roles: {', '.join(close)}." if close else ""
+    if entry is None and not instructions:
+        if ctx.is_user:  # the board's hire form, the TUI or the console: the user's tools and views
+            raise ToolError(f"'{role}' is not in the role catalog: describe the new role in the instructions (in the "
+                            f"terminal: /hire {role} | instructions), or pick a catalog role (the list of the board's "
+                            f"hire form, /roles in the terminal).{similar}")
+        raise ToolError(f"'{role}' is not in the role catalog: describe the new role's responsibilities in "
+                        f"instructions, or pick a catalog role (`agents` lists them).{similar}")
+    name = await swarm.hire(ctx.actor, role, instructions, model=args.get("model") or None,
+                            name=args.get("name") or None)
+    member = swarm.member(name) or {}
+    shown = member.get("role") or role
+    if ctx.is_user:  # no agent-facing advice (task_update, welcome messages) for the user
+        if entry is not None:
+            return f"Hired {name} as \"{shown}\" (catalog role, model profile {member.get('model')})."
+        return (f"Hired {name} as \"{shown}\": a new role, not in the role catalog; your instructions are all they "
+                f"know about it.{similar}")
+    if entry is not None:
+        source = f" They got the catalog description of the role; model profile {member.get('model')}."
+    else:
+        source = (f" \"{shown}\" is a new role (not in the role catalog): your instructions are all they know about "
+                  f"it.{similar}")
+    return (f"Hired {name} as \"{shown}\".{source} They are woken now: assign them a task (task_update assignee) "
+            "or leave ready tasks for them to claim; no welcome message is needed.")
 
 
 @tool(
@@ -132,6 +168,13 @@ async def goal_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
     if goal and goal.get("status") == "done":
         raise ToolError("The global goal is already marked as achieved. If more work is needed, tell the user "
                         "(send_message to \"user\"); only the user can reopen the goal.")
+    if swarm.board.independent_review:
+        waiting = swarm.board.list(status=Status.REVIEW)
+        if waiting:
+            listed = ", ".join(f"#{t.id} ({t.reviewer or 'user'})" for t in waiting[:20])
+            raise ToolError(f"Tasks are still waiting for review: {listed}. The goal can be completed only after "
+                            "every task is reviewed: call `wait` (when all tasks are finished, a member is woken to "
+                            "verify the result and complete the goal).")
     swarm.complete_goal(ctx.actor, args["summary"])
     text = "The global goal is marked as achieved and the user was notified."
     still_open = swarm.board.list()
@@ -172,11 +215,18 @@ async def join_swarm(ctx: ToolContext, args: dict[str, Any]) -> str:
     name = await swarm.hire(
         USER, args["role"], args.get("instructions") or "", name=wanted or None, kind=AgentKind.EXTERNAL,
     )
-    return (
-        f"You joined the swarm as {name} (role: {args['role'].strip()}). Pass as_agent=\"{name}\" in every call. "
+    member = swarm.member(name) or {}
+    role = member.get("role") or args["role"].strip()
+    text = (
+        f"You joined the swarm as {name} (role: {role}). Pass as_agent=\"{name}\" in every call. "
         "Look at `board`, claim tasks with `task_claim`, talk with `send_message`, and call `wait_for_events` "
         "to receive messages, assignments and trigger notifications."
     )
+    # an external member has no system prompt: a catalog role's description reaches it here
+    entry = roles.find_role(swarm.config.roles, role, member.get("language") or swarm.language)
+    if entry is not None and entry.description:
+        text += f"\nYour role ({role}): {entry.description}"
+    return text
 
 
 def _stopping(swarm) -> bool:
@@ -215,9 +265,14 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 @tool(
     "set_goal",
-    en="Set or replace the global goal of the swarm. The team is woken up to plan the work.",
-    ru="Задать или заменить глобальную цель роя. Команда будет разбужена, чтобы спланировать работу.",
-    properties={"title": {"type": "string"}, "description": {"type": "string"}},
+    en="Set or replace the global goal of the swarm. The team is woken up to plan the work. A multi-line title is "
+       "split: its first line becomes the title, the other lines open the description.",
+    ru="Задать или заменить глобальную цель роя. Команда будет разбужена, чтобы спланировать работу. Многострочный "
+       "title делится: первая строка становится заголовком, остальные открывают описание.",
+    properties={
+        "title": {"type": "string", "description": "The goal: one line, or several lines (the first one is the title)"},
+        "description": {"type": "string", "description": "Details, success criteria, constraints (optional)"},
+    },
     required=["title"],
     audience=("user",),
 )

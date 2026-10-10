@@ -8,7 +8,9 @@ import contextlib
 import io
 import json
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -20,16 +22,18 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from prompt_toolkit.output.vt100 import Vt100_Output
 
+from dreamteam import prompts
 from dreamteam import settings as st
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.tui import app as app_module
 from dreamteam.tui import main_print, render
 from dreamteam.tui.app import TUI
 from dreamteam.tui.client import Connection, HubError, connect
-from dreamteam.tui.dialogs import ConfirmDialog, MCPApprovalDialog, SessionPicker
+from dreamteam.tui.dialogs import BusyDialog, ConfirmDialog, MCPApprovalDialog, SessionPicker
 from dreamteam.tui.input import load_prefs
 
-CTRL_C, ESC, SHIFT_TAB, CTRL_O, DOWN = "\x03", "\x1b", "\x1b[Z", "\x0f", "\x1b[B"
+CTRL_C, ESC, SHIFT_TAB, CTRL_O, DOWN, CTRL_J = "\x03", "\x1b", "\x1b[Z", "\x0f", "\x1b[B", "\n"
+PLANNING = prompts.PLANNING_TASK["en"][0]  # the title of the planning task of an English swarm
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[=>78]")
 
 
@@ -87,8 +91,9 @@ def make_home(tmp_path: Path) -> Path:
 class Harness:
     """A running TUI fed through a pipe input; everything it prints is kept as plain text."""
 
-    def __init__(self, conn: Connection, stack: contextlib.ExitStack, **kwargs: Any):
+    def __init__(self, conn: Connection, stack: contextlib.ExitStack, width: int = 100, **kwargs: Any):
         self.conn = conn
+        self.width = width  # of the captured text (long paths: wider, so that they are not wrapped)
         self.out: list[str] = []
         self.pipe = stack.enter_context(create_pipe_input())
         kwargs.setdefault("lang", "en")
@@ -96,7 +101,7 @@ class Harness:
         self.task = asyncio.create_task(self.tui.run())
 
     def capture(self, renderable: Any) -> None:
-        self.out.append(render.to_plain(renderable, 100))
+        self.out.append(render.to_plain(renderable, self.width))
 
     @property
     def text(self) -> str:
@@ -245,7 +250,7 @@ async def test_commands_on_an_attached_session(launch, monkeypatch):
     assert "Build a calculator" in h.text  # the goal panel
     agent = h.tui.members[0]
 
-    await h.run("/board", "Decompose the global goal")
+    await h.run("/board", PLANNING)
     await h.run("/agents", agent)
     await h.run("/status", "Version")
     assert "Calc" in h.out[-1] and "in this process" in h.out[-1]
@@ -253,14 +258,18 @@ async def test_commands_on_an_attached_session(launch, monkeypatch):
     assert "/board" in h.out[-1] and "task board" in h.out[-1]
     await h.run("/frobnicate", "Unknown command /frobnicate")
     await h.run("/bord", "Did you mean: /board")
-    await h.run("/boa", "Decompose the global goal")    # Enter runs the selected suggestion
-    await h.run("/task 1", "Decompose the global goal")
+    await h.run("/boa", PLANNING)    # Enter runs the selected suggestion
+    await h.run("/task 1", PLANNING)
+    await h.run("/roles", "Role catalog")                 # the session's catalog (GET /api/roles)
+    assert "Tester" in h.out[-1] and "Generalist" in h.out[-1]
+    await h.run("/roles reviewer", "Reviewer")
+    assert "built-in" in h.out[-1] and "second pair of eyes" in h.out[-1]
     await h.run("/cost", "Total")
     await h.run(f"/to {agent.split()[0]}", f"Now writing to: {agent}")
     assert h.tui.box_title() == f"→ {agent}"
     await h.run("/budget 3", "Limits: budget $3.00")
     assert (await conn.client.state(sid))["swarm"]["limits"]["max_cost_usd"] == 3.0
-    await h.run("/files", "(empty folder)")
+    await h.run("/files", ".scratch/")  # only the agents' scratch folder so far (never committed)
     workspace = Path((await conn.client.session(sid))["session"]["dir"]) / "workspace"
     (workspace / "marker-file.txt").write_text("made by the test\n", encoding="utf-8")
     await h.run("!ls", "marker-file.txt", timeout=30)  # runs in the session workspace
@@ -289,6 +298,57 @@ async def test_commands_on_an_attached_session(launch, monkeypatch):
     h.type("are you there?\r")  # a message to a stopped session starts it first
     await h.until(lambda: messages_from_user(conn, sid, "are you there?"), 20, "the message")
     assert (await conn.client.session(sid))["session"]["status"] == "running"
+    assert await h.quit() == 0
+
+
+async def test_a_multi_line_goal_goes_whole_to_the_hub_which_splits_it(launch, monkeypatch):
+    conn = await launch()
+    created: list[tuple] = []
+    create_session = conn.client.create_session
+
+    async def recording(title, goal, *args, **kwargs):
+        created.append((title, goal))
+        return await create_session(title, goal, *args, **kwargs)
+
+    monkeypatch.setattr(conn.client, "create_session", recording)
+    h = launch.tui(conn)
+    await h.until(lambda: h.tui.ready.is_set())
+    h.type("/new\r")
+    await h.until(lambda: h.tui.input_mode == ("goal", None))
+    assert h.tui._placeholder().startswith("Describe the goal: the first line is its title")
+    h.type("Line one" + CTRL_J + "Line two\r")
+    await h.until(lambda: h.tui.attached and h.tui.sid, 30, "the new session")
+    assert created == [("", "Line one\nLine two")]  # the title comes from the hub: the goal's first line
+    await h.see('Created session "Line one"')
+    goal = (await conn.client.state(h.tui.sid))["swarm"]["goal"]
+    assert (goal["title"], goal["description"]) == ("Line one", "Line two")
+
+    acts: list[tuple] = []
+    act = conn.client.act
+
+    async def recording_act(sid, tool, args=None):
+        acts.append((tool, args))
+        return await act(sid, tool, args)
+
+    monkeypatch.setattr(conn.client, "act", recording_act)
+    h.type("/goal A" + CTRL_J + "B\r")
+    await h.until(lambda: acts, what="the new goal")
+    assert acts[0] == ("set_goal", {"title": "A\nB"})
+    goal = (await conn.client.state(h.tui.sid))["swarm"]["goal"]
+    assert (goal["title"], goal["description"]) == ("A", "B")
+    assert await h.quit() == 0
+
+
+async def test_team_sets_the_starting_team_of_the_next_session(launch):
+    conn = await launch()
+    h = launch.tui(conn)
+    await h.until(lambda: h.tui.ready.is_set())
+    await h.run("/team", "Starting team of new sessions: Generalist ×1")
+    await h.run("/team tester, reviewer", "New sessions from this window start with: Tester ×1 · Reviewer ×1")
+    h.type("Check the parser\r")
+    await h.until(lambda: h.tui.attached and len(h.tui.members) == 2, 30, "the team of two")
+    agents = (await conn.client.state(h.tui.sid))["agents"]
+    assert sorted(a["role"] for a in agents) == ["Reviewer", "Tester"]
     assert await h.quit() == 0
 
 
@@ -814,3 +874,405 @@ async def test_session_restart_reconnects_quietly_and_a_deleted_session_detaches
     await h.see("no longer exists", timeout=20)
     assert not h.tui.attached and h.tui.box_title() == "new session"
     assert await h.quit() == 0
+
+
+DELETE_KEY = "\x1b[3~"
+
+
+async def test_sessions_are_deleted_from_the_picker_and_by_command(launch, monkeypatch):
+    conn = await launch()
+    old = (await conn.client.create_session("Old", "", start=False))["id"]
+    spare = (await conn.client.create_session("Spare", "", start=False))["id"]
+    main = (await conn.client.create_session("Main", "Main goal"))["id"]
+    h = launch.tui(conn, session=main)
+    await h.until(lambda: h.tui.attached and h.tui.sid == main, 20, "the attach")
+
+    async def ids() -> list[str]:
+        return [s["id"] for s in await conn.client.sessions()]
+
+    async def select(sid: str) -> None:
+        await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker")
+        for _ in range(len(h.tui.dialog.select.options)):
+            if h.tui.dialog.select.selected.value == sid:
+                return
+            index = h.tui.dialog.select.index
+            h.type(DOWN)
+            await h.until(lambda: h.tui.dialog.select.index != index)
+        raise AssertionError(f"{sid} is not in the picker")
+
+    async def confirm() -> ConfirmDialog:
+        await h.until(lambda: isinstance(h.tui.dialog, ConfirmDialog), what="the confirmation")
+        assert h.tui.dialog.select.selected.value is False  # "No" is preselected: Enter keeps the session
+        return h.tui.dialog
+
+    # /sessions: Delete asks first; "No" brings the picker back on the same session
+    h.type("/sessions\r")
+    await select(old)
+    assert "Del to delete" in h.tui.dialog.footer
+    h.type(DELETE_KEY)
+    dialog = await confirm()
+    assert dialog.title == 'Delete session "Old"?' and "cannot be undone" in dialog.text
+    assert "agents will be stopped" not in dialog.text  # a stopped session
+    h.type("\r")
+    await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker again")
+    assert h.tui.dialog.select.selected.value == old and old in await ids()
+    h.type(DELETE_KEY)
+    await confirm()
+    h.type("1")  # "Yes"
+    await h.see(f'Session "Old" ({old}) deleted', 20)
+    await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker with the sessions left")
+    assert old not in [o.value for o in h.tui.dialog.select.options]
+    assert old not in await ids() and not conn.manager.dir_of(old).exists()
+    h.type(ESC)
+    await h.until(lambda: h.tui.dialog is None)
+    assert h.tui.attached and h.tui.sid == main
+
+    # /delete without an id: a picker that deletes the chosen session, then closes
+    await h.run("/delete nope", 'No session "nope"')
+    h.type("/delete\r")
+    await select(spare)
+    assert h.tui.dialog.title.startswith("Which session to delete?")
+    h.type("\r")
+    await confirm()
+    h.type("1")
+    await h.see(f'Session "Spare" ({spare}) deleted', 20)
+    await h.until(lambda: h.tui.dialog is None)
+    assert await ids() == [main]
+
+    # a refusal (files in use) keeps the current session
+    async def refuse(sid: str) -> None:
+        raise HubError(409, "Could not delete session: its files are in use")
+
+    monkeypatch.setattr(conn.client, "delete_session", refuse)
+    h.type(f"/delete {main}\r")
+    dialog = await confirm()
+    assert "agents will be stopped" in dialog.text  # the session is running
+    h.type("1")
+    await h.see("its files are in use")
+    assert h.tui.attached and h.tui.sid == main and h.tui.dialog is None
+    monkeypatch.undo()
+
+    # the main session of a project home is refused before any question; a folder outside the session is kept
+    summary = next(s for s in await conn.client.sessions() if s["id"] == main)
+    assert await h.tui.delete_session(main, {**summary, "legacy": True}) is False
+    await h.see("cannot be deleted here")
+    task = asyncio.create_task(h.tui.delete_session(main, {**summary, "workspace": {"path": "D:/proj", "default": False}}))
+    dialog = await confirm()
+    assert "the folder D:/proj stays" in dialog.text and "workspace files" not in dialog.text
+    h.type(ESC)
+    assert await task is False and main in await ids()
+
+    # the current session, with a slow hub (a big workspace to purge): a busy notice takes the keys meanwhile,
+    # and the session is left quietly (its stream is refused before the hub answers: no "no longer exists")
+    purge = conn.manager._purge_trash
+
+    def slow_purge() -> None:
+        time.sleep(app_module.LOST_GRACE + 1)
+        purge()
+
+    monkeypatch.setattr(conn.manager, "_purge_trash", slow_purge)
+    h.type(f"/delete {main}\r")
+    await confirm()
+    h.type("1")
+    await h.until(lambda: isinstance(h.tui.dialog, BusyDialog), what="the busy notice")
+    h.type("typed meanwhile\r")  # swallowed: neither sent to the agents nor a new session's goal
+    await h.see(f'Session "Main" ({main}) deleted', 20)
+    await h.until(lambda: not h.tui.attached and h.tui.dialog is None, what="the detach")
+    assert h.tui.sid is None and h.tui.box_title() == "new session" and h.tui.buffer.text == ""
+    await asyncio.sleep(app_module.LOST_GRACE + 0.5)
+    assert "no longer exists" not in h.text and "Lost connection" not in h.text and "typed meanwhile" not in h.text
+    assert await ids() == [] and not conn.manager.dir_of(main).exists()
+    await h.run("/sessions", "No sessions yet")
+    assert await h.quit() == 0
+
+
+async def test_a_dialog_of_another_task_waits_for_the_picker_and_its_confirmation(launch):
+    """An MCP approval (any dialog of another task) must not pop up between the picker, the delete
+    confirmation and the picker again: the keys meant for them would answer it."""
+    conn = await launch()
+    first = (await conn.client.create_session("First", "", start=False))["id"]
+    second = (await conn.client.create_session("Second", "", start=False))["id"]
+    h = launch.tui(conn)
+    await h.until(lambda: h.tui.ready.is_set(), what="the start")
+    h.type("/sessions\r")
+    await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker")
+    other = asyncio.create_task(h.tui.ask(ConfirmDialog("en", "Another task's question")))
+    await asyncio.sleep(0.2)
+    h.type(DELETE_KEY)  # on the first session
+    await h.until(lambda: isinstance(h.tui.dialog, ConfirmDialog), what="a confirmation")
+    assert h.tui.dialog.title.startswith("Delete session"), h.tui.dialog.title
+    h.type("\r")  # "No"
+    await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker again")
+    assert not other.done()
+    h.type(ESC)
+    await h.until(lambda: isinstance(h.tui.dialog, ConfirmDialog) and h.tui.dialog.title == "Another task's question",
+                  what="the other dialog after the picker")
+    h.type(ESC)
+    assert await other is None
+    assert sorted(s["id"] for s in await conn.client.sessions()) == sorted([first, second])
+    assert await h.quit() == 0
+
+
+# ---- /cd: the folder a session works in (docs/TUI.md §4.5, SPEC §17.2) -------------------------------------
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+
+
+def git(root: Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(root), *args], capture_output=True, text=True, encoding="utf-8",
+                          check=True).stdout
+
+
+def user_repo(path: Path) -> Path:
+    """A project of the user: a git repository with one commit on the branch `feature`."""
+    path.mkdir(parents=True)
+    git(path, "init", "-q")
+    for key, value in (("user.name", "Owner"), ("user.email", "owner@example.com"), ("core.autocrlf", "false")):
+        git(path, "config", "--local", key, value)
+    (path / "README.md").write_text("# My project\n", encoding="utf-8")
+    git(path, "add", "-A")
+    git(path, "-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", "Initial")
+    git(path, "checkout", "-q", "-b", "feature")
+    return path
+
+
+async def confirm_dialog(h: Harness, title_part: str) -> ConfirmDialog:
+    await h.until(lambda: isinstance(h.tui.dialog, ConfirmDialog) and title_part in h.tui.dialog.title,
+                  what=f"the confirmation {title_part!r}")
+    return h.tui.dialog
+
+
+@needs_git
+async def test_cd_moves_the_session_adopts_a_project_and_goes_back(launch, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)  # relative /cd paths resolve against the TUI's current directory
+    conn = await launch()
+    sid = (await conn.client.create_session("Calc", "Build a calculator",
+                                            overrides={"workspace": {"git": True}}))["id"]
+    h = launch.tui(conn, session=sid, width=400)
+    await h.until(lambda: h.tui.attached and h.tui.members, 30, "the attach")
+    default = Path((await conn.client.session(sid))["session"]["dir"]) / "workspace"
+    (default / "marker-file.txt").write_text("made by the test\n", encoding="utf-8")
+
+    async def folder() -> dict:
+        return (await conn.client.session(sid))["session"]["workspace"]
+
+    await h.run("/cd", "Session folder:")
+    assert f"Session folder: {default} (the session's own folder)" in h.text
+    assert "/cd --default" in h.out[-1]
+
+    # an empty (here: missing) folder: the files and the git history move there, "Yes" preselected
+    moved = tmp_path / "moved" / "here"
+    h.type("/cd moved/here\r")
+    dialog = await confirm_dialog(h, 'Move session "Calc" to')
+    assert str(moved) in dialog.title and "it will be created" in dialog.text and "agents stop" in dialog.text
+    assert dialog.select.selected.value is True
+    h.type("\r")
+    await h.see(f"now works in {moved}: its files moved there", 60)
+    await h.see("git: the history moved along")
+    assert (moved / "marker-file.txt").exists() and (moved / ".git").is_dir() and not default.exists()
+    assert (await folder()) == {"path": str(moved), "default": False, "adopted": False, "exists": True}
+    assert (await conn.client.session(sid))["session"]["status"] == "running"  # restarted in its new folder
+    (moved / "only-in-moved.txt").write_text("x\n", encoding="utf-8")
+    await h.run("!ls", "only-in-moved.txt", timeout=30)  # `!` runs in the session's new folder
+
+    # cancelled (Esc, or "No"): nothing changes
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    h.type(f"/cd {empty}\r")
+    dialog = await confirm_dialog(h, "Move session")
+    assert "The folder is empty" in dialog.text
+    h.type(ESC)
+    await h.see("The session folder is unchanged")
+    h.type(f"/cd {empty}\r")
+    await confirm_dialog(h, "Move session")
+    h.type("2")
+    await h.until(lambda: h.text.count("The session folder is unchanged") == 2, what="the second cancel")
+    assert (await folder())["path"] == str(moved) and not any(empty.iterdir())
+
+    # back to its own folder: the files move back
+    h.type("/cd --default\r")
+    await confirm_dialog(h, 'Move session "Calc" back to its own folder')
+    h.type("\r")
+    await h.see(f"now works in {default}: its files moved there", 60)
+    assert (default / "marker-file.txt").exists() and (await folder())["default"] is True
+    assert moved.is_dir() and not any(moved.iterdir())  # the other old folder is left, empty
+
+    # the user's project with uncommitted changes: refused, nothing changes
+    repo = user_repo(tmp_path / "project")
+    (repo / "notes.txt").write_text("my own changes\n", encoding="utf-8")
+    h.type(f"/cd {repo}\r")
+    dialog = await confirm_dialog(h, "Move session")
+    assert "not empty" in dialog.text and "current branch" in dialog.text
+    assert dialog.select.selected.value is False  # adopting a folder with files: "No" preselected
+    h.type("1")
+    await h.see("uncommitted changes", 30)
+    assert "Commit or stash" in h.text
+    assert (await folder())["default"] is True and (default / "marker-file.txt").exists()
+    assert git(repo, "status", "--porcelain").strip() == "?? notes.txt"
+
+    # a clean one: adopted, the agents commit to its current branch, the old folder stays
+    (repo / "notes.txt").unlink()
+    config_before = git(repo, "config", "--local", "--list")
+    h.type(f"/cd {repo}\r")
+    await confirm_dialog(h, "Move session")
+    h.type("1")
+    await h.see(f"now works with the files of {repo}", 60)
+    await h.see("git: the agents commit to the current branch")
+    await h.see(f"The previous folder {default} stays where it is")
+    assert (await folder()) == {"path": str(repo), "default": False, "adopted": True, "exists": True}
+    assert (default / "marker-file.txt").exists() and git(repo, "branch", "--show-current").strip() == "feature"
+    assert git(repo, "config", "--local", "--list") == config_before  # the user's repository config is untouched
+    await h.run("!ls", "README.md", timeout=30)
+    await h.run("/cd", "Session folder:")
+    assert f"{repo} (a project folder: the agents commit to its current branch)" in h.text
+    await h.run("/status", "Version")
+    assert str(repo) in h.out[-1]
+    # the current folder: nothing to ask, and a running `!` command goes on (nothing moves)
+    h.type(f"!{long_command()}\r")
+    await h.until(lambda: h.tui._bash is not None and h.tui._bash.running, 20, "the running command")
+    run = h.tui._bash
+    await h.run(f"/cd {repo}", "already works in")
+    assert h.tui._bash is run and run.running and "interrupted" not in h.text
+    # leaving the project for an empty folder: the project's files stay where they are, so the command goes on
+    other = tmp_path / "other-empty"
+    other.mkdir()
+    h.type(f"/cd {other}\r")
+    dialog = await confirm_dialog(h, "Move session")
+    assert "starts afresh" in dialog.text and "! command" not in dialog.text
+    h.type("\r")
+    await h.see(f'Session "Calc" now works in {other}', 60)
+    await h.see(f"The previous folder {repo} stays where it is")
+    assert h.tui._bash is run and run.running and "interrupted" not in h.text
+    h.type(ESC)  # (interrupts the command)
+    await h.until(lambda: h.tui._bash is None, 15, "the interrupted command")
+    # a command in the folder whose files move: the question says that it will be stopped
+    h.type(f"!{long_command()}\r")
+    await h.until(lambda: h.tui._bash is not None and h.tui._bash.running, 20, "the second running command")
+    run = h.tui._bash
+    assert run.cwd == other
+    h.type(f"/cd {tmp_path / 'third'}\r")
+    dialog = await confirm_dialog(h, "Move session")
+    assert "The running ! command will be stopped" in dialog.text
+    h.type(ESC)
+    await h.until(lambda: h.text.count("The session folder is unchanged") == 3, what="the third cancel")
+    assert run.running
+    h.type(ESC)  # (interrupts the command)
+    await h.until(lambda: h.tui._bash is None, 15, "the interrupted command")
+    # the restarts of the session during the moves were not reported as a lost connection (a loss that is not
+    # made good is reported only after LOST_GRACE)
+    await asyncio.sleep(app_module.LOST_GRACE + 0.5)
+    assert "Lost connection" not in h.text and "Reconnected to the hub" not in h.text
+    assert await h.quit() == 0
+
+
+async def test_a_session_in_a_missing_folder_attaches_stopped_and_cd_brings_it_back(launch, tmp_path):
+    conn = await launch()
+    project = tmp_path / "proj"
+    h = launch.tui(conn, workspace=str(project), width=400)  # `dreamteam --workspace DIR`: the next new session
+    await h.until(lambda: h.tui.ready.is_set())
+    await h.see(f"A new session will work in the folder {project}")
+    await h.run("/cd --default", "A new session will work in its own folder")  # no session: /cd picks the folder
+    assert h.tui.workspace_override is None
+    await h.run(f"/cd {project}", f"A new session will work in the folder {project}")
+    h.type("Write a haiku about the sea\r")
+    await h.until(lambda: h.tui.attached and h.tui.members, 30, "the new session")
+    sid = h.tui.sid
+    await h.see(f"works in the new folder {project}")
+    assert (await conn.client.session(sid))["session"]["workspace"]["path"] == str(project)
+    assert h.tui.workspace_override is None  # only the first session
+    assert await h.quit() == 0
+
+    await conn.client.stop_session(sid)
+    shutil.rmtree(project)  # e.g. a project folder deleted, or a drive unplugged
+    h = launch.tui(conn, session=sid, width=400)
+    await h.see("its folder", 30)
+    await h.until(lambda: h.tui.attached and h.tui.sid == sid, what="the attach of the stopped session")
+    assert f'Session "Write a haiku about the sea" is not running: its folder {project} does not exist' in h.text
+    assert "╭─ Goal" in h.text and h.tui.last_event > 0  # an ordinary attach (no replay from the first event)
+    assert (await conn.client.session(sid))["session"]["status"] == "stopped" and not project.exists()
+    await h.run("!ls", "/cd to choose another one")  # no stand-in folder for the user's project
+    h.tui.local = False  # a hub on another computer: a relative path means nothing here
+    await h.run("/cd some/where", "The hub is not on this computer: give the absolute path")
+    h.tui.local = True
+    h.type("hello?\r")  # a message tries to start it: the same clear error
+    await h.until(lambda: h.text.count("is not running: its folder") == 2, what="the start error")
+
+    h.type("/cd --default\r")
+    dialog = await confirm_dialog(h, "back to its own folder")
+    assert "does not exist, so nothing moves" in dialog.text
+    h.type("\r")
+    await h.see("did not exist: nothing was moved", 30)
+    workspace = (await conn.client.session(sid))["session"]["workspace"]
+    assert workspace["default"] is True and not project.exists()
+    h.type("are you there?\r")  # now it starts
+    await h.until(lambda: messages_from_user(conn, sid, "are you there?"), 30, "the message")
+    assert (await conn.client.session(sid))["session"]["status"] == "running"
+    assert await h.quit() == 0
+
+
+async def test_console_cd_asks_then_moves_and_comes_back(launch, tmp_path, capsys):
+    """`dreamteam console`: /cd shows the folder; /cd PATH asks y/N (Enter = no), --yes does not ask."""
+    from dreamteam import console as console_module
+
+    conn = await launch()
+    sid = (await conn.client.create_session("Calc", "Build a calculator"))["id"]
+    default = Path((await conn.client.session(sid))["session"]["dir"]) / "workspace"
+    (default / "marker.txt").write_text("x\n", encoding="utf-8")
+    con = console_module.Console(f"{conn.base_url}/s/{sid}", "en")
+    assert con.local and con.session_id == sid
+
+    async def say(line: str) -> str:
+        capsys.readouterr()
+        assert await asyncio.to_thread(con.handle, line) is True
+        return " ".join(capsys.readouterr().out.split())
+
+    assert f"Session folder: {default} (the session's own folder)" in await say("/cd")
+    target = tmp_path / "target"
+    out = await say(f"/cd {target}")
+    assert f'Move session "Calc" to {target}?' in out and "it will be created" in out and "[y/N]" in out
+    assert "agents stop during the move" in out and con.pending_cd is not None
+    assert "Cancelled" in await say("")  # Enter: no
+    assert not target.exists() and (default / "marker.txt").exists()
+
+    await say(f'/cd "{target}"')
+    out = await say("y")
+    assert f"now works in {target}: its files moved there" in out and (target / "marker.txt").exists()
+    assert (await conn.client.session(sid))["session"]["status"] == "running"
+    assert f"Session folder: {target} (the session's own folder, moved here)" in await say("/cd")
+
+    out = await say("/cd --default --yes")  # no question
+    assert f"now works in {default}: its files moved there" in out and (default / "marker.txt").exists()
+    assert (await conn.client.session(sid))["session"]["workspace"]["default"] is True
+
+    await say(f"/cd {target}")
+    out = await say("/help")  # another line than y/n: cancelled, and handled as usual
+    assert "Cancelled" in out and "/cd [path | --default]" in out
+    assert (await conn.client.session(sid))["session"]["workspace"]["default"] is True
+
+    con.local = False  # a hub on another computer: a relative path means nothing here
+    assert "give the absolute path" in await say("/cd some/where")
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    out = await say(f"/cd {project}")  # the folder cannot be looked at from here: both cases are explained
+    assert "An empty folder:" in out and "A folder with files:" in out
+    out = await say("yes")
+    assert f"now works with the files of {project}" in out and f"The previous folder {default} stays" in out
+    assert "git is off in the settings" in out
+
+    # a stopped session whose folder is gone (`dreamteam console --session` attaches to it for this): /cd fixes it
+    lost = tmp_path / "lost"
+    usb = (await conn.client.create_session("Usb", "Later", start=False, workspace=str(lost)))["id"]
+    shutil.rmtree(lost)
+    stopped = console_module.Console(f"{conn.base_url}/s/{usb}", "en", local=True)
+    await asyncio.to_thread(stopped._prime)
+    capsys.readouterr()
+    await asyncio.to_thread(stopped.handle, "/cd")
+    assert f"The folder {lost} does not exist" in " ".join(capsys.readouterr().out.split())
+    await asyncio.to_thread(stopped.handle, "/cd --default --yes")
+    assert "did not exist: nothing was moved" in " ".join(capsys.readouterr().out.split())
+    assert (await conn.client.session(usb))["session"]["workspace"]["default"] is True
+
+    single = console_module.Console(conn.base_url, "ru")  # not a launcher session: no /cd
+    capsys.readouterr()
+    await asyncio.to_thread(single.handle, "/cd")
+    assert "только с сессией лаунчера" in capsys.readouterr().out

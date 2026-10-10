@@ -17,8 +17,9 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-from . import __version__
+from . import __version__, roles
 from .config import CONFIG_FILE, PROVIDER_PRESETS, Config, render_template
+from .goal_text import split_goal
 from .models import USER
 
 log = logging.getLogger("dreamteam")
@@ -141,6 +142,55 @@ def _remove_hub_file(project_dir: Path) -> None:
         pass
 
 
+def write_launcher_marker(home: Path) -> Path | None:
+    """Mark that this process runs sessions of `home`: also without a hub.json (`dreamteam mcp --no-web`, the
+    TUI's in-process launcher without its web UI), `sessions rm` must not delete their files behind its back."""
+    path = home / ".dreamteam" / f"launcher-{os.getpid()}.pid"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        return None
+    return path
+
+
+def remove_launcher_marker(path: Path | None) -> None:
+    if path is not None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _session_holders(home: Path) -> list[str]:
+    """Other live DreamTeam processes that may run sessions of `home` without a hub that answers: a hub.json whose
+    process is alive (busy, starting) or that a Docker sandbox wrote, and launcher markers (a marker of a dead
+    process is removed)."""
+    found: list[str] = []
+    info = _read_hub_file(home)
+    if info is not None:
+        try:
+            pid = int(info.get("pid") or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        written_for = info.get("project")
+        local = written_for is None or _same_path(str(written_for), str(Path(home).resolve()))
+        if not local or (pid != os.getpid() and _pid_alive(pid)):
+            found.append(f"the server of {hub_file(home)} (pid {pid}, {info['base_url']})")
+    for marker in sorted((Path(home) / ".dreamteam").glob("launcher-*.pid")):
+        try:
+            pid = int(marker.stem.split("-", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if pid == os.getpid():
+            continue
+        if _pid_alive(pid):
+            found.append(f"process {pid} ({marker})")
+        else:  # crashed or killed
+            remove_launcher_marker(marker)
+    return found
+
+
 def _stdin_is_terminal() -> bool:
     """sys.stdin.isatty(), except that on Windows the NUL device (stdin redirected from nowhere: a scheduled task,
     `start /b`, `< NUL`) claims to be a tty too. The console would read EOF from it at once, and its end stops
@@ -242,7 +292,7 @@ def _start_console(loop: asyncio.AbstractEventLoop, base: str, lang: str, stop: 
 
     def target() -> None:
         try:
-            console_module.run_console(base, lang, stop=stop)
+            console_module.run_console(base, lang, stop=stop, local=True)  # (in the hub's own process)
         except Exception:
             log.exception("console failed")
         finally:
@@ -295,7 +345,8 @@ async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal
         await swarm.start()
         if goal:
             current = swarm.goal()
-            if not current or current.get("title") != goal or current.get("status") != "active":
+            title, _ = split_goal(goal)  # stored split: a multi-line --goal must not reset the goal at every restart
+            if not current or current.get("title") != title or current.get("status") != "active":
                 swarm.set_goal(USER, goal)
         base = public_base(host, port)
         started = asyncio.Event()
@@ -359,12 +410,14 @@ def cmd_run(args) -> int:
 def cmd_console(args) -> int:
     from .console import run_console
 
+    local: bool | None = None  # the hub's address decides (a loopback one is local)
     if args.url:
         base = args.url.rstrip("/")
         lang = args.lang or "ru"
     else:
         project = _home_arg(args)
         base = running_hub(project)
+        local = True  # found through the home's hub.json: the hub runs on this computer, whatever its address
         if not base:
             print(f"No running hub for {project}. Start it with `dreamteam serve` (or `dreamteam run`).",
                   file=sys.stderr)
@@ -386,14 +439,20 @@ def cmd_console(args) -> int:
         except (OSError, ValueError) as exc:  # the hub went away, or not a DreamTeam answer
             print(f"Cannot list the sessions at {base}: {exc}", file=sys.stderr)
             return 1
-        if session.get("status") != "running":  # every console command would get 409 "The session is stopped"
+        folder = session.get("workspace") if isinstance(session.get("workspace"), dict) else {}
+        lost = folder.get("default") is False and folder.get("exists") is False
+        if session.get("status") != "running" and not lost:  # every command would get 409 "The session is stopped"
             print(f"Session {session['id']} is stopped. Start it on the sessions page ({base}/) first.",
                   file=sys.stderr)
             return 1
+        print(f"Session {session['id']}: {session.get('title', '')}", file=sys.stderr)
+        if session.get("status") != "running":  # it cannot start: /cd is what this console can do for it
+            print(f"It is stopped and cannot start: its folder {folder.get('path')} does not exist. Move it with "
+                  "/cd <folder> (or /cd --default for its own folder), then start it on the sessions page "
+                  f"({base}/).", file=sys.stderr)
         base = f"{base}/s/{session['id']}"
         lang = args.lang or session.get("language") or lang
-        print(f"Session {session['id']}: {session.get('title', '')}", file=sys.stderr)
-    run_console(base, lang)
+    run_console(base, lang, local=local)
     return 0
 
 
@@ -592,7 +651,11 @@ def _print_sessions(home: Path, base: str | None) -> int:
         if is_home(home):
             from .sessions import SessionManager
 
-            sessions = SessionManager(home).list()
+            try:
+                sessions = SessionManager(home).list()
+            except (OSError, ValueError) as exc:
+                print(f"Cannot list the sessions of {home}: {exc}", file=sys.stderr)
+                return 1
         else:  # listing must not create a home (a typo, before the first `serve`) nor turn a `run` project into one
             sessions = []
     print("\n".join(session_line(s) for s in sessions) if sessions else "No sessions yet.")
@@ -603,11 +666,13 @@ def _print_sessions(home: Path, base: str | None) -> int:
 
 async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_browser: bool,
                       goal: str | None = None, title: str | None = None, start: str | None = None,
-                      stop: asyncio.Event | None = None) -> int:
+                      stop: asyncio.Event | None = None, workspace: str | None = None) -> int:
     """Run the launcher (sessions page, settings, every session's board, MCP) until a stop signal, the
-    console's /quit or a server failure. `goal` creates and starts a new session; `start` starts an
-    existing one. hub.json exists exactly while the server listens; all sessions stop at the end."""
+    console's /quit or a server failure. `goal` creates and starts a new session (working in the absolute
+    folder `workspace` when given, docs/SPEC.md §17.2); `start` starts an existing one. hub.json exists exactly
+    while the server listens; all sessions stop at the end."""
     from .launcher import serve_launcher
+    from .launcher_mcp import workspace_text
     from .sessions import SessionManager
     from .web import public_base
 
@@ -620,6 +685,7 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
     signals = _StopSignals(loop, stop).install()
     console_stop = threading.Event()
     server: asyncio.Task | None = None
+    marker = write_launcher_marker(home)  # sessions may run before hub.json exists (--goal, resume)
     code = 0
     try:
         focus = None
@@ -628,8 +694,11 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                 await manager.start(start)
                 focus = start
             if goal:
-                focus = (await manager.create(title or "", goal))["id"]
-        except Exception as exc:  # unknown session, invalid settings, the swarm failed to start
+                created = await manager.create(title or "", goal, workspace=workspace)
+                focus = created["id"]
+                if created.get("workspace_result"):
+                    print(f"Session {focus}: {workspace_text(created['workspace_result'])}", file=sys.stderr)
+        except Exception as exc:  # unknown session, invalid settings, a refused folder, the swarm failed to start
             print(f"Could not start the session: {exc}", file=sys.stderr)
             return 1
         base = public_base(host, port)
@@ -678,6 +747,7 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                 await manager.shutdown()
             finally:
                 signals.restore()
+                remove_launcher_marker(marker)
                 log.info("launcher stopped")
     return code
 
@@ -694,6 +764,15 @@ def cmd_serve(args) -> int:
     except OSError as exc:  # e.g. DIR is a file, or not writable
         print(f"Cannot use {home} as the DreamTeam home: {exc}", file=sys.stderr)
         return 1
+    workspace = None
+    if args.workspace:
+        if not args.goal:
+            print("--workspace needs --goal: it is the folder of the session that --goal creates (an existing "
+                  "session moves with /cd in the TUI or the console).", file=sys.stderr)
+            return 2
+        workspace = _workspace_arg(args.workspace)
+        if workspace is None:
+            return 2
     existing = running_hub(home)
     if existing:
         print(f"DreamTeam is already running for {home}: {existing}/", file=sys.stderr)
@@ -706,14 +785,149 @@ def cmd_serve(args) -> int:
     port = args.port or config.server.port
     try:
         return asyncio.run(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
-                                       goal=args.goal, title=args.title))
+                                       goal=args.goal, title=args.title, workspace=workspace))
     except KeyboardInterrupt:
         return 0
 
 
+SESSIONS_USAGE = ("dreamteam sessions [DIR] [--home HOME]\n"
+                  "       dreamteam sessions rm ID [ID ...] [--yes] [--home HOME]")
+DELETE_WORDS = ("rm", "delete", "del", "remove")
+
+
 def cmd_sessions(args) -> int:
+    """`dreamteam sessions [DIR]` lists the sessions; `dreamteam sessions rm ID...` deletes sessions."""
+    words = list(args.words or [])
+    if words and words[0] in DELETE_WORDS:
+        args.dir = None
+        return _delete_sessions(args, words[1:])
+    if words and words[0] in ("ls", "list"):
+        words = words[1:]
+    if len(words) > 1:
+        print(f"usage: {SESSIONS_USAGE}", file=sys.stderr)
+        return 2
+    args.dir = words[0] if words else None
     home = _home_arg(args)
     return _print_sessions(home, running_hub(home))
+
+
+def _hub_delete_session(base: str, sid: str) -> dict:
+    """DELETE a session through the running hub (it stops the session first): its answer ({"ok", and
+    "workspace_kept" for a folder outside the session}); RuntimeError with the hub's reason."""
+    quoted = urllib.parse.quote(sid, safe="")
+    request = urllib.request.Request(f"{base}/api/sessions/{quoted}?confirm={quoted}", method="DELETE")
+    try:
+        with urllib.request.urlopen(request, timeout=120) as resp:
+            answer = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        try:
+            reason = json.loads(exc.read().decode("utf-8")).get("error")
+        except (ValueError, AttributeError, OSError):
+            reason = None
+        raise RuntimeError(reason or f"HTTP {exc.code}") from None
+    return answer if isinstance(answer, dict) else {}
+
+
+def _kept_folder(summary: dict) -> str | None:
+    """The workspace folder of a session that lies outside it (the user's project): deleting keeps it."""
+    workspace = summary.get("workspace")
+    if isinstance(workspace, dict) and workspace.get("default") is False:
+        return str(workspace.get("path") or "") or None
+    return None
+
+
+def _delete_sessions(args, ids: list[str]) -> int:
+    """Delete sessions with their board, messages, workspace, MCP servers and traces: through the running hub
+    when there is one (a running session is stopped first), else in the home itself, unless another DreamTeam
+    process may be running them. A workspace folder outside the session is kept. Asks unless --yes."""
+    if not ids:
+        print(f"usage: {SESSIONS_USAGE}", file=sys.stderr)
+        return 2
+    from .launcher_mcp import session_line
+    from .sessions import SessionManager
+
+    home = _home_arg(args)
+    if not is_home(home):
+        print(f"{home} is not a DreamTeam home: there are no sessions to delete.", file=sys.stderr)
+        return 1
+
+    def holders_refused() -> bool:
+        holders = _session_holders(home)
+        if holders:
+            print("Nothing deleted: another DreamTeam process may be running these sessions ("
+                  + "; ".join(holders) + "). Delete them through its web page or console, or stop it and try "
+                  "again.", file=sys.stderr)
+        return bool(holders)
+
+    base = running_hub(home)
+    if not base and holders_refused():
+        return 1
+    try:
+        manager = None if base else SessionManager(home)
+        sessions = _hub_json(base, "/api/sessions").get("sessions", []) if base else manager.list()
+    except (OSError, ValueError) as exc:
+        print(f"Cannot list the sessions of {home}: {exc}", file=sys.stderr)
+        return 1
+    by_id = {s["id"]: s for s in sessions}
+    ids = list(dict.fromkeys(ids))
+    unknown = [sid for sid in ids if sid not in by_id]
+    if unknown:
+        print(f"Unknown session{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}. "
+              f"Sessions: {', '.join(by_id) or 'none'}.", file=sys.stderr)
+        return 1
+    legacy = [sid for sid in ids if by_id[sid].get("legacy")]
+    if legacy:
+        print(f"Nothing deleted: {', '.join(legacy)} is the project's own session; its files are "
+              f"{home / '.dreamteam'}, delete that folder by hand if you mean it.", file=sys.stderr)
+        return 1
+    if not args.yes:
+        if not _stdin_is_terminal():
+            print("Nothing deleted: pass --yes to delete without a confirmation.", file=sys.stderr)
+            return 1
+        for sid in ids:
+            print(session_line(by_id[sid]))
+            if _kept_folder(by_id[sid]):
+                print(f"    its workspace folder {_kept_folder(by_id[sid])} is kept")
+        what = "this session" if len(ids) == 1 else f"these {len(ids)} sessions"
+        try:
+            answer = input(f"Delete {what} with the task board, messages, workspace files, MCP servers and traces? "
+                           "This cannot be undone. [y/N] ")
+        except EOFError:
+            answer = ""
+        except KeyboardInterrupt:
+            print("\nNothing deleted.")
+            return 130
+        if answer.strip().lower() not in ("y", "yes", "д", "да"):
+            print("Nothing deleted.")
+            return 0
+        if not base:  # a hub may have started while the user answered: it must do the deleting
+            base = running_hub(home)
+            if not base and holders_refused():
+                return 1
+
+    async def delete_all() -> int:
+        code = 0
+        for sid in ids:
+            try:
+                if base:
+                    answer = await asyncio.to_thread(_hub_delete_session, base, sid)
+                else:
+                    answer = {"workspace_kept": await manager.delete(sid)}
+            except (RuntimeError, OSError, ValueError) as exc:  # SessionError is a ValueError
+                reason = str(exc)
+                print(reason if reason.startswith(f"Could not delete session {sid}")
+                      else f"Could not delete session {sid}: {reason}", file=sys.stderr)
+                code = 1
+            else:
+                kept = answer.get("workspace_kept")  # (as it was when deleted: a /cd may have run since the listing)
+                print(f"Deleted session {sid}." + (f" Its workspace folder {kept} was kept." if kept else ""))
+        return code
+
+    try:
+        return asyncio.run(delete_all())
+    except KeyboardInterrupt:  # the sessions deleted so far are printed
+        print("Interrupted.", file=sys.stderr)
+        return 130
 
 
 async def _mcp_launcher_in_process(home: Path, config: Config, web: bool, stop: asyncio.Event | None = None) -> None:
@@ -730,6 +944,7 @@ async def _mcp_launcher_in_process(home: Path, config: Config, web: bool, stop: 
     signals = _StopSignals(loop, stop).install()
     server: asyncio.Task | None = None
     stdio: asyncio.Task | None = None
+    marker = write_launcher_marker(home)  # without the web UI there is no hub.json
     try:
         host, port = config.server.host, config.server.port
         if web and _port_free(host, port):
@@ -766,6 +981,7 @@ async def _mcp_launcher_in_process(home: Path, config: Config, web: bool, stop: 
                 await manager.shutdown()
             finally:
                 signals.restore()
+                remove_launcher_marker(marker)
                 log.info("launcher stopped")
 
 
@@ -886,13 +1102,39 @@ def _piped_stdin() -> str:
         return ""
 
 
+def _workspace_arg(text: str) -> str | None:
+    """`--workspace DIR` as the absolute folder the hub needs (`~` and relative paths resolved against the
+    current directory); None, with the reason printed, for a file. The hub checks the rest (docs/SPEC.md §17.2)."""
+    path = os.path.normpath(os.path.abspath(os.path.expanduser(text)))
+    if os.path.isfile(path):
+        print(f"dreamteam: --workspace {path} is a file, not a folder.", file=sys.stderr)
+        return None
+    return path
+
+
 def cmd_tui(args) -> int:
     """The terminal UI in the style of Claude Code (docs/TUI.md), or with -p the non-interactive print mode."""
     home = _home_arg(args)
     overrides = {"model": args.model, "agents": args.agents, "max_agents": args.max_agents, "budget": args.budget,
                  "title": args.title}
+    if args.team is not None:
+        try:  # checked here, before a session or the TUI starts (the TUI turns it into swarm.starting_roles)
+            roles.parse_team(args.team)
+        except ValueError as exc:
+            print(f"dreamteam: --team: {exc}", file=sys.stderr)
+            return 2
+        overrides["team"] = args.team
     session = args.resume or None
     prompt = args.prompt
+    workspace = None
+    if args.workspace:
+        if args.continue_last or args.resume is not None:
+            print("dreamteam: --workspace is the folder of a new session; move an existing one with /cd in the TUI.",
+                  file=sys.stderr)
+            return 2
+        workspace = _workspace_arg(args.workspace)
+        if workspace is None:
+            return 2
     if args.print:
         from .tui import main_print
 
@@ -904,7 +1146,8 @@ def cmd_tui(args) -> int:
             return 2
         options = {"session": session, "continue_last": args.continue_last, "overrides": overrides,
                    "output_format": args.output_format, "verbose": args.verbose, "timeout": args.timeout,
-                   "auto_reply": not args.no_auto_reply, "host": args.host, "port": args.port}
+                   "auto_reply": not args.no_auto_reply, "host": args.host, "port": args.port,
+                   "workspace": workspace}
         if args.lang:
             options["lang"] = args.lang
         return main_print(home, prompt, **options)
@@ -919,7 +1162,7 @@ def cmd_tui(args) -> int:
     try:
         return main_tui(home, lang=args.lang, session=session, continue_last=args.continue_last,
                         initial_prompt=prompt, overrides=overrides, host=args.host, port=args.port,
-                        verbosity="verbose" if args.verbose else "normal")
+                        verbosity="verbose" if args.verbose else "normal", workspace=workspace)
     except Exception as exc:  # e.g. prompt_toolkit's NoConsoleScreenBufferError in mintty without winpty
         if type(exc).__name__ != "NoConsoleScreenBufferError":
             raise
@@ -929,7 +1172,8 @@ def cmd_tui(args) -> int:
 
 
 TUI_FLAGS = frozenset({"-p", "--print", "-c", "--continue", "-r", "--resume", "--output-format", "--model",
-                       "--budget", "--agents", "--max-agents", "--verbose", "--timeout", "--no-auto-reply", "--lang"})
+                       "--budget", "--agents", "--team", "--max-agents", "--verbose", "--timeout", "--no-auto-reply",
+                       "--lang"})
 SERVE_FLAGS = frozenset({"--no-console", "--no-browser", "--goal"})
 
 
@@ -963,8 +1207,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("tui", aliases=["chat"],
                        help="the terminal UI in the style of Claude Code (the default command in a terminal); "
                             "-p runs one prompt non-interactively")
-    s.add_argument("prompt", nargs="?", help="first message: the goal of a new session (or, with -c/-r, the next "
-                                             "instruction to that session)")
+    s.add_argument("prompt", nargs="?", help="first message: the goal of a new session (its first line becomes the "
+                                             "title, the rest the description; or, with -c/-r, the next instruction "
+                                             "to that session)")
     s.add_argument("-p", "--print", action="store_true",
                    help="non-interactive: run the prompt, follow the session until the goal is done, print the result")
     s.add_argument("-c", "--continue", dest="continue_last", action="store_true",
@@ -981,9 +1226,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--lang", choices=["ru", "en"], help="UI language")
     s.add_argument("--model", help="model profile of a new session's agents")
     s.add_argument("--agents", type=int, help="agents a new session starts with")
+    s.add_argument("--team", help='starting team of a new session: roles in order, ROLE*N for several, e.g. '
+                                  '"architect,developer*2,tester"')
     s.add_argument("--max-agents", type=int, help="agent limit of a new session")
     s.add_argument("--budget", type=float, help="money limit of a new session, USD")
     s.add_argument("--title", help="title of a new session")
+    s.add_argument("--workspace", metavar="DIR",
+                   help="the folder the new session works in instead of its own one: an empty or missing folder "
+                        "becomes its workspace; a folder with files (your project) is adopted: the agents work "
+                        "with its files and commit to its current git branch (refused while the repository has "
+                        "uncommitted changes). An existing session moves with /cd")
     s.add_argument("--host", help="host of the launcher started in-process (when none runs)")
     s.add_argument("--port", type=int, help="port of the launcher started in-process")
     s.set_defaults(func=cmd_tui, dir=None)
@@ -994,15 +1246,22 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--home", help="same as DIR")
     s.add_argument("--host")
     s.add_argument("--port", type=int)
-    s.add_argument("--goal", help="create and start a new session with this goal")
+    s.add_argument("--goal", help="create and start a new session with this goal (first line: the title)")
     s.add_argument("--title", help="title of the session created by --goal")
+    s.add_argument("--workspace", metavar="DIR",
+                   help="with --goal: the folder that session works in (an empty or missing folder becomes its "
+                        "workspace, a folder with files is adopted, as for `dreamteam --workspace`)")
     s.add_argument("--no-console", action="store_true")
     s.add_argument("--no-browser", action="store_true", help="do not open the browser")
     s.set_defaults(func=cmd_serve)
 
-    s = sub.add_parser("sessions", help="list the sessions of a home")
-    s.add_argument("dir", nargs="?")
+    s = sub.add_parser("sessions", help="list the sessions of a home; `sessions rm ID` deletes a session",
+                       usage=SESSIONS_USAGE)
+    s.add_argument("words", nargs="*", metavar="DIR | rm ID",
+                   help="a home directory to list, or `rm` (delete, del, remove) and the ids of the sessions "
+                        "to delete with their task board, messages, workspace files, MCP servers and traces")
     s.add_argument("--home")
+    s.add_argument("-y", "--yes", action="store_true", help="delete without asking")
     s.set_defaults(func=cmd_sessions)
 
     s = sub.add_parser("traces", help="show agent traces (LLM calls, thinking, tools, tokens, cost) of a session")
@@ -1074,7 +1333,11 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     commands = [name for action in parser._subparsers._group_actions for name in action.choices]
-    args = parser.parse_args(_default_command(argv, commands))
+    args, extra = parser.parse_known_args(_default_command(argv, commands))
+    if extra and getattr(args, "command", None) == "sessions" and not any(x.startswith("-") for x in extra):
+        args.words += extra  # `sessions rm --yes ID`: argparse ends the words at the first option
+    elif extra:
+        parser.error("unrecognized arguments: " + " ".join(extra))
     try:
         return int(args.func(args) or 0)
     except FileNotFoundError as exc:

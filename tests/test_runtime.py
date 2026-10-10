@@ -1294,7 +1294,8 @@ async def test_snapshot_session_fields(tmp_path):
     try:
         assert swarm.snapshot()["swarm"]["session"] is None
         swarm.session_id, swarm.session_title = "001-demo", "Demo"
-        assert swarm.snapshot()["swarm"]["session"] == {"id": "001-demo", "title": "Demo", "status": "running"}
+        assert swarm.snapshot()["swarm"]["session"] == {"id": "001-demo", "title": "Demo", "status": "running",
+                                                         "pending_goal": None}
         assert swarm.snapshot()["swarm"]["tracing"] is True
     finally:
         await shutdown(swarm)

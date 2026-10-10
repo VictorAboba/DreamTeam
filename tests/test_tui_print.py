@@ -15,7 +15,7 @@ from dreamteam import settings as st
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.tui import printmode
 from dreamteam.tui.client import Connection, connect
-from dreamteam.tui.printmode import AUTO_REPLY, run_print
+from dreamteam.tui.printmode import AUTO_REPLY, AUTO_REVIEW, run_print
 
 MARK = "haiku"
 
@@ -57,6 +57,32 @@ def asker(system, messages, tools):
 
 
 def idler(system, messages, tools):
+    return call("wait")
+
+
+def planner(system, messages, tools):
+    """The only agent: claims the planning task and completes it (its review goes to the user: nobody else can
+    review it), then completes the goal once the board says that every task is finished."""
+    seen = texts(messages)
+    last = seen[-1] if seen else ""
+    if "marked as achieved" in last or "already marked" in last:
+        return call("wait")
+    if any("All tasks on the board are finished" in t for t in seen):
+        return call("goal_complete", summary="Planned, reviewed and done.")
+    if "You now work on" in last:
+        return call("task_complete", task_id=1, result="One task is enough: the haiku itself.")
+    if any(MARK in t for t in seen) and not any("You now work on" in t for t in seen):
+        return call("task_claim", task_id=1)
+    return call("wait")
+
+
+def asking_planner(system, messages, tools):
+    """The planner, after one question to the user (answered automatically)."""
+    seen = texts(messages)
+    if any("decide yourself" in t for t in seen):
+        return planner(system, messages, tools)
+    if any(MARK in t for t in seen) and not any("Sent message" in t for t in seen):
+        return call("send_message", to=["user"], text="Which colour should the haiku be about?")
     return call("wait")
 
 
@@ -181,6 +207,59 @@ async def test_without_auto_reply_the_question_stays_unanswered(launch):
     assert code == 3 and out == "" and "1.5" in err
     sid = (await conn.client.sessions())[0]["id"]
     assert all(m["sender"] != "user" for m in await conn.client.messages(sid))
+
+
+async def test_user_reviews_are_auto_approved(launch):
+    conn = await launch(planner)
+    code, out, err = await run(conn, f"Plan a {MARK}", output_format="json")
+    assert code == 0, err
+    result = json.loads(out)
+    assert result["summary"] == "Planned, reviewed and done."
+    assert [t["status"] for t in result["tasks"]] == ["done"]
+    data = await conn.client.task(result["session"], 1)
+    assert data["task"]["status"] == "done"
+    assert [p["text"] for p in data["discussion"] if p["author"] == "user"] == [AUTO_REVIEW["en"]]
+
+
+async def test_auto_approvals_are_not_limited_by_the_auto_reply_cap(launch, monkeypatch):
+    # the cap guards against a question / auto-answer ping-pong; a long one-agent run sends every task to the user
+    monkeypatch.setattr(printmode, "AUTO_REPLY_MAX", 1)
+    conn = await launch(asking_planner)
+    code, out, err = await run(conn, f"Plan a {MARK}", output_format="json")
+    assert code == 0, err
+    result = json.loads(out)
+    assert result["summary"] == "Planned, reviewed and done."
+    assert [t["status"] for t in result["tasks"]] == ["done"]
+    sid = result["session"]
+    assert [m["text"] for m in await conn.client.messages(sid) if m["sender"] == "user"] == [AUTO_REPLY["en"]]
+
+
+async def test_without_auto_reply_a_user_review_waits_until_the_timeout(launch):
+    conn = await launch(planner)
+    code, out, err = await run(conn, f"Plan a {MARK}", auto_reply=False, timeout=2.5, output_format="json")
+    assert code == 3, err
+    result = json.loads(out)
+    assert result["status"] == "timeout" and [t["status"] for t in result["tasks"]] == ["review"]
+    task = (await conn.client.task(result["session"], 1))["task"]
+    assert task["reviewer"] == "user" and task["status"] == "review"
+
+
+async def test_a_multi_line_prompt_leaves_the_title_to_the_hub(launch, monkeypatch):
+    conn = await launch(finisher())
+    created: list[tuple] = []
+    create_session = conn.client.create_session
+
+    async def recording(title, goal, *args, **kwargs):
+        created.append((title, goal))
+        return await create_session(title, goal, *args, **kwargs)
+
+    monkeypatch.setattr(conn.client, "create_session", recording)
+    code, out, err = await run(conn, f"A {MARK}\nabout the sea", output_format="json")
+    assert code == 0, err
+    assert created == [("", f"A {MARK}\nabout the sea")]
+    result = json.loads(out)
+    assert result["goal"]["title"] == f"A {MARK}" and result["goal"]["description"] == "about the sea"
+    assert (await conn.client.session(result["session"]))["session"]["title"] == f"A {MARK}"
 
 
 async def test_timeout_budget_and_interrupt(launch, monkeypatch):

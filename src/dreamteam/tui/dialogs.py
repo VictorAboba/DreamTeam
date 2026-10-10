@@ -1,9 +1,9 @@
 """Dialogs that replace the input box (docs/TUI.md §4.1, §4.5): the select-list widget, a confirm dialog,
-the MCP approval dialog and the session picker.
+the MCP approval dialog, the session picker and a busy notice.
 
 A dialog renders itself as prompt_toolkit formatted text inside a rounded box (yellow border) and is driven
-by the app's key bindings: `move()`, `pick_number()`, `choose()` and `cancel()`. `wait()` returns the chosen
-option's value, or None when the dialog was cancelled (Esc)."""
+by the app's key bindings: `move()`, `pick_number()`, `choose()`, `cancel()` and `remove()` (the Delete key).
+`wait()` returns the chosen option's value, or None when the dialog was cancelled (Esc)."""
 
 from __future__ import annotations
 
@@ -206,6 +206,9 @@ class Dialog:
     def cancel(self) -> None:
         self._resolve(None)
 
+    def remove(self) -> None:
+        """The Delete key: nothing, unless the dialog lists things that can be deleted."""
+
     def move(self, delta: int) -> None:
         self.select.move(delta)
 
@@ -236,6 +239,7 @@ class Dialog:
 
 class ConfirmDialog(Dialog):
     kind = "confirm"
+    max_lines = 10   # of the text (a /cd question names folders: long paths on a narrow terminal)
 
     def __init__(self, lang: str, title: str, text: str = "", *, default: bool = True):
         options = [Option(t(lang, "confirm_yes"), True), Option(t(lang, "confirm_no"), False)]
@@ -243,10 +247,31 @@ class ConfirmDialog(Dialog):
         self.text = text
 
     def body(self, width: int, unicode: bool) -> list[Fragments]:
-        return [[(TEXT, line)] for line in wrap(self.text, width)] if self.text else []
+        return [[(TEXT, line)] for line in wrap(self.text, width, self.max_lines)] if self.text else []
+
+
+class BusyDialog(Dialog):
+    """A line of text while something runs (a deletion): it takes the keys, so nothing typed meanwhile is
+    submitted, and it cannot be answered; the app closes it."""
+
+    kind = "busy"
+
+    def __init__(self, lang: str, title: str, text: str = ""):
+        super().__init__(lang, title, [], numbered=False)
+        self.text = text
+
+    def choose(self) -> None:
+        pass
+
+    def cancel(self) -> None:
+        pass
+
+    def body(self, width: int, unicode: bool) -> list[Fragments]:
+        return [[(DIM, line)] for line in wrap(self.text, width)] if self.text else []
 
 
 APPROVE, REJECT = "approve", "reject"
+DELETE = "delete"
 
 
 class MCPApprovalDialog(Dialog):
@@ -305,13 +330,16 @@ class MCPApprovalDialog(Dialog):
 
 
 class SessionPicker(Dialog):
-    """↑↓ and Enter pick a session (its id), Esc cancels."""
+    """↑↓ and Enter pick a session (its id), Delete picks it for deletion ((DELETE, id)), Esc cancels.
+    `focus`: the session selected at the start (default: the current one); `title`: the picker's title."""
 
     kind = "sessions"
 
-    def __init__(self, lang: str, sessions: Sequence[dict], current: str | None = None, unicode: bool = True):
+    def __init__(self, lang: str, sessions: Sequence[dict], current: str | None = None, unicode: bool = True,
+                 *, focus: str | None = None, title: str | None = None):
         options = []
         index = 0
+        focus = focus or current
         dot = " · " if unicode else " - "
         for i, s in enumerate(sessions):
             sid = str(s.get("id") or "")
@@ -321,9 +349,15 @@ class SessionPicker(Dialog):
             if goal:
                 hint.append(" ".join(str(goal).split())[:80])
             options.append(Option(mark + " ".join(str(s.get("title") or sid).split()), sid, dot.join(hint)))
-            if current and sid == current:
+            if focus and sid == focus:
                 index = i
-        super().__init__(lang, t(lang, "pick_session"), options, index=index, numbered=False, rows=10)
+        super().__init__(lang, title or t(lang, "pick_session"), options, index=index,
+                         footer=t(lang, "pick_session_footer"), numbered=False, rows=10)
+
+    def remove(self) -> None:
+        option = self.select.selected
+        if option is not None:
+            self._resolve((DELETE, option.value))
 
     def pick_number(self, number: int) -> bool:
         return False
@@ -349,6 +383,6 @@ def border_chars(unicode: bool) -> dict[str, str]:
 
 
 __all__ = [
-    "Option", "SelectList", "Dialog", "ConfirmDialog", "MCPApprovalDialog", "SessionPicker", "APPROVE",
-    "REJECT", "box", "fit", "wrap", "frag_len", "session_status", "border_chars",
+    "Option", "SelectList", "Dialog", "ConfirmDialog", "BusyDialog", "MCPApprovalDialog", "SessionPicker",
+    "APPROVE", "REJECT", "DELETE", "box", "fit", "wrap", "frag_len", "session_status", "border_chars",
 ]

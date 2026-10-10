@@ -31,10 +31,18 @@ const I18N = {
     no_triggers: "Активных триггеров нет", delete: "Удалить", owner: "Владелец", fired: "срабатываний",
     mcp_hint: "Подключить рой к Claude Code:", copy_hint: "Нажмите, чтобы скопировать", saved: "Сохранено", copied: "Скопировано",
     tab_traces: "Трейсы", traces: "Трейсы", sessions: "Все сессии", session_stopped: "Сессия остановлена: агенты не работают, доска только для просмотра.",
+    session_not_started: "Сессия ещё не запускалась: агенты появятся и возьмутся за цель после запуска.",
+    goal_pending: "при запуске", goal_pending_hint: "Рой получит эту цель, когда вы запустите сессию.",
     start_session: "Запустить сессию",
     open_task: "Открыть", disconnected: "Нет связи с хабом — переподключаюсь…", live: "Живые обновления подключены",
     review_needed: "Задача ждёт ревью",
-    review_drop: "На ревью задачу отправляет исполнитель, когда завершает её с назначенным ревьюером",
+    review_drop: "На ревью задача уходит сама, когда исполнитель её завершает",
+    review_you: "ждёт вашего ревью", review_needed_you: "Задача ждёт вашего ревью",
+    review_instead: "Вы можете принять или вернуть её вместо ревьюера.", review_reason: "Напишите в комментарии, что исправить.",
+    reviewer_auto: "— (выберет доска)",
+    role_new: "Новая роль — её нет в каталоге: опишите обязанности в инструкциях.",
+    instructions_hint: "необязательно для роли из каталога", model_auto: "— профиль роли или сессии", role_model: "профиль роли: {model}",
+    goal_split_hint: "первая строка — заголовок, остальные строки — описание (перед подробностями ниже)",
     required: "Заполните обязательные поля", required_task: "Заполните заголовок и цель задачи",
     invalid_limits: "Бюджет должен быть ≥ 0, а максимум агентов — целым числом ≥ 1",
     discard_changes: "Закрыть без сохранения? Введённый текст пропадёт.",
@@ -53,6 +61,11 @@ const I18N = {
     f_parent_id: "родитель",
     op_create: "создал(а) файл", op_write: "перезаписал(а) файл", op_edit: "изменил(а) файл",
     locked_by: "Заблокирован: {owner}", select_file: "Выберите файл слева", workspace: "workspace",
+    ws_folder: "Папка сессии", ws_default: "своя папка", ws_adopted: "папка проекта", ws_moved: "перенесена", ws_missing_badge: "папки нет",
+    ws_default_hint: "Собственная папка workspace сессии; удаляется вместе с сессией.",
+    ws_adopted_hint: "Существующая папка (ваш проект): агенты работают с её файлами и коммитят в текущую ветку её репозитория. При удалении сессии папка остаётся.",
+    ws_moved_hint: "Сессия перенесена в эту папку (/cd). При удалении сессии папка остаётся.",
+    ws_missing: "Папка сессии не найдена: {path}. Сессия не запустится, пока её не перенесут в другую папку: /cd ПАПКА или /cd --default в dreamteam tui.",
     "reason_budget": "исчерпан бюджет — увеличьте его в настройках", "reason_paused by the user": "остановлен вами",
   },
   en: {
@@ -84,10 +97,18 @@ const I18N = {
     no_triggers: "No active triggers", delete: "Delete", owner: "Owner", fired: "fired",
     mcp_hint: "Connect the swarm to Claude Code:", copy_hint: "Click to copy", saved: "Saved", copied: "Copied",
     tab_traces: "Traces", traces: "Traces", sessions: "All sessions", session_stopped: "The session is stopped: agents are not working, the board is read-only.",
+    session_not_started: "The session has not been started yet: the agents appear and take up the goal once you start it.",
+    goal_pending: "on start", goal_pending_hint: "The swarm gets this goal when you start the session.",
     start_session: "Start the session",
     open_task: "Open", disconnected: "Lost connection to the hub — reconnecting…", live: "Live updates connected",
     review_needed: "Task waits for review",
-    review_drop: "A task goes to review when its assignee completes it with a reviewer set",
+    review_drop: "A task goes to review by itself when its assignee completes it",
+    review_you: "waits for your review", review_needed_you: "The task waits for your review",
+    review_instead: "You can approve or return it instead of the reviewer.", review_reason: "Write in the comment what to fix.",
+    reviewer_auto: "— (the board picks)",
+    role_new: "A new role, not in the catalog: describe its responsibilities in the instructions.",
+    instructions_hint: "optional for a catalog role", model_auto: "— the role's or the session's profile", role_model: "role profile: {model}",
+    goal_split_hint: "the first line is the title, the other lines the description (before the details below)",
     required: "Fill in the required fields", required_task: "Fill in the title and the task goal",
     invalid_limits: "The budget must be ≥ 0 and max agents a whole number ≥ 1",
     discard_changes: "Close without saving? Your text will be lost.",
@@ -106,6 +127,11 @@ const I18N = {
     f_parent_id: "parent",
     op_create: "created file", op_write: "rewrote file", op_edit: "edited file",
     locked_by: "Locked by {owner}", select_file: "Select a file on the left", workspace: "workspace",
+    ws_folder: "Session folder", ws_default: "own folder", ws_adopted: "project folder", ws_moved: "moved", ws_missing_badge: "missing",
+    ws_default_hint: "The session's own workspace folder; deleted with the session.",
+    ws_adopted_hint: "An existing folder (your project): the agents work with its files and commit to the current branch of its repository. Deleting the session keeps the folder.",
+    ws_moved_hint: "The session was moved to this folder (/cd). Deleting the session keeps the folder.",
+    ws_missing: "The session folder is missing: {path}. The session cannot start until it is moved to another folder: /cd FOLDER or /cd --default in dreamteam tui.",
     "reason_budget": "the budget is spent — raise it in the settings", "reason_paused by the user": "paused by you",
   },
 };
@@ -223,9 +249,9 @@ function members(includeRetired = false) {
 }
 /** <option>s for an assignee/reviewer select. The current value is always present, even when it is a
  * retired member: otherwise the select silently shows "none" and saving the form would unassign. */
-function memberOptions(selected, withUser = true) {
+function memberOptions(selected, withUser = true, noneLabel = t("none")) {
   selected = selected || "";
-  const opts = [`<option value=""${selected ? "" : " selected"}>${esc(t("none"))}</option>`];
+  const opts = [`<option value=""${selected ? "" : " selected"}>${esc(noneLabel)}</option>`];
   const seen = new Set([""]);
   if (withUser) { opts.push(`<option value="user"${selected === "user" ? " selected" : ""}>${esc(t("user"))}</option>`); seen.add("user"); }
   for (const a of members()) {
@@ -238,6 +264,8 @@ function memberOptions(selected, withUser = true) {
   }
   return opts.join("");
 }
+/** The "no reviewer" option: with independent review the board picks a reviewer when the task is completed. */
+function reviewerNone() { return S.state && S.state.swarm && S.state.swarm.independent_review ? t("reviewer_auto") : t("none"); }
 /** Status <option>s: "review" is only reachable through task_complete, so it is disabled unless current. */
 function statusOptions(current) {
   return ALL_STATUSES.map((s) => `<option value="${s}"${s === current ? " selected" : ""}${s === "review" && current !== "review" ? " disabled" : ""}>${esc(t("s_" + s))}</option>`).join("");
@@ -309,6 +337,7 @@ function setLang(lang, remember = true) {
 
 function renderAll() {
   if (!S.state) return;
+  syncWorkspace();
   renderHeader();
   renderAgents();
   if (S.tab === "board") renderBoard();
@@ -328,12 +357,17 @@ function renderHeader() {
   $("#back-link").classList.toggle("hidden", !BASE);
   $("#stopped-banner").classList.toggle("hidden", !(session && session.status === "stopped"));
   const goal = sw.goal;
-  $("#goal-title").textContent = goal ? goal.title : t("no_goal");
-  $("#goal-btn").title = goal ? goal.title + (goal.description ? "\n\n" + goal.description : "") : t("no_goal");
+  // a session created without starting keeps its goal until the first start: show it, marked as such
+  const pendingGoal = !goal && session && session.pending_goal ? session.pending_goal : null;
+  const shown = goal || pendingGoal;
+  $("#stopped-banner span").textContent = t(pendingGoal ? "session_not_started" : "session_stopped");
+  $("#goal-title").textContent = shown ? shown.title : t("no_goal");
+  $("#goal-btn").title = shown ? shown.title + (shown.description ? "\n\n" + shown.description : "") +
+    (pendingGoal ? "\n\n" + t("goal_pending_hint") : "") : t("no_goal");
   const gs = $("#goal-status");
-  gs.textContent = goal ? (goal.status === "done" ? t("goal_done") : t("goal_active")) : "";
-  gs.className = "badge" + (goal && goal.status === "done" ? " done" : "");
-  gs.classList.toggle("hidden", !goal);
+  gs.textContent = goal ? (goal.status === "done" ? t("goal_done") : t("goal_active")) : pendingGoal ? t("goal_pending") : "";
+  gs.className = "badge" + (goal && goal.status === "done" ? " done" : "") + (pendingGoal ? " warn" : "");
+  gs.classList.toggle("hidden", !shown);
   const limit = sw.limits.max_cost_usd;
   $("#budget-text").textContent = `$${(sw.spent_usd || 0).toFixed(2)}` + (limit > 0 ? ` / $${limit.toFixed(2)}` : " / ∞");
   const pct = limit > 0 ? Math.min(100, (sw.spent_usd / limit) * 100) : 0;
@@ -362,6 +396,47 @@ function renderHeader() {
   const teamBadge = $("#team-unread");
   teamBadge.textContent = unread || "";
   teamBadge.classList.toggle("hidden", !unread);
+  // the folder the session works in: a missing one (deleted, unplugged drive) is said at the top of every tab
+  const ws = sw.workspace || null;
+  const missing = workspaceMissing(ws);
+  const wsBanner = $("#workspace-banner");
+  wsBanner.classList.toggle("hidden", !missing);
+  wsBanner.textContent = missing ? t("ws_missing", { path: ws.path }) : "";
+  const filesTab = $('#tabs > button[data-tab="files"]');
+  if (filesTab) filesTab.title = ws && ws.path ? `${t("ws_folder")}: ${ws.path}` : "";
+  setHtml($("#workspace-info"), workspaceHtml(ws));
+}
+
+/* ---------------------------------------------------------------- session folder */
+/** "default" (the session's own workspace/), "adopted" (an existing folder, e.g. the user's project) or
+ * "moved" (a folder the session was moved to with /cd); null when the state has no `swarm.workspace`. */
+function workspaceKind(ws) {
+  if (!ws || typeof ws !== "object" || !ws.path) return null;
+  return ws.default ? "default" : ws.adopted ? "adopted" : "moved";
+}
+/** A folder outside the session that does not exist (its own folder is created on demand: never missing). */
+function workspaceMissing(ws) { return !!(workspaceKind(ws) && !ws.default && !ws.exists); }
+/** The head of the Files tab: the absolute path of the session folder (click to copy) and what kind it is
+ * (a missing folder is explained by the banner above the tabs). */
+function workspaceHtml(ws) {
+  const kind = workspaceKind(ws);
+  if (!kind) return "";
+  const missing = workspaceMissing(ws);
+  const label = missing ? t("ws_missing_badge") : t("ws_" + kind);
+  return `<span class="ws-label">📁 ${esc(t("ws_folder"))}</span>`
+    + `<span class="badge${missing ? " err" : kind === "default" ? " plain" : ""}" title="${esc(t("ws_" + kind + "_hint"))}">${esc(label)}</span>`
+    + `<code class="ws-path" id="ws-path" title="${esc(t("copy_hint"))}">${esc(ws.path)}</code>`;
+}
+/** After /cd (or the folder coming back) the Files tab starts again from the root of the new folder. */
+function syncWorkspace() {
+  const ws = S.state && S.state.swarm ? S.state.swarm.workspace : null;
+  const key = ws ? `${ws.path}\n${ws.exists}` : "";
+  if (S.workspaceKey === undefined || S.workspaceKey === key) { S.workspaceKey = key; return; }
+  S.workspaceKey = key;
+  S.fileDir = "."; S.fileEntries = []; S.openFile = null;
+  $("#file-path").textContent = t("select_file");
+  $("#file-content").textContent = "";
+  if (S.tab === "files") openDir(".");
 }
 
 /* ---------------------------------------------------------------- board */
@@ -371,10 +446,13 @@ function taskMatches(task) {
   return hay.includes(S.search.toLowerCase());
 }
 function columnOf(task) { return task.status === "failed" || task.status === "cancelled" ? "closed" : task.status; }
-/** What dropping `task` on column `col` does: null (nothing), {error: i18n key} or {status}. */
+/** What dropping `task` on column `col` does: null (nothing), {error: i18n key}, {review: true} (approve),
+ * {open: true} (open the card: returning a task needs a reason) or {status}. */
 function dropAction(task, col) {
   if (!task || !COLUMNS.includes(col) || columnOf(task) === col) return null;
   if (col === "review") return { error: "review_drop" };
+  if (task.status === "review" && col === "done") return { review: true };
+  if (task.status === "review" && col !== "closed") return { open: true };
   return { status: col === "closed" ? "cancelled" : col };
 }
 
@@ -414,7 +492,8 @@ function cardHtml(task) {
   const assignee = task.assignee ? `<span class="chip">${avatar(task.assignee, "sm")}${esc(displayName(task.assignee))}</span>` : "";
   const tags = (task.tags || []).map((g) => `<span class="tag">${esc(g)}</span>`).join("");
   const comments = task.comments ? `<span class="chip plain">💬 ${Number(task.comments)}</span>` : "";
-  const review = task.status === "review" && task.reviewer ? `<span class="chip plain">👁 ${esc(displayName(task.reviewer))}</span>` : "";
+  const review = task.status === "review" && task.reviewer ? (task.reviewer === "user"
+    ? `<span class="badge warn">👁 ${esc(t("review_you"))}</span>` : `<span class="chip plain">👁 ${esc(displayName(task.reviewer))}</span>`) : "";
   const failed = task.status === "failed" ? `<span class="badge err">${esc(t("s_failed"))}</span>` : task.status === "cancelled" ? `<span class="badge">${esc(t("s_cancelled"))}</span>` : "";
   const prio = Math.max(0, Math.min(3, Number(task.priority) || 0));
   return `<div class="card p${prio}" draggable="true" tabindex="0" role="button" data-id="${Number(task.id)}" title="${esc(t("p" + prio))}">
@@ -476,6 +555,8 @@ function moveTask(id, col) {
   const action = dropAction(task, col);
   if (!action) return;
   if (action.error) { toast(t(action.error), "err"); return; }
+  if (action.review) { act("task_review", { task_id: id, approve: true }, true); return; }
+  if (action.open) { openTask(id).then(() => { $("#review-comment")?.focus(); toast(t("review_reason")); }); return; }
   act("task_update", { task_id: id, status: action.status }, true);
 }
 
@@ -748,7 +829,7 @@ function fillTaskForm(task, old, force) {
     if (!el) continue;
     if (!force && old && norm(el.value) !== valueOf(old)) continue; // the user is editing this field
     if (id === "f-status") el.innerHTML = statusOptions(task.status);
-    else if (id === "f-assignee" || id === "f-reviewer") el.innerHTML = memberOptions(valueOf(task));
+    else if (id === "f-assignee" || id === "f-reviewer") el.innerHTML = memberOptions(valueOf(task), true, id === "f-reviewer" ? reviewerNone() : undefined);
     if (el.value !== valueOf(task)) el.value = valueOf(task);
   }
 }
@@ -769,7 +850,10 @@ function taskResultHtml(task) {
 }
 function taskReviewHtml(task) {
   if (task.status !== "review") return "";
-  return `<div class="section-title">${esc(t("review_needed"))}${task.reviewer ? ` · ${esc(t("reviewer"))}: ${esc(displayName(task.reviewer))}` : ""}</div>
+  const title = task.reviewer === "user" ? esc(t("review_needed_you"))
+    : esc(t("review_needed")) + (task.reviewer ? ` · ${esc(t("reviewer"))}: ${esc(displayName(task.reviewer))}` : "");
+  return `<div class="section-title">${title}</div>
+    ${task.reviewer && task.reviewer !== "user" ? `<p class="muted">${esc(t("review_instead"))}</p>` : ""}
     <label class="field"><span>${esc(t("review_comment"))}</span><textarea id="review-comment" rows="2"></textarea></label>
     <div class="modal-actions start"><button class="btn primary" id="approve-btn" type="button">${esc(t("approve"))}</button>
     <button class="btn danger" id="reject-btn" type="button">${esc(t("reject"))}</button></div>`;
@@ -951,6 +1035,8 @@ async function postComment() {
 async function reviewTask(approve) {
   const taskId = S.openTaskId;
   const comment = ($("#review-comment")?.value || "").trim();
+  // a return without a reason gives the agent nothing to act on
+  if (!approve && !comment) { toast(t("review_reason"), "err"); $("#review-comment")?.focus(); return; }
   const res = await act("task_review", { task_id: taskId, approve, comment });
   if (res.ok && S.openTaskId === taskId) {
     const box = $("#review-comment");
@@ -1058,7 +1144,7 @@ function newTaskModal() {
       <label class="field full"><span>🎯 ${esc(t("goal_field"))} *</span><textarea id="n-goal" rows="2" placeholder="${esc(t("goal_hint"))}"></textarea></label>
       <label class="field full"><span>${esc(t("description"))}</span><textarea id="n-desc" rows="4"></textarea></label>
       <label class="field"><span>${esc(t("assignee"))}</span><select id="n-assignee">${memberOptions("")}</select></label>
-      <label class="field"><span>${esc(t("reviewer"))}</span><select id="n-reviewer">${memberOptions("")}</select></label>
+      <label class="field"><span>${esc(t("reviewer"))}</span><select id="n-reviewer">${memberOptions("", true, reviewerNone())}</select></label>
       <label class="field"><span>${esc(t("priority"))}</span><select id="n-priority">${priorityOptions(1)}</select></label>
       <label class="field"><span>${esc(t("tags"))}</span><input id="n-tags"></label>
       <label class="field"><span>${esc(t("depends_on"))}</span><input id="n-deps"></label>
@@ -1081,14 +1167,15 @@ function newTaskModal() {
 }
 
 function goalModal() {
-  const goal = S.state.swarm.goal;
+  const session = S.state.swarm.session;
+  const goal = S.state.swarm.goal || (session && session.pending_goal) || null;
   const done = goal && goal.status === "done";
   openModal(`<div class="modal-head"><h3>🎯 ${esc(t("set_goal"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}">✕</button></div>
     ${done ? `<div class="section-title">${esc(t("goal_summary"))}</div><div class="result-box">${linkify(goal.summary || "")}</div>
       <label class="field" style="margin-top:10px"><span>${esc(t("reopen_comment"))}</span><textarea id="g-reopen" rows="2"></textarea></label>
       <div class="modal-actions start"><button class="btn" id="g-reopen-btn" type="button">${esc(t("reopen"))}</button></div>` : ""}
     <div class="form-grid" style="margin-top:10px">
-      <label class="field full"><span>${esc(t("goal_title"))} *</span><input id="g-title"></label>
+      <label class="field full"><span>${esc(t("goal_title"))} * <span class="hint">${esc(t("goal_split_hint"))}</span></span><textarea id="g-title" rows="3"></textarea></label>
       <label class="field full"><span>${esc(t("goal_desc"))}</span><textarea id="g-desc" rows="6"></textarea></label>
     </div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="g-save" type="button">${esc(t("save"))}</button></div>`);
@@ -1108,22 +1195,51 @@ function goalModal() {
   });
 }
 
-function hireModal() {
+/** The catalog role a typed name means, as the hire resolves it (roles.find_role; case-insensitive on its name, its
+ * key or another of its `names`, e.g. a built-in role's name in the other language), or null: a new role. */
+function findRole(catalog, name) {
+  const norm = (s) => String(s || "").trim().replace(/\s+/g, " ").toLowerCase();
+  const q = norm(name);
+  if (!q) return null;
+  return (catalog || []).find((r) => [r.name, r.key, ...(r.names || [])].some((s) => norm(s) === q)) || null;
+}
+/** The line under the role input: the catalog description of the role (and its model profile), or role_new. */
+function rolePreviewHtml(catalog, name) {
+  if (!String(name || "").trim()) return "";
+  const role = findRole(catalog, name);
+  if (!role) return esc(t("role_new"));
+  return esc(role.description) + (role.model ? ` <span class="badge plain">${esc(t("role_model", { model: role.model }))}</span>` : "");
+}
+/** hire_agent arguments of the hire form. `instructions` is always sent ("" is fine for a catalog role, but the
+ * tool requires the parameter); `model` only when one is chosen, so that the role's own profile applies. */
+function hireArgs(role, instructions, model, name) {
+  const args = { role: String(role || "").trim(), instructions: String(instructions || "").trim() };
+  if (model) args.model = model;
+  if (String(name || "").trim()) args.name = String(name).trim();
+  return args;
+}
+async function hireModal() {
+  let catalog = [], known = [];   // offered roles; all roles a hire resolves (the hidden ones too)
+  try {
+    const data = await api("/api/roles");
+    catalog = data.roles || [];
+    known = [...catalog, ...(data.hidden || [])];
+  } catch (e) { console.error(e); }  // no catalog: any role still works
   const models = S.state.swarm.models && S.state.swarm.models.length ? S.state.swarm.models : ["default"];
   openModal(`<div class="modal-head"><h3>${esc(t("hire_title"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}">✕</button></div>
     <div class="form-grid">
-      <label class="field"><span>${esc(t("role"))} *</span><input id="h-role"></label>
-      <label class="field"><span>${esc(t("model"))}</span><select id="h-model">${models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select></label>
-      <label class="field full"><span>${esc(t("instructions"))}</span><textarea id="h-instr" rows="4"></textarea></label>
+      <label class="field"><span>${esc(t("role"))} *</span><input id="h-role" list="h-roles" autocomplete="off"><datalist id="h-roles">${catalog.map((r) => `<option value="${esc(r.name)}"></option>`).join("")}</datalist></label>
+      <label class="field"><span>${esc(t("model"))}</span><select id="h-model"><option value="">${esc(t("model_auto"))}</option>${models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select></label>
+      <div class="full muted role-preview" id="h-role-desc"></div>
+      <label class="field full"><span>${esc(t("instructions"))} <span class="hint">${esc(t("instructions_hint"))}</span></span><textarea id="h-instr" rows="4"></textarea></label>
       <label class="field"><span>${esc(t("name_optional"))}</span><input id="h-name"></label>
     </div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="h-save" type="button">${esc(t("hire_btn"))}</button></div>`);
+  $("#h-role").addEventListener("input", () => setHtml($("#h-role-desc"), rolePreviewHtml(known, $("#h-role").value)));
   $("#h-save").addEventListener("click", async () => {
     const role = $("#h-role").value.trim();
     if (!role) { toast(t("required"), "err"); $("#h-role").focus(); return; }
-    const args = { role, instructions: $("#h-instr").value.trim() || role, model: $("#h-model").value };
-    if ($("#h-name").value.trim()) args.name = $("#h-name").value.trim();
-    const res = await act("hire_agent", args);
+    const res = await act("hire_agent", hireArgs(role, $("#h-instr").value, $("#h-model").value, $("#h-name").value));
     if (res.ok) closeModal(true);
   });
 }
@@ -1261,6 +1377,12 @@ function renderFeed() {
 function fmtSize(n) { if (n == null) return ""; if (n < 1024) return n + " B"; if (n < 1048576) return (n / 1024).toFixed(1) + " KB"; return (n / 1048576).toFixed(1) + " MB"; }
 async function openDir(path) {
   const dir = path || ".";
+  if (workspaceMissing(S.state && S.state.swarm && S.state.swarm.workspace)) {
+    // nothing to list (#workspace-banner says why): no error toast on every refresh
+    S.fileDir = "."; S.fileEntries = [];
+    renderCrumbs(); renderFileList();
+    return;
+  }
   try {
     const data = await api(`/api/files?path=${encodeURIComponent(dir)}`);
     S.fileDir = dir;
@@ -1419,7 +1541,7 @@ function applyTheme(theme) {
 }
 
 function onDocumentClick(e) {
-  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-retire],[data-traces],[data-agent],#mcp-cmd");
+  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path");
   if (!target) {
     if (document.body.classList.contains("team-open") && !e.target.closest(".sidebar, #team-btn")) toggleTeamOverlay(false);
     return;
@@ -1437,7 +1559,7 @@ function onDocumentClick(e) {
   else if ("retire" in ds) { if (confirm(t("retire_confirm"))) act("retire_agent", { name: ds.retire, reason: "retired by the user" }); }
   else if ("traces" in ds) { if (typeof openTraces === "function") { if (isNarrow()) closeDrawer(); openTraces(ds.traces); } }
   else if ("agent" in ds) openChat(ds.agent);
-  else if (target.id === "mcp-cmd") navigator.clipboard?.writeText(target.textContent).then(() => toast(t("copied")));
+  else if (target.id === "mcp-cmd" || target.id === "ws-path") navigator.clipboard?.writeText(target.textContent).then(() => toast(t("copied")));
 }
 
 function onKeydown(e) {
@@ -1503,9 +1625,13 @@ if (typeof module !== "undefined" && module.exports) {
     dropAction, makeScheduler, threadOrder, threadHtml, dirtyFields, taskChanges, mentionQuery, mentionCandidates,
     limitsArgs, describeEvent, changesText, activityHtml, messageHtml, cardHtml, boardHtml, boardColumns, rejectMcp,
     deleteTrigger, fillTaskForm, autoMarkRead, loadFeed, FEED_TYPES,
+    // review, the hire dialog (role catalog), the goal dialog
+    reviewerNone, taskReviewHtml, reviewTask, moveTask, findRole, rolePreviewHtml, hireArgs, hireModal, goalModal,
     // used by traces.js (the tests load it on top of these) and by the session-chrome tests
     BASE, $, $$, api, post, act, toast, avatar, members, fmtTime, short, openModal, closeModal, setTab, store, setHtml,
     renderHeader, responseError, errText, startSession, connect,
+    // the session folder (the Files tab head, the missing-folder banner)
+    workspaceKind, workspaceMissing, workspaceHtml, syncWorkspace, openDir, renderAll,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

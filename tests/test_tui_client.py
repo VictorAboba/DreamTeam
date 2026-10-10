@@ -4,6 +4,7 @@ launcher with scripted agents."""
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
 import time
 from pathlib import Path
@@ -140,6 +141,13 @@ async def test_rest_api_of_an_in_process_launcher(conn: Connection):
     assert all(e["type"] == "goal.set" for e in await client.events(sid, types=["goal.*"]))
     assert (await client.files(sid))["type"] == "dir"
 
+    roles = await client.roles(sid)   # the session's role catalog, in its language
+    assert roles["language"] == "en" and roles["roles"][0]["key"] == "generalist"
+    assert {"key", "name", "description", "instructions", "model", "builtin"} <= set(roles["roles"][0])
+    assert "Tester" in [r["name"] for r in roles["roles"]]
+    settings = await client.settings()  # the launcher's catalog, both languages (TUI /roles and /team without a session)
+    assert settings["role_catalog"][0]["name"] == {"ru": "Универсал", "en": "Generalist"}
+
     assert isinstance(await client.traces(sid), list)
     assert isinstance(await client.traces(sid, agent=agent, limit=5), list)
     assert isinstance(await client.trace_stats(sid), dict)
@@ -246,9 +254,10 @@ async def test_connect_writes_hub_file_and_attaches_to_a_running_hub(tmp_path):
         await connect(home, start=False)
     assert exc.value.status == 0
     first = await connect(home, llm_factory=factory)
+    marker = home / ".dreamteam" / f"launcher-{os.getpid()}.pid"
     try:
         assert first.owned and first.base_url == f"http://127.0.0.1:{port}"
-        assert cli.hub_file(home).exists()
+        assert cli.hub_file(home).exists() and marker.exists()  # `sessions rm` leaves this process's sessions alone
         assert await asyncio.to_thread(cli.running_hub, home) == first.base_url
         second = await connect(home)
         try:
@@ -261,7 +270,7 @@ async def test_connect_writes_hub_file_and_attaches_to_a_running_hub(tmp_path):
         assert cli.hub_file(home).exists() and first.server_running  # the attached client did not stop it
     finally:
         await first.close()
-    assert not cli.hub_file(home).exists() and not first.server_running
+    assert not cli.hub_file(home).exists() and not first.server_running and not marker.exists()
 
 
 async def test_connect_falls_back_to_a_free_port_and_cleans_up_on_failure(tmp_path, monkeypatch):
@@ -286,6 +295,7 @@ async def test_connect_falls_back_to_a_free_port_and_cleans_up_on_failure(tmp_pa
     with pytest.raises(HubError) as exc:
         await connect(home, llm_factory=factory)
     assert "disk full" in exc.value.message
+    assert not list((home / ".dreamteam").glob("launcher-*.pid"))  # a failed start leaves no marker behind
     assert not [t for t in asyncio.all_tasks() if t.get_name() == "dreamteam-launcher" and not t.done()]
 
 
@@ -411,6 +421,7 @@ async def test_single_swarm_hub(tmp_path):
         ok, text = await client.act(None, "set_goal", {"title": "Solo goal"})
         assert ok, text
         assert (await client.state(None))["swarm"]["goal"]["title"] == "Solo goal"
+        assert (await client.roles(None))["roles"][0]["key"] == "generalist"
         feed = Feed(client, None)
         try:
             await feed.until(connection("connected"))

@@ -48,7 +48,8 @@ async def test_goal_cycle_is_traced(tmp_path):
             assert all(s["input"]["messages"] >= 1 for s in llm)
         tools = [s for tr in full for s in tr["spans"] if s["kind"] == "tool"]
         names_called = {s["name"] for s in tools}
-        assert {"task_claim", "task_create", "write_file", "task_complete", "goal_complete"} <= names_called
+        assert {"task_claim", "task_create", "write_file", "task_complete", "task_review",
+                "goal_complete"} <= names_called
         write = next(s for s in tools if s["name"] == "write_file")
         assert write["input"]["path"].startswith("out/") and write["meta"]["call_id"]
         # tasks are linked to traces

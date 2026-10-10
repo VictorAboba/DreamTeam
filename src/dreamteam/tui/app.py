@@ -35,13 +35,16 @@ from prompt_toolkit.shortcuts import print_formatted_text
 from prompt_toolkit.styles import Style
 
 from .. import __version__
+from ..console import (
+    cd_expect, cd_moves_files, cd_preview, cd_result_lines, folder_kind, resolve_folder, same_folder,
+)
 from ..models import USER
 from . import commands, render, theme
 from .bash import ShellCommand
 from .client import Connection, HubError, HubUnreachable
 from .dialogs import (
-    APPROVE, REJECT, ConfirmDialog, Dialog, MCPApprovalDialog, SessionPicker, ascii_text, border_chars, fit,
-    frag_len,
+    APPROVE, DELETE, REJECT, BusyDialog, ConfirmDialog, Dialog, MCPApprovalDialog, SessionPicker, ascii_text,
+    border_chars, fit, frag_len,
 )
 from .i18n import LANGS, t
 from .input import (
@@ -66,6 +69,7 @@ CATCHUP_PAGE = 500
 CATCHUP_PAGES = 4
 MCP_WAIT_POLL = 0.25         # the approval dialog waits for an empty input box this often
 BASH_HINT_CHARS = 40
+CD_TITLE_CELLS = 60          # a /cd question whose title is longer repeats the folder in its text
 # what is replayed after a reconnect (activity, usage and traces of the gap are skipped)
 CATCHUP_TYPES = ["message.*", "notification", "goal.*", "task.*", "agent.hired", "agent.retired", "swarm.*",
                  "mcp.*"]
@@ -128,7 +132,7 @@ class TUI:
     def __init__(self, conn: Connection, *, lang: str | None = None, session: str | None = None,
                  continue_last: bool = False, initial_prompt: str | None = None, verbosity: str = "normal",
                  overrides: dict | None = None, input: Any = None, output: Any = None,
-                 printer: Callable[[Any], None] | None = None):
+                 printer: Callable[[Any], None] | None = None, workspace: str | None = None):
         self.conn = conn
         self.client = conn.client
         self.home = Path(conn.home)
@@ -139,6 +143,7 @@ class TUI:
         self.continue_last = continue_last
         self.initial_prompt = initial_prompt
         self.overrides, self.title_override = commands.session_overrides(overrides)
+        self.workspace_override = workspace   # the folder of the next session created here (--workspace)
         self._printer = printer
         self._real_terminal = output is None
         self.ctx = render.RenderContext(lang=start_lang,
@@ -169,6 +174,11 @@ class TUI:
         self._generation = 0          # +1 on every attach: answers for an earlier view are not applied
         self._bash: ShellCommand | None = None
         self._mcp_waiting: str | None = None   # a pending server whose dialog waits for an empty input
+        self._deleting: str | None = None      # the session this TUI is deleting: its stream ends, quietly
+        self._deferred_conn: Any = None        # the last connection state of that stream (replayed if it fails)
+        self._moving: str | None = None        # the session this TUI is moving (/cd): it restarts, quietly
+        self._moving_conn: Any = None          # a loss of its stream not made good yet (handled after the move)
+        self._dialog_owner: asyncio.Task | None = None   # the task whose chain of dialogs holds _dialog_lock
         self.tools = render.ToolPairs()
         self._tools_timer: asyncio.TimerHandle | None = None
         self._reset_session()
@@ -598,6 +608,11 @@ class TUI:
         def _dialog_escape(event) -> None:
             self.dialog.cancel()
 
+        @kb.add("delete", filter=in_dialog)
+        def _dialog_delete(event) -> None:
+            if self.dialog.ready():
+                self.dialog.remove()
+
         for digit in "123456789":
             @kb.add(digit, filter=in_dialog)
             def _dialog_digit(event) -> None:
@@ -779,6 +794,11 @@ class TUI:
                 swarm = state.get("swarm") or {}
                 info["session"] = self.session or {"title": swarm.get("name"), "status": "running"}
                 info["goal"] = swarm.get("goal")
+                folder = self.workspace_info()
+                if folder is not None:
+                    info["workspace"] = f"{folder['path']} ({self.t('cd_' + folder_kind(folder))})"
+                    if not folder.get("default", True) and folder.get("exists") is False:
+                        info["workspace"] += f" {self.ctx.sym['warn']} " + self.t("cd_missing", path=folder["path"])
                 info["model"] = (self.session or {}).get("model")
                 info["agents"] = {"total": len(self.members), "working": len(self.working)}
                 info["budget"] = {"spent": self.spent, "limit": self.budget}
@@ -798,27 +818,108 @@ class TUI:
         if not goal:
             self.ask_goal()
             return
-        title = self.title_override or " ".join(goal.split())[:60]
+        title = self.title_override or ""  # "": the hub derives it from the goal's first line
         self.set_hint(self.t("session_creating"))
         try:
-            summary = await self.client.create_session(title, goal, overrides=self.overrides, start=True)
+            summary = await self.client.create_session(title, goal, overrides=self.overrides, start=True,
+                                                       workspace=self.workspace_override)
         finally:
             self.set_hint(None)
-        self.title_override = None
+        self.title_override = self.workspace_override = None  # (kept for another try when the hub refused)
         self.info(self.t("session_created", title=summary.get("title") or title, id=summary.get("id")))
+        if isinstance(summary.get("workspace_result"), dict):
+            self._print_folder_result(summary["workspace_result"], summary.get("title") or title)
         await self.attach(summary, announce=False, fresh=True)
 
-    async def open_picker(self) -> None:
-        sessions = await self.client.sessions()
-        if not sessions:
-            self.info(self.t("no_sessions"))
-            return
-        choice = await self.ask(SessionPicker(self.ctx.lang, sessions, self.sid, self.ctx.unicode))
-        if choice is None:
-            return
+    async def open_picker(self, *, deleting: bool = False) -> None:
+        """The session picker: Enter attaches the chosen session (`deleting`: deletes it, after a
+        confirmation); Delete deletes the selected one, and the picker comes back with the sessions left."""
+        focus: str | None = None
+        async with self.dialog_flow():  # no MCP approval pops up between the picker and a confirmation
+            while True:
+                sessions = await self.client.sessions()
+                if not sessions:
+                    self.info(self.t("no_sessions"))
+                    return
+                choice = await self.ask(SessionPicker(self.ctx.lang, sessions, self.sid, self.ctx.unicode,
+                                                      focus=focus, title=self.t("pick_delete") if deleting else None))
+                if choice is None:
+                    return
+                if not (deleting or isinstance(choice, tuple)):
+                    break
+                sid = choice[1] if isinstance(choice, tuple) and choice[0] == DELETE else str(choice)
+                deleted = await self.delete_session(sid, next((s for s in sessions if s.get("id") == sid), None))
+                if deleted and deleting:
+                    return
+                focus = None if deleted else sid
         summary = next((s for s in sessions if s.get("id") == choice), None)
         if summary is not None:
             await self.attach(summary)
+
+    async def delete_session(self, sid: str, summary: dict | None = None) -> bool:
+        """Ask, then stop the session `sid` and delete it with its board, messages, workspace and traces (a
+        workspace folder outside the session, e.g. the user's project, stays). The main session of a project
+        home is refused here, as the hub would. While the hub deletes, a busy notice takes the keys. The
+        current session is left quietly: its stream ends meanwhile, but no "session gone" line is printed;
+        if the deletion fails, the connection states it missed are handled then. True when it was deleted."""
+        if summary is None:
+            summary = next((s for s in await self.client.sessions() if s.get("id") == sid), None)
+            if summary is None:
+                self.error(self.t("unknown_session", id=sid))
+                return False
+        if summary.get("legacy"):
+            self.error(self.t("delete_legacy"))
+            return False
+        title = " ".join(str(summary.get("title") or sid).split())
+        workspace = summary.get("workspace") if isinstance(summary.get("workspace"), dict) else {}
+        external = workspace.get("path") if workspace.get("default") is False else None
+        text = self.t("delete_text_kept", path=external) if external else self.t("delete_text")
+        running = summary.get("status") == "running"
+        if running:
+            text += " " + self.t("delete_running")
+        failure: HubError | None = None
+        answer: Any = None
+        async with self.dialog_flow():
+            if not await self.ask(ConfirmDialog(self.ctx.lang, self.t("delete_title", title=title), text,
+                                                default=False)):
+                return False
+            if self.attached and self.sid == sid:
+                await self._stop_bash()  # a `!` command in its folder: Windows cannot rename the folder meanwhile
+            self._deleting, self._deferred_conn = sid, None
+            try:
+                async with self.busy(BusyDialog(self.ctx.lang, self.t("delete_title", title=title),
+                                                self.t("session_deleting"))):
+                    try:
+                        answer = await self.client.delete_session(sid)
+                    except HubError as exc:
+                        if exc.status != 404:  # 404: deleted meanwhile (another client): gone all the same
+                            failure = exc
+                    if failure is None and self.sid == sid:
+                        await self._detach()
+                        self._reset_session()
+                        self._update_suggestions()
+            finally:
+                self._deleting = None
+                deferred, self._deferred_conn = self._deferred_conn, None
+        if failure is not None:
+            self.error(self.hub_error(failure))
+            if self.attached and self.sid == sid:
+                with contextlib.suppress(HubError):
+                    self.session = (await self.client.session(sid)).get("session") or self.session
+                if running and (self.session or {}).get("status") == "stopped":
+                    # the hub stops a session before it moves its files away: say so when the move failed
+                    self.info(self.t("session_stopped", title=title, id=sid))
+                if deferred is not None:  # e.g. deleted by another client meanwhile, or the hub is gone
+                    await self._on_connection(deferred)
+            self.invalidate()
+            return False
+        self.info(self.t("session_deleted", title=title, id=sid))
+        # the hub names the kept folder as it was when it deleted (a /cd may have run since the question)
+        kept = answer.get("workspace_kept") if isinstance(answer, dict) else external
+        if kept:
+            self.info(self.t("delete_kept", path=kept))
+        self.invalidate()
+        return True
 
     async def attach_id(self, sid: str) -> None:
         sessions = await self.client.sessions()
@@ -836,16 +937,171 @@ class TUI:
         self.info(self.t("session_stopped", title=summary.get("title") or self.sid, id=self.sid))
         self.invalidate()
 
+    # ---- the session folder (/cd) ------------------------------------------------------------------
+    def workspace_info(self) -> dict | None:
+        """The folder the current session works in ({"path", "default", "adopted", "exists"}): the state
+        snapshot's (fresh after another client moved it), else the session summary's."""
+        if not self.attached:
+            return None
+        for folder in (((self.state or {}).get("swarm") or {}).get("workspace"), (self.session or {}).get("workspace")):
+            if isinstance(folder, dict) and folder.get("path"):
+                return folder
+        return None
+
+    async def _folder_gone(self, sid: str | None, exc: HubError) -> dict | None:
+        """After a failed start: the session's fresh summary when its folder (one outside the session) is gone,
+        else None (another failure)."""
+        if exc.status != 409 or not sid:
+            return None
+        try:
+            summary = (await self.client.session(sid)).get("session") or {}
+        except HubError:
+            return None
+        folder = summary.get("workspace") if isinstance(summary.get("workspace"), dict) else {}
+        return summary if not folder.get("default", True) and folder.get("exists") is False else None
+
+    def _not_started_text(self) -> str:
+        folder = self.workspace_info() or (self.session or {}).get("workspace") or {}
+        return self.t("cd_not_started", title=(self.session or {}).get("title") or self.sid, path=folder.get("path"))
+
+    def _choose_new_folder(self, text: str) -> None:
+        """`/cd` with no session: the folder the next new session works in (the hub checks it then)."""
+        if text == "--default":
+            self.workspace_override = None
+        elif text:
+            target = resolve_folder(text, local=self.local)
+            if target is None:
+                self.error(self.t("cd_remote_relative"))
+                return
+            if self.local and os.path.isfile(target):
+                self.error(self.t("cd_file", path=target))
+                return
+            self.workspace_override = target
+        if self.workspace_override:
+            self.info(self.t("cd_new_session", path=self.workspace_override))
+        else:
+            self.info(self.t("cd_new_default" if text else "cd_no_session"))
+
+    def _print_folder_result(self, result: dict, title: str) -> None:
+        for key, fields in cd_result_lines(result, " ".join(str(title).split())):
+            text = self.t("cd_" + key, **fields)
+            if key == "start_error":
+                self.error(text)
+            else:
+                self.info(text)
+
+    async def change_folder(self, arg: str) -> None:
+        """`/cd` shows the current session's folder. `/cd PATH` (`~` and relative paths resolved here when the hub
+        is local) or `/cd --default` asks first, then moves the session: an empty or missing folder gets its
+        files and git history, a folder with files (the user's project) is adopted — the agents work with its
+        files and commit to its current branch (docs/TUI.md §4.5, SPEC §17.2). A running session restarts
+        there; its stream comes back by itself, so the loss meanwhile is not reported. Without a current
+        session it chooses the folder of the next new session instead (as `--workspace` does)."""
+        sid = self.sid
+        if not self.attached or not sid:
+            self._choose_new_folder(arg.strip())
+            return
+        summary = (await self.client.session(sid)).get("session") or {}
+        if self.attached and self.sid == sid:
+            self.session = {**(self.session or {}), **summary}
+        current = summary.get("workspace") if isinstance(summary.get("workspace"), dict) else {}
+        title = " ".join(str(summary.get("title") or sid).split())
+        text = arg.strip()
+        if not text:
+            self.info(self.t("cd_current", path=current.get("path") or "?",
+                             kind=self.t("cd_" + folder_kind(current))))
+            if not current.get("default", True) and current.get("exists") is False:
+                self.error(self.t("cd_missing", path=current.get("path")))
+            self.info(self.t("cd_hint"))
+            return
+        if summary.get("legacy"):
+            self.error(self.t("cd_legacy"))
+            return
+        target = None if text == "--default" else resolve_folder(text, local=self.local)
+        if target is None and text != "--default":
+            self.error(self.t("cd_remote_relative"))
+            return
+        default_folder = os.path.join(str(summary.get("dir") or ""), "workspace")
+        shown = default_folder if target is None else target
+        state, key = cd_preview(current, target, default_folder, local=self.local)
+        if state == "file":
+            self.error(self.t("cd_file", path=shown))
+            return
+        heading = self.t("cd_title_default" if target is None else "cd_title", title=title, path=shown)
+        # a `!` command in the folder the session's files leave is stopped first (Windows cannot move files it
+        # holds open, and it must not go on writing into the emptied folder); an adopt, or leaving the user's
+        # folder, leaves those files where they are, and the command goes on
+        bash = self._bash if self.attached and self.sid == sid else None
+        if bash is not None and not (cd_moves_files(state, current)
+                                     and same_folder(bash.cwd, current.get("path"))):
+            bash = None
+        answer: Any = None
+        failure: HubError | None = None
+        async with self.dialog_flow():  # no MCP approval between the question and the busy notice
+            if state != "same":
+                question = self.t("cd_" + (key or "text_unknown"), old=current.get("path") or "?")
+                if summary.get("status") == "running":
+                    question += "\n" + self.t("cd_text_running")
+                if bash is not None:
+                    question += "\n" + self.t("cd_text_bash")
+                if state in ("files", "unknown"):  # adopting the user's folder (maybe): the question comes last
+                    question += "\n" + self.t("cd_continue")
+                if render.cells(heading) > CD_TITLE_CELLS:  # the box cuts a long title: the whole path goes first
+                    question = f"{shown}\n{question}"
+                # an empty folder: "Yes" is preselected; adopting a folder with files: "No"
+                if not await self.ask(ConfirmDialog(self.ctx.lang, heading, question,
+                                                    default=state in ("missing", "empty"))):
+                    self.info(self.t("cd_cancelled"))
+                    return
+            if bash is not None and self._bash is bash:  # (the question said so)
+                await self._stop_bash()
+            self._moving, self._moving_conn = sid, None
+            try:
+                async with self.busy(BusyDialog(self.ctx.lang, heading, self.t("cd_moving"))):
+                    try:
+                        answer = await self.client.set_workspace(sid, target, cd_expect(state))
+                    except HubError as exc:
+                        failure = exc
+            finally:
+                self._moving = None
+                lost, self._moving_conn = self._moving_conn, None
+        here = self.attached and self.sid == sid
+        if failure is not None:
+            self.error(self.hub_error(failure))  # nothing changed: a refusal, or a move undone (and restarted)
+            with contextlib.suppress(HubError):
+                fresh = (await self.client.session(sid)).get("session")
+                if fresh and here:
+                    self.session = {**(self.session or {}), **fresh}
+        else:
+            summary = (answer or {}).get("session") or summary
+            if here:
+                self.session = {**(self.session or {}), **summary}
+                if self.state is not None and isinstance(summary.get("workspace"), dict):
+                    self.state.setdefault("swarm", {})["workspace"] = dict(summary["workspace"])
+            self._print_folder_result((answer or {}).get("result") or {}, title)
+        if lost is not None and here:
+            await self._on_connection(lost)  # still not back: the usual grace, then «нет связи»
+        self.request_refresh()
+        self.invalidate()
+
     async def attach(self, summary: dict | None, *, announce: bool = True, fresh: bool = False) -> None:
         """Follow a session (None: the hub itself is one swarm): print its goal, a board summary and the
         latest messages, then its live events. Everything that can fail (start, events, state) runs before
         the current session is left, so a failed attach keeps it. `fresh`: a session just created here —
         its whole journal is replayed instead (the team joining, the goal, the first tasks), so nothing
-        that happened before the stream connected is lost and the goal is not printed twice."""
+        that happened before the stream connected is lost and the goal is not printed twice. A session that
+        cannot start because its folder is gone is attached stopped, so that /cd can move it."""
         sid = summary.get("id") if summary else None
+        folder_gone = False
         if summary and self.client.mode == "launcher" and summary.get("status") != "running":
             self.info(self.t("session_starting", title=summary.get("title") or sid))
-            summary = await self.client.start_session(sid)
+            try:
+                summary = await self.client.start_session(sid)
+            except HubError as exc:
+                stopped = await self._folder_gone(sid, exc)
+                if stopped is None:
+                    raise
+                summary, folder_gone = stopped, True
         # the baseline first: a message sent while the history is fetched is replayed, and deduplicated by id
         latest = await self.client.events(sid, limit=1)
         state = await self.client.state(sid)
@@ -865,6 +1121,8 @@ class TUI:
             if state.get("tasks"):
                 self.print(render.board_summary(self.ctx, state["tasks"]))
             self._print_history(history)
+        if folder_gone:
+            self.error(self._not_started_text())
         self._stream_task = self._spawn(self._follow(sid), "dreamteam-tui-stream")
         if self._refresher is None or self._refresher.done():
             self._refresher = self._spawn(self._refresh_loop(), "dreamteam-tui-refresh")
@@ -951,7 +1209,14 @@ class TUI:
     async def _ensure_running(self) -> None:
         if self.client.mode == "launcher" and self.sid and (self.session or {}).get("status") == "stopped":
             self.info(self.t("session_starting", title=(self.session or {}).get("title") or self.sid))
-            self.session = await self.client.start_session(self.sid)
+            try:
+                self.session = await self.client.start_session(self.sid)
+            except HubError as exc:
+                stopped = await self._folder_gone(self.sid, exc)
+                if stopped is None:
+                    raise
+                self.session = {**(self.session or {}), **stopped}
+                raise HubError(exc.status, self._not_started_text(), exc.data) from None
 
     # ---- input -------------------------------------------------------------------------------------
     async def handle_input(self, text: str, mode: tuple[str, Any] | None = None) -> None:
@@ -1047,10 +1312,24 @@ class TUI:
         if self._bash is not None:
             self.error(self.t("bash_busy"))
             return None
-        run = ShellCommand(command, cwd=self._workspace(), program=await self._shell())
+        cwd = self._workspace()
+        if cwd is None:  # the user's folder is gone: no stand-in (a command meant for it could hit another one)
+            self.error(self.t("bash_no_folder", path=(self.workspace_info() or {}).get("path")))
+            return None
+        run = ShellCommand(command, cwd=cwd, program=await self._shell())
         self._bash = run
         self.invalidate()
         return self._spawn(self._run_bash(run), "dreamteam-tui-bash")
+
+    async def _stop_bash(self, timeout: float = 10.0) -> None:
+        """Interrupt the running `!` command (if any) and wait until it has ended."""
+        run = self._bash
+        if run is None:
+            return
+        run.interrupt()
+        deadline = time.monotonic() + timeout
+        while self._bash is run and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
 
     async def _run_bash(self, run: ShellCommand) -> None:
         try:
@@ -1078,7 +1357,17 @@ class TUI:
             self._shell_program = program
         return self._shell_program
 
-    def _workspace(self) -> Path:
+    def _workspace(self) -> Path | None:
+        """Where `!` commands run: the session's folder (the snapshot's or the summary's path, wherever /cd put
+        it); None when it is a folder outside the session that does not exist now. A session's own folder that
+        does not exist yet (never started) falls back to its directory, then the home."""
+        folder = self.workspace_info()
+        if folder is not None:
+            path = Path(str(folder["path"]))
+            if path.is_dir():
+                return path
+            if not folder.get("default", True):
+                return None
         candidates: list[Path] = []
         if self.attached and (self.session or {}).get("dir"):
             directory = Path(self.session["dir"])
@@ -1091,21 +1380,53 @@ class TUI:
     # ---- dialogs -----------------------------------------------------------------------------------
     async def ask(self, dialog: Dialog) -> Any:
         """Show `dialog` in place of the input box until it is answered; its value (None = cancelled)."""
-        async with self._dialog_lock:
-            self.dialog = dialog
-            dialog.open()
-            self.suggestions = []
-            with contextlib.suppress(ValueError):
-                self.app.layout.focus(self.dialog_window)
-            self.invalidate()
+        async with self.dialog_flow():
+            self._show_dialog(dialog)
             try:
                 return await dialog.wait()
             finally:
-                self.dialog = None
-                with contextlib.suppress(ValueError):
-                    self.app.layout.focus(self.input_window)
-                self._update_suggestions()
-                self.invalidate()
+                self._hide_dialog()
+
+    @contextlib.asynccontextmanager
+    async def busy(self, dialog: Dialog):
+        """Show `dialog` (a BusyDialog) in place of the input box while the block runs."""
+        async with self.dialog_flow():
+            self._show_dialog(dialog)
+            try:
+                yield dialog
+            finally:
+                self._hide_dialog()
+
+    @contextlib.asynccontextmanager
+    async def dialog_flow(self):
+        """Hold the place of the input box for a chain of dialogs of one task (the picker, a confirmation, a
+        busy notice, the picker again): an MCP approval waits until the chain ends instead of popping up
+        between its steps, where the keys meant for the chain would answer it."""
+        task = asyncio.current_task()
+        if self._dialog_owner is task:
+            yield
+            return
+        async with self._dialog_lock:
+            self._dialog_owner = task
+            try:
+                yield
+            finally:
+                self._dialog_owner = None
+
+    def _show_dialog(self, dialog: Dialog) -> None:
+        self.dialog = dialog
+        dialog.open()
+        self.suggestions = []
+        with contextlib.suppress(ValueError):
+            self.app.layout.focus(self.dialog_window)
+        self.invalidate()
+
+    def _hide_dialog(self) -> None:
+        self.dialog = None
+        with contextlib.suppress(ValueError):
+            self.app.layout.focus(self.input_window)
+        self._update_suggestions()
+        self.invalidate()
 
     async def decide_mcp(self, name: str, approve: bool, comment: str = "") -> None:
         self.mcp_answered.add(name)
@@ -1332,6 +1653,14 @@ class TUI:
             await self.client.mark_read(self.sid, with_=sender)
 
     async def _on_connection(self, state: Any) -> None:
+        if self._deleting is not None and self._deleting == self.sid:
+            self._deferred_conn = state  # its stream ends: delete_session() leaves it (or replays this on failure)
+            return
+        if self._moving is not None and self._moving == self.sid:
+            if state in ("lost", "rejected"):  # it stops and starts in its new folder: the stream comes back
+                self._moving_conn = state      # (change_folder handles a loss not made good by then)
+                return
+            self._moving_conn = None
         if state == "rejected" and self.sid is not None:
             # the hub refused the stream: if the session is gone (deleted in the web UI), stop following it
             try:
@@ -1455,6 +1784,8 @@ class TUI:
                 await self.attach(target, announce=False)
             else:
                 self.print(render.tips(self.ctx, bool(sessions)))
+            if self.workspace_override and self.client.mode == "launcher" and not self.attached:
+                self.info(self.t("cd_new_session", path=self.workspace_override))
         except HubError as exc:
             self.error(self.hub_error(exc))
         finally:
@@ -1513,12 +1844,14 @@ class TUI:
 async def run_tui(conn: Connection, *, lang: str | None = None, session: str | None = None,
                   continue_last: bool = False, initial_prompt: str | None = None, verbosity: str = "normal",
                   input: Any = None, output: Any = None, printer: Callable[[Any], None] | None = None,
-                  overrides: dict | None = None) -> int:
+                  overrides: dict | None = None, workspace: str | None = None) -> int:
     """Run the interactive TUI on a hub connection until the user quits (docs/TUI.md §4). The connection
     is left open: the caller closes it. `printer(renderable)` replaces printing above the input box
-    (tests capture `render.to_plain`); `input` / `output` are prompt_toolkit Input / Output."""
+    (tests capture `render.to_plain`); `input` / `output` are prompt_toolkit Input / Output. `workspace`: the
+    absolute folder the first session created here works in (`--workspace`)."""
     tui = TUI(conn, lang=lang, session=session, continue_last=continue_last, initial_prompt=initial_prompt,
-              verbosity=verbosity, overrides=overrides, input=input, output=output, printer=printer)
+              verbosity=verbosity, overrides=overrides, input=input, output=output, printer=printer,
+              workspace=workspace)
     return await tui.run()
 
 

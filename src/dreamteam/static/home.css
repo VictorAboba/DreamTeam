@@ -41,6 +41,11 @@ body.home-page { overflow: auto; display: block; }
 .sc-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; color: var(--muted); }
 .sc-meta b { color: var(--text); font-weight: 600; }
 .sc-error { font-size: 12px; color: var(--err); white-space: pre-wrap; overflow-wrap: anywhere; }
+.sc-folder { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); min-width: 0; }
+/* a path too long for the card loses its start, not its end (the end tells folders apart): rtl box, ltr text */
+.sc-folder code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text); direction: rtl; text-align: left; }
+.sc-folder .badge { flex: none; }
+.sc-warn { font-size: 12px; color: var(--warn); font-weight: 600; overflow-wrap: anywhere; }
 .sc-actions { display: flex; gap: 6px; align-items: center; border-top: 1px solid var(--border); padding-top: 10px; margin-top: 2px; }
 .sc-actions a.btn { text-decoration: none; }
 .sc-actions .spacer { margin-left: auto; }
@@ -71,6 +76,7 @@ label.field .hint, .field-hint { font-weight: 400; font-size: 11px; color: var(-
 .key-label { display: flex; align-items: center; gap: 4px 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted); font-weight: 600; }
 label.check { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; }
 label.check input { width: auto; margin: 0; }
+label.check .hint { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
 .input-row { display: flex; gap: 6px; align-items: stretch; }
 .input-row > input, .input-row > select { flex: 1; min-width: 0; }
 
@@ -102,9 +108,36 @@ textarea.mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; 
 .save-msg { font-size: 13px; }
 .save-msg.err { color: var(--err); white-space: pre-wrap; }
 
+/* the starting team composer (new-session modal, Settings → defaults for new sessions) */
+.team { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.team-head { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--muted); font-weight: 600; }
+.team-total { margin-left: auto; font-weight: 500; }
+.team-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 10px; background: var(--panel-2); min-width: 0; }
+.team-row > select, .team-row > input { flex: 1 1 160px; width: auto; min-width: 0; }
+.team-count { display: inline-flex; align-items: center; gap: 4px; }
+.team-count input { width: 58px; text-align: center; padding-left: 4px; padding-right: 4px; }
+.team-model { font-size: 11px; color: var(--muted); }
+.team-row > .icon-btn { margin-left: auto; }
+.team-desc { flex-basis: 100%; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.team-desc.hint { white-space: normal; font-style: italic; }
+.team .field-hint { margin: 0; }
+
+/* Settings → Roles */
+.roles { display: flex; flex-direction: column; gap: 10px; }
+.role-card { border: 1px solid var(--border); border-radius: 12px; padding: 10px 14px; background: var(--panel-2); }
+.role-card.hidden-role { opacity: .6; padding-top: 8px; padding-bottom: 8px; }
+.role-card.hidden-role .role-head { margin-bottom: 0; }
+.role-card .settings-grid { grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); }
+.role-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.role-head .role-name { font-weight: 700; }
+.role-head input.role-name { width: 240px; max-width: 100%; }
+.role-other { font-size: 12px; }
+.add-role { margin-top: 10px; }
+
 .new-session .form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .new-session .form-grid .two { grid-column: span 2; }
 .modal .lead { margin: -4px 0 14px; color: var(--muted); font-size: 13px; }
+.modal p { overflow-wrap: anywhere; } /* a folder path in the delete dialog */
 
 @media (max-width: 760px) {
   .home { padding: 14px 12px 90px; }

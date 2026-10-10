@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -47,9 +49,9 @@ def test_registry_lookup_and_texts():
     assert find("nope") is None
     names = [cmd.name for cmd in COMMANDS]
     assert len(names) == len(set(names))
-    for required in ("help", "new", "sessions", "resume", "goal", "board", "task", "agents", "to", "hire", "trace",
-                     "span", "files", "cat", "cost", "status", "model", "pause", "budget", "max", "approve",
-                     "reject", "stop", "web", "settings", "verbose", "lang", "clear", "exit"):
+    for required in ("help", "new", "team", "sessions", "resume", "goal", "board", "task", "agents", "roles", "to",
+                     "hire", "trace", "span", "files", "cat", "cd", "cost", "status", "model", "pause", "budget", "max",
+                     "approve", "reject", "stop", "web", "settings", "verbose", "lang", "clear", "exit"):
         assert required in names
     for lang in ("ru", "en"):
         for cmd in COMMANDS:
@@ -59,7 +61,9 @@ def test_registry_lookup_and_texts():
         rows = commands.help_rows(lang)
         assert rows[0]["name"] == "help" and rows[0]["description"] == TEXTS[lang]["cmd_help"]
     assert find("task").usage("en") == "/task N"
-    assert find("hire").usage("ru") == "/hire Роль | инструкции"
+    assert find("hire").usage("ru") == "/hire Роль [| инструкции]"
+    assert find("approve").usage("en") == "/approve name | N [comment]"
+    assert names.index("roles") == names.index("agents") + 1 and names.index("team") == names.index("new") + 1
     help_text = render.to_plain(render.help_view(render.RenderContext(lang="en"), commands.help_rows("en")), 100)
     assert "/board" in help_text and "/exit, /quit, /q" in help_text and "task board" in help_text
 
@@ -82,6 +86,14 @@ def test_session_overrides():
     sections, title = session_overrides({"swarm": {"max_agents": 2}, "agents": {"default_model": "x"}})
     assert sections == {"swarm": {"max_agents": 2}, "agents": {"default_model": "x"}} and title is None
     assert session_overrides(None) == ({}, None)
+    # --team: the roles in order; it sets start_agents unless --agents gives it (in either order)
+    assert session_overrides({"team": "architect, developer*2"})[0] == \
+        {"swarm": {"starting_roles": ["architect", "developer", "developer"], "start_agents": 3}}
+    assert session_overrides({"team": "developer*2", "agents": 5})[0] == \
+        {"swarm": {"starting_roles": ["developer", "developer"], "start_agents": 5}}
+    assert session_overrides({"agents": 1, "team": "tester"})[0] == \
+        {"swarm": {"start_agents": 1, "starting_roles": ["tester"]}}
+    assert session_overrides({"team": None, "agents": 2})[0] == {"swarm": {"start_agents": 2}}
 
 
 # ---- suggestions ----------------------------------------------------------------------------------
@@ -296,5 +308,286 @@ def test_app_texts_exist(lang):
                 "unknown_command", "did_you_mean", "attached", "session_created", "no_session", "addressee_set",
                 "unknown_member", "pick_session", "mcp_title", "mcp_yes", "mcp_no", "mcp_later",
                 "mcp_reject_reason", "mcp_deferred", "usage", "launcher_only", "confirm_new_title",
-                "confirm_new_text", "session_starting", "session_stopped", "unknown_session"):
+                "confirm_new_text", "session_starting", "session_stopped", "unknown_session",
+                "task_review_you", "td_review_hint", "review_reason_required", "roles_title", "roles_hint",
+                "unknown_role", "no_roles", "builtin_role", "role_model", "role_instructions", "team_line", "team_set",
+                "team_reset", "team_bad", "col_description"):
         assert TEXTS[lang].get(key), key
+    # the goal texts say how a typed goal is split (first line = title)
+    assert all("Alt+Enter" in TEXTS[lang][key] for key in ("ph_goal", "ph_no_session", "tip_goal"))
+
+
+# ---- review, roles and the starting team with a stand-in hub client -------------------------------------
+CATALOG = [{"key": "generalist", "name": "Generalist", "builtin": True,
+            "description": "You take whichever task is most useful now. More.", "instructions": "", "model": None},
+           {"key": "tester", "name": "Tester", "description": "You check that what others built really works. More.",
+            "instructions": "Use pytest.", "model": "fast", "builtin": True},
+           {"key": "data engineer", "name": "Data engineer", "description": "You build data pipelines.",
+            "instructions": "", "model": None, "builtin": False}]
+
+
+def settings_view() -> dict:
+    """GET /api/settings as the launcher answers it (the parts /roles and /team read)."""
+    def both(en: str, ru: str) -> dict:
+        return {"en": en, "ru": ru}
+    return {"settings": {"swarm": {"starting_roles": ["architect"], "start_agents": 3}},
+            "role_catalog": [
+                {"key": "generalist", "builtin": True, "customized": False, "hidden": False,
+                 "name": both("Generalist", "Универсал"), "description": both("You take tasks.", "Ты берёшь задачи."),
+                 "instructions": "", "model": None},
+                {"key": "architect", "builtin": True, "customized": False, "hidden": False,
+                 "name": both("Architect", "Архитектор"), "description": both("You design.", "Ты проектируешь."),
+                 "instructions": "", "model": None},
+                {"key": "developer", "builtin": True, "customized": False, "hidden": False,
+                 "name": both("Developer", "Разработчик"), "description": both("You code.", "Ты пишешь код."),
+                 "instructions": "", "model": None},
+                {"key": "researcher", "builtin": True, "customized": True, "hidden": True,
+                 "name": both("Researcher", "Исследователь"), "description": both("You dig.", "Ты исследуешь."),
+                 "instructions": "", "model": None}]}
+
+
+class HubApp(FakeApp):
+    """A stand-in app whose hub client records the calls (act, roles, settings) and the MCP decisions."""
+
+    def __init__(self, mode: str = "launcher", attached: bool = False):
+        super().__init__(mode, attached)
+        self.acts: list[tuple[str, dict]] = []
+        self.overrides: dict = {}
+
+        async def act(sid, tool, args):
+            self.acts.append((tool, args))
+            return True, f"{tool} ok"
+
+        async def roles(sid):
+            self.calls.append(("roles", sid))
+            return {"language": "en", "roles": CATALOG}
+
+        async def settings():
+            self.calls.append(("settings",))
+            return settings_view()
+
+        self.client = SimpleNamespace(mode=mode, act=act, roles=roles, settings=settings)
+
+    async def decide_mcp(self, name, approve, comment=""):
+        self.calls.append(("mcp", name, approve, comment))
+
+
+async def test_approve_and_reject_settle_tasks_or_mcp_servers():
+    app = HubApp(attached=True)
+    await execute(app, "/approve 12 looks good")
+    await execute(app, "/approve #12")
+    await execute(app, "/reject 12")
+    await execute(app, "/reject #12 fix the parser: it drops the last line")
+    await execute(app, "/reject 12 'don't use global state'")
+    await execute(app, "/approve calc")
+    await execute(app, "/reject calc 'not safe'")
+    assert app.acts == [
+        ("task_review", {"task_id": 12, "approve": True, "comment": "looks good"}),
+        ("task_review", {"task_id": 12, "approve": True, "comment": ""}),
+        ("task_review", {"task_id": 12, "approve": False, "comment": "fix the parser: it drops the last line"}),
+        ("task_review", {"task_id": 12, "approve": False, "comment": "don't use global state"}),  # quotes around
+    ]
+    assert "Say what to fix: /reject 12 what to fix" in app.text   # a return needs a reason: no call
+    assert "task_review ok" in app.text
+    assert [c for c in app.calls if c[0] == "mcp"] == [("mcp", "calc", True, ""), ("mcp", "calc", False, "not safe")]
+
+
+async def test_hire_always_sends_instructions():
+    # `instructions` stays a required parameter of hire_agent (R0): "" for a catalog role
+    app = HubApp(attached=True)
+    await execute(app, "/hire Tester")
+    await execute(app, "/hire QA engineer | test the parser")
+    await execute(app, "/hire | nothing")
+    assert app.acts == [("hire_agent", {"role": "Tester", "instructions": ""}),
+                        ("hire_agent", {"role": "QA engineer", "instructions": "test the parser"})]
+    assert "Usage: /hire Role [| instructions]" in app.text
+
+
+async def test_roles_lists_the_catalog_and_one_role():
+    app = HubApp(attached=True)
+    app.ctx.width = 100
+    await execute(app, "/roles")
+    table = app.out[-1]
+    assert "Role catalog" in table and "Tester" in table and "fast" in table and "Data engineer" in table
+    assert "You check that what others built really works." in table and "More." not in table  # the first sentence
+    assert "/roles Role for the full description" in table
+    await execute(app, "/roles tester")
+    detail = app.out[-1]
+    assert "Tester" in detail and "built-in" in detail and "More." in detail
+    assert "Extra instructions: Use pytest." in detail and "model profile: fast" in detail
+    await execute(app, "/roles  data   ENGINEER ")
+    assert "You build data pipelines." in app.out[-1] and "built-in" not in app.out[-1]
+    await execute(app, "/roles Тестировщик")   # a preset by its name in the other language
+    assert "Use pytest." in app.out[-1]
+    await execute(app, "/roles nope")
+    assert "No role “nope” in the catalog. /roles lists them." in app.out[-1]
+    assert [c for c in app.calls if c[0] == "roles"] == [("roles", "001-x")] * 5
+
+    launcher = HubApp()   # no session: the launcher's catalog in the UI language, hidden roles left out
+    launcher.ctx.lang = "ru"
+    await execute(launcher, "/roles")
+    assert "Архитектор" in launcher.out[-1] and "Ты проектируешь." in launcher.out[-1]
+    assert "Исследователь" not in launcher.out[-1]
+    swarm_hub = HubApp(mode="swarm")
+    await execute(swarm_hub, "/roles")
+    assert "No current session" in swarm_hub.text
+
+
+async def test_team_sets_the_starting_team_of_new_sessions():
+    app = HubApp()
+    await execute(app, "/team")
+    assert "Starting team of new sessions: Architect ×1 · Generalist ×2 (3 in all)" in app.out[-1]
+    await execute(app, "/team developer*2, tester")
+    assert app.overrides == {"swarm": {"starting_roles": ["developer", "developer", "tester"], "start_agents": 3}}
+    assert "New sessions from this window start with: Developer ×2 · Tester ×1 (3 in all)" in app.out[-1]
+    await execute(app, "/team")
+    assert "New sessions from this window start with: Developer ×2" in app.out[-1]
+    await execute(app, "/team x*0")
+    assert "'x*0': the count must be a whole number from 1 to 50. Example: /team architect" in app.out[-1]
+    assert app.overrides["swarm"]["start_agents"] == 3                       # unchanged
+    app.overrides["swarm"]["max_agents"] = 9                                 # (another override stays)
+    await execute(app, "/team -")
+    assert app.overrides == {"swarm": {"max_agents": 9}} and "comes from the settings" in app.out[-1]
+    await execute(app, "/team reset")
+    assert app.overrides == {"swarm": {"max_agents": 9}}
+    del app.overrides["swarm"]["max_agents"]
+    await execute(app, "/team сброс")
+    assert app.overrides == {}
+    swarm_hub = HubApp(mode="swarm", attached=True)
+    await execute(swarm_hub, "/team tester")
+    assert "needs a session launcher" in swarm_hub.text and swarm_hub.overrides == {}
+
+
+# ---- /cd helpers (dreamteam.console, shared by the TUI and the console) ------------------------------------
+def test_cd_folder_resolution_and_states(tmp_path):
+    from dreamteam.console import folder_state, is_loopback, resolve_folder, same_folder, unquote
+
+    assert unquote('"C:\\My Projects\\app"') == "C:\\My Projects\\app" and unquote("'/srv/a b'") == "/srv/a b"
+    assert unquote("plain") == "plain" and unquote('"') == '"'
+    assert resolve_folder("proj", local=True, cwd=str(tmp_path)) == str(tmp_path / "proj")
+    assert resolve_folder(f'"{tmp_path / "a" / ".." / "b"}"', local=True) == str(tmp_path / "b")
+    assert resolve_folder("~/proj", local=True) == os.path.normpath(os.path.expanduser("~/proj"))
+    assert resolve_folder("proj", local=False) is None and resolve_folder("~/proj", local=False) is None
+    assert resolve_folder("/srv/app", local=False) == "/srv/app"  # the hub's system decides
+    assert resolve_folder("D:\\app", local=False) == "D:\\app"
+    assert resolve_folder("  ", local=True) is None
+    if sys.platform == "win32":  # a rooted path without a drive gets the current drive (as `--workspace` does)
+        drive = os.path.splitdrive(str(tmp_path))[0]
+        assert resolve_folder("\\projects\\app", local=True, cwd=str(tmp_path)) == drive + "\\projects\\app"
+        assert os.path.isabs(resolve_folder("\\projects\\app", local=True))
+    assert is_loopback("http://127.0.0.1:8765/s/001") and is_loopback("http://[::1]:1")
+    assert is_loopback("http://localhost")
+    assert not is_loopback("http://10.0.0.5:8765")
+    # the console of `serve --host <LAN IP>` runs next to its hub, and `dreamteam console` found the hub through the
+    # home's hub.json: local, whatever the address
+    from dreamteam.console import Console
+
+    assert not Console("http://192.168.1.5:8765/s/001-calc", "en").local
+    assert Console("http://192.168.1.5:8765/s/001-calc", "en", local=True).local
+
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "full").mkdir()
+    (tmp_path / "full" / "x.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+    assert [folder_state(str(tmp_path / n)) for n in ("empty", "full", "file.txt", "nope")] == \
+        ["empty", "files", "file", "missing"]
+    assert same_folder(tmp_path / "full", str(tmp_path / "x" / ".." / "full"))
+    assert not same_folder(tmp_path / "full", tmp_path / "empty") and not same_folder(None, tmp_path)
+
+
+def test_cd_preview_words_the_question(tmp_path):
+    from dreamteam.console import cd_preview
+
+    own = {"path": str(tmp_path / "s" / "workspace"), "default": True, "adopted": False, "exists": True}
+    moved = {"path": str(tmp_path / "moved"), "default": False, "adopted": False, "exists": True}
+    adopted = {"path": str(tmp_path / "project"), "default": False, "adopted": True, "exists": True}
+    lost = {**moved, "exists": False}
+    default = own["path"]
+    (tmp_path / "empty").mkdir()
+    (tmp_path / "full").mkdir()
+    (tmp_path / "full" / "x.txt").write_text("x", encoding="utf-8")
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+
+    def preview(current, target, local=True):
+        return cd_preview(current, None if target is None else str(tmp_path / target), default, local=local)
+
+    assert preview(own, None) == ("same", None)
+    assert cd_preview(moved, moved["path"], default, local=True) == ("same", None)
+    assert preview(own, "new") == ("missing", "text_missing")
+    assert preview(own, "empty") == ("empty", "text_empty")
+    assert preview(own, "full") == ("files", "text_files")
+    assert preview(own, "file.txt") == ("file", None)
+    assert preview(adopted, "empty") == ("empty", "text_fresh")  # the user's files stay: nothing of theirs moves
+    assert preview(lost, "new") == ("missing", "text_lost")
+    assert preview(moved, None) == ("missing", "text_missing")   # its own folder was removed by the first move
+    (tmp_path / "s" / "workspace").mkdir(parents=True)
+    (tmp_path / "s" / "workspace" / "old.txt").write_text("x", encoding="utf-8")
+    assert preview(adopted, None) == ("files", "text_back")      # its old files are still there
+    assert preview(own, "full", local=False) == ("unknown", "text_unknown")
+
+
+def test_cd_result_lines():
+    from dreamteam.console import cd_result_lines
+
+    unchanged = cd_result_lines({"mode": "unchanged", "to": "/p"}, "Calc")
+    assert unchanged == [("unchanged", {"title": "Calc", "path": "/p"})]
+    lines = cd_result_lines({"mode": "moved", "from": "/a", "to": "/b", "git": "moved", "mcp_moved": ["calc", "csv"],
+                             "old_kept": None, "old_missing": False, "restarted": True, "start_error": None}, "Calc")
+    assert lines == [("moved", {"title": "Calc", "path": "/b"}), ("git_moved", {}),
+                     ("mcp_moved", {"names": "calc, csv"})]
+    lines = cd_result_lines({"mode": "adopted", "from": "/a", "to": "/repo", "git": "existing", "mcp_moved": [],
+                             "old_kept": "/a", "old_missing": False, "start_error": "boom"}, "Calc")
+    assert [key for key, _ in lines] == ["adopted", "git_existing", "old_kept", "start_error"]
+    lines = cd_result_lines({"mode": "moved", "from": "/gone", "to": "/b", "git": "disabled", "old_kept": None,
+                             "old_missing": True}, "Calc")
+    assert [key for key, _ in lines] == ["now", "git_disabled", "old_missing"]
+    assert lines[-1] == ("old_missing", {"path": "/gone"})
+    assert [k for k, _ in cd_result_lines({"mode": "created", "to": "/n", "git": "initialized"}, "N")] == \
+        ["created", "git_initialized"]
+    # leaving the user's folder whose repository tracked the session's MCP servers: their removal is said
+    left = {"mode": "moved", "from": "/repo", "to": "/b", "git": "initialized", "mcp_moved": ["calc"],
+            "old_kept": "/repo", "old_missing": False,
+            "old_changed": {"paths": ["mcp/calc"], "commit": "0123456789abcdef", "error": None}}
+    lines = cd_result_lines(left, "Calc")
+    assert [k for k, _ in lines] == ["now", "git_initialized", "mcp_moved", "old_mcp_committed"]
+    assert lines[-1][1] == {"path": "/repo", "paths": "mcp/calc", "commit": "01234567"}
+    lines = cd_result_lines({**left, "old_changed": {"paths": ["mcp/calc"], "commit": None, "error": "detached"}}, "C")
+    assert lines[-1] == ("old_mcp_uncommitted", {"path": "/repo", "paths": "mcp/calc", "error": "detached"})
+    for lang in ("ru", "en"):  # every key has a text in the TUI and in the console
+        from dreamteam.console import CD_TEXTS
+
+        for key in ("unchanged", "moved", "now", "adopted", "created", "git_moved", "git_existing", "git_initialized",
+                    "git_disabled", "git_none", "mcp_moved", "old_kept", "old_missing", "start_error", "text_missing",
+                    "text_empty", "text_fresh", "text_lost", "text_files", "text_back", "text_unknown",
+                    "kind_default", "kind_moved", "kind_adopted", "old_mcp_committed", "old_mcp_uncommitted"):
+            assert TEXTS[lang].get("cd_" + key) and CD_TEXTS[lang].get(key), (lang, key)
+            fields = {"path": "/p", "paths": "mcp/x", "commit": "abc", "error": "e", "title": "T", "names": "n",
+                      "old": "/o"}
+            TEXTS[lang]["cd_" + key].format(**fields)  # (no unknown fields)
+            CD_TEXTS[lang][key].format(**fields)
+        assert TEXTS[lang].get("cd_text_bash")
+
+
+def test_cd_expect_and_the_mcp_words():
+    from dreamteam.console import cd_expect, cd_moves_files
+    from dreamteam.launcher_mcp import workspace_text
+
+    assert [cd_expect(s) for s in ("missing", "empty", "files", "unknown", "same")] == \
+        ["moved", "moved", "adopted", None, None]
+    # the session's own files leave its folder (a running `!` command there is stopped first) only on a real move
+    own = {"path": "D:/w", "default": True, "adopted": False, "exists": True}
+    assert [cd_moves_files(s, own) for s in ("missing", "empty", "unknown", "files", "same", "file")] == \
+        [True, True, True, False, False, False]
+    assert not cd_moves_files("empty", {**own, "default": False, "adopted": True})  # the user's files stay
+    assert not cd_moves_files("missing", {**own, "default": False, "exists": False})  # nothing there to move
+    # the MCP words say what the TUI and the console say: after the user's folder nothing of the session's moved
+    text = workspace_text({"mode": "moved", "to": "D:/fresh", "git": "initialized", "mcp_moved": ["calc"],
+                           "old_kept": "D:/proj"})
+    assert text.startswith("The session now works in D:/fresh.") and "Moved the session's files" not in text
+    text = workspace_text({"mode": "moved", "from": "D:/gone", "to": "D:/b", "git": "disabled", "old_missing": True})
+    assert text.startswith("The session now works in D:/b.") and "did not exist" in text
+    assert workspace_text({"mode": "moved", "to": "D:/b", "git": "moved"}).startswith("Moved the session's files to")
+    text = workspace_text({"mode": "moved", "from": "D:/proj", "to": "D:/b", "git": "initialized",
+                           "old_kept": "D:/proj",
+                           "old_changed": {"paths": ["mcp/calc"], "commit": None, "error": "detached HEAD"}})
+    assert "not committed there (detached HEAD)" in text and "stays as it was" not in text
