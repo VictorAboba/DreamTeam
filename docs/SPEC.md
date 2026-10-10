@@ -582,9 +582,12 @@ signing); an agent's own commits carry its identity from the shell environment (
 The whole-tree autocommit (after every `shell` call): `ensure_scratch()` (an agent may have deleted the marker),
 `git status --porcelain -z` (`porcelain_entries`), `git reset -q -- .scratch` when something under `.scratch/` is
 staged (a manual `git add -f`; it only resets index entries to HEAD), nothing more when nothing outside `.scratch/`
-changed, else `git add -A --ignore-errors -- . :(exclude).scratch` (with pathspec magic, `literal=False`) and a
-commit of the index without a pathspec (a merge an agent left in progress concludes as before). Path commits of
-`write`/`edit` keep literal pathspecs (`-- rel`).
+changed, else `git add -A --ignore-errors -- . ":(exclude)[.]scratch" ":(exclude)[.]scratch/*"`
+(`SCRATCH_EXCLUDES`, with pathspec magic, `literal=False`) and a commit of the index without a pathspec (a merge an
+agent left in progress concludes as before). The excludes are spelled with `[.]`: git add takes a literal
+`:(exclude).scratch` as naming the folder and, when the root `.gitignore` ignores `.scratch/` (`DEFAULT_GITIGNORE`
+does), reports it as an ignored path and exits 1 on every autocommit, burying real add errors in the log. Path
+commits of `write`/`edit` keep literal pathspecs (`-- rel`).
 
 #### Scratch folder
 Agents put temporary files (experiments, check scripts, test output, downloads) into **`.scratch/`** at the
@@ -596,7 +599,7 @@ three independent layers:
 | layer | what | where it applies |
 |---|---|---|
 | A. self-ignoring marker | `.scratch/.gitignore` = `SCRATCH_GITIGNORE` (a comment and `*`: git ignores the folder, the marker included), written by `ensure_scratch` | every workspace: a repository DreamTeam created, an adopted repository of the user, a folder without git |
-| B. autocommit exclusion | the whole-tree autocommit stages `-- . :(exclude).scratch` and resets anything staged under `.scratch/`; path commits of a path under `.scratch/` are skipped (and `ensure_scratch` runs, so a marker overwritten by `write_file` / `edit_file` is put back at once) | every repository; holds even without the marker or when `.scratch` is a file or a link |
+| B. autocommit exclusion | the whole-tree autocommit stages `-- .` minus `SCRATCH_EXCLUDES` and resets anything staged under `.scratch/`; path commits of a path under `.scratch/` are skipped (and `ensure_scratch` runs, so a marker overwritten by `write_file` / `edit_file` is put back at once) | every repository; holds even without the marker or when `.scratch` is a file or a link |
 | C. `DEFAULT_GITIGNORE` | the root `.gitignore` that `init_repo` writes has the line `.scratch/` | only repositories whose `.gitignore` DreamTeam created |
 
 | workspace | `.scratch/` + marker | root `.gitignore` | repository config |

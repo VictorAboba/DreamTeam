@@ -260,6 +260,24 @@ async def test_autocommit_excludes_the_folder_even_without_its_marker(repo, monk
 
 
 @needs_git
+async def test_autocommit_excludes_the_folder_where_no_gitignore_hides_it(fake_swarm, monkeypatch):
+    root = user_repo(fake_swarm, {".scratch/keep.txt": "the user's\n", "b.txt": "b\n"})  # no .gitignore at all
+    ws = Workspace(fake_swarm)
+    await ws.init()
+    marker(ws).unlink()
+    monkeypatch.setattr(ws, "ensure_scratch", lambda actor=None: None)  # only the pathspec keeps .scratch/ out
+    put(root, ".scratch/keep.txt", "changed by an agent\n")
+    put(root, ".scratch/deep/er/t.py", "print(1)\n")
+    put(root, ".scratchpad", "an ordinary file\n")
+    put(root, "sub/.scratch/kept.txt", "not the workspace's scratch folder\n")
+    put(root, "b.txt", "b2\n")
+    assert await ws.autocommit(ANNA, "shell: run")
+    assert commits(root)[0] == (ANNA, "shell: run", [".scratchpad", "b.txt", "sub/.scratch/kept.txt"])
+    assert git(root, "show", "HEAD:.scratch/keep.txt") == "the user's\n"
+    assert git(root, "ls-files", SCRATCH_DIR) == ".scratch/keep.txt\n"
+
+
+@needs_git
 async def test_autocommit_unstages_force_added_scratch(repo):
     put(repo.root, ".scratch/x.txt", "tmp")
     git(repo.root, "add", "-f", ".scratch/x.txt")  # an agent's manual `git add -f`

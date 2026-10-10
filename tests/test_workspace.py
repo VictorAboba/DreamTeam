@@ -246,18 +246,33 @@ def make_unindexable(root: Path) -> Path | None:
 
 
 @needs_git
-async def test_autocommit_survives_a_file_git_cannot_index(ws):
+async def test_autocommit_survives_a_file_git_cannot_index(ws, caplog):
     bad = make_unindexable(ws.root)
     if bad is None:
         pytest.skip("cannot create a file that git fails to index here")
     put(ws, "good.txt", "fine")
     assert await ws.autocommit(BORIS, "shell: build")
     assert commits(ws.root)[0] == (BORIS, "shell: build", ["good.txt"])
+    assert "git add reported errors" in caplog.text  # a real add error is still reported
     result = await ws.write(ANNA, "next.txt", "x")
     assert "commit" in result
     assert commits(ws.root)[0] == (ANNA, "create next.txt", ["next.txt"])
     if sys.platform != "win32":
         bad.chmod(0o644)
+
+
+@needs_git
+async def test_autocommit_reports_no_add_errors_for_the_ignored_scratch_folder(ws, caplog):
+    # the default .gitignore ignores .scratch/: git add must not complain about it on every autocommit
+    assert ".scratch/" in (ws.root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    put(ws, ".scratch/anna.smith/t.py", "print(1)\n")
+    put(ws, "out.txt", "result\n")
+    assert await ws.autocommit(ANNA, "shell: run")
+    assert commits(ws.root)[0] == (ANNA, "shell: run", ["out.txt"])
+    put(ws, ".scratch/anna.smith/t.py", "print(2)\n")
+    put(ws, "out.txt", "result 2\n")
+    assert await ws.autocommit(ANNA, "shell: run again")
+    assert "git add reported errors" not in caplog.text
 
 
 # --- paths ---------------------------------------------------------------------------------------------

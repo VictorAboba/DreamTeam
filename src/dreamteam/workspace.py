@@ -24,6 +24,10 @@ DEFAULT_GITIGNORE = "node_modules/\n.venv/\n__pycache__/\n*.pyc\n.DS_Store\n.scr
 SCRATCH_DIR = ".scratch"   # the agents' temporary files: never committed
 SCRATCH_GITIGNORE = ("# DreamTeam: temporary files of the agents. Git ignores this folder, this file included;\n"
                      "# nothing in it is ever committed.\n*\n")
+# `git add` pathspecs that keep SCRATCH_DIR out: the path itself and all below it (without glob magic `*` matches "/").
+# "[.]" rather than ".": git add takes an exclude spelled out literally as naming the path, and when the root
+# .gitignore ignores .scratch/ (DEFAULT_GITIGNORE does) it reports it as an ignored path and exits 1 every time.
+SCRATCH_EXCLUDES = (":(exclude)[.]scratch", ":(exclude)[.]scratch/*")
 # inherited variables that would point an agent's git at another repository or index
 GIT_LOCATION_VARS = frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX"})
@@ -906,8 +910,8 @@ class Workspace:
                     await self._git(actor, "reset", "-q", "--", SCRATCH_DIR)
                 if not outside:
                     return None
-                # the exclude pathspec needs pathspec magic (literal=False); both pathspecs are fixed strings
-                add = await self._git(actor, "add", "-A", "--ignore-errors", "--", ".", f":(exclude){SCRATCH_DIR}",
+                # the exclude pathspecs need pathspec magic (literal=False); all the pathspecs are fixed strings
+                add = await self._git(actor, "add", "-A", "--ignore-errors", "--", ".", *SCRATCH_EXCLUDES,
                                       literal=False)
                 if add.returncode != 0:
                     log.warning("git add reported errors (committing what it could add): %s", self._output(add))
