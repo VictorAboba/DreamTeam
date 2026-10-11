@@ -1,6 +1,6 @@
 "use strict";
 // Agent traces tab of the board UI (docs/SPEC.md §18.4). Loaded after app.js and uses its
-// helpers (S, $, $$, esc, t, api, toast, avatar, members, fmtTime, short, openModal, openTask, BASE).
+// helpers (S, $, $$, esc, t, md, api, toast, avatar, members, fmtTime, short, openModal, openTask, BASE).
 
 Object.assign(I18N.ru, {
   tr_all_agents: "Все агенты", tr_all_statuses: "Все статусы", tr_failed: "Только с ошибками", tr_refresh: "Обновить",
@@ -52,7 +52,7 @@ const TR = {
 const TRACE_STATUSES_UI = ["running", "done", "error", "step_limit", "refusal", "paused", "stopped", "interrupted"];
 const FAILED_STATUSES = ["error", "step_limit", "refusal", "interrupted"]; // the "failed" filter (tracing.list_traces)
 const TRACE_BADGE = { done: "done", running: "", error: "err", refusal: "err", interrupted: "err", step_limit: "warn", paused: "warn", stopped: "plain" };
-const SPAN_ICONS = { input: "📥", llm: "🧠", tool: "🔧", compaction: "🗜", event: "📌" };
+const SPAN_ICONS = { input: '<i class="ic ic-inbox"></i>', llm: '<i class="ic ic-cpu"></i>', tool: '<i class="ic ic-tool"></i>', compaction: '<i class="ic ic-compress"></i>', event: '<i class="ic ic-pin"></i>' };
 const CUT_MARK = /…\[\d+ chars cut\]…/;
 const PAGE = 50;
 
@@ -93,6 +93,8 @@ function spanName(s) {
   return tv("trn_", s.name);
 }
 function pre(text, cls = "") { return `<pre class="tr-pre ${cls}">${esc(text)}</pre>`; }
+/** What the model wrote (its reply, its thinking) as Markdown (app.js md); requests, arguments and results stay raw. */
+function prose(text, cls = "") { return `<div class="tr-md ${cls}">${md(text)}</div>`; }
 function json(value) { return JSON.stringify(value, null, 2); }
 
 /* ---------------------------------------------------------------- list */
@@ -110,8 +112,8 @@ function tracesPaneHtml() {
       <div class="traces-filters">
         <select id="tr-agent">${agentOptionsHtml()}</select>
         <select id="tr-status">${sopts.join("")}</select>
-        <button class="icon-btn small" type="button" id="tr-refresh" title="${esc(t("tr_refresh"))}">⟳</button>
-        <button class="btn small${TR.view === "stats" ? " primary" : ""}" type="button" id="tr-stats">📊 ${esc(t("tr_stats"))}</button>
+        <button class="icon-btn small" type="button" id="tr-refresh" title="${esc(t("tr_refresh"))}"><i class="ic ic-refresh"></i></button>
+        <button class="btn small${TR.view === "stats" ? " primary" : ""}" type="button" id="tr-stats"><i class="ic ic-chart"></i>${esc(t("tr_stats"))}</button>
       </div>
       <div class="trace-list" id="trace-list"></div>
     </div>
@@ -256,11 +258,11 @@ function renderTraceDetail(keepScroll) {
     <div class="td-actions">
       ${tasks ? `<span class="muted">${esc(t("tr_tasks"))}:</span> ${tasks}` : ""}
       <span class="spacer"></span>
-      <a class="btn small" href="${exportBase}" download>⬇ ${esc(t("tr_export"))}</a>
-      <a class="btn small" href="${exportBase}?contexts=1" download>⬇ ${esc(t("tr_export_ctx"))}</a>
-      <a class="btn small" href="${BASE}/api/agents/${encodeURIComponent(tr.agent)}/traces.jsonl" download>⬇ JSONL</a>
+      <a class="btn small" href="${exportBase}" download><i class="ic ic-download"></i>${esc(t("tr_export"))}</a>
+      <a class="btn small" href="${exportBase}?contexts=1" download><i class="ic ic-download"></i>${esc(t("tr_export_ctx"))}</a>
+      <a class="btn small" href="${BASE}/api/agents/${encodeURIComponent(tr.agent)}/traces.jsonl" download><i class="ic ic-download"></i>JSONL</a>
     </div>
-    ${tr.trigger ? `<details class="td-block" data-keep="trigger"${detailsOpen("trigger", spans.length < 3) ? " open" : ""}><summary>📥 ${esc(t("tr_woke"))}</summary>${pre(tr.trigger)}</details>` : ""}
+    ${tr.trigger ? `<details class="td-block" data-keep="trigger"${detailsOpen("trigger", spans.length < 3) ? " open" : ""}><summary>${esc(t("tr_woke"))}</summary>${pre(tr.trigger)}</details>` : ""}
     <div class="td-section">${esc(t("tr_timeline"))}</div>
     <div class="waterfall">${waterfallHtml(Object.assign({}, tr, { spans }))}</div>
     ${tr.outcome ? `<div class="td-outcome"><b>${esc(t("tr_outcome"))}:</b> ${esc(tr.outcome)}</div>` : ""}`;
@@ -282,7 +284,7 @@ function waterfallHtml(tr) {
     const err = s.status === "error" || s.status === "interrupted";
     return `<div class="wf-row${open ? " open" : ""}${err ? " err" : ""}" data-span="${Number(s.id)}">
       <div class="wf-label" style="padding-left:${depth[s.id] * 16 + 4}px">
-        <span class="wf-step">${s.step == null ? "" : Number(s.step)}</span>${SPAN_ICONS[s.kind] || "•"} <b>${esc(spanName(s))}</b>
+        <span class="wf-step">${s.step == null ? "" : Number(s.step)}</span>${SPAN_ICONS[s.kind] || '<i class="ic ic-spark"></i>'}<b>${esc(spanName(s))}</b>
         <span class="wf-sum">${esc(spanSummary(s))}</span>
       </div>
       <div class="wf-track"><div class="wf-bar k-${esc(s.kind)}${err ? " err" : ""}${s.status === "running" ? " running" : ""}" style="left:${left}%;width:${width}%"></div></div>
@@ -323,13 +325,13 @@ function spanDetailHtml(s) {
     parts.push(`<div class="sd-facts">${facts.map((f) => `<span>${esc(f)}</span>`).join("")}</div>`);
     if (s.error) parts.push(`<div class="sd-title err-text">${esc(t("tr_error"))}</div>${pre(s.error, "err")}`);
     const out = full.output || {};
-    if (out.thinking) parts.push(`<details class="sd-think" data-keep="think-${Number(s.id)}"${detailsOpen("think-" + Number(s.id), !(out.text || (out.tool_calls || []).length)) ? " open" : ""}><summary>💭 ${esc(t("tr_thinking"))}</summary>${pre(out.thinking, "thinking")}</details>`);
-    if (out.text) parts.push(`<div class="sd-title">💬 ${esc(t("tr_text"))}</div>${pre(out.text)}`);
+    if (out.thinking) parts.push(`<details class="sd-think" data-keep="think-${Number(s.id)}"${detailsOpen("think-" + Number(s.id), !(out.text || (out.tool_calls || []).length)) ? " open" : ""}><summary>${esc(t("tr_thinking"))}</summary>${prose(out.thinking, "thinking")}</details>`);
+    if (out.text) parts.push(`<div class="sd-title"><i class="ic ic-chat"></i>${esc(t("tr_text"))}</div>${prose(out.text)}`);
     if ((out.tool_calls || []).length) {
-      parts.push(`<div class="sd-title">🔧 ${esc(t("tr_calls"))}</div>` + out.tool_calls.map((c) =>
+      parts.push(`<div class="sd-title"><i class="ic ic-tool"></i>${esc(t("tr_calls"))}</div>` + out.tool_calls.map((c) =>
         `<div class="sd-call"><code>${esc(c.name)}</code>${c.parse_error ? ` <span class="err-text">${esc(c.parse_error)}</span>` : ""}${pre(json(c.arguments))}</div>`).join(""));
     }
-    parts.push(`<div class="sd-actions"><button class="btn small" type="button" data-span-context="${Number(s.id)}">🧾 ${esc(t("tr_context"))}</button>${cutNote(s.output) && !TR.full[s.id] ? `<button class="btn small" type="button" data-span-full="${Number(s.id)}">${esc(t("tr_load_full"))}</button>` : ""}</div>`);
+    parts.push(`<div class="sd-actions"><button class="btn small" type="button" data-span-context="${Number(s.id)}"><i class="ic ic-layers"></i>${esc(t("tr_context"))}</button>${cutNote(s.output) && !TR.full[s.id] ? `<button class="btn small" type="button" data-span-full="${Number(s.id)}">${esc(t("tr_load_full"))}</button>` : ""}</div>`);
   } else if (s.kind === "tool") {
     parts.push(`<div class="sd-title">${esc(t("tr_args"))}</div>${pre(typeof full.input === "string" ? full.input : json(full.input ?? {}))}`);
     const note = meta.shown_chars ? ` <span class="muted">(${esc(t("tr_shown", { shown: meta.shown_chars, total: meta.chars }))})</span>` : "";
@@ -362,7 +364,7 @@ function contextHtml(ctx, id) {
     return `<div class="ctx-msg r-${esc(role)}${m.is_error ? " err" : ""}"><div class="ctx-role">[${i}] ${esc(label)}</div>${body ? pre(body) : ""}${calls}</div>`;
   }).join("");
   const tools = ctx.tools || [];
-  return `<div class="modal-head"><h3>🧾 ${esc(t("tr_ctx_title", { id: Number(id) }))}</h3><button class="icon-btn small" type="button" data-close>✕</button></div>
+  return `<div class="modal-head"><h3>${esc(t("tr_ctx_title", { id: Number(id) }))}</h3><button class="icon-btn small" type="button" data-close><i class="ic ic-close"></i></button></div>
     <p class="muted">${esc(t("tr_ctx_note"))}${ctx.note ? " " + esc(ctx.note) : ""}</p>
     <div class="ctx-facts"><span>${esc(ctx.agent)}</span><span>${esc(ctx.model || "")}</span><span>${esc(t("tr_tools_n", { n: tools.length }))}</span><span>${esc(t("tr_messages_n", { n: (ctx.messages || []).length }))}</span></div>
     <details class="ctx-system"><summary>${esc(t("tr_system"))}</summary>${pre(ctx.system || "")}</details>
@@ -380,7 +382,7 @@ async function showSpanContext(id) {
 function statsHtml(st) {
   const num = (v) => Number(v) || 0;
   const rows = (items, cols) => items.map((r) => `<tr>${cols.map((c) => `<td>${esc(c(r))}</td>`).join("")}</tr>`).join("");
-  return `<div class="td-head"><b>📊 ${esc(t("tr_stats"))}${TR.agent ? " · " + esc(TR.agent) : ""}</b></div>
+  return `<div class="td-head"><b>${esc(t("tr_stats"))}${TR.agent ? " · " + esc(TR.agent) : ""}</b></div>
       <div class="td-stats">
         <div><b>${num(st.traces)}</b><span>${esc(t("tr_traces_n"))}</span></div>
         <div><b>${num(st.llm_calls)}</b><span>${esc(t("tr_llm"))}</span></div>

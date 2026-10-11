@@ -68,6 +68,68 @@ def test_planning_task_and_default_role_exist_in_both_languages():
         assert prompts.DEFAULT_ROLE[lang]
 
 
+PLANNING_SNIPPETS = {
+    # step: (en, ru) phrases the step must contain
+    2: (("Work that needs no contracts", "literature", "data", "before CONTRACTS.md is written",
+         "Only you create the tasks of the plan"),
+        ("Работа, которой не нужны контракты", "литература", "данные", "ещё до того, как написан CONTRACTS.md",
+         "Задачи плана создаёшь только ты")),
+    3: (("Then the contracts", "Before creating the other tasks"),
+        ("Затем контракты", "Прежде чем создавать остальные задачи")),
+    4: (("Then the rest of the tasks",), ("Затем остальные задачи",)),
+    5: (("depends only on the tasks without whose results it cannot be written", "exploratory and optional tasks do "
+         "not block it", "still open"),
+        ("зависит только от задач, без результатов которых её нельзя написать", "исследовательские и необязательные "
+         "задачи её не блокируют", "ещё открыты")),
+}
+
+
+def test_planning_task_starts_independent_work_before_the_contracts():
+    """The members waiting for the plan get work at once: tasks that need no contracts come before CONTRACTS.md,
+    and a final task waits only for what it cannot be written without. Both languages number the same steps."""
+    steps = {}
+    for lang in LANGS:
+        description = prompts.PLANNING_TASK[lang][2]
+        steps[lang] = {int(m.group(1)): m.group(2) for m in re.finditer(r"^(\d+)\. (.*)$", description, re.M)}
+        assert sorted(steps[lang]) == list(range(1, 10)), lang
+    for number, (en, ru) in PLANNING_SNIPPETS.items():
+        for lang, snippets in (("en", en), ("ru", ru)):
+            for snippet in snippets:
+                assert snippet in steps[lang][number], (lang, number, snippet)
+    # the others are told that tasks come before the plan is complete; new members learn the order
+    assert "before the plan is complete" in prompts.TEXTS["en"]["n_kickoff"]
+    assert "до того, как план готов" in prompts.TEXTS["ru"]["n_kickoff"]
+    assert "tasks that need no contracts at once, then the shared contracts" in prompts.SYSTEM_EN
+    assert "сразу задачи, которым не нужны контракты, затем общие контракты" in prompts.SYSTEM_RU
+    assert "a final task (report, summary, release) depends only on the tasks it cannot be written without" in \
+        prompts.SYSTEM_EN
+    assert "итоговая задача (отчёт, сводка, релиз) зависит только от задач, без которых её нельзя написать" in \
+        prompts.SYSTEM_RU
+
+
+def test_dependency_removal_texts():
+    """The assignee of a blocked task may drop dependencies (Board._plan_deps): the wake-up line, the creator's
+    notification and the discussion record exist in both languages with the same placeholders."""
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        assert placeholders(texts["my_blocked"]) == {"id", "blockers"}
+        assert "`task_update`" in texts["my_blocked"] and "depends_on" in texts["my_blocked"]
+        assert placeholders(texts["n_deps_removed"]) == {"by", "id", "title", "deps"}
+        assert placeholders(texts["post_deps_removed"]) == {"by", "deps"}
+        # removed blockers are not done: the unblock news must not claim they are
+        assert placeholders(texts["n_unblocked_removed"]) == {"by", "id", "title", "deps"}
+        assert "`task_claim`" in texts["n_unblocked_removed"]
+
+
+def test_planning_task_title_follows_its_steps():
+    """The title (shown in n_kickoff and on the board) names the same order as the steps: independent tasks before
+    the contracts, the rest after them."""
+    for lang, (independent, contracts, rest) in {"en": ("independent tasks", "contracts", "the rest"),
+                                                  "ru": ("независимые задачи", "контракты", "остальное")}.items():
+        title = prompts.PLANNING_TASK[lang][0]
+        assert title.index(independent) < title.index(contracts) < title.index(rest), (lang, title)
+
+
 def test_texts_reference_only_real_tools():
     llm_tools = {s.name for s in tools_for("llm")}
     params = {p for spec in REGISTRY.values() for p in spec.parameters.get("properties", {})}
@@ -263,6 +325,7 @@ def test_texts_steer_agents_to_the_right_tools(lang):
         "n_review_rejected": {"task_complete"},
         "n_assigned": {"task_claim"},
         "n_unblocked": {"task_claim"},
+        "n_unblocked_removed": {"task_claim"},
         "n_mention": {"task_comment"},
     }
     for key, tools in expected.items():

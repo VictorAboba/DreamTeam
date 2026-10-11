@@ -889,8 +889,13 @@ async def test_wait_for_events(swarm):
     assert "No new events in 0s" in await ok(swarm, USER, "wait_for_events", {"timeout": -5})
 
 
+_ITEM_TIME = re.compile(r"^• \d\d:\d\d ")
+
+
 def board_progress(text: str) -> list[str]:
-    return text.split("Board progress:\n", 1)[1].splitlines() if "Board progress:\n" in text else []
+    """The progress lines of a wait_for_events result, without their times (HH:MM)."""
+    lines = text.split("Board progress:\n", 1)[1].splitlines() if "Board progress:\n" in text else []
+    return [_ITEM_TIME.sub("• ", line) for line in lines]
 
 
 async def test_wait_for_events_with_progress(swarm):
@@ -916,7 +921,9 @@ async def test_wait_for_events_with_progress(swarm):
     text = await ok(swarm, ext, "wait_for_events", {"timeout": 10, "progress": True})
     await mover
     assert time.monotonic() - started < 5 and text.startswith("=== New events while you were working (")
-    assert text.splitlines()[1:] == ["Board progress:", f"• #2 Parser: created by user (assignee {b})"]
+    assert board_progress(text) == [f"• #2 Parser: created by user (assignee {b})"]
+    # every progress line carries the time of its event
+    assert text.splitlines()[1] == "Board progress:" and _ITEM_TIME.match(text.splitlines()[2])
     # changes are batched with the messages; the caller's own changes and edits that change no status are left out
     await ok(swarm, b, "task_update", {"task_id": 2, "status": "in_progress"})
     await ok(swarm, ext, "task_create", {"title": "Mine", "goal": "g"})
@@ -953,7 +960,8 @@ async def test_wait_for_events_with_progress(swarm):
     swarm.db.execute("UPDATE agents SET language = 'ru' WHERE name = ?", (ext,))
     await ok(swarm, USER, "task_update", {"task_id": 2, "status": "cancelled"})
     text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
-    assert text.splitlines()[1:] == ["Прогресс на доске:", "• #2 Parser: waiting → cancelled (user)"]
+    assert text.splitlines()[1] == "Прогресс на доске:"
+    assert _ITEM_TIME.sub("• ", text.splitlines()[2]) == "• #2 Parser: waiting → cancelled (user)"
     # the user has a cursor of its own
     await ok(swarm, USER, "wait_for_events", {"timeout": 0})  # what was addressed to the user so far
     assert (await ok(swarm, USER, "wait_for_events", {"timeout": 0, "progress": True})).startswith("No new events")
@@ -977,6 +985,112 @@ async def test_wait_for_events_with_progress_ends_when_the_swarm_stops(tmp_path)
         assert not sw.bus._queues  # and stopped listening
     finally:
         sw.close()
+
+
+async def test_wait_for_events_stamps_a_batch_that_spans_time(swarm):
+    """One wait_for_events result may hold hours of news (progress collected since the last progress call,
+    notifications queued while the client was away): progress lines always carry their time, the notifications and
+    messages too when the batch spans more than a minute, and the header then shows the range. An agent's wake-up
+    text stays as it was (its history must not grow)."""
+    from dreamteam.tools.fmt import item_time, stamp_range
+
+    a, b = llm_members(swarm)
+    ext = await join(swarm)
+    assert (await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})).startswith("No new events")
+    now = time.time()
+    two_hours, half_hour = now - 7200, now - 1800
+    await ok(swarm, USER, "task_create", {"title": "Parser", "goal": "g"})
+    swarm.db.execute("UPDATE events SET ts = ? WHERE id = (SELECT MAX(id) FROM events WHERE type = 'task.created')",
+                     (two_hours,))
+    swarm.notify(ext, "n_restart")
+    swarm.notify(a, "n_restart")
+    swarm.db.execute("UPDATE notifications SET ts = ? WHERE kind = 'n_restart'", (half_hour,))
+    swarm.mail.send(a, [ext], "hello")
+    text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
+    lines = text.splitlines()
+    header = prompts.t("en", "incoming_header", time=stamp_range(two_hours, time.time()))
+    assert lines[0] == header and "–" in lines[0]
+    assert lines[1] == "What happened:"
+    assert lines[2] == f"• {item_time(half_hour, now)} " + prompts.t("en", "n_restart")
+    assert re.fullmatch(rf"• \d\d:\d\d Message #\d+ from {a} to you:", lines[3]) and lines[4] == "hello"
+    assert lines[5:] == ["Board progress:", f"• {item_time(two_hours, now)} #1 Parser: created by user"]
+    # a batch within a minute: one stamp, no times but the progress lines'
+    swarm.mail.send(a, [ext], "again")
+    text = await ok(swarm, ext, "wait_for_events", {"timeout": 0})
+    assert "–" not in text.splitlines()[0] and re.fullmatch(rf"• Message #\d+ from {a} to you:", text.splitlines()[2])
+    # progress alone, hours old: the range header is built for it too
+    await ok(swarm, USER, "task_create", {"title": "Old", "goal": "g"})
+    swarm.db.execute("UPDATE events SET ts = ? WHERE id = (SELECT MAX(id) FROM events WHERE type = 'task.created')",
+                     (two_hours,))
+    text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
+    assert text.splitlines()[0] == prompts.t("en", "incoming_header", time=stamp_range(two_hours, time.time()))
+    # the agents' own wake-up keeps one stamp and no item times
+    wake = swarm.render_wake(a, incoming=True)
+    assert "–" not in wake.splitlines()[0] and "\n• " + prompts.t("en", "n_restart") in wake
+
+
+def test_stamp_helpers():
+    from datetime import datetime
+
+    from dreamteam.tools.fmt import item_time, stamp_range
+
+    morning, noon = datetime(2026, 10, 11, 10, 50).timestamp(), datetime(2026, 10, 11, 12, 50).timestamp()
+    yesterday = datetime(2026, 10, 10, 23, 5).timestamp()
+    assert stamp_range(None, noon) == "2026-10-11 12:50"
+    assert stamp_range(morning, noon) == "2026-10-11 10:50–12:50"
+    assert stamp_range(yesterday, noon) == "2026-10-10 23:05–2026-10-11 12:50"
+    assert item_time(morning, noon) == "10:50" and item_time(yesterday, noon) == "2026-10-10 23:05"
+
+
+async def test_swarm_status_brief(swarm):
+    await ok(swarm, USER, "set_goal", {"title": "Ship", "description": "a long description of the goal"})
+    assert REGISTRY["swarm_status"].parameters["properties"]["brief"]["type"] == "boolean"
+    full = await ok(swarm, USER, "swarm_status")
+    assert "a long description of the goal" in full
+    brief = await ok(swarm, USER, "swarm_status", {"brief": True})
+    assert "Global goal [active]: Ship" in brief.splitlines() and "a long description" not in brief
+    # the rest stays
+    assert [line.split(":")[0] for line in brief.splitlines()[2:]] == [line.split(":")[0] for line in
+                                                                       full.splitlines()[3:]]
+    swarm.complete_goal(llm_members(swarm)[0], "all done")
+    assert "Summary" not in await ok(swarm, USER, "swarm_status", {"brief": True})
+    assert "Summary: all done" in await ok(swarm, USER, "swarm_status")
+
+
+async def test_a_blocked_task_teaches_its_assignee_to_drop_dependencies(swarm):
+    """The wake-up text and task_get tell the assignee of a blocked task that it may remove what it can do without
+    (Board._plan_deps); task_update then tells it to say why, and the creator learns it at its next wake-up."""
+    a, b = llm_members(swarm)
+    dep = swarm.board.create(USER, "dep", goal="g")
+    opt = swarm.board.create(USER, "optional", goal="g")
+    t = swarm.board.create(b, "report", goal="g", depends_on=[dep.id, opt.id], assignee=a)
+    hint = prompts.t("en", "my_blocked", id=t.id, blockers=f"#{dep.id}, #{opt.id}")
+    assert hint in swarm.render_wake(a).splitlines()
+    assert "is blocked by" not in swarm.render_wake(b)
+    assert "You hold it while it is blocked" in await ok(swarm, a, "task_get", {"task_id": t.id})
+    assert "You hold it" not in await ok(swarm, b, "task_get", {"task_id": t.id})
+    text = await ok(swarm, a, "task_update", {"task_id": t.id, "depends_on": [dep.id]})
+    assert f"Its creator ({b}) was told that you removed #{opt.id}" in text and "Say there why" in text
+    assert prompts.t("en", "my_blocked", id=t.id, blockers=f"#{dep.id}") in swarm.render_wake(a).splitlines()
+    assert prompts.t("en", "n_deps_removed", by=a, id=t.id, title="report", deps=f"#{opt.id} [todo]") in \
+        swarm.render_wake(b)
+    # with a comment the reason is given already; the comment wakes the creator
+    text = await ok(swarm, a, "task_update", {"task_id": t.id, "depends_on": [], "comment": "the summary needs none"})
+    assert f"removed #{dep.id}" in text and "Say there why" not in text
+    assert swarm.has_pending(b)  # n_discussion of the comment (n_deps_removed is quiet)
+    assert "is blocked by" not in swarm.render_wake(a)
+
+
+async def test_a_blocked_task_in_review_gets_no_drop_hint(swarm):
+    """A task in review has its result produced already: no hint to drop its dependencies, at each wake-up or in
+    task_get (it gets there blocked when task_complete is called on an unclaimed blocked task)."""
+    a, b = llm_members(swarm)
+    dep = swarm.board.create(USER, "dep", goal="g")
+    t = swarm.board.create(b, "report", goal="g", depends_on=[dep.id], assignee=a)
+    await ok(swarm, a, "task_complete", {"task_id": t.id, "result": "written"})
+    assert swarm.board.get(t.id).status == Status.REVIEW and swarm.board.get(t.id).blocked_by == [dep.id]
+    assert "is blocked by" not in swarm.render_wake(a)
+    assert "You hold it" not in await ok(swarm, a, "task_get", {"task_id": t.id})
 
 
 def test_progress_texts_match_in_both_languages():

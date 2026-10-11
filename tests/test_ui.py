@@ -117,6 +117,9 @@ def test_no_hardcoded_user_visible_english_in_index():
 def test_ids_used_by_app_js_exist():
     static_ids = set(re.findall(r'\bid="([\w-]+)"', INDEX))
     template_ids = set(re.findall(r'\bid="([\w-]+)"', APP_JS))
+    # a Markdown field (mdFieldHtml) renders its textarea and its formatted view: id and id-view
+    for field in re.findall(r'mdFieldHtml\("([\w-]+)"', APP_JS):
+        template_ids |= {field, field + "-view"}
     used = set(re.findall(r'\$\("#([\w-]+)[" .]', APP_JS))
     used |= {m for m in re.findall(r'"#([\w-]+)"', APP_JS)}
     missing = sorted(u for u in used - static_ids - template_ids if not u.endswith("-"))
@@ -327,6 +330,20 @@ def test_linkify_escapes_everything_but_task_links_and_mentions():
 
 
 @needs_node
+def test_member_colours_are_the_ones_of_the_terminal_ui():
+    from dreamteam.tui import theme
+
+    names = ["Анна Смирнова", "Bob Stone", "  Олег   Борисов ", "ГРИГОРИЙ Козлов", "Ирина Титова", "x", '<b x="1">'] + [f"Agent {i}" for i in range(24)]
+    out = run_js(f"""
+      out.colors = {json.dumps(names, ensure_ascii=False)}.map(app.agentColor);
+      out.avatar = app.avatar("Bob Stone");
+    """)
+    assert out["colors"] == [theme.agent_color(n) for n in names]
+    assert len(set(out["colors"])) > 6  # the names spread over the palette
+    assert out["avatar"] == f'<span class="avatar " style="--c:{theme.agent_color("Bob Stone")}">BS</span>'
+
+
+@needs_node
 def test_scheduler_is_not_starved_by_a_stream_of_events():
     # regression: scheduleRefresh restarted its timer on every event, so a busy swarm (an event every
     # <250 ms) never refreshed the board at all
@@ -456,8 +473,8 @@ def test_review_on_the_board():
       app.moveTask(4, "done");
       out.calls = calls.map((c) => [c.url, c.body]);
     """)
-    assert '<span class="badge warn">👁 waits for your review</span>' in out["cardUser"]
-    assert '<span class="chip plain">👁 Bob Stone</span>' in out["cardAgent"] and "badge warn" not in out["cardAgent"]
+    assert '<span class="badge warn"><i class="ic ic-eye"></i>waits for your review</span>' in out["cardUser"]
+    assert '<span class="chip plain"><i class="ic ic-eye"></i>Bob Stone</span>' in out["cardAgent"] and "badge warn" not in out["cardAgent"]
     assert out["opts"].startswith('<option value="" selected>X</option>')
     assert out["auto"] == "— (the board picks)" and out["none"] == "— none —"
     assert "The task waits for your review" in out["reviewUser"] and "instead of the reviewer" not in out["reviewUser"]
@@ -518,8 +535,10 @@ def test_goal_and_hire_dialogs():
     assert '<select id="h-model"><option value="">— the role&#39;s or the session&#39;s profile</option>' in hire
     assert "optional for a catalog role" in hire
     known, upper, unknown, empty, other_language, hidden = out["previews"]
-    assert known == upper == other_language == 'You check &lt;things&gt;. <span class="badge plain">role profile: fast</span>'
-    assert hidden == "You find things out." and "Researcher" not in hire   # resolved by the hire, not offered
+    # the role description is Markdown (escaped like any text), the model profile a badge after it
+    assert known == upper == other_language == ('<div class="md"><p>You check &lt;things&gt;.</p></div>'
+                                                '<span class="badge plain">role profile: fast</span>')
+    assert hidden == '<div class="md"><p>You find things out.</p></div>' and "Researcher" not in hire  # not offered
     assert unknown == "A new role, not in the catalog: describe its responsibilities in the instructions." and empty == ""
     assert out["calls"] == [
         ["/api/act/set_goal", {"title": "Snake game\nArrow keys, score", "description": "pytest"}],
@@ -552,7 +571,7 @@ def test_discussion_thread_and_mentions():
       out.c4 = app.mentionCandidates("анна смирнова", names);
     """)
     assert out["order"] == [[1, 0], [3, 1], [4, 2], [2, 0], [5, 0]]
-    assert 'data-goto-post="1"' in out["html"] and "↪ Анна Смирнова" in out["html"] and "margin-left:44px" in out["html"]
+    assert 'data-goto-post="1"' in out["html"] and '<i class="ic ic-reply"></i>Анна Смирнова</button>' in out["html"] and "margin-left:44px" in out["html"]
     assert out["q1"] == {"start": 3, "query": "Ан"} and out["q2"] is None and out["q3"] == {"start": 0, "query": "Анна См"}
     assert out["c1"] == ["Анна Смирнова", "Анатолий Ким"]
     assert out["c2"] == ["Борис Лев"] and out["c3"] == ["Анна Смирнова"] and out["c4"] == []
@@ -615,6 +634,221 @@ def test_feed_requests_only_feed_events_and_describes_changes():
     assert out["system"] == "MCP x: ждёт одобрения"
     assert out["en"] == "system edited file a.txt"
     assert out["limits"] == {"max_cost_usd": 2.5, "max_agents": 4} and out["bad"] == [None, None, None, None]
+
+
+def test_session_settings_fields_match_the_config():
+    """The settings dialog's per-session fields name real [shell] / [agents] settings, with config.py's minimums."""
+    from dreamteam.config import _MIN_ONE, AgentSettings
+
+    block = re.search(r"const SESSION_FIELDS = \[(.*?)\n\];", APP_JS, re.S).group(1)
+    fields = re.findall(r'section: "(\w+)", key: "(\w+)", label: "(\w+)", kind: "(\w+)", min: (\d+)', block)
+    assert len(fields) == 9 == block.count("{ group:")
+    known = {"shell": {f.name for f in dataclasses.fields(ShellSettings)},
+             "agents": {f.name for f in dataclasses.fields(AgentSettings)}}
+    for section, key, label, kind, low in fields:
+        assert key in known[section], key
+        assert int(low) == (1 if key in _MIN_ONE else 0), key
+        assert label in i18n_blocks()["en"], label
+    assert ("shell", "cpu_threads", "sf_cpu", "auto", "0") in fields
+    assert ("agents", "idle_nudge_seconds", "sf_nudge", "num", "0") in fields
+
+
+SETTINGS_HARNESS = r"""
+  const handlers = {};
+  const on = (id) => el(id, { addEventListener: (type, fn) => { handlers[id + ":" + type] = fn; } });
+  el("modal"); el("modal-backdrop", { classList: classList(["hidden"]) }); on("s-save"); el("s-cost"); el("s-agents");
+  const toasts = [];
+  el("toasts", { children: [], appendChild: (box) => toasts.push([box.className.trim(), box.textContent]) });
+  document.createElement = () => ({ className: "", textContent: "", remove() {}, addEventListener() {} });
+  for (const f of app.SESSION_FIELDS) el(app.sessionFieldId(f), { focus() { out.focused = this.id; } });
+  app.S.lang = "en";
+  app.S.state = { swarm: { limits: { max_cost_usd: 2, max_agents: 3 } } };
+"""
+
+
+@needs_node
+def test_session_settings_helpers():
+    out = run_js(r"""
+      app.S.lang = "en";
+      const F = app.SESSION_FIELDS;
+      const texts = (o) => Object.fromEntries(F.map((f) => [`${f.section}.${f.key}`, o[`${f.section}.${f.key}`] ?? ""]));
+      const overrides = { swarm: { language: "ru" }, shell: { max_jobs: 3, cpu_threads: "4" }, agents: { context_tokens: 50000 } };
+      out.same = app.sessionSettingsPatch(texts({ "shell.max_jobs": "3", "shell.cpu_threads": "4", "agents.context_tokens": " 50000 " }), overrides);
+      out.changed = app.sessionSettingsPatch(texts({ "shell.max_jobs": "", "shell.cpu_threads": " AUTO ", "agents.context_tokens": "50000",
+                                                     "shell.max_jobs_per_member": "0", "agents.idle_nudge_seconds": "7,5" }), overrides);
+      out.bad = app.sessionSettingsPatch(texts({ "shell.max_jobs": "-1", "agents.context_tokens": "0", "shell.cpu_threads": "many",
+                                                 "agents.idle_nudge_seconds": "1e3", "agents.max_steps_per_turn": "2.5" }), {})
+        .errors.map((e) => [e.field.key, e.text]);
+      out.parsed = [app.parseSessionField(F[3], "auto"), app.parseSessionField(F[3], "0"), app.parseSessionField(F[4], "0x10")];
+      const defaults = { shell: { max_jobs_per_member: 4, max_jobs: 16, job_max_minutes: 480, cpu_threads: "auto" },
+                         agents: { max_steps_per_turn: 40, context_tokens: 120000, tool_output_chars: 12000, idle_nudge_seconds: 60,
+                                   max_parallel_llm_calls: 8 } };
+      out.html = app.sessionFieldsHtml(Object.assign({}, overrides, { agents: { context_tokens: '"><img src=x>' } }), defaults,
+                                       { agents: { default_model: "local" }, models: { local: { context_tokens: 32000 } } });
+      out.hint = app.contextHint({ agents: { default_model: "default" }, models: { default: { context_tokens: null } } });
+      out.sid = app.sessionSid();
+    """)
+    assert out["same"] == {"patch": {}, "errors": []}
+    assert out["changed"] == {"patch": {"shell": {"max_jobs": None, "cpu_threads": "auto", "max_jobs_per_member": 0},
+                                        "agents": {"idle_nudge_seconds": 7.5}}, "errors": []}
+    assert out["bad"] == [
+        ["max_jobs", "“Background jobs per session”: a whole number ≥ 0 is needed"],
+        ["cpu_threads", "“Compute threads per command (auto or a number)”: auto or a whole number ≥ 0"],
+        ["max_steps_per_turn", "“Steps per wake-up”: a whole number ≥ 1 is needed"],
+        ["context_tokens", "“Context window, tokens”: a whole number ≥ 1 is needed"],
+        ["idle_nudge_seconds", "“Nudge idle agents after, s”: a number ≥ 0 is needed"],
+    ]
+    assert out["parsed"][:2] == [{"value": "auto"}, {"value": 0}] and "error" in out["parsed"][2]
+    html = out["html"]
+    assert html.index("Background jobs") < html.index('id="sf-shell-max_jobs"') < html.index("Agents")
+    assert 'id="sf-shell-max_jobs" inputmode="numeric" autocomplete="off" value="3" placeholder="16"' in html
+    assert 'id="sf-shell-cpu_threads" inputmode="text" autocomplete="off" value="4" placeholder="auto"' in html
+    assert 'id="sf-shell-job_max_minutes" inputmode="numeric" autocomplete="off" value="" placeholder="480" data-empty-edit>' in html
+    assert 'id="sf-agents-idle_nudge_seconds" inputmode="decimal"' in html and "<img" not in html
+    assert "a context window set in the model profile wins; the profile “local” sets 32000 now" in html
+    assert "An empty field takes the value of the general settings" in html
+    assert out["hint"] == "a context window set in the model profile wins" and out["sid"] == ""
+
+
+@needs_node
+def test_settings_dialog_of_a_launcher_session():
+    pre = r"""
+      globalThis.location = { pathname: "/s/002-tuned/" };
+      const routes = {
+        "/api/sessions/002-tuned": { session: { id: "002-tuned", overrides: { swarm: { language: "ru" }, shell: { max_jobs: 3 } } },
+                                     config: { agents: { default_model: "default" }, models: { default: {} } } },
+        "/api/settings": { settings: { shell: { max_jobs: 16, max_jobs_per_member: 4 }, agents: { context_tokens: 120000 } } },
+      };
+      globalThis.fetch = async (url, opts) => {
+        const body = opts && opts.body ? JSON.parse(opts.body) : null;
+        calls.push({ url, method: (opts && opts.method) || "GET", body });
+        let data = routes[url] || { ok: true, result: "Limits set" };
+        if (opts && opts.method === "PATCH") data = { session: { overrides: { swarm: { language: "ru" }, agents: body.settings.agents } }, config: {} };
+        return { ok: true, json: async () => data, text: async () => "" };
+      };
+    """
+    out = run_js(SETTINGS_HARNESS + r"""
+      await app.settingsModal();
+      out.html = elements.modal.innerHTML;
+      out.loaded = calls.map((c) => [c.method, c.url]);
+      calls.length = 0;
+      // an invalid value: nothing is sent, the field gets the focus
+      Object.assign(elements["s-cost"], { value: "2" }); Object.assign(elements["s-agents"], { value: "3" });
+      elements["sf-agents-context_tokens"].value = "0";
+      await handlers["s-save:click"]();
+      out.invalid = [calls.length, toasts.slice(), out.focused];
+      // the limits unchanged: only the PATCH, with the changed keys (the emptied max_jobs is null)
+      toasts.length = 0;
+      elements["sf-agents-context_tokens"].value = "64000";
+      elements["sf-shell-max_jobs"].value = "";
+      await handlers["s-save:click"]();
+      out.saved = calls.map((c) => [c.method, c.url, c.body]);
+      out.toasts = toasts.slice();
+      out.closed = elements["modal-backdrop"].classList.contains("hidden");
+      // the budget changed: swarm_control as well; the session fields untouched this time: no PATCH
+      await app.settingsModal();
+      calls.length = 0;
+      elements["sf-agents-context_tokens"].value = "";
+      elements["sf-shell-max_jobs"].value = "3";
+      elements["s-cost"].value = "5";
+      await handlers["s-save:click"]();
+      out.limits = calls.map((c) => [c.method, c.url, c.body]);
+    """, pre=pre)
+    html = out["html"]
+    assert out["loaded"] == [["GET", "/api/sessions/002-tuned"], ["GET", "/api/settings"]]  # launcher routes, no BASE
+    assert 'id="sf-shell-max_jobs" inputmode="numeric" autocomplete="off" value="3" placeholder="16"' in html
+    assert 'id="sf-agents-context_tokens" inputmode="numeric" autocomplete="off" value="" placeholder="120000"' in html
+    assert "general settings" in html and "are set in the general settings" not in html
+    assert out["invalid"] == [0, [["toast err", "“Context window, tokens”: a whole number ≥ 1 is needed"]],
+                              "sf-agents-context_tokens"]
+    assert out["saved"] == [["PATCH", "/api/sessions/002-tuned",
+                             {"settings": {"shell": {"max_jobs": None}, "agents": {"context_tokens": 64000}}}]]
+    assert out["toasts"] == [["toast", "Saved"]] and out["closed"] is True
+    assert out["limits"] == [["POST", "/s/002-tuned/api/act/swarm_control", {"max_cost_usd": 5, "max_agents": 3}]]
+
+
+@needs_node
+def test_settings_dialog_edge_cases():
+    """A failed limits change after a saved PATCH, a cleared field as an edit, a failed load, a modal opened meanwhile."""
+    pre = r"""
+      globalThis.location = { pathname: "/s/002-tuned/" };
+      const net = { down: false, hold: null, stopped: true };
+      globalThis.fetch = async (url, opts) => {
+        const body = opts && opts.body ? JSON.parse(opts.body) : null;
+        calls.push({ url, method: (opts && opts.method) || "GET", body });
+        if (net.hold) await net.hold;
+        if (net.down && url.startsWith("/api/")) return { ok: false, status: 502, text: async () => '{"error":"down"}' };
+        if (url.endsWith("/swarm_control") && net.stopped) return { ok: false, status: 409, text: async () => '{"error":"stopped"}' };
+        const data = url === "/api/sessions/002-tuned"
+          ? { session: { overrides: opts && opts.method === "PATCH" ? { shell: body.settings.shell } : { shell: { max_jobs: 3 } } }, config: {} }
+          : url === "/api/settings" ? { settings: { shell: { max_jobs: 16 } } } : { ok: true, result: "Limits set" };
+        return { ok: true, json: async () => data, text: async () => "" };
+      };
+    """
+    out = run_js(SETTINGS_HARNESS + r"""
+      let confirms = 0;
+      globalThis.confirm = () => { confirms++; return false; };
+      // the fake DOM gives the modal's inputs to openModal's snapshot and to modalHasUnsaved
+      const inputs = ["s-cost", "s-agents", ...app.SESSION_FIELDS.map(app.sessionFieldId)].map((id) => elements[id]);
+      for (const input of inputs) input.hasAttribute = (name) => name === "data-empty-edit" && input.id.startsWith("sf-");
+      elements.modal.querySelectorAll = () => inputs;
+      document.querySelectorAll = (sel) => (sel.startsWith("#modal input") ? inputs : []);
+      Object.assign(elements["s-cost"], { value: "2" }); Object.assign(elements["s-agents"], { value: "3" });
+      elements["sf-shell-max_jobs"].value = "3";
+      // a cleared field is an edit: closing asks first
+      await app.settingsModal();
+      elements["sf-shell-max_jobs"].value = "";
+      out.clearedAsks = [app.closeModal(), confirms];
+      // the PATCH gets through, swarm_control does not (a stopped session): both are said, closing does not ask
+      elements["s-cost"].value = "5";
+      toasts.length = 0; calls.length = 0;
+      await handlers["s-save:click"]();
+      out.partial = [calls.map((c) => [c.method, c.url]), toasts.slice()];
+      out.budgetAsks = [app.closeModal(), confirms];  // the budget is still unsaved
+      elements["s-cost"].value = "2";
+      out.partialClose = [app.closeModal(), confirms];
+      // a failed load: no per-session fields, and no claim that they live in the general settings
+      net.down = true; toasts.length = 0;
+      await app.settingsModal();
+      out.failed = [elements.modal.innerHTML, toasts.slice()];
+      app.closeModal(true);
+      // another modal opened while loading stays
+      net.down = false;
+      let release;
+      net.hold = new Promise((resolve) => { release = resolve; });
+      const loading = app.settingsModal();
+      app.openModal("TASK MODAL");
+      release();
+      await loading;
+      out.kept = elements.modal.innerHTML;
+    """, pre=pre)
+    assert out["clearedAsks"] == [False, 1]
+    calls, toasts = out["partial"]
+    assert calls == [["PATCH", "/api/sessions/002-tuned"], ["POST", "/s/002-tuned/api/act/swarm_control"]]
+    assert toasts == [["toast err", "stopped"], ["toast", "The session parameters are saved, the budget and max agents are not"]]
+    assert out["budgetAsks"] == [False, 2] and out["partialClose"] == [True, 2]
+    html, toasts = out["failed"]
+    assert toasts == [["toast err", "Could not load the session parameters: down"]]
+    assert "sf-" not in html and "did not load" in html and "are set in the general settings" not in html
+    assert out["kept"] == "TASK MODAL"
+
+
+@needs_node
+def test_settings_dialog_of_the_main_session_and_a_standalone_app():
+    for path in ("/s/main/", None):
+        pre = f"globalThis.location = {{ pathname: {json.dumps(path)} }};" if path else ""
+        out = run_js(SETTINGS_HARNESS + r"""
+          await app.settingsModal();
+          out.html = elements.modal.innerHTML;
+          out.loaded = calls.length;
+          Object.assign(elements["s-cost"], { value: "2" }); Object.assign(elements["s-agents"], { value: "4" });
+          await handlers["s-save:click"]();
+          out.calls = calls.map((c) => [c.url, c.body]);
+        """, pre=pre)
+        assert out["loaded"] == 0, path
+        assert "sf-" not in out["html"] and "The other parameters (background jobs, agents) are set in the general settings." in out["html"]
+        base = "/s/main" if path else ""
+        assert out["calls"] == [[f"{base}/api/act/swarm_control", {"max_cost_usd": 2, "max_agents": 4}]], path
 
 
 EVIL = "<img src=x onerror=alert(1)>\"'&"
@@ -1468,6 +1702,696 @@ def test_jobs_in_the_feed_team_panel_drawer_and_header():
     assert out["badge2"] == ["", True] and out["count2"] == "2 / 3"   # the external member is not counted
 
 
+# ------------------------------------------------------------------------------------------------ Markdown
+MD_PRE = 'const M = require(staticDir + "/markdown.js"); const R = (s) => M.render(s);'
+
+
+def md_js(cases: dict[str, str], body: str = "") -> dict:
+    """Markdown.render of every case (and app.md through `body`)."""
+    return run_js(MD_PRE + f"\nconst CASES = {json.dumps(cases)};\n"
+                  + "out.r = Object.fromEntries(Object.entries(CASES).map(([k, v]) => [k, R(v)]));\n" + body)
+
+
+@needs_node
+def test_markdown_blocks():
+    r = md_js({
+        "plain": "Hello\nworld",
+        "paras": "one\n\n\ntwo",
+        "headings": "# H1\n###### H6 ###\n#12 is a task\n#no-space",
+        "fence": "```python\nx = 1 < 2\n  **not bold**\n```\nafter",
+        "tilde": "~~~\na\n~~~",
+        "unclosed": "text\n```\ncode\n\nmore",
+        "quote": "> a\n> > b\n>\n> c",
+        "ul": "- a\n- b\n  - c\n    - d\n- e",
+        "ol": "3. a\n4. b",
+        "mixed": "1. a\n  - nested\n2. b",
+        "loose": "- a\n\n- b",
+        "tasks": "- [ ] todo\n- [x] done\n- [X] Done\n- [y] no",
+        "lazy": "Steps:\n1. first\n2. second\ncontinued",
+        "table": "| a | b | c |\n|:--|:-:|--:|\n| 1 | **2** | 3 \\| 4 |\n| only |",
+        "notable": "a | b\n--- x",
+        "hr": "a\n\n---\n\n* * *\n___",
+        "dash": "-\n+1 to that\n3.14 is pi",
+        "indent": "Results:\n    x = 1\n    y = 2",
+        "spaces": "col1    col2\nval     1",
+        "nestedLoose": "- a\n  - b\n\n  - c",
+        "fenceInItem": "- step one:\n  ```py\n  a = 1\n\n  b = 2\n  ```\n- step two",
+        "itemGap": "- a\n\n  more\n- b",
+        "listThenPara": "- a\n- b\n\npara",
+        "siblingGap": "- a\n  - b\n\n- c",
+    })["r"]
+    assert r["plain"] == "<p>Hello<br>world</p>"           # a single newline is a line break
+    assert r["paras"] == "<p>one</p><br><p>two</p>"       # the blank lines past the first stay, as in the plain text
+    # a text without Markdown looks as written: the lines keep their indentation (and .md p keeps runs of spaces)
+    assert r["indent"] == "<p>Results:<br>    x = 1<br>    y = 2</p>"
+    assert r["spaces"] == "<p>col1    col2<br>val     1</p>"
+    # loose only by blank lines between the items or between an item's own blocks (CommonMark)
+    assert r["nestedLoose"] == "<ul><li>a<ul><li><p>b</p></li><li><p>c</p></li></ul></li></ul>"
+    assert r["fenceInItem"] == ('<ul><li>step one:<div class="md-lang">py</div><pre><code>a = <span class="hl-number">1</span>'
+                                '\n\nb = <span class="hl-number">2</span></code></pre></li><li>step two</li></ul>')
+    assert r["itemGap"] == "<ul><li><p>a</p><p>more</p></li><li><p>b</p></li></ul>"
+    assert r["listThenPara"] == "<ul><li>a</li><li>b</li></ul><p>para</p>"
+    assert r["siblingGap"] == "<ul><li><p>a</p><ul><li>b</li></ul></li><li><p>c</p></li></ul>"
+    assert r["headings"] == "<h1>H1</h1><h6>H6</h6><p>#12 is a task<br>#no-space</p>"
+    # a fence that names its language is highlighted (highlight.js), still escaped and never Markdown inside
+    assert r["fence"] == ('<div class="md-lang">python</div><pre><code>x = <span class="hl-number">1</span> &lt; '
+                          '<span class="hl-number">2</span>\n  **<span class="hl-keyword">not</span> bold**</code></pre>'
+                          "<p>after</p>")
+    assert r["tilde"] == "<pre><code>a</code></pre>"
+    assert r["unclosed"] == "<p>text</p><pre><code>code\n\nmore</code></pre>"   # runs to the end
+    assert r["quote"] == "<blockquote><p>a</p><blockquote><p>b</p></blockquote><p>c</p></blockquote>"
+    assert r["ul"] == "<ul><li>a</li><li>b<ul><li>c<ul><li>d</li></ul></li></ul></li><li>e</li></ul>"
+    assert r["ol"] == '<ol start="3"><li>a</li><li>b</li></ol>'
+    assert r["mixed"] == "<ol><li>a<ul><li>nested</li></ul></li><li>b</li></ol>"
+    assert r["loose"] == "<ul><li><p>a</p></li><li><p>b</p></li></ul>"
+    assert r["tasks"] == ('<ul><li class="md-task"><input type="checkbox" disabled> todo</li>'
+                          '<li class="md-task"><input type="checkbox" disabled checked> done</li>'
+                          '<li class="md-task"><input type="checkbox" disabled checked> Done</li><li>[y] no</li></ul>')
+    assert r["lazy"] == "<p>Steps:</p><ol><li>first</li><li>second<br>continued</li></ol>"
+    assert r["table"] == ('<div class="md-table"><table><thead><tr><th class="md-l">a</th><th class="md-c">b</th>'
+                          '<th class="md-r">c</th></tr></thead><tbody><tr><td class="md-l">1</td><td class="md-c">'
+                          '<strong>2</strong></td><td class="md-r">3 | 4</td></tr><tr><td class="md-l">only</td>'
+                          '<td class="md-c"></td><td class="md-r"></td></tr></tbody></table></div>')
+    assert r["notable"] == "<p>a | b<br>--- x</p>"
+    assert r["hr"] == "<p>a</p><hr><hr><hr>"
+    assert r["dash"] == "<p>-<br>+1 to that<br>3.14 is pi</p>"
+
+
+@needs_node
+def test_markdown_inline():
+    r = md_js({
+        "em": "**b** __b__ *i* _i_ ~~s~~ ***bi***",
+        "nested": "**a *b* c** *a **b** c*",
+        "snake": "snake_case_name and file_v2_final.py, 2*3*4 and a * b",
+        "code": "`a *b* <c> **d**` and ``x ` y`` and ` `` `",
+        "lonely": "a ` b and ~5 min and ~~~x",
+        "link": '[the docs](https://example.com/a_b?x=1&y=2 "title") and [mail](mailto:a@b.c)',
+        "auto": "<https://example.com/x> and <ftp://x.y> and <b>",
+        "bare": "see https://example.com/path_(x)/a_b, (https://x.y/z). or http://q.r/s!",
+        "escape": r"\*not em\* \_x\_ \# \[a](b) a\\b",
+        "image": "![a cat](https://img.example/cat.png)",
+        "linkcode": "[`code` and **bold**](https://x.y)",
+        "nolinkinlink": "[a [b](https://x.y) c](https://z.w)",
+        "latex": "$x_1 + y_2 = z$",
+        "latexEm": "Let $a*b$ and $c*d$ be, $x^*$ and $y^*$ too",
+        "latexEsc": "$\\{x\\} \\|y\\|_2$ and $$\\begin{a} p &= q \\\\ r \\end{a}$$",
+        "latexParens": "Inline \\(x_1\\) and display \\[a \\, b\\]",
+        "latexLines": "$$\na_1 = *b*\n$$",
+        "dollars": "costs $5 and $6, *em*\n\\$x\\$ and $ a $ *em*",
+        "latexHtml": "$<b>x</b>$ and $#12$",
+        "badge": "[![build](https://ci.example/badge.svg)](https://ci.example/run)",
+        "imgInLink": "[a ![b](http://x.y) c](http://z.w)",
+    })["r"]
+    a = lambda href: f'<a href="{href}" target="_blank" rel="noopener noreferrer">'  # noqa: E731
+    assert r["em"] == ("<p><strong>b</strong> <strong>b</strong> <em>i</em> <em>i</em> <del>s</del> "
+                       "<em><strong>bi</strong></em></p>")
+    assert r["nested"] == "<p><strong>a <em>b</em> c</strong> <em>a <strong>b</strong> c</em></p>"
+    assert r["snake"] == "<p>snake_case_name and file_v2_final.py, 2<em>3</em>4 and a * b</p>"
+    assert r["code"] == ("<p><code>a *b* &lt;c&gt; **d**</code> and <code>x ` y</code> and <code>``</code></p>")
+    assert r["lonely"] == "<p>a ` b and ~5 min and ~~~x</p>"
+    assert r["link"] == f'<p>{a("https://example.com/a_b?x=1&amp;y=2")}the docs</a> and {a("mailto:a@b.c")}mail</a></p>'
+    assert r["auto"] == f'<p>{a("https://example.com/x")}https://example.com/x</a> and &lt;ftp://x.y&gt; and &lt;b&gt;</p>'
+    assert r["bare"] == (f'<p>see {a("https://example.com/path_(x)/a_b")}https://example.com/path_(x)/a_b</a>, '
+                         f'({a("https://x.y/z")}https://x.y/z</a>). or {a("http://q.r/s")}http://q.r/s</a>!</p>')
+    assert r["escape"] == r"<p>*not em* _x_ # [a](b) a\b</p>"
+    assert r["image"] == f'<p>{a("https://img.example/cat.png")}a cat</a></p>'   # no images: a link
+    assert r["linkcode"] == f'<p>{a("https://x.y")}<code>code</code> and <strong>bold</strong></a></p>'
+    assert r["nolinkinlink"].count("<a ") == 2 and r["nolinkinlink"].startswith(f'<p>[a {a("https://x.y")}b</a> c](')
+    assert r["latex"] == "<p>$x_1 + y_2 = z$</p>"   # no math: the text as written
+    # LaTeX is kept as written: no emphasis inside or across formulas, no backslash escapes
+    assert r["latexEm"] == "<p>Let $a*b$ and $c*d$ be, $x^*$ and $y^*$ too</p>"
+    assert r["latexEsc"] == r"<p>$\{x\} \|y\|_2$ and $$\begin{a} p &amp;= q \\ r \end{a}$$</p>"
+    assert r["latexParens"] == r"<p>Inline \(x_1\) and display \[a \, b\]</p>"
+    assert r["latexLines"] == "<p>$$<br>a_1 = *b*<br>$$</p>"
+    assert r["dollars"] == "<p>costs $5 and $6, <em>em</em><br>$x$ and $ a $ <em>em</em></p>"   # prices are not math
+    assert r["latexHtml"] == "<p>$&lt;b&gt;x&lt;/b&gt;$ and $#12$</p>"
+    # an image in a link's text is its alt text: an <a> never holds another <a>
+    assert r["badge"] == f'<p>{a("https://ci.example/run")}build</a></p>'
+    assert r["imgInLink"] == f'<p>{a("http://z.w")}a b c</a></p>'
+
+
+@needs_node
+def test_markdown_task_links_and_mentions_only_in_plain_text():
+    out = run_js(r"""
+      app.S.state = { agents: [{ name: "Ann Lee", status: "idle" }] };
+      out.plain = app.md("Done #12, ask @Ann Lee");
+      out.code = app.md("`#12 @Ann Lee` and\n```\n#13 @Ann Lee\n```");
+      out.link = app.md("[see #14 @Ann Lee](https://x.y/#15) https://x.y/#16");
+      out.heading = app.md("## #17 for @user\n- #18");
+      out.cached = app.md("Done #12, ask @Ann Lee") === out.plain && app.MD_CACHE.size > 0;
+      app.S.state.agents.push({ name: "Bob", status: "idle" });
+      out.newName = app.md("@Bob");   // the cache key holds the names: a new member is highlighted at once
+    """)
+    btn = lambda n: f'<button type="button" class="link" data-open-task="{n}">#{n}</button>'  # noqa: E731
+    assert out["plain"] == f'<div class="md"><p>Done {btn(12)}, ask <span class="mention">@Ann Lee</span></p></div>'
+    assert "data-open-task" not in out["code"] and "mention" not in out["code"]
+    assert "data-open-task" not in out["link"] and "mention" not in out["link"]
+    assert 'href="https://x.y/#15"' in out["link"] and ">https://x.y/#16</a>" in out["link"]
+    assert btn(17) in out["heading"] and btn(18) in out["heading"] and '<span class="mention">@user</span>' in out["heading"]
+    assert out["cached"] is True
+    assert '<span class="mention">@Bob</span>' in out["newName"]
+
+
+@needs_node
+def test_markdown_is_safe_against_untrusted_input():
+    vectors = {
+        "script": "<script>alert(1)</script>",
+        "img": '<img src=x onerror="alert(1)">',
+        "js": "[x](javascript:alert(1))",
+        "jsCase": "[x](JaVaScRiPt:alert(1))",
+        "jsSpace": "[x]( javascript:alert(1))",
+        "jsEntity": "[x](javascript&#58;alert(1))",
+        "jsTab": "[x](java\tscript:alert(1))",
+        "jsCtrl": "[x](\u0001javascript:alert(1))",
+        "data": "[x](data:text/html;base64,PHNjcmlwdD4=)",
+        "vb": "[x](vbscript:msgbox(1))",
+        "auto": "<javascript:alert(1)>",
+        "imgJs": "![x](javascript:alert(1))",
+        "quote": '[x](https://a.b/"onmouseover="alert(1))',
+        "quote2": "[x](<https://a.b/\" onclick=\"alert(1)>)",
+        "bareQuote": 'https://a.b/"onmouseover="alert(1)',
+        "codeHtml": "`<img src=x onerror=alert(1)>`\n```\n<script>alert(1)</script>\n```",
+        "linkText": "[<img src=x onerror=alert(1)>](https://a.b)",
+        "lang": "```\"><script>alert(1)</script>\nx\n```",
+        "table": "| <b>a</b> |\n|---|\n| <i onclick=x>b</i> |",
+        "heading": "# <svg onload=alert(1)>",
+        # a highlighted fence: its tags and quotes become escaped text inside <span class="hl-…">
+        "fenceHtml": '```html\n<img src=x onerror="alert(1)"><script>alert("</code>")</script>\n```',
+    }
+    out = md_js(vectors, r"""
+      out.app = app.md("<script>alert(1)</script> [x](javascript:alert(1)) @<b>");
+    """)
+    r = out["r"]
+    allowed = {"p", "/p", "a", "/a", "code", "/code", "pre", "/pre", "div", "/div", "h1", "/h1", "table", "/table",
+               "thead", "/thead", "tbody", "/tbody", "tr", "/tr", "th", "/th", "td", "/td", "br", "span", "/span"}
+    for name, html in list(r.items()) + [("app", out["app"])]:
+        tags = set(re.findall(r"<(/?[a-z0-9]+)", html))
+        assert tags <= allowed, (name, html)
+        for href in re.findall(r'href="([^"]*)"', html):
+            assert href.startswith("https://"), (name, href)
+        # no attribute other than the fixed ones, and no quote of the input closes one
+        attrs = set(re.findall(r'\s([a-z-]+)=', "".join(re.findall(r"<[a-z][^>]*>", html))))
+        assert attrs <= {"href", "target", "rel", "class"}, (name, html)
+        assert all(re.fullmatch(r'<span class="hl-[a-z]+">', t) for t in re.findall(r"<span[^>]*>", html)), (name, html)
+    assert '<span class="hl-tag">img</span>' in r["fenceHtml"] and "&lt;/code&gt;" in r["fenceHtml"]
+    assert r["script"] == "<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>"
+    for name in ("js", "jsCase", "jsSpace", "jsEntity", "jsTab", "jsCtrl", "data", "vb", "auto", "imgJs"):
+        assert "<a " not in r[name], (name, r[name])   # shown as text
+    assert r["js"] == "<p>[x](javascript:alert(1))</p>"
+    assert 'href="https://a.b/&quot;onmouseover=&quot;alert(1)"' in r["quote"]
+    assert 'href="https://a.b/&quot;%20onclick=&quot;alert(1)"' in r["quote2"]
+    assert 'href="https://a.b/&quot;onmouseover=&quot;alert(1)"' in r["bareQuote"]
+    assert "&lt;img src=x onerror=alert(1)&gt;" in r["codeHtml"] and "&lt;script&gt;" in r["codeHtml"]
+    assert r["linkText"] == ('<p><a href="https://a.b" target="_blank" rel="noopener noreferrer">'
+                             "&lt;img src=x onerror=alert(1)&gt;</a></p>")
+    assert '<div class="md-lang">&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;</div>' in r["lang"]
+
+
+@needs_node
+def test_markdown_pathological_inputs_render_fast():
+    out = run_js(MD_PRE + r"""
+      const patterns = ["*a **a ", "**a*", "_a ", "a*", "*", "[a](", "[", "![[", "](", "[](<", "`a``", "` `` ``` ",
+                        "<a:", "<", "http://", "https://x.y/)", "~~a ", "\\*", "> ", "- ", "  - a\n", "| ", "|-", "# ",
+                        "a\n", "\n", "    ", "&#", "((((", "[a](b \"", "*_*_",
+                        // a "(" title, a rejected bare URL, math openers without a closer
+                        "[a](x (", "[a](<x> (", "(http://\u0001", "*http://\u007f", "[](a()", "$a ", "$$a ",
+                        "\\(a ", "\\[", "- a\n\n"];
+      out.times = {};
+      for (const p of patterns) {
+        const s = p.repeat(Math.ceil(100000 / p.length));
+        const t0 = Date.now();
+        const html = M.render(s);
+        out.times[p] = Date.now() - t0;
+        if (typeof html !== "string") throw new Error(p);
+      }
+      const nested = "> ".repeat(5000) + "x\n" + "- ".repeat(5000) + "y\n" + Array.from({ length: 300 }, (_, k) => " ".repeat(k * 2) + "- z").join("\n");
+      const t1 = Date.now(); M.render(nested); out.times.nested = Date.now() - t1;
+    """)
+    # each is ~100 KB and takes well under 50 ms; a quadratic scan takes about a second or more at this size
+    slow = {p: ms for p, ms in out["times"].items() if ms > 400}
+    assert not slow, slow
+
+
+@needs_node
+def test_markdown_call_sites():
+    out = run_js(r"""
+      app.S.lang = "en";
+      app.S.state = { swarm: { goal: { title: "G", description: "**Ship** it", status: "done", summary: "- one\n- two" },
+                               session: null, limits: {} }, agents: [{ name: "Ann Lee", role: "Dev", status: "idle" }],
+                      mcp: [{ name: "csv", status: "active", origin: "workspace", scope: "swarm", description: "Reads `csv`", tools: [] }],
+                      triggers: [{ id: 1, condition: "x", owner: "Ann Lee", once: true, note: "check **#3**" }] };
+      out.msg = app.messageHtml({ sender: "Ann Lee", recipients: ["user"], text: "**done** see #3", ts: 0 });
+      out.mine = app.messageHtml({ sender: "user", recipients: ["Ann Lee"], text: "- a\n- b", ts: 0 });
+      out.text = app.activityHtml({ id: 1, ts: 0, data: { kind: "text", text: "# Plan\n- a" } });
+      out.thinking = app.activityHtml({ id: 2, ts: 0, data: { kind: "thinking", text: "*hmm*" } });
+      out.tool = app.activityHtml({ id: 3, ts: 0, data: { kind: "tool_call", tool: "shell", text: '{"cmd": "**x**"}' } });
+      out.result = app.taskResultHtml({ result: "## Done\n`ok`" });
+      out.thread = app.threadHtml([{ id: 1, author: "Ann Lee", text: "> quoted\n\n**LGTM**", reply_to: null, ts: 0 }]);
+      out.field = app.mdFieldHtml("f-desc", "Description", "1. one\n2. two", 4);
+      out.emptyField = app.mdFieldHtml("f-desc", "Description", "  ", 4);
+      el("mcp-list"); el("trigger-list");
+      app.renderMcp(); app.renderTriggers();
+      out.mcp = elements["mcp-list"].innerHTML; out.triggers = elements["trigger-list"].innerHTML;
+      // the goal dialog: the summary and the description are formatted, the description can still be edited
+      el("modal"); el("modal-backdrop"); el("g-title"); el("g-desc"); el("g-save"); el("g-reopen-btn");
+      app.goalModal();
+      out.goal = elements.modal.innerHTML;
+      // the task modal: the description is formatted, «Edit» opens its textarea; a live update refreshes the view
+      const task = { id: 4, title: "T", goal: "G", description: "**old**", status: "todo", priority: 1, assignee: null,
+                     reviewer: null, tags: [], depends_on: [], created_at: 0, updated_at: 0 };
+      for (const id of Object.keys(app.TASK_FORM)) el(id, { focus: () => {} });
+      el("f-desc-view"); el("task-form"); el("task-head"); el("task-meta"); el("task-result"); el("task-review");
+      el("discussion-title"); el("thread"); el("task-history"); el("save-task"); el("post-btn"); el("post-text"); el("mention-menu");
+      app.renderTaskModal({ task, discussion: [], events: [] });
+      out.taskModal = elements.modal.innerHTML;
+      out.descHidden = elements["f-desc"].classList.contains("hidden");
+      out.descValue = elements["f-desc"].value;
+      app.updateTaskModal({ task: Object.assign({}, task, { description: "*new*" }), discussion: [], events: [] });
+      out.viewAfterUpdate = elements["f-desc-view"].innerHTML;
+      app.editMdField("f-desc");
+      out.editing = [elements["f-desc"].classList.contains("hidden"), elements["f-desc-view"].classList.contains("hidden")];
+      elements["f-desc"].value = "*mine*";
+      app.updateTaskModal({ task: Object.assign({}, task, { description: "*agent*" }), discussion: [], events: [] });
+      out.keptEdit = [elements["f-desc"].value, elements["f-desc"].classList.contains("hidden")];
+      app.updateTaskModal({ task: Object.assign({}, task, { description: "*mine*" }), discussion: [], events: [] }, true);
+      out.afterSave = [elements["f-desc"].classList.contains("hidden"), elements["f-desc-view"].innerHTML];
+      // the file viewer: a .md file formatted (or its source), any other file as text
+      out.views = [app.fileView("docs/README.md", "# T", false), app.fileView("a.MARKDOWN", "*x*", false),
+                   app.fileView("notes.md", "# T", true), app.fileView("main.py", "# comment", false)];
+      el("file-content"); el("file-md"); el("file-mode"); el("file-path");
+      app.S.openFile = "README.md"; app.S.fileText = "# Title\n\n<b>x</b>";
+      app.renderFileContent();
+      out.file = [elements["file-md"].innerHTML, elements["file-md"].classList.contains("hidden"),
+                  elements["file-content"].classList.contains("hidden"), elements["file-mode"].textContent,
+                  elements["file-mode"].classList.contains("hidden")];
+      app.toggleFileSource();
+      out.source = [elements["file-content"].innerHTML, elements["file-md"].classList.contains("hidden"),
+                    elements["file-mode"].textContent];
+      app.S.openFile = "main.py"; app.S.fileSource = false; app.S.fileText = "def f(): # <x>\n    return 1";
+      app.renderFileContent();
+      out.py = [elements["file-mode"].classList.contains("hidden"), elements["file-md"].classList.contains("hidden"),
+                elements["file-content"].innerHTML, elements["file-content"].classList.contains("hidden")];
+      app.S.openFile = "data.csv"; app.S.fileText = "a,<b>\n1,2"; app.renderFileContent();
+      out.csv = elements["file-content"].innerHTML;
+      // traces: the model's reply and thinking are formatted, tool arguments stay raw
+      const tr = loadTracesJs();
+      tr.TR.full = {};
+      out.span = tr.spanDetailHtml({ id: 1, kind: "llm", name: "step", status: "done", usage: {}, meta: {},
+                                     output: { thinking: "_think_", text: "**reply**", tool_calls: [{ name: "x", arguments: { a: "**raw**" } }] } });
+    """)
+    assert '<div class="md"><p><strong>done</strong> see <button type="button" class="link" data-open-task="3">#3</button></p></div>' in out["msg"]
+    assert '<div class="msg me">' in out["mine"] and "<ul><li>a</li><li>b</li></ul>" in out["mine"]
+    assert '<div class="md"><h1>Plan</h1><ul><li>a</li></ul></div>' in out["text"]
+    assert "<em>hmm</em>" in out["thinking"]
+    assert '<pre>{&quot;cmd&quot;: &quot;**x**&quot;}</pre>' in out["tool"] and 'class="md"' not in out["tool"]
+    assert '<div class="result-box"><div class="md"><h2>Done</h2><p><code>ok</code></p></div></div>' in out["result"]
+    assert '<div class="post-body"><div class="md"><blockquote><p>quoted</p></blockquote><p><strong>LGTM</strong></p></div></div>' in out["thread"]
+    field = out["field"]
+    assert '<div class="md-view" id="f-desc-view"><div class="md"><ol><li>one</li><li>two</li></ol></div></div>' in field
+    assert '<textarea id="f-desc" rows="4" aria-label="Description" class="hidden"></textarea>' in field
+    assert 'data-md-edit="f-desc"><i class="ic ic-edit"></i>Edit</button>' in field and 'class="link hidden"' not in field
+    empty = out["emptyField"]   # nothing to read: the textarea at once
+    assert '<textarea id="f-desc" rows="4" aria-label="Description"></textarea>' in empty and 'class="md-view hidden"' in empty
+    assert '<div class="desc"><div class="md"><p>Reads <code>csv</code></p></div></div>' in out["mcp"]
+    assert "<strong>" in out["triggers"] and 'data-open-task="3"' in out["triggers"]
+    goal = out["goal"]
+    assert '<div class="result-box"><div class="md"><ul><li>one</li><li>two</li></ul></div></div>' in goal
+    assert '<div class="md"><p><strong>Ship</strong> it</p></div>' in goal and 'id="g-desc"' in goal
+    assert '<div class="md"><p><strong>old</strong></p></div>' in out["taskModal"]
+    assert out["descHidden"] is True and out["descValue"] == "**old**"   # the form still holds the text
+    assert out["viewAfterUpdate"] == '<div class="md"><p><em>new</em></p></div>'
+    assert out["editing"] == [False, True]
+    assert out["keptEdit"] == ["*mine*", False]          # a live update never takes the textarea away
+    assert out["afterSave"] == [True, '<div class="md"><p><em>mine</em></p></div>']
+    views = out["views"]
+    assert views[0] == {"markdown": True, "formatted": True, "html": '<div class="md"><h1>T</h1></div>'}
+    assert views[1]["formatted"] is True and views[2] == {"markdown": True, "formatted": False, "html": ""}
+    assert views[3] == {"markdown": False, "formatted": False, "html": ""}
+    assert out["file"] == ['<div class="md"><h1>Title</h1><p>&lt;b&gt;x&lt;/b&gt;</p></div>', False, True, "Source", False]
+    # the source of a .md file and any other text file: highlighted by the file's name (escaped, only spans)
+    assert out["source"] == ['<span class="hl-section"># Title</span>\n\n&lt;b&gt;x&lt;/b&gt;', True, "Formatted"]
+    assert out["py"] == [True, True, '<span class="hl-keyword">def</span> <span class="hl-title">f</span>(): '
+                         '<span class="hl-comment"># &lt;x&gt;</span>\n    <span class="hl-keyword">return</span> '
+                         '<span class="hl-number">1</span>', False]
+    assert out["csv"] == "a,&lt;b&gt;\n1,2"   # a kind without highlighting: plain escaped text
+    span = out["span"]
+    assert '<div class="tr-md thinking"><div class="md"><p><em>think</em></p></div></div>' in span
+    assert '<div class="tr-md "><div class="md"><p><strong>reply</strong></p></div></div>' in span
+    assert "**raw**" in span
+
+
+@needs_node
+def test_modal_focus_skips_the_task_marks_of_a_formatted_text():
+    # a finished goal's summary with a checklist comes before the reopen comment: its disabled checkbox takes no focus
+    out = run_js(r"""
+      el("modal"); el("modal-backdrop");
+      out.focused = null;
+      const mark = { focus() { out.focused = "mark"; } }, field = { focus() { out.focused = "field"; } };
+      const html = app.md("- [x] done");
+      // a stand-in for the browser's selector matching: the task mark is a disabled <input>
+      const byId = document.querySelector;
+      document.querySelector = (sel) => (!sel.includes(" input") ? byId(sel)
+        : sel.split(",").every((s) => s.includes(":not([disabled])")) ? field : mark);
+      app.openModal(html);
+      out.html = html;
+    """)
+    assert '<input type="checkbox" disabled checked>' in out["html"]
+    assert out["focused"] == "field"
+
+
+def test_markdown_css_keeps_plain_text_layout():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    # paragraph lines keep their indentation and runs of spaces, as the pre-wrap plain text did
+    assert re.search(r"\.md p, \.md li, \.md td, \.md th \{ white-space: pre-wrap; \}", css)
+    # the hire dialog's role preview is a grid item: without min-width 0 a wide code block widens the modal
+    assert re.search(r"\.role-preview \{[^}]*min-width: 0;", css)
+
+
+def test_markdown_is_loaded_before_the_scripts_that_use_it():
+    assert INDEX.index("/static/markdown.js") < INDEX.index("/static/app.js") < INDEX.index("/static/traces.js")
+    md_src = (STATIC / "markdown.js").read_text(encoding="utf-8")
+    assert "innerHTML" not in md_src and "eval(" not in md_src and "new Function" not in md_src
+    # highlight.js before both (markdown.js highlights fences with it, app.js the file viewer)
+    assert INDEX.index("/static/highlight.js") < INDEX.index("/static/markdown.js")
+    hl_src = (STATIC / "highlight.js").read_text(encoding="utf-8")
+    assert "innerHTML" not in hl_src and "eval(" not in hl_src and "new Function" not in hl_src
+
+
+# ------------------------------------------------------------------------------------------------ syntax highlighting
+HL_PRE = r"""
+const H = require(staticDir + "/highlight.js");
+const unesc = (h) => h.replace(/<span class="hl-[a-z]+">|<\/span>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+  .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, "&");
+const onlySpans = (h) => (h.match(/<[^>]*>/g) || []).every((t) => /^<span class="hl-[a-z]+">$|^<\/span>$/.test(t));
+"""
+
+# a sample per language: the text content of the result must be the sample itself
+HL_SAMPLES = {
+    "python": '@app.route("/x")\ndef handler(req, n=0x1F):\n    """Doc\n    string"""\n    s = rb\'raw\' + f"{n}"  # note\n'
+              "    return self.data / 2 if n else None\n",
+    "js": "const a = `x${b + `y${c}`}z` / 2;\nlet r = /ab+c/g;\nconst q = a / b / c; // div\nfunction run() { return 1e3; }\n",
+    "ts": "interface P { name: string }\nexport type Id = number;\n",
+    "json": '{"name": "dt", "n": [1, -2.5e3, true, null], "nested": {"k": "v"}}\n',
+    "toml": '# c\n[tool.pytest]\nname = "v"\nlist = [\n  [1, 2],\n]\na.b = true\n',
+    "yaml": 'key: value\nlist:\n  - name: "x"  # c\n    n: 12\n    ok: true\nscript: |\n  a: b\nanchor: &a 1\n',
+    "ini": "; c\n[section]\nkey = value\nexport TOKEN=\"x\"\n",
+    "bash": '#!/bin/sh\n# c\necho "a # $HOME ${X:-y}" $1 # tail\nFOO=bar\nf() { local v; }\n',
+    "dockerfile": "FROM python:3.12\nRUN pip install x && echo $HOME\n",
+    "make": "CC := gcc\nall: main.o\n\t$(CC) -o $@ $^\n",
+    "powershell": '# c\n$x = Get-Item -Path "a$env:PATH" -eq $true\n@\'\nhere $x\n\'@\n[int]$n = 5\n<# block #>\n',
+    "batch": "@echo off\nREM c\n:label\nset X=%1 & echo !Y!\n",
+    "markup": '<!DOCTYPE html><a href="x" id=y>t &amp; <script>let x = 1 < 2;</script></a><!-- c -->\n',
+    "css": "a:hover, .c #d { color: #fff; margin: .5em 1px !important; }\n@media (max-width: 6px) { p { x: var(--y) } }\n",
+    "scss": "// Don't touch\n.a { b: url(http://x/y); margin: 0 // tail\n}\n",
+    "sql": "SELECT name, COUNT(*) FROM t WHERE x = 'it''s' -- c\n",
+    "c": '#include <stdio.h>\nstruct point { int x; };\nint main(void) { printf("%d\\n", \'a\'); return 0; }\n',
+    "cpp": "namespace n { class A : public B { auto x = nullptr; }; }\n",
+    "csharp": 'public class A { string s = @"a""b"; var t = $"{x}"; }\n',
+    "java": "@Override\npublic final class A { String s = \"x\"; char c = 'y'; }\n",
+    "kotlin": 'fun main() { val s = """raw"""; println("$s") }\n',
+    "go": "package main\nfunc main() { s := `raw\nline`; r := 'x'; fmt.Println(s, r, nil) }\n",
+    "rust": "#[derive(Debug)]\nfn f<'a>(x: &'a str) -> Option<u8> { let c = 'x'; println!(\"{}\", r#\"raw\"#); None }\n",
+    "ruby": "def f(x)\n  @y = :sym # c\n  puts \"#{x}\"\nend\n",
+    "php": "<?php\nfunction f($x) { return $x . 'a'; } // c\n",
+    "lua": "--[[ block ]]\nlocal function f(x) return [[long]] .. 'a' end -- c\n",
+    "r": "x <- c(1, 2L, NA) %in% y # c\nf <- function(a) TRUE\n",
+    "julia": "#= block =#\nfunction f(x::Int)\n  @show x\n  return \"s\"\nend\n",
+    "latex": "\\begin{document}\n% c\nText $x^2$ \\textbf{b}\n\\end{document}\n",
+    "markdown": "# Title\n- item **b** and *e* `code` [l](https://x.y)\n```python\nx = 1\n```\n> quote\n",
+    "diff": "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n ctx\n",
+}
+
+
+@needs_node
+def test_highlight_language_detection():
+    names = ["src/app.py", "x.PYI", "a/b.tsx", "c.mjs", "nb.ipynb", "data.jsonl", "pyproject.toml", "ci.yml", "setup.cfg",
+             ".env", ".env.local", "run.sh", "Dockerfile", "Dockerfile.dev", "Makefile", "x.mk", "build.ps1", "go.bat",
+             "page.HTM", "icon.svg", "a.css", "a.scss", "b.less", "q.sql", "x.h", "x.hpp", "x.cs", "A.java", "a.kt", "m.go", "lib.rs",
+             "a.rb", "a.php", "a.lua", "a.R", "a.jl", "paper.tex", "README.md", "fix.patch", "table.csv", "notes.txt",
+             "LICENSE", "", None, "a.unknownext",
+             # fence info strings
+             "python", "py", "JS", "typescript", "yml", "console", "pwsh", "c++", "c#", "golang", "rs", "diff", "text"]
+    out = run_js(HL_PRE + f"out.langs = {json.dumps(names)}.map(H.language); out.all = H.languages;")
+    langs = dict(zip([str(n) for n in names], out["langs"]))
+    assert langs == {
+        "src/app.py": "python", "x.PYI": "python", "a/b.tsx": "ts", "c.mjs": "js", "nb.ipynb": "json",
+        "data.jsonl": "json", "pyproject.toml": "toml", "ci.yml": "yaml", "setup.cfg": "ini", ".env": "ini",
+        ".env.local": "ini", "run.sh": "bash", "Dockerfile": "dockerfile", "Dockerfile.dev": "dockerfile",
+        "Makefile": "make", "x.mk": "make", "build.ps1": "powershell", "go.bat": "batch", "page.HTM": "markup",
+        "icon.svg": "markup", "a.css": "css", "a.scss": "scss", "b.less": "scss", "q.sql": "sql", "x.h": "c", "x.hpp": "cpp", "x.cs": "csharp",
+        "A.java": "java", "a.kt": "kotlin", "m.go": "go", "lib.rs": "rust", "a.rb": "ruby", "a.php": "php",
+        "a.lua": "lua", "a.R": "r", "a.jl": "julia", "paper.tex": "latex", "README.md": "markdown", "fix.patch": "diff",
+        "table.csv": None, "notes.txt": None, "LICENSE": None, "": None, "None": None, "a.unknownext": None,
+        "python": "python", "py": "python", "JS": "js", "typescript": "ts", "yml": "yaml", "console": "bash",
+        "pwsh": "powershell", "c++": "cpp", "c#": "csharp", "golang": "go", "rs": "rust", "diff": "diff", "text": None,
+    }
+    assert set(out["all"]) == set(HL_SAMPLES)
+
+
+@needs_node
+def test_highlight_marks_the_key_constructs_of_each_language():
+    out = run_js(HL_PRE + f"const S = {json.dumps(HL_SAMPLES)};\n"
+                 "out.h = Object.fromEntries(Object.entries(S).map(([l, s]) => [l, H.render(s, l)]));\n"
+                 "out.ok = Object.fromEntries(Object.entries(S).map(([l, s]) => [l, unesc(out.h[l]) === s && onlySpans(out.h[l])]));")
+    assert all(out["ok"].values()), out["ok"]
+    h = out["h"]
+
+    def has(lang: str, *spans: tuple[str, str]) -> None:
+        for cls, text in spans:
+            assert f'<span class="hl-{cls}">{text}</span>' in h[lang], (lang, cls, text, h[lang])
+
+    has("python", ("meta", "@app.route"), ("keyword", "def"), ("title", "handler"), ("number", "0x1F"),
+        ("string", "&quot;&quot;&quot;Doc\n    string&quot;&quot;&quot;"), ("string", "rb&#39;raw&#39;"),
+        ("string", "f&quot;{n}&quot;"), ("comment", "# note"), ("literal", "self"), ("literal", "None"))
+    assert "self</span>.data / <span" in h["python"]   # a division, a member name stays plain
+    # a template literal with nested ${…}; a regex where an operand is expected, a division after a name
+    has("js", ("string", "`x"), ("string", "`y"), ("string", "z`"), ("regexp", "/ab+c/g"), ("comment", "// div"),
+        ("title", "run"), ("number", "1e3"))
+    assert "q = a / b / c;" in h["js"] and h["js"].count("hl-regexp") == 1
+    has("ts", ("keyword", "interface"), ("title", "P"), ("type", "string"), ("keyword", "type"), ("type", "number"))
+    # JSON: keys and string values apart
+    has("json", ("key", "&quot;name&quot;"), ("string", "&quot;dt&quot;"), ("number", "2.5e3"), ("literal", "true"),
+        ("literal", "null"), ("key", "&quot;k&quot;"), ("string", "&quot;v&quot;"))
+    # TOML: a section, keys, but not a line of a multi-line array
+    has("toml", ("comment", "# c"), ("section", "[tool.pytest]"), ("key", "name"), ("key", "a"), ("key", "b"))
+    assert "hl-section\">[1" not in h["toml"]
+    # YAML: keys after indentation and "- ", comments, the text of a block scalar
+    has("yaml", ("key", "key"), ("key", "name"), ("key", "n"), ("number", "12"), ("literal", "true"),
+        ("comment", "# c"), ("string", "a: b"), ("variable", "&amp;a"))
+    has("ini", ("comment", "; c"), ("section", "[section]"), ("key", "key"), ("keyword", "export"), ("key", "TOKEN"))
+    # shell: a comment vs "#" inside a string, variables inside and outside strings
+    has("bash", ("meta", "#!/bin/sh"), ("comment", "# c"), ("string", "&quot;a # "), ("variable", "$HOME"),
+        ("variable", "${X:-y}"), ("variable", "$1"), ("comment", "# tail"), ("variable", "FOO"), ("title", "f"))
+    has("dockerfile", ("keyword", "FROM"), ("keyword", "RUN"), ("variable", "$HOME"))
+    has("make", ("variable", "CC"), ("title", "all"), ("variable", "$(CC)"), ("variable", "$@"))
+    has("powershell", ("comment", "# c"), ("variable", "$x"), ("builtin", "Get-Item"), ("attr", "-Path"),
+        ("variable", "$env:PATH"), ("keyword", "-eq"), ("literal", "$true"), ("string", "@&#39;\nhere $x\n&#39;@"),
+        ("type", "[int]"), ("comment", "&lt;# block #&gt;"))
+    has("batch", ("comment", "REM c"), ("title", ":label"), ("variable", "%1"), ("variable", "!Y!"))
+    # HTML: tags, attributes, values, entities, comments, and the script inside highlighted as JavaScript
+    has("markup", ("meta", "&lt;!DOCTYPE html&gt;"), ("tag", "a"), ("attr", "href"), ("string", "&quot;x&quot;"),
+        ("string", "y"), ("literal", "&amp;amp;"), ("keyword", "let"), ("comment", "&lt;!-- c --&gt;"))
+    has("css", ("tag", "a"), ("meta", ":hover"), ("title", ".c"), ("title", "#d"), ("attr", "color"),
+        ("number", "#fff"), ("number", ".5em"), ("keyword", "!important"), ("keyword", "@media"), ("builtin", "var"))
+    # SCSS / LESS: // comments (an apostrophe in one is text), but not the // of a url
+    has("scss", ("comment", "// Don&#39;t touch"), ("title", ".a"), ("builtin", "url"), ("comment", "// tail"))
+    assert "(http://x/y)" in h["scss"]
+    has("sql", ("keyword", "SELECT"), ("builtin", "COUNT"), ("string", "&#39;it&#39;&#39;s&#39;"), ("comment", "-- c"))
+    has("c", ("meta", "#include &lt;stdio.h&gt;"), ("keyword", "struct"), ("title", "point"), ("type", "int"),
+        ("string", "&#39;a&#39;"), ("builtin", "printf"))
+    has("cpp", ("keyword", "namespace"), ("title", "n"), ("keyword", "class"), ("title", "A"), ("literal", "nullptr"))
+    has("csharp", ("keyword", "class"), ("string", "@&quot;a&quot;&quot;b&quot;"), ("string", "$&quot;{x}&quot;"))
+    has("java", ("meta", "@Override"), ("keyword", "class"), ("title", "A"), ("type", "String"), ("string", "&#39;y&#39;"))
+    has("kotlin", ("keyword", "fun"), ("title", "main"), ("string", "&quot;&quot;&quot;raw&quot;&quot;&quot;"))
+    has("go", ("keyword", "package"), ("keyword", "func"), ("string", "`raw\nline`"), ("string", "&#39;x&#39;"),
+        ("literal", "nil"))
+    has("rust", ("meta", "#[derive(Debug)]"), ("keyword", "fn"), ("title", "f"), ("meta", "&#39;a"),
+        ("string", "&#39;x&#39;"), ("builtin", "println"), ("string", "r#&quot;raw&quot;#"), ("builtin", "None"))
+    has("ruby", ("keyword", "def"), ("title", "f"), ("variable", "@y"), ("literal", ":sym"), ("comment", "# c"))
+    has("php", ("meta", "&lt;?php"), ("keyword", "function"), ("variable", "$x"), ("comment", "// c"))
+    has("lua", ("comment", "--[[ block ]]"), ("keyword", "local"), ("string", "[[long]]"), ("comment", "-- c"))
+    has("r", ("number", "2L"), ("literal", "NA"), ("keyword", "%in%"), ("comment", "# c"), ("keyword", "function"))
+    has("julia", ("comment", "#= block =#"), ("title", "f"), ("type", "Int"), ("meta", "@show"))
+    has("latex", ("keyword", "\\begin"), ("title", "document"), ("comment", "% c"), ("string", "$x^2$"),
+        ("keyword", "\\textbf"))
+    # the source of a .md file: headings, markers, emphasis, code, links; a fence's code in its own language
+    has("markdown", ("section", "# Title"), ("keyword", "-"), ("strong", "**b**"), ("em", "*e*"),
+        ("string", "`code`"), ("attr", "https://x.y"), ("meta", "```python"), ("number", "1"), ("keyword", "&gt;"))
+    has("diff", ("meta", "diff --git a/x b/x"), ("meta", "--- a/x"), ("meta", "+++ b/x"), ("hunk", "@@ -1 +1 @@"),
+        ("del", "-old"), ("add", "+new"))
+    assert "\n ctx\n" in h["diff"]
+
+
+@needs_node
+def test_highlight_is_safe_and_keeps_the_text():
+    out = run_js(HL_PRE + r"""
+      const evil = '<script>alert("x")</script> & &amp; \'q\' "dq" <img src=x onerror=alert(1)> \u00a0 </span><span class="x">';
+      out.evil = {};
+      for (const l of H.languages) {
+        const h = H.render(evil, l);
+        out.evil[l] = unesc(h) === evil && onlySpans(h) && !/<(?!\/?span)/.test(h) && !h.includes("\u0000");
+      }
+      out.unknown = [H.render(evil, null), H.render(evil, "nope"), H.render(evil, "constructor"), H.render(evil, "__proto__")];
+      // random texts of the characters that matter to the tokenizers: the text is always kept, only spans appear
+      let seed = 7;
+      const rnd = () => (seed = (seed * 1103515245 + 12345) % 2147483648) / 2147483648;
+      const chars = [..."abXY_09 \t\n\r\"'`$#@{}[]()<>/\\*-+=:;,.!?%&|~^\u00e9\u{1F600}"];
+      out.fuzz = [];
+      for (const l of H.languages) for (let k = 0; k < 150; k++) {
+        let s = "";
+        const len = Math.floor(rnd() * 160);
+        for (let j = 0; j < len; j++) s += chars[Math.floor(rnd() * chars.length)];
+        const h = H.render(s, l);
+        if (unesc(h) !== s || !onlySpans(h)) out.fuzz.push([l, s, h]);
+      }
+      // above the size cap: plain escaped text
+      const big = "x = 1 # <c>\n".repeat(Math.ceil((H.MAX_CHARS + 1) / 12));
+      out.big = H.render(big, "python") === big.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      out.cap = H.MAX_CHARS;
+    """)
+    assert all(out["evil"].values()), out["evil"]
+    plain = ("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; &amp;amp; &#39;q&#39; &quot;dq&quot; "
+             "&lt;img src=x onerror=alert(1)&gt; \u00a0 &lt;/span&gt;&lt;span class=&quot;x&quot;&gt;")
+    assert out["unknown"] == [plain] * 4
+    assert out["fuzz"] == []
+    assert out["big"] is True and out["cap"] >= 100_000
+
+
+@needs_node
+def test_highlight_pathological_inputs_stay_linear():
+    out = run_js(HL_PRE + r"""
+      const patterns = ['"', "'", "`", "/*", "#", "${", "$", "$'", "<", "<a ", "<!--", "[", "](", "*", "**", "_", "`a",
+                        "@", "@'\n", "-", "--[[", "[[", "%", "\\", "{", "}", "#[", 'r#"', "a: ", "- ", "/[", "(/[",
+                        "x = ", "'''", '\"\"\"', "<#", "&", "!", ":", ".", "1", "a.b", "*a ", "$x{", "a\n", " ", "```\n",
+                        "<<a\n", "<<a\na\n", "<<-'x' <<y\n\tx\ny\n", 'R"(', 'R"d(x)"', "<?", "?>", "<?php '\n?>'",
+                        "- k: |\n", "@@ -1,3 +1,3 @@\n", "--- a\n", "\\😀", "x//"];
+      out.slow = {};
+      for (const l of H.languages) for (const p of patterns) {
+        const s = p.repeat(Math.ceil(40000 / p.length));
+        const t0 = Date.now();
+        const h = H.render(s, l);
+        const ms = Date.now() - t0;
+        if (ms > 250 || h.length < s.length) out.slow[l + " " + JSON.stringify(p)] = ms;   // (the text: the fuzz test)
+      }
+      const line = "q".repeat(1000000) + '"' + "w".repeat(1000);   // one 1 MB line: over the cap, plain
+      const t1 = Date.now(); H.render(line, "js"); out.longLine = Date.now() - t1;
+    """)
+    # each input is ~40 KB and takes a few ms; a quadratic scan takes seconds at this size
+    assert out["slow"] == {}, out["slow"]
+    assert out["longLine"] < 300
+
+
+# constructs where one stray quote used to colour the rest of a file (or split a character)
+HL_EDGE = {
+    "sh": ("bash", "cat <<-'EOF' | grep a # c\n\tIt's a heredoc\n\tEOF\necho \"$HOME\" # after\nx=$((1 << n)) 'ok'\n"
+                   "cat <<A <<B\na's\nA\nb's\nB\nexit 0\n"),
+    "yaml": ("yaml", "steps:\n  - run: |\n      echo a\n    env:\n      X: 1\n  - name: next\n"),
+    "jsx": ("js", "const el = <li><p>a</p><p>b</p></li>;\nconst t = <p>Don't stop</p>;\nlet n = 1; // c\n"),
+    "ruby": ("ruby", "x.gsub(/'/, \"\")  # strip quotes\nmsg = <<~EOS\n  Don't forget\n  EOS\n@count += 1 # c\n"
+                     "y = a / b / 2\n"),
+    "php": ("php", "<html>\n<p>Don't worry</p>\n<?php echo $x; ?>\n<p>ok</p>\n"),
+    "phpSnippet": ("php", "$x = 'a'; // c\n"),
+    "cpp": ("cpp", "auto a = R\"(raw \"q\" /* x)\";\nauto s = u8R\"d(\nmulti \"line\"\n)d\";\nint x; // c\n"),
+    "diff": ("diff", "--- a/x.sql\n+++ b/x.sql\n@@ -1,2 +1,2 @@\n--- a removed sql comment\n+++ an added line\n ctx\n"
+                     "--- a/y\n+++ b/y\n@@ -1 +1 @@\n-old\n+new\n"),
+}
+
+
+@needs_node
+def test_highlight_keeps_the_rest_of_the_file_after_tricky_constructs():
+    out = run_js(HL_PRE + f"const E = {json.dumps(HL_EDGE)};\n" + r"""
+      out.h = {};
+      for (const [k, [l, s]] of Object.entries(E)) {
+        out.h[k] = H.render(s, l);
+        if (unesc(out.h[k]) !== s || !onlySpans(out.h[k])) out.h[k] = "BROKEN " + out.h[k];
+      }
+      // a backslash before an emoji (LaTeX): the span never ends between the two halves of the character
+      const emoji = String.fromCodePoint(0x1F600);
+      out.pairs = H.languages.filter((l) => ["\\", "%", "'", "$", "!", "@", "#", "`", '"'].some((p) => {
+        const h = H.render("a " + p + emoji + " " + p + p + emoji, l);
+        return /[\uD800-\uDBFF]</.test(h) || />[\uDC00-\uDFFF]/.test(h);
+      }));
+      out.latex = H.render("\\" + emoji + " x", "latex");
+    """)
+    h = out["h"]
+    for k, v in h.items():
+        assert not v.startswith("BROKEN"), (k, v)
+
+    def has(key: str, *spans: tuple[str, str]) -> None:
+        for cls, text in spans:
+            assert f'<span class="hl-{cls}">{text}</span>' in h[key], (key, cls, text, h[key])
+
+    # a heredoc body is one string; the code after its delimiter line is highlighted again
+    has("sh", ("string", "&lt;&lt;-&#39;EOF&#39;"), ("comment", "# c"),
+        ("string", "\tIt&#39;s a heredoc\n\tEOF"), ("variable", "$HOME"), ("comment", "# after"),
+        ("string", "&#39;ok&#39;"), ("string", "a&#39;s\nA\nb&#39;s\nB"), ("keyword", "exit"))
+    assert "1 &lt;&lt; n" in h["sh"]   # a shift is not a heredoc (no line "n" follows)
+    # "- run: |": the item's next keys are keys, not text of the block scalar
+    has("yaml", ("string", "echo a"), ("key", "env"), ("key", "X"), ("number", "1"), ("key", "name"))
+    # JSX: "</p>" is not a regex, an apostrophe in its text not a string
+    assert "hl-regexp" not in h["jsx"] and "Don&#39;t stop" in h["jsx"]
+    has("jsx", ("keyword", "let"), ("number", "1"), ("comment", "// c"))
+    # Ruby: a regex literal and a heredoc keep their quotes to themselves
+    has("ruby", ("regexp", "/&#39;/"), ("comment", "# strip quotes"), ("string", "&lt;&lt;~EOS"),
+        ("string", "  Don&#39;t forget\n  EOS"), ("variable", "@count"), ("comment", "# c"))
+    assert "a / b / <span" in h["ruby"]   # a division stays one
+    # PHP: the HTML around <?php … ?> is markup; a snippet without <?php is all PHP
+    has("php", ("tag", "p"), ("meta", "&lt;?php"), ("keyword", "echo"), ("variable", "$x"), ("meta", "?&gt;"))
+    assert "Don&#39;t worry" in h["php"] and "hl-string" not in h["php"]
+    has("phpSnippet", ("variable", "$x"), ("string", "&#39;a&#39;"), ("comment", "// c"))
+    # C++ raw strings: quotes and /* inside are text
+    has("cpp", ("string", "R&quot;(raw &quot;q&quot; /* x)&quot;"), ("string", "u8R&quot;d(\nmulti &quot;line&quot;\n)d&quot;"),
+        ("type", "int"), ("comment", "// c"))
+    # diff: inside a counted hunk "--- x" / "+++ x" are a removed / an added line; the next file's headers are headers
+    has("diff", ("meta", "--- a/x.sql"), ("hunk", "@@ -1,2 +1,2 @@"), ("del", "--- a removed sql comment"),
+        ("add", "+++ an added line"), ("meta", "--- a/y"), ("meta", "+++ b/y"), ("del", "-old"), ("add", "+new"))
+    assert out["pairs"] == []
+    assert out["latex"] == '<span class="hl-keyword">\\\U0001F600</span> x'
+
+
+def test_syntax_colours_are_readable_on_every_code_background():
+    """WCAG 4.5:1 for each --hl-* colour on --code-bg over the surfaces code is shown on: the file viewer (--panel),
+    messages and posts (--panel-2) and one's own messages (--accent-soft over --panel), in both themes."""
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+
+    def tokens(block: str) -> dict[str, str]:
+        return dict(re.findall(r"--([\w-]+):\s*([^;]+);", block))
+
+    light = tokens(css[css.index(":root {"):css.index('}', css.index(":root {"))])
+    dark = tokens(css[css.index(':root[data-theme="dark"] {'):css.index('}', css.index(':root[data-theme="dark"] {'))])
+    media = css[css.index("@media (prefers-color-scheme: dark)"):]
+    auto_dark = tokens(media[:media.index("}")])
+    assert {k: v for k, v in auto_dark.items() if k.startswith("hl-")} == {k: v for k, v in dark.items() if k.startswith("hl-")}
+
+    def rgba(v: str) -> tuple[list[float], float]:
+        v = v.strip()
+        if v.startswith("#"):
+            return [int(v[k:k + 2], 16) for k in (1, 3, 5)], 1.0
+        *rgb, a = [float(x) for x in re.findall(r"[\d.]+", v)]
+        return rgb, a
+
+    def over(fg: str, bg: list[float]) -> list[float]:
+        rgb, a = rgba(fg)
+        return [x * a + y * (1 - a) for x, y in zip(rgb, bg)]
+
+    def lum(rgb: list[float]) -> float:
+        f = [(x / 255) / 12.92 if x / 255 <= .03928 else ((x / 255 + .055) / 1.055) ** 2.4 for x in rgb]
+        return .2126 * f[0] + .7152 * f[1] + .0722 * f[2]
+
+    low = []
+    for name, t in (("light", light), ("dark", dark)):
+        panel = rgba(t["panel"])[0]
+        surfaces = {"panel": panel, "panel-2": rgba(t["panel-2"])[0], "me": over(t["accent-soft"], panel)}
+        for sname, base in surfaces.items():
+            bg = over(t["code-bg"], base)
+            for k in ("comment", "keyword", "string", "number", "title", "type", "tag"):
+                a, b = lum(rgba(t["hl-" + k])[0]), lum(bg)
+                ratio = (max(a, b) + .05) / (min(a, b) + .05)
+                if ratio < 4.5:
+                    low.append((name, sname, k, round(ratio, 2)))
+    assert low == []
+
+
 # ------------------------------------------------------------------------------------------------ API contract
 def make_swarm(tmp_path: Path) -> Swarm:
     raw: dict[str, Any] = {
@@ -1755,7 +2679,7 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
         try:
             page = c.get("/")
             assert page.status_code == 200 and "/static/home.js" in page.text and "/static/home.css" in page.text
-            for asset in ("home.js", "home.css", "style.css", "app.js", "traces.js", "traces.css"):
+            for asset in ("home.js", "home.css", "style.css", "highlight.js", "markdown.js", "app.js", "traces.js", "traces.css"):
                 assert c.get("/static/" + asset).status_code == 200, asset
 
             # settings: every field the editor binds exists; no key value reaches the browser

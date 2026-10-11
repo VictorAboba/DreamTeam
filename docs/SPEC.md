@@ -68,8 +68,8 @@ src/dreamteam/
   sessions.py    SessionManager — the sessions of a home (§17.2)
   launcher.py    launcher web app: sessions page, settings, /s/{sid}/ routing (§18.1)
   launcher_mcp.py  the launcher as one MCP server (§18.2)
-  static/        index.html app.js traces.js style.css traces.css (board), home.html home.js home.css (launcher);
-                 no build step
+  static/        index.html app.js traces.js style.css traces.css (board), home.html home.js home.css (launcher),
+                 markdown.js and icons.css (both); no build step
   console.py     terminal chat client (talks to the REST API)
   tui/           terminal UI client (docs/TUI.md)
   docker.py      sandbox: build & run DreamTeam in Docker
@@ -202,9 +202,10 @@ class Swarm:
     def signal(self, name: str) -> None                 # wakes LLM runtime / releases wait_signal waiters
     async def wait_signal(self, name: str, timeout: float) -> bool
     def has_pending(self, name: str) -> bool            # unread inbox or undelivered non-quiet notifications
-    def render_wake(self, name: str, incoming: bool = False) -> str | None
+    def render_wake(self, name: str, incoming: bool = False, stamps: bool = False,
+                    since: float | None = None) -> str | None
         # drains (marks read/delivered) and renders the wake-up text (§6.3); None if nothing pending
-        # and incoming=True
+        # and incoming=True; stamps/since: only wait_for_events (§12), never an agent's wake-up
     def notes_shown(self, name: str, notes: str) -> None   # the agent's context now holds these notes
 
     # goal
@@ -217,7 +218,14 @@ class Swarm:
         # values, so the goal line of every wake-up is one line; empty title -> ToolError("The goal title is
         # empty."); an empty board gets a planning task (PLANNING_TASK, body = its text + title + description);
         # agents are kicked off staggered: `n_kickoff` {by, title, description, team, task_id, task_title}, with
-        # team = "Name — Role; ..." of all members, or `n_goal_updated` when the board was not empty
+        # team = "Name — Role; ..." of all members, or `n_goal_updated` when the board was not empty.
+        # PLANNING_TASK's steps: 1 look around; 2 independent work at once (work that needs no contracts:
+        # literature and theory, the environment and tools, data, exploratory experiments, becomes tasks before
+        # CONTRACTS.md, so the members waiting for the plan start now; only the planner creates the plan's tasks);
+        # 3 then the contracts; 4 then the rest of the tasks; 5 no false dependencies (a final task: report,
+        # summary, documentation, release, depends only on the tasks it cannot be written without; exploratory and
+        # optional tasks do not block it); 6 tests by someone else; 7 reviews; 8 team; 9 finish quickly. n_kickoff
+        # tells the others that the first tasks come before the plan is complete
     def complete_goal(self, actor: str, summary: str) -> dict
         # ToolError when there is no goal, it is already done, or the summary is empty; notifies USER u_goal_done;
         # background jobs keep running (a dev server may be for the user): when some run, USER also gets the quiet
@@ -353,8 +361,20 @@ Rules (USER may do anything; "member" = agent of any kind):
 * `claim`: status must be `todo` (if already assigned to actor and in_progress/waiting: return as is).
   assignee must be None or actor (else ToolError naming the holder). No blockers (ToolError lists them).
   Sets assignee=actor, status=in_progress. Atomic (DB transaction re-reads the row).
-* `update` permissions for members: title/goal/description/priority/tags/depends_on/reviewer/parent_id —
-  creator or assignee. assignee — anyone if task is unassigned; otherwise current assignee or creator.
+* `update` permissions for members: title/goal/description/priority/tags/reviewer/parent_id —
+  creator or assignee. depends_on — the creator and the current assignee (any member kind); for the assignee a new
+  order of the same ids is no change. Anyone else: ToolError `Only the creator (X) or the assignee (Y) of task #N
+  can change its depends_on (the assignee may remove dependencies the task can do without). Suggest the change in
+  the discussion.` When an assignee who did not create the task removes dependencies (done ones too: harmless), the
+  discussion gets a record posted under its name
+  (`post_deps_removed` {by, deps: "#3 [in_progress], #5 [todo]"} in the swarm language; `task.comment` is emitted,
+  but no participant is notified) and the creator a quiet `n_deps_removed` {by, id, title, deps} (the assignee is
+  told in the tool result to post why, and that post wakes the creator, a participant). A task whose last blocker is
+  removed (by anyone) and that is open: its assignee gets `n_unblocked_removed` {id, title, by, deps} (if != actor;
+  it wakes like `n_unblocked`, but says the removed blockers are not done, so their results do not exist); an
+  unassigned one becomes ready (the scheduler offers it). A blocked-task ToolError for the current assignee (claim,
+  status `in_progress`; not one becoming the assignee in the same call) adds `If the task can be done without some of them, remove those from its depends_on (task_update)
+  and say why in its discussion.` assignee — anyone if task is unassigned; otherwise current assignee or creator.
   Reassignment of an in_progress/waiting task resets status to `todo`. Notify new assignee `n_assigned`
   and removed assignee `n_unassigned` (never notify the actor themself).
   status transitions for members: assignee may set `in_progress` (only without blockers), `waiting`,
@@ -624,12 +644,20 @@ class AgentRuntime:
 ### 6.3 Wake-up text (render_wake)
 `wake_header` (or `incoming_header`), `reasons:` then one bullet per undelivered notification text and
 per unread message (`msg` template, recipients list with the agent shown as `you`), then (not for
-incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, `my_reviews` (only when
+incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, one `my_blocked` {id,
+blockers: "#3, #4"} per open task of the agent with unfinished dependencies, except one in review whose result is
+already produced (it may remove those it can do without, §4), `my_reviews` (only when
 tasks wait for its review: `#id title (assignee or -)`), `my_jobs` (only while it has running background jobs,
 §7.1: `my_job` items `j3 npm run dev (running 25 min)` joined with "; ", the command cut to 60 characters, the
 duration in the member's language), `ready` (up to 8), notes: in full only when they changed
 since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
 otherwise the one-line `notes_unchanged`, since the history is append-only.
+
+`stamps=True` (only `wait_for_events`, whose one result may hold hours of news; an agent's wake-up stays as above so
+its history does not grow): when the oldest undelivered notification or unread message, or `since` (the oldest
+progress line shown with it), is more than `fmt.STAMP_SPAN` (60 s) older than now, each notification and message
+bullet starts with its time (`fmt.item_time`: `HH:MM`, with the date when not today's) and the header shows the range
+(`fmt.stamp_range`: `2026-10-11 10:50–12:50`) instead of one stamp.
 
 ## 7. Workspace (workspace.py) and shell (shell.py)
 
@@ -1364,7 +1392,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `join_swarm` | role, name?, instructions? | EU (the user via MCP only, before joining; creates kind "external") |
 | `wait_for_events` | timeout? (s, default 50, max 600; an error at once when the swarm stops meanwhile), progress? (below) | EU |
 | `set_goal` | title (a multi-line title is split: §3 `set_goal`), description? | U |
-| `swarm_status` | — | EU |
+| `swarm_status` | brief? (the goal as one line) | EU |
 | `swarm_control` | action (pause/resume), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
 | `mcp_approve` | name, approve, comment? | U |
 | `agent_traces` | agent?, trace_id?, span_id?, context?, status?, task?, limit?, offset? | EU (§16.2) |
@@ -1400,6 +1428,12 @@ Results and checks of the review and role-catalog flows:
   own reviewer); `... was sent to the user for review: nobody else in the team can review it. You will be told the
   verdict; meanwhile take the next task or call wait.`; or `... was sent to X for review: a member other than you
   checks it, and you will be told the verdict.` (picked by the board).
+- Dependencies (§4 `update`): `task_get` of an open task (not in review) the caller holds while it is blocked adds `You hold it while
+  it is blocked: if its result can be produced without some of #3, #4, remove those with task_update (depends_on =
+  the ones still needed) and say why in its discussion.`; `task_update` in which an assignee that did not create the
+  task removed dependencies adds `Its creator (X) was told that you removed #3, and the discussion records it.` (or
+  `The discussion records that you removed #3.` when the creator is the user or has left) and, without a `comment`,
+  ` Say there why the task can do without them (task_comment).`
 - `goal_complete` (switch on) is refused while tasks are in review: ``Tasks are still waiting for review: #N
   (reviewer), .... The goal can be completed only after every task is reviewed: call `wait` ...``. The "already
   achieved" check comes first.
@@ -1425,7 +1459,8 @@ Results of the team, wait and job flows:
 - `agents` starts with `AI agents: 2 of max 6, plus 1 external member (not counted).` and the budget line (the
   same team line in `swarm_status`); a member line ends with `, background jobs: j3, j5` while it has running jobs.
 - `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run,
-  and for a member caller `Your background jobs: j3, j5.` after its open tasks.
+  and for a member caller `Your background jobs: j3, j5.` after its open tasks. `brief=true` shows the goal as one
+  line, `Global goal [active]: <title>` (no description, no summary); the rest is the same.
 - `wait` (description: the end of one of its background jobs wakes it too; "End every turn with it" stays): `OK,
   waiting. You will be woken up by new events.`, plus `, also when your background job j3 ends.` / `…jobs j3, j5 end.`
   for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet).
@@ -1439,6 +1474,21 @@ Results of the team, wait and job flows:
   journal after a per-actor cursor (kv `wait_progress:<actor>`; the first such call starts at the journal's end;
   calls without progress neither use nor move it) and appended as `Board progress:` / `Прогресс на доске:` with `• `
   lines (at most 20, then ``… and N more: see `board` ``), after the incoming header when nothing else is pending.
+  Each progress line starts with the time of its journal event (`• 10:50 #2 Parser: todo → in_progress (Ann Lee)`).
+- `wait_for_events` renders with `render_wake(actor, incoming=True, stamps=True, since=<oldest progress line>)`
+  (§6.3): one result may hold hours of news (progress collected since the last progress call, notifications queued
+  while the client was away), so when it spans more than a minute the header shows the range and every notification
+  and message has its time; within a minute: one stamp, no times but the progress lines'. Example:
+  ```
+  === New events while you were working (2026-10-11 10:50–12:50) ===
+  What happened:
+  • 12:20 Task #3 "API" was assigned to you by Ann Lee. Claim it with `task_claim` when you start working on it.
+  • 12:50 Message #7 from Ann Lee to you:
+  status?
+  Board progress:
+  • 10:50 #2 Parser: created by user
+  • 11:40 #2 Parser: todo → in_progress (Bob Stone)
+  ```
 
 ## 13. Hub MCP (hub_mcp.py)
 
@@ -1639,6 +1689,11 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
   - For each runtime, `runtime.reset_llm()` (the next call builds a client from the new profile); an agent in
     ERROR whose activation was cut short is woken to retry it.
   - Lift a budget pause the new budget allows.
+  - Called for the global settings (`update_settings`) and for one session (`SessionManager.update`: its
+    `overrides`, or the partial `settings` of the board's settings dialog, §17.2, §18.4). The rest is read at each
+    use: `[shell]` limits at the next command or job check, `agents.max_steps_per_turn` at the agent's next
+    wake-up, `context_tokens` (when the model profile has none of its own) and `tool_output_chars` at the next
+    call, `idle_nudge_seconds` at the next scheduler pass.
 - `AgentRuntime`:
   - `self.trace` is the current `Trace`, or None (`_tr` is a disabled writer outside an activation).
   - `_activate` finishes a trace left open (`interrupted`), begins the trace after a non-empty wake text and
@@ -1776,7 +1831,8 @@ settings; ValueError when they are invalid):
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
   workspace=None)`, `async load(sid)`, `async start(sid)`, `async stop(sid, *, remember=False)`,
-  `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None)`, `async delete(sid)`, `async resume()`,
+  `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None, settings=None)`, `async delete(sid)`,
+  `async resume()`,
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
   `async set_workspace(sid, path, *, expect=None)`; module functions `read_stats(db_path, conn=None)`,
   `slugify(title)` and `external_workspaces(home)`.
@@ -1799,6 +1855,12 @@ settings; ValueError when they are invalid):
   starting team with `swarm.starting_roles` / `start_agents`); they are validated at create and update time
   (`update` applies them to a loaded swarm at once via `reconfigure`). `config_view(sid)` is the public view of
   the effective settings (the global ones when the overrides are invalid now).
+- Partial update (`update(sid, settings=...)`, the settings dialog of the board, §18.4): `settings` is
+  `{section: {key: value | None}}`; each key is set in the stored overrides, None (or "") removes it so the session
+  inherits the global value again, and a section left empty disappears. The other overrides (those given at
+  creation: language, team, model...) stay. Same sections, cleaning (`clean_overrides`, no goal keys) and
+  validation as `overrides`; nothing is written when it fails (also not a `title` passed along). Passing both
+  `overrides` and `settings`, a non-object, or `main` is a 400. A loaded swarm is reconfigured as for `overrides`.
 - `create` splits the goal as `set_goal` does (`goal_text.split_goal(goal, description)`) and stores it already
   split as `pending_goal` {title, description, actor} (only with a non-empty title); the first `start` sets it
   once the members exist (a failure keeps it). Module function `pending_goal(meta)` → {title, description} | None
@@ -2012,7 +2074,7 @@ of a home or a project, never a session override (§17.2).
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
 | POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?}` → `{"session": summary}` (201); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
 | GET `/api/sessions/{sid}` | `{"session": summary, "config": manager.config_view(sid)}` |
-| PATCH `/api/sessions/{sid}` | body `{title?, overrides?}` → `{"session"}` |
+| PATCH `/api/sessions/{sid}` | body `{title?, overrides?, settings?}` → `{"session": summary, "config": config_view(sid)}`; `overrides` replaces all of them, `settings` `{section: {key: value \| null}}` changes only those keys (null: the global value again; §17.2 "Partial update"); both at once, a bad value or `main` → 400 and nothing changes |
 | DELETE `/api/sessions/{sid}?confirm={sid}` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm |
 | POST `/api/sessions/{sid}/workspace` | body `{"path": "<absolute>"}` or `{"default": true}`, optionally `"expect": "moved"\|"adopted"` (the mode the user agreed to, §17.2) → `{"session": summary, "result": set_workspace result}`; 400 bad body or target, 404 unknown session, 409 dirty repository, MCP name conflict, a folder of another session, a folder that is not what `expect` says, a file in use, `main` |
 | POST `/api/sessions/{sid}/start` / `/stop` | `{"session"}`; another action → 404 |
@@ -2176,6 +2238,16 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
 - `run [DIR]` stays the single-swarm server of a project (§15); it does not serve the launcher.
 
 ### 18.4 UI
+- **Look** (the tokens of style.css, shared by both pages): one quiet surface per theme (light and dark; the system
+  preference unless the theme button chose), hairline borders, one accent — the TUI's orange `#d97757` (filled
+  controls carry dark text on it). Monospace (`--mono`) is for what is read as data: ids, numbers, times, costs,
+  badges, column and section labels; the rest is the sans font. Status colours: in progress blue, waiting amber,
+  review violet, done green, failed red; «working» (an agent, a running session) is the accent. Icons are line
+  icons of `icons.css` (`<i class="ic ic-NAME">`, a CSS mask in the colour of the text), not emoji. A member's
+  colour is the one of the TUI (tui/theme.py `agent_color`: the palette, crc32 of the case-folded name; app.js
+  `agentColor`), so an agent looks the same in the terminal and in the browser; its avatar is a rounded square
+  tinted with it. The agent's activity in the chat drawer follows the TUI too: a coloured bullet per step, a tool
+  result hangs under its call (⎿).
 - **home.html + home.js + home.css** (launcher page, `/`): header (DreamTeam, tabs «Сессии» / «Настройки»,
   RU/EN, theme, connection state); live updates from `/ws` plus a 5 s poll; texts in ru and en.
   - Sessions tab: a big «Начать новую сессию» button, search and the filters all / running / stopped, and a
@@ -2238,6 +2310,16 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
 - **index.html + app.js + traces.js** (session board, `/s/{sid}/`):
   - All API/WS/MCP URLs are relative to the session base `/s/{sid}` (`BASE`, the same id pattern as the
     server), with `""` when the page is served at `/` (`dreamteam run`).
+  - Texts written by agents, external members or the user are shown as Markdown (`markdown.js`, loaded before
+    app.js; app.js `md()`): chat messages, the agent's reply, thinking and compaction summary in its activity (tool
+    calls and results stay raw), task description (formatted, «Изменить» opens its textarea) and result, discussion
+    posts (review comments included), the goal's description and summary, trigger notes, role and MCP
+    descriptions, the reply and thinking of an LLM span in «Трейсы», and `.md` / `.markdown` files in «Файлы»
+    (formatted by default, a button switches to the source). A safe subset: everything is escaped, raw HTML is shown
+    as text, links only to http(s) and mailto (opened in a new tab, `rel="noopener noreferrer"`), images become
+    links, no math (`$..$`, `$$..$$`, `\(..\)`, `\[..\]` are shown as written, no emphasis or escapes inside); a
+    single newline is a line break, and a text without Markdown looks as written (lines keep their indentation,
+    extra blank lines stay); task links `#12` and @mentions work in the plain text (not in code, math or links). Toasts, the feed, one-line previews and tooltips stay plain. Rendered HTML is cached by text.
   - Topbar: «← Все сессии» link to `/` and the session title; a stopped banner with «Запустить сессию»
     (POST `/api/sessions/{sid}/start`, then reload). Actions on a stopped session show the stopped message.
     A folder outside the session that does not exist (snapshot `swarm.workspace`) adds a banner naming the
@@ -2254,6 +2336,26 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     model select starts with «— профиль роли или сессии» (`model` is sent only when chosen); instructions are
     optional for a catalog role (sent as "").
   - Goal modal: the goal is a textarea with the split hint (first line = title), sent unchanged (the hub splits).
+  - Settings dialog (⚙ «Настройки роя»): budget and max agents (`swarm_control`, stored in the session's
+    database; sent only when changed). On a launcher session other than `main` it loads `GET /api/sessions/{sid}`
+    and `GET /api/settings` (launcher routes, without `BASE`) and adds the groups «Фоновые процессы»
+    (`shell.max_jobs_per_member`, `max_jobs`, `job_max_minutes`, `cpu_threads`) and «Агенты»
+    (`agents.max_steps_per_turn`, `context_tokens`, `tool_output_chars`, `idle_nudge_seconds`,
+    `max_parallel_llm_calls`; `SESSION_FIELDS`). Each input holds the session's own override (empty when none) and
+    shows the global value (the public view of `/api/settings`, defaults filled) as its placeholder; a hint says
+    that an empty field takes the general value and that changes apply at once (steps from the agent's next
+    wake-up, the rest from the next command or call), the context field that a model profile's own window wins
+    (naming it when the session's profile has one). Save checks the values with config.py's minimums (whole
+    numbers; `idle_nudge_seconds` a number; `cpu_threads` "auto" or a whole number ≥ 0; the first error is a toast
+    and gets the focus), then sends `PATCH /api/sessions/{sid}` `{"settings": ...}` with only the changed keys (an
+    emptied field is null) before `swarm_control`, so a stopped session takes them too; when the PATCH succeeds and
+    `swarm_control` fails, a toast says the session parameters were saved and the dialog stays open with them counted
+    as saved. An emptied field counts as an unsaved edit when the dialog is closed (it removes an override). ⚙ is
+    disabled while the two requests load, and a modal opened meanwhile is not replaced; if they fail, the dialog
+    keeps budget and max agents with a line that the session parameters did not load. The pure parts are
+    exported for the Node tests (`parseSessionField`, `sessionSettingsPatch`, `sessionFieldsHtml`, `contextHint`).
+    `main` and a standalone `dreamteam run` board show only budget and max agents, with a line that the other
+    parameters are in the general settings.
   - Background jobs (§7.1; «фоновый процесс» in Russian, shown as j3): the tab «Процессы» (badge: the running
     ones) has a card per job of the snapshot's `jobs` (running, then ended in the last hour): label, owner chip,
     state («работает 25 мин»; at the end by status and reason: «завершён: код 0», «завершён» for a job with no
@@ -2269,7 +2371,12 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   - Tab «Файлы»: above the tree, the session folder (`swarm.workspace`): its absolute path (click to copy) and
     the badge «своя папка» / «папка проекта» / «перенесена» / «папки нет»; the tab button's tooltip is the
     path. A missing folder is not listed (no `/api/files` call). When the path (or its existence) changes
-    after a `/cd`, the tab starts again from the root of the new folder.
+    after a `/cd`, the tab starts again from the root of the new folder. The viewer highlights the syntax of a file
+    (and the source of a `.md`) by its name (`highlight.js`, in-house, offline, loaded before markdown.js; also
+    Markdown fences that name a language): Python, JS/TS, JSON, TOML, YAML, INI/.env, shell, Dockerfile, Makefile,
+    PowerShell, batch, HTML/XML/SVG, CSS, SCSS/LESS, SQL, C/C++, C#, Java, Kotlin, Go, Rust, Ruby, PHP, Lua, R, Julia, LaTeX,
+    Markdown, diff; other kinds (CSV, text) and files over 300 000 characters stay plain. Safe and copy-exact:
+    everything is escaped, the only markup is `<span class="hl-…">`, the text content is the file; one linear pass.
   - Tab «Трейсы»: agent filter, status filter (all statuses, «Только с ошибками» = failed), refresh and
     «Статистика»; the list of traces on the left (newest first, «Показать ещё» pages with `before`) and the
     trace detail on the right.

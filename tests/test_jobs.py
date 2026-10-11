@@ -584,6 +584,28 @@ async def test_one_finisher(setup, kids, monkeypatch):
     assert row(swarm, 1)["status"] == "ended"
 
 
+async def test_the_owner_stays_busy_until_the_end_notice(setup, kids, monkeypatch):
+    """Between a job's end and its notice (after the commit, seconds under load) its owner is still busy: idle with
+    nothing pending meanwhile, the scheduler would wake it as stalled for the task it holds."""
+    swarm, manager = setup
+    gate, started, notices = asyncio.Event(), [], []
+
+    async def slow_commit(actor, message="", **kw):
+        started.append(kw)
+        await gate.wait()
+
+    monkeypatch.setattr(swarm.workspace, "autocommit", slow_commit)
+    monkeypatch.setattr(manager, "_announce_end_notice", lambda job: notices.append(job.id))
+    out = await run(manager, ANNA, py(kids.script, "1.5", kids.pidfile()))
+    assert out.job.origin == "timeout" and manager.busy(ANNA)
+    await until(lambda: started, 10)  # it ended by itself; its finish waits in the commit
+    assert manager.running_of(ANNA) == [] and notices == []
+    assert manager.busy(ANNA)
+    gate.set()
+    await until(lambda: out.job.done.done(), 10)
+    assert notices == [out.job.id] and not manager.busy(ANNA) and manager._ending == {}
+
+
 async def test_stop_all_waits_for_finishes_in_flight(setup, kids, monkeypatch):
     swarm, manager = setup
     started, finished = [], []

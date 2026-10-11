@@ -526,6 +526,88 @@ def test_in_progress_checks_new_dependencies_in_same_call(swarm, board):
     assert board.get(t.id).depends_on == []  # rolled back
 
 
+def test_assignee_removing_dependencies_is_recorded(swarm, board):
+    """The assignee of a blocked task may drop dependencies it can do without (an optional task a report need not
+    wait for). The discussion records it, the creator is told quietly (the assignee's explanation post wakes it),
+    and other members are not disturbed; adding one stays the assignee's right too, without a record."""
+    d1, d2, d3, extra = (board.create(ANNA, f"d{i}") for i in range(1, 5))
+    t = board.create(ANNA, "report", depends_on=[d1.id, d2.id, d3.id], assignee=BOB)
+    board.post(CARL, t.id, "I watch this")  # a participant
+    clear(swarm)
+    before = len(events(swarm, "task.updated"))
+    with pytest.raises(ToolError, match="Only the creator \\(Anna Smith\\) or the assignee \\(Bob Brown\\) of task "
+                                        "#5 can change its depends_on \\(the assignee may remove dependencies"):
+        board.update(CARL, t.id, depends_on=[d1.id])
+    # a new order alone changes nothing
+    assert board.update(BOB, t.id, depends_on=[d3.id, d2.id, d1.id]).depends_on == [d1.id, d2.id, d3.id]
+    assert len(events(swarm, "task.updated")) == before and board.discussion(t.id)[-1]["author"] == CARL
+    upd = board.update(BOB, t.id, depends_on=[d3.id, d1.id])
+    assert upd.depends_on == [d1.id, d3.id] and upd.blocked_by == [d1.id, d3.id]
+    record = board.discussion(t.id)[-1]
+    assert record["author"] == BOB
+    assert record["text"] == prompts.t(swarm.language, "post_deps_removed", by=BOB, deps=f"#{d2.id} [todo]")
+    assert events(swarm, "task.comment")[-1]["data"]["post"]["id"] == record["id"]
+    assert quiet_flags(swarm, ANNA)[-1] == ("n_deps_removed", True)  # (before it: CARL's post)
+    assert swarm.notifications_for(ANNA) == [("n_deps_removed", {"id": t.id, "title": "report", "by": BOB,
+                                                                 "deps": f"#{d2.id} [todo]"})]
+    assert keys_for(swarm, CARL) == [] and keys_for(swarm, BOB) == []  # the record wakes no participant
+    # a done dependency may go too (harmless), and dropping the last blockers unblocks the task
+    board.claim(ANNA, d1.id)
+    board.complete(ANNA, d1.id, "ok")
+    upd = board.update(BOB, t.id, depends_on=[])
+    assert upd.depends_on == [] and upd.blocked_by == []
+    assert board.discussion(t.id)[-1]["text"] == prompts.t(swarm.language, "post_deps_removed", by=BOB,
+                                                           deps=f"#{d1.id} [done], #{d3.id} [todo]")
+    assert board.claim(BOB, t.id).status == Status.IN_PROGRESS
+    # the creator and the user change dependencies freely, without a record
+    posts = len(board.discussion(t.id))
+    board.update(ANNA, t.id, depends_on=[d2.id])
+    board.update(USER, t.id, depends_on=[])
+    assert len(board.discussion(t.id)) == posts and keys_for(swarm, ANNA) == ["n_deps_removed"] * 2
+    # the assignee may add one (its task needs another's result): no record, no notice
+    board.claim(ANNA, extra.id)
+    board.complete(ANNA, extra.id, "ok")  # (a blocker added to a task in progress is refused: tested above)
+    assert board.update(BOB, t.id, depends_on=[extra.id]).depends_on == [extra.id]
+    assert len(board.discussion(t.id)) == posts and keys_for(swarm, ANNA) == ["n_deps_removed"] * 2
+
+
+def test_creator_removing_the_last_blocker_unblocks_the_assignee(swarm, board):
+    """Like a dependency done (_notify_unblocked): the assignee of a task that lost its last blocker is woken, but
+    told that the blockers were removed, not done (their results do not exist)."""
+    dep = board.create(ANNA, "dep")
+    t = board.create(ANNA, "t", depends_on=[dep.id], assignee=BOB)
+    clear(swarm)
+    board.update(ANNA, t.id, depends_on=[])
+    assert quiet_flags(swarm, BOB)[-1] == ("n_unblocked_removed", False)
+    assert swarm.notifications_for(BOB) == [("n_unblocked_removed", {"id": t.id, "title": "t", "by": ANNA,
+                                                                     "deps": f"#{dep.id}"})]
+    assert "done" not in prompts.t("en", "n_unblocked_removed", id=t.id, title="t", by=ANNA, deps=f"#{dep.id}")
+    # still blocked by another one: no news
+    d2 = board.create(ANNA, "d2")
+    board.update(ANNA, t.id, depends_on=[dep.id, d2.id])
+    clear(swarm)
+    board.update(ANNA, t.id, depends_on=[d2.id])
+    assert keys_for(swarm, BOB) == []
+
+
+def test_blocked_errors_tell_the_assignee_it_may_remove_dependencies(swarm, board):
+    dep = board.create(ANNA, "dep")
+    t = board.create(ANNA, "t", depends_on=[dep.id], assignee=BOB)
+    with pytest.raises(ToolError, match="remove those from its depends_on"):
+        board.claim(BOB, t.id)
+    other = board.create(ANNA, "o", depends_on=[dep.id])
+    with pytest.raises(ToolError) as exc:
+        board.claim(CARL, other.id)
+    assert "depends_on" not in str(exc.value)
+    # one becoming the assignee in the same call may not remove dependencies yet: no hint it cannot follow
+    with pytest.raises(ToolError, match="is blocked by") as exc:
+        board.update(CARL, other.id, assignee=CARL, status="in_progress")
+    assert "depends_on" not in str(exc.value)
+    # the current assignee setting in_progress gets it
+    with pytest.raises(ToolError, match="remove those from its depends_on"):
+        board.update(BOB, t.id, status="in_progress")
+
+
 def test_non_assignee_cannot_set_working_statuses(swarm, board):
     t = board.create(ANNA, "t")
     for status in ("in_progress", "waiting", "failed"):

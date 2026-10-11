@@ -46,6 +46,7 @@ const I18N = {
     required: "Заполните обязательные поля", required_task: "Заполните заголовок и цель задачи",
     invalid_limits: "Бюджет должен быть ≥ 0, а максимум агентов — целым числом ≥ 1",
     discard_changes: "Закрыть без сохранения? Введённый текст пропадёт.",
+    edit: "Изменить", md_source: "Исходный текст", md_formatted: "Форматированный вид",
     truncated: "(обрезано)", system: "система", theme: "Тема: светлая / тёмная", language: "Язык интерфейса",
     collapse_team: "Свернуть панель команды", expand_team: "Развернуть панель команды",
     k_wake: "пробуждение", k_thinking: "размышление", k_text: "ответ", k_tool_call: "вызов инструмента",
@@ -77,6 +78,17 @@ const I18N = {
     job_log_hint: "Открыть журнал на вкладке «Файлы»", job_took: "проработал {t}", agent_jobs: "фоновых процессов: {n}",
     ev_job_started: "{who}: фоновый процесс {id} — {command}", ev_job_ended: "{who}: процесс {id} {result} ({t})",
     dur_s: "{n} с", dur_min: "{n} мин", dur_h: "{h} ч {m} мин",
+    sg_jobs: "Фоновые процессы", sf_jobs: "Фоновых процессов на участника", sf_jobs_total: "Фоновых процессов на сессию",
+    sf_job_minutes: "Предел жизни фонового процесса, мин (0 — без предела)", sf_cpu: "Потоков вычислений на команду (auto или число)",
+    sf_steps: "Шагов за пробуждение", sf_context: "Окно контекста, токенов", sf_tool_out: "Лимит вывода инструмента (симв.)",
+    sf_nudge: "Напоминание простаивающим, с", sf_parallel: "Параллельных вызовов LLM",
+    sf_hint: "Пустое поле — значение из общих настроек (оно показано серым). Изменения действуют сразу: шаги — со следующего пробуждения агента, остальное — со следующей команды или вызова.",
+    sf_context_hint: "окно контекста, заданное в профиле модели, важнее", sf_context_profile: "сейчас действует окно профиля «{profile}»: {n}",
+    sf_general_only: "Остальные параметры (фоновые процессы, агенты) задаются в общих настройках.",
+    sf_bad_int: "«{field}»: нужно целое число ≥ {min}", sf_bad_num: "«{field}»: нужно число ≥ {min}",
+    sf_bad_auto: "«{field}»: auto или целое число ≥ 0", sf_load_failed: "Не удалось загрузить параметры сессии: {error}",
+    sf_not_loaded: "Параметры сессии (фоновые процессы, агенты) не загрузились — откройте окно ещё раз.",
+    sf_saved_part: "Параметры сессии сохранены, бюджет и максимум агентов — нет",
   },
   en: {
     goal: "Goal", budget: "Budget", budget_hint: "Spent / budget limit", agents: "Agents", team: "Team",
@@ -122,6 +134,7 @@ const I18N = {
     required: "Fill in the required fields", required_task: "Fill in the title and the task goal",
     invalid_limits: "The budget must be ≥ 0 and max agents a whole number ≥ 1",
     discard_changes: "Close without saving? Your text will be lost.",
+    edit: "Edit", md_source: "Source", md_formatted: "Formatted",
     truncated: "(truncated)", system: "system", theme: "Theme: light / dark", language: "Interface language",
     collapse_team: "Collapse the team panel", expand_team: "Expand the team panel",
     k_wake: "wake-up", k_thinking: "thinking", k_text: "reply", k_tool_call: "tool call",
@@ -153,12 +166,23 @@ const I18N = {
     job_log_hint: "Open the log in the Files tab", job_took: "ran {t}", agent_jobs: "background jobs: {n}",
     ev_job_started: "{who}: background job {id} — {command}", ev_job_ended: "{who}: job {id} {result} ({t})",
     dur_s: "{n} s", dur_min: "{n} min", dur_h: "{h} h {m} min",
+    sg_jobs: "Background jobs", sf_jobs: "Background jobs per member", sf_jobs_total: "Background jobs per session",
+    sf_job_minutes: "Background job time limit, min (0 = none)", sf_cpu: "Compute threads per command (auto or a number)",
+    sf_steps: "Steps per wake-up", sf_context: "Context window, tokens", sf_tool_out: "Tool output limit (chars)",
+    sf_nudge: "Nudge idle agents after, s", sf_parallel: "Parallel LLM calls",
+    sf_hint: "An empty field takes the value of the general settings (shown in grey). Changes apply at once: the steps from the agent's next wake-up, the rest from the next command or call.",
+    sf_context_hint: "a context window set in the model profile wins", sf_context_profile: "the profile “{profile}” sets {n} now",
+    sf_general_only: "The other parameters (background jobs, agents) are set in the general settings.",
+    sf_bad_int: "“{field}”: a whole number ≥ {min} is needed", sf_bad_num: "“{field}”: a number ≥ {min} is needed",
+    sf_bad_auto: "“{field}”: auto or a whole number ≥ 0", sf_load_failed: "Could not load the session parameters: {error}",
+    sf_not_loaded: "The session parameters (background jobs, agents) did not load: open the dialog again.",
+    sf_saved_part: "The session parameters are saved, the budget and max agents are not",
   },
 };
 
 const COLUMNS = ["todo", "in_progress", "waiting", "review", "done", "closed"];
 const ALL_STATUSES = ["todo", "in_progress", "waiting", "review", "done", "failed", "cancelled"];
-const ACTIVITY_ICONS = { wake: "⏰", thinking: "💭", text: "💬", tool_call: "🔧", tool_result: "📄", error: "⚠️", nudge: "👉", compacted: "🗜" };
+const ACTIVITY_PROSE = new Set(["text", "thinking", "compacted"]);   // activity kinds the LLM wrote: shown as Markdown
 // the feed asks the server only for these types: agent.activity / agent.usage would crowd everything else out
 const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*"];
 const FEED_SKIP = new Set(["agent.activity", "agent.usage", "notification", "agent.status", "agent.compacted"]);
@@ -175,6 +199,7 @@ const S = {
   openTaskId: null, taskBase: null, lastPostId: 0, ws: null, wsRetry: 0, wsEverOpen: false, dragging: null,
   boardDirty: false, appliedSeq: 0, modalInitial: null, markingRead: new Set(), drafts: {},
   jobOpen: new Set(), jobOutputs: {}, jobLoading: new Set(),   // Jobs tab: ids whose output is shown, its text
+  fileText: "", fileSource: false,   // Files tab: the open file's text; a Markdown file shown as its source
 };
 
 /* ---------------------------------------------------------------- utils */
@@ -200,28 +225,68 @@ function fmtTime(ts) {
   const hm = d.toLocaleTimeString(S.lang === "ru" ? "ru-RU" : "en-GB", { hour: "2-digit", minute: "2-digit" });
   return d.toDateString() === today.toDateString() ? hm : d.toLocaleDateString(S.lang === "ru" ? "ru-RU" : "en-GB") + " " + hm;
 }
-function hue(name) { let h = 0; for (const ch of String(name)) h = (h * 31 + ch.codePointAt(0)) % 360; return h; }
+/** Colours of the members: the palette of the terminal UI (tui/theme.py AGENT_PALETTE) and the same choice
+ * (crc32 of the case-folded name), so an agent has one colour in the terminal and in the browser. */
+const AGENT_PALETTE = "#5f87d7 #2aa198 #9c6ade #d33682 #859900 #268bd2 #b58900 #6c71c4 #3a9e6e #c0607e #4f97a3 #a0794f".split(" ");
+let CRC_TABLE = null;
+function crc32(text) {
+  if (!CRC_TABLE) {
+    CRC_TABLE = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; CRC_TABLE[n] = c >>> 0; }
+  }
+  let crc = 0xffffffff;
+  for (const byte of new TextEncoder().encode(text)) crc = CRC_TABLE[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+function agentColor(name) { return AGENT_PALETTE[crc32(String(name).split(/\s+/).filter(Boolean).join(" ").toLowerCase()) % AGENT_PALETTE.length]; }
 function initials(name) { return String(name).split(/\s+/).filter(Boolean).slice(0, 2).map((p) => p[0].toUpperCase()).join(""); }
 function avatar(name, cls = "") {
   if (name === "user") return `<span class="avatar user ${cls}">U</span>`;
-  return `<span class="avatar ${cls}" style="background:hsl(${hue(name)} 55% 45%)">${esc(initials(name))}</span>`;
+  return `<span class="avatar ${cls}" style="--c:${agentColor(name)}">${esc(initials(name))}</span>`;
 }
 function displayName(name) { return name === "user" ? t("user") : name === null || name === undefined ? t("system") : name; }
 function reEscape(text) { return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"); }
 function norm(text) { return String(text ?? "").replace(/\r\n?/g, "\n"); }
 function short(text, n = 160) { text = String(text || "").replace(/\s+/g, " "); return text.length > n ? text.slice(0, n - 1) + "…" : text; }
 
+let mentionMemo = { key: null, re: null };   // the mention regex of the last list of names (md() calls it per text run)
 /** Wraps `@Full Name` mentions of known members (and `@user`) in already escaped HTML. */
 function highlightMentions(html, names) {
   const list = (names || members(true).map((a) => a.name)).concat(["user"]).filter(Boolean);
-  const alts = Array.from(new Set(list)).sort((a, b) => b.length - a.length).map((n) => reEscape(esc(n)).replace(/\s+/g, "\\s+"));
-  const re = new RegExp(`(^|[^\\p{L}\\p{N}_&])@(${alts.join("|")})(?![\\p{L}\\p{N}_])`, "giu");
-  return html.replace(re, '$1<span class="mention">@$2</span>');
+  const key = list.join("\u0001");
+  if (mentionMemo.key !== key) {
+    const alts = Array.from(new Set(list)).sort((a, b) => b.length - a.length).map((n) => reEscape(esc(n)).replace(/\s+/g, "\\s+"));
+    mentionMemo = { key, re: new RegExp(`(^|[^\\p{L}\\p{N}_&])@(${alts.join("|")})(?![\\p{L}\\p{N}_])`, "giu") };
+  }
+  return html.replace(mentionMemo.re, '$1<span class="mention">@$2</span>');
+}
+/** Task links (`#12`) and mentions in already escaped HTML. */
+function decorate(html, names) {
+  return highlightMentions(html.replace(/(^|[\s(\[,:])#(\d+)\b/g, '$1<button type="button" class="link" data-open-task="$2">#$2</button>'), names);
 }
 /** Escapes text, turns `#12` into task links and highlights mentions. Everything except the inserted markup is escaped. */
-function linkify(text, names) {
-  const html = esc(text).replace(/(^|[\s(\[,:])#(\d+)\b/g, '$1<button type="button" class="link" data-open-task="$2">#$2</button>');
-  return highlightMentions(html, names);
+function linkify(text, names) { return decorate(esc(text), names); }
+
+// markdown.js: a global of the page (loaded before this script), a module in the Node tests
+const MARKDOWN = typeof Markdown !== "undefined" ? Markdown : require("./markdown.js");
+const HIGHLIGHT = typeof Highlight !== "undefined" ? Highlight : require("./highlight.js");   // highlight.js, the same way
+const MD_CACHE = new Map();
+const MD_CACHE_MAX = 400;      // rendered texts kept (the chat alone re-renders up to 300 messages on a refresh)
+const MD_CACHE_CHARS = 50000;  // longer texts (a big .md file) are rendered every time instead of being kept
+/** A text written by an agent, an external member or the user, formatted as Markdown (markdown.js: escaped, no raw
+ * HTML) with the board's task links and mentions in its plain text: `<div class="md">…</div>`. */
+function md(text, names) {
+  const src = String(text ?? "");
+  const list = names || members(true).map((a) => a.name);
+  const key = list.join("\u0001") + "\u0002" + src;
+  let html = MD_CACHE.get(key);
+  if (html !== undefined) { MD_CACHE.delete(key); MD_CACHE.set(key, html); return html; }   // most recently used last
+  html = `<div class="md">${MARKDOWN.render(src, { decorate: (h) => decorate(h, list) })}</div>`;
+  if (src.length <= MD_CACHE_CHARS) {
+    MD_CACHE.set(key, html);
+    if (MD_CACHE.size > MD_CACHE_MAX) MD_CACHE.delete(MD_CACHE.keys().next().value);
+  }
+  return html;
 }
 
 function toast(text, kind = "", onClick = null) {
@@ -249,6 +314,14 @@ async function api(path, options) {
   if (!resp.ok) throw new Error(responseError(resp.status, await resp.text()));
   return resp.json();
 }
+/** A launcher route (/api/sessions/{sid}, /api/settings): it is not under the session's BASE. */
+async function launcherApi(path, options) {
+  const resp = await fetch(path, options);
+  if (!resp.ok) throw new Error(responseError(resp.status, await resp.text()));
+  return resp.json();
+}
+/** The id of the launcher session this board belongs to; "" for a standalone swarm app. */
+function sessionSid() { return BASE ? BASE.split("/").pop() : ""; }
 async function post(path, body) {
   return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
 }
@@ -353,7 +426,7 @@ function setLang(lang, remember = true) {
   applyI18n();
   renderAll();
   renderFeed();
-  if (S.tab === "files") { renderCrumbs(); renderFileList(); }
+  if (S.tab === "files") { renderCrumbs(); renderFileList(); if (S.openFile) renderFileContent(); }
   if (S.chatWith) { loadMessages(); if (S.dtab === "activity") loadActivity(); }
   if (typeof tracesLangChanged === "function") tracesLangChanged();
 }
@@ -402,7 +475,7 @@ function renderHeader() {
   const counted = sw.agent_count ?? members().filter((a) => a.kind === "llm").length;
   $("#agents-count").textContent = `${counted} / ${sw.limits.max_agents}`;
   const pause = $("#pause-btn");
-  setHtml(pause, `<span aria-hidden="true">${sw.paused ? "▶" : "⏸"}</span><span class="btn-label">${esc(sw.paused ? t("resume") : t("pause"))}</span>`);
+  setHtml(pause, `<span aria-hidden="true">${sw.paused ? '<i class="ic ic-play"></i>' : '<i class="ic ic-pause"></i>'}</span><span class="btn-label">${esc(sw.paused ? t("resume") : t("pause"))}</span>`);
   pause.title = sw.paused ? t("resume") : t("pause");
   pause.classList.toggle("primary", !!sw.paused);
   const banner = $("#paused-banner");
@@ -453,7 +526,7 @@ function workspaceHtml(ws) {
   if (!kind) return "";
   const missing = workspaceMissing(ws);
   const label = missing ? t("ws_missing_badge") : t("ws_" + kind);
-  return `<span class="ws-label">📁 ${esc(t("ws_folder"))}</span>`
+  return `<span class="ws-label"><i class="ic ic-folder"></i>${esc(t("ws_folder"))}</span>`
     + `<span class="badge${missing ? " err" : kind === "default" ? " plain" : ""}" title="${esc(t("ws_" + kind + "_hint"))}">${esc(label)}</span>`
     + `<code class="ws-path" id="ws-path" title="${esc(t("copy_hint"))}">${esc(ws.path)}</code>`;
 }
@@ -463,9 +536,9 @@ function syncWorkspace() {
   const key = ws ? `${ws.path}\n${ws.exists}` : "";
   if (S.workspaceKey === undefined || S.workspaceKey === key) { S.workspaceKey = key; return; }
   S.workspaceKey = key;
-  S.fileDir = "."; S.fileEntries = []; S.openFile = null;
+  S.fileDir = "."; S.fileEntries = []; S.openFile = null; S.fileText = "";
   $("#file-path").textContent = t("select_file");
-  $("#file-content").textContent = "";
+  renderFileContent();
   if (S.tab === "files") openDir(".");
 }
 
@@ -518,17 +591,17 @@ function boardColumns(tasks) {
 
 function cardHtml(task) {
   const blocked = (task.blocked_by || []).length && task.status === "todo"
-    ? `<span class="blocked">⛔ ${esc(t("blocked_by"))} ${task.blocked_by.map((b) => "#" + Number(b)).join(", ")}</span>` : "";
+    ? `<span class="blocked"><i class="ic ic-blocked"></i>${esc(t("blocked_by"))} ${task.blocked_by.map((b) => "#" + Number(b)).join(", ")}</span>` : "";
   const assignee = task.assignee ? `<span class="chip">${avatar(task.assignee, "sm")}${esc(displayName(task.assignee))}</span>` : "";
   const tags = (task.tags || []).map((g) => `<span class="tag">${esc(g)}</span>`).join("");
-  const comments = task.comments ? `<span class="chip plain">💬 ${Number(task.comments)}</span>` : "";
+  const comments = task.comments ? `<span class="chip plain"><i class="ic ic-chat"></i>${Number(task.comments)}</span>` : "";
   const review = task.status === "review" && task.reviewer ? (task.reviewer === "user"
-    ? `<span class="badge warn">👁 ${esc(t("review_you"))}</span>` : `<span class="chip plain">👁 ${esc(displayName(task.reviewer))}</span>`) : "";
-  const failed = task.status === "failed" ? `<span class="badge err">${esc(t("s_failed"))}</span>` : task.status === "cancelled" ? `<span class="badge">${esc(t("s_cancelled"))}</span>` : "";
+    ? `<span class="badge warn"><i class="ic ic-eye"></i>${esc(t("review_you"))}</span>` : `<span class="chip plain"><i class="ic ic-eye"></i>${esc(displayName(task.reviewer))}</span>`) : "";
+  const failed = task.status === "failed" ? `<span class="badge err">${esc(t("s_failed"))}</span>` : task.status === "cancelled" ? `<span class="badge st-cancelled">${esc(t("s_cancelled"))}</span>` : "";
   const prio = Math.max(0, Math.min(3, Number(task.priority) || 0));
   return `<div class="card p${prio}" draggable="true" tabindex="0" role="button" data-id="${Number(task.id)}" title="${esc(t("p" + prio))}">
     <div class="card-top"><span class="card-id">#${Number(task.id)}</span><span class="card-title">${esc(task.title)}</span></div>
-    ${task.goal ? `<div class="card-goal">🎯 ${esc(task.goal)}</div>` : ""}
+    ${task.goal ? `<div class="card-goal"><i class="ic ic-goal"></i>${esc(task.goal)}</div>` : ""}
     <div class="card-meta">${assignee}${review}${comments}${tags}${blocked}${failed}</div>
   </div>`;
 }
@@ -638,7 +711,7 @@ function renderDrawerHead() {
   } else {
     html = `${avatar(a.name)}<div class="drawer-who"><b>${esc(a.name)}</b>
       <div class="sub">${esc(a.role)} · <span class="status-dot ${esc(a.status)}"></span> ${esc(t("a_" + a.status))} · ${esc(a.model || a.kind)} · $${(a.cost_usd || 0).toFixed(3)}</div></div>
-      <button class="btn small" type="button" data-traces="${esc(a.name)}">📈 ${esc(t("traces"))}</button>
+      <button class="btn small" type="button" data-traces="${esc(a.name)}"><i class="ic ic-pulse"></i>${esc(t("traces"))}</button>
       ${a.status !== "retired" ? `<button class="btn small danger" type="button" data-retire="${esc(a.name)}">${esc(t("retire"))}</button>` : ""}`;
   }
   setHtml($("#drawer-title"), html);
@@ -696,7 +769,7 @@ function setDrawerTab(tab, load = true) {
 function messageHtml(m) {
   const me = m.sender === "user";
   const to = S.chatWith === "all" ? ` → ${(m.recipients || []).map(displayName).map(esc).join(", ")}` : "";
-  return `<div class="msg ${me ? "me" : ""}"><div class="meta">${esc(displayName(m.sender))}${to} · ${esc(fmtTime(m.ts))}</div>${linkify(m.text)}</div>`;
+  return `<div class="msg ${me ? "me" : ""}"><div class="meta">${esc(displayName(m.sender))}${to} · ${esc(fmtTime(m.ts))}</div>${md(m.text)}</div>`;
 }
 
 function nearBottom(el) { return el.scrollHeight - el.scrollTop - el.clientHeight < 80; }
@@ -732,8 +805,10 @@ function autoMarkRead() {
 function activityHtml(item) {
   const d = item.data || {};
   const kind = String(d.kind || "");
-  const head = `${ACTIVITY_ICONS[kind] || "•"} ${esc(tv("k_", kind))}${d.tool ? ` · <code>${esc(d.tool)}</code>` : ""} · ${esc(fmtTime(item.ts))}`;
-  return `<div class="act ${esc(kind)}${d.is_error ? " err" : ""}"><div class="act-head">${head}</div>${d.text ? `<pre>${esc(d.text)}</pre>` : ""}</div>`;
+  const head = `<b>${esc(tv("k_", kind))}</b>${d.tool ? `<code>${esc(d.tool)}</code>` : ""}<span>${esc(fmtTime(item.ts))}</span>`;
+  // the agent's own words (its reply, its thinking) are Markdown; tool calls, results and errors stay as they are
+  const body = !d.text ? "" : ACTIVITY_PROSE.has(kind) ? md(d.text) : `<pre>${esc(d.text)}</pre>`;
+  return `<div class="act ${esc(kind)}${d.is_error ? " err" : ""}"><div class="act-head">${head}</div>${body}</div>`;
 }
 
 async function loadActivity(toBottom = false) {
@@ -792,7 +867,8 @@ function openModal(html, { focus = true } = {}) {
   backdrop.classList.remove("hidden");
   backdrop.scrollTop = 0;
   S.modalInitial = new Map($$("input, textarea, select", modal).filter((el) => el.id).map((el) => [el.id, el.value]));
-  if (focus) { const first = $("#modal input, #modal textarea"); if (first) first.focus(); }
+  // not a disabled input: a formatted text's task marks (.md li.md-task) come before the fields and take no focus
+  if (focus) { const first = $("#modal input:not([disabled]), #modal textarea:not([disabled])"); if (first) first.focus(); }
 }
 function modalOpen() { return !$("#modal-backdrop").classList.contains("hidden"); }
 /** True when closing the modal would throw away something the user typed. */
@@ -802,8 +878,10 @@ function modalHasUnsaved() {
     if (($("#post-text")?.value || "").trim() || ($("#review-comment")?.value || "").trim()) return true;
     return Object.keys(dirtyFields(S.taskBase, readTaskForm())).length > 0;
   }
+  // an emptied field is no edit, except where emptying it means something (data-empty-edit: a session setting
+  // cleared to take the global value again)
   return $$("#modal input, #modal textarea").some((el) => el.id && S.modalInitial && S.modalInitial.has(el.id)
-    && el.value !== S.modalInitial.get(el.id) && el.value.trim() !== "");
+    && el.value !== S.modalInitial.get(el.id) && (el.value.trim() !== "" || el.hasAttribute("data-empty-edit")));
 }
 function closeModal(force = false) {
   if (!force && modalHasUnsaved() && !confirm(t("discard_changes"))) return false;
@@ -881,11 +959,40 @@ function taskMetaHtml(task) {
   const parts = [`${esc(t("created_by"))}: ${esc(displayName(task.created_by || "-"))} · ${esc(fmtTime(task.created_at))}`];
   if (task.updated_at && task.updated_at - task.created_at > 1) parts.push(`${esc(t("updated"))} ${esc(fmtTime(task.updated_at))}`);
   if (task.parent_id) parts.push(`${esc(t("parent"))}: <button type="button" class="link" data-open-task="${Number(task.parent_id)}">#${Number(task.parent_id)}</button>`);
-  if ((task.blocked_by || []).length) parts.push(`⛔ ${esc(t("blocked_by"))} ${task.blocked_by.map((b) => `<button type="button" class="link" data-open-task="${Number(b)}">#${Number(b)}</button>`).join(", ")}`);
+  if ((task.blocked_by || []).length) parts.push(`<span class="blocked"><i class="ic ic-blocked"></i>${esc(t("blocked_by"))}</span> ${task.blocked_by.map((b) => `<button type="button" class="link" data-open-task="${Number(b)}">#${Number(b)}</button>`).join(", ")}`);
   return parts.join(" · ");
 }
 function taskResultHtml(task) {
-  return task.result ? `<div class="section-title">${esc(t("result"))}</div><div class="result-box">${linkify(task.result)}</div>` : "";
+  return task.result ? `<div class="section-title">${esc(t("result"))}</div><div class="result-box">${md(task.result)}</div>` : "";
+}
+/** A long text field shown formatted (Markdown) with «Изменить» that opens its textarea. The textarea is always in the
+ * form (hidden while the text is read), so the form reads and compares it as before; an empty text starts editable. */
+function mdFieldHtml(id, label, text, rows) {
+  const reading = norm(text).trim() !== "";
+  return `<div class="field full md-field"><div class="md-field-head"><span>${esc(label)}</span>
+      <button class="link${reading ? "" : " hidden"}" type="button" data-md-edit="${esc(id)}"><i class="ic ic-edit"></i>${esc(t("edit"))}</button></div>
+    <div class="md-view${reading ? "" : " hidden"}" id="${esc(id)}-view">${reading ? md(text) : ""}</div>
+    <textarea id="${esc(id)}" rows="${Number(rows)}" aria-label="${esc(label)}"${reading ? ' class="hidden"' : ""}></textarea></div>`;
+}
+/** The field after a live update: a text being read shows the new one (`read`: back to reading, after a save);
+ * one being edited stays in its textarea; an emptied one opens it. */
+function syncMdField(id, text, read = false) {
+  const box = $("#" + id), view = $("#" + id + "-view"), btn = $(`[data-md-edit="${id}"]`);
+  if (!box || !view) return;
+  const reading = norm(text).trim() !== "" && (read || box.classList.contains("hidden"));
+  setHtml(view, reading ? md(text) : "");
+  view.classList.toggle("hidden", !reading);
+  box.classList.toggle("hidden", reading);
+  if (btn) btn.classList.toggle("hidden", !reading);
+}
+/** «Изменить»: the textarea in place of the formatted text. */
+function editMdField(id) {
+  const box = $("#" + id);
+  if (!box) return;
+  $("#" + id + "-view")?.classList.add("hidden");
+  $(`[data-md-edit="${id}"]`)?.classList.add("hidden");
+  box.classList.remove("hidden");
+  box.focus();
 }
 function taskReviewHtml(task) {
   if (task.status !== "review") return "";
@@ -920,11 +1027,11 @@ function renderTaskModal(data) {
   const task = data.task;
   const posts = data.discussion || [];
   openModal(`
-    <div class="modal-head"><h3 id="task-head">${taskHeadHtml(task)}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}">✕</button></div>
+    <div class="modal-head"><h3 id="task-head">${taskHeadHtml(task)}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
     <div class="form-grid" id="task-form">
       <label class="field full"><span>${esc(t("title"))}</span><input id="f-title" maxlength="200"></label>
-      <label class="field full"><span>🎯 ${esc(t("goal_field"))}</span><textarea id="f-goal" rows="2" placeholder="${esc(t("goal_hint"))}"></textarea></label>
-      <label class="field full"><span>${esc(t("description"))}</span><textarea id="f-desc" rows="4"></textarea></label>
+      <label class="field full"><span><i class="ic ic-goal"></i>${esc(t("goal_field"))}</span><textarea id="f-goal" rows="2" placeholder="${esc(t("goal_hint"))}"></textarea></label>
+      ${mdFieldHtml("f-desc", t("description"), task.description, 4)}
       <label class="field"><span>${esc(t("status"))}</span><select id="f-status"></select></label>
       <label class="field"><span>${esc(t("priority"))}</span><select id="f-priority">${priorityOptions(task.priority)}</select></label>
       <label class="field"><span>${esc(t("assignee"))}</span><select id="f-assignee"></select></label>
@@ -944,6 +1051,7 @@ function renderTaskModal(data) {
     <div class="section-title">${esc(t("history"))}</div>
     <div class="history" id="task-history">${historyHtml(data.events)}</div>`, { focus: false });
   fillTaskForm(task, null, true);
+  syncMdField("f-desc", task.description, true);
   S.openTaskId = task.id;
   S.taskBase = task;
   S.lastPostId = posts.reduce((m, p) => Math.max(m, p.id), 0);
@@ -963,6 +1071,7 @@ function updateTaskModal(data, force = false) {
   if (!old || old.id !== task.id || !$("#task-form")) return;
   const posts = data.discussion || [];
   fillTaskForm(task, old, force);
+  syncMdField("f-desc", task.description, force);
   $("#task-head").innerHTML = taskHeadHtml(task);
   setHtml($("#task-meta"), taskMetaHtml(task));
   setHtml($("#task-result"), taskResultHtml(task));
@@ -1017,11 +1126,11 @@ function threadHtml(posts) {
   const byId = new Map(posts.map((p) => [p.id, p]));
   return threadOrder(posts).map(({ post: p, depth }) => {
     const parent = p.reply_to ? byId.get(p.reply_to) : null;
-    const replyLink = p.reply_to ? ` <button class="link reply-link" type="button" data-goto-post="${Number(p.reply_to)}" title="${esc(t("reply_to_post"))}">↪ ${esc(parent ? displayName(parent.author) : "#" + Number(p.reply_to))}</button>` : "";
+    const replyLink = p.reply_to ? ` <button class="link reply-link" type="button" data-goto-post="${Number(p.reply_to)}" title="${esc(t("reply_to_post"))}"><i class="ic ic-reply"></i>${esc(parent ? displayName(parent.author) : "#" + Number(p.reply_to))}</button>` : "";
     return `<div class="post${depth ? " reply" : ""}" id="post-${Number(p.id)}" style="margin-left:${Math.min(depth, 4) * 22}px">
     <div class="post-head">${avatar(p.author, "sm")}<b>${esc(displayName(p.author))}</b>${replyLink}<span>· ${esc(fmtTime(p.ts))}</span>
     <span class="post-actions"><button class="link" type="button" data-reply="${Number(p.id)}">${esc(t("reply"))}</button></span></div>
-    <div class="post-body">${linkify(p.text)}</div></div>`;
+    <div class="post-body">${md(p.text)}</div></div>`;
   }).join("");
 }
 
@@ -1043,7 +1152,7 @@ function setReply(postId) {
   const parent = $("#post-" + Number(postId) + " .post-head b");
   const el = $("#reply-to");
   el.classList.remove("hidden");
-  el.innerHTML = `${esc(t("replying_to"))} <b>${esc(parent ? parent.textContent : "#" + postId)}</b> <button class="link" type="button" id="reply-cancel" title="${esc(t("cancel"))}">✕</button>`;
+  el.innerHTML = `${esc(t("replying_to"))} <b>${esc(parent ? parent.textContent : "#" + postId)}</b> <button class="link" type="button" id="reply-cancel" title="${esc(t("cancel"))}" aria-label="${esc(t("cancel"))}"><i class="ic ic-close"></i></button>`;
   $("#reply-cancel").addEventListener("click", clearReply);
   $("#post-text").focus();
 }
@@ -1177,10 +1286,10 @@ function attachMentions(textarea, menu) {
 
 /* ---------------------------------------------------------------- new task, goal, hire, settings */
 function newTaskModal() {
-  openModal(`<div class="modal-head"><h3>${esc(t("new_task"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}">✕</button></div>
+  openModal(`<div class="modal-head"><h3>${esc(t("new_task"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
     <div class="form-grid">
       <label class="field full"><span>${esc(t("title"))} *</span><input id="n-title" maxlength="200"></label>
-      <label class="field full"><span>🎯 ${esc(t("goal_field"))} *</span><textarea id="n-goal" rows="2" placeholder="${esc(t("goal_hint"))}"></textarea></label>
+      <label class="field full"><span><i class="ic ic-goal"></i>${esc(t("goal_field"))} *</span><textarea id="n-goal" rows="2" placeholder="${esc(t("goal_hint"))}"></textarea></label>
       <label class="field full"><span>${esc(t("description"))}</span><textarea id="n-desc" rows="4"></textarea></label>
       <label class="field"><span>${esc(t("assignee"))}</span><select id="n-assignee">${memberOptions("")}</select></label>
       <label class="field"><span>${esc(t("reviewer"))}</span><select id="n-reviewer">${memberOptions("", true, reviewerNone())}</select></label>
@@ -1209,13 +1318,13 @@ function goalModal() {
   const session = S.state.swarm.session;
   const goal = S.state.swarm.goal || (session && session.pending_goal) || null;
   const done = goal && goal.status === "done";
-  openModal(`<div class="modal-head"><h3>🎯 ${esc(t("set_goal"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}">✕</button></div>
-    ${done ? `<div class="section-title">${esc(t("goal_summary"))}</div><div class="result-box">${linkify(goal.summary || "")}</div>
+  openModal(`<div class="modal-head"><h3><i class="ic ic-goal"></i> ${esc(t("set_goal"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
+    ${done ? `<div class="section-title">${esc(t("goal_summary"))}</div><div class="result-box">${md(goal.summary || "")}</div>
       <label class="field" style="margin-top:10px"><span>${esc(t("reopen_comment"))}</span><textarea id="g-reopen" rows="2"></textarea></label>
       <div class="modal-actions start"><button class="btn" id="g-reopen-btn" type="button">${esc(t("reopen"))}</button></div>` : ""}
     <div class="form-grid" style="margin-top:10px">
       <label class="field full"><span>${esc(t("goal_title"))} * <span class="hint">${esc(t("goal_split_hint"))}</span></span><textarea id="g-title" rows="3"></textarea></label>
-      <label class="field full"><span>${esc(t("goal_desc"))}</span><textarea id="g-desc" rows="6"></textarea></label>
+      ${mdFieldHtml("g-desc", t("goal_desc"), goal ? goal.description : "", 6)}
     </div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="g-save" type="button">${esc(t("save"))}</button></div>`);
   $("#g-title").value = goal ? goal.title : "";
@@ -1247,7 +1356,7 @@ function rolePreviewHtml(catalog, name) {
   if (!String(name || "").trim()) return "";
   const role = findRole(catalog, name);
   if (!role) return esc(t("role_new"));
-  return esc(role.description) + (role.model ? ` <span class="badge plain">${esc(t("role_model", { model: role.model }))}</span>` : "");
+  return md(role.description) + (role.model ? `<span class="badge plain">${esc(t("role_model", { model: role.model }))}</span>` : "");
 }
 /** hire_agent arguments of the hire form. `instructions` is always sent ("" is fine for a catalog role, but the
  * tool requires the parameter); `model` only when one is chosen, so that the role's own profile applies. */
@@ -1265,7 +1374,7 @@ async function hireModal() {
     known = [...catalog, ...(data.hidden || [])];
   } catch (e) { console.error(e); }  // no catalog: any role still works
   const models = S.state.swarm.models && S.state.swarm.models.length ? S.state.swarm.models : ["default"];
-  openModal(`<div class="modal-head"><h3>${esc(t("hire_title"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}">✕</button></div>
+  openModal(`<div class="modal-head"><h3>${esc(t("hire_title"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
     <div class="form-grid">
       <label class="field"><span>${esc(t("role"))} *</span><input id="h-role" list="h-roles" autocomplete="off"><datalist id="h-roles">${catalog.map((r) => `<option value="${esc(r.name)}"></option>`).join("")}</datalist></label>
       <label class="field"><span>${esc(t("model"))}</span><select id="h-model"><option value="">${esc(t("model_auto"))}</option>${models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join("")}</select></label>
@@ -1292,19 +1401,129 @@ function limitsArgs(costText, agentsText) {
   return { max_cost_usd: cost, max_agents: agents };
 }
 
-function settingsModal() {
+// Per-session settings of the dialog (overrides of a launcher session, PATCH /api/sessions/{sid} "settings"; the
+// budget and max agents live in the session's database instead). kind: "int" a whole number >= min, "num" a number
+// >= min, "auto" ([shell] cpu_threads) "auto" or a whole number >= 0; the minimums are config.py's.
+const SESSION_FIELDS = [
+  { group: "jobs", section: "shell", key: "max_jobs_per_member", label: "sf_jobs", kind: "int", min: 0 },
+  { group: "jobs", section: "shell", key: "max_jobs", label: "sf_jobs_total", kind: "int", min: 0 },
+  { group: "jobs", section: "shell", key: "job_max_minutes", label: "sf_job_minutes", kind: "int", min: 0 },
+  { group: "jobs", section: "shell", key: "cpu_threads", label: "sf_cpu", kind: "auto", min: 0 },
+  { group: "agents", section: "agents", key: "max_steps_per_turn", label: "sf_steps", kind: "int", min: 1 },
+  { group: "agents", section: "agents", key: "context_tokens", label: "sf_context", kind: "int", min: 1 },
+  { group: "agents", section: "agents", key: "tool_output_chars", label: "sf_tool_out", kind: "int", min: 1 },
+  { group: "agents", section: "agents", key: "idle_nudge_seconds", label: "sf_nudge", kind: "num", min: 0 },
+  { group: "agents", section: "agents", key: "max_parallel_llm_calls", label: "sf_parallel", kind: "int", min: 1 },
+];
+function sessionFieldId(f) { return `sf-${f.section}-${f.key}`; }
+/** The session's own value of a field; undefined when it inherits the global one. */
+function sessionOverride(overrides, f) {
+  const section = overrides && overrides[f.section];
+  return section && typeof section === "object" && section[f.key] !== null && section[f.key] !== "" ? section[f.key] : undefined;
+}
+/** What a field's text means: {value} (null for an empty field: the global value) or {error}. */
+function parseSessionField(f, text) {
+  const raw = String(text ?? "").trim();
+  if (raw === "") return { value: null };
+  if (f.kind === "auto" && raw.toLowerCase() === "auto") return { value: "auto" };
+  const ok = f.kind === "num" ? /^\d+([.,]\d+)?$/.test(raw) : /^\d+$/.test(raw);
+  const value = Number(raw.replace(",", "."));
+  if (ok && Number.isFinite(value) && value <= Number.MAX_SAFE_INTEGER && value >= f.min) return { value };
+  const key = f.kind === "auto" ? "sf_bad_auto" : f.kind === "num" ? "sf_bad_num" : "sf_bad_int";
+  return { error: t(key, { field: t(f.label), min: f.min }) };
+}
+/** {patch, errors} of the dialog's texts ({"section.key": text}): the "settings" of PATCH /api/sessions/{sid} with
+ * only the keys that differ from the session's overrides (an emptied field is null: the global value again), and
+ * [{field, text}] for the invalid ones. */
+function sessionSettingsPatch(texts, overrides, fields = SESSION_FIELDS) {
+  const patch = {}, errors = [];
+  for (const f of fields) {
+    const parsed = parseSessionField(f, texts[`${f.section}.${f.key}`]);
+    if (parsed.error) { errors.push({ field: f, text: parsed.error }); continue; }
+    const own = sessionOverride(overrides, f);
+    // a value stored as text ("4" in a hand-edited file) is the same as the number
+    const same = parsed.value === null ? own === undefined : own !== undefined && String(own).trim().toLowerCase() === String(parsed.value);
+    if (!same) (patch[f.section] = patch[f.section] || {})[f.key] = parsed.value;
+  }
+  return { patch, errors };
+}
+/** The hint of the context field: a model profile's own window wins over this one (and the session's profile has one). */
+function contextHint(config) {
+  const profile = config && config.agents ? config.agents.default_model : null;
+  const own = profile && config.models && config.models[profile] ? config.models[profile].context_tokens : null;
+  return t("sf_context_hint") + (own ? "; " + t("sf_context_profile", { profile, n: own }) : "");
+}
+/** The per-session groups of the dialog: each input holds the session's own value, its placeholder the global one. */
+function sessionFieldsHtml(overrides, defaults, config, fields = SESSION_FIELDS) {
+  const field = (f) => {
+    const own = sessionOverride(overrides, f);
+    const inherited = defaults && defaults[f.section] ? defaults[f.section][f.key] : undefined;
+    const hint = f.key === "context_tokens" ? ` <span class="hint">${esc(contextHint(config))}</span>` : "";
+    const mode = f.kind === "int" ? "numeric" : f.kind === "num" ? "decimal" : "text";
+    return `<label class="field"><span>${esc(t(f.label))}${hint}</span><input id="${sessionFieldId(f)}" inputmode="${mode}" autocomplete="off" value="${esc(own ?? "")}" placeholder="${esc(inherited ?? "")}" data-empty-edit></label>`;
+  };
+  const group = (name, title) => `<div class="section-title">${esc(title)}</div>
+    <div class="form-grid">${fields.filter((f) => f.group === name).map(field).join("")}</div>`;
+  return group("jobs", t("sg_jobs")) + group("agents", t("agents"))
+    + `<p class="muted" style="font-size:12px;margin:10px 0 0">${esc(t("sf_hint"))}</p>`;
+}
+
+async function settingsModal() {
   const lim = S.state.swarm.limits;
-  openModal(`<div class="modal-head"><h3>⚙ ${esc(t("settings"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}">✕</button></div>
+  const cost = Number(lim.max_cost_usd) || 0, maxAgents = Number(lim.max_agents) || 1;
+  // a launcher session also gets its own background-job limits and agents' parameters; the main session (the
+  // global settings themselves) and a standalone swarm app keep them in the general settings
+  const sid = sessionSid();
+  const perSession = Boolean(sid && sid !== "main");
+  let session = null;
+  if (perSession) {
+    // ⚙ stays disabled while loading: the click shows something is happening, and a second one does not open it twice
+    const btn = $("#settings-btn");
+    if (btn) btn.disabled = true;
+    try {
+      const [detail, global] = await Promise.all([launcherApi(`/api/sessions/${encodeURIComponent(sid)}`), launcherApi("/api/settings")]);
+      session = { overrides: detail.session.overrides || {}, config: detail.config, defaults: global.settings };
+    } catch (e) { toast(t("sf_load_failed", { error: errText(e) }), "err"); }
+    finally { if (btn) btn.disabled = false; }
+    // a modal opened while loading (a task with a half-typed comment, say) is not replaced behind the user's back
+    if (modalOpen()) return;
+  }
+  const muted = (key) => `<p class="muted" style="font-size:12px;margin:10px 0 0">${esc(t(key))}</p>`;
+  openModal(`<div class="modal-head"><h3>${esc(t("settings"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
     <div class="form-grid">
-      <label class="field"><span>${esc(t("max_cost"))}</span><input id="s-cost" type="number" min="0" step="0.5" value="${Number(lim.max_cost_usd) || 0}"></label>
-      <label class="field"><span>${esc(t("max_agents"))}</span><input id="s-agents" type="number" min="1" step="1" value="${Number(lim.max_agents) || 1}"></label>
+      <label class="field"><span>${esc(t("max_cost"))}</span><input id="s-cost" type="number" min="0" step="0.5" value="${cost}"></label>
+      <label class="field"><span>${esc(t("max_agents"))}</span><input id="s-agents" type="number" min="1" step="1" value="${maxAgents}"></label>
     </div>
+    ${session ? sessionFieldsHtml(session.overrides, session.defaults, session.config)
+      : muted(perSession ? "sf_not_loaded" : "sf_general_only")}
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="s-save" type="button">${esc(t("save"))}</button></div>`);
   $("#s-save").addEventListener("click", async () => {
     const args = limitsArgs($("#s-cost").value, $("#s-agents").value);
     if (!args) { toast(t("invalid_limits"), "err"); return; }
-    const res = await act("swarm_control", args);
-    if (res.ok) closeModal(true);
+    let patch = {};
+    if (session) {
+      const texts = Object.fromEntries(SESSION_FIELDS.map((f) => [`${f.section}.${f.key}`, $("#" + sessionFieldId(f)).value]));
+      const result = sessionSettingsPatch(texts, session.overrides);
+      if (result.errors.length) { toast(result.errors[0].text, "err"); $("#" + sessionFieldId(result.errors[0].field)).focus(); return; }
+      patch = result.patch;
+    }
+    // first the session settings (a stopped session takes them too); swarm_control only when the limits changed
+    let saved = false;
+    if (Object.keys(patch).length) {
+      try {
+        const data = await launcherApi(`/api/sessions/${encodeURIComponent(sid)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ settings: patch }) });
+        session.overrides = data.session.overrides || {};  // a second save (after a failed limits change) does not resend them
+        // stored now: closing the dialog after a failed limits change does not offer to discard them
+        if (S.modalInitial) for (const f of SESSION_FIELDS) S.modalInitial.set(sessionFieldId(f), $("#" + sessionFieldId(f)).value);
+        saved = true;
+      } catch (e) { toast(errText(e), "err"); return; }
+    }
+    if (args.max_cost_usd !== cost || args.max_agents !== maxAgents) {
+      const res = await act("swarm_control", args);
+      // the dialog stays open on the limits' error; say that the session settings did get through
+      if (!res.ok) { if (saved) toast(t("sf_saved_part")); return; }
+    } else if (saved) toast(t("saved"));
+    closeModal(true);
   });
 }
 
@@ -1319,7 +1538,7 @@ function renderMcp() {
       ${s.owner ? `<span class="muted">${esc(t("owner"))}: ${esc(displayName(s.owner))}</span>` : ""}
       ${s.status === "pending" ? `<span class="spacer"></span><button class="btn small primary" data-mcp-approve="${esc(s.name)}" type="button">${esc(t("approve_mcp"))}</button>
       <button class="btn small danger" data-mcp-reject="${esc(s.name)}" type="button">${esc(t("reject_mcp"))}</button>` : ""}</div>
-    <div class="desc">${esc(s.description || "")}</div>
+    <div class="desc">${md(s.description || "")}</div>
     ${(s.tools || []).length ? `<div class="tools">${s.tools.map((x) => `<code>${esc(x)}</code>`).join("")}</div>` : ""}
     ${s.error ? `<pre class="muted err-text">${esc(s.error)}</pre>` : ""}
   </div>`).join("") : `<div class="empty">${esc(t("no_mcp"))}</div>`);
@@ -1339,10 +1558,10 @@ function deleteTrigger(id) {
 function renderTriggers() {
   const items = S.state.triggers || [];
   setHtml($("#trigger-list"), items.length ? items.map((x) => `<div class="item">
-    <div class="item-head"><b>#${Number(x.id)}</b><span class="cond">${esc(x.condition)}</span>${x.once ? "" : `<span class="badge" title="${esc(t("periodic"))}">↻</span>`}
+    <div class="item-head"><b>#${Number(x.id)}</b><span class="cond">${esc(x.condition)}</span>${x.once ? "" : `<span class="badge" title="${esc(t("periodic"))}"><i class="ic ic-repeat"></i></span>`}
       <span class="muted">${esc(t("owner"))}: ${esc(displayName(x.owner))} · ${esc(t("fired"))}: ${Number(x.fire_count) || 0}</span>
       <span class="spacer"></span><button class="btn small danger" data-trigger-del="${Number(x.id)}" type="button">${esc(t("delete"))}</button></div>
-    ${x.note ? `<div class="desc">${linkify(x.note)}</div>` : ""}
+    ${x.note ? `<div class="desc">${md(x.note)}</div>` : ""}
     ${x.actions && JSON.stringify(x.actions) !== '[{"type":"wake"}]' ? `<div class="desc"><code>${esc(JSON.stringify(x.actions))}</code></div>` : ""}
     ${x.last_error ? `<div class="desc err-text">${esc(x.last_error)}</div>` : ""}
   </div>`).join("") : `<div class="empty">${esc(t("no_triggers"))}</div>`);
@@ -1565,9 +1784,36 @@ function renderFileList() {
   setHtml($("#file-list"), entries.map((e) => {
     const name = e.path.split("/").pop();
     const dir = e.type === "dir";
-    const lock = locks.has(e.path) ? ` <span class="lock" title="${esc(t("locked_by", { owner: displayName(locks.get(e.path)) }))}">🔒</span>` : "";
-    return `<div class="file-entry${e.path === S.openFile ? " active" : ""}" role="button" tabindex="0" data-${dir ? "dir" : "file"}="${esc(e.path)}"><span class="file-name">${dir ? "📁" : "📄"} ${esc(name)}${lock}</span><span class="size">${dir ? "" : esc(fmtSize(e.size))}</span></div>`;
+    const lock = locks.has(e.path) ? ` <span class="lock" title="${esc(t("locked_by", { owner: displayName(locks.get(e.path)) }))}"><i class="ic ic-lock"></i></span>` : "";
+    return `<div class="file-entry${e.path === S.openFile ? " active" : ""}" role="button" tabindex="0" data-${dir ? "dir" : "file"}="${esc(e.path)}"><span class="file-name">${dir ? '<i class="ic ic-folder"></i>' : '<i class="ic ic-file"></i>'}${esc(name)}${lock}</span><span class="size">${dir ? "" : esc(fmtSize(e.size))}</span></div>`;
   }).join("") || `<div class="empty">${esc(t("empty"))}</div>`);
+}
+function isMarkdownPath(path) { return /\.(md|markdown)$/i.test(String(path || "")); }
+/** What the file viewer shows: a Markdown file formatted (unless the user switched to its source), any other as text. */
+function fileView(path, content, source) {
+  const markdown = isMarkdownPath(path);
+  const formatted = markdown && !source;
+  return { markdown, formatted, html: formatted ? md(content) : "" };
+}
+/** The text of a file (or a .md source) with syntax highlighting by its name (highlight.js: escaped, only spans; a
+ * file of an unknown kind or above Highlight.MAX_CHARS stays plain). */
+function codeHtml(path, text) { return HIGHLIGHT.render(text, HIGHLIGHT.language(path)); }
+/** The open file's text in the viewer (S.fileText), formatted or as its source (S.fileSource, the toggle). */
+function renderFileContent() {
+  const view = fileView(S.openFile, S.fileText || "", S.fileSource);
+  setHtml($("#file-content"), view.formatted ? "" : codeHtml(S.openFile, S.fileText || ""));
+  $("#file-content").classList.toggle("hidden", view.formatted);
+  const box = $("#file-md");
+  setHtml(box, view.html);
+  box.classList.toggle("hidden", !view.formatted);
+  const mode = $("#file-mode");
+  mode.classList.toggle("hidden", !view.markdown);
+  mode.textContent = t(S.fileSource ? "md_formatted" : "md_source");
+}
+function toggleFileSource() {
+  S.fileSource = !S.fileSource;
+  store("dt-md-source", S.fileSource ? "1" : "0");
+  renderFileContent();
 }
 async function openFile(path, quiet = false) {
   try {
@@ -1575,8 +1821,9 @@ async function openFile(path, quiet = false) {
     const view = $(".file-view");
     const keep = S.openFile === path ? view.scrollTop : 0;
     S.openFile = path;
+    S.fileText = data.content || "";
     $("#file-path").textContent = path + (data.truncated ? " " + t("truncated") : "");
-    $("#file-content").textContent = data.content || "";
+    renderFileContent();
     view.scrollTop = keep;
     renderFileList();
     if (!quiet && isNarrow()) view.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -1600,13 +1847,13 @@ function handleEvent(ev) {
     if (S.chatWith === d.agent && S.dtab === "activity") appendActivity(ev);
     return;
   }
-  if (ev.type === "notification" && d.recipient === "user") toast("🔔 " + short(d.text, 400));
+  if (ev.type === "notification" && d.recipient === "user") toast(short(d.text, 400));
   if (ev.type === "message.sent") {
     const m = d.message || {};
     const rcpt = m.recipients || [];
     const involvesOpen = S.chatWith === "all" || (S.chatWith && (m.sender === S.chatWith || rcpt.includes(S.chatWith)) && (m.sender === "user" || rcpt.includes("user")));
     if (involvesOpen) scheduleMessages(100);
-    else if (rcpt.includes("user")) toast(`💬 ${m.sender}: ${short(m.text, 200)}`, "", () => openChat(m.sender));
+    else if (rcpt.includes("user")) toast(`${m.sender}: ${short(m.text, 200)}`, "", () => openChat(m.sender));
   }
   if (S.openTaskId && ((ev.type === "task.updated" && d.task && d.task.id === S.openTaskId)
       || (ev.type === "task.comment" && d.task_id === S.openTaskId))) refreshOpenTask(150);
@@ -1702,7 +1949,7 @@ function applyTheme(theme) {
 }
 
 function onDocumentClick(e) {
-  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path");
+  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path");
   if (!target) {
     if (document.body.classList.contains("team-open") && !e.target.closest(".sidebar, #team-btn")) toggleTeamOverlay(false);
     return;
@@ -1720,6 +1967,7 @@ function onDocumentClick(e) {
   else if ("jobOut" in ds) toggleJobOutput(Number(ds.jobOut));
   else if ("jobStop" in ds) stopJob(Number(ds.jobStop));
   else if ("jobLog" in ds) openJobLog(ds.jobLog);
+  else if ("mdEdit" in ds) editMdField(ds.mdEdit);
   else if ("retire" in ds) { if (confirm(t("retire_confirm"))) act("retire_agent", { name: ds.retire, reason: "retired by the user" }); }
   else if ("traces" in ds) { if (typeof openTraces === "function") { if (isNarrow()) closeDrawer(); openTraces(ds.traces); } }
   else if ("agent" in ds) openChat(ds.agent);
@@ -1738,6 +1986,7 @@ function onKeydown(e) {
 
 function init() {
   S.lang = store("dt-lang") || "ru";
+  S.fileSource = store("dt-md-source") === "1";
   applyTheme(store("dt-theme"));
   applyI18n();
   const onResize = () => { applyTeamLayout(); if (!isNarrow()) toggleTeamOverlay(false); };
@@ -1767,6 +2016,7 @@ function init() {
   });
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#start-session-btn").addEventListener("click", startSession);
+  $("#file-mode").addEventListener("click", toggleFileSource);
   $("#composer").addEventListener("submit", (e) => { e.preventDefault(); sendComposer(); });
   $("#composer-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendComposer(); } });
   $("#search").addEventListener("input", (e) => { S.search = e.target.value.trim(); if (S.tab === "board") renderBoard(); });
@@ -1793,13 +2043,19 @@ if (typeof module !== "undefined" && module.exports) {
     // review, the hire dialog (role catalog), the goal dialog
     reviewerNone, taskReviewHtml, reviewTask, moveTask, findRole, rolePreviewHtml, hireArgs, hireModal, goalModal,
     // used by traces.js (the tests load it on top of these) and by the session-chrome tests
-    BASE, $, $$, api, post, act, toast, avatar, members, fmtTime, short, openModal, closeModal, setTab, store, setHtml,
+    BASE, $, $$, api, post, act, toast, avatar, agentColor, members, fmtTime, short, openModal, closeModal, setTab, store, setHtml,
     renderHeader, responseError, errText, startSession, connect,
     // the session folder (the Files tab head, the missing-folder banner)
     workspaceKind, workspaceMissing, workspaceHtml, syncWorkspace, openDir, renderAll,
     // background jobs: the Jobs tab, the agent marker and the drawer, live events
     fmtDur, jobState, jobCardHtml, renderJobs, loadJobOutput, toggleJobOutput, stopJob, openJobLog, tickJobs,
     processNames, runningJobs, renderAgents, renderDrawerHead, handleEvent, onDocumentClick,
+    // the settings dialog: the session's own background-job limits and agents' parameters
+    SESSION_FIELDS, sessionSid, launcherApi, sessionFieldId, sessionOverride, parseSessionField, sessionSettingsPatch, contextHint,
+    sessionFieldsHtml, settingsModal,
+    // Markdown (markdown.js) where agents', members' and the user's texts are shown
+    md, decorate, MD_CACHE, mdFieldHtml, syncMdField, editMdField, taskResultHtml, renderTaskModal, updateTaskModal,
+    renderMcp, renderTriggers, fileView, renderFileContent, toggleFileSource, openFile, isMarkdownPath, codeHtml,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

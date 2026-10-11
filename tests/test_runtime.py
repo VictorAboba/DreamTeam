@@ -1291,6 +1291,55 @@ async def test_reconfigure_applies_new_settings_to_a_running_swarm(tmp_path):
         await shutdown(swarm)
 
 
+async def test_settings_saved_during_an_llm_call_do_not_close_its_client(tmp_path):
+    """reconfigure while an agent's request runs: the request finishes on its own client, which is closed only
+    after it returns (closing it under the call crashed the activation: "the client has been closed")."""
+    gate, in_call = asyncio.Event(), asyncio.Event()
+    built: list[str] = []
+    closed: list[str] = []
+
+    class ClosableLLM(ScriptedLLM):
+        is_closed = False
+
+        async def complete(self, system, messages, tools):
+            result = await super().complete(system, messages, tools)
+            if self.is_closed:  # as httpx: a request on a client closed meanwhile fails
+                raise RuntimeError("Cannot send a request, as the client has been closed.")
+            return result
+
+        async def aclose(self) -> None:
+            self.is_closed = True
+            closed.append(self.profile.model)
+
+    async def handler(*a):
+        if not gate.is_set():
+            in_call.set()
+            await gate.wait()
+        return call("wait")
+
+    def factory(profile, agent):
+        built.append(profile.model)
+        return ClosableLLM(handler, profile)
+
+    swarm = Swarm(config=make_config(tmp_path), llm_factory=factory)
+    await swarm.start()
+    try:
+        agent = swarm.members()[0]["name"]
+        swarm.notify(agent, "n_restart")
+        await asyncio.wait_for(in_call.wait(), 10)
+        swarm.reconfigure(make_config(tmp_path, models={"default": {"provider": "scripted", "model": "scripted-2"}}))
+        await asyncio.sleep(0.05)
+        assert closed == []  # still in use by the running call
+        gate.set()
+        await run_until(lambda: closed == ["scripted"] and swarm.member(agent)["status"] == AgentStatus.IDLE)
+        assert swarm.runtimes[agent]._last_error is None and not swarm.runtimes[agent].interrupted
+        swarm.notify(agent, "n_restart")
+        await run_until(lambda: built == ["scripted", "scripted-2"] and swarm.member(agent)["status"] == AgentStatus.IDLE)
+        assert closed == ["scripted"]
+    finally:
+        await shutdown(swarm)
+
+
 async def test_snapshot_session_fields(tmp_path):
     swarm, rec = make_swarm(tmp_path, lambda *a: call("wait"))
     await swarm.start(run_agents=False)
