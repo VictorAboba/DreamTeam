@@ -9,7 +9,7 @@ import time
 from typing import Any, Iterable, Iterator
 
 from .db import Database, dumps, loads
-from .models import ALL, ToolError
+from .models import ALL, USER, ToolError
 
 log = logging.getLogger(__name__)
 
@@ -76,7 +76,7 @@ class Mailbox:
         if len(body) > MAX_TEXT:
             raise ToolError(f"Message is too long ({len(body)} chars, max {MAX_TEXT}). Put long content into a "
                             "workspace file and send its path.")
-        recipients = self._recipients(sender, to)
+        recipients, broadcast = self._recipients(sender, to)
         reply = self._check_reply(reply_to)
         context = _SEEN_BY.get()  # the sender's own other identities (sent_as_seen_by)
         seen = context[1] if context is not None and context[0] == sender else frozenset()
@@ -92,16 +92,26 @@ class Mailbox:
                    "reply_to": reply}
         log.info("message #%s from %s to %s", message_id, sender, ", ".join(recipients))
         self.swarm.bus.emit("message.sent", sender, message=message)
+        # A member's broadcast does not wake an agent asleep while it waits for its own job: that job's end wakes it
+        # and shows the message then (a wake-up only to read "all" news would re-read its whole context). Personal
+        # messages and the user's messages wake as always.
+        waits_for_job = getattr(self.swarm, "waits_for_job", None) if sender != USER else None
         for name in recipients:
-            if name not in seen:
-                self.swarm.signal(name)
+            if name in seen:
+                continue
+            if name in broadcast and waits_for_job is not None and waits_for_job(name):
+                self.swarm.defer_wake(name)
+                continue
+            self.swarm.signal(name)
         return message
 
-    def _recipients(self, sender: str, to: str | list[str] | None) -> list[str]:
+    def _recipients(self, sender: str, to: str | list[str] | None) -> tuple[list[str], set[str]]:
+        """The recipients in order, and those of them reached only through "all" (not named)."""
         items = self._split(to)
         if not items:
             raise ToolError('No recipients. Use a member name, a list of names, "all" or "user".')
         resolved: list[str] = []
+        named: set[str] = set()
         named_self = False
         for item in items:
             if item.lower() == ALL:
@@ -110,6 +120,7 @@ class Mailbox:
                 name = self.swarm.resolve_member(item, allow_user=True)
                 named_self = named_self or name == sender
                 resolved.append(name)
+                named.add(name)
         recipients: list[str] = []
         for name in resolved:
             if name != sender and name not in recipients:
@@ -118,7 +129,7 @@ class Mailbox:
             if named_self:
                 raise ToolError("You cannot send a message only to yourself. Use `update_notes` to keep notes.")
             raise ToolError('No recipients: there are no other active members. Message "user" or hire someone.')
-        return recipients
+        return recipients, set(recipients) - named
 
     @staticmethod
     def _split(to: str | list[str] | None) -> list[str]:

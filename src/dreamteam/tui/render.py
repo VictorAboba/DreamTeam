@@ -44,7 +44,7 @@ EVENT_TYPES = (
     "goal.completed", "goal.reopened", "agent.hired", "agent.retired", "agent.status", "agent.activity",
     "agent.compacted", "agent.usage", "file.changed", "file.locked", "file.unlocked", "trigger.created",
     "trigger.fired", "trigger.deleted", "mcp.created", "mcp.status", "swarm.paused", "swarm.resumed",
-    "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
+    "swarm.wrap_up", "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
     "sessions.changed", "_connection",
 )
 ACTIVITY_KINDS = ("wake", "thinking", "text", "tool_call", "tool_result", "error", "nudge", "compacted")
@@ -895,6 +895,14 @@ def _ev_resumed(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     return _line(ctx, ctx.sym["play"], theme.OK, Text(ctx.t("resumed"), style=theme.OK))
 
 
+def _ev_wrap_up(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """The user's wrap-up mode switched on (a warning line, like a pause) or off."""
+    who = _who(ctx, ev.get("actor") or "user")
+    if d.get("on"):
+        return _line(ctx, ctx.sym["warn"], theme.WARN, Text(ctx.t("wrap_up_on", who=who), style=theme.WARN))
+    return _line(ctx, ctx.sym["dot"], "dim", Text(ctx.t("wrap_up_off", who=who), style="dim"))
+
+
 def _ev_limits(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     cost = _float(d.get("max_cost_usd"))
     budget = fmt_cost(cost) if cost > 0 else ctx.t("unlimited")
@@ -979,6 +987,7 @@ _HANDLERS: dict[str, Callable[[RenderContext, dict, dict], RenderableType | None
     "mcp.status": _ev_mcp,
     "swarm.paused": _ev_paused,
     "swarm.resumed": _ev_resumed,
+    "swarm.wrap_up": _ev_wrap_up,
     "swarm.limits": _ev_limits,
     "job.started": _ev_job,
     "job.ended": _ev_job,
@@ -1456,6 +1465,8 @@ def _session_status(ctx: RenderContext, s: dict) -> tuple[str, str]:
     if s.get("status") == "running":
         if s.get("paused"):
             return ctx.t("sess_paused"), theme.WARN
+        if s.get("wrap_up"):  # the user's wrap-up mode (as the launcher's card shows it)
+            return ctx.t("sess_wrap_up"), theme.WARN
         return ctx.t("sess_running"), theme.ACCENT
     return ctx.t("sess_stopped"), "dim"
 

@@ -136,6 +136,8 @@ def session_line(s: dict[str, Any]) -> str:
     status = s.get("status", "?")
     if status == "running" and s.get("paused"):
         status = f"paused ({s.get('pause_reason') or 'user'})"
+    if status == "running" and s.get("wrap_up"):
+        status = "running, wrapping up"
     goal = s.get("goal") or {}
     tasks = s.get("tasks") or {}
     agents = s.get("agents") or {}

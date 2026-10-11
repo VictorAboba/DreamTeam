@@ -8,7 +8,11 @@ const I18N = {
     broadcast_hint: "лента роя и сообщение всем", tab_board: "Доска", tab_feed: "Лента", tab_files: "Файлы",
     tab_mcp: "MCP", tab_triggers: "Триггеры", search: "Поиск задач…", new_task: "+ Задача", chat: "Чат",
     activity: "Активность", type_message: "Сообщение… (Ctrl+Enter — отправить)", send: "Отправить",
-    pause: "Пауза", resume: "Продолжить", paused: "Рой на паузе", no_goal: "Цель не задана — нажмите, чтобы задать",
+    pause: "Пауза", resume: "Продолжить", paused: "Рой на паузе",
+    wrap_up: "Завершать", wrap_up_hint: "Попросить команду закругляться: агенты завершат свои задачи с тем, что есть, без новых вычислений и фоновых процессов",
+    wrap_up_on_hint: "Режим завершения включён — нажмите, чтобы выключить",
+    wrap_up_banner: "Режим завершения: агенты завершают свои задачи с тем, что есть; новые вычисления и фоновые процессы не запускаются",
+    no_goal: "Цель не задана — нажмите, чтобы задать",
     goal_active: "в работе", goal_done: "достигнута", s_todo: "К работе", s_in_progress: "В работе", s_waiting: "Ожидание",
     s_review: "Ревью", s_done: "Готово", s_failed: "Провалено", s_cancelled: "Отменено", s_closed: "Закрыто",
     a_idle: "свободен", a_working: "работает", a_paused: "пауза", a_error: "ошибка", a_retired: "покинул рой",
@@ -96,7 +100,11 @@ const I18N = {
     broadcast_hint: "swarm feed and message to all", tab_board: "Board", tab_feed: "Feed", tab_files: "Files",
     tab_mcp: "MCP", tab_triggers: "Triggers", search: "Search tasks…", new_task: "+ Task", chat: "Chat",
     activity: "Activity", type_message: "Message… (Ctrl+Enter to send)", send: "Send",
-    pause: "Pause", resume: "Resume", paused: "The swarm is paused", no_goal: "No goal yet — click to set one",
+    pause: "Pause", resume: "Resume", paused: "The swarm is paused",
+    wrap_up: "Wrap up", wrap_up_hint: "Ask the team to wrap up: the agents finish their tasks with what they have, with no new computations or background jobs",
+    wrap_up_on_hint: "Wrap-up mode is on: click to switch it off",
+    wrap_up_banner: "Wrap-up mode: the agents finish their tasks with what they have; no new computations or background jobs start",
+    no_goal: "No goal yet — click to set one",
     goal_active: "active", goal_done: "achieved", s_todo: "To do", s_in_progress: "In progress", s_waiting: "Waiting",
     s_review: "Review", s_done: "Done", s_failed: "Failed", s_cancelled: "Cancelled", s_closed: "Closed",
     a_idle: "idle", a_working: "working", a_paused: "paused", a_error: "error", a_retired: "retired",
@@ -445,6 +453,12 @@ function renderAll() {
 }
 
 /* ---------------------------------------------------------------- header */
+/** The wrap-up toggle: on (the team finishes with what it has, no new background jobs) or back off. */
+function toggleWrapUp() {
+  if (!S.state) return undefined;
+  return act("swarm_control", { wrap_up: !S.state.swarm.wrap_up });
+}
+
 function renderHeader() {
   const sw = S.state.swarm;
   const session = sw.session || null;
@@ -481,6 +495,16 @@ function renderHeader() {
   const banner = $("#paused-banner");
   banner.classList.toggle("hidden", !sw.paused);
   banner.textContent = sw.paused ? `${t("paused")}${sw.pause_reason ? ": " + tv("reason_", sw.pause_reason) : ""}` : "";
+  // the user's wrap-up mode: a toggle next to Pause (pressed while on) and a line under the header
+  const wrapping = !!sw.wrap_up;
+  const wrap = $("#wrap-btn");
+  setHtml(wrap, `<span aria-hidden="true"><i class="ic ic-check"></i></span><span class="btn-label">${esc(t("wrap_up"))}</span>`);
+  wrap.title = wrapping ? t("wrap_up_on_hint") : t("wrap_up_hint");
+  wrap.classList.toggle("on", wrapping);
+  wrap.setAttribute("aria-pressed", String(wrapping));
+  const wrapBanner = $("#wrapup-banner");
+  wrapBanner.classList.toggle("hidden", !wrapping);
+  wrapBanner.textContent = wrapping ? t("wrap_up_banner") : "";
   const mcpUrl = sw.mcp_url || `${location.origin}${BASE}/mcp`;
   setHtml($("#mcp-hint"), `${esc(t("mcp_hint"))}<br><code id="mcp-cmd" title="${esc(t("copy_hint"))}">claude mcp add --transport http dreamteam ${esc(mcpUrl)}</code>`);
   const pending = (S.state.mcp || []).filter((s) => s.status === "pending").length;
@@ -1721,6 +1745,8 @@ function describeEvent(ev) {
     case "mcp.status": return `MCP ${d.name}: ${tv("mcp_", d.status)}`;
     case "swarm.paused": return ru ? `рой на паузе (${tv("reason_", d.reason)})` : `swarm paused (${tv("reason_", d.reason)})`;
     case "swarm.resumed": return ru ? "рой продолжил работу" : "swarm resumed";
+    case "swarm.wrap_up": return d.on ? (ru ? `${who} включил(а) режим завершения: агенты завершают задачи с тем, что есть` : `${who} switched wrap-up mode on: the agents finish their tasks with what they have`)
+                                      : (ru ? `${who} выключил(а) режим завершения` : `${who} switched wrap-up mode off`);
     case "swarm.limits": return ru ? `лимиты: $${d.max_cost_usd}, агентов ${d.max_agents}` : `limits: $${d.max_cost_usd}, ${d.max_agents} agents`;
     case "job.started": {
       const job = d.job || {};
@@ -2006,6 +2032,7 @@ function init() {
   $("#team-close").addEventListener("click", () => toggleTeamOverlay(false));
   $("#team-btn").addEventListener("click", () => toggleTeamOverlay());
   $("#pause-btn").addEventListener("click", () => act("swarm_control", { action: S.state && S.state.swarm.paused ? "resume" : "pause" }));
+  $("#wrap-btn").addEventListener("click", toggleWrapUp);
   $("#lang-btn").addEventListener("click", () => setLang(S.lang === "ru" ? "en" : "ru"));
   $("#theme-btn").addEventListener("click", () => {
     const cur = document.documentElement.dataset.theme;
@@ -2044,7 +2071,7 @@ if (typeof module !== "undefined" && module.exports) {
     reviewerNone, taskReviewHtml, reviewTask, moveTask, findRole, rolePreviewHtml, hireArgs, hireModal, goalModal,
     // used by traces.js (the tests load it on top of these) and by the session-chrome tests
     BASE, $, $$, api, post, act, toast, avatar, agentColor, members, fmtTime, short, openModal, closeModal, setTab, store, setHtml,
-    renderHeader, responseError, errText, startSession, connect,
+    renderHeader, toggleWrapUp, responseError, errText, startSession, connect,
     // the session folder (the Files tab head, the missing-folder banner)
     workspaceKind, workspaceMissing, workspaceHtml, syncWorkspace, openDir, renderAll,
     // background jobs: the Jobs tab, the agent marker and the drawer, live events

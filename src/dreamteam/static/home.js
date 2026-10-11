@@ -11,6 +11,7 @@ const I18N = {
     empty_hint: "Опишите цель — рой сам спланирует задачи, распределит их между агентами и начнёт работу. Перед стартом проверьте модель в настройках.",
     no_match: "Ничего не найдено.", loading: "Загрузка…",
     st_running: "Работает", st_paused: "На паузе", st_stopped: "Остановлена", st_done: "Цель достигнута", st_pending: "ждёт запуска",
+    st_wrap_up: "Завершается", st_wrap_up_hint: "Режим завершения: агенты завершают задачи с тем, что есть, без новых вычислений",
     no_goal: "Цель не задана", tasks_done: "{done} из {total} задач", agents_n: "агентов", working_n: "работают",
     spent: "Потрачено", model: "Модель", last_activity: "Активность", created: "Создана",
     open: "Открыть", start: "Запустить", stop: "Остановить", delete: "Удалить", legacy: "проект",
@@ -119,6 +120,7 @@ const I18N = {
     empty_hint: "Describe a goal: the swarm plans the tasks, shares them out between agents and gets to work. Check the model in Settings first.",
     no_match: "Nothing found.", loading: "Loading…",
     st_running: "Running", st_paused: "Paused", st_stopped: "Stopped", st_done: "Goal reached", st_pending: "waiting to start",
+    st_wrap_up: "Wrapping up", st_wrap_up_hint: "Wrap-up mode: the agents finish their tasks with what they have, no new computations",
     no_goal: "No goal yet", tasks_done: "{done} of {total} tasks", agents_n: "agents", working_n: "working",
     spent: "Spent", model: "Model", last_activity: "Activity", created: "Created",
     open: "Open", start: "Start", stop: "Stop", delete: "Delete", legacy: "project",
@@ -421,6 +423,7 @@ function sessionCard(s) {
       <span class="dot ${state === "done" ? "" : state}"></span>
       <a class="sc-title" href="/s/${encodeURIComponent(s.id)}/" title="${esc(s.title)}">${esc(s.title)}</a>
       <span class="badge ${badgeCls}">${esc(t("st_" + state))}</span>
+      ${state === "running" && s.wrap_up ? `<span class="badge warn" title="${esc(t("st_wrap_up_hint"))}">${esc(t("st_wrap_up"))}</span>` : ""}
     </div>
     ${goal}
     <div class="sc-progress"><div class="meter"><div style="width:${pct}%"></div></div><span>${esc(t("tasks_done", { done: Number(tasks.done) || 0, total: Number(tasks.total) || 0 }))}</span></div>

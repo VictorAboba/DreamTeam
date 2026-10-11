@@ -39,7 +39,8 @@ share a git-versioned workspace, set triggers and build their own MCP tools.
 
 By default every call acts as the human USER of the swarm: you can read the board (`board`, `task_get`,
 `task_discussion`), set the global goal (`set_goal`), create and edit tasks, talk to any agent
-(`send_message`, `read_messages`), hire or retire agents, pause/resume and change limits (`swarm_control`),
+(`send_message`, `read_messages`), hire or retire agents, pause/resume, switch wrap-up mode (the team finishes its
+tasks with what it has and starts no new computations or background jobs) and change limits (`swarm_control`),
 approve MCP servers (`mcp_approve`) and wait for messages addressed to the user (`wait_for_events`; with
 `progress=true` it also returns when the board moves on). `jobs` and `job_stop` list and stop every member's
 background jobs.
@@ -51,7 +52,8 @@ To work INSIDE the swarm as a member, call `join_swarm(role=...)`: you get a uni
 not count toward the swarm's agent limit (max_agents). A `shell` command still running at its timeout (at most 600
 seconds over MCP) continues as a background job, and background=true starts one at once; processes a command leaves
 running become a job too. `jobs` shows jobs and their output, `job_stop` stops one, and a job's end reaches you
-through `wait_for_events`, so don't poll."""
+through `wait_for_events`, so don't poll. In the user's wrap-up mode no new background job starts: finish your tasks
+with what you have."""
 
 AS_AGENT = {
     "type": "string",

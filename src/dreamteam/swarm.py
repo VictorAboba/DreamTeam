@@ -122,6 +122,9 @@ class Swarm:
         self._review_lapsed: dict[int, set[str]] = {}  # task in review -> reviewers it was taken from (hand-over)
         self._user_reviews_key: frozenset[int] | None = None  # the user's reviews it was last told about
         self._notes_shown: dict[str, str] = {}  # agent -> digest of the notes last put into its context
+        # agents a broadcast reached without a wake while they wait for their own job (Mailbox.send): woken by the
+        # scheduler if that wait ends without the job's end waking them (_wake_deferred)
+        self._deferred: set[str] = set()
         self._missing_profiles: set[str] = set()  # members' profiles gone from the settings (warned once)
         self.stopping = False  # stop() runs or ran: long polls (wait_for_events) end without touching the db
         self.hub_url: str | None = None
@@ -364,6 +367,18 @@ class Swarm:
         finally:
             event.clear()
 
+    def waits_for_job(self, name: str) -> bool:
+        """An AI agent asleep (idle) while a command of its own runs on as a job it waits for (JobManager.busy) and
+        whose end will wake it (JobManager.awaited): a broadcast of another member reaches it without a wake."""
+        runtime = self.runtimes.get(name)
+        return (runtime is not None and runtime.state == AgentStatus.IDLE and self.jobs.busy(name)
+                and bool(self.jobs.awaited(name)))
+
+    def defer_wake(self, name: str) -> None:
+        """`name` got news without a wake (waits_for_job): its job's end shows it; should that wait end otherwise,
+        the scheduler wakes it (_wake_deferred)."""
+        self._deferred.add(name)
+
     def has_pending(self, name: str) -> bool:
         if self.db.scalar("SELECT 1 FROM inbox WHERE recipient = ? AND read_at IS NULL LIMIT 1", (name,)):
             return True
@@ -399,6 +414,8 @@ class Swarm:
             return f"{item_time(ts, now)} " if first is not None and ts else ""
 
         lines = [prompts.t(lang, "incoming_header" if incoming else "wake_header", time=stamp_range(first, now))]
+        if not incoming and self.wrapping_up:
+            lines.append(prompts.t(lang, "wrap_up_line"))
         if notes or messages:
             lines.append(prompts.t(lang, "reasons"))
             lines.extend(f"• {at(n['ts'])}{n['text']}" for n in notes)
@@ -470,6 +487,7 @@ class Swarm:
                 "set_by": actor, "updated_at": time.time()}
         self.db.set("goal", goal)
         self.bus.emit("goal.set", actor, goal=goal)
+        self.end_wrap_up(actor)  # a new goal is new work (its kickoff follows the quiet notice)
         planning = None
         if not self.board.list():
             p_title, p_goal, p_desc = prompts.PLANNING_TASK[self.language]
@@ -527,6 +545,7 @@ class Swarm:
         goal.update(status="active", updated_at=time.time())
         self.db.set("goal", goal)
         self.bus.emit("goal.reopened", actor, goal=goal, comment=comment)
+        self.end_wrap_up(actor)  # the missing parts are to be done now
         # One member re-plans: the one who declared the goal achieved, else the most recently active. Waking
         # everyone at once made them all create tasks for the same missing parts; the others are offered the
         # new tasks by the scheduler (n_ready) and see the reopened goal in their next wake-up.
@@ -732,6 +751,35 @@ class Swarm:
                 elif runtime is not None:
                     runtime.wake()  # paused -> idle
 
+    @property
+    def wrapping_up(self) -> bool:
+        """The user's wrap-up mode: the team finishes with what it has. Every wake-up says so (render_wake), and no
+        command of a member becomes a new background job (jobs.py). Nothing is paused."""
+        return bool((self.db.get("wrap_up") or {}).get("on"))
+
+    def wrap_up(self, actor: str) -> bool:
+        """Switch wrap-up mode on; every AI agent is told once (n_wrap_up). False when it was on already."""
+        if self.wrapping_up:
+            return False
+        self.db.set("wrap_up", {"on": True, "by": actor, "since": time.time()})
+        self.bus.emit("swarm.wrap_up", actor, on=True)
+        for m in self.members():
+            if m["kind"] == AgentKind.LLM:
+                self.notify(m["name"], "n_wrap_up")
+        return True
+
+    def end_wrap_up(self, actor: str) -> bool:
+        """Switch wrap-up mode off (the user, a new or reopened goal): a quiet notice for the next wake-up. False when
+        it was not on."""
+        if not self.wrapping_up:
+            return False
+        self.db.set("wrap_up", {"on": False})
+        self.bus.emit("swarm.wrap_up", actor, on=False)
+        for m in self.members():
+            if m["kind"] == AgentKind.LLM:
+                self.notify(m["name"], "n_wrap_up_end", wake=False)
+        return True
+
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient:
         if profile_name and profile_name not in self.config.models:
             # the member's profile (agents.model) was renamed or deleted in the settings: an error here would
@@ -757,6 +805,7 @@ class Swarm:
                 # an external member that stopped calling: its session trace ends at its last call
                 self.tracer.close_external(idle_seconds=EXTERNAL_IDLE_SECONDS)
                 if not self.paused:
+                    self._wake_deferred()
                     self._nudge_idle()
                     self._wake_stalled()
                     self._wake_idle_holders()
@@ -774,6 +823,17 @@ class Swarm:
         return [m for m in self.members()
                 if m["kind"] == AgentKind.LLM and m["status"] == AgentStatus.IDLE
                 and m["name"] in self.runtimes and not self.has_pending(m["name"]) and not self.jobs.busy(m["name"])]
+
+    def _wake_deferred(self) -> None:
+        """A broadcast reached an agent without a wake while it waited for its own job (defer_wake): if that wait
+        ended without a wake (the job stopped being busy, e.g. past its busy window, or its end is quiet now), the
+        news must not sit unread: wake it now."""
+        for name in list(self._deferred):
+            if name not in self.runtimes or not self.has_pending(name):
+                self._deferred.discard(name)  # shown already (or the member left)
+            elif not self.waits_for_job(name):
+                self._deferred.discard(name)
+                self.signal(name)
 
     def _nudge_idle(self) -> None:
         ready = self.board.ready_unassigned()
@@ -950,7 +1010,8 @@ class Swarm:
         if not idle:
             return
         self._all_done_key = key
-        self.notify(idle[0]["name"], "n_all_done")
+        # wrapping up: the goal is closed with what there is, no new tasks for what is missing
+        self.notify(idle[0]["name"], "n_all_done_wrap_up" if self.wrapping_up else "n_all_done")
 
     # ---- snapshot -----------------------------------------------------------------------------
     def workspace_info(self) -> dict:
@@ -993,7 +1054,7 @@ class Swarm:
         return {
             "swarm": {
                 "name": self.config.swarm.name, "language": self.language, "paused": bool(pause.get("paused")),
-                "pause_reason": pause.get("reason", ""), "limits": self.limits(),
+                "pause_reason": pause.get("reason", ""), "wrap_up": self.wrapping_up, "limits": self.limits(),
                 "agent_count": self.agent_count(),  # what limits.max_agents counts: external members do not
                 "spent_usd": round(self.spent_usd(), 4), "goal": goal, "counts": counts,
                 "mcp_url": self.hub_url, "models": list(self.config.models),

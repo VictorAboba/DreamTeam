@@ -247,7 +247,9 @@ class RenderContext:
 - Hires: `+ Анна Смирнова (Аналитик) присоединилась` (gendered verb not required: use «в команде»).
   Retire: `− Анна покинула рой`.
 - Pause/resume renders as `⏸ Рой на паузе (причина)` / `▶ Рой продолжает работу`.
-- Quiet shows only messages to/from the user, the goal, errors, approvals and pause/budget lines.
+- Wrap-up mode (`swarm.wrap_up`) renders as a warning line `⚠ вы: режим завершения — агенты завершают задачи с тем,
+  что есть, без новых вычислений и фоновых процессов` / a dim `· вы: режим завершения выключен`.
+- Quiet shows only messages to/from the user, the goal, errors, approvals and pause/budget/wrap-up lines.
 - Unicode symbols have ASCII fallbacks (`*`, `|_`, `[ ]`, `[~]`, `[x]`, `x`, `>`), used when the terminal
   encoding cannot encode them.
 
@@ -395,7 +397,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/help` | commands table + key hints |
 | `/new [цель]` | new session (asks for the goal when omitted: the next input is the goal); first line = title, the rest = description |
 | `/team [роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); without an argument shows it; the settings stay as they are |
-| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id |
+| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза») or, in the user's wrap-up mode, «завершается» / "wrapping up" |
 | `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
 | `/board` | the board (`board`) |
@@ -412,6 +414,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/status` | setup and session status (with the session folder) |
 | `/model [профиль]` | list model profiles (✓ default); with an argument set the default profile in the settings (new sessions and new hires) |
 | `/pause` | pause / resume the swarm (toggle, `swarm_control`) |
+| `/wrapup [off]` | wrap-up mode on (`on`/`вкл` or nothing) or off (`off`/`выкл`): the agents finish their tasks with what they have, start no new computations, and no new background jobs start (`swarm_control` wrap_up; the `swarm.wrap_up` event prints the change, a no-op prints the tool's answer) |
 | `/budget N`, `/max N` | limits |
 | `/approve имя`, `/approve N [комментарий]` | MCP approval; accept a task in review (`task_review`) |
 | `/reject имя [почему]`, `/reject N что исправить` | MCP rejection; return a task in review (the comment is required; after N it is free text taken as typed, without one pair of quotes around all of it) |

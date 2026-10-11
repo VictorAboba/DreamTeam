@@ -371,7 +371,9 @@ def session_status(lang: str, s: dict) -> str:
     if goal.get("status") == "done":
         return t(lang, "sess_done")
     if s.get("status") == "running":
-        return t(lang, "sess_paused") if s.get("paused") else t(lang, "sess_running")
+        if s.get("paused"):
+            return t(lang, "sess_paused")
+        return t(lang, "sess_wrap_up") if s.get("wrap_up") else t(lang, "sess_running")
     return t(lang, "sess_stopped")
 
 

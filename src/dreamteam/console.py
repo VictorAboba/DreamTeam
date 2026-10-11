@@ -30,6 +30,7 @@ HELP = {
   /comment N текст         — написать в обсуждение задачи N
   /hire Роль [| инструкции]  — нанять агента (роль из каталога или новая)
   /pause  /resume          — пауза / продолжить
+  /wrapup [off]            — режим завершения: агенты завершают задачи с тем, что есть (off — выключить)
   /budget 10               — лимит бюджета в $;  /max 6 — максимум агентов
   /approve имя|N [комментарий]  /reject имя|N [что исправить] — MCP-сервер или задача на ревью
   /trace [Имя | N]         — трейсы агентов: последние, агента или трейс N по шагам
@@ -49,6 +50,7 @@ HELP = {
   /comment N text          — post to the discussion of task N
   /hire Role [| instructions] — hire an agent (a catalog role or a new one)
   /pause  /resume          — pause / resume
+  /wrapup [off]            — wrap-up mode: the agents finish their tasks with what they have (off: switch it off)
   /budget 10               — budget limit in $;  /max 6 — max agents
   /approve name|N [comment]  /reject name|N [what to fix] — an MCP server or a task in review
   /trace [Name | N]        — agent traces: recent ones, an agent's, or trace N step by step
@@ -153,6 +155,8 @@ CD_TEXTS = {
     },
 }
 JOB_STOP = ("stop", "kill", "стоп")   # `/jobs stop j3`
+WRAP_UP_ON = ("", "on", "вкл")                  # `/wrapup`, as the TUI's (tui/commands.py) ...
+WRAP_UP_OFF = ("off", "выкл", "stop", "стоп")   # ... `/wrapup off`
 YES_WORDS = frozenset({"y", "yes", "д", "да"})
 NO_WORDS = frozenset({"", "n", "no", "н", "нет"})
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -534,6 +538,11 @@ class Console:
             return hub.act("swarm_control", action="pause")
         if cmd == "/resume":
             return hub.act("swarm_control", action="resume")
+        if cmd == "/wrapup":
+            word = arg.strip().casefold()
+            if word not in WRAP_UP_ON + WRAP_UP_OFF:
+                return _color("err", "/wrapup [off]")
+            return hub.act("swarm_control", wrap_up=word in WRAP_UP_ON)
         if cmd == "/budget" and arg:
             return hub.act("swarm_control", max_cost_usd=float(arg.replace("$", "")))
         if cmd == "/max" and arg:
