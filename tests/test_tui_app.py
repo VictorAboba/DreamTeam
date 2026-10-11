@@ -1276,3 +1276,70 @@ async def test_console_cd_asks_then_moves_and_comes_back(launch, tmp_path, capsy
     capsys.readouterr()
     await asyncio.to_thread(single.handle, "/cd")
     assert "только с сессией лаунчера" in capsys.readouterr().out
+
+
+async def test_background_jobs_in_the_status_line_and_the_jobs_command(tmp_path, monkeypatch):
+    """An agent's dev server as a background job: "jobs 1" in the status line, the job.* lines, /jobs (the table),
+    /status, /jobs j1 (its output) and /jobs stop j1. A pause does not stop it. No process is left behind."""
+    from test_procs import Children, pid_alive
+
+    monkeypatch.setenv("PYEXE", sys.executable)
+    (tmp_path / "kids").mkdir()
+    kids = Children(tmp_path / "kids")
+    script, pidfile = str(tmp_path / "kids" / "child.py"), kids.pidfile()
+    if sys.platform == "win32":
+        program, command = "cmd", f'"%PYEXE%" "{script}" "60" "{pidfile}"'
+    else:
+        program, command = "sh", f"\"$PYEXE\" '{script}' 60 '{pidfile}'"
+    started: list[bool] = []
+
+    def server(system, messages, tools):
+        if not started:          # its first turn: the server, in the background; then it sleeps
+            started.append(True)
+            return call("shell", command=command, background=True)
+        return call("wait")
+
+    home = make_home(tmp_path)
+    st.write_raw(home, {**st.read_raw(home), "shell": {"program": program}})
+    conn = await connect(home, web=False, llm_factory=lambda profile, agent: ScriptedLLM(server, profile))
+    stack = contextlib.ExitStack()
+    h = None
+    try:
+        sid = (await conn.client.create_session("Dev server", "Run the dev server"))["id"]
+        h = Harness(conn, stack, width=140, continue_last=True)
+        await h.until(lambda: h.tui.attached and h.tui.members, 20, "the attach")
+        await h.until(lambda: h.tui.jobs == ["j1"], 30, "the running job")
+        pid = await asyncio.to_thread(kids.pid)
+        agent = h.tui.members[0]
+        assert "jobs 1" in "".join(text for _, text in h.tui._status_text())
+        await h.see(f"{agent} · background job j1: ")
+        await h.run("/jobs", "/jobs jN — a job's output")
+        table = h.out[-1]
+        assert "j1" in table and agent in table and "running" in table and "started in the background" in table
+        await h.run("/status", "Jobs")
+        assert re.search(r"Jobs +1 running \(j1\)", h.out[-1])
+
+        async def logged() -> bool:
+            ok, text = await conn.client.act(sid, "jobs", {"job_id": "j1"})
+            return ok and "child up" in text
+
+        await h.until(logged, 20, "the job's first output")
+        await h.run("/jobs j1", "child up")
+        assert f"Job j1 of {agent}: " in h.out[-1]
+        await h.run("/pause", "The swarm is paused")   # a pause does not stop the background jobs
+        await asyncio.sleep(0.5)
+        assert pid_alive(pid) and h.tui.jobs == ["j1"]
+        await h.run("/jobs stop j1", "Stopped job j1 (")
+        assert not pid_alive(pid)
+        await h.until(lambda: not h.tui.jobs, 10, "the job gone from the status line")
+        await h.see(f"{agent} · job j1 stopped by you (")
+        assert "jobs" not in "".join(text for _, text in h.tui._status_text())
+        await h.run("/jobs", "j1")
+        assert "stopped by you" in h.out[-1]
+        assert await h.quit() == 0
+    finally:
+        if h is not None:
+            await h.close()
+        stack.close()
+        await conn.close()
+    assert kids.check() == [], "child processes were left running"

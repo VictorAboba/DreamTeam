@@ -51,6 +51,7 @@
         <button type="button" role="tab" data-tab="files"><span data-i18n="tab_files"></span></button>
         <button type="button" role="tab" data-tab="mcp"><span data-i18n="tab_mcp"></span><span class="tab-badge warn hidden" id="mcp-badge"></span></button>
         <button type="button" role="tab" data-tab="triggers"><span data-i18n="tab_triggers"></span><span class="tab-badge hidden" id="triggers-badge"></span></button>
+        <button type="button" role="tab" data-tab="jobs"><span data-i18n="tab_jobs"></span><span class="tab-badge hidden" id="jobs-badge"></span></button>
         <button type="button" role="tab" data-tab="traces"><span data-i18n="tab_traces"></span></button>
         <div class="tabs-spacer"></div>
         <input class="search" id="search" type="search" data-i18n-placeholder="search">
@@ -67,6 +68,7 @@
       </section>
       <section class="tab-pane hidden" id="pane-mcp"><div id="mcp-list" class="cards-list"></div></section>
       <section class="tab-pane hidden" id="pane-triggers"><div id="trigger-list" class="cards-list"></div></section>
+      <section class="tab-pane hidden" id="pane-jobs"><div id="job-list" class="cards-list"></div></section>
       <section class="tab-pane traces-pane hidden" id="pane-traces"></section>
     </main>
 
@@ -92,6 +94,7 @@
       <div class="drawer-title" id="drawer-title"></div>
       <button class="icon-btn" id="drawer-close" type="button" data-i18n-title="close">✕</button>
     </div>
+    <div class="drawer-jobs hidden" id="drawer-jobs"></div>
     <div class="drawer-tabs">
       <button type="button" data-dtab="chat" class="active" data-i18n="chat"></button>
       <button type="button" data-dtab="activity" data-i18n="activity"></button>

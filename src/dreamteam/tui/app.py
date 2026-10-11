@@ -73,7 +73,7 @@ CD_TITLE_CELLS = 60          # a /cd question whose title is longer repeats the 
 # what is replayed after a reconnect (activity, usage and traces of the gap are skipped)
 CATCHUP_TYPES = ["message.*", "notification", "goal.*", "task.*", "agent.hired", "agent.retired", "swarm.*",
                  "mcp.*"]
-REFRESH_ON = ("goal.", "swarm.", "task.", "mcp.", "agent.hired", "agent.retired")
+REFRESH_ON = ("goal.", "swarm.", "task.", "mcp.", "agent.hired", "agent.retired", "job.")
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -197,6 +197,7 @@ class TUI:
         self._shown_messages: set[int] = set()  # message ids printed as history at the attach
         self.tools.reset()
         self.working: set[str] = set()
+        self.jobs: list[str] = []     # the labels of the agents' running background jobs (j3, j5)
         self.work_since = time.monotonic()
         self.tokens_in = self.tokens_out = 0
         self.work_cost = 0.0
@@ -461,7 +462,7 @@ class TUI:
             self.ctx, session=session, addressee=self.addressee, agents_total=len(self.members),
             working=len(self.working), spent=self.spent, budget=self.budget,
             model=(self.session or {}).get("model"), verbosity=self.ctx.verbosity, connected=self.connected,
-            hint=hint)
+            hint=hint, jobs=len(self.jobs))
         gap = max(2, width - 4 - frag_len(left) - frag_len(right))
         return [("", "  "), *left, ("", " " * gap), *right]
 
@@ -801,6 +802,7 @@ class TUI:
                         info["workspace"] += f" {self.ctx.sym['warn']} " + self.t("cd_missing", path=folder["path"])
                 info["model"] = (self.session or {}).get("model")
                 info["agents"] = {"total": len(self.members), "working": len(self.working)}
+                info["jobs"] = {"running": len(self.jobs), "ids": list(self.jobs)}
                 info["budget"] = {"spent": self.spent, "limit": self.budget}
                 info["tracing"] = bool(swarm.get("tracing"))
         info["language"] = self.ctx.lang
@@ -1187,6 +1189,8 @@ class TUI:
             self.session = {**(self.session or {}), "title": swarm.get("name") or "DreamTeam", "status": "running"}
         self._sync_working({a["name"] for a in state.get("agents") or []
                             if isinstance(a, dict) and a.get("status") == "working" and a.get("name")})
+        self.jobs = [str(j.get("label") or f"j{j.get('id')}") for j in state.get("jobs") or []
+                     if isinstance(j, dict) and j.get("status") == "running"]
         self._scan_mcp()
         self._update_suggestions()
         self.invalidate()

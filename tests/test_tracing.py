@@ -155,6 +155,28 @@ def test_context_reconstruction_across_compaction(store):
     json.dumps(doc)
 
 
+def test_context_tools_are_the_frozen_tool_set_the_call_sent(store):
+    from dreamteam.tools import frozen
+
+    tracer, db, _ = store
+    agent = "John Smith"
+    trace = tracer.begin(agent, "wake")
+    before = trace.llm_start(0)  # recorded before tool sets were frozen: no revision
+    first = trace.llm_start(0, tools_rev=1)
+    assert "tools_rev" not in tracer.get_span(before.id)["input"]
+    assert tracer.get_span(first.id)["input"]["tools_rev"] == 1
+    baseline = frozen.snapshot(frozen.BASELINE_REVISION, "en")
+    assert tracer.span_context(before.id)["tools"] == baseline
+    assert tracer.span_context(first.id)["tools"] == frozen.snapshot(1, "en")
+    # a revision only the agent's record holds (e.g. one this code no longer ships) comes from the record
+    own = [{"name": "board", "description": "Old.", "parameters": {"type": "object", "properties": {}}}]
+    frozen.write(db, agent, frozen.record(7, "en", own))
+    upgraded = trace.llm_start(0, tools_rev=7)
+    assert tracer.span_context(upgraded.id)["tools"] == own
+    assert tracer.span_context(first.id)["tools"] == frozen.snapshot(1, "en")
+    assert tracer.span_context(upgraded.id, tools=[])["tools"] == []  # export passes its own
+
+
 def test_recover_marks_interrupted(store):
     tracer, db, _ = store
     trace = tracer.begin("John Smith", "wake")

@@ -230,13 +230,16 @@ class Trace:
 
     # ---- convenience wrappers used by the runtime ---------------------------------------------
     def llm_start(self, messages: int, *, purpose: str = "step", extra: list[dict] | None = None,
-                  attempt: int = 1, parent: Span | None = None) -> Span | None:
+                  attempt: int = 1, parent: Span | None = None, tools_rev: int | None = None) -> Span | None:
+        """`tools_rev`: the revision of the agent's frozen tool set the call sends (span_context shows it)."""
         if not self.enabled:
             return None
         epoch = self.tracer.current_epoch(self.agent)
-        return self.start("llm", purpose, {"epoch": epoch, "upto": messages - len(extra or []),
-                                           "messages": messages, "extra": extra or []},
-                          parent=parent, meta={"purpose": purpose, "attempt": attempt})
+        request: dict[str, Any] = {"epoch": epoch, "upto": messages - len(extra or []), "messages": messages,
+                                   "extra": extra or []}
+        if tools_rev is not None:
+            request["tools_rev"] = tools_rev
+        return self.start("llm", purpose, request, parent=parent, meta={"purpose": purpose, "attempt": attempt})
 
     def llm_end(self, span: Span | None, response: Any, cost: float) -> None:
         output = {
@@ -503,8 +506,9 @@ class Tracer:
     def span_context(self, span_id: int, tools: list[dict] | None = None, *,
                      _span: dict[str, Any] | None = None, _cache: dict | None = None) -> dict[str, Any] | None:
         """The request of an LLM span as the model received it: system prompt, tools and messages
-        (neutral DreamTeam format; the provider adapter converts it). `tools` defaults to the agent's
-        tool schemas. (`_span` / `_cache`: export() passes the loaded span and shares one read per epoch.)"""
+        (neutral DreamTeam format; the provider adapter converts it). `tools` defaults to the frozen tool set
+        the call sent (its revision is in the span input; tools/frozen.py). (`_span` / `_cache`: export()
+        passes the loaded span and shares one read per epoch.)"""
         span = _span if _span is not None else self.get_span(span_id)
         if span is None or span["kind"] != "llm":
             return None
@@ -534,8 +538,9 @@ class Tracer:
             cache[member_key] = self.db.one("SELECT system_prompt, language FROM agents WHERE name = ?", (agent,))
         member = cache[member_key]
         if tools is None:
-            from .tools import schemas_for  # local import: tools import the swarm stack
-            tools = schemas_for("llm", (member["language"] if member else None) or "en")
+            from .tools import frozen  # local import: tools import the swarm stack
+            language = (member["language"] if member else None) or "en"
+            tools = frozen.for_span(self.db, agent, language, req.get("tools_rev"))
         complete = len(stored) == upto
         return {
             "span_id": span["id"], "agent": agent, "epoch": epoch, "model": span.get("name"),

@@ -863,6 +863,76 @@ def test_console_settles_reviews_and_hires_from_the_catalog(capsys):
     assert "/hire Role [| instructions] — hire an agent (a catalog role or a new one)" in console_module.HELP["en"]
 
 
+def test_console_lists_shows_and_stops_background_jobs(capsys):
+    con = console_module.Console("http://127.0.0.1:9", "en")
+    hub = StubHub(MEMBERS)
+    con.hub = hub
+    for line in ("/jobs", "/jobs j2", "/jobs stop j1", "/jobs stop j1 %3", "/jobs стоп 4", "/jobs kill j5"):
+        con.handle(line)
+    con.handle("/jobs stop")                      # no job: the usage, no call
+    assert hub.acts == [
+        ("jobs", {}), ("jobs", {"job_id": "j2"}), ("job_stop", {"job_id": "j1"}), ("job_stop", {"job_id": "j1"}),
+        ("job_stop", {"job_id": "%3"}), ("job_stop", {"job_id": "4"}), ("job_stop", {"job_id": "j5"}),
+    ]
+    assert "/jobs stop jN" in capsys.readouterr().out
+    for lang, text in (("ru", "фоновые процессы агентов: список, вывод одного, остановка"),
+                       ("en", "agents' background jobs: list, one job's output, stop")):
+        assert f"  /jobs [jN | stop jN]     — {text}" in console_module.HELP[lang].splitlines()
+
+
+@pytest.mark.filterwarnings("ignore::DeprecationWarning")
+async def test_launcher_mcp_forwards_calls_as_its_client(tmp_path):
+    """The launcher MCP server forwards a client's calls to a session as that client (hub_mcp.serving_client): what
+    a client that joined as a member sends as the user is no news to its own member, while another client's is."""
+    from mcp import Client
+
+    from dreamteam import settings as st
+    from dreamteam.launcher_mcp import build_launcher_server
+    from dreamteam.sessions import SessionManager
+
+    home = tmp_path / "home"
+    home.mkdir()
+    st.write_raw(home, {
+        "swarm": {"name": "Home", "language": "en", "start_agents": 1, "max_agents": 3, "max_cost_usd": 0},
+        "agents": {"stagger_seconds": 0, "idle_nudge_seconds": 30},
+        "workspace": {"git": False},
+        "mcp": {"library_dir": str(tmp_path / "library")},
+        "models": {"default": {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0}},
+    })
+    manager = SessionManager(home, llm_factory=lambda profile, agent: ScriptedLLM(
+        lambda *a: {"tool_calls": [{"name": "wait", "arguments": {}}]}, profile))
+
+    async def call(client, tool: str, args: dict) -> str:
+        res = await client.call_tool(tool, args)
+        assert not res.is_error, res.content[0].text
+        return res.content[0].text
+
+    try:
+        async with Client(build_launcher_server(manager)) as one, Client(build_launcher_server(manager)) as two:
+            await call(one, "session_create", {"title": "Clients", "goal": "Talk", "start_agents": 1})
+            sid = manager.ids()[0]
+            swarm = manager.swarms[sid]
+            await call(one, "join_swarm", {"session": sid, "role": "Researcher", "name": "Ann Lee"})
+            await call(one, "send_message", {"session": sid, "to": ["all"], "text": "status, please"})  # as the user
+            assert not swarm.has_pending("Ann Lee")
+            await call(two, "send_message", {"session": sid, "to": ["all"], "text": "from the other client"})
+            assert swarm.has_pending("Ann Lee")
+    finally:
+        await manager.shutdown()
+
+
+def test_session_line_counts_the_running_jobs():
+    from dreamteam.launcher_mcp import session_line
+
+    summary = {"id": "001-calc", "title": "Calc", "status": "running", "tasks": {"done": 1, "total": 3},
+               "agents": {"total": 2, "working": 1}, "spent_usd": 0.5, "max_cost_usd": 5, "jobs": {"running": 2}}
+    assert session_line(summary).startswith(
+        "001-calc [running] Calc | tasks 1/3 done | agents 2 (1 working) | jobs 2 running | $0.50 of $5.00")
+    assert "jobs" not in session_line({**summary, "jobs": {"running": 0}})
+    assert "jobs" not in session_line({**summary, "status": "stopped"})       # (a stale count of a stopped one)
+    assert "jobs" not in session_line({k: v for k, v in summary.items() if k != "jobs"})  # an older hub
+
+
 def test_console_strips_terminal_escapes(monkeypatch):
     buf = io.StringIO()
     monkeypatch.setattr(sys, "stdout", buf)
@@ -887,6 +957,9 @@ async def test_console_against_a_real_hub(tmp_path):
             assert [m["text"] for m in msgs] == ["Привет, как дела?"]
             await asyncio.to_thread(con.handle, "/goal Сделать CSV-конвертер | с тестами")
             assert swarm.goal()["title"] == "Сделать CSV-конвертер"
+            # the user's `jobs` / `job_stop` through the act API (no job runs here)
+            assert await asyncio.to_thread(con._jobs, "") == "No background jobs are running."
+            assert "There is no job j4. No jobs are running." in await asyncio.to_thread(con._jobs, "stop j4")
             swarm.mail.send("Анна Смирнова", [USER], "Готово")
             data = await asyncio.to_thread(con.hub.get, "/api/inbox")
             assert data["messages"][-1]["text"] == "Готово"
@@ -935,6 +1008,7 @@ def test_sandbox_command(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-secret-value")
     cmd = docker_module.sandbox_command(project, 9200, config, goal="Build it", docker="docker")
     assert cmd[:2] == ["docker", "run"]
+    assert "--init" in cmd                                       # a reaper as PID 1: agents' orphans never linger
     assert "127.0.0.1:9200:8765" in cmd                          # only on the host's loopback
     assert "DREAMTEAM_PUBLIC_URL=http://127.0.0.1:9200" in cmd
     assert cmd[cmd.index("--port") + 1] == "8765" and cmd[-2:] == ["--goal", "Build it"]

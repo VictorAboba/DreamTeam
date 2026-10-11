@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import logging
 import time
-from typing import Any
+from typing import Any, Iterable, Iterator
 
 from .db import Database, dumps, loads
 from .models import ALL, ToolError
@@ -12,6 +14,23 @@ from .models import ALL, ToolError
 log = logging.getLogger(__name__)
 
 MAX_TEXT = 50000
+# (sender, members): a message `sender` sends in the current context is no news for `members`: the MCP client that
+# sends it acts as them too (it may send as the user and listen as its member; hub_mcp.hub_call sets this). They get
+# it as already read. Tied to the sender: a task started inside the block inherits the context (e.g. the runtime of
+# an agent the client hires), and the messages of others must still reach those members as news.
+_SEEN_BY: contextvars.ContextVar[tuple[str, frozenset[str]] | None] = contextvars.ContextVar("dreamteam_seen_by",
+                                                                                            default=None)
+
+
+@contextlib.contextmanager
+def sent_as_seen_by(members: Iterable[str], sender: str) -> Iterator[None]:
+    """Messages `sender` sends inside this block reach `members` as already read: they are delivered (their history
+    shows them) but neither wake those members nor come back to them as news."""
+    token = _SEEN_BY.set((sender, frozenset(members)))
+    try:
+        yield
+    finally:
+        _SEEN_BY.reset(token)
 
 
 def _message_dict(row: Any) -> dict[str, Any]:
@@ -59,20 +78,23 @@ class Mailbox:
                             "workspace file and send its path.")
         recipients = self._recipients(sender, to)
         reply = self._check_reply(reply_to)
+        context = _SEEN_BY.get()  # the sender's own other identities (sent_as_seen_by)
+        seen = context[1] if context is not None and context[0] == sender else frozenset()
         with self.db.transaction():
             ts = time.time()
             message_id = self.db.insert(
                 "INSERT INTO messages(ts, sender, recipients, text, reply_to) VALUES (?, ?, ?, ?, ?)",
                 (ts, sender, dumps(recipients), body, reply))
             for name in recipients:
-                self.db.execute("INSERT INTO inbox(message_id, recipient, read_at) VALUES (?, ?, NULL)",
-                                (message_id, name))
+                self.db.execute("INSERT INTO inbox(message_id, recipient, read_at) VALUES (?, ?, ?)",
+                                (message_id, name, ts if name in seen else None))
         message = {"id": message_id, "ts": ts, "sender": sender, "recipients": recipients, "text": body,
                    "reply_to": reply}
         log.info("message #%s from %s to %s", message_id, sender, ", ".join(recipients))
         self.swarm.bus.emit("message.sent", sender, message=message)
         for name in recipients:
-            self.swarm.signal(name)
+            if name not in seen:
+                self.swarm.signal(name)
         return message
 
     def _recipients(self, sender: str, to: str | list[str] | None) -> list[str]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import time
@@ -14,7 +15,7 @@ from .llm.base import LLMError, LLMResponse, estimate_tokens
 from .mailbox import MAX_TEXT
 from .models import USER, AgentStatus, Status, ToolError
 from .shell import truncate_middle
-from .tools import ToolContext, call_tool, schemas_for
+from .tools import ToolContext, call_tool, frozen
 from .tracing import Span, Trace
 
 if TYPE_CHECKING:
@@ -79,8 +80,34 @@ class AgentRuntime:
         self.profile_name: str | None = member.get("model") or None
         self.last_prompt_tokens: int = int(member.get("context_tokens") or 0)
         self.last_output_tokens = 0
-        self.tools = schemas_for("llm", self.language)
+        # its frozen tool set (tools/frozen.py): sent unchanged, so the prompt prefix stays the same
+        self.tools_rev = 0
+        self.tools: list[dict[str, Any]] = []
+        self.tool_names: frozenset[str] = frozenset()
+        self._tool_params: dict[str, dict[str, Any]] = {}
+        self._load_tools()
         self._resume = self._ended_mid_activation()
+
+    def _load_tools(self) -> None:
+        """The agent's tool set, stored at its first runtime start (it never changes until a compaction).
+        An agent that has a history but no record ran before tool sets were frozen: it keeps the baseline."""
+        db = self.swarm.db
+        rec = frozen.read(db, self.name)
+        if rec is None:
+            has_history = db.scalar("SELECT 1 FROM history WHERE agent = ? LIMIT 1", (self.name,))
+            rec = frozen.initial_record(self.language, bool(has_history))
+            frozen.write(db, self.name, rec)
+        self._set_tools(rec)
+
+    def _set_tools(self, rec: dict[str, Any]) -> None:
+        self.tools_rev = int(rec["rev"])
+        self.tools = rec["tools"]
+        self.tool_names = frozenset(frozen.names(self.tools))
+        self._tool_params = {t["name"]: t.get("parameters") or {} for t in self.tools}
+
+    def tool_parameters(self, name: str) -> dict[str, Any] | None:
+        """The parameters of `name` in the agent's own tool set; None when it does not have that tool."""
+        return self._tool_params.get(name)
 
     def _ended_mid_activation(self) -> bool:
         """True when the stored history stops inside an activation (the process died or the agent was
@@ -98,7 +125,9 @@ class AgentRuntime:
     # ---- control ------------------------------------------------------------------------------
     def start(self) -> None:
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run(), name=f"agent:{self.name}")
+            # a context of its own: the runtime must not inherit the request context of whoever started it (e.g.
+            # hub_call's sent_as_seen_by, when an MCP client hires the agent)
+            self._task = asyncio.create_task(self._run(), name=f"agent:{self.name}", context=contextvars.Context())
 
     def request_stop(self) -> None:
         self._stopping = True
@@ -213,14 +242,19 @@ class AgentRuntime:
         self._next_seq += 1
         self.history.append(msg)
 
-    def _replace_history(self, messages: list[dict[str, Any]]) -> int:
+    def _replace_history(self, messages: list[dict[str, Any]], tools: dict[str, Any] | None = None) -> int:
         """Compaction rewrite; the old history is archived (its epoch is returned) so traces keep the
-        exact context of earlier LLM calls."""
+        exact context of earlier LLM calls. `tools`: a new tool set record, stored in the same transaction
+        (the new history holds no assistant turn bound to the old tool set)."""
         with self.swarm.db.transaction() as db:
             epoch = self.swarm.tracer.archive_history(db.conn, self.name)
             db.conn.execute("DELETE FROM history WHERE agent = ?", (self.name,))
             for seq, msg in enumerate(messages):
                 db.conn.execute("INSERT INTO history(agent, seq, msg) VALUES (?, ?, ?)", (self.name, seq, dumps(msg)))
+            if tools is not None:
+                frozen.write(db, self.name, tools)
+        if tools is not None:
+            self._set_tools(tools)
         self.history = list(messages)
         self._next_seq = len(messages)
         self._len_at_last_call = 0
@@ -405,9 +439,13 @@ class AgentRuntime:
                     self._forward_reply(reply)
                 reply.clear()
                 in_progress = [t for t in swarm.board.open_tasks_of(self.name) if t.status == Status.IN_PROGRESS]
+                # a command of the agent went on as a job it waits for (JobManager.busy): no nudge now; its end
+                # wakes the agent, and the stall below is still recorded for once the busy window ends
+                jobs = getattr(swarm, "jobs", None)
+                busy = in_progress and jobs is not None and jobs.busy(self.name)
                 # one nudge per task: an agent that finished #2 with a nudge and then stopped with text again
                 # after claiming #3 would otherwise go idle holding #3, and nothing would ever wake it
-                if any(t.id not in nudged for t in in_progress):
+                if not busy and any(t.id not in nudged for t in in_progress):
                     nudged.update(t.id for t in in_progress)
                     nudge = prompts.t(self.language, "nudge", tasks=", ".join(f"#{t.id}" for t in in_progress))
                     self._append({"role": "user", "content": nudge})
@@ -511,7 +549,8 @@ class AgentRuntime:
         trace = self._tr
         self._last_error = None
         for attempt in range(len(RETRY_DELAYS) + 1):
-            span = trace.llm_start(len(messages), purpose=purpose, extra=extra, attempt=attempt + 1, parent=parent)
+            span = trace.llm_start(len(messages), purpose=purpose, extra=extra, attempt=attempt + 1, parent=parent,
+                                   tools_rev=self.tools_rev)
             try:
                 async with swarm.llm_semaphore:
                     response = await self.llm.complete(self.system_prompt, messages, self.tools)
@@ -613,7 +652,7 @@ class AgentRuntime:
         if not summary:
             summary = self._fallback_summary("The summary could not be produced.")
         epoch = self._replace_with_summary(summary)
-        trace.end(span, summary, meta={"epoch_archived": epoch})
+        trace.end(span, summary, meta={"epoch_archived": epoch, "tools_revision": self.tools_rev})
 
     def _compact_without_llm(self, span: Span | None = None) -> None:
         """Compaction after the model rejected the context as too long: notes + a digest of the latest
@@ -625,7 +664,7 @@ class AgentRuntime:
         summary = self._fallback_summary(
             "The conversation no longer fit into the model's context, so no summary could be written.")
         epoch = self._replace_with_summary(summary)
-        trace.end(span, summary, meta={"epoch_archived": epoch, "fallback": True})
+        trace.end(span, summary, meta={"epoch_archived": epoch, "fallback": True, "tools_revision": self.tools_rev})
 
     def _notes(self) -> str:
         return ((self.swarm.member(self.name) or {}).get("notes") or "").strip()
@@ -633,19 +672,27 @@ class AgentRuntime:
     def _replace_with_summary(self, summary: str) -> int:
         # the notebook survives compaction (update_notes promises it): shown right away, not only at the next wake
         notes = self._notes()
+        # The only safe point to move the agent to the current tool set: the new history holds no assistant
+        # turn (no thinking block) bound to the old one. `!=`: after a code downgrade it realigns here too.
+        upgrade = frozen.current_record(self.language) if self.tools_rev != frozen.TOOLSET_REVISION else None
+        added = [n for n in frozen.names(upgrade["tools"]) if n not in self.tool_names] if upgrade else []
         text = (prompts.t(self.language, "compacted", summary=summary)
                 + ("\n\n" + prompts.t(self.language, "notes", notes=notes) if notes else "")
+                + ("\n\n" + prompts.t(self.language, "tools_added", tools=", ".join(f"`{n}`" for n in added))
+                   if added else "")
                 + "\n\n" + prompts.t(self.language, "continue"))
         # The newest user-side texts (the wake-up that started this activation, new events) are kept
         # verbatim: a summary written before the agent acted on them may drop what they asked for.
-        epoch = self._replace_history([{"role": "user", "content": text}, *self._tail_to_keep()])
+        # (Before _fixed_tokens below: the compaction floor counts the new tool set.)
+        epoch = self._replace_history([{"role": "user", "content": text}, *self._tail_to_keep()], tools=upgrade)
         self.swarm.notes_shown(self.name, notes)
         self.last_prompt_tokens = self._compaction_floor = estimate_tokens(self.history) + self._fixed_tokens()
         self.last_output_tokens = 0
         self._len_at_last_call = len(self.history)
         self.swarm.db.execute("UPDATE agents SET context_tokens = ? WHERE name = ?", (self.last_prompt_tokens, self.name))
         self._activity("compacted", summary)
-        self.swarm.bus.emit("agent.compacted", self.name, agent=self.name, chars=len(summary))
+        self.swarm.bus.emit("agent.compacted", self.name, agent=self.name, chars=len(summary),
+                            tools_revision=self.tools_rev)
         return epoch
 
     def _tail_start(self) -> int:

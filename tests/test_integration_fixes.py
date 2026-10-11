@@ -1,12 +1,15 @@
 """Regression tests for the problems found by the contract audit and the area owners, fixed during
 integration: /api/inbox paging, lone surrogates in LLM output, compaction at a real context window, the
-per-task in-progress nudge and the stalled-agent wake, member names in triggers, the shared name resolver
+per-task in-progress nudge and the stalled-agent wake (none while a background job keeps the agent busy), member
+names in triggers, the shared name resolver
 of the test double, a retiring reviewer, read_messages marking read, goal complete/reopen guards, notes
 after compaction and in wake-ups, big tool outputs, the launcher's unknown-tool answer, the Docker files."""
 
 from __future__ import annotations
 
+import asyncio
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +17,7 @@ import pytest
 
 from conftest import FakeSwarm
 from dreamteam import agent as agent_module
+from dreamteam import jobs as jobs_module
 from dreamteam import prompts
 from dreamteam import swarm as swarm_module
 from dreamteam.agent import AgentRuntime
@@ -22,6 +26,7 @@ from dreamteam.llm.base import LLMError, estimate_tokens
 from dreamteam.models import USER, AgentStatus, Status, ToolError
 from dreamteam.tools import REGISTRY, ToolContext, call_tool
 from dreamteam.web import create_app
+from test_procs import CHILD, pid_alive, wait_until
 from test_runtime import (call, check_history, history, is_compaction_request, kinds_for, last_text, make_swarm,
                           replies_to_user, run_until, shutdown)
 
@@ -258,6 +263,90 @@ async def test_each_new_in_progress_task_gets_a_nudge_and_a_stalled_agent_is_wok
         assert not rec.violations, rec.violations
     finally:
         await shutdown(swarm)
+
+
+async def test_an_agent_waiting_with_work_in_progress_is_woken_once_per_set(tmp_path):
+    """An agent that calls `wait` while it holds an in_progress task, with nothing that would wake it, is woken after
+    idle_nudge_seconds (n_stalled), once per set of such tasks: waiting again on the same set is its choice."""
+    ids: dict[str, int] = {}
+
+    def policy(swarm, name, system, messages, tools):
+        for task_id in ids.values():
+            task = swarm.board.get(task_id)
+            if task.status == Status.TODO and task.assignee in (None, name):
+                return call("task_claim", task_id=task_id)
+        return call("wait", reason="an answer from the user")
+
+    swarm, rec = make_swarm(tmp_path, policy, swarm={"independent_review": False})
+    ids["a"] = swarm.board.create(USER, "Task A", goal="a").id
+    await swarm.start()
+    try:
+        agent = swarm.members()[0]["name"]
+        swarm.mail.send(USER, agent, "please do A")
+        await run_until(lambda: kinds_for(swarm, agent).count("n_stalled") == 1, 10)
+        assert f"#{ids['a']}" in swarm.db.scalar(
+            "SELECT text FROM notifications WHERE recipient = ? AND kind = 'n_stalled'", (agent,))
+        await run_until(lambda: swarm.member(agent)["status"] == AgentStatus.IDLE and not swarm.has_pending(agent))
+        await asyncio.sleep(1.0)  # idle_nudge_seconds is 0.2: the same set is never woken about again
+        assert kinds_for(swarm, agent).count("n_stalled") == 1
+        ids["b"] = swarm.board.create(USER, "Task B", goal="b", assignee=agent).id  # a new set: woken once more
+        await run_until(lambda: kinds_for(swarm, agent).count("n_stalled") == 2, 10)
+        await asyncio.sleep(1.0)
+        assert kinds_for(swarm, agent).count("n_stalled") == 2
+        assert not rec.violations, rec.violations
+    finally:
+        await shutdown(swarm)
+
+
+async def test_no_nudge_while_a_background_job_keeps_the_agent_busy(tmp_path, monkeypatch):
+    """An agent that holds a task in progress and ends its turn with plain text while its own test run goes on as a
+    job (still running at its timeout: JobManager.busy) is not nudged: the job's end wakes it. The stall is still
+    recorded, for the scheduler once the busy window is over."""
+    monkeypatch.setattr(jobs_module, "JOB_TICK", 0.1)
+    monkeypatch.setattr(jobs_module, "LEFTOVER_GRACE", 0.3)
+    monkeypatch.setenv("PYEXE", sys.executable)
+    (tmp_path / "child.py").write_text(CHILD, encoding="utf-8")
+    pidfile = tmp_path / "pid.txt"
+    windows = sys.platform == "win32"
+    program = "cmd" if windows else "sh"
+    run = (f'"%PYEXE%" "{tmp_path / "child.py"}" 3 "{pidfile}"' if windows
+           else f"\"$PYEXE\" '{tmp_path / 'child.py'}' 3 '{pidfile}'")
+    ids: dict[str, int] = {}
+    seen: dict[str, Any] = {}
+
+    def policy(swarm, name, system, messages, tools):
+        last = messages[-1]
+        tool = last.get("name") if last["role"] == "tool" else None
+        if last["role"] == "user" and "has ended (exit code 0)" in str(last.get("content")):
+            return call("task_complete", task_id=ids["a"], result="The tests pass.")
+        if swarm.board.get(ids["a"]).status == Status.TODO:
+            return call("task_claim", task_id=ids["a"])
+        if tool == "task_claim":
+            return call("shell", command=run, timeout=1)
+        if tool == "shell":
+            seen["busy"] = swarm.jobs.busy(name)
+            return "The tests are running in the background; I will look at them when they end."
+        return call("wait")
+
+    swarm, rec = make_swarm(tmp_path, policy, swarm={"independent_review": False}, shell={"program": program})
+    ids["a"] = swarm.board.create(USER, "Task A", goal="a").id
+    await swarm.start()
+    try:
+        agent = swarm.members()[0]["name"]
+        swarm.mail.send(USER, agent, "please do A")
+        runtime = swarm.runtimes[agent]
+        await run_until(lambda: seen.get("busy") is not None and swarm.member(agent)["status"] == AgentStatus.IDLE)
+        assert seen["busy"] and swarm.jobs.busy(agent)
+        assert runtime.stalled == frozenset({ids["a"]})  # recorded, not acted on while busy
+        await run_until(lambda: swarm.board.get(ids["a"]).status == Status.DONE, 20)
+        texts = [last_text(c) for c in rec.calls[agent]]
+        assert not any("stopped without calling a tool" in t for t in texts)  # no nudge at all
+        assert "n_job_done" in kinds_for(swarm, agent)
+        assert not rec.violations, rec.violations
+    finally:
+        await shutdown(swarm)
+    pid = int(pidfile.read_text())
+    assert wait_until(lambda: not pid_alive(pid), 5)
 
 
 # ------------------------------------------------------------------------------------- trigger names

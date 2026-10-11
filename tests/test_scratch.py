@@ -260,6 +260,24 @@ async def test_autocommit_excludes_the_folder_even_without_its_marker(repo, monk
 
 
 @needs_git
+async def test_autocommit_excludes_the_folder_where_no_gitignore_hides_it(fake_swarm, monkeypatch):
+    root = user_repo(fake_swarm, {".scratch/keep.txt": "the user's\n", "b.txt": "b\n"})  # no .gitignore at all
+    ws = Workspace(fake_swarm)
+    await ws.init()
+    marker(ws).unlink()
+    monkeypatch.setattr(ws, "ensure_scratch", lambda actor=None: None)  # only the pathspec keeps .scratch/ out
+    put(root, ".scratch/keep.txt", "changed by an agent\n")
+    put(root, ".scratch/deep/er/t.py", "print(1)\n")
+    put(root, ".scratchpad", "an ordinary file\n")
+    put(root, "sub/.scratch/kept.txt", "not the workspace's scratch folder\n")
+    put(root, "b.txt", "b2\n")
+    assert await ws.autocommit(ANNA, "shell: run")
+    assert commits(root)[0] == (ANNA, "shell: run", [".scratchpad", "b.txt", "sub/.scratch/kept.txt"])
+    assert git(root, "show", "HEAD:.scratch/keep.txt") == "the user's\n"
+    assert git(root, "ls-files", SCRATCH_DIR) == ".scratch/keep.txt\n"
+
+
+@needs_git
 async def test_autocommit_unstages_force_added_scratch(repo):
     put(repo.root, ".scratch/x.txt", "tmp")
     git(repo.root, "add", "-f", ".scratch/x.txt")  # an agent's manual `git add -f`
@@ -441,3 +459,23 @@ async def test_manual_commit_in_shell_is_attributed_to_the_agent(make_swarm):
     await shell(swarm, agent, "git commit -q --allow-empty -m manual")
     name, email = git_identity(agent)
     assert git(root, "log", "-1", "--format=%an|%ae|%cn|%ce|%s").strip() == f"{name}|{email}|{name}|{email}|manual"
+
+
+@needs_git
+async def test_shell_commit_names_the_files_and_keeps_the_command(make_swarm):
+    """One commit per shell call; its subject names what changed rather than repeating the command line, and the
+    command is in the body."""
+    swarm = await make_swarm(git_on=True)
+    agent = agent_of(swarm)
+    root = swarm.workspace.root
+    put(root, "gen.py", "import pathlib\nfor n in (200, 300):\n"
+                        "    pathlib.Path('candidates').mkdir(exist_ok=True)\n"
+                        "    pathlib.Path(f'candidates/lp_N{n}.json').write_text('{}')\n"
+                        "pathlib.Path('.scratch/notes.txt').write_text('scratch')\n")
+    command = python(swarm, "gen.py")
+    await shell(swarm, agent, command)
+    assert commits(root)[0] == (agent, "shell: candidates/lp_N200.json, candidates/lp_N300.json, gen.py",
+                                ["candidates/lp_N200.json", "candidates/lp_N300.json", "gen.py"])
+    assert git(root, "log", "-1", "--format=%b").strip() == command
+    await shell(swarm, agent, "echo nothing changes")
+    assert len(commits(root)) == 2  # no commit for a call that changed nothing

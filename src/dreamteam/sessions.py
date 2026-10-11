@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from .config import Config
 from .db import loads
 from .goal_text import shorten_title, split_goal
-from .models import USER
+from .models import USER, Status
 from .settings import (
     apply_update, deep_merge, ensure_home, profile_renames, public_view, read_raw, settings_path, validate, write_raw,
 )
@@ -375,7 +375,7 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
-        "limits": {}, "paused": False, "pause_reason": "", "last_activity": None,
+        "limits": {}, "paused": False, "pause_reason": "", "last_activity": None, "jobs": {"running": 0},
     }
     own = conn is None
     if own:
@@ -414,6 +414,11 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
         stats["pause_reason"] = paused.get("reason", "") or ""
         row = conn.execute("SELECT ts FROM events ORDER BY id DESC LIMIT 1").fetchone()
         stats["last_activity"] = row[0] if row else None
+        try:  # its own try: a database of a version before background jobs has no jobs table
+            row = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'running'").fetchone()
+            stats["jobs"]["running"] = int(row[0] or 0)
+        except sqlite3.Error as exc:
+            log.debug("cannot count the jobs of %s: %s", db_path, exc)
     except sqlite3.Error as exc:  # a database of an older version or locked: show what we have
         log.debug("cannot read stats of %s: %s", db_path, exc)
     finally:
@@ -1568,12 +1573,28 @@ class SessionManager:
                 if path.exists():
                     log.warning("could not remove %s completely; it is retried at the next delete", path)
 
+    def finished(self, sid: str) -> bool:
+        """The session's work is over: its goal is achieved and no task is open (todo, in_progress, waiting or
+        review). Read from its database without loading it; False when that cannot be read."""
+        try:
+            stats = self.summary(sid)
+        except Exception:  # e.g. a damaged session.json: whether it can start is start()'s to say
+            log.debug("cannot tell whether session %s is finished", sid, exc_info=True)
+            return False
+        by_status = (stats.get("tasks") or {}).get("by_status") or {}
+        return ((stats.get("goal") or {}).get("status") == "done"
+                and not any(by_status.get(status) for status in Status.OPEN))
+
     async def resume(self) -> list[str]:
-        """Start the sessions that were running when the server last stopped."""
+        """Start the sessions that were running when the server last stopped, except finished ones (finished()):
+        they stay stopped until started by hand."""
         started = []
         for sid in self.ids():
             try:
                 if self.meta(sid).get("autostart"):
+                    if self.finished(sid):
+                        log.info("session %s is finished (goal achieved, no open task): not resumed", sid)
+                        continue
                     await self.start(sid)
                     started.append(sid)
             except SessionError as exc:  # e.g. its workspace folder is missing: the message says what to do

@@ -137,7 +137,10 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
     `home`: serve the directory as a launcher home (True) or `run` it as a single-swarm project (False);
     None decides by its sessions/ directory."""
     public = f"http://127.0.0.1:{port}"
-    cmd = [docker, "run", "--rm", "--name", f"dreamteam-{port}", "-p", f"127.0.0.1:{port}:{CONTAINER_PORT}",
+    # --init: a tiny init (tini) is PID 1 and reaps orphans (processes the agents' commands leave running), so a
+    # zombie never keeps a process group alive; it forwards SIGTERM/SIGINT to dreamteam. Ports that agents' dev
+    # servers open inside the container are not published.
+    cmd = [docker, "run", "--rm", "--init", "--name", f"dreamteam-{port}", "-p", f"127.0.0.1:{port}:{CONTAINER_PORT}",
            "-v", f"{project_dir.resolve()}:/swarm", "-e", f"DREAMTEAM_PUBLIC_URL={public}"]
     if tty:
         cmd.append("-it")

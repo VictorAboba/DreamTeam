@@ -25,6 +25,7 @@ HELP = {
   /goal Заголовок | описание — задать глобальную цель
   /task Заголовок | цель   — создать задачу
   /board  /agents  /status — доска, команда, статус
+  /jobs [jN | stop jN]     — фоновые процессы агентов: список, вывод одного, остановка
   /show N                  — задача N с обсуждением
   /comment N текст         — написать в обсуждение задачи N
   /hire Роль [| инструкции]  — нанять агента (роль из каталога или новая)
@@ -43,6 +44,7 @@ HELP = {
   /goal Title | description — set the global goal
   /task Title | goal       — create a task
   /board  /agents  /status — board, team, status
+  /jobs [jN | stop jN]     — agents' background jobs: list, one job's output, stop
   /show N                  — task N with its discussion
   /comment N text          — post to the discussion of task N
   /hire Role [| instructions] — hire an agent (a catalog role or a new one)
@@ -150,6 +152,7 @@ CD_TEXTS = {
         "start_error": "The session did not start again: {error}",
     },
 }
+JOB_STOP = ("stop", "kill", "стоп")   # `/jobs stop j3`
 YES_WORDS = frozenset({"y", "yes", "д", "да"})
 NO_WORDS = frozenset({"", "n", "no", "н", "нет"})
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
@@ -490,6 +493,8 @@ class Console:
             return hub.act("agents")
         if cmd == "/status":
             return hub.act("swarm_status")
+        if cmd == "/jobs":
+            return self._jobs(arg)
         if cmd == "/show" and arg:
             task = hub.act("task_get", task_id=int(arg.lstrip("#")))
             return task + "\n" + hub.act("task_discussion", task_id=int(arg.lstrip("#")))
@@ -564,6 +569,18 @@ class Console:
         if cmd == "/cd":
             return self._cd(arg)
         return _color("err", "Unknown command. /help")
+
+    def _jobs(self, arg: str) -> str:
+        """`/jobs`: the agents' background jobs; `/jobs jN`: one job's state and the end of its output;
+        `/jobs stop jN [jM …]`: stop them (as the user: any member's job)."""
+        words = arg.split()
+        if not words:
+            return self.hub.act("jobs")
+        if words[0].casefold() in JOB_STOP:
+            if len(words) < 2:
+                return _color("err", "/jobs stop jN")
+            return "\n".join(self.hub.act("job_stop", job_id=ref) for ref in words[1:])
+        return self.hub.act("jobs", job_id=words[0])
 
     # ---- /cd: the session's folder ---------------------------------------------------------
     def _t(self, key: str, **kw: Any) -> str:

@@ -4,12 +4,16 @@ can watch and steer the swarm as the user, or join it as a working member."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import copy
 import logging
 import os
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Iterable
+import uuid
+import weakref
+from typing import TYPE_CHECKING, Any, Iterable, Iterator
 
 import mcp.types as types
 from mcp.server.lowlevel import Server
@@ -18,6 +22,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 
 from . import __version__
+from .mailbox import sent_as_seen_by
 from .models import USER, AgentKind, ToolError
 from .tools import REGISTRY, ToolContext, call_tool, tools_for
 
@@ -35,12 +40,18 @@ share a git-versioned workspace, set triggers and build their own MCP tools.
 By default every call acts as the human USER of the swarm: you can read the board (`board`, `task_get`,
 `task_discussion`), set the global goal (`set_goal`), create and edit tasks, talk to any agent
 (`send_message`, `read_messages`), hire or retire agents, pause/resume and change limits (`swarm_control`),
-approve MCP servers (`mcp_approve`) and wait for messages addressed to the user (`wait_for_events`).
+approve MCP servers (`mcp_approve`) and wait for messages addressed to the user (`wait_for_events`; with
+`progress=true` it also returns when the board moves on). `jobs` and `job_stop` list and stop every member's
+background jobs.
 
 To work INSIDE the swarm as a member, call `join_swarm(role=...)`: you get a unique human name; then pass
 `as_agent="<that name>"` in every call. Members claim tasks (`task_claim`), write shared files (`write_file`,
 `edit_file`), run commands in the swarm workspace (`shell`), build and call MCP tools (`mcp_create`,
-`mcp_call`), finish tasks (`task_complete`) and receive events with `wait_for_events`."""
+`mcp_call`), finish tasks (`task_complete`) and receive events with `wait_for_events`. Members who join this way do
+not count toward the swarm's agent limit (max_agents). A `shell` command still running at its timeout (at most 600
+seconds over MCP) continues as a background job, and background=true starts one at once; processes a command leaves
+running become a job too. `jobs` shows jobs and their output, `job_stop` stops one, and a job's end reaches you
+through `wait_for_events`, so don't poll."""
 
 AS_AGENT = {
     "type": "string",
@@ -89,18 +100,97 @@ def _text_result(text: str, is_error: bool) -> types.CallToolResult:
 # Calls of external members are recorded in their traces, except polling for events.
 UNTRACED_TOOLS = frozenset({"wait_for_events"})
 
+# Names one MCP client over any transport and protocol version: serve_stdio_proxy sends it with every request (the
+# 2026-07-28 protocol has no session id); any HTTP client may send it too (e.g. a `--header` of `claude mcp add`).
+CLIENT_HEADER = "X-DreamTeam-Client"
+_CLIENT: contextvars.ContextVar[str | None] = contextvars.ContextVar("dreamteam_mcp_client", default=None)
 
-async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any]) -> tuple[str, bool]:
-    """Run a tool over MCP with the hub actor rules (`as_agent`); calls of external members are traced."""
+
+class HubClients:
+    """Which MCP client acts as which external member of a swarm. A client may send as the user (no as_agent)
+    and listen as its member: what it sends must not come back to it as news (wait_for_events). A member belongs
+    to the client that last acted as it (join_swarm, or a call with its as_agent)."""
+
+    def __init__(self) -> None:
+        self._client_of: dict[str, str] = {}  # external member -> client
+
+    def acted_as(self, client: str | None, member: str) -> None:
+        if client:
+            self._client_of[member] = client
+
+    def members_of(self, client: str | None) -> frozenset[str]:
+        return frozenset(m for m, c in self._client_of.items() if client and c == client)
+
+
+_HUB_CLIENTS: "weakref.WeakKeyDictionary[Any, HubClients]" = weakref.WeakKeyDictionary()
+
+
+def hub_clients(swarm: "Swarm") -> HubClients:
+    clients = _HUB_CLIENTS.get(swarm)
+    if clients is None:
+        clients = _HUB_CLIENTS[swarm] = HubClients()
+    return clients
+
+
+def client_key(ctx: Any, local: str) -> str | None:
+    """Which MCP client a request comes from: `local` without HTTP (a stdio server has one client), else the
+    CLIENT_HEADER or the MCP session id (handshake protocol versions). None when nothing names it: the 2026-07-28
+    protocol and stateless HTTP serve every request alone, and a client cannot be told from another one then."""
+    request = getattr(ctx, "request", None)
+    if request is None:
+        return local
+    headers = getattr(request, "headers", None) or {}
+    named = " ".join(str(headers.get(CLIENT_HEADER) or "").split())[:200]
+    if named:
+        return f"client:{named}"
+    session = str(headers.get("mcp-session-id") or "").strip()
+    return f"session:{session}" if session else None
+
+
+@contextlib.contextmanager
+def serving_client(client: str | None) -> Iterator[None]:
+    """hub_call inside this block (also in tasks it starts) comes from `client` (client_key), e.g. for a launcher
+    MCP server that forwards calls to a session."""
+    token = _CLIENT.set(client)
+    try:
+        yield
+    finally:
+        _CLIENT.reset(token)
+
+
+def _externals(swarm: "Swarm") -> set[str]:
+    return {m["name"] for m in swarm.members() if m["kind"] == AgentKind.EXTERNAL}
+
+
+async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any], client: str | None = None) -> tuple[str, bool]:
+    """Run a tool over MCP with the hub actor rules (`as_agent`); calls of external members are traced. `client`
+    (client_key; default: serving_client's): a message the client sends reaches the external members it acts as
+    already read, so it never comes back to it as news (user broadcasts still reach every other member)."""
     args = dict(args or {})
     try:
         actor = resolve_actor(swarm, args.pop("as_agent", None))
     except ToolError as exc:
         return f"Error: {exc}", True
+    client = _CLIENT.get() if client is None else client
+    clients = hub_clients(swarm)
+    if actor != USER:
+        clients.acted_as(client, actor)
+    joining = bool(client) and actor == USER and name == "join_swarm"
+    before = _externals(swarm) if joining else set()
     started = time.time()
-    text, is_error = await call_tool(ToolContext(swarm, actor), name, args)
+    with sent_as_seen_by(clients.members_of(client), actor):
+        text, is_error = await call_tool(ToolContext(swarm, actor), name, args)
+    if joining and not is_error:
+        # the member it became: a new one, or the one it continues as after a reconnect (join_swarm with its name)
+        joined = _externals(swarm) - before
+        wanted = " ".join(str(args.get("name") or "").split()).lower()
+        for member in joined or {n for n in _externals(swarm) if wanted and n.lower() == wanted}:
+            clients.acted_as(client, member)
     tracer = getattr(swarm, "tracer", None)
-    if tracer is not None and actor != USER and name not in UNTRACED_TOOLS and swarm.is_member(actor):
+    # not while the swarm stops: a call that returns then (e.g. a shell command killed by the session stop) must not
+    # write into a database that Swarm.stop's caller closes right after
+    if (tracer is not None and actor != USER and name not in UNTRACED_TOOLS and not getattr(swarm, "stopping", False)
+            and swarm.is_member(actor)):
         try:
             tracer.external_call(actor, name, args, text, is_error, started)
         except Exception:  # tracing must never break a call
@@ -109,11 +199,14 @@ async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any]) -> tuple[str
 
 
 def build_hub_server(swarm: "Swarm") -> Server:
+    local = f"local:{uuid.uuid4().hex}"  # the client of a connection without HTTP (stdio, in-process)
+
     async def on_list_tools(ctx, params) -> types.ListToolsResult:
         return types.ListToolsResult(tools=list_hub_tools(swarm))
 
     async def on_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
-        text, is_error = await hub_call(swarm, params.name, dict(params.arguments or {}))
+        text, is_error = await hub_call(swarm, params.name, dict(params.arguments or {}),
+                                        client=client_key(ctx, local))
         return _text_result(text, is_error)
 
     return Server("dreamteam", version=__version__, title="DreamTeam swarm", instructions=INSTRUCTIONS,
@@ -180,14 +273,22 @@ async def serve_stdio(swarm: "Swarm") -> None:
 PROXY_READ_TIMEOUT = 700.0
 
 
+def proxy_http_client():
+    """The HTTP client of a stdio proxy. Its CLIENT_HEADER names the proxy's one client to the hub, whatever
+    protocol version the proxy speaks (the 2026-07-28 one has no session id)."""
+    import httpx2
+
+    return httpx2.AsyncClient(timeout=httpx2.Timeout(30.0, read=PROXY_READ_TIMEOUT),
+                              headers={CLIENT_HEADER: uuid.uuid4().hex})
+
+
 async def serve_stdio_proxy(url: str, instructions: str | None = None) -> None:
     """Expose a running hub (HTTP) over stdio, for MCP clients that only launch commands. The client gets the
     upstream server's instructions (a launcher's explain sessions), unless `instructions` is given."""
-    import httpx2
     from mcp import Client
     from mcp.client.streamable_http import streamable_http_client
 
-    http = httpx2.AsyncClient(timeout=httpx2.Timeout(30.0, read=PROXY_READ_TIMEOUT))
+    http = proxy_http_client()
     async with http, Client(streamable_http_client(url, http_client=http)) as client:
         async def on_list_tools(ctx, params) -> types.ListToolsResult:
             return await client.list_tools()

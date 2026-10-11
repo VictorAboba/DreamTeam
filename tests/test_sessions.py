@@ -205,6 +205,39 @@ async def test_session_lifecycle(tmp_path):
     assert {e["change"] for e in events} >= {"created", "started", "stopped"}
 
 
+async def test_resume_skips_a_finished_session(tmp_path):
+    """A session whose goal is achieved and which has no open task (todo, in_progress, waiting, review) is
+    finished: the next server start does not resume it, and it can still be started by hand. An achieved goal
+    with an open task, or an active goal, resumes as before."""
+    home = _home(tmp_path)
+    manager = _manager(home)
+    states = {"finished": ("done", ["done", "done"]), "failed": ("done", ["failed", "cancelled"]),
+              "review": ("done", ["done", "review"]), "waiting": ("done", ["waiting"]),
+              "active": ("active", ["done"])}
+    ids = {}
+    for title, (goal_status, statuses) in states.items():
+        sid = (await manager.create(title.title(), f"Goal of {title}"))["id"]
+        swarm = manager.swarms[sid]
+        swarm.db.execute("DELETE FROM tasks")
+        for i, status in enumerate(statuses):
+            swarm.board.create(USER, f"Task {i}", goal="g")
+            swarm.db.execute("UPDATE tasks SET status = ? WHERE id = (SELECT MAX(id) FROM tasks)", (status,))
+        if goal_status == "done":
+            swarm.complete_goal(USER, "all done")
+        ids[title] = sid
+    assert manager.finished(ids["finished"]) and manager.finished(ids["failed"])
+    assert not any(manager.finished(ids[t]) for t in ("review", "waiting", "active"))
+    await manager.shutdown()  # a server stop: every session stays marked for resume
+
+    again = _manager(home)
+    assert await again.resume() == [ids["review"], ids["waiting"], ids["active"]]
+    for title in ("finished", "failed"):
+        assert again.summary(ids[title])["status"] == "stopped" and ids[title] not in again.swarms
+    await again.start(ids["finished"])  # by hand
+    assert again.summary(ids["finished"])["status"] == "running"
+    await again.shutdown()
+
+
 async def test_pending_goal_set_at_first_start(tmp_path):
     manager = _manager(_home(tmp_path))
     summary = await manager.create("Later", "Do it later", "Step by step", start=False)

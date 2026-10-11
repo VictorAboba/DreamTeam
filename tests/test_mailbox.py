@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from dreamteam.mailbox import MAX_TEXT, Mailbox
+from dreamteam.mailbox import MAX_TEXT, Mailbox, sent_as_seen_by
 from dreamteam.models import USER, AgentKind, AgentStatus, ToolError
 
 ANNA, BOB, CARL, OLD = "Anna Smith", "Bob Brown", "Иван Орлов", "Old Timer"
@@ -33,6 +33,22 @@ def inbox(swarm, name: str) -> list[int]:
 
 
 # --- send --------------------------------------------------------------------------------------------
+
+def test_send_as_seen_by_delivers_as_read_without_waking(swarm, mail):
+    """hub_mcp: an MCP client that sends (e.g. as the user) and also acts as an external member must not get its
+    own message back as news; everyone else gets it as before."""
+    with sent_as_seen_by({BOB}, USER):
+        msg = mail.send(USER, "all", "status?")
+        # only what that sender sends: a task started inside the block (e.g. the runtime of an agent the client
+        # hires) inherits it, and the others' messages must still reach Bob as news
+        other = mail.send(ANNA, [BOB], "found it")
+    assert msg["recipients"] == [ANNA, BOB, CARL] and inbox(swarm, BOB) == [msg["id"], other["id"]]
+    assert [m["id"] for m in mail.unread(BOB)] == [other["id"]]
+    assert mail.unread_count(ANNA) == 1 and mail.unread_count(CARL) == 1
+    assert swarm.signals.count(BOB) == 1 and {ANNA, CARL} <= set(swarm.signals)  # woken by Anna's message only
+    assert [m["id"] for m in mail.history(BOB)] == [msg["id"], other["id"]]  # its history shows both
+    mail.send(USER, [BOB], "after the block")  # only inside the block
+    assert mail.unread_count(BOB) == 1
 
 def test_send_to_one(swarm, mail):
     msg = mail.send(ANNA, "bob  brown", "  hello  ")

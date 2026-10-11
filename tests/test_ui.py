@@ -9,12 +9,14 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import re
 import shutil
 import socket
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -25,9 +27,10 @@ from typing import Any
 import pytest
 
 import dreamteam
+from dreamteam import jobs as jobs_module
 from dreamteam import mcp_forge
 from dreamteam import swarm as swarm_module
-from dreamteam.config import Config
+from dreamteam.config import Config, ShellSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status
 from dreamteam.swarm import Swarm
@@ -89,10 +92,16 @@ def test_i18n_covers_every_value_the_backend_emits():
     pause_reasons = {r for f in SRC.rglob("*.py")
                      for r in re.findall(r"\.pause\(\w+, \"([^\"]+)\"\)", f.read_text(encoding="utf-8"))}
     assert "budget" in pause_reasons
+    # background jobs (the Jobs tab): how one went to the background, why one was stopped
+    job_origins = set(jobs_module.ORIGIN_PHRASES)
+    stop_reasons = set(re.findall(r'"(\w+)": f?"stopped', (SRC / "jobs.py").read_text(encoding="utf-8")))
+    assert job_origins == {"timeout", "background", "detached"}
+    assert stop_reasons == {"owner", "user", "lifetime", "session", "retired"}
     expected = ({f"reason_{r}" for r in pause_reasons} | {f"s_{s}" for s in statuses} | {f"a_{s}" for s in agent_statuses} | {f"k_{k}" for k in activity_kinds}
                 | {f"mcp_{s}" for s in mcp_statuses} | {f"origin_{o}" for o in origins}
                 | {f"scope_{s}" for s in mcp_forge.SCOPES} | {f"op_{o}" for o in ops} | {f"f_{f}" for f in task_fields}
-                | {f"p{p}" for p in range(4)})
+                | {f"p{p}" for p in range(4)} | {f"job_origin_{o}" for o in job_origins}
+                | {f"job_stopped_{r}" for r in stop_reasons})
     missing = sorted(expected - keys)
     assert not missing, missing
 
@@ -115,6 +124,27 @@ def test_ids_used_by_app_js_exist():
     # the task modal live-update needs these sections
     assert {"task-head", "task-meta", "task-result", "task-review", "thread", "task-history", "post-text",
             "mention-menu", "f-goal"} <= template_ids
+
+
+def test_jobs_tab_feed_and_settings_fields():
+    assert INDEX.index('data-tab="triggers"') < INDEX.index('data-tab="jobs"') < INDEX.index('data-tab="traces"')
+    assert '<span data-i18n="tab_jobs"></span><span class="tab-badge hidden" id="jobs-badge"></span>' in INDEX
+    pane = '<section class="tab-pane hidden" id="pane-jobs"><div id="job-list" class="cards-list"></div></section>'
+    assert pane in INDEX
+    assert 'id="drawer-jobs"' in INDEX
+    panes = json.loads(re.search(r'for \(const name of (\[.*?\])\) \$\("#pane-"', APP_JS).group(1))
+    assert panes == ["board", "feed", "files", "mcp", "triggers", "jobs", "traces"]
+    for name in panes:
+        assert f'id="pane-{name}"' in INDEX, name
+    # one line: the API contract test below reads it
+    assert "job.*" in json.loads(re.search(r"const FEED_TYPES = (\[.*?\]);", APP_JS).group(1))
+    # the settings page has a field for every [shell] setting, the background-job limits included
+    shell = dict(re.findall(r'\bfield\("(sh_\w+)", "shell\.(\w+)"', HOME_JS))
+    assert set(shell.values()) == {f.name for f in dataclasses.fields(ShellSettings)}
+    assert {"sh_bg", "sh_jobs", "sh_jobs_total", "sh_job_minutes", "sh_job_log", "sh_fg_max", "sh_cpu"} <= set(shell)
+    assert re.search(r'field\("sh_cpu", "shell\.cpu_threads", "auto"', HOME_JS)
+    assert re.search(r'field\("sh_bg", "shell\.background_on_timeout", "bool", \{ full: true, hint: "sh_bg_hint" \}\)',
+                     HOME_JS)
 
 
 # ------------------------------------------------------------------------------------------------ launcher / traces
@@ -1265,6 +1295,179 @@ def test_board_shows_the_session_folder_and_a_missing_one():
     assert out["third"] == 0
 
 
+JOBS_PRE = r"""
+  globalThis.jobsState = (E) => {
+    const now = Date.now() / 1000;
+    return [
+      { id: 3, label: "j3", owner: E, command: E, origin: "background", status: "running", reason: null, exit_code: null,
+        started_at: now - 1530, ended_at: null, log: ".scratch/" + E + "/jobs/j3.log", processes: ["node.exe", "node.exe", E] },
+      { id: 2, label: "j2", owner: "Ann Lee", command: "pytest -q", origin: "timeout", status: "ended", reason: null,
+        exit_code: 1, started_at: now - 600, ended_at: now - 360, log: "C:\\data\\jobs\\j2.log", processes: [] },
+      { id: 1, label: "j1", owner: "Ann Lee", command: "serve", origin: "background", status: "stopped", reason: "user",
+        exit_code: null, started_at: now - 900, ended_at: now - 840, log: ".scratch/ann/jobs/j1.log", processes: [] },
+      { id: 4, owner: "Bob", command: "x", origin: "timeout", status: "stopped", reason: "brand-new", exit_code: null,
+        started_at: now - 900, ended_at: now - 840, log: "", processes: [] },
+      { id: 5, owner: "Bob", command: "make", origin: "detached", status: "lost", reason: "crash", exit_code: null,
+        started_at: now - 900, ended_at: now - 840, log: null },
+      { id: 6, owner: "Bob", command: "gradle build", origin: "detached", status: "ended", reason: null, exit_code: null,
+        started_at: now - 900, ended_at: now - 840, log: ".scratch/bob/jobs/j6.log", processes: [] },
+    ];
+  };
+"""
+
+
+@needs_node
+def test_jobs_tab_cards_output_and_stop():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      app.S.lang = "en";
+      el("job-list");
+      app.S.state = { swarm: { name: "S", goal: null, limits: { max_cost_usd: 0, max_agents: 3 }, spent_usd: 0, mcp_url: "http://h/mcp" },
+                      agents: [], mcp: [], triggers: [], jobs: jobsState(E) };
+      app.S.tab = "jobs";
+      app.renderJobs();
+      out.html = elements["job-list"].innerHTML;
+      out.states = app.S.state.jobs.map(app.jobState);
+      // the output: the `jobs` tool as the user through the act API, shown escaped under its card
+      calls.length = 0;
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
+        return { ok: true, json: async () => ({ ok: true, result: "Job j3 of x\n" + E }), text: async () => "" };
+      };
+      app.toggleJobOutput(3);
+      out.loading = elements["job-list"].innerHTML.includes('data-job-pre="3">…</pre>');
+      await new Promise((r) => setImmediate(r));
+      out.load = calls.map((c) => [c.url, c.body]);
+      out.open = elements["job-list"].innerHTML;
+      app.tickJobs();                                   // every few seconds while it runs
+      await new Promise((r) => setImmediate(r));
+      out.ticks = calls.length;
+      app.handleEvent({ id: 41, ts: 0, type: "job.ended", actor: "x", data: { job: { id: 3, status: "ended" } } });
+      await new Promise((r) => setImmediate(r));
+      out.onEvent = calls.length;
+      app.toggleJobOutput(3);
+      out.closed = elements["job-list"].innerHTML.includes("data-job-pre");
+      // stop: asks first; a "no" calls nothing
+      calls.length = 0;
+      answers.confirm = false;
+      out.cancelled = await app.stopJob(3);
+      out.cancelCalls = calls.length;
+      answers.confirm = true;
+      await app.stopJob(3);
+      out.stop = calls.map((c) => [c.url, c.body]);
+      // the clicks of a card
+      const click = (dataset) => app.onDocumentClick({ target: { closest: () => ({ dataset }) } });
+      calls.length = 0;
+      click({ jobOut: "2" });
+      await new Promise((r) => setImmediate(r));
+      out.clickOut = [app.S.jobOpen.has(2), calls.map((c) => c.body)];
+      click({ jobLog: ".scratch/ann/jobs/j1.log" });  // the log in the Files tab
+      await new Promise((r) => setImmediate(r));
+      out.log = [app.S.tab, app.S.fileDir, app.S.openFile, calls.slice(-2).map((c) => decodeURIComponent(c.url))];
+      app.S.state.jobs = [];
+      app.S.tab = "jobs";
+      app.renderJobs();
+      out.empty = elements["job-list"].innerHTML;
+      app.S.lang = "ru";
+      out.dur = [5, 59, 60, 754, 3600, 7500].map(app.fmtDur);
+      out.ru = app.jobState(jobsState(E)[0])[1];
+    """, pre=JOBS_PRE, env={"EVIL": EVIL})
+    html = out["html"]
+    assert_escaped(html, at_least=4)                    # owner, command, log, a process name
+    assert html.count('data-job-stop="') == 1 and 'data-job-stop="3"' in html   # only a running job can be stopped
+    assert html.count('data-job-out="') == 6 and 'aria-expanded="false"' in html
+    assert "node.exe ×2, " + EVIL_ESC in html
+    assert f'data-job-log=".scratch/{EVIL_ESC}/jobs/j3.log"' in html             # a workspace log: a link
+    assert "<code>C:\\data\\jobs\\j2.log</code>" in html                         # outside the workspace: text
+    assert '<div class="item job dim" data-job="2">' in html and '<div class="item job" data-job="3">' in html
+    assert ">started in the background<" in html and ">went to the background at its timeout<" in html
+    assert "ran 4 min · " in html
+    assert out["states"] == [["", "running 25 min"], ["err", "ended: exit code 1"], ["plain", "stopped by you"],
+                             ["plain", "stopped"], ["err", "lost in a crash"], ["done", "ended"]]
+    assert out["loading"] is True
+    assert out["load"] == [["/api/act/jobs", {"job_id": "j3", "tail": 200}]]
+    assert '<pre class="job-output" data-job-pre="3">Job j3 of x\n' + EVIL_ESC + "</pre>" in out["open"]
+    assert 'aria-expanded="true">Hide output</button>' in out["open"]
+    assert out["ticks"] == 2 and out["onEvent"] == 3 and out["closed"] is False
+    assert out["cancelled"] is None and out["cancelCalls"] == 0
+    assert out["stop"] == [["/api/act/job_stop", {"job_id": "j3"}]]
+    assert out["clickOut"] == [True, [{"job_id": "j2", "tail": 200}]]
+    assert out["log"] == ["files", ".scratch/ann/jobs", ".scratch/ann/jobs/j1.log",
+                          ["/api/files?path=.scratch/ann/jobs", "/api/files?path=.scratch/ann/jobs/j1.log"]]
+    assert out["empty"].startswith('<div class="empty">No background jobs. A job appears when')
+    assert out["dur"] == ["5 с", "59 с", "1 мин", "12 мин", "1 ч 00 мин", "2 ч 05 мин"]
+    assert out["ru"] == "работает 25 мин"
+
+
+@needs_node
+def test_jobs_in_the_feed_team_panel_drawer_and_header():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      app.S.lang = "en";
+      const job = (extra) => ({ id: 3, owner: "Ann Lee", command: "npm run dev", started_at: 1000, ...extra });
+      out.feed = [
+        app.describeEvent({ type: "job.started", actor: "Ann Lee", data: { job: job({ status: "running" }) } }),
+        app.describeEvent({ type: "job.ended", actor: "Ann Lee", data: { job: job({ status: "ended", exit_code: 0, duration: 245 }) } }),
+        app.describeEvent({ type: "job.ended", actor: "Ann Lee", data: { job: job({ status: "stopped", reason: "user", ended_at: 1060 }) } }),
+        app.describeEvent({ type: "job.ended", actor: "Ann Lee", data: {} }),
+      ];
+      out.feedLine = app.describeEvent({ type: "job.started", actor: E, data: { job: job({ owner: E, command: E }) } });
+      app.S.lang = "ru";
+      out.feedRu = app.describeEvent({ type: "job.ended", actor: "Ann Lee", data: { job: job({ status: "ended", exit_code: 2, duration: 3700 }) } });
+      app.S.lang = "en";
+      // the team panel: ⚙N (and a tooltip) for a member whose jobs run
+      el("agent-list");
+      app.S.userInbox = [];
+      app.S.state = { swarm: { name: "S", goal: null, limits: { max_cost_usd: 0, max_agents: 3 }, spent_usd: 0, mcp_url: "http://h/mcp",
+                               session: null, agent_count: 2 },
+                      agents: [{ name: "Ann Lee", role: "Dev", status: "idle", kind: "llm", cost_usd: 0, open_tasks: [4], jobs: 2 },
+                               { name: "Bob", role: "QA", status: "idle", kind: "llm", cost_usd: 0, open_tasks: [], jobs: 0 },
+                               { name: "Claude Code", role: "Helper", status: "idle", kind: "external", cost_usd: 0, open_tasks: [] }],
+                      jobs: [{ id: 3, owner: "Ann Lee", command: E, status: "running", started_at: Date.now() / 1000 - 125 },
+                             { id: 5, owner: "Ann Lee", command: "pytest", status: "running", started_at: Date.now() / 1000 - 5 },
+                             { id: 2, owner: "Ann Lee", command: "old", status: "ended", started_at: 0, ended_at: 1 }],
+                      mcp: [], triggers: [] };
+      app.renderAgents();
+      out.agents = elements["agent-list"].innerHTML;
+      // the drawer of a member: its running jobs, each with a stop button
+      el("drawer-title"); el("drawer-jobs", { classList: classList(["hidden"]) }); el("composer-text");
+      app.S.chatWith = "Ann Lee";
+      app.renderDrawerHead();
+      out.drawer = elements["drawer-jobs"].innerHTML;
+      out.drawerShown = !elements["drawer-jobs"].classList.contains("hidden");
+      app.S.chatWith = "Bob";
+      app.renderDrawerHead();
+      out.bobHidden = elements["drawer-jobs"].classList.contains("hidden");
+      // the header: the running count on the tab; the agents counter counts what max_agents counts
+      for (const id of ["back-link", "stopped-banner", "paused-banner", "workspace-banner", "goal-status", "mcp-badge",
+                        "triggers-badge", "jobs-badge", "team-unread"])
+        el(id, { classList: classList(["hidden"]) });
+      for (const id of ["swarm-name", "mcp-hint", "pause-btn", "budget-bar", "goal-btn", "agents-count", "workspace-info"]) el(id);
+      app.renderHeader();
+      out.badge = [elements["jobs-badge"].textContent, elements["jobs-badge"].classList.contains("hidden")];
+      out.count = elements["agents-count"].textContent;
+      delete app.S.state.swarm.agent_count;              // an older hub: the AI agents of the state
+      app.S.state.jobs = [];
+      app.renderHeader();
+      out.badge2 = [elements["jobs-badge"].textContent, elements["jobs-badge"].classList.contains("hidden")];
+      out.count2 = elements["agents-count"].textContent;
+    """, pre=JOBS_PRE, env={"EVIL": EVIL})
+    assert out["feed"] == ["Ann Lee: background job j3 — npm run dev", "Ann Lee: job j3 ended: exit code 0 (4 min)",
+                           "Ann Lee: job j3 stopped by you (1 min)", "Ann Lee: job ? ended (0 s)"]
+    assert out["feedRu"] == "Ann Lee: процесс j3 завершён: код 2 (1 ч 01 мин)"
+    assert EVIL in out["feedLine"]                       # plain text: feedLine() escapes it (linkify)
+    agents = out["agents"]
+    assert '<span class="jobs-mark">⚙2</span> #4 $0.00' in agents and agents.count("jobs-mark") == 1
+    assert 'title="Ann Lee — Dev · idle · #4 · background jobs: 2"' in agents
+    drawer = out["drawer"]
+    assert_escaped(drawer, at_least=2)                    # the command and its tooltip
+    assert drawer.count('data-job-stop="') == 2 and 'data-job-stop="3"' in drawer and 'data-job-stop="5"' in drawer
+    assert "⚙ j3" in drawer and "2 min" in drawer and "5 s" in drawer and "old" not in drawer
+    assert out["drawerShown"] is True and out["bobHidden"] is True
+    assert out["badge"] == [2, False] and out["count"] == "2 / 3"
+    assert out["badge2"] == ["", True] and out["count2"] == "2 / 3"   # the external member is not counted
+
+
 # ------------------------------------------------------------------------------------------------ API contract
 def make_swarm(tmp_path: Path) -> Swarm:
     raw: dict[str, Any] = {
@@ -1374,8 +1577,9 @@ async def test_api_provides_every_field_the_ui_reads(tmp_path):
         assert all(task_keys <= set(t) for t in state["tasks"])
         second = next(t for t in state["tasks"] if t["id"] == 2)
         assert second["blocked_by"] == [1] and second["comments"] == 2 and second["goal"] == "It works"
-        agent_keys = {"name", "kind", "role", "status", "model", "cost_usd", "open_tasks"}
+        agent_keys = {"name", "kind", "role", "status", "model", "cost_usd", "open_tasks", "jobs"}
         assert all(agent_keys <= set(a) for a in state["agents"])
+        assert state["jobs"] == [] and sw["agent_count"] == 1
         assert {"id", "condition", "once", "owner", "fire_count", "note", "actions", "last_error"} <= set(state["triggers"][0])
         assert isinstance(state["mcp"], list) and isinstance(state["locks"], list)
 
@@ -1425,6 +1629,74 @@ async def test_api_provides_every_field_the_ui_reads(tmp_path):
         await asyncio.gather(server, return_exceptions=True)
         await swarm.stop()
         swarm.close()
+
+
+QUICK = "cmd" if sys.platform == "win32" else "sh"  # the fastest shell to start
+
+
+def py_command(script: str, *args: str) -> str:
+    """`$PYEXE script args` in the syntax of QUICK."""
+    if sys.platform == "win32":
+        return '"%PYEXE%" ' + " ".join(f'"{a}"' for a in (script, *args))
+    return '"$PYEXE" ' + " ".join(f"'{a}'" for a in (script, *args))
+
+
+async def test_api_serves_the_jobs_tab(tmp_path, monkeypatch):
+    """A member's background job as the board sees it: the state's "jobs" and the agent's count, its output and its
+    stop through the act API as the user, job.* in the feed. No process is left behind."""
+    from dreamteam.web import serve
+    from test_procs import Children
+
+    monkeypatch.setenv("PYEXE", sys.executable)
+    kids = Children(tmp_path)
+    raw: dict[str, Any] = {
+        "swarm": {"name": "UI swarm", "language": "en", "start_agents": 0, "max_agents": 3, "max_cost_usd": 0},
+        "agents": {"stagger_seconds": 0, "idle_nudge_seconds": 30},
+        "shell": {"program": QUICK},
+        "mcp": {"library_dir": str(tmp_path / "library")},
+        "models": {"default": {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0}},
+    }
+    def waiting(*args):
+        return {"tool_calls": [{"name": "wait", "arguments": {}}]}
+
+    swarm = Swarm(config=Config.from_dict(tmp_path / "project", raw),
+                  llm_factory=lambda profile, agent: ScriptedLLM(waiting, profile))
+    await swarm.start()
+    port = free_port()
+    server = asyncio.create_task(serve(swarm, "127.0.0.1", port))
+    base = f"http://127.0.0.1:{port}"
+    try:
+        await until(lambda: _is_up(base))
+        member = await swarm.hire(USER, "Helper", name="Claude Code", kind="external")
+        out = await swarm.jobs.run(member, py_command(str(tmp_path / "child.py"), "60", kids.pidfile()), timeout=60,
+                                   env={**os.environ, "PYEXE": sys.executable}, max_output=4000, background=True)
+        assert out.state == "started", out
+        await asyncio.to_thread(kids.pid)
+        state = await get(base, "/api/state")
+        (job,) = state["jobs"]
+        assert {"id", "label", "owner", "command", "origin", "status", "reason", "exit_code", "started_at",
+                "ended_at", "log", "processes"} <= set(job)
+        assert (job["label"], job["owner"], job["origin"], job["status"]) == ("j1", member, "background", "running")
+        assert job["log"] == ".scratch/claude.code/jobs/j1.log"
+        assert next(a for a in state["agents"] if a["name"] == member)["jobs"] == 1
+        output = await act(base, "jobs", job_id="j1", tail=200)          # the card's "Output"
+        assert output.startswith(f"Job j1 of {member}: ") and "child up" in output
+        assert (await get(base, "/api/files?path=.scratch/claude.code/jobs/j1.log"))["type"] == "file"
+        stopped = await act(base, "job_stop", job_id="j1")               # the card's "Stop"
+        assert stopped.startswith(f"Stopped job j1 (") and f"of {member} after" in stopped
+        assert not await asyncio.to_thread(lambda: kids.check())
+        job = (await get(base, "/api/state"))["jobs"][0]
+        assert (job["status"], job["reason"], job["stopped_by"]) == ("stopped", "user", "user")
+        assert next(a for a in (await get(base, "/api/state"))["agents"] if a["name"] == member)["jobs"] == 0
+        feed_types = json.loads(re.search(r"const FEED_TYPES = (\[.*?\]);", APP_JS).group(1))
+        feed = (await get(base, "/api/events?limit=400&types=" + urllib.parse.quote(",".join(feed_types))))["events"]
+        assert [e["type"] for e in feed if e["type"].startswith("job.")] == ["job.started", "job.ended"]
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        await swarm.stop()
+        swarm.close()
+        assert kids.check() == [], "child processes were left running"
 
 
 async def _is_up(base: str) -> bool:

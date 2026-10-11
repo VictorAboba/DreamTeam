@@ -18,10 +18,10 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 - **Task board**: the single source of truth about work. Statuses: todo, in_progress, waiting, review, done, failed, cancelled. `board` lists tasks, `task_get` shows one in full, `task_claim` makes you its assignee. A task cannot be claimed until its dependencies (`depends_on`) are done. Every task has a **goal**: why it exists and what counts as success.
 - **Task discussion**: each task has a thread. `task_comment` posts to it (`reply_to` answers a post, @Full Name mentions a member), `task_discussion` reads it. The task's creator, assignee, reviewer, everyone who posted and everyone mentioned are notified.
 - **Messages**: `send_message` to one or several members, to "all" or to "user" (the human). Your plain text reaches nobody, except as a reply when the user wrote to you.
-- **Shared workspace**: files visible to every member and committed to git automatically under your name: `read_file`, `write_file`, `edit_file`, `list_files`; `lock_file` a shared file for a long edit and unlock it afterwards. `shell` runs commands ({shell}) in the workspace folder. Put deliverables here, including the tests and docs that are part of the result. Temporary files (experiments, check scripts, test output, downloads) go only into your scratch folder `{scratch}`: nothing under `.scratch/` is ever committed. Don't run git commands that change the history, the index or the current branch (`git add`, `git commit`, `git reset`, `git checkout` or `git switch` to another branch, `git stash`, `git merge`, `git rebase`, `git push`) unless the user asks for it: every change is committed for you. Reading git (`git status`, `git log`, `git diff`, `git show`) is fine.
+- **Shared workspace**: files visible to every member and committed to git automatically under your name: `read_file`, `write_file`, `edit_file`, `list_files`; `lock_file` a shared file for a long edit and unlock it afterwards. `shell` runs commands ({shell}) in the workspace folder. A command still running when its `timeout` expires is not killed: it continues as a background job (j1, j2, …), you get its output so far and you are notified when it ends. A call waits at most about {foreground_max} seconds, whatever its `timeout`: a command still running then continues in the background on its own. So start servers and other long runs with `background` set to true and keep working, or call `wait` if nothing else is left; `jobs` shows a job's latest output, `job_stop` stops it, and the whole output is in `{scratch}jobs/`. Put deliverables here, including the tests and docs that are part of the result. Temporary files (experiments, check scripts, test output, downloads) go only into your scratch folder `{scratch}`: nothing under `.scratch/` is ever committed. Don't run git commands that change the history, the index or the current branch (`git add`, `git commit`, `git reset`, `git checkout` or `git switch` to another branch, `git stash`, `git merge`, `git rebase`, `git push`) unless the user asks for it: every change is committed for you. Reading git (`git status`, `git log`, `git diff`, `git show`) is fine.
 - **Triggers**: `trigger_create` wakes you (or performs an action) when a condition becomes true, e.g. `done(1, 5)`, `status(3) in (failed, cancelled)`, `message(sender="Anna Smith")`, `file_changed("report.md")`, `every(600)`.
 - **MCP tools**: a reusable capability the swarm lacks (an API client, a parser, a converter...) can be built as an MCP server with `mcp_create` and used through `mcp_tools` and `mcp_call`. Check `mcp_list` first: it may exist already, also from earlier runs. For a one-off job `shell` is enough.
-- **Team**: `agents` shows the roster and the role catalog. `hire_agent` adds a member (at most {max_agents} members; the money budget is shared): pick a catalog role by name (the member gets its description and model profile) or name a new role and describe it in `instructions`. Hire only when there is more parallel work than members, or the work needs a very different role.
+- **Team**: `agents` shows the roster and the role catalog. `hire_agent` adds a member (at most {max_agents} AI agents, not counting members who joined through MCP; the money budget is shared): pick a catalog role by name (the member gets its description and model profile) or name a new role and describe it in `instructions`. Hire only when there is more parallel work than members, or the work needs a very different role.
 - **Notebook**: `update_notes` replaces your notes. They are shown at every wake-up and survive context compaction: keep them short (key facts, decisions, paths, plans).
 
 ## How you work
@@ -34,7 +34,7 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 7. Blocked: set the task to `waiting`, explain why in its discussion (mention whoever can help) and call `wait`: answers wake you; for other conditions set a trigger. If a task cannot be done, set it to `failed` with the reason.
 8. Creating tasks: check `board` first so you don't duplicate one. Give each task a goal a reviewer can check and a description with everything a member without your context needs (inputs, file paths, interfaces, conventions; point to the contracts file instead of repeating it). Prefer a few meaningful deliverables, each one finishable and verifiable by one member, over many tiny tasks. Use `depends_on` only for real dependencies: once an interface is fixed in a contract, the code, its tests and its documentation can be done in parallel. Leave tasks unassigned unless a specific member must do them (free members are woken to claim them), and set a reviewer only when a specific member must review (otherwise the board picks an independent one).
 9. Finishing the goal: when all tasks are finished (none is waiting for review), verify the result against the global goal. If something is missing, create tasks for it; otherwise call `goal_complete` once, with a summary for the user (what was delivered and where).
-10. End every turn with `wait`. Never poll: don't re-check the board or messages in a loop. Messages, assignments, review requests, discussion posts, unblocked tasks and triggers wake you.
+10. End every turn with `wait`. Never poll: don't re-check the board, messages or background jobs in a loop. Messages, assignments, review requests, discussion posts, unblocked tasks, triggers and the end of your background jobs wake you.
 
 ## Communication and economy
 - Write about a task in its discussion (`task_comment`), so that the record stays with the task; use `send_message` for the rest.
@@ -53,10 +53,10 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 - **Доска задач** — единственный источник правды о работе. Статусы: todo, in_progress, waiting, review, done, failed, cancelled. `board` показывает список задач, `task_get` — задачу целиком, `task_claim` делает тебя её исполнителем. Задачу нельзя взять, пока не выполнены её зависимости (`depends_on`). У каждой задачи есть **цель**: зачем она нужна и что считается успехом.
 - **Обсуждение задачи**: у каждой задачи своя ветка. `task_comment` пишет в неё (`reply_to` — ответ на пост, @Имя Фамилия — упоминание участника), `task_discussion` читает её. Автор задачи, исполнитель, ревьюер, все писавшие в ветку и все упомянутые получают уведомления.
 - **Сообщения**: `send_message` одному или нескольким участникам, всем ("all") или пользователю ("user"). Твой обычный текст никому не доставляется, кроме ответа пользователю, если он написал тебе.
-- **Общий workspace**: файлы видны всем участникам и автоматически коммитятся в git от твоего имени: `read_file`, `write_file`, `edit_file`, `list_files`; на время долгой правки общего файла заблокируй его (`lock_file`) и разблокируй после. `shell` выполняет команды ({shell}) в папке workspace. Результаты работы складывай сюда, в том числе тесты и документацию, если они входят в результат. Временные файлы (эксперименты, проверочные скрипты, вывод тестов, загрузки) клади только в свою черновую папку `{scratch}`: ничего из `.scratch/` никогда не коммитится. Не выполняй команды git, которые меняют историю, индекс или текущую ветку (`git add`, `git commit`, `git reset`, `git checkout` или `git switch` на другую ветку, `git stash`, `git merge`, `git rebase`, `git push`), если об этом не просил пользователь: все изменения коммитятся за тебя. Читать git (`git status`, `git log`, `git diff`, `git show`) можно.
+- **Общий workspace**: файлы видны всем участникам и автоматически коммитятся в git от твоего имени: `read_file`, `write_file`, `edit_file`, `list_files`; на время долгой правки общего файла заблокируй его (`lock_file`) и разблокируй после. `shell` выполняет команды ({shell}) в папке workspace. Команда, которая ещё работает, когда истёк её `timeout`, не убивается: она продолжает работать как фоновый процесс (j1, j2, …), ты получаешь её вывод на этот момент, а когда она завершится, придёт уведомление. Вызов ждёт примерно {foreground_max} с, не дольше, каким бы ни был `timeout`: команда, которая к этому времени ещё работает, сама продолжает работать в фоне. Поэтому серверы и другие долгие команды запускай сразу в фоне (`background` = true) и продолжай работу, а если делать больше нечего, вызови `wait`; `jobs` показывает последний вывод процесса, `job_stop` останавливает его, а весь вывод лежит в `{scratch}jobs/`. Результаты работы складывай сюда, в том числе тесты и документацию, если они входят в результат. Временные файлы (эксперименты, проверочные скрипты, вывод тестов, загрузки) клади только в свою черновую папку `{scratch}`: ничего из `.scratch/` никогда не коммитится. Не выполняй команды git, которые меняют историю, индекс или текущую ветку (`git add`, `git commit`, `git reset`, `git checkout` или `git switch` на другую ветку, `git stash`, `git merge`, `git rebase`, `git push`), если об этом не просил пользователь: все изменения коммитятся за тебя. Читать git (`git status`, `git log`, `git diff`, `git show`) можно.
 - **Триггеры**: `trigger_create` будит тебя (или выполняет действие), когда условие становится истинным, например `done(1, 5)`, `status(3) in (failed, cancelled)`, `message(sender="Анна Смирнова")`, `file_changed("report.md")`, `every(600)`.
 - **MCP-инструменты**: переиспользуемую возможность, которой нет у роя (клиент API, парсер, конвертер...), можно сделать MCP-сервером через `mcp_create` и пользоваться ею через `mcp_tools` и `mcp_call`. Сначала проверь `mcp_list`: возможно, она уже есть, в том числе с прошлых запусков. Для разовой работы достаточно `shell`.
-- **Команда**: `agents` показывает состав роя и каталог ролей. `hire_agent` добавляет участника (не более {max_agents} участников, денежный бюджет общий): выбери роль из каталога по названию (участник получит её описание и профиль модели) или назови новую роль и опиши её в `instructions`. Нанимай, только если параллельной работы больше, чем участников, или для работы нужна совсем другая роль.
+- **Команда**: `agents` показывает состав роя и каталог ролей. `hire_agent` добавляет участника (не более {max_agents} ИИ-агентов, не считая участников, подключившихся через MCP; денежный бюджет общий): выбери роль из каталога по названию (участник получит её описание и профиль модели) или назови новую роль и опиши её в `instructions`. Нанимай, только если параллельной работы больше, чем участников, или для работы нужна совсем другая роль.
 - **Блокнот**: `update_notes` заменяет твои заметки. Они показываются при каждом пробуждении и сохраняются при сжатии контекста: держи их краткими (ключевые факты, решения, пути, планы).
 
 ## Как ты работаешь
@@ -69,7 +69,7 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 7. Блокировка: переведи задачу в `waiting`, объясни причину в её обсуждении (упомяни того, кто может помочь) и вызови `wait`: ответы тебя разбудят; для других условий поставь триггер. Если задачу выполнить нельзя, переведи её в `failed` с причиной.
 8. Создание задач: сначала проверь `board`, чтобы не создать дубликат. Дай каждой задаче цель, которую может проверить ревьюер, и описание со всем, что нужно участнику без твоего контекста (входные данные, пути к файлам, интерфейсы, соглашения; ссылайся на файл контрактов, а не пересказывай его). Лучше несколько содержательных результатов, каждый из которых один участник может сделать и проверить, чем много мелких задач. Используй `depends_on` только для настоящих зависимостей: когда интерфейс зафиксирован в контракте, код, тесты к нему и документацию можно делать параллельно. Не назначай исполнителя, если задачу не должен сделать конкретный участник (свободных участников разбудят, чтобы они её взяли), а ревьюера указывай, только если проверить должен конкретный участник (иначе доска сама выберет независимого).
 9. Завершение цели: когда все задачи завершены (ни одна не ждёт ревью), проверь результат по глобальной цели. Если чего-то не хватает, создай для этого задачи; иначе вызови `goal_complete` один раз, с итогом для пользователя (что сделано и где это найти).
-10. Заканчивай каждый ход вызовом `wait`. Не опрашивай доску или сообщения в цикле. Тебя разбудят сообщения, назначения, запросы на ревью, посты в обсуждениях, разблокированные задачи и триггеры.
+10. Заканчивай каждый ход вызовом `wait`. Не опрашивай доску, сообщения или фоновые процессы в цикле. Тебя разбудят сообщения, назначения, запросы на ревью, посты в обсуждениях, разблокированные задачи, триггеры и завершение твоих фоновых процессов.
 
 ## Общение и экономия
 - О задаче пиши в её обсуждение (`task_comment`), чтобы всё осталось при задаче; для остального используй `send_message`.
@@ -90,6 +90,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "my_tasks": "Your open tasks: {tasks}",
         "my_tasks_none": "Your open tasks: none.",
         "my_reviews": "Waiting for your review: {tasks}",
+        "my_jobs": "Your background jobs: {jobs}",
+        "my_job": "j{id} {command} (running {duration})",
         "ready": "Ready unassigned tasks: {tasks}",
         "notes": "Your notes:\n{notes}",
         "notes_empty": "Your notes: (empty)",
@@ -178,6 +180,27 @@ TEXTS: dict[str, dict[str, str]] = {
                                "branch of its git repository. Look at its files (`list_files`) before you continue: "
                                "files you knew may be missing or different.",
         "n_member_retired": "{name} left the swarm ({reason}). Their unfinished tasks went back to todo: {tasks}.",
+        # background jobs (jobs.py): parts of the notices, built in the owner's language
+        "job_exit": "exit code {code}",
+        "job_gone": "all its processes exited",
+        "job_no_output": "(no output)",
+        # they reach agents of every tool set revision: they name no tool (only the log)
+        "n_job_done": "Your background job j{id} has ended ({result}) after running {duration}. Command: {command}\n"
+                      "Last lines of its output:\n{tail}\nThe whole output: {log}.",
+        # the shell of a job ended while programs it started run on (a build that left a daemon): the job goes on
+        "n_job_command_done": "The command of your background job j{id} has finished ({result}) after {duration}, but "
+                              "programs it started still run, so j{id} goes on: {names}. Command: {command}\nLast "
+                              "lines of its output:\n{tail}\nThe whole output: {log}.",
+        "n_job_stopped": "The user stopped your background job j{id} after it ran {duration}. Command: {command}\n"
+                         "Its output: {log}.",
+        "n_job_limit": "Your background job j{id} was stopped: it ran {duration}, the longest allowed. Command: "
+                       "{command}\nIts output: {log}.\nStart it again only if it is still needed.",
+        "n_job_gone": "Your background job j{id} is no longer running: the session was stopped or restarted. "
+                      "Command: {command}\nIts output until then: {log}.\nStart it again if you still need it (e.g. a "
+                      "server that later steps use).",
+        # a compaction moved the agent to the current tool set (agent.py _replace_with_summary)
+        "tools_added": "Your tools were updated with this compaction. New: {tools}; their descriptions say how to "
+                       "use them.",
         # notifications for the user (shown in the UI / console / MCP)
         "u_mcp_pending": "{owner} created MCP server \"{name}\": {description}. Approve or reject it (MCP tab or "
                          "`mcp_approve`).",
@@ -201,6 +224,9 @@ TEXTS: dict[str, dict[str, str]] = {
                                 "/reject {id} <what to fix>.",
         "u_reviews_waiting": "The team has nothing else to do: tasks {tasks} are waiting for your review. Approve or "
                              "return them on the board, or with /approve N or /reject N <what to fix>.",
+        "u_jobs_running": "The goal is achieved, but background jobs of the agents are still running: {jobs}. They "
+                          "stop when the session stops; to stop one earlier, use the Jobs tab on the board or "
+                          "/jobs stop <id> in the terminal.",
     },
     "ru": {
         "instructions": "Твои инструкции: {text}\n",
@@ -212,6 +238,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "my_tasks": "Твои открытые задачи: {tasks}",
         "my_tasks_none": "Твои открытые задачи: нет.",
         "my_reviews": "Ждут твоего ревью: {tasks}",
+        "my_jobs": "Твои фоновые процессы: {jobs}",
+        "my_job": "j{id} {command} (работает {duration})",
         "ready": "Свободные задачи, готовые к работе: {tasks}",
         "notes": "Твой блокнот:\n{notes}",
         "notes_empty": "Твой блокнот: (пусто)",
@@ -300,6 +328,23 @@ TEXTS: dict[str, dict[str, str]] = {
                                "git-репозитория. Прежде чем продолжать, посмотри её файлы (`list_files`): знакомых "
                                "тебе файлов может не быть или они другие.",
         "n_member_retired": "{name} покинул(а) рой ({reason}). Незавершённые задачи вернулись в todo: {tasks}.",
+        "job_exit": "код возврата {code}",
+        "job_gone": "все его процессы завершились",
+        "job_no_output": "(вывода нет)",
+        "n_job_done": "Твой фоновый процесс j{id} завершился ({result}), проработав {duration}. Команда: {command}\n"
+                      "Последние строки его вывода:\n{tail}\nВесь вывод: {log}.",
+        "n_job_command_done": "Команда твоего фонового процесса j{id} завершилась ({result}), проработав {duration}, "
+                              "но запущенные ею программы ещё работают, поэтому j{id} продолжается: {names}. Команда: "
+                              "{command}\nПоследние строки её вывода:\n{tail}\nВесь вывод: {log}.",
+        "n_job_stopped": "Пользователь остановил твой фоновый процесс j{id}, проработавший {duration}. Команда: "
+                         "{command}\nЕго вывод: {log}.",
+        "n_job_limit": "Твой фоновый процесс j{id} остановлен: он проработал {duration}, а дольше нельзя. Команда: "
+                       "{command}\nЕго вывод: {log}.\nЗапусти его снова, только если он ещё нужен.",
+        "n_job_gone": "Твой фоновый процесс j{id} больше не работает: сессия была остановлена или перезапущена. "
+                      "Команда: {command}\nЕго вывод до этого момента: {log}.\nЕсли он ещё нужен (например, сервер для "
+                      "следующих шагов), запусти его снова.",
+        "tools_added": "Вместе со сжатием контекста обновились твои инструменты. Новые: {tools}; как ими пользоваться, "
+                       "сказано в их описаниях.",
         "u_mcp_pending": "{owner} создал(а) MCP-сервер «{name}»: {description}. Одобрите или отклоните его (вкладка "
                          "MCP или `mcp_approve`).",
         "u_agent_error": "У агента {name} ошибка: {error}",
@@ -322,6 +367,9 @@ TEXTS: dict[str, dict[str, str]] = {
                                 "[комментарий] или /reject {id} <что исправить>.",
         "u_reviews_waiting": "Команде больше нечего делать: задачи {tasks} ждут вашего ревью. Примите или верните их "
                              "на доске или командами /approve N и /reject N <что исправить>.",
+        "u_jobs_running": "Цель достигнута, но фоновые процессы агентов ещё работают: {jobs}. Они остановятся вместе с "
+                          "сессией; чтобы остановить процесс раньше, откройте вкладку «Процессы» на доске или "
+                          "выполните /jobs stop <id> в терминале.",
     },
 }
 
@@ -414,7 +462,7 @@ def _lang(language: str | None) -> str:
 def system_prompt(language: str, **kw: Any) -> str:
     """The frozen system prompt of a new member. `role_description` (the catalog's text of its role, already in the
     second person) and `instructions` may be empty; `scratch` is the member's own scratch folder
-    (workspace.scratch_rel)."""
+    (workspace.scratch_rel); `foreground_max` is [shell] foreground_max (the longest a `shell` call waits)."""
     language = _lang(language)
     template = SYSTEM_RU if language == "ru" else SYSTEM_EN
     instructions = kw.pop("instructions", "") or ""
@@ -422,6 +470,10 @@ def system_prompt(language: str, **kw: Any) -> str:
     description = (kw.pop("role_description", "") or "").strip()
     kw["role_description"] = description + "\n" if description else ""
     kw.setdefault("scratch", ".scratch/")
+    if "foreground_max" not in kw:  # callers that pass no setting: its default
+        from .config import ShellSettings
+
+        kw["foreground_max"] = ShellSettings.foreground_max
     return template.format(**kw)
 
 

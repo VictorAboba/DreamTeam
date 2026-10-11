@@ -26,6 +26,8 @@ TEAM_RESET = ("-", "default", "reset", "сброс")   # /team: back to the star
 # "/approve 12", "/reject #12 ...": a task in review. Agent-built MCP servers are named like mcp_forge.NAME_RE
 # (they start with a letter) and external servers are never pending, so a number is never an MCP server.
 _TASK_REF = re.compile(r"#?\d+")
+_JOB_REF = re.compile(r"[jJ%#]?(\d+)")          # "/jobs j3", "/jobs stop 3": a background job of an agent
+JOB_STOP = ("stop", "kill", "стоп")
 
 # CLI flags that become session overrides of a new session (the sections of the launcher's modal)
 FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
@@ -225,6 +227,30 @@ async def _task(c: CommandContext) -> None:
 async def _agents(c: CommandContext) -> None:
     state = await c.state()
     c.print(render.agents_table(c.ctx, state.get("agents") or []))
+
+
+async def _jobs(c: CommandContext) -> None:
+    """`/jobs`: the agents' background jobs (from the state: the running ones, then those ended in the last hour);
+    `/jobs jN`: one job's state and the end of its output (the `jobs` tool); `/jobs stop jN [jM …]`: stop jobs (the
+    `job_stop` tool: the user may stop any member's job). Pausing the swarm does not stop them."""
+    words = c.args.split()
+    if not words:
+        state = await c.state()
+        c.print(render.jobs_table(c.ctx, state.get("jobs") or []))
+        return
+    stop = words[0].casefold() in JOB_STOP
+    refs = [_JOB_REF.fullmatch(word) for word in (words[1:] if stop else words)]
+    if not refs or not all(refs) or (not stop and len(refs) > 1):
+        raise UsageError
+    if stop:
+        for ref in refs:
+            await c.act("job_stop", {"job_id": f"j{ref.group(1)}"}, report=True)
+        return
+    ok, text = await c.client.act(c.sid, "jobs", {"job_id": f"j{refs[0].group(1)}"})
+    if not ok:
+        c.error(text)
+    else:
+        c.print(render.job_output(c.ctx, text))
 
 
 async def _roles(c: CommandContext) -> None:
@@ -441,6 +467,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("task", _task, args=True, required=True, session=True),
     Command("agents", _agents, session=True),
     Command("roles", _roles, args=True),
+    Command("jobs", _jobs, args=True, session=True),
     Command("to", _to, args=True, required=True, session=True),
     Command("hire", _hire, args=True, required=True, session=True),
     Command("trace", _trace, args=True, session=True),
