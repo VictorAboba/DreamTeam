@@ -19,7 +19,7 @@ WAIT_MAX = 600
 # wait_for_events(progress=true): the journal events that are board progress, the lines shown per result (the rest
 # is counted) and the events read per result
 PROGRESS_TYPES = ("task.created", "task.updated", "goal.set", "goal.completed", "goal.reopened", "agent.hired",
-                  "agent.retired")
+                  "agent.retired", "swarm.wrap_up")
 PROGRESS_MAX = 20
 PROGRESS_SCAN = 1000
 PROGRESS_TITLE = 80
@@ -35,6 +35,9 @@ _PROGRESS = {
         "hired": "{name} hired as \"{role}\" by {by}",
         "joined": "{name} joined as \"{role}\" (external member)",
         "retired": "{name} left the swarm ({by})",
+        "wrap_up_on": "wrap-up mode on ({by}): finish your tasks with what you have, no new computations or background "
+                      "jobs",
+        "wrap_up_off": "wrap-up mode off ({by})",
         "more": "… and {n} more: see `board`",
     },
     "ru": {
@@ -48,6 +51,9 @@ _PROGRESS = {
         "hired": "{name} нанят(а) на роль «{role}» ({by})",
         "joined": "{name} присоединился(ась) к рою в роли «{role}» (внешний участник)",
         "retired": "{name} покинул(а) рой ({by})",
+        "wrap_up_on": "режим завершения включён ({by}): заверши свои задачи с тем, что есть, без новых вычислений и "
+                      "фоновых процессов",
+        "wrap_up_off": "режим завершения выключен ({by})",
         "more": "… и ещё {n}: смотри `board`",
     },
 }
@@ -350,6 +356,8 @@ def _progress_line(texts: dict[str, str], event: dict, actor: str) -> str | None
         return texts["goal_done"].format(by=by)
     if kind == "goal.reopened":
         return texts["goal_reopened"].format(by=by)
+    if kind == "swarm.wrap_up":
+        return texts["wrap_up_on" if data.get("on") else "wrap_up_off"].format(by=by)
     name = data.get("name")
     if not name or name == actor:
         return None
@@ -397,13 +405,13 @@ async def _signal_or_progress(swarm, actor: str, queue: asyncio.Queue, timeout: 
     en=f"Wait (up to timeout seconds, default {WAIT_DEFAULT}, max {WAIT_MAX}) for new messages, notifications, "
        "assignments or triggers addressed to you, and return them. Returns immediately if something is already "
        "pending. With progress=true it also returns on board progress made by others (tasks created or changing "
-       "status, the goal set, achieved or reopened, members hired, joined or leaving), as short lines with their "
-       "time (HH:MM). When the news spans more than a minute, every item has its time and the header the range.",
+       "status, the goal set, achieved or reopened, members hired, joined or leaving, wrap-up mode switched on or "
+       "off), as short lines with their time (HH:MM). When the news spans more than a minute, every item has its time and the header the range.",
     ru=f"Подождать (до timeout секунд, по умолчанию {WAIT_DEFAULT}, максимум {WAIT_MAX}) новых сообщений, "
        "уведомлений, назначений или срабатываний триггеров, адресованных тебе, и вернуть их. Сразу "
        "возвращается, если что-то уже есть. С progress=true возвращается и при прогрессе на доске, сделанном "
        "другими (задачи созданы или сменили статус, цель задана, достигнута или возвращена в работу, участники "
-       "наняты, вступили или ушли), короткими строками со временем (ЧЧ:ММ). Если новости охватывают больше "
+       "наняты, вступили или ушли, режим завершения включён или выключен), короткими строками со временем (ЧЧ:ММ). Если новости охватывают больше "
        "минуты, время есть у каждой из них, а в заголовке — диапазон.",
     properties={"timeout": {"type": "integer", "description": f"Seconds, 0-{WAIT_MAX}"},
                 "progress": {"type": "boolean",
@@ -482,10 +490,10 @@ async def set_goal(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 @tool(
     "swarm_status",
-    en="Overview of the swarm: goal, budget, pause state, members, task counts and your unread items. brief=true "
-       "shows the goal as one line (title and status, without its description and summary).",
-    ru="Обзор роя: цель, бюджет, пауза, участники, счётчики задач и твои непрочитанные. brief=true показывает цель "
-       "одной строкой (заголовок и статус, без описания и итога).",
+    en="Overview of the swarm: goal, budget, pause and wrap-up state, members, task counts and your unread items. "
+       "brief=true shows the goal as one line (title and status, without its description and summary).",
+    ru="Обзор роя: цель, бюджет, пауза и режим завершения, участники, счётчики задач и твои непрочитанные. "
+       "brief=true показывает цель одной строкой (заголовок и статус, без описания и итога).",
     properties={"brief": {"type": "boolean",
                           "description": "The goal as one line, without its description and summary (default false)"}},
     audience=("external", "user"),
@@ -498,8 +506,12 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     goal = swarm.goal()
     if args.get("brief") and goal:  # a client that checks often needs no repeat of a long goal text
         goal = {"title": goal.get("title"), "status": goal.get("status", "active")}
+    state = "PAUSED: " + swarm.pause_reason if swarm.paused else "running"
+    if swarm.wrapping_up:
+        state += ("; WRAP-UP MODE: the agents finish their tasks with what they have, no new computations or "
+                  "background jobs")
     lines = [
-        f"Swarm \"{swarm.config.swarm.name}\" — {'PAUSED: ' + swarm.pause_reason if swarm.paused else 'running'}",
+        f"Swarm \"{swarm.config.swarm.name}\" — {state}",
         goal_line(goal),
         f"{budget_line(swarm.spent_usd(), limits['max_cost_usd'])} {_team_size(members, limits)}",
         "Members: " + (", ".join(f"{m['name']} ({m['role']}, {m['status']})" for m in members) or "none"),
@@ -522,12 +534,18 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 @tool(
     "swarm_control",
-    en="Control the swarm: action=pause|resume, change limits (max_cost_usd, 0 = no limit; max_agents), or "
-       "reopen a completed goal with reopen_goal_comment.",
-    ru="Управление роем: action=pause|resume, изменение лимитов (max_cost_usd, 0 — без лимита; max_agents) "
+    en="Control the swarm: action=pause|resume, wrap_up=true|false (wrap-up mode: the agents finish their tasks with "
+       "what they have, start no new computations, and no new background jobs start; a new or reopened goal ends "
+       "it), change limits (max_cost_usd, 0 = no limit; max_agents), or reopen a completed goal with "
+       "reopen_goal_comment.",
+    ru="Управление роем: action=pause|resume, wrap_up=true|false (режим завершения: агенты завершают свои задачи с "
+       "тем, что есть, не начинают новых вычислений, и новые фоновые процессы не запускаются; новая или "
+       "возвращённая в работу цель его выключает), изменение лимитов (max_cost_usd, 0 — без лимита; max_agents) "
        "или возврат завершённой цели в работу через reopen_goal_comment.",
     properties={
         "action": {"type": "string", "enum": ["pause", "resume"]},
+        "wrap_up": {"type": "boolean",
+                    "description": "true: switch wrap-up mode on (each agent is told once); false: switch it off"},
         "max_cost_usd": {"type": "number", "description": "Budget in USD, 0 = no limit"},
         "max_agents": {"type": "integer",
                        "description": "Maximum number of AI agents (members who joined through MCP do not count)"},
@@ -538,6 +556,7 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
 async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
     done = []
+    wrap = args.get("wrap_up")
     if args.get("max_cost_usd") is not None or args.get("max_agents") is not None:
         limits = swarm.set_limits(ctx.actor, args.get("max_cost_usd"), args.get("max_agents"))
         budget = f"${limits['max_cost_usd']:.2f}" if limits["max_cost_usd"] > 0 else "no budget limit"
@@ -556,6 +575,12 @@ async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
     elif action == "resume":
         swarm.resume(ctx.actor)
         done.append("resumed")
+    # after reopen_goal_comment, which ends wrap-up mode: both in one call means "reopen, then wrap up"
+    if wrap is True:
+        done.append("wrap-up mode on: every agent was told to finish its tasks with what it has, and no new background "
+                    "jobs start" if swarm.wrap_up(ctx.actor) else "wrap-up mode was already on")
+    elif wrap is False:
+        done.append("wrap-up mode off" if swarm.end_wrap_up(ctx.actor) else "wrap-up mode was not on")
     if not done:
-        raise ToolError("Nothing to do: pass action (pause/resume), a limit or reopen_goal_comment.")
+        raise ToolError("Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.")
     return "Done: " + "; ".join(done) + "."

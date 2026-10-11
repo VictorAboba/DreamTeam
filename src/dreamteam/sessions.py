@@ -375,7 +375,8 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
-        "limits": {}, "paused": False, "pause_reason": "", "last_activity": None, "jobs": {"running": 0},
+        "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
+        "jobs": {"running": 0},
     }
     own = conn is None
     if own:
@@ -412,6 +413,8 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
         paused = paused if isinstance(paused, dict) else {}
         stats["paused"] = bool(paused.get("paused"))
         stats["pause_reason"] = paused.get("reason", "") or ""
+        wrap_up = kv("wrap_up")  # the user's wrap-up mode (Swarm.wrap_up)
+        stats["wrap_up"] = bool(wrap_up.get("on")) if isinstance(wrap_up, dict) else False
         row = conn.execute("SELECT ts FROM events ORDER BY id DESC LIMIT 1").fetchone()
         stats["last_activity"] = row[0] if row else None
         try:  # its own try: a database of a version before background jobs has no jobs table

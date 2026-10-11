@@ -85,6 +85,10 @@ BACKGROUND_ERRORS = {
     "disabled": "Background jobs are turned off in the settings ([shell] max_jobs_per_member or max_jobs is 0): run "
                 "the command without background.",
 }
+# the user's wrap-up mode (Swarm.wrapping_up): no command of a member becomes a new job
+WRAP_UP_ERROR = ("The user asked the team to wrap up, so no new background jobs are started. If the command is quick, "
+                 "run it without background (it is stopped at its timeout); otherwise finish your task with what you "
+                 "have (task_complete with the result so far and what is left).")
 NOTES = {
     "limit_member": "It was not moved to the background: you already have {n} background jobs ({ids}), the most "
                     "allowed. Stop one you no longer need ({how}) or wait for one to end.",
@@ -92,6 +96,10 @@ NOTES = {
                      "allowed.",
     "disabled": "Background jobs are turned off in the settings ([shell] max_jobs_per_member or max_jobs is 0).",
     "no_time": "{max} is the longest a command may run unless it was started in the background on purpose ({how}).",
+    "wrap_up": "It was not moved to the background: the user asked the team to wrap up, so no new background jobs "
+               "are started. Finish your task with the results you have and say what is left.",
+    "wrap_up_left": "They were not kept as a background job: the user asked the team to wrap up, so no new "
+                    "background jobs are started.",
 }
 # (new callers, old agents). PowerShell: Start-Process only with -NoNewWindow keeps the output in the job (without it
 # the program writes into a console window of its own on the user's desktop, and the job's log stays empty)
@@ -319,7 +327,8 @@ class ShellOutcome:
     shell: str
     wait: float
     job: Job | None = None
-    note: str = ""      # limit_member | limit_session | disabled | no_time; for killed: session | retired
+    note: str = ""      # limit_member | limit_session | disabled | no_time | wrap_up | wrap_up_left; for killed:
+                        # session | retired
     names: list[str] = field(default_factory=list)
     note_args: dict = field(default_factory=dict)
     max_output: int = 12000
@@ -423,12 +432,16 @@ class JobManager:
         `background`; an AI agent at most [shell] foreground_max while its command could become a job, an external
         member at most EXTERNAL_WAIT_MAX), then return its result, or keep it as a job and return its output so far.
         ToolError when no command may start (the session stops, the actor leaves) or `background` is not allowed
-        now."""
+        now. In the user's wrap-up mode no command becomes a new job: `background` is refused, a command still
+        running at its timeout is killed then (as without background_on_timeout), and processes it leaves running
+        are killed at its end."""
         if self._stopping():
             raise ToolError(STOPPING_ERROR)
         if actor in self._forbidden:
             raise ToolError(LEAVING_ERROR)
         cfg = self.swarm.config.shell
+        if background and self.wrapping_up(actor):
+            raise ToolError(WRAP_UP_ERROR)
         if background:
             note = self.check_start(actor)
             if note is not None:
@@ -452,10 +465,12 @@ class JobManager:
                 cmd.tree.kill()
             exited = await cmd.wait_exit(wait)
             # foreground_max only moves an AI agent's command to the background sooner: one that cannot become a job
-            # now (the limits, jobs turned off) gets the rest of its own timeout, as before the cap, and goes on as a
-            # job as soon as a slot frees. (An external member's cap stays: it protects the MCP transport.)
+            # now (the limits, jobs turned off, wrap-up mode switched on during the call) gets the rest of its own
+            # timeout, as before the cap, and goes on as a job as soon as a slot frees. (An external member's cap
+            # stays: it protects the MCP transport.)
             while (not exited and fg.killed is None and wait < requested and self._may_adopt(actor)
-                   and self.swarm.kind_of(actor) == AgentKind.LLM and self.check_start(actor) is not None):
+                   and self.swarm.kind_of(actor) == AgentKind.LLM
+                   and (self.check_start(actor) is not None or (not background and self.wrapping_up(actor)))):
                 step = min(JOB_TICK, requested - wait)
                 exited = await cmd.wait_exit(step)
                 wait += step
@@ -468,7 +483,9 @@ class JobManager:
                     fg.killed = self._refusal(actor)
                 if fg.killed is None:  # processes the command started run on after its shell exited
                     code = cmd.returncode
-                    note = self.check_start(actor)
+                    # wrapping up: what a command leaves running dies with it (a background=true call was accepted
+                    # before wrap-up began: its program is the job it asked for)
+                    note = "wrap_up_left" if not background and self.wrapping_up(actor) else self.check_start(actor)
                     if note is None:
                         output = cmd.output()
                         job = self._adopt(actor, command, cmd, "background" if background else "detached",
@@ -493,6 +510,8 @@ class JobManager:
                 note = self.check_start(actor)
             elif not self._setting("background_on_timeout"):
                 note = ""  # exactly the old result: killed at its timeout
+            elif self.wrapping_up(actor):
+                note = "wrap_up"  # killed at its timeout, as without background_on_timeout, saying why
             elif wait >= cfg.max_timeout:
                 note = "no_time"  # a timeout job would have no lifetime left
             else:
@@ -530,6 +549,8 @@ class JobManager:
             return wait
         kind = self.swarm.kind_of(actor)
         if kind == AgentKind.LLM:
+            # also in wrap-up mode: run() extends the wait tick by tick while the mode lasts, so switching it off
+            # during the call moves the command to the background at once instead of blocking to its timeout
             return min(wait, float(max(1, int(self._setting("foreground_max") or 1))))
         if kind == AgentKind.EXTERNAL:
             return min(wait, EXTERNAL_WAIT_MAX)
@@ -564,6 +585,11 @@ class JobManager:
         if callable(count):
             return int(count())
         return sum(1 for m in self.swarm.members() if m["kind"] == AgentKind.LLM)
+
+    def wrapping_up(self, actor: str) -> bool:
+        """The user's wrap-up mode (Swarm.wrapping_up) holds for `actor`'s commands: every member's, AI agent or
+        external; never the user's own."""
+        return actor != USER and bool(getattr(self.swarm, "wrapping_up", False))
 
     def _may_start(self, actor: str) -> bool:
         return not self._stopping() and actor not in self._forbidden

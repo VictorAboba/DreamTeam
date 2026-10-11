@@ -202,6 +202,11 @@ class Swarm:
     def signal(self, name: str) -> None                 # wakes LLM runtime / releases wait_signal waiters
     async def wait_signal(self, name: str, timeout: float) -> bool
     def has_pending(self, name: str) -> bool            # unread inbox or undelivered non-quiet notifications
+    def waits_for_job(self, name: str) -> bool
+        # an AI agent asleep (runtime state idle) while a command of its own runs on as a job it waits for
+        # (JobManager.busy) and whose end will wake it (JobManager.awaited): a member's broadcast reaches it without a
+        # wake (§5 "Quiet broadcasts")
+    def defer_wake(self, name: str) -> None              # such news reached `name` unwoken (_wake_deferred, below)
     def render_wake(self, name: str, incoming: bool = False, stamps: bool = False,
                     since: float | None = None) -> str | None
         # drains (marks read/delivered) and renders the wake-up text (§6.3); None if nothing pending
@@ -232,7 +237,8 @@ class Swarm:
         # u_jobs_running {jobs: "j3 (Anna Smith: npm run dev, 25 min); ..."}, and their later ends wake nobody
     def reopen_goal(self, actor: str, comment: str = "") -> dict
         # only a done goal (else ToolError); notifies ONE LLM member n_goal_reopened: the one who completed
-        # the goal, else the most recently active (the others are offered new tasks by the scheduler)
+        # the goal, else the most recently active (the others are offered new tasks by the scheduler).
+        # set_goal and reopen_goal both end wrap-up mode (end_wrap_up, below)
 
     # team
     async def hire(self, by: str, role: str, instructions: str = "", model: str | None = None,
@@ -269,6 +275,19 @@ class Swarm:
     def resume(self, actor: str) -> None
         # n_resumed to LLM agents with open tasks, reviews waiting for them, pending events or an activation the
         # pause cut short (runtime.interrupted); a reply owed to the user by that activation is still forwarded
+    wrapping_up: bool                                    # the user's wrap-up mode (kv "wrap_up" {"on", "by", "since"})
+    def wrap_up(self, actor: str) -> bool
+        # wrap-up mode on (False when it was on already): the team finishes with what it has. Emits `swarm.wrap_up`
+        # {on: true} and notifies every LLM member once, waking it: `n_wrap_up` (start no new computations or
+        # background jobs, not even one more quick pass; task_complete with the result so far and what is left; do
+        # the reviews waiting for you; stop the jobs nobody needs; when every task is finished the goal is completed
+        # with what was achieved and what is left, without new tasks). While on: every wake-up carries
+        # `wrap_up_line` (§6.3), no command of a member becomes a new job (§7.1 "Wrap-up mode"), `_check_all_done`
+        # sends `n_all_done_wrap_up` (goal_complete, no new tasks) instead of `n_all_done`. Nothing is paused; the
+        # user's own actions are not restricted
+    def end_wrap_up(self, actor: str) -> bool
+        # off (False when it was not on): `swarm.wrap_up` {on: false} and a quiet `n_wrap_up_end` to every LLM member
+        # (shown at its next wake-up); called by the user (swarm_control wrap_up=false), set_goal and reopen_goal
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient
         # a member's profile (agents.model) that no longer exists in the settings (renamed or deleted) falls back
         # to the default profile with a warning, instead of crashing that agent at every activation
@@ -284,7 +303,9 @@ resolve_member is the real `resolve_member_in`; set_goal / complete_goal validat
 like the real ones (the planning task is created when a real Board is wired).
 
 Scheduler (every 3 s): expires file locks, prunes old traces (every 6 h) and closes idle external trace
-sessions (§16); unless paused, in this order. "Idle" (`_idle_llm_members`) is an LLM agent with status idle, a
+sessions (§16); unless paused, `_wake_deferred` first (an agent a broadcast reached without a wake, §5, that no longer
+`waits_for_job` while the news is still unread is woken once: e.g. the busy window of its server ended), then in this
+order. "Idle" (`_idle_llm_members`) is an LLM agent with status idle, a
 runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Liveness"):
 1. `_nudge_idle`: offers ready unassigned tasks to idle LLM agents (`n_ready`), never more agents considering
    offers than there are ready tasks, and the kickoff counts as everyone's offer of the planning task; with
@@ -522,7 +543,7 @@ class Mailbox:
         # to: name, list of names, "all" (all active members except sender; USER not included) or USER.
         # Resolves via swarm.resolve_member; duplicates removed; sender cannot be the only recipient.
         # text non-empty, <= 50000 chars. Inserts message + inbox rows; emits "message.sent" {message};
-        # swarm.signal(each recipient). Inside `sent_as_seen_by(members, sender)` (a context manager over a
+        # swarm.signal(each recipient), except quiet broadcasts (below). Inside `sent_as_seen_by(members, sender)` (a context manager over a
         # ContextVar, set by hub_mcp.hub_call with the caller as `sender`, §13) a message from that sender reaches
         # those recipients with their inbox row already read and no signal: the MCP client that sends acts as them
         # too, so the message is in their history but is no news to them. Only that sender's: a task started inside
@@ -539,6 +560,15 @@ class Mailbox:
     def recent(self, limit: int = 100, since_id: int = 0) -> list[dict]
 # message dict: {"id","ts","sender","recipients":[...],"text","reply_to"}
 ```
+
+Quiet broadcasts: when a member (not the user) sends to "all", a recipient reached only through "all" (not also
+named) that `swarm.waits_for_job` (an AI agent asleep while it waits for the end of its own job, §3) is not signalled:
+its inbox row stays unread (`has_pending` is true; it is not idle for the scheduler, being busy anyway), and the
+job's end wakes it and shows the message in the same wake-up instead of a wake-up of its own (which would re-read its
+whole context to read "all" news). `swarm.defer_wake` records it; should its wait end without a wake (the busy window
+of a server ended, its end became quiet), the scheduler's `_wake_deferred` wakes it. Personal messages (also to several
+named members, or "all" plus its name), every message of the user (its "all" included), reviews, assignments and
+notifications wake as always. The sender's result is unchanged.
 
 ## 6. Agent runtime (agent.py)
 
@@ -642,7 +672,9 @@ class AgentRuntime:
 * State changes emit `agent.status` {name, status}; persisted in `agents.status`.
 
 ### 6.3 Wake-up text (render_wake)
-`wake_header` (or `incoming_header`), `reasons:` then one bullet per undelivered notification text and
+`wake_header` (or `incoming_header`), then (not for incoming, only while the user's wrap-up mode is on, §3) the one-line
+`wrap_up_line` ("Wrap-up mode (the user): start no new computations or background jobs; finish your tasks with what
+you have."), `reasons:` then one bullet per undelivered notification text and
 per unread message (`msg` template, recipients list with the agent shown as `you`), then (not for
 incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, one `my_blocked` {id,
 blockers: "#3, #4"} per open task of the agent with unfinished dependencies, except one in review whose result is
@@ -965,7 +997,10 @@ def shown_log(log) -> str                                # a data_dir log with "
   no job may start now (`check_start`): `You already have {n} background jobs ({ids}), the most allowed: stop one
   with job_stop, or run this command without background.` / `The session already runs {n} background jobs, the most
   allowed: run this command without background.` / `Background jobs are turned off in the settings ([shell]
-  max_jobs_per_member or max_jobs is 0): run the command without background.`
+  max_jobs_per_member or max_jobs is 0): run the command without background.`; with `background` in the user's
+  wrap-up mode (below): `The user asked the team to wrap up, so no new background jobs are started. If the command is
+  quick, run it without background (it is stopped at its timeout); otherwise finish your task with what you have
+  (task_complete with the result so far and what is left).` (nothing starts).
 - Wait: `BACKGROUND_GRACE` (2 s) with `background`, else `timeout`. With `background_on_timeout` an AI agent waits at
   most `[shell] foreground_max` (180 s; blocked in a long command it would see no message, comment or review), an
   external member at most `EXTERNAL_WAIT_MAX` (600 s, below the stdio proxy's read timeout of 700 s). Without
@@ -973,7 +1008,10 @@ def shown_log(log) -> str                                # a data_dir log with "
   background sooner: when the command cannot become a job when the cap ends (`check_start`: jobs turned off, a
   limit reached), the call waits on up to its own `timeout` (checking every `JOB_TICK`), so the command is killed
   only then, as before the cap, and goes on as a `timeout` job as soon as a slot frees. The external cap stays
-  (it protects the MCP transport).
+  (it protects the MCP transport). Wrap-up mode is one more such case: while it lasts, an AI agent's call waits on
+  past the cap up to its `timeout` (its command cannot become a job), whether the mode was on when the call started
+  or came during it; switched off during the call (also by a new or reopened goal), the next tick moves the command
+  to the background as usual instead of blocking the agent to its timeout.
 - Environment (`command_env`): `PYTHONUNBUFFERED=1` (the output so far is live), `MSBUILDDISABLENODEREUSE=1` unless
   set (MSBuild nodes would become jobs), the thread caps of numeric libraries (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
   `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`, `RAYON_NUM_THREADS`) unless set:
@@ -987,10 +1025,10 @@ def shown_log(log) -> str                                # a data_dir log with "
   | `exited` | the shell exited within the wait and the tree emptied within LEFTOVER_GRACE (1 s) | `exit code: N [shell]` (as before) |
   | `quick` | the same, with `background` | `exit code: N [shell] (it ended within 2 s, so it did not stay in the background)` |
   | `detached` | the shell exited, processes run on, a job is allowed (without `background`) | `exit code: N [shell]; processes it started keep running as background job jN` |
-  | `leftovers_killed` | the same, no job allowed (they are killed) | `exit code: N [shell]; the processes it left running were stopped` |
+  | `leftovers_killed` | the same, no job allowed (they are killed; in wrap-up mode note `wrap_up_left`) | `exit code: N [shell]; the processes it left running were stopped` |
   | `started` | `background`: the shell still runs after the wait, or it exited and processes it started run on | `STARTED in the background as job jN [shell]` |
   | `background` | the shell still runs when the wait ended | `STILL RUNNING after Ws: continues in the background as job jN [shell]` |
-  | `timeout` | the same, but killed: `background_on_timeout` off (exactly the old result), the wait is `max_timeout` or more (note `no_time`), or a limit at the end of the call's own timeout (note `limit_member`, `limit_session`, `disabled`) | `TIMEOUT after Ws (process tree killed) [shell]` |
+  | `timeout` | the same, but killed: `background_on_timeout` off (exactly the old result), wrap-up mode (note `wrap_up`), the wait is `max_timeout` or more (note `no_time`), or a limit at the end of the call's own timeout (note `limit_member`, `limit_session`, `disabled`) | `TIMEOUT after Ws (process tree killed) [shell]` |
   | `killed` | the session stopped or the member left while the command ran in the foreground | `KILLED: the session is stopping [shell]` / `KILLED: you are leaving the swarm [shell]` |
 
   Then the output (`(no output)`, or `(no output yet)` for a job), and for `leftovers_killed` / `timeout` a
@@ -1005,6 +1043,17 @@ def shown_log(log) -> str                                # a data_dir log with "
   cut to `max_output`.
 - A caller cancelled before its command became a job: the tree is killed and awaited (KILL_WAIT), the cancellation
   goes on; any other failure kills it too. After the adoption the caller's cancellation never touches the job.
+
+**Wrap-up mode** (the user's `Swarm.wrap_up`, §3; `JobManager.wrapping_up(actor)`: true for every member, AI agent
+or external, never for the user): no command becomes a NEW job. `background=true` is refused before anything starts
+(the error above); a foreground command still running at its timeout is killed then, like `background_on_timeout`
+off, with the note `wrap_up` ("It was not moved to the background: the user asked the team to wrap up, so no new
+background jobs are started. Finish your task with the results you have and say what is left."), an AI agent waiting
+up to its own `timeout`, not `foreground_max`; processes a command leaves running after its shell exited are killed
+at its end (`leftovers_killed`, note `wrap_up_left`: "They were not kept as a background job: …"), except for a
+`background=true` call accepted before the mode began. Jobs started before keep running (their owners may
+`job_stop` them; the monitor's `_command_done` of such a job still keeps its processes). Switched off, the usual rules
+apply at once.
 
 **Adoption** (`_adopt`, synchronous, so the limit check and the INSERT are atomic) is allowed when
 `max_jobs_per_member > 0` and `max_jobs > 0`, the owner's running jobs < `max_jobs_per_member` (4), the session's
@@ -1213,7 +1262,10 @@ Trigger dict: {"id","owner","condition","note","actions","once","active","create
 `task.created task.updated task.comment message.sent notification goal.set goal.completed
 goal.reopened agent.hired agent.retired agent.status agent.activity agent.compacted agent.usage
 file.changed file.locked file.unlocked trigger.created trigger.fired trigger.deleted
-mcp.created mcp.status swarm.paused swarm.resumed swarm.limits job.started job.ended`
+mcp.created mcp.status swarm.paused swarm.resumed swarm.wrap_up swarm.limits job.started job.ended`
+
+`swarm.wrap_up` {on: bool}, actor = who switched it (the user, or the actor of the set_goal / reopen_goal that ended
+it).
 
 `job.started` {job} and `job.ended` {job: … + `duration` (seconds)} carry the public job dict (§7.1), actor = the
 job's owner; a job's output is never sent as events. `agent.retired` also carries `jobs` (the ids of the jobs it
@@ -1393,7 +1445,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `wait_for_events` | timeout? (s, default 50, max 600; an error at once when the swarm stops meanwhile), progress? (below) | EU |
 | `set_goal` | title (a multi-line title is split: §3 `set_goal`), description? | U |
 | `swarm_status` | brief? (the goal as one line) | EU |
-| `swarm_control` | action (pause/resume), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
+| `swarm_control` | action (pause/resume), wrap_up? (true/false: the user's wrap-up mode, §3), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
 | `mcp_approve` | name, approve, comment? | U |
 | `agent_traces` | agent?, trace_id?, span_id?, context?, status?, task?, limit?, offset? | EU (§16.2) |
 
@@ -1458,6 +1510,13 @@ Results and checks of the review and role-catalog flows:
 Results of the team, wait and job flows:
 - `agents` starts with `AI agents: 2 of max 6, plus 1 external member (not counted).` and the budget line (the
   same team line in `swarm_status`); a member line ends with `, background jobs: j3, j5` while it has running jobs.
+- `swarm_status`: its first line `Swarm "<name>" — running` (or `PAUSED: <reason>`) ends with `; WRAP-UP MODE: the
+  agents finish their tasks with what they have, no new computations or background jobs` while the user's wrap-up mode
+  is on.
+- `swarm_control`: the limits, then `reopen_goal_comment` (which ends wrap-up mode), then `action`, then `wrap_up`;
+  `Done: ...` lists what was done: `wrap-up mode on: every agent was told to finish its tasks with what it has, and no
+  new background jobs start` / `wrap-up mode was already on` / `wrap-up mode off` / `wrap-up mode was not on`. Nothing
+  to do: `Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.`
 - `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run,
   and for a member caller `Your background jobs: j3, j5.` after its open tasks. `brief=true` shows the goal as one
   line, `Global goal [active]: <title>` (no description, no summary); the rest is the same.
@@ -1470,7 +1529,8 @@ Results of the team, wait and job flows:
 - `shell`, `jobs`, `job_stop`: §7.1.
 - `wait_for_events(progress=true)` also returns when others make board progress: `task.created`, `task.updated` with
   a status change, `goal.set`, `goal.completed`, `goal.reopened`, `agent.hired` (an external member: "joined"),
-  `agent.retired` (the caller's own changes and events about itself are skipped). They are read from the events
+  `agent.retired`, `swarm.wrap_up` (`wrap-up mode on (user): finish your tasks with what you have, no new computations
+  or background jobs` / `wrap-up mode off (user)`) (the caller's own changes and events about itself are skipped). They are read from the events
   journal after a per-actor cursor (kv `wait_progress:<actor>`; the first such call starts at the journal's end;
   calls without progress neither use nor move it) and appended as `Board progress:` / `Прогресс на доске:` with `• `
   lines (at most 20, then ``… and N more: see `board` ``), after the incoming header when nothing else is pending.
@@ -1535,7 +1595,8 @@ each launcher server has its own `local:<uuid>` key, and it forwards every call 
 background jobs; and the members' side that members who join do not count toward max_agents, that a `shell` command
 still running at its timeout (at most 600 seconds over MCP) continues as a background job, that `background=true`
 starts one at once, that processes a command leaves running become a job too, and that a job's end arrives through
-`wait_for_events` (no polling).
+`wait_for_events` (no polling); `swarm_control` also switches wrap-up mode (§3), in which no new background job
+starts.
 
 ## 14. Web (web.py) — REST for the UI and the console
 
@@ -1572,7 +1633,8 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 
 ### 14.1 snapshot
 ```json
-{"swarm": {"name","language","paused","pause_reason","limits":{"max_cost_usd","max_agents"},
+{"swarm": {"name","language","paused","pause_reason","wrap_up": bool,   // the user's wrap-up mode (§3)
+           "limits":{"max_cost_usd","max_agents"},
            "agent_count": n,               // what limits.max_agents counts (Swarm.agent_count: external members do not)
            "spent_usd","goal": {...}|null, "counts": {status: n}, "mcp_url", "models": [profile names],
            "session": {"id","title","status": "running"|"stopped",
@@ -1896,7 +1958,7 @@ settings; ValueError when they are invalid):
    "model_profile","model","max_cost_usd","max_agents","overrides","config_error","url":"/s/{sid}/",
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
-   "spent_usd","paused","pause_reason","last_activity","jobs":{"running"},
+   "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
    "workspace":{"path","default","adopted","exists"}}
   ```
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
@@ -2126,7 +2188,8 @@ of a home or a project, never a session override (§17.2).
   word it: "Moved the session's files to X" only when they moved, "The session now works in X" after a folder of
   the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
   shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), and for a
-  running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs").
+  running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
+  in the user's wrap-up mode is `[running, wrapping up]`.
 - Every hub tool (§13) with an extra optional `session` property. Without it the call goes to
   `manager.default_session()`; when there is none, the error lists the sessions. An unknown or stopped session
   is an error result (`session_start` is suggested).
@@ -2207,7 +2270,8 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   `/span N [ctx]` and `/session` (the current session; another one is `dreamteam console --session ID`),
   `/approve N [comment]` and `/reject N what to fix` (a task in review; the comment is free text taken as typed,
   without one pair of quotes around all of it, as in the TUI; a name instead of N approves or rejects
-  an MCP server) and `/hire Role [| instructions]` (instructions `""` when omitted: a catalog role needs none).
+  an MCP server), `/hire Role [| instructions]` (instructions `""` when omitted: a catalog role needs none) and
+  `/wrapup [off]` (`swarm_control` wrap_up true / false, §3; the TUI's words: `on`/`вкл` or nothing, `off`/`выкл`).
   `/cd` prints the session folder (`GET {hub}/api/sessions/{sid}` → `workspace`); `/cd PATH` or `/cd --default`
   prints the question worded as in the TUI (`console.cd_preview`, docs/TUI.md §4.5) ending in `[y/N]`: the next
   line `y`/`yes`/`д`/`да` moves the session (`POST {hub}/api/sessions/{sid}/workspace`) and prints the result
@@ -2253,7 +2317,8 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   - Sessions tab: a big «Начать новую сессию» button, search and the filters all / running / stopped, and a
     card per session.
     - Card: title (link to the board), goal (or «ждёт запуска» for a pending goal), status badge (running /
-      paused / stopped / goal done), task progress bar, agents (working), spent/budget, model, last activity,
+      paused / stopped / goal done) and, for a running session in the user's wrap-up mode (summary `wrap_up`, read
+      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity,
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
       and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved with /cd); a folder
       outside the session that does not exist gets the badge «папки нет» and a warning that the session cannot
@@ -2324,6 +2389,11 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     (POST `/api/sessions/{sid}/start`, then reload). Actions on a stopped session show the stopped message.
     A folder outside the session that does not exist (snapshot `swarm.workspace`) adds a banner naming the
     path and the fix (`/cd FOLDER` or `/cd --default`).
+  - Wrap-up (§3): a toggle button «Завершать» / «Wrap up» (`ic-check`, label hidden on phones) right after «Пауза»
+    calls `swarm_control` {wrap_up: !snapshot swarm.wrap_up} (`toggleWrapUp`); while the mode is on the button is
+    pressed (class `on`, `aria-pressed`, the warning colour, tooltip: click to switch it off) and a banner under the
+    header says what it means (`#wrapup-banner`). The feed shows `swarm.wrap_up` («… включил(а) режим завершения:
+    агенты завершают задачи с тем, что есть» / «… выключил(а) режим завершения»).
   - Reviews (§4.1): a card waiting for the user's review has the badge «ждёт вашего ревью», another one in review
     names its reviewer; the task card's «Принять» / «Вернуть» (a return needs a comment: what to fix; for a
     task another member reviews, the card says the user may decide instead). Dragging a task from «review» to

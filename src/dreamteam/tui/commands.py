@@ -28,6 +28,8 @@ TEAM_RESET = ("-", "default", "reset", "сброс")   # /team: back to the star
 _TASK_REF = re.compile(r"#?\d+")
 _JOB_REF = re.compile(r"[jJ%#]?(\d+)")          # "/jobs j3", "/jobs stop 3": a background job of an agent
 JOB_STOP = ("stop", "kill", "стоп")
+WRAP_UP_ON = ("", "on", "вкл")                  # /wrapup: the user's wrap-up mode on ...
+WRAP_UP_OFF = ("off", "выкл", "stop", "стоп")   # ... or back off
 
 # CLI flags that become session overrides of a new session (the sections of the launcher's modal)
 FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
@@ -381,6 +383,21 @@ async def _pause(c: CommandContext) -> None:
     await c.app.toggle_pause()
 
 
+async def _wrapup(c: CommandContext) -> None:
+    arg = c.args.strip().casefold()
+    if arg in WRAP_UP_ON:
+        on = True
+    elif arg in WRAP_UP_OFF:
+        on = False
+    else:
+        raise UsageError
+    ok, text = await c.client.act(c.sid, "swarm_control", {"wrap_up": on})
+    if not ok:
+        c.error(text)
+    elif "already on" in text or "was not on" in text:  # no change, so no swarm.wrap_up event prints a line
+        c.info(text)
+
+
 async def _budget(c: CommandContext) -> None:
     value = number(c.args)
     if value is None or value < 0:
@@ -479,6 +496,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("status", _status),
     Command("model", _model, args=True, launcher=True),
     Command("pause", _pause, session=True),
+    Command("wrapup", _wrapup, args=True, session=True),
     Command("budget", _budget, args=True, required=True, session=True),
     Command("max", _max, args=True, required=True, session=True),
     Command("approve", _approve, args=True, required=True, session=True),

@@ -681,7 +681,7 @@ def test_event_types_cover_the_server():
     assert emitted <= set(render.EVENT_TYPES), emitted - set(render.EVENT_TYPES)
     spec = (src.parents[1] / "docs" / "SPEC.md").read_text(encoding="utf-8")
     section = spec.split("## 9.", 1)[1].split("## 10.", 1)[0]
-    assert set(re.findall(r"[a-z]+\.[a-z]+|notification", section)) <= set(render.EVENT_TYPES)
+    assert set(re.findall(r"[a-z_]+\.[a-z_]+|notification", section)) <= set(render.EVENT_TYPES)
     agent_src = (src / "agent.py").read_text(encoding="utf-8")
     kinds = set(re.findall(r"self\._activity\(\"([a-z_]+)\"", agent_src))
     assert kinds and kinds <= set(render.ACTIVITY_KINDS), kinds - set(render.ACTIVITY_KINDS)

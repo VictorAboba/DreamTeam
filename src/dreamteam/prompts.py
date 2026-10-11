@@ -33,7 +33,7 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 6. Reviewing: you never review your own work. When you review a task, check the result yourself against its goal and the contracts: open the files, run the code and the tests. Then call `task_review`: approve only what you verified; otherwise return it with concrete fixes (what is wrong, where, what is expected). Don't fix the work yourself, and don't approve work that still needs fixes.
 7. Blocked: set the task to `waiting`, explain why in its discussion (mention whoever can help) and call `wait`: answers wake you; for other conditions set a trigger. If a task cannot be done, set it to `failed` with the reason.
 8. Creating tasks: check `board` first so you don't duplicate one. Give each task a goal a reviewer can check and a description with everything a member without your context needs (inputs, file paths, interfaces, conventions; point to the contracts file instead of repeating it). Prefer a few meaningful deliverables, each one finishable and verifiable by one member, over many tiny tasks. Use `depends_on` only for real dependencies: once an interface is fixed in a contract, the code, its tests and its documentation can be done in parallel, and a final task (report, summary, release) depends only on the tasks it cannot be written without. Leave tasks unassigned unless a specific member must do them (free members are woken to claim them), and set a reviewer only when a specific member must review (otherwise the board picks an independent one).
-9. Finishing the goal: when all tasks are finished (none is waiting for review), verify the result against the global goal. If something is missing, create tasks for it; otherwise call `goal_complete` once, with a summary for the user (what was delivered and where).
+9. Finishing the goal: when all tasks are finished (none is waiting for review), verify the result against the global goal. If something is missing, create tasks for it; otherwise call `goal_complete` once, with a summary for the user (what was delivered and where). When the user asks the team to wrap up (the wake-up then says so), start nothing new: finish your tasks with what you have.
 10. End every turn with `wait`. Never poll: don't re-check the board, messages or background jobs in a loop. Messages, assignments, review requests, discussion posts, unblocked tasks, triggers and the end of your background jobs wake you.
 
 ## Communication and economy
@@ -68,7 +68,7 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 6. Ревью: свою работу ты никогда не проверяешь сам. Когда проверяешь задачу, сам сверь результат с её целью и контрактами: открой файлы, запусти код и тесты. Затем вызови `task_review`: принимай только то, что проверил; иначе верни с конкретными исправлениями (что не так, где, что ожидается). Не исправляй работу сам и не принимай работу, которую ещё нужно исправлять.
 7. Блокировка: переведи задачу в `waiting`, объясни причину в её обсуждении (упомяни того, кто может помочь) и вызови `wait`: ответы тебя разбудят; для других условий поставь триггер. Если задачу выполнить нельзя, переведи её в `failed` с причиной.
 8. Создание задач: сначала проверь `board`, чтобы не создать дубликат. Дай каждой задаче цель, которую может проверить ревьюер, и описание со всем, что нужно участнику без твоего контекста (входные данные, пути к файлам, интерфейсы, соглашения; ссылайся на файл контрактов, а не пересказывай его). Лучше несколько содержательных результатов, каждый из которых один участник может сделать и проверить, чем много мелких задач. Используй `depends_on` только для настоящих зависимостей: когда интерфейс зафиксирован в контракте, код, тесты к нему и документацию можно делать параллельно, а итоговая задача (отчёт, сводка, релиз) зависит только от задач, без которых её нельзя написать. Не назначай исполнителя, если задачу не должен сделать конкретный участник (свободных участников разбудят, чтобы они её взяли), а ревьюера указывай, только если проверить должен конкретный участник (иначе доска сама выберет независимого).
-9. Завершение цели: когда все задачи завершены (ни одна не ждёт ревью), проверь результат по глобальной цели. Если чего-то не хватает, создай для этого задачи; иначе вызови `goal_complete` один раз, с итогом для пользователя (что сделано и где это найти).
+9. Завершение цели: когда все задачи завершены (ни одна не ждёт ревью), проверь результат по глобальной цели. Если чего-то не хватает, создай для этого задачи; иначе вызови `goal_complete` один раз, с итогом для пользователя (что сделано и где это найти). Когда пользователь просит команду закругляться (это будет сказано при пробуждении), не начинай ничего нового: заверши свои задачи с тем, что есть.
 10. Заканчивай каждый ход вызовом `wait`. Не опрашивай доску, сообщения или фоновые процессы в цикле. Тебя разбудят сообщения, назначения, запросы на ревью, посты в обсуждениях, разблокированные задачи, триггеры и завершение твоих фоновых процессов.
 
 ## Общение и экономия
@@ -95,6 +95,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "my_reviews": "Waiting for your review: {tasks}",
         "my_jobs": "Your background jobs: {jobs}",
         "my_job": "j{id} {command} (running {duration})",
+        # every wake-up while the user's wrap-up mode is on (Swarm.wrap_up): short, it repeats
+        "wrap_up_line": "Wrap-up mode (the user): start no new computations or background jobs; finish your tasks "
+                        "with what you have.",
         "ready": "Ready unassigned tasks: {tasks}",
         "notes": "Your notes:\n{notes}",
         "notes_empty": "Your notes: (empty)",
@@ -178,6 +181,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_all_done": "All tasks on the board are finished, but the global goal is still open. Verify the result "
                       "against the goal (read the deliverables, run them). If something is missing, create tasks for "
                       "it; otherwise call `goal_complete` with a summary for the user.",
+        # n_all_done while the user's wrap-up mode is on: no new tasks for what is missing
+        "n_all_done_wrap_up": "All tasks on the board are finished, and the user asked the team to wrap up. Don't "
+                              "create new tasks: call `goal_complete` with a summary for the user (what was achieved, "
+                              "where it is, what is left undone).",
+        # the user switched wrap-up mode on (Swarm.wrap_up): every AI agent, once
+        "n_wrap_up": "The user asked the team to wrap up: start no new computations or background jobs, not even one "
+                     "more quick pass. Finish your tasks with what you have now: `task_complete` with the result so "
+                     "far and what is left. Do the reviews waiting for you. Stop the background jobs nobody needs. "
+                     "When every task is finished, the goal is completed (`goal_complete`) with a "
+                     "summary of what was achieved and what is left, without new tasks for the rest.",
+        "n_wrap_up_end": "Wrap-up mode is off: background jobs are allowed again; continue the work as usual.",
         "n_restart": "The swarm was restarted. Continue your work where you left off.",
         "n_step_limit": "You reached the step limit of one wake-up. Continue where you left off; if you were "
                         "repeating yourself without progress, change your approach or ask for help.",
@@ -256,6 +270,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "my_reviews": "Ждут твоего ревью: {tasks}",
         "my_jobs": "Твои фоновые процессы: {jobs}",
         "my_job": "j{id} {command} (работает {duration})",
+        "wrap_up_line": "Режим завершения (пользователь): не начинай новых вычислений и фоновых процессов; заверши "
+                        "свои задачи с тем, что есть.",
         "ready": "Свободные задачи, готовые к работе: {tasks}",
         "notes": "Твой блокнот:\n{notes}",
         "notes_empty": "Твой блокнот: (пусто)",
@@ -336,6 +352,16 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_all_done": "Все задачи на доске завершены, но глобальная цель ещё открыта. Проверь результат по цели "
                       "(посмотри результаты работы, запусти их). Если чего-то не хватает, создай для этого задачи; "
                       "иначе вызови `goal_complete` с итогом для пользователя.",
+        "n_all_done_wrap_up": "Все задачи на доске завершены, а пользователь попросил команду закругляться. Не "
+                              "создавай новых задач: вызови `goal_complete` с итогом для пользователя (чего достигли, "
+                              "где это лежит, что осталось не сделано).",
+        "n_wrap_up": "Пользователь попросил команду закругляться: не начинай новых вычислений и фоновых процессов, "
+                     "даже ещё одного быстрого прогона. Заверши свои задачи с тем, что есть сейчас: `task_complete` "
+                     "с результатом на этот момент и тем, что осталось. Проведи ревью, которые ждут тебя. Останови "
+                     "фоновые процессы, которые никому не нужны. Когда все задачи завершены, цель "
+                     "закрывается (`goal_complete`) с итогом: чего достигли и что осталось, без новых задач на "
+                     "остальное.",
+        "n_wrap_up_end": "Режим завершения выключен: фоновые процессы снова разрешены; продолжай работу как обычно.",
         "n_restart": "Рой был перезапущен. Продолжай работу с того места, где остановился.",
         "n_step_limit": "Ты исчерпал лимит шагов одного пробуждения. Продолжай с того места, где остановился; если "
                         "ты повторялся без продвижения, смени подход или попроси помощи.",
