@@ -59,6 +59,8 @@ class AgentRuntime:
         self._sent_to_user = False
         self._from_user = False
         self._llm = None
+        # id of an LLM client with calls in flight -> their number: reset_llm closes a client only once it is idle
+        self._llm_calls: dict[int, int] = {}
         self.history: list[dict[str, Any]] = []
         self._next_seq = 0
         self._len_at_last_call = 0
@@ -182,14 +184,35 @@ class AgentRuntime:
 
     def reset_llm(self) -> None:
         """Drop the cached LLM client (settings changed): the next call builds one from the new profile.
-        The old client is closed in the background when an event loop runs."""
+        The old client is closed in the background when an event loop runs; a client with a call in flight only
+        when that call returns (closing it under the call fails it: "the client has been closed")."""
         llm, self._llm = self._llm, None
+        if llm is not None and not self._llm_calls.get(id(llm)):
+            self._close_soon(llm)
+
+    def _close_soon(self, llm: Any) -> None:
         if getattr(llm, "aclose", None) is None:
             return
         try:
             asyncio.get_running_loop().create_task(self._aclose(llm))
         except RuntimeError:
             pass
+
+    async def _complete(self, messages: list[dict[str, Any]]) -> tuple[LLMResponse, Any]:
+        """One request on the current client, which stays open until it returns even if the settings change
+        meanwhile (reset_llm); the response and the client that produced it (its profile prices the usage)."""
+        llm = self.llm
+        key = id(llm)  # (a test double may be unhashable)
+        self._llm_calls[key] = self._llm_calls.get(key, 0) + 1
+        try:
+            async with self.swarm.llm_semaphore:
+                return await llm.complete(self.system_prompt, messages, self.tools), llm
+        finally:
+            left = self._llm_calls.pop(key) - 1
+            if left:
+                self._llm_calls[key] = left
+            elif llm is not self._llm:  # replaced while the call ran: nothing uses it any more
+                self._close_soon(llm)
 
     # ---- tracing ------------------------------------------------------------------------------
     @property
@@ -552,8 +575,7 @@ class AgentRuntime:
             span = trace.llm_start(len(messages), purpose=purpose, extra=extra, attempt=attempt + 1, parent=parent,
                                    tools_rev=self.tools_rev)
             try:
-                async with swarm.llm_semaphore:
-                    response = await self.llm.complete(self.system_prompt, messages, self.tools)
+                response, llm = await self._complete(messages)
             except LLMError as exc:
                 if exc.retryable and attempt < len(RETRY_DELAYS):
                     delay = RETRY_DELAYS[attempt]
@@ -574,7 +596,7 @@ class AgentRuntime:
             except BaseException as exc:  # a crash: the span must not stay "running"
                 trace.llm_error(span, f"{type(exc).__name__}: {exc}", kind="other", model=self._model_id())
                 raise
-            cost = swarm.record_usage(self.name, response.usage, self.llm.profile, response.model)
+            cost = swarm.record_usage(self.name, response.usage, llm.profile, response.model)
             trace.llm_end(span, response, cost)
             usage = response.usage
             self.last_prompt_tokens = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens

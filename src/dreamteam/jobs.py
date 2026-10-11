@@ -398,6 +398,8 @@ class JobManager:
         # jobs that ended by themselves while the session stops (no commit of their own then): owner -> [(id,
         # command, how it ended)], committed by stop_all
         self._uncommitted: dict[str, list[tuple[int, str, str]]] = {}
+        # owner -> its jobs that kept it busy and have ended, until their end notice is out (_finish_job)
+        self._ending: dict[str, int] = {}
 
     # settings, read live
     def _setting(self, name: str) -> Any:
@@ -790,6 +792,7 @@ class JobManager:
 
     async def _finish_job(self, job: Job, status: str, reason: str | None, stopped_by: str | None,
                           commit: bool) -> None:
+        ending = False
         try:
             cmd = job.cmd
             await cmd.wait_eof(READ_SETTLE)
@@ -814,6 +817,11 @@ class JobManager:
                 "UPDATE jobs SET status = ?, reason = ?, stopped_by = ?, exit_code = ?, ended_at = ?, tail = ?,"
                 " processes = ?, origin = ? WHERE id = ?",
                 (status, reason, stopped_by, exit_code, now, job.tail, dumps(job.processes), job.origin, job.id))
+            # the owner stays busy as it was until the end notice is out, after the commit below (seconds under
+            # load): idle with nothing pending meanwhile, it would get a stalled nudge, an LLM call for nothing
+            ending = self.busy(job.owner)
+            if ending:
+                self._ending[job.owner] = self._ending.get(job.owner, 0) + 1
             self._jobs.pop(job.id, None)
             self._announce_ended(job)
             phrase = self._end_phrase(job.public(now), now)
@@ -829,6 +837,10 @@ class JobManager:
             with contextlib.suppress(Exception):
                 job.cmd.close()  # idempotent: the handles and the log are given back in any case
         finally:
+            if ending:
+                left = self._ending.pop(job.owner, 1) - 1
+                if left > 0:
+                    self._ending[job.owner] = left
             if job.done is not None and not job.done.done():
                 job.done.set_result(None)
 
@@ -999,6 +1011,8 @@ class JobManager:
     def busy(self, name: str) -> bool:
         """D18: a running `timeout` job, or a `background` job younger than max_timeout while the member holds an
         in_progress task or a review. A busy member is not idle for the scheduler."""
+        if self._ending.get(name):  # one of those jobs has just ended, its end notice is not out yet
+            return True
         jobs = self.running_of(name)
         if any(j.origin == "timeout" for j in jobs):
             return True
