@@ -47,6 +47,12 @@ CREATE TABLE IF NOT EXISTS mcp_servers (
     command TEXT, cwd TEXT, requirements TEXT DEFAULT '[]', origin TEXT, status TEXT, tools TEXT DEFAULT '[]',
     error TEXT, created_at REAL, updated_at REAL);
 CREATE TABLE IF NOT EXISTS file_locks (path TEXT PRIMARY KEY, owner TEXT, acquired_at REAL, expires_at REAL);
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, command TEXT NOT NULL, shell TEXT,
+    origin TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, stopped_by TEXT, exit_code INTEGER, log TEXT,
+    pid INTEGER, pgid INTEGER, token TEXT, hub_pid INTEGER, processes TEXT DEFAULT '[]', tail TEXT DEFAULT '',
+    started_at REAL, background_at REAL, ended_at REAL);
+CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, status);
 """
 
 

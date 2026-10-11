@@ -152,7 +152,8 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
   - Ctrl+C → 130. The session is left as it is (running, if the hub is external).
 - When `dreamteam -p` runs the launcher in its own process (`main_print`, `conn.owned`), the session it used
   is stopped explicitly at the end, whatever the outcome: a one-shot run is not resumed by the next
-  `dreamteam` / `dreamteam serve` (`dreamteam -c` can still continue it).
+  `dreamteam` / `dreamteam serve` (`dreamteam -c` can still continue it). Stopping the session stops the agents'
+  background jobs with it (a dev server started for the goal does not outlive the run).
 - A reader of `out` / `err` that goes away (`| head -1`) does not crash the run: the output is dropped and
   the exit code is returned as usual.
 - `auto_reply`: every message an agent sends to the user is answered automatically (at most `AUTO_REPLY_MAX` = 50
@@ -175,7 +176,14 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     `render.event()` lines at verbosity "normal".
   - `json`: one object on `out` at the end:
     `{"type":"result","status":"done|budget|timeout|error|interrupted","session":id,"goal":{...},
-    "summary":str,"tasks":[{id,title,status,assignee}],"cost_usd":float,"duration_s":float,"agents":[names]}`.
+    "summary":str,"tasks":[{id,title,status,assignee}],"cost_usd":float,"duration_s":float,"agents":[names],
+    "jobs":[{id,label,owner,command,origin}]}`. `jobs`: the agents' background jobs still running at the end.
+  - `text` against a hub of another process (`conn.owned` false): when background jobs are still running at the
+    end, one more line on `err` lists them (`label (owner: command)`, the command clipped to 60 characters):
+    - ru: «Ещё работают фоновые процессы агентов: {jobs}. Они остановятся вместе с сессией (остановить раньше можно
+      командой /jobs stop jN в dreamteam tui).»
+    - en: "Background jobs of the agents are still running: {jobs}. They stop when the session stops (to stop one
+      earlier: /jobs stop jN in dreamteam tui)."
   - `stream-json`: every received bus event as one JSON line `{"type": ev.type, "ts": ..., "actor": ...,
     "data": ...}` (trace.* and agent.activity included), then the same `result` object as the last line.
 
@@ -257,14 +265,25 @@ def agent_message(ctx, msg: dict) -> RenderableType      # msg from /api/message
 def goal_panel(ctx, goal: dict | None) -> RenderableType
 def board(ctx, tasks: list[dict]) -> RenderableType      # grouped by column, todo symbols, assignee, deps, 💬n
 def task_detail(ctx, data: dict) -> RenderableType       # /api/tasks/{id}: header, goal, description, result, discussion
-def agents_table(ctx, agents: list[dict]) -> RenderableType
+def agents_table(ctx, agents: list[dict]) -> RenderableType   # a member with running background jobs: `⚙N` after
+                                                              # its tasks (narrow: after its status)
+def jobs_table(ctx, jobs: list[dict]) -> RenderableType       # /jobs: the state's "jobs" (running, then ended in the
+    # last hour): Процесс (j3), Агент, Состояние («работает» + how it went to the background / «завершился с кодом
+    # 1» / «остановлен вами» / «потерян при сбое»), Время, Команда (+ its processes; the log in verbose); narrow
+    # (< 80): no agent / time columns. Footer hint «/jobs jN — вывод процесса · /jobs stop jN — остановить · пауза
+    # роя их не останавливает»; none: info «Фоновых процессов нет.»
+def job_output(ctx, text: str) -> RenderableType              # /jobs jN: the hub's text (`jobs` tool), its first
+                                                              # line bold after ⚙, the rest under ⎿ (200 lines;
+                                                              # 1000 in verbose)
 def roles_table(ctx, catalog: list[dict]) -> RenderableType   # /roles: role, model (≥ 80 columns), the first
                                                               # sentence of the description; hint line
 def role_detail(ctx, role: dict) -> RenderableType            # /roles Роль: panel with the whole description,
                                                               # the role's instructions and model
 def sessions_table(ctx, sessions: list[dict], current: str | None = None) -> RenderableType
 def cost_table(ctx, state: dict) -> RenderableType       # per agent tokens in/out, cost; total vs budget
-def status_report(ctx, info: dict) -> RenderableType     # version, home, web, session, goal, models, language, agents, tracing
+def status_report(ctx, info: dict) -> RenderableType     # version, home, web, session, goal, models, language, agents,
+                                                         # jobs ({"running": N, "ids": ["j3", "j5"]}: «2 работают
+                                                         # (j3, j5)»), tracing
 def traces_list(ctx, traces: list[dict]) -> RenderableType
 def trace_detail(ctx, trace: dict) -> RenderableType     # header + spans as ⏺/⎿ lines (llm: tokens, cost, stop, calls)
 def span_detail(ctx, span: dict) -> RenderableType
@@ -293,8 +312,10 @@ def spinner_line(ctx, *, frame: int, verb: str, working: list[str], elapsed: flo
     # "✻ Совещаются… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc — пауза)  Анна, Борис"
 def status_line(ctx, *, session: dict | None, addressee: str | None, agents_total: int, working: int,
                 spent: float, budget: float, model: str | None, verbosity: str, connected: bool,
-                hint: str | None) -> tuple[list, list]   # (left, right) parts
-    # left: "? — горячие клавиши" (or the hint / mode); right: "Калькулятор · → Анна · 3 агента · $0.42/$5.00 · claude-opus-5-5"
+                hint: str | None, jobs: int = 0) -> tuple[list, list]   # (left, right) parts
+    # left: "? — горячие клавиши" (or the hint / mode); right: "Калькулятор · → Анна · 3 агента · процессы 2 ·
+    # $0.42/$5.00 · claude-opus-5-5" («процессы N» / "jobs N" only while background jobs run; when narrow, the model
+    # goes first, then the jobs, then the agents count)
 def to_ansi(renderable, width: int) -> str
 def to_plain(renderable, width: int) -> str
 ```
@@ -381,6 +402,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/task N` | task with discussion |
 | `/agents` | team table |
 | `/roles [роль]` | the role catalog (`roles_table`) / one role in full (`role_detail`) |
+| `/jobs`, `/jobs jN`, `/jobs stop jN …` | the agents' background jobs (`jobs_table` from the state) / one job's output (the `jobs` tool as the user, `job_output`) / stop jobs and everything they started (`job_stop`, its result printed); `stop` also as `kill` / `стоп`; a job id as `j3`, `3`, `#3` or `%3`; anything else: the usage line |
 | `/to Имя\|all` | set the addressee |
 | `/hire Роль [\| инструкции]` | `hire_agent`; the instructions are optional for a catalog role (sent as `""`) |
 | `/trace [Имя\|N]`, `/span N [ctx]` | traces list / trace N / span / its context |
@@ -411,7 +433,7 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
 | Alt+Enter, Ctrl+J, `\`+Enter | newline |
 | Tab | complete the selected suggestion |
 | ↑/↓ | move in suggestions, else history |
-| Esc | close suggestions or a dialog; else interrupt a running `!command`; else, while agents work: pause the swarm (prints `⏸ …`) |
+| Esc | close suggestions or a dialog; else interrupt a running `!command`; else, while agents work: pause the swarm (prints `⏸ …`). Neither Esc nor `/pause` stops the agents' background jobs (`/jobs stop jN` does) |
 | Shift+Tab | cycle verbosity quiet → normal → verbose (shown in the status line) |
 | Ctrl+O | toggle verbose |
 | Ctrl+C | clear the input; else interrupt a running `!command`; on an empty input "Нажмите Ctrl+C ещё раз для выхода" (2 s), twice → exit |
@@ -503,7 +525,13 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   `agent.usage` since then. The spinner frame advances every 120 ms (refresh_interval); the verb changes
   every ~8 s.
 - The state snapshot (`/api/state`) is refreshed at most every 2 s, and after events that change agents,
-  limits or the goal. It feeds the status line, `@`/`#` suggestions and the addressee logic.
+  limits, the goal or background jobs (`job.*`). It feeds the status line, `@`/`#` suggestions and the addressee
+  logic.
+- Background jobs (SPEC §7): `job.started` / `job.ended` print one dim line each (`⚙ Анна Смирнова · фоновый
+  процесс j3: npm run dev`, `⚙ Анна Смирнова · процесс j3 остановлен вами (25m 00s): npm run dev`; hidden in
+  quiet). While jobs run the status line says «процессы N» (agents asleep while their jobs work: the session is
+  not stalled), and `/status` lists them. Quitting the TUI with an owned launcher stops the sessions and so their
+  jobs; with an external hub they go on until their session stops.
 - Messages to the user are printed in full, are marked read (`mark_read` with the sender), and make the
   sender the addressee when the user has not chosen one explicitly in the last 60 s.
 - MCP approval: on `mcp.*` events with status `pending` (or a notification `u_mcp_pending`), the input area

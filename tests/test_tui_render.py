@@ -54,6 +54,16 @@ def message(sender: str, recipients: list[str], text: str, id_: int = 5) -> dict
     return {"id": id_, "ts": NOW, "sender": sender, "recipients": recipients, "text": text, "reply_to": None}
 
 
+def job(id_: int = 3, **kw) -> dict:
+    """A background job as job.started / job.ended carry it (DESIGN: the public job dict)."""
+    base = {"id": id_, "label": f"j{id_}", "owner": ANNA, "command": "npm run dev", "origin": "background",
+            "status": "running", "reason": None, "stopped_by": None, "exit_code": None, "started_at": NOW,
+            "background_at": NOW + 2, "ended_at": None, "log": f".scratch/anna/jobs/j{id_}.log",
+            "processes": ["node.exe"]}
+    base.update(kw)
+    return base
+
+
 TRACE = {
     "id": 12, "agent": ANNA, "kind": "llm", "status": "done", "steps": 3, "llm_calls": 2, "tool_calls": 2,
     "errors": 1, "input_tokens": 4200, "output_tokens": 310, "cache_read_tokens": 0, "cache_write_tokens": 0,
@@ -118,6 +128,20 @@ ROLES = [  # GET /api/roles "roles"
     {"key": "дата-инженер", "name": "Дата-инженер", "builtin": False, "instructions": "", "model": None,
      "description": "Ты строишь конвейеры данных " + "и проверяешь их " * 30},
 ]
+# the state's "jobs": the running ones, then those that ended in the last hour (newest first)
+JOBS = [job(5, command="pytest -q tests/test_parser.py", origin="timeout", owner=BORIS, processes=["python.exe"],
+            started_at=NOW - 245),
+        job(3, processes=["node.exe", "node.exe", "conhost.exe"], started_at=NOW - 1500),
+        job(4, command="npm test", status="ended", exit_code=1, started_at=NOW - 600, ended_at=NOW - 360),
+        job(2, command="gradle build", origin="detached", status="ended", started_at=NOW - 900, ended_at=NOW - 700),
+        job(1, command="python -m http.server", status="stopped", reason="user", stopped_by="user",
+            started_at=NOW - 3000, ended_at=NOW - 2900),
+        job(6, command="sleep 99", status="stopped", reason="lifetime", started_at=NOW - 3500, ended_at=NOW - 1700),
+        job(7, command="make", status="lost", reason="crash", started_at=NOW - 3500, ended_at=NOW - 3400)]
+JOB_DETAIL = ("Job j3 of Анна Смирнова: npm run dev\nState: running for 25 min (started in the background) [bash]\n"
+              "Processes: node.exe ×2\nLog: .scratch/anna/jobs/j3.log (2.1 MB; below is its end)\n"
+              "--- last 3 lines ---\n"
+              "> dev\nready in 300 ms\nListening on :5173")
 COMMANDS = [{"name": "/help", "args": "", "description": {"ru": "справка", "en": "help"}},
             ("/new", "[цель]", "новая сессия"),
             {"name": "board", "args": "", "description": "доска задач"},
@@ -189,6 +213,9 @@ def realistic_events() -> list[dict]:
         ev("swarm.paused", "user", reason="paused by the user"),
         ev("swarm.resumed", "user"),
         ev("swarm.limits", "user", max_cost_usd=5.0, max_agents=6),
+        ev("job.started", ANNA, job=job()),
+        ev("job.ended", ANNA, job=job(status="ended", exit_code=0, ended_at=NOW + 245, duration=245.0)),
+        ev("job.ended", ANNA, job=job(status="stopped", reason="user", stopped_by="user", ended_at=NOW + 60)),
         {"id": None, "ts": NOW, "type": "trace.started", "actor": ANNA, "data": {"trace": TRACE}},
         {"id": None, "ts": NOW, "type": "trace.span", "actor": ANNA, "data": {"trace": TRACE, "span": SPAN}},
         {"id": None, "ts": NOW, "type": "trace.finished", "actor": ANNA, "data": {"trace": TRACE}},
@@ -219,6 +246,9 @@ def all_renderables(c: RenderContext) -> list:
         render.board_summary(c, {"todo": 1, "in_progress": 2}),
         render.task_detail(c, task_data()), render.task_detail(c, {"error": "not found"}),
         render.agents_table(c, AGENTS), render.agents_table(c, []),
+        render.agents_table(c, [{**AGENTS[0], "jobs": 2}, {**AGENTS[1], "open_tasks": [], "jobs": 1}]),
+        render.jobs_table(c, JOBS), render.jobs_table(c, []), render.jobs_table(c, [{"id": None}, {}]),
+        render.job_output(c, JOB_DETAIL), render.job_output(c, "Job j9 of x: y"),
         render.sessions_table(c, SESSIONS, current="001-calc"), render.sessions_table(c, []),
         render.cost_table(c, STATE), render.cost_table(c, {}),
         render.models_table(c, SETTINGS),
@@ -253,8 +283,8 @@ def status_info() -> dict:
     return {"version": "0.1.0", "home": "C:/Users/me/DreamTeam", "web": "http://127.0.0.1:8765",
             "session": SESSIONS[0], "goal": {"title": "Калькулятор", "status": "active"},
             "models": [{"name": "default", "model": "claude-opus-5-5", "default": True}, "local"],
-            "language": "ru", "agents": {"total": 3, "working": 1}, "tracing": True, "verbosity": "verbose",
-            "connected": False, "extra_key": "value"}
+            "language": "ru", "agents": {"total": 3, "working": 1}, "jobs": {"running": 2, "ids": ["j3", "j5"]},
+            "tracing": True, "verbosity": "verbose", "connected": False, "extra_key": "value"}
 
 
 def dir_data() -> dict:
@@ -557,6 +587,26 @@ def test_team_pause_and_notification_lines():
     assert render.event(c, {"type": "_connection", "data": {"state": "connected"}}) is None
 
 
+def test_background_job_lines():
+    c = ctx()
+    assert plain(render.event(c, ev("job.started", ANNA, job=job()))) == \
+        "⚙ Анна Смирнова · фоновый процесс j3: npm run dev"
+    ended = ev("job.ended", ANNA, job=job(status="ended", exit_code=0, ended_at=NOW + 245, duration=245.0,
+                                          command="npm test"))
+    assert plain(render.event(c, ended)) == "⚙ Анна Смирнова · процесс j3 завершился с кодом 0 (4m 05s): npm test"
+    assert plain(render.event(ctx(lang="en"), ended)) == \
+        "⚙ Анна Смирнова · job j3 ended with exit code 0 (4m 05s): npm test"
+    cases = {("ended", None): "завершился (1m 00s)", ("stopped", "user"): "остановлен вами (1m 00s)",
+             ("stopped", "lifetime"): "остановлен по пределу времени", ("stopped", "session"): "вместе с сессией",
+             ("stopped", "retired"): "агент ушёл из роя", ("stopped", "owner"): "остановлен владельцем",
+             ("stopped", "new"): "процесс j3 остановлен (1m 00s)", ("lost", "crash"): "потерян при сбое"}
+    for (status, reason), text in cases.items():  # without a duration it is counted from the times
+        line = plain(render.event(c, ev("job.ended", ANNA, job=job(status=status, reason=reason, ended_at=NOW + 60))))
+        assert text in line, (status, reason, line)
+    assert render.event(ctx("quiet"), ended) is None  # the user hears of jobs through notifications there
+    assert plain(render.event(ctx("verbose", unicode=False), ended)).startswith("& Анна Смирнова - процесс j3")
+
+
 def test_verbose_only_lines():
     v, n = ctx("verbose"), ctx()
     thinking = activity("thinking", "\n".join(f"мысль {i}" for i in range(20)))
@@ -823,6 +873,55 @@ def test_role_catalog_views():
     assert own.startswith("╭─ Дата-инженер ─") and "built-in" not in own and "model profile" not in own
 
 
+def test_jobs_table_and_one_job(monkeypatch):
+    monkeypatch.setattr(render.time, "time", lambda: NOW)   # the running times
+    out = plain(render.jobs_table(ctx(width=140), JOBS), 140)
+    head = out.split("\n")[1]
+    for column in ("Процесс", "Агент", "Состояние", "Время", "Команда"):
+        assert column in head, column
+    rows = {m.group(1): line for line in out.split("\n") if (m := re.search(r"│ (j\d) ", line))}
+    assert list(rows) == ["j5", "j3", "j4", "j2", "j1", "j6", "j7"]            # in the order of the state
+    assert "Борис Петров" in rows["j5"] and "работает" in rows["j5"] and "pytest -q tests/test_parser.py" in rows["j5"]
+    assert "4m 05s" in rows["j5"] and "25m 00s" in rows["j3"]
+    assert "ушёл в фон по тайм-ауту" in out and "запущен в фоне" in out           # how a running one got there
+    assert "node.exe ×2, conhost.exe" in out                                      # its processes
+    assert "завершился с кодом 1" in rows["j4"] and "4m 00s" in rows["j4"]
+    assert "завершился" in rows["j2"] and "кодом" not in rows["j2"]               # a detached job: no shell code
+    assert "остановлен вами" in rows["j1"] and "остановлен по пределу времени" in rows["j6"]
+    assert "потерян при сбое" in rows["j7"]
+    assert out.endswith("/jobs jN — вывод процесса · /jobs stop jN — остановить · пауза роя их не останавливает")
+    assert ".scratch/anna/jobs/j3.log" not in out and ".scratch/anna/jobs/j3.log" in plain(
+        render.jobs_table(ctx("verbose", width=140), JOBS), 140)                  # the log in verbose
+    narrow = plain(render.jobs_table(ctx(lang="en", width=50), JOBS), 50)
+    assert "Agent" not in narrow and "Time" not in narrow and "Борис" in narrow and "running" in narrow
+    assert plain(render.jobs_table(ctx(lang="en"), [])) == "  ⎿  No background jobs."
+    ansi = to_ansi(render.jobs_table(ctx(width=140), JOBS[:3]), 140)
+    assert re.search(r"38;2;\d+;\d+;\d+m.*завершился с кодом 1", ansi)              # a failed job in colour
+    ascii_out = plain(render.jobs_table(ctx(lang="en", width=140, unicode=False), JOBS), 140)
+    assert "node.exe x2" in ascii_out and not UNICODE_SYMBOLS & set(ascii_out)
+
+    detail = plain(render.job_output(ctx(), JOB_DETAIL))
+    lines = detail.split("\n")
+    assert lines[0] == "⚙ Job j3 of Анна Смирнова: npm run dev"
+    assert lines[1] == "  ⎿  State: running for 25 min (started in the background) [bash]"
+    assert lines[-1] == "     Listening on :5173"
+    assert plain(render.job_output(ctx(unicode=False), "Job j9 of x: y")) == "& Job j9 of x: y"
+    long = "Job j1 of x: y\n" + "\n".join(f"line {i}" for i in range(300))
+    assert "line 299" not in plain(render.job_output(ctx(), long)) and "+100 строк" in plain(
+        render.job_output(ctx(), long))
+    assert "line 299" in plain(render.job_output(ctx("verbose"), long))
+
+
+def test_agents_table_marks_members_with_running_jobs():
+    agents = [{**AGENTS[0], "jobs": 2}, {**AGENTS[1], "open_tasks": [], "jobs": 1}, AGENTS[2]]
+    out = plain(render.agents_table(ctx(width=120), agents), 120)
+    assert "#3 ⚙2" in out and re.search(r"│ ⚙1 +│", out)
+    assert out.count("⚙") == 2
+    narrow = plain(render.agents_table(ctx(width=60), agents), 60)   # no tasks column: after the status
+    assert "работает ⚙2" in narrow and "свободен ⚙1" in narrow
+    assert "#3 &2" in plain(render.agents_table(ctx(width=120, unicode=False), agents), 120)
+
+
 def test_tables():
     out = plain(render.agents_table(ctx(width=120), AGENTS), 120)
     assert out.startswith("╭") and "│ ⏺ Анна Смирнова" in out and "Координатор" in out and "работает" in out
@@ -857,6 +956,16 @@ def test_status_report():
     out = plain(render.status_report(ctx(), folder))
     assert "Папка сессии   C:/proj/app (папка проекта: агенты коммитят в её текущую ветку)" in out
     assert out.index("Сессия ") < out.index("Папка сессии") < out.index("Цель ")
+
+
+def test_status_report_counts_the_running_jobs():
+    out = plain(render.status_report(ctx(), status_info()))
+    assert "Процессы       2 работают (j3, j5)" in out
+    assert out.index("Агенты ") < out.index("Процессы ") < out.index("Трейсы ")
+    one = status_info() | {"jobs": {"running": 1, "ids": ["j7"]}}
+    assert "Процессы       1 работает (j7)" in plain(render.status_report(ctx(), one))
+    out = plain(render.status_report(ctx(lang="en"), status_info() | {"jobs": {"running": 0, "ids": []}}))
+    assert "Jobs            0 running" in out and "(" not in out.split("Jobs", 1)[1].split("\n")[0]
 
 
 def test_traces():
@@ -1034,6 +1143,22 @@ def test_status_line():
         assert "claude-opus-5-5" not in _text(right)
         if width >= 50:
             assert "Калькулятор" in _text(right)
+
+
+def test_status_line_counts_the_running_jobs():
+    # agents asleep while their jobs work: the session is not stalled, and the status line says so
+    def right_of(width: int, jobs: int, lang: str = "ru") -> str:
+        _, right = render.status_line(ctx(lang=lang, width=width), session={"title": "Калькулятор"}, addressee=None,
+                                      agents_total=3, working=0, spent=0.42, budget=5.0, model="m1", verbosity="normal",
+                                      connected=True, hint=None, jobs=jobs)
+        return _text(right)
+
+    assert right_of(120, 2) == "Калькулятор · 3 агента · процессы 2 · $0.42/$5.00 · m1"
+    assert right_of(120, 1, "en") == "Калькулятор · 3 agents · jobs 1 · $0.42/$5.00 · m1"
+    assert "процессы" not in right_of(120, 0)
+    # narrow: the model goes first, then the jobs, then the agents count
+    assert right_of(76, 2) == "Калькулятор · 3 агента · процессы 2 · $0.42/$5.00"
+    assert right_of(70, 2) == "Калькулятор · 3 агента · $0.42/$5.00"
 
 
 # ---- output ---------------------------------------------------------------------------------------

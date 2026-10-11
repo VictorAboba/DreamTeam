@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
 import json
 import re
 import subprocess
@@ -100,7 +99,8 @@ SPEC_AUDIENCE = {  # docs/SPEC.md §12
     "send_message": "LEU", "read_messages": "LEU", "agents": "LEU", "hire_agent": "LEU", "retire_agent": "LEU",
     "update_notes": "L", "wait": "L", "goal_complete": "LE", "trigger_create": "LEU", "trigger_list": "LEU",
     "trigger_delete": "LEU", "read_file": "LEU", "write_file": "LE", "edit_file": "LE", "list_files": "LEU",
-    "lock_file": "LE", "shell": "LE", "mcp_create": "LE", "mcp_list": "LEU", "mcp_tools": "LEU", "mcp_call": "LE",
+    "lock_file": "LE", "shell": "LE", "jobs": "LEU", "job_stop": "LEU",
+    "mcp_create": "LE", "mcp_list": "LEU", "mcp_tools": "LEU", "mcp_call": "LE",
     # join_swarm is called before joining, i.e. as the user ("E (MCP only)")
     "join_swarm": "EU", "wait_for_events": "EU", "set_goal": "U", "swarm_status": "EU", "swarm_control": "U",
     "mcp_approve": "U",
@@ -212,12 +212,8 @@ def test_schemas_for_is_deterministic_and_returns_copies():
     assert {s["name"] for s in schemas_for("user", "en")} == {n for n, a in SPEC_AUDIENCE.items() if "U" in a}
 
 
-def test_llm_tool_schemas_are_unchanged():
-    """An LLM tool's schema is part of every existing agent's frozen prefix (thinking blocks bind to it):
-    change it only with a deliberate migration, then update the digest."""
-    data = [schemas_for("llm", lang) for lang in ("en", "ru")]
-    digest = hashlib.sha256(json.dumps(data, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
-    assert digest == "e3c5cbc798e3aafddcd44284bb515d9655e68b953e6ca707f67063dcad7cda85"
+# An LLM tool's schema is part of every agent's frozen prefix: a change is released as a new revision of the frozen
+# tool sets (tools/frozen.py), whose digests tests/test_frozen_tools.py pins (RELEASED).
 
 
 def test_tool_order_does_not_depend_on_import_order():
@@ -684,8 +680,17 @@ async def test_shell_tool(swarm):
     text = await ok(swarm, a, "shell", {"command": "echo hello"})
     assert text.startswith(f"exit code: 0 [{shell_name}]\n") and "hello" in text
     sleep = "Start-Sleep -Seconds 5" if shell_name in ("powershell", "pwsh") else "sleep 5"
+    # still running at its timeout: the command goes on as a background job (docs/SPEC.md §7.1)
     text = await ok(swarm, a, "shell", {"command": sleep, "timeout": "1"})
-    assert text.startswith(f"TIMEOUT after 1s (process tree killed) [{shell_name}]")
+    assert text.startswith(f"STILL RUNNING after 1s: continues in the background as job j1 [{shell_name}]\n"), text
+    assert swarm.jobs.get(1)["status"] == "running" and "job_stop stops it" in text
+    assert (await ok(swarm, USER, "job_stop", {"job_id": "j1"})).startswith(f"Stopped job j1 ({sleep}) of {a} after ")
+    assert swarm.jobs.get(1)["status"] == "stopped"
+    # without background_on_timeout it is killed at its timeout: exactly the old result
+    swarm.config.shell.background_on_timeout = False
+    text = await ok(swarm, a, "shell", {"command": sleep, "timeout": "1"})
+    assert text.startswith(f"TIMEOUT after 1s (process tree killed) [{shell_name}]\n") and "[It was" not in text
+    assert swarm.jobs.get(2) is None
     text = await ok(swarm, a, "shell", {"command": "exit 3"})
     assert text.startswith("exit code: 3") and "(no output)" in text
 
@@ -695,7 +700,7 @@ async def test_agents_and_status_show_the_budget_honestly(swarm):
     a, b = llm_members(swarm)
     text = await ok(swarm, a, "agents")
     # regression: an unlimited budget (0) was shown as "Spent $0.00 of $0.00"
-    assert text.startswith("Members: 2 of max 6. Spent $0.00 (no budget limit).")
+    assert text.startswith("AI agents: 2 of max 6. Spent $0.00 (no budget limit).")
     assert f"- {a} (you): Generalist [idle], model default, tasks: none" in text
     ext = await join(swarm)
     await ok(swarm, USER, "task_create", {"title": "Mine", "goal": "g", "assignee": ext})
@@ -703,8 +708,10 @@ async def test_agents_and_status_show_the_budget_honestly(swarm):
     swarm.db.execute("UPDATE agents SET cost_usd = 1.25 WHERE name = ?", (a,))
     text = await ok(swarm, b, "agents")
     assert "Spent $1.25 of $3.00." in text and f"{ext}: Reviewer [idle, external], tasks: #1" in text
+    assert text.startswith("AI agents: 2 of max 6, plus 1 external member (not counted).")
     text = await ok(swarm, USER, "swarm_status")
-    assert 'Swarm "Tool swarm" — running' in text and "Spent $1.25 of $3.00. Members: 3 of 6." in text
+    assert 'Swarm "Tool swarm" — running' in text
+    assert "Spent $1.25 of $3.00. AI agents: 2 of max 6, plus 1 external member (not counted)." in text
     assert "Global goal: not set." in text and "Tasks: todo=1" in text
     text = await ok(swarm, ext, "swarm_status")
     assert f"You are {ext}. Your open tasks: #1 [todo] Mine" in text
@@ -781,7 +788,7 @@ async def test_hire_and_retire(swarm):
     assert swarm.member(b)["status"] == AgentStatus.RETIRED
     # the member limit
     await ok(swarm, USER, "swarm_control", {"max_agents": 1})
-    assert "maximum of 1 members" in await err(swarm, a, "hire_agent", {"role": "x", "instructions": "y"})
+    assert "maximum of 1 AI agents" in await err(swarm, a, "hire_agent", {"role": "x", "instructions": "y"})
 
 
 async def test_update_notes_and_wait(swarm):
@@ -826,8 +833,17 @@ async def test_join_swarm(swarm):
     generated = await ok(swarm, USER, "join_swarm", {"role": "Helper"})
     name = re.search(r"as (.+?) \(role", generated).group(1)
     assert swarm.kind_of(name) == AgentKind.EXTERNAL
-    await ok(swarm, USER, "swarm_control", {"max_agents": 4})
-    assert "maximum of 4 members" in await err(swarm, USER, "join_swarm", {"role": "One more"})
+    # external members neither count toward max_agents (a client joining must not block hiring) nor are limited
+    await ok(swarm, USER, "swarm_control", {"max_agents": 2})
+    assert "You do not count toward the agent limit" in await ok(swarm, USER, "join_swarm", {"role": "One more"})
+    assert "maximum of 2 AI agents (members who joined through MCP do not count)" in await err(
+        swarm, USER, "hire_agent", {"role": "Tester", "instructions": "t"})
+    await ok(swarm, USER, "swarm_control", {"max_agents": 3})
+    await ok(swarm, USER, "hire_agent", {"role": "Tester", "instructions": "t"})
+    assert swarm.agent_count() == 3 and len(swarm.members()) == 6
+    assert swarm.snapshot()["swarm"]["agent_count"] == 3
+    text = await ok(swarm, USER, "swarm_status")
+    assert "AI agents: 3 of max 3, plus 3 external members (not counted)." in text
     # members act through the tools: claim and talk
     await ok(swarm, USER, "task_create", {"title": "Review", "goal": "g"})
     await ok(swarm, "Claude Code", "task_claim", {"task_id": 1})
@@ -873,6 +889,106 @@ async def test_wait_for_events(swarm):
     assert "No new events in 0s" in await ok(swarm, USER, "wait_for_events", {"timeout": -5})
 
 
+def board_progress(text: str) -> list[str]:
+    return text.split("Board progress:\n", 1)[1].splitlines() if "Board progress:\n" in text else []
+
+
+async def test_wait_for_events_with_progress(swarm):
+    """progress=true (external members and the user): board progress made by others also ends the wait, as short
+    lines batched with the other events and capped; the caller's own changes are no news; the default is as
+    before (only what is addressed to the caller)."""
+    from dreamteam.tools.swarm_tools import PROGRESS_MAX
+
+    assert REGISTRY["wait_for_events"].parameters["properties"]["progress"]["type"] == "boolean"
+    a, b = llm_members(swarm)
+    ext = await join(swarm)
+    await ok(swarm, USER, "set_goal", {"title": "Ship"})  # before the first progress call: not news
+    assert await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True}) == \
+        "No new events in 0s. Call wait_for_events again to keep listening."
+
+    async def later(actor: str, tool: str, args: dict) -> None:
+        await asyncio.sleep(0.2)
+        await ok(swarm, actor, tool, args)
+
+    # progress during the wait ends it
+    mover = asyncio.create_task(later(USER, "task_create", {"title": "Parser", "goal": "g", "assignee": b}))
+    started = time.monotonic()
+    text = await ok(swarm, ext, "wait_for_events", {"timeout": 10, "progress": True})
+    await mover
+    assert time.monotonic() - started < 5 and text.startswith("=== New events while you were working (")
+    assert text.splitlines()[1:] == ["Board progress:", f"• #2 Parser: created by user (assignee {b})"]
+    # changes are batched with the messages; the caller's own changes and edits that change no status are left out
+    await ok(swarm, b, "task_update", {"task_id": 2, "status": "in_progress"})
+    await ok(swarm, ext, "task_create", {"title": "Mine", "goal": "g"})
+    await ok(swarm, USER, "task_update", {"task_id": 2, "description": "more details"})
+    swarm.mail.send(a, [ext], "hello")
+    text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
+    assert "hello" in text and text.index("hello") < text.index("Board progress:")
+    assert board_progress(text) == [f"• #2 Parser: todo → in_progress ({b})"]
+    assert (await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})).startswith("No new events")
+    # the goal and the team
+    await ok(swarm, USER, "hire_agent", {"role": "Tester", "instructions": "t", "name": "Ada King"})
+    await join(swarm, "Bob Stone", "Helper")
+    await ok(swarm, USER, "retire_agent", {"name": "Ada King"})
+    await ok(swarm, a, "goal_complete", {"summary": "done"})
+    await ok(swarm, USER, "swarm_control", {"reopen_goal_comment": "more"})
+    assert board_progress(await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})) == [
+        '• Ada King hired as "Tester" by user', '• Bob Stone joined as "Helper" (external member)',
+        "• Ada King left the swarm (user)", f"• goal achieved ({a})", "• goal reopened by user"]
+    # without progress, board progress neither ends the wait nor is consumed
+    mover = asyncio.create_task(later(USER, "task_update", {"task_id": 2, "status": "waiting"}))
+    started = time.monotonic()
+    text = await ok(swarm, ext, "wait_for_events", {"timeout": 1})
+    await mover
+    assert text.startswith("No new events in 1s") and time.monotonic() - started >= 0.9
+    assert board_progress(await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})) == [
+        "• #2 Parser: in_progress → waiting (user)"]
+    # a cap on the lines of one result
+    for i in range(PROGRESS_MAX + 5):
+        swarm.board.create(USER, f"T{i}", goal="g")
+    lines = board_progress(await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True}))
+    assert len(lines) == PROGRESS_MAX + 1 and lines[0] == "• #4 T0: created by user"
+    assert lines[-1] == "• … and 5 more: see `board`"
+    # in the caller's language
+    swarm.db.execute("UPDATE agents SET language = 'ru' WHERE name = ?", (ext,))
+    await ok(swarm, USER, "task_update", {"task_id": 2, "status": "cancelled"})
+    text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
+    assert text.splitlines()[1:] == ["Прогресс на доске:", "• #2 Parser: waiting → cancelled (user)"]
+    # the user has a cursor of its own
+    await ok(swarm, USER, "wait_for_events", {"timeout": 0})  # what was addressed to the user so far
+    assert (await ok(swarm, USER, "wait_for_events", {"timeout": 0, "progress": True})).startswith("No new events")
+    await ok(swarm, b, "task_claim", {"task_id": 3})
+    assert board_progress(await ok(swarm, USER, "wait_for_events", {"timeout": 0, "progress": True})) == [
+        f"• #3 Mine: todo → in_progress ({b})"]
+
+
+async def test_wait_for_events_with_progress_ends_when_the_swarm_stops(tmp_path):
+    sw = Swarm(config=make_config(tmp_path), llm_factory=lambda profile, agent: ScriptedLLM(lambda *a: "ok", profile))
+    await sw.start(run_agents=False)
+    try:
+        poll = asyncio.create_task(call_tool(ToolContext(sw, USER), "wait_for_events",
+                                             {"timeout": 120, "progress": True}))
+        await asyncio.sleep(0.3)
+        assert len(sw.bus._queues) == 1  # it listens to the board's events
+        started = time.monotonic()
+        await sw.stop()
+        text, is_error = await asyncio.wait_for(poll, 10)
+        assert is_error and "stopped while waiting" in text and time.monotonic() - started < 5
+        assert not sw.bus._queues  # and stopped listening
+    finally:
+        sw.close()
+
+
+def test_progress_texts_match_in_both_languages():
+    from dreamteam.tools.swarm_tools import _PROGRESS
+
+    assert _PROGRESS["en"].keys() == _PROGRESS["ru"].keys()
+    for key, en in _PROGRESS["en"].items():
+        ru = _PROGRESS["ru"][key]
+        assert sorted(re.findall(r"\{(\w+)\}", en)) == sorted(re.findall(r"\{(\w+)\}", ru)), key
+        assert re.findall(r"`[^`]+`", en) == re.findall(r"`[^`]+`", ru), key
+
+
 async def test_set_goal_is_for_the_user(swarm):
     a = llm_members(swarm)[0]
     ext = await join(swarm)
@@ -895,7 +1011,7 @@ async def test_swarm_control(swarm):
     assert swarm.paused and swarm.pause_reason == "paused by the user"
     assert await ok(swarm, USER, "swarm_control", {"action": "resume"}) == "Done: resumed."
     text = await ok(swarm, USER, "swarm_control", {"max_cost_usd": 0, "max_agents": "5"})
-    assert text == "Done: limits: no budget limit, 5 agents."
+    assert text == "Done: limits: no budget limit, at most 5 AI agents."
     assert "max_agents must be at least 1" in await err(swarm, USER, "swarm_control", {"max_agents": 0})
     assert "Nothing to do" in await err(swarm, USER, "swarm_control", {})
     # resume is refused while the budget is exhausted; raising the limit resumes

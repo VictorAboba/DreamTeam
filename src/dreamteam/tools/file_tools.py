@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..shell import resolve_shell, run_shell, scrubbed_env
+from ..shell import scrubbed_env
 from ..workspace import agent_git_env, scratch_rel
 from . import ToolContext, tool
 
@@ -94,14 +94,24 @@ async def lock_file(ctx: ToolContext, args: dict[str, Any]) -> str:
 @tool(
     "shell",
     en="Run a console command in the workspace directory and get its exit code and output (the result names "
-       "the shell). Use it to run code, tests, package managers, git, etc. There is no input (stdin is closed); "
-       "start long-running servers in the background. Secrets from the environment are not available.",
+       "the shell). Use it to run code, tests, package managers, git, etc. There is no input (stdin is closed). "
+       "A command still running when its timeout expires is not killed: it continues as a background job, you get "
+       "its output so far and you are notified when it ends. Start servers and other long commands with "
+       "background=true: the call returns after 2 seconds with the job's id; `jobs` shows a job's output and "
+       "`job_stop` stops it. Secrets from the environment are not available.",
     ru="Выполнить команду в консоли в папке workspace и получить код возврата и вывод (в результате указана "
        "оболочка). Подходит для запуска кода, тестов, пакетных менеджеров, git и т. п. Ввода нет (stdin "
-       "закрыт); долгоживущие серверы запускай в фоне. Секреты из окружения недоступны.",
+       "закрыт). Команда, которая ещё работает, когда истёк её timeout, не убивается: она продолжает работать "
+       "как фоновый процесс, ты получаешь её вывод на этот момент, а когда она завершится, придёт уведомление. "
+       "Серверы и другие долгие команды запускай с background=true: вызов вернётся через 2 секунды с "
+       "идентификатором процесса (например, j3); `jobs` покажет вывод процесса, а `job_stop` остановит его. "
+       "Секреты из окружения недоступны.",
     properties={
         "command": {"type": "string"},
-        "timeout": {"type": "integer", "description": "Seconds (default from config)"},
+        "timeout": {"type": "integer", "description": "Seconds to wait for the command (default from config); a "
+                                                      "command still running then continues in the background"},
+        "background": {"type": "boolean",
+                       "description": "Start the command as a background job and return after 2 seconds"},
     },
     required=["command"],
     audience=("llm", "external"),
@@ -109,6 +119,12 @@ async def lock_file(ctx: ToolContext, args: dict[str, Any]) -> str:
 async def shell(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
     cfg = swarm.config.shell
+    command = args["command"]
+    # `jobs`, `jobs j3` or `kill j3` as the whole command line is answered by the hub (how agents whose tool set
+    # has no `jobs` tool list and stop their jobs): nothing is spawned and nothing is committed
+    answer = await swarm.jobs.console(ctx.actor, command, max_chars=ctx.output_cap)
+    if answer is not None:
+        return answer
     timeout = min(max(args.get("timeout") or cfg.timeout, 1), cfg.max_timeout)
     swarm.workspace.ensure_scratch(ctx.actor)  # .scratch/<slug>/ exists for redirects like `> .scratch/...`
     root = swarm.workspace.root
@@ -116,11 +132,12 @@ async def shell(ctx: ToolContext, args: dict[str, Any]) -> str:
     env = agent_git_env(scrubbed_env(swarm.config, {"DREAMTEAM_AGENT": ctx.actor, "DREAMTEAM_WORKSPACE": str(root),
                                                     "DREAMTEAM_SCRATCH": str(root / scratch_rel(ctx.actor))}),
                         ctx.actor)
-    code, output = await run_shell(
-        args["command"], cwd=swarm.workspace.root, timeout=timeout, program=cfg.program,
-        env=env, max_output=ctx.output_cap,
-    )
-    await swarm.workspace.autocommit(ctx.actor, f"shell: {args['command'][:72]}")
-    name = resolve_shell(cfg.program)[0]
-    head = f"TIMEOUT after {timeout}s (process tree killed)" if code is None else f"exit code: {code}"
-    return f"{head} [{name}]\n" + (output if output.strip() else "(no output)")
+    # the command's result, or (still running at its timeout, background=true, processes it left running) a job
+    outcome = await swarm.jobs.run(ctx.actor, command, timeout=timeout, env=env, max_output=ctx.output_cap,
+                                   background=bool(args.get("background")))
+    if outcome.state != "killed":  # killed: the session stops or the member leaves, so no git work may start now
+        # one commit per call: the subject names the files it changed, the body keeps the command
+        await swarm.workspace.autocommit(ctx.actor, kind="shell", detail=command)
+    # the footer of a job points at the tools the caller has (`jobs`, `job_stop` or the console commands; `wait`,
+    # or `wait_for_events` for an external member)
+    return outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=cfg, has_wait=ctx.has_tool("wait"))

@@ -459,3 +459,23 @@ async def test_manual_commit_in_shell_is_attributed_to_the_agent(make_swarm):
     await shell(swarm, agent, "git commit -q --allow-empty -m manual")
     name, email = git_identity(agent)
     assert git(root, "log", "-1", "--format=%an|%ae|%cn|%ce|%s").strip() == f"{name}|{email}|{name}|{email}|manual"
+
+
+@needs_git
+async def test_shell_commit_names_the_files_and_keeps_the_command(make_swarm):
+    """One commit per shell call; its subject names what changed rather than repeating the command line, and the
+    command is in the body."""
+    swarm = await make_swarm(git_on=True)
+    agent = agent_of(swarm)
+    root = swarm.workspace.root
+    put(root, "gen.py", "import pathlib\nfor n in (200, 300):\n"
+                        "    pathlib.Path('candidates').mkdir(exist_ok=True)\n"
+                        "    pathlib.Path(f'candidates/lp_N{n}.json').write_text('{}')\n"
+                        "pathlib.Path('.scratch/notes.txt').write_text('scratch')\n")
+    command = python(swarm, "gen.py")
+    await shell(swarm, agent, command)
+    assert commits(root)[0] == (agent, "shell: candidates/lp_N200.json, candidates/lp_N300.json, gen.py",
+                                ["candidates/lp_N200.json", "candidates/lp_N300.json", "gen.py"])
+    assert git(root, "log", "-1", "--format=%b").strip() == command
+    await shell(swarm, agent, "echo nothing changes")
+    assert len(commits(root)) == 2  # no commit for a call that changed nothing

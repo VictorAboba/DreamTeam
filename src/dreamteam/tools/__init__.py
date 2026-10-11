@@ -25,7 +25,8 @@ _AUDIENCE_NAMES = {"llm": "swarm agents", "external": "external members", "user"
 # Presentation order of the tool modules. The registry is sorted by (module, definition order) once
 # everything is loaded, so the tool list never depends on which module happened to be imported first
 # (a reordered tool list would invalidate the LLM prompt cache).
-_MODULE_ORDER = ("board_tools", "comm_tools", "file_tools", "mcp_tools", "swarm_tools", "trigger_tools", "trace_tools")
+_MODULE_ORDER = ("board_tools", "comm_tools", "file_tools", "job_tools", "mcp_tools", "swarm_tools", "trigger_tools",
+                 "trace_tools")
 _seq = itertools.count()
 
 
@@ -47,6 +48,17 @@ class ToolContext:
     @property
     def is_user(self) -> bool:
         return self.actor == USER
+
+    def has_tool(self, name: str) -> bool:
+        """Whether the caller has the tool `name`: an LLM agent has its own frozen tool set (tools/frozen.py),
+        which may be older than the registry; other callers see the live registry of their kind. Results that
+        point at a tool are tailored with it, so an agent is never told to call a tool it lacks."""
+        own = getattr(self.runtime, "tool_names", None)
+        if own is not None:
+            return name in own
+        _load()
+        spec = REGISTRY.get(name)
+        return spec is not None and self.kind in spec.audience
 
     @property
     def output_cap(self) -> int:
@@ -247,14 +259,18 @@ def _check_type(name: str, value: Any, schema: dict[str, Any]) -> None:
             _check_type(f"{name}[{i}]", item, schema["items"])
 
 
-def _signature(spec: ToolSpec) -> str:
-    props = spec.parameters.get("properties", {})
-    required = set(spec.parameters.get("required", []))
+def _signature(spec: ToolSpec, parameters: dict[str, Any] | None = None) -> str:
+    """`name(a, b?)` from `parameters` (the caller's own schema of the tool; default: the registry's)."""
+    parameters = parameters or spec.parameters
+    props = parameters.get("properties", {})
+    required = set(parameters.get("required", []))
     return f"{spec.name}(" + ", ".join(p if p in required else f"{p}?" for p in props) + ")"
 
 
-def prepare_args(spec: ToolSpec, args: dict[str, Any] | None) -> dict[str, Any]:
-    """Validated and lightly coerced copy of `args`; unknown keys are dropped (see `unknown_args`)."""
+def prepare_args(spec: ToolSpec, args: dict[str, Any] | None,
+                 usage: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Validated and lightly coerced copy of `args`; unknown keys are dropped (see `unknown_args`). `usage`:
+    the parameters the caller knows the tool by (an agent's frozen schema), for the usage line of errors."""
     args = dict(args or {})
     props = spec.parameters.get("properties", {})
     for key in [k for k in args if k not in props]:
@@ -270,19 +286,24 @@ def prepare_args(spec: ToolSpec, args: dict[str, Any] | None) -> dict[str, Any]:
             missing.append(key)
     if missing:
         raise ToolError(f"Missing required argument(s) for {spec.name}: {', '.join(missing)}. "
-                        f"Usage: {_signature(spec)} (? = optional).")
+                        f"Usage: {_signature(spec, usage)} (? = optional).")
     return args
 
 
-def unknown_args(spec: ToolSpec, args: dict[str, Any] | None) -> list[str]:
-    props = spec.parameters.get("properties", {})
+def unknown_args(spec: ToolSpec, args: dict[str, Any] | None,
+                 parameters: dict[str, Any] | None = None) -> list[str]:
+    """Keys of `args` that `parameters` (the caller's own schema of the tool; default: the registry's) lacks."""
+    props = (parameters or spec.parameters).get("properties", {})
     return [k for k in (args or {}) if k not in props]
 
 
 # --- calling ----------------------------------------------------------------------------------------
 
-def _unknown_tool(name: str, kind: str) -> str:
-    names = [s.name for s in tools_for(kind)]
+def _unknown_tool(name: str, kind: str, names: list[str] | None = None) -> str:
+    """`names`: the tools the caller has (an LLM agent's frozen set); default: the registry for its kind. Only
+    those are suggested, so an agent is never pointed at a tool its tool set lacks."""
+    if names is None:
+        names = [s.name for s in tools_for(kind)]
     close = difflib.get_close_matches(str(name), names, n=3, cutoff=0.5)
     hint = f" Did you mean: {', '.join(close)}?" if close else ""
     return f"Unknown tool '{name}'.{hint} Available tools: {', '.join(names)}."
@@ -305,20 +326,29 @@ async def call_tool(ctx: ToolContext, name: str, args: dict[str, Any] | None) ->
         reason = "has left the swarm (retired)" if known else "is not a member of this swarm"
         return f"Error: '{ctx.actor}' {reason}; tools cannot be used on its behalf.", True
     kind = ctx.kind
+    # An LLM agent calls the tools of its own frozen tool set (tools/frozen.py), with the parameters they have
+    # there: the registry may already be a later revision. (getattr: tool tests pass simpler runtimes.)
+    lookup = getattr(ctx.runtime, "tool_parameters", None)
+    frozen_params = lookup(name) if lookup is not None else None
+    if lookup is not None and frozen_params is None:
+        own = [t.get("name") for t in getattr(ctx.runtime, "tools", None) or []]
+        return _unknown_tool(name, kind, names=own), True
     spec = REGISTRY.get(name)
     if spec is None:
         return _unknown_tool(name, kind), True
     if kind not in spec.audience:
         return _not_available(spec, kind), True
+    params = frozen_params or spec.parameters
     if args is not None and not isinstance(args, dict):
         return (f"Error: the arguments of {name} must be a JSON object, got {type(args).__name__}. "
-                f"Usage: {_signature(spec)}."), True
-    ignored = unknown_args(spec, args)
+                f"Usage: {_signature(spec, params)}."), True
+    ignored = unknown_args(spec, args, params)
     note = ""
     if ignored:
-        note = (f"\n[Ignored unknown argument(s): {', '.join(ignored)}. Usage: {_signature(spec)}]")
+        note = (f"\n[Ignored unknown argument(s): {', '.join(ignored)}. Usage: {_signature(spec, params)}]")
+        args = {k: v for k, v in args.items() if k not in ignored}  # also those only a later revision has
     try:
-        prepared = prepare_args(spec, args)
+        prepared = prepare_args(spec, args, usage=params)
         result = await spec.handler(ctx, prepared)
         return (result if isinstance(result, str) else str(result)) + note, False
     except ToolError as exc:
@@ -338,7 +368,8 @@ def _load() -> None:
     global _loaded
     if _loaded:
         return
-    from . import board_tools, comm_tools, file_tools, mcp_tools, swarm_tools, trace_tools, trigger_tools  # noqa: F401
+    from . import (board_tools, comm_tools, file_tools, job_tools, mcp_tools, swarm_tools, trace_tools,  # noqa: F401
+                   trigger_tools)
 
     ordered = sorted(REGISTRY.values(), key=lambda s: s.order)
     REGISTRY.clear()

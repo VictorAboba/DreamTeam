@@ -149,9 +149,18 @@ class ServerSettings:
 
 @dataclass
 class ShellSettings:
+    """The members' `shell` commands and their background jobs (docs/SPEC.md §7.1); read at each use (hot)."""
+
     program: str = "auto"
-    timeout: int = 120
-    max_timeout: int = 1800
+    timeout: int = 120                 # seconds a call waits; a command still running then goes on in the background
+    max_timeout: int = 1800            # the largest timeout, and the lifetime of a command that went on at its timeout
+    background_on_timeout: bool = True  # False: a command still running at its timeout is killed (the old behaviour)
+    foreground_max: int = 180          # an AI agent's call waits at most this, whatever its timeout (it then goes on)
+    max_jobs_per_member: int = 4       # running background jobs per member; 0 = no background jobs
+    max_jobs: int = 16                 # running background jobs per session; 0 = no background jobs
+    job_max_minutes: int = 480         # lifetime of jobs started in the background or left running (0 = no limit)
+    job_log_mb: int = 2                # output kept per job, in two files
+    cpu_threads: int | str = "auto"    # numeric libraries' threads per command: "auto" (cores / AI agents), N, 0 = all
     pass_env: list[str] = field(default_factory=list)
 
 
@@ -183,7 +192,8 @@ _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSetti
                "TracingSettings": "tracing", "ModelProfile": "models", "RoleSettings": "roles"}
 # numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm)
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
-                      "max_parallel_llm_calls", "max_tokens", "timeout", "max_timeout"})
+                      "max_parallel_llm_calls", "max_tokens", "timeout", "max_timeout", "foreground_max",
+                      "job_log_mb"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 
@@ -197,6 +207,15 @@ def _checked(where: str, key: str, annotation: str, value: Any) -> Any:
     """`value` checked against the field's annotation (a string: this module postpones annotations).
     A settings file or a UI update with a wrong type must fail here, not later inside a running swarm."""
     kind = annotation.replace(" ", "").removesuffix("|None")
+    if kind == "int|str":  # [shell] cpu_threads: "auto" or a count (also written as a string, "4")
+        text = value.strip().lower() if isinstance(value, str) else None
+        if text == "auto":
+            return "auto"
+        if text is not None:
+            if not text.isdigit():
+                raise _bad(where, key, '"auto" or a whole number', value)
+            value = int(text)
+        return _checked(where, key, "int", value)
     if kind == "bool":
         if not isinstance(value, bool):
             raise _bad(where, key, "true or false", value)
@@ -455,7 +474,7 @@ def render_template(name: str, language: str = "ru", provider: str = "anthropic"
 name = {toml_string(name)}
 language = "{language}"        # язык промптов агентов: ru | en
 start_agents = 3              # сколько агентов стартует
-max_agents = 8                # максимум агентов (агенты могут нанимать новых)
+max_agents = 8                # максимум ИИ-агентов (агенты могут нанимать новых; участники, подключившиеся через MCP, не считаются)
 max_cost_usd = 5.0            # бюджет роя в долларах; при исчерпании рой встаёт на паузу
 goal = {toml_string(goal)}          # глобальная задача (можно задать позже в веб-интерфейсе)
 starting_roles = []           # стартовая команда по порядку, например ["architect", "developer", "developer", "tester"]; недостающим до start_agents — «Универсал»
@@ -473,7 +492,15 @@ port = 8765
 
 [shell]
 program = "auto"              # auto | bash | sh | powershell | pwsh | cmd
-timeout = 120
+timeout = 120                 # сколько секунд вызов shell ждёт команду; не завершившаяся за это время продолжает работать в фоне
+max_timeout = 1800            # наибольший timeout команды; столько же (от запуска) живёт команда, ушедшая в фон по тайм-ауту (само ожидание ИИ-агента ограничивает foreground_max, по MCP — 600 с)
+background_on_timeout = true  # false — команду, не уложившуюся в timeout, убивать, как раньше
+foreground_max = 180          # ИИ-агент ждёт команду не дольше этого, какой бы timeout он ни задал: дальше она работает в фоне, а агент видит сообщения и комментарии
+max_jobs_per_member = 4       # фоновых процессов у одного участника; 0 — без фоновых процессов
+max_jobs = 16                 # фоновых процессов во всей сессии; 0 — без фоновых процессов
+job_max_minutes = 480         # сколько живёт процесс, запущенный в фоне намеренно или оставленный командой (0 — без предела)
+job_log_mb = 2                # сколько вывода фонового процесса хранить (.scratch/<участник>/jobs/), МБ
+cpu_threads = "auto"          # потоков у numpy, BLAS, OpenMP и т. п. на команду: "auto" — ядра поровну между ИИ-агентами, число, 0 — не ограничивать
 pass_env = []                 # переменные окружения с секретами, которые можно передать в консоль агентов
 
 [workspace]

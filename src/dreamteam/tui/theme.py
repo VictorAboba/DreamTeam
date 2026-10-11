@@ -85,6 +85,7 @@ SYMBOLS: dict[str, str] = {
     "prompt": ">",
     "edit": "✎",       # file changed / locked
     "trigger": "⚡",
+    "job": "⚙",        # background job of an agent
     "folder": "▸",
     "current": "▶",
 }
@@ -119,6 +120,7 @@ SYMBOLS_ASCII: dict[str, str] = {
     "prompt": ">",
     "edit": "~",
     "trigger": "!",
+    "job": "&",
     "folder": ">",
     "current": ">",
 }

@@ -84,7 +84,15 @@ const I18N = {
     r_err_model: "Роль «{name}» использует профиль «{model}», которого нет.",
     ag_steps: "Шагов за пробуждение", ag_context: "Окно контекста по умолчанию", ag_tool_out: "Лимит вывода инструмента (симв.)",
     ag_stagger: "Пауза между стартами агентов, с", ag_nudge: "Напоминание простаивающим, с", ag_parallel: "Параллельных вызовов LLM",
-    sh_program: "Оболочка", sh_timeout: "Таймаут по умолчанию, с", sh_max_timeout: "Максимальный таймаут, с",
+    sh_program: "Оболочка", sh_timeout: "Ожидание команды по умолчанию, с", sh_max_timeout: "Наибольший тайм-аут команды, с",
+    sh_max_timeout_hint: "столько же от запуска живёт команда, ушедшая в фон по тайм-ауту; само ожидание ИИ-агента ограничено следующим полем, по MCP — 600 с",
+    sh_fg_max: "ИИ-агент ждёт команду не дольше, с", sh_fg_max_hint: "дальше она работает в фоне",
+    sh_bg: "Долгие команды — в фон",
+    sh_bg_hint: "Команда агента, которая работает дольше тайм-аута, продолжает работать в фоне: агент получает уже накопленный вывод и уведомление, когда она завершится. Выключите, чтобы такие команды прерывались, как раньше.",
+    sh_jobs: "Фоновых процессов на участника", sh_jobs_total: "Фоновых процессов на сессию",
+    sh_job_minutes: "Предел жизни фонового процесса, мин (0 — без предела)", sh_job_log: "Вывод фонового процесса, МБ",
+    sh_cpu: "Потоков вычислений на команду",
+    sh_cpu_hint: "для numpy, BLAS, OpenMP и т. п.: auto — ядра поровну между ИИ-агентами, число — столько потоков, 0 — не ограничивать; значение, заданное в самой команде, важнее",
     sh_pass_env: "Пробрасывать переменные", sh_pass_env_hint: "секреты из окружения скрыты от агентов, кроме перечисленных",
     ws_git: "Git с автокоммитами", ws_lock: "Время блокировки файла, мин",
     mcp_approval: "Подтверждать новые MCP-серверы агентов", mcp_library: "Папка библиотеки MCP", mcp_startup: "Таймаут запуска, с",
@@ -183,7 +191,15 @@ const I18N = {
     r_err_model: "Role “{name}” uses the profile “{model}”, which does not exist.",
     ag_steps: "Steps per wake-up", ag_context: "Default context window", ag_tool_out: "Tool output limit (chars)",
     ag_stagger: "Delay between agent starts, s", ag_nudge: "Nudge idle agents after, s", ag_parallel: "Parallel LLM calls",
-    sh_program: "Shell", sh_timeout: "Default timeout, s", sh_max_timeout: "Max timeout, s",
+    sh_program: "Shell", sh_timeout: "Default wait for a command, s", sh_max_timeout: "Largest command timeout, s",
+    sh_max_timeout_hint: "a command that went to the background at its timeout lives this long from its start; an AI agent's wait itself is capped by the next field, 600 s over MCP",
+    sh_fg_max: "An AI agent waits for a command at most, s", sh_fg_max_hint: "then it goes on in the background",
+    sh_bg: "Long commands go to the background",
+    sh_bg_hint: "An agent's command still running at its timeout keeps running in the background: the agent gets its output so far and a notice when it ends. Turn off to kill such commands, as before.",
+    sh_jobs: "Background jobs per member", sh_jobs_total: "Background jobs per session",
+    sh_job_minutes: "Background job time limit, min (0 = none)", sh_job_log: "Background job output, MB",
+    sh_cpu: "Compute threads per command",
+    sh_cpu_hint: "for numpy, BLAS, OpenMP and the like: auto shares the cores equally between the AI agents, a number sets that many threads, 0 = no limit; a value set in the command itself wins",
     sh_pass_env: "Pass environment variables", sh_pass_env_hint: "secrets are hidden from agents except the listed ones",
     ws_git: "Git with auto-commits", ws_lock: "File lock time, min",
     mcp_approval: "Require approval of new agent MCP servers", mcp_library: "MCP library folder", mcp_startup: "Startup timeout, s",
@@ -971,7 +987,14 @@ function renderSettings(fromServer) {
     ${section("shell", grid([
       field("sh_program", "shell.program", "select", { options: ["auto", "bash", "sh", "powershell", "pwsh", "cmd"].map((x) => [x, x]) }),
       field("sh_timeout", "shell.timeout", "int", { min: 1 }),
-      field("sh_max_timeout", "shell.max_timeout", "int", { min: 1 }),
+      field("sh_max_timeout", "shell.max_timeout", "int", { min: 1, hint: "sh_max_timeout_hint" }),
+      field("sh_fg_max", "shell.foreground_max", "int", { min: 1, hint: "sh_fg_max_hint" }),
+      field("sh_bg", "shell.background_on_timeout", "bool", { full: true, hint: "sh_bg_hint" }),
+      field("sh_jobs", "shell.max_jobs_per_member", "int", { min: 0 }),
+      field("sh_jobs_total", "shell.max_jobs", "int", { min: 0 }),
+      field("sh_job_minutes", "shell.job_max_minutes", "int", { min: 0 }),
+      field("sh_job_log", "shell.job_log_mb", "int", { min: 1 }),
+      field("sh_cpu", "shell.cpu_threads", "auto", { full: true, hint: "sh_cpu_hint", placeholder: "auto" }),
       field("sh_pass_env", "shell.pass_env", "list", { full: true, hint: "sh_pass_env_hint", placeholder: "GITHUB_TOKEN, HF_TOKEN" }),
     ]))}
     ${section("workspace", grid([
@@ -1044,6 +1067,8 @@ function readInput(el) {
   const raw = el.value.trim();
   if (type === "int") return raw === "" ? null : Math.round(Number(raw));
   if (type === "float") return raw === "" ? null : Number(raw);
+  // "auto" or a count ([shell] cpu_threads): anything else is sent as typed, and the server says what it expects
+  if (type === "auto") return raw === "" || raw.toLowerCase() === "auto" ? "auto" : /^\d+$/.test(raw) ? Number(raw) : raw;
   if (type === "list") return raw ? raw.split(",").map((x) => x.trim()).filter(Boolean) : [];
   if (type === "json") {
     if (!raw) return {};

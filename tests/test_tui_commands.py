@@ -49,9 +49,9 @@ def test_registry_lookup_and_texts():
     assert find("nope") is None
     names = [cmd.name for cmd in COMMANDS]
     assert len(names) == len(set(names))
-    for required in ("help", "new", "team", "sessions", "resume", "goal", "board", "task", "agents", "roles", "to",
-                     "hire", "trace", "span", "files", "cat", "cd", "cost", "status", "model", "pause", "budget", "max",
-                     "approve", "reject", "stop", "web", "settings", "verbose", "lang", "clear", "exit"):
+    for required in ("help", "new", "team", "sessions", "resume", "goal", "board", "task", "agents", "roles", "jobs",
+                     "to", "hire", "trace", "span", "files", "cat", "cd", "cost", "status", "model", "pause", "budget",
+                     "max", "approve", "reject", "stop", "web", "settings", "verbose", "lang", "clear", "exit"):
         assert required in names
     for lang in ("ru", "en"):
         for cmd in COMMANDS:
@@ -64,6 +64,10 @@ def test_registry_lookup_and_texts():
     assert find("hire").usage("ru") == "/hire Роль [| инструкции]"
     assert find("approve").usage("en") == "/approve name | N [comment]"
     assert names.index("roles") == names.index("agents") + 1 and names.index("team") == names.index("new") + 1
+    assert names.index("jobs") == names.index("roles") + 1
+    assert find("jobs").usage("en") == "/jobs [jN | stop jN]" and find("jobs").session and not find("jobs").required
+    assert "pausing does not stop them" in find("jobs").description("en")
+    assert "пауза их не останавливает" in find("jobs").description("ru")
     help_text = render.to_plain(render.help_view(render.RenderContext(lang="en"), commands.help_rows("en")), 100)
     assert "/board" in help_text and "/exit, /quit, /q" in help_text and "task board" in help_text
 
@@ -390,6 +394,76 @@ async def test_approve_and_reject_settle_tasks_or_mcp_servers():
     assert "Say what to fix: /reject 12 what to fix" in app.text   # a return needs a reason: no call
     assert "task_review ok" in app.text
     assert [c for c in app.calls if c[0] == "mcp"] == [("mcp", "calc", True, ""), ("mcp", "calc", False, "not safe")]
+
+
+JOB_STATE = {"jobs": [
+    {"id": 3, "label": "j3", "owner": ANNA, "command": "npm run dev", "origin": "background", "status": "running",
+     "reason": None, "exit_code": None, "started_at": 1_760_000_000.0, "ended_at": None, "processes": ["node.exe"],
+     "log": ".scratch/anna/jobs/j3.log"},
+    {"id": 2, "label": "j2", "owner": BORIS, "command": "pytest -q", "origin": "timeout", "status": "ended",
+     "reason": None, "exit_code": 0, "started_at": 1_760_000_000.0, "ended_at": 1_760_000_240.0, "processes": [],
+     "log": ".scratch/boris/jobs/j2.log"}]}
+
+
+class JobsApp(HubApp):
+    """HubApp whose state has background jobs and whose `jobs` / `job_stop` answer like the hub."""
+
+    def __init__(self, state: dict | None = None):
+        super().__init__(attached=True)
+        self.state = state if state is not None else JOB_STATE
+
+        async def act(sid, tool, args):
+            self.acts.append((tool, args))
+            if args.get("job_id") == "j9":
+                return False, "There is no job j9. Running jobs: j3."
+            if tool == "jobs":
+                return True, (f"Job {args['job_id']} of {ANNA}: npm run dev\nState: running for 25 min (started in the "
+                              "background) [bash]\n--- last 2 lines ---\nready\nListening on :5173")
+            return True, f"Stopped job {args['job_id']} (npm run dev) of {ANNA} after 25 min, together with the " \
+                         "processes it started. Last output:\nListening on :5173"
+
+        self.client.act = act
+
+    async def refresh_state(self) -> dict:
+        self.calls.append(("state",))
+        return self.state
+
+
+async def test_jobs_lists_shows_and_stops_background_jobs():
+    app = JobsApp()
+    await execute(app, "/jobs")
+    table = app.out[-1]
+    assert ("state",) in app.calls and not app.acts                     # the table comes from the state
+    assert "j3" in table and "Анна Смирнова" in table and "npm run dev" in table and "running" in table
+    assert "j2" in table and "ended with exit code 0" in table and "/jobs stop jN" in table
+    await execute(app, "/jobs j3")
+    assert app.acts[-1] == ("jobs", {"job_id": "j3"})
+    assert app.out[-1].startswith("⚙ Job j3 of Анна Смирнова: npm run dev") and "Listening on :5173" in app.out[-1]
+    for ref in ("#3", "%3", "3", "J3"):                                   # the forms of a job id people type
+        await execute(app, f"/jobs {ref}")
+        assert app.acts[-1] == ("jobs", {"job_id": "j3"})
+    await execute(app, "/jobs stop j3 5")
+    assert app.acts[-2:] == [("job_stop", {"job_id": "j3"}), ("job_stop", {"job_id": "j5"})]
+    assert "Stopped job j5 (npm run dev)" in app.out[-1] and "Listening on :5173" in app.out[-1]
+    await execute(app, "/jobs стоп j3")
+    assert app.acts[-1] == ("job_stop", {"job_id": "j3"})
+    acts = len(app.acts)
+    for bad in ("/jobs stop", "/jobs npm", "/jobs j3 j4", "/jobs stop all"):
+        await execute(app, bad)
+        assert app.out[-1] == "⚠ Usage: /jobs [jN | stop jN]", bad
+    assert len(app.acts) == acts
+    await execute(app, "/jobs j9")                                         # a refusal is an error line
+    assert app.out[-1] == "⚠ There is no job j9. Running jobs: j3."
+    await execute(app, "/jobs stop j9")
+    assert app.out[-1] == "⚠ There is no job j9. Running jobs: j3."
+
+    empty = JobsApp({"jobs": []})
+    empty.ctx.lang = "ru"
+    await execute(empty, "/jobs")
+    assert empty.out[-1] == "  ⎿  Фоновых процессов нет."
+    detached = HubApp()                                                    # no session: nothing to list
+    await execute(detached, "/jobs")
+    assert "No current session" in detached.text and not detached.acts
 
 
 async def test_hire_always_sends_instructions():

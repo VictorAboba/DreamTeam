@@ -275,6 +275,83 @@ async def test_autocommit_reports_no_add_errors_for_the_ignored_scratch_folder(w
     assert "git add reported errors" not in caplog.text
 
 
+# --- autocommit messages that name what changed ---------------------------------------------------------
+
+def message_of(root: Path, rev: str = "HEAD") -> str:
+    out = subprocess.run(["git", "-C", str(root), "log", "-1", "--format=%B", rev], capture_output=True, check=True)
+    return out.stdout.decode("utf-8").rstrip("\n")
+
+
+def test_commit_message_names_the_paths_and_keeps_the_detail():
+    cmd = '.venv\\Scripts\\python.exe -c " import json,glob\nfor f in glob.glob(\'*.json\'): print(f)"'
+    assert workspace_mod.commit_message("shell", ["src/optimize_lp.py", "candidates/lp_N200.json"], cmd) == (
+        "shell: src/optimize_lp.py, candidates/lp_N200.json\n\n" + cmd)
+    assert workspace_mod.commit_message("job j3", ["out.txt"], "") == "job j3: out.txt"
+    # more paths than fit: as many as fit, then a count of the others; the subject stays a short line
+    paths = [f"candidates/lp_N{n}.json" for n in range(100, 140)]
+    subject = workspace_mod.commit_message("shell", paths, "x").split("\n")[0]
+    assert subject.startswith("shell: candidates/lp_N100.json, candidates/lp_N101.json")
+    assert subject.endswith(" more)") and len(subject) <= workspace_mod.COMMIT_SUBJECT_MAX
+    shown = subject.removeprefix("shell: ").rsplit(" (+", 1)
+    assert len(shown[0].split(", ")) + int(shown[1].split()[0]) == 40
+    # one long path keeps its end; a too long file name keeps its start
+    deep = "src/" + "/".join(["level"] * 12) + "/models/user_profile.py"
+    assert workspace_mod.commit_message("shell", [deep]) == "shell: …/level/level/models/user_profile.py"
+    long_name = "x" * 90 + ".py"
+    subject = workspace_mod.commit_message("shell", [long_name])
+    assert subject == "shell: " + "x" * (workspace_mod.COMMIT_PATH_MAX - 1) + "…"
+
+
+def test_commit_message_without_paths_and_with_odd_details():
+    # nothing staged against HEAD (e.g. the conclusion of a merge): the subject quotes the start of the detail
+    assert workspace_mod.commit_message("shell", [], "git merge --continue") == (
+        "shell: git merge --continue\n\ngit merge --continue")
+    assert workspace_mod.commit_message("shell", [], "") == "shell"
+    # control characters (a NUL would not even reach git), CRLF, trailing blanks and unpaired surrogates
+    message = workspace_mod.commit_message("shell", ["a\tb.txt"], "echo 1\x00\r\necho 2   \r\n\ud800")
+    assert message == "shell: a b.txt\n\necho 1\necho 2\n?"
+    # a long command is cut in the middle: its start and its end stay
+    long = "python run.py " + "--flag " * 1000 + "> result.txt"
+    body = workspace_mod.commit_message("shell", ["result.txt"], long).split("\n\n", 1)[1]
+    assert body.startswith("python run.py --flag") and body.endswith("> result.txt")
+    assert "characters skipped" in body and len(body) < workspace_mod.COMMIT_DETAIL_MAX + 60
+
+
+@needs_git
+async def test_autocommit_by_kind_names_the_changed_files(ws):
+    put(ws, "src/app.py", "print(1)\n")
+    put(ws, "data/in.json", "{}\n")
+    put(ws, ".scratch/anna.smith/tmp.txt", "never committed\n")
+    command = "python gen.py --out data"
+    assert await ws.autocommit(ANNA, kind="shell", detail=command)
+    assert commits(ws.root)[0] == (ANNA, "shell: data/in.json, src/app.py", ["data/in.json", "src/app.py"])
+    assert message_of(ws.root) == "shell: data/in.json, src/app.py\n\n" + command
+    # deleted and renamed files are named too (a rename as its old and its new path)
+    (ws.root / "data" / "in.json").unlink()
+    (ws.root / "src" / "app.py").rename(ws.root / "src" / "main.py")
+    assert await ws.autocommit(BORIS, kind="job j3", detail="mv src/app.py src/main.py")
+    assert commits(ws.root)[0][:2] == (BORIS, "job j3: data/in.json, src/app.py, src/main.py")
+    # nothing to commit: no commit, whatever the kind
+    assert await ws.autocommit(BORIS, kind="shell", detail="ls") is None
+    # a message given as is stays as it is (write_file's own commits are untouched too)
+    put(ws, "notes.md", "n\n")
+    assert await ws.autocommit(ANNA, "shell: build")
+    assert message_of(ws.root) == "shell: build"
+    result = await ws.write(ANNA, "a.txt", "a\n")
+    assert "commit" in result and message_of(ws.root) == "create a.txt"
+
+
+@needs_git
+async def test_autocommit_by_kind_with_many_files(ws):
+    for i in range(30):
+        put(ws, f"out/part_{i:02d}.csv", f"{i}\n")
+    assert await ws.autocommit(ANNA, kind="shell", detail="python split.py")
+    author, subject, files = commits(ws.root)[0]
+    assert author == ANNA and len(files) == 30
+    assert subject.startswith("shell: out/part_00.csv, out/part_01.csv") and subject.endswith(" more)")
+    assert len(subject) <= workspace_mod.COMMIT_SUBJECT_MAX
+
+
 # --- paths ---------------------------------------------------------------------------------------------
 
 async def test_resolve_and_rel(ws):

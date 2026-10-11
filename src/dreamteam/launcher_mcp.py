@@ -7,6 +7,7 @@ import asyncio
 import copy
 import difflib
 import logging
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import mcp.types as types
@@ -16,7 +17,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__, roles
 from .hub_mcp import INSTRUCTIONS as HUB_INSTRUCTIONS
-from .hub_mcp import _StdinLines, hub_call, hub_specs, list_hub_tools, security_settings
+from .hub_mcp import _StdinLines, client_key, hub_call, hub_specs, list_hub_tools, security_settings, serving_client
 from .models import ToolError
 from .sessions import SessionError
 from .tools import REGISTRY
@@ -138,10 +139,12 @@ def session_line(s: dict[str, Any]) -> str:
     goal = s.get("goal") or {}
     tasks = s.get("tasks") or {}
     agents = s.get("agents") or {}
+    jobs = int((s.get("jobs") or {}).get("running") or 0)  # the agents' background jobs (read_stats)
     line = (f"{s['id']} [{status}] {s.get('title', '')}"
             f" | tasks {tasks.get('done', 0)}/{tasks.get('total', 0)} done"
             f" | agents {agents.get('total', 0)} ({agents.get('working', 0)} working)"
-            f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}")
+            + (f" | jobs {jobs} running" if jobs and s.get("status") == "running" else "")
+            + f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}")
     if goal:
         line += f"\n    goal [{goal.get('status', 'active')}]: {goal.get('title', '')}"
     workspace = s.get("workspace") or {}
@@ -309,11 +312,16 @@ async def dispatch_launcher_call(manager: "SessionManager", name: str, args: dic
 
 
 def build_launcher_server(manager: "SessionManager") -> Server:
+    local = f"local:{uuid.uuid4().hex}"  # the client of a connection without HTTP (stdio, in-process)
+
     async def on_list_tools(ctx, params) -> types.ListToolsResult:
         return types.ListToolsResult(tools=list_launcher_tools(manager))
 
     async def on_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
-        text, is_error = await dispatch_launcher_call(manager, params.name, dict(params.arguments or {}))
+        # the session's hub_call knows which client calls (hub_mcp.client_key): what the client sends never comes
+        # back to the external member it acts as
+        with serving_client(client_key(ctx, local)):
+            text, is_error = await dispatch_launcher_call(manager, params.name, dict(params.arguments or {}))
         return types.CallToolResult(content=[types.TextContent(type="text", text=text)], is_error=is_error)
 
     return Server("dreamteam", version=__version__, title="DreamTeam", instructions=INSTRUCTIONS,

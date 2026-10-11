@@ -44,7 +44,8 @@ EVENT_TYPES = (
     "goal.completed", "goal.reopened", "agent.hired", "agent.retired", "agent.status", "agent.activity",
     "agent.compacted", "agent.usage", "file.changed", "file.locked", "file.unlocked", "trigger.created",
     "trigger.fired", "trigger.deleted", "mcp.created", "mcp.status", "swarm.paused", "swarm.resumed",
-    "swarm.limits", "trace.started", "trace.span", "trace.finished", "sessions.changed", "_connection",
+    "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
+    "sessions.changed", "_connection",
 )
 ACTIVITY_KINDS = ("wake", "thinking", "text", "tool_call", "tool_result", "error", "nudge", "compacted")
 
@@ -901,6 +902,39 @@ def _ev_limits(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     return _line(ctx, ctx.sym["dot"], "dim", Text(text, style="dim"))
 
 
+def _job_result(ctx: RenderContext, job: dict) -> str:
+    """How a background job ended: "завершился с кодом 0", "остановлен вами"..."""
+    status = clean(job.get("status"))
+    if status == "lost":
+        return ctx.t("job_lost")
+    if status == "stopped":
+        key = "job_stopped_" + clean(job.get("reason"))
+        label = ctx.t(key)
+        return ctx.t("job_stopped") if label == key else label
+    if job.get("exit_code") is not None:
+        return ctx.t("job_ended_code", code=clean(job.get("exit_code")))
+    return ctx.t("job_ended")
+
+
+def _ev_job(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """`⚙ Анна Смирнова · процесс j3 завершился с кодом 0 (4m 05s): npm test` (one dim line)."""
+    if ctx.quiet:
+        return None
+    job = _d(d.get("job"))
+    who = _who(ctx, job.get("owner") or ev.get("actor"))
+    label = clean(job.get("label")) or (f"j{clean(job.get('id'))}" if job.get("id") is not None else "?")
+    command = ctx.short(job.get("command"), 160) or "?"
+    if ev.get("type") == "job.started":
+        text = ctx.t("ev_job_started", who=who, id=label, command=command)
+    else:
+        seconds = job.get("duration")
+        if seconds is None:
+            seconds = _float(job.get("ended_at")) - _float(job.get("started_at"))
+        text = ctx.t("ev_job_ended", who=who, id=label, result=_job_result(ctx, job), t=fmt_elapsed(seconds),
+                     command=command)
+    return _line(ctx, ctx.sym["job"], "dim", Text(text, style="dim"))
+
+
 def _ev_session(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     if not ctx.verbose:
         return None
@@ -946,6 +980,8 @@ _HANDLERS: dict[str, Callable[[RenderContext, dict, dict], RenderableType | None
     "swarm.paused": _ev_paused,
     "swarm.resumed": _ev_resumed,
     "swarm.limits": _ev_limits,
+    "job.started": _ev_job,
+    "job.ended": _ev_job,
     "sessions.changed": _ev_session,
     "_connection": _ev_connection,
 }
@@ -1305,12 +1341,21 @@ def agents_table(ctx: RenderContext, agents: list[dict]) -> RenderableType:
         role = clean(a.get("role"))
         if a.get("kind") == "external":
             role = f"{role} ({ctx.t('external')})" if role else ctx.t("external")
+        # its running background jobs: ⚙2 after its tasks (after its status when the table has no tasks column)
+        jobs = _int(a.get("jobs"))
+        marker = f"{ctx.sym['job']}{jobs}" if jobs > 0 else ""
         row: list[RenderableType] = [cell]
         if wide:
             row.append(Text(role, style="dim" if status == "retired" else ""))
-        row.append(Text(_status_label(ctx, "a_", status), style=_agent_status_style(status)))
+        state = Text(_status_label(ctx, "a_", status), style=_agent_status_style(status))
+        if marker and not wide:
+            state.append(" " + marker, style=theme.ACCENT)
+        row.append(state)
         if wide:
-            row.append(Text(", ".join(f"#{_int(i)}" for i in _list(a.get("open_tasks"))), style="dim"))
+            tasks = Text(", ".join(f"#{_int(i)}" for i in _list(a.get("open_tasks"))), style="dim")
+            if marker:
+                tasks.append((" " if tasks.plain else "") + marker, style=theme.ACCENT)
+            row.append(tasks)
             up, down = fmt_tokens(a.get("tokens_in")), fmt_tokens(a.get("tokens_out"))
             row.append(Text(f"{ctx.sym['up']}{up} {ctx.sym['down']}{down}", style="dim"))
         row.append(Text(fmt_cost(a.get("cost_usd"))))
@@ -1318,6 +1363,88 @@ def agents_table(ctx: RenderContext, agents: list[dict]) -> RenderableType:
             row.append(Text(clean(a.get("model"))))
         table.add_row(*row)
     return _out(ctx, table)
+
+
+def _process_names(names: Any) -> str:
+    """"node.exe ×2, python.exe" (as the hub words them for the agents)."""
+    counts: dict[str, int] = {}
+    for name in _list(names):
+        name = clean(name).strip()
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return ", ".join(f"{name} ×{n}" if n > 1 else name for name, n in counts.items())
+
+
+def _job_state(ctx: RenderContext, job: dict) -> tuple[str, str]:
+    """(text, style) of a job's state: running, how it ended, or that it was stopped or lost."""
+    status = job.get("status")
+    if status == "running":
+        return ctx.t("job_running"), theme.ACCENT
+    text = _job_result(ctx, job)
+    if status == "lost":
+        return text, theme.ERROR
+    if status == "stopped":
+        return text, theme.WARN if job.get("reason") == "lifetime" else "dim"
+    code = job.get("exit_code")
+    return text, theme.OK if code is None or _int(code, 1) == 0 else theme.ERROR
+
+
+def jobs_table(ctx: RenderContext, jobs: list[dict]) -> RenderableType:
+    """/jobs: the agents' background jobs (state "jobs": the running ones, then those that ended in the last hour):
+    the job, its agent, its state (and for a running one how it went to the background), how long it ran, its
+    command (and the processes it runs)."""
+    jobs = [_d(j) for j in _list(jobs) if isinstance(j, dict)]
+    if not jobs:
+        return _out(ctx, info(ctx, ctx.t("jobs_none")))
+    wide = ctx.width >= 80
+    now = time.time()
+    table = _table(ctx)
+    table.add_column(ctx.t("col_job"), no_wrap=True)
+    if wide:
+        table.add_column(ctx.t("col_agent"), overflow="fold")
+    table.add_column(ctx.t("col_state"), overflow="fold")
+    if wide:
+        table.add_column(ctx.t("col_time"), justify="right", no_wrap=True)
+    table.add_column(ctx.t("col_command"), overflow="fold")
+    for job in jobs:
+        owner, running = job.get("owner"), job.get("status") == "running"
+        label = clean(job.get("label")) or (f"j{_int(job.get('id'))}" if job.get("id") is not None else "?")
+        cell = Text(label, style="bold" if running else "dim")
+        if not wide:  # the agent under the job
+            cell.append("\n" + first_name(owner), style=theme.agent_style(owner))
+        row: list[RenderableType] = [cell]
+        if wide:
+            row.append(Text(clean(owner) or "?", style=theme.agent_style(owner)))
+        text, style = _job_state(ctx, job)
+        state = Text(text, style=style)
+        if running and job.get("origin"):
+            state.append("\n" + _status_label(ctx, "job_origin_", job.get("origin")), style="dim")
+        row.append(state)
+        if wide:
+            started = _float(job.get("started_at"))
+            ended = _float(job.get("ended_at")) or now
+            row.append(Text(fmt_elapsed(ended - started) if started else "-", style="" if running else "dim"))
+        command = Text(ctx.short(job.get("command"), 200) or "?", style="" if running else "dim")
+        names = _process_names(job.get("processes"))
+        if running and names:
+            command.append("\n" + names, style="dim")
+        if ctx.verbose and job.get("log"):
+            command.append("\n" + clean(job.get("log")), style="dim")
+        row.append(command)
+        table.add_row(*row)
+    return _out(ctx, Group(table, Text(ctx.t("jobs_hint"), style="dim")))
+
+
+def job_output(ctx: RenderContext, text: Any) -> RenderableType:
+    """`/jobs jN`: the hub's description of one job (the `jobs` tool's result: its command, state, processes, log
+    and the end of its output): the first line after the job symbol, the rest under `  ⎿  `."""
+    lines = clean(text).rstrip().split("\n")
+    head = Text(f"{ctx.sym['job']} ", style=theme.ACCENT)
+    head.append(lines[0], style="bold")
+    rest = "\n".join(lines[1:])
+    if not rest.strip():
+        return _out(ctx, head)
+    return _out(ctx, Group(head, _cont(ctx, _clipped_text(ctx, rest, 1000 if ctx.verbose else 200))))
 
 
 def _session_status(ctx: RenderContext, s: dict) -> tuple[str, str]:
@@ -1493,15 +1620,16 @@ def _key_state(ctx: RenderContext, profile: dict) -> Text:
 
 
 def status_report(ctx: RenderContext, info: dict) -> RenderableType:  # `info` shadows info() here
-    """`/status`: version, home, web, session, workspace, goal, models, language, agents, tracing (keys of `info`;
-    others are listed after them as they are). Values may be plain or structured: session / goal dicts,
-    agents {total, working}, models [{name, model, default}], budget {spent, limit}, booleans."""
+    """`/status`: version, home, web, session, workspace, goal, models, language, agents, jobs, tracing (keys of
+    `info`; others are listed after them as they are). Values may be plain or structured: session / goal dicts,
+    agents {total, working}, jobs {running, ids}, models [{name, model, default}], budget {spent, limit},
+    booleans."""
     data = _d(info)
     grid = Table.grid(padding=(0, 2))
     grid.add_column(style="dim", no_wrap=True)
     grid.add_column(overflow="fold")
     order = ("version", "home", "web", "hub", "session", "workspace", "goal", "models", "model", "language",
-             "agents", "budget", "tracing", "verbosity", "connected")
+             "agents", "jobs", "budget", "tracing", "verbosity", "connected")
     for key in order + tuple(k for k in data if k not in order):
         if key not in data or data[key] is None:
             continue
@@ -1538,6 +1666,13 @@ def _status_value(ctx: RenderContext, key: str, value: Any) -> Text:
     if key == "agents" and isinstance(value, (list, tuple)):
         names = [clean(_d(a).get("name") if isinstance(a, dict) else a) for a in value]
         return Text(f"{len(names)}: " + ", ".join(names) if names else "0")
+    if key == "jobs" and isinstance(value, dict):  # {running, ids}: "2 работают (j3, j5)"
+        running = _int(value.get("running"))
+        out = Text(ctx.tn("n_jobs_running", running), style=theme.ACCENT if running else "")
+        ids = [clean(i) for i in _list(value.get("ids")) if clean(i)]
+        if ids:
+            out.append(f" ({', '.join(ids)})", style="dim")
+        return out
     if key == "models" and isinstance(value, (list, tuple)):
         parts = []
         for m in value:
@@ -2087,9 +2222,9 @@ def spinner_line(ctx: RenderContext, *, frame: int, verb: str, working: list[str
 
 def status_line(ctx: RenderContext, *, session: dict | None, addressee: str | None, agents_total: int,
                 working: int, spent: float, budget: float, model: str | None, verbosity: str, connected: bool,
-                hint: str | None) -> tuple[list, list]:
+                hint: str | None, jobs: int = 0) -> tuple[list, list]:
     """(left, right): left = hint / mode / "? — горячие клавиши"; right = session · → addressee · agents ·
-    $spent/$budget · model."""
+    running background jobs (when there are any) · $spent/$budget · model."""
     s = ctx.sym
     if not connected:
         left = [("class:status.warn", f"{s['warn']} {ctx.t('st_disconnected')}")]
@@ -2114,6 +2249,8 @@ def status_line(ctx: RenderContext, *, session: dict | None, addressee: str | No
         if _int(working):
             text += f" ({ctx.t('working_n', n=_int(working))})"
         items.append((3, [("class:status", text)]))
+    if _int(jobs) > 0:  # agents asleep while their jobs work: the session is not stalled
+        items.append((4, [("class:status", ctx.t("sl_jobs", n=_int(jobs)))]))
     if sess or _float(spent):
         style = "class:status"
         if _float(budget) > 0:

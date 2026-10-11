@@ -15,7 +15,7 @@ import pytest
 
 from dreamteam import prompts
 from dreamteam import swarm as swarm_module
-from dreamteam.config import Config
+from dreamteam.config import Config, ShellSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, Status
 from dreamteam.swarm import Swarm
@@ -25,7 +25,8 @@ SRC = Path(prompts.__file__).resolve().parent
 LANGS = ("en", "ru")
 SYSTEMS = {"en": prompts.SYSTEM_EN, "ru": prompts.SYSTEM_RU}
 SYSTEM_KW = dict(name="Ann Lee", swarm="Swarm X", role="Tester", role_description="Checks things.",
-                 instructions="Check {curly} things", shell="bash", scratch=".scratch/ann.lee/", max_agents=7)
+                 instructions="Check {curly} things", shell="bash", scratch=".scratch/ann.lee/", max_agents=7,
+                 foreground_max=95)
 _FMT = string.Formatter()
 _CODE_IDENT = re.compile(r"`([a-z_]+)`")
 
@@ -51,7 +52,8 @@ def test_languages_have_the_same_keys_placeholders_and_tool_names():
 
 def test_system_prompts_have_the_same_placeholders_and_tool_names():
     assert placeholders(prompts.SYSTEM_EN) == placeholders(prompts.SYSTEM_RU) == {
-        "name", "swarm", "role", "role_description", "instructions", "shell", "scratch", "max_agents"}
+        "name", "swarm", "role", "role_description", "instructions", "shell", "scratch", "max_agents",
+        "foreground_max"}
     assert code_idents(prompts.SYSTEM_EN) == code_idents(prompts.SYSTEM_RU)
 
 
@@ -79,12 +81,81 @@ def test_texts_reference_only_real_tools():
             assert not code_idents(text) - allowed, (lang, key, code_idents(text) - allowed)
 
 
+def test_agent_texts_name_only_baseline_tools():
+    """Notifications and wake-up texts reach agents of every tool set revision (tools/frozen.py: an agent keeps
+    its tools until a compaction), so they may name only the tools and parameters that every shipped revision
+    has, plus statuses. A text that points at a newer tool is either tailored by its caller with
+    ToolContext.has_tool (listed in TAILORED) or would send old agents to a tool they lack. The system prompts
+    are exempt: only new members, who get the current revision, receive them."""
+    from dreamteam.tools import frozen
+
+    tailored: set[str] = set()
+    shared: set[str] | None = None
+    for rev in frozen.revisions():
+        for lang in LANGS:
+            tools = frozen.snapshot(rev, lang)
+            names = set(frozen.names(tools)) | {p for t in tools for p in t["parameters"].get("properties", {})}
+            shared = names if shared is None else shared & names
+    allowed = (shared or set()) | set(Status.ALL)
+    for lang in LANGS:
+        for key, text in prompts.TEXTS[lang].items():
+            if key.startswith("u_") or key in tailored:
+                continue
+            assert not code_idents(text) - allowed, (lang, key, code_idents(text) - allowed)
+
+
+def test_background_job_texts():
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        # a job's whole output is in its log, which every agent can read (read_file, shell)
+        assert "{log}" in texts["n_job_done"] and "{log}" in texts["n_job_gone"]
+        assert "{log}" in texts["n_job_command_done"]
+        for key in ("my_jobs", "my_job", "job_exit", "job_gone", "job_no_output", "n_job_done", "n_job_command_done",
+                    "n_job_stopped", "n_job_limit", "n_job_gone", "u_jobs_running"):
+            assert not code_idents(texts[key]) and "job_stop" not in texts[key], (lang, key)
+            # a job is shown as j3 (#3 is a task); in Russian it is a «фоновый процесс», «задача» is a board task
+            assert "#{id}" not in texts[key], (lang, key)
+            if lang == "ru":
+                assert "задач" not in texts[key].lower(), key
+        assert "j{id}" in texts["my_job"] and "{tools}" in texts["tools_added"]
+    # the command of a job ended while programs it started run on: the job goes on, so its notice never says that the
+    # job has ended (the job's own end comes later, with n_job_done)
+    assert "has ended" not in prompts.TEXTS["en"]["n_job_command_done"]
+    assert "процесс j{id} завершился" not in prompts.TEXTS["ru"]["n_job_command_done"]
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_system_prompt_teaches_background_jobs(lang):
+    """New members (revision 2 of the tool set) learn the jobs protocol: a command still running at its timeout, or
+    after [shell] foreground_max seconds, goes on as a background job; long runs start with `background`, then
+    `wait`; `jobs` and `job_stop` show and stop a job; the whole output is in the scratch folder. The end of a job
+    is among the events that wake the member (How you work, item 10)."""
+    system = SYSTEMS[lang]
+    for snippet in ("`{scratch}jobs/`", "`background`", "`jobs`", "`job_stop`", "`timeout`", "{foreground_max}",
+                    "(j1, j2, …)"):
+        assert snippet in system, snippet
+    shared = system[system.index("`shell`"):system.index("`{scratch}jobs/`")]
+    assert "`wait`" in shared and "{foreground_max}" in shared  # long runs: background, then wait
+    item10 = next(line for line in system.splitlines() if line.startswith("10. "))
+    assert "`wait`" in item10
+    assert ("background jobs" if lang == "en" else "фоновые процессы") in item10
+    assert ("the end of your background jobs wake you" if lang == "en"
+            else "завершение твоих фоновых процессов") in item10
+    if lang == "ru":  # a job is a «фоновый процесс»: «задача» is a board task
+        assert "фоновая задача" not in system.lower()
+    # the team limit counts the AI agents: members who joined through MCP do not count
+    assert ("not counting members who joined through MCP" if lang == "en"
+            else "не считая участников, подключившихся через MCP") in system
+    text = prompts.system_prompt(lang, **SYSTEM_KW)
+    assert "95" in text and ".scratch/ann.lee/jobs/" in text
+
+
 # ------------------------------------------------------------------------- rendering & callers
 def test_system_prompt_renders_all_fields():
     for lang in LANGS:
         text = prompts.system_prompt(lang, **SYSTEM_KW)
         for value in ("Ann Lee", "Swarm X", "Tester", "Checks things.", "Check {curly} things", "bash",
-                      ".scratch/ann.lee/", "7"):
+                      ".scratch/ann.lee/", "7", "95"):
             assert value in text, (lang, value)
         assert not re.search(r"\{[a-z_]+\}", text.replace("{curly}", ""))
         # the role's description follows the role line, before the member's own instructions
@@ -93,10 +164,12 @@ def test_system_prompt_renders_all_fields():
         assert third == prompts.TEXTS[lang]["instructions"].format(text="Check {curly} things").strip()
         bare = prompts.system_prompt(lang, **{**SYSTEM_KW, "instructions": ""})
         assert prompts.TEXTS[lang]["instructions"].split("{")[0] not in bare
-        # callers that pass neither a role description nor a scratch folder (older callers, tests) still render
-        old = {k: v for k, v in SYSTEM_KW.items() if k not in ("role_description", "scratch")}
+        # callers that pass neither a role description, a scratch folder nor the foreground cap (older callers,
+        # tests) still render, with the default cap of [shell] foreground_max
+        old = {k: v for k, v in SYSTEM_KW.items() if k not in ("role_description", "scratch", "foreground_max")}
         text = prompts.system_prompt(lang, **{**old, "instructions": ""})
         assert not re.search(r"\{[a-z_]+\}", text) and ".scratch/" in text
+        assert str(ShellSettings.foreground_max) in text
         # no empty description line: the role line, one blank line, then the first section
         assert text.splitlines()[1:3] == ["", SYSTEMS[lang].splitlines()[2]]
 

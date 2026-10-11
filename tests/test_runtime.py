@@ -958,7 +958,10 @@ async def test_restart_wakes_agents_with_open_tasks_exactly_once(tmp_path):
     await swarm.stop()
     swarm.close()
 
-    swarm2, rec2 = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"start_agents": 2})
+    # a long idle_nudge_seconds: `a` waits holding its in-progress task, which the scheduler would wake it about
+    # once more later (n_stalled, Swarm._wake_idle_holders); here only the restart's own wake-ups are counted
+    swarm2, rec2 = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"start_agents": 2},
+                              agents={"idle_nudge_seconds": 60})
     await swarm2.start()
     try:
         await run_until(lambda: rec2.count(a) >= 1)

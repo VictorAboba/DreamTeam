@@ -36,6 +36,9 @@ LIST_MAX_ENTRIES = 500
 TREE_MAX_ENTRIES = 5000
 MAX_LOCK_MINUTES = 24 * 60
 GIT_TIMEOUT = 120.0
+COMMIT_SUBJECT_MAX = 72   # the subject of an autocommit that names what changed: "shell: src/app.py, x.json (+3 more)"
+COMMIT_PATH_MAX = 40      # one path in it; a longer one keeps its end: "…/models/user.py"
+COMMIT_DETAIL_MAX = 2000  # its body (the command that made the change), cut in the middle beyond this
 # Directories shown but never expanded in listings (dependency caches, virtualenvs).
 NO_EXPAND = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
                        ".pytest_cache", ".ruff_cache", ".tox"})
@@ -109,6 +112,67 @@ def _covers(lock_path: str, rel: str) -> bool:
 def in_scratch(rel: str) -> bool:
     """`rel` (workspace-relative, "/"-separated) is `.scratch` or inside it."""
     return _covers(SCRATCH_DIR, rel.rstrip("/"))
+
+
+_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # control characters other than tab and newline
+
+
+def _one_line(text: str) -> str:
+    return " ".join(_CONTROL.sub(" ", text or "").split())
+
+
+def _short_path(path: str, limit: int = COMMIT_PATH_MAX) -> str:
+    """`path` in at most `limit` characters: its last parts behind "…/" ("…/models/user.py"), or the start of a file
+    name that alone is too long ("a_very_long_file_na…")."""
+    if len(path) <= limit:
+        return path
+    *folders, shown = path.split("/")
+    if len(shown) > limit:
+        return shown[:limit - 1] + "…"
+    if len(shown) + 2 > limit:
+        return shown
+    for folder in reversed(folders):  # "…/" + folder + "/" + what is shown so far
+        if len(folder) + len(shown) + 3 > limit:
+            break
+        shown = f"{folder}/{shown}"
+    return "…/" + shown
+
+
+def _describe_paths(paths: list[str], room: int) -> str:
+    """As many of `paths` as fit in `room` characters (at least one), then "(+N more)" for the others."""
+    names = [_short_path(p) for p in paths]
+    count, used = 1, 0
+    for i, name in enumerate(names):
+        used += len(name) + (2 if i else 0)
+        rest = len(names) - i - 1
+        if used + (len(f" (+{rest} more)") if rest else 0) > room:
+            break
+        count = i + 1
+    rest = len(names) - count
+    return ", ".join(names[:count]) + (f" (+{rest} more)" if rest else "")
+
+
+def commit_message(kind: str, paths: list[str], detail: str = "") -> str:
+    """The message of an autocommit made for `kind` (e.g. "shell", "job j3"): the subject names what is committed
+    ("shell: src/app.py, data/lp.json (+3 more)", at most COMMIT_SUBJECT_MAX characters; renamed and deleted files
+    too), the body keeps `detail` (e.g. the command that made the change), cut in the middle beyond
+    COMMIT_DETAIL_MAX. Without paths (e.g. a merge left in progress being concluded) the subject quotes `detail`."""
+    kind = _one_line(kind) or "update"
+    body = _CONTROL.sub("", (detail or "").replace("\r\n", "\n").replace("\r", "\n"))
+    body = "\n".join(line.rstrip() for line in body.split("\n")).strip("\n")
+    if len(body) > COMMIT_DETAIL_MAX:
+        head = COMMIT_DETAIL_MAX * 2 // 5
+        tail = COMMIT_DETAIL_MAX - head
+        body = f"{body[:head]}\n[... {len(body) - head - tail} characters skipped ...]\n{body[-tail:]}"
+    names = [_one_line(p) for p in paths if p]
+    if names:
+        subject = f"{kind}: {_describe_paths(names, COMMIT_SUBJECT_MAX - len(kind) - 2)}"
+    else:
+        subject = f"{kind}: {_one_line(body)}" if body.strip() else kind
+    if len(subject) > COMMIT_SUBJECT_MAX:
+        subject = subject[:COMMIT_SUBJECT_MAX - 1] + "…"
+    message = f"{subject}\n\n{body}" if body.strip() else subject
+    return message.encode("utf-8", "replace").decode("utf-8")  # an unpaired surrogate cannot reach git
 
 
 def _encode(text: str, what: str) -> bytes:
@@ -869,15 +933,19 @@ class Workspace:
         return len(rows)
 
     # --- git --------------------------------------------------------------------------------
-    async def autocommit(self, actor: str, message: str) -> str | None:
+    async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "") -> str | None:
+        """Commit every change outside `.scratch/` as `actor`, one commit per call. The message is `message` as
+        given or, with `kind` (e.g. "shell", "job j3"), commit_message() of what is committed: the subject names the
+        changed files, the body holds `detail` (the command that changed them)."""
         if not self.git_enabled:
             return None
         async with self._git_lock:
-            return await self._commit_locked(actor, message, None)
+            return await self._commit_locked(actor, message, None, kind=kind, detail=detail)
 
-    async def _commit_locked(self, actor: str, message: str, rel: str | None) -> str | None:
+    async def _commit_locked(self, actor: str, message: str, rel: str | None, *, kind: str = "",
+                             detail: str = "") -> str | None:
         """Commit everything except `.scratch/` (rel None) or just `rel` as `actor`. Caller holds the git lock.
-        Nothing under `.scratch/` is ever committed."""
+        Nothing under `.scratch/` is ever committed. `kind`, `detail`: see autocommit (rel None only)."""
         if not self.git_enabled:
             return None
         if rel is not None and in_scratch(rel):
@@ -916,6 +984,8 @@ class Workspace:
                 if add.returncode != 0:
                     log.warning("git add reported errors (committing what it could add): %s", self._output(add))
                 # no pathspec: the index is committed (a merge an agent left in progress concludes as before)
+                if kind:
+                    message = await self._index_message(actor, kind, detail)
                 commit = await self._git(actor, "commit", "-q", "--no-verify", "-m", message or "update")
             if commit.returncode != 0:
                 log.info("git commit skipped: %s", self._output(commit))
@@ -925,6 +995,15 @@ class Workspace:
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("git autocommit failed: %s", exc)
             return None
+
+    async def _index_message(self, actor: str, kind: str, detail: str) -> str:
+        """commit_message() for what the index holds after `git add`: the paths staged against HEAD (a rename as
+        its old and its new path). Caller holds the git lock."""
+        diff = await self._git(actor, "diff", "--cached", "--name-only", "--no-renames", "--no-ext-diff", "-z")
+        if diff.returncode != 0:  # e.g. an unusual repository state: the subject quotes the detail instead
+            log.info("git diff --cached failed: %s", self._output(diff))
+        names = diff.stdout.decode("utf-8", "replace").split("\0") if diff.returncode == 0 else []
+        return commit_message(kind, [name for name in names if name], detail)
 
     def _git_argv(self, actor: str | None, args: tuple[str, ...], literal: bool = True) -> list[str]:
         # an adopted folder: the user's line-ending settings apply to the agents' commits as to the user's own

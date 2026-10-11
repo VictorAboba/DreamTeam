@@ -19,7 +19,9 @@ User-visible texts for agents live in `prompts.py` (ru/en). Python >= 3.11, asyn
 * Every state change emits exactly one event via `swarm.bus.emit(type, actor, **data)` (see §9).
 * No module prints to stdout (stdio MCP mode uses it). Use `logging.getLogger(__name__)`.
 * Event loop: everything runs in one asyncio loop; the DB is used synchronously from it.
-  Blocking work (subprocess, git, big file IO) goes through `asyncio.to_thread`.
+  Blocking work (git, big file IO) goes through `asyncio.to_thread`. Shell commands never use the loop's default
+  executor (git does, and `asyncio.run` waits for its threads at exit): their spawn, output reader and waiter are
+  daemon threads of their own (§7).
 
 ## 1. Layout
 
@@ -38,7 +40,10 @@ src/dreamteam/
   board.py       Board          — tasks, goal field, discussion, independent review (§4)
   mailbox.py     Mailbox        — direct messages
   workspace.py   Workspace      — shared files, git, locks
-  shell.py       run_shell, scrubbed_env
+  shell.py       run_shell, start_command, RunningCommand, Capture, scrubbed_env (§7)
+  procs.py       ProcessTree    — a command's contained process tree: Windows Job Object, POSIX process group with a
+                 lifeline watchdog (§7); standard library only
+  jobs.py        JobManager, ShellOutcome — background jobs of the members' shell commands (§7.1)
   triggers.py    TriggerEngine + condition DSL
   llm/__init__.py  create_llm(profile)
   llm/base.py      ToolCall, Usage, LLMResponse, LLMError, LLMClient, estimate_tokens
@@ -47,7 +52,10 @@ src/dreamteam/
   llm/scripted.py       ScriptedLLM (tests / demos)
   mcp_forge.py   MCPForge, MCPConnection — agent-built MCP servers + library
   tools/__init__.py  registry: ToolSpec, ToolContext, tool(), tools_for(), schemas_for(), call_tool()
-  tools/board_tools.py comm_tools.py file_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
+  tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
+  tools/frozen.py    frozen LLM tool sets: revisions, the kv record of each agent, `python -m dreamteam.tools.frozen`
+                     (§6.1)
+  tools/snapshots/   llm_r<N>.json: every released LLM tool set (revision N, en and ru), never edited
   agent.py       AgentRuntime   — ReAct loop of one LLM agent
   swarm.py       Swarm          — composition root
   hub_mcp.py     the swarm as an MCP server (stdio / streamable HTTP / stdio->HTTP proxy)
@@ -90,7 +98,10 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 <project>/dreamteam.toml
 <project>/workspace/            shared files (git repo), workspace/mcp/<name>/server.py
 <project>/workspace/.scratch/<slug>/  each member's temporary files, never committed (§7 "Scratch folder")
+<project>/workspace/.scratch/<slug>/jobs/  j<N>.log (and j<N>.prev.log): the output of the member's background
+                                jobs (§7.1)
 <project>/.dreamteam/swarm.db   sqlite
+<project>/.dreamteam/jobs/      job logs when `.scratch` is not a plain folder of the workspace (§7.1)
 <project>/.dreamteam/hub.json   {"base_url": "...", "mcp_url": "...", "pid": 123, "project": "<abs path>"}
                                 written once the server listens; other commands trust it only if GET /api/hub
                                 confirms the same pid and project
@@ -113,9 +124,21 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 * `messages` + `inbox(message_id, recipient, read_at)`.
 * `notifications`: id, ts, recipient, kind (prompt key), text (rendered), data (json), delivered_at.
 * `triggers`, `mcp_servers`, `file_locks`, `kv`, `events`.
+* `jobs` (background jobs, §7.1; index `jobs_owner(owner, status)`): id (AUTOINCREMENT: `j<id>`, unique for the
+  session's life), owner, command, shell (display name), origin (`timeout`|`background`|`detached`), status
+  (`running`|`ended`|`stopped`|`lost`), reason (stopped: `owner`|`user`|`lifetime`|`retired`|`session`; lost:
+  `crash`), stopped_by (the owner's name or `user` for reason owner/user), exit_code (the shell's own code once it
+  ended by itself, also while processes it started run on; NULL when the shell was killed), log (workspace-relative
+  posix path, or absolute for the data_dir fallback), pid, pgid (POSIX), token (the random
+  `DREAMTEAM_PROCESS_TOKEN`), hub_pid (the process that ran it), processes (json list of names), tail (the last
+  2000 characters of the output, at the end), started_at, background_at, ended_at. `CREATE TABLE IF NOT EXISTS`:
+  an older database gets it at its next open.
 * `traces`, `spans`, `history_archive(agent, epoch, seq, msg, archived_at)`: tracing.py SCHEMA (§16).
 * kv keys: `goal` → `{"title","description","status":"active"|"done","summary","set_by","updated_at"}`,
-  `limits` → `{"max_cost_usd": float, "max_agents": int}` (overrides config), `paused` → `{"paused": bool, "reason": str}`.
+  `limits` → `{"max_cost_usd": float, "max_agents": int}` (overrides config), `paused` → `{"paused": bool, "reason": str}`,
+  `tools:<agent name>` → `{"rev": int, "language": "en"|"ru", "tools": [{"name","description","parameters"}]}` (the
+  agent's frozen tool set, §6.1; kept for retired agents, traces read it), `wait_progress:<actor>` → the last events
+  id whose board progress `wait_for_events(progress=true)` returned to that actor (§12).
 
 ## 3. Swarm (swarm.py) — what other modules may use
 
@@ -127,6 +150,7 @@ class Swarm:
     language: str                            # config.swarm.language
     llm_semaphore: asyncio.Semaphore
     tracer: Tracer                           # §16
+    jobs: JobManager                         # background jobs of the members' shell commands (§7.1)
     session_id: str | None; session_title: str | None   # set by SessionManager (§17.2)
     hub_url: str | None                      # MCP URL of this swarm while a web server runs (snapshot mcp_url)
     stopping: bool                           # set by stop()/close(): long polls (wait_for_events) end at once
@@ -135,14 +159,21 @@ class Swarm:
                  llm_factory: Callable[[ModelProfile, str], LLMClient] | None = None): ...
         # a failure after the database was opened (a corrupt swarm.db...) closes it before re-raising
     async def start(self, run_agents: bool = True) -> None
-        # tracer.recover() and prune first (§16.1); the very first start creates the starting team:
+        # tracer.recover(), then jobs.recover() (rows a previous process left running become `lost`, §7.1 "Crash
+        # recovery"), and the trace prune first (§16.1); the very first start creates the starting team:
         # roles.starting_team(swarm.starting_roles, swarm.start_agents), member i gets starting_roles[i], the rest
         # (and blank entries) are generalists (§17.3); LLM agents with open tasks, reviews waiting for them or
         # pending events (goal active), or whose last activation was cut short (the stored history ends
         # mid-activation), get `n_restart`; hire() respects run_agents
     async def stop(self) -> None
-        # wakes every wait_signal() waiter (stopping=True), closes external trace sessions, stops the runtimes,
-        # then waits for git commands still running in threads (workspace.settle(), §7)
+        # wakes every wait_signal() waiter (stopping=True), closes external trace sessions (a failure is logged:
+        # tracing never keeps a session from stopping), stops the runtimes (an LLM agent's foreground command dies
+        # with its cancellation), then jobs.stop_all() (every job and every foreground command, e.g. an external
+        # member's call, is killed; every finish and call in flight has returned and every job log and handle is
+        # closed, §7.1), then forge.stop(), then waits for git commands still running in threads
+        # (workspace.settle(), §7): nothing touches git or the database afterwards. stop_all, forge.stop and
+        # settle run in `finally`: also when an earlier step failed or the stop was cancelled (the caller closes
+        # and drops the session after a failed stop, so no process may outlive it)
     def close(self) -> None                              # closes the database
     def reconfigure(self, config: Config) -> None        # hot-apply new settings (§16.1)
 
@@ -150,6 +181,9 @@ class Swarm:
     def member(self, name: str) -> dict | None          # agents row as dict (any status), exact canonical name
     def members(self, include_retired: bool = False) -> list[dict]
     def is_member(self, name: str) -> bool              # exists and not retired (llm or external)
+    def agent_count(self) -> int                        # active LLM members: what max_agents limits (external
+                                                        # members, MCP clients that joined, neither count nor are
+                                                        # limited)
     def kind_of(self, name: str) -> str | None          # "user" | "llm" | "external" | None
     def resolve_member(self, name: str, allow_user: bool = True, allow_retired: bool = False) -> str
         # case-insensitive / whitespace-tolerant, a leading "@" ignored, a unique first name alone accepted;
@@ -185,7 +219,9 @@ class Swarm:
         # agents are kicked off staggered: `n_kickoff` {by, title, description, team, task_id, task_title}, with
         # team = "Name — Role; ..." of all members, or `n_goal_updated` when the board was not empty
     def complete_goal(self, actor: str, summary: str) -> dict
-        # ToolError when there is no goal, it is already done, or the summary is empty; notifies USER u_goal_done
+        # ToolError when there is no goal, it is already done, or the summary is empty; notifies USER u_goal_done;
+        # background jobs keep running (a dev server may be for the user): when some run, USER also gets the quiet
+        # u_jobs_running {jobs: "j3 (Anna Smith: npm run dev, 25 min); ..."}, and their later ends wake nobody
     def reopen_goal(self, actor: str, comment: str = "") -> dict
         # only a done goal (else ToolError); notifies ONE LLM member n_goal_reopened: the one who completed
         # the goal, else the most recently active (the others are offered new tasks by the scheduler)
@@ -199,12 +235,20 @@ class Swarm:
         # Model profile: explicit `model` (unknown -> ToolError) > the role's `model` (a profile missing from
         # the settings logs a warning and falls back) > agents.default_model. The frozen system prompt
         # (LLM members only) is prompts.system_prompt(language, name, swarm, role, role_description,
-        # instructions, shell, scratch, max_agents): role_description = the catalog description, instructions =
-        # the catalog's then the hirer's (blank line between), scratch = workspace.scratch_rel(name) (§7). The
-        # agents row keeps only the hirer's instructions. u_member_joined (quiet, when `by` is not USER) and
-        # n_hired carry the canonical role. The tool's guard (a new role needs instructions) is in `hire_agent`
-        # (§12), not here: the starting team and programmatic hires need none
+        # instructions, shell, scratch, max_agents, foreground_max): role_description = the catalog description,
+        # instructions = the catalog's then the hirer's (blank line between), scratch = workspace.scratch_rel(name)
+        # (§7), foreground_max = [shell] foreground_max (§7.1). The agents row keeps only the hirer's instructions.
+        # u_member_joined (quiet, when `by` is not USER) and n_hired carry the canonical role. The tool's guard (a
+        # new role needs instructions) is in `hire_agent` (§12), not here: the starting team and programmatic hires
+        # need none. An LLM hire beyond max_agents (agent_count()) is a ToolError: "The swarm already has the
+        # maximum of N AI agents (members who joined through MCP do not count). Retire someone or ask the user to
+        # raise max_agents."; external members are not limited
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
+        # before the first await: the ids of its running jobs, and jobs.forbid(name) (none of its commands may
+        # become a job while it leaves); then tasks and locks released, triggers deactivated, status retired,
+        # `agent.retired` {name, reason, released, jobs}, n_member_retired; then its runtime stops; last
+        # jobs.stop_owner(name, "retired"): its jobs and its foreground commands (an external member's call in
+        # flight) are killed and awaited, committed under its name, with no notice to it
 
     # budget / control
     def limits(self) -> dict                             # {"max_cost_usd", "max_agents"}
@@ -232,17 +276,26 @@ resolve_member is the real `resolve_member_in`; set_goal / complete_goal validat
 like the real ones (the planning task is created when a real Board is wired).
 
 Scheduler (every 3 s): expires file locks, prunes old traces (every 6 h) and closes idle external trace
-sessions (§16); unless paused, in this order:
+sessions (§16); unless paused, in this order. "Idle" (`_idle_llm_members`) is an LLM agent with status idle, a
+runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Liveness"):
 1. `_nudge_idle`: offers ready unassigned tasks to idle LLM agents (`n_ready`), never more agents considering
    offers than there are ready tasks, and the kickoff counts as everyone's offer of the planning task; with
    independent review on, a member with reviews waiting for it is not offered more work (it is reminded of them
    instead);
 2. `_wake_stalled`: wakes once (`n_stalled`) an idle agent whose activation ended with plain text while holding
    in_progress tasks even after the nudge (§6.2);
-3. `_remind_reviewers` (independent review only): review reminder and hand-over (§4.1 "Liveness");
-4. `_check_all_done`: sends `n_all_done` to one idle agent when every task is finished but the goal is open
-   (`review` is an open status, so it waits for every review);
-5. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
+3. `_wake_idle_holders`: an idle agent holding in_progress tasks (e.g. after `wait` with nothing that will wake
+   it) is woken once per such set of tasks with `n_stalled`, once it has been idle with that set for
+   `agents.idle_nudge_seconds` (the clock starts when it was first seen idle with that set, or at its
+   `last_active` when that is later: an activation in between restarts it); the woken sets are shared with
+   `_wake_stalled`, so a set is never woken about twice. Neither 2 nor 3 wakes an agent while the end of one of
+   its running jobs will wake it (`JobManager.awaited`, what its `wait` result promised): it waits for that job
+   (a `detached` one, or a `background` one past its busy window), it has not stalled;
+4. `_remind_reviewers` (independent review only): review reminder and hand-over (§4.1 "Liveness");
+5. `_check_all_done`: sends `n_all_done` to one idle agent when every task is finished but the goal is open
+   (`review` is an open status, so it waits for every review); not while any LLM member works or is busy with a
+   job (with no open task only a `timeout` job can make it busy: its command may still change the result);
+6. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
    (§4.1 "Liveness").
 
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
@@ -347,7 +400,7 @@ so it is the member that called `task_complete`; it is NULL only when the execut
 reviews when no other member can. `false` keeps the legacy rules above (a task without a reviewer is done at once).
 `Board.independent_review` reads `swarm.config.swarm.independent_review` on every call, so `reconfigure()` and
 session overrides apply at once; turning it off leaves tasks already in review alone (their reviewers still review
-them). Tool descriptions and system prompts are mode-neutral (§12 R0), so no frozen prompt or tools array depends on
+them). Tool descriptions and system prompts are mode-neutral (§12 R0′), so no frozen prompt or tools array depends on
 the switch. A resumed session follows the current setting too: its existing members' completions go to review, and
 the tool results and notifications explain it.
 
@@ -417,14 +470,17 @@ the tool results and notifications explain it.
     `Board.hand_over_review(task_id, exclude=lapsed)`, `lapsed` being every member the task's review was already
     taken from (kept in memory while the task is in review, `Swarm._review_lapsed`). A review therefore never
     returns to a member it was taken from, and goes to the user once every agent let it lapse; a stalled set costs
-    at most a reminder and a hand-over. A working member is neither reminded nor handed over.
+    at most a reminder and a hand-over. A working member is neither reminded nor handed over, nor is a member busy
+    with a job (e.g. its test run went on in the background, §7.1): while it is busy its reminder time is renewed
+    at every tick, so the hand-over clock restarts when the busy window ends.
   - `hand_over_review(task_id, exclude)`: reviewer = `pick_reviewer(task, exclude={*exclude, current reviewer})`,
     else USER; `task.updated` with actor None (scheduler-driven); the new reviewer is asked (`n_review_requested`
     by the executor, else by the old reviewer) or USER gets `u_review_handed_over` (the old reviewer did not review
     it and no other agent can take it over); the old reviewer gets the quiet `n_review_reassigned`.
   - `_remind_user_reviews` (both modes): the goal is active, at least one task waits for USER's review, no LLM
-    member is working or has pending events, no `todo` task is actionable (not blocked and not assigned to USER),
-    no task is `in_progress` and no review waits for anyone but USER → USER gets `u_reviews_waiting` {tasks:
+    member is working, busy with a job (§7.1) or has pending events, no `todo` task is actionable (not blocked and
+    not assigned to USER), no task is `in_progress` and no review waits for anyone but USER → USER gets
+    `u_reviews_waiting` {tasks:
     "#3, #5"} once per set of such tasks. Blocked `todo` tasks (the tests of an implementation that waits for the
     user) do not suppress it. The user never answering only leaves the session idle (no cost).
   - Goal completion: `review` is an open status, so `n_all_done` waits for every review, and `goal_complete`
@@ -446,7 +502,12 @@ class Mailbox:
         # to: name, list of names, "all" (all active members except sender; USER not included) or USER.
         # Resolves via swarm.resolve_member; duplicates removed; sender cannot be the only recipient.
         # text non-empty, <= 50000 chars. Inserts message + inbox rows; emits "message.sent" {message};
-        # swarm.signal(each recipient).
+        # swarm.signal(each recipient). Inside `sent_as_seen_by(members, sender)` (a context manager over a
+        # ContextVar, set by hub_mcp.hub_call with the caller as `sender`, §13) a message from that sender reaches
+        # those recipients with their inbox row already read and no signal: the MCP client that sends acts as them
+        # too, so the message is in their history but is no news to them. Only that sender's: a task started inside
+        # the block inherits the context (an agent runtime starts in a context of its own anyway, §6.2), and the
+        # messages of every other sender reach those members as news.
     def get(self, message_id: int) -> dict
     def unread(self, name: str, mark_read: bool = True, limit: int = 100) -> list[dict]
     def mark_read(self, name: str, message_ids: list[int]) -> int   # returns how many were unread
@@ -477,15 +538,48 @@ at most 40000 chars, never an earlier summary). The old history is archived for 
 transaction. Without a usable LLM summary (a context-overflow error or another non-retryable 400 for
 the compaction request, or an overflow of the main call) the agent compacts without the LLM: notes +
 a digest of its latest steps + the kept texts. The system prompt is frozen in `agents.system_prompt` at
-creation; the tool list for an agent kind is constant (agent-built MCP tools go through `mcp_call`), and so are
-the tools' schemas (§12 R0). New rules reach existing members only through tool results and notifications.
+creation, and the tools array is frozen per agent (below; agent-built MCP tools go through `mcp_call`). New rules
+reach existing members through tool results and notifications, and new tools at their next compaction.
+
+**Frozen tool sets** (tools/frozen.py). The tools array is part of the prompt prefix that thinking blocks are bound
+to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
+it:
+- Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
+  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 2: background jobs) is what `schemas_for("llm",
+  language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were frozen (sorted digest
+  `e3c5cbc7…`).
+- Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
+  tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without one gets
+  `frozen.initial_record(language, has_history)`, written at once: the baseline revision when it already has a
+  history (it ran before tool sets were frozen), else the current one. View-only loads (no runtime) write nothing.
+- `AgentRuntime`: `tools_rev`, `tools` (the record's list, passed unchanged to `llm.complete`), `tool_names`
+  (frozenset), `tool_parameters(name) -> dict | None` (None: the agent lacks that tool).
+- **Upgrade at compaction only**: `_replace_with_summary` moves an agent whose `tools_rev != TOOLSET_REVISION` to
+  `frozen.current_record(language)` (`!=`: after a code downgrade it realigns too); the record is written in the same
+  `db.transaction()` as the history rewrite (`_replace_history(messages, tools=)`), and the new history holds no
+  assistant turn bound to the old array. The compaction request itself still sends the old array. When tools were
+  added, the summary message gets `tools_added` {tools: "`jobs`, `job_stop`"} before `continue`. `agent.compacted`
+  data and the compaction span meta carry `tools_revision`.
+- Existing agents keep revision 1 until their next compaction: they get timer backgrounding, the adoption of
+  processes a command leaves running, the console intercept, the job notices and the wake line at once (§7.1), and
+  texts that point at a tool are tailored with `ToolContext.has_tool` (§12). Downgrading the code below a session's
+  newest revision is unsupported.
+- `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions()`, `snapshot(rev, language)` (a fresh copy; unknown
+  language → en), `current(language)`, `record(rev, language, tools)`, `current_record(language)`,
+  `initial_record(language, has_history)`, `read(db, name) -> dict | None` (an invalid record is logged and ignored),
+  `write(db, name, rec)`, `names(tools)`, `for_span(db, name, language, revision)` (§16), `member_tool_names(swarm,
+  member) -> frozenset` (a runtime's names, else the record or the set its first start will freeze, nothing
+  written; the live registry for external members and the user). `python -m dreamteam.tools.frozen --write
+  [--force]` writes `llm_r{TOOLSET_REVISION}.json` (exit 2 when a different file exists: a released revision is
+  never edited), `--check` exits 1 when the code differs from it.
 
 ### 6.2 Loop
 ```python
 class AgentRuntime:
     def __init__(self, swarm, name: str): ...
     name: str; state: str
-    def start(self) -> None            # creates the asyncio task
+    def start(self) -> None            # creates the asyncio task, in a fresh contextvars context: it never inherits
+                                       # the request context of its starter (hub_call's sent_as_seen_by, §5)
     async def stop(self) -> None
     def wake(self) -> None
     def end_turn(self) -> None         # called by the `wait` tool
@@ -507,8 +601,9 @@ class AgentRuntime:
   emit `agent.activity` events (thinking summary / text / tool call / tool result, truncated 2000
   chars), execute tool calls sequentially via `tools.call_tool`, append results; after tools, if
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
-  called, no tool calls (a `nudge` once per in_progress task the agent holds; after plain text even
-  then, `stalled` records those tasks and the scheduler wakes it once with `n_stalled`), refusal, or
+  called, no tool calls (a `nudge` once per in_progress task the agent holds, none while it is busy with a
+  job, §7.1 "Liveness": the job's end wakes it; after plain text even then, `stalled` records those tasks and
+  the scheduler wakes it once with `n_stalled`, also once the busy window ended), refusal, or
   step limit (then `notify(name, "n_step_limit")`). A reply cut off by max_tokens gets `cut_off` and
   the loop continues. After an activation, the agent re-wakes itself if events are still pending.
 * If the activation was caused by a USER message and the agent finished with plain text without
@@ -530,7 +625,9 @@ class AgentRuntime:
 `wake_header` (or `incoming_header`), `reasons:` then one bullet per undelivered notification text and
 per unread message (`msg` template, recipients list with the agent shown as `you`), then (not for
 incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, `my_reviews` (only when
-tasks wait for its review: `#id title (assignee or -)`), `ready` (up to 8), notes: in full only when they changed
+tasks wait for its review: `#id title (assignee or -)`), `my_jobs` (only while it has running background jobs,
+§7.1: `my_job` items `j3 npm run dev (running 25 min)` joined with "; ", the command cut to 60 characters, the
+duration in the member's language), `ready` (up to 8), notes: in full only when they changed
 since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
 otherwise the one-line `notes_unchanged`, since the history is append-only.
 
@@ -565,8 +662,11 @@ class Workspace:
     def check_writable(self, actor: str, path: str) -> None
     def release_all(self, actor: str) -> int
     def expire_locks(self) -> int
-    async def autocommit(self, actor: str, message: str) -> str | None
-        # commits everything except `.scratch/` as `actor`; commit hash or None (nothing outside .scratch changed)
+    async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "") -> str | None
+        # commits everything except `.scratch/` as `actor`, one commit per call; commit hash or None (nothing
+        # outside .scratch changed). The message is `message` as given or, with `kind` ("shell", "job j3", "jobs
+        # j3, j5"), commit_message(kind, the paths staged after `git add`, detail): the subject names the changed
+        # files, the body holds `detail` (the command that changed them)
     def mtime(self, path: str) -> float | None
     def exists(self, path: str) -> bool
 ```
@@ -584,7 +684,9 @@ The whole-tree autocommit (after every `shell` call): `ensure_scratch()` (an age
 staged (a manual `git add -f`; it only resets index entries to HEAD), nothing more when nothing outside `.scratch/`
 changed, else `git add -A --ignore-errors -- . ":(exclude)[.]scratch" ":(exclude)[.]scratch/*"`
 (`SCRATCH_EXCLUDES`, with pathspec magic, `literal=False`) and a commit of the index without a pathspec (a merge an
-agent left in progress concludes as before). The excludes are spelled with `[.]`: git add takes a literal
+agent left in progress concludes as before). With `kind`, its message is built from `git diff --cached --name-only
+--no-renames -z` (`_index_message`; a rename shows as its old and its new path, deleted files are named; a failed
+diff quotes the detail instead). The excludes are spelled with `[.]`: git add takes a literal
 `:(exclude).scratch` as naming the folder and, when the root `.gitignore` ignores `.scratch/` (`DEFAULT_GITIGNORE`
 does), reports it as an ignored path and exits 1 on every autocommit, burying real add errors in the log. Path
 commits of `write`/`edit` keep literal pathspecs (`-- rel`).
@@ -643,6 +745,11 @@ def git_identity(actor) -> tuple[str, str]           # (name, e-mail) of commits
                                                      # "<email_slug>@dreamteam.local"); autocommits and the shell
 def scratch_rel(actor) -> str                        # ".scratch/<email_slug(actor)>/"
 def in_scratch(rel) -> bool                          # `.scratch` or inside it (case-insensitive on Windows)
+def commit_message(kind, paths, detail="") -> str    # subject "<kind>: p1, p2 (+N more)" in at most
+    # COMMIT_SUBJECT_MAX (72) characters, each path at most COMMIT_PATH_MAX (40: "…/models/user.py", a file name
+    # too long alone is cut with "…"); body = `detail` (CRLF normalized, control characters dropped, trailing
+    # blanks removed, unpaired surrogates replaced), cut in the middle beyond COMMIT_DETAIL_MAX (2000) with
+    # "[... N characters skipped ...]"; without paths the subject quotes the detail
 def agent_git_env(env, actor) -> dict[str, str]      # a new env: GIT_LOCATION_VARS dropped, GIT_AUTHOR_NAME/EMAIL
                                                      # and GIT_COMMITTER_NAME/EMAIL = git_identity(actor)
 def porcelain_entries(data: bytes) -> list[tuple[str, str]]   # (XY, path) of `git status --porcelain -z`; a
@@ -671,24 +778,350 @@ def commit_paths(root, paths, message, git=None) -> (commit | None, error | None
 ```
 
 ```python
+# shell.py
 async def run_shell(command: str, *, cwd: Path, timeout: float, program: str = "auto",
                     env: dict[str, str] | None = None, max_output: int = 12000) -> tuple[int | None, str]
-    # returns (exit_code | None on timeout, combined stdout+stderr, decoded, head+tail truncated)
+    # (exit code | None on timeout, combined stdout+stderr decoded, head+tail truncated): returns when the shell
+    # exits, kills what it left running after LEFTOVER_GRACE (1 s), waits for the last output up to READ_SETTLE
+    # (2 s); on timeout the tree is killed and the output so far returned; a cancelled caller's tree is killed and
+    # awaited (KILL_WAIT, 5 s) before the cancellation goes on. For callers without jobs: the `shell` tool goes
+    # through JobManager.run (§7.1)
+async def start_command(command: str, *, cwd: Path, program: str = "auto", env: dict[str, str] | None = None,
+                        max_output: int = 12000, token: str | None = None) -> RunningCommand
+    # starts the command as a contained tree (ProcessTree.spawn in a daemon thread) and returns at once; `token`
+    # goes into the environment as DREAMTEAM_PROCESS_TOKEN; ValueError for an unsupported shell
+class RunningCommand:   # name (the shell's display name), tree, capture, started_at, serial; exited, eof, returncode
+    async def wait_exit(self, timeout) -> bool          # the shell exited (its processes may run on)
+    async def wait_eof(self, timeout) -> bool           # the output pipe reached EOF
+    async def settle(self, grace) -> bool               # polls the tree (SETTLE_POLL 0.05 s): True once it is empty
+    async def wait_dead(self, timeout) -> bool
+    async def kill(self, term_grace: float = 0.0) -> bool   # terminate, term_grace, kill; at most term_grace + 2 s
+    def output(self) -> str                             # the output so far (capture.text())
+    def tail(self, lines=40, chars=4000) -> str
+    def close(self) -> None                             # releases the tree and detaches the capture (idempotent)
+async def kill_after_cancel(cmd: RunningCommand, timeout: float = KILL_WAIT) -> None
+class StreamDecoder:    # feed(data: bytes, final=False) -> str: complete lines only; `pending` = the unfinished one
+class Capture:          # Capture(max_output, program): feed(data), text(), tail(lines, chars), shrink(head, tail),
+                        # attach_log(path, header, max_bytes), log_line(line), detach_log(footer), detach()
 def resolve_shell(program: str = "auto") -> tuple[str, list[str]]   # (display name, argv prefix)
+def shell_args(name: str, prefix: list[str], command: str) -> list[str] | str
+    # Popen args: prefix + [command]; for cmd on Windows one string `<prefix> "<command>"` (list2cmdline would
+    # escape the command's quotes as \", which cmd does not understand; /s strips exactly the outer pair)
 def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[str, str]
     # os.environ minus secrets (model api_key_env vars, *_API_KEY, *_TOKEN, *SECRET*, *PASSWORD*)
     # except config.shell.pass_env; plus PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
+def kill_tree(proc) -> None   # tui/bash.py's `!` commands: POSIX os.killpg(proc.pid, SIGKILL); Windows taskkill /T /F
+
+# procs.py (standard library only; kernel32 through ctypes, loaded lazily)
+TOKEN_ENV = "DREAMTEAM_PROCESS_TOKEN"
+class ProcessTree:      # proc, pid, pgid (POSIX: the shell's pid, stored), contained, token; released, watchdog
+    @classmethod
+    def spawn(cls, argv: list[str] | str, *, cwd, env, token=None,
+              breakaway=True) -> "ProcessTree"         # blocking: via daemon_call
+    def alive(self) -> bool; def pids(self) -> list[int]; def processes(self) -> list[str]
+    def terminate(self) -> None; def kill(self) -> None; def release(self) -> None; def mark_eof(self) -> None
+def live_groups(pgids) -> set[int]                     # Linux: one /proc pass, zombies ignored; other POSIX: killpg 0
+def sweep_token(token: str) -> int                     # Linux: SIGKILL every own-user process carrying the token
+def alive_all(trees) -> list[bool]                     # alive() of many trees (one /proc pass on Linux)
+async def daemon_call(fn, *args, on_orphan=None)       # fn in a new daemon thread; on_orphan(result) when the
+                                                       # caller was cancelled meanwhile (kills the new tree)
 ```
-The `shell` tool first calls `workspace.ensure_scratch(actor)` (so `> .scratch/<slug>/out.txt` works), then runs
-the command with `agent_git_env(scrubbed_env(config, {DREAMTEAM_AGENT: actor, DREAMTEAM_WORKSPACE: root,
-DREAMTEAM_SCRATCH: root/scratch_rel(actor)}), actor)`: git in the shell always works on the workspace repository,
-and a commit an agent makes anyway (its system prompt forbids history-changing git commands) is authored and
-committed by that member, with the same identity as its autocommits; the identity is set after `scrubbed_env`, so
-it also beats `shell.pass_env` and inherited values. Other `GIT_*` variables (e.g. `GIT_SSH_COMMAND`) pass through.
-MCP servers and the user's TUI `!` commands keep their own environment.
-Kills the whole process tree on timeout (Windows: `taskkill /T /F`; POSIX: process group), and also when the
-awaiting caller is cancelled (a stopped agent): its command must not go on writing into the workspace after
-the swarm stopped.
+**Process layer.** Every command runs as a contained tree, because nobody knows in advance which command will
+outlive its call:
+- Windows: a Job Object with KILL_ON_JOB_CLOSE (no BREAKAWAY_OK); Popen with CREATE_NEW_PROCESS_GROUP |
+  CREATE_NO_WINDOW; the shell is assigned through Popen's own handle right after Popen returns, in the spawning
+  thread; then up to three Toolhelp32 passes assign the children (and their children) it already started, those
+  created after it (creation time checked). Liveness = the job's count of active processes; names from its process
+  id list (`conhost.exe` left out); terminate and kill = TerminateJobObject (Windows has no graceful stop); closing
+  the handle (`release()`, or the hub's death) kills what is still in it. When the job cannot be created or
+  assigned, the tree is degraded (`contained = False`, one warning): liveness = the shell or an open pipe, kill =
+  `taskkill /T /F` in a daemon thread. No program may break away from the job (`shell.JOB_BREAKAWAY = False`,
+  `spawn(..., breakaway=False)`): the Cygwin runtime of Git Bash and MSYS2 asks for CREATE_BREAKAWAY_FROM_JOB for
+  every Windows program it starts whenever the job allows it, also when cmd or PowerShell runs `bash`, `sh` or a
+  git hook, which would take what they run out of the job. A program that insists on breaking away fails to start
+  instead.
+- POSIX: `start_new_session=True`, the group id (= the shell's pid) is stored and never asked again (`getpgid` fails
+  once the leader was reaped). A `sh` lifeline watchdog per command (`dreamteam-watchdog <pgid>`) reads a pipe the
+  hub holds: a line (`release()`) ends it quietly, EOF (the hub died) sends TERM to the group, then KILL after 2 s.
+  The watchdog's environment has no `DREAMTEAM_PROCESS_TOKEN`: a hub that itself runs as a command of another hub
+  (an agent running `dreamteam run`, this project's tests run as a job) carries that outer token, and the outer
+  job's token sweep must kill the inner hub but leave its watchdogs, which then kill the groups they guard.
+  Liveness after the shell was reaped: Linux counts the group's live processes in /proc (zombies ignored, so
+  init-less containers stay correct), other systems `killpg(pgid, 0)`. terminate = SIGTERM to the group; kill =
+  SIGKILL to the group plus, on Linux, the token sweep (it also ends `setsid` escapes). Names from
+  `/proc/<pid>/comm` (Linux), else none ("processes").
+- After `release()` nothing is ever signalled again (idempotent); a tree dropped without it is released by a
+  `weakref.finalize`.
+- A command ends when its shell has exited and its tree is empty; the pipe's EOF is waited for at most
+  `READ_SETTLE`, because a process the command left running may hold the pipe for hours.
+- Output: a daemon reader thread owns the pipe's read end and alone ever closes it (a closed fd number is soon
+  reused, and a reader still blocked on it would consume someone else's file or socket); a daemon waiter thread
+  waits for the shell; every wait is `asyncio.wait` on a future only those threads resolve. `StreamDecoder` decodes
+  strict UTF-8 and switches for good at the first invalid byte to the shell's fallback (`cp<OEM>` for cmd on Windows,
+  else the locale), turns `\r\n` into `\n` (also across chunks) and keeps only the text after a line's last bare
+  `\r` (a progress bar's final state); an unfinished line is held back (beyond PENDING_MAX, 65536, emitted as it is)
+  but shown by `text()` and `tail()`. `Capture(max_output)` keeps a head (40 %) and a tail, so `text()` equals
+  `truncate_middle(output, max_output)`; one lock guards its buffers and log writes.
+
+**The `shell` tool** (tools/file_tools.py):
+1. The console intercept: `await swarm.jobs.console(actor, command, max_chars=ctx.output_cap)`; a whole command line
+   `jobs`, `jobs j3` or `kill j3` is answered by the hub (nothing spawned, nothing committed, §7.1).
+2. timeout = `min(max(args.timeout or [shell] timeout, 1), [shell] max_timeout)`; `workspace.ensure_scratch(actor)`
+   (so `> .scratch/<slug>/out.txt` works); env = `agent_git_env(scrubbed_env(config, {DREAMTEAM_AGENT: actor,
+   DREAMTEAM_WORKSPACE: root, DREAMTEAM_SCRATCH: root/scratch_rel(actor)}), actor)`: git in the shell always works
+   on the workspace repository, and a commit an agent makes anyway (its system prompt forbids history-changing git
+   commands) is authored and committed by that member, with the same identity as its autocommits; the identity is
+   set after `scrubbed_env`, so it also beats `shell.pass_env` and inherited values. Other `GIT_*` variables (e.g.
+   `GIT_SSH_COMMAND`) pass through. MCP servers and the user's TUI `!` commands keep their own environment.
+3. `outcome = await swarm.jobs.run(actor, command, timeout=, env=, max_output=ctx.output_cap,
+   background=args.background)` (§7.1): the command's result, or a job.
+4. Unless the outcome is `killed` (the session stops or the member leaves: no git work may start then):
+   `workspace.autocommit(actor, kind="shell", detail=command)`, one commit per call.
+5. The result is `outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=[shell], has_wait=ctx.has_tool("wait"))`.
+
+An agent's command dies when the agent's task is cancelled (a stopped or retired agent) before the command became a
+job: its command must not go on writing into the workspace after the swarm stopped.
+
+### 7.1 Background jobs (jobs.py)
+
+A `shell` command is no longer killed at its timeout. A command still running when its call stops waiting goes on
+as a **job** `j<N>` (N = `jobs.id`; written `j3` everywhere, never `#3`, which is a task), and so do processes a
+command leaves running and commands started with `background=true`. `Swarm.jobs` (`JobManager(swarm)`) owns every
+job: its row (§2), its log, its lifetime, its end, its commits and its cleanup. Russian texts call a job «фоновый
+процесс» («задача» is a board task).
+
+```python
+class JobManager:
+    closing: bool                                        # stop_all ran or runs: no new command, no new job
+    async def run(self, actor, command, *, timeout, env, max_output, background=False) -> ShellOutcome
+    async def console(self, actor, command, *, max_chars=12000) -> str | None
+    def listing(self, actor) -> str
+    def describe(self, job_id: int, *, actor, lines=40, max_chars=12000) -> str      # ToolError: unknown id
+    async def stop(self, job_id: int, by: str, *, force=False) -> str                # ToolError: unknown, not yours
+    def forbid(self, owner) -> None                      # synchronous: no new command or job for owner (retire)
+    async def stop_owner(self, owner, reason="retired") -> list[int]   # its jobs and foreground commands, awaited
+    async def stop_all(self, reason="session") -> None   # idempotent; awaits every finish and call in flight
+    def recover(self) -> None
+    def busy(self, name) -> bool; def wakes(self, job) -> bool; def awaited(self, owner) -> list[Job]
+    def running_of(self, owner=None) -> list[Job]; def get(self, job_id) -> dict | None
+    def snapshot(self) -> list[dict]
+    def check_start(self, actor) -> str | None           # "disabled" | "limit_member" | "limit_session" | None
+    def command_env(self, env) -> dict; def cpu_threads(self) -> int
+@dataclass
+class Job:   # id, owner, command, origin, cmd: RunningCommand, log, log_path, started_at, background_at, stopping,
+             # finishing, done: Future, command_done, exit_code, command_ended_at, shell, processes, status, reason,
+             # stopped_by, ended_at, tail; label "j<id>", log_shown, notice_tail(), public(now=None) -> dict
+@dataclass
+class ShellOutcome:  # state, code, output, shell, wait, job=None, note="", names=[], note_args={}, max_output=12000
+    def render(self, *, has_jobs_tool: bool, cfg: ShellSettings, has_wait: bool = True) -> str
+def parse_job_id(text) -> int | None                     # "j3" "J3" "%3" "#3" "3" -> 3
+def parse_console(command) -> tuple[str, list[int], bool] | None   # ("list"|"show"|"kill", ids, force)
+def short_command(cmd, limit) -> str                     # one line, cut in the middle with "…"
+def fmt_duration(seconds, lang="en") -> str; def format_names(names) -> str   # "node.exe ×2, python.exe"
+def shown_log(log) -> str                                # a data_dir log with "(outside the workspace: ...)"
+```
+
+**Origins** (`jobs.origin`):
+
+| origin | how a command becomes one | stopped at (from its start) | keeps its owner busy | its end wakes the owner |
+|---|---|---|---|---|
+| `timeout` | its shell still runs when the call's wait ended | `[shell] max_timeout` | always | unless the goal is done |
+| `background` | `background=true` (revision-2 agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
+| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow`, `start /b`; with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
+
+`wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
+
+**A call** — `JobManager.run(actor, command, *, timeout, env, max_output, background=False) -> ShellOutcome`:
+- Refused (ToolError) while the session stops: `The session is stopping: no new commands are started.`; for a
+  member being retired (`forbid`): `You are leaving the swarm: no new commands are started.`; with `background` when
+  no job may start now (`check_start`): `You already have {n} background jobs ({ids}), the most allowed: stop one
+  with job_stop, or run this command without background.` / `The session already runs {n} background jobs, the most
+  allowed: run this command without background.` / `Background jobs are turned off in the settings ([shell]
+  max_jobs_per_member or max_jobs is 0): run the command without background.`
+- Wait: `BACKGROUND_GRACE` (2 s) with `background`, else `timeout`. With `background_on_timeout` an AI agent waits at
+  most `[shell] foreground_max` (180 s; blocked in a long command it would see no message, comment or review), an
+  external member at most `EXTERNAL_WAIT_MAX` (600 s, below the stdio proxy's read timeout of 700 s). Without
+  `background_on_timeout` the timeout is the wait, as before. The cap only moves an AI agent's command to the
+  background sooner: when the command cannot become a job when the cap ends (`check_start`: jobs turned off, a
+  limit reached), the call waits on up to its own `timeout` (checking every `JOB_TICK`), so the command is killed
+  only then, as before the cap, and goes on as a `timeout` job as soon as a slot frees. The external cap stays
+  (it protects the MCP transport).
+- Environment (`command_env`): `PYTHONUNBUFFERED=1` (the output so far is live), `MSBUILDDISABLENODEREUSE=1` unless
+  set (MSBuild nodes would become jobs), the thread caps of numeric libraries (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
+  `OPENBLAS_NUM_THREADS`, `NUMEXPR_NUM_THREADS`, `VECLIB_MAXIMUM_THREADS`, `RAYON_NUM_THREADS`) unless set:
+  `cpu_threads()` = `[shell] cpu_threads` ("auto": the cores divided by the active AI agents, at least 1; N; 0 = no
+  cap); plus a random `DREAMTEAM_PROCESS_TOKEN`.
+- Outcomes (`ShellOutcome.state`; first match wins; the first line of the result always carries the outcome and the
+  job, because the TUI shows first lines):
+
+  | state | when | first line |
+  |---|---|---|
+  | `exited` | the shell exited within the wait and the tree emptied within LEFTOVER_GRACE (1 s) | `exit code: N [shell]` (as before) |
+  | `quick` | the same, with `background` | `exit code: N [shell] (it ended within 2 s, so it did not stay in the background)` |
+  | `detached` | the shell exited, processes run on, a job is allowed (without `background`) | `exit code: N [shell]; processes it started keep running as background job jN` |
+  | `leftovers_killed` | the same, no job allowed (they are killed) | `exit code: N [shell]; the processes it left running were stopped` |
+  | `started` | `background`: the shell still runs after the wait, or it exited and processes it started run on | `STARTED in the background as job jN [shell]` |
+  | `background` | the shell still runs when the wait ended | `STILL RUNNING after Ws: continues in the background as job jN [shell]` |
+  | `timeout` | the same, but killed: `background_on_timeout` off (exactly the old result), the wait is `max_timeout` or more (note `no_time`), or a limit at the end of the call's own timeout (note `limit_member`, `limit_session`, `disabled`) | `TIMEOUT after Ws (process tree killed) [shell]` |
+  | `killed` | the session stopped or the member left while the command ran in the foreground | `KILLED: the session is stopping [shell]` / `KILLED: you are leaving the swarm [shell]` |
+
+  Then the output (`(no output)`, or `(no output yet)` for a job), and for `leftovers_killed` / `timeout` a
+  `[note]`, for a job a footer. The footer of `background`, `started` and `detached` says where the output goes,
+  that the owner is notified at the end (so: no polling, other work or `wait`; `wait_for_events` for an external
+  member, which has no `wait`: `has_wait`), how to see and stop the job and its lifetime. For a caller with the
+  `jobs` tool (`ToolContext.has_tool`) it names `jobs` with job_id and `job_stop` (and for `background`: "start
+  servers and long runs with background=true instead"); for a revision-1 agent it names the console commands ("run
+  the shell command jobs jN / kill jN (each as a command of its own)") and `&` / `Start-Process -NoNewWindow` (a
+  plain `Start-Process` opens a console window of its own on the user's desktop and its output never reaches the
+  job), never a tool it lacks. `render()` never cuts the first line or the footer: only the output between them is
+  cut to `max_output`.
+- A caller cancelled before its command became a job: the tree is killed and awaited (KILL_WAIT), the cancellation
+  goes on; any other failure kills it too. After the adoption the caller's cancellation never touches the job.
+
+**Adoption** (`_adopt`, synchronous, so the limit check and the INSERT are atomic) is allowed when
+`max_jobs_per_member > 0` and `max_jobs > 0`, the owner's running jobs < `max_jobs_per_member` (4), the session's
+< `max_jobs` (16), the session is not stopping, and the owner is a member not being retired. The job keeps a head of
+2000 and a tail of 16000 characters in memory (`JOB_HEAD_CHARS`, `JOB_TAIL_CHARS`); `job.started` is emitted.
+
+**Log**: `.scratch/<slug>/jobs/j<N>.log` (UTF-8; readable with `read_file`, never committed, collapsed in
+`list_files`): the header `# job jN of <owner> [<shell>]: <command>` and `# started HH:MM:SS, in the background since
+HH:MM:SS (<origin phrase>)`, the output so far (its head and tail when it was cut), then the output as it comes;
+`# command ended HH:MM:SS: exit code N; still running: <names>`; the footer `# ended HH:MM:SS: exit code N`, `# ended
+HH:MM:SS: all its processes exited` (a job whose shell had ended before it: detached, or `background=true` whose shell
+exited within the grace) or `# stopped HH:MM:SS (<reason>)`. At half of `job_log_mb` MiB (at
+most 64) the file is renamed to `j<N>.prev.log` and a new one starts with `[earlier output: jN.prev.log]`; while
+someone holds it open (Windows), the rename is retried at every chunk, and at the full size the log ends with `[log
+limit reached: further output is not saved]` (the pipe is still drained). When `.scratch` is not a plain folder of
+the workspace (a file, a link elsewhere) the log is `<data_dir>/jobs/j<N>.log`, shown as `<path> (outside the
+workspace: read it with shell)`. At each adoption the owner's ended logs beyond `JOB_LOGS_KEPT` (20) are deleted (both
+files), chosen by rows, never by listing the folder (two names may share a slug); a file in use is skipped.
+
+**The monitor**: one task, started at an adoption and ended when no job is left; every `JOB_TICK` (1 s) it checks all
+jobs in one `alive_all` pass: an empty tree → the job ended; a timeout/background job whose shell exited while its
+tree lives (seen for LEFTOVER_GRACE) → `_command_done`; past its lifetime → stopped with reason `lifetime`.
+
+**The shell exited, processes run on** (`_command_done`, once per job): a build that left a daemon is done, so its
+owner must not wait for the daemon. The shell's code is stored, the log line written, the origin becomes `detached`
+(never busy, lifetime `job_max_minutes`), the change is committed (kind `job jN`, detail `<command>\n\njN: the command
+ended with exit code C; processes it started still run: <names>`), and the owner gets `n_job_command_done` ("The
+command of your background job j3 has finished (exit code 0) after 4 min, but programs it started still run, so j3
+goes on: java.exe. …": the job has not ended, so the notice never says it has; it wakes unless the goal is done or
+the session stops).
+
+**The end** (`_finish`): exactly one finisher per job. The monitor, `stop`, `stop_owner` and `stop_all` claim it
+synchronously (`job.finishing`); any other ender awaits `job.done`; the manager never cancels a future a caller
+awaits. The finisher waits for EOF (READ_SETTLE), writes the footer, closes the log, releases the tree, sets
+`exit_code` (the code of the job's own end: its shell's, when the shell ended by itself as the last of the job; NULL
+when it was stopped, or when its shell had ended before it — detached, `background=true` whose shell exited within
+the grace, after `_command_done` — since that shell's code was reported when it ended, and a crash of what ran on
+must not read as "exit code 0"; while such a job runs, its row holds the shell's code), updates the row (status,
+reason, stopped_by, exit_code, ended_at, tail = the last 2000 characters, processes, origin), drops the job, emits
+`job.ended` {job: public + `duration`}, commits unless the session stops (kind `job jN`, detail `<command>\n\njN: <how
+it ended>`, e.g. "ended with exit code 0 after 4 min"; while the session stops the job is left to `stop_all`'s
+commit), then notifies the owner when it is still a member:
+
+| how it ended | row: status, reason, stopped_by | the owner's notice | wakes |
+|---|---|---|---|
+| by itself | `ended` | `n_job_done` {id, result: `job_exit` {code}, or `job_gone` when it has no code of its own, duration, command, tail, log} | `wakes(job)` |
+| its shell exited, processes run on (`_command_done`) | still `running`, origin `detached` | `n_job_command_done` {id, result: `job_exit` {code}, duration, names, command, tail, log} | unless the goal is done |
+| the user stopped it | `stopped`, `user`, `user` | `n_job_stopped` {id, duration, command, log} | `wakes(job)` |
+| its owner stopped it | `stopped`, `owner`, the owner | none (the tool result says it) | — |
+| its lifetime | `stopped`, `lifetime` | `n_job_limit` {id, duration, command, log} | `wakes(job)` |
+| the session stopped | `stopped`, `session` | `n_job_gone` {id, command, log} | quiet |
+| its owner retired | `stopped`, `retired` | none | — |
+| lost after a crash (`recover`) | `lost`, `crash` | `n_job_gone` | quiet |
+
+Only the owner or the user can stop a job. `{duration}` (`fmt_duration`: "45 s", "12 min", "2 h 05 min"; ru "45 с",
+"12 мин", "2 ч 05 мин") and `{result}` are built in the owner's language; `{tail}` = the last 15 lines, at most 1200
+characters, each indented by two spaces, or `job_no_output`; `{command}` = `short_command(command, 120)`; `{log}` =
+the log as shown above. These texts reach agents of every tool revision, so they name no tool, only the log. A
+paused swarm holds them until `resume` like any notice; an external member gets them through `wait_for_events`.
+
+**Stop** — `async stop(job_id, by, *, force=False) -> str`, synchronous (a restart on the same port does not race):
+only the owner or USER (else ToolError `Job j3 belongs to Anna Smith; only its owner or the user can stop it (ask them
+with send_message).`); terminate, `STOP_GRACE` (3 s; none with `force`), kill, then the job is finished. Result:
+`Stopped job j3 (<command>) of Anna Smith after 25 min, together with the processes it started. Last output:` and up
+to 15 lines; a job that had ended (or ended meanwhile) is no error: `Job j3 had already ended (<how it ended>);
+nothing to stop.`; an unknown id: ToolError `There is no job j9. Running jobs: j3, j5.` (or `No jobs are running.`).
+
+**Views**: `listing(actor)` (the `jobs` tool without job_id): `Running background jobs (N):` with lines `- j3 <command
+(60)>: Anna Smith (you), running 25 min, started in the background; log <log>` (the log only for the caller's own
+jobs, every log for the user), or `No background jobs are running.`, then `Your jobs that ended in the last hour:`
+(everyone's for the user: `Jobs that ended in the last hour:`) with lines `- j2 npm test: exit code 0 after 4 min,
+ended 10 min ago`. Origin phrases: `went to the background at its timeout`, `started in the background`, `left running
+by its command`. `describe(job_id, *, actor, lines=40, max_chars=12000)` (any member may read any job): `Job j3 of Anna
+Smith: <command>`, `State: running for 25 min (started in the background) [bash]`, or `ended with exit code 0 after 4
+min; processes it started still run: java.exe` after `_command_done`, or how it ended (`ended with exit code 1 after
+4 min`, `ended after 4 min (all its processes exited)` for a job with no code of its own, `stopped by the user after
+3 min`, `stopped by its owner
+after …`, `stopped at its time limit after …`, `stopped with the session`, `stopped when Anna Smith left the swarm`,
+each followed by `, 6 min ago`; `lost: the session's process ended unexpectedly`), `Processes: node.exe ×2` (a running
+job), `Log: <log> (2.1 MB; below is its end)` and `--- last N lines ---` (1–400 lines, at most max_chars): a live
+job from memory, an ended one from the end of its log file, or, when the file is gone (a `/cd` move, a deleted
+scratch folder), the stored tail with `(log file not found)`.
+`snapshot()`: the running jobs (from memory), then those ended in the last hour (one query, at most 50).
+`get(job_id)`, `running_of(owner=None)`, `check_start(actor)`, `busy(name)`, `wakes(job)`, `awaited(owner)`.
+Public job dict (snapshot, events): `{"id", "label": "j3", "owner", "command" (≤ 200 chars), "origin", "status",
+"reason", "stopped_by", "exit_code", "started_at", "background_at", "ended_at", "log", "processes"}`.
+
+**Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: how revision-1 agents
+list and stop jobs with the `shell` tool they have. The command is stripped and one trailing `;` dropped; the WHOLE
+line must match (case-sensitive), else None and the command goes to the real shell (`kill j3; npm start`, `jobs |
+wc -l`, `echo kill j3` all do):
+
+| command line | answer |
+|---|---|
+| `jobs`, `jobs -l`, `jobs -p` | `listing(actor)` |
+| `jobs [-l] <id>` (`j3`, `%3` or `3`) | `describe(id)`, 40 lines |
+| `kill [-9 \| -KILL \| -SIGKILL \| -s KILL \| -s SIGKILL \| -15 \| -TERM \| -SIGTERM \| -s TERM] <id> [<id> …]` (`j3` or `%3`, never a bare number: that is a PID) | `stop(id, actor)` for each, joined by newlines; a KILL form skips the TERM grace |
+
+The first line of every answer (and of its error) ends with ` [dreamteam]`; errors arrive as `Error: …` like any
+tool error. Nothing is spawned or committed.
+
+**Tools** (§12, audience LEU): `jobs(job_id?, tail?)` and `job_stop(job_id)`; `job_id` accepts `j3`, `J3`, `%3`,
+`#3`, `3` (`parse_job_id`), else ToolError `Not a job id: '<x>'. Pass one such as j3 (jobs without job_id lists
+them).`; a blank job_id lists. The user lists and stops every member's jobs through them (`POST /api/act/jobs`,
+`/api/act/job_stop`, MCP).
+
+**Lifecycle**:
+
+| event | jobs |
+|---|---|
+| `Swarm.stop` (session stop, delete, `/cd` move, launcher shutdown, `dreamteam run` end, stdio `mcp` end, the end of print mode with an owned launcher, a failed start) | `stop_all()`: no new command or job (`closing`), the monitor cancelled; every job tree and every foreground tree terminated, after `STOP_ALL_TERM` (3 s) the survivors killed and awaited up to `STOP_ALL_KILL` (2 s); every job finished as `stopped`/`session` (quiet `n_job_gone`, no commit of its own), every finish, stop and foreground call in flight awaited; then one autocommit per owner of its stopped jobs and of its jobs that ended by themselves since the session began to stop (`Swarm.stop` sets `stopping` first and stops the runtimes before `stop_all`: such an end makes no commit of its own), kind `job j3` or `jobs j3, j4, j5`, detail `Stopped with the session:\nj3: <command>…` and `Ended while the session stopped:\nj4: <command> (<how it ended>)…`; every tree released, every log closed. About 5 s plus git; idempotent; nothing touches git or the database after it returned (`hub_call` also skips its trace while the swarm stops, §13). `Swarm.stop` runs it in `finally`, also after a failed step |
+| `Swarm.retire` | §3 `retire`: `forbid`, then the runtime, then `stop_owner(name, "retired")` |
+| `Swarm.start` | `recover()` (below) |
+| pause | nothing: a pause stops LLM spending only |
+| `complete_goal` | the jobs go on; USER gets `u_jobs_running`; their later ends are quiet |
+| `reopen_goal` | nothing (the goal is active again, so ends wake again) |
+| `reconfigure` | nothing: the limits are read at each use; turning `background_on_timeout` off kills no job |
+| an external member disconnects | nothing: its lifetime, the user, its retirement or the session stop end its jobs |
+| compaction | nothing |
+| `docker stop` | SIGTERM reaches dreamteam through the container's init (§18.3 `sandbox`), `Swarm.stop` ends the jobs; what is left dies with the container |
+
+**Crash recovery**: when the hub dies, Windows closes its job handles (KILL_ON_JOB_CLOSE kills every tree), POSIX
+watchdogs see EOF and kill their groups, a container stops. At the next `Swarm.start`, `recover()` turns every row
+still `running` into `lost`/`crash` (ended_at = now); on Linux, when the row's `hub_pid` is dead or is this process,
+every own-user process carrying its token is killed (identity from a random token, never from a bare pid); each owner
+still a member gets a quiet `n_job_gone`. View-only loads (`Swarm(...)` without `start`, `cli status`, the launcher
+viewing a stopped session) change nothing. Sessions never started again are cleaned by the OS containment alone.
+
+**Liveness**: `busy(name)` is true while the member has a running `timeout` job, or a `background` job younger than
+`max_timeout` while it holds an in_progress task or a review (the board is queried only then); `detached` jobs never
+make it busy. A busy member is not idle for the scheduler (§3): no `n_ready`, no stalled wake, no review reminder or
+hand-over (its reminder time is renewed while busy), it holds `n_all_done` back and counts as working for
+`u_reviews_waiting`; `AgentRuntime` skips its in-activation nudge (§6.2). A free member with a server started with
+`background=true` is still offered ready tasks. A member that is not busy but whose running job's end will wake it
+(`awaited`: a detached job while it holds an in_progress task, a server past its busy window) waits for that job:
+the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone meanwhile.
+
+**Git**: the caller's `shell` autocommit at every return, also when the command went on as a job (not for
+`killed`); the job's own commits under its owner when its shell exits with processes left, at its end and at the
+session stop (above; a job that ends by itself while the session stops is committed by `stop_all`, never left to
+another member's next commit). Files a job writes between those commits go into the next autocommit of any member, under that
+member's name (`git add -A` cannot tell writers apart): build output belongs in `.scratch/` or `.gitignore`. Job logs
+are never committed. A job's own git commands carry its owner's identity (`agent_git_env`).
+
+Settings: `[shell]` in §17.1; all of them are read at each use.
 
 ## 8. Triggers (triggers.py)
 
@@ -752,7 +1185,11 @@ Trigger dict: {"id","owner","condition","note","actions","once","active","create
 `task.created task.updated task.comment message.sent notification goal.set goal.completed
 goal.reopened agent.hired agent.retired agent.status agent.activity agent.compacted agent.usage
 file.changed file.locked file.unlocked trigger.created trigger.fired trigger.deleted
-mcp.created mcp.status swarm.paused swarm.resumed swarm.limits`
+mcp.created mcp.status swarm.paused swarm.resumed swarm.limits job.started job.ended`
+
+`job.started` {job} and `job.ended` {job: … + `duration` (seconds)} carry the public job dict (§7.1), actor = the
+job's owner; a job's output is never sent as events. `agent.retired` also carries `jobs` (the ids of the jobs it
+stopped), `agent.compacted` `tools_revision` (§6.1).
 
 Live-only events (sent with the EventBus method `publish(type, actor, **data)` instead of `emit`: delivered to
 listeners and WebSocket subscribers with id None, not journaled): `trace.started`, `trace.span`,
@@ -868,12 +1305,19 @@ class ToolContext:
                                              # (it cuts results for the model and traces them in full)
                                              # max(tool_output_chars, tracing.max_payload_chars), else
                                              # agents.tool_output_chars
+    def has_tool(self, name: str) -> bool    # the caller has that tool: an LLM agent's own frozen set
+                                             # (runtime.tool_names, §6.1), else the live registry for ctx.kind;
+                                             # results that point at a tool are tailored with it
 REGISTRY: dict[str, ToolSpec]               # sorted by `order` once all modules are loaded (import-order free)
 def tool(name, en, ru, properties, required=(), audience=("llm","external","user"), allow_empty=()): decorator
 def tools_for(kind: str) -> list[ToolSpec]
 def schemas_for(kind: str, language: str) -> list[dict]   # [{"name","description","parameters"}], deterministic copies
 async def call_tool(ctx: ToolContext, name: str, args: dict) -> tuple[str, bool]
-    # rejects actors that are neither USER nor an active member; unknown tool -> close matches + the
+    # rejects actors that are neither USER nor an active member; an LLM agent (a runtime with
+    # tool_parameters) calls only the tools of its frozen set, with their frozen parameters: a tool it lacks is
+    # "Unknown tool" with close matches and the list from its own set only (never a newer tool), and arguments
+    # its schema lacks are dropped with the note "[Ignored unknown argument(s): ...; Usage: <its frozen
+    # signature>]"; validation still uses the registry spec (hence R0′ below); unknown tool -> close matches + the
     # available tools; audience errors say how to fix the call (join_swarm/as_agent); checks required args
     # (whitespace-only = missing unless allow_empty) and types with coercion ("5"/"#5" -> 5, JSON strings for
     # arrays/objects, 0/1 -> bool, numbers -> str, case-insensitive enums, finite numbers); validates enums;
@@ -910,13 +1354,15 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `edit_file` | path, old_text, new_text, replace_all? | LE |
 | `list_files` | path?, depth? | LEU |
 | `lock_file` | path, minutes?, unlock? | LE |
-| `shell` | command, timeout? (its environment: §7 after `scrubbed_env`) | LE |
+| `shell` | command, timeout?, background? (its environment: §7 after `scrubbed_env`; results and jobs: §7.1) | LE |
+| `jobs` | job_id?, tail? (without job_id: the running jobs of the swarm and the caller's ended in the last hour, everyone's for the user; with it: that job, §7.1) | LEU |
+| `job_stop` | job_id (only the job's owner or the user) | LEU |
 | `mcp_create` | name, description, code, scope?, task_id?, requirements? | LE |
 | `mcp_list` | query? | LEU |
 | `mcp_tools` | server | LEU |
 | `mcp_call` | server, tool, arguments? | LE |
 | `join_swarm` | role, name?, instructions? | EU (the user via MCP only, before joining; creates kind "external") |
-| `wait_for_events` | timeout? (s, default 50, max 600; an error at once when the swarm stops meanwhile) | EU |
+| `wait_for_events` | timeout? (s, default 50, max 600; an error at once when the swarm stops meanwhile), progress? (below) | EU |
 | `set_goal` | title (a multi-line title is split: §3 `set_goal`), description? | U |
 | `swarm_status` | — | EU |
 | `swarm_control` | action (pause/resume), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
@@ -927,14 +1373,25 @@ Tool results are plain text (compact, line-oriented), language = English for dat
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
 `ctx.runtime.note_sent_to_user()` when USER is a recipient.
 
-**R0: LLM tool schemas are part of every agent's frozen prefix.** `AgentRuntime.__init__` builds its tools from
-`schemas_for("llm", language)` (from the code, not the database), and Anthropic thinking blocks bind to the exact
-prefix, so a changed name, description, parameter, `required` list or enum of a tool with the `llm` audience would
-change the prefix of every existing agent of a resumed session. Such a change needs a deliberate migration;
-tests/test_tools.py (`test_llm_tool_schemas_are_unchanged`) pins the SHA-256 digest of `schemas_for("llm", lang)`
-for en and ru. New behaviour reaches agents through tool results, notifications, the `agents` output and the system
-prompts of new members. `allow_empty` is validation only, not part of the schema. Tools of the `user`/`external`
-audiences only (e.g. `set_goal`) are not in the LLM tools array.
+**R0′: LLM tool schemas are released as revisions.** Every LLM agent sends its own frozen tools array (§6.1), and
+Anthropic thinking blocks bind to the exact prefix, so a changed name, description, parameter, `required` list, enum
+or order of a tool with the `llm` audience is released as a new revision, in one change:
+1. change the code;
+2. bump `frozen.TOOLSET_REVISION`;
+3. run `python -m dreamteam.tools.frozen --write` (it writes `tools/snapshots/llm_r<N>.json`);
+4. pin its exact-order digests (`sha256(db.dumps(tools))` per language) in tests/test_frozen_tools.py (`RELEASED`).
+
+Existing agents keep their revision until their next compaction; new agents get the current one. Arguments are
+still validated against the current registry, so the registry must keep serving every released revision
+(tests/test_frozen_tools.py checks it): no tool leaves the `llm` audience, no property is removed or retyped
+(`items.type` included), the current `required` is a subset of every released one, enums only grow, a free property
+never gains an enum. Revisions: 1 = the tools before background jobs (sorted digest `e3c5cbc7…`, the baseline of
+agents created before tool sets were frozen), 2 = background jobs (`shell` gains `background`, new `jobs` and
+`job_stop`, new `shell` and `wait` descriptions). Notifications and wake-up texts reach agents of every revision, so
+they name only tools of every released revision (tests/test_prompts.py); tool results that point at a newer tool
+check `ToolContext.has_tool`. `allow_empty` is validation only, not part of the schema. Tools of the
+`user`/`external` audiences only (e.g. `set_goal`) are not in the LLM tools array, and external members and the user
+always see the live registry.
 
 Results and checks of the review and role-catalog flows:
 - `task_claim` by the task's designated reviewer (independent review, §4.1) adds "You were its reviewer; since
@@ -950,7 +1407,7 @@ Results and checks of the review and role-catalog flows:
   description and model profile, and instructions may then be empty; any other name is a new role you describe
   in instructions):` and one line per visible role, `- <name>[ (model <profile>)]: <roles.summary(description)>`.
 - `hire_agent` resolves `role` in the catalog (swarm language). `instructions` stays required in the schema
-  (R0), so a missing one is still "Missing required argument(s)"; `""` is accepted (`allow_empty`). An unknown
+  (R0′), so a missing one is still "Missing required argument(s)"; `""` is accepted (`allow_empty`). An unknown
   role with empty instructions: ``'X' is not in the role catalog: describe the new role's responsibilities in
   instructions, or pick a catalog role (`agents` lists them).`` plus up to three similar catalog roles
   (`roles.close_roles`). Results start with `Hired <name> as "<canonical role>".`, then either `They got the
@@ -961,7 +1418,27 @@ Results and checks of the review and role-catalog flows:
   list, `/roles`), and the result is `Hired <name> as "<role>" (catalog role, model profile P).` or `Hired <name>
   as "<role>": a new role, not in the role catalog; your instructions are all they know about it.`
 - `join_swarm` shows the canonical role and, for a catalog role, appends `\nYour role (<role>): <description>`
-  (an external member has no system prompt).
+  (an external member has no system prompt); its description and result say that members who join this way do not
+  count toward max_agents.
+
+Results of the team, wait and job flows:
+- `agents` starts with `AI agents: 2 of max 6, plus 1 external member (not counted).` and the budget line (the
+  same team line in `swarm_status`); a member line ends with `, background jobs: j3, j5` while it has running jobs.
+- `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run,
+  and for a member caller `Your background jobs: j3, j5.` after its open tasks.
+- `wait` (description: the end of one of its background jobs wakes it too; "End every turn with it" stays): `OK,
+  waiting. You will be woken up by new events.`, plus `, also when your background job j3 ends.` / `…jobs j3, j5 end.`
+  for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet).
+- `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
+  min). Stop the ones nobody needs with job_stop; the rest stop with the session.` (a caller without `job_stop`: `with
+  the shell command kill jN (as a command of its own)`).
+- `shell`, `jobs`, `job_stop`: §7.1.
+- `wait_for_events(progress=true)` also returns when others make board progress: `task.created`, `task.updated` with
+  a status change, `goal.set`, `goal.completed`, `goal.reopened`, `agent.hired` (an external member: "joined"),
+  `agent.retired` (the caller's own changes and events about itself are skipped). They are read from the events
+  journal after a per-actor cursor (kv `wait_progress:<actor>`; the first such call starts at the journal's end;
+  calls without progress neither use nor move it) and appended as `Board progress:` / `Прогресс на доске:` with `• `
+  lines (at most 20, then ``… and N more: see `board` ``), after the incoming header when nothing else is pending.
 
 ## 13. Hub MCP (hub_mcp.py)
 
@@ -971,9 +1448,23 @@ def build_hub_server(swarm) -> mcp.server.lowlevel.Server
     # (string: name returned by join_swarm; omit to act as the user). on_call_tool: actor =
     # as_agent (must be an active external member) or USER; returns
     # CallToolResult(content=[TextContent], is_error). `instructions=` explains the swarm.
-async def hub_call(swarm, name: str, args: dict) -> tuple[str, bool]
+async def hub_call(swarm, name: str, args: dict, client: str | None = None) -> tuple[str, bool]
     # one MCP tool call with the actor rules above (also used by the launcher MCP, §18.2); calls of external
-    # members are traced (tracer.external_call), except UNTRACED_TOOLS = {"wait_for_events"}
+    # members are traced (tracer.external_call), except UNTRACED_TOOLS = {"wait_for_events"} and except while the
+    # swarm stops (a call that returns then, e.g. a shell command killed by the session stop, must not write into
+    # the database that Swarm.stop's caller closes next). `client` (default: serving_client's) names the MCP
+    # client: a message it sends (as the call's actor) reaches the external members it acts as already read
+    # (mailbox.sent_as_seen_by(members, actor)), so it never comes back to it as news; messages others send, e.g.
+    # an agent this call hires, reach them as news
+CLIENT_HEADER = "X-DreamTeam-Client"
+def client_key(ctx, local: str) -> str | None
+    # the client of a request: `local` without HTTP (stdio, in-process: one client per server), else
+    # "client:<CLIENT_HEADER>", else "session:<mcp-session-id>", else None (the 2026-07-28 protocol without the
+    # header: such a client cannot be told from another one and may get its own message back once)
+def serving_client(client) -> ContextManager       # hub_call inside it (and in tasks it starts) comes from `client`
+def hub_clients(swarm) -> HubClients               # external member -> the client that last acted as it (as_agent,
+                                                   # or join_swarm: a new member or a welcome-back)
+def proxy_http_client()                            # the stdio proxy's httpx client, with a random CLIENT_HEADER
 async def serve_stdio(swarm) -> None
 async def serve_stdio_proxy(url: str, instructions: str | None = None) -> None
     # stdio server forwarding to a running hub's /mcp (a swarm's or the launcher's); the client gets the
@@ -984,7 +1475,17 @@ class MCPHttpEndpoint:   # ASGI app for /mcp backed by StreamableHTTPSessionMana
 ```
 In mcp 2.x the request context is passed to handlers (`ctx.session` is per request), so identity
 is explicit via `as_agent`. Stdio servers read stdin with `_StdinLines` (a daemon reader thread), so a stop
-signal ends them even while the client keeps stdin open.
+signal ends them even while the client keeps stdin open. The launcher MCP (§18.2) names its clients the same way:
+each launcher server has its own `local:<uuid>` key, and it forwards every call inside
+`serving_client(client_key(ctx, local))`, so `hub_call` in the session gets the client (also in the task that
+`_call_in_session` starts).
+
+`INSTRUCTIONS` (also in the launcher's, through `HUB_INSTRUCTIONS`) tell the user's side that `wait_for_events` with
+`progress=true` also returns when the board moves on and that `jobs` and `job_stop` list and stop every member's
+background jobs; and the members' side that members who join do not count toward max_agents, that a `shell` command
+still running at its timeout (at most 600 seconds over MCP) continues as a background job, that `background=true`
+starts one at once, that processes a command leaves running become a job too, and that a job's end arrives through
+`wait_for_events` (no polling).
 
 ## 14. Web (web.py) — REST for the UI and the console
 
@@ -1014,7 +1515,7 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/api/events?since=&limit=&types=` | events |
 | GET `/api/agents/{name}/activity?limit=` | `agent.activity` events of that agent |
 | GET `/api/files?path=` | dir → {"type":"dir","entries":[...]}; file → {"type":"file","content","truncated"} |
-| POST `/api/act/{tool}` | run tool as USER: body = args → {"ok": bool, "result": str} |
+| POST `/api/act/{tool}` | run tool as USER: body = args → {"ok": bool, "result": str}; the user's `jobs` and `job_stop` (§7.1) go through it too: background jobs have no endpoint of their own |
 | `/api/traces...`, `/api/spans/...`, `/api/agents/{name}/traces.jsonl` | traces (§16.3) |
 | WS `/ws` | pushes every bus event as JSON (also the live-only `trace.*` events) |
 | `/mcp` | hub MCP over streamable HTTP |
@@ -1022,6 +1523,7 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 ### 14.1 snapshot
 ```json
 {"swarm": {"name","language","paused","pause_reason","limits":{"max_cost_usd","max_agents"},
+           "agent_count": n,               // what limits.max_agents counts (Swarm.agent_count: external members do not)
            "spent_usd","goal": {...}|null, "counts": {status: n}, "mcp_url", "models": [profile names],
            "session": {"id","title","status": "running"|"stopped",
                        "pending_goal": {"title","description"}|null}|null,   // null outside a SessionManager;
@@ -1032,8 +1534,15 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
                                        // members work in (same shape as a session summary's "workspace", §17.2)
  "tasks": [Task.to_dict() + {"blocked_by","comments"}],
  "agents": [{"name","kind","role","status","model","language","cost_usd","tokens_in","tokens_out","hired_by",
-             "created_at","last_active","instructions","context_tokens","open_tasks":[ids],"unread"}],
- "triggers": [...], "mcp": [...], "locks": [...],
+             "created_at","last_active","instructions","context_tokens","open_tasks":[ids],"unread",
+             "jobs": n}],                  // its running background jobs
+ "triggers": [...],
+ "jobs": [job...],                         // JobManager.snapshot(): the running jobs (from memory), then those that
+                                           // ended in the last hour (one query, at most 50); the public job dict of
+                                           // §7.1 ({"id","label","owner","command","origin","status","reason",
+                                           // "stopped_by","exit_code","started_at","background_at","ended_at","log",
+                                           // "processes"}); no "busy" (it needs the board)
+ "mcp": [...], "locks": [...],
  "user": {"unread": n}}
 ```
 
@@ -1058,9 +1567,9 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
 | kind | name | input | output | notes |
 |---|---|---|---|---|
 | input | `wake` / `incoming` / `nudge` / `continue` | – | text added to the context | `record()` |
-| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra"}` | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
+| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1; absent in spans recorded before tool sets were frozen) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
 | tool | tool name | arguments (dict) | full result text (before truncation for the model) | meta `{call_id, chars, shown_chars?}`; status `error` if is_error; task ids in `task_id` / `parent_id` / `depends_on` are added to the trace's `tasks` |
-| compaction | `compaction` | `{"messages","prompt_tokens"}` | summary text | parent of its llm span; meta `{epoch_archived, fallback?}`; status `error` when the summary call failed |
+| compaction | `compaction` | `{"messages","prompt_tokens"}` | summary text | parent of its llm span; meta `{epoch_archived, fallback?, tools_revision}` (the tool set from then on, §6.1); status `error` when the summary call failed |
 | event | `reply_to_user` / `refusal` / `budget_pause` / `step_limit` / `stopped` / `crash` | – | text | `refusal` and `crash` have status `error` |
 
 - Span statuses: `running`, `ok`, `error`, `interrupted` (cut off: a stop, or a finished/recovered trace).
@@ -1084,7 +1593,9 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
   tracing off only the marker is written (plus the messages when the agent's newest LLM trace may still need
   them). `Tracer.span_context(span_id)` then rebuilds `{span_id, agent, epoch, model, system, tools, messages,
   complete, note}` for any LLM span, reading the live epoch from the table (a second reader such as the CLI
-  gets it right too).
+  gets it right too); its `tools` (unless given) are the tools that call sent: `frozen.for_span(db, agent, language,
+  input.tools_rev)` = the agent's record when its revision matches, else that revision's shipped snapshot, and the
+  baseline revision for a span without `tools_rev`. `export()` passes `tools=[]`.
 - External members: `tracer.external_call(agent, tool, args_without_as_agent, result_text, is_error, started_at)`
   for every hub tool call by an external member except `wait_for_events`. A session trace closes (`done`) at
   its last call after `EXTERNAL_IDLE_SECONDS` (15 min) without calls (scheduler: `close_external(idle_seconds)`),
@@ -1107,9 +1618,9 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
     keeping the newest epoch marker of every agent.
 - `Trace` (the writer of one trace; every method is a no-op when tracing is off, and `llm_start` then runs no
   SQL at all): `start`, `end`, `record`, `note_tasks`, `llm_start(messages, *, purpose, extra, attempt,
-  parent)`, `llm_end(span, response, cost)`, `llm_error(span, error, *, kind, retry_in=None, model=None,
-  status="error")`, `tool_start(call_id, name, arguments)`, `tool_end(span, result, is_error, shown_chars=None)`,
-  `finish(status, outcome)`.
+  parent, tools_rev=None)`, `llm_end(span, response, cost)`, `llm_error(span, error, *, kind, retry_in=None,
+  model=None, status="error")`, `tool_start(call_id, name, arguments)`, `tool_end(span, result, is_error,
+  shown_chars=None)`, `finish(status, outcome)`.
 - Text renderers (CLI, console, the tool; UTF-8-safe): `trace_line(t)`, `render_trace(trace, detail_chars=300)`,
   `render_span(span, limit=20000)`, `render_context(ctx, offset=0, limit=30, chars=4000)`.
 
@@ -1117,10 +1628,10 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
 - `Swarm.__init__`: `self.tracer = Tracer(self.db, self.bus, enabled=cfg.tracing.enabled,
   max_payload_chars=cfg.tracing.max_payload_chars)`; `session_id` and `session_title` are None until a
   SessionManager sets them.
-- `Swarm.start`: first `self.tracer.recover()`, then `self.tracer.prune(retention_days)` if it is > 0. The
-  scheduler prunes again every 6 h.
+- `Swarm.start`: first `self.tracer.recover()` (then `self.jobs.recover()`, §7.1), then
+  `self.tracer.prune(retention_days)` if it is > 0. The scheduler prunes again every 6 h.
 - `Swarm.stop`: wakes the long polls, `self.tracer.close_external()`, then stops the runtimes (each closes its
-  LLM client with `aclose()`).
+  LLM client with `aclose()`), then the jobs (§3).
 - `Swarm.reconfigure(config: Config)`: hot-apply new settings to a loaded swarm.
   - Keep `project_dir` (data_dir and workspace stay), `self.language` and the agents' frozen system prompts.
   - Replace `self.config`; update the tracer `enabled` / `max_payload_chars`.
@@ -1198,6 +1709,19 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
   true` with a comment, after the `starting_roles` comment (which names the starting team rule, §17.3), and a
   commented `[[roles]]` example before the model profiles.
+- `[shell]` (`ShellSettings`, read at each use, so `reconfigure` and session overrides apply at once; §7, §7.1):
+  `program = "auto"` (auto | bash | sh | powershell | pwsh | cmd), `timeout = 120` (seconds a call waits; a command
+  still running then continues in the background), `max_timeout = 1800` (the largest `timeout`, and the lifetime of a
+  command that went on at its timeout; the wait itself is capped by `foreground_max`, over MCP by 600 s),
+  `background_on_timeout = true` (false: such a command is killed, as before), `foreground_max = 180` (an AI agent's
+  call waits at most this, whatever its `timeout`, while its command could become a job), `max_jobs_per_member = 4`
+  and `max_jobs = 16` (running background jobs per member and per session; 0 = no background jobs),
+  `job_max_minutes = 480` (lifetime of jobs started in the background or left running by their command; 0 = no
+  limit), `job_log_mb = 2` (output kept per job in two files; at most 64 is used), `cpu_threads = "auto"` (the
+  thread pools of numeric libraries per command: "auto" shares the cores among the AI agents, N, 0 = no cap; "auto"
+  in any case or a whole number, also written as a string; anything else is a ValueError `[shell] cpu_threads must
+  be "auto" or a whole number ...`), `pass_env = []`. `timeout`, `max_timeout`, `foreground_max` and `job_log_mb`
+  are at least 1. The template lists every key with a Russian comment.
 - `[[roles]]` → `Config.roles: list[RoleSettings]` (`RoleSettings(name, description="", instructions="",
   model=None, hidden=False)`), checked by `config.parse_roles(raw, profiles)` after the model profiles (§17.3).
 - `config.Config.from_dict` checks every field against its type (bool / int / float / str / list[str] /
@@ -1253,7 +1777,7 @@ settings; ValueError when they are invalid):
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
   workspace=None)`, `async load(sid)`, `async start(sid)`, `async stop(sid, *, remember=False)`,
   `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None)`, `async delete(sid)`, `async resume()`,
-  `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
+  `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
   `async set_workspace(sid, path, *, expect=None)`; module functions `read_stats(db_path, conn=None)`,
   `slugify(title)` and `external_workspaces(home)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
@@ -1280,8 +1804,12 @@ settings; ValueError when they are invalid):
   once the members exist (a failure keeps it). Module function `pending_goal(meta)` → {title, description} | None
   splits again on read (a `session.json` written before the split may hold a multi-line title); the summary and
   the snapshot's `session.pending_goal` use it. `start` marks `autostart`; an explicit `stop` clears it
-  (`remember=True`, used at shutdown, keeps it), and `resume()` starts the marked sessions. `stop` unloads the
-  swarm (stop + close its database).
+  (`remember=True`, used at shutdown, keeps it), and `resume()` starts the marked sessions except finished ones
+  (`finished(sid)`: the goal is done and no task is open, read from the summary without loading it; False when it
+  cannot be read), which stay stopped until started by hand. `stop` unloads the swarm (stop + close its database).
+  Every unload (`stop`, `delete`, a workspace move, `shutdown`) goes through `Swarm.stop`, which ends the session's
+  background jobs and closes their logs and handles before it returns (§7.1), so the folder can be moved or deleted
+  on Windows too.
 - `load(sid)` constructs the swarm without starting it (a stopped session is viewable) and closes the traces a
   crashed process left running (`tracer.recover()`). Load, start, stop, delete and set_workspace run under a
   per-session lock and re-check that the session still exists (404). `shutdown()` also waits for sessions in the
@@ -1306,12 +1834,13 @@ settings; ValueError when they are invalid):
    "model_profile","model","max_cost_usd","max_agents","overrides","config_error","url":"/s/{sid}/",
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
-   "spent_usd","paused","pause_reason","last_activity",
+   "spent_usd","paused","pause_reason","last_activity","jobs":{"running"},
    "workspace":{"path","default","adopted","exists"}}
   ```
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
-  `exists` = it is a folder now.
+  `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
+  rows, in a `try` of its own: a database older than background jobs gives 0).
 
 #### Workspace folder
 A session works in `<session dir>/workspace` (`default_workspace(sid)`) unless its `session.json` has
@@ -1534,12 +2063,15 @@ of a home or a project, never a session override (§17.2).
   absolute or `"default"`; the result in words by `workspace_text(result)`, worded as the TUI and the console
   word it: "Moved the session's files to X" only when they moved, "The session now works in X" after a folder of
   the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
-  shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`).
+  shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), and for a
+  running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs").
 - Every hub tool (§13) with an extra optional `session` property. Without it the call goes to
   `manager.default_session()`; when there is none, the error lists the sessions. An unknown or stopped session
   is an error result (`session_start` is suggested).
 - Calls run `hub_mcp.hub_call` on the session's swarm (same actor rules: `as_agent`). A call still running when
-  its session stops or is deleted ends with `Error: session X was stopped while <tool> was running.`
+  its session stops or is deleted ends with `Error: session X was stopped while <tool> was running.` Each call is
+  dispatched inside `hub_mcp.serving_client(client_key(ctx, local))` (`local` = `local:<uuid>` per launcher server),
+  so the session's `hub_call` knows the MCP client (§13: its own messages never come back to it as news).
 - `dispatch_launcher_call(manager, name, args)` answers a tool name nobody knows (close matches + the list);
   `call_launcher_tool` turns SessionError / ToolError / unexpected failures into error results.
 - `INSTRUCTIONS` explain sessions, then the hub instructions.
@@ -1632,10 +2164,15 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   that never started prints "No traces." without creating its database).
 - `status` of a home lists the sessions (from the hub, or read from the home); of a project, `swarm_status`.
 - `sandbox` refuses when a hub runs for the directory; the container runs `serve /swarm` for a home and
-  `run /swarm` for a project. Only the directory is mounted: for a home, `docker.outside_home_warning(home)`
-  prints a warning listing the sessions whose workspace folder is outside it (`external_workspaces`): they
-  cannot start in the container (their start reports the missing folder). A folder inside the home is found in
-  the container (session.json `in_home`, §17.2).
+  `run /swarm` for a project. `docker.sandbox_command` starts it with `docker run --rm --init ...`: a tiny init
+  (tini) is PID 1, reaps the orphans of agents' commands (dreamteam never does, and a zombie would keep a job's
+  process group alive) and forwards `docker stop`'s SIGTERM to dreamteam, whose `Swarm.stop` ends the jobs within
+  Docker's 10 s grace (a launcher home unloads its sessions one after another, so with jobs in several sessions the
+  last final commits may be cut off; the processes die with the container anyway). Ports that agents' dev servers
+  open inside the container are not published. Only the directory is mounted: for a home,
+  `docker.outside_home_warning(home)` prints a warning listing the sessions whose workspace folder is outside it
+  (`external_workspaces`): they cannot start in the container (their start reports the missing folder). A folder
+  inside the home is found in the container (session.json `in_home`, §17.2).
 - `run [DIR]` stays the single-swarm server of a project (§15); it does not serve the launcher.
 
 ### 18.4 UI
@@ -1686,6 +2223,14 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
       in the results is masked. Default profile (★, cannot be deleted), add from a preset, delete.
     - The external MCP servers are a JSON field; their `env` values come masked (`••••…abcd`) and are kept
       when sent back unchanged.
+    - «Консоль» (`[shell]`, §17.1): the shell; the default wait for a command (`timeout`); «Наибольший тайм-аут
+      команды» (`max_timeout`, with a hint: a command that went to the background at its timeout lives this long
+      from its start, and an AI agent's wait itself is capped by the next field, 600 s over MCP); «ИИ-агент ждёт
+      команду не дольше» (`foreground_max`); the switch «Долгие команды — в фон» (`background_on_timeout`);
+      background jobs per member and per session (`max_jobs_per_member`, `max_jobs`); their time limit in minutes
+      (`job_max_minutes`, 0 = none); their output in MB (`job_log_mb`); compute threads per command (`cpu_threads`:
+      empty or "auto" in any case saves "auto", digits save the number, anything else is sent as typed for the
+      server to refuse); the environment variables passed to the console (`pass_env`).
     - A save bar with «Сохранить» (PUT) and «Отменить изменения»; client-side checks (profile names,
       duplicates, a model is required, JSON fields) and server errors are shown there. Leaving the tab or the
       page with unsaved edits asks first.
@@ -1709,6 +2254,18 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     model select starts with «— профиль роли или сессии» (`model` is sent only when chosen); instructions are
     optional for a catalog role (sent as "").
   - Goal modal: the goal is a textarea with the split hint (first line = title), sent unchanged (the hub splits).
+  - Background jobs (§7.1; «фоновый процесс» in Russian, shown as j3): the tab «Процессы» (badge: the running
+    ones) has a card per job of the snapshot's `jobs` (running, then ended in the last hour): label, owner chip,
+    state («работает 25 мин»; at the end by status and reason: «завершён: код 0», «завершён» for a job with no
+    code of its own, «остановлен вами», «остановлен по пределу времени»…), origin, process names while it runs,
+    how long it ran and when it ended, and its log (a workspace log is a link that opens it in «Файлы»).
+    «Вывод» shows its last 200 lines (`POST api/act/jobs {job_id, tail: 200}`), refreshed every 3 s while the
+    tab is open and the job runs; «Остановить» asks first («Остановить процесс j3 и всё, что он запустил?»),
+    then `POST api/act/job_stop {job_id}`. Keyboard focus stays on a card's button when the cards are rebuilt.
+    In the team panel a member with running jobs has the marker ⚙N (tooltip «фоновых процессов: N»), and its
+    drawer lists them, each with «Остановить». The feed shows `job.started` / `job.ended` (FEED_TYPES `job.*`).
+    The header's agents counter is `swarm.agent_count` (members who joined through MCP do not count) against
+    max_agents.
   - Tab «Файлы»: above the tree, the session folder (`swarm.workspace`): its absolute path (click to copy) and
     the badge «своя папка» / «папка проекта» / «перенесена» / «папки нет»; the tab button's tooltip is the
     path. A missing folder is not listed (no `/api/files` call). When the path (or its existence) changes

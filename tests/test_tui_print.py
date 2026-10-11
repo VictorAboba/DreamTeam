@@ -6,7 +6,9 @@ import asyncio
 import io
 import json
 import socket
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import pytest
@@ -401,3 +403,59 @@ async def test_hub_gone_is_an_error(launch, monkeypatch):
     code, out, err = await run(conn, "Hub goes away", timeout=20)
     await stopper
     assert code == 1 and err.strip()
+
+
+def py_command(script: str, *args: str) -> str:
+    """`$PYEXE script args` in the syntax of the test shell (cmd on Windows, sh elsewhere)."""
+    if sys.platform == "win32":
+        return '"%PYEXE%" ' + " ".join(f'"{a}"' for a in (script, *args))
+    return '"$PYEXE" ' + " ".join(f"'{a}'" for a in (script, *args))
+
+
+async def test_the_result_lists_the_jobs_still_running(tmp_path, monkeypatch):
+    """The goal is done while an agent's dev server runs as a background job: the JSON result lists it; the text
+    result says so on stderr when the hub is not this process's (an owned launcher stops them right after)."""
+    from test_procs import Children
+
+    monkeypatch.setenv("PYEXE", sys.executable)
+    (tmp_path / "kids").mkdir()
+    kids = Children(tmp_path / "kids")
+    commands: list[str] = []
+
+    def server(system, messages, tools):
+        seen = texts(messages)
+        last = seen[-1] if seen else ""
+        if "marked as achieved" in last or "already marked" in last:
+            return call("wait")
+        if any("STARTED in the background as job" in t for t in seen):
+            return call("goal_complete", summary="The server runs.")
+        if any(MARK in t for t in seen):
+            commands.append(py_command(str(tmp_path / "kids" / "child.py"), "60", kids.pidfile()))
+            return call("shell", command=commands[-1], background=True)
+        return call("wait")
+
+    home = make_home(tmp_path)
+    raw = st.read_raw(home)
+    st.write_raw(home, {**raw, "shell": {"program": "cmd" if sys.platform == "win32" else "sh"}})
+    conn = await connect(home, web=False, llm_factory=lambda profile, agent: ScriptedLLM(server, profile))
+    try:
+        code, out, err = await run(conn, f"Serve the {MARK}")         # owned: no line about the jobs
+        assert code == 0, err
+        assert out.strip() == "The server runs." and "Background jobs" not in err
+        external = SimpleNamespace(client=conn.client, owned=False)  # a hub of another process
+        code, out, err = await run(external, f"Serve another {MARK}", output_format="json")
+        assert code == 0, err
+        result = json.loads(out)
+        (job,) = result["jobs"]
+        assert job == {"id": 1, "label": "j1", "owner": result["agents"][0], "command": commands[-1][:200],
+                       "origin": "background"}                         # (the state clips a command to 200)
+        code, out, err = await run(external, f"Serve a third {MARK}", lang="ru")
+        assert code == 0, err
+        line = err.strip().splitlines()[-1]
+        assert line.startswith("Ещё работают фоновые процессы агентов: j1 (") and "PYEXE" in line
+        assert line.endswith("Они остановятся вместе с сессией (остановить раньше можно командой /jobs stop jN в "
+                             "dreamteam tui).")
+        assert len(kids.pids()) == 3
+    finally:
+        await conn.close()
+    assert kids.check() == [], "child processes were left running"

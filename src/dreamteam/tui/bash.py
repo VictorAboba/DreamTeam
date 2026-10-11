@@ -1,9 +1,9 @@
 """`!command` of the terminal UI (docs/TUI.md §4.2): one shell command in the session workspace that the user
 can interrupt.
 
-shell.run_shell blocks a thread of the loop's default executor until the command ends: neither Esc nor quitting
-could stop it, and asyncio.run waits for that thread at exit. Here a daemon thread reads the output, and the
-whole process tree is killed on interrupt(), on the timeout and when the task running it is cancelled."""
+A thread of the loop's default executor would block until the command ends: neither Esc nor quitting could stop
+it, and asyncio.run waits for that thread at exit. Here a daemon thread reads the output, and the whole process
+tree is killed on interrupt(), on the timeout and when the task running it is cancelled."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from ..shell import decode, kill_tree, resolve_shell, truncate_middle
+from ..shell import decode, kill_tree, resolve_shell, shell_args, truncate_middle
 
 MAX_OUTPUT = 12000       # characters kept (the middle of a longer output is cut), as for the agents' console
 KILL_WAIT = 5.0          # after a kill, how long the rest of the output may take to arrive
@@ -58,8 +58,8 @@ class ShellCommand:
             kwargs["start_new_session"] = True  # its own process group: killpg ends the whole tree
         loop = asyncio.get_running_loop()
         done: asyncio.Future = loop.create_future()
-        proc = subprocess.Popen(prefix + [command], cwd=str(self.cwd), env=self.env, stdin=subprocess.DEVNULL,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
+        proc = subprocess.Popen(shell_args(name, prefix, command), cwd=str(self.cwd), env=self.env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **kwargs)
         self._proc = proc
 
         def read() -> None:

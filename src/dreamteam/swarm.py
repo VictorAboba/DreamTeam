@@ -20,6 +20,7 @@ from .config import Config, ModelProfile
 from .db import Database, dumps, loads, utf8_safe
 from .events import EventBus
 from .goal_text import split_goal
+from .jobs import JobManager, fmt_duration, short_command
 from .llm import create_llm
 from .llm.base import LLMClient, Usage, cost_of
 from .mailbox import Mailbox
@@ -114,6 +115,8 @@ class Swarm:
         self._considering: dict[str, tuple[float, frozenset[int], frozenset[int]]] = {}
         self._all_done_key: tuple | None = None
         self._stall_woken: dict[str, frozenset[int]] = {}  # agent -> stalled task ids it was woken about
+        # agent idle (not busy, nothing pending) holding in-progress tasks -> (their ids, idle with them since)
+        self._idle_holding: dict[str, tuple[frozenset[int], float]] = {}
         # reviewer -> (ids of the reviews it was reminded about, or that waited while it was in error; since when)
         self._review_reminded: dict[str, tuple[frozenset[int], float]] = {}
         self._review_lapsed: dict[int, set[str]] = {}  # task in review -> reviewers it was taken from (hand-over)
@@ -127,11 +130,13 @@ class Swarm:
         self.workspace = Workspace(self)
         self.triggers = TriggerEngine(self)
         self.forge = MCPForge(self)
+        self.jobs = JobManager(self)  # the background jobs of the members' shell commands
 
     # ---- lifecycle ----------------------------------------------------------------------------
     async def start(self, run_agents: bool = True) -> None:
         self.stopping = False
         self.tracer.recover()  # traces left open by a previous process
+        self.jobs.recover()  # jobs a previous process left running died with it: lost (quiet notices)
         self._prune_traces()
         await self.workspace.init()
         await self.forge.start()
@@ -182,13 +187,30 @@ class Swarm:
             except (asyncio.CancelledError, Exception):
                 pass
         self._background.clear()
-        self.tracer.close_external()
-        for runtime in list(self.runtimes.values()):
-            await runtime.stop()  # also closes its LLM client
-        self.runtimes.clear()
-        await self.forge.stop()
-        await self.workspace.settle()  # a commit a stopped agent started finishes before the files may move
-        self._started = False
+        try:
+            self.tracer.close_external()
+        except Exception:  # noqa: BLE001 - tracing must never keep the session from stopping
+            log.exception("could not close the traces of external members")
+        try:
+            failure: Exception | None = None
+            for runtime in list(self.runtimes.values()):
+                try:
+                    await runtime.stop()  # also closes its LLM client
+                except Exception as exc:  # noqa: BLE001 - the other agents stop all the same; raised below
+                    failure = failure or exc
+            self.runtimes.clear()
+            if failure is not None:
+                raise failure
+        finally:
+            # even when a step above failed: every job and every foreground command (an external member's call) is
+            # killed, and every finish and call in flight has returned: nothing of them touches git or the database
+            # after this (logs, handles closed), and no process outlives its session
+            try:
+                await self.jobs.stop_all()
+            finally:
+                await self.forge.stop()
+                await self.workspace.settle()  # a commit a stopped agent started finishes before the files may move
+                self._started = False
 
     def reconfigure(self, config: Config) -> None:
         """Hot-apply new settings (docs/SPEC.md §16.1). The project directory, the workspace folder, the swarm
@@ -262,6 +284,12 @@ class Swarm:
     def is_member(self, name: str) -> bool:
         m = self.member(name)
         return bool(m) and m["status"] != AgentStatus.RETIRED
+
+    def agent_count(self) -> int:
+        """The members counted against max_agents: the active AI (LLM) agents. External members (MCP clients that
+        joined with join_swarm) do not count: a client joining must not use up a place of the team."""
+        return int(self.db.scalar("SELECT COUNT(*) FROM agents WHERE kind = ? AND status != ?",
+                                  (AgentKind.LLM, AgentStatus.RETIRED)) or 0)
 
     def kind_of(self, name: str) -> str | None:
         if name == USER:
@@ -382,6 +410,12 @@ class Swarm:
             if reviews:
                 lines.append(prompts.t(lang, "my_reviews", tasks="; ".join(
                     f"#{t.id} {t.title} ({t.assignee or '-'})" for t in reviews)))
+            jobs = self.jobs.running_of(name)
+            if jobs:
+                now = time.time()
+                lines.append(prompts.t(lang, "my_jobs", jobs="; ".join(
+                    prompts.t(lang, "my_job", id=j.id, command=short_command(j.command, 60),
+                              duration=fmt_duration(now - j.started_at, lang)) for j in jobs)))
             ready = self.board.ready_unassigned()[:8]
             if ready:
                 lines.append(prompts.t(lang, "ready", tasks="; ".join(f"#{t.id} {t.title}" for t in ready)))
@@ -459,6 +493,12 @@ class Swarm:
         self.db.set("goal", goal)
         self.bus.emit("goal.completed", actor, goal=goal)
         self.notify(USER, "u_goal_done", by=actor, summary=summary.strip())
+        running = self.jobs.running_of()
+        if running:  # they go on (a dev server may be for the user); their later ends wake nobody
+            now = time.time()
+            listed = (f"{j.label} ({j.owner}: {short_command(j.command, 60)}, "
+                      f"{fmt_duration(now - j.started_at, self.language)})" for j in running)
+            self.notify(USER, "u_jobs_running", wake=False, jobs="; ".join(listed))
         return goal
 
     def reopen_goal(self, actor: str, comment: str = "") -> dict:
@@ -536,7 +576,7 @@ class Swarm:
                 role_description=entry.description if entry else "",
                 instructions="\n\n".join(t for t in (extra, instructions.strip()) if t),
                 shell=resolve_shell(self.config.shell.program)[0], max_agents=self.limits()["max_agents"],
-                scratch=scratch_rel(name),
+                scratch=scratch_rel(name), foreground_max=self.config.shell.foreground_max,
             )
         now = time.time()
         self.db.execute(
@@ -554,9 +594,10 @@ class Swarm:
         if by != USER and not self.is_member(by):
             raise ToolError("Only swarm members or the user can hire.")
         limits = self.limits()
-        if len(self.members()) >= limits["max_agents"]:
-            raise ToolError(f"The swarm already has the maximum of {limits['max_agents']} members. "
-                            "Retire someone or ask the user to raise max_agents.")
+        # max_agents limits the AI agents: external members (MCP clients that joined) neither count nor are limited
+        if kind == AgentKind.LLM and self.agent_count() >= limits["max_agents"]:
+            raise ToolError(f"The swarm already has the maximum of {limits['max_agents']} AI agents (members who "
+                            "joined through MCP do not count). Retire someone or ask the user to raise max_agents.")
         if kind == AgentKind.LLM and self.budget_exceeded():
             raise ToolError("The budget is exhausted; hiring is not possible.")
         name = self._create_member(by, role, instructions, model, name, language, kind)
@@ -574,11 +615,14 @@ class Swarm:
         member = self.member(name)
         if by not in (USER, name) and member.get("hired_by") != by:
             raise ToolError(f"Only the user, {name} or whoever hired them ({member.get('hired_by')}) can retire {name}.")
+        # before the first await: no command of the member may become a job while it leaves (D24)
+        jobs = [j.id for j in self.jobs.running_of(name)]
+        self.jobs.forbid(name)
         released = self.board.release_all(name, by)
         self.workspace.release_all(name)
         self.db.execute("UPDATE triggers SET active = 0 WHERE owner = ?", (name,))
         self.db.execute("UPDATE agents SET status = ? WHERE name = ?", (AgentStatus.RETIRED, name))
-        self.bus.emit("agent.retired", by, name=name, reason=reason, released=released)
+        self.bus.emit("agent.retired", by, name=name, reason=reason, released=released, jobs=jobs)
         hirer = member.get("hired_by")
         if hirer and hirer not in (USER, by, name) and self.is_member(hirer):
             self.notify(hirer, "n_member_retired", name=name, reason=reason or "-",
@@ -588,7 +632,10 @@ class Swarm:
             if runtime._task is asyncio.current_task():
                 runtime.request_stop()
             else:
-                await runtime.stop()
+                await runtime.stop()  # an LLM agent's foreground command dies with its cancellation
+        # its jobs and its foreground commands (an external member's call in flight): stopped, committed under its
+        # name, no notice
+        await self.jobs.stop_owner(name, "retired")
         return released
 
     # ---- budget & control ---------------------------------------------------------------------
@@ -695,6 +742,7 @@ class Swarm:
                 if not self.paused:
                     self._nudge_idle()
                     self._wake_stalled()
+                    self._wake_idle_holders()
                     self._remind_reviewers()
                     self._check_all_done()
                     self._remind_user_reviews()
@@ -704,9 +752,11 @@ class Swarm:
                 log.exception("scheduler tick failed")
 
     def _idle_llm_members(self) -> list[dict]:
+        """LLM agents that sleep with nothing pending and are not busy: a member whose command went on as a job it
+        waits for (JobManager.busy) is at work, so it gets no nudge, reminder or hand-over meanwhile."""
         return [m for m in self.members()
                 if m["kind"] == AgentKind.LLM and m["status"] == AgentStatus.IDLE
-                and m["name"] in self.runtimes and not self.has_pending(m["name"])]
+                and m["name"] in self.runtimes and not self.has_pending(m["name"]) and not self.jobs.busy(m["name"])]
 
     def _nudge_idle(self) -> None:
         ready = self.board.ready_unassigned()
@@ -746,7 +796,8 @@ class Swarm:
 
     def _wake_stalled(self) -> None:
         """An agent that stopped with plain text holding in-progress tasks even after the in-activation nudge
-        is idle with nothing pending, so no event would ever wake it: wake it once per such set of tasks."""
+        is idle with nothing pending, so no event would ever wake it: wake it once per such set of tasks (not while
+        the end of one of its jobs will wake it)."""
         now = time.time()
         for m in self._idle_llm_members():
             name = m["name"]
@@ -754,12 +805,41 @@ class Swarm:
             stalled = getattr(runtime, "stalled", frozenset())
             if not stalled or now - runtime.stalled_at < self.config.agents.idle_nudge_seconds:
                 continue
+            if self.jobs.awaited(name):
+                continue  # the end of its job will wake it: it waits for that job, it has not stalled
             runtime.stalled = frozenset()
             still = [t for t in self.board.open_tasks_of(name) if t.status == Status.IN_PROGRESS and t.id in stalled]
             if not still or self._stall_woken.get(name) == stalled:
                 continue
             self._stall_woken[name] = stalled
             self.notify(name, "n_stalled", tasks=", ".join(f"#{t.id}" for t in still))
+
+    def _wake_idle_holders(self) -> None:
+        """An agent that sleeps (idle, not busy, nothing pending) while it holds in-progress tasks, e.g. after
+        `wait` with nothing that will wake it, would sleep until some unrelated event: after
+        agents.idle_nudge_seconds it is woken once per such set of tasks (n_stalled, shared with _wake_stalled, so
+        a set is never woken about twice). The clock starts when it was last seen going idle with that set. A
+        member whose running job's end will wake it (JobManager.awaited, what `wait` promised it) is waiting for
+        that job: no clock runs for it meanwhile."""
+        now, wait = time.time(), self.config.agents.idle_nudge_seconds
+        holding: dict[str, tuple[frozenset[int], float]] = {}
+        for m in self._idle_llm_members():
+            name = m["name"]
+            held = frozenset(t.id for t in self.board.open_tasks_of(name) if t.status == Status.IN_PROGRESS)
+            if not held or self.jobs.awaited(name):
+                continue
+            key, since = self._idle_holding.get(name, (None, now))
+            if key != held:
+                since = now
+            # an activation between two ticks (woken and idle again) restarts the clock: last_active is when it
+            # last went idle
+            since = max(since, float(m.get("last_active") or 0))
+            holding[name] = (held, since)
+            if now - since < wait or self._stall_woken.get(name) == held:
+                continue
+            self._stall_woken[name] = held
+            self.notify(name, "n_stalled", tasks=", ".join(f"#{i}" for i in sorted(held)))
+        self._idle_holding = holding
 
     def _remind_reviewers(self) -> None:
         """Liveness of reviews: an idle LLM reviewer whose reviews wait longer than agents.idle_nudge_seconds is
@@ -789,6 +869,10 @@ class Swarm:
             if not key:
                 self._review_reminded.pop(name, None)
                 continue
+            if seen is not None and seen[0] == key and self.jobs.busy(name):
+                # e.g. its test run went on as a job: the hand-over clock restarts when it stops being busy
+                self._review_reminded[name] = (key, now)
+                continue
             if seen is None or seen[0] != key:
                 if m["status"] == AgentStatus.ERROR:
                     self._review_reminded[name] = (key, now)  # it cannot act: start the clock only
@@ -816,7 +900,9 @@ class Swarm:
         llm = [m for m in self.members() if m["kind"] == AgentKind.LLM]
         actionable = [t for t in self.board.list(status=Status.TODO)  # claimable or assigned, not blocked
                       if not t.blocked_by and t.assignee != USER]
-        if (any(m["status"] == AgentStatus.WORKING or self.has_pending(m["name"]) for m in llm)
+        # a member busy with a job (its command went on in the background) is at work like a WORKING one
+        if (any(m["status"] == AgentStatus.WORKING or self.has_pending(m["name"]) or self.jobs.busy(m["name"])
+                for m in llm)
                 or actionable or self.board.list(status=Status.IN_PROGRESS)
                 or any(t.reviewer != USER for t in reviews)):
             return
@@ -834,7 +920,11 @@ class Swarm:
         if total == 0 or any(counts.get(s, 0) for s in Status.OPEN):
             self._all_done_key = None
             return
-        if any(m["status"] == AgentStatus.WORKING for m in self.members()):
+        members = self.members()
+        if any(m["status"] == AgentStatus.WORKING for m in members):
+            return
+        # a command that went on as a job may still change the result (with no open task only timeout jobs count)
+        if any(m["kind"] == AgentKind.LLM and self.jobs.busy(m["name"]) for m in members):
             return
         key = (total, self.db.scalar("SELECT MAX(updated_at) FROM tasks"))
         if key == self._all_done_key:
@@ -864,6 +954,11 @@ class Swarm:
                 open_tasks.setdefault(t.assignee, []).append(t.id)
         unread = {r["recipient"]: r["n"] for r in self.db.all(
             "SELECT recipient, COUNT(*) AS n FROM inbox WHERE read_at IS NULL GROUP BY recipient")}
+        jobs = self.jobs.snapshot()  # the running ones (from memory), then those ended in the last hour (one query)
+        running_jobs: dict[str, int] = {}
+        for job in jobs:
+            if job["status"] == "running":
+                running_jobs[job["owner"]] = running_jobs.get(job["owner"], 0) + 1
         members = []
         for m in self.members(include_retired=True):
             members.append({
@@ -874,6 +969,7 @@ class Swarm:
                 "instructions": m.get("instructions") or "", "context_tokens": m.get("context_tokens") or 0,
                 "open_tasks": open_tasks.get(m["name"], []),
                 "unread": unread.get(m["name"], 0),
+                "jobs": running_jobs.get(m["name"], 0),  # its running background jobs
             })
         pause = self.db.get("paused") or {}
         goal = self.goal()
@@ -881,6 +977,7 @@ class Swarm:
             "swarm": {
                 "name": self.config.swarm.name, "language": self.language, "paused": bool(pause.get("paused")),
                 "pause_reason": pause.get("reason", ""), "limits": self.limits(),
+                "agent_count": self.agent_count(),  # what limits.max_agents counts: external members do not
                 "spent_usd": round(self.spent_usd(), 4), "goal": goal, "counts": counts,
                 "mcp_url": self.hub_url, "models": list(self.config.models),
                 "session": None if self.session_id is None else {
@@ -894,6 +991,7 @@ class Swarm:
             "tasks": [t.to_dict() for t in tasks],
             "agents": members,
             "triggers": self.triggers.list(include_inactive=False),
+            "jobs": jobs,
             "mcp": self.forge.list(USER),
             "locks": self.workspace.locks(),
             "user": {"unread": unread.get(USER, 0)},

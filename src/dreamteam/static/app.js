@@ -67,6 +67,16 @@ const I18N = {
     ws_moved_hint: "Сессия перенесена в эту папку (/cd). При удалении сессии папка остаётся.",
     ws_missing: "Папка сессии не найдена: {path}. Сессия не запустится, пока её не перенесут в другую папку: /cd ПАПКА или /cd --default в dreamteam tui.",
     "reason_budget": "исчерпан бюджет — увеличьте его в настройках", "reason_paused by the user": "остановлен вами",
+    tab_jobs: "Процессы",
+    jobs_empty: "Фоновых процессов нет. Процесс появляется, когда команда агента работает дольше своего тайм-аута, запущена в фоне или оставляет работать запущенные процессы.",
+    job_running: "работает {t}", job_origin_timeout: "ушёл в фон по тайм-ауту", job_origin_background: "запущен в фоне",
+    job_origin_detached: "оставлен командой", job_ended_code: "завершён: код {code}", job_ended: "завершён", job_stopped: "остановлен",
+    job_stopped_owner: "остановлен владельцем", job_stopped_user: "остановлен вами", job_stopped_lifetime: "остановлен по пределу времени",
+    job_stopped_session: "остановлен вместе с сессией", job_stopped_retired: "остановлен: агент ушёл из роя", job_lost: "потерян при сбое",
+    job_output: "Вывод", job_hide: "Скрыть вывод", job_stop: "Остановить", job_stop_confirm: "Остановить процесс {id} и всё, что он запустил?",
+    job_log_hint: "Открыть журнал на вкладке «Файлы»", job_took: "проработал {t}", agent_jobs: "фоновых процессов: {n}",
+    ev_job_started: "{who}: фоновый процесс {id} — {command}", ev_job_ended: "{who}: процесс {id} {result} ({t})",
+    dur_s: "{n} с", dur_min: "{n} мин", dur_h: "{h} ч {m} мин",
   },
   en: {
     goal: "Goal", budget: "Budget", budget_hint: "Spent / budget limit", agents: "Agents", team: "Team",
@@ -133,6 +143,16 @@ const I18N = {
     ws_moved_hint: "The session was moved to this folder (/cd). Deleting the session keeps the folder.",
     ws_missing: "The session folder is missing: {path}. The session cannot start until it is moved to another folder: /cd FOLDER or /cd --default in dreamteam tui.",
     "reason_budget": "the budget is spent — raise it in the settings", "reason_paused by the user": "paused by you",
+    tab_jobs: "Jobs",
+    jobs_empty: "No background jobs. A job appears when an agent's command runs past its timeout, is started in the background or leaves processes running.",
+    job_running: "running {t}", job_origin_timeout: "went to the background at its timeout", job_origin_background: "started in the background",
+    job_origin_detached: "left running by its command", job_ended_code: "ended: exit code {code}", job_ended: "ended", job_stopped: "stopped",
+    job_stopped_owner: "stopped by its owner", job_stopped_user: "stopped by you", job_stopped_lifetime: "stopped at the time limit",
+    job_stopped_session: "stopped with the session", job_stopped_retired: "stopped: its agent left the swarm", job_lost: "lost in a crash",
+    job_output: "Output", job_hide: "Hide output", job_stop: "Stop", job_stop_confirm: "Stop job {id} and everything it started?",
+    job_log_hint: "Open the log in the Files tab", job_took: "ran {t}", agent_jobs: "background jobs: {n}",
+    ev_job_started: "{who}: background job {id} — {command}", ev_job_ended: "{who}: job {id} {result} ({t})",
+    dur_s: "{n} s", dur_min: "{n} min", dur_h: "{h} h {m} min",
   },
 };
 
@@ -140,18 +160,21 @@ const COLUMNS = ["todo", "in_progress", "waiting", "review", "done", "closed"];
 const ALL_STATUSES = ["todo", "in_progress", "waiting", "review", "done", "failed", "cancelled"];
 const ACTIVITY_ICONS = { wake: "⏰", thinking: "💭", text: "💬", tool_call: "🔧", tool_result: "📄", error: "⚠️", nudge: "👉", compacted: "🗜" };
 // the feed asks the server only for these types: agent.activity / agent.usage would crowd everything else out
-const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*"];
+const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*"];
 const FEED_SKIP = new Set(["agent.activity", "agent.usage", "notification", "agent.status", "agent.compacted"]);
 const DND_TYPE = "application/x-dreamteam-task";
 const MAX_SEEN = 5000;
 const MAX_NODES = 800;
 const RAIL_QUERY = "(max-width: 1279px)";
 const NARROW_QUERY = "(max-width: 900px)";
+const JOB_TAIL = 200;        // lines of a job's output the Jobs tab shows
+const JOB_REFRESH = 3000;    // ms: an open output of a running job (and the running times) is refreshed this often
 const S = {
   state: null, lang: "ru", tab: "board", chatWith: null, dtab: "chat", fileDir: ".", fileEntries: [], openFile: null,
   search: "", feed: [], feedMaxId: 0, activityMaxId: 0, seenEvents: new Set(), userInbox: [], replyTo: null,
   openTaskId: null, taskBase: null, lastPostId: 0, ws: null, wsRetry: 0, wsEverOpen: false, dragging: null,
   boardDirty: false, appliedSeq: 0, modalInitial: null, markingRead: new Set(), drafts: {},
+  jobOpen: new Set(), jobOutputs: {}, jobLoading: new Set(),   // Jobs tab: ids whose output is shown, its text
 };
 
 /* ---------------------------------------------------------------- utils */
@@ -343,6 +366,7 @@ function renderAll() {
   if (S.tab === "board") renderBoard();
   if (S.tab === "mcp") renderMcp();
   if (S.tab === "triggers") renderTriggers();
+  if (S.tab === "jobs") renderJobs();
   if (S.tab === "files") renderFileList();
   if (S.chatWith) renderDrawerHead();
 }
@@ -374,7 +398,9 @@ function renderHeader() {
   const bar = $("#budget-bar");
   bar.style.width = pct + "%";
   bar.className = pct >= 100 ? "err" : pct >= 80 ? "warn" : "";
-  $("#agents-count").textContent = `${members().length} / ${sw.limits.max_agents}`;
+  // what max_agents counts: the AI agents (members who joined through MCP do not count)
+  const counted = sw.agent_count ?? members().filter((a) => a.kind === "llm").length;
+  $("#agents-count").textContent = `${counted} / ${sw.limits.max_agents}`;
   const pause = $("#pause-btn");
   setHtml(pause, `<span aria-hidden="true">${sw.paused ? "▶" : "⏸"}</span><span class="btn-label">${esc(sw.paused ? t("resume") : t("pause"))}</span>`);
   pause.title = sw.paused ? t("resume") : t("pause");
@@ -392,6 +418,10 @@ function renderHeader() {
   const trBadge = $("#triggers-badge");
   trBadge.textContent = triggers || "";
   trBadge.classList.toggle("hidden", !triggers);
+  const jobs = runningJobs().length;
+  const jobsBadge = $("#jobs-badge");
+  jobsBadge.textContent = jobs || "";
+  jobsBadge.classList.toggle("hidden", !jobs);
   const unread = S.userInbox.filter((m) => !m.read).length;
   const teamBadge = $("#team-unread");
   teamBadge.textContent = unread || "";
@@ -569,11 +599,13 @@ function renderAgents() {
     const unread = unreadFrom(a.name);
     const tasks = (a.open_tasks || []).map((id) => "#" + Number(id)).join(", ");
     const status = t("a_" + a.status);
-    const tip = `${a.name} — ${a.role} · ${status}${tasks ? " · " + tasks : ""}`;
+    const jobs = Number(a.jobs) || 0;   // its running background jobs: ⚙N (a member asleep while they work)
+    const tip = `${a.name} — ${a.role} · ${status}${tasks ? " · " + tasks : ""}${jobs ? " · " + t("agent_jobs", { n: jobs }) : ""}`;
+    const mark = jobs ? `<span class="jobs-mark">⚙${jobs}</span> ` : "";
     return `<button type="button" class="agent ${a.status === "retired" ? "retired" : ""}${S.chatWith === a.name ? " active" : ""}" data-agent="${esc(a.name)}" title="${esc(tip)}">
       <span class="avatar-wrap">${avatar(a.name)}<span class="status-dot ${esc(a.status)}"></span></span>
       <span class="agent-info"><span class="agent-name">${esc(a.name)}</span><span class="agent-role">${esc(a.role)}${a.kind === "external" ? " · MCP" : ""}</span></span>
-      <span class="agent-side"><span>${esc(status)}</span><span>${esc(tasks)} $${(a.cost_usd || 0).toFixed(2)}</span></span>
+      <span class="agent-side"><span>${esc(status)}</span><span>${mark}${esc(tasks)} $${(a.cost_usd || 0).toFixed(2)}</span></span>
       ${unread ? `<span class="unread">${unread}</span>` : ""}
     </button>`;
   }).join(""));
@@ -610,6 +642,13 @@ function renderDrawerHead() {
       ${a.status !== "retired" ? `<button class="btn small danger" type="button" data-retire="${esc(a.name)}">${esc(t("retire"))}</button>` : ""}`;
   }
   setHtml($("#drawer-title"), html);
+  // the member's running background jobs, each with a stop button
+  const jobs = a ? runningJobs(a.name) : [];
+  const jobsBox = $("#drawer-jobs");
+  setHtml(jobsBox, jobs.map((j) => `<div class="drawer-job"><span class="job-label">⚙ ${esc(jobLabel(j))}</span>
+    <code title="${esc(j.command)}">${esc(short(j.command, 90))}</code><span class="muted">${esc(fmtDur(nowSeconds() - j.started_at))}</span>
+    <button class="btn small danger" type="button" data-job-stop="${Number(j.id)}">${esc(t("job_stop"))}</button></div>`).join(""));
+  jobsBox.classList.toggle("hidden", !jobs.length);
   const retired = !!a && a.status === "retired";
   const box = $("#composer-text");
   box.disabled = retired;
@@ -1309,6 +1348,118 @@ function renderTriggers() {
   </div>`).join("") : `<div class="empty">${esc(t("no_triggers"))}</div>`);
 }
 
+/* ---------------------------------------------------------------- background jobs */
+function nowSeconds() { return Date.now() / 1000; }
+/** "45 с", "12 мин", "2 ч 05 мин": a duration as the hub words it for the agents (jobs.fmt_duration). */
+function fmtDur(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  if (total < 60) return t("dur_s", { n: total });
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return t("dur_min", { n: minutes });
+  return t("dur_h", { h: Math.floor(minutes / 60), m: String(minutes % 60).padStart(2, "0") });
+}
+/** The agents' running background jobs (all, or `owner`'s) from the state. */
+function runningJobs(owner) {
+  return (S.state?.jobs || []).filter((j) => j.status === "running" && (owner === undefined || j.owner === owner));
+}
+function jobLabel(job) { return job && job.id !== undefined && job.id !== null ? `j${Number(job.id)}` : "?"; }
+/** "node.exe ×2, python.exe" */
+function processNames(names) {
+  const counts = new Map();
+  for (const n of Array.isArray(names) ? names : []) if (n) counts.set(String(n), (counts.get(String(n)) || 0) + 1);
+  return Array.from(counts, ([n, c]) => (c > 1 ? `${n} ×${c}` : n)).join(", ");
+}
+/** [badge class, text] of a job's state: running (for how long), how it ended, stopped (why) or lost. */
+function jobState(job) {
+  if (job.status === "running") return ["", t("job_running", { t: fmtDur(nowSeconds() - job.started_at) })];
+  if (job.status === "lost") return ["err", t("job_lost")];
+  if (job.status === "stopped") {
+    return [job.reason === "lifetime" ? "warn" : "plain", I18N.en["job_stopped_" + job.reason] ? t("job_stopped_" + job.reason) : t("job_stopped")];
+  }
+  if (job.exit_code !== null && job.exit_code !== undefined) return [Number(job.exit_code) === 0 ? "done" : "err", t("job_ended_code", { code: job.exit_code })];
+  return ["done", t("job_ended")];
+}
+/** A log the Files tab can open: workspace-relative (the data_dir fallback is an absolute path outside it). */
+function workspaceLog(log) { return typeof log === "string" && log !== "" && !/^(?:[A-Za-z]:)?[\\/]/.test(log); }
+
+function jobCardHtml(job) {
+  const id = Number(job.id);
+  const running = job.status === "running";
+  const [cls, state] = jobState(job);
+  const open = S.jobOpen.has(id);
+  const meta = [];
+  const names = running ? processNames(job.processes) : "";
+  if (names) meta.push(esc(names));
+  if (!running && job.ended_at) meta.push(`${esc(t("job_took", { t: fmtDur(job.ended_at - job.started_at) }))} · ${esc(fmtTime(job.ended_at))}`);
+  if (job.log) meta.push(workspaceLog(job.log) ? `<button type="button" class="link" data-job-log="${esc(job.log)}" title="${esc(t("job_log_hint"))}">${esc(job.log)}</button>` : `<code>${esc(job.log)}</code>`);
+  const output = S.jobOutputs[id];
+  return `<div class="item job${running ? "" : " dim"}" data-job="${id}">
+    <div class="item-head"><b>${esc(jobLabel(job))}</b><span class="chip">${avatar(job.owner, "sm")}${esc(displayName(job.owner))}</span>
+      <span class="badge ${cls}">${esc(state)}</span><span class="badge plain">${esc(tv("job_origin_", job.origin))}</span>
+      <span class="spacer"></span><button class="btn small" type="button" data-job-out="${id}" aria-expanded="${open}">${esc(t(open ? "job_hide" : "job_output"))}</button>
+      ${running ? `<button class="btn small danger" type="button" data-job-stop="${id}">${esc(t("job_stop"))}</button>` : ""}</div>
+    <div class="job-cmd"><code>${esc(job.command)}</code></div>
+    ${meta.length ? `<div class="desc">${meta.join(" · ")}</div>` : ""}
+    ${open ? `<pre class="job-output" data-job-pre="${id}">${esc(output === undefined ? "…" : output)}</pre>` : ""}
+  </div>`;
+}
+
+/** The Jobs tab: one card per job of the state (the running ones, then those ended in the last hour). An open output
+ * keeps its scroll position, and one scrolled to its end follows the new output. */
+function renderJobs() {
+  const box = $("#job-list");
+  const items = (S.state && S.state.jobs) || [];
+  const scrolls = {};
+  $$("pre[data-job-pre]", box).forEach((p) => { scrolls[p.dataset.jobPre] = nearBottom(p) ? null : p.scrollTop; });
+  // the cards are rebuilt while jobs run: a focused button keeps the focus (keyboard users)
+  const active = document.activeElement;
+  const attr = active && box.contains && box.contains(active)
+    ? ["data-job-out", "data-job-stop", "data-job-log"].find((a) => active.hasAttribute(a)) : null;
+  const refocus = attr ? `[${attr}="${CSS.escape(active.getAttribute(attr))}"]` : null;
+  setHtml(box, items.length ? items.map(jobCardHtml).join("") : `<div class="empty">${esc(t("jobs_empty"))}</div>`);
+  $$("pre[data-job-pre]", box).forEach((p) => { const s = scrolls[p.dataset.jobPre]; p.scrollTop = s === undefined || s === null ? p.scrollHeight : s; });
+  if (refocus && !box.contains(document.activeElement)) box.querySelector(refocus)?.focus();
+}
+
+/** The end of a job's output (the `jobs` tool, as the user) for its open card. */
+async function loadJobOutput(id) {
+  if (S.jobLoading.has(id)) return;
+  S.jobLoading.add(id);
+  try {
+    const res = await post("/api/act/jobs", { job_id: `j${id}`, tail: JOB_TAIL });
+    S.jobOutputs[id] = String(res.result ?? "");   // a refusal (e.g. an unknown job) explains itself
+  } catch (e) {
+    S.jobOutputs[id] = errText(e);
+  } finally {
+    S.jobLoading.delete(id);
+  }
+  if (S.tab === "jobs" && S.state) renderJobs();
+}
+function toggleJobOutput(id) {
+  if (S.jobOpen.has(id)) S.jobOpen.delete(id);
+  else { S.jobOpen.add(id); loadJobOutput(id); }
+  if (S.state) renderJobs();
+}
+/** Stop a job (and every process it started): synchronous on the hub, its result is the toast. */
+async function stopJob(id) {
+  if (!confirm(t("job_stop_confirm", { id: `j${Number(id)}` }))) return null;
+  const res = await act("job_stop", { job_id: `j${Number(id)}` });
+  if (S.jobOpen.has(Number(id))) loadJobOutput(Number(id));
+  return res;
+}
+/** A job's log in the Files tab. */
+function openJobLog(path) {
+  S.openFile = path;
+  S.fileDir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".";
+  setTab("files");
+}
+/** Every JOB_REFRESH ms while the Jobs tab is shown: the open outputs of running jobs and the running times. */
+function tickJobs() {
+  if (S.tab !== "jobs" || !S.state || (typeof document !== "undefined" && document.hidden)) return;
+  for (const id of S.jobOpen) if (runningJobs().some((j) => Number(j.id) === id)) loadJobOutput(id);
+  renderJobs();
+}
+
 /* ---------------------------------------------------------------- feed */
 function fmtValue(field, value) {
   if (value === null || value === undefined || value === "") return "—";
@@ -1352,6 +1503,15 @@ function describeEvent(ev) {
     case "swarm.paused": return ru ? `рой на паузе (${tv("reason_", d.reason)})` : `swarm paused (${tv("reason_", d.reason)})`;
     case "swarm.resumed": return ru ? "рой продолжил работу" : "swarm resumed";
     case "swarm.limits": return ru ? `лимиты: $${d.max_cost_usd}, агентов ${d.max_agents}` : `limits: $${d.max_cost_usd}, ${d.max_agents} agents`;
+    case "job.started": {
+      const job = d.job || {};
+      return t("ev_job_started", { who: displayName(job.owner || ev.actor), id: jobLabel(job), command: short(job.command, 120) });
+    }
+    case "job.ended": {
+      const job = d.job || {};
+      const took = job.duration ?? (Number(job.ended_at) || 0) - (Number(job.started_at) || 0);
+      return t("ev_job_ended", { who: displayName(job.owner || ev.actor), id: jobLabel(job), result: jobState(job)[1], t: fmtDur(took) });
+    }
     default: return `${ev.type} ${short(JSON.stringify(d), 120)}`;
   }
 }
@@ -1465,6 +1625,7 @@ function handleEvent(ev) {
     scheduleFiles(300);
     if (ev.type === "file.changed" && d.path === S.openFile) openFile(S.openFile, true);
   }
+  if (ev.type.startsWith("job.") && d.job && S.jobOpen.has(Number(d.job.id))) loadJobOutput(Number(d.job.id));
   scheduleRefresh(ev.type === "agent.usage" ? 1000 : 250);
 }
 
@@ -1513,7 +1674,7 @@ function connect() {
 function setTab(tab) {
   S.tab = tab;
   $$("#tabs > button[data-tab]").forEach((b) => { b.classList.toggle("active", b.dataset.tab === tab); b.setAttribute("aria-selected", b.dataset.tab === tab); });
-  for (const name of ["board", "feed", "files", "mcp", "triggers", "traces"]) $("#pane-" + name).classList.toggle("hidden", name !== tab);
+  for (const name of ["board", "feed", "files", "mcp", "triggers", "jobs", "traces"]) $("#pane-" + name).classList.toggle("hidden", name !== tab);
   if (tab === "traces" && typeof loadTraces === "function") loadTraces();
   if (tab === "feed") loadFeed();
   if (tab === "files") { openDir(S.fileDir); if (S.openFile) openFile(S.openFile, true); }
@@ -1541,7 +1702,7 @@ function applyTheme(theme) {
 }
 
 function onDocumentClick(e) {
-  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path");
+  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path");
   if (!target) {
     if (document.body.classList.contains("team-open") && !e.target.closest(".sidebar, #team-btn")) toggleTeamOverlay(false);
     return;
@@ -1556,6 +1717,9 @@ function onDocumentClick(e) {
   else if ("mcpApprove" in ds) act("mcp_approve", { name: ds.mcpApprove, approve: true });
   else if ("mcpReject" in ds) rejectMcp(ds.mcpReject);
   else if ("triggerDel" in ds) deleteTrigger(Number(ds.triggerDel));
+  else if ("jobOut" in ds) toggleJobOutput(Number(ds.jobOut));
+  else if ("jobStop" in ds) stopJob(Number(ds.jobStop));
+  else if ("jobLog" in ds) openJobLog(ds.jobLog);
   else if ("retire" in ds) { if (confirm(t("retire_confirm"))) act("retire_agent", { name: ds.retire, reason: "retired by the user" }); }
   else if ("traces" in ds) { if (typeof openTraces === "function") { if (isNarrow()) closeDrawer(); openTraces(ds.traces); } }
   else if ("agent" in ds) openChat(ds.agent);
@@ -1616,6 +1780,7 @@ function init() {
   refresh();
   connect();
   setInterval(() => { if (!S.ws || S.ws.readyState !== 1) refresh(); }, 10000);
+  setInterval(tickJobs, JOB_REFRESH);
 }
 
 if (typeof module !== "undefined" && module.exports) {
@@ -1632,6 +1797,9 @@ if (typeof module !== "undefined" && module.exports) {
     renderHeader, responseError, errText, startSession, connect,
     // the session folder (the Files tab head, the missing-folder banner)
     workspaceKind, workspaceMissing, workspaceHtml, syncWorkspace, openDir, renderAll,
+    // background jobs: the Jobs tab, the agent marker and the drawer, live events
+    fmtDur, jobState, jobCardHtml, renderJobs, loadJobOutput, toggleJobOutput, stopJob, openJobLog, tickJobs,
+    processNames, runningJobs, renderAgents, renderDrawerHead, handleEvent, onDocumentClick,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

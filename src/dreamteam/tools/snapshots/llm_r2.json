@@ -1,0 +1,1629 @@
+{
+ "revision": 2,
+ "en": [
+  {
+   "name": "board",
+   "description": "Show the task board: the global goal, task counts and tasks (open ones by default). Filters: status (one or several, comma-separated), assignee ('me' for yourself), tag, include_closed. Your wake-up message already lists your open tasks and the ready ones; call this when you need the full picture (e.g. before creating tasks).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "status": {
+      "type": "string",
+      "description": "One status or several, comma-separated: todo | in_progress | waiting | review | done | failed | cancelled"
+     },
+     "assignee": {
+      "type": "string",
+      "description": "Member name, 'me' or 'user'"
+     },
+     "tag": {
+      "type": "string"
+     },
+     "include_closed": {
+      "type": "boolean",
+      "description": "Also show done/failed/cancelled tasks"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "task_get",
+   "description": "Show one task in full: goal, description, status, people, dependencies, subtasks, result and the latest discussion posts.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "task_create",
+   "description": "Create a task on the board. Always give a goal: why the task exists and what counts as success. Optional: description, assignee (member name or 'me'; they are notified), reviewer, depends_on (task ids that must be done first), parent_id (for subtasks), priority (0 low, 1 normal, 2 high, 3 critical), tags. Check the board first so you do not duplicate a task. Write the description for a member who has none of your context (inputs, file paths, interfaces). Leave assignee empty to let free members claim it.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "title": {
+      "type": "string",
+      "description": "Short imperative title (max 200 characters)"
+     },
+     "goal": {
+      "type": "string",
+      "description": "Why the task exists / success criterion"
+     },
+     "description": {
+      "type": "string",
+      "description": "Details, context, acceptance criteria"
+     },
+     "assignee": {
+      "type": "string",
+      "description": "Member name, 'me' or 'user'"
+     },
+     "reviewer": {
+      "type": "string",
+      "description": "Member name, 'me' or 'user'"
+     },
+     "depends_on": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      },
+      "description": "Ids of tasks that must be done first"
+     },
+     "parent_id": {
+      "type": "integer",
+      "description": "Parent task id (makes this a subtask)"
+     },
+     "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3,
+      "description": "0 low, 1 normal, 2 high, 3 critical"
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "title",
+     "goal"
+    ]
+   }
+  },
+  {
+   "name": "task_claim",
+   "description": "Claim a todo task: you become its assignee and it moves to in_progress. Fails if someone else holds it or its dependencies are not done.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "task_update",
+   "description": "Change a task (fields of tasks you created or are assigned to): title, goal, description, priority, tags, depends_on, parent_id (0 = none), reviewer, assignee ('me', a name, '' to unassign), status. Status: in_progress, waiting (blocked: explain in comment), todo (releases the task), failed, cancelled; finish with task_complete, not with done/review. comment is posted to the task discussion.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "title": {
+      "type": "string"
+     },
+     "goal": {
+      "type": "string"
+     },
+     "description": {
+      "type": "string"
+     },
+     "status": {
+      "type": "string",
+      "enum": [
+       "todo",
+       "in_progress",
+       "waiting",
+       "review",
+       "done",
+       "failed",
+       "cancelled"
+      ]
+     },
+     "assignee": {
+      "type": "string",
+      "description": "Member name, 'me', 'user' or '' to unassign"
+     },
+     "reviewer": {
+      "type": "string",
+      "description": "Member name, 'me', 'user' or '' for no reviewer"
+     },
+     "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3,
+      "description": "0 low, 1 normal, 2 high, 3 critical"
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "depends_on": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      },
+      "description": "Ids of tasks that must be done first"
+     },
+     "parent_id": {
+      "type": "integer",
+      "description": "Parent task id; 0 = no parent"
+     },
+     "comment": {
+      "type": "string",
+      "description": "Why you change it (posted to the discussion)"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "task_complete",
+   "description": "Finish your task with a concise result: what was done, where it is (file paths), what is left. If the task has a reviewer it goes to review, otherwise to done.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "result": {
+      "type": "string",
+      "description": "What was done, where it is, what is left"
+     }
+    },
+    "required": [
+     "task_id",
+     "result"
+    ]
+   }
+  },
+  {
+   "name": "task_review",
+   "description": "Review a task that is in review (you are its reviewer): approve=true moves it to done, approve=false returns it to the assignee with your comment.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "approve": {
+      "type": "boolean"
+     },
+     "comment": {
+      "type": "string",
+      "description": "What is good / what must be fixed"
+     }
+    },
+    "required": [
+     "task_id",
+     "approve"
+    ]
+   }
+  },
+  {
+   "name": "task_comment",
+   "description": "Post to a task's discussion thread (questions, proposals, findings, review remarks). Use reply_to to answer a specific post and @Full Name to mention a member. Participants are notified.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "text": {
+      "type": "string"
+     },
+     "reply_to": {
+      "type": "integer",
+      "description": "Number of the post you answer"
+     }
+    },
+    "required": [
+     "task_id",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "task_discussion",
+   "description": "Read a task's discussion thread (the latest 200 posts, or only those after since_id).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "since_id": {
+      "type": "integer",
+      "description": "Show posts after this one"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "send_message",
+   "description": "Send a direct message to one or several members (array of names), to [\"all\"] (every member) or to [\"user\"] (the human). Use it to coordinate, ask, hand off and report: plain text replies reach nobody. Every message wakes its recipients: no greetings, thanks or acknowledgements. About a specific task, prefer task_comment.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "to": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Recipient names, \"all\" or \"user\""
+     },
+     "text": {
+      "type": "string"
+     },
+     "reply_to": {
+      "type": "integer",
+      "description": "Number of the message you answer"
+     }
+    },
+    "required": [
+     "to",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "read_messages",
+   "description": "Read messages. Without arguments returns your unread messages (they are also shown when you wake up). with=<name> shows your conversation with that member (or \"user\"); include_read=true shows your recent message history.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "with": {
+      "type": "string",
+      "description": "Member name or \"user\""
+     },
+     "limit": {
+      "type": "integer",
+      "description": "Max messages (default 30, max 200)"
+     },
+     "include_read": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "read_file",
+   "description": "Read a text file from the shared workspace. Large files are returned in chunks: use offset (first line, 1-based) and limit (number of lines, default 400).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "offset": {
+      "type": "integer"
+     },
+     "limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "write_file",
+   "description": "Create or overwrite a whole file in the shared workspace (parent folders are created). The change is committed to git under your name. Fails if another member locked the file. For small changes use edit_file.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "content": {
+      "type": "string",
+      "description": "The full new file content"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "edit_file",
+   "description": "Replace exact text in a workspace file. old_text must match exactly once (copy it from read_file) unless replace_all=true; new_text \"\" deletes it.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "old_text": {
+      "type": "string"
+     },
+     "new_text": {
+      "type": "string"
+     },
+     "replace_all": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path",
+     "old_text",
+     "new_text"
+    ]
+   }
+  },
+  {
+   "name": "list_files",
+   "description": "List files and folders of the shared workspace as a tree (path defaults to the root, depth 1-6, default 2).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "depth": {
+      "type": "integer"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "lock_file",
+   "description": "Lock a shared file (or folder) so that only you can write it (for minutes, default from config), or unlock it with unlock=true. Lock shared files before long edits and unlock them afterwards.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "minutes": {
+      "type": "number"
+     },
+     "unlock": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "shell",
+   "description": "Run a console command in the workspace directory and get its exit code and output (the result names the shell). Use it to run code, tests, package managers, git, etc. There is no input (stdin is closed). A command still running when its timeout expires is not killed: it continues as a background job, you get its output so far and you are notified when it ends. Start servers and other long commands with background=true: the call returns after 2 seconds with the job's id; `jobs` shows a job's output and `job_stop` stops it. Secrets from the environment are not available.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "integer",
+      "description": "Seconds to wait for the command (default from config); a command still running then continues in the background"
+     },
+     "background": {
+      "type": "boolean",
+      "description": "Start the command as a background job and return after 2 seconds"
+     }
+    },
+    "required": [
+     "command"
+    ]
+   }
+  },
+  {
+   "name": "jobs",
+   "description": "Background jobs: shell commands that kept running after their call returned (past their timeout, started in the background on purpose, or processes a command left running). Without job_id: the running jobs of the swarm and your jobs that ended in the last hour. With job_id: that job's state and the end of its output. You are notified when your job ends, so don't poll: do other work or call `wait`.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3; without it you get the list"
+     },
+     "tail": {
+      "type": "integer",
+      "description": "Lines of output to show (default 40, at most 400)"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "job_stop",
+   "description": "Stop a background job together with every process it started. Only its owner or the user can stop a job; its output stays in its log.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3"
+     }
+    },
+    "required": [
+     "job_id"
+    ]
+   }
+  },
+  {
+   "name": "mcp_create",
+   "description": "Build a new MCP server (a reusable tool set) from Python code using the mcp 2.x SDK, test it and register it for the swarm. The code must follow this template (type hints and docstrings become the tool schema; any library from `requirements` can be imported):\nfrom mcp.server.mcpserver import MCPServer\n\nmcp = MCPServer(\"my_tools\")\n\n@mcp.tool()\ndef add(a: int, b: int) -> int:\n    \"\"\"Add two numbers.\"\"\"\n    return a + b\n\nif __name__ == \"__main__\":\n    mcp.run()\nname: lowercase snake_case. scope: swarm (everyone, default; also saved to the cross-run library), task (people of task_id) or private. Calling it again with the same name replaces your server. If the smoke test fails you get the error log: fix the code and call again. Build one only for a capability that will be reused; for one-off work use shell.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "e.g. csv_tools"
+     },
+     "description": {
+      "type": "string",
+      "description": "What the tools are for (one sentence)"
+     },
+     "code": {
+      "type": "string",
+      "description": "Full server.py source"
+     },
+     "scope": {
+      "type": "string",
+      "enum": [
+       "swarm",
+       "task",
+       "private"
+      ]
+     },
+     "task_id": {
+      "type": "integer",
+      "description": "For scope=task"
+     },
+     "requirements": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "pip packages, e.g. [\"httpx\"]"
+     }
+    },
+    "required": [
+     "name",
+     "description",
+     "code"
+    ]
+   }
+  },
+  {
+   "name": "mcp_list",
+   "description": "List MCP servers available to you: built in this swarm, configured by the user, and from the library of earlier runs. Optional query filters by name/description/tool names.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "mcp_tools",
+   "description": "Show the tools of an MCP server with their input schemas (starts the server if needed).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "server"
+    ]
+   }
+  },
+  {
+   "name": "mcp_call",
+   "description": "Call a tool of an MCP server: server name, tool name and arguments object (see mcp_tools for schemas).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     },
+     "tool": {
+      "type": "string"
+     },
+     "arguments": {
+      "type": "object",
+      "description": "Arguments of the MCP tool, e.g. {\"a\": 1}"
+     }
+    },
+    "required": [
+     "server",
+     "tool"
+    ]
+   }
+  },
+  {
+   "name": "agents",
+   "description": "Show the swarm roster: every member's name, role, status, model, open tasks and spending.",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  },
+  {
+   "name": "hire_agent",
+   "description": "Hire a new AI agent into the swarm with a role and instructions (what they should focus on). Optional model profile name and human name. Limited by max agents and the budget.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "role": {
+      "type": "string",
+      "description": "e.g. Backend developer, Researcher, QA engineer"
+     },
+     "instructions": {
+      "type": "string",
+      "description": "What they should do and focus on"
+     },
+     "model": {
+      "type": "string",
+      "description": "Model profile from the config (default if omitted)"
+     },
+     "name": {
+      "type": "string",
+      "description": "Human first and last name (generated if omitted)"
+     }
+    },
+    "required": [
+     "role",
+     "instructions"
+    ]
+   }
+  },
+  {
+   "name": "retire_agent",
+   "description": "Remove a member from the swarm (yourself by default, or a member you hired). Their open tasks go back to todo.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "update_notes",
+   "description": "Replace your personal notebook with content ('' clears it). It is shown to you on every wake-up and survives context compaction: keep key facts, decisions, plans and file paths there.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "content": {
+      "type": "string",
+      "description": "The whole new notebook text"
+     }
+    },
+    "required": [
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "wait",
+   "description": "End your turn and sleep until something happens (a message, an assignment, a discussion post, an unblocked task, a trigger or the end of one of your background jobs). Call it when there is nothing useful left for you to do now. End every turn with it. Never poll the board, messages or jobs in a loop instead: these events wake you.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "reason": {
+      "type": "string",
+      "description": "What you are waiting for"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "goal_complete",
+   "description": "Declare the global goal achieved (only after verifying the result) with a summary for the user: what was delivered and where to find it.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "summary": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "summary"
+    ]
+   }
+  },
+  {
+   "name": "trigger_create",
+   "description": "Create a trigger that fires when a condition over the swarm state becomes true. Condition = a boolean expression with and/or/not, comparisons (== != < <= > >= in) and functions: status(id), done(*ids) [all done], any_done(*ids), finished(*ids) [all done/failed/cancelled], failed(*ids) [any failed], assignee(id), count(status=, tag=, assignee=, parent=), all_done(tag=, parent=), message(sender=, contains=) [a message to you arrived], comment(task=, sender=, contains=) [a new discussion post], file_exists(path), file_changed(path), after(\"2026-10-09 18:00\"), elapsed(seconds), every(seconds) [periodic, >= 10], agent_status(name), goal_done(). Status names (todo, in_progress, waiting, review, done, failed, cancelled) can be used bare. Examples: done(1, 5); status(3) in (failed, cancelled); done(2) and not failed(4); count(status=done, tag=\"api\") >= 3; message(sender=\"Anna Smith\"); every(1800). By default the trigger wakes you with the note; actions can instead send a message, set a task status or create a task (add {\"type\": \"wake\"} to also wake you). once=true (default): the trigger is deactivated after it fires; once=false: it fires every time the condition becomes true again (every() triggers always repeat).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "condition": {
+      "type": "string"
+     },
+     "note": {
+      "type": "string",
+      "description": "Reminder shown when it fires (what to do then)"
+     },
+     "once": {
+      "type": "boolean"
+     },
+     "actions": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "type": {
+         "type": "string",
+         "enum": [
+          "wake",
+          "message",
+          "set_status",
+          "create_task"
+         ]
+        },
+        "to": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "message: recipient names, \"all\" or \"user\""
+        },
+        "text": {
+         "type": "string",
+         "description": "message: text"
+        },
+        "task_id": {
+         "type": "integer",
+         "description": "set_status: task id"
+        },
+        "status": {
+         "type": "string",
+         "enum": [
+          "todo",
+          "in_progress",
+          "waiting",
+          "review",
+          "done",
+          "failed",
+          "cancelled"
+         ],
+         "description": "set_status: new status"
+        },
+        "title": {
+         "type": "string",
+         "description": "create_task: title"
+        },
+        "goal": {
+         "type": "string",
+         "description": "create_task: goal"
+        },
+        "description": {
+         "type": "string",
+         "description": "create_task: description"
+        },
+        "assignee": {
+         "type": "string",
+         "description": "create_task: member name"
+        },
+        "tags": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "create_task: tags"
+        },
+        "priority": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 3,
+         "description": "create_task: 0-3"
+        }
+       },
+       "required": [
+        "type"
+       ]
+      },
+      "description": "Default: [{\"type\": \"wake\"}]"
+     }
+    },
+    "required": [
+     "condition"
+    ]
+   }
+  },
+  {
+   "name": "trigger_list",
+   "description": "List your active triggers (all=true: every member's triggers, including inactive ones).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "all": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "trigger_delete",
+   "description": "Delete one of your triggers.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "trigger_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "trigger_id"
+    ]
+   }
+  }
+ ],
+ "ru": [
+  {
+   "name": "board",
+   "description": "Показать доску задач: глобальную цель, счётчики и задачи (по умолчанию открытые). Фильтры: status (один или несколько через запятую), assignee ('me' — свои), tag, include_closed. Сообщение при пробуждении уже перечисляет твои открытые и готовые задачи; вызывай, когда нужна полная картина (например, перед созданием задач).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "status": {
+      "type": "string",
+      "description": "One status or several, comma-separated: todo | in_progress | waiting | review | done | failed | cancelled"
+     },
+     "assignee": {
+      "type": "string",
+      "description": "Member name, 'me' or 'user'"
+     },
+     "tag": {
+      "type": "string"
+     },
+     "include_closed": {
+      "type": "boolean",
+      "description": "Also show done/failed/cancelled tasks"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "task_get",
+   "description": "Показать задачу полностью: цель, описание, статус, участники, зависимости, подзадачи, итог и последние посты обсуждения.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "task_create",
+   "description": "Создать задачу на доске. Всегда указывай goal (цель): зачем нужна задача и что считается успехом. Необязательно: description, assignee (имя участника или 'me'; он получит уведомление), reviewer, depends_on (номера задач, которые должны быть выполнены раньше), parent_id (для подзадач), priority (0 низкий, 1 обычный, 2 высокий, 3 критичный), tags. Сначала проверь доску, чтобы не создать дубликат. Пиши description для участника без твоего контекста (входные данные, пути к файлам, интерфейсы). Оставь assignee пустым, чтобы задачу взял свободный участник.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "title": {
+      "type": "string",
+      "description": "Short imperative title (max 200 characters)"
+     },
+     "goal": {
+      "type": "string",
+      "description": "Why the task exists / success criterion"
+     },
+     "description": {
+      "type": "string",
+      "description": "Details, context, acceptance criteria"
+     },
+     "assignee": {
+      "type": "string",
+      "description": "Member name, 'me' or 'user'"
+     },
+     "reviewer": {
+      "type": "string",
+      "description": "Member name, 'me' or 'user'"
+     },
+     "depends_on": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      },
+      "description": "Ids of tasks that must be done first"
+     },
+     "parent_id": {
+      "type": "integer",
+      "description": "Parent task id (makes this a subtask)"
+     },
+     "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3,
+      "description": "0 low, 1 normal, 2 high, 3 critical"
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     }
+    },
+    "required": [
+     "title",
+     "goal"
+    ]
+   }
+  },
+  {
+   "name": "task_claim",
+   "description": "Взять задачу в статусе todo: ты становишься исполнителем, статус in_progress. Не получится, если задачу держит кто-то другой или её зависимости не выполнены.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "task_update",
+   "description": "Изменить задачу (поля задач, которые ты создал или которые на тебе): title, goal, description, priority, tags, depends_on, parent_id (0 — без родителя), reviewer, assignee ('me', имя, '' — снять исполнителя), status. Статусы: in_progress, waiting (заблокирована: объясни в comment), todo (отпустить задачу), failed, cancelled; завершай через task_complete, а не через done/review. comment публикуется в обсуждении задачи.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "title": {
+      "type": "string"
+     },
+     "goal": {
+      "type": "string"
+     },
+     "description": {
+      "type": "string"
+     },
+     "status": {
+      "type": "string",
+      "enum": [
+       "todo",
+       "in_progress",
+       "waiting",
+       "review",
+       "done",
+       "failed",
+       "cancelled"
+      ]
+     },
+     "assignee": {
+      "type": "string",
+      "description": "Member name, 'me', 'user' or '' to unassign"
+     },
+     "reviewer": {
+      "type": "string",
+      "description": "Member name, 'me', 'user' or '' for no reviewer"
+     },
+     "priority": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 3,
+      "description": "0 low, 1 normal, 2 high, 3 critical"
+     },
+     "tags": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      }
+     },
+     "depends_on": {
+      "type": "array",
+      "items": {
+       "type": "integer"
+      },
+      "description": "Ids of tasks that must be done first"
+     },
+     "parent_id": {
+      "type": "integer",
+      "description": "Parent task id; 0 = no parent"
+     },
+     "comment": {
+      "type": "string",
+      "description": "Why you change it (posted to the discussion)"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "task_complete",
+   "description": "Завершить свою задачу с кратким итогом: что сделано, где лежит (пути к файлам), что осталось. Если у задачи есть ревьюер, она уйдёт на ревью, иначе — в done.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "result": {
+      "type": "string",
+      "description": "What was done, where it is, what is left"
+     }
+    },
+    "required": [
+     "task_id",
+     "result"
+    ]
+   }
+  },
+  {
+   "name": "task_review",
+   "description": "Проверить задачу на ревью (ты её ревьюер): approve=true переводит её в done, approve=false возвращает исполнителю с твоим комментарием.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "approve": {
+      "type": "boolean"
+     },
+     "comment": {
+      "type": "string",
+      "description": "What is good / what must be fixed"
+     }
+    },
+    "required": [
+     "task_id",
+     "approve"
+    ]
+   }
+  },
+  {
+   "name": "task_comment",
+   "description": "Написать в обсуждение задачи (вопросы, предложения, находки, замечания ревью). reply_to — ответ на конкретный пост, @Имя Фамилия — упоминание участника. Участники обсуждения получат уведомление.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "text": {
+      "type": "string"
+     },
+     "reply_to": {
+      "type": "integer",
+      "description": "Number of the post you answer"
+     }
+    },
+    "required": [
+     "task_id",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "task_discussion",
+   "description": "Прочитать обсуждение задачи (последние 200 постов или только новее since_id).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "task_id": {
+      "type": "integer",
+      "description": "Task number, e.g. 5"
+     },
+     "since_id": {
+      "type": "integer",
+      "description": "Show posts after this one"
+     }
+    },
+    "required": [
+     "task_id"
+    ]
+   }
+  },
+  {
+   "name": "send_message",
+   "description": "Отправить личное сообщение одному или нескольким участникам (массив имён), всем — [\"all\"], или пользователю — [\"user\"]. Используй для координации, вопросов, передачи работы и отчётов: обычный текстовый ответ никому не доставляется. Каждое сообщение будит получателей: без приветствий, благодарностей и подтверждений. О конкретной задаче лучше пиши через task_comment.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "to": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "Recipient names, \"all\" or \"user\""
+     },
+     "text": {
+      "type": "string"
+     },
+     "reply_to": {
+      "type": "integer",
+      "description": "Number of the message you answer"
+     }
+    },
+    "required": [
+     "to",
+     "text"
+    ]
+   }
+  },
+  {
+   "name": "read_messages",
+   "description": "Прочитать сообщения. Без аргументов — непрочитанные (они также показываются при пробуждении). with=<имя> — переписка с участником (или \"user\"); include_read=true — недавняя история сообщений.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "with": {
+      "type": "string",
+      "description": "Member name or \"user\""
+     },
+     "limit": {
+      "type": "integer",
+      "description": "Max messages (default 30, max 200)"
+     },
+     "include_read": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "read_file",
+   "description": "Прочитать текстовый файл из общего workspace. Большие файлы читаются частями: offset (первая строка, с 1) и limit (число строк, по умолчанию 400).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "offset": {
+      "type": "integer"
+     },
+     "limit": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "write_file",
+   "description": "Создать или целиком перезаписать файл в общем workspace (папки создаются автоматически). Изменение коммитится в git от твоего имени. Не сработает, если файл заблокирован другим участником. Для небольших правок используй edit_file.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "content": {
+      "type": "string",
+      "description": "The full new file content"
+     }
+    },
+    "required": [
+     "path",
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "edit_file",
+   "description": "Заменить точный фрагмент текста в файле workspace. old_text должен встречаться ровно один раз (скопируй его из read_file), если не указан replace_all=true; new_text \"\" удаляет фрагмент.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "old_text": {
+      "type": "string"
+     },
+     "new_text": {
+      "type": "string"
+     },
+     "replace_all": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path",
+     "old_text",
+     "new_text"
+    ]
+   }
+  },
+  {
+   "name": "list_files",
+   "description": "Показать файлы и папки общего workspace деревом (по умолчанию корень; depth от 1 до 6, по умолчанию 2).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "depth": {
+      "type": "integer"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "lock_file",
+   "description": "Заблокировать общий файл (или папку), чтобы писать в него мог только ты (на minutes минут, по умолчанию из настроек), или разблокировать через unlock=true. Блокируй общие файлы перед долгой правкой и разблокируй после.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "path": {
+      "type": "string",
+      "description": "Path relative to the workspace root, e.g. src/app.py"
+     },
+     "minutes": {
+      "type": "number"
+     },
+     "unlock": {
+      "type": "boolean"
+     }
+    },
+    "required": [
+     "path"
+    ]
+   }
+  },
+  {
+   "name": "shell",
+   "description": "Выполнить команду в консоли в папке workspace и получить код возврата и вывод (в результате указана оболочка). Подходит для запуска кода, тестов, пакетных менеджеров, git и т. п. Ввода нет (stdin закрыт). Команда, которая ещё работает, когда истёк её timeout, не убивается: она продолжает работать как фоновый процесс, ты получаешь её вывод на этот момент, а когда она завершится, придёт уведомление. Серверы и другие долгие команды запускай с background=true: вызов вернётся через 2 секунды с идентификатором процесса (например, j3); `jobs` покажет вывод процесса, а `job_stop` остановит его. Секреты из окружения недоступны.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "command": {
+      "type": "string"
+     },
+     "timeout": {
+      "type": "integer",
+      "description": "Seconds to wait for the command (default from config); a command still running then continues in the background"
+     },
+     "background": {
+      "type": "boolean",
+      "description": "Start the command as a background job and return after 2 seconds"
+     }
+    },
+    "required": [
+     "command"
+    ]
+   }
+  },
+  {
+   "name": "jobs",
+   "description": "Фоновые процессы — команды shell, которые продолжают работать после того, как вызов вернул результат (не уложились в timeout, запущены в фоне намеренно или остались работать после завершения команды). Без job_id — работающие фоновые процессы роя и твои, завершившиеся за последний час. С job_id — состояние процесса и конец его вывода. Когда твой процесс завершится, придёт уведомление, поэтому не опрашивай: займись другим делом или вызови `wait`.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3; without it you get the list"
+     },
+     "tail": {
+      "type": "integer",
+      "description": "Lines of output to show (default 40, at most 400)"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "job_stop",
+   "description": "Остановить фоновый процесс вместе со всеми процессами, которые он запустил. Остановить процесс может только его владелец или пользователь; его вывод остаётся в журнале.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "job_id": {
+      "type": "string",
+      "description": "A job id such as j3"
+     }
+    },
+    "required": [
+     "job_id"
+    ]
+   }
+  },
+  {
+   "name": "mcp_create",
+   "description": "Создать новый MCP-сервер (переиспользуемый набор инструментов) из кода на Python с SDK mcp 2.x, проверить его и зарегистрировать в рое. Код должен следовать шаблону (аннотации типов и docstring становятся схемой инструмента; можно импортировать библиотеки из `requirements`):\nfrom mcp.server.mcpserver import MCPServer\n\nmcp = MCPServer(\"my_tools\")\n\n@mcp.tool()\ndef add(a: int, b: int) -> int:\n    \"\"\"Add two numbers.\"\"\"\n    return a + b\n\nif __name__ == \"__main__\":\n    mcp.run()\nname: латиница snake_case. scope: swarm (все, по умолчанию; сохраняется и в общую библиотеку между запусками), task (участники задачи task_id) или private. Повторный вызов с тем же name заменяет твой сервер. Если проверка не прошла, вернётся лог ошибки: исправь код и вызови снова. Создавай сервер только для переиспользуемой возможности; для разовой работы используй shell.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "e.g. csv_tools"
+     },
+     "description": {
+      "type": "string",
+      "description": "What the tools are for (one sentence)"
+     },
+     "code": {
+      "type": "string",
+      "description": "Full server.py source"
+     },
+     "scope": {
+      "type": "string",
+      "enum": [
+       "swarm",
+       "task",
+       "private"
+      ]
+     },
+     "task_id": {
+      "type": "integer",
+      "description": "For scope=task"
+     },
+     "requirements": {
+      "type": "array",
+      "items": {
+       "type": "string"
+      },
+      "description": "pip packages, e.g. [\"httpx\"]"
+     }
+    },
+    "required": [
+     "name",
+     "description",
+     "code"
+    ]
+   }
+  },
+  {
+   "name": "mcp_list",
+   "description": "Список доступных тебе MCP-серверов: созданных в этом рое, настроенных пользователем и из библиотеки прошлых запусков. query фильтрует по имени, описанию и названиям инструментов.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "query": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "mcp_tools",
+   "description": "Показать инструменты MCP-сервера с их входными схемами (при необходимости запускает сервер).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "server"
+    ]
+   }
+  },
+  {
+   "name": "mcp_call",
+   "description": "Вызвать инструмент MCP-сервера: имя сервера, имя инструмента и объект arguments (схемы — в mcp_tools).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "server": {
+      "type": "string"
+     },
+     "tool": {
+      "type": "string"
+     },
+     "arguments": {
+      "type": "object",
+      "description": "Arguments of the MCP tool, e.g. {\"a\": 1}"
+     }
+    },
+    "required": [
+     "server",
+     "tool"
+    ]
+   }
+  },
+  {
+   "name": "agents",
+   "description": "Показать состав роя: имя, роль, статус, модель, открытые задачи и расходы каждого участника.",
+   "parameters": {
+    "type": "object",
+    "properties": {},
+    "required": []
+   }
+  },
+  {
+   "name": "hire_agent",
+   "description": "Нанять в рой нового ИИ-агента с ролью и инструкциями (на чём сосредоточиться). Можно указать профиль модели (model) и человеческое имя. Ограничено максимумом агентов и бюджетом.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "role": {
+      "type": "string",
+      "description": "e.g. Backend developer, Researcher, QA engineer"
+     },
+     "instructions": {
+      "type": "string",
+      "description": "What they should do and focus on"
+     },
+     "model": {
+      "type": "string",
+      "description": "Model profile from the config (default if omitted)"
+     },
+     "name": {
+      "type": "string",
+      "description": "Human first and last name (generated if omitted)"
+     }
+    },
+    "required": [
+     "role",
+     "instructions"
+    ]
+   }
+  },
+  {
+   "name": "retire_agent",
+   "description": "Вывести участника из роя (по умолчанию себя или нанятого тобой). Его открытые задачи вернутся в todo.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "name": {
+      "type": "string"
+     },
+     "reason": {
+      "type": "string"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "update_notes",
+   "description": "Заменить содержимое твоего блокнота на content ('' — очистить). Он показывается при каждом пробуждении и переживает сжатие контекста: храни там ключевые факты, решения, планы и пути к файлам.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "content": {
+      "type": "string",
+      "description": "The whole new notebook text"
+     }
+    },
+    "required": [
+     "content"
+    ]
+   }
+  },
+  {
+   "name": "wait",
+   "description": "Завершить ход и спать, пока что-нибудь не произойдёт (сообщение, назначение, пост в обсуждении, разблокировка задачи, триггер или завершение твоего фонового процесса). Вызывай, когда полезных дел для тебя сейчас нет. Заканчивай им каждый ход. Не опрашивай доску, сообщения и фоновые процессы в цикле: эти события тебя разбудят.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "reason": {
+      "type": "string",
+      "description": "What you are waiting for"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "goal_complete",
+   "description": "Объявить глобальную цель достигнутой (только после проверки результата) с итогом для пользователя: что сделано и где это найти.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "summary": {
+      "type": "string"
+     }
+    },
+    "required": [
+     "summary"
+    ]
+   }
+  },
+  {
+   "name": "trigger_create",
+   "description": "Создать триггер, срабатывающий, когда условие над состоянием роя становится истинным. Условие — логическое выражение с and/or/not, сравнениями (== != < <= > >= in) и функциями: status(id), done(*ids) [все выполнены], any_done(*ids), finished(*ids) [все завершены как угодно], failed(*ids) [хотя бы одна провалена], assignee(id), count(status=, tag=, assignee=, parent=), all_done(tag=, parent=), message(sender=, contains=) [пришло сообщение тебе], comment(task=, sender=, contains=) [новый пост в обсуждении], file_exists(path), file_changed(path), after(\"2026-10-09 18:00\"), elapsed(секунды), every(секунды) [периодически, >= 10], agent_status(имя), goal_done(). Статусы (todo, in_progress, waiting, review, done, failed, cancelled) можно писать без кавычек. Примеры: done(1, 5); status(3) in (failed, cancelled); done(2) and not failed(4); count(status=done, tag=\"api\") >= 3; message(sender=\"Анна Смирнова\"); every(1800). По умолчанию триггер будит тебя с заметкой note; actions позволяют вместо этого отправить сообщение, сменить статус задачи или создать задачу (добавь {\"type\": \"wake\"}, чтобы ещё и проснуться). once=true (по умолчанию): после срабатывания триггер отключается; once=false: срабатывает каждый раз, когда условие снова становится истинным (триггеры с every() повторяются всегда).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "condition": {
+      "type": "string"
+     },
+     "note": {
+      "type": "string",
+      "description": "Reminder shown when it fires (what to do then)"
+     },
+     "once": {
+      "type": "boolean"
+     },
+     "actions": {
+      "type": "array",
+      "items": {
+       "type": "object",
+       "properties": {
+        "type": {
+         "type": "string",
+         "enum": [
+          "wake",
+          "message",
+          "set_status",
+          "create_task"
+         ]
+        },
+        "to": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "message: recipient names, \"all\" or \"user\""
+        },
+        "text": {
+         "type": "string",
+         "description": "message: text"
+        },
+        "task_id": {
+         "type": "integer",
+         "description": "set_status: task id"
+        },
+        "status": {
+         "type": "string",
+         "enum": [
+          "todo",
+          "in_progress",
+          "waiting",
+          "review",
+          "done",
+          "failed",
+          "cancelled"
+         ],
+         "description": "set_status: new status"
+        },
+        "title": {
+         "type": "string",
+         "description": "create_task: title"
+        },
+        "goal": {
+         "type": "string",
+         "description": "create_task: goal"
+        },
+        "description": {
+         "type": "string",
+         "description": "create_task: description"
+        },
+        "assignee": {
+         "type": "string",
+         "description": "create_task: member name"
+        },
+        "tags": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         },
+         "description": "create_task: tags"
+        },
+        "priority": {
+         "type": "integer",
+         "minimum": 0,
+         "maximum": 3,
+         "description": "create_task: 0-3"
+        }
+       },
+       "required": [
+        "type"
+       ]
+      },
+      "description": "Default: [{\"type\": \"wake\"}]"
+     }
+    },
+    "required": [
+     "condition"
+    ]
+   }
+  },
+  {
+   "name": "trigger_list",
+   "description": "Показать твои активные триггеры (all=true — триггеры всех участников, включая неактивные).",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "all": {
+      "type": "boolean"
+     }
+    },
+    "required": []
+   }
+  },
+  {
+   "name": "trigger_delete",
+   "description": "Удалить свой триггер.",
+   "parameters": {
+    "type": "object",
+    "properties": {
+     "trigger_id": {
+      "type": "integer"
+     }
+    },
+    "required": [
+     "trigger_id"
+    ]
+   }
+  }
+ ]
+}

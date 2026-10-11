@@ -51,6 +51,8 @@ TEXTS = {
         "session": "Сессия {sid}: {title}",
         "folder": "Папка сессии: {path}",
         "error": "Ошибка: {error}",
+        "jobs_running": "Ещё работают фоновые процессы агентов: {jobs}. Они остановятся вместе с сессией "
+                        "(остановить раньше можно командой /jobs stop jN в dreamteam tui).",
     },
     "en": {
         "timeout": "Timed out after {seconds:g} s: the goal is not achieved.",
@@ -64,12 +66,19 @@ TEXTS = {
         "session": "Session {sid}: {title}",
         "folder": "Session folder: {path}",
         "error": "Error: {error}",
+        "jobs_running": "Background jobs of the agents are still running: {jobs}. They stop when the session stops "
+                        "(to stop one earlier: /jobs stop jN in dreamteam tui).",
     },
 }
 
 
 def _text(lang: str, key: str, **kw: Any) -> str:
     return TEXTS.get(lang, TEXTS["en"])[key].format(**kw)
+
+
+def _short(text: Any, limit: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 class _Finished(Exception):
@@ -208,6 +217,8 @@ class _PrintRun:
                  timeout: float | None, auto_reply: bool, lang: str | None, out: TextIO, err: TextIO,
                  on_session: Callable[[str], Any] | None = None, workspace: str | None = None):
         self.client = conn.client
+        # this process runs the launcher: main_print stops the session (and its jobs) at the end
+        self.owned = getattr(conn, "owned", False)
         self.workspace = workspace
         self.on_session = on_session
         self.prompt = prompt
@@ -513,6 +524,11 @@ class _PrintRun:
             "cost_usd": float(swarm.get("spent_usd") or 0.0),
             "duration_s": round(time.monotonic() - self.started, 3),
             "agents": [a.get("name") for a in (state or {}).get("agents") or [] if a.get("status") != "retired"],
+            # the agents' background jobs still running (e.g. a dev server after the goal): with an external hub
+            # they go on after this run, until the session stops
+            "jobs": [{"id": j.get("id"), "label": j.get("label"), "owner": j.get("owner"), "command": j.get("command"),
+                      "origin": j.get("origin")}
+                     for j in (state or {}).get("jobs") or [] if isinstance(j, dict) and j.get("status") == "running"],
         }
         if status != "done" and reason:
             result["error"] = reason
@@ -521,6 +537,10 @@ class _PrintRun:
                 self.out.write((summary or (goal or {}).get("title") or "").rstrip() + "\n")
             else:
                 self.err.write((reason or status) + "\n")
+            if result["jobs"] and not self.owned:  # an owned launcher stops the session (and its jobs) right after
+                listed = "; ".join(f"{j['label'] or j['id']} ({j['owner']}: {_short(j['command'], 60)})"
+                                   for j in result["jobs"])
+                self.err.write(_text(self.text_lang, "jobs_running", jobs=listed) + "\n")
         else:
             self.out.json(result)
         return EXIT_CODES[status]
