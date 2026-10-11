@@ -42,8 +42,8 @@ log = logging.getLogger(__name__)
 SESSION_PATH = re.compile(r"^/s/([a-z0-9][a-z0-9-]{0,63})(/.*)?$")
 STOPPED_TEXT = "The session is stopped. Start it on the sessions page."
 ERROR_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>DreamTeam</title>
-<style>body{font-family:system-ui,sans-serif;background:#0f1115;color:#e6e6e6;display:grid;place-items:center;
-height:100vh;margin:0}a{color:#7aa2ff}</style></head><body><div><h2>{title}</h2>
+<style>body{font-family:"Segoe UI",system-ui,sans-serif;background:#0b0b0d;color:#ebe9e6;display:grid;
+place-items:center;height:100vh;margin:0}p{color:#92929b}a{color:#e8916f}</style></head><body><div><h2>{title}</h2>
 <p>{text} <a href="/">Back to sessions</a></p></div></body></html>"""
 
 
@@ -308,11 +308,13 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                 return JSONResponse({"session": manager.summary(sid), "config": manager.config_view(sid)})
             if request.method == "PATCH":
                 body = await _json_body(request)
-                problem = _body_error(body, strings=("title",), objects=("overrides",))
+                problem = _body_error(body, strings=("title",), objects=("overrides", "settings"))
                 if problem:
                     return JSONResponse({"error": problem}, status_code=400)
-                summary = manager.update(sid, title=body.get("title"), overrides=body.get("overrides"))
-                return JSONResponse({"session": summary})
+                # "overrides" replaces them all; "settings" changes some keys (null: inherit the global value again)
+                summary = manager.update(sid, title=body.get("title"), overrides=body.get("overrides"),
+                                         settings=body.get("settings"))
+                return JSONResponse({"session": summary, "config": manager.config_view(sid)})
             if request.method == "DELETE":
                 if request.query_params.get("confirm") != sid:
                     return JSONResponse({"error": "Pass ?confirm=<session id> to delete a session."}, status_code=400)

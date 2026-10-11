@@ -1310,10 +1310,39 @@ class SessionManager:
                 if sid not in self.running:
                     await self._unload(sid)
 
-    def update(self, sid: str, *, title: str | None = None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Rename a session or replace its overrides (applied to the loaded swarm at once, like the global
-        settings; the language and the start settings matter only at the first start)."""
+    def _patched_overrides(self, stored: Any, settings: Any) -> dict[str, Any]:
+        """The stored overrides with a partial update applied: {section: {key: value or None}}; None (or "") removes
+        the key, so the session inherits the global value again, and a section left empty disappears. The other
+        overrides (those given at creation: language, team, model...) stay as they are."""
+        if not isinstance(settings, dict):
+            raise SessionError("Settings must be an object of sections.")
+        if stored is not None and not isinstance(stored, dict):
+            raise SessionError("The stored overrides of the session are damaged; replace them with \"overrides\".")
+        result = copy.deepcopy(stored or {})
+        for section, values in settings.items():
+            if section not in OVERRIDE_SECTIONS:
+                raise SessionError(f"Sessions cannot override [{section}] (allowed: {', '.join(OVERRIDE_SECTIONS)}).")
+            if not isinstance(values, dict):
+                raise SessionError(f"Settings [{section}] must be an object.")
+            current = result.get(section)
+            current = current if isinstance(current, dict) else {}
+            for key, value in values.items():
+                if value is None:
+                    current.pop(key, None)
+                else:
+                    current[key] = copy.deepcopy(value)
+            result[section] = current
+        return self.clean_overrides(result)
+
+    def update(self, sid: str, *, title: str | None = None, overrides: dict[str, Any] | None = None,
+               settings: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Rename a session, replace its overrides (`overrides`) or change some of them (`settings`: {section: {key:
+        value or None}}, see _patched_overrides; the settings dialog of the session page). Applied to the loaded
+        swarm at once, like the global settings; the language and the start settings matter only at the first start.
+        Nothing is written when a value is invalid."""
         self._check(sid)
+        if overrides is not None and settings is not None:
+            raise SessionError("Pass either \"overrides\" (all of them) or \"settings\" (the keys to change), not both.")
         meta = self.meta(sid)
         if title is not None:
             if not isinstance(title, str):
@@ -1323,10 +1352,11 @@ class SessionManager:
                 raise SessionError("The title cannot be empty.")
             meta["title"] = title
         config = None
-        if overrides is not None:
+        if overrides is not None or settings is not None:
             if sid == LEGACY_ID:
                 raise SessionError("The main session uses the global settings directly; edit them instead.")
-            clean = self.clean_overrides(overrides)
+            clean = (self.clean_overrides(overrides) if settings is None
+                     else self._patched_overrides(meta.get("overrides"), settings))
             try:
                 config = self._apply_workspace(self._config_from(self.raw, sid, clean), sid, meta)
             except SessionError:

@@ -487,6 +487,34 @@ def test_session_detail_answers_for_invalid_overrides(client):
     assert c.get("/api/sessions/nope").status_code == 404
 
 
+def test_session_settings_patch(client):
+    """The settings dialog of a session page: PATCH {"settings": {section: {key: value or null}}} changes those keys
+    only (the overrides given at creation stay) and answers the session and its effective settings."""
+    c = client
+    sid = _post(c, "/api/sessions", {"title": "Tuned", "goal": "x", "start": True,
+                                     "overrides": {"swarm": {"language": "ru"}}}).json()["session"]["id"]
+
+    def patch(body: Any):
+        return c.patch(f"/api/sessions/{sid}", content=json.dumps(body), headers={"content-type": "application/json"})
+
+    resp = patch({"settings": {"shell": {"max_jobs": 3, "cpu_threads": 2}, "agents": {"tool_output_chars": 4000}}})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["session"]["overrides"] == {"swarm": {"language": "ru"}, "shell": {"max_jobs": 3, "cpu_threads": 2},
+                                            "agents": {"tool_output_chars": 4000}}
+    assert data["config"]["shell"]["max_jobs"] == 3 and data["config"]["agents"]["tool_output_chars"] == 4000
+    assert "sk-hidden" not in resp.text
+    swarm = c.manager.swarms[sid]
+    assert swarm.config.shell.max_jobs == 3 and swarm.config.agents.tool_output_chars == 4000  # hot-applied
+    data = patch({"settings": {"shell": {"max_jobs": None}}}).json()
+    assert data["session"]["overrides"]["shell"] == {"cpu_threads": 2} and data["config"]["shell"]["max_jobs"] == 16
+    for body in ({"settings": [1]}, {"settings": {"shell": {"max_jobs": -1}}}, {"settings": {"server": {"port": 1}}},
+                 {"settings": {"shell": {}}, "overrides": {}}):
+        resp = patch(body)
+        assert resp.status_code == 400 and resp.json()["error"], (body, resp.text)
+    assert c.get(f"/api/sessions/{sid}").json()["session"]["overrides"]["shell"] == {"cpu_threads": 2}
+
+
 def _git(root: Path, *args: str) -> str:
     import subprocess
 

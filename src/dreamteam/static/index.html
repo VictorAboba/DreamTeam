@@ -6,7 +6,8 @@
   <title>DreamTeam</title>
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/traces.css">
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='10' cy='12' r='6' fill='%236366f1'/><circle cx='22' cy='12' r='6' fill='%2322c55e'/><circle cx='16' cy='22' r='6' fill='%23f59e0b'/></svg>">
+  <link rel="stylesheet" href="/static/icons.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><path d='M16 7 6.5 24h19z' fill='none' stroke='%2385858d' stroke-width='2.4' stroke-linejoin='round'/><circle cx='16' cy='7' r='5.2' fill='%23d97757'/><circle cx='6.5' cy='24' r='5.2' fill='%2385858d'/><circle cx='25.5' cy='24' r='5.2' fill='%2385858d'/></svg>">
 </head>
 <body>
   <header class="topbar">
@@ -18,7 +19,7 @@
         <a class="back-link hidden" id="back-link" href="/">← <span data-i18n="sessions"></span></a>
       </div>
     </div>
-    <button class="icon-btn team-btn" id="team-btn" type="button" data-i18n-title="team">👥<span class="unread hidden" id="team-unread"></span></button>
+    <button class="icon-btn team-btn" id="team-btn" type="button" data-i18n-title="team"><i class="ic ic-users"></i><span class="unread hidden" id="team-unread"></span></button>
     <button class="goal" id="goal-btn" type="button">
       <span class="goal-label" data-i18n="goal"></span>
       <span class="goal-title" id="goal-title"></span>
@@ -31,9 +32,9 @@
       </div>
       <div class="stat compact"><div class="stat-row"><span data-i18n="agents"></span><b id="agents-count"></b></div></div>
       <button class="btn" id="pause-btn" type="button"></button>
-      <button class="icon-btn" id="settings-btn" type="button" data-i18n-title="settings">⚙</button>
+      <button class="icon-btn" id="settings-btn" type="button" data-i18n-title="settings"><i class="ic ic-gear"></i></button>
       <button class="icon-btn" id="lang-btn" type="button" data-i18n-title="language">RU</button>
-      <button class="icon-btn" id="theme-btn" type="button" data-i18n-title="theme">◐</button>
+      <button class="icon-btn" id="theme-btn" type="button" data-i18n-title="theme"><i class="ic ic-contrast"></i></button>
       <span class="conn" id="conn" role="status"></span>
     </div>
   </header>
@@ -63,7 +64,10 @@
         <div class="files-head" id="workspace-info"></div>
         <div class="files">
           <div class="file-tree"><div class="crumbs" id="crumbs"></div><div id="file-list"></div></div>
-          <div class="file-view"><div class="file-path" id="file-path"></div><pre id="file-content"></pre></div>
+          <div class="file-view">
+            <div class="file-head"><div class="file-path" id="file-path"></div><button class="btn small hidden" id="file-mode" type="button"></button></div>
+            <pre id="file-content"></pre><div class="file-md hidden" id="file-md"></div>
+          </div>
         </div>
       </section>
       <section class="tab-pane hidden" id="pane-mcp"><div id="mcp-list" class="cards-list"></div></section>
@@ -77,7 +81,7 @@
         <h2 data-i18n="team"></h2>
         <button class="btn small hire-btn" id="hire-btn" type="button" data-i18n="hire"></button>
         <button class="icon-btn small team-toggle" id="team-toggle" type="button">»</button>
-        <button class="icon-btn small team-close" id="team-close" type="button" data-i18n-title="close">✕</button>
+        <button class="icon-btn small team-close" id="team-close" type="button" data-i18n-title="close"><i class="ic ic-close"></i></button>
       </div>
       <button class="agent broadcast" id="broadcast-btn" type="button" data-i18n-title="broadcast_hint">
         <span class="avatar-wrap"><span class="avatar all">∗</span></span>
@@ -92,7 +96,7 @@
   <div class="drawer hidden" id="drawer" role="complementary">
     <div class="drawer-head">
       <div class="drawer-title" id="drawer-title"></div>
-      <button class="icon-btn" id="drawer-close" type="button" data-i18n-title="close">✕</button>
+      <button class="icon-btn" id="drawer-close" type="button" data-i18n-title="close"><i class="ic ic-close"></i></button>
     </div>
     <div class="drawer-jobs hidden" id="drawer-jobs"></div>
     <div class="drawer-tabs">
@@ -113,6 +117,8 @@
   </div>
 
   <div class="toasts" id="toasts" aria-live="polite"></div>
+  <script src="/static/highlight.js"></script>
+  <script src="/static/markdown.js"></script>
   <script src="/static/app.js"></script>
   <script src="/static/traces.js"></script>
 </body>

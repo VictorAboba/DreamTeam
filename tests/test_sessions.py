@@ -705,6 +705,60 @@ async def test_update_overrides_apply_to_the_loaded_swarm(tmp_path):
     await manager.shutdown()
 
 
+async def test_partial_settings_update_keeps_the_other_overrides(tmp_path):
+    """The settings dialog of a session page changes some keys (`settings`): the overrides given at creation stay,
+    null brings back the global value, and the running swarm (its jobs manager, its agents) sees the change."""
+    manager = _manager(_home(tmp_path))
+    created = {"swarm": {"language": "ru", "starting_roles": ["Tester"]}, "agents": {"default_model": "fast"}}
+    sid = (await manager.create("Live", start=False, overrides=created))["id"]
+    events: list[dict] = []
+    manager.listen(events.append)
+    summary = manager.update(sid, settings={"shell": {"max_jobs": 2, "cpu_threads": "auto"},
+                                            "agents": {"context_tokens": 50_000, "default_model": None}})
+    assert summary["overrides"] == {"swarm": created["swarm"], "agents": {"context_tokens": 50_000},
+                                    "shell": {"max_jobs": 2, "cpu_threads": "auto"}}
+    assert manager.config_view(sid)["shell"]["max_jobs"] == 2 and (sid, "updated") in {
+        (e["session"], e["change"]) for e in events}
+    # null and "" remove a key; a section left empty disappears; the goal is never a session setting
+    manager.update(sid, settings={"shell": {"max_jobs": None, "cpu_threads": ""}, "swarm": {"goal": "x"}})
+    assert manager.meta(sid)["overrides"] == {"swarm": created["swarm"], "agents": {"context_tokens": 50_000}}
+    before = manager.meta(sid)["overrides"]
+    for settings, match in (({"shell": {"max_jobs": -1}}, "max_jobs"), ({"agents": {"context_tokens": 0}}, ">= 1"),
+                            ({"shell": {"cpu_threads": "many"}}, "auto"), ({"server": {"port": 1}}, "cannot override"),
+                            ({"shell": 5}, "must be an object"), ("x", "object of sections"),
+                            ({"agents": {"default_model": "missing"}}, "missing")):
+        with pytest.raises(SessionError, match=match) as err:
+            manager.update(sid, title="Not saved", settings=settings)
+        assert err.value.status == 400
+    assert manager.meta(sid)["overrides"] == before and manager.summary(sid)["title"] == "Live"  # nothing written
+    with pytest.raises(SessionError, match="not both"):
+        manager.update(sid, overrides={}, settings={"shell": {"max_jobs": 1}})
+
+    swarm = await manager.start(sid)
+    manager.update(sid, settings={"shell": {"max_jobs": 1, "max_jobs_per_member": 0, "job_max_minutes": 5},
+                                  "agents": {"context_tokens": 64_000, "tool_output_chars": 900,
+                                             "max_steps_per_turn": 3, "max_parallel_llm_calls": 2}})
+    assert swarm.config.shell.max_jobs == 1 and swarm.jobs._setting("max_jobs_per_member") == 0
+    assert swarm.jobs._setting("job_max_minutes") == 5
+    assert swarm.config.agents.context_tokens == 64_000 and swarm.config.agents.tool_output_chars == 900
+    assert swarm.config.agents.max_steps_per_turn == 3 and swarm.config.swarm.language == "ru"
+    assert swarm.config.project_dir == swarm.project_dir
+    manager.update(sid, settings={"agents": {"context_tokens": None}})
+    assert swarm.config.agents.context_tokens == 120_000  # the global value (here: the default) again
+    await manager.shutdown()
+
+
+async def test_partial_settings_update_of_the_main_session_is_refused(tmp_path):
+    from dreamteam.db import Database
+
+    home = _home(tmp_path)
+    Database(home / ".dreamteam" / "swarm.db").close()
+    manager = _manager(home)
+    with pytest.raises(SessionError, match="global settings"):
+        manager.update(LEGACY_ID, settings={"shell": {"max_jobs": 2}})
+    assert manager.summary(LEGACY_ID)["overrides"] == {}
+
+
 @pytest.mark.skipif(os.name != "nt", reason="an open file blocks renaming its directory only on Windows")
 async def test_delete_of_a_session_in_use_keeps_it_intact(tmp_path):
     home = _home(tmp_path)

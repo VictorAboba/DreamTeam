@@ -309,7 +309,7 @@ async function loadSettingsPane() {
   } catch (e) {
     H.settingsError = e.message;
     $("#settings-form").innerHTML = `<div class="err-text">${esc(t("err"))}: ${esc(e.message)}</div>
-      <div><button class="btn" type="button" id="settings-retry">⟳ ${esc(t("retry"))}</button></div>`;
+      <div><button class="btn" type="button" id="settings-retry"><i class="ic ic-refresh"></i>${esc(t("retry"))}</button></div>`;
     $("#settings-retry").addEventListener("click", () => {
       $("#settings-form").innerHTML = `<div class="settings-loading muted">${esc(t("loading"))}</div>`;
       loadSettingsPane();
@@ -399,8 +399,8 @@ function workspaceLine(ws) {
   const missing = workspaceMissing(ws);
   const label = missing ? t("ws_missing_badge") : t("ws_" + kind);
   const badge = `<span class="badge ${missing ? "err" : kind === "default" ? "plain" : ""}">${esc(label)}</span>`;
-  return `<div class="sc-folder" title="${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}">📁 <code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</div>
-    ${missing ? `<div class="sc-warn">⚠ ${esc(t("ws_missing"))}</div>` : ""}`;
+  return `<div class="sc-folder" title="${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}"><i class="ic ic-folder"></i><code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</div>
+    ${missing ? `<div class="sc-warn"><i class="ic ic-alert"></i>${esc(t("ws_missing"))}</div>` : ""}`;
 }
 
 function sessionCard(s) {
@@ -408,9 +408,9 @@ function sessionCard(s) {
   const tasks = s.tasks || { total: 0, done: 0 };
   const agents = s.agents || { total: 0, working: 0 };
   const pct = tasks.total ? Math.round(100 * tasks.done / tasks.total) : 0;
-  const badgeCls = { running: "done", paused: "warn", done: "", stopped: "plain" }[state];
+  const badgeCls = { running: "", paused: "warn", done: "done", stopped: "plain" }[state];   // working: the accent, as everywhere
   const goal = s.goal && s.goal.title
-    ? `<div class="sc-goal" title="${esc(s.goal.description || s.goal.title)}">🎯 ${esc(s.goal.title)}${s.goal.status === "pending" ? ` <span class="muted">(${esc(t("st_pending"))})</span>` : ""}</div>`
+    ? `<div class="sc-goal" title="${esc(s.goal.description || s.goal.title)}"><i class="ic ic-goal"></i>${esc(s.goal.title)}${s.goal.status === "pending" ? ` <span class="muted">(${esc(t("st_pending"))})</span>` : ""}</div>`
     : `<div class="sc-goal none">${esc(t("no_goal"))}</div>`;
   const budget = s.max_cost_usd > 0 ? `${money(s.spent_usd)} / ${money(s.max_cost_usd)}` : money(s.spent_usd);
   const running = s.status === "running";
@@ -425,20 +425,20 @@ function sessionCard(s) {
     ${goal}
     <div class="sc-progress"><div class="meter"><div style="width:${pct}%"></div></div><span>${esc(t("tasks_done", { done: Number(tasks.done) || 0, total: Number(tasks.total) || 0 }))}</span></div>
     <div class="sc-meta">
-      <span>👥 <b>${Number(agents.total) || 0}</b> ${esc(t("agents_n"))}${agents.working ? ` · <b>${Number(agents.working) || 0}</b> ${esc(t("working_n"))}` : ""}</span>
-      <span>💲 <b>${esc(budget)}</b></span>
-      ${s.model ? `<span title="${esc(t("model"))}: ${esc(s.model_profile)}">🧠 ${esc(s.model)}</span>` : ""}
-      <span title="${esc(t("created"))}: ${esc(ago(s.created_at))}">🕒 ${esc(ago(s.last_activity || s.created_at))}</span>
+      <span><i class="ic ic-users"></i><b>${Number(agents.total) || 0}</b> ${esc(t("agents_n"))}${agents.working ? ` · <b>${Number(agents.working) || 0}</b> ${esc(t("working_n"))}` : ""}</span>
+      <span><i class="ic ic-coin"></i><b>${esc(budget)}</b></span>
+      ${s.model ? `<span title="${esc(t("model"))}: ${esc(s.model_profile)}"><i class="ic ic-cpu"></i>${esc(s.model)}</span>` : ""}
+      <span title="${esc(t("created"))}: ${esc(ago(s.created_at))}"><i class="ic ic-clock"></i>${esc(ago(s.last_activity || s.created_at))}</span>
     </div>
     ${workspaceLine(s.workspace)}
     ${error ? `<div class="sc-error">${esc(error)}</div>` : ""}
     <div class="sc-actions">
       <a class="btn primary small" href="/s/${encodeURIComponent(s.id)}/">${esc(t("open"))}</a>
-      ${running ? `<button class="btn small" type="button" data-stop="${esc(s.id)}"${busy}>⏹ ${esc(t("stop"))}</button>`
-                : `<button class="btn small" type="button" data-start="${esc(s.id)}"${busy}>▶ ${esc(t("start"))}</button>`}
+      ${running ? `<button class="btn small" type="button" data-stop="${esc(s.id)}"${busy}><i class="ic ic-stop"></i>${esc(t("stop"))}</button>`
+                : `<button class="btn small" type="button" data-start="${esc(s.id)}"${busy}><i class="ic ic-play"></i>${esc(t("start"))}</button>`}
       <span class="spacer"></span>
       <span class="sc-id" title="${esc(s.dir || "")}">${esc(s.legacy ? t("legacy") + " · " + s.id : s.id)}</span>
-      ${s.legacy ? "" : `<button class="icon-btn small" type="button" data-delete="${esc(s.id)}" title="${esc(t("delete"))}">🗑</button>`}
+      ${s.legacy ? "" : `<button class="icon-btn small" type="button" data-delete="${esc(s.id)}" title="${esc(t("delete"))}"><i class="ic ic-trash"></i></button>`}
     </div>
   </article>`;
 }
@@ -470,10 +470,9 @@ function deleteModal(sid) {
     <p>${esc(kept ? t("delete_text_kept", { title: s.title, path: kept }) : t("delete_text", { title: s.title }))}</p>
     <div class="modal-actions">
       <button class="btn" type="button" data-close>${esc(t("cancel"))}</button>
-      <button class="btn primary danger-fill" type="button" id="confirm-delete">🗑 ${esc(t("delete"))}</button>
+      <button class="btn primary danger-fill" type="button" id="confirm-delete"><i class="ic ic-trash"></i>${esc(t("delete"))}</button>
     </div>`);
   const btn = $("#confirm-delete");
-  btn.style.background = "var(--err)"; btn.style.borderColor = "var(--err)";
   btn.addEventListener("click", async () => {
     btn.disabled = true;
     try {
@@ -592,13 +591,13 @@ function teamInner(id) {
       ${role ? "" : `<input type="text" ${attrs("custom", i)} maxlength="${ROLE_NAME_MAX}" value="${esc(row.role)}" placeholder="${esc(t("team_custom_ph"))}">`}
       <span class="team-count"><button class="btn small" type="button" ${attrs("dec", i)}>−</button><input type="number" min="1" max="${TEAM_ROW_MAX}" ${attrs("count", i)} value="${Number(row.count) || 1}"><button class="btn small" type="button" ${attrs("inc", i)}>+</button></span>
       ${role && role.model ? `<span class="team-model">${esc(t("team_model", { model: role.model }))}</span>` : ""}
-      <button class="icon-btn small" type="button" ${attrs("del", i)} title="${esc(t("team_remove"))}" aria-label="${esc(t("team_remove"))}">✕</button>
+      <button class="icon-btn small" type="button" ${attrs("del", i)} title="${esc(t("team_remove"))}" aria-label="${esc(t("team_remove"))}"><i class="ic ic-close"></i></button>
       ${desc}
     </div>`;
   }).join("");
   return `<div class="team-head"><span>${esc(t("f_team"))}</span><span class="team-total" id="team-total-${id}">${esc(t("team_total", { n: teamTotal(rows) }))}</span></div>
     ${rowHtml}
-    <div><button class="btn small" type="button" data-team="add" data-composer="${id}">＋ ${esc(t("team_add"))}</button></div>
+    <div><button class="btn small" type="button" data-team="add" data-composer="${id}"><i class="ic ic-plus"></i>${esc(t("team_add"))}</button></div>
     <p class="field-hint">${esc(t("f_team_hint"))}</p>`;
 }
 function renderTeam(id) { const box = $("#team-" + id); if (box) box.innerHTML = teamInner(id); }
@@ -705,7 +704,7 @@ function roleHeadInner(card) {
   const actions = card.builtin
     ? `${roleCustomized(card) ? `<button class="btn small" type="button" data-rc-reset>${esc(t("r_reset"))}</button>` : ""}
        <button class="btn small" type="button" data-rc-hide>${esc(t(card.hidden ? "r_show" : "r_hide"))}</button>`
-    : `<button class="icon-btn small" type="button" data-rc-del title="${esc(t("r_delete"))}" aria-label="${esc(t("r_delete"))}">🗑</button>`;
+    : `<button class="icon-btn small" type="button" data-rc-del title="${esc(t("r_delete"))}" aria-label="${esc(t("r_delete"))}"><i class="ic ic-trash"></i></button>`;
   const name = preset ? `<span class="role-name">${esc(roleCardName(card))}</span>`
     : `<input class="role-name" type="text" data-rc="name" maxlength="${ROLE_NAME_MAX}" value="${esc(card.name)}" placeholder="${esc(t("r_name_ph"))}" title="${esc(t("r_name"))}">`;
   const otherLang = H.lang === "ru" ? "en" : "ru";   // the name of a built-in role in the other language
@@ -835,12 +834,12 @@ async function newSessionModal() {
   const def = (v.agents || {}).default_model || "default";
   const modelOpts = profiles.map(([name, p]) =>
     `<option value="${esc(name)}"${name === def ? " selected" : ""}>${esc(name)} — ${esc(p.model || "?")}${name === def ? ` (${esc(t("default_marker"))})` : ""}</option>`).join("");
-  openModal(`<div class="modal-head"><h3>✨ ${esc(t("ns_title"))}</h3><button class="icon-btn small" type="button" data-close>✕</button></div>
+  openModal(`<div class="modal-head"><h3>${esc(t("ns_title"))}</h3><button class="icon-btn small" type="button" data-close><i class="ic ic-close"></i></button></div>
     <p class="lead">${esc(t("ns_lead"))}</p>
     <form class="new-session" id="ns-form" novalidate>
       <div class="form-grid">
         <label class="field full"><span>${esc(t("f_title"))}</span><input id="ns-title" maxlength="120" placeholder="${esc(t("f_title_ph"))}"></label>
-        <label class="field full"><span>🎯 ${esc(t("f_goal"))} * <span class="hint">${esc(t("f_goal_hint"))}</span></span><textarea id="ns-goal" rows="4" placeholder="${esc(t("f_goal_ph"))}"></textarea></label>
+        <label class="field full"><span><i class="ic ic-goal"></i>${esc(t("f_goal"))} * <span class="hint">${esc(t("f_goal_hint"))}</span></span><textarea id="ns-goal" rows="4" placeholder="${esc(t("f_goal_ph"))}"></textarea></label>
         <label class="field full"><span>${esc(t("f_desc"))}</span><textarea id="ns-desc" rows="3" placeholder="${esc(t("f_desc_ph"))}"></textarea></label>
         <label class="field two"><span>${esc(t("f_model"))} <span class="hint">${esc(t("f_model_hint"))}</span></span><select id="ns-model">${modelOpts}</select></label>
         <label class="field"><span>${esc(t("f_lang"))}</span><select id="ns-lang">
@@ -860,12 +859,12 @@ async function newSessionModal() {
       <div class="modal-actions">
         <label class="check" style="margin-right:auto"><input type="checkbox" id="ns-run" checked> ${esc(t("f_start_now"))}</label>
         <button class="btn" type="button" data-close>${esc(t("cancel"))}</button>
-        <button class="btn primary" type="submit" id="ns-submit">🚀 ${esc(t("create_open"))}</button>
+        <button class="btn primary" type="submit" id="ns-submit">${esc(t("create_open"))}</button>
       </div>
     </form>`);
   $("#ns-goal").focus();
   for (const type of ["input", "change", "click"]) $("#ns-form .team").addEventListener(type, onTeamEvent);
-  $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = "🚀 " + t(e.target.checked ? "create_open" : "create"); });
+  $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = t(e.target.checked ? "create_open" : "create"); });
   $("#ns-form").addEventListener("submit", submitNewSession);
 }
 
@@ -964,10 +963,10 @@ function renderSettings(fromServer) {
     ${section("models", `<div class="profiles" id="profiles"></div>
       <div class="add-profile"><span class="muted">${esc(t("p_add_from"))}</span>
         <select id="add-preset">${H.providers.map((p) => `<option value="${esc(p.id)}">${esc(p.label)}</option>`).join("")}</select>
-        <button class="btn" type="button" id="add-profile">＋ ${esc(t("p_add"))}</button></div>
+        <button class="btn" type="button" id="add-profile"><i class="ic ic-plus"></i>${esc(t("p_add"))}</button></div>
       <p class="field-hint">${esc(t("p_key_note"))} <code>${esc(H.path)}</code></p>`)}
     ${section("roles", `<div class="roles" id="roles"></div>
-      <div class="add-role"><button class="btn" type="button" data-role-add>＋ ${esc(t("r_add"))}</button></div>`)}
+      <div class="add-role"><button class="btn" type="button" data-role-add><i class="ic ic-plus"></i>${esc(t("r_add"))}</button></div>`)}
     ${section("swarm", grid([
       field("sw_name", "swarm.name", "str"),
       field("sw_lang", "swarm.language", "select", { options: [["ru", "Русский"], ["en", "English"]] }),
@@ -1141,22 +1140,22 @@ function profileCard(p) {
     ? `<input data-pf="api_key_env" type="text" value="${esc(d.api_key_env || "")}" placeholder="${esc(t("p_env_ph"))}">`
     : `<div class="input-row"><input data-pf="new_key" type="password" autocomplete="new-password" value="${esc(p.newKey || "")}"
          placeholder="${esc(p.cleared ? t("p_key_cleared") : d.api_key_set ? t("p_key_saved", { hint: d.api_key_hint || "" }) : t("p_key_new"))}">
-         ${d.api_key_set && !p.cleared ? `<button class="btn small" type="button" data-clear-key title="${esc(t("p_key_clear"))}">✕</button>` : ""}</div>`;
+         ${d.api_key_set && !p.cleared ? `<button class="btn small" type="button" data-clear-key title="${esc(t("p_key_clear"))}" aria-label="${esc(t("p_key_clear"))}"><i class="ic ic-close"></i></button>` : ""}</div>`;
   const check = p.check ? `<div class="check-result ${p.check.ok ? "ok" : "bad"}">${esc(p.check.text)}</div>` : "";
   const list = `<datalist id="dl-${p.uid}">${(p.models.length ? p.models : presetModels(d)).map((m) => `<option value="${esc(m)}">`).join("")}</datalist>`;
   return `<div class="profile-card${isDefault ? " default" : ""}" data-uid="${p.uid}">
     <div class="profile-head">
       <input class="pname" data-pf="name" value="${esc(p.name)}" title="${esc(t("p_name"))}" maxlength="40">
-      ${isDefault ? `<span class="badge">★ ${esc(t("p_default"))}</span>` : `<button class="btn small" type="button" data-make-default>☆ ${esc(t("p_make_default"))}</button>`}
+      ${isDefault ? `<span class="badge"><i class="ic ic-star-fill"></i>${esc(t("p_default"))}</span>` : `<button class="btn small" type="button" data-make-default><i class="ic ic-star"></i>${esc(t("p_make_default"))}</button>`}
       <span class="spacer"></span>
       <select data-apply-preset><option value="">${esc(t("p_preset"))}</option>${H.providers.map((x) => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join("")}</select>
-      ${H.profiles.length > 1 && !isDefault ? `<button class="icon-btn small" type="button" data-del-profile title="${esc(t("p_delete"))}">🗑</button>` : ""}
+      ${H.profiles.length > 1 && !isDefault ? `<button class="icon-btn small" type="button" data-del-profile title="${esc(t("p_delete"))}"><i class="ic ic-trash"></i></button>` : ""}
     </div>
     <div class="settings-grid">
       <label class="field"><span>${esc(t("p_provider"))}</span>${sel("provider", providers, d.provider)}</label>
       <label class="field"><span>${esc(t("p_base_url"))}</span>${inp("base_url", d.base_url, "str", `placeholder="${esc(t("p_base_url_ph"))}"`)}</label>
       <label class="field full"><span>${esc(t("p_model"))}</span><div class="input-row">${inp("model", d.model, "str", `list="dl-${p.uid}"`)}
-        <button class="btn small" type="button" data-load-models${p.busy ? " disabled" : ""}>⟳ ${esc(t("p_load_models"))}</button></div>${list}</label>
+        <button class="btn small" type="button" data-load-models${p.busy ? " disabled" : ""}><i class="ic ic-refresh"></i>${esc(t("p_load_models"))}</button></div>${list}</label>
       <div class="field full"><span class="key-label">${esc(t("p_key"))}
         <span class="key-mode"><button type="button" data-key-mode="env" class="${p.keyMode === "env" ? "active" : ""}">${esc(t("p_key_env"))}</button><button type="button" data-key-mode="key" class="${p.keyMode === "key" ? "active" : ""}">${esc(t("p_key_value"))}</button></span>
         ${keyState}</span>${keyInput}</div>
@@ -1180,8 +1179,8 @@ function profileCard(p) {
       </div>
     </details>
     <div class="profile-actions">
-      <button class="btn small" type="button" data-check="0"${p.busy ? " disabled" : ""}>🔌 ${esc(t("p_check"))}</button>
-      <button class="btn small" type="button" data-check="1"${p.busy ? " disabled" : ""}>💬 ${esc(t("p_live"))}</button>
+      <button class="btn small" type="button" data-check="0"${p.busy ? " disabled" : ""}><i class="ic ic-plug"></i>${esc(t("p_check"))}</button>
+      <button class="btn small" type="button" data-check="1"${p.busy ? " disabled" : ""}><i class="ic ic-chat"></i>${esc(t("p_live"))}</button>
       ${H.dirty ? `<span class="field-hint">${esc(t("unsaved_check"))}</span>` : ""}
     </div>
     ${check}
