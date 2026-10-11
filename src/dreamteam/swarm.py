@@ -9,7 +9,6 @@ import difflib
 import hashlib
 import logging
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,6 +27,7 @@ from .mcp_forge import MCPForge
 from .models import USER, AgentKind, AgentStatus, Status, ToolError
 from .names import generate_name
 from .shell import resolve_shell
+from .tools.fmt import STAMP_SPAN, item_time, stamp_range
 from .tracing import EXTERNAL_IDLE_SECONDS, Tracer
 from .triggers import TriggerEngine
 from .workspace import Workspace, scratch_rel
@@ -371,32 +371,45 @@ class Swarm:
             "SELECT 1 FROM notifications WHERE recipient = ? AND delivered_at IS NULL"
             f" AND json_extract(data, '$.{QUIET_KEY}') IS NULL LIMIT 1", (name,)))
 
-    def render_wake(self, name: str, incoming: bool = False) -> str | None:
+    def render_wake(self, name: str, incoming: bool = False, stamps: bool = False,
+                    since: float | None = None) -> str | None:
+        """The wake-up text of `name` (incoming: only the news, None when there is none). `stamps` (only
+        wait_for_events: an MCP client's batch may span hours, unlike an agent's wake-up, whose history must not
+        grow): when the oldest item, or `since` (the oldest of other lines shown with this text), is more than
+        STAMP_SPAN seconds old, each notification and message gets its own time and the header the range."""
         lang = self.language_of(name)
         notes = self.db.all(
-            "SELECT id, text FROM notifications WHERE recipient = ? AND delivered_at IS NULL ORDER BY id", (name,))
+            "SELECT id, ts, text FROM notifications WHERE recipient = ? AND delivered_at IS NULL ORDER BY id", (name,))
         messages = self.mail.unread(name, mark_read=True)
         if incoming and not notes and not messages:
             return None
+        now = time.time()
         if notes:
-            now = time.time()
             self.db.execute(
                 f"UPDATE notifications SET delivered_at = ? WHERE id IN ({','.join('?' * len(notes))})",
                 [now] + [n["id"] for n in notes],
             )
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-        lines = [prompts.t(lang, "incoming_header" if incoming else "wake_header", time=stamp)]
+        first = None
+        if stamps:
+            times = [t for t in [*(n["ts"] for n in notes), *(m["ts"] for m in messages), since] if t]
+            if times and now - min(times) > STAMP_SPAN:
+                first = min(times)
+
+        def at(ts: float | None) -> str:
+            return f"{item_time(ts, now)} " if first is not None and ts else ""
+
+        lines = [prompts.t(lang, "incoming_header" if incoming else "wake_header", time=stamp_range(first, now))]
         if notes or messages:
             lines.append(prompts.t(lang, "reasons"))
-            lines.extend(f"• {n['text']}" for n in notes)
+            lines.extend(f"• {at(n['ts'])}{n['text']}" for n in notes)
             you = prompts.t(lang, "you")
             for m in messages:
                 to = ", ".join(you if r == name else r for r in m["recipients"])
                 text = prompts.t(lang, "msg", id=m["id"], sender=m["sender"], to=to, text=m["text"])
                 if m.get("reply_to"):
-                    first, _, rest = text.partition("\n")
-                    text = first.rstrip(":") + prompts.t(lang, "msg_reply", reply_to=m["reply_to"]) + ":\n" + rest
-                lines.append("• " + text)
+                    head, _, rest = text.partition("\n")
+                    text = head.rstrip(":") + prompts.t(lang, "msg_reply", reply_to=m["reply_to"]) + ":\n" + rest
+                lines.append("• " + at(m["ts"]) + text)
         if not incoming:
             goal = self.goal()
             if goal:
@@ -406,6 +419,10 @@ class Swarm:
             mine = self.board.open_tasks_of(name)
             lines.append(prompts.t(lang, "my_tasks", tasks="; ".join(t.short() for t in mine))
                          if mine else prompts.t(lang, "my_tasks_none"))
+            # a held task blocked by unfinished ones: its assignee may drop what it can do without (Board._plan_deps);
+            # not in review, where the result is already produced
+            lines.extend(prompts.t(lang, "my_blocked", id=t.id, blockers=", ".join(f"#{d}" for d in t.blocked_by))
+                         for t in mine if t.blocked_by and t.status != Status.REVIEW)
             reviews = self.board.reviews_of(name)
             if reviews:
                 lines.append(prompts.t(lang, "my_reviews", tasks="; ".join(

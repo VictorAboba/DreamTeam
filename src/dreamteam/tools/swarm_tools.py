@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime
 from typing import Any
 
 from .. import prompts, roles
@@ -12,7 +11,7 @@ from ..db import loads
 from ..jobs import fmt_duration, short_command
 from ..models import USER, AgentKind, Status, ToolError
 from . import ToolContext, tool
-from .fmt import ago, budget_line, goal_line
+from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
 
 MAX_NOTES = 20000
 WAIT_DEFAULT = 50
@@ -362,9 +361,10 @@ def _progress_line(texts: dict[str, str], event: dict, actor: str) -> str | None
     return None
 
 
-def _progress(swarm, actor: str, cursor: int) -> tuple[list[str], int]:
-    """Board progress after journal event `cursor`, as lines in `actor`'s language, and the last event read."""
-    rows = swarm.db.all(f"SELECT id, type, actor, data FROM events WHERE id > ? AND type IN "
+def _progress(swarm, actor: str, cursor: int) -> tuple[list[tuple[float, str]], int]:
+    """Board progress after journal event `cursor`, as (event time, line in `actor`'s language), and the last event
+    read."""
+    rows = swarm.db.all(f"SELECT id, ts, type, actor, data FROM events WHERE id > ? AND type IN "
                         f"({', '.join('?' * len(PROGRESS_TYPES))}) ORDER BY id LIMIT ?",
                         (cursor, *PROGRESS_TYPES, PROGRESS_SCAN))
     texts = _PROGRESS.get(swarm.language_of(actor)) or _PROGRESS["en"]
@@ -373,7 +373,7 @@ def _progress(swarm, actor: str, cursor: int) -> tuple[list[str], int]:
         event = {"type": row["type"], "actor": row["actor"], "data": loads(row["data"], {})}
         line = _progress_line(texts, event, actor) if isinstance(event["data"], dict) else None
         if line:
-            lines.append(line)
+            lines.append((row["ts"] or 0.0, line))
     return lines, (rows[-1]["id"] if rows else cursor)
 
 
@@ -397,12 +397,14 @@ async def _signal_or_progress(swarm, actor: str, queue: asyncio.Queue, timeout: 
     en=f"Wait (up to timeout seconds, default {WAIT_DEFAULT}, max {WAIT_MAX}) for new messages, notifications, "
        "assignments or triggers addressed to you, and return them. Returns immediately if something is already "
        "pending. With progress=true it also returns on board progress made by others (tasks created or changing "
-       "status, the goal set, achieved or reopened, members hired, joined or leaving), as short lines.",
+       "status, the goal set, achieved or reopened, members hired, joined or leaving), as short lines with their "
+       "time (HH:MM). When the news spans more than a minute, every item has its time and the header the range.",
     ru=f"Подождать (до timeout секунд, по умолчанию {WAIT_DEFAULT}, максимум {WAIT_MAX}) новых сообщений, "
        "уведомлений, назначений или срабатываний триггеров, адресованных тебе, и вернуть их. Сразу "
        "возвращается, если что-то уже есть. С progress=true возвращается и при прогрессе на доске, сделанном "
        "другими (задачи созданы или сменили статус, цель задана, достигнута или возвращена в работу, участники "
-       "наняты, вступили или ушли), короткими строками.",
+       "наняты, вступили или ушли), короткими строками со временем (ЧЧ:ММ). Если новости охватывают больше "
+       "минуты, время есть у каждой из них, а в заголовке — диапазон.",
     properties={"timeout": {"type": "integer", "description": f"Seconds, 0-{WAIT_MAX}"},
                 "progress": {"type": "boolean",
                              "description": "Also return on board progress (default false: only what is addressed "
@@ -439,19 +441,24 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
             swarm.bus.unsubscribe(queue)
     if _stopping(swarm):  # its database may already be closed
         raise ToolError("The swarm was stopped while waiting; call wait_for_events again once it runs again.")
-    text = swarm.render_wake(ctx.actor, incoming=True)
+    lines: list[tuple[float, str]] = []
     if progress:
         lines, last = _progress(swarm, ctx.actor, cursor)
         swarm.db.set(_progress_key(ctx.actor), last)
-        if lines:
-            texts = _PROGRESS.get(swarm.language_of(ctx.actor)) or _PROGRESS["en"]
-            shown = [f"• {line}" for line in lines[:PROGRESS_MAX]]
-            if len(lines) > PROGRESS_MAX:
-                shown.append(f"• {texts['more'].format(n=len(lines) - PROGRESS_MAX)}")
-            if not text:
-                stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-                text = prompts.t(swarm.language_of(ctx.actor), "incoming_header", time=stamp)
-            text += "\n" + "\n".join([texts["header"], *shown])
+    # one result may hold hours of news (progress collected since the last progress call, notifications queued
+    # while the client was away): every progress line has its time, the rest too when the batch spans minutes
+    since = min((ts for ts, _ in lines if ts), default=None)
+    text = swarm.render_wake(ctx.actor, incoming=True, stamps=True, since=since)
+    if lines:
+        now = time.time()
+        texts = _PROGRESS.get(swarm.language_of(ctx.actor)) or _PROGRESS["en"]
+        shown = [f"• {item_time(ts, now)} {line}" if ts else f"• {line}" for ts, line in lines[:PROGRESS_MAX]]
+        if len(lines) > PROGRESS_MAX:
+            shown.append(f"• {texts['more'].format(n=len(lines) - PROGRESS_MAX)}")
+        if not text:
+            first = since if since is not None and now - since > STAMP_SPAN else None
+            text = prompts.t(swarm.language_of(ctx.actor), "incoming_header", time=stamp_range(first, now))
+        text += "\n" + "\n".join([texts["header"], *shown])
     return text or f"No new events in {timeout}s. Call wait_for_events again to keep listening."
 
 
@@ -475,8 +482,12 @@ async def set_goal(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 @tool(
     "swarm_status",
-    en="Overview of the swarm: goal, budget, pause state, members, task counts and your unread items.",
-    ru="Обзор роя: цель, бюджет, пауза, участники, счётчики задач и твои непрочитанные.",
+    en="Overview of the swarm: goal, budget, pause state, members, task counts and your unread items. brief=true "
+       "shows the goal as one line (title and status, without its description and summary).",
+    ru="Обзор роя: цель, бюджет, пауза, участники, счётчики задач и твои непрочитанные. brief=true показывает цель "
+       "одной строкой (заголовок и статус, без описания и итога).",
+    properties={"brief": {"type": "boolean",
+                          "description": "The goal as one line, without its description and summary (default false)"}},
     audience=("external", "user"),
 )
 async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
@@ -484,9 +495,12 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     limits = swarm.limits()
     members = swarm.members()
     counts = swarm.board.counts()
+    goal = swarm.goal()
+    if args.get("brief") and goal:  # a client that checks often needs no repeat of a long goal text
+        goal = {"title": goal.get("title"), "status": goal.get("status", "active")}
     lines = [
         f"Swarm \"{swarm.config.swarm.name}\" — {'PAUSED: ' + swarm.pause_reason if swarm.paused else 'running'}",
-        goal_line(swarm.goal()),
+        goal_line(goal),
         f"{budget_line(swarm.spent_usd(), limits['max_cost_usd'])} {_team_size(members, limits)}",
         "Members: " + (", ".join(f"{m['name']} ({m['role']}, {m['status']})" for m in members) or "none"),
         "Tasks: " + (", ".join(f"{k}={v}" for k, v in counts.items() if v) or "none"),

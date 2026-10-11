@@ -91,6 +91,11 @@ async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
     board_ = ctx.swarm.board
     task = board_.get(args["task_id"])
     text = task_detail(task)
+    # not in review: its result is already produced and waits for the reviewer
+    if task.blocked_by and task.assignee == ctx.actor and task.status in Status.OPEN - {Status.REVIEW}:
+        text += ("\nYou hold it while it is blocked: if its result can be produced without some of "
+                 f"{', '.join(f'#{d}' for d in task.blocked_by)}, remove those with task_update (depends_on = the "
+                 "ones still needed) and say why in its discussion.")
     every = board_.list(include_closed=True)
     subtasks = [t for t in every if t.parent_id == task.id]
     if subtasks:
@@ -223,6 +228,15 @@ async def task_update(ctx: ToolContext, args: dict[str, Any]) -> str:
         text = f"No fields changed in task #{task.id}."
     if post is not None:
         text += f"\nPosted comment #{post['id']} in its discussion."
+    removed = [d for d in old.depends_on if d not in task.depends_on]
+    if removed and ctx.actor not in (USER, old.created_by):  # an assignee dropped what its creator planned
+        ids = ", ".join(f"#{d}" for d in removed)
+        if old.created_by and ctx.swarm.is_member(old.created_by):
+            text += f"\nIts creator ({old.created_by}) was told that you removed {ids}, and the discussion records it."
+        else:  # created by the user (who sees the discussion) or by a member who left
+            text += f"\nThe discussion records that you removed {ids}."
+        if post is None:
+            text += " Say there why the task can do without them (task_comment)."
     return text
 
 

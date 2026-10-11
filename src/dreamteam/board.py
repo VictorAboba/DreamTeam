@@ -308,7 +308,7 @@ class Board:
                                 "you have something the assignee needs.")
             if old.status != Status.TODO:
                 raise ToolError(f"Task #{old.id} has status '{old.status}'; only 'todo' tasks can be claimed.")
-            self._raise_if_blocked(old.id, old.depends_on)
+            self._raise_if_blocked(old.id, old.depends_on, assignee=old.assignee == actor)
             values: dict[str, Any] = {"assignee": actor, "status": Status.IN_PROGRESS}
             if old.reviewer == actor and self.independent_review:
                 values["reviewer"] = None  # the designated reviewer executes it now: someone else will review it
@@ -342,6 +342,8 @@ class Board:
                                     title=task.title, by=actor, comment="")
             self._review_dropped(actor, old, task)
             self._on_status_change(actor, old.status, task)
+            if "depends_on" in changes:
+                self._deps_changed(actor, old, task)
         return task
 
     def complete(self, actor: str, task_id: int, result: str) -> Task:
@@ -498,10 +500,27 @@ class Board:
         values: dict[str, Any] = {}
         for field_name, compute in candidates.items():
             value = compute()
+            if field_name == "depends_on":
+                value = self._plan_deps(actor, old, value)
             if value != getattr(old, field_name):
                 self._require_owner(actor, old, field_name)
                 values[field_name] = value
         return values
+
+    @staticmethod
+    def _plan_deps(actor: str, old: Task, deps: list[int]) -> list[int]:
+        """depends_on: its creator, its assignee and the user change it. When an assignee who did not create the
+        task removes entries (a dependency it can do without, e.g. an optional task a report need not wait for),
+        the discussion records it and the creator is told (_deps_changed). Removing a done entry is harmless."""
+        if deps == old.depends_on or actor in (USER, old.created_by):
+            return deps
+        if old.assignee and actor == old.assignee:
+            if set(deps) <= set(old.depends_on):  # removals keep the plan's order (a new order alone is no change)
+                return [d for d in old.depends_on if d in deps]
+            return deps
+        raise ToolError(f"Only the creator ({old.created_by}) or the assignee ({old.assignee or 'nobody'}) of task "
+                        f"#{old.id} can change its depends_on (the assignee may remove dependencies the task can do "
+                        "without). Suggest the change in the discussion.")
 
     def _plan_assignment(self, actor: str, old: Task, assignee: Any, status: Any,
                          deps: list[int]) -> dict[str, Any]:
@@ -585,7 +604,8 @@ class Board:
             raise ToolError(f"Only the assignee of task #{old.id} ({old.assignee or 'nobody'}) can set status "
                             f"'{new}'. {hint}")
         if new == Status.IN_PROGRESS:
-            self._raise_if_blocked(old.id, deps)
+            # the removal hint only for the current assignee: one becoming it in this call cannot drop deps yet
+            self._raise_if_blocked(old.id, deps, assignee=actor == old.assignee)
 
     @staticmethod
     def _require_owner(actor: str, task: Task, field_name: str) -> None:
@@ -655,13 +675,16 @@ class Board:
             node = self.db.scalar("SELECT parent_id FROM tasks WHERE id = ?", (node,))
         return parent
 
-    def _raise_if_blocked(self, task_id: int, deps: list[int]) -> None:
+    def _raise_if_blocked(self, task_id: int, deps: list[int], assignee: bool = False) -> None:
+        """`assignee`: the actor is the task's assignee, who may remove dependencies it can do without."""
         blocked = self._blockers_of(deps)
         if blocked:
             statuses = self._statuses(blocked)
             listed = ", ".join(f"#{d} [{statuses[d]}]" for d in blocked)
+            hint = (" If the task can be done without some of them, remove those from its depends_on (task_update) "
+                    "and say why in its discussion." if assignee else "")
             raise ToolError(f"Task #{task_id} is blocked by unfinished dependencies: {listed}. Wait until they "
-                            f"are done (e.g. a trigger `done({', '.join(map(str, blocked))})`).")
+                            f"are done (e.g. a trigger `done({', '.join(map(str, blocked))})`).{hint}")
 
     # --- storage -------------------------------------------------------------------------------------
 
@@ -733,7 +756,10 @@ class Board:
             "SELECT author FROM comments WHERE task_id = ? GROUP BY author ORDER BY MIN(id)", (task.id,))]
         return _unique([task.created_by, task.assignee, task.reviewer, *posters])
 
-    def _post(self, actor: str, task: Task, text: Any, reply_to: Any, skip: set[str | None] | None = None) -> dict:
+    def _post(self, actor: str, task: Task, text: Any, reply_to: Any, skip: set[str | None] | None = None,
+              notify: bool = True) -> dict:
+        """notify=False: a record the board writes on the actor's behalf (its own notification tells whom it
+        concerns), so participants are not woken by it."""
         body = _check_post(text)
         reply = self._check_reply(task.id, reply_to)
         ts = time.time()
@@ -741,7 +767,8 @@ class Board:
                                  (task.id, actor, body, reply, ts))
         post = {"id": post_id, "task_id": task.id, "author": actor, "text": body, "reply_to": reply, "ts": ts}
         self.swarm.bus.emit("task.comment", actor, task_id=task.id, post=post)
-        self._notify_post(actor, task, post, skip or set())
+        if notify:
+            self._notify_post(actor, task, post, skip or set())
         return post
 
     def _check_reply(self, task_id: int, reply_to: Any) -> int | None:
@@ -833,6 +860,25 @@ class Board:
             wake = task.status != Status.DONE or any(t.status == Status.WAITING for t in self.open_tasks_of(creator))
             self._notify_member(creator, actor, "n_task_closed", wake=wake, id=task.id, title=task.title,
                                 status=task.status, by=actor, result=_clip(task.result or "-"))
+
+    def _deps_changed(self, actor: str, old: Task, task: Task) -> None:
+        """depends_on changed: an assignee that removed dependencies its creator planned leaves a record in the
+        discussion and tells the creator, quietly (the assignee is told to post why there, and that post wakes the
+        creator, who is a participant); a task that lost its last blocker wakes its assignee as a dependency done
+        does, but with its own text (n_unblocked_removed): the removed ones are not done."""
+        removed = [d for d in old.depends_on if d not in task.depends_on]
+        if removed and actor not in (USER, old.created_by):
+            statuses = self._statuses(removed)
+            listed = ", ".join(f"#{d} [{statuses.get(d, '?')}]" for d in removed)
+            record = prompts.t(self.swarm.language, "post_deps_removed", by=actor, deps=listed)
+            self._post(actor, task, record, None, notify=False)
+            self._notify_member(old.created_by, actor, "n_deps_removed", wake=False, id=task.id, title=task.title,
+                                by=actor, deps=listed)
+        if task.status in Status.OPEN and self._blockers_of(old.depends_on) and not task.blocked_by:
+            # not n_unblocked: the removed blockers are not done, their results do not exist yet
+            listed = ", ".join(f"#{d}" for d in self._blockers_of(removed))
+            self._notify_member(task.assignee, actor, "n_unblocked_removed", id=task.id, title=task.title,
+                                by=actor, deps=listed)
 
     def _notify_unblocked(self, actor: str, done_id: int) -> None:
         dependents = [t for t in self._query([f"status IN ({_qmarks(len(_OPEN))})"], list(_OPEN))

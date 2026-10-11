@@ -20,6 +20,23 @@ def clock(ts: float | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
+# Swarm.render_wake(stamps=True) (wait_for_events): news older than this gets its own time, and the header a range
+STAMP_SPAN = 60.0
+
+
+def item_time(ts: float, now: float) -> str:
+    """The time of one item of a wake-up text: HH:MM, with the date when it is not the date of `now`."""
+    at = datetime.fromtimestamp(ts)
+    return at.strftime("%H:%M" if at.date() == datetime.fromtimestamp(now).date() else "%Y-%m-%d %H:%M")
+
+
+def stamp_range(first: float | None, now: float) -> str:
+    """The time of a wake-up header: `now`, or the range from `first` to `now` ("2026-10-11 10:50–12:50")."""
+    if first is None:
+        return datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M")
+    return f"{datetime.fromtimestamp(first):%Y-%m-%d %H:%M}–{item_time(now, first)}"
+
+
 def ago(ts: float | None) -> str:
     if not ts:
         return "never"
