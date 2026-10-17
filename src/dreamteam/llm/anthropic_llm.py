@@ -196,12 +196,13 @@ def beta_names(profile: ModelProfile) -> list[str]:
 
 
 def build_request(profile: ModelProfile, system: str, messages: list[dict], tools: list[dict], *,
-                  use_betas: bool, strip_thinking_before: int = 0) -> dict:
-    """Keyword arguments for `messages.create` (or `beta.messages.create` when use_betas)."""
+                  use_betas: bool, strip_thinking_before: int = 0, max_tokens: int | None = None) -> dict:
+    """Keyword arguments for `messages.create` (or `beta.messages.create` when use_betas). `max_tokens`: this
+    request's output limit (None: the profile's)."""
     betas = beta_names(profile) if use_betas else []
     params: dict[str, Any] = {
         "model": profile.model,
-        "max_tokens": profile.max_tokens,
+        "max_tokens": max_tokens or profile.max_tokens,
         "messages": convert_messages(
             messages,
             strip_thinking_before=strip_thinking_before,
@@ -223,8 +224,11 @@ def build_request(profile: ModelProfile, system: str, messages: list[dict], tool
         fallbacks = fallbacks_param(profile)
         if fallbacks is not None:
             params["fallbacks"] = fallbacks
-    if profile.extra:
-        params["extra_body"] = dict(profile.extra)
+    extra = dict(profile.extra)
+    if max_tokens:  # a raised limit wins over max_tokens in extra (extra_body is merged over the body)
+        extra.pop("max_tokens", None)
+    if extra:
+        params["extra_body"] = extra
     return params
 
 
@@ -344,6 +348,11 @@ def is_missing_auth(exc: BaseException) -> bool:
 
 # --- client -----------------------------------------------------------------------------------
 
+def timeout_seconds(max_tokens: int | None) -> float:
+    """Read timeout of a non-streaming request with this output limit (~35 tokens/s for the whole budget)."""
+    return max(600.0, 3600.0 * (max_tokens or 0) / 128_000)
+
+
 def _digest(msg: dict) -> str:
     return hashlib.sha256(json.dumps(msg, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()
 
@@ -379,7 +388,7 @@ class AnthropicLLM:
 
     def _make_client(self, http_client: Any, max_retries: int) -> anthropic.AsyncAnthropic:
         # A non-default timeout also disables the SDK's "streaming required" guard for big max_tokens.
-        seconds = max(600.0, 3600.0 * self.profile.max_tokens / 128_000)
+        seconds = timeout_seconds(self.profile.max_tokens)
         kwargs: dict[str, Any] = {"max_retries": max_retries, "timeout": anthropic.Timeout(seconds, connect=10.0)}
         key = self.profile.resolve_api_key()
         if key:
@@ -413,13 +422,16 @@ class AnthropicLLM:
             return await self.client.beta.messages.create(**params)
         return await self.client.messages.create(**params)
 
-    async def complete(self, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse:
+    async def complete(self, system: str, messages: list[dict], tools: list[dict], *,
+                       max_tokens: int | None = None) -> LLMResponse:
         degraded = stripped = False
         while True:
             use_betas = self.uses_betas
             boundary = self._strip_boundary(messages)
-            params = build_request(self.profile, system, messages, tools,
-                                   use_betas=use_betas, strip_thinking_before=boundary)
+            params = build_request(self.profile, system, messages, tools, use_betas=use_betas,
+                                   strip_thinking_before=boundary, max_tokens=max_tokens)
+            if max_tokens and max_tokens > self.profile.max_tokens:  # a raised limit may take longer to write
+                params["timeout"] = anthropic.Timeout(timeout_seconds(max_tokens), connect=10.0)
             try:
                 response = await self._send(params, use_betas)
             except anthropic.BadRequestError as exc:

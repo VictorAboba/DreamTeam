@@ -20,7 +20,7 @@ Object.assign(I18N.ru, {
   trs_paused: "пауза", trs_stopped: "остановлен", trs_interrupted: "прерван",
   trk_input: "вход", trk_llm: "LLM", trk_tool: "инструмент", trk_compaction: "сжатие", trk_event: "событие",
   trn_wake: "пробуждение", trn_incoming: "новые события", trn_nudge: "напоминание", trn_continue: "продолжение",
-  trn_reply_to_user: "ответ пользователю", trn_refusal: "отказ", trn_budget_pause: "пауза по бюджету", trn_step_limit: "лимит шагов",
+  trn_reply_to_user: "ответ пользователю", trn_refusal: "отказ", trn_budget_pause: "пауза по бюджету", trn_output_limit_fallback: "откат лимита вывода", trn_step_limit: "лимит шагов",
   trn_stopped: "остановка", trn_crash: "сбой", trn_step: "запрос", trn_compaction: "сжатие контекста", tr_external: "внешний участник",
 });
 Object.assign(I18N.en, {
@@ -41,7 +41,7 @@ Object.assign(I18N.en, {
   trs_paused: "paused", trs_stopped: "stopped", trs_interrupted: "interrupted",
   trk_input: "input", trk_llm: "LLM", trk_tool: "tool", trk_compaction: "compaction", trk_event: "event",
   trn_wake: "wake-up", trn_incoming: "new events", trn_nudge: "nudge", trn_continue: "continuation",
-  trn_reply_to_user: "reply to the user", trn_refusal: "refusal", trn_budget_pause: "budget pause", trn_step_limit: "step limit",
+  trn_reply_to_user: "reply to the user", trn_refusal: "refusal", trn_budget_pause: "budget pause", trn_output_limit_fallback: "output limit fallback", trn_step_limit: "step limit",
   trn_stopped: "stop", trn_crash: "crash", trn_step: "request", trn_compaction: "context compaction", tr_external: "external member",
 });
 

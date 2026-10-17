@@ -60,7 +60,9 @@ const I18N = {
     p_key_saved: "сохранён {hint} — оставьте пустым, чтобы не менять", p_key_new: "вставьте ключ", p_key_clear: "Удалить ключ",
     p_key_cleared: "ключ будет удалён при сохранении", p_key_note: "Ключ хранится в dreamteam.toml на этом компьютере и не передаётся в браузер.",
     p_model: "Модель", p_load_models: "Загрузить список", p_max_tokens: "max_tokens", p_context: "Окно контекста (токены)",
-    p_context_hint: "при превышении история сжимается", p_effort: "Effort", p_thinking: "Thinking", p_thinking_display: "Показ мыслей",
+    p_context_hint: "при превышении история сжимается",
+    p_ceiling: "Потолок max_tokens", p_ceiling_hint: "после обрезанного ответа лимит удваивается до него; пусто — 2 × max_tokens",
+    p_effort: "Effort", p_thinking: "Thinking", p_thinking_display: "Показ мыслей",
     p_fallbacks: "Серверный fallback при отказе (beta)", p_mismatch: "Thinking при изменённом префиксе", p_max_param: "Параметр лимита вывода",
     p_prices: "Цены, $ за 1M токенов", p_price_in: "Вход", p_price_out: "Выход", p_price_cr: "Чтение кэша", p_price_cw: "Запись кэша",
     p_prices_hint: "Пусто — известные цены модели (или 0). OpenRouter сообщает стоимость сам.", p_extra: "Доп. параметры запроса (JSON)",
@@ -168,7 +170,9 @@ const I18N = {
     p_key_saved: "saved {hint} — leave empty to keep it", p_key_new: "paste the key", p_key_clear: "Remove key",
     p_key_cleared: "the key will be removed on save", p_key_note: "The key is stored in dreamteam.toml on this computer and never sent to the browser.",
     p_model: "Model", p_load_models: "Load list", p_max_tokens: "max_tokens", p_context: "Context window (tokens)",
-    p_context_hint: "the history is compacted beyond it", p_effort: "Effort", p_thinking: "Thinking", p_thinking_display: "Thinking display",
+    p_context_hint: "the history is compacted beyond it",
+    p_ceiling: "max_tokens ceiling", p_ceiling_hint: "after a cut-off reply the limit doubles up to it; empty = 2 × max_tokens",
+    p_effort: "Effort", p_thinking: "Thinking", p_thinking_display: "Thinking display",
     p_fallbacks: "Server-side fallback on refusal (beta)", p_mismatch: "Thinking on a changed prefix", p_max_param: "Output limit parameter",
     p_prices: "Prices, $ per 1M tokens", p_price_in: "Input", p_price_out: "Output", p_price_cr: "Cache read", p_price_cw: "Cache write",
     p_prices_hint: "Empty — the model's known prices (or 0). OpenRouter reports the cost itself.", p_extra: "Extra request parameters (JSON)",
@@ -1163,6 +1167,7 @@ function profileCard(p) {
         <span class="key-mode"><button type="button" data-key-mode="env" class="${p.keyMode === "env" ? "active" : ""}">${esc(t("p_key_env"))}</button><button type="button" data-key-mode="key" class="${p.keyMode === "key" ? "active" : ""}">${esc(t("p_key_value"))}</button></span>
         ${keyState}</span>${keyInput}</div>
       <label class="field"><span>${esc(t("p_max_tokens"))}</span>${inp("max_tokens", d.max_tokens, "int")}</label>
+      <label class="field"><span>${esc(t("p_ceiling"))} <span class="hint">${esc(t("p_ceiling_hint"))}</span></span>${inp("max_tokens_ceiling", d.max_tokens_ceiling, "int")}</label>
       <label class="field"><span>${esc(t("p_context"))} <span class="hint">${esc(t("p_context_hint"))}</span></span>${inp("context_tokens", d.context_tokens, "int")}</label>
       <label class="field"><span>${esc(t("p_effort"))}</span>${sel("effort", [["", t("none_opt")], ["low", "low"], ["medium", "medium"], ["high", "high"], ["xhigh", "xhigh"], ["max", "max"]], d.effort)}</label>
       ${anthropic ? `<label class="field"><span>${esc(t("p_thinking"))}</span>${sel("thinking", [["adaptive", "adaptive"], ["off", "off"]], d.thinking)}</label>`

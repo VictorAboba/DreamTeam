@@ -64,6 +64,9 @@ class ModelProfile:
     api_key: str | None = None
     api_key_env: str | None = None
     max_tokens: int = 16000
+    # the largest output limit of a retry after a reply cut off by max_tokens (the limit doubles per cut-off up
+    # to it); None = 2 x max_tokens; at or below max_tokens: never raised (docs/SPEC.md §6.2)
+    max_tokens_ceiling: int | None = None
     # anthropic: output_config.effort; openai: reasoning_effort
     effort: str | None = None
     # anthropic only: "adaptive" (default for current models) or "off" (omit the parameter)
@@ -96,6 +99,12 @@ class ModelProfile:
         cr = self.cache_read_price if self.cache_read_price is not None else (known[2] if known else inp * 0.1)
         cw = self.cache_write_price if self.cache_write_price is not None else (known[3] if known else inp * 1.25)
         return inp, out, cr, cw
+
+    @property
+    def output_ceiling(self) -> int:
+        """The largest output limit a retry after a cut-off reply may ask for (never below max_tokens)."""
+        limit = max(int(self.max_tokens or 0), 1)
+        return max(int(self.max_tokens_ceiling or 2 * limit), limit)
 
     @property
     def has_prices(self) -> bool:
@@ -192,8 +201,8 @@ _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSetti
                "TracingSettings": "tracing", "ModelProfile": "models", "RoleSettings": "roles"}
 # numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm)
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
-                      "max_parallel_llm_calls", "max_tokens", "timeout", "max_timeout", "foreground_max",
-                      "job_log_mb"})
+                      "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
+                      "foreground_max", "job_log_mb"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 

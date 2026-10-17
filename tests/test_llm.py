@@ -976,3 +976,88 @@ async def test_openai_connection_error():
     with pytest.raises(LLMError) as info:
         await make_openai(rec).complete("", [{"role": "user", "content": "q"}], [])
     assert (info.value.kind, info.value.retryable) == ("connection", True)
+
+
+# --- per-request output limit (a raised max_tokens after a cut-off reply) ----------------------
+
+def request_read_timeout(rec: Recorder, index: int = -1) -> float | None:
+    return (rec.requests[index].extensions.get("timeout") or {}).get("read")
+
+
+async def test_anthropic_per_request_max_tokens_and_timeout():
+    rec = Recorder(a_msg([{"type": "text", "text": "ok"}]))
+    llm = make_anthropic(rec, max_tokens=16_000)
+    await llm.complete("s", [{"role": "user", "content": "x"}], [])
+    assert rec.body()["max_tokens"] == 16_000 and request_read_timeout(rec) == 600
+    await llm.complete("s", [{"role": "user", "content": "x"}], [], max_tokens=64_000)
+    # a raised limit gets a request timeout of its own (the client's covers only the profile's limit)
+    assert rec.body()["max_tokens"] == 64_000 and request_read_timeout(rec) == A.timeout_seconds(64_000) == 1800
+    await llm.complete("s", [{"role": "user", "content": "x"}], [], max_tokens=None)
+    assert rec.body()["max_tokens"] == 16_000 and request_read_timeout(rec) == 600
+    params = A.build_request(ModelProfile(max_tokens=8000), "", [], [], use_betas=False, max_tokens=12_000)
+    assert params["max_tokens"] == 12_000
+
+
+async def test_openai_per_request_max_tokens_and_timeout():
+    rec = Recorder(o_msg({"content": "Hello"}))
+    llm = make_openai(rec, base_url="http://localhost:8000/v1", max_tokens=8000)
+    await llm.complete("", [{"role": "user", "content": "hi"}], [])
+    assert rec.body()["max_tokens"] == 8000 and request_read_timeout(rec) == 1600
+    await llm.complete("", [{"role": "user", "content": "hi"}], [], max_tokens=16_000)
+    assert rec.body()["max_tokens"] == 16_000 and request_read_timeout(rec) == O.timeout_seconds(16_000) == 3200
+    official = O.build_request(ModelProfile(provider="openai"), "", [], [], max_tokens=32_000)
+    assert official["max_completion_tokens"] == 32_000
+    odd_profile = ModelProfile(provider="openai", base_url="https://x.example/v1", max_tokens_param="num_predict",
+                               extra={"num_predict": 100})
+    odd = O.build_request(odd_profile, "", [], [], max_tokens=32_000)
+    assert odd["extra_body"] == {"num_predict": 32_000}  # a raised limit wins over the profile's extra
+    plain = O.build_request(odd_profile, "", [], [])
+    assert plain["extra_body"] == {"num_predict": 100}
+
+
+async def test_raised_limit_wins_over_a_limit_key_in_extra():
+    # extra_body is merged over the body by the SDK: an old limit there would silently undo the raise
+    rec = Recorder(o_msg({"content": "Hello"}))
+    llm = make_openai(rec, base_url="http://localhost:8000/v1", max_tokens=1000,
+                      extra={"max_tokens": 1000, "max_completion_tokens": 1000, "top_k": 20})
+    await llm.complete("", [{"role": "user", "content": "hi"}], [], max_tokens=2000)
+    body = rec.body()
+    assert body["max_tokens"] == 2000 and body["max_completion_tokens"] == 2000 and body["top_k"] == 20
+    await llm.complete("", [{"role": "user", "content": "hi"}], [])
+    assert rec.body()["max_tokens"] == 1000  # without a raise the profile's extra stays as it was
+    rec = Recorder(a_msg([{"type": "text", "text": "ok"}]))
+    llm = make_anthropic(rec, max_tokens=1000, extra={"max_tokens": 1000, "top_k": 20})
+    await llm.complete("s", [{"role": "user", "content": "x"}], [], max_tokens=2000)
+    assert rec.body()["max_tokens"] == 2000 and rec.body()["top_k"] == 20
+
+
+async def test_scripted_records_the_request_limit_and_the_keyword_probe():
+    from dreamteam.llm.base import accepts_max_tokens
+
+    llm = ScriptedLLM(lambda *a: "ok")
+    await llm.complete("s", [], [])
+    await llm.complete("s", [], [], max_tokens=4000)
+    assert [c["max_tokens"] for c in llm.calls] == [None, 4000]
+
+    class Old:
+        async def complete(self, system, messages, tools):
+            return None
+
+    class Kw:
+        async def complete(self, system, messages, tools, **kwargs):
+            return None
+
+    assert accepts_max_tokens(llm) and accepts_max_tokens(Kw()) and not accepts_max_tokens(Old())
+    assert not accepts_max_tokens(object())
+
+
+def test_profile_output_ceiling():
+    from dreamteam.config import make_profile
+
+    assert ModelProfile(max_tokens=24_000).output_ceiling == 48_000  # default: twice max_tokens
+    assert ModelProfile(max_tokens=24_000, max_tokens_ceiling=64_000).output_ceiling == 64_000
+    assert ModelProfile(max_tokens=24_000, max_tokens_ceiling=8000).output_ceiling == 24_000  # never raised
+    assert make_profile("p", {"max_tokens_ceiling": 32_000}).max_tokens_ceiling == 32_000
+    for bad in (0, -5, "big", 1.5):
+        with pytest.raises(ValueError, match="max_tokens_ceiling"):
+            make_profile("p", {"max_tokens_ceiling": bad})

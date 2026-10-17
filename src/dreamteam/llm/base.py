@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -73,9 +74,21 @@ class LLMError(Exception):
 class LLMClient(Protocol):
     profile: ModelProfile
 
-    async def complete(self, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse:
-        """tools: [{"name","description","parameters"}]; messages: neutral format (SPEC §6.1)."""
+    async def complete(self, system: str, messages: list[dict], tools: list[dict], *,
+                       max_tokens: int | None = None) -> LLMResponse:
+        """tools: [{"name","description","parameters"}]; messages: neutral format (SPEC §6.1). `max_tokens`: the
+        output limit of this request (None: the profile's); the agent passes it only to raise the limit after a
+        reply was cut off, so a client without the keyword still works."""
         ...
+
+
+def accepts_max_tokens(llm: Any) -> bool:
+    """Whether `llm.complete` takes the `max_tokens` keyword (test doubles and older clients may not)."""
+    try:
+        params = inspect.signature(llm.complete).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return "max_tokens" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def estimate_tokens(obj: Any) -> int:

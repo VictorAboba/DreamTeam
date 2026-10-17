@@ -300,6 +300,8 @@ api_key_env = "ANTHROPIC_API_KEY"
 effort = "medium"
 fallbacks = "default"           # серверный fallback при отказе модели (beta)
 thinking_mismatch = "drop_block" # не падать при изменении префикса диалога (beta)
+max_tokens = 16000
+max_tokens_ceiling = 32000      # после ответа, обрезанного по лимиту, лимит удваивается до этого (по умолчанию 2 × max_tokens)
 
 [models.local]           # Ollama / vLLM / OpenRouter — любой OpenAI-совместимый API
 provider = "openai"

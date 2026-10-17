@@ -230,8 +230,10 @@ class Trace:
 
     # ---- convenience wrappers used by the runtime ---------------------------------------------
     def llm_start(self, messages: int, *, purpose: str = "step", extra: list[dict] | None = None,
-                  attempt: int = 1, parent: Span | None = None, tools_rev: int | None = None) -> Span | None:
-        """`tools_rev`: the revision of the agent's frozen tool set the call sends (span_context shows it)."""
+                  attempt: int = 1, parent: Span | None = None, tools_rev: int | None = None,
+                  max_tokens: int | None = None) -> Span | None:
+        """`tools_rev`: the revision of the agent's frozen tool set the call sends (span_context shows it).
+        `max_tokens`: the output limit of the request when it is not the profile's (raised after a cut-off reply)."""
         if not self.enabled:
             return None
         epoch = self.tracer.current_epoch(self.agent)
@@ -239,7 +241,10 @@ class Trace:
                                    "extra": extra or []}
         if tools_rev is not None:
             request["tools_rev"] = tools_rev
-        return self.start("llm", purpose, request, parent=parent, meta={"purpose": purpose, "attempt": attempt})
+        meta: dict[str, Any] = {"purpose": purpose, "attempt": attempt}
+        if max_tokens is not None:
+            meta["max_tokens"] = max_tokens
+        return self.start("llm", purpose, request, parent=parent, meta=meta)
 
     def llm_end(self, span: Span | None, response: Any, cost: float) -> None:
         output = {

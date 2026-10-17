@@ -657,6 +657,24 @@ class AgentRuntime:
   the scheduler wakes it once with `n_stalled`, also once the busy window ended), refusal, or
   step limit (then `notify(name, "n_step_limit")`). A reply cut off by max_tokens gets `cut_off` and
   the loop continues. After an activation, the agent re-wakes itself if events are still pending.
+* Output limit after a cut-off reply (`_output_limit`): a reply cut off by max_tokens **without tool calls**
+  (typically all thinking) makes the next step ask for twice the limit of the cut-off call, and it keeps doubling
+  while replies keep being cut off, up to the profile's ceiling `max_tokens_ceiling` (None = 2 × max_tokens; at
+  or below max_tokens = never raised; `ModelProfile.output_ceiling`) and never beyond the context room
+  (`_context_limit() − _prompt_estimate()`: when context_tokens is the model's real window, prompt + max_tokens
+  must fit; less room than the profile's own limit = the profile's limit). Any other reply (tool calls, a normal
+  end) returns to the profile's max_tokens; so does a new activation, and so do compaction calls. The limit goes
+  to the client as `complete(..., max_tokens=n)` only when raised (a client whose `complete` has no such keyword,
+  `accepts_max_tokens`, is never raised). If a raised request fails with a non-retryable `bad_request` about the
+  output limit (`is_output_limit_error`: "max_tokens", "max_completion_tokens", "max_output_tokens",
+  "max_new_tokens", "maximum output", "output tokens", "completion tokens"), the same step is retried once with
+  the profile's limit (not a counted attempt) and the runtime remembers for this client (`_limit_refused_by`,
+  cleared when `reset_llm` / a stop drops the client) not to raise again; a context overflow of a raised request
+  (`is_context_overflow`, checked first: vLLM's "maximum context length ... (32000 > 32768 − 1000)" and Anthropic's
+  "input length and `max_tokens` exceed context limit" name max_tokens too) is retried the same way but not
+  remembered. A raised limit also replaces a limit key in the profile's `extra` (the SDKs merge `extra_body` over
+  the body, so the old value would silently win). Both are an `output_limit_fallback` event in the trace and an
+  `error` activity; any other error of a raised request behaves as before. The `cut_off` text is unchanged.
 * If the activation was caused by a USER message and the agent finished with plain text without
   messaging USER, the text (all parts, truncated to the mailbox limit) is forwarded to USER as a
   message from the agent; an activation cut short owes that reply to its continuation.
@@ -726,11 +744,15 @@ class Workspace:
     def check_writable(self, actor: str, path: str) -> None
     def release_all(self, actor: str) -> int
     def expire_locks(self) -> int
-    async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "") -> str | None
-        # commits everything except `.scratch/` as `actor`, one commit per call; commit hash or None (nothing
-        # outside .scratch changed). The message is `message` as given or, with `kind` ("shell", "job j3", "jobs
-        # j3, j5"), commit_message(kind, the paths staged after `git add`, detail): the subject names the changed
-        # files, the body holds `detail` (the command that changed them)
+    async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",
+                         skipped: list[str] | None = None) -> str | None
+        # commits everything except `.scratch/` and nested repositories as `actor`, one commit per call; commit hash
+        # or None (nothing outside .scratch changed). The message is `message` as given or, with `kind` ("shell",
+        # "job j3", "jobs j3, j5"), commit_message(kind, the paths staged after `git add`, detail): the subject names
+        # the changed files, the body holds `detail` (the command that changed them). `skipped` receives the paths
+        # of the nested repositories left out
+    def nested_repos_note(self, actor: str, paths: list[str]) -> str
+        # the line for the actor's tool result about them ("" when none is new to this actor in this session)
     def mtime(self, path: str) -> float | None
     def exists(self, path: str) -> bool
 ```
@@ -754,6 +776,25 @@ diff quotes the detail instead). The excludes are spelled with `[.]`: git add ta
 `:(exclude).scratch` as naming the folder and, when the root `.gitignore` ignores `.scratch/` (`DEFAULT_GITIGNORE`
 does), reports it as an ignored path and exits 1 on every autocommit, burying real add errors in the log. Path
 commits of `write`/`edit` keep literal pathspecs (`-- rel`).
+
+**Nested repositories** (`_nested_repos`): an agent that runs `git init` in a generated project (e.g.
+`examples/lab_project/a`, or a folder literally named `--help`) leaves an untracked folder with its own `.git`;
+`git add -A` would commit it as a gitlink (mode 160000) without a `.gitmodules` entry, an empty reference nobody
+can check out. Before `git add`, the untracked folders of the status (`git status --porcelain -z
+--untracked-files=normal`, whatever the user's `status.showUntrackedFiles`, which `git add -A` ignores; `??`
+entries that are directories, outside `.scratch/`; up to `NESTED_PATHSPECS_MAX` = 100 of them by name, else all) go to `git ls-files --others
+--exclude-standard -z -- <folder>/...` (literal pathspecs after `--`): it stops at a nested repository and names it
+with a trailing `/`, also one deep inside an untracked folder, which `git status` shows only as that folder. Those
+with a `.git` (folder or file) are excluded with `:(exclude,literal)<path>` and passed to the caller (`skipped`).
+Ignored folders are never listed, and tracked submodules (an adopted project's own, with `.gitmodules`) are
+tracked, so they are left as they are. The `shell` tool appends one line to its result, each path named once per
+session to that member (`Workspace._nested_reported`, in memory), at most `NESTED_SHOWN` = 5 paths + "and N more":
+`Not committed: examples/lab_project/a, --help — folders with their own .git (nested repositories). Delete their
+.git or move them into your scratch folder .scratch/<slug>/ if they are temporary.` Job commits leave them out the
+same way without a note (the owner's next `shell` call names them); `write_file` / `edit_file` commit one path
+and cannot create one. The initial "Initialize workspace" commit (`init_repo`, also for an adopted folder that was
+not a repository yet) leaves them out as well (`nested_repo_paths` of `git ls-files --others --exclude-standard
+-z`); the first `shell` autocommit afterwards names them to the agent.
 
 #### Scratch folder
 Agents put temporary files (experiments, check scripts, test output, downloads) into **`.scratch/`** at the
@@ -1304,9 +1345,13 @@ listeners and WebSocket subscribers with id None, not journaled): `trace.started
 class LLMError(Exception): message: str; retryable: bool; kind: str  # rate_limit auth bad_request server connection refusal other
 class LLMClient(Protocol):
     profile: ModelProfile
-    async def complete(self, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse
+    async def complete(self, system: str, messages: list[dict], tools: list[dict], *,
+                       max_tokens: int | None = None) -> LLMResponse
         # tools: [{"name","description","parameters"}]; stop_reason normalised to
-        # "end_turn" | "tool_use" | "max_tokens" | "refusal" | "other"
+        # "end_turn" | "tool_use" | "max_tokens" | "refusal" | "other"; max_tokens: this request's output limit
+        # (None = profile.max_tokens; the agent passes it only to raise the limit after a cut-off reply, §6.2, and
+        # only to a client whose complete() takes it, `accepts_max_tokens`). A raised limit also gets a request
+        # timeout of its own (the client's timeout is derived from profile.max_tokens)
 def estimate_tokens(obj) -> int    # ~ len(json)/3.5
 def create_llm(profile: ModelProfile) -> LLMClient   # llm/__init__.py
 # clients may also expose `async aclose()` to release their HTTP pool (called when an agent stops)
@@ -1717,7 +1762,7 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
 | kind | name | input | output | notes |
 |---|---|---|---|---|
 | input | `wake` / `incoming` / `nudge` / `continue` | – | text added to the context | `record()` |
-| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1; absent in spans recorded before tool sets were frozen) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
+| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1; absent in spans recorded before tool sets were frozen) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` (+ `max_tokens` when the request's output limit was raised, §6.2) + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
 | tool | tool name | arguments (dict) | full result text (before truncation for the model) | meta `{call_id, chars, shown_chars?}`; status `error` if is_error; task ids in `task_id` / `parent_id` / `depends_on` are added to the trace's `tasks` |
 | compaction | `compaction` | `{"messages","prompt_tokens"}` | summary text | parent of its llm span; meta `{epoch_archived, fallback?, tools_revision}` (the tool set from then on, §6.1); status `error` when the summary call failed |
 | event | `reply_to_user` / `refusal` / `budget_pause` / `step_limit` / `stopped` / `crash` | – | text | `refusal` and `crash` have status `error` |
@@ -2392,7 +2437,7 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     - Model profiles: one card per profile. Fields: name, provider, base_url, key (mode «Переменная
       окружения» with its state on the server, or «Ключ»: a password input that is never filled from the
       server, «сохранён …abcd», a button to remove it), model (input + datalist filled by «Загрузить список»),
-      max_tokens, context window, effort, thinking (Anthropic) or the max-tokens parameter (OpenAI), and under
+      max_tokens, context window, the max_tokens ceiling (after a cut-off reply, §6.2), effort, thinking (Anthropic) or the max-tokens parameter (OpenAI), and under
       «Дополнительно» thinking display, prefix-mismatch handling and fallbacks (Anthropic), prices and extra
       request parameters (JSON). Buttons «Проверить» (models list) and «Тестовый запрос» (live); key-like text
       in the results is masked. Default profile (★, cannot be deleted), add from a preset, delete.

@@ -147,7 +147,7 @@ def commit_spy(swarm, monkeypatch) -> list[tuple[str, str]]:
     """Record every autocommit (actor, kind) instead of making it."""
     commits: list[tuple[str, str]] = []
 
-    async def autocommit(actor: str, message: str = "", *, kind: str = "", detail: str = ""):
+    async def autocommit(actor: str, message: str = "", *, kind: str = "", detail: str = "", skipped=None):
         commits.append((actor, kind or message))
 
     monkeypatch.setattr(swarm.workspace, "autocommit", autocommit)

@@ -38,6 +38,11 @@ ERROR_PREFIX = "ERROR: "
 EMPTY_OUTPUT_TEXT = "(no output)"  # same placeholder as the Anthropic client
 
 
+def timeout_seconds(max_tokens: int | None) -> float:
+    """Local models (Ollama/vLLM) can be slow: allow ~5 tokens/s for the whole output budget."""
+    return max(600.0, (max_tokens or 0) / 5.0)
+
+
 def is_official_openai(base_url: str | None) -> bool:
     return base_url is None or "api.openai.com" in base_url
 
@@ -110,15 +115,24 @@ def convert_messages(system: str, messages: list[dict]) -> list[dict]:
     return out
 
 
-def build_request(profile: ModelProfile, system: str, messages: list[dict], tools: list[dict]) -> dict:
-    """Keyword arguments for `chat.completions.create`."""
+def build_request(profile: ModelProfile, system: str, messages: list[dict], tools: list[dict], *,
+                  max_tokens: int | None = None) -> dict:
+    """Keyword arguments for `chat.completions.create`. `max_tokens`: this request's output limit (None: the
+    profile's)."""
     params: dict[str, Any] = {"model": profile.model, "messages": convert_messages(system, messages)}
     extra = dict(profile.extra)
+    limit = max_tokens or profile.max_tokens
     limit_name = max_tokens_param(profile)
     if limit_name in MAX_TOKENS_PARAMS:
-        params[limit_name] = profile.max_tokens
-    else:  # an unusual provider-specific name goes into the body as is
-        extra.setdefault(limit_name, profile.max_tokens)
+        params[limit_name] = limit
+    elif not max_tokens:  # an unusual provider-specific name goes into the body as is
+        extra.setdefault(limit_name, limit)
+    if max_tokens:
+        # A raised limit wins over a limit key in extra: extra_body is merged over the body, so the old value
+        # would reach the provider while the agent and the trace believe the limit was raised.
+        for name in {*MAX_TOKENS_PARAMS, limit_name}:
+            if name in extra or (name == limit_name and name not in MAX_TOKENS_PARAMS):
+                extra[name] = limit
     if tools:
         params["tools"] = convert_tools(tools)
         params["tool_choice"] = "auto"
@@ -281,8 +295,7 @@ class OpenAILLM:
         key = self.profile.resolve_api_key()
         if not key and is_official_openai(self.profile.base_url):
             key = os.environ.get("OPENAI_API_KEY")
-        # Local models (Ollama/vLLM) can be slow: allow ~5 tokens/s for the whole output budget.
-        timeout = max(600.0, (self.profile.max_tokens or 0) / 5.0)
+        timeout = timeout_seconds(self.profile.max_tokens)
         kwargs: dict[str, Any] = {"api_key": key or "not-needed", "max_retries": max_retries, "timeout": timeout}
         if self.profile.base_url:
             kwargs["base_url"] = self.profile.base_url
@@ -297,8 +310,11 @@ class OpenAILLM:
         except Exception:  # closing must never fail a shutdown
             pass
 
-    async def complete(self, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse:
-        params = build_request(self.profile, system, messages, tools)
+    async def complete(self, system: str, messages: list[dict], tools: list[dict], *,
+                       max_tokens: int | None = None) -> LLMResponse:
+        params = build_request(self.profile, system, messages, tools, max_tokens=max_tokens)
+        if max_tokens and max_tokens > (self.profile.max_tokens or 0):  # a raised limit may take longer to write
+            params["timeout"] = timeout_seconds(max_tokens)
         try:
             response = await self.client.chat.completions.create(**params)
         except openai.OpenAIError as exc:
