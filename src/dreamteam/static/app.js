@@ -80,6 +80,7 @@ const I18N = {
     job_stopped_session: "остановлен вместе с сессией", job_stopped_retired: "остановлен: агент ушёл из роя", job_lost: "потерян при сбое",
     job_output: "Вывод", job_hide: "Скрыть вывод", job_stop: "Остановить", job_stop_confirm: "Остановить процесс {id} и всё, что он запустил?",
     job_log_hint: "Открыть журнал на вкладке «Файлы»", job_took: "проработал {t}", agent_jobs: "фоновых процессов: {n}",
+    job_silent: "{t} без вывода", job_silent_hint: "Процесс давно ничего не выводит и, возможно, завис: посмотрите его вывод и остановите, если он застрял.",
     ev_job_started: "{who}: фоновый процесс {id} — {command}", ev_job_ended: "{who}: процесс {id} {result} ({t})",
     dur_s: "{n} с", dur_min: "{n} мин", dur_h: "{h} ч {m} мин",
     sg_jobs: "Фоновые процессы", sf_jobs: "Фоновых процессов на участника", sf_jobs_total: "Фоновых процессов на сессию",
@@ -172,6 +173,7 @@ const I18N = {
     job_stopped_session: "stopped with the session", job_stopped_retired: "stopped: its agent left the swarm", job_lost: "lost in a crash",
     job_output: "Output", job_hide: "Hide output", job_stop: "Stop", job_stop_confirm: "Stop job {id} and everything it started?",
     job_log_hint: "Open the log in the Files tab", job_took: "ran {t}", agent_jobs: "background jobs: {n}",
+    job_silent: "no output for {t}", job_silent_hint: "It has printed nothing for a long time and may hang: look at its output, and stop it if it is stuck.",
     ev_job_started: "{who}: background job {id} — {command}", ev_job_ended: "{who}: job {id} {result} ({t})",
     dur_s: "{n} s", dur_min: "{n} min", dur_h: "{h} h {m} min",
     sg_jobs: "Background jobs", sf_jobs: "Background jobs per member", sf_jobs_total: "Background jobs per session",
@@ -1636,9 +1638,12 @@ function jobCardHtml(job) {
   if (!running && job.ended_at) meta.push(`${esc(t("job_took", { t: fmtDur(job.ended_at - job.started_at) }))} · ${esc(fmtTime(job.ended_at))}`);
   if (job.log) meta.push(workspaceLog(job.log) ? `<button type="button" class="link" data-job-log="${esc(job.log)}" title="${esc(t("job_log_hint"))}">${esc(job.log)}</button>` : `<code>${esc(job.log)}</code>`);
   const output = S.jobOutputs[id];
+  // silent for more than jobs.SILENT_MINUTES (the hub says since when; a job.silent event refreshes the state)
+  const silentSince = running ? Number(job.silent_since) || 0 : 0;
+  const silent = silentSince ? `<span class="badge warn" title="${esc(t("job_silent_hint"))}"><i class="ic ic-clock"></i>${esc(t("job_silent", { t: fmtDur(nowSeconds() - silentSince) }))}</span>` : "";
   return `<div class="item job${running ? "" : " dim"}" data-job="${id}">
     <div class="item-head"><b>${esc(jobLabel(job))}</b><span class="chip">${avatar(job.owner, "sm")}${esc(displayName(job.owner))}</span>
-      <span class="badge ${cls}">${esc(state)}</span><span class="badge plain">${esc(tv("job_origin_", job.origin))}</span>
+      <span class="badge ${cls}">${esc(state)}</span>${silent}<span class="badge plain">${esc(tv("job_origin_", job.origin))}</span>
       <span class="spacer"></span><button class="btn small" type="button" data-job-out="${id}" aria-expanded="${open}">${esc(t(open ? "job_hide" : "job_output"))}</button>
       ${running ? `<button class="btn small danger" type="button" data-job-stop="${id}">${esc(t("job_stop"))}</button>` : ""}</div>
     <div class="job-cmd"><code>${esc(job.command)}</code></div>

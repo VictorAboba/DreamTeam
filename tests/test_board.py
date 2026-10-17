@@ -1163,3 +1163,99 @@ def test_all_notifications_render_in_both_languages(swarm, board):
     for _, key, kw in swarm.notified:
         for lang in ("en", "ru"):
             assert prompts.t(lang, key, **kw)
+
+
+# --- similar tasks (task_create warns about likely duplicates) -----------------------------------------
+
+@pytest.mark.parametrize("a, b", [
+    (("Fix crash in parser on empty input", "The parser must not crash on empty input"),
+     ("Parser crashes on empty input", "Handle empty input in the parser without exceptions")),
+    (("Benchmark the solver on N=100", "Measure the runtime of the solver"),
+     ("Run solver benchmarks for N = 100", "Get timing numbers")),
+    (("Verify the result of the haiku task", ""), ("Verify the haiku result", "Check it against the goal")),
+    (("Исправить падение парсера на пустом вводе", "Парсер не должен падать на пустом вводе"),
+     ("Парсер падает на пустом входе", "Обработать пустой ввод без исключений")),
+    (("Написать README проекта", "Пользователям нужна инструкция по установке"), ("Добавить README для проекта", "")),
+    (("Add --json flag", "The user asked for a --json flag on the CLI"),
+     ("Support a --json flag in the CLI output", "The user asked for JSON output")),
+    (("Parser fails on empty input", "g"), ("Parser crashes on empty input", "Handle empty input")),
+])
+def test_similar_task_pairs(a, b):
+    from dreamteam.board import SIMILAR_SCORE, similarity
+
+    assert similarity(*a, *b) >= SIMILAR_SCORE and similarity(*b, *a) >= SIMILAR_SCORE
+
+
+@pytest.mark.parametrize("a, b", [
+    (("Fix crash in parser on empty input", "The parser must not crash"),
+     ("Write unit tests for the lexer", "Cover tokens and errors")),
+    (("Implement login page UI", "Users can log in from the browser"),
+     ("Implement login API endpoint", "POST /api/login checks the password")),
+    (("Design the database schema", "Tables for users and orders"),
+     ("Write the deployment script", "Deploy to the server with docker")),
+    (("Search for a better N=14 amplifier", "Improve the certified bound"),
+     ("Verify the N=14 amplifier certificate", "Check the proof independently")),
+    (("Literature review on Thomson problem in a disk", "Find published records"),
+     ("Optimize Thomson configurations for N=50", "Beat the published records with local search")),
+    (("Сравнить алгоритмы сортировки", "Замерить время на больших массивах"),
+     ("Написать отчёт по экспериментам", "Свести результаты в таблицу")),
+    (("Fix the parser", ""), ("Fix the build", "")),            # one shared word is not enough
+    # a parameter tells a sweep's tasks apart, though task_words drops numbers
+    (("Benchmark solver on N=100", ""), ("Benchmark solver on N=200", "")),
+    (("Thomson problem N=30 in a disk", ""), ("Thomson problem N=31 in a disk", "")),
+    (("Запустить бенчмарк на N=100", ""), ("Запустить бенчмарк на N=200", "")),
+    (("Train with lr 1e-3", ""), ("Train with lr 1e-4", "")),
+    (("Benchmark the solver", "Use N=100"), ("Benchmark the solver", "Use N=200")),
+    # so do a kind of work and a side
+    (("Оптимизировать функцию шага", ""), ("Проверить функцию шага", "")),
+    (("Optimize the step function", "Erdos minimum overlap upper bound"),
+     ("Verify the step function", "Erdos minimum overlap upper bound")),
+    (("Compute lower bound for C5", ""), ("Compute upper bound for C5", "")),
+    (("Найти нижнюю оценку C5", ""), ("Найти верхнюю оценку C5", "")),
+    (("Deploy staging server", ""), ("Deploy production server", "")),
+    # below SIMILAR_SURE the titles need the goals to confirm them
+    (("Write unit tests for the parser", ""), ("Write unit tests for the lexer", "")),
+    (("Run the parser test suite", ""), ("Fix the parser test failures", "")),
+    # siblings of one plan repeat the swarm goal in their goals: goals never make a match alone
+    (("Literature review of known bounds", "Erdos minimum overlap upper bound: collect the known bounds"),
+     ("Step-function optimizer", "Erdos minimum overlap upper bound: optimize a step function")),
+    (("Exact verification of the best candidate", "Erdos minimum overlap upper bound"),
+     ("Final report", "Erdos minimum overlap upper bound: write it up")),
+])
+def test_unrelated_task_pairs(a, b):
+    from dreamteam.board import SIMILAR_SCORE, similarity
+
+    assert similarity(*a, *b) < SIMILAR_SCORE and similarity(*b, *a) < SIMILAR_SCORE
+
+
+def test_task_words_normalize():
+    from dreamteam.board import task_words
+
+    assert task_words("Fix: the Parser's crashes (on EMPTY input #12)!") == {"parse", "crash", "empty", "input"}
+    assert task_words("Исправить ёлку и т.д.", None, "") == {"елку"}
+
+
+def test_similar_open_tasks_best_first(swarm, board):
+    from dreamteam.board import similar_tasks
+
+    parser = board.create(ANNA, "Parser crashes on empty input", goal="Handle empty input")
+    board.create(BOB, "Write the deployment script", goal="Deploy with docker")
+    near = board.create(BOB, "Crash in the parser", goal="Stop the parser crash on empty input")
+    closed = board.create(BOB, "Fix parser crash on empty input")
+    board.update(BOB, closed.id, status="cancelled")
+    new = board.create(CARL, "Fix crash in parser on empty input", goal="The parser must not crash on empty input")
+    assert [t.id for t in board.similar_open(new)] == [parser.id, near.id]   # open ones only, not itself
+    # its parent and the tasks it depends on share its words by design
+    sub = board.create(CARL, "Parser: empty input crash test", parent_id=parser.id, depends_on=[near.id])
+    assert not {parser.id, near.id} & {t.id for t in board.similar_open(sub)}
+    many = [board.create(ANNA, f"Parser crash on empty input, case {i}") for i in range(5)]
+    assert len(similar_tasks(new.title, new.goal, many)) == 3
+
+
+def test_similar_open_skips_the_creators_own_tasks(swarm, board):
+    """A planner splits work into alike tasks on purpose; run 006's duplicates came from different members."""
+    mine = board.create(ANNA, "Write unit tests for the parser", goal="Cover the parser with unit tests")
+    again = board.create(ANNA, "Unit tests for the parser", goal="Cover the parser with unit tests")
+    assert board.similar_open(again) == []
+    other = board.create(BOB, "Parser unit tests", goal="Cover the parser with unit tests")
+    assert [t.id for t in board.similar_open(other)] == [mine.id, again.id]

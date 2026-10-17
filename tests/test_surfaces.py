@@ -22,7 +22,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+import anyio
 import pytest
+from proc_guard import kill_tree, read_line, read_rest, spawn
 
 from dreamteam import cli, console as console_module, docker as docker_module, hub_mcp, web
 from dreamteam.cli import main as cli_main
@@ -163,16 +165,13 @@ def interrupt(proc: subprocess.Popen) -> None:
 @contextlib.contextmanager
 def hub_process(project: Path, port: int, log: Path):
     with open(log, "w", encoding="utf-8") as err:
-        proc = subprocess.Popen([sys.executable, "-m", "dreamteam", "run", str(project), "--port", str(port),
-                                 "--no-console"], stdin=subprocess.DEVNULL, stdout=err, stderr=err,
-                                env=child_env(), **group_kwargs())
+        proc = spawn([sys.executable, "-m", "dreamteam", "run", str(project), "--port", str(port), "--no-console"],
+                     stdin=subprocess.DEVNULL, stdout=err, stderr=err, env=child_env(), **group_kwargs())
         try:
             wait_http_sync(f"http://127.0.0.1:{port}/api/hub", proc=proc)
             yield proc
         finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait(10)
+            kill_tree(proc)  # the venv launcher and the hub it runs (proc.kill() ended only the launcher)
 
 
 # ---------------------------------------------------------------------------------------------- guard (unit)
@@ -448,11 +447,7 @@ def test_proxy_read_timeout_outlasts_wait_for_events():
 
 
 def _read_json_line(proc: subprocess.Popen, timeout: float = 30) -> dict:
-    box: dict[str, bytes] = {}
-    reader = threading.Thread(target=lambda: box.setdefault("line", proc.stdout.readline()), daemon=True)
-    reader.start()
-    reader.join(timeout)
-    line = box.get("line")
+    line = read_line(proc, timeout, "the MCP server")  # kills the tree and fails when none comes
     assert line, f"no output from the MCP server (exit={proc.poll()})"
     return json.loads(line)   # anything else on stdout breaks the protocol
 
@@ -462,8 +457,9 @@ def test_stdio_mcp_with_web_board_lifecycle(tmp_path):
     the board runs and names this process, closing stdin stops everything and removes hub.json."""
     port = free_port()
     project = make_project(tmp_path, "stdio", port=port)
-    proc = subprocess.Popen([sys.executable, "-m", "dreamteam", "mcp", str(project)], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env())
+    # (stderr is not read: a pipe of it could fill up and block the server)
+    proc = spawn([sys.executable, "-m", "dreamteam", "mcp", str(project)], stdin=subprocess.PIPE,
+                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=child_env())
     try:
         def send(obj: dict) -> None:
             proc.stdin.write((json.dumps(obj) + "\n").encode())
@@ -485,14 +481,12 @@ def test_stdio_mcp_with_web_board_lifecycle(tmp_path):
         assert state["swarm"]["goal"]["title"] == "Over stdio"
         proc.stdin.close()
         assert proc.wait(30) == 0
-        rest = proc.stdout.read()
+        rest = read_rest(proc, 30, "the MCP server")  # a child left holding stdout fails, not hangs
         assert all(json.loads(line) for line in rest.splitlines() if line.strip())
         assert not (project / ".dreamteam" / "hub.json").exists()
         assert "swarm stopped" in (project / ".dreamteam" / "logs" / "dreamteam.log").read_text(encoding="utf-8")
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(10)
+        kill_tree(proc)
 
 
 def test_stdio_mcp_stops_on_signal_while_client_keeps_stdin_open(tmp_path):
@@ -500,8 +494,9 @@ def test_stdio_mcp_stops_on_signal_while_client_keeps_stdin_open(tmp_path):
     hub.json and exits (the SDK's stdin worker thread could not be cancelled, so it hung until stdin closed)."""
     port = free_port()
     project = make_project(tmp_path, "sig", port=port)
-    proc = subprocess.Popen([sys.executable, "-m", "dreamteam", "mcp", str(project)], stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env(), **group_kwargs())
+    errlog = open(tmp_path / "stderr.log", "w+", encoding="utf-8")  # a file: a pipe read after the exit may hang
+    proc = spawn([sys.executable, "-m", "dreamteam", "mcp", str(project)], stdin=subprocess.PIPE,
+                 stdout=subprocess.PIPE, stderr=errlog, env=child_env(), **group_kwargs())
     try:
         proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}) + "\n").encode())
@@ -509,14 +504,13 @@ def test_stdio_mcp_stops_on_signal_while_client_keeps_stdin_open(tmp_path):
         assert _read_json_line(proc)["id"] == 1
         assert (project / ".dreamteam" / "hub.json").exists()
         interrupt(proc)
-        assert proc.wait(30) == 0, proc.stderr.read().decode(errors="replace")[-2000:]
+        assert proc.wait(30) == 0, (tmp_path / "stderr.log").read_text(encoding="utf-8", errors="replace")[-2000:]
         assert not (project / ".dreamteam" / "hub.json").exists()
         assert "swarm stopped" in (project / ".dreamteam" / "logs" / "dreamteam.log").read_text(encoding="utf-8")
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(10)
+        kill_tree(proc)
         proc.stdin.close()
+        errlog.close()
 
 
 async def test_stdio_mcp_survives_web_port_race(tmp_path):
@@ -534,11 +528,15 @@ async def test_stdio_mcp_survives_web_port_race(tmp_path):
         params = StdioServerParameters(command=sys.executable, args=["-c", script, str(project)], env=child_env(),
                                        cwd=str(tmp_path))
         with open(tmp_path / "stderr.log", "w", encoding="utf-8") as errlog:
-            async with Client(stdio_client(params, errlog=errlog)) as client:
-                res = await client.call_tool("set_goal", {"title": "Still alive"})
-                assert not res.is_error, res.content[0].text
-                res = await client.call_tool("swarm_status", {})
-                assert "Still alive" in res.content[0].text
+            try:
+                with anyio.fail_after(120):  # leaving the client kills the server's whole process tree
+                    async with Client(stdio_client(params, errlog=errlog)) as client:
+                        res = await client.call_tool("set_goal", {"title": "Still alive"})
+                        assert not res.is_error, res.content[0].text
+                        res = await client.call_tool("swarm_status", {})
+                        assert "Still alive" in res.content[0].text
+            except TimeoutError:
+                pytest.fail("the stdio MCP server did not answer within 120 s: its process tree was killed")
         assert not (project / ".dreamteam" / "hub.json").exists()
         log = (project / ".dreamteam" / "logs" / "dreamteam.log").read_text(encoding="utf-8")
         assert "web board not started" in log
@@ -578,7 +576,7 @@ def test_run_proxy_hub_json_and_graceful_stop(tmp_path):
 
             params = StdioServerParameters(command=sys.executable, args=["-m", "dreamteam", "mcp", str(project)],
                                            env=child_env(), cwd=str(tmp_path))
-            with open(tmp_path / "proxy.log", "w", encoding="utf-8") as errlog:
+            with open(tmp_path / "proxy.log", "w", encoding="utf-8") as errlog, anyio.fail_after(120):
                 async with Client(stdio_client(params, errlog=errlog)) as client:
                     res = await client.call_tool("set_goal", {"title": "Via proxy"})
                     assert not res.is_error, res.content[0].text
@@ -610,7 +608,7 @@ def test_running_hub_tolerates_broken_and_stale_files(tmp_path):
         assert cli.running_hub(project) is None, content   # used to raise on lists / bad pids
     # a crashed hub: its pid is gone
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
+    dead.wait(60)
     path.write_text(json.dumps({"base_url": "http://127.0.0.1:9", "pid": dead.pid, "project": str(project)}),
                     encoding="utf-8")
     assert cli.running_hub(project) is None

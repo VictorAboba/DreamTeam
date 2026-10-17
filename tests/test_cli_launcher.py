@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.request
 from pathlib import Path
 
 import pytest
+from proc_guard import kill_tree, read_line, run as run_bounded, run_async, spawn
 
 from dreamteam import cli
 from dreamteam import console as console_module
@@ -120,7 +121,7 @@ def test_sessions_rm_refusals_without_a_hub(tmp_path, capsys, monkeypatch):
     capsys.readouterr()
     # another DreamTeam process runs this home's sessions without a hub that answers (`dreamteam mcp --no-web`):
     # nothing is deleted behind its back; the marker of a process that is gone is removed
-    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    holder = spawn([sys.executable, "-c", "import time; time.sleep(60)"])
     try:
         marker = home / ".dreamteam" / f"launcher-{holder.pid}.pid"
         marker.parent.mkdir(exist_ok=True)
@@ -129,8 +130,7 @@ def test_sessions_rm_refusals_without_a_hub(tmp_path, capsys, monkeypatch):
         err = capsys.readouterr().err
         assert "another DreamTeam process" in err and f"process {holder.pid}" in err and (sessions / "001-one").is_dir()
     finally:
-        holder.kill()
-        holder.wait(10)
+        kill_tree(holder)
     dead = home / ".dreamteam" / f"launcher-{holder.pid}.pid"
     assert dead.exists()
     # a refusal of the home is printed once (not "Could not delete session X: Could not delete session X: ...")
@@ -166,21 +166,17 @@ def test_serve_home_hub_end_to_end(tmp_path, capsys, monkeypatch):
     home = make_home(tmp_path, port)
     monkeypatch.chdir(tmp_path)
 
-    async def scenario():
-        stop = asyncio.Event()
-        task = asyncio.create_task(cli._serve_home(home, "127.0.0.1", port, console=False, open_browser=False,
-                                                   goal="Write a haiku", title="Poetry", stop=stop))
-        base = f"http://127.0.0.1:{port}"
+    async def steps(base: str) -> None:
         for _ in range(200):  # running_hub() calls the hub over HTTP: never from the loop thread
             if cli.hub_file(home).exists() and await asyncio.to_thread(cli.running_hub, home):
                 break
             await asyncio.sleep(0.05)
         assert await asyncio.to_thread(cli.running_hub, home) == base
-        sessions = await asyncio.to_thread(lambda: json.loads(urllib.request.urlopen(base + "/api/sessions").read()))
+        sessions = await asyncio.to_thread(_get_json, base + "/api/sessions")
         assert sessions["sessions"][0]["id"] == "001-poetry" and sessions["sessions"][0]["status"] == "running"
         assert (await asyncio.to_thread(cli.main, ["sessions", "--home", str(home)])) == 0
         assert (await asyncio.to_thread(cli.main, ["traces", "--home", str(home)])) == 0
-        state = await asyncio.to_thread(lambda: json.loads(urllib.request.urlopen(base + "/s/001-poetry/api/state").read()))
+        state = await asyncio.to_thread(_get_json, base + "/s/001-poetry/api/state")
         assert state["swarm"]["goal"]["title"] == "Write a haiku"
         assert (await asyncio.to_thread(cli._pick_session, base, None))["id"] == "001-poetry"
         with pytest.raises(LookupError):
@@ -208,8 +204,8 @@ def test_serve_home_hub_end_to_end(tmp_path, capsys, monkeypatch):
         # `dreamteam mcp` while the launcher runs: a stdio proxy, which hands on the launcher's instructions (the
         # single-swarm ones said nothing about sessions)
         def through_proxy() -> str:
-            proc = subprocess.Popen([sys.executable, "-m", "dreamteam", "mcp", "--home", str(home)], cwd=str(tmp_path),
-                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            proc = spawn([sys.executable, "-m", "dreamteam", "mcp", "--home", str(home)], cwd=str(tmp_path),
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                     env=_child_env())
             try:
                 proc.stdin.write((json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -222,8 +218,7 @@ def test_serve_home_hub_end_to_end(tmp_path, capsys, monkeypatch):
                 try:
                     proc.wait(30)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(10)
+                    kill_tree(proc)
 
         instructions = await asyncio.to_thread(through_proxy)
         assert "session_create" in instructions and "sessions_list" in instructions
@@ -242,17 +237,33 @@ def test_serve_home_hub_end_to_end(tmp_path, capsys, monkeypatch):
                             lambda url, lang, stop=None, local=None: consoles.append((url, local)))
         assert (await asyncio.to_thread(cli.main, ["console", "--home", str(home), "--session", usb_sid])) == 0
         assert consoles == [(f"{base}/s/{usb_sid}", True)]
-        await asyncio.to_thread(urllib.request.urlopen, urllib.request.Request(
-            f"{base}/api/sessions/{usb_sid}?confirm={usb_sid}", method="DELETE"))
+        await asyncio.to_thread(lambda: urllib.request.urlopen(urllib.request.Request(
+            f"{base}/api/sessions/{usb_sid}?confirm={usb_sid}", method="DELETE"), timeout=20).close())
         # `sessions rm` deletes through the running hub, which stops a running session first
         await asyncio.to_thread(_post, base + "/api/sessions/002-later/start", {})
         assert (await asyncio.to_thread(cli.main, ["sessions", "rm", "--yes", "002-later", "--home", str(home)])) == 0
-        listed = await asyncio.to_thread(lambda: json.loads(urllib.request.urlopen(base + "/api/sessions").read()))
+        listed = await asyncio.to_thread(_get_json, base + "/api/sessions")
         assert [s["id"] for s in listed["sessions"]] == ["001-poetry"] and not (home / "sessions" / "002-later").exists()
-        stop.set()
-        assert await asyncio.wait_for(task, 30) == 0
 
-    asyncio.run(scenario())
+    async def scenario() -> None:
+        stop = asyncio.Event()
+        task = asyncio.create_task(cli._serve_home(home, "127.0.0.1", port, console=False, open_browser=False,
+                                                   goal="Write a haiku", title="Poetry", stop=stop))
+        try:
+            await steps(f"http://127.0.0.1:{port}")
+        except BaseException:
+            stop.set()  # the hub stops also when a step failed or the bound below ran out...
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(task, 30)
+            raise  # ...and the step's failure is what the test reports
+        stop.set()
+        try:
+            code = await asyncio.wait_for(task, 30)
+        except TimeoutError:
+            pytest.fail("the hub did not stop within 30 s")
+        assert code == 0
+
+    run_async(scenario, 180, "the launcher scenario")
     out, err = capsys.readouterr()
     assert "Session 002-later is stopped" in err and "No DreamTeam hub answers" in err
     assert "cannot start: its folder" in err and "/cd <folder>" in err
@@ -391,13 +402,15 @@ def _child_env(**extra: str) -> dict[str, str]:
     return env
 
 
+def _get_json(url: str) -> dict:
+    with urllib.request.urlopen(url, timeout=20) as resp:
+        return json.loads(resp.read())
+
+
 def _read_line(proc: subprocess.Popen, timeout: float = 60) -> dict:
-    box: dict[str, bytes] = {}
-    reader = threading.Thread(target=lambda: box.setdefault("line", proc.stdout.readline()), daemon=True)
-    reader.start()
-    reader.join(timeout)
-    assert box.get("line"), f"no output from the MCP server (exit={proc.poll()})"
-    return json.loads(box["line"])
+    line = read_line(proc, timeout, "the MCP server")  # kills the tree and fails when none comes
+    assert line, f"no output from the MCP server (exit={proc.poll()})"
+    return json.loads(line)
 
 
 def test_stdio_launcher_creates_the_home_and_stops_on_signal(tmp_path):
@@ -407,8 +420,8 @@ def test_stdio_launcher_creates_the_home_and_stops_on_signal(tmp_path):
     home = tmp_path / "fresh-home"
     group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
              else {"start_new_session": True})
-    proc = subprocess.Popen([sys.executable, "-m", "dreamteam", "mcp", "--no-web"], cwd=str(tmp_path),
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    proc = spawn([sys.executable, "-m", "dreamteam", "mcp", "--no-web"], cwd=str(tmp_path),
+                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             env=_child_env(DREAMTEAM_HOME=str(home)), **group)
     try:
         def send(obj: dict) -> None:
@@ -429,9 +442,7 @@ def test_stdio_launcher_creates_the_home_and_stops_on_signal(tmp_path):
         assert proc.wait(30) == 0
         assert "launcher stopped" in (home / ".dreamteam" / "logs" / "dreamteam.log").read_text(encoding="utf-8")
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(10)
+        kill_tree(proc)
         proc.stdin.close()
 
 
@@ -440,8 +451,8 @@ def test_nul_stdin_is_no_terminal():
     console, which read EOF at once, and its end shut the launcher down right after it started."""
     script = "from dreamteam.cli import _stdin_is_terminal; print(_stdin_is_terminal())"
     for stdin in (subprocess.DEVNULL, subprocess.PIPE):
-        out = subprocess.run([sys.executable, "-c", script], stdin=stdin, capture_output=True, text=True,
-                             env=_child_env(), timeout=60)
+        out = run_bounded([sys.executable, "-c", script], 60, stdin=stdin, capture_output=True, text=True,
+                          env=_child_env())
         assert out.stdout.strip() == "False", out.stderr
 
 
@@ -459,8 +470,8 @@ def test_serve_subprocess_stops_on_signal_and_keeps_sessions_for_resume(tmp_path
     asyncio.run(prepare())
     group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32"
              else {"start_new_session": True})
-    proc = subprocess.Popen([sys.executable, "-m", "dreamteam", "--home", str(home), "--no-browser"],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    proc = spawn([sys.executable, "-m", "dreamteam", "--home", str(home), "--no-browser"],
+                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             env=_child_env(), **group)
     base = f"http://127.0.0.1:{port}"
     try:
@@ -484,9 +495,7 @@ def test_serve_subprocess_stops_on_signal_and_keeps_sessions_for_resume(tmp_path
             proc.send_signal(signal.SIGTERM)
         assert proc.wait(30) == 0
     finally:
-        if proc.poll() is None:
-            proc.kill()
-            proc.wait(10)
+        kill_tree(proc)
     assert not cli.hub_file(home).exists()
     assert SessionManager(home).meta("001-keep")["autostart"] is True
     assert "launcher stopped" in (home / ".dreamteam" / "logs" / "dreamteam.log").read_text(encoding="utf-8")

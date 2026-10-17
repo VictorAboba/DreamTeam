@@ -6,6 +6,10 @@ import os
 import sys
 from pathlib import Path
 
+import anyio
+import pytest
+from proc_guard import call
+
 from dreamteam.cli import main
 from dreamteam.config import Config
 
@@ -33,7 +37,7 @@ def test_init_creates_loadable_project(tmp_path, capsys):
 def test_status_without_hub(tmp_path, capsys):
     project = _init(tmp_path)
     capsys.readouterr()
-    assert main(["status", str(project)]) == 0
+    assert call(main, ["status", str(project)], timeout=60, what="dreamteam status") == 0
     out = capsys.readouterr().out
     assert "CLI test" in out and "Hub: not running" in out
 
@@ -47,10 +51,15 @@ async def test_stdio_mcp_server_subprocess(tmp_path):
     params = StdioServerParameters(command=sys.executable, args=["-m", "dreamteam", "mcp", str(project), "--no-web"],
                                    env=env, cwd=str(tmp_path))
     with open(tmp_path / "stderr.log", "w", encoding="utf-8") as errlog:
-        async with Client(stdio_client(params, errlog=errlog)) as client:
-            names = {t.name for t in (await client.list_tools()).tools}
-            assert {"set_goal", "board", "join_swarm"} <= names
-            res = await client.call_tool("set_goal", {"title": "Test goal over stdio"})
-            assert not res.is_error, res.content[0].text
-            res = await client.call_tool("board", {})
-            assert "Test goal over stdio" in res.content[0].text
+        try:
+            # bounded: leaving the client (also when the bound cancels it) kills the server's whole process tree
+            with anyio.fail_after(120):
+                async with Client(stdio_client(params, errlog=errlog)) as client:
+                    names = {t.name for t in (await client.list_tools()).tools}
+                    assert {"set_goal", "board", "join_swarm"} <= names
+                    res = await client.call_tool("set_goal", {"title": "Test goal over stdio"})
+                    assert not res.is_error, res.content[0].text
+                    res = await client.call_tool("board", {})
+                    assert "Test goal over stdio" in res.content[0].text
+        except TimeoutError:
+            pytest.fail("the stdio MCP server did not answer within 120 s: its process tree was killed")

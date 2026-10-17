@@ -150,6 +150,123 @@ def find_mentions(text: str, names: Iterable[str]) -> list[str]:
     return found
 
 
+# --- similar tasks (task_create warns about likely duplicates) ---------------------------------------------
+SIMILAR_MAX = 3            # at most this many similar tasks are named
+SIMILAR_SCORE = 0.5        # the share of the shorter title's words found in the other title
+SIMILAR_SURE = 0.75        # ... from which the titles alone decide; below it the goals must add a shared word
+SIMILAR_SHARED = 2         # ... and at least this many title words in common
+_STEM = 5                  # crude stemming: a word's first letters ("crashes" ~ "crash", "парсера" ~ "парсер")
+_SIMILAR_WORD = re.compile(r"[^\W_]+")
+# words that say nothing about what a task is (generic verbs of task titles, function words), en + ru
+_SIMILAR_STOP = frozenset("""
+the and for with from into onto that this these those are was were will can should must not all any its our your
+their has have had been being out off per via use using make add new fix get set run task tasks work done
+implement implementation create write update check ensure
+что это как для при без над под или его она они оно все всё был была были будет есть нет надо нужно также
+только если чтобы через после перед между задача задачу задачи сделать добавить создать написать исправить
+обновить реализовать проверить работа работу
+""".split())
+# a planner splits work by kind and by side, in words the overlap ignores or cannot weigh: titles naming different
+# kinds of work ("Optimize the step function" / "Verify the step function") or opposite sides ("lower bound" /
+# "upper bound", "staging" / "production") are different tasks. Entries of 4+ letters match as prefixes.
+_SIMILAR_KINDS = (
+    ("fix", "fixes", "fixing", "repair", "debug", "исправ", "почин", "устран"),
+    ("implement", "add", "adds", "adding", "create", "write", "build", "develop", "напис", "добав", "созда",
+     "реализ", "разраб"),
+    ("verif", "check", "checks", "validat", "review", "audit", "провер", "валид", "ревью"),
+    ("optimi", "speed", "tune", "improv", "оптимиз", "ускор", "улучш"),
+    ("benchmark", "measur", "profil", "бенчмарк", "замер", "измер"),
+    ("research", "search", "investigat", "explor", "survey", "исслед", "изуч", "поиск", "найти", "найди"),
+    ("document", "описа", "задокумент"),
+    ("remove", "delete", "drop", "удал"),
+    ("deploy", "release", "publish", "развер", "выкат", "опубли"),
+)
+_SIMILAR_OPPOSITE = (
+    (("lower",), ("upper",)), (("min", "minim"), ("max", "maxim")), (("нижн",), ("верхн",)),
+    (("миним",), ("максим",)), (("staging", "stage"), ("production", "prod")), (("frontend",), ("backend",)),
+    (("client",), ("server",)), (("клиент",), ("сервер",)), (("input",), ("output",)),
+    (("ввод", "вход"), ("вывод", "выход")), (("import",), ("export",)), (("импорт",), ("экспорт",)),
+    (("light",), ("dark",)), (("светл",), ("темн",)),
+)
+
+
+def _raw_words(*texts: str | None) -> list[str]:
+    return [w for text in texts for w in _SIMILAR_WORD.findall((text or "").lower().replace("ё", "е"))]
+
+
+def task_words(*texts: str | None) -> set[str]:
+    """The content words of a task's texts: lower-cased, without punctuation, short words, numbers and stop words,
+    each cut to its first _STEM letters."""
+    return {w[:_STEM] for w in _raw_words(*texts) if len(w) >= 3 and not w.isdigit() and w not in _SIMILAR_STOP}
+
+
+def _markers(*texts: str | None) -> set[str]:
+    """The tokens with a digit (parameters: "N=100" -> "100", "C5", "1e-3" -> "1e", "3"), which task_words drops."""
+    return {w for w in _raw_words(*texts) if any(c.isdigit() for c in w)}
+
+
+def _has(words: list[str], entries: tuple[str, ...]) -> bool:
+    return any(w == e or (len(e) >= 4 and w.startswith(e)) for w in words for e in entries)
+
+
+def _distinct(title: str, goal: str, other_title: str, other_goal: str) -> bool:
+    """The two tasks are told apart by a parameter, a kind of work or a side, whatever their other words."""
+    marks, other_marks = _markers(title), _markers(other_title)
+    if marks and other_marks and marks != other_marks:          # N=100 / N=200 (a parameter sweep)
+        return True
+    marks, other_marks = marks | _markers(goal), other_marks | _markers(other_goal)
+    if marks and other_marks and not marks & other_marks:
+        return True
+    words, other_words = _raw_words(title), _raw_words(other_title)
+    kinds = {i for i, kind in enumerate(_SIMILAR_KINDS) if _has(words, kind)}
+    other_kinds = {i for i, kind in enumerate(_SIMILAR_KINDS) if _has(other_words, kind)}
+    if kinds and other_kinds and not kinds & other_kinds:      # optimize / verify
+        return True
+    for side, opposite in _SIMILAR_OPPOSITE:                     # lower / upper
+        for a, b in ((words, other_words), (other_words, words)):
+            if _has(a, side) and not _has(a, opposite) and _has(b, opposite) and not _has(b, side):
+                return True
+    return False
+
+
+def _same_word(a: str, b: str) -> bool:
+    """Equal stems, or one a prefix of the other of at least 4 letters ("ввод" ~ "вводе")."""
+    short, other = (a, b) if len(a) <= len(b) else (b, a)
+    return a == b or (len(short) >= 4 and other.startswith(short))
+
+
+def _overlap(a: set[str], b: set[str]) -> tuple[int, float]:
+    """(words of the smaller set found in the other, their share of the smaller set)."""
+    if not a or not b:
+        return 0, 0.0
+    small, big = (a, b) if len(a) <= len(b) else (b, a)
+    shared = sum(1 for w in small if any(_same_word(w, x) for x in big))
+    return shared, shared / len(small)
+
+
+def similarity(title: str, goal: str, other_title: str, other_goal: str) -> float:
+    """How much two tasks look alike, 0..1. The titles decide: the share of the shorter one's words found in the
+    other, with at least SIMILAR_SHARED in common; below SIMILAR_SURE the goals must confirm it (title + goal still
+    reach SIMILAR_SCORE with a shared word more). Goals never make a match alone: siblings of one plan repeat the
+    swarm goal's words in theirs. Tasks told apart by a parameter, a kind of work or a side score 0."""
+    shared, score = _overlap(task_words(title), task_words(other_title))
+    if shared < SIMILAR_SHARED or score < SIMILAR_SCORE or _distinct(title, goal, other_title, other_goal):
+        return 0.0
+    if score < SIMILAR_SURE:
+        more, whole = _overlap(task_words(title, goal), task_words(other_title, other_goal))
+        if more <= shared or whole < SIMILAR_SCORE:
+            return 0.0
+    return score
+
+
+def similar_tasks(title: str, goal: str, candidates: Iterable[Task], limit: int = SIMILAR_MAX) -> list[Task]:
+    """The candidates that look like a task with this title and goal (similarity >= SIMILAR_SCORE), best first
+    (then the older one), at most `limit`."""
+    scored = [(similarity(title, goal, t.title, t.goal), t) for t in candidates]
+    hits = sorted(((s, t) for s, t in scored if s >= SIMILAR_SCORE), key=lambda st: (-st[0], st[1].id))
+    return [t for _, t in hits[:limit]]
+
+
 def _post_dict(row: Any) -> dict[str, Any]:
     return {"id": row["id"], "task_id": row["task_id"], "author": row["author"], "text": row["text"],
             "reply_to": row["reply_to"], "ts": row["ts"]}
@@ -196,6 +313,14 @@ class Board:
 
     def blockers(self, task: Task) -> list[int]:
         return self._blockers_of(task.depends_on)
+
+    def similar_open(self, task: Task) -> list[Task]:
+        """Open tasks of other creators that look like `task` (similar_tasks): not the task itself, its parent or
+        the tasks it depends on, which share its words by design, nor the creator's own tasks (a planner splits
+        work into alike tasks on purpose; run 006's duplicates came from different members)."""
+        skip = {task.id, task.parent_id, *task.depends_on}
+        return similar_tasks(task.title, task.goal,
+                             [t for t in self.list() if t.id not in skip and t.created_by != task.created_by])
 
     def ready_unassigned(self) -> list[Task]:
         return [t for t in self.list(status=Status.TODO) if t.assignee is None and not t.blocked_by]

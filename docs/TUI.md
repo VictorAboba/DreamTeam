@@ -271,7 +271,8 @@ def agents_table(ctx, agents: list[dict]) -> RenderableType   # a member with ru
                                                               # its tasks (narrow: after its status)
 def jobs_table(ctx, jobs: list[dict]) -> RenderableType       # /jobs: the state's "jobs" (running, then ended in the
     # last hour): Процесс (j3), Агент, Состояние («работает» + how it went to the background / «завершился с кодом
-    # 1» / «остановлен вами» / «потерян при сбое»), Время, Команда (+ its processes; the log in verbose); narrow
+    # 1» / «остановлен вами» / «потерян при сбое»; a silent running job, `silent_since`: «40 мин без вывода» in the
+    # warn colour), Время, Команда (+ its processes; the log in verbose); narrow
     # (< 80): no agent / time columns. Footer hint «/jobs jN — вывод процесса · /jobs stop jN — остановить · пауза
     # роя их не останавливает»; none: info «Фоновых процессов нет.»
 def job_output(ctx, text: str) -> RenderableType              # /jobs jN: the hub's text (`jobs` tool), its first

@@ -61,9 +61,11 @@ _PROGRESS = {
 
 def _job_list(jobs: list, *, parens: bool = True) -> str:
     """Running jobs for a tool result (English): "j3 (Anna Smith: npm run dev, 25 min); j5 (...)", or without
-    `parens` "j3 Anna Smith: npm run dev, 25 min; j5 ..."."""
+    `parens` "j3 Anna Smith: npm run dev, 25 min; j5 ...". A silent job (jobs.SILENT_MINUTES) adds "no output for
+    12 min"."""
     now = time.time()
-    items = [(j.label, f"{j.owner}: {short_command(j.command, 60)}, {fmt_duration(now - j.started_at)}") for j in jobs]
+    items = [(j.label, f"{j.owner}: {short_command(j.command, 60)}, {fmt_duration(now - j.started_at)}"
+              + (f", {silent}" if (silent := j.silent_phrase("en", now)) else "")) for j in jobs]
     return "; ".join(f"{label} ({text})" if parens else f"{label} {text}" for label, text in items)
 
 

@@ -466,6 +466,49 @@ async def test_task_create_options(swarm):
     assert swarm.board.get(2).assignee == USER
 
 
+async def test_task_create_names_similar_open_tasks(swarm):
+    """Run 006: three agents created three alike tasks for one message to all. The task is still created, and its
+    creator (an agent or an external member, in its language; not the user) is shown the likely duplicates."""
+    a, b = llm_members(swarm)
+    ext = await join(swarm)
+    await ok(swarm, USER, "task_create", {"title": "Parser crashes on empty input", "goal": "Handle empty input"})
+    await ok(swarm, b, "task_claim", {"task_id": 1})
+    await ok(swarm, a, "task_create", {"title": "Write the deployment script", "goal": "Deploy with docker"})
+    text = await ok(swarm, a, "task_create", {"title": "Fix crash in parser on empty input",
+                                               "goal": "The parser must not crash on empty input"})
+    assert text == (f'Created task #3 [todo] Fix crash in parser on empty input\nSimilar open tasks: #1 "Parser '
+                    f'crashes on empty input" [in_progress, {b}]. If yours duplicates one of them, cancel it '
+                    "(`task_update` status=cancelled) and take or comment on that one.")
+    assert swarm.board.get(3).status == Status.TODO
+    text = await ok(swarm, ext, "task_create", {"title": "Empty input crashes the parser", "goal": "g"})
+    assert (f'\nSimilar open tasks: #1 "Parser crashes on empty input" [in_progress, {b}], #3 "Fix crash in parser '
+            'on empty input" [todo]. ') in text
+    assert await ok(swarm, USER, "task_create", {"title": "Parser crash on empty input", "goal": "g"}) == \
+        "Created task #5 [todo] Parser crash on empty input"
+    assert "Similar" not in await ok(swarm, a, "task_create", {"title": "Benchmark the solver", "goal": "speed"})
+    swarm.db.execute("UPDATE agents SET language = 'ru' WHERE name = ?", (b,))
+    text = await ok(swarm, b, "task_create", {"title": "Parser fails on empty input", "goal": "g"})
+    assert "\nПохожие открытые задачи: #1 " in text and "(`task_update` status=cancelled)" in text
+
+
+async def test_a_message_to_all_brings_the_board_hint(swarm):
+    """A wake-up with a message to all (from the user or a member) asks to check the board before creating a task
+    for it; other wake-ups do not repeat it."""
+    a, b = llm_members(swarm)
+    swarm.render_wake(a), swarm.render_wake(b)  # the hiring notices
+    hint = prompts.t("en", "all_hint")
+    await ok(swarm, USER, "send_message", {"to": ["all"], "text": "Please add a --json flag"})
+    text = swarm.render_wake(b)
+    assert hint in text and text.index("Please add a --json flag") < text.index(hint)
+    assert hint not in swarm.render_wake(b)
+    await ok(swarm, a, "send_message", {"to": [b], "text": "personal"})
+    assert hint not in swarm.render_wake(b, incoming=True)
+    await ok(swarm, a, "send_message", {"to": "все", "text": "news for everyone"})
+    assert hint in swarm.render_wake(b, incoming=True)
+    assert swarm.mail.history(b)[-1]["to_all"] is True and swarm.mail.history(b)[-2]["to_all"] is False
+    assert prompts.t("ru", "all_hint") != hint
+
+
 async def test_task_update_reports_what_changed(swarm):
     a, b = llm_members(swarm)
     await ok(swarm, a, "task_create", {"title": "Epic", "goal": "g"})

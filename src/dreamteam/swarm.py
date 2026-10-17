@@ -427,6 +427,9 @@ class Swarm:
                     head, _, rest = text.partition("\n")
                     text = head.rstrip(":") + prompts.t(lang, "msg_reply", reply_to=m["reply_to"]) + ":\n" + rest
                 lines.append("• " + at(m["ts"]) + text)
+            # every member reads a message to all at once: only with one, not at every wake-up
+            if any(m.get("to_all") for m in messages):
+                lines.append(prompts.t(lang, "all_hint"))
         if not incoming:
             goal = self.goal()
             if goal:
@@ -447,9 +450,7 @@ class Swarm:
             jobs = self.jobs.running_of(name)
             if jobs:
                 now = time.time()
-                lines.append(prompts.t(lang, "my_jobs", jobs="; ".join(
-                    prompts.t(lang, "my_job", id=j.id, command=short_command(j.command, 60),
-                              duration=fmt_duration(now - j.started_at, lang)) for j in jobs)))
+                lines.append(prompts.t(lang, "my_jobs", jobs="; ".join(self._my_job(j, lang, now) for j in jobs)))
             ready = self.board.ready_unassigned()[:8]
             if ready:
                 lines.append(prompts.t(lang, "ready", tasks="; ".join(f"#{t.id} {t.title}" for t in ready)))
@@ -467,6 +468,16 @@ class Swarm:
                     lines.append(prompts.t(lang, "notes", notes=notes_text))
                     self.notes_shown(name, notes_text)
         return "\n".join(lines)
+
+    @staticmethod
+    def _my_job(job: Any, lang: str, now: float) -> str:
+        """One job of the my_jobs line; a silent one (jobs.SILENT_MINUTES) says for how long."""
+        kw = {"id": job.id, "command": short_command(job.command, 60),
+              "duration": fmt_duration(now - job.started_at, lang)}
+        silent = job.silent_for(now)
+        if silent is None:
+            return prompts.t(lang, "my_job", **kw)
+        return prompts.t(lang, "my_job_silent", silent=fmt_duration(silent, lang), **kw)
 
     def notes_shown(self, name: str, notes: str) -> None:
         """The agent's context now holds these notes (a wake-up text or a compaction summary)."""

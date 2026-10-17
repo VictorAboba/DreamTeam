@@ -45,7 +45,7 @@ EVENT_TYPES = (
     "agent.compacted", "agent.usage", "file.changed", "file.locked", "file.unlocked", "trigger.created",
     "trigger.fired", "trigger.deleted", "mcp.created", "mcp.status", "swarm.paused", "swarm.resumed",
     "swarm.wrap_up", "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
-    "sessions.changed", "_connection",
+    "job.silent", "sessions.changed", "_connection",
 )
 ACTIVITY_KINDS = ("wake", "thinking", "text", "tool_call", "tool_result", "error", "nudge", "compacted")
 
@@ -991,6 +991,7 @@ _HANDLERS: dict[str, Callable[[RenderContext, dict, dict], RenderableType | None
     "swarm.limits": _ev_limits,
     "job.started": _ev_job,
     "job.ended": _ev_job,
+    "job.silent": _none,        # (live only) refreshes the state: /jobs shows the silent marker
     "sessions.changed": _ev_session,
     "_connection": _ev_connection,
 }
@@ -1426,6 +1427,12 @@ def jobs_table(ctx: RenderContext, jobs: list[dict]) -> RenderableType:
             row.append(Text(clean(owner) or "?", style=theme.agent_style(owner)))
         text, style = _job_state(ctx, job)
         state = Text(text, style=style)
+        silent_since = _float(job.get("silent_since")) if running else 0.0
+        if silent_since:  # silent for more than jobs.SILENT_MINUTES: it may hang
+            from ..jobs import fmt_duration
+
+            state.append("\n" + prompts.t(ctx.lang, "job_silent", duration=fmt_duration(now - silent_since, ctx.lang)),
+                         style=theme.WARN)
         if running and job.get("origin"):
             state.append("\n" + _status_label(ctx, "job_origin_", job.get("origin")), style="dim")
         row.append(state)

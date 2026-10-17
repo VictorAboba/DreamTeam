@@ -95,6 +95,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "my_reviews": "Waiting for your review: {tasks}",
         "my_jobs": "Your background jobs: {jobs}",
         "my_job": "j{id} {command} (running {duration})",
+        # a running job that printed nothing for jobs.SILENT_MINUTES (also in jobs / swarm_status): the agent decides
+        "my_job_silent": "j{id} {command} (running {duration}, no output for {silent})",
+        "job_silent": "no output for {duration}",
+        # a wake-up with a message to "all": several members read it at once (run 006: three alike tasks)
+        "all_hint": "Before creating a task for a message to all, check the board: one member creates it, the "
+                    "others take it or comment.",
+        # the task_create result when open tasks look alike (board.similar_tasks); the task is created anyway
+        "similar_tasks": "Similar open tasks: {tasks}. If yours duplicates one of them, cancel it (`task_update` "
+                         "status=cancelled) and take or comment on that one.",
         # every wake-up while the user's wrap-up mode is on (Swarm.wrap_up): short, it repeats
         "wrap_up_line": "Wrap-up mode (the user): start no new computations or background jobs; finish your tasks "
                         "with what you have.",
@@ -270,6 +279,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "my_reviews": "Ждут твоего ревью: {tasks}",
         "my_jobs": "Твои фоновые процессы: {jobs}",
         "my_job": "j{id} {command} (работает {duration})",
+        "my_job_silent": "j{id} {command} (работает {duration}, {silent} без вывода)",
+        "job_silent": "{duration} без вывода",
+        "all_hint": "Прежде чем создавать задачу по сообщению для всех, проверь доску: создаёт её один участник, "
+                    "остальные берут её или комментируют.",
+        "similar_tasks": "Похожие открытые задачи: {tasks}. Если твоя дублирует одну из них, отмени её "
+                         "(`task_update` status=cancelled) и возьми ту или напиши в её обсуждение.",
         "wrap_up_line": "Режим завершения (пользователь): не начинай новых вычислений и фоновых процессов; заверши "
                         "свои задачи с тем, что есть.",
         "ready": "Свободные задачи, готовые к работе: {tasks}",

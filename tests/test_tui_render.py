@@ -899,6 +899,12 @@ def test_jobs_table_and_one_job(monkeypatch):
     assert re.search(r"38;2;\d+;\d+;\d+m.*завершился с кодом 1", ansi)              # a failed job in colour
     ascii_out = plain(render.jobs_table(ctx(lang="en", width=140, unicode=False), JOBS), 140)
     assert "node.exe x2" in ascii_out and not UNICODE_SYMBOLS & set(ascii_out)
+    # a running job silent for more than jobs.SILENT_MINUTES (the hub's silent_since): how long, in warn colour
+    silent = [{**JOBS[1], "silent_since": NOW - 2430}, {**JOBS[2], "silent_since": NOW - 2430}]
+    out = plain(render.jobs_table(ctx(width=140), silent), 140)
+    assert out.count("40 мин без вывода") == 1                                    # not for the ended one
+    assert "no output for 40 min" in plain(render.jobs_table(ctx(lang="en", width=140), silent), 140)
+    assert re.search(r"38;2;\d+;\d+;\d+m40 мин без вывода", to_ansi(render.jobs_table(ctx(width=140), silent), 140))
 
     detail = plain(render.job_output(ctx(), JOB_DETAIL))
     lines = detail.split("\n")

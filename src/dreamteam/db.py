@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS history (
     agent TEXT, seq INTEGER, msg TEXT, PRIMARY KEY (agent, seq));
 CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, sender TEXT, recipients TEXT, text TEXT, reply_to INTEGER);
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, sender TEXT, recipients TEXT, text TEXT, reply_to INTEGER,
+    to_all INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS inbox (
     message_id INTEGER, recipient TEXT, read_at REAL, PRIMARY KEY (message_id, recipient));
 CREATE INDEX IF NOT EXISTS inbox_recipient ON inbox(recipient, read_at);
@@ -54,6 +55,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at REAL, background_at REAL, ended_at REAL);
 CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, status);
 """
+# columns added to a table after its first release, (table, column, declaration): a file made by an older version
+# gets them when it is opened
+ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"),)
 
 
 class Database:
@@ -68,9 +72,20 @@ class Database:
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA foreign_keys=OFF")
             self.conn.executescript(SCHEMA)
+            self._add_columns()
         except BaseException:  # e.g. "file is not a database": do not keep the file open until garbage collection
             self.conn.close()
             raise
+
+    def _add_columns(self) -> None:
+        for table, column, declaration in ADDED_COLUMNS:
+            if column in {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}:
+                continue
+            try:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+            except sqlite3.OperationalError:  # another process opening the same file added it first
+                if column not in {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}:
+                    raise
 
     def close(self) -> None:
         with self._lock:

@@ -558,7 +558,8 @@ class Mailbox:
     def conversation(self, a: str, b: str, limit: int = 200, since_id: int = 0) -> list[dict]
         # messages where (sender a and b in recipients) or (sender b and a in recipients), ascending
     def recent(self, limit: int = 100, since_id: int = 0) -> list[dict]
-# message dict: {"id","ts","sender","recipients":[...],"text","reply_to"}
+# message dict: {"id","ts","sender","recipients":[...],"text","reply_to","to_all"}
+# to_all: sent to "all" (column messages.to_all; Database adds it to a file of an older version: db.ADDED_COLUMNS)
 ```
 
 Quiet broadcasts: when a member (not the user) sends to "all", a recipient reached only through "all" (not also
@@ -675,13 +676,16 @@ class AgentRuntime:
 `wake_header` (or `incoming_header`), then (not for incoming, only while the user's wrap-up mode is on, §3) the one-line
 `wrap_up_line` ("Wrap-up mode (the user): start no new computations or background jobs; finish your tasks with what
 you have."), `reasons:` then one bullet per undelivered notification text and
-per unread message (`msg` template, recipients list with the agent shown as `you`), then (not for
-incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, one `my_blocked` {id,
+per unread message (`msg` template, recipients list with the agent shown as `you`), then, only when one of those
+messages was sent to "all" (`to_all`, from the user or a member; incoming too), the one-line `all_hint` ("Before
+creating a task for a message to all, check the board: one member creates it, the others take it or comment."), then
+(not for incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, one `my_blocked` {id,
 blockers: "#3, #4"} per open task of the agent with unfinished dependencies, except one in review whose result is
 already produced (it may remove those it can do without, §4), `my_reviews` (only when
 tasks wait for its review: `#id title (assignee or -)`), `my_jobs` (only while it has running background jobs,
 §7.1: `my_job` items `j3 npm run dev (running 25 min)` joined with "; ", the command cut to 60 characters, the
-duration in the member's language), `ready` (up to 8), notes: in full only when they changed
+duration in the member's language; a silent job, §7.1, is `my_job_silent` `j3 npm run dev (running 50 min, no output
+for 40 min)`), `ready` (up to 8), notes: in full only when they changed
 since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
 otherwise the one-line `notes_unchanged`, since the history is append-only.
 
@@ -1139,7 +1143,21 @@ scratch folder), the stored tail with `(log file not found)`.
 `snapshot()`: the running jobs (from memory), then those ended in the last hour (one query, at most 50).
 `get(job_id)`, `running_of(owner=None)`, `check_start(actor)`, `busy(name)`, `wakes(job)`, `awaited(owner)`.
 Public job dict (snapshot, events): `{"id", "label": "j3", "owner", "command" (≤ 200 chars), "origin", "status",
-"reason", "stopped_by", "exit_code", "started_at", "background_at", "ended_at", "log", "processes"}`.
+"reason", "stopped_by", "exit_code", "started_at", "background_at", "ended_at", "log", "processes",
+"last_output_at", "silent_since"}`.
+
+**Silent jobs** (run 006: a job ran over an hour without output): `Capture.last_output_at` is the time bytes last
+arrived (set by the reader thread in `feed`, no thread of its own). A running job whose last output (or, when it never
+printed, its start) is more than `SILENT_MINUTES` (10, a constant) ago is silent: `Job.silent_for(now)` (seconds, else
+None), `silent_phrase(lang)` `no output for 40 min` / «40 мин без вывода» (`job_silent`, `fmt_duration`). Not once
+its output pipe reached EOF (`cmd.eof`: what its shell left running prints elsewhere or nowhere, e.g. a detached
+server, and cannot print here, so the marker would only invite stopping it). It shows in
+the `listing` line (`…, started in the background, no output for 40 min; log …`), the `describe` state (`running for
+50 min (started in the background); no output for 40 min`), the `swarm_status` / `goal_complete` job list
+(`j3 Anna Smith: npm run dev, 50 min, no output for 40 min`), its owner's `my_jobs` (§6.3), the public dict
+(`silent_since`: when it last printed or started; None when not silent) and so the UI's Jobs tab and the TUI's
+`/jobs`. The monitor publishes a live-only `job.silent` {job} each time a job turns silent or prints again, so the UI
+reloads the state; no notice, no automatic stop: its owner (or the user) decides.
 
 **Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: how revision-1 agents
 list and stop jobs with the `shell` tool they have. The command is stripped and one trailing `;` dropped; the WHOLE
@@ -1273,7 +1291,7 @@ stopped), `agent.compacted` `tools_revision` (§6.1).
 
 Live-only events (sent with the EventBus method `publish(type, actor, **data)` instead of `emit`: delivered to
 listeners and WebSocket subscribers with id None, not journaled): `trace.started`, `trace.span`,
-`trace.finished` (§16).
+`trace.finished` (§16), `job.silent` {job} (a job turned silent or printed again, §7.1).
 
 ## 10. LLM (llm/)
 
@@ -1486,6 +1504,25 @@ Results and checks of the review and role-catalog flows:
   task removed dependencies adds `Its creator (X) was told that you removed #3, and the discussion records it.` (or
   `The discussion records that you removed #3.` when the creator is the user or has left) and, without a `comment`,
   ` Say there why the task can do without them (task_comment).`
+- Likely duplicates (run 006: three agents created three alike tasks for one message to all): `task_create` of an
+  agent or an external member (not the user) still creates the task, and when open tasks look like it its result
+  adds, in the caller's language (`similar_tasks`), `Similar open tasks: #33 "Fix the parser" [in_progress, Anna
+  Smith], #34 "..." [todo]. If yours duplicates one of them, cancel it (`task_update` status=cancelled) and take or
+  comment on that one.` `Board.similar_open(task)`: the open tasks of other creators (a planner splits work into
+  alike tasks on purpose; run 006's duplicates came from different members) except the task's parent and the tasks it
+  depends on, ranked by `board.similarity` (pure). The titles decide: their words lower-cased, without punctuation,
+  numbers, words under 3 letters and an en+ru stop list (generic verbs such as fix/implement/исправить, function
+  words), each cut to its first 5 letters; two words match when equal or one (≥ 4 letters) is a prefix of the other;
+  the score is the share of the shorter title's words found in the other (overlap coefficient), with ≥ 2 shared
+  words. From 0.75 the titles alone decide; from 0.5 the goals must confirm (title + goal still ≥ 0.5 with a shared
+  word more); goals never make a match alone (siblings repeat the swarm goal's words in theirs). Tasks told apart by
+  a parameter (the tokens with a digit differ: N=100 / N=200, C5, 1e-3), a kind of work (fix / build / verify /
+  optimize / measure / research / document / remove / deploy words, en+ru) or a side (lower / upper, staging /
+  production, нижн / верхн, ...) score 0. At most 3, best first, then the older. "Fix crash in parser on empty input"
+  ~ "Parser crashes on empty input" (1.0); "Benchmark solver on N=100" / "N=200", "Optimize the step function" /
+  "Verify the step function", "Compute lower bound for C5" / "upper bound", "Write unit tests for the parser" /
+  "for the lexer" (0.67, no goal confirms) and "Implement login page UI" / "Implement login API endpoint" (one shared
+  word) are not.
 - `goal_complete` (switch on) is refused while tasks are in review: ``Tasks are still waiting for review: #N
   (reviewer), .... The goal can be completed only after every task is reviewed: call `wait` ...``. The "already
   achieved" check comes first.
@@ -1517,7 +1554,8 @@ Results of the team, wait and job flows:
   `Done: ...` lists what was done: `wrap-up mode on: every agent was told to finish its tasks with what it has, and no
   new background jobs start` / `wrap-up mode was already on` / `wrap-up mode off` / `wrap-up mode was not on`. Nothing
   to do: `Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.`
-- `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run,
+- `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run (a
+  silent one, §7.1: `j5 Bob: pytest, 50 min, no output for 40 min`),
   and for a member caller `Your background jobs: j3, j5.` after its open tasks. `brief=true` shows the goal as one
   line, `Global goal [active]: <title>` (no description, no summary); the rest is the same.
 - `wait` (description: the end of one of its background jobs wakes it too; "End every turn with it" stays): `OK,
@@ -2429,7 +2467,9 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   - Background jobs (§7.1; «фоновый процесс» in Russian, shown as j3): the tab «Процессы» (badge: the running
     ones) has a card per job of the snapshot's `jobs` (running, then ended in the last hour): label, owner chip,
     state («работает 25 мин»; at the end by status and reason: «завершён: код 0», «завершён» for a job with no
-    code of its own, «остановлен вами», «остановлен по пределу времени»…), origin, process names while it runs,
+    code of its own, «остановлен вами», «остановлен по пределу времени»…), for a silent one (`silent_since`, §7.1)
+    a warn badge with the clock icon «40 мин без вывода» (tooltip: it may hang, look at its output and stop it if it
+    is stuck), origin, process names while it runs,
     how long it ran and when it ended, and its log (a workspace log is a link that opens it in «Файлы»).
     «Вывод» shows its last 200 lines (`POST api/act/jobs {job_id, tail: 200}`), refreshed every 3 s while the
     tab is open and the job runs; «Остановить» asks first («Остановить процесс j3 и всё, что он запустил?»),

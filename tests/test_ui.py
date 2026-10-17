@@ -1634,6 +1634,38 @@ def test_jobs_tab_cards_output_and_stop():
 
 
 @needs_node
+def test_jobs_tab_marks_a_silent_job():
+    """A running job the hub reports silent (silent_since: jobs.SILENT_MINUTES without output) gets a warn badge
+    with how long it has been silent; a talking or ended job gets none."""
+    out = run_js(r"""
+      el("job-list");
+      const now = Date.now() / 1000;
+      const job = (id, extra) => Object.assign({ id, label: "j" + id, owner: "Ann Lee", command: "serve", origin: "background",
+        status: "running", reason: null, exit_code: null, started_at: now - 3000, ended_at: null, log: "", processes: [] }, extra);
+      app.S.state = { jobs: [job(1, { silent_since: now - 2430, last_output_at: null }),
+                             job(2, { silent_since: null, last_output_at: now - 30 }),
+                             job(3, { status: "ended", exit_code: 0, ended_at: now - 10, silent_since: now - 2000 })] };
+      app.S.tab = "jobs";
+      app.S.lang = "en";
+      app.renderJobs();
+      out.en = elements["job-list"].innerHTML;
+      app.S.lang = "ru";
+      app.renderJobs();
+      out.ru = elements["job-list"].innerHTML;
+      app.handleEvent({ id: null, ts: 0, type: "job.silent", actor: "Ann Lee", data: { job: job(2, { silent_since: now - 700 }) } });
+      out.feed = app.S.feed.length;
+    """)
+    cards = {int(c.split('"', 1)[0]): c for c in out["en"].split('data-job="')[1:]}
+    hint = "It has printed nothing for a long time and may hang: look at its output, and stop it if it is stuck."
+    assert (f'<span class="badge warn" title="{hint}"><i class="ic ic-clock"></i>no output for 40 min</span>'
+            in cards[1])
+    assert "ic-clock" not in cards[2] and "ic-clock" not in cards[3]
+    assert out["en"].count("no output for") == 1
+    assert "<i class=\"ic ic-clock\"></i>40 мин без вывода</span>" in out["ru"]
+    assert out["feed"] == 0   # a job.silent event (live only, it schedules a state reload) is no feed line
+
+
+@needs_node
 def test_jobs_in_the_feed_team_panel_drawer_and_header():
     out = run_js(r"""
       const E = process.env.EVIL;

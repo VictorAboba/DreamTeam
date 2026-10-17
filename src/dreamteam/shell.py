@@ -245,12 +245,15 @@ class Capture:
         self._log_size = 0
         self._log_max = 0
         self._log_full = False
+        self.last_output_at: float | None = None  # when bytes last arrived (a job silent for long is shown so)
 
     # buffers
     def feed(self, data: bytes, final: bool = False) -> None:
         with self._lock:
             if self.detached:
                 return  # the reader goes on draining the pipe into nothing
+            if data:
+                self.last_output_at = time.time()
             text = self._decoder.feed(data, final)
             if text:
                 self._keep(text)
