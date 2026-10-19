@@ -212,6 +212,87 @@ def test_system_prompt_teaches_background_jobs(lang):
     assert "95" in text and ".scratch/ann.lee/jobs/" in text
 
 
+@pytest.mark.parametrize("lang", LANGS)
+def test_system_prompt_teaches_skills(lang):
+    """New members learn that skills exist, that the first wake-up lists them and later ones name them, and that a
+    skill's SKILL.md is read with `read_file` before work it fits; item 1 says the wake-up shows them."""
+    system = SYSTEMS[lang]
+    bullet = next(line for line in system.splitlines() if line.startswith("- **Skills**" if lang == "en"
+                                                                          else "- **Скиллы**"))
+    assert "SKILL.md" in bullet and "`read_file`" in bullet
+    assert ("The first wake-up lists them" if lang == "en" else "Первое сообщение о пробуждении перечисляет") in bullet
+    item1 = next(line for line in system.splitlines() if line.startswith("1. "))
+    assert ("the skills attached to the swarm" if lang == "en" else "подключённые к рою скиллы") in item1
+    if lang == "ru":
+        assert "скилл" in bullet and "навык" not in system.lower()
+    # new members have skill_propose (revision 3): a procedure that worked can be proposed as a skill
+    assert "`skill_propose`" in bullet and "`name`" in bullet and "`description`" in bullet
+    assert ("the user decides whether it is kept" if lang == "en" else "пользователь решит, сохранить ли его") in bullet
+
+
+def test_skill_texts():
+    """The index and its notifications: the same placeholders in both languages, the Claude Code tool mapping, a
+    literal ${CLAUDE_SKILL_DIR} (not a placeholder) and only tools every revision has."""
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        for key in ("skills_index", "skills_index_own"):
+            assert placeholders(texts[key]) == {"skills"}, (lang, key)
+            rendered = prompts.t(lang, key, skills="- x")
+            assert "${CLAUDE_SKILL_DIR}" in rendered and rendered.endswith("\n- x")
+            assert {"read_file", "shell", "write_file", "edit_file"} <= code_idents(texts[key])
+        assert "«" in texts["skills_index_own"] or "\"Your role's\"" in texts["skills_index_own"]
+        assert placeholders(texts["skills_item"]) == {"name", "own", "description", "path", "deps"}
+        assert placeholders(texts["skills_names"]) == {"names"}
+        assert placeholders(texts["skills_path_outside"]) == {"path"} and "`shell`" in texts["skills_path_outside"]
+        for key in ("n_skill_added", "n_skill_updated"):
+            assert placeholders(texts[key]) == {"name", "description", "path", "deps"} and "`read_file`" in texts[key]
+        assert placeholders(texts["n_skill_removed"]) == {"name"}
+        # proposals and the user's decision; agents of every revision get these, so they name no skill_propose
+        assert placeholders(texts["n_skill_shared"]) == {"owner", "name", "description", "path", "deps"}
+        assert placeholders(texts["n_skill_saved"]) == {"name"}
+        assert placeholders(texts["n_skill_not_saved"]) == {"name", "comment"}
+        assert placeholders(texts["u_skill_proposed"]) == {"owner", "name", "description", "files", "installs"}
+        assert "`skill_approve`" in texts["u_skill_proposed"]
+        assert placeholders(texts["u_role_skills_missing"]) == {"role", "names"}
+        assert placeholders(texts["u_role_skills_over_cap"]) == {"role", "names", "max"}
+        for key in ("n_skill_shared", "n_skill_saved", "n_skill_not_saved"):
+            assert "skill_propose" not in texts[key], (lang, key)
+
+
+def test_skill_deps_texts():
+    """A skill's script dependencies (skill_deps.py): fragments of the index line start with a space, name only
+    `shell` / `read_file` (every revision has them), and the reasons render inside skills_deps_manual without a
+    sentence of their own; the user's failure text points at skill_reinstall."""
+    deps_keys = [k for k in prompts.TEXTS["en"] if k.startswith(("skills_deps_", "deps_reason_", "n_skill_deps_"))]
+    assert len(deps_keys) == 16
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        # an AI member's "being installed" promises no wake-up: the news of the end reaches it quietly
+        assert placeholders(texts["skills_deps_installing_quiet"]) == placeholders(texts["skills_deps_installing"])
+        assert ("does not wake you" if lang == "en" else "не будит") in texts["skills_deps_installing_quiet"]
+        for key in deps_keys:
+            assert code_idents(texts[key]) <= {"shell", "read_file"}, (lang, key)
+            if key.startswith("skills_deps_"):
+                assert texts[key].startswith(" "), (lang, key)
+            if key.startswith("deps_reason_"):
+                assert "." not in texts[key] and "(" not in texts[key] and ")" not in texts[key], (lang, key)
+        assert code_idents(texts["u_skill_deps_failed"]) == {"skill_reinstall"}
+        assert not code_idents(texts["u_skill_installs"]) and texts["u_skill_installs"].startswith(" ")
+        assert placeholders(texts["u_skill_deps_failed"]) == {"name", "files", "error", "log"}
+        assert placeholders(texts["u_skill_installs"]) == {"files", "packages"}
+        ending = {k for k, v in texts.items() if v.endswith("{deps}")}
+        assert ending == {"n_skill_added", "n_skill_updated", "n_skill_shared", "n_skill_deps_ready",
+                          "n_skill_deps_failed", "skills_item"}
+        assert texts["skills_item"].endswith("{path}{deps}")
+        # the index header says what a line with or without packages means (the frozen system prompt does not)
+        for key in ("skills_index", "skills_index_own"):
+            text = prompts.t(lang, key, skills="- x")
+            assert "requirements.txt, pyproject.toml" in text and "npm ci" in text, (lang, key)
+        assert ("Your role's" if lang == "en" else "«Твоей роли»") in prompts.t(lang, "skills_index_own", skills="")
+        # a path is never put in backticks: code_idents would read a piece of it as a tool name
+        assert not any("`{" in texts[k] for k in deps_keys), lang
+
+
 # ------------------------------------------------------------------------- rendering & callers
 def test_system_prompt_renders_all_fields():
     for lang in LANGS:
@@ -244,7 +325,9 @@ def test_unknown_language_falls_back_to_english():
 
 
 # positional index of the prompt key in each notification / text call
-_KEY_ARG = {"notify": 1, "notify_later": 2, "_notify_member": 2, "t": 1}
+_KEY_ARG = {"notify": 1, "notify_later": 2, "_notify_member": 2, "t": 1, "_announce": 0}
+# placeholders a helper fills in itself: SessionSkills._announce computes `path` and `deps` per recipient
+_IMPLIED = {"_announce": {"path", "deps"}}
 
 
 def _string_values(node: ast.AST) -> list[str]:
@@ -282,7 +365,7 @@ def _prompt_calls() -> list[tuple[str, str, set[str]]]:
                 continue  # pass-through helpers (**kw) are checked at their own call sites
             owner = next((f for f in funcs if f.lineno <= node.lineno <= (f.end_lineno or f.lineno)
                           and any(c is node for c in ast.walk(f))), None)
-            kwargs = {k.arg for k in node.keywords} - {"wake"}
+            kwargs = ({k.arg for k in node.keywords} - {"wake"}) | _IMPLIED.get(name, set())
             for key in _key_candidates(node.args[index], owner):
                 calls.append((f"{path.relative_to(SRC)}:{node.lineno}", key, kwargs))
     return calls

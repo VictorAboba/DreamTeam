@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -107,10 +108,40 @@ def env_passthrough(config: Config) -> list[str]:
     """Names of environment variables to pass into the container (values are taken from the host env)."""
     names = {p.api_key_env for p in config.models.values() if p.api_key_env}
     names |= {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} | set(config.shell.pass_env)
+    # the skills variables are set by sandbox_command; a host value passed by name would come later and win
+    names -= SKILLS_ENV
     return sorted(n for n in names if n and n in os.environ)
 
 
 CONTAINER_PORT = 8765
+HOST_SKILLS_MOUNT = "/dreamteam/host-skills"        # the host's skills library inside the sandbox (read-only)
+# the sandbox's own, writable library (in the mounted home). Not .dreamteam/skills, the default library's name: a
+# home mounted from the user's home folder would make the host's own library writable there
+SANDBOX_SKILLS_DIR = "/swarm/.dreamteam/skills-library"
+SANDBOX_ENVS_DIR = "/dreamteam/skill-envs"   # the skills' dependency environments: a named volume per home
+SKILLS_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR",
+                        "UV_CACHE_DIR"})
+
+
+def envs_volume(project_dir: Path) -> str:
+    """The named volume of a home's skill environments: a Linux file system (venv symlinks, hardlinks and flock work
+    there), kept across `--rm` containers, never shared with another home."""
+    return f"dreamteam-skill-envs-{hashlib.sha256(str(project_dir.resolve()).encode()).hexdigest()[:10]}"
+
+
+def sandbox_host_library(config: Config) -> Path:
+    """The host's skills library as it is mounted into the sandbox (created by run_sandbox, never here)."""
+    return config.skills_library_dir.expanduser().resolve()
+
+
+def library_inside_warning(project_dir: Path, config: Config) -> list[str]:
+    """A warning when the host's skills library is inside the mounted directory: it is then writable through
+    /swarm as well, so the read-only mount protects nothing (empty otherwise)."""
+    library, mounted = sandbox_host_library(config), project_dir.resolve()
+    if library != mounted and mounted not in library.parents:
+        return []
+    return [f"Warning: the skills library {library} is inside {mounted}, which is mounted writable: agents in the "
+            "container can change it. Move it ([skills] library_dir or DREAMTEAM_SKILLS_DIR) outside."]
 
 
 def outside_home_warning(home: Path) -> list[str]:
@@ -142,6 +173,15 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
     # servers open inside the container are not published.
     cmd = [docker, "run", "--rm", "--init", "--name", f"dreamteam-{port}", "-p", f"127.0.0.1:{port}:{CONTAINER_PORT}",
            "-v", f"{project_dir.resolve()}:/swarm", "-e", f"DREAMTEAM_PUBLIC_URL={public}"]
+    # Skills (docs/SPEC.md §19): the agents have `shell` in the hub's container, so the host's library is mounted
+    # read-only (the source `host-library` inside); the sandbox's own library is <home>/.dreamteam/skills-library,
+    # which the host never reads by itself. ~/.claude/skills is not mounted: it would show all the user's personal
+    # skills.
+    cmd += ["-v", f"{sandbox_host_library(config)}:{HOST_SKILLS_MOUNT}:ro",
+            "-e", f"DREAMTEAM_HOST_SKILLS_DIR={HOST_SKILLS_MOUNT}", "-e", f"DREAMTEAM_SKILLS_DIR={SANDBOX_SKILLS_DIR}"]
+    # the skills' environments: never the host's (another platform, other interpreter paths); uv's cache beside them
+    cmd += ["-v", f"{envs_volume(project_dir)}:{SANDBOX_ENVS_DIR}", "-e", f"DREAMTEAM_SKILL_ENVS_DIR={SANDBOX_ENVS_DIR}",
+            "-e", f"UV_CACHE_DIR={SANDBOX_ENVS_DIR}/.cache/uv"]
     if tty:
         cmd.append("-it")
     for name in env_passthrough(config):
@@ -171,7 +211,12 @@ def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | N
     if is_home:
         for line in outside_home_warning(project_dir):
             print(line, file=sys.stderr)
+    for line in library_inside_warning(project_dir, config):
+        print(line, file=sys.stderr)
     from .cli import _stdin_is_terminal  # (NUL claims to be a tty on Windows: `docker run -it` would refuse it)
+
+    # Docker would create a missing host folder of a bind mount itself, owned by root on Linux
+    sandbox_host_library(config).mkdir(parents=True, exist_ok=True)
 
     cmd = sandbox_command(project_dir, port, config, goal, image, docker=_docker(), tty=_stdin_is_terminal(),
                           home=home)

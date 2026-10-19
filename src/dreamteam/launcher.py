@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import html
 import json
 import logging
 import os
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 import uvicorn
@@ -23,14 +25,16 @@ from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, roles
+from . import __version__, procs, roles
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
 from .sessions import SessionError
 from .settings import PROVIDER_CHOICES, check_profile, profile_from_view, settings_path
+from .skill_deps import EnvManager
+from .skills import SkillError
 from .web import (
     GRACEFUL_SECONDS, STATIC_DIR, GuardMiddleware, HubServer, UIStaticFiles, create_app, env_allowed_hosts,
-    public_base,
+    public_base, skill_routes,
 )
 
 if TYPE_CHECKING:
@@ -40,6 +44,10 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 SESSION_PATH = re.compile(r"^/s/([a-z0-9][a-z0-9-]{0,63})(/.*)?$")
+# unused skill environments ([skills] env_retention_days, docs/SPEC.md §19): removed this long after the launcher
+# started, then once a day
+ENV_CLEANUP_DELAY = 60.0
+ENV_CLEANUP_EVERY = 24 * 3600.0
 STOPPED_TEXT = "The session is stopped. Start it on the sessions page."
 ERROR_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>DreamTeam</title>
 <style>body{font-family:"Segoe UI",system-ui,sans-serif;background:#0b0b0d;color:#ebe9e6;display:grid;
@@ -124,6 +132,9 @@ class SessionRouter:
             elif entry is not None and event.get("change") == "started":
                 self._close_sockets_later(entry)  # same swarm object, now running: let browsers reload state
 
+    def _library_changed(self) -> None:
+        self.manager._changed(None, "skills")   # (a session page changed the library: the home page reloads it)
+
     def _close_later(self, entry: _SessionApp) -> None:
         try:
             task = asyncio.get_running_loop().create_task(entry.close())
@@ -154,7 +165,7 @@ class SessionRouter:
             if entry is None or entry.swarm is not swarm:
                 if entry is not None:
                     self._close_later(entry)
-                entry = _SessionApp(swarm, create_app(swarm, self.host))
+                entry = _SessionApp(swarm, create_app(swarm, self.host, on_library_change=self._library_changed))
                 await entry.start()
                 self.apps[sid] = entry
             return entry
@@ -230,7 +241,8 @@ class SessionRouter:
 
 def _error(exc: Exception) -> JSONResponse:
     status = getattr(exc, "status", 400)
-    return JSONResponse({"error": str(exc)}, status_code=status)
+    # extra: e.g. "pending_skills" of a refused delete, "exists" of a skill clash
+    return JSONResponse({"error": str(exc), **(getattr(exc, "extra", None) or {})}, status_code=status)
 
 
 _BAD_JSON = object()
@@ -255,8 +267,9 @@ def _failure(what: str, exc: Exception) -> JSONResponse:
 
 
 def _body_error(body: Any, *, strings: tuple[str, ...] = (), objects: tuple[str, ...] = (),
-                flags: tuple[str, ...] = ()) -> str | None:
-    """Why a JSON body has the wrong shape (None if it is fine); absent and null fields are fine."""
+                flags: tuple[str, ...] = (), lists: tuple[str, ...] = ()) -> str | None:
+    """Why a JSON body has the wrong shape (None if it is fine); absent and null fields are fine. `lists`: lists of
+    strings."""
     if body is _BAD_JSON:
         return "The body is not valid JSON."
     if not isinstance(body, dict):
@@ -266,7 +279,52 @@ def _body_error(body: Any, *, strings: tuple[str, ...] = (), objects: tuple[str,
         for name in names:
             if body.get(name) is not None and not isinstance(body[name], kind):
                 return f"'{name}' must be {label}."
+    for name in lists:
+        value = body.get(name)
+        if value is not None and not (isinstance(value, list) and all(isinstance(v, str) for v in value)):
+            return f"'{name}' must be a list of strings."
     return None
+
+
+VIAS = ("home", "cli")   # the surfaces a REST caller may name for the skills audit (`via`); none given: the home page
+
+
+def _via(value: Any) -> str:
+    """`via` of a create, start or delete (body or query): "home" unless the caller names another of VIAS (the
+    terminal's client says "cli"). SessionError 400 for anything else."""
+    if value in (None, ""):
+        return "home"
+    if value not in VIAS:
+        raise SessionError(f"'via' must be one of {', '.join(VIAS)}.")
+    return value
+
+
+def _workspace_query(request: Request) -> Path | None:
+    """`?workspace=<absolute folder>`: the folder whose .claude/skills a new session would offer (claude-project)."""
+    value = (request.query_params.get("workspace") or "").strip()
+    if not value:
+        return None
+    if not Path(value).is_absolute():
+        raise SkillError("'workspace' must be an absolute folder path.")
+    return Path(value)
+
+
+async def _clean_envs_daily(manager: "SessionManager") -> None:
+    """The launcher's cleanup of unused skill environments: ENV_CLEANUP_DELAY after the start, then every
+    ENV_CLEANUP_EVERY (env_retention_days = 0: none; the settings are read each time)."""
+    await asyncio.sleep(ENV_CLEANUP_DELAY)
+    while True:
+        config = manager.global_config()
+        if config.skills.env_retention_days > 0:
+            try:
+                report = await procs.daemon_call(EnvManager.for_config(config).cleanup,
+                                                 config.skills.env_retention_days)
+                if report["removed"]:
+                    log.info("removed unused skill environments: %s", ", ".join(report["removed"]))
+                    manager._changed(None, "skill-envs")
+            except Exception:  # noqa: BLE001 - the next day tries again
+                log.exception("cannot remove the unused skill environments")
+        await asyncio.sleep(ENV_CLEANUP_EVERY)
 
 
 def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> GuardMiddleware:
@@ -279,21 +337,23 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
 
     async def hub_info(request: Request):
         return JSONResponse({"pid": os.getpid(), "project": str(manager.home), "home": str(manager.home),
-                             "name": "DreamTeam", "version": __version__, "mode": "launcher"})
+                             "name": "DreamTeam", "version": __version__, "mode": "launcher",
+                             "sandbox": manager.config.skills_host_library_dir is not None})
 
     async def sessions(request: Request):
         if request.method == "GET":
             return JSONResponse({"sessions": manager.list()})
         body = await _json_body(request)
-        problem = _body_error(body, strings=("title", "goal", "description", "workspace"), objects=("overrides",),
-                              flags=("start",))
+        problem = _body_error(body, strings=("title", "goal", "description", "workspace", "via"),
+                              objects=("overrides",), flags=("start",), lists=("skills",))
         if problem:
             return JSONResponse({"error": problem}, status_code=400)
         try:
             summary = await manager.create(body.get("title") or "", body.get("goal") or "",
                                            body.get("description") or "", overrides=body.get("overrides") or {},
                                            start=body.get("start") is not False,
-                                           workspace=body.get("workspace") or None)
+                                           workspace=body.get("workspace") or None, skills=body.get("skills") or None,
+                                           via=_via(body.get("via")))
         except (SessionError, ValueError) as exc:
             return _error(exc)
         except Exception as exc:  # e.g. the swarm failed to start: show it in the UI
@@ -319,8 +379,10 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                 if request.query_params.get("confirm") != sid:
                     return JSONResponse({"error": "Pass ?confirm=<session id> to delete a session."}, status_code=400)
                 # a folder outside the session (the user's project, or one it was moved to) is never deleted; delete
-                # names it as it was under the session's lock (a /cd of the session may have run just before)
-                kept = await manager.delete(sid)
+                # names it as it was under the session's lock (a /cd of the session may have run just before).
+                # ?skills=save|discard: what happens to members' proposals waiting for the user (409 without)
+                kept = await manager.delete(sid, skills=request.query_params.get("skills") or None,
+                                            via=_via(request.query_params.get("via")))
                 return JSONResponse({"ok": True, **({"workspace_kept": kept} if kept else {})})
         except (SessionError, ValueError) as exc:
             return _error(exc)
@@ -355,8 +417,12 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     async def session_action(request: Request):
         sid, action = request.path_params["sid"], request.path_params["action"]
         try:
-            if action == "start":
-                await manager.start(sid)
+            if action == "start":  # optional body {"skills": [...]}: attached before the start (live when running)
+                body = await _json_body(request)
+                problem = _body_error(body, strings=("via",), lists=("skills",))
+                if problem:
+                    return JSONResponse({"error": problem}, status_code=400)
+                await manager.start(sid, skills=body.get("skills") or None, via=_via(body.get("via")))
             elif action == "stop":
                 await manager.stop(sid)
             else:
@@ -367,6 +433,44 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
         except Exception as exc:
             log.exception("session %s %s failed", sid, action)
             return JSONResponse({"error": f"{type(exc).__name__}: {exc}"}, status_code=500)
+
+    async def session_skills(request: Request):
+        """A session's attached skills, also while it is stopped (`?show=<name>`: that copy's files and SKILL.md)."""
+        sid = request.path_params["sid"]
+        try:
+            return JSONResponse(await manager.session_skills(sid, request.query_params.get("show") or None))
+        except (SessionError, ValueError) as exc:
+            return _error(exc)
+
+    async def session_skill_decide(request: Request):
+        """The library decision on a member's proposal: the running session's skill_approve, or on a stopped
+        session's files (the owner is told at its next start)."""
+        sid, name = request.path_params["sid"], request.path_params["name"]
+        body = await _json_body(request)
+        problem = _body_error(body, strings=("comment",), flags=("approve", "replace"))
+        if problem or not isinstance(body.get("approve"), bool):
+            return JSONResponse({"error": problem or "Body must be {\"approve\": true|false, \"comment\"?, "
+                                 "\"replace\"?}."}, status_code=400)
+        try:
+            text = await manager.decide_skill(sid, name, body["approve"], comment=body.get("comment") or "",
+                                              replace=body.get("replace") is True, via="home")
+            return JSONResponse({"text": text, "session": manager.summary(sid)})
+        except (SessionError, ValueError) as exc:
+            return _error(exc)
+
+    async def skill_envs_cleanup(request: Request):
+        """Remove the unused skill environments now (the home page's button, /skills clean-envs): every one no
+        session uses, whatever its age and whatever env_retention_days says (that is for the automatic runs)."""
+        config = manager.global_config()
+        envs = EnvManager.for_config(config)
+        try:
+            report = await procs.daemon_call(functools.partial(envs.cleanup, config.skills.env_retention_days,
+                                                               every_unused=True))
+        except Exception as exc:
+            return _failure("skill environments cleanup", exc)
+        envs._changed(None, "skill-envs")
+        manager._changed(None, "skill-envs")
+        return JSONResponse(report)
 
     def role_views() -> dict[str, Any]:
         # the built-in roles (both languages) and the catalog they make with the stored [[roles]] entries
@@ -430,13 +534,19 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
 
     @contextlib.asynccontextmanager
     async def lifespan(app):
-        async with endpoint.manager.run():
-            try:
-                yield
-            finally:
-                router = holder.get("router")
-                if router is not None:
-                    await router.aclose()
+        cleaner = asyncio.create_task(_clean_envs_daily(manager), name="skill-envs-cleanup")
+        try:
+            async with endpoint.manager.run():
+                try:
+                    yield
+                finally:
+                    router = holder.get("router")
+                    if router is not None:
+                        await router.aclose()
+        finally:
+            cleaner.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cleaner
 
     routes = [
         Route("/", home),
@@ -444,7 +554,12 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
         Route("/api/sessions", sessions, methods=["GET", "POST"]),
         Route("/api/sessions/{sid}", session_item, methods=["GET", "PATCH", "DELETE"]),
         Route("/api/sessions/{sid}/workspace", session_workspace, methods=["POST"]),
+        Route("/api/sessions/{sid}/skills", session_skills),
+        Route("/api/sessions/{sid}/skills/{name}/decide", session_skill_decide, methods=["POST"]),
         Route("/api/sessions/{sid}/{action}", session_action, methods=["POST"]),
+        *skill_routes(manager.global_config, _workspace_query, via="home",
+                      changed=lambda: manager._changed(None, "skills")),
+        Route("/api/skill-envs/cleanup", skill_envs_cleanup, methods=["POST"]),
         Route("/api/settings", settings, methods=["GET", "PUT"]),
         Route("/api/settings/check", settings_check, methods=["POST"]),
         WebSocketRoute("/ws", ws_endpoint),

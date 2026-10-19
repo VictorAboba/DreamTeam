@@ -24,11 +24,13 @@ CONNECT_OPTIONS = ("host", "port", "llm_factory", "web")
 async def run_print_mode(conn: Connection, prompt: str, *, overrides: dict | None = None,
                          title: str | None = None, **options: Any) -> int:
     """`dreamteam -p`: printmode.run_print with the CLI overrides (model, agents, max_agents, budget, title,
-    or override sections) turned into the session overrides of a new session."""
+    or override sections) turned into the session overrides of a new session; `skills` (`--skill`) goes along."""
     from .printmode import run_print
 
     sections, flat_title = session_overrides(overrides)
-    return await run_print(conn, prompt, title=title or flat_title, overrides=sections or None, **options)
+    skills = list((overrides or {}).get("skills") or []) or None
+    return await run_print(conn, prompt, title=title or flat_title, overrides=sections or None, skills=skills,
+                           **options)
 
 
 def _default_logging(home: Path) -> None:
@@ -49,8 +51,9 @@ def main_tui(home: str | Path, *, lang: str | None = None, session: str | None =
              host: str | None = None, port: int | None = None, verbosity: str = "normal",
              llm_factory: Callable | None = None, workspace: str | None = None) -> int:
     """Run the interactive TUI for `home`. `overrides` (model, agents, max_agents, budget, title) apply to
-    sessions created from it; `workspace` (an absolute folder) to the first one. Returns the exit code (130 on
-    Ctrl+C outside the UI)."""
+    sessions created from it; `workspace` (an absolute folder) and `skills` (`--skill`) to the first one, or the
+    skills to the session `session` / `continue_last` resumes. Returns the exit code (130 on Ctrl+C outside the
+    UI)."""
     home = Path(home).expanduser()
     _default_logging(home)
 

@@ -352,6 +352,60 @@ async def test_team_sets_the_starting_team_of_the_next_session(launch):
     assert await h.quit() == 0
 
 
+async def test_skill_option_reaches_the_new_or_the_resumed_session(launch, tmp_path):
+    """`dreamteam --skill X`: the session the TUI creates first gets it; with -r / -c it is attached to the session
+    resumed, also when that one runs already (docs/SPEC.md §19)."""
+    import os
+
+    from conftest import make_skill
+    from dreamteam.skills import Library
+
+    conn = await launch()
+    pdf, csv = (make_skill(tmp_path / "src" / name, name) for name in ("pdf", "csv"))
+    h = launch.tui(conn, overrides={"skills": [str(pdf)]})
+    await h.until(lambda: h.tui.ready.is_set(), what="the start")
+    h.type("Write a haiku\r")
+    await h.until(lambda: h.tui.attached and h.tui.sid, 30, "the new session")
+    sid = h.tui.sid
+    summary = next(s for s in await conn.client.sessions() if s["id"] == sid)
+    assert summary["skills"] == ["pdf"] and h.tui.skills_override == []
+    assert await h.quit() == 0
+    resumed = launch.tui(conn, session=sid, overrides={"skills": [str(csv)]})   # running: attached live
+    await resumed.until(lambda: resumed.tui.attached and resumed.tui.sid == sid, 20, "the attach")
+    summary = next(s for s in await conn.client.sessions() if s["id"] == sid)
+    assert summary["skills"] == ["csv", "pdf"]
+    assert await resumed.quit() == 0
+    # the library records the terminal as the surface the sources came through
+    library = Library(Path(os.environ["DREAMTEAM_SKILLS_DIR"]))
+    assert (library.get("pdf")["via"], library.get("csv")["via"]) == ("cli", "cli")
+
+
+async def test_skill_option_with_the_session_picker(launch, tmp_path):
+    """`dreamteam -r --skill X`: the session picked is the one resumed and gets X; a later switch gets nothing."""
+    from conftest import make_skill
+
+    conn = await launch()
+    other = (await conn.client.create_session("Other", "", start=False))["id"]
+    main = (await conn.client.create_session("Main", "Main goal"))["id"]
+    pdf = make_skill(tmp_path / "src" / "pdf", "pdf")
+    h = launch.tui(conn, session="", initial_prompt="/sessions", overrides={"skills": [str(pdf)]})
+    await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker")
+    for _ in range(5):
+        if h.tui.dialog.select.selected.value == other:
+            break
+        h.type(DOWN)
+        await asyncio.sleep(0.05)
+    assert h.tui.dialog.select.selected.value == other
+    h.type("\r")
+    await h.until(lambda: h.tui.attached and h.tui.sid == other, 20, "the switch")
+    sessions = {s["id"]: s for s in await conn.client.sessions()}
+    assert sessions[other]["skills"] == ["pdf"] and h.tui.skills_override == []
+    await h.run(f"/resume {main}", "Main goal")
+    sessions = {s["id"]: s for s in await conn.client.sessions()}
+    assert h.tui.sid == main and sessions[main]["skills"] == []
+    assert await h.quit() == 0
+
+
 async def test_session_picker_and_resume(launch):
     conn = await launch()
     other = (await conn.client.create_session("Other", "", start=False))["id"]
@@ -940,7 +994,7 @@ async def test_sessions_are_deleted_from_the_picker_and_by_command(launch, monke
     assert await ids() == [main]
 
     # a refusal (files in use) keeps the current session
-    async def refuse(sid: str) -> None:
+    async def refuse(sid: str, skills: str | None = None) -> None:
         raise HubError(409, "Could not delete session: its files are in use")
 
     monkeypatch.setattr(conn.client, "delete_session", refuse)
@@ -1343,3 +1397,89 @@ async def test_background_jobs_in_the_status_line_and_the_jobs_command(tmp_path,
         stack.close()
         await conn.close()
     assert kids.check() == [], "child processes were left running"
+
+
+async def test_skill_proposals_are_asked_about_and_a_delete_asks_what_to_do_with_them(launch, monkeypatch):
+    """A member's skill_propose pops the library dialog (1 saves; 2 asks for the reason; Esc puts it off); /skills
+    lists the session's skills; deleting a session whose proposals wait asks to save or discard them."""
+    import os
+
+    from conftest import make_skill
+    from dreamteam.skills import Library
+    from dreamteam.tui.dialogs import ChoiceDialog, SkillApprovalDialog
+
+    conn = await launch()
+    sid = (await conn.client.create_session("Skills", "Make skills"))["id"]
+    h = launch.tui(conn, session=sid)
+    await h.until(lambda: h.tui.attached and h.tui.members, 20, "the attach")
+    agent = h.tui.members[0]
+    swarm = conn.manager.swarms[sid]
+    monkeypatch.setattr(SkillApprovalDialog, "settle", 0.2)
+    library = Library(Path(os.environ["DREAMTEAM_SKILLS_DIR"]))
+
+    async def propose(name: str, description: str, body: str = "Steps.\n") -> None:
+        rel = f".scratch/drafts/{name}"
+        make_skill(swarm.workspace.root / rel, name, description, {"run.py": "print(1)\n"}, body=body)
+        await swarm.skills.propose(agent, rel)
+
+    def dialog_for(name: str) -> bool:
+        return isinstance(h.tui.dialog, SkillApprovalDialog) and h.tui.dialog.name == name
+
+    await propose("csv-cleanup", "Cleans CSV files.", "# CSV cleanup\n\nRun scripts/run.py on the file.\n")
+    await h.until(lambda: dialog_for("csv-cleanup"), 20, "the skill dialog")
+    text = "".join(part for _, part in h.tui.dialog.fragments(100))
+    assert "A member proposes a skill" in text and "Cleans CSV files." in text and agent in text
+    assert "1. Save to the library" in text and "only decides the library" in text
+    # what is decided on: the file names with sizes and the start of SKILL.md (not its front matter)
+    assert "Files: SKILL.md (" in text and re.search(r"run\.py \(\d+ B\)", text)
+    assert "# CSV cleanup" in text and "Run scripts/run.py on the file." in text and "description:" not in text
+    await asyncio.sleep(0.25)
+    h.type("1")
+    await h.until(lambda: (library.get("csv-cleanup") or {}).get("name") == "csv-cleanup", 20, "saved")
+    await h.until(lambda: h.tui.dialog is None)
+
+    await propose("risky", "Does risky things.")
+    await h.until(lambda: dialog_for("risky"), 20)
+    await asyncio.sleep(0.25)
+    h.type("2")
+    await h.until(lambda: h.tui.input_mode == ("skill_reject", "risky"))
+    assert h.tui.box_title() == "Skill risky" and "optional" in h.tui._placeholder()
+    h.type("too broad\r")
+    await h.see("risky", 20)
+    await h.until(lambda: swarm.skills.get("risky").library == "rejected", 20, "rejected")
+    assert swarm.skills.get("risky").comment == "too broad" and library.get("risky") is None
+
+    await propose("later", "Waits.")
+    await h.until(lambda: dialog_for("later"), 20)
+    h.type(ESC)
+    await h.see("/skills approve later")
+    await asyncio.sleep(2.5)   # a state refresh meanwhile does not bring the dialog back
+    assert h.tui.dialog is None
+    table = await h.reply("/skills")
+    assert "csv-cleanup" in table and "saved" in table and "not saved" in table and "waits for you" in table
+    assert "agent" in table and "/skills add" in table
+
+    # another, stopped session's proposal: listed and decided from here without starting that session
+    other = (await conn.client.create_session("Other", "Make more skills"))["id"]
+    await conn.client.start_session(other)
+    swarm2 = conn.manager.swarms[other]
+    rel = ".scratch/drafts/elsewhere"
+    make_skill(swarm2.workspace.root / rel, "elsewhere", "From the other session.", {"run.py": "print(2)\n"})
+    await swarm2.skills.propose(swarm2.members()[0]["name"], rel)
+    await conn.client.stop_session(other)
+    pending = await h.reply(f"/skills pending {other}")
+    assert "elsewhere" in pending and f"--session {other}" in pending
+    await h.run(f"/skills approve elsewhere --session {other}", "elsewhere")
+    await h.until(lambda: library.get("elsewhere") is not None, 20, "saved from the other session")
+    assert other not in conn.manager.running and h.tui.sid == sid
+
+    # the delete: Yes, then "Delete them too" (the third answer would cancel)
+    h.type(f"/delete {sid}\r")
+    await h.until(lambda: isinstance(h.tui.dialog, ConfirmDialog) and not isinstance(h.tui.dialog, ChoiceDialog))
+    h.type("1")
+    await h.until(lambda: isinstance(h.tui.dialog, ChoiceDialog), what="the pending skills question")
+    assert "later" in h.tui.dialog.text and [o.value for o in h.tui.dialog.select.options] == ["save", "discard", None]
+    h.type("2")
+    await h.see(f'Session "Skills" ({sid}) deleted', 20)
+    assert library.get("later") is None
+    assert await h.quit() == 0

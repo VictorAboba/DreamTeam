@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import socket
 import sys
@@ -324,6 +325,31 @@ def cmd_init(args) -> int:
     return 0
 
 
+ENV_CLEANUP_DELAY = 60.0   # a standalone `dreamteam run` removes unused skill environments once, this long after start
+
+
+def _schedule_env_cleanup(config: Config) -> None:
+    """Once, ENV_CLEANUP_DELAY after the swarm started, in a daemon thread: the skills' environments unused for
+    [skills] env_retention_days (docs/SPEC.md §19; the launcher runs its own daily cleanup)."""
+    days = config.skills.env_retention_days
+    if days <= 0:
+        return
+
+    def run() -> None:
+        from .skill_deps import EnvManager
+
+        try:
+            report = EnvManager.for_config(config).cleanup(days)
+            if report["removed"]:
+                log.info("removed unused skill environments: %s", ", ".join(report["removed"]))
+        except Exception:  # noqa: BLE001 - a later run tries again
+            log.exception("cannot remove the unused skill environments")
+
+    timer = threading.Timer(ENV_CLEANUP_DELAY, run)
+    timer.daemon = True
+    timer.start()
+
+
 async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal: str | None,
                        console: bool, open_browser: bool, stop: asyncio.Event | None = None) -> int:
     """Run swarm + web board (+ terminal console) until a stop signal, the console's /quit or a server
@@ -343,6 +369,7 @@ async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal
     code = 0
     try:
         await swarm.start()
+        _schedule_env_cleanup(config)
         if goal:
             current = swarm.goal()
             title, _ = split_goal(goal)  # stored split: a multi-line --goal must not reset the goal at every restart
@@ -666,11 +693,12 @@ def _print_sessions(home: Path, base: str | None) -> int:
 
 async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_browser: bool,
                       goal: str | None = None, title: str | None = None, start: str | None = None,
-                      stop: asyncio.Event | None = None, workspace: str | None = None) -> int:
+                      stop: asyncio.Event | None = None, workspace: str | None = None,
+                      skills: list[str] | None = None) -> int:
     """Run the launcher (sessions page, settings, every session's board, MCP) until a stop signal, the
     console's /quit or a server failure. `goal` creates and starts a new session (working in the absolute
-    folder `workspace` when given, docs/SPEC.md §17.2); `start` starts an existing one. hub.json exists exactly
-    while the server listens; all sessions stop at the end."""
+    folder `workspace` when given, docs/SPEC.md §17.2; with the skills `skills`, §19); `start` starts an existing
+    one. hub.json exists exactly while the server listens; all sessions stop at the end."""
     from .launcher import serve_launcher
     from .launcher_mcp import workspace_text
     from .sessions import SessionManager
@@ -694,7 +722,7 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                 await manager.start(start)
                 focus = start
             if goal:
-                created = await manager.create(title or "", goal, workspace=workspace)
+                created = await manager.create(title or "", goal, workspace=workspace, skills=skills, via="cli")
                 focus = created["id"]
                 if created.get("workspace_result"):
                     print(f"Session {focus}: {workspace_text(created['workspace_result'])}", file=sys.stderr)
@@ -773,6 +801,15 @@ def cmd_serve(args) -> int:
         workspace = _workspace_arg(args.workspace)
         if workspace is None:
             return 2
+    skills = None
+    if args.skill:
+        if not args.goal:
+            print("--skill needs --goal: it is a skill of the session that --goal creates (an existing session "
+                  "attaches skills in its Skills tab).", file=sys.stderr)
+            return 2
+        skills = _skill_items(args.skill, home, workspace)
+        if skills is None:
+            return 2
     existing = running_hub(home)
     if existing:
         print(f"DreamTeam is already running for {home}: {existing}/", file=sys.stderr)
@@ -785,13 +822,13 @@ def cmd_serve(args) -> int:
     port = args.port or config.server.port
     try:
         return asyncio.run(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
-                                       goal=args.goal, title=args.title, workspace=workspace))
+                                       goal=args.goal, title=args.title, workspace=workspace, skills=skills))
     except KeyboardInterrupt:
         return 0
 
 
 SESSIONS_USAGE = ("dreamteam sessions [DIR] [--home HOME]\n"
-                  "       dreamteam sessions rm ID [ID ...] [--yes] [--home HOME]")
+                  "       dreamteam sessions rm ID [ID ...] [--yes] [--skills save|discard] [--home HOME]")
 DELETE_WORDS = ("rm", "delete", "del", "remove")
 
 
@@ -811,11 +848,13 @@ def cmd_sessions(args) -> int:
     return _print_sessions(home, running_hub(home))
 
 
-def _hub_delete_session(base: str, sid: str) -> dict:
+def _hub_delete_session(base: str, sid: str, skills: str | None = None) -> dict:
     """DELETE a session through the running hub (it stops the session first): its answer ({"ok", and
-    "workspace_kept" for a folder outside the session}); RuntimeError with the hub's reason."""
+    "workspace_kept" for a folder outside the session}); RuntimeError with the hub's reason. `skills`: "save" or
+    "discard" for proposals waiting for the user's library decision."""
     quoted = urllib.parse.quote(sid, safe="")
-    request = urllib.request.Request(f"{base}/api/sessions/{quoted}?confirm={quoted}", method="DELETE")
+    extra = f"&skills={skills}&via=cli" if skills else ""   # (the library records the CLI as the surface)
+    request = urllib.request.Request(f"{base}/api/sessions/{quoted}?confirm={quoted}{extra}", method="DELETE")
     try:
         with urllib.request.urlopen(request, timeout=120) as resp:
             answer = json.loads(resp.read().decode("utf-8") or "{}")
@@ -910,11 +949,13 @@ def _delete_sessions(args, ids: list[str]) -> int:
         for sid in ids:
             try:
                 if base:
-                    answer = await asyncio.to_thread(_hub_delete_session, base, sid)
+                    answer = await asyncio.to_thread(_hub_delete_session, base, sid, args.skills)
                 else:
-                    answer = {"workspace_kept": await manager.delete(sid)}
+                    answer = {"workspace_kept": await manager.delete(sid, skills=args.skills, via="cli")}
             except (RuntimeError, OSError, ValueError) as exc:  # SessionError is a ValueError
                 reason = str(exc)
+                if "waiting for your library decision" in reason and not args.skills:
+                    reason += " Pass --skills save (to the skills library first) or --skills discard."
                 print(reason if reason.startswith(f"Could not delete session {sid}")
                       else f"Could not delete session {sid}: {reason}", file=sys.stderr)
                 code = 1
@@ -1112,6 +1153,49 @@ def _workspace_arg(text: str) -> str | None:
     return path
 
 
+def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
+                 resuming: bool = False) -> list[str] | None:
+    """`--skill REF|PATH|URL` (repeatable) as the hub needs it: a path (it has a `/` or `\\`, starts with `.` or `~`,
+    ends in `.zip`, or is a folder or .zip here) made absolute against the current directory, a Git URL as it is,
+    anything else a skill reference (`x`, `claude-user:x`, `claude-project:x`, ...). References are checked here,
+    before anything starts (bare names: the home's library, then ~/.claude/skills; claude-project: the
+    `--workspace` folder's .claude/skills, or with `resuming` left to the hub, which knows the session's folder):
+    None, with the reason printed, when one is unknown. Sources are checked by the hub."""
+    from . import skills as skill_lib
+    from .settings import read_raw, validate
+
+    out: list[str] = []
+    refs: list[str] = []
+    for raw in items or []:
+        text = raw.strip()
+        if not text:
+            continue
+        url = "://" in text or bool(re.match(r"[^@/\\\s]+@[^:/\\\s]+:", text))
+        here = os.path.isdir(text) or (os.path.isfile(text) and text.lower().endswith(".zip"))
+        if url:
+            out.append(text)
+        elif any(c in text for c in "/\\") or text[0] in ".~" or text.lower().endswith(".zip") or here:
+            out.append(os.path.normpath(os.path.abspath(os.path.expanduser(text))))
+        else:
+            out.append(text)
+            refs.append(text)
+    if refs:
+        try:
+            config = validate(home, read_raw(home)) if (home / CONFIG_FILE).exists() else validate(home, {})
+        except (OSError, ValueError):
+            config = None   # the hub reports broken settings itself
+        project = Path(workspace) if workspace else None
+        for ref in refs if config is not None else []:
+            if resuming and ref.startswith("claude-project:"):
+                continue
+            try:
+                skill_lib.resolve_ref(config, ref, workspace=project)
+            except skill_lib.SkillError as exc:
+                print(f"dreamteam: --skill {ref}: {exc}", file=sys.stderr)
+                return None
+    return out
+
+
 def cmd_tui(args) -> int:
     """The terminal UI in the style of Claude Code (docs/TUI.md), or with -p the non-interactive print mode."""
     home = _home_arg(args)
@@ -1135,6 +1219,11 @@ def cmd_tui(args) -> int:
         workspace = _workspace_arg(args.workspace)
         if workspace is None:
             return 2
+    if args.skill:  # a new session's skills, or (-c / -r) attached to the resumed one
+        skills = _skill_items(args.skill, home, workspace, resuming=args.continue_last or args.resume is not None)
+        if skills is None:
+            return 2
+        overrides["skills"] = skills
     if args.print:
         from .tui import main_print
 
@@ -1159,8 +1248,8 @@ def cmd_tui(args) -> int:
 
     if args.resume == "" and not prompt:  # `-r` without an id: pick a session from the list
         prompt = "/sessions"
-    try:
-        return main_tui(home, lang=args.lang, session=session, continue_last=args.continue_last,
+    try:   # (session "": the one picked is the session resumed, which gets the --skill ones)
+        return main_tui(home, lang=args.lang, session=args.resume, continue_last=args.continue_last,
                         initial_prompt=prompt, overrides=overrides, host=args.host, port=args.port,
                         verbosity="verbose" if args.verbose else "normal", workspace=workspace)
     except Exception as exc:  # e.g. prompt_toolkit's NoConsoleScreenBufferError in mintty without winpty
@@ -1236,6 +1325,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "becomes its workspace; a folder with files (your project) is adopted: the agents work "
                         "with its files and commit to its current git branch (refused while the repository has "
                         "uncommitted changes). An existing session moves with /cd")
+    s.add_argument("--skill", action="append", metavar="REF|PATH|URL",
+                   help="a skill for the new session (repeatable; with -c / -r attached to that session): a name "
+                        "from the skills library or ~/.claude/skills (claude-user:NAME / claude-project:NAME picks "
+                        "the source), or a folder, .zip or Git URL, imported into the library first")
     s.add_argument("--host", help="host of the launcher started in-process (when none runs)")
     s.add_argument("--port", type=int, help="port of the launcher started in-process")
     s.set_defaults(func=cmd_tui, dir=None)
@@ -1251,6 +1344,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--workspace", metavar="DIR",
                    help="with --goal: the folder that session works in (an empty or missing folder becomes its "
                         "workspace, a folder with files is adopted, as for `dreamteam --workspace`)")
+    s.add_argument("--skill", action="append", metavar="REF|PATH|URL",
+                   help="with --goal: a skill for that session (repeatable), as for `dreamteam --skill`")
     s.add_argument("--no-console", action="store_true")
     s.add_argument("--no-browser", action="store_true", help="do not open the browser")
     s.set_defaults(func=cmd_serve)
@@ -1262,6 +1357,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "to delete with their task board, messages, workspace files, MCP servers and traces")
     s.add_argument("--home")
     s.add_argument("-y", "--yes", action="store_true", help="delete without asking")
+    s.add_argument("--skills", choices=["save", "discard"],
+                   help="skills the session's members proposed that wait for your library decision: save them to "
+                        "the skills library first, or delete them with the session (refused without it)")
     s.set_defaults(func=cmd_sessions)
 
     s = sub.add_parser("traces", help="show agent traces (LLM calls, thinking, tools, tokens, cost) of a session")

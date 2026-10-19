@@ -32,7 +32,7 @@ from .models import USER, AgentKind, Status, ToolError
 from .procs import alive_all, sweep_token
 from .shell import (KILL_SETTLE, PENDING_MAX, SETTLE_POLL, RunningCommand, kill_after_cancel, start_command,
                     truncate_middle)
-from .workspace import SCRATCH_DIR, format_size, scratch_rel
+from .workspace import format_size, scratch_is_local, scratch_rel
 
 log = logging.getLogger(__name__)
 
@@ -646,15 +646,6 @@ class JobManager:
         return None
 
     # --- adoption -----------------------------------------------------------------------------------------------
-    def _scratch_is_local(self, root: Path) -> bool:
-        folder = root / SCRATCH_DIR
-        try:
-            if not folder.is_dir() or folder.is_symlink():
-                return False
-            return os.path.normcase(str(folder.resolve())) == os.path.normcase(str(root.resolve() / SCRATCH_DIR))
-        except OSError:
-            return False
-
     def _log_location(self, owner: str, job_id: int) -> tuple[str, Path]:
         """(the `log` column, the file) of job `job_id`: `.scratch/<member>/jobs/j<N>.log`, or
         `<data_dir>/jobs/j<N>.log` when `.scratch` is not a plain folder of the workspace (a link, a file)."""
@@ -663,7 +654,7 @@ class JobManager:
         root = Path(workspace.root)
         with contextlib.suppress(Exception):
             workspace.ensure_scratch(owner)
-        if self._scratch_is_local(root):
+        if scratch_is_local(root):
             folder = root / scratch_rel(owner) / "jobs"
             try:
                 folder.mkdir(parents=True, exist_ok=True)

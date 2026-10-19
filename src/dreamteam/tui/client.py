@@ -165,13 +165,17 @@ class HubClient:
         return await self._get(f"/api/sessions/{urllib.parse.quote(sid, safe='')}")
 
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
-                             start: bool = True, workspace: str | None = None) -> dict:
+                             start: bool = True, workspace: str | None = None,
+                             skills: list[str] | None = None) -> dict:
         """POST /api/sessions -> the new session's summary. `workspace`: an absolute folder the session works in
-        (docs/SPEC.md §17.2); the summary then has "workspace_result" (the hub's "result")."""
+        (docs/SPEC.md §17.2); the summary then has "workspace_result" (the hub's "result"). `skills`: references or
+        sources attached before its first start (§19)."""
         body = {"title": title, "goal": goal, "description": description, "overrides": overrides or {},
                 "start": start}
         if workspace:
             body["workspace"] = workspace
+        if skills:
+            body["skills"], body["via"] = list(skills), "cli"   # (the library records the terminal as the surface)
         data = await self._call("POST", "/api/sessions", body=body,
                                 timeout=MOVE_TIMEOUT if workspace else SESSION_TIMEOUT)
         summary = data["session"]
@@ -179,21 +183,43 @@ class HubClient:
             summary = {**summary, "workspace_result": data["result"]}
         return summary
 
-    async def _session_action(self, sid: str, action: str) -> dict:
+    async def _session_action(self, sid: str, action: str, body: dict | None = None) -> dict:
         path = f"/api/sessions/{urllib.parse.quote(sid, safe='')}/{action}"
-        return (await self._call("POST", path, body={}, timeout=SESSION_TIMEOUT))["session"]
+        return (await self._call("POST", path, body=body or {}, timeout=SESSION_TIMEOUT))["session"]
 
-    async def start_session(self, sid: str) -> dict:
-        return await self._session_action(sid, "start")
+    async def start_session(self, sid: str, skills: list[str] | None = None) -> dict:
+        """POST /api/sessions/{sid}/start; `skills` are attached first (live when the session runs)."""
+        return await self._session_action(sid, "start", {"skills": list(skills), "via": "cli"} if skills else None)
 
     async def stop_session(self, sid: str) -> dict:
         return await self._session_action(sid, "stop")
 
-    async def delete_session(self, sid: str) -> Any:
+    async def delete_session(self, sid: str, skills: str | None = None) -> Any:
         """DELETE /api/sessions/{sid}?confirm={sid}: stop the session and delete its directory. The hub's answer:
-        {"ok": true} plus "workspace_kept" for a folder outside the session (it stays)."""
+        {"ok": true} plus "workspace_kept" for a folder outside the session (it stays). Members' skill proposals
+        waiting for the user refuse it (409, `pending_skills`) unless `skills` is "save" or "discard"."""
+        params = {"confirm": sid, **({"skills": skills, "via": "cli"} if skills else {})}
         return await self._call("DELETE", f"/api/sessions/{urllib.parse.quote(sid, safe='')}",
-                                params={"confirm": sid}, timeout=SESSION_TIMEOUT)
+                                params=params, timeout=SESSION_TIMEOUT)
+
+    async def session_skills(self, sid: str, show: str | None = None) -> dict:
+        """GET /api/sessions/{sid}/skills: {"attached", "running"} of a session, also a stopped one; `show`: also
+        that copy's files_list, skill_md and deps."""
+        return await self._get(f"/api/sessions/{urllib.parse.quote(sid, safe='')}/skills", show=show)
+
+    async def decide_skill(self, sid: str, name: str, approve: bool, comment: str = "",
+                           replace: bool = False) -> dict:
+        """POST /api/sessions/{sid}/skills/{name}/decide: the library decision on a member's proposal, also on a
+        stopped session -> {"text", "session"} (409 with `exists`: the library has another skill of that name)."""
+        body: dict[str, Any] = {"approve": approve, "comment": comment}
+        if replace:
+            body["replace"] = True
+        path = f"/api/sessions/{urllib.parse.quote(sid, safe='')}/skills/{urllib.parse.quote(name, safe='')}/decide"
+        return await self._call("POST", path, body=body, timeout=ACT_TIMEOUT)
+
+    async def clean_skill_envs(self) -> dict:
+        """POST /api/skill-envs/cleanup: remove the skill environments no session uses -> {"removed", "kept"}."""
+        return await self._call("POST", "/api/skill-envs/cleanup", body={}, timeout=SESSION_TIMEOUT)
 
     async def set_workspace(self, sid: str, path: str | None, expect: str | None = None) -> dict:
         """POST /api/sessions/{sid}/workspace: make the session work in the absolute folder `path` (None: back to
@@ -274,6 +300,22 @@ class HubClient:
 
     async def trace_stats(self, sid: str | None, agent: str | None = None) -> dict:
         return await self._get(f"{self.session_base(sid)}/api/traces/stats", agent=agent)
+
+    async def skills(self, sid: str | None) -> dict:
+        """GET /api/skills: the library, Claude Code's and the host's skills, the limits and the install switches;
+        in a session also "attached" (with each one's source digest: "Update")."""
+        return await self._get(f"{self.session_base(sid)}/api/skills")
+
+    async def skill(self, sid: str | None, name: str, frm: str = "library") -> dict:
+        """GET /api/skills/{name}?from=library|claude-user|claude-project|host-library|session: the entry with its
+        files_list, skill_md, deps and the install switches."""
+        return await self._get(f"{self.session_base(sid)}/api/skills/{urllib.parse.quote(name, safe='')}",
+                               **{"from": frm})
+
+    async def skill_log(self, sid: str | None, name: str, ecosystem: str | None = None) -> dict:
+        """GET /api/skills/{name}/deps-log: {name, ecosystem, status, path, log} of a skill's install."""
+        return await self._get(f"{self.session_base(sid)}/api/skills/{urllib.parse.quote(name, safe='')}/deps-log",
+                               ecosystem=ecosystem)
 
     # ---- live events ---------------------------------------------------------------------------
     def ws_url(self, sid: str | None) -> str:

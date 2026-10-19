@@ -37,6 +37,9 @@ HELP = {
   /span N [ctx]            — шаг трейса полностью (ctx — сообщения, которые видела модель)
   /session                 — текущая сессия (другая: dreamteam console --session ID)
   /cd [путь | --default]   — папка сессии / перенести сессию в другую папку (спросит y/N; --yes — без вопроса)
+  /skills [lib | add X | update X | rm X | show X | approve X | reject X [reason] | reinstall X | log X | clean-envs]
+                           — скиллы роя: список, библиотека, подключить (имя, папка, .zip, Git-URL), обновить,
+                             отключить, показать, решение по предложенному, пакеты, удалить неиспользуемые окружения
   /help  /quit""",
     "en": """Commands:
   @First Last text         — message an agent (or /msg First Last: text)
@@ -57,6 +60,9 @@ HELP = {
   /span N [ctx]            — one trace step in full (ctx — the messages the model saw)
   /session                 — the current session (another: dreamteam console --session ID)
   /cd [path | --default]   — the session folder / move the session to another folder (asks y/N; --yes: no question)
+  /skills [lib | add X | update X | rm X | show X | approve X | reject X [reason] | reinstall X | log X | clean-envs]
+                           — the swarm's skills: list, the library, attach (a name, folder, .zip, Git URL), update,
+                             detach, show, decide a proposed one, its packages, remove unused environments
   /help  /quit""",
 }
 
@@ -385,6 +391,9 @@ def _http_error(exc: urllib.error.HTTPError) -> str:
 
 _SESSION_BASE = re.compile(r"^(?P<hub>.+)/s/(?P<sid>[^/?#]+)$")
 _CD_FLAGS = ("--yes", "-y")
+# `/skills add`: a skill reference (skills.parse_ref) rather than a source; a Git scp-like URL (user@host:path)
+_SKILL_REF = re.compile(r"(?:(?:library|claude-user|claude-project|host-library):)?[a-z0-9]+(?:-[a-z0-9]+)*")
+_SCP_URL = re.compile(r"[^@/\\\s]+@[^:/\\\s]+:")
 
 
 class Console:
@@ -577,6 +586,11 @@ class Console:
             return self._session()
         if cmd == "/cd":
             return self._cd(arg)
+        if cmd == "/skills":
+            try:
+                return self._skills(arg)
+            except urllib.error.HTTPError as exc:
+                return _color("err", _http_error(exc))
         return _color("err", "Unknown command. /help")
 
     def _jobs(self, arg: str) -> str:
@@ -590,6 +604,133 @@ class Console:
                 return _color("err", "/jobs stop jN")
             return "\n".join(self.hub.act("job_stop", job_id=ref) for ref in words[1:])
         return self.hub.act("jobs", job_id=words[0])
+
+    # ---- /skills: the swarm's skills (docs/SPEC.md §19) --------------------------------------
+    def _skills(self, arg: str) -> str:
+        """`/skills`: the attached skills; `lib`: the library and Claude Code's; `add X [--pick a,b] [--replace]` (a
+        name, a folder or .zip path, a Git URL); `update X` (again from its own source); `rm X`; `show X`;
+        `approve X [replace]`; `reject X [reason]`; `reinstall X [python|node]`; `log X [python|node]` (the install
+        log); `clean-envs` (the launcher removes unused skill environments)."""
+        word, _, rest = arg.strip().partition(" ")
+        word, rest = word.casefold(), rest.strip()
+        ru = self.lang == "ru"
+        if not word:
+            return self.hub.act("skills")
+        if word in ("lib", "library", "библиотека"):
+            return self._skill_library()
+        if word == "clean-envs":
+            if self.launcher is None:
+                return _color("err", "Окружения скиллов чистит лаунчер (dreamteam serve)." if ru else
+                              "The launcher (dreamteam serve) removes the skills' environments.")
+            report = self.launcher.post("/api/skill-envs/cleanup", {})
+            removed, kept = report.get("removed") or [], report.get("kept") or []
+            text = f"Удалено окружений: {len(removed)}" if ru else f"Removed {len(removed)} environment(s)"
+            if kept:   # each kept one says why: in use, or being built right now
+                words = {"in use": "используются", "being built": "собираются"} if ru else {}
+                why = ", ".join(dict.fromkeys(words.get(k.get("why"), k.get("why") or "?") for k in kept))
+                text += f"; оставлено: {len(kept)} ({why})" if ru else f"; kept {len(kept)} ({why})"
+            return text + "."
+        name, _, tail = rest.partition(" ")
+        tail = tail.strip()
+        usage = {"add": "/skills add NAME|PATH|URL [--pick a,b] [--replace]", "update": "/skills update NAME",
+                 "rm": "/skills rm NAME", "show": "/skills show NAME", "approve": "/skills approve NAME [replace]",
+                 "reject": "/skills reject NAME [reason]", "reinstall": "/skills reinstall NAME [python|node]",
+                 "log": "/skills log NAME [python|node]"}
+        word = {"detach": "rm", "remove": "rm"}.get(word, word)
+        if word not in usage:
+            return _color("err", "/skills [lib | add X | update X | rm X | show X | approve X | reject X [reason] | "
+                                 "reinstall X | log X | clean-envs]")
+        if not name:
+            return _color("err", usage[word])
+        if word == "add":
+            return self._skill_add(rest)
+        if word == "update":
+            attached = {s.get("name"): s for s in self.hub.get("/api/skills").get("attached") or []}
+            skill = attached.get(name)
+            if skill is None:
+                return _color("err", f"Скилл {name} не подключён." if ru else f"Skill {name} is not attached.")
+            if skill.get("from") == "agent":
+                return _color("err", "У предложенного участником скилла нет источника: его автор предлагает его "
+                                     "снова." if ru else
+                              "A member's proposal has no source of its own: its owner proposes it again.")
+            return self.hub.act("skill_attach", name=f"{skill.get('from')}:{name}", replace=True)
+        if word == "rm":
+            return self.hub.act("skill_detach", name=name)
+        if word == "approve":
+            return self.hub.act("skill_approve", name=name, approve=True, replace=tail.casefold() == "replace")
+        if word == "reject":
+            return self.hub.act("skill_approve", name=name, approve=False, comment=_unquote(tail))
+        if word == "reinstall":
+            return self.hub.act("skill_reinstall", name=name, ecosystem=tail or None)
+        if word == "log":
+            data = self.hub.get(f"/api/skills/{urllib.parse.quote(name, safe='')}/deps-log", ecosystem=tail or None)
+            return f"{clean(data.get('path') or '')}\n{clean(data.get('log') or '')}".rstrip()
+        return self._skill_show(name)
+
+    def _skill_add(self, text: str) -> str:
+        """`/skills add X [--pick a,b] [--replace]`: a reference attaches (skill_attach name), anything else is a
+        source imported first (a path is resolved here when the hub is on this computer)."""
+        replace, pick = False, None
+        words = text.split()
+        if "--replace" in words:
+            replace = True
+            words = [w for w in words if w != "--replace"]
+        if "--pick" in words:
+            at = words.index("--pick")
+            if at + 1 >= len(words):
+                return _color("err", "/skills add NAME|PATH|URL [--pick a,b] [--replace]")
+            pick = [p for p in words[at + 1].split(",") if p]
+            del words[at:at + 2]
+        target = unquote(" ".join(words))
+        if _SKILL_REF.fullmatch(target):
+            return self.hub.act("skill_attach", name=target, replace=replace or None)
+        if not ("://" in target or _SCP_URL.match(target)):   # a folder or .zip path on the hub's machine
+            path = resolve_folder(target, local=self.local)
+            if path is None:
+                return _color("err", CD_TEXTS[self.lang]["remote_relative"])
+            target = path
+        return self.hub.act("skill_attach", source=target, pick=pick, replace=replace or None)
+
+    def _skill_library(self) -> str:
+        data = self.hub.get("/api/skills")
+        attached = {s.get("name") for s in data.get("attached") or []}
+        ru = self.lang == "ru"
+        lines = [(f"Библиотека скиллов ({clean(data.get('library_dir') or '')}):" if ru else
+                  f"Skills library ({clean(data.get('library_dir') or '')}):")]
+        rows = [(e, "library") for e in data.get("library") or []]
+        rows += [(e, "host-library") for e in data.get("host") or []]
+        rows += [(e, e.get("origin") or "claude-user") for e in data.get("claude") or []]
+        if not rows:
+            lines.append("  (пусто)" if ru else "  (empty)")
+        for entry, origin in rows:
+            name = clean(entry.get("name") or "?")
+            marks = [origin] + (["подключён" if ru else "attached"] if name in attached else [])
+            if entry.get("changed_outside"):
+                marks.append("изменён вне DreamTeam" if ru else "changed outside DreamTeam")
+            if entry.get("agent_writable"):
+                marks.append("из workspace: агенты могут его менять" if ru else
+                             "from the workspace: agents can write here")
+            text = clean(entry.get("error") or entry.get("description") or "")
+            ref = name if origin == "library" else f"{origin}:{name}"
+            lines.append(f"  {ref} [{', '.join(marks)}]: {text}")
+        return "\n".join(lines)
+
+    def _skill_show(self, name: str) -> str:
+        attached = {s.get("name") for s in self.hub.get("/api/skills").get("attached") or []}
+        origin, _, bare = name.rpartition(":")
+        where = "session" if not origin and bare in attached else (origin or "library")
+        data = self.hub.get(f"/api/skills/{urllib.parse.quote(bare, safe='')}", **{"from": where})
+        lines = [f"{clean(data.get('name') or bare)} [{where}]: {clean(data.get('description') or '')}"]
+        files = data.get("files_list") or []
+        if files:
+            lines.append(("Файлы: " if self.lang == "ru" else "Files: ")
+                         + ", ".join(clean(f.get("path")) for f in files[:50]) + (" …" if len(files) > 50 else ""))
+        for ecosystem, found in (data.get("deps") or {}).items():
+            lines.append(f"{ecosystem}: {', '.join(found.get('files') or [])}: "
+                         + clean(found.get("unsupported") or ", ".join(found.get("packages") or [])))
+        text = clean(data.get("skill_md") or "").splitlines()
+        lines += ["SKILL.md:", *text[:40]] + (["…"] if len(text) > 40 else [])
+        return "\n".join(lines)
 
     # ---- /cd: the session's folder ---------------------------------------------------------
     def _t(self, key: str, **kw: Any) -> str:

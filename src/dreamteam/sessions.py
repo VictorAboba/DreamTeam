@@ -28,7 +28,6 @@ import shutil
 import sqlite3
 import stat
 import subprocess
-import sys
 import tempfile
 import time
 import unicodedata
@@ -36,14 +35,18 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import skills as skill_lib
 from .config import Config
 from .db import loads
 from .goal_text import shorten_title, split_goal
-from .models import USER, Status
+from .models import USER, Status, ToolError
 from .settings import (
     apply_update, deep_merge, ensure_home, profile_renames, public_view, read_raw, settings_path, validate, write_raw,
 )
-from .workspace import SCRATCH_DIR, commit_paths, init_repo, looks_like_git_dir, repo_state, tracked
+from .skills import Library, Limits, SkillError, SkillInfo, Staged
+from .swarm_skills import attach_files, decide_files, read_session_skills, skills_dir, source_spec, stopped_public
+from .workspace import (SCRATCH_DIR, SKILLS_MIRROR, commit_paths, init_repo, is_link, looks_like_git_dir, repo_state,
+                        rmtree, tracked)
 
 if TYPE_CHECKING:
     from .swarm import Swarm
@@ -72,11 +75,18 @@ _TRANSLIT = dict(zip(
 
 
 class SessionError(ValueError):
-    """A session operation that cannot be done; `status` is the matching HTTP status."""
+    """A session operation that cannot be done; `status` is the matching HTTP status, `extra` goes into the JSON
+    answer (`exists`: skill names that clash, `pending_skills`: the proposals a delete would lose)."""
 
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, **extra: Any):
         super().__init__(message)
         self.status = status
+        self.extra = extra
+
+
+def _session_error(exc: SkillError | ToolError) -> SessionError:
+    """A skills error (SkillError, or a swarm_skills ToolError with its status) as a SessionError."""
+    return SessionError(str(exc), getattr(exc, "status", 400), **(getattr(exc, "extra", None) or {}))
 
 
 def slugify(title: str, limit: int = 40) -> str:
@@ -104,26 +114,9 @@ def _number(value: Any) -> float:
         return 0.0
 
 
-def _rmtree(path: Path) -> None:
-    def on_error(func, target, _exc):  # git objects are read-only on Windows
-        try:
-            os.chmod(target, stat.S_IWRITE)
-            func(target)
-        except OSError:
-            pass
-
-    if not path.exists():
-        return
-    target = str(path)
-    if sys.platform == "win32" and not target.startswith("\\\\?\\"):
-        # the extended-length form: a renamed-away session (.deleted-<id>-<ns>) is longer than the original, and
-        # its deepest files (git objects) may pass the 260-character limit of plain Windows paths
-        full = os.path.abspath(target)
-        target = "\\\\?\\UNC\\" + full[2:] if full.startswith("\\\\") else "\\\\?\\" + full
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(target, onexc=on_error)
-    else:
-        shutil.rmtree(target, onerror=lambda func, target, info: on_error(func, target, info[1]))
+# workspace.rmtree: the extended-length form on Windows, since a renamed-away session (.deleted-<id>-<ns>) is longer
+# than the original and its deepest files (git objects, read-only there) may pass the 260-character limit
+_rmtree = rmtree
 
 
 # ---- workspace folders ---------------------------------------------------------------------------------
@@ -153,6 +146,20 @@ def _remove(path: Path) -> None:
             path.unlink()
     if os.path.lexists(path):
         raise OSError(f"could not remove {path} completely (a file in it is in use?)")
+
+
+def _drop_mirror(folder: Path) -> None:
+    """Remove the agents' skills mirror `<folder>/.scratch/_skills` (Swarm.start rebuilds it from the session's
+    copies). A link there is never followed: a junction goes with rmdir, a symlink with unlink."""
+    mirror = Path(folder, *SKILLS_MIRROR.split("/"))
+    if is_link(mirror):
+        try:
+            os.rmdir(mirror)
+        except OSError:
+            with contextlib.suppress(OSError):
+                os.unlink(mirror)
+    elif mirror.is_dir():
+        _rmtree(mirror)
 
 
 def _cross_device(exc: OSError) -> bool:
@@ -231,6 +238,7 @@ class _Plan:
     mcp: list[str] = field(default_factory=list)  # forged/imported MCP servers whose folders go along
     old_exists: bool = True
     old_is_default: bool = False
+    old_adopted: bool = False    # leaving a folder of the user: the skills mirror there goes (docs/SPEC.md §19)
     # leaving a folder of the user: the `mcp/<name>` folders its repository tracks (the agents committed them
     # there), whose removal is committed there after the move so that the user's repository stays clean
     old_tracked: list[str] = field(default_factory=list)
@@ -241,6 +249,27 @@ class _Plan:
         return {"mode": self.mode, "from": str(self.old), "to": str(self.target), "git": git or self.git,
                 "mcp_moved": list(self.mcp) if self.mode != "unchanged" else [], "old_kept": kept,
                 "old_missing": not self.old_exists, "old_changed": None}
+
+
+@dataclass
+class _SkillItem:
+    """One skill given to create or start: a reference resolved to its folder, or a source staged (committed to the
+    library only once every item is ready)."""
+    given: str
+    shown: str = ""              # `given` as messages show it: a Git URL without its credentials
+    name: str = ""
+    folder: Path | None = None
+    frm: str = "library"         # the session copy's `from`
+    source: dict = field(default_factory=dict)
+    info: SkillInfo | None = None
+    staged: Staged | None = None
+
+
+def _discard(items: list[_SkillItem]) -> None:
+    for item in items:
+        if item.staged is not None:
+            item.staged.discard()
+            item.staged = None
 
 
 class _Undo:
@@ -506,6 +535,12 @@ class SessionManager:
     def settings_view(self) -> dict[str, Any]:
         self._refresh_settings()
         return public_view(self.raw)
+
+    def global_config(self) -> Config:
+        """The home's global settings, a hand edit of the file picked up first: the skills library and its limits
+        are global ([skills] is no session override)."""
+        self._refresh_settings()
+        return self.config
 
     async def update_settings(self, update: dict[str, Any]) -> dict[str, Any]:
         """Apply a settings update from the UI (settings.apply_update semantics), save it and reconfigure
@@ -897,6 +932,20 @@ class SessionManager:
             if _within(target, library) or _within(library, target):
                 raise SessionError(f"{target} is DreamTeam's shared MCP library {library}, or inside it or contains "
                                    "it (every session imports its servers from there); choose another folder.")
+        try:  # the skills library: agents would write into the skills every session attaches from
+            skills_library = self.config.skills_library_dir.resolve()
+        except (OSError, ValueError, RuntimeError):
+            skills_library = None
+        if skills_library is not None and (_within(target, skills_library) or _within(skills_library, target)):
+            raise SessionError(f"{target} is DreamTeam's shared skills library {skills_library}, or inside it or "
+                               "contains it (sessions attach their skills from there); choose another folder.")
+        try:  # the skills' environments: agents' files and autocommit's `git add -A` would reach every session's
+            envs = self.config.skill_envs_dir.resolve()
+        except (OSError, ValueError, RuntimeError):
+            envs = None
+        if envs is not None and (_within(target, envs) or _within(envs, target)):
+            raise SessionError(f"{target} is DreamTeam's skill environments folder {envs}, or inside it or contains "
+                               "it (every session runs its skills' packages from there); choose another folder.")
         if old_real is not None and _same_path(target, old_real):
             git = "existing" if (target / ".git").exists() else ("disabled" if not git_on else "none")
             return _Plan(target=target, old=old_real, mode="unchanged", default=is_default,
@@ -934,7 +983,7 @@ class SessionManager:
         git_exe = shutil.which("git")
         plan = _Plan(target=target, old=old_real if old_real is not None else target, mode="moved",
                      default=is_default, adopted=False, git="none", old_exists=old_exists,
-                     old_is_default=old_stored is None and old is not None)
+                     old_is_default=old_stored is None and old is not None, old_adopted=old_adopted)
         carried = [name for name in (mcp or []) if old_exists and (old_real / "mcp" / name).is_dir()]
         if old_adopted and carried and git_exe:  # leaving the user's folder: did the agents commit the servers there?
             plan.old_tracked = tracked(old_real, [f"mcp/{name}" for name in carried], git_exe)
@@ -989,8 +1038,19 @@ class SessionManager:
         for folder in reversed(missing):
             folder.mkdir()
             undo.created.append(folder)
+        if plan.old_exists and plan.old_adopted and not plan.move_all:
+            # leaving the user's folder: copies of library or Claude Code skills never stay in their project (not
+            # undone on a rollback: every start rebuilds the mirror)
+            try:
+                _drop_mirror(plan.old)
+            except OSError as exc:
+                log.warning("could not remove the skills mirror in %s: %s", plan.old, exc)
         if plan.move_all:
             if plan.old_exists:
+                # the skills mirror first (not undone on a rollback: every start rebuilds it): across volumes a
+                # move copies with copytree(symlinks=True), which follows its node_modules junctions into the
+                # skills' shared environments
+                _drop_mirror(plan.old)
                 # .git last: until the end, the old folder stays a complete repository of what has not moved yet
                 for entry in sorted(plan.old.iterdir(), key=lambda p: (p.name.casefold() == ".git", p.name)):
                     # (a name that appeared in the target meanwhile: FileExistsError, and it is never touched)
@@ -1083,6 +1143,7 @@ class SessionManager:
             stats["goal"] = {**pending, "status": "pending", "summary": ""}
         profile = cfg.agents.default_model
         model = cfg.models.get(profile)
+        attached = self._attached_skills(sid)
         return {
             "id": sid, "title": meta.get("title") or sid, "legacy": meta.get("legacy", False),
             "dir": str(self.dir_of(sid)), "created_at": meta.get("created_at"),
@@ -1092,7 +1153,10 @@ class SessionManager:
             "max_cost_usd": _number(limits.get("max_cost_usd", cfg.swarm.max_cost_usd)),
             "max_agents": int(_number(limits.get("max_agents", cfg.swarm.max_agents))),
             "overrides": meta.get("overrides") or {}, "config_error": config_error,
-            "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta), **stats,
+            "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta),
+            "skills": [s.name for s in attached],
+            "skills_pending": [s.name for s in attached if s.library == "pending"],
+            **stats,
         }
 
     def list(self) -> list[dict[str, Any]]:
@@ -1119,6 +1183,218 @@ class SessionManager:
         ids = self.ids()
         return ids[0] if len(ids) == 1 else None
 
+    # ---- skills (docs/SPEC.md §19) -------------------------------------------------------------
+    def _data_dir(self, sid: str) -> Path:
+        return self.dir_of(sid) / ".dreamteam"   # (Config.data_dir of the session, whatever its overrides)
+
+    def _attached_skills(self, sid: str) -> list:
+        """The session's attached skills: from memory when it is loaded, else its metadata files (no Swarm)."""
+        swarm = self.swarms.get(sid)
+        skills = getattr(swarm, "skills", None)
+        if skills is not None:
+            return skills.list()
+        return read_session_skills(self._data_dir(sid), self.config.skills_library_dir)
+
+    def _prepare_skills(self, config: Config, items: Any, workspace: Path | None) -> list[_SkillItem]:
+        """The skills given to create or start, made ready before anything changes (blocking: run it in a thread):
+        a reference (`x`, `claude-user:x`, ...) is resolved like a bare attach (`claude-project` only when named,
+        against `workspace`) and checked; a source (a folder or .zip path on this machine, a Git URL) is staged, not
+        yet committed to the library. SessionError (400 a bad item or a source with several skills, 404 an unknown
+        name, 409 a library clash or two different skills of one name); nothing staged is left behind then."""
+        if not isinstance(items, list) or not all(isinstance(i, str) and i.strip() for i in items):
+            raise SessionError("'skills' must be a list of skill names or sources (folder or .zip paths, Git URLs).")
+        lib = Library.from_config(config)
+        prepared: list[_SkillItem] = []
+        try:
+            for text in dict.fromkeys(i.strip() for i in items):
+                item = _SkillItem(given=text, shown=text)
+                prepared.append(item)
+                if skill_lib.looks_like_ref(text):
+                    found = skill_lib.resolve_ref(config, text, workspace=workspace)
+                    item.name, item.folder, item.frm = found["name"], Path(found["path"]), found["origin"]
+                    item.info = skill_lib.check_skill_dir(item.folder, lib.limits)
+                    if item.frm == "library":
+                        entry = lib.get(item.name) or {}
+                        item.source = {"origin": entry.get("origin") or "folder", **(entry.get("source") or {})}
+                    else:
+                        item.source = {"path": str(item.folder)}
+                    continue
+                try:
+                    spec = source_spec(text)
+                except ToolError as exc:
+                    raise SessionError(str(exc)) from None
+                item.staged = skill_lib.stage_source(lib, spec, workspace=workspace)
+                item.shown = item.staged.shown   # (never the typed URL: it may carry a token)
+                if item.staged.need_pick:
+                    names = ", ".join(c.name for c in item.staged.candidates if c.error is None)
+                    raise SessionError(f"{item.staged.shown} holds several skills ({names}): add them in the Skills "
+                                       "tab and name them.")
+                item.info = item.staged.picked[0].info
+                item.name = item.info.name
+                if item.staged.conflicts():   # (the commit would be a 409: known now, before anything changes)
+                    raise SessionError(f"The library already has a skill '{item.name}' (different content): import "
+                                       f"{item.shown} in the Skills tab to replace it.", 409, exists=[item.name])
+            unique: dict[str, _SkillItem] = {}
+            for item in prepared:
+                first = unique.setdefault(item.name, item)
+                if first is not item and first.info.digest != item.info.digest:
+                    raise SessionError(f"Two of the skills given are named '{item.name}' ({first.shown}, "
+                                       f"{item.shown}) and differ.", 409, exists=[item.name])
+            _discard([item for item in prepared if unique[item.name] is not item])   # the same skill twice
+            return list(unique.values())
+        except SkillError as exc:
+            _discard(prepared)
+            raise _session_error(exc) from None
+        except BaseException:
+            _discard(prepared)
+            raise
+
+    def _commit_skills(self, config: Config, items: list[_SkillItem], data_dir: Path, *,
+                       via: str) -> list[str]:
+        """Commit the staged sources to the library (`by` the user, `via`), then copy every skill into the session
+        whose data dir is `data_dir` (attached_via "create"). Blocking: run it in a thread. The names attached."""
+        lib = Library.from_config(config)
+        names = []
+        try:
+            for item in items:
+                if item.staged is not None:
+                    entry = item.staged.commit(by=USER, via=via)["imported"][0]
+                    item.staged = None
+                    item.folder, item.frm, item.info = lib.path(entry["name"]), "library", None
+                    item.source = {"origin": entry.get("origin") or "folder", **(entry.get("source") or {})}
+                skill, _status = attach_files(data_dir, item.folder, item.name, item.frm, item.source, lib.limits,
+                                              info=item.info, library_dir=config.skills_library_dir)
+                names.append(skill.name)
+        except (SkillError, ToolError) as exc:
+            raise _session_error(exc) from None
+        finally:
+            _discard(items)
+        return names
+
+    async def _skills_at_start(self, sid: str, swarm: "Swarm", items: Any, via: str) -> list[str]:
+        """`start(sid, skills=...)` under the session's lock: a running session attaches them live (the members are
+        told); a stopped one gets their copies written before its Swarm starts (the members find them in their
+        first wake-up). Every item is ready before anything changes. Returns the names written (stopped)."""
+        config = self.global_config()
+        if not isinstance(items, list):
+            raise SessionError("'skills' must be a list of skill names or sources (folder or .zip paths, Git URLs).")
+        prepared = await asyncio.to_thread(self._prepare_skills, config, items, swarm.workspace.root)
+        try:
+            attached = {s.name: s for s in self._attached_skills(sid)}
+            for item in prepared:
+                have = attached.get(item.name)
+                if have is not None and have.digest != item.info.digest:
+                    raise SessionError(f"A skill named '{item.name}' is already attached to session {sid} (different "
+                                       "content): replace it in the session's Skills tab.", 409, exists=[item.name])
+            new = [item for item in prepared if item.name not in attached]
+            if len(attached) + len(new) > config.skills.max_attached:
+                raise SessionError(f"Session {sid} would have more than {config.skills.max_attached} skills ([skills] "
+                                   "max_attached): detach some first.", 409)
+            if sid not in self.running:
+                return await asyncio.to_thread(self._commit_skills, config, prepared, swarm.config.data_dir, via=via)
+            for item in prepared:   # live, with the usual notifications
+                ref = item.given
+                if item.staged is not None:
+                    entry = (await asyncio.to_thread(item.staged.commit, False, USER, via))["imported"][0]
+                    item.staged, ref = None, f"library:{entry['name']}"
+                await swarm.skills.attach(USER, ref, via=via)
+            return []
+        except (SkillError, ToolError) as exc:
+            raise _session_error(exc) from None
+        finally:
+            _discard(prepared)
+
+    async def session_skills(self, sid: str, show: str | None = None) -> dict[str, Any]:
+        """`{"attached": [...], "running": bool}` of a session, stopped or running: the snapshot items (docs/SPEC.md
+        §14.1) of a loaded swarm, else the same keys from its files (`deps` empty); `show`: also `files_list`,
+        `skill_md` and `deps` of that session copy, and `install` (the switches its preview line is worded by)."""
+        self._check(sid)
+        swarm = self.swarms.get(sid)
+        if getattr(swarm, "skills", None) is not None:
+            attached = swarm.skills.public()   # on the loop: its deps read live state
+        else:
+            attached = await asyncio.to_thread(self._stopped_skills, sid)
+        out: dict[str, Any] = {"attached": attached, "running": sid in self.running}
+        if show is not None:
+            try:
+                name = skill_lib.check_name(show)
+            except SkillError as exc:
+                raise _session_error(exc) from None
+            if name not in {a["name"] for a in attached}:
+                raise SessionError(f"No skill '{name}' is attached to session {sid}.", 404)
+            out.update(await asyncio.to_thread(skill_lib.show_folder, skills_dir(self._data_dir(sid)) / name,
+                                               Limits.from_config(self.config)))
+            # the home's proposal dialog may open before its Skills tab ever loaded the switches
+            out["install"] = skill_lib.install_info(self.global_config())
+        return out
+
+    def _stopped_skills(self, sid: str) -> list[dict]:
+        try:
+            config = self.config_for(sid)
+        except (ValueError, OSError):   # invalid overrides now: the home's roles, the session's own files
+            config = self._apply_workspace(copy.copy(self.config), sid, self.meta(sid))
+            config.project_dir = self.dir_of(sid)
+        return stopped_public(config)
+
+    async def decide_skill(self, sid: str, name: str, approve: bool, *, comment: str = "", replace: bool = False,
+                           via: str = "home") -> str:
+        """The user's library decision on a member's proposal (skill_approve), also on a stopped session: there it is
+        made on its files (`via` "stopped-session"; the owner is told at the next start). The result text;
+        SessionError with the status (404 unknown, 409 not pending or a library clash)."""
+        self._check(sid)
+        async with self._lock(sid):
+            self._check(sid)
+            try:
+                if sid in self.running:
+                    text = await self.swarms[sid].skills.decide(USER, name, approve, comment=comment,
+                                                                replace=replace, via=via)
+                else:
+                    config = self.global_config()
+                    _skill, text = await asyncio.to_thread(
+                        decide_files, self._data_dir(sid), Library.from_config(config), name, approve, comment=comment,
+                        replace=replace, via="stopped-session", project=self._swarm_name(sid), session=sid)
+                    loaded = self.swarms.get(sid)   # viewed while stopped: its cache reads the decision too
+                    if getattr(loaded, "skills", None) is not None:
+                        await asyncio.to_thread(loaded.skills.load)
+            except (SkillError, ToolError) as exc:
+                raise _session_error(exc) from None
+        self._changed(sid, "updated")
+        if approve:   # saved to the library: an open Skills tab of the home page reloads it
+            self._changed(None, "skills")
+        return text
+
+    def _swarm_name(self, sid: str) -> str:
+        try:
+            return self._config_from(self.raw, sid).swarm.name
+        except (ValueError, OSError):   # invalid overrides now: the home's name
+            return self.config.swarm.name
+
+    async def _save_pending(self, sid: str, pending: list[str], via: str) -> None:
+        """`delete(sid, skills="save")`: every pending proposal saved to the library first; any clash is found before
+        one is saved (409 `exists`, nothing saved, nothing deleted)."""
+        lib = Library.from_config(self.global_config())
+        attached = {s.name: s for s in self._attached_skills(sid)}
+        clashes = []
+        for name in pending:
+            entry = lib.get(name)
+            if entry is not None and ("error" in entry or lib.digest_of(name) != attached[name].digest):
+                clashes.append(name)
+        if clashes:
+            raise SessionError(f"The library already has other skills named {', '.join(clashes)}: decide them in the "
+                               f"session's Skills tab first, or delete session {sid} with its proposals discarded.",
+                               409, exists=clashes, pending_skills=pending)
+        try:
+            for name in pending:
+                if sid in self.running:
+                    await self.swarms[sid].skills.decide(USER, name, True, via=via)
+                else:   # decided on its files, as decide_skill records it
+                    await asyncio.to_thread(decide_files, self._data_dir(sid), lib, name, True, via="stopped-session",
+                                            project=self._swarm_name(sid), session=sid)
+        except (SkillError, ToolError) as exc:
+            raise _session_error(exc) from None
+        finally:
+            self._changed(None, "skills")   # the library gained them (also when one failed after others)
+
     # ---- lifecycle ----------------------------------------------------------------------------
     def _new_id(self, title: str) -> str:
         numbers = [int(m.group(1)) for p in (self.sessions_dir.iterdir() if self.sessions_dir.is_dir() else [])
@@ -1130,11 +1406,15 @@ class SessionManager:
 
     async def create(self, title: str, goal: str = "", description: str = "", *,
                      overrides: dict[str, Any] | None = None, start: bool = True, actor: str = USER,
-                     workspace: str | os.PathLike | None = None) -> dict[str, Any]:
+                     workspace: str | os.PathLike | None = None, skills: list[str] | None = None,
+                     via: str = "home") -> dict[str, Any]:
         """Create a session (and start it with the goal unless start=False). Returns its summary.
         `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
         an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
-        "workspace_result" (set_workspace's result, mode "created" for a new folder)."""
+        "workspace_result" (set_workspace's result, mode "created" for a new folder).
+        `skills`: skills attached before the first start, references (`x`, `claude-user:x`, `claude-project:x` from
+        the `workspace` folder) or sources (absolute folder or .zip paths, Git URLs: imported into the library, `by`
+        the user, `via` the surface); all of them are resolved and staged before anything is created."""
         # the goal split as set_goal splits it: its first line also names the session (cut at a word)
         goal_title, goal_description = split_goal(_text(goal), _text(description))
         title = (_one_line(title) or shorten_title(goal_title, 60) or "Session")[:TITLE_LIMIT].strip()
@@ -1143,6 +1423,23 @@ class SessionManager:
         if workspace is not None:  # checked before anything is created
             git_on = validate(self.sessions_dir / "new", self._merged(self.raw, overrides)).workspace.git
             await asyncio.to_thread(self._plan, None, workspace, git_on=git_on)
+        prepared: list[_SkillItem] = []
+        if skills:
+            if isinstance(skills, list) and len(skills) > self.config.skills.max_attached:
+                raise SessionError(f"At most {self.config.skills.max_attached} skills can be attached to a session "
+                                   "([skills] max_attached).")
+            prepared = await asyncio.to_thread(self._prepare_skills, self.config, skills,
+                                               Path(workspace) if workspace is not None else None)
+        try:
+            summary = await self._create(title, goal_title, goal_description, overrides, start, actor, workspace,
+                                         prepared, via)
+        finally:
+            _discard(prepared)   # (whatever a failure left staged)
+        return summary
+
+    async def _create(self, title: str, goal_title: str, goal_description: str, overrides: dict[str, Any],
+                      start: bool, actor: str, workspace: str | os.PathLike | None, prepared: list[_SkillItem],
+                      via: str) -> dict[str, Any]:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         for _attempt in range(100):  # another process (a second launcher, the CLI) may take the same id
             sid = self._new_id(title)
@@ -1160,6 +1457,12 @@ class SessionManager:
         if goal_title:  # set at the first start, when the members exist
             meta["pending_goal"] = {"title": goal_title, "description": goal_description, "actor": actor}
         self._write_meta(sid, meta)
+        if prepared:  # before the folder: a failure leaves nothing in it; the members find them at the first start
+            try:
+                await asyncio.to_thread(self._commit_skills, self.config, prepared, self._data_dir(sid), via=via)
+            except BaseException:
+                await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
+                raise
         result = None
         if workspace is not None:
             try:
@@ -1222,10 +1525,18 @@ class SessionManager:
         async with self._lock(sid):
             return self._load_locked(sid)
 
-    async def start(self, sid: str) -> "Swarm":
+    async def start(self, sid: str, *, skills: list[str] | None = None, via: str = "home") -> "Swarm":
+        """Start the session (a no-op when it runs). `skills`: references or sources, as `create` takes them,
+        attached first: live to a running session, written into a stopped one before it starts (`via`: the surface,
+        recorded in the library for a source). SessionError before anything changes when one of them cannot be."""
         self._check(sid)
         async with self._lock(sid):
+            written: list[str] = []
+            if skills:
+                written = await self._skills_at_start(sid, self._load_locked(sid), skills, via)
             swarm = await self._start_locked(sid)
+            if written:
+                swarm.skills.attached_again(written)
         self._changed(sid, "started")
         return swarm
 
@@ -1558,18 +1869,30 @@ class SessionManager:
             + ("; a file is in use: close the programs that use it and try again" if in_use else "")
             + f". Nothing was changed: the session still works in {plan.old}.", status)
 
-    async def delete(self, sid: str) -> str | None:
+    async def delete(self, sid: str, *, skills: str | None = None, via: str = "home") -> str | None:
         """Stop the session and delete its directory (board, messages, workspace, traces). The directory is
         first renamed away, so a session whose files are in use stays intact (409) instead of being
         half-deleted. A workspace folder outside the directory (set_workspace) is never deleted: it is the
-        user's folder. Returns that folder (read under the session's lock, so a workspace change that ran just
-        before is taken into account), else None."""
+        user's folder (the skills mirror in it goes). Returns that folder (read under the session's lock, so a
+        workspace change that ran just before is taken into account), else None.
+        Skills members proposed that wait for the user's library decision are not lost silently: 409
+        (`pending_skills`) unless `skills` is "save" (each saved to the library first, `via`; a clash refuses the
+        delete) or "discard"."""
         self._check(sid)
         if sid == LEGACY_ID:
             raise SessionError("The main session lives in the home directory itself and cannot be deleted "
                                "from the UI; delete its .dreamteam folder by hand.", 409)
+        if skills not in (None, "save", "discard"):
+            raise SessionError("skills must be \"save\" or \"discard\".")
         async with self._lock(sid):
             self._check(sid)  # a concurrent delete finished first
+            pending = [s.name for s in self._attached_skills(sid) if s.library == "pending"]
+            if pending and skills is None:
+                raise SessionError(f"Session {sid} has skills waiting for your library decision: "
+                                   f"{', '.join(pending)}. Save them to the library first, or delete them with the "
+                                   "session.", 409, pending_skills=pending)
+            if pending and skills == "save":
+                await self._save_pending(sid, pending, via)
             try:
                 await self._unload(sid)
             except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
@@ -1578,7 +1901,14 @@ class SessionManager:
                 workspace = self.workspace_of(sid)
                 kept = None if workspace["default"] else workspace["path"]
             except SessionError:  # a damaged session.json: it can still be deleted
-                kept = None
+                workspace, kept = {}, None
+            if workspace.get("adopted") and workspace.get("exists"):
+                # the user's folder keeps no copy of the session's skills (Swarm.stop removes it too: this covers a
+                # crashed or never-stopped one)
+                try:
+                    await asyncio.to_thread(_drop_mirror, Path(workspace["path"]))
+                except OSError as exc:
+                    log.warning("could not remove the skills mirror in %s: %s", workspace["path"], exc)
             path = self.dir_of(sid)
             trash = self.sessions_dir / f"{TRASH_PREFIX}{sid}-{time.time_ns()}"
             for attempt in range(10):

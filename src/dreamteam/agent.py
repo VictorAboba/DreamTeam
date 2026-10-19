@@ -776,8 +776,12 @@ class AgentRuntime:
         # turn (no thinking block) bound to the old one. `!=`: after a code downgrade it realigns here too.
         upgrade = frozen.current_record(self.language) if self.tools_rev != frozen.TOOLSET_REVISION else None
         added = [n for n in frozen.names(upgrade["tools"]) if n not in self.tool_names] if upgrade else []
+        # the attached skills too: the compacted context forgets the index an earlier wake-up showed
+        skills = getattr(self.swarm, "skills", None)
+        index = skills.index_text(self.name) if skills is not None else ""
         text = (prompts.t(self.language, "compacted", summary=summary)
                 + ("\n\n" + prompts.t(self.language, "notes", notes=notes) if notes else "")
+                + ("\n\n" + index if index else "")
                 + ("\n\n" + prompts.t(self.language, "tools_added", tools=", ".join(f"`{n}`" for n in added))
                    if added else "")
                 + "\n\n" + prompts.t(self.language, "continue"))
@@ -786,6 +790,8 @@ class AgentRuntime:
         # (Before _fixed_tokens below: the compaction floor counts the new tool set.)
         epoch = self._replace_history([{"role": "user", "content": text}, *self._tail_to_keep()], tools=upgrade)
         self.swarm.notes_shown(self.name, notes)
+        if skills is not None:  # True: the summary holds the full index; None: forgotten, the next wake shows it
+            self.swarm.skills_shown(self.name, True if index else None)
         self.last_prompt_tokens = self._compaction_floor = estimate_tokens(self.history) + self._fixed_tokens()
         self.last_output_tokens = 0
         self._len_at_last_call = len(self.history)

@@ -665,3 +665,206 @@ def test_cd_expect_and_the_mcp_words():
                            "old_kept": "D:/proj",
                            "old_changed": {"paths": ["mcp/calc"], "commit": None, "error": "detached HEAD"}})
     assert "not committed there (detached HEAD)" in text and "stays as it was" not in text
+
+
+# ---- /skills ----------------------------------------------------------------------------------------
+SKILL_STATE = {"skills": [
+    {"name": "pdf", "description": "Reads PDF files.", "from": "library", "owner": None, "library": "none",
+     "roles": ["tester"], "manual": False, "files": 3,
+     "deps": [{"ecosystem": "python", "status": "ready", "files": ["requirements.txt"], "packages": ["pypdf"]},
+              {"ecosystem": "node", "status": "failed", "files": ["package.json"], "packages": ["sharp"],
+               "error": "npm ci exited with code 1"}]},
+    {"name": "csv-cleanup", "description": "Cleans CSV files.", "from": "agent", "owner": ANNA, "library": "pending",
+     "roles": [], "manual": True, "files": 2,
+     "deps": [{"ecosystem": "python", "status": "unsupported", "files": ["setup.py"], "packages": [],
+               "reason": {"code": "unsupported", "detail": "setup.py runs code"}}]},
+    {"name": "old", "description": "", "from": "claude-user", "owner": None, "library": "rejected",
+     "comment": "too broad", "roles": [], "deps": []}]}
+SKILLS_GET = {"library_dir": "/home/u/.dreamteam/skills",
+              "library": [{"name": "pdf", "description": "Reads PDF files."},
+                          {"name": "web", "description": "Browses.", "changed_outside": True}],
+              "claude": [{"name": "notes", "origin": "claude-project", "description": "Notes.", "agent_writable": True}],
+              "host": [], "attached": [{"name": "pdf"}]}
+
+
+class SkillsApp(HubApp):
+    """HubApp with the skills parts of the client and the app (`skills_override`, `local`, decide_skill)."""
+
+    def __init__(self, attached: bool = True, mode: str = "launcher"):
+        super().__init__(mode, attached)
+        self.state = SKILL_STATE
+        self.local = True
+        self.skills_override: list[str] = []
+        self.cleanup = {"removed": ["a", "b"], "kept": [{"dirname": "c", "why": "in use"}]}
+        client = self.client
+
+        async def skills(sid):
+            self.calls.append(("skills", sid))
+            return SKILLS_GET
+
+        async def skill(sid, name, frm="library"):
+            self.calls.append(("skill", sid, name, frm))
+            return {"name": name, "description": "Reads PDF files.", "files_list": [{"path": "SKILL.md"}],
+                    "skill_md": "\n".join(f"line {i}" for i in range(60)),
+                    "deps": {"python": {"files": ["requirements.txt"], "packages": ["pypdf"]}},
+                    "install": {"enabled": True, "proposals": True}}
+
+        async def skill_log(sid, name, ecosystem=None):
+            self.calls.append(("log", sid, name, ecosystem))
+            return {"name": name, "ecosystem": "node", "status": "failed", "path": "/envs/x/install.log",
+                    "log": "npm ERR! gyp"}
+
+        async def session_skills(sid, show=None):
+            self.calls.append(("session_skills", sid))
+            return {"attached": SKILL_STATE["skills"], "running": False}
+
+        async def clean_skill_envs():
+            self.calls.append(("clean",))
+            return self.cleanup
+
+        for fn in (skills, skill, skill_log, session_skills, clean_skill_envs):
+            setattr(client, fn.__name__, fn)
+
+    async def refresh_state(self) -> dict:
+        return self.state
+
+    async def decide_skill(self, name, approve, comment="", replace=False, sid=None):
+        self.calls.append(("decide", name, approve, comment, replace) + ((sid,) if sid else ()))
+
+
+async def test_skills_lists_attaches_and_decides(tmp_path):
+    app = SkillsApp()
+    await execute(app, "/skills")
+    table = app.out[-1]
+    assert "pdf" in table and "Reads PDF files." in table and "tester" in table
+    assert "python: ready" in table and "node: failed" in table and "npm ci exited with code 1" in table
+    assert "csv-cleanup" in table and "waits for you" in table and "only when asked" in table
+    assert "setup.py runs code" in table and "manual" in table and "not saved" in table and "too broad" in table
+    await execute(app, "/skills add pdf")
+    await execute(app, "/skills add claude-user:notes --replace")
+    await execute(app, f"/skills add {tmp_path / 'my skill'} --pick a,b")
+    await execute(app, "/skills add https://github.com/org/repo")
+    await execute(app, "/skills update pdf")
+    await execute(app, "/skills rm pdf")
+    await execute(app, "/skills reinstall pdf node")
+    assert app.acts == [
+        ("skill_attach", {"name": "pdf"}),
+        ("skill_attach", {"name": "claude-user:notes", "replace": True}),
+        ("skill_attach", {"source": os.path.normpath(str(tmp_path / "my skill")), "pick": ["a", "b"]}),
+        ("skill_attach", {"source": "https://github.com/org/repo"}),
+        ("skill_attach", {"name": "library:pdf", "replace": True}),   # again from its own source
+        ("skill_detach", {"name": "pdf"}),
+        ("skill_reinstall", {"name": "pdf", "ecosystem": "node"}),
+    ]
+    acts = len(app.acts)
+    await execute(app, "/skills update csv-cleanup")   # a member's proposal has no source of its own
+    assert "made by a member" in app.out[-1]
+    await execute(app, "/skills update nope")
+    assert 'Skill "nope" is not attached' in app.out[-1] and len(app.acts) == acts
+    for bad in ("/skills frobnicate", "/skills add", "/skills reject", "/skills log pdf ruby"):
+        await execute(app, bad)
+        assert app.out[-1].startswith("⚠ Usage: /skills [lib |"), bad
+    await execute(app, "/skills approve csv-cleanup replace")
+    await execute(app, '/skills reject csv-cleanup "not general enough"')
+    await execute(app, "/skills reject csv-cleanup")   # the reason is optional, as on the web page and in the dialog
+    assert [c for c in app.calls if c[0] == "decide"] == [("decide", "csv-cleanup", True, "", True),
+                                                          ("decide", "csv-cleanup", False, "not general enough", False),
+                                                          ("decide", "csv-cleanup", False, "", False)]
+    await execute(app, "/skills show pdf")   # attached: the session's copy
+    assert app.calls[-1] == ("skill", "001-x", "pdf", "session")
+    shown = app.out[-1]
+    assert "pdf · session" in shown and "Files (1): SKILL.md" in shown and "Installs automatically: pypdf" in shown
+    assert "line 39" in shown and "line 40" not in shown and "+20 lines" in shown
+    await execute(app, "/skills show claude-user:notes")
+    assert app.calls[-1] == ("skill", "001-x", "notes", "claude-user")
+    await execute(app, "/skills log pdf")
+    assert app.calls[-1] == ("log", "001-x", "pdf", None) and "npm ERR! gyp" in app.out[-1]
+    await execute(app, "/skills lib")
+    lib = app.out[-1]
+    assert "Skills library (/home/u/.dreamteam/skills)" in lib and "claude-project:notes" in lib
+    assert "attached" in lib and "changed outside DreamTeam" in lib and "agents can write here" in lib
+    await execute(app, "/skills pending")
+    assert "csv-cleanup" in app.out[-1] and "pdf" not in app.out[-1] and "/skills approve name" in app.out[-1]
+    assert "--session" not in app.out[-1]
+    # another session's proposals: the header names it, and the decision goes to it (not the attached one)
+    await execute(app, "/skills pending 002-y")
+    assert app.calls[-1] == ("session_skills", "002-y") and "/skills approve name --session 002-y" in app.out[-1]
+    await execute(app, "/skills approve csv-cleanup --session 002-y")
+    await execute(app, "/skills reject csv-cleanup --session 002-y too narrow")
+    await execute(app, "/skills approve csv-cleanup replace --session 001-x")   # the attached one: as without it
+    assert [c for c in app.calls if c[0] == "decide"][-3:] == [
+        ("decide", "csv-cleanup", True, "", False, "002-y"), ("decide", "csv-cleanup", False, "too narrow", False, "002-y"),
+        ("decide", "csv-cleanup", True, "", True)]
+    await execute(app, "/skills approve csv-cleanup --session")
+    assert app.out[-1].startswith("⚠ Usage: /skills [lib |")
+    await execute(app, "/skills clean-envs")
+    assert "Removed 2 skill environment(s); kept 1 (in use)" in app.out[-1]
+    # what was kept and why comes from the report: nothing kept says nothing about it
+    app.cleanup = {"removed": [], "kept": [{"dirname": "c", "why": "being built"}, {"dirname": "d", "why": "in use"}]}
+    await execute(app, "/skills clean-envs")
+    assert "Removed 0 skill environment(s); kept 2 (being built, in use)" in app.out[-1]
+    app.cleanup = {"removed": ["a"], "kept": []}
+    await execute(app, "/skills clean-envs")
+    assert "Removed 1 skill environment(s)" in app.out[-1] and "kept" not in app.out[-1]
+
+
+async def test_skills_without_a_session_pick_the_next_ones():
+    app = SkillsApp(attached=False)
+    await execute(app, "/skills")
+    assert "No current session" in app.out[-1]
+    await execute(app, "/skills add pdf")
+    await execute(app, "/skills add claude-user:notes")
+    assert app.skills_override == ["pdf", "claude-user:notes"] and not app.acts
+    await execute(app, "/skills")
+    assert "Skills of the next new session: pdf, claude-user:notes" in app.out[-1]
+    await execute(app, "/skills show pdf")   # without a session: the library's
+    assert app.calls[-1] == ("skill", None, "pdf", "library")
+    await execute(app, "/skills rm pdf")
+    assert "No current session" in app.out[-1]
+    await execute(app, "/skills approve csv-cleanup")
+    assert "No current session" in app.out[-1]
+    # a session listed by `/skills pending ID` is decided without attaching (and so starting) it
+    await execute(app, "/skills pending 002-y")
+    assert "[reason] --session 002-y" in app.out[-1]
+    await execute(app, "/skills approve csv-cleanup --session 002-y")
+    assert app.calls[-1] == ("decide", "csv-cleanup", True, "", False, "002-y")
+    swarm = SkillsApp(mode="swarm")
+    await execute(swarm, "/skills clean-envs")
+    assert "needs a session launcher" in swarm.out[-1]
+
+
+def test_skill_approval_dialog_shows_the_files_and_the_start_of_skill_md():
+    from dreamteam.tui.dialogs import SkillApprovalDialog
+
+    body = "\n".join(f"step {i}" for i in range(1, 21))
+    skill = {"name": "csv-cleanup", "owner": ANNA, "files": 2, "description": "Cleans CSV files.",
+             "files_list": [{"path": "SKILL.md", "size": 2048}, {"path": "scripts/run.py", "size": 12}],
+             "skill_md": f"---\nname: csv-cleanup\ndescription: Cleans CSV files.\n---\n\n{body}\n"}
+    text = "".join(part for _, part in SkillApprovalDialog("en", skill).fragments(100))
+    assert "Files: SKILL.md (2.0 KB), scripts/run.py (12 B)" in text
+    assert "step 1" in text and "step 8" in text and "step 9" not in text and "name: csv-cleanup" not in text
+    assert "all of SKILL.md: /skills show csv-cleanup" in text
+    # the snapshot alone (no detail fetched): the count, no SKILL.md
+    text = "".join(part for _, part in SkillApprovalDialog("ru", {"name": "x", "files": 3}).fragments(100))
+    assert "Файлов: 3" in text and "/skills show" not in text
+    assert render.skill_md_body("---\nname: x\n") == "---\nname: x"   # unclosed: not front matter
+
+
+def test_skills_registry_and_texts():
+    names = [cmd.name for cmd in COMMANDS]
+    assert names.index("skills") == names.index("jobs") + 1
+    skills = find("skills")
+    assert skills.args and not skills.session and not skills.required and not skills.launcher
+    for lang in ("ru", "en"):
+        assert "clean-envs" in skills.usage(lang) and "reinstall X" in skills.usage(lang)
+        for key in ("skill_title", "skill_yes", "skill_no", "skill_later", "skill_reject_reason", "skill_deferred",
+                    "skill_waiting", "delete_pending_title", "delete_pending_save", "delete_pending_discard",
+                    "skills_none", "skills_hint", "col_packages", "role_skills"):
+            assert TEXTS[lang].get(key), (lang, key)
+    # the role catalog of the launcher keeps each role's skills (/roles X shows them)
+    view = settings_view()
+    view["role_catalog"][1]["skills"] = ["pdf"]
+    assert commands._localized("en", view["role_catalog"])[1]["skills"] == ["pdf"]
+    text = render.to_plain(render.role_detail(render.RenderContext(lang="en"), {"name": "Tester", "skills": ["pdf"]}),
+                           100)
+    assert "Role skills (from the library): pdf" in text

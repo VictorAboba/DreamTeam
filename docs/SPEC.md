@@ -51,8 +51,15 @@ src/dreamteam/
   llm/openai_llm.py     OpenAILLM
   llm/scripted.py       ScriptedLLM (tests / demos)
   mcp_forge.py   MCPForge, MCPConnection — agent-built MCP servers + library
+  skills.py      skill folders (SKILL.md), their sources (folder, zip, Git, Claude Code) and the shared library (§19)
+  swarm_skills.py SessionSkills — the skills attached to one session, the agents' mirror, the wake-up index,
+                 members' proposals and the user's library decision, the roles' skills (§19)
+  skill_deps.py  skills' script dependencies: manifest detection, EnvManager — environments shared by all sessions
+                 under ~/.dreamteam/skill-envs, builds, OS locks, Node views, cleanup (§19)
   tools/__init__.py  registry: ToolSpec, ToolContext, tool(), tools_for(), schemas_for(), call_tool()
   tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
+  tools/skill_tools.py the skills tools: the user's `skills`, `skill_attach`, `skill_detach`, `skill_approve`,
+                 `skill_reinstall`, and the members' `skill_propose` (frozen revision 3; §19)
   tools/frozen.py    frozen LLM tool sets: revisions, the kv record of each agent, `python -m dreamteam.tools.frozen`
                      (§6.1)
   tools/snapshots/   llm_r<N>.json: every released LLM tool set (revision N, en and ru), never edited
@@ -151,6 +158,7 @@ class Swarm:
     llm_semaphore: asyncio.Semaphore
     tracer: Tracer                           # §16
     jobs: JobManager                         # background jobs of the members' shell commands (§7.1)
+    skills: SessionSkills                    # the skills attached to this session and their mirror (§19)
     session_id: str | None; session_title: str | None   # set by SessionManager (§17.2)
     hub_url: str | None                      # MCP URL of this swarm while a web server runs (snapshot mcp_url)
     stopping: bool                           # set by stop()/close(): long polls (wait_for_events) end at once
@@ -164,7 +172,13 @@ class Swarm:
         # roles.starting_team(swarm.starting_roles, swarm.start_agents), member i gets starting_roles[i], the rest
         # (and blank entries) are generalists (§17.3); LLM agents with open tasks, reviews waiting for them or
         # pending events (goal active), or whose last activation was cut short (the stored history ends
-        # mid-activation), get `n_restart`; hire() respects run_agents
+        # mid-activation), get `n_restart`; hire() respects run_agents. After forge.start(): skills.start() (the
+        # session's skills read again, their script dependencies planned in a daemon thread and held in use, the
+        # agents' mirror rebuilt from the session copies with its node_modules links, the owners of decisions made
+        # while stopped told, §19), then skills.ensure_deps() as a `_background` task (builds never waited for);
+        # after the starting team is created: skills.ensure_role_skills(announce=False)
+        # (the skills the members' roles list; nobody is told: every first wake-up after a start shows the index).
+        # The scheduler calls skills.check() (the mirror, at most once a minute) and skills.touch_envs() (hourly)
     async def stop(self) -> None
         # wakes every wait_signal() waiter (stopping=True), closes external trace sessions (a failure is logged:
         # tracing never keeps a session from stopping), stops the runtimes (an LLM agent's foreground command dies
@@ -173,9 +187,16 @@ class Swarm:
         # closed, §7.1), then forge.stop(), then waits for git commands still running in threads
         # (workspace.settle(), §7): nothing touches git or the database afterwards. stop_all, forge.stop and
         # settle run in `finally`: also when an earlier step failed or the stop was cancelled (the caller closes
-        # and drops the session after a failed stop, so no process may outlive it)
+        # and drops the session after a failed stop, so no process may outlive it); then skills.stop_deps() (no
+        # more build news, the view tasks cancelled, the session's in-use set released; builds go on in the
+        # process); in an adopted folder (§17.2) skills.remove_mirror() last: no copy of a skill stays in the user's
+        # project
     def close(self) -> None                              # closes the database
     def reconfigure(self, config: Config) -> None        # hot-apply new settings (§16.1)
+        # when the roles' skills changed (swarm_skills.role_skill_pairs) under a running swarm (started, not
+        # stopping): skills.ensure_role_skills() in a background task (`_role_skills_task`, in `_background`: stop()
+        # cancels it; a newer change while it runs makes it run once more, never cancels it: its copy thread
+        # would go on past the lock); a save that does not touch them starts nothing
 
     # members
     def member(self, name: str) -> dict | None          # agents row as dict (any status), exact canonical name
@@ -212,6 +233,9 @@ class Swarm:
         # drains (marks read/delivered) and renders the wake-up text (§6.3); None if nothing pending
         # and incoming=True; stamps/since: only wait_for_events (§12), never an agent's wake-up
     def notes_shown(self, name: str, notes: str) -> None   # the agent's context now holds these notes
+    def skills_shown(self, name: str, value: bool | None) -> None
+        # what the agent's context holds of the Skills index (§6.3): True the full index, False "none attached",
+        # None nothing known (the next wake-up shows the full index); in memory, like notes_shown
 
     # goal
     def goal(self) -> dict | None
@@ -256,7 +280,9 @@ class Swarm:
         # new role needs instructions) is in `hire_agent` (§12), not here: the starting team and programmatic hires
         # need none. An LLM hire beyond max_agents (agent_count()) is a ToolError: "The swarm already has the
         # maximum of N AI agents (members who joined through MCP do not count). Retire someone or ask the user to
-        # raise max_agents."; external members are not limited
+        # raise max_agents."; external members are not limited. After the member is created and before n_hired:
+        # skills.ensure_role_skills([name]) (its role's skills, §19; the other members are told, not the new one,
+        # whose first wake-up lists them), the report kept for `hire_agent` (skills.note_hire / hire_report)
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
         # before the first await: the ids of its running jobs, and jobs.forbid(name) (none of its commands may
         # become a job while it leaves); then tasks and locks released, triggers deactivated, status retired,
@@ -302,7 +328,8 @@ wires them), and records notifications in `fake.notified: list[tuple[recipient, 
 resolve_member is the real `resolve_member_in`; set_goal / complete_goal validate, split the goal and notify
 like the real ones (the planning task is created when a real Board is wired).
 
-Scheduler (every 3 s): expires file locks, prunes old traces (every 6 h) and closes idle external trace
+Scheduler (every 3 s): expires file locks, compares the skills mirror with its manifest (`skills.check()`, at most
+every `SKILLS_CHECK_SECONDS` = 60 s, §19), prunes old traces (every 6 h) and closes idle external trace
 sessions (§16); unless paused, `_wake_deferred` first (an agent a broadcast reached without a wake, §5, that no longer
 `waits_for_job` while the news is still unread is woken once: e.g. the busy window of its server ended), then in this
 order. "Idle" (`_idle_llm_members`) is an LLM agent with status idle, a
@@ -596,7 +623,7 @@ reach existing members through tool results and notifications, and new tools at 
 to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
 it:
 - Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
-  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 2: background jobs) is what `schemas_for("llm",
+  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 3: `skill_propose`) is what `schemas_for("llm",
   language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were frozen (sorted digest
   `e3c5cbc7…`).
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
@@ -703,9 +730,17 @@ already produced (it may remove those it can do without, §4), `my_reviews` (onl
 tasks wait for its review: `#id title (assignee or -)`), `my_jobs` (only while it has running background jobs,
 §7.1: `my_job` items `j3 npm run dev (running 25 min)` joined with "; ", the command cut to 60 characters, the
 duration in the member's language; a silent job, §7.1, is `my_job_silent` `j3 npm run dev (running 50 min, no output
-for 40 min)`), `ready` (up to 8), notes: in full only when they changed
+for 40 min)`), `ready` (up to 8), for an LLM member the Skills index (below), notes: in full only when they
+changed
 since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
 otherwise the one-line `notes_unchanged`, since the history is append-only.
+
+The **Skills index** (§19 "Delivery to agents"; never for external members, never in an incoming render): with skills
+attached, the full `skills_index` (or `skills_index_own` when the member's role lists one of them) once per agent
+memory: when `Swarm._skills_shown[name]` is not True (never shown, after a restart, or after a compaction whose text
+had none); every later wake-up shows the one-line `skills_names` (the names with their marks) instead. With none
+attached, nothing, except one `skills_none` line for a member that had seen an index (`_skills_shown` False then; a
+later attach shows the full index again).
 
 `stamps=True` (only `wait_for_events`, whose one result may hold hours of news; an agent's wake-up stays as above so
 its history does not grow): when the oldest undelivered notification or unread message, or `since` (the oldest
@@ -731,6 +766,13 @@ class Workspace:
     def read(self, path: str, offset: int = 1, limit: int = 400) -> str   # lines offset..offset+limit-1, header "[path: lines a-b of N]"; binary -> ToolError
     async def write(self, actor: str, path: str, content: str) -> str
     async def edit(self, actor: str, path: str, old: str, new: str, replace_all: bool = False) -> str
+        # both refuse a path under SKILLS_MIRROR (`.scratch/_skills`, a lexical check on the resolved relative path,
+        # case-folded on Windows): ToolError "'.scratch/_skills/' holds the swarm's skills and is rebuilt by
+        # DreamTeam. To change a skill, copy its folder (without node_modules) into your scratch folder and edit it
+        # there, then call skill_propose." (§19); the last clause only for a caller whose tool set has skill_propose
+        # (frozen.member_tool_names: an agent of revision 1 or 2 gets "... edit it there.")
+        # a read-only file elsewhere (a copy of a mirror folder keeps its read-only files) is made writable first
+        # (owner write bit), unless it has other hard links; the write is the member's explicit edit
         # old must occur exactly once unless replace_all; ToolError with hints otherwise
     def list(self, path: str = ".", depth: int = 2) -> str   # tree text, dirs end with "/", skips .git, sizes;
         # folders named `.scratch` are shown collapsed like the NO_EXPAND ones (".scratch/ (2 entries)"), so the
@@ -825,6 +867,15 @@ start check of an adopted repository (§17.2) leaves `.scratch/` out like the se
 a marker an agent removed in its last command (`?? .scratch/`) does not refuse the start, which writes it again.
 `.scratch2` and the like are ordinary paths (the exclude matches whole path components).
 
+One exception to "agents own `.scratch/`": **`.scratch/_skills/`** (`SKILLS_MIRROR`) is DreamTeam's read-only copy
+of the swarm's skills (§19), rebuilt from the session's copies at every start, on every attach and detach, and
+within a minute of a change made there; `write_file` and `edit_file` refuse it, and other edits are undone. To change
+a skill, an agent copies it into its own scratch folder. In an adopted folder it is removed when the swarm stops.
+`_skills` is never a member's scratch folder (`email_slug` never starts with `_`). A Node skill's copy there holds
+a `node_modules` link (a junction on Windows, a symlink elsewhere) to this session's own view of the skill's shared
+environment (§19 "Script dependencies"); every DreamTeam walk skips links, `.scratch/` is never committed, and a
+workspace move removes `.scratch/_skills` before it moves anything (§17.2).
+
 The root is `config.workspace_dir`: `<project>/workspace`, or `config.workspace_path` when a session works in
 another folder (§17.2 "Workspace folder"). Then:
 - `init()` never creates a missing root (FileNotFoundError): a folder outside the session (the user's project,
@@ -850,6 +901,15 @@ def git_identity(actor) -> tuple[str, str]           # (name, e-mail) of commits
                                                      # "<email_slug>@dreamteam.local"); autocommits and the shell
 def scratch_rel(actor) -> str                        # ".scratch/<email_slug(actor)>/"
 def in_scratch(rel) -> bool                          # `.scratch` or inside it (case-insensitive on Windows)
+SKILLS_MIRROR = ".scratch/_skills"                   # the agents' read-only copy of the session's skills (§19)
+def scratch_is_local(root) -> bool                   # <root>/.scratch is a plain folder of the workspace (not a
+                                                     # file, nor a link/junction resolving elsewhere): job logs
+                                                     # and the skills mirror go there only then
+def is_link(entry_or_path) -> bool                   # a symlink or a redirecting reparse point (junction); a
+                                                     # DirEntry, Path or str; cloud placeholders are not links
+def long_path(path) -> str                           # the \\?\ (\\?\UNC\) form on Windows, unchanged elsewhere
+def rmtree(path) -> None                             # best effort, read-only files made writable first, long
+                                                     # paths (sessions._rmtree is this function)
 def commit_message(kind, paths, detail="") -> str    # subject "<kind>: p1, p2 (+N more)" in at most
     # COMMIT_SUBJECT_MAX (72) characters, each path at most COMMIT_PATH_MAX (40: "…/models/user.py", a file name
     # too long alone is cut with "…"); body = `detail` (CRLF normalized, control characters dropped, trailing
@@ -914,7 +974,10 @@ def shell_args(name: str, prefix: list[str], command: str) -> list[str] | str
     # escape the command's quotes as \", which cmd does not understand; /s strips exactly the outer pair)
 def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[str, str]
     # os.environ minus secrets (model api_key_env vars, *_API_KEY, *_TOKEN, *SECRET*, *PASSWORD*)
-    # except config.shell.pass_env; plus PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
+    # except config.shell.pass_env, and always minus _INTERNAL_ENV (DREAMTEAM_SKILLS_DIR, DREAMTEAM_HOST_SKILLS_DIR,
+    # DREAMTEAM_SKILL_ENVS_DIR: agents' commands are never pointed at the skills library or the skills'
+    # environments, even through pass_env); plus
+    # PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
 def kill_tree(proc) -> None   # tui/bash.py's `!` commands: POSIX os.killpg(proc.pid, SIGKILL); Windows taskkill /T /F
 
 # procs.py (standard library only; kernel32 through ctypes, loaded lazily)
@@ -973,7 +1036,9 @@ outlive its call:
    `jobs`, `jobs j3` or `kill j3` is answered by the hub (nothing spawned, nothing committed, §7.1).
 2. timeout = `min(max(args.timeout or [shell] timeout, 1), [shell] max_timeout)`; `workspace.ensure_scratch(actor)`
    (so `> .scratch/<slug>/out.txt` works); env = `agent_git_env(scrubbed_env(config, {DREAMTEAM_AGENT: actor,
-   DREAMTEAM_WORKSPACE: root, DREAMTEAM_SCRATCH: root/scratch_rel(actor)}), actor)`: git in the shell always works
+   DREAMTEAM_WORKSPACE: root, DREAMTEAM_SCRATCH: root/scratch_rel(actor), DREAMTEAM_SKILLS: swarm.skills.agent_dir()
+   (the skills mirror, or the session copies when `.scratch` is not local, §19)}), actor)`: git in the shell always
+   works
    on the workspace repository, and a commit an agent makes anyway (its system prompt forbids history-changing git
    commands) is authored and committed by that member, with the same identity as its autocommits; the identity is
    set after `scrubbed_env`, so it also beats `shell.pass_env` and inherited values. Other `GIT_*` variables (e.g.
@@ -1321,7 +1386,20 @@ Trigger dict: {"id","owner","condition","note","actions","once","active","create
 `task.created task.updated task.comment message.sent notification goal.set goal.completed
 goal.reopened agent.hired agent.retired agent.status agent.activity agent.compacted agent.usage
 file.changed file.locked file.unlocked trigger.created trigger.fired trigger.deleted
-mcp.created mcp.status swarm.paused swarm.resumed swarm.wrap_up swarm.limits job.started job.ended`
+mcp.created mcp.status swarm.paused swarm.resumed swarm.wrap_up swarm.limits job.started job.ended
+skill.attached skill.detached skill.proposed skill.library skill.deps`
+
+`skill.attached` {name, from, files, replaced: bool, via, attached_via} and `skill.detached` {name, via}, actor = the
+user (§19); `via` is the surface (`act`, `mcp`, `launcher-mcp`; `role` for the skills a role brings), `attached_via`
+`user`, `role:<Role>` or `create`. `skill.proposed` {name, owner, files, replaced: bool}, actor = the member who
+proposed it; `skill.library` {name, owner, status: saved or rejected, comment, via}, actor = the user (a decision
+on a stopped session's files emits none). The feeds (web, TUI) name the owner of a decided proposal ("saved Ann
+Lee's skill x to the library") and the surface of a skill change an MCP client made ("(via MCP)", "(via the launcher
+MCP)"; the user's own surfaces `act`, `home`, `cli`, `role`, `create` are not named): a save no UI click made shows
+as such. `skill.deps` {name, ecosystem: python | node, status: installing | ready |
+failed, files, env, key, installer?, reused: bool, seconds?, error?}, actor None: a skill's script dependencies,
+emitted by every session that has the skill when a build really starts and when it ends (§19 "Script
+dependencies").
 
 `swarm.wrap_up` {on: bool}, actor = who switched it (the user, or the actor of the set_goal / reopen_goal that ended
 it).
@@ -1443,6 +1521,9 @@ class ToolSpec:
 @dataclass
 class ToolContext:
     swarm: Swarm; actor: str; runtime: AgentRuntime | None = None
+    via: str = "act"                         # the surface: "act" (web /api/act: web UI, TUI, console), "mcp"
+                                             # (hub_call), "launcher-mcp"; recorded where the user's changes are
+                                             # audited (skills, §19)
     @property kind -> str                    # swarm.kind_of(actor), "unknown" for a non-member
     @property output_cap -> int              # max chars of big outputs (shell, MCP results): with a runtime
                                              # (it cuts results for the model and traces them in full)
@@ -1511,6 +1592,12 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `swarm_control` | action (pause/resume), wrap_up? (true/false: the user's wrap-up mode, §3), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
 | `mcp_approve` | name, approve, comment? | U |
 | `agent_traces` | agent?, trace_id?, span_id?, context?, status?, task?, limit?, offset? | EU (§16.2) |
+| `skills` | available? (also the library's and Claude Code's skills not attached) | U (§19) |
+| `skill_attach` | name? (a reference: `x`, `library:x`, `claude-user:x`, `claude-project:x`) or source? (a folder or .zip path on the hub's machine, or a Git URL: imported into the library first), pick?, replace? | U (§19) |
+| `skill_detach` | name | U (§19) |
+| `skill_approve` | name, approve, comment?, replace? (a member's proposal: saved to the skills library or not) | U (§19) |
+| `skill_reinstall` | name, ecosystem? (`python` or `node`; default both: the skill's packages installed again) | U (§19) |
+| `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (revision 3, §19) |
 
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
@@ -1530,7 +1617,8 @@ still validated against the current registry, so the registry must keep serving 
 (`items.type` included), the current `required` is a subset of every released one, enums only grow, a free property
 never gains an enum. Revisions: 1 = the tools before background jobs (sorted digest `e3c5cbc7…`, the baseline of
 agents created before tool sets were frozen), 2 = background jobs (`shell` gains `background`, new `jobs` and
-`job_stop`, new `shell` and `wait` descriptions). Notifications and wake-up texts reach agents of every revision, so
+`job_stop`, new `shell` and `wait` descriptions), 3 = `skill_propose` (appended last; the array of revision 2
+before it is unchanged). Notifications and wake-up texts reach agents of every revision, so
 they name only tools of every released revision (tests/test_prompts.py); tool results that point at a newer tool
 check `ToolContext.has_tool`. `allow_empty` is validation only, not part of the schema. Tools of the
 `user`/`external` audiences only (e.g. `set_goal`) are not in the LLM tools array, and external members and the user
@@ -1641,14 +1729,22 @@ def build_hub_server(swarm) -> mcp.server.lowlevel.Server
     # (string: name returned by join_swarm; omit to act as the user). on_call_tool: actor =
     # as_agent (must be an active external member) or USER; returns
     # CallToolResult(content=[TextContent], is_error). `instructions=` explains the swarm.
-async def hub_call(swarm, name: str, args: dict, client: str | None = None) -> tuple[str, bool]
+async def hub_call(swarm, name: str, args: dict, client: str | None = None, *, via: str = "mcp") -> tuple[str, bool]
     # one MCP tool call with the actor rules above (also used by the launcher MCP, §18.2); calls of external
     # members are traced (tracer.external_call), except UNTRACED_TOOLS = {"wait_for_events"} and except while the
     # swarm stops (a call that returns then, e.g. a shell command killed by the session stop, must not write into
     # the database that Swarm.stop's caller closes next). `client` (default: serving_client's) names the MCP
     # client: a message it sends (as the call's actor) reaches the external members it acts as already read
     # (mailbox.sent_as_seen_by(members, actor)), so it never comes back to it as news; messages others send, e.g.
-    # an agent this call hires, reach them as news
+    # an agent this call hires, reach them as news. `via` becomes ToolContext.via (the launcher MCP: "launcher-mcp").
+    # No self-approval: `skill_approve` with approve=true, as the user, of a proposal whose owner is an external
+    # member this client acts as (HubClients.members_of(client)) returns "Error: skill 'x' was proposed by Ann Lee,
+    # the member this MCP client acts as; the user decides it in the web UI, the TUI or the console." without
+    # running the tool (also for the launcher MCP's forwarded calls, inside serving_client); rejecting is allowed.
+    # A client nothing names (client None) cannot be told from any external member: approve=true of an external
+    # member's proposal returns "Error: skill 'x' was proposed by Ann Lee, an MCP member, and this MCP client cannot
+    # be told apart from it (it sends no X-DreamTeam-Client header and has no MCP session); the user decides it in
+    # the web UI, the TUI or the console."
 CLIENT_HEADER = "X-DreamTeam-Client"
 def client_key(ctx, local: str) -> str | None
     # the client of a request: `local` without HTTP (stdio, in-process: one client per server), else
@@ -1679,11 +1775,13 @@ background jobs; and the members' side that members who join do not count toward
 still running at its timeout (at most 600 seconds over MCP) continues as a background job, that `background=true`
 starts one at once, that processes a command leaves running become a job too, and that a job's end arrives through
 `wait_for_events` (no polling); `swarm_control` also switches wrap-up mode (§3), in which no new background job
-starts.
+starts. The user's side also learns `skills`, `skill_attach`, `skill_detach` and `skill_approve` (not for a member
+the client acts as); the members' side that skills (SKILL.md folders under `.scratch/_skills/`) are listed by
+`join_swarm` and `swarm_status`, and that `skill_propose` proposes one.
 
 ## 14. Web (web.py) — REST for the UI and the console
 
-`create_app(swarm, host) -> Starlette` is the app of ONE swarm: the whole server of `dreamteam run`, and the
+`create_app(swarm, host, *, on_library_change=None) -> Starlette` is the app of ONE swarm: the whole server of `dreamteam run`, and the
 per-session app the launcher serves under `/s/{sid}/` (§18.1). All JSON (`httpjson.JSONResponse`; the
 WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json`. Guard
 (`GuardMiddleware`, every bind, also 0.0.0.0 in Docker): Host must be localhost/127.0.0.1/[::1]; for
@@ -1700,8 +1798,8 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/` | static/index.html |
 | GET `/static/{file}` | static files |
 | GET `/api/state` | snapshot (§14.1 below) |
-| GET `/api/roles` | `{"language": swarm language, "roles": [{key, name, description, instructions, model, builtin, names}], "hidden": [same]}`: the visible roles of the catalog in the swarm's language (§17.3; the board's hire dialog, the TUI's `/roles`), and the hidden ones, which a hire by name still resolves; `names`: every spelling `roles.find_role` resolves to the role (its name and id, a built-in role's name in either language); also for a stopped session; not in the snapshot (several KB) |
-| GET `/api/hub` | {pid, project, name, version}: identity of this hub process (checked against hub.json) |
+| GET `/api/roles` | `{"language": swarm language, "roles": [{key, name, description, instructions, model, builtin, names, skills}], "hidden": [same]}`: the visible roles of the catalog in the swarm's language (§17.3; the board's hire dialog, the TUI's `/roles`), and the hidden ones, which a hire by name still resolves; `names`: every spelling `roles.find_role` resolves to the role (its name and id, a built-in role's name in either language); also for a stopped session; not in the snapshot (several KB) |
+| GET `/api/hub` | {pid, project, name, version, sandbox}: identity of this hub process (checked against hub.json); `sandbox`: inside the Docker sandbox (the host library is a read-only source, folder paths are the container's) |
 | GET `/api/tasks/{id}` | {task, discussion: [...], events: [...]} |
 | GET `/api/messages?with=Name&limit=&since=` | conversation USER↔Name; without `with`: all recent messages |
 | GET `/api/inbox?since_message=&since_notification=` | `{"messages","notifications"}` to USER: with since_* > 0 the ones with a larger id (oldest first, ≤ 500); without, the newest 500 (ascending). `since` = alias of since_message. Messages carry `read` |
@@ -1710,9 +1808,25 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/api/agents/{name}/activity?limit=` | `agent.activity` events of that agent |
 | GET `/api/files?path=` | dir → {"type":"dir","entries":[...]}; file → {"type":"file","content","truncated"} |
 | POST `/api/act/{tool}` | run tool as USER: body = args → {"ok": bool, "result": str}; the user's `jobs` and `job_stop` (§7.1) go through it too: background jobs have no endpoint of their own |
+| GET `/api/skills` | `{library_dir, library: [entry], claude: [item], host: [entry], sandbox, limits: {max_mb, max_files, max_attached, max_archive_mb}, install, attached: [snapshot item + source_digest]}` (§19): the Skills tab; `source_digest` is the attached skill's own source now (`SessionSkills.source_digest`: "Update" compares with it only) |
+| POST `/api/skills` | an import body (§19 "Requests": exactly one of `path`, `zip`, `git`, `claude`, `host`; `pick`, `replace`) plus `attach?: bool` → the import report + `install`; with `attach` every imported skill is attached as `library:<name>` (`attached: [{name, status, files}]`, `failed: [{name, error, status}]`, as `attach_source`); `attach` on a stopped session is 409 `STOPPED_SKILLS_TEXT` (importing works) |
+| GET `/api/skills/{name}?from=library\|claude-user\|claude-project\|host-library\|session` | the entry + `files_list`, `skill_md`, `deps` (`show_folder`) + `install`; `session`: the session copy with its metadata and shown path |
+| DELETE `/api/skills/{name}?confirm={name}` | `{"removed": name}` (`Library.remove`; the sessions keep their copies); 400 without a matching confirm |
+| GET `/api/skills/{name}/deps-log?ecosystem=python\|node` | `{name, ecosystem, status, path, log}`: the install log of the attached skill's environment (the failed one first; `EnvManager.log_tail` / `log_path`); 404 when DreamTeam installs nothing for it |
 | `/api/traces...`, `/api/spans/...`, `/api/agents/{name}/traces.jsonl` | traces (§16.3) |
 | WS `/ws` | pushes every bus event as JSON (also the live-only `trace.*` events) |
 | `/mcp` | hub MCP over streamable HTTP |
+
+The skills routes are `skill_routes(config_of, workspace_of, *, via, swarm=None, changed=None) -> [Route]`, shared
+with the launcher (§18.1): `config_of()` the settings (here the swarm's), `workspace_of(request)` the folder whose
+`.claude/skills` is `claude-project` (here the workspace), `via` recorded in the library (`act` here), `swarm` the
+session (its attached list, `attach`, `from=session`, `deps-log`; the launcher passes none), `changed()` after a
+library change (here `on_library_change`, which the launcher's `SessionRouter` sets so the home page reloads its
+Skills tab). `on_library_change` is also called after a successful `/api/act` call and a successful call of the
+app's `/mcp` (`build_hub_server(swarm, on_library_change)`) of a `hub_mcp.LIBRARY_TOOLS` tool (`skill_attach`,
+`skill_approve`); the launcher MCP's forwarded calls of those tools send the `skills` change themselves. Every `{name}` goes through `check_name` before any path is built (400). Errors are
+`skill_error_response(exc)`: `{"error", **extra}` (e.g. `exists`) with the SkillError's / ToolError's status. The
+stopped check uses `Swarm.started`.
 
 ### 14.1 snapshot
 ```json
@@ -1737,7 +1851,17 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
                                            // §7.1 ({"id","label","owner","command","origin","status","reason",
                                            // "stopped_by","exit_code","started_at","background_at","ended_at","log",
                                            // "processes"}); no "busy" (it needs the board)
- "mcp": [...], "locks": [...],
+ "mcp": [...],
+ "skills": [{"name","description","from","owner","library","comment","attached_by","attached_at","updated_at",
+             "attached_via","files","size","digest","manual",
+             "path",                       // SessionSkills.shown_path: ".scratch/_skills/<name>/SKILL.md", or the
+                                           // session copy's absolute path when .scratch is not local
+             "roles": [names],             // the catalog roles that list it (§19); from memory, no query
+             "deps": [EnvState]}],         // its script dependencies, one per ecosystem (§19), [] without manifests:
+                                           // {"ecosystem","status","files","packages","env","key","python"?,"bin"?,
+                                           // "commands"?,"node_modules"?,"linked"?,"view"?,"log"?,"error"?,
+                                           // "installer"?,"reason"?,"queued"?,"other_process"?,"seconds"?,...}
+ "locks": [...],
  "user": {"unread": n}}
 ```
 
@@ -1898,7 +2022,7 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
 ### 17.1 Settings (settings.py, config.py)
 - The **home** is `$DREAMTEAM_HOME`, else `~/DreamTeam` (`default_home()`); the CLI flags `--home` / DIR
   override both. Its settings file is `<home>/dreamteam.toml` (`settings_path(home)`) with the sections
-  `SECTIONS = swarm, agents, server, shell, workspace, mcp, tracing, roles, models` (same format as a project's
+  `SECTIONS = swarm, agents, server, shell, workspace, mcp, skills, tracing, roles, models` (same format as a project's
   `dreamteam.toml`; `roles` is an array of tables, `[[roles]]`, the role catalog of §17.3).
 - `ensure_home(home, language="ru", provider="anthropic")` creates the directory, `sessions/` and the settings
   file from the template; `read_raw(home)`; `validate(home, raw) -> Config` (ValueError with a readable text);
@@ -1922,8 +2046,25 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   in any case or a whole number, also written as a string; anything else is a ValueError `[shell] cpu_threads must
   be "auto" or a whole number ...`), `pass_env = []`. `timeout`, `max_timeout`, `foreground_max` and `job_log_mb`
   are at least 1. The template lists every key with a Russian comment.
+- `[skills]` (`SkillsSettings`, global only: not one of the session `OVERRIDE_SECTIONS`; §19): `library_dir =
+  "~/.dreamteam/skills"` (the shared skills library; `Config.skills_library_dir`, where `DREAMTEAM_SKILLS_DIR` wins:
+  the Docker sandbox and the tests set it), `claude = true` (offer Claude Code's skills), `max_mb = 10` and
+  `max_files = 200` (one skill), `max_archive_mb = 50` (one zip or Git checkout before a skill is picked from it),
+  `max_attached = 40` (skills of one session), `max_proposals = 10` (skills the members of one session may
+  propose; 0 turns proposals off). Script dependencies (§19): `install = true` (install a skill's
+  requirements.txt / pyproject.toml / package.json), `install_proposals = true` (also for members' proposals),
+  `envs_dir = "~/.dreamteam/skill-envs"` (`Config.skill_envs_dir`, where `DREAMTEAM_SKILL_ENVS_DIR` wins: the
+  sandbox's volume and the tests), `python = ""` (the environments' interpreter: "" = the base interpreter DreamTeam
+  runs on; a path, a command, or with uv a version such as "3.12"), `install_scripts = false` (npm lifecycle
+  scripts of the dependencies), `install_timeout = 900` (seconds per install command), `env_retention_days = 30`
+  (unused environments are removed after this; 0 = never automatically), `install_env = []` (variables the
+  installers of the user's own skills get, e.g. a private index's password; each must be a variable name, else
+  ValueError `skills.install_env: 'x y' is not an environment variable name`). Changes apply at the next attach or
+  session start (a plan is keyed by `skill_deps.settings_hash`). All but `max_proposals` and `env_retention_days`
+  are at least 1. `Config.skills_host_library_dir` is `DREAMTEAM_HOST_SKILLS_DIR` (set only inside the sandbox),
+  else None. The template has the block after `[mcp]` with Russian comments.
 - `[[roles]]` → `Config.roles: list[RoleSettings]` (`RoleSettings(name, description="", instructions="",
-  model=None, hidden=False)`), checked by `config.parse_roles(raw, profiles)` after the model profiles (§17.3).
+  model=None, hidden=False, skills=[])`), checked by `config.parse_roles(raw, profiles)` after the model profiles (§17.3).
 - `config.Config.from_dict` checks every field against its type (bool / int / float / str / list[str] /
   tables; integral floats become ints, bools are not numbers, no NaN/inf, counts and sizes >= 1, port <= 65535;
   None = the default) with messages like `[agents] max_steps_per_turn must be ...`; API keys are never echoed.
@@ -1939,12 +2080,12 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
     `api_key_env_set` (true/false, or null when there is no env name); `api_key_env` is a variable name or
     null (a key pasted there is never shown);
   - values of `mcp.external.<server>.env` are masked as `SECRET_MASK + hint` (`••••…abcd`);
-  - `roles`: the stored `[[roles]]` entries `[{name, description, instructions, model, hidden}]`, normalized
+  - `roles`: the stored `[[roles]]` entries `[{name, description, instructions, model, hidden, skills}]`, normalized
     (a built-in role by its id, e.g. «Тестировщик» → `tester`); `[]` when there are none.
 - `apply_update(raw, update)` (a dict of sections; ValueError for bad input):
   - `roles` is the complete list of entries: not a list → "Section roles must be a list of roles", an item that
     is not an object → "Role N must be an object"; names get their whitespace collapsed; fields that are null,
-    `""` or `hidden: false` are not stored (an untouched field of a built-in role keeps the built-in value);
+    `""`, `[]` (no skills) or `hidden: false` are not stored (an untouched field of a built-in role keeps the built-in value);
     `[]` removes every customization; a role's `model` follows a profile rename; the rules themselves are
     checked by `validate` (`[roles.N] ...`);
   - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays;
@@ -1975,15 +2116,18 @@ settings; ValueError when they are invalid):
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
-  workspace=None)`, `async load(sid)`, `async start(sid)`, `async stop(sid, *, remember=False)`,
-  `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None, settings=None)`, `async delete(sid)`,
-  `async resume()`,
+  workspace=None, skills=None, via="home")`, `async load(sid)`, `async start(sid, *, skills=None, via="home")`,
+  `async stop(sid, *, remember=False)`, `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None,
+  settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`, `global_config()`,
+  `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
+  via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
   `async set_workspace(sid, path, *, expect=None)`; module functions `read_stats(db_path, conn=None)`,
   `slugify(title)` and `external_workspaces(home)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
-- `SessionError(message, status)` (a ValueError) carries an HTTP status: 400 bad input or invalid settings,
+- `SessionError(message, status=400, **extra)` (a ValueError) carries an HTTP status and `extra` (put into the
+  JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid settings,
   404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
   a folder of another session, a folder that changed since the user was asked, a missing workspace folder at
   start), 500 damaged or cannot be opened.
@@ -2042,12 +2186,14 @@ settings; ValueError when they are invalid):
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
-   "workspace":{"path","default","adopted","exists"}}
+   "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names]}
   ```
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
-  rows, in a `try` of its own: a database older than background jobs gives 0).
+  rows, in a `try` of its own: a database older than background jobs gives 0). `skills`: the attached skills' names,
+  `skills_pending`: those members proposed that wait for the user's library decision (from memory when loaded,
+  else `read_session_skills` of the session's data dir).
 
 #### Workspace folder
 A session works in `<session dir>/workspace` (`default_workspace(sid)`) unless its `session.json` has
@@ -2071,7 +2217,10 @@ next start, which checks the folder).
   `<home>/.dreamteam/`, anything in `<home>/sessions/` except this session's own default folder, the session's
   data folder, a repository database (a path with a `.git` component, a bare repository, a folder with `HEAD`,
   `objects/` and `refs/`; whether git is on or not), the shared MCP library (`mcp.library_dir`, the global one and
-  the session's) or a folder inside or containing it, a folder inside the current workspace or containing it (or
+  the session's) or a folder inside or containing it, the shared skills library (`Config.skills_library_dir`, §19)
+  or a folder inside or containing it, the skills' environments folder (`Config.skill_envs_dir`: "... is
+  DreamTeam's skill environments folder ..., or inside it or contains it (every session runs its skills' packages
+  from there)") or a folder inside or containing it, a folder inside the current workspace or containing it (or
   containing the session directory), an existing file, a folder that cannot be created or written (a temporary
   probe file). 409: a folder another session works in, or inside / containing one (the legacy `main` works in
   `<home>/workspace`). The current folder itself: `"unchanged"`, nothing happens. 404 unknown session; 409 for
@@ -2148,6 +2297,46 @@ next start, which checks the folder).
   `in_home`; read from the `session.json` files, nothing opened): `dreamteam sandbox` warns about them (only the
   home is mounted).
 
+#### Skills
+The manager's side of §19, for the home page, the CLI and the launcher MCP (`via` home / cli / launcher-mcp):
+- `global_config()`: the home's settings (`Config`) as the library routes use them (re-read when the file changed).
+- `skills` of `create` and `start`: a list of references (`x`, `library:x`, `claude-user:x`, `claude-project:x`
+  against the session's folder, `host-library:x`) or sources (an absolute folder or .zip path on this machine, a Git
+  URL; `source_spec`). Everything is made ready first, in a thread (`_prepare_skills`): references resolved and
+  checked, sources staged (`stage_source`, not yet in the library). SessionError 400 (not a list of non-blank
+  strings, a bad source, a source holding several skills: "... holds several skills (a, b): add them in the Skills
+  tab and name them."), 404 (an unknown name), 409 (a source whose skill the library has with other content,
+  `exists`; two different skills of one name); nothing staged is left behind. Then the staged sources are committed
+  to the library (`by` user, `via`) and every skill is copied into the session (`swarm_skills.attach_files`,
+  `attached_via` "create").
+- `create(..., skills=)`: prepared before the session exists; committed right after `session.json` is written and
+  before `set_workspace`, so a failure (the new session is removed) leaves nothing in the user's folder. The first
+  start mirrors them; the members find them in their first wake-up.
+- `start(sid, skills=)`, also for a running session (the start itself is then a no-op): a name already attached
+  with other content is 409 (`exists`: "replace it in the session's Skills tab"); past `[skills] max_attached` 409.
+  A stopped session gets the copies before its Swarm starts (`SessionSkills.attached_again(names)` takes the names
+  out of kv `skills_detached`, as a live attach does); a running one attaches them live with
+  `swarm.skills.attach(USER, ref, via=via)` (the members are told).
+- `async session_skills(sid, show=None)` → `{"attached": [...], "running"}`, stopped or running, always the snapshot
+  items of §14.1: a loaded swarm's `SessionSkills.public()` (on the loop: `deps` read live state), else the same keys
+  from the session's files (`swarm_skills.stopped_public`, in a thread: `path` the mirror's, `roles` from its
+  catalog, `deps` []); `show` adds that session copy's `files_list`, `skill_md`, `deps` and `install` (the global
+  `[skills]` switches its preview line is worded by: the home page's proposal dialog may open before anything else
+  loaded them; 404 when not attached).
+- Messages about a source show it as `Staged.shown` (a Git URL without its user info), never as typed.
+- `decide_skill(...)`: a running session's `SessionSkills.decide`; a stopped one's `decide_files` (`via`
+  "stopped-session", `project` = the session's swarm name, `session` = sid; a loaded swarm's cache is reloaded); an
+  `updated` event, and after a save (also the saves of `delete(sid, skills="save")`) a `skills` one (session None:
+  an open home Skills tab reloads the library). SessionError 404 / 409 as §19.
+- `delete(sid, skills=None)`: proposals waiting for the user's decision are never lost silently: 409 "Session X has
+  skills waiting for your library decision: a, b. Save them to the library first, or delete them with the
+  session." (`pending_skills`) unless `skills` is `"save"` (every one saved first; a name the library has with other
+  content refuses the delete before anything is saved, 409 `exists`; a stopped session's are saved on its files with
+  `via` "stopped-session", as `decide_skill` does) or `"discard"`; anything else 400.
+- **The mirror in the user's folder**: an adopted folder never keeps `.scratch/_skills` once the session leaves it:
+  `Swarm.stop` removes it, and so do `delete` (a crashed or never-stopped session) and `set_workspace` when it
+  leaves an adopted folder (`_drop_mirror`, never following a link; a failure is logged).
+
 ### 17.3 Role catalog (roles.py)
 A leaf module (no package imports; config.py uses it to check `[[roles]]`). The catalog is global: the settings
 of a home or a project, never a session override (§17.2).
@@ -2162,17 +2351,22 @@ of a home or a project, never a session override (§17.2).
   customizes that role, only with the fields given; any other name is a role of the user's own), `description`
   (a non-empty one replaces a built-in description in both languages; required for an own role unless it is
   hidden), `instructions` (added for every member of the role), `model` (a profile of `[models]`; `""` = none),
-  `hidden` (not offered: not in the team composer, not listed to agents; it still resolves). Deleting the entry
+  `hidden` (not offered: not in the team composer, not listed to agents; it still resolves), `skills` (skill names
+  its agents get attached to their session at hire, marked as their own, §19; built-in presets list none). Deleting
+  the entry
   of a built-in role resets it. `parse_roles` checks: a list of tables, at most 100 (`MAX_ROLES`); names 1–60
   characters (`NAME_LIMIT`) without `,` or `*` (they separate the items of a team), unique by `role_key`; texts at
   most 4000 characters (`TEXT_LIMIT`); errors `[[roles]] must be a list of role tables (write each role as a
   [[roles]] table)`, `At most 100 roles`, `[roles.N] name is empty`, `... the role 'X' is listed twice (also as
   role J)`, `... 'X': a role of your own needs a description`, `... 'X' uses the model profile 'M', which is not
-  defined in [models]` (and unknown keys or types as for the other sections). Stored normalized: a built-in role
-  by its id, texts stripped, `model = ""` as None.
+  defined in [models]`, `[roles.N] skills: 'Bad Name' is not a skill name (lowercase letters, digits and
+  hyphens)` (`skills.NAME_RE`, at most 64 characters), `[roles.N] skills: at most 20 skills per role`
+  (`MAX_ROLE_SKILLS`) (and unknown keys or types as for the other sections); whether the library has a role's
+  skills is not checked (a missing one is reported at hire). Stored normalized: a built-in role by its id, texts
+  stripped, `model = ""` as None, skill names stripped and deduplicated in order.
 - **Merge and resolution**: `catalog(entries, language, *, include_hidden=False) -> list[Role]` = the built-in
   roles in `PRESET_IDS` order with their entries applied, then the own roles in entry order; `Role(key, name,
-  description, instructions="", model=None, builtin=False, customized=False, hidden=False)`, `key` = preset id or
+  description, instructions="", model=None, builtin=False, customized=False, hidden=False, skills=())`, `key` = preset id or
   the casefolded name. `normalize(name)` collapses whitespace; `preset_id(name)` matches an id or a built-in name
   in either language, any case; `role_key(name)` = preset id or casefolded name; `find_role(entries, name,
   language)` (hidden roles too; None = a new role); `close_roles(entries, name, language, n=3)` (difflib, cutoff
@@ -2198,7 +2392,7 @@ of a home or a project, never a session override (§17.2).
     must be a whole number from 1 to 50`, `'*2': the role name is empty`, `'<item>': a role name cannot be longer
     than 60 characters`, `The team is empty`, `A team has at most 200 agents`.
 - **Views**: `presets_view()` → `[{id, name: {ru, en}, description: {ru, en}}]`; `catalog_view(entries)` →
-  `[{key, builtin, customized, hidden, name: {ru, en}, description: {ru, en}, instructions, model}]` (hidden roles
+  `[{key, builtin, customized, hidden, name: {ru, en}, description: {ru, en}, instructions, model, skills}]` (hidden roles
   included; an own role has the same text under both languages). Served by `GET /api/settings` (§18.1); the
   visible roles of one swarm by `GET /api/roles` (§14).
 - **Compatibility**: no `[[roles]]` → the 8 built-in roles; existing `starting_roles` keep working (built-in names
@@ -2209,20 +2403,26 @@ of a home or a project, never a session override (§17.2).
 ### 18.1 Web (launcher.py)
 `create_launcher_app(manager, host="127.0.0.1")` returns the app wrapped in the same `GuardMiddleware`
 (host/origin, JSON POSTs). A `SessionRouter` in front sends `/s/{sid}/...` to that session's app
-(`web.create_app(swarm)`, §14, served with `root_path = /s/{sid}`) and everything else to the launcher routes.
+(`web.create_app(swarm, on_library_change=...)`, §14, served with `root_path = /s/{sid}`; a library change there
+emits `sessions.changed` with change `skills`, also a `skill_attach` or `skill_approve` of `/api/act` that
+succeeded: either may have changed the library) and everything else to the launcher routes.
 
 | method path | response |
 |---|---|
 | GET `/` | `static/home.html` (launcher page, `no-store`) |
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
-| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher"}` |
+| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox"}` |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
-| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?}` → `{"session": summary}` (201); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
+| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
 | GET `/api/sessions/{sid}` | `{"session": summary, "config": manager.config_view(sid)}` |
 | PATCH `/api/sessions/{sid}` | body `{title?, overrides?, settings?}` → `{"session": summary, "config": config_view(sid)}`; `overrides` replaces all of them, `settings` `{section: {key: value \| null}}` changes only those keys (null: the global value again; §17.2 "Partial update"); both at once, a bad value or `main` → 400 and nothing changes |
-| DELETE `/api/sessions/{sid}?confirm={sid}` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm |
+| DELETE `/api/sessions/{sid}?confirm={sid}&skills=save\|discard&via=` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm; 409 `{"error", "pending_skills"}` when members' proposals wait for the user's decision and `skills` is not given (§17.2) |
 | POST `/api/sessions/{sid}/workspace` | body `{"path": "<absolute>"}` or `{"default": true}`, optionally `"expect": "moved"\|"adopted"` (the mode the user agreed to, §17.2) → `{"session": summary, "result": set_workspace result}`; 400 bad body or target, 404 unknown session, 409 dirty repository, MCP name conflict, a folder of another session, a folder that is not what `expect` says, a file in use, `main` |
-| POST `/api/sessions/{sid}/start` / `/stop` | `{"session"}`; another action → 404 |
+| POST `/api/sessions/{sid}/start` / `/stop` | `{"session"}`; another action → 404; start takes an optional body `{"skills": [...], "via"?}` (attached first; live when it is running; `via` as for create; the delete's `?via=` too) |
+| GET `/api/sessions/{sid}/skills?show=` | `manager.session_skills(sid, show)`: the attached skills (snapshot items, §14.1), also of a stopped session |
+| POST `/api/sessions/{sid}/skills/{name}/decide` | body `{"approve": bool, "comment"?, "replace"?}` → `{"text", "session"}` (`decide_skill`, via home) |
+| GET / POST `/api/skills`, GET / DELETE `/api/skills/{name}` | the library routes of §14 (`skill_routes` with `manager.global_config`, via `home`, no swarm: no `attached`, no `attach`, no `from=session`, no `deps-log`); `?workspace=<absolute>` names the folder whose `.claude/skills` is offered (a relative one 400); a change emits `sessions.changed` (session None, change `skills`) |
+| POST `/api/skill-envs/cleanup` | `EnvManager.cleanup(env_retention_days, every_unused=True)` now (a daemon thread: every env no session uses, whatever its age) → `{"removed", "kept"}`; emits change `skill-envs` |
 | GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home"}` (a hand edit of the file is picked up first) |
 | PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` text for a bad role (nothing saved) |
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result |
@@ -2235,6 +2435,9 @@ of a home or a project, never a session override (§17.2).
 - Errors are `{"error": text}` with SessionError.status; a body that is not JSON, not an object or has fields of
   the wrong type is 400; unexpected failures (e.g. the swarm failed to start, a locked file) are JSON 500s.
 - `POST /s/{sid}/api/*` without `Content-Type: application/json` is 415 (the guard only knows `/api/...`).
+- The app's lifespan runs `_clean_envs_daily(manager)`: unused skill environments are removed
+  `ENV_CLEANUP_DELAY` (60 s) after the start and then every `ENV_CLEANUP_EVERY` (24 h), with the settings read
+  each time (`env_retention_days = 0`: none); a failure is logged; the task is cancelled at exit.
 - An unknown sid: 404 JSON for `/api` and `/mcp` paths, an HTML error page otherwise, WebSocket close 1008. A
   session that cannot be opened: its status as JSON for `/api` and `/mcp`, an HTML page for the board, close
   1011. After shutdown began, no new session app is built (503).
@@ -2258,21 +2461,29 @@ of a home or a project, never a session override (§17.2).
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
-  start_agents?, max_agents?, team?, max_cost_usd?, model?, start?=true, workspace?)` (unset values come from the
+  start_agents?, max_agents?, team?, max_cost_usd?, model?, start?=true, workspace?, skills?)` (unset values come from the
   global settings; the board URL is shown only when a web server runs; `goal`: one line, or several, split as in
   §17.2; `team`: role names in order, a name repeated per agent (§17.3) → `swarm.starting_roles` (normalized) and
   `start_agents = len(team)` unless `start_agents` is given, `[]` = no team; not a list of non-blank strings →
   "team must be a list of role names, e.g. [...]", more than 200 → "A team has at most 200 agents.", a name over
   60 characters → "'<name>': a role name cannot be longer than 60 characters.", a name with `,` or `*` (the
   `--team` syntax) → "'<name>': a role name cannot contain ',' or '*'; give one item per agent and repeat a name
-  for several agents, e.g. [...]."; `workspace`: an absolute folder, §17.2),
-  `session_start(session)`, `session_stop(session)` and `session_cd(session, path)` (`set_workspace`; `path`
+  for several agents, e.g. [...]."; `workspace`: an absolute folder, §17.2; `skills`: names or sources attached
+  before the first start, §17.2 "Skills"),
+  `session_start(session, skills?)` (the skills attached first, live when it runs), `session_stop(session)` and `session_cd(session, path)` (`set_workspace`; `path`
   absolute or `"default"`; the result in words by `workspace_text(result)`, worded as the TUI and the console
   word it: "Moved the session's files to X" only when they moved, "The session now works in X" after a folder of
   the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
   shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), and for a
   running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
-  in the user's wrap-up mode is `[running, wrapping up]`.
+  in the user's wrap-up mode is `[running, wrapping up]`; a session with skills gets `skills: a, b (waiting for your
+  library decision: b)`. The last session tool is `skill_library(action: list | show | import | delete, name?,
+  source?, pick?, replace?)`, the home page's Skills tab in words (via `launcher-mcp`): `list` the library, the
+  host library and Claude Code's skills; `show` an entry (`name` may be `claude-user:x` / `host-library:x`) with
+  its source, files, the dependency preview and SKILL.md; `import` either `source` (a folder or .zip path, a Git
+  URL) or `name` (`claude-user:x`, `host-library:x`); several skills without `pick` list them; `delete` a library
+  entry (the sessions keep their copies). Library changes emit `sessions.changed` (change `skills`). There is no
+  `session_delete` tool.
 - Every hub tool (§13) with an extra optional `session` property. Without it the call goes to
   `manager.default_session()`; when there is none, the error lists the sessions. An unknown or stopped session
   is an error result (`session_start` is suggested).
@@ -2282,19 +2493,20 @@ of a home or a project, never a session override (§17.2).
   so the session's `hub_call` knows the MCP client (§13: its own messages never come back to it as news).
 - `dispatch_launcher_call(manager, name, args)` answers a tool name nobody knows (close matches + the list);
   `call_launcher_tool` turns SessionError / ToolError / unexpected failures into error results.
-- `INSTRUCTIONS` explain sessions, then the hub instructions.
+- `INSTRUCTIONS` explain sessions (with `skill_library` and the `skills` of `session_create` / `session_start`),
+  then the hub instructions.
 - `/s/{sid}/mcp` keeps the per-session hub MCP (§13).
 
 ### 18.3 CLI (cli.py)
 ```
 dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|stream-json] [--timeout S]
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
-          [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR] [--host H]
-          [--port P]
-dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]] [--no-console]
-          [--no-browser]
+          [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
+          [--skill REF|PATH|URL ...] [--host H] [--port P]
+dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]
+          [--skill REF|PATH|URL ...]] [--no-console] [--no-browser]
 dreamteam sessions [DIR | --home H]
-dreamteam sessions rm SID [SID ...] [--yes] [--home H]
+dreamteam sessions rm SID [SID ...] [--yes] [--skills save|discard] [--home H]
 dreamteam traces [AGENT] [--home H] [--session SID] [--id N] [--span N [--context]] [--status S] [--limit N] [--json]
 dreamteam console [DIR | --home H | --url URL] [--session SID] [--lang ru|en]
 dreamteam mcp [DIR | --home H] [--no-web]
@@ -2324,6 +2536,15 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   with `/cd`), and for `serve` without `--goal`. The TUI applies it to the first session it creates (and says so
   under the welcome box); `-p` names the folder on stderr with `--verbose`; `serve` prints the result
   (`launcher_mcp.workspace_text`) on stderr.
+- `--skill X` (repeatable; `tui`, `-p`, and `serve` with `--goal`, exit 2 without it): a skill attached to the
+  session (§17.2 "Skills"). A URL (`scheme://` or `user@host:path`) is passed as given, a path (it has a separator,
+  starts with `.` or `~`, ends in `.zip`, or is a folder or .zip here) is made absolute against the current
+  directory, anything else is a reference checked before anything starts against the home's settings
+  (`resolve_ref`; `claude-project:x` against the `--workspace` folder; not checked when resuming, the hub resolves it
+  against the session's folder): `dreamteam: --skill X: <error>` on stderr, exit 2. The TUI attaches them to the session it creates, or
+  with `-c` / `-r` to the resumed one (`POST .../start {"skills", "via": "cli"}`, live when it runs; `-r` without an
+  id: the session picked; one attempt, so a failed one never attaches them to another session later); `-p` the
+  same; `serve` passes them to `create(..., skills=, via="cli")`. `--skill` is not a TUI-only flag (`serve` takes it too).
 - The directory: `--home`, else DIR, else the current directory when it has `dreamteam.toml`, else the default
   home (`serve` never takes the current directory: `--home`, DIR or the default home). It is a launcher **home**
   when `--home` is given, when it has `sessions/` next to `dreamteam.toml`, or when it is the default home;
@@ -2337,7 +2558,10 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   run (markers of dead processes are removed). Then nothing is deleted (exit 1). All ids are checked first (an
   unknown one or the project's own `main` session: nothing is deleted, exit 1). It shows the sessions and asks
   `[y/N]` in a terminal (Ctrl+C: exit 130); without one it needs `--yes` (exit 1). Before deleting without a hub
-  it looks for a hub again. A workspace folder outside the session is kept and named in the output. The words
+  it looks for a hub again. A workspace folder outside the session is kept and named in the output. A session
+  whose members' proposals wait for the user's library decision is refused (409, the error plus " Pass --skills
+  save (to the skills library first) or --skills discard.", exit 1) unless `--skills save|discard` is given
+  (`&skills=` on the hub's DELETE, `delete(sid, skills=, via="cli")` without one). The words
   of `sessions` are `[DIR]` or `rm SID...`, in any order with the options.
 - `hub.json` lives in `<home>/.dreamteam/hub.json`, written once the port listens (before the resume) and
   removed at exit (only by the process that wrote it). `running_hub(dir)` trusts it only when `GET /api/hub`
@@ -2355,6 +2579,13 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   without one pair of quotes around all of it, as in the TUI; a name instead of N approves or rejects
   an MCP server), `/hire Role [| instructions]` (instructions `""` when omitted: a catalog role needs none) and
   `/wrapup [off]` (`swarm_control` wrap_up true / false, §3; the TUI's words: `on`/`вкл` or nothing, `off`/`выкл`).
+  `/skills` (the user's `skills` tool) with `lib` (the library, the host library and Claude Code's skills, marked when
+  attached; `GET /api/skills`), `add X [--pick a,b] [--replace]` (a reference → `skill_attach name`; a URL or a path,
+  resolved as for `/cd`, → `skill_attach source`), `update X` (`skill_attach <from>:X` with replace; a member's
+  proposal has no source), `rm X` (`skill_detach`), `show X` (the entry and the first 40 lines of SKILL.md;
+  `from=session` when attached), `approve X [replace]` / `reject X [reason]` (`skill_approve`), `reinstall X
+  [python|node]` (`skill_reinstall`), `log X [python|node]` (`GET /api/skills/X/deps-log`: the path and the log) and
+  `clean-envs` (the launcher's `POST /api/skill-envs/cleanup`; a single-swarm hub has none).
   `/cd` prints the session folder (`GET {hub}/api/sessions/{sid}` → `workspace`); `/cd PATH` or `/cd --default`
   prints the question worded as in the TUI (`console.cd_preview`, docs/TUI.md §4.5) ending in `[y/N]`: the next
   line `y`/`yes`/`д`/`да` moves the session (`POST {hub}/api/sessions/{sid}/workspace`) and prints the result
@@ -2381,7 +2612,17 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   open inside the container are not published. Only the directory is mounted: for a home,
   `docker.outside_home_warning(home)` prints a warning listing the sessions whose workspace folder is outside it
   (`external_workspaces`): they cannot start in the container (their start reports the missing folder). A folder
-  inside the home is found in the container (session.json `in_home`, §17.2).
+  inside the home is found in the container (session.json `in_home`, §17.2). The host's skills library is mounted
+  read-only at `/dreamteam/host-skills` with `DREAMTEAM_HOST_SKILLS_DIR` pointing there and `DREAMTEAM_SKILLS_DIR=
+  /swarm/.dreamteam/skills-library` (the sandbox's own library inside the mounted home; not `.dreamteam/skills`,
+  the default library's name: a home that is the user's home folder would make the host's library writable);
+  `env_passthrough` never passes the two skills variables by name; `run_sandbox` creates the host folder first and
+  warns when the library is inside the mounted directory (`library_inside_warning`: writable through `/swarm`
+  then), `sandbox_command` stays a pure argv builder; `~/.claude/skills` is not mounted (§19). The skills'
+  environments are a named volume per home, `dreamteam-skill-envs-<sha256 of the home's path, 10 hex>` mounted at
+  `/dreamteam/skill-envs` (`docker.envs_volume`; `DREAMTEAM_SKILL_ENVS_DIR` and `UV_CACHE_DIR=/dreamteam/skill-envs/
+  .cache/uv` set; never the host's envs: another platform); `docker volume rm` resets it. Node is not in the image,
+  so Node skills show as unavailable there.
 - `run [DIR]` stays the single-swarm server of a project (§15); it does not serve the launcher.
 
 ### 18.4 UI
@@ -2395,8 +2636,23 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   `agentColor`), so an agent looks the same in the terminal and in the browser; its avatar is a rounded square
   tinted with it. The agent's activity in the chat drawer follows the TUI too: a coloured bullet per step, a tool
   result hangs under its call (⎿).
-- **home.html + home.js + home.css** (launcher page, `/`): header (DreamTeam, tabs «Сессии» / «Настройки»,
-  RU/EN, theme, connection state); live updates from `/ws` plus a 5 s poll; texts in ru and en.
+- **Skills on both pages** (§19): `skills.js` (loaded before home.js and app.js; `Skills`, also a Node module for
+  the tests) holds what they share: the add form (sources «Папка» — a folder or .zip path on the server's computer —,
+  «Zip» — a file read in the browser and sent as base64, refused over `max_archive_mb` before the upload — and
+  «Git» — a URL, `#ref:subdir` or a GitHub / GitLab tree link) with its flow (`runImport`: a source holding several
+  skills lists them as checkboxes and posts again with `pick`; a clash with the library, 409 `exists`, asks «Заменить?»
+  and posts again with `replace`; Enter in a field imports and never submits an enclosing form, such as the
+  new-session dialog's), the report line of an import (imported, attached, failed, skipped files) and the
+  packages preview (`previewLine`: «Установится автоматически: pypdf, … (requirements.txt).» plus the trust line
+  «Установка запускает собственный код пакетов с вашими правами (вне песочницы Docker).», an unsupported manifest's
+  reason, or «Установка пакетов выключена в настройках.»; `install.proposals` decides for a member's proposal). A
+  skill's SKILL.md is shown as Markdown on the session page (`md()`, its YAML front matter left out: `bodyOf`; the
+  card shows the name and description) and escaped as preformatted text on the home
+  page (it has no Markdown renderer); every other skill text is escaped. The icon is `ic-skill` (a book).
+- **home.html + home.js + home.css** (launcher page, `/`): header (DreamTeam, tabs «Сессии» / «Скиллы» /
+  «Настройки», RU/EN, theme, connection state; the tab is kept in the URL hash, `#skills`); live updates from `/ws`
+  plus a 5 s poll (a `sessions.changed` event with change "skills" or "skill-envs" reloads the skills); texts in ru
+  and en.
   - Sessions tab: a big «Начать новую сессию» button, search and the filters all / running / stopped, and a
     card per session.
     - Card: title (link to the board), goal (or «ждёт запуска» for a pending goal), status badge (running /
@@ -2409,12 +2665,29 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     - Card buttons: «Открыть», «Запустить» / «Остановить» (disabled while the request runs), delete (not for
       the legacy `main`) with a confirmation dialog naming the session; for a folder outside the session the
       dialog says the folder stays, and the toast names it (`workspace_kept` of the DELETE answer). The web UI
-      never changes the folder (`/cd`, MCP `session_cd` or REST do).
+      never changes the folder (`/cd`, MCP `session_cd` or REST do). When members' skill proposals wait for the
+      user (summary `skills_pending`, or a 409 with `pending_skills` for one proposed since), the dialog names them
+      and offers «Сохранить в библиотеку и удалить» (`?skills=save`; a library clash refuses, shown in the dialog)
+      and «Удалить вместе с ними» (`?skills=discard`) instead of a plain «Удалить».
+    - Skills on the card: «скиллов: N» (summary `skills`) and, while proposals wait, a warning button «Скиллы ждут
+      вашего решения: N» that opens a dialog with one row per proposal (owner, description, files): «Сохранить в
+      библиотеку» / «Не сохранять» with an optional reason (`POST /api/sessions/{sid}/skills/{name}/decide`, also on
+      a stopped session; a library clash, 409 `exists`, asks «В библиотеке уже есть другой скилл «x». Заменить его?»
+      and decides again with `replace`).
   - New-session modal: title (default: the goal's first line, derived by the server); goal (required,
     multi-line: the first line is the title, the other lines its description, explained by a hint);
     description; model profile (from the saved settings; a role with its own profile keeps it); language, max
-    agents, budget; the starting team composer (below; from the saved catalog); under «Дополнительно» steps per
-    wake-up and MCP approval; «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
+    agents, budget; the starting team composer (below; from the saved catalog); «Скиллы»: a checkbox per skill
+    of the library and of Claude Code (a library skill is sent as its name, Claude Code's as `claude-user:x`;
+    one changed outside DreamTeam carries the warn badge «изменён вне DreamTeam» and ticking it asks «подключить всё
+    равно?», as the board's attach dialog does), the skills the chosen team's roles bring (from the catalog's
+    `skills`; one not in the library or ~/.claude/skills gets a warning chip «нет в библиотеке») and «Добавить новый:
+    папка, zip или Git» (the shared form; what it imports is ticked); the ticked ones go as `skills`. Deviation from
+    the skills design (§7.4): the modal has no workspace folder field (a new session works in its own folder), so it
+    offers no `claude-project:x` rows and loads `/api/skills` without `?workspace=`; a project's `.claude/skills`
+    skill is attached at create through the CLI (`--workspace` with `--skill claude-project:x`) or the launcher MCP,
+    or later on the board; under «Дополнительно» steps per wake-up and MCP
+    approval; «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
     from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). A stray
     click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
     settings page has it; sessions can still override it through the API).
@@ -2427,13 +2700,15 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     team (the saved list may hold more roles than its `start_agents`: they would fill a larger team).
   - Settings tab: sections «Модели и эндпоинты», «Роли», «Новые сессии по умолчанию» (with the team composer and
     the switch «Независимое ревью задач», `swarm.independent_review`), «Агенты», «Консоль», «Workspace», «MCP»,
-    «Трейсы», «Сервер», with a section navigation.
+    «Скиллы», «Трейсы», «Сервер», with a section navigation.
     - Roles: a card per catalog role (from `role_presets` and `settings.roles`). A built-in role: its name in
       both languages (read-only), «встроенная» / «изменена» marks, «Сбросить» and «Скрыть» / «Показать»;
       description (a changed one applies to agents of both languages), model profile, extra instructions. An own
-      role: an editable name, the same fields, delete. Saved as `settings.roles` (only what differs from the
-      built-in texts); client checks (names, duplicates, a description for an own role, a known profile) are
-      shown in the save bar.
+      role: an editable name, the same fields, delete. Both have «Скиллы»: chips of the role's skills (✕ removes one,
+      a warning one is not in the library or ~/.claude/skills) and an input with the known names as suggestions
+      plus «Добавить» (Enter too; a name must be a skill name: lowercase letters, digits and `-`). Saved as
+      `settings.roles` (only what differs from the built-in texts; `skills` when not empty); client checks (names,
+      duplicates, a description for an own role, a known profile, skill names) are shown in the save bar.
     - Model profiles: one card per profile. Fields: name, provider, base_url, key (mode «Переменная
       окружения» with its state on the server, or «Ключ»: a password input that is never filled from the
       server, «сохранён …abcd», a button to remove it), model (input + datalist filled by «Загрузить список»),
@@ -2451,10 +2726,24 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
       (`job_max_minutes`, 0 = none); their output in MB (`job_log_mb`); compute threads per command (`cpu_threads`:
       empty or "auto" in any case saves "auto", digits save the number, anything else is sent as typed for the
       server to refuse); the environment variables passed to the console (`pass_env`).
+    - «Скиллы» (`[skills]`, §19): the library folder, Claude Code's skills on or off, the limits (MB and files per
+      skill, an archive or Git copy in MB, skills per session, members' proposals per session, 0 = none), package
+      installation (on, also for proposals, npm scripts), the environments' folder and Python, the time limit of one
+      install, removing unused environments after N days (0 = never) and the installers' environment variables (a
+      list); a note says changes apply from the next attach or session start.
     - A save bar with «Сохранить» (PUT) and «Отменить изменения»; client-side checks (profile names,
       duplicates, a model is required, JSON fields) and server errors are shown there. Leaving the tab or the
       page with unsaved edits asks first.
     - Models and limits apply to running sessions at once; server settings after a restart of `dreamteam serve`.
+  - Skills tab (`GET /api/skills`): «Библиотека» (the folder named; a card per skill: name, description, files and
+    size, «добавил(а): … · через …», warning badges «изменён вне DreamTeam» (with what it means) and «только по
+    запросу» for a manual one, an error for a damaged entry; «Показать» opens its files, the packages preview and its
+    SKILL.md, `?from=library`; «Удалить из библиотеки» asks first, `DELETE /api/skills/{name}?confirm=name`, sessions
+    keep their copy), «Добавить в библиотеку» (the shared form), «Claude Code» (~/.claude/skills and the project's,
+    read only: «Показать» and «В библиотеку», `POST /api/skills {claude, origin}`, with «в библиотеке» / «в
+    библиотеке другой» badges by digest) and, inside the Docker sandbox, «Библиотека хоста» (read only; «В
+    библиотеку», `{host}`). The hero has «Удалить неиспользуемые окружения» (`POST /api/skill-envs/cleanup`; the toast
+    says how many were removed and kept).
 - **index.html + app.js + traces.js** (session board, `/s/{sid}/`):
   - All API/WS/MCP URLs are relative to the session base `/s/{sid}` (`BASE`, the same id pattern as the
     server), with `""` when the page is served at `/` (`dreamteam run`).
@@ -2543,3 +2832,518 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     - Buttons «Экспорт JSON», «JSON с контекстами» and JSONL of the agent.
     - Live updates come from the `trace.*` WS events (a running trace reloads; opened details stay open).
   - Agent drawer: the button «Трейсы» opens the tab filtered to that agent.
+  - Skills tab (§19; the tab after «MCP», a warning badge with the number of proposals waiting): a bar with
+    «Подключить скилл» and what a session's copy means, then a card per attached skill (the snapshot's `skills`):
+    name, description, badges — where it came from, «роль: X» / «от роли X» (`attached_via`, `roles`), «автор: X» and
+    «ждёт вашего решения» / «в библиотеке» / «не сохранён» (with the reason) for a member's proposal, «только по
+    запросу», «источника нет» when its source is gone —, files and size, and «Пакеты»: a row per ecosystem
+    (`deps`): «готовы» with the environment's path (click to copy), «ставятся…» (in the queue / another DreamTeam
+    process builds it), «ошибка» with the error, «Журнал» (`GET api/skills/{name}/deps-log`) and «Переустановить»
+    (`skill_reinstall`), or «вручную» with the reason (off, proposals off, missing on this machine, another Python,
+    unsupported). Buttons: «Показать» (files and SKILL.md, `?from=session`), «Сохранить в библиотеку» / «Не
+    сохранять» for a pending proposal (`skill_approve`; the clash text asks before `replace`), «Обновить» only when
+    the skill's own source changed (its `source_digest` in `GET api/skills` differs from the copy's digest; never
+    for a member's proposal: `<from>:name` with `replace`), «Отключить» (asks first). «Подключить скилл» opens a
+    dialog listing the library's, the host's and Claude Code's skills not attached yet (a warning for one agents can
+    write or one changed outside DreamTeam asks before attaching), each with «Показать» and «Подключить»
+    (`skill_attach`), plus the shared form with «Добавить и подключить» (`attach: true`). On a standalone board
+    (`dreamteam run`, no launcher home page) the tab also has the library itself under «Библиотека скиллов» (show,
+    delete). The feed shows `skill.*` (attached, updated, detached, proposed, saved or not, packages ready or failed);
+    a member's row and drawer and the hire dialog's role preview show the role's skills.
+
+## 19. Skills (skills.py)
+
+A **skill** is an Anthropic Agent Skill: a folder whose root holds `SKILL.md` (YAML front matter with `name` and
+`description`, then instructions) plus any other files (`scripts/`, references, templates). Agents see names and
+descriptions and read a SKILL.md when a task matches it (progressive disclosure). In Russian texts: «скилл».
+Nothing from a skill is ever run, imported or rendered as HTML by DreamTeam: it is data until an agent reads it.
+
+**Concepts.** The *library* (`[skills] library_dir`, default `~/.dreamteam/skills`, §17.1) is shared by every
+session of every home on the machine. A library entry's *origin* says where it came from: `folder`, `zip`, `git`,
+`agent` (a proposal the user saved), `claude-user`, `claude-project` (copied from Claude Code) or `host-library`
+(copied in the Docker sandbox from the host's library). *Claude Code skills* (candidates) are found read-only in
+`$CLAUDE_CONFIG_DIR/skills` (default `~/.claude/skills`; origin `claude-user`) and in `<workspace>/.claude/skills`
+(origin `claude-project`, agent-writable). Claude Code plugin skills (`~/.claude/plugins`) are not offered (v1).
+
+**Names** (`NAME_RE = [a-z0-9]+(-[a-z0-9]+)*`, `NAME_MAX = 64`; "anthropic" and "claude" are allowed):
+`check_name(name)` (SkillError 400) is called by every function that takes a name before any path is built (reads,
+writes, removals), and `child(root, name)` asserts the joined path resolves to a direct child of `root`: `..`, `.`,
+`a/b`, `..\x`, a decoded `%5C` and a planted link never reach a file operation. `slug(text)` makes a name of any
+text (Cyrillic transliterated, accents dropped: "My Skill" → `my-skill`). `for_agents(text)` replaces `<` / `>`
+with ‹ › in every text built for agents.
+
+**References** (`parse_ref(text) -> (source | None, name)`, `looks_like_ref(text)`): `x`, `library:x`,
+`claude-user:x`, `claude-project:x`, and `host-library:x` in the sandbox. A Git scp URL (it has an `@`) and a
+Windows path (a one-letter drive) are not references. `resolve_ref(config, ref, *, workspace=None) -> {"origin",
+"name", "path"}`: a prefixed reference uses only that source; a bare name the library, then `claude-user` (when
+`[skills] claude`), then `host-library` (sandbox only). `claude-project` is used **only** when named, because agents
+can write `<workspace>/.claude/skills` (and a cloned repository may bring one). Nothing found: SkillError 404 "No
+skill 'x' in the library or in ~/.claude/skills. Library: a, b." plus, when the workspace has one, "attach
+claude-project:x to use it".
+
+**Validation** (`check_skill_dir(folder, limits, *, strict=False, digest=True) -> SkillInfo(name, description,
+path, files, size, digest, manual, manifest, renamed_from, skipped)`; `Limits(max_mb, max_files, max_archive_mb)`,
+`Limits.from_config(config)`):
+- `SKILL.md` at the root, spelled exactly (`skill.md` only on a case-insensitive file system, stored as `SKILL.md`),
+  a regular file (not a link), at most `SKILL_MD_MAX` = 100 000 bytes, UTF-8 (a BOM is stripped). The skill folder
+  itself must not be a link.
+- `parse_frontmatter(text) -> dict[str, str]` (stdlib, no PyYAML): the first non-blank line is `---`, the front
+  matter closes with `---` or `...` within 200 lines; top-level `key: value` with plain values (a ` #comment`
+  stripped, indented continuation lines folded), `'single'` (`''` escape) and `"double"` (`\" \\ \n \t`) quotes, and
+  block scalars `|` / `>` (with `-` / `+`); nested maps and lists are skipped, unknown keys ignored except
+  `disable-model-invocation: true` → `manual` ("only when the user asks for it").
+- `name`: the front matter's, else the folder's name (`fallback`: for a zip's or a clone's root, which is a
+  staging folder, the zip's file name without `.zip`, or the Git subdir's last part, else the repository's name
+  without `.git`). `strict=True` (agent proposals): it must match the rule as written; otherwise (imports, Claude Code) it is slugged and the report says `renamed_from`. The copy is stored under
+  this name, not the folder's.
+- `description`: required; whitespace collapsed; 1–1024 characters. `<` / `>` are kept (replaced only in agent
+  texts); `strict=True` refuses tag-like text (`<tag`).
+- The tree: `.git`, `node_modules`, caches (`workspace.NO_EXPAND`), `.DS_Store`, `__MACOSX`, `Thumbs.db` and our
+  `.dreamteam.json` are skipped silently; links and junctions (`workspace.is_link`) and special files are skipped
+  and reported in `skipped: [{path, error}]`, never followed; every path part must be portable (the Windows rules on
+  every OS: no `<>:"|?*\`, control characters, trailing dot or space, reserved device names); two paths equal after
+  NFC + casefold fail the skill naming both; at most `max_files` files, `max_mb` MB and 8 folder levels (413).
+  Binary files are allowed.
+- `digest`: sha256 over the sorted `"<posix rel>\0<sha256 of the bytes>"` lines (without `.dreamteam.json`): "same
+  content". `manifest`: `[[rel, size, mtime_ns]]` of the walk, cheap to recompute (`stat_manifest`): "changed since".
+
+**Safe copy** (`copy_skill(src, dest_parent, name, limits, *, strict=False, info=None, readonly=False, meta=None)
+-> SkillInfo` of the copy): validated first (`info`: a check already made); built file by file in
+`dest_parent/.t-<hex6>-<epoch>/` (same volume, a short name); each file is opened only after `lstat` says it is a regular
+file, and the opened file must be that same file (`fstat` inode), so a link swapped in after the check is never
+followed; the digest of the bytes written must equal the checked one ("the folder changed while it was being copied;
+try again", 409). Source mode bits `& 0o755` are kept (scripts stay executable, the owner can write); `readonly`
+makes the files 0o444 / 0o555 (the agents' mirror); `meta` writes `.dreamteam.json` into the copy before it appears.
+The swap: an existing `<name>` (or a link there, never followed) is renamed to `.o-<hex6>-<epoch>`, the new folder
+renamed in, the old one removed; a failure restores the old one. Renames are retried 5 times over about a second on `PermissionError` (a scanner or an indexer
+holding a file). Every file operation uses `workspace.long_path`. `clean_stale(parent)` removes `.t-*` / `.o-*`
+folders older than an hour (`Library.list` and staging call it), judged by the later of the time in the name and the
+mtime (a rename keeps an old mtime: an `.o-` copy mid-swap must not look stale).
+
+**The library** (`Library(root, limits=None, *, read_only=False, config=None)`, `Library.from_config(config)`,
+`Library.host(config)`): one folder per skill; `.dreamteam.json` = `{name, description, origin, source, added_at,
+updated_at, digest, manifest, by, via, files, size, manual}`, where `source` is `{path}` (folder, Claude Code, host
+library), `{filename, subdir?}` (zip) or `{url, ref, subdir, commit}` (Git; the redacted URL), `by` is `user` or a
+member, and `via` the surface (`act`, `mcp`, `launcher-mcp`, `stopped-session`, `home`, `cli`).
+- `list()` (sorted; folders whose name is not a skill name and dot folders are left out), `get(name)`,
+  `path(name)` (a valid entry's folder), `show(name)` (entry + `show_folder`: `files_list` [{path, size}] ≤ 500,
+  `skill_md` and `deps`; a link entry `deps: {}`),
+  `digest_of(name)` (hashed again when the entry changed outside), `add(folder, origin, source, *, replace=False,
+  by="user", via="act", strict=False, info=None)`, `remove(name)` (renamed away, then removed; 404 when missing; a
+  link removes only the link).
+- A public entry: `{name, description, origin, source, added_at, updated_at, files, size, digest, manual, by, via,
+  changed_outside}`; a folder that fails validation is `{name, error, origin}` (shown, not attachable), and so is a
+  link or junction there (never followed: one link cannot break the listing). Missing metadata (a folder dropped in,
+  or its `.dreamteam.json` deleted) is rebuilt from SKILL.md once: origin `folder`, `by` "", `via` `outside` and
+  `outside: true`, which keeps `changed_outside` true.
+- **Tamper signal**: `changed_outside` is true when the stat walk differs from the stored manifest (a file edited,
+  added or removed behind DreamTeam's back) or the entry was not added through DreamTeam; it stays until the skill
+  is imported again (which records the new `by` / `via`) or deleted. A signal, not a protection.
+- `add`: the same name with the same digest is `"unchanged": true` (only `updated_at` and `source` change, and a
+  stale manifest is rewritten); other content is SkillError 409 `exists: [name]` unless `replace` (then `added_at`
+  is kept). No lock between processes: every change is a rename.
+- `read_only` (the host library in the sandbox): `add` / `remove` raise 403 "The host's skills library is read-only
+  inside the sandbox."
+- `sessions._plan` refuses a workspace that is the skills library, inside it or containing it (§17.2).
+
+**Sources.** `stage_source(lib, spec, *, pick=None, workspace=None) -> Staged` fetches and validates into
+`library_dir/.t-<hex6>/` (nothing visible in the library); `Staged.commit(replace=False, by="user", via="act")`
+checks every clash first (409 `exists` listing all of them, nothing added) and adds the picked skills with
+`Library.add`; `Staged.discard()` (also on leaving `with`) removes the staging folder; `Staged.conflicts()` names
+the picked skills the library has with other content; `import_source(lib, spec, *, pick, replace, workspace, by,
+via)` is stage + commit. `spec`: `{"path": abs}` (a folder on the hub's machine, or a `.zip` file read from disk;
+relative: 400), `{"zip": base64, "filename"}`, `{"git": url}`, `{"claude": name, "origin": "claude-user" |
+"claude-project"}`, `{"host": name}` (sandbox). The report: `{"imported": [entry + "unchanged"], "candidates":
+[{name, description, path, files, size, digest, manual, renamed_from?, error?, deps}], "skipped": [{path, error}],
+"need_pick": bool}`.
+- `find_skills(root, limits, max_depth=4)`: the root alone when it has a SKILL.md, else every folder with one down to
+  4 levels (no links, the skip-list left out, never below a found skill); each candidate is checked; a second one
+  with the same name gets "duplicate name". No valid candidate: the single candidate's own error, or 400 "No SKILL.md
+  found in …"; exactly one valid or `pick` given: those (an unknown name is 400, a picked candidate's error is
+  raised); several without `pick`: `need_pick`, nothing imported.
+- Folder and Claude Code sources are copied into the staging folder first, so the commit takes what was checked.
+- Zip (`extract_zip(data, dest, limits) -> skipped`): the base64 text is capped before decoding
+  (`Limits.zip_b64_max`, 413); members: `\` read as `/`; absolute names, drive letters, `..`, `.` and empty parts,
+  duplicates, NFC + casefold collisions (also a file beside a folder of that name), link entries and encrypted
+  entries are refused; directories are implied; `__MACOSX/`, `.DS_Store` and `.dreamteam.json` skipped; the
+  portable-name rule applies; at most 5000 entries; the declared sizes and the bytes actually streamed are both
+  capped by `max_archive_mb` (413); a member over 1 MB compressed more than 200 times "looks like a zip bomb" (413);
+  a damaged archive is a 400; exec bits come from `external_attr`. `max_mb` / `max_files` apply per picked skill,
+  so a multi-skill "Download ZIP" of a repository fits. Origin `zip`, `source = {filename, subdir?}`.
+- Git (`parse_git_source(text) -> GitSource(url, ref, subdir, shown, scheme)`, pure): `https://`, `ssh://`,
+  scp-like `user@host:path` and `file://`; plain `http://`, `transport::` remote helpers, a leading `-`, spaces, a
+  user or host starting with `-` and invalid hosts are refused. `URL#ref:subdir`, `URL#ref`, `URL#:subdir`; GitHub
+  `/tree/<ref>/<sub>` and `/blob/<ref>/<sub>/SKILL.md` and GitLab `/-/tree/` / `/-/blob/` become the repository URL,
+  the ref and the folder (a ref with `/` in a tree URL cannot be told from the path: `URL#ref:path`). Refs match
+  `[A-Za-z0-9][A-Za-z0-9._/-]*`, ≤ 200 characters, without `..`, `@{`, `//` or a trailing `/`, `.` or `.lock`;
+  folders are plain relative POSIX paths (no `\`, `:`, `..`, `.` or empty parts) and are checked again after the
+  checkout (inside the clone, no link on the way). **Credentials**: `shown` has no user info (except the bare user of
+  ssh / scp URLs), no query and no fragment; it is the only form stored (`source.url`), shown, logged or put into an
+  error; `redact(text, src)` removes the full URL, the user info (git prints it without the scheme too) and any
+  `//user:secret@` from git's output. A credential helper is recommended over a token in the URL.
+- `clone(src, dest, limits, git=None, timeout=120)` (a dedicated helper, not `run_git`): no git → 400 "git is not
+  installed: …"; `-c` options before the subcommand: `credential.interactive=never`, `core.symlinks=false`,
+  `core.longpaths=true`, `protocol.allow=never` with `https` and `ssh` allowed (`file` only for a `file://` URL: a
+  user `url.<base>.insteadOf` can never reach a remote helper), `core.hooksPath=<staging>/nohooks` (an empty folder:
+  no global or system hook runs), `submodule.recurse=false`, `fetch.recurseSubmodules=false`. With git ≥ 2.35:
+  `clone --depth 1 --single-branch --no-tags --filter=blob:none --no-checkout [--branch=<ref>] -- URL DEST`, then
+  `sparse-checkout set --no-cone -- /<subdir>/` (or `/*`) and `checkout` (only the folder's blobs are fetched; a
+  server without filter support falls back to a full shallow clone); older git: a plain shallow clone. The
+  environment (`clone_env`): `git_env()`, `GCM_INTERACTIVE=never`, `GIT_LFS_SKIP_SMUDGE=1`, the user's
+  `GIT_SSH_COMMAND` / `GIT_SSH` / `GIT_SSH_VARIANT` put back, and `GIT_SSH_COMMAND="ssh -o BatchMode=yes"` when the
+  user has neither those nor a `core.sshCommand` (a host-key question or a passphrase fails at once). stdin is
+  closed, and on POSIX git runs in a new session (no controlling tty for ssh to read). A watchdog sums the staging
+  folder every half second and kills git (`shell.kill_tree`) past `max_archive_mb` (413 "point the URL at the
+  skill's folder") or the timeout. The user's git configuration is only read, nothing is ever written. Errors give
+  the first `fatal:` line, redacted: "Could not clone <shown>: …". `rev-parse HEAD` gives `commit`. Origin `git`,
+  `source = {url: shown, ref, subdir, commit}`.
+- Claude Code (`claude_skills(config, workspace=None) -> [item]`, `[]` when `[skills] claude` is false): one level
+  of folders in each Claude Code skills folder (links skipped); an item is `{name, description, origin, path, files,
+  size, digest, manual, renamed_from?, library: "absent"|"same"|"different", agent_writable? (claude-project),
+  error?}`; names and descriptions are normalised with `strict=False`, so existing Claude Code skills are attachable.
+  "Add to library" is `{"claude": name, "origin": …}` (origin `claude-user` / `claude-project`, `source = {path}`).
+  SKILL.md files written for Claude Code may name its tools or `${CLAUDE_SKILL_DIR}`: they are copied unchanged.
+- Requests (`import_request(config, body, workspace=None, *, by, via)`): exactly one of `path`, `zip`, `git`,
+  `claude` (or `host`), else 400 "Give exactly one of path, zip, git, claude."; `pick` a list of strings, `replace`
+  a bool; a `workspace` for `claude-project` must be absolute. `read_import_body(request, config)` reads a JSON
+  body capped by `body_limit(config)` (the base64 of `max_archive_mb` plus 64 KB; 413 from Content-Length or while
+  streaming, 415 when not JSON). `SkillError(message, status, **extra)` maps to the HTTP status; `to_json()` is
+  `{"error", **extra}`.
+- Previews (what the user sees before attaching): `show_folder(folder, limits) -> {files_list, skill_md, deps}`
+  (`deps: {}` and `error` when it cannot be read); `deps_preview(folder) -> {"python"?: {files, packages,
+  unsupported?}, "node"?: {files, packages, lock, unsupported?, ignored?}}` (`skill_deps.detect`: files read, no tool
+  probed, nothing started; `{}` without manifests or when they cannot be read); `install_info(config) -> {enabled,
+  proposals, scripts}` (`[skills] install`, `install_proposals`, `install_scripts`), which the skills routes add as
+  `install` so a preview can say whether the packages would be installed.
+
+**The session's skills** (swarm_skills.py; `Swarm.skills: SessionSkills`). A skill attached to a session is
+visible to all its members. No database table: the authoritative copies are `<data_dir>/attached-skills/<name>/`
+(`skills_dir`; not `skills/`, since for a project in the home folder the data dir is `~/.dreamteam`, whose `skills/`
+is the default library; outside every workspace, so never committed; they survive `/cd` moves and are deleted with
+the session), each with the session's `.dreamteam.json` = `{name, description, digest, files, size, from: library | claude-user | claude-project
+| host-library | agent, source (the library entry's source plus its "origin", or {path}), attached_by,
+attached_at, updated_at, owner (from = agent), attached_via: user | role:<Role> | create | proposal, manual,
+library: none | pending | saved | rejected, comment, decided_while_stopped}`. `read_session_skills(data_dir, library_dir=None)`
+lists them without a Swarm (a stopped session); a folder without valid metadata is left out. `library_clash(data_dir,
+library_dir)`: the session's folder is the library, or inside it or contains it (a `library_dir` set to it); then
+nothing is read from it, `load()` cleans nothing there, and attach and detach are 409.
+- `SessionSkills`: `load()` (in `Swarm.__init__` and `start()`; `.t-*` / `.o-*` leftovers cleaned), `list()`,
+  `get(name)`, `names()`, `pending()`, `public()` (the snapshot's `skills`, §14.1, from memory), `shown_path(name) ->
+  (text, inside)`, `agent_dir()` (`DREAMTEAM_SKILLS` of the agents' shells), `role_skills(member)` (the names its
+  catalog role lists, resolved live), `source_digest(skill)` (its own source's digest now: the library entry for
+  `library`, the folder at `source.path` for Claude Code, the host library; None when gone or for `agent`),
+  `detached()`, `proposed()`, `hire_report(name)`.
+- `async attach(actor, ref, *, replace=False, announce=True, attached_via="user", via="act", exclude=()) -> (SessionSkill,
+  "attached" | "updated" | "unchanged")`: only USER (ToolError "Only the user can attach skills to the swarm.");
+  the reference is resolved with `resolve_ref` against the session's workspace (`claude-project` only when named);
+  under the lock: the same name with the same digest is "unchanged", other content is ToolError 409 unless
+  `replace`, a new name past `[skills] max_attached` is 409; `copy_skill` into `<data_dir>/attached-skills/` with the
+  metadata, then its script dependencies planned in a daemon thread and held in use ("Script dependencies" below),
+  the mirror sync, `skill.attached`, the name leaves kv `skills_detached`, (`announce`) `n_skill_added` /
+  `n_skill_updated` to the members but `exclude`, and last `ensure_deps([name])`, which only starts the builds.
+- `async attach_source(actor, source, *, pick=None, replace=False, via="act") -> ImportReport + {"attached": [{name,
+  status, files}], "failed": [{name, error, status}]}`: a folder or .zip path on the hub's machine, or a Git URL
+  (`source_spec`: `scheme://` or `user@host:path` is Git), imported into the library (`import_source`, `by` user),
+  then each imported skill attached as `library:<name>`; one attach refused (the cap, a clash) leaves the others
+  attached and is listed in `failed` (it stays in the library); `skill_attach` reports both and is an error only
+  when nothing was attached. With `need_pick` nothing changes.
+- `async detach(actor, name, *, via="act") -> SessionSkill`: only USER; 404 when not attached; the session copy is
+  renamed away and removed, its environments leave the session's in-use set (they stay for other sessions and
+  cleanup), the mirror synced, `skill.detached`, the name added to kv `skills_detached` (a role never attaches it
+  again until the user does), `n_skill_removed` to the members.
+- Errors are ToolErrors carrying `status` (and `extra`, e.g. `exists`) for REST callers (`skill_error`).
+- `attach_files(data_dir, folder, name, frm, source, limits, *, info=None, attached_via="create", library_dir=None)
+  -> (SessionSkill, "attached" | "unchanged")` (module function, no Swarm): a checked folder copied into a session
+  being created or a stopped one about to start (`SessionManager`, §17.2); the same digest is "unchanged", other
+  content 409 (`exists`), a `library_clash` 409; the caller checks `max_attached`. `attached_again(names)` takes such
+  names out of kv `skills_detached` once the Swarm runs.
+
+**The mirror** `<workspace>/.scratch/_skills/<name>/` (`workspace.SKILLS_MIRROR`) is what agents read: `read_file`
+cannot leave the workspace, and a link would be refused, so it is a real copy (`copy_skill(..., readonly=True)`:
+files 0o444 / 0o555, the read-only attribute on Windows; no `.dreamteam.json`). Its expected state lives only in
+memory (`_mirror`: name -> (session copy digest, the mirror copy's listing as it was written, from copy_skill's
+manifest)); nothing in the mirror is trusted. A sync (in a thread, under the skills lock and a files lock that the
+removal at stop shares) runs `ensure_scratch()`; when `scratch_is_local(root)` it rebuilds a copy when asked for a
+full sync, when it is missing or a link, when the session copy's digest changed, or when `_listing` of it differs
+(every entry with its kind, size and mtime: unlike the skill walk, the skip-list's names such as `node_modules/` or
+`.git` and links count too, and the walk stops past the expected number of entries) (each rebuild is copy_skill's
+build-and-swap, so a reader never sees half a skill), and removes everything else there (detached skills, folders a
+command put there). A removal Windows refuses (a process holding a file there or using
+it as its working directory) does not fail the caller: the name goes into `_pending_removal`, is left out of the
+index and retried by every later sync. Syncs: full at every `Swarm.start`, on every attach and detach, and from the
+scheduler at most every `SKILLS_CHECK_SECONDS` (60 s), so a tampered mirror is repaired within a minute and at every
+start. `write_file` / `edit_file` refuse the mirror (§7). The listing leaves out the places of DreamTeam's own
+`node_modules` links, which are checked by themselves ("Script dependencies"). Without a local `.scratch` there is
+no mirror and agents are shown the session copy's absolute path with `skills_path_outside` ("read it with `shell`");
+the Node link then goes into the session copy. In an adopted folder
+`Swarm.stop` removes `.scratch/_skills` after the agents stopped; a session's own folder keeps it (it is rebuilt at
+start anyway).
+
+**Delivery to agents.** The system prompt is frozen at hire and the tool array until a compaction, so running agents
+learn through texts: new members' system prompts have a generic **Skills** bullet (no concrete names) and item 1 of
+"How you work" says the wake-up shows the skills. The **Skills index** (§6.3): `skills_index` (with
+`skills_index_own` when the member's role lists an attached skill) followed by one `skills_item` line per skill
+(`- name{own}: description → path{deps}`): the member's role skills first, then the rest, by name; `own` is `skills_own`
+(" (your role's)") for its role's skills plus `skills_manual` for a `disable-model-invocation` skill; the description
+is cut to 300 characters and `<` / `>` become ‹ ›; the path is `shown_path`; `deps` is the dependency fragment
+(`deps_fragment`, "Script dependencies"), "" for a skill without manifests. The header tells how to use a skill
+written for Claude Code (its tool names mapped to `shell`, `read_file`, `write_file`, `edit_file`;
+`${CLAUDE_SKILL_DIR}` = the folder shown) and what a line's packages part means (a named Python runs that skill's
+scripts, install nothing into it; linked Node packages are found, run no npm install or npm ci in the skill's
+folder; a line without one lists none: install what SKILL.md asks for with `shell`, best in the scratch folder). It
+is shown in full once per agent memory (`Swarm._skills_shown`), then
+as `skills_names` (`names_line`); `AgentRuntime._replace_with_summary` puts the full index into the compaction text
+(after the notes) and sets `skills_shown(name, True)`, or None when there is none. Notifications
+(`SessionSkills._announce(key, exclude, *, name, description=None, owner=None)`: every non-retired member but
+`exclude`, AI agents with `wake=False`, external members with a wake so `wait_for_events` returns; `path` and
+`deps` per recipient): `n_skill_added` {name, description, path, deps} on an attach, `n_skill_updated` on a replace,
+`n_skill_removed` {name} on a detach, `n_skill_deps_ready` / `n_skill_deps_failed` {name, deps} when a build this
+session waited for ends. External members have no wake-up index: `join_swarm` lists the attached skills
+(also on a rejoin, "Welcome back"; it adds that `skill_propose` proposes one) and `swarm_status` gives "Skills: N attached (a, b)" (with the item lines for a
+member, not with `brief`; "; packages being installed for 1 (pdf)" / "; packages failed for 1 (pdf)" when that
+applies); `agents` ends with
+"Skills attached to the swarm: a, b (the wake-up lists them; read their SKILL.md with read_file)." The user's tools:
+`skills` (the attached list with source, who, description, path and "source changed" / "source gone" against
+`source_digest`, and a `packages: python ready; node manual (...)` line; `available=true` adds the library's, the
+host library's and Claude Code's skills not attached), `skill_attach` (name or source; its result ends with " Its
+packages (requirements.txt) are being installed; members are told when they are ready." or " Its packages are
+installed already."), `skill_detach`, `skill_reinstall` (§12).
+
+**Proposals** (`skill_propose(path)`, audience llm and external: an LLM tool of frozen revision 3, so new members
+and external members have it at once and older agents after their next compaction, whose `tools_added` names it;
+the system prompt's Skills bullet ends with the proposing sentence, which agents hired before revision 3 never got).
+`SessionSkills.propose(actor, path)`: not the user ("Members propose skills; the user attaches them with
+skill_attach."); `[skills] max_proposals = 0` → "Proposing skills is turned off in this swarm's settings."; the path
+goes through `Workspace.resolve` (inside the workspace, never `.git`), a `SKILL.md` file means its folder, and a
+folder under `.scratch/_skills/` is refused ("That is the swarm's copy of an attached skill. Copy the folder
+(without node_modules) into your scratch folder, edit it there, and propose that copy."); `check_skill_dir(strict=True)`
+(the name as written,
+no tag-like description), its error followed by " Fix SKILL.md and call skill_propose again.". Names (ToolError 409,
+with a suggested free name: `<name>-<the proposer's first name, slugged>`, then `<name>-2`, ...): a name attached by
+the user, a role or another member → "A skill named 'x' is already attached; choose another name, e.g. 'x-ann'.";
+a name the library or the host library has, or a catalog role lists, unless it is the proposer's own attached
+proposal → "The skills library already has a skill named 'x' (or a role lists it); choose another name, e.g.
+'x-ann'." (a later role attach would take the draft for the role's skill, and the approval would clash). Count: kv
+`skills_proposed` holds every name members proposed in the session (detached ones too); a new name past
+`max_proposals` is 409; proposing one's own name again replaces it and counts once; a new name past `max_attached`
+is 409. The same content as the attached copy changes nothing ("Your skill "x" is unchanged ...") while the
+session copy still holds it (else it is copied again, as a replacement). Otherwise, under
+the lock, `copy_skill(strict=True)` into the session folder with `from = agent`, `owner = attached_by = actor`,
+`attached_via = proposal`, `library = pending`, `source = {path: workspace-relative}`; then its dependencies planned
+(trust class `agent`), the mirror sync, and after
+it, also when that await is cancelled (as `mcp_create`, no silent proposal): `skill.proposed`, `n_skill_shared`
+{owner, name, description, path} to every other member (`n_skill_updated` for a replacement), `u_skill_proposed`
+{owner, name, description without its final period, files, installs: `u_skill_installs` when its packages are
+installed automatically, else ""} to the user; then `ensure_deps([name])`. The result: `Skill "x" is attached to the swarm (4 files, 12 KB) and every member sees it at
+.scratch/_skills/x/SKILL.md. The user was asked whether to save it to the skills library; you are told the answer.
+Edit it by proposing the same name again.` (a replacement: `Your skill "x" was replaced by the new version ...; ...
+The user was asked again ...`), plus the links left out, plus " Its packages (requirements.txt) are being
+installed; you are told when they are ready." (an AI member, whom the quiet news does not wake: "...; a later
+wake-up of yours says when they are ready (the install does not wake you).") or " Its requirements.txt is not
+installed automatically: <reason>.".
+
+**The user's decision** (`skill_approve {name, approve, comment?, replace?}`, user only; `SessionSkills.decide(actor,
+name, approve, *, comment="", replace=False, via="act") -> str`): only USER; `check_name`; the skill must be
+attached (404) and `library == "pending"` (409 "Skill 'x' is not waiting for a library decision (status:
+saved)."). The file part is `decide_files(data_dir, library, name, approve, *, comment="", replace=False,
+via="stopped-session", project="", session=None, stopped=True) -> (SessionSkill, text)`, a plain function over a data
+dir, so a stopped session's proposal can be decided without a Swarm.
+approve: the session copy is checked again and must still have the digest recorded at the proposal (an agent's
+shell can write into the session folder): else 409 "Skill 'x' changed since it was proposed, so it is not saved.
+Detach it, or ask its owner to propose it again." and nothing changes; then `Library.add(<session copy>, "agent",
+source={owner, project, session, swarm}, replace, by="user", via, info=<that check>)` (copy_skill refuses bytes that
+differ from it);
+another skill of that name in the library is 409 "The library already has a different skill 'x'. Approve with
+replace to overwrite it, or reject." (`exists`); the result `Skill "x" saved to the skills library.`. A "no" keeps
+it attached to this session only: `Skill "x" will not be saved to the library; it stays attached to this swarm
+(detach it to remove it).`. The session metadata gets `library` saved / rejected, `comment` (whitespace collapsed,
+at most 2000 characters) and `decided_while_stopped` (`stopped`). A running swarm then emits `skill.library` and
+tells the owner (`n_skill_saved` {name} / `n_skill_not_saved` {name, comment: " <comment>" or ""}, a wake) unless it is the user or
+has left; a decision on a stopped session's files is told quietly by the next `SessionSkills.start`, once (the
+flag is cleared). There is no switch to skip the decision: saving to the library always takes the user's yes. A
+proposal the user detaches is discarded.
+
+**Role skills.** A `[[roles]]` entry may list `skills` (§17.3). `SessionSkills.ensure_role_skills(names=None, *,
+announce=True) -> {"attached": [names], "missing": {role: [names]}, "detached": {role: [names]}, "over_cap": {role:
+[names]}}` takes the given members (default: all), each role once: names already attached are skipped, names in kv
+`skills_detached` go to `detached` (the user's detach stands), a name past `max_attached` to `over_cap`, the rest
+are attached as bare names (the library, `claude-user`, the host library; never the workspace's
+`.claude/skills`) with actor USER, `attached_via = "role:<canonical role name>"`, `via = "role"`, the given members
+not told; a name nothing has goes to `missing`. The user is told once per (role, names) in memory:
+`u_role_skills_missing` {role, names}, `u_role_skills_over_cap` {role, names, max}. It never raises (a hire or a
+start goes on; failures are logged). Callers: `Swarm.hire` (the new member), `Swarm.start` (everybody,
+`announce=False`) and `Swarm.reconfigure` (the background task, §3). `hire_agent` appends ` They also got the skills
+of their role: a, b.` (the role's skills attached now), ` Not found in the skills library (the user was told): c.`,
+` Detached by the user, so not attached: d.` and ` Not attached, the swarm has the maximum of 40 skills: e.`;
+`agents` shows a role's skills in its catalog line (`- Tester (model x; skills: a, b): …`). Marks are resolved live
+(`role_skills`): skills a role brought stay attached when the role stops listing them, without the "your role's"
+mark, until the user detaches them; the snapshot's `roles` lists the catalog roles that list a skill.
+
+**Docker sandbox** (§18.3): the hub runs in the agents' container and agents have `shell`, so the host library is
+mounted read-only at `/dreamteam/host-skills` (`DREAMTEAM_HOST_SKILLS_DIR`; `host_skills(config)` lists it as the
+read-only source `host-library`, attachable, never written), and the sandbox's own writable library is
+`/swarm/.dreamteam/skills-library` (`DREAMTEAM_SKILLS_DIR`), i.e. `<home>/.dreamteam/skills-library` on the host,
+which the host never reads by itself (import that folder on the host to keep a sandbox skill). It is not
+`.dreamteam/skills`, the default library's name: for a home that is the user's home folder that would be the host's
+own library, writable from the container. A host library inside the mounted directory would be writable through `/swarm`, so
+`run_sandbox` warns about it. `~/.claude/skills` is not mounted (it
+would expose all of the user's personal skills); add a Claude Code skill to the host library first. In the sandbox,
+folder paths are container paths: the zip upload is the portable source. The pages say both when the listing's
+`sandbox` is true: the add form's folder field gets a hint (`sk_folder_sandbox`; skills.js `setSandbox` shows it in
+a form mounted before the listing came) and the home Skills tab's Claude Code section says to add such a skill to
+the library of a DreamTeam run on the host (`sk_claude_sandbox`). (The MCP library is not mounted into the
+sandbox at all; it stays container-local.) The sandbox's skill environments are a named volume per home (§18.3).
+
+**Script dependencies** (skill_deps.py). A skill's `requirements.txt` / `pyproject.toml` (Python) or `package.json`
+(Node) is installed automatically into an environment of its own, one per skill and dependency set, shared by every
+session that attaches the same skill with the same manifests; without one, agents install what SKILL.md asks for
+themselves (the index header says so). SKILL.md prose is never parsed.
+- **Detection** (`detect(folder) -> Detected(python: PyManifest | None, node: NodeManifest | None)`, pure). Fixed
+  places: `requirements.txt`, `pyproject.toml`, `scripts/requirements.txt`, `scripts/pyproject.toml` (every one found
+  goes into one venv, in that order: `-r` each, a pyproject as a generated `pyproject-deps-<n>.txt` of its
+  `[project].dependencies`), `package.json` then `scripts/package.json` (the first one; the other and a lone
+  `yarn.lock` / `pnpm-lock.yaml` are `ignored`) with `npm-shrinkwrap.json` or `package-lock.json` beside it. A
+  manifest is a regular file (never a link), at most 256 KiB (a lock 8 MiB), UTF-8; an empty dependency list means
+  none. A skill's own `node_modules`, `.venv`, `venv` never reach the session copy (skip list). Requirement lines
+  (`parse_requirements`: continuations joined, comments dropped; `-r` / `-c` includes inside the skill, at most 5
+  deep, their bytes in the key): requirements with extras, specifiers and markers, `name @ https://…` and
+  `git+https://`, `--hash`, `--pre`, `--prefer-binary`, `--only-binary`, `--require-hashes` are kept; refused, so
+  the agent installs by hand (`unsupported`, a text naming the file, the line and the rule, without parentheses):
+  `-e`, local paths, `file:`, every index option (`-i`, `--extra-index-url`, `-f`, `--trusted-host`, `--no-index`: a
+  skill never chooses the index), any other option, `${…}`, `http://`, credentials in a URL, more than 1000 lines.
+  Hashes are all or nothing: when one line or file uses them, every requirement must be pinned with `==` and hashed,
+  and no pyproject may take part. `parse_pyproject` reads only `[project].dependencies` and `requires-python`
+  (`dynamic` dependencies and Poetry / PDM tables are unsupported; optional dependencies ignored); the key covers the
+  canonical JSON of those two, not the file. `python_satisfies(spec, version)` checks `requires-python` against the
+  environments' Python (`>=`, `>`, `<=`, `<`, `==`, `!=`, `~=`, `==X.*`; an unknown specifier is ignored).
+  `parse_package_json`: `dependencies`, `optionalDependencies`, `overrides` (with a lock also `devDependencies` and
+  `peerDependencies`, which `npm ci` compares); a spec is kept only when it is a semver range or tag, an `npm:` alias
+  (its own spec checked too), an `https://` tarball, a `git+https://` or `github:` spec, or a hosted `user/repo`
+  shorthand; refused: `workspaces`, `file:`, `link:`, `workspace:`, `portal:`, local paths, `http://`, credentials and
+  every other scheme (`git:`, `ssh:`, `git+ssh:`, ...). The env always gets a generated `package.json` (no `scripts`,
+  `bin` or the like: the skill's own lifecycle scripts never run); `check_lock` wants lockfileVersion 2 or 3, no
+  `link: true`, every `resolved` https.
+- **Environments** under `Config.skill_envs_dir` (`~/.dreamteam/skill-envs`): `<skill[:24]>-py-<key12>` /
+  `…-js-<key12>` (`env_dirname`, `DIRNAME_RE`). `env_key` hashes the skill name, the ecosystem, the trust class, the
+  manifests' material and the tool: Python's implementation, minor version, platform, cache tag, ABI flags, base
+  interpreter path, C library and Linux distribution (`os_marker`), or Node's major version, ABI, platform and arch.
+  Not the installer, the index configuration or the skill's other files (editing a script reinstalls nothing).
+  Trust class (`trust_class(from)`): `user` for `library`, `claude-user`, `host-library`; `agent` for `agent` and
+  `claude-project` (agent-writable origins): the two never share an environment, both are shared across sessions.
+  Layout: `env.json`, `src/` (the manifests, the generated files), `venv/` or `package.json` + lock +
+  `node_modules/`, `views/<owner12>/node_modules` (Node), `install.log` (redacted, at most 2 MiB), `failed.json`,
+  `ok` (written last: "ready"), `used` (mtime = last use); `.locks/`, `.cache/`, `.trash-*` are reserved.
+- **Tools** (`INSTALLERS`, a `RealInstallers`; tests replace it): Python is `[skills] python` (default the base
+  interpreter DreamTeam runs on), probed once per process (`probe_python`, `-I -c`; a probe that failed is run again
+  after 5 minutes, or at once by `skill_reinstall`, which also plans an `unavailable` skill again); the installer is
+  uv when there is one (`uv venv --python <interp> venv`, then `uv pip install --python <venv python>
+  [--require-hashes] -r …`),
+  else the interpreter's pip ≥ 22.3 (`-m venv --without-pip`, then `-m pip --python <venv python> install`), else a
+  venv's ensurepip; none: unavailable. Node: the real `node` binary behind any shim (`process.execPath`; on Windows
+  only `node.exe`), npm run as `node npm-cli.js` (never `npm.cmd`), `npm ci` with a lock else `npm install`, both
+  with `--omit=dev --no-audit --no-fund` and `--ignore-scripts` unless `install_scripts`. Commands run with cwd =
+  the env folder, as contained process trees (`ProcessTree`), the venv step 120 s and the install `install_timeout`
+  (then killed: "timed out after 900 s"), in `installer_env(config, trust)`: `scrubbed_env`, plus `install_env` for
+  the `user` class only, without `VIRTUAL_ENV`, `PYTHONHOME`, `PYTHONPATH`, `PIP_USER`, `UV_PYTHON` and the like,
+  with `PIP_NO_INPUT`, `PYTHONNOUSERSITE`, `UV_NO_PROGRESS`; the user's own pip / uv / npm configuration applies.
+  On Windows with long paths off, a venv holding a path of 260 characters or more fails with a text saying so.
+- **The manager** (`EnvManager.for_config(config)`, one per process and root): `plan(folder, skill, trust,
+  settings, *, config, proposal) -> [EnvSpec | state]` (blocking, a daemon thread; a state for off, unsupported,
+  unavailable), `peek(spec, owner) -> state` (never blocks: memory, then stats; a ready env is verified at most
+  once a minute: the venv's python and every installed dist-info, or npm's hidden lockfile and every dependency's
+  folder; one that fails is broken, shown as installing and rebuilt), `ensure(spec, *, owner, force) ->
+  Future[state]` (one build per env in the process, joined by later callers), `use(owner, dirnames)`,
+  `exclusive(dirname, requester)`, `check_reinstall`, `view(spec, owner)` / `view_ok`, `touch`, `cleanup(days)`,
+  `log_tail`, `subscribe(fn) -> unsubscribe` (published on the subscriber's loop with a phase: queued, waiting,
+  started, done). A build takes the OS build lock `.locks/<dirname>.lock` first (another process's build is waited
+  for, as `installing, other_process`, holding no slot, at most `install_timeout + 120` s, then a failure kept in
+  memory), then decides: ready (reused), failed less than an hour ago (not retried; a reinstall is), failed or half
+  built (removed and rebuilt), broken (rebuilt for everyone), ready with `force` (the reinstall: refused 409 while
+  another session uses it); then one of `INSTALL_PARALLEL = 2` slots (`installing, queued` meanwhile), the manifests
+  copied (the bytes must be the key's), the commands, the checks, and `ok` last. A failure writes `failed.json`
+  (`error` = the first `ERROR` / `error:` / `npm ERR!` line or the last one, redacted, prefixed by the installer);
+  an exception outside the commands (env.json or the log cannot be written: a full disk, a lock, a long path) is a
+  failure too (`OSError: …`), and one whose `failed.json` cannot be written is kept in memory (the half-built folder
+  alone would read as installing). A build that raises before that (a reinstall's exclusive lock refused) publishes
+  the env's real state as its end (still ready, an older failure, else a failure in memory) before the caller gets
+  the error, so no subscriber keeps waiting. While this process takes or holds an env's use lock exclusively, its own
+  shared takes (a peek, `use`) wait: taking one back would make that exclusive lock fail.
+  **In use**: every process holds a shared OS lock (`LockFileEx` / `flock`) on `.locks/<dirname>.use` while one of
+  its sessions has the env attached (taken before the first peek); a reinstall of a ready env, a removal and cleanup
+  take it exclusively: "The environment of skill "x" is used by N other running session(s); stop them, or
+  reinstall from there." / "... is used by another DreamTeam process; ...". A rename is no in-use test (Windows
+  renames a venv whose python runs).
+- **Per session** (`SessionSkills`): the plan of each attached skill is cached by (digest, `settings_hash`) and made
+  in a daemon thread at `start()` (every skill; then `use`, and the views of ready Node envs), on every attach and
+  proposal; `ensure_deps(names=None, *, force, ecosystem)` starts the builds in the background (at every start and
+  after each attach); `deps(name)` (the snapshot's `deps`) and `deps_fragment(name, lang, shell=None)`: `skills_deps_python`
+  {python: the venv's python written for the swarm's shell (`shell_ready`: bare or `& '…'` in PowerShell, always
+  quoted for cmd, `shlex.quote` elsewhere; never in backticks), files, extra: `skills_deps_bin` {names, bin} for the
+  commands its packages installed, `skills_deps_own` when a pyproject is among the files}, `skills_deps_node`
+  (linked) or `skills_deps_node_path` (the link could not be made), `skills_deps_installing` (an external member,
+  whom the end wakes: "you are told when they are ready") or, with `quiet` (the default; an AI member, `item_lines`
+  and `_announce` pick it by kind), `skills_deps_installing_quiet` (a later wake-up says so: the install does not
+  wake it), `skills_deps_failed`
+  {files, error, log} and `skills_deps_manual` {files, reason: `deps_reason_off` / `_proposals` / `_unavailable`
+  {detail} / `_python` {need, have} / `_unsupported` {detail}}. The subscription emits `skill.deps` and, when a build
+  ends that this session saw as installing (or an env it saw as failed turns out ready: another process built it, a
+  retry succeeded), `n_skill_deps_ready` / `n_skill_deps_failed` to the members (quiet for AI
+  agents, a wake for external ones) and `u_skill_deps_failed` {name, files, error, log} to the user. Node: when its
+  env is ready the session's view is made (a hardlink farm of the env's `node_modules`, a copy where the file system
+  has no hardlinks; reused while it matches the env's `ok`) and the mirror copy gets a `node_modules` link to it at
+  its package.json's folder (made after the copy's swap; checked by every sync: a missing, dangling or re-pointed
+  link is made again, a view an agent's command emptied rebuilt, a real folder in its place — an agent's own npm
+  install — left alone until the next full rebuild); an agent's `npm ci` or `rm -rf node_modules/` through the link
+  reaches only that view. A view that cannot be made shows as failed ("this session's view of its node_modules could
+  not be made: …"; the members are told) and is tried again by the minute check: an agent is never pointed at the
+  shared env itself. `reinstall(actor, name, ecosystem=None)` (`skill_reinstall`, user only): "Reinstalling the
+  packages of skill "x" (requirements.txt); members are told when they are ready.", "... are being installed
+  already; ...", "No skill "x" is attached to this swarm." (404), "Skill "x" has no requirements.txt,
+  pyproject.toml or package.json.", "Skill "x" has no Python packages (requirements.txt or pyproject.toml)." / "...
+  no Node packages (package.json).", "Skill "x": its packages are not installed automatically (<reason>).", the 409
+  texts above. `touch_envs()` (hourly from the scheduler) refreshes the `used` stamps, rebuilds broken envs,
+  retries failures older than an hour and builds an env that reads as installing while nothing in this process
+  builds it (`ensure`: another process's build is waited for); `stop_deps()` at `Swarm.stop`.
+- **Cleanup** (`EnvManager.cleanup(retention_days) -> {"removed": [dirname], "kept": [{dirname, why: in use | being
+  built}]}`): envs whose `used` is older than `env_retention_days` (0: none by age), failed or half-built ones older
+  than a day, views unused for a day, trash older than an hour; never an env whose use lock any process holds or
+  whose build lock is held; `ok` goes first, then the folder is renamed away (a refused rename puts `ok` back).
+  A standalone `dreamteam run` runs it once, 60 s after the start, in a daemon thread; the launcher 60 s after its
+  start and then daily (`ENV_CLEANUP_DELAY`, `ENV_CLEANUP_EVERY`, §18.1), and at once on `POST
+  /api/skill-envs/cleanup` (the home page's button, the console's and the TUI's `/skills clean-envs`). The user's run
+  is `cleanup(…, every_unused=True)`: every env no session uses now goes, whatever its age and also with
+  `env_retention_days = 0` (which only turns the automatic runs off); the in-use and being-built ones are kept and
+  reported.
+- **Trust model**: Installing a skill's dependencies runs code from the packages it lists (Python build backends of
+  source packages; npm install scripts of its dependencies only when `install_scripts` is on) with DreamTeam's
+  rights, which outside the Docker sandbox are the user's. It happens only for skills attached to a session — by the
+  user, by a role in the user's catalog, or by a member's proposal. Packages come from the indexes the user
+  configured, or from https and git URLs the skill names directly (including the resolved URLs of its npm
+  lockfile); a skill cannot add or replace an index, or name a local path or an environment variable. Skills a
+  member proposed, or taken from the workspace's agent-writable `.claude/skills`, install into environments kept
+  apart from the user's own skills and never get `install_env`. A non-sandboxed agent can still write
+  `~/.dreamteam/skill-envs` directly, as it can write the skills library: environments are a convenience, not a
+  security boundary. Logs, errors and the recorded commands are redacted (URL credentials, the values of
+  `install_env` and of the index variables).
+- **Not in v1**: Poetry, PDM, `[dependency-groups]` and optional dependencies; PEP 723 inline metadata; conda,
+  Pipfile, pnpm and yarn; installing the skill itself (`pip install .`); local paths, `-e` and indexes a skill names;
+  one environment for several skills; a skill's venv or `.bin` on agents' `PATH` (the index names the folders);
+  settings for the installer, `node` and `npm`; a per-environment list, removing one environment, launcher MCP
+  actions for them, a size cap; Node in the Docker image.
+
+**Security.** "Only the user attaches, imports, deletes and saves to the library" is a user-interface convention,
+not a security boundary, as `mcp_approve` is: the hub has no authentication (GuardMiddleware stops browsers on
+other sites, not local processes), and without the sandbox agents run as the user and can write
+`~/.dreamteam/skills` directly. What DreamTeam does: the sandbox mounts the host library read-only; library entries
+changed outside DreamTeam are flagged (`changed_outside`); a hub MCP client cannot save to the library a proposal of
+a member it acts as, nor one of any external member when nothing names the client (§13); the library gets only
+the content that was proposed (the digest is checked again); every library change records `by` and `via`, and every
+attach the surface it came through (`skill.attached` `via`); agents' shells never get `DREAMTEAM_SKILLS_DIR`,
+`DREAMTEAM_HOST_SKILLS_DIR` or `DREAMTEAM_SKILL_ENVS_DIR` (§7);
+`<workspace>/.claude/skills` is never used implicitly; Git URLs are hardened and redacted; zips and folders are
+checked as above; sizes are capped per skill (`max_mb`, `max_files`), per archive or checkout (`max_archive_mb`) and
+for SKILL.md (100 KB). A per-launch hub token, which would make "only the user" a real boundary, is out of scope.
+
+**Not in v1**: Claude Code plugin skills; automatic updates of library skills from their Git source (the recorded
+`commit` makes a later check possible); per-role visibility; mounting the MCP library or `~/.claude/skills` into the
+sandbox; rendered Markdown on the home page; refs given as commit SHAs (`--branch` takes branches and tags only).

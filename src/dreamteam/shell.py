@@ -36,6 +36,10 @@ _KNOWN_SECRETS = {
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
     "GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
 }
+# DreamTeam's own settings that must not point agents' commands at the skills library or the skills' shared
+# environments (docs/SPEC.md §19): dropped even when shell.pass_env names them. (DREAMTEAM_SKILLS, the folder of the
+# swarm's skills, is set for the shell.)
+_INTERNAL_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR"})
 
 POWERSHELL_UTF8 = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                    "$OutputEncoding = [System.Text.Encoding]::UTF8; ")
@@ -55,7 +59,8 @@ JOB_BREAKAWAY = False
 
 
 def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[str, str]:
-    """Environment for agent processes: everything except secrets, unless whitelisted in shell.pass_env."""
+    """Environment for agent processes: everything except secrets, unless whitelisted in shell.pass_env, and never
+    DreamTeam's skills variables (_INTERNAL_ENV)."""
     allowed = set(config.shell.pass_env)
     secret_names = set(_KNOWN_SECRETS)
     for profile in config.models.values():
@@ -63,6 +68,8 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
             secret_names.add(profile.api_key_env)
     env: dict[str, str] = {}
     for key, value in os.environ.items():
+        if key.upper() in _INTERNAL_ENV:
+            continue
         if key in allowed:
             env[key] = value
             continue

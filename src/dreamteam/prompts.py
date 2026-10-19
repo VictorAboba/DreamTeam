@@ -23,9 +23,10 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 - **MCP tools**: a reusable capability the swarm lacks (an API client, a parser, a converter...) can be built as an MCP server with `mcp_create` and used through `mcp_tools` and `mcp_call`. Check `mcp_list` first: it may exist already, also from earlier runs. For a one-off job `shell` is enough.
 - **Team**: `agents` shows the roster and the role catalog. `hire_agent` adds a member (at most {max_agents} AI agents, not counting members who joined through MCP; the money budget is shared): pick a catalog role by name (the member gets its description and model profile) or name a new role and describe it in `instructions`. Hire only when there is more parallel work than members, or the work needs a very different role.
 - **Notebook**: `update_notes` replaces your notes. They are shown at every wake-up and survive context compaction: keep them short (key facts, decisions, paths, plans).
+- **Skills**: a skill is a folder with a SKILL.md (instructions for a kind of work, sometimes with scripts and other files) that the user attached to the swarm or a member proposed. The first wake-up lists them with what each one is for, later ones only by name, and you are told when one is attached, updated or detached; before work one of them fits, read its SKILL.md with `read_file` and follow it. A procedure that worked and will be needed again can become a skill: write its folder (a SKILL.md that starts with `name` and `description` lines between two `---` lines, plus its files) in your scratch folder and call `skill_propose`; every member can use it at once, and the user decides whether it is kept for future runs.
 
 ## How you work
-1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and shows the global goal, your open tasks, the tasks waiting for your review, ready unassigned tasks and your notes, so you rarely need `board` right after waking. If nothing needs your action, call `wait` at once.
+1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and shows the global goal, your open tasks, the tasks waiting for your review, ready unassigned tasks and your notes, and the skills attached to the swarm, so you rarely need `board` right after waking. If nothing needs your action, call `wait` at once.
 2. Planning: when a goal is set, a planning task appears. Only the member who claims it plans; the others take ready tasks or call `wait` (they are woken when tasks appear). Do not plan in parallel and do not offer help with planning. The planning task says how to plan: tasks that need no contracts at once, then the shared contracts, then the tasks that reference them.
 3. Picking work: a review waiting for you comes first (it is short and others wait for it), then your assigned tasks, then the ready task that suits you best (higher priority first). Hold one task in progress at a time. Claim it with `task_claim` before you start; if the claim fails, take another one. Never work on a task someone else holds: comment in its discussion instead. Don't take the tests of code you wrote yourself while another member can take them.
 4. Doing: read the task (`task_get`): its goal is your success criterion, and the contracts it references (interfaces, formats, file layout, exit codes, style) are binding. Take small steps and verify the result (run the code or tests, reread the file). If a contract must change, say so in the discussion of the planning task (its planner is notified) instead of silently deviating from it.
@@ -58,9 +59,10 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 - **MCP-инструменты**: переиспользуемую возможность, которой нет у роя (клиент API, парсер, конвертер...), можно сделать MCP-сервером через `mcp_create` и пользоваться ею через `mcp_tools` и `mcp_call`. Сначала проверь `mcp_list`: возможно, она уже есть, в том числе с прошлых запусков. Для разовой работы достаточно `shell`.
 - **Команда**: `agents` показывает состав роя и каталог ролей. `hire_agent` добавляет участника (не более {max_agents} ИИ-агентов, не считая участников, подключившихся через MCP; денежный бюджет общий): выбери роль из каталога по названию (участник получит её описание и профиль модели) или назови новую роль и опиши её в `instructions`. Нанимай, только если параллельной работы больше, чем участников, или для работы нужна совсем другая роль.
 - **Блокнот**: `update_notes` заменяет твои заметки. Они показываются при каждом пробуждении и сохраняются при сжатии контекста: держи их краткими (ключевые факты, решения, пути, планы).
+- **Скиллы**: скилл — папка с файлом SKILL.md (инструкции для определённого вида работы, иногда со скриптами и другими файлами), которую пользователь подключил к рою или предложил участник. Первое сообщение о пробуждении перечисляет их и говорит, для чего каждый, следующие — только по именам, а о подключении, обновлении или отключении скилла тебе сообщат; перед работой, к которой подходит скилл, прочитай его SKILL.md через `read_file` и следуй ему. Приём, который сработал и ещё понадобится, можно сделать скиллом: запиши его папку (SKILL.md, который начинается со строк `name` и `description` между двумя строками `---`, и его файлы) в свою черновую папку и вызови `skill_propose`; все участники смогут сразу им пользоваться, а пользователь решит, сохранить ли его для будущих запусков.
 
 ## Как ты работаешь
-1. Ты спишь, пока тебя не разбудит событие. Сообщение о пробуждении перечисляет, что произошло (включая новые сообщения), и показывает глобальную цель, твои открытые задачи, задачи, ждущие твоего ревью, свободные готовые задачи и твой блокнот, поэтому сразу после пробуждения `board` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.
+1. Ты спишь, пока тебя не разбудит событие. Сообщение о пробуждении перечисляет, что произошло (включая новые сообщения), и показывает глобальную цель, твои открытые задачи, задачи, ждущие твоего ревью, свободные готовые задачи и твой блокнот, а также подключённые к рою скиллы, поэтому сразу после пробуждения `board` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.
 2. Планирование: когда задана цель, появляется задача планирования. Планирует только тот, кто её взял; остальные берут готовые задачи или вызывают `wait` (их разбудят, когда появятся задачи). Не планируй параллельно и не предлагай помощь с планированием. Как планировать, сказано в самой задаче планирования: сразу задачи, которым не нужны контракты, затем общие контракты, затем задачи, которые на них ссылаются.
 3. Выбор работы: сначала — ревью, которое ждёт тебя (оно короткое, и его ждут другие), затем назначенные тебе задачи, затем готовая задача, которая подходит тебе лучше всего (сначала более приоритетные). Держи в работе одну задачу за раз. Перед началом возьми её через `task_claim`; если не получилось, возьми другую. Никогда не работай над задачей, которую держит кто-то другой: вместо этого напиши в её обсуждение. Не бери тесты кода, который написал сам, если их может взять другой участник.
 4. Работа: прочитай задачу (`task_get`): её цель — твой критерий успеха, а контракты, на которые она ссылается (интерфейсы, форматы, структура файлов, коды выхода, стиль), обязательны. Делай небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Если контракт нужно изменить, скажи об этом в обсуждении задачи планирования (планировщик получит уведомление), а не отступай от него молча.
@@ -238,9 +240,99 @@ TEXTS: dict[str, dict[str, str]] = {
         # a compaction moved the agent to the current tool set (agent.py _replace_with_summary)
         "tools_added": "Your tools were updated with this compaction. New: {tools}; their descriptions say how to "
                        "use them.",
+        # the skills attached to the swarm (swarm_skills.py): the full index once per agent memory (the first
+        # wake-up, after a restart, in a compaction text), then the one-line skills_names
+        "skills_index": "Skills attached to the swarm (a skill is a SKILL.md with instructions for a kind of work, "
+                        "sometimes with scripts; later wake-ups list only their names, and you are told when one is "
+                        "attached, updated or detached). Before work one of them fits, read its SKILL.md with "
+                        "`read_file` and follow it: paths in it are relative to its folder, and its scripts run with "
+                        "`shell` by their path from the workspace root. A skill written for another assistant may "
+                        "name its tools: use yours instead (`shell` for Bash, `read_file` for Read, `write_file` for "
+                        "Write, `edit_file` for Edit); ${{CLAUDE_SKILL_DIR}} means the skill's folder shown here."
+                        " When a skill's line names a Python, run that skill's Python scripts with it: its packages are "
+                        "installed there (the environment is shared with other sessions, so install nothing into "
+                        "it). When a line says its Node packages are linked, its scripts find them: do not run npm "
+                        "install or npm ci in the skill's folder. When a line says nothing about packages, the "
+                        "skill lists none in a requirements.txt, pyproject.toml or package.json: install what its "
+                        "SKILL.md asks for yourself with `shell`, best inside your scratch folder (a virtual "
+                        "environment there, for example).\n{skills}",
+        "skills_index_own": "Skills attached to the swarm (a skill is a SKILL.md with instructions for a kind of "
+                            "work, sometimes with scripts; later wake-ups list only their names, and you are told "
+                            "when one is attached, updated or detached). Before work one of them fits, read its "
+                            "SKILL.md with `read_file` and follow it: paths in it are relative to its folder, and its "
+                            "scripts run with `shell` by their path from the workspace root. A skill written for "
+                            "another assistant may name its tools: use yours instead (`shell` for Bash, `read_file` "
+                            "for Read, `write_file` for Write, `edit_file` for Edit); ${{CLAUDE_SKILL_DIR}} means the "
+                            "skill's folder shown here."
+                            " When a skill's line names a Python, run that skill's Python scripts with it: its packages are "
+                            "installed there (the environment is shared with other sessions, so install nothing into "
+                            "it). When a line says its Node packages are linked, its scripts find them: do not run npm "
+                            "install or npm ci in the skill's folder. When a line says nothing about packages, the "
+                            "skill lists none in a requirements.txt, pyproject.toml or package.json: install what its "
+                            "SKILL.md asks for yourself with `shell`, best inside your scratch folder (a virtual "
+                            "environment there, for example). \"Your role's\": the skills of your role, made "
+                            "for your work.\n{skills}",
+        "skills_item": "- {name}{own}: {description} → {path}{deps}",
+        "skills_own": " (your role's)",
+        "skills_manual": " (only when the user asks for it)",
+        "skills_path_outside": "{path} (outside the workspace: read it with `shell`)",
+        "skills_names": "Skills attached to the swarm: {names}. Their SKILL.md paths and descriptions are in the list "
+                        "shown to you earlier and in your notifications.",
+        "skills_none": "Skills: none are attached to the swarm any more.",
+        # quiet for AI agents (their next render shows them), a wake for external members (swarm_skills._announce)
+        "n_skill_added": "The skill \"{name}\" was attached to the swarm: {description}\nBefore work it fits, read "
+                         "{path} with `read_file` and follow it.{deps}",
+        "n_skill_updated": "The skill \"{name}\" was updated: {description}\nIf you use it, read {path} again with "
+                           "`read_file`.{deps}",
+        "n_skill_removed": "The skill \"{name}\" was detached from the swarm: don't use it any more (its folder is "
+                           "gone).",
+        "n_skill_shared": "{owner} proposed the skill \"{name}\", and it is attached to the swarm: {description}\n"
+                          "Before work it fits, read {path} with `read_file` and follow it.{deps}",
+        # a skill's script dependencies (skill_deps.py): fragments of its index line and of its notifications,
+        # " " first ("" when it lists none); {python} and {bin} are paths, never in backticks
+        "skills_deps_python": " Python: {python} (packages from {files} installed).{extra}",
+        "skills_deps_node": " Node: packages from {files} are linked into its folder.{extra}",
+        "skills_deps_node_path": " Node: packages from {files} are in {path}; set NODE_PATH to that folder for "
+                                 "require() (import does not read NODE_PATH).",
+        "skills_deps_bin": " Their commands ({names}) are in {bin}.",
+        "skills_deps_own": " The skill's own code is not installed as a package: run its scripts by their path (for "
+                           "a src layout, set PYTHONPATH to its src folder).",
+        "skills_deps_installing": " Packages from {files}: being installed; you are told when they are ready.",
+        # an AI member: the news is quiet (it waits for the member's next wake-up), so no wake-up is promised
+        "skills_deps_installing_quiet": " Packages from {files}: being installed; a later wake-up of yours says "
+                                        "when they are ready (the install does not wake you: meanwhile do other "
+                                        "work).",
+        "skills_deps_failed": " Packages from {files}: installing them failed ({error}; log: {log}, read it with "
+                              "`shell`); install what you need yourself.",
+        "skills_deps_manual": " Packages from {files}: not installed automatically ({reason}); install what you need "
+                              "yourself.",
+        "deps_reason_off": "turned off in the settings",
+        "deps_reason_proposals": "turned off for skills that members propose",
+        "deps_reason_unavailable": "{detail} is not available on this machine",
+        "deps_reason_python": "it needs Python {need}, the environments use {have}",
+        "deps_reason_unsupported": "not supported: {detail}",
+        "n_skill_deps_ready": "The packages of the skill \"{name}\" are installed.{deps}",
+        "n_skill_deps_failed": "Installing the packages of the skill \"{name}\" failed.{deps}",
+        # to the proposer (a wake): the user's library decision; {comment} is the user's comment after a space, or ""
+        "n_skill_saved": "The user saved your skill \"{name}\" to the skills library: future runs can use it too.",
+        "n_skill_not_saved": "The user decided not to save your skill \"{name}\" to the library; it stays attached "
+                             "to this swarm.{comment}",
         # notifications for the user (shown in the UI / console / MCP)
         "u_mcp_pending": "{owner} created MCP server \"{name}\": {description}. Approve or reject it (MCP tab or "
                          "`mcp_approve`).",
+        "u_skill_proposed": "{owner} proposed the skill \"{name}\" (files: {files}): {description}. The swarm uses it "
+                            "already.{installs} Save it to the skills library for future runs, or not: Skills tab, "
+                            "/skills approve {name} or `skill_approve`.",
+        "u_skill_installs": " Its packages ({files}: {packages}) are installed automatically, in an environment kept "
+                            "apart from your own skills'.",
+        "u_skill_deps_failed": "Installing the packages of the skill \"{name}\" ({files}) failed: {error}. Log: "
+                               "{log}. Reinstall in the Skills tab, with /skills reinstall {name} or "
+                               "`skill_reinstall`.",
+        "u_role_skills_missing": "The role \"{role}\" lists skills that are not in the skills library: {names}. Add "
+                                 "them to the library (the Skills tab) or remove them from the role.",
+        "u_role_skills_over_cap": "The role \"{role}\" lists skills that were not attached, because the swarm already "
+                                  "has the maximum of {max} skills: {names}. Detach some, or raise max_attached in "
+                                  "the skills settings.",
         "u_agent_error": "Agent {name} hit an error: {error}",
         "u_budget": "Budget exhausted: spent ${spent:.2f} of ${limit:.2f}. The swarm is paused; raise the limit to "
                     "continue.",
@@ -410,8 +502,90 @@ TEXTS: dict[str, dict[str, str]] = {
                       "следующих шагов), запусти его снова.",
         "tools_added": "Вместе со сжатием контекста обновились твои инструменты. Новые: {tools}; как ими пользоваться, "
                        "сказано в их описаниях.",
+        "skills_index": "Скиллы, подключённые к рою (скилл — файл SKILL.md с инструкциями для определённого вида "
+                        "работы, иногда со скриптами; в следующих пробуждениях будут только их имена, а о "
+                        "подключении, обновлении или отключении скилла тебе сообщат). Перед работой, к которой "
+                        "подходит скилл, прочитай его SKILL.md через `read_file` и следуй ему: пути в нём указаны "
+                        "относительно его папки, а его скрипты запускаются через `shell` по их пути от корня "
+                        "workspace. Скилл, написанный для другого ассистента, может называть его инструменты: "
+                        "пользуйся своими (`shell` вместо Bash, `read_file` вместо Read, `write_file` вместо Write, "
+                        "`edit_file` вместо Edit); ${{CLAUDE_SKILL_DIR}} означает показанную здесь папку скилла."
+                        " Если в строке скилла указан Python, запускай Python-скрипты этого скилла им: там "
+                        "установлены его пакеты (это окружение общее с другими сессиями, поэтому ничего в него не "
+                        "устанавливай). Если в строке сказано, что его пакеты Node подключены, его скрипты их "
+                        "находят: не запускай npm install и npm ci в папке скилла. Если в строке ничего не сказано "
+                        "о пакетах, скилл не перечисляет их в requirements.txt, pyproject.toml или package.json: "
+                        "то, что требует его SKILL.md, установи сам через `shell`, лучше внутри своей черновой "
+                        "папки (например, в виртуальное окружение там).\n{skills}",
+        "skills_index_own": "Скиллы, подключённые к рою (скилл — файл SKILL.md с инструкциями для определённого вида "
+                            "работы, иногда со скриптами; в следующих пробуждениях будут только их имена, а о "
+                            "подключении, обновлении или отключении скилла тебе сообщат). Перед работой, к которой "
+                            "подходит скилл, прочитай его SKILL.md через `read_file` и следуй ему: пути в нём "
+                            "указаны относительно его папки, а его скрипты запускаются через `shell` по их пути от "
+                            "корня workspace. Скилл, написанный для другого ассистента, может называть его "
+                            "инструменты: пользуйся своими (`shell` вместо Bash, `read_file` вместо Read, "
+                            "`write_file` вместо Write, `edit_file` вместо Edit); ${{CLAUDE_SKILL_DIR}} означает "
+                            "показанную здесь папку скилла."
+                            " Если в строке скилла указан Python, запускай Python-скрипты этого скилла им: там "
+                            "установлены его пакеты (это окружение общее с другими сессиями, поэтому ничего в него не "
+                            "устанавливай). Если в строке сказано, что его пакеты Node подключены, его скрипты их "
+                            "находят: не запускай npm install и npm ci в папке скилла. Если в строке ничего не сказано "
+                            "о пакетах, скилл не перечисляет их в requirements.txt, pyproject.toml или package.json: "
+                            "то, что требует его SKILL.md, установи сам через `shell`, лучше внутри своей черновой "
+                            "папки (например, в виртуальное окружение там). «Твоей роли» — скиллы твоей роли, они сделаны "
+                            "для твоей работы.\n{skills}",
+        "skills_item": "- {name}{own}: {description} → {path}{deps}",
+        "skills_own": " (твоей роли)",
+        "skills_manual": " (только по просьбе пользователя)",
+        "skills_path_outside": "{path} (вне workspace: читай через `shell`)",
+        "skills_names": "Подключённые к рою скиллы: {names}. Пути к их SKILL.md и описания — в списке, показанном тебе "
+                        "раньше, и в твоих уведомлениях.",
+        "skills_none": "Скиллы: к рою больше не подключено ни одного.",
+        "n_skill_added": "К рою подключён скилл «{name}»: {description}\nПеред работой, к которой он подходит, "
+                         "прочитай {path} через `read_file` и следуй ему.{deps}",
+        "n_skill_updated": "Скилл «{name}» обновлён: {description}\nЕсли ты им пользуешься, перечитай {path} через "
+                           "`read_file`.{deps}",
+        "n_skill_removed": "Скилл «{name}» отключён от роя: больше не пользуйся им (его папки больше нет).",
+        "n_skill_shared": "{owner} предложил(а) скилл «{name}», он подключён к рою: {description}\nПеред работой, к "
+                          "которой он подходит, прочитай {path} через `read_file` и следуй ему.{deps}",
+        "skills_deps_python": " Python: {python} (пакеты из {files} установлены).{extra}",
+        "skills_deps_node": " Node: пакеты из {files} подключены в его папку.{extra}",
+        "skills_deps_node_path": " Node: пакеты из {files} лежат в {path}; для require() укажи эту папку в NODE_PATH "
+                                 "(import не читает NODE_PATH).",
+        "skills_deps_bin": " Их команды ({names}) — в {bin}.",
+        "skills_deps_own": " Собственный код скилла не установлен как пакет: запускай его скрипты по пути (для "
+                           "src-раскладки укажи его папку src в PYTHONPATH).",
+        "skills_deps_installing": " Пакеты из {files} устанавливаются; о готовности тебе сообщат.",
+        "skills_deps_installing_quiet": " Пакеты из {files} устанавливаются; о готовности скажет одно из следующих "
+                                        "твоих пробуждений (установка тебя не будит: пока займись другим).",
+        "skills_deps_failed": " Пакеты из {files}: установить их не удалось ({error}; журнал: {log}, читай через "
+                              "`shell`); нужное установи сам.",
+        "skills_deps_manual": " Пакеты из {files} не устанавливаются автоматически ({reason}); нужное установи сам.",
+        "deps_reason_off": "выключено в настройках",
+        "deps_reason_proposals": "выключено для скиллов, предложенных участниками",
+        "deps_reason_unavailable": "на этой машине нет: {detail}",
+        "deps_reason_python": "нужен Python {need}, а окружения используют {have}",
+        "deps_reason_unsupported": "не поддерживается: {detail}",
+        "n_skill_deps_ready": "Пакеты скилла «{name}» установлены.{deps}",
+        "n_skill_deps_failed": "Установить пакеты скилла «{name}» не удалось.{deps}",
+        "n_skill_saved": "Пользователь сохранил твой скилл «{name}» в библиотеку скиллов: им смогут пользоваться и в "
+                         "будущих запусках.",
+        "n_skill_not_saved": "Пользователь решил не сохранять твой скилл «{name}» в библиотеку; к этому рою он "
+                             "остаётся подключённым.{comment}",
         "u_mcp_pending": "{owner} создал(а) MCP-сервер «{name}»: {description}. Одобрите или отклоните его (вкладка "
                          "MCP или `mcp_approve`).",
+        "u_skill_proposed": "{owner} предлагает скилл «{name}» (файлов: {files}): {description}. Рой уже пользуется "
+                            "им.{installs} Сохранить ли его в библиотеку скиллов для будущих запусков — вкладка «Скиллы», "
+                            "/skills approve {name} или `skill_approve`.",
+        "u_skill_installs": " Его пакеты ({files}: {packages}) ставятся автоматически, в окружение отдельно от ваших "
+                            "собственных скиллов.",
+        "u_skill_deps_failed": "Не удалось установить пакеты скилла «{name}» ({files}): {error}. Журнал: {log}. "
+                               "Переустановить можно на вкладке «Скиллы», командой /skills reinstall {name} или "
+                               "через `skill_reinstall`.",
+        "u_role_skills_missing": "Роль «{role}» указывает скиллы, которых нет в библиотеке скиллов: {names}. Добавьте "
+                                 "их в библиотеку (вкладка «Скиллы») или уберите из роли.",
+        "u_role_skills_over_cap": "Скиллы роли «{role}» не подключены, потому что у роя уже максимум — {max} скиллов: "
+                                  "{names}. Отключите лишние или увеличьте max_attached в настройках скиллов.",
         "u_agent_error": "У агента {name} ошибка: {error}",
         "u_budget": "Бюджет исчерпан: потрачено ${spent:.2f} из ${limit:.2f}. Рой на паузе; увеличьте лимит, чтобы "
                     "продолжить.",

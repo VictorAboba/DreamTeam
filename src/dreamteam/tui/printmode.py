@@ -215,11 +215,13 @@ class _PrintRun:
     def __init__(self, conn: Connection, prompt: str, *, session: str | None, continue_last: bool,
                  title: str | None, overrides: dict | None, output_format: str, verbose: bool,
                  timeout: float | None, auto_reply: bool, lang: str | None, out: TextIO, err: TextIO,
-                 on_session: Callable[[str], Any] | None = None, workspace: str | None = None):
+                 on_session: Callable[[str], Any] | None = None, workspace: str | None = None,
+                 skills: list[str] | None = None):
         self.client = conn.client
         # this process runs the launcher: main_print stops the session (and its jobs) at the end
         self.owned = getattr(conn, "owned", False)
         self.workspace = workspace
+        self.skills = skills or None   # `--skill`: the new session's, or attached to the resumed one
         self.on_session = on_session
         self.prompt = prompt
         self.session = session
@@ -290,7 +292,7 @@ class _PrintRun:
         if not (self.session or self.continue_last):
             title = self.title or ""  # "": the hub derives it from the goal's first line
             summary = await client.create_session(title, self.prompt, overrides=self.overrides, start=True,
-                                                  workspace=self.workspace)
+                                                  workspace=self.workspace, skills=self.skills)
             self.started_session(summary["id"])
             self.lang = summary.get("language") or self.lang
             self.progress(_text(self.text_lang, "session", sid=self.sid, title=summary.get("title", "")))
@@ -307,8 +309,9 @@ class _PrintRun:
             if not sessions:
                 raise _Finished("error", _text(self.text_lang, "no_sessions"))
             summary = max(sessions, key=lambda s: s.get("last_activity") or s.get("created_at") or 0)
-        if summary.get("status") != "running":
-            summary = await client.start_session(summary["id"])
+        if summary.get("status") != "running" or self.skills:   # (a running one attaches the skills live)
+            summary = await (client.start_session(summary["id"], skills=self.skills) if self.skills else
+                             client.start_session(summary["id"]))
         self.started_session(summary["id"])
         self.lang = summary.get("language") or self.lang
         self.progress(_text(self.text_lang, "session", sid=summary["id"], title=summary.get("title", "")))
@@ -550,7 +553,8 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
                     title: str | None = None, overrides: dict | None = None, output_format: str = "text",
                     verbose: bool = False, timeout: float | None = None, auto_reply: bool = True,
                     lang: str | None = None, out: TextIO | None = None, err: TextIO | None = None,
-                    on_session: Callable[[str], Any] | None = None, workspace: str | None = None) -> int:
+                    on_session: Callable[[str], Any] | None = None, workspace: str | None = None,
+                    skills: list[str] | None = None) -> int:
     """Run `prompt` as a goal (a new session), or as the next instruction to an existing session
     (`session` / `continue_last`), follow the session until it ends and print the result.
 
@@ -558,13 +562,14 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     error lines and the progress feed (default: the session's language). `on_session(sid)` is called with
     the session the run works in, once it is created or started (main_print stops it at the end). `workspace`:
     the absolute folder a new session works in (docs/SPEC.md §17.2: an empty or missing folder gets the files, one
-    with files is adopted; a git repository with uncommitted changes is refused, an error)."""
+    with files is adopted; a git repository with uncommitted changes is refused, an error). `skills`: references or
+    sources (docs/SPEC.md §19) for the new session, or attached to the existing one before the prompt goes there."""
     if output_format not in OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {', '.join(OUTPUT_FORMATS)}")
     run = _PrintRun(conn, prompt, session=session, continue_last=continue_last, title=title, overrides=overrides,
                     output_format=output_format, verbose=verbose, timeout=timeout, auto_reply=auto_reply,
                     lang=lang, out=out or sys.stdout, err=err or sys.stderr, on_session=on_session,
-                    workspace=workspace)
+                    workspace=workspace, skills=skills)
     status, reason = "error", ""
     try:
         try:

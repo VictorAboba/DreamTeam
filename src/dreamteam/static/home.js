@@ -112,6 +112,66 @@ const I18N = {
     p_key_env_drop: "сохранённый ключ {hint} будет удалён при сохранении",
     p_name_bad: "Имя профиля «{name}»: нужны латинские буквы, цифры, «-» или «_».",
     p_name_dup: "Два профиля с именем «{name}».", p_model_required: "Укажите модель в профиле «{name}».",
+    // skills: the home tab, the settings, the role cards, the new-session picker, the session cards
+    tab_skills: "Скиллы", sk_title: "Скиллы",
+    sk_hint: "Библиотека скиллов общая для всех сессий. Сессия получает копию скилла при подключении и хранит её, пока вы не обновите скилл на вкладке «Скиллы» сессии.",
+    sk_library: "Библиотека", sk_lib_empty: "Библиотека пуста ({dir}). Добавьте скилл из папки, .zip или Git ниже — или из Claude Code.",
+    sk_add_title: "Добавить в библиотеку", sk_claude: "Claude Code", sk_claude_hint: "Скиллы из ~/.claude/skills: DreamTeam их только читает.",
+    sk_claude_empty: "В ~/.claude/skills скиллов нет.", sk_host: "Библиотека хоста",
+    sk_claude_sandbox: "Хаб работает в песочнице Docker, и ваш ~/.claude/skills в неё не подключён: добавьте скилл Claude Code в библиотеку DreamTeam, запущенного на самом компьютере (без песочницы), и он появится ниже в «Библиотеке хоста».",
+    sk_host_hint: "Библиотека компьютера, на котором запущена песочница Docker: только для чтения.", sk_host_empty: "Библиотека хоста пуста.",
+    sk_add_lib: "В библиотеку", sk_show: "Показать", sk_hide: "Скрыть", sk_delete: "Удалить из библиотеки",
+    sk_delete_title: "Удалить скилл из библиотеки?",
+    sk_delete_text: "Скилл «{name}» будет удалён из библиотеки. Сессии, к которым он подключён, сохранят свою копию.",
+    sk_deleted: "Скилл «{name}» удалён из библиотеки", sk_files: "файлов: {n} · {size}",
+    sk_changed_outside: "изменён вне DreamTeam",
+    sk_attach_anyway: "Скилл «{name}»: {why}. Подключить всё равно?",
+    sk_changed_hint: "Файлы скилла в библиотеке менялись не через DreamTeam (вручную или агентом). Проверьте их; повторный импорт снимает отметку.",
+    sk_manual: "только по запросу", sk_manual_hint: "disable-model-invocation: агенты берут его, только когда вы попросите",
+    sk_in_lib: "в библиотеке", sk_diff_lib: "в библиотеке другой", sk_by: "добавил(а): {by} · через {via}", sk_source: "Источник",
+    sk_files_title: "Файлы", sk_envs_clean: "Удалить неиспользуемые окружения",
+    sk_envs_cleaned: "Удалено окружений: {removed}", sk_envs_kept: "; оставлено: {kept} ({why})",
+    sk_why_in_use: "используются", sk_why_being_built: "собираются",
+    sk_envs_hint: "Окружения с пакетами скиллов (~/.dreamteam/skill-envs), которыми не пользуется ни одна сессия",
+    sk_deps_settings_note: "Изменения действуют со следующего подключения скилла или запуска сессии.",
+    s_skills: "Скиллы",
+    s_skills_hint: "Общая библиотека скиллов, их лимиты и зависимости скриптов скиллов (requirements.txt, pyproject.toml, package.json).",
+    sk_f_library_dir: "Папка библиотеки", sk_f_claude: "Предлагать скиллы Claude Code (~/.claude/skills)",
+    sk_f_max_mb: "Размер скилла, МБ", sk_f_max_files: "Файлов в скилле", sk_f_max_archive_mb: "Архив или Git-копия, МБ",
+    sk_f_max_attached: "Скиллов в сессии", sk_f_max_proposals: "Предложений агентов в сессии", sk_f_max_proposals_hint: "0 — без предложений",
+    sk_f_install: "Ставить зависимости скриптов",
+    sk_f_install_hint: "requirements.txt, pyproject.toml, package.json — в отдельное окружение каждого скилла; установка запускает код пакетов с вашими правами",
+    sk_f_install_proposals: "То же для скиллов, предложенных агентами", sk_f_envs_dir: "Папка окружений",
+    sk_f_python: "Python окружений", sk_f_python_hint: "пусто — тот, на котором работает DreamTeam; путь, команда или (с uv) версия, например 3.12",
+    sk_f_install_scripts: "Запускать скрипты пакетов npm (postinstall и т. п.)", sk_f_install_timeout: "Одна установка не дольше, с",
+    sk_f_env_retention_days: "Удалять неиспользуемые окружения через, дней", sk_f_env_retention_days_hint: "0 — никогда",
+    sk_f_install_env: "Переменные для установщиков", sk_f_install_env_hint: "например, пароль частного индекса пакетов",
+    r_skills: "Скиллы", r_skills_hint: "агент этой роли получает их сразу; имена из библиотеки или ~/.claude/skills",
+    r_skill_add: "Добавить", r_skill_ph: "имя скилла", r_skill_missing: "нет в библиотеке", r_skill_remove: "Убрать",
+    r_skill_bad: "Скилл «{name}»: латинские строчные буквы, цифры и «-», до 64 символов.",
+    f_skills: "Скиллы", f_skills_hint: "их видят все агенты сессии",
+    f_skills_none: "В библиотеке и в ~/.claude/skills пока нет скиллов — добавьте новый ниже.",
+    f_skills_roles: "от ролей:", f_skill_missing: "«{name}» нет в библиотеке — роль его не получит",
+    f_skills_add: "Добавить новый: папка, zip или Git",
+    sc_skills: "скиллов: {n}", sc_skills_pending: "Скиллы ждут вашего решения: {n}",
+    pend_title: "Скиллы ждут решения", pend_text: "Агенты предложили эти скиллы. Сохранить их в библиотеку для будущих запусков? Эта сессия пользуется ими в любом случае.",
+    pend_save: "Сохранить в библиотеку", pend_nosave: "Не сохранять", pend_reason: "Почему не сохранять (необязательно)",
+    pend_none: "Решения больше не ждёт ни один скилл.", pend_by: "от {owner}",
+    sk_replace_lib: "В библиотеке уже есть другой скилл «{name}». Заменить его?",
+    delete_pending: "Агенты этой сессии предложили скиллы, которые ждут вашего решения: {names}.",
+    delete_save: "Сохранить в библиотеку и удалить", delete_discard: "Удалить вместе с ними",
+    // the add form (skills.js, shared with the session page)
+    sk_src_folder: "Папка", sk_src_zip: "Zip", sk_src_git: "Git", sk_folder_ph: "Путь к папке или .zip на компьютере сервера",
+    sk_folder_sandbox: "Хаб работает в песочнице Docker: это путь внутри контейнера. Папку со своего компьютера проще загрузить как .zip.",
+    sk_git_hint: "Ветка и подпапка: URL#ветка:папка; ссылки GitHub и GitLab на tree/blob тоже подходят.",
+    sk_add: "Добавить", sk_add_attach: "Добавить и подключить", sk_pick: "В источнике несколько скиллов — выберите нужные:",
+    sk_pick_go: "Взять выбранные", sk_cancel: "Отмена", sk_replace_q: "В библиотеке уже есть другие скиллы с этими именами: {names}. Заменить?",
+    sk_zip_big: "Архив больше {mb} МБ ([skills] max_archive_mb).", sk_need_source: "Укажите папку, файл или URL.",
+    sk_importing: "Загружаю…", sk_imported: "В библиотеке: {names}.", sk_attached: "Подключён: {name}.", sk_attached_same: "Уже подключён: {name}.",
+    sk_skipped: "Пропущено {path}: {error}", sk_pkgs_preview: "Установится автоматически: {packages} ({files}).",
+    sk_pkgs_trust: "Установка запускает собственный код пакетов с вашими правами (вне песочницы Docker).",
+    sk_pkgs_unsupported: "Его {files} не ставится автоматически: {reason}; нужное агенты поставят сами.",
+    sk_pkgs_off: "Установка пакетов выключена в настройках.",
   },
   en: {
     tagline: "AI agent swarm", tab_sessions: "Sessions", tab_settings: "Settings", language: "Language", theme: "Theme",
@@ -222,6 +282,64 @@ const I18N = {
     p_key_env_drop: "the saved key {hint} will be removed on save",
     p_name_bad: "Profile name “{name}”: use Latin letters, digits, “-” or “_”.",
     p_name_dup: "Two profiles are named “{name}”.", p_model_required: "Enter the model of profile “{name}”.",
+    tab_skills: "Skills", sk_title: "Skills",
+    sk_hint: "The skills library is shared by every session. A session gets a copy of a skill when it is attached and keeps it until you update the skill in the session's Skills tab.",
+    sk_library: "Library", sk_lib_empty: "The library is empty ({dir}). Add a skill from a folder, a .zip or Git below, or from Claude Code.",
+    sk_add_title: "Add to the library", sk_claude: "Claude Code", sk_claude_hint: "Skills in ~/.claude/skills: DreamTeam only reads them.",
+    sk_claude_empty: "No skills in ~/.claude/skills.", sk_host: "The host's library",
+    sk_claude_sandbox: "The hub runs in the Docker sandbox, which does not see your ~/.claude/skills: add a Claude Code skill to the library of a DreamTeam run on the computer itself (without the sandbox) and it shows below in “The host's library”.",
+    sk_host_hint: "The library of the computer the Docker sandbox runs on: read-only.", sk_host_empty: "The host's library is empty.",
+    sk_add_lib: "Add to library", sk_show: "Show", sk_hide: "Hide", sk_delete: "Delete from the library",
+    sk_delete_title: "Delete the skill from the library?",
+    sk_delete_text: "Skill “{name}” will be deleted from the library. Sessions it is attached to keep their copy.",
+    sk_deleted: "Skill “{name}” deleted from the library", sk_files: "files: {n} · {size}",
+    sk_changed_outside: "changed outside DreamTeam",
+    sk_attach_anyway: "Skill “{name}”: {why}. Attach it anyway?",
+    sk_changed_hint: "The skill's files in the library changed outside DreamTeam (by hand or by an agent). Check them; importing it again clears the mark.",
+    sk_manual: "only when asked", sk_manual_hint: "disable-model-invocation: agents use it only when you ask",
+    sk_in_lib: "in the library", sk_diff_lib: "different in the library", sk_by: "added by {by} via {via}", sk_source: "Source",
+    sk_files_title: "Files", sk_envs_clean: "Remove unused environments now",
+    sk_envs_cleaned: "Removed {removed} environment(s)", sk_envs_kept: "; kept {kept} ({why})",
+    sk_why_in_use: "in use", sk_why_being_built: "being built",
+    sk_envs_hint: "The environments with skills' packages (~/.dreamteam/skill-envs) that no session uses",
+    sk_deps_settings_note: "Changes apply at the next attach or session start.",
+    s_skills: "Skills",
+    s_skills_hint: "The shared skills library, the limits of skills and the dependencies of skills' scripts (requirements.txt, pyproject.toml, package.json).",
+    sk_f_library_dir: "Library folder", sk_f_claude: "Offer Claude Code skills (~/.claude/skills)",
+    sk_f_max_mb: "Skill size, MB", sk_f_max_files: "Files per skill", sk_f_max_archive_mb: "Archive or Git checkout, MB",
+    sk_f_max_attached: "Skills per session", sk_f_max_proposals: "Members' proposals per session", sk_f_max_proposals_hint: "0 — no proposals",
+    sk_f_install: "Install script dependencies",
+    sk_f_install_hint: "requirements.txt, pyproject.toml, package.json, into an environment of each skill; installing runs the packages' code with your rights",
+    sk_f_install_proposals: "Also for skills members propose", sk_f_envs_dir: "Environments folder",
+    sk_f_python: "Python of the environments", sk_f_python_hint: "empty: the one DreamTeam runs on; a path, a command or (with uv) a version such as 3.12",
+    sk_f_install_scripts: "Run npm packages' lifecycle scripts (postinstall, …)", sk_f_install_timeout: "One install at most, s",
+    sk_f_env_retention_days: "Remove unused environments after, days", sk_f_env_retention_days_hint: "0 — never",
+    sk_f_install_env: "Variables the installers get", sk_f_install_env_hint: "e.g. a private package index's password",
+    r_skills: "Skills", r_skills_hint: "an agent of this role gets them at once; names from the library or ~/.claude/skills",
+    r_skill_add: "Add", r_skill_ph: "skill name", r_skill_missing: "not in the library", r_skill_remove: "Remove",
+    r_skill_bad: "Skill “{name}”: lower-case Latin letters, digits and “-”, at most 64 characters.",
+    f_skills: "Skills", f_skills_hint: "every agent of the session sees them",
+    f_skills_none: "No skills in the library or in ~/.claude/skills yet: add one below.",
+    f_skills_roles: "from roles:", f_skill_missing: "“{name}” is not in the library: the role will not get it",
+    f_skills_add: "Add a new one: folder, zip or Git",
+    sc_skills: "skills: {n}", sc_skills_pending: "Skills waiting for your decision: {n}",
+    pend_title: "Skills waiting for your decision", pend_text: "Members proposed these skills. Save them to the library for future runs? This session uses them either way.",
+    pend_save: "Save to library", pend_nosave: "Don't save", pend_reason: "Why not save it (optional)",
+    pend_none: "No skill waits for a decision any more.", pend_by: "by {owner}",
+    sk_replace_lib: "The library already has another skill “{name}”. Replace it?",
+    delete_pending: "Members of this session proposed skills that wait for your decision: {names}.",
+    delete_save: "Save to library, then delete", delete_discard: "Delete them too",
+    sk_src_folder: "Folder", sk_src_zip: "Zip", sk_src_git: "Git", sk_folder_ph: "A folder or .zip path on the server's computer",
+    sk_folder_sandbox: "The hub runs in the Docker sandbox: this is a path inside the container. A folder on your computer is easier to upload as a .zip.",
+    sk_git_hint: "A branch and a subfolder: URL#branch:folder; GitHub and GitLab tree/blob links work too.",
+    sk_add: "Add", sk_add_attach: "Add and attach", sk_pick: "The source holds several skills: pick the ones to take:",
+    sk_pick_go: "Take the selected", sk_cancel: "Cancel", sk_replace_q: "The library already has other skills named {names}. Replace them?",
+    sk_zip_big: "The archive is larger than {mb} MB ([skills] max_archive_mb).", sk_need_source: "Give a folder, a file or a URL.",
+    sk_importing: "Importing…", sk_imported: "In the library: {names}.", sk_attached: "Attached: {name}.", sk_attached_same: "Already attached: {name}.",
+    sk_skipped: "Left out {path}: {error}", sk_pkgs_preview: "Installs automatically: {packages} ({files}).",
+    sk_pkgs_trust: "Installing runs the packages' own install code with your rights (outside the Docker sandbox).",
+    sk_pkgs_unsupported: "Its {files} is not installed automatically: {reason}; agents install what they need themselves.",
+    sk_pkgs_off: "Package installation is off in the settings.",
   },
 };
 
@@ -230,7 +348,13 @@ const H = {
   view: null, original: null, providers: [], path: "", profiles: [], defaultUid: null,
   dirty: false, ws: null, wsRetry: 0, reloadTimer: null, uid: 0, busy: new Set(), settingsError: null,
   rolePresets: [], roleCards: [], teams: {},   // the role catalog (Settings → Roles) and the team composers
+  // skills: GET /api/skills (null until loaded), the cards shown open (key → GET /api/skills/{name}), the refs ticked
+  // in the new-session modal
+  skills: null, skillShown: {}, nsSkills: new Set(),
 };
+// skills.js: a global of the page (loaded before this script), a module in the Node tests
+const SK = typeof Skills !== "undefined" ? Skills : require("./skills.js");
+const SKILL_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;   // skills.NAME_RE (at most 64 characters)
 // profile names the settings accept (settings.apply_update)
 const PROFILE_NAME = /^[A-Za-z0-9_-]+$/;
 
@@ -254,8 +378,20 @@ async function api(method, path, body) {
   try { resp = await fetch(path, opts); } catch (e) { throw new Error(t("conn_lost")); }
   let data = null;
   try { data = await resp.json(); } catch (e) { data = null; }
-  if (!resp.ok) throw new Error((data && (data.error || data.result)) || `${resp.status} ${resp.statusText}`);
+  if (!resp.ok) {
+    // status and body go along: a skills clash (409 "exists"), a delete refused for pending proposals
+    const err = new Error((data && (data.error || data.result)) || `${resp.status} ${resp.statusText}`);
+    err.status = resp.status; err.data = data;
+    throw err;
+  }
   return data;
+}
+/** {status, data} of a request that answers in several ways (the skills import flow, skills.js runImport). */
+async function apiRaw(method, path, body) {
+  try { return { status: 200, data: await api(method, path, body) }; } catch (e) {
+    if (e.status) return { status: e.status, data: e.data || { error: e.message } };
+    throw e;
+  }
 }
 
 function toast(text, isErr = false) {
@@ -284,11 +420,12 @@ function applyI18n() {
   $$("[data-i18n-placeholder]").forEach((el) => { el.placeholder = t(el.dataset.i18nPlaceholder); });
   $$("[data-i18n-title]").forEach((el) => { el.title = t(el.dataset.i18nTitle); });
   $("#lang-btn").textContent = H.lang.toUpperCase();
-  document.title = "DreamTeam — " + t(H.tab === "settings" ? "tab_settings" : "tab_sessions");
+  document.title = "DreamTeam — " + t("tab_" + (TABS.includes(H.tab) ? H.tab : "sessions"));
 }
 function setLang(lang) {
   H.lang = lang; store("dt-lang", lang); applyI18n(); renderSessions();
   if (H.view) renderSettings(false);
+  if (H.skills) renderSkillsPane();
 }
 function applyTheme(theme) {
   if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme;
@@ -296,14 +433,16 @@ function applyTheme(theme) {
 }
 
 // ---- tabs ------------------------------------------------------------------------------------------
+const TABS = ["sessions", "skills", "settings"];
 function setTab(tab, push = true) {
+  if (!TABS.includes(tab)) tab = "sessions";
   H.tab = tab;
   $$(".home-tabs > button").forEach((b) => b.classList.toggle("active", b.dataset.htab === tab));
-  $("#pane-sessions").classList.toggle("hidden", tab !== "sessions");
-  $("#pane-settings").classList.toggle("hidden", tab !== "settings");
-  if (push) history.replaceState(null, "", tab === "settings" ? "#settings" : location.pathname);
+  for (const name of TABS) $("#pane-" + name).classList.toggle("hidden", name !== tab);
+  if (push) history.replaceState(null, "", tab === "sessions" ? location.pathname : "#" + tab);
   if (tab === "settings" && !H.view) loadSettingsPane();
   if (tab === "sessions") loadSessions();
+  if (tab === "skills") { mountHomeSkillForm(); loadSkills(); }
   updateSaveBar();
   applyI18n();
 }
@@ -312,6 +451,7 @@ function setTab(tab, push = true) {
 async function loadSettingsPane() {
   try {
     await loadSettings();
+    if (!H.skills) loadSkills();   // the role cards check their skills against it
   } catch (e) {
     H.settingsError = e.message;
     $("#settings-form").innerHTML = `<div class="err-text">${esc(t("err"))}: ${esc(e.message)}</div>
@@ -422,6 +562,7 @@ function sessionCard(s) {
   const running = s.status === "running";
   const error = s.error || s.config_error;
   const busy = H.busy.has(s.id) ? " disabled" : "";
+  const skills = sessionSkillsHtml(s);
   return `<article class="session-card ${state}" data-sid="${esc(s.id)}">
     <div class="sc-head">
       <span class="dot ${state === "done" ? "" : state}"></span>
@@ -436,8 +577,10 @@ function sessionCard(s) {
       <span><i class="ic ic-coin"></i><b>${esc(budget)}</b></span>
       ${s.model ? `<span title="${esc(t("model"))}: ${esc(s.model_profile)}"><i class="ic ic-cpu"></i>${esc(s.model)}</span>` : ""}
       <span title="${esc(t("created"))}: ${esc(ago(s.created_at))}"><i class="ic ic-clock"></i>${esc(ago(s.last_activity || s.created_at))}</span>
+      ${skills.count}
     </div>
     ${workspaceLine(s.workspace)}
+    ${skills.warn}
     ${error ? `<div class="sc-error">${esc(error)}</div>` : ""}
     <div class="sc-actions">
       <a class="btn primary small" href="/s/${encodeURIComponent(s.id)}/">${esc(t("open"))}</a>
@@ -469,26 +612,43 @@ async function sessionAction(sid, action, button) {
 function startSession(sid, button) { return sessionAction(sid, "start", button); }
 function stopSession(sid, button) { return sessionAction(sid, "stop", button); }
 
-function deleteModal(sid) {
+/** The delete confirmation. Members' proposals still waiting for the user's library decision (`pending`, from the
+ * summary or a refused delete) are not lost silently: the dialog names them and offers "Save to library, then
+ * delete" (?skills=save) or "Delete them too" (?skills=discard). */
+function deleteModal(sid, pending) {
   const s = findSession(sid);
+  pending = pending || (Array.isArray(s.skills_pending) ? s.skills_pending : []);
   // a folder outside the session (the user's project, or one it was moved to) is never deleted
   const kept = workspaceKind(s.workspace) && !s.workspace.default ? s.workspace.path : null;
+  const buttons = pending.length
+    ? `<button class="btn" type="button" data-delete-skills="save"><i class="ic ic-skill"></i>${esc(t("delete_save"))}</button>
+       <button class="btn primary danger-fill" type="button" data-delete-skills="discard"><i class="ic ic-trash"></i>${esc(t("delete_discard"))}</button>`
+    : `<button class="btn primary danger-fill" type="button" data-delete-skills=""><i class="ic ic-trash"></i>${esc(t("delete"))}</button>`;
   openModal(`<div class="modal-head"><h3>${esc(t("delete_title"))}</h3></div>
     <p>${esc(kept ? t("delete_text_kept", { title: s.title, path: kept }) : t("delete_text", { title: s.title }))}</p>
-    <div class="modal-actions">
+    ${pending.length ? `<p class="sc-warn"><i class="ic ic-alert"></i>${esc(t("delete_pending", { names: pending.join(", ") }))}</p>` : ""}
+    <div class="modal-actions" id="delete-actions">
       <button class="btn" type="button" data-close>${esc(t("cancel"))}</button>
-      <button class="btn primary danger-fill" type="button" id="confirm-delete"><i class="ic ic-trash"></i>${esc(t("delete"))}</button>
+      ${buttons}
     </div>`);
-  const btn = $("#confirm-delete");
-  btn.addEventListener("click", async () => {
-    btn.disabled = true;
-    try {
-      const data = await api("DELETE", `/api/sessions/${encodeURIComponent(sid)}?confirm=${encodeURIComponent(sid)}`);
-      closeModal();
-      toast(data && data.workspace_kept ? t("deleted_kept", { path: data.workspace_kept }) : t("deleted"));
-      loadSessions();
-    } catch (e) { btn.disabled = false; toast(e.message, true); }
+  $("#delete-actions").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-delete-skills]");
+    return btn ? confirmDelete(sid, btn.dataset.deleteSkills, btn) : undefined;
   });
+}
+async function confirmDelete(sid, skills, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const data = await api("DELETE", `/api/sessions/${encodeURIComponent(sid)}?confirm=${encodeURIComponent(sid)}${skills ? "&skills=" + skills : ""}`);
+    closeModal();
+    toast(data && data.workspace_kept ? t("deleted_kept", { path: data.workspace_kept }) : t("deleted"));
+    loadSessions();
+  } catch (e) {
+    if (btn) btn.disabled = false;
+    // proposals the card did not know of yet (an agent proposed one meanwhile): ask again, naming them
+    if (e.status === 409 && e.data && Array.isArray(e.data.pending_skills) && !skills) { deleteModal(sid, e.data.pending_skills); return; }
+    toast(e.message, true);
+  }
 }
 
 // ---- role catalog, starting team -------------------------------------------------------------------
@@ -563,11 +723,11 @@ function catalogOf(entries) {
   const out = (H.rolePresets || []).map((p) => {
     const e = byKey.get(p.id) || {};
     return { key: p.id, value: p.id, name: p.name[lang] || p.name.en, builtin: true, hidden: !!e.hidden, model: e.model || null,
-             description: String(e.description || "").trim() || p.description[lang] || p.description.en };
+             description: String(e.description || "").trim() || p.description[lang] || p.description.en, skills: e.skills || [] };
   });
   for (const [key, e] of own) {
     out.push({ key, value: normRole(e.name), name: normRole(e.name), builtin: false, hidden: !!e.hidden, model: e.model || null,
-               description: String(e.description || "").trim() });
+               description: String(e.description || "").trim(), skills: e.skills || [] });
   }
   return out;
 }
@@ -576,7 +736,7 @@ function catalogOf(entries) {
 function teamCatalog(id) {
   if (id === "ns") return catalogOf(savedDefaults().roles);
   return catalogOf((H.roleCards || []).map((c) => ({ name: c.builtin ? c.id : c.name, description: c.description ?? "",
-                                                      model: c.model, hidden: c.hidden })));
+                                                      model: c.model, hidden: c.hidden, skills: c.skills })));
 }
 function findCatalogRole(catalog, role) { const key = roleMatchKey(role); return key ? catalog.find((r) => r.key === key) || null : null; }
 function teamTotal(rows) { return (rows || []).reduce((n, r) => n + (Number(r.count) || 0), 0); }
@@ -656,6 +816,7 @@ function onTeamEvent(e) {
   const total = $("#team-total-" + id);
   if (total) total.textContent = t("team_total", { n: teamTotal(rows) });
   teamChanged(id);
+  if (id === "ns") renderNsRoleSkills();   // the skills the team's roles bring
   return true;
 }
 /** The settings composer writes its value back, except when it equals the canonical value of the saved team:
@@ -681,12 +842,12 @@ function makeRoleCards(entries) {
   const cards = H.rolePresets.map((p) => {
     const e = byKey.get(p.id) || {};
     return { uid: "r" + (++H.uid), builtin: true, id: p.id, description: e.description || null,
-             instructions: e.instructions || "", model: e.model || null, hidden: !!e.hidden };
+             instructions: e.instructions || "", model: e.model || null, hidden: !!e.hidden, skills: [...(e.skills || [])] };
   });
   for (const e of entries || []) {
     if (!e || !normRole(e.name) || presetIdOf(e.name)) continue;
     cards.push({ uid: "r" + (++H.uid), builtin: false, name: normRole(e.name), description: e.description || "",
-                 instructions: e.instructions || "", model: e.model || null, hidden: !!e.hidden });
+                 instructions: e.instructions || "", model: e.model || null, hidden: !!e.hidden, skills: [...(e.skills || [])] });
   }
   return cards;
 }
@@ -697,7 +858,8 @@ function changedDescription(card) {
   return desc && preset && !Object.values(preset.description).some((d) => String(d).trim() === desc) ? desc : "";
 }
 function roleCustomized(card) {
-  return card.builtin && !!(changedDescription(card) || String(card.instructions || "").trim() || card.model || card.hidden);
+  return card.builtin && !!(changedDescription(card) || String(card.instructions || "").trim() || card.model || card.hidden
+                            || (card.skills || []).length);
 }
 function roleCardName(card) {
   const preset = card.builtin ? presetOf(card.id) : null;
@@ -740,11 +902,41 @@ function roleCard(card) {
         <textarea rows="5" data-rc="description">${esc(desc)}</textarea>${preset ? `<span class="field-hint">${esc(t("r_desc_both"))}</span>` : ""}</label>
       <label class="field"><span>${esc(t("r_model"))}</span><select data-rc="model">${roleModelOptions(card.model)}</select></label>
     </div>
-    <details class="more"${card.moreOpen ? " open" : ""}><summary>${esc(t("f_more"))}</summary>
+    <details class="more"${card.moreOpen ? " open" : ""}><summary>${esc(t("f_more"))}${(card.skills || []).length ? ` · ${esc(t("r_skills"))}: ${esc(card.skills.join(", "))}` : ""}</summary>
       <label class="field"><span>${esc(t("r_instr"))} <span class="hint">${esc(t("r_instr_hint"))}</span></span>
         <textarea rows="3" data-rc="instructions">${esc(card.instructions || "")}</textarea></label>
+      ${roleSkillsHtml(card)}
     </details>
   </div>`;
+}
+/** A role card's skills: a chip per name (✕ removes it; a warn chip when no source has it, so the role would not get
+ * it), a name input offering the library's and Claude Code's names (free text is allowed) and «Добавить». */
+function roleSkillsHtml(card) {
+  const chips = (card.skills || []).map((name) => {
+    const missing = skillResolves(name) === false;
+    return `<span class="badge ${missing ? "warn" : "plain"} sk-chip"${missing ? ` title="${esc(t("r_skill_missing"))}"` : ""}>${missing ? '<i class="ic ic-alert"></i>' : ""}${esc(name)}${missing ? ` · ${esc(t("r_skill_missing"))}` : ""}
+      <button class="icon-btn small" type="button" data-rc-skill-del="${esc(name)}" title="${esc(t("r_skill_remove"))}" aria-label="${esc(t("r_skill_remove"))}"><i class="ic ic-close"></i></button></span>`;
+  }).join("");
+  return `<div class="field full role-skills"><span>${esc(t("r_skills"))} <span class="hint">${esc(t("r_skills_hint"))}</span></span>
+    ${chips ? `<div class="sk-chips">${chips}</div>` : ""}
+    <div class="input-row"><input type="text" data-rc="skill" list="dl-role-skills" maxlength="64" autocomplete="off" placeholder="${esc(t("r_skill_ph"))}">
+      <button class="btn small" type="button" data-rc-skill-add><i class="ic ic-plus"></i>${esc(t("r_skill_add"))}</button></div></div>`;
+}
+/** The names a role's skill input offers: the library's, then Claude Code's that the library lacks. */
+function roleSkillOptions(data = H.skills) {
+  const names = [];
+  for (const s of skillSources(data)) if (s.origin !== "claude-project" && !s.entry.error && !names.includes(s.entry.name)) names.push(s.entry.name);
+  return names.map((n) => `<option value="${esc(n)}">`).join("");
+}
+/** «Добавить» of a role card: the typed name (a skill name; checked like parse_roles) joins its skills. */
+function addRoleSkill(card, cardEl) {
+  const input = cardEl && cardEl.querySelector ? cardEl.querySelector('input[data-rc="skill"]') : null;
+  const name = String((input && input.value) || "").trim().toLowerCase();
+  if (!name) return false;
+  if (name.length > 64 || !SKILL_NAME.test(name)) { updateSaveBar(t("r_skill_bad", { name }), true); return false; }
+  card.skills = card.skills || [];
+  if (!card.skills.includes(name)) card.skills.push(name);
+  return true;
 }
 function renderRoles() {
   const box = $("#roles");
@@ -755,7 +947,7 @@ function renderRoles() {
     const more = el.querySelector("details.more");
     if (card && more) card.moreOpen = more.open;
   });
-  box.innerHTML = H.roleCards.map(roleCard).join("");
+  box.innerHTML = H.roleCards.map(roleCard).join("") + `<datalist id="dl-role-skills">${roleSkillOptions()}</datalist>`;
 }
 /** Role card events: typing in a card (true when the event was one; the card is not re-rendered while typed in). */
 function onRoleCardEvent(e) {
@@ -765,7 +957,7 @@ function onRoleCardEvent(e) {
   if (!uid) return false;
   const card = H.roleCards.find((c) => c.uid === uid);
   const field = el.dataset && el.dataset.rc;
-  if (!card || !field) return true;
+  if (!card || !field || field === "skill") return true;   // (a skill name being typed is added by its button)
   if (field === "name") card.name = el.value;
   else if (field === "description") card.description = el.value;
   else if (field === "instructions") card.instructions = el.value;
@@ -791,8 +983,10 @@ function onRoleCardClick(e) {
   if (!uid) return false;
   const card = H.roleCards.find((c) => c.uid === uid);
   if (!card) return true;
-  if ("rcReset" in ds) Object.assign(card, { description: null, instructions: "", model: null, hidden: false });
+  if ("rcReset" in ds) Object.assign(card, { description: null, instructions: "", model: null, hidden: false, skills: [] });
   else if ("rcHide" in ds) card.hidden = !card.hidden;
+  else if ("rcSkillDel" in ds) card.skills = (card.skills || []).filter((n) => n !== ds.rcSkillDel);
+  else if ("rcSkillAdd" in ds) { if (!addRoleSkill(card, cardEl)) return true; }
   else if ("rcDel" in ds) H.roleCards = H.roleCards.filter((c) => c !== card);
   else return true;
   renderRoles(); renderTeam("defaults"); markDirty();
@@ -823,6 +1017,7 @@ function roleEntries(cards) {
     if (instructions) entry.instructions = instructions;
     if (model) entry.model = model;
     if (card.hidden) entry.hidden = true;
+    if ((card.skills || []).length) entry.skills = [...card.skills];   // (none: the key is left out)
     if (!card.builtin || Object.keys(entry).length > 1) out.push(entry);
   }
   return out;
@@ -837,6 +1032,7 @@ async function newSessionModal() {
   const v = savedDefaults();
   const sw = v.swarm || {};
   H.teams.ns = teamRows(sw.starting_roles, sw.start_agents ?? 3);
+  H.nsSkills = new Set();
   const profiles = Object.entries(v.models || {});
   const def = (v.agents || {}).default_model || "default";
   const modelOpts = profiles.map(([name, p]) =>
@@ -855,6 +1051,11 @@ async function newSessionModal() {
         <label class="field"><span>${esc(t("f_max_agents"))}</span><input id="ns-max" type="number" min="1" max="200" value="${esc(sw.max_agents ?? 8)}"></label>
         <label class="field"><span>${esc(t("f_budget"))}</span><input id="ns-budget" type="number" min="0" step="0.5" value="${esc(sw.max_cost_usd ?? 5)}"></label>
         ${teamComposer("ns")}
+        <div class="field full ns-skills"><span><i class="ic ic-skill"></i>${esc(t("f_skills"))} <span class="hint">${esc(t("f_skills_hint"))}</span></span>
+          <div id="ns-skills-list">${H.skills ? nsSkillsHtml(H.skills, H.nsSkills) : `<span class="muted">${esc(t("loading"))}</span>`}</div>
+          <div id="ns-role-skills"></div>
+          <details class="more sk-add-more"><summary>${esc(t("f_skills_add"))}</summary><div id="ns-skill-add"></div></details>
+        </div>
       </div>
       <details class="more"><summary>${esc(t("f_more"))}</summary>
         <div class="form-grid">
@@ -871,6 +1072,10 @@ async function newSessionModal() {
     </form>`);
   $("#ns-goal").focus();
   for (const type of ["input", "change", "click"]) $("#ns-form .team").addEventListener(type, onTeamEvent);
+  $("#ns-skills-list").addEventListener("change", onNsSkillChange);
+  mountNsSkillForm();
+  renderNsRoleSkills();
+  loadSkills();
   $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = t(e.target.checked ? "create_open" : "create"); });
   $("#ns-form").addEventListener("submit", submitNewSession);
 }
@@ -917,11 +1122,360 @@ async function submitNewSession(e) {
   if (btn.disabled) return;
   btn.disabled = true; $("#ns-error").textContent = t("creating");
   try {
-    const data = await api("POST", "/api/sessions", { title: $("#ns-title").value.trim(), goal, description: $("#ns-desc").value.trim(), overrides, start: run });
+    const body = { title: $("#ns-title").value.trim(), goal, description: $("#ns-desc").value.trim(), overrides, start: run };
+    if (H.nsSkills.size) body.skills = [...H.nsSkills];   // references: "x" from the library, "claude-user:x"…
+    const data = await api("POST", "/api/sessions", body);
     if (run) { location.href = data.session.url; return; }
     closeModal(true); loadSessions();
   } catch (err) {
     btn.disabled = false; $("#ns-error").textContent = err.message;
+  }
+}
+
+// ---- skills (docs/SPEC.md §18.4, §19) --------------------------------------------------------------
+/** GET /api/skills into H.skills, then everything that shows it: the Skills tab, the role cards' warn chips, an open
+ * new-session picker. A failure shows in the tab (the other places keep what they had). */
+async function loadSkills() {
+  const seq = H.skillSeq = (H.skillSeq || 0) + 1;
+  try {
+    const data = await api("GET", "/api/skills");
+    if (seq !== H.skillSeq) return;
+    H.skills = data;
+    renderSkillsPane();
+    // the role cards' warn chips and name list (not while the user types in a card: a re-render loses the focus)
+    const roles = $("#roles");
+    const typing = document.activeElement && roles && roles.contains && roles.contains(document.activeElement);
+    if (H.view && roles && !typing) renderRoles();
+    if ($("#modal #ns-skills-list")) renderNsSkills();
+  } catch (e) {
+    if (seq !== H.skillSeq) return;
+    const box = $("#skill-library");
+    if (box && !H.skills) box.innerHTML = `<div class="err-text">${esc(e.message)}</div>`;
+  }
+}
+
+/** The import form of the Skills tab (skills.js), mounted once. */
+function mountHomeSkillForm() {
+  const box = $("#skill-add-home");
+  if (!box || box._skMounted) return;
+  box._skMounted = true;
+  SK.mount(box, { t, esc, post: (body) => apiRaw("POST", "/api/skills", body), limits: () => H.skills && H.skills.limits,
+                  sandbox: () => H.skills && H.skills.sandbox, onImported: () => loadSkills() });
+}
+
+/** The entries of every source the user can attach from: the library, then Claude Code's, then (in the Docker
+ * sandbox) the host's library, each `{entry, origin, ref}`; `ref` is what a session's `skills` takes (a library
+ * entry by its bare name, the others prefixed: two skills of one name stay apart). */
+function skillSources(data) {
+  const out = [];
+  for (const e of (data && data.library) || []) out.push({ entry: e, origin: "library", ref: e.name });
+  for (const e of (data && data.claude) || []) out.push({ entry: e, origin: e.origin || "claude-user", ref: `${e.origin || "claude-user"}:${e.name}` });
+  for (const e of (data && data.host) || []) out.push({ entry: e, origin: "host-library", ref: `host-library:${e.name}` });
+  return out;
+}
+/** Whether a bare skill name resolves as a role's skill does (skills.resolve_ref: the library, then ~/.claude/skills,
+ * then the host's library; never the workspace's .claude/skills); null while the lists are not loaded. */
+function skillResolves(name, data = H.skills) {
+  if (!data) return null;
+  return skillSources(data).some((s) => s.origin !== "claude-project" && s.entry.name === name && !s.entry.error);
+}
+/** Where a library entry came from, as one line (a Git URL already has its credentials stripped by the hub). */
+function skillSourceText(entry) {
+  const s = (entry && entry.source) || {};
+  if (entry && entry.origin === "agent") return [s.owner, s.session].filter(Boolean).join(" · ");
+  if (s.url) return s.url + (s.ref || s.subdir ? `#${s.ref || ""}${s.subdir ? ":" + s.subdir : ""}` : "");
+  return String(s.path || s.filename || "");
+}
+/** The files, the package preview and SKILL.md of a shown skill; on this page SKILL.md stays text (`esc()` in a
+ * <pre>): the Markdown renderer lives in the board's scripts. */
+function skillShowHtml(data, install) {
+  if (!data) return "";
+  if (data.loading) return `<div class="sk-show muted">${esc(t("loading"))}</div>`;
+  if (data.failed) return `<div class="sk-show err-text">${esc(data.failed)}</div>`;
+  const files = (data.files_list || []).map((f) => `<li><code>${esc(f.path)}</code> <span class="muted">${esc(SK.fmtSize(f.size))}</span></li>`).join("");
+  // the switches the show request returned first: H.skills is not loaded until the Skills or Settings tab opens
+  const deps = SK.previewLine(t, data.deps, data.install || install, data.origin === "agent");
+  return `<div class="sk-show">
+    ${files ? `<div class="sk-files"><span class="sk-label">${esc(t("sk_files_title"))}</span><ul>${files}</ul></div>` : ""}
+    ${deps ? `<div class="sk-deps">${esc(deps)}</div>` : ""}
+    <pre class="skill-md">${esc(data.skill_md || "")}</pre></div>`;
+}
+function skillBadges(entry) {
+  const out = [];
+  if (entry.error) out.push(`<span class="badge err">${esc(t("err"))}</span>`);
+  if (entry.changed_outside) out.push(`<span class="badge warn" title="${esc(t("sk_changed_hint"))}"><i class="ic ic-alert"></i>${esc(t("sk_changed_outside"))}</span>`);
+  if (entry.manual) out.push(`<span class="badge plain" title="${esc(t("sk_manual_hint"))}">${esc(t("sk_manual"))}</span>`);
+  return out.join("");
+}
+function libraryCard(entry) {
+  const shown = H.skillShown["library:" + entry.name];
+  const meta = [];
+  if (!entry.error) meta.push(esc(t("sk_files", { n: Number(entry.files) || 0, size: SK.fmtSize(entry.size) })));
+  const source = skillSourceText(entry);
+  if (source) meta.push(`<code title="${esc(t("sk_source"))}">${esc(source)}</code>`);
+  if (entry.origin === "agent" && entry.by) meta.push(esc(t("sk_by", { by: entry.by, via: entry.via || "?" })));
+  return `<article class="skill-card${entry.error ? " broken" : ""}" data-skill="${esc(entry.name)}">
+    <div class="sk-head"><i class="ic ic-skill"></i><b>${esc(entry.name)}</b><span class="badge plain">${esc(entry.origin || "folder")}</span>${skillBadges(entry)}
+      <span class="spacer"></span>
+      ${entry.error ? "" : `<button class="btn small" type="button" data-skill-show="${esc(entry.name)}" data-from="library">${esc(t(shown ? "sk_hide" : "sk_show"))}</button>`}
+      <button class="icon-btn small" type="button" data-skill-del="${esc(entry.name)}" title="${esc(t("sk_delete"))}" aria-label="${esc(t("sk_delete"))}"><i class="ic ic-trash"></i></button></div>
+    <div class="sk-desc${entry.error ? " err-text" : ""}">${esc(entry.error || entry.description || "")}</div>
+    ${meta.length ? `<div class="sk-meta">${meta.join(" · ")}</div>` : ""}
+    ${skillShowHtml(shown, H.skills && H.skills.install)}
+  </article>`;
+}
+/** A Claude Code skill (or, in the sandbox, one of the host's library): "Add to library", whether the library has
+ * it already (the same, or another skill of that name). */
+function sourceRow(entry, origin) {
+  const key = `${origin}:${entry.name}`;
+  const shown = H.skillShown[key];
+  const lib = { same: t("sk_in_lib"), different: t("sk_diff_lib") }[entry.library];
+  const badges = (lib ? `<span class="badge ${entry.library === "same" ? "done" : "warn"}">${esc(lib)}</span>` : "") + skillBadges(entry);
+  return `<article class="skill-card${entry.error ? " broken" : ""}">
+    <div class="sk-head"><i class="ic ic-skill"></i><b>${esc(entry.name)}</b><span class="badge plain">${esc(origin)}</span>${badges}
+      <span class="spacer"></span>
+      ${entry.error ? "" : `<button class="btn small" type="button" data-skill-show="${esc(entry.name)}" data-from="${esc(origin)}">${esc(t(shown ? "sk_hide" : "sk_show"))}</button>
+      <button class="btn small" type="button" data-skill-import="${esc(entry.name)}" data-from="${esc(origin)}"${entry.library === "same" ? " disabled" : ""}><i class="ic ic-plus"></i>${esc(t("sk_add_lib"))}</button>`}</div>
+    <div class="sk-desc${entry.error ? " err-text" : ""}">${esc(entry.error || entry.description || "")}</div>
+    ${entry.path ? `<div class="sk-meta"><code>${esc(entry.path)}</code></div>` : ""}
+    ${skillShowHtml(shown, H.skills && H.skills.install)}
+  </article>`;
+}
+function renderSkillsPane() {
+  const data = H.skills;
+  const lib = $("#skill-library");
+  if (!data || !lib) return;
+  const library = data.library || [];
+  lib.innerHTML = library.length ? library.map(libraryCard).join("")
+    : `<div class="sk-empty muted">${esc(t("sk_lib_empty", { dir: data.library_dir || "" }))}</div>`;
+  const dir = $("#skill-lib-dir");
+  if (dir) dir.textContent = data.library_dir || "";
+  const claude = (data.claude || []).filter((e) => e.origin !== "claude-project");
+  // in the Docker sandbox ~/.claude/skills is the container's: the user's own come in through the host library
+  $("#skill-claude").innerHTML = (data.sandbox ? `<div class="field-hint">${esc(t("sk_claude_sandbox"))}</div>` : "")
+    + (claude.length ? claude.map((e) => sourceRow(e, e.origin || "claude-user")).join("")
+      : `<div class="sk-empty muted">${esc(t("sk_claude_empty"))}</div>`);
+  const host = data.host || [];
+  $("#skill-host-section").classList.toggle("hidden", !data.sandbox);
+  SK.setSandbox(document, !!data.sandbox);   // the add forms mounted before the listing came
+  $("#skill-host").innerHTML = host.map((e) => sourceRow(e, "host-library")).join("") || `<div class="sk-empty muted">${esc(t("sk_host_empty"))}</div>`;
+}
+
+async function toggleSkillShow(name, from) {
+  const key = `${from}:${name}`;
+  if (H.skillShown[key]) { delete H.skillShown[key]; renderSkillsPane(); return; }
+  H.skillShown[key] = { loading: true };
+  renderSkillsPane();
+  try {
+    H.skillShown[key] = await api("GET", `/api/skills/${encodeURIComponent(name)}?from=${encodeURIComponent(from)}`);
+  } catch (e) { H.skillShown[key] = { failed: e.message }; }
+  renderSkillsPane();
+}
+/** "Add to library" of a Claude Code skill or a host-library one: the usual import (a clash asks first). */
+async function importSkillFrom(name, from, button) {
+  if (button) button.disabled = true;
+  const body = from === "host-library" ? { host: name } : { claude: name, origin: from };
+  try {
+    const res = await SK.runImport((b) => apiRaw("POST", "/api/skills", b), body,
+                                   { replace: async (names) => confirm(t("sk_replace_q", { names: names.join(", ") })), pick: async () => null });
+    if (res.ok) toast(SK.reportLines(t, res.data).map((l) => l.text).join(" ") || t("sk_imported", { names: name }));
+    else if (!res.cancelled) toast(res.error, true);
+  } catch (e) { toast(e.message, true); }
+  if (button) button.disabled = false;
+  loadSkills();
+}
+function deleteSkillModal(name) {
+  openModal(`<div class="modal-head"><h3>${esc(t("sk_delete_title"))}</h3></div>
+    <p>${esc(t("sk_delete_text", { name }))}</p>
+    <div class="modal-actions">
+      <button class="btn" type="button" data-close>${esc(t("cancel"))}</button>
+      <button class="btn primary danger-fill" type="button" id="confirm-skill-delete"><i class="ic ic-trash"></i>${esc(t("delete"))}</button>
+    </div>`);
+  const btn = $("#confirm-skill-delete");
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    try {
+      await api("DELETE", `/api/skills/${encodeURIComponent(name)}?confirm=${encodeURIComponent(name)}`);
+      closeModal(true);
+      toast(t("sk_deleted", { name }));
+      delete H.skillShown["library:" + name];
+      loadSkills();
+    } catch (e) { btn.disabled = false; toast(e.message, true); }
+  });
+}
+/** "Remove unused environments now": the launcher's cleanup of every environment no session uses, whatever its age
+ * (env_retention_days is for the automatic runs). */
+async function cleanSkillEnvs(button) {
+  if (button) button.disabled = true;
+  try {
+    toast(envsCleanedText(await api("POST", "/api/skill-envs/cleanup", {})));
+  } catch (e) { toast(e.message, true); }
+  if (button) button.disabled = false;
+}
+/** The cleanup's report as one line: what was removed, and what was kept with each reason (in use, being built). */
+function envsCleanedText(r) {
+  const kept = Array.isArray(r && r.kept) ? r.kept : [];
+  let text = t("sk_envs_cleaned", { removed: ((r && r.removed) || []).length });
+  if (kept.length) {
+    const words = new Map([["in use", t("sk_why_in_use")], ["being built", t("sk_why_being_built")]]);
+    const why = [...new Set(kept.map((k) => words.get(k && k.why) || String((k && k.why) || "?")))].join(", ");
+    text += t("sk_envs_kept", { kept: kept.length, why });
+  }
+  return text;
+}
+function onSkillsPaneClick(e) {
+  const btn = e.target.closest("button[data-skill-show],button[data-skill-del],button[data-skill-import]");
+  if (!btn) return;
+  const ds = btn.dataset;
+  if ("skillShow" in ds) toggleSkillShow(ds.skillShow, ds.from || "library");
+  else if ("skillDel" in ds) deleteSkillModal(ds.skillDel);
+  else if ("skillImport" in ds) importSkillFrom(ds.skillImport, ds.from, btn);
+}
+
+// ---- skills of a new session, of a session card --------------------------------------------------
+/** The new-session picker: a checkbox per skill of every source (a name in two sources shows twice, each row with
+ * its own reference), then the skills the composed team's roles bring ("not in the library" when one resolves
+ * nowhere: the role would not get it). */
+function nsSkillsHtml(data, checked) {
+  const rows = skillSources(data).filter((s) => !s.entry.error && s.origin !== "claude-project");
+  if (!rows.length) return `<div class="sk-empty muted">${esc(t("f_skills_none"))}</div>`;
+  return `<div class="sk-picker">${rows.map((s) => `<label class="check" title="${esc(s.entry.description || "")}">
+    <input type="checkbox" data-ns-skill="${esc(s.ref)}"${checked.has(s.ref) ? " checked" : ""}>
+    <span><b>${esc(s.entry.name)}</b> <span class="badge plain">${esc(s.origin)}</span>${s.entry.changed_outside ? ` <span class="badge warn" title="${esc(t("sk_changed_hint"))}"><i class="ic ic-alert"></i>${esc(t("sk_changed_outside"))}</span>` : ""} <span class="hint">${esc(roleSummary(s.entry.description || "", 90))}</span></span></label>`).join("")}</div>`;
+}
+/** The skills the roles of `rows` (a composer's) list, by the saved catalog: [{name, resolves}]. */
+function teamSkills(rows, catalog) {
+  const names = [];
+  for (const row of rows || []) {
+    const role = row.custom ? null : findCatalogRole(catalog, row.role);
+    for (const name of (role && role.skills) || []) if (!names.includes(name)) names.push(name);
+  }
+  return names.map((name) => ({ name, resolves: skillResolves(name) }));
+}
+function nsRoleSkillsHtml(list) {
+  if (!list.length) return "";
+  return `<div class="sk-roles"><span class="hint">${esc(t("f_skills_roles"))}</span> ${list.map((s) => s.resolves === false
+    ? `<span class="badge warn" title="${esc(t("f_skill_missing", { name: s.name }))}"><i class="ic ic-alert"></i>${esc(s.name)} · ${esc(t("r_skill_missing"))}</span>`
+    : `<span class="badge plain">${esc(s.name)}</span>`).join(" ")}</div>`;
+}
+function onNsSkillChange(e) {
+  const ref = e.target && e.target.dataset ? e.target.dataset.nsSkill : null;
+  if (!ref) return;
+  // a library entry whose files changed since the import asks first, as the board's attach dialog does
+  const row = e.target.checked ? skillSources(H.skills || {}).find((s) => s.ref === ref) : null;
+  if (row && row.entry.changed_outside && !confirm(t("sk_attach_anyway", { name: row.entry.name, why: t("sk_changed_outside") }))) {
+    e.target.checked = false;
+    return;
+  }
+  if (e.target.checked) H.nsSkills.add(ref); else H.nsSkills.delete(ref);
+}
+function renderNsSkills() {
+  const box = $("#ns-skills-list");
+  if (box && H.skills) box.innerHTML = nsSkillsHtml(H.skills, H.nsSkills);
+  renderNsRoleSkills();
+}
+function renderNsRoleSkills() {
+  const box = $("#ns-role-skills");
+  if (box) box.innerHTML = nsRoleSkillsHtml(teamSkills(H.teams.ns, teamCatalog("ns")));
+}
+function mountNsSkillForm() {
+  const box = $("#ns-skill-add");
+  if (!box) return;
+  SK.mount(box, { t, esc, post: (body) => apiRaw("POST", "/api/skills", body), limits: () => H.skills && H.skills.limits,
+                  sandbox: () => H.skills && H.skills.sandbox,
+                  // what was just imported is ticked: a new source is attached at launch without leaving the dialog
+                  onImported: (data) => { for (const e of data.imported || []) H.nsSkills.add(e.name); loadSkills(); } });
+}
+
+/** The session card's skills: a count, and a warn button when members' proposals wait for the user's decision. */
+function sessionSkillsHtml(s) {
+  const names = Array.isArray(s.skills) ? s.skills : [];
+  const pending = Array.isArray(s.skills_pending) ? s.skills_pending : [];
+  const count = names.length ? `<span title="${esc(names.join(", "))}"><i class="ic ic-skill"></i>${esc(t("sc_skills", { n: names.length }))}</span>` : "";
+  const warn = pending.length ? `<button class="sc-warn link" type="button" data-skills-pending="${esc(s.id)}" title="${esc(pending.join(", "))}"><i class="ic ic-alert"></i>${esc(t("sc_skills_pending", { n: pending.length }))}</button>` : "";
+  return { count, warn };
+}
+/** The session's proposals waiting for the user (GET /api/sessions/{sid}/skills: also a stopped session), each with
+ * its preview and Save / Don't save (the launcher's decide route). */
+async function pendingSkillsModal(sid) {
+  const s = findSession(sid);
+  let attached = [];
+  try { attached = (await api("GET", `/api/sessions/${encodeURIComponent(sid)}/skills`)).attached || []; }
+  catch (e) { toast(e.message, true); return; }
+  H.pendingSid = sid;
+  H.pendingItems = attached.filter((a) => a.library === "pending");
+  H.pendingShown = {};
+  openModal(`<div class="modal-head"><h3>${esc(t("pend_title"))} · ${esc(s.title)}</h3><button class="icon-btn small" type="button" data-close><i class="ic ic-close"></i></button></div>
+    <p class="lead">${esc(t("pend_text"))}</p><div id="pending-skills"></div>
+    <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button></div>`);
+  renderPendingSkills();
+  $("#pending-skills").addEventListener("click", onPendingClick);
+}
+function pendingSkillHtml(item) {
+  const shown = H.pendingShown[item.name];
+  return `<article class="skill-card" data-pending="${esc(item.name)}">
+    <div class="sk-head"><i class="ic ic-skill"></i><b>${esc(item.name)}</b>${item.owner ? `<span class="muted">${esc(t("pend_by", { owner: item.owner }))}</span>` : ""}
+      <span class="badge plain">${esc(t("sk_files", { n: Number(item.files) || 0, size: SK.fmtSize(item.size) }))}</span><span class="spacer"></span>
+      <button class="btn small" type="button" data-pend-show="${esc(item.name)}">${esc(t(shown ? "sk_hide" : "sk_show"))}</button></div>
+    <div class="sk-desc">${esc(item.description || "")}</div>
+    ${skillShowHtml(shown, H.skills && H.skills.install)}
+    <div class="sk-actions"><button class="btn small primary" type="button" data-pend-save="${esc(item.name)}">${esc(t("pend_save"))}</button>
+      <button class="btn small" type="button" data-pend-nosave="${esc(item.name)}">${esc(t("pend_nosave"))}</button></div>
+  </article>`;
+}
+function renderPendingSkills() {
+  const box = $("#pending-skills");
+  if (!box) return;
+  box.innerHTML = (H.pendingItems || []).map(pendingSkillHtml).join("") || `<div class="sk-empty muted">${esc(t("pend_none"))}</div>`;
+}
+/** Save to the library (a clash asks, then replaces) or not (an optional reason); the session's summary follows. */
+async function decidePendingSkill(sid, name, approve) {
+  let comment = "";
+  if (!approve) {
+    const reason = prompt(t("pend_reason"), "");
+    if (reason === null) return null;
+    comment = reason.trim();
+  }
+  const url = `/api/sessions/${encodeURIComponent(sid)}/skills/${encodeURIComponent(name)}/decide`;
+  let body = { approve, comment };
+  for (;;) {
+    try {
+      const data = await api("POST", url, body);
+      toast(data.text || name);
+      H.pendingItems = (H.pendingItems || []).filter((a) => a.name !== name);
+      renderPendingSkills();
+      loadSessions();
+      return data;
+    } catch (e) {
+      if (e.status === 409 && e.data && Array.isArray(e.data.exists) && approve && !body.replace && confirm(t("sk_replace_lib", { name }))) {
+        body = { ...body, replace: true };
+        continue;
+      }
+      toast(e.message, true);
+      return null;
+    }
+  }
+}
+async function onPendingClick(e) {
+  const btn = e.target.closest("button[data-pend-show],button[data-pend-save],button[data-pend-nosave]");
+  if (!btn) return;
+  const ds = btn.dataset, sid = H.pendingSid;
+  if ("pendShow" in ds) {
+    const name = ds.pendShow;
+    if (H.pendingShown[name]) delete H.pendingShown[name];
+    else {
+      H.pendingShown[name] = { loading: true };
+      renderPendingSkills();
+      try {
+        const data = await api("GET", `/api/sessions/${encodeURIComponent(sid)}/skills?show=${encodeURIComponent(name)}`);
+        H.pendingShown[name] = { ...data, origin: "agent" };
+      } catch (err) { H.pendingShown[name] = { failed: err.message }; }
+    }
+    renderPendingSkills();
+  } else {
+    btn.disabled = true;
+    await decidePendingSkill(sid, ds.pendSave || ds.pendNosave, "pendSave" in ds);
+    btn.disabled = false;
   }
 }
 
@@ -951,7 +1505,7 @@ async function loadSettings() {
 
 const SECTIONS = [
   ["models", "s_models"], ["roles", "s_roles"], ["swarm", "s_swarm"], ["agents", "s_agents"], ["shell", "s_shell"],
-  ["workspace", "s_workspace"], ["mcp", "s_mcp"], ["tracing", "s_tracing"], ["server", "s_server"],
+  ["workspace", "s_workspace"], ["mcp", "s_mcp"], ["skills", "s_skills"], ["tracing", "s_tracing"], ["server", "s_server"],
 ];
 
 function renderSettings(fromServer) {
@@ -1013,6 +1567,24 @@ function renderSettings(fromServer) {
       field("mcp_startup", "mcp.startup_timeout", "float", { min: 1 }),
       field("mcp_call", "mcp.call_timeout", "float", { min: 1 }),
       field("mcp_external", "mcp.external", "json", { full: true, placeholder: t("mcp_external_hint"), hint: "mcp_env_hint" }),
+    ]))}
+    ${section("skills", grid([
+      field("sk_f_library_dir", "skills.library_dir", "str", { full: true }),
+      field("sk_f_claude", "skills.claude", "bool", { full: true }),
+      field("sk_f_max_mb", "skills.max_mb", "int", { min: 1 }),
+      field("sk_f_max_files", "skills.max_files", "int", { min: 1 }),
+      field("sk_f_max_archive_mb", "skills.max_archive_mb", "int", { min: 1 }),
+      field("sk_f_max_attached", "skills.max_attached", "int", { min: 1 }),
+      field("sk_f_max_proposals", "skills.max_proposals", "int", { min: 0, hint: "sk_f_max_proposals_hint" }),
+      field("sk_f_install", "skills.install", "bool", { full: true, hint: "sk_f_install_hint" }),
+      field("sk_f_install_proposals", "skills.install_proposals", "bool", { full: true }),
+      field("sk_f_install_scripts", "skills.install_scripts", "bool", { full: true }),
+      field("sk_f_envs_dir", "skills.envs_dir", "str", { full: true }),
+      field("sk_f_python", "skills.python", "str", { full: true, hint: "sk_f_python_hint" }),
+      field("sk_f_install_timeout", "skills.install_timeout", "int", { min: 1 }),
+      field("sk_f_env_retention_days", "skills.env_retention_days", "int", { min: 0, hint: "sk_f_env_retention_days_hint" }),
+      field("sk_f_install_env", "skills.install_env", "list", { full: true, hint: "sk_f_install_env_hint", placeholder: "PIP_INDEX_URL, NPM_TOKEN" }),
+      `<p class="field-hint full">${esc(t("sk_deps_settings_note"))}</p>`,
     ]))}
     ${section("tracing", grid([
       field("tr_enabled", "tracing.enabled", "bool", { full: true }),
@@ -1398,6 +1970,7 @@ function connectWs() {
     if (H.wsEverOpen) { // changes made while the socket was down were not pushed: reload
       loadSessions();
       if (H.view && !H.dirty) loadSettings().catch(() => {});
+      if (H.skills) loadSkills();
     }
     H.wsEverOpen = true;
   };
@@ -1405,6 +1978,7 @@ function connectWs() {
     let ev; try { ev = JSON.parse(msg.data); } catch (e) { return; }
     if (ev.type !== "sessions.changed") return;
     if (ev.change === "settings" && H.view && !H.dirty) loadSettings().catch(() => {});
+    else if (ev.change === "skills" || ev.change === "skill-envs") { if (H.skills || H.tab === "skills") loadSkills(); }
     else scheduleSessions();
   };
   ws.onclose = () => {
@@ -1438,10 +2012,11 @@ function init() {
     renderSessions();
   }));
   document.addEventListener("click", (e) => {
-    const el = e.target.closest("[data-start],[data-stop],[data-delete],[data-close],[data-new-session]");
+    const el = e.target.closest("[data-start],[data-stop],[data-delete],[data-close],[data-new-session],[data-skills-pending]");
     if (!el) return;
     const ds = el.dataset;
     if ("start" in ds) startSession(ds.start, el);
+    else if ("skillsPending" in ds) pendingSkillsModal(ds.skillsPending);
     else if ("stop" in ds) stopSession(ds.stop, el);
     else if ("delete" in ds) deleteModal(ds.delete);
     else if ("close" in ds) closeModal();
@@ -1454,11 +2029,18 @@ function init() {
   form.addEventListener("change", onSettingsChange);
   form.addEventListener("click", onSettingsClick);
   form.addEventListener("submit", (e) => e.preventDefault());
+  form.addEventListener("keydown", (e) => {   // Enter in a role card's skill name adds it (not a form submit)
+    if (e.key !== "Enter" || !e.target.dataset || e.target.dataset.rc !== "skill") return;
+    e.preventDefault();
+    e.target.closest(".role-card")?.querySelector("[data-rc-skill-add]")?.click();
+  });
   $("#settings-nav").addEventListener("click", onSettingsClick);
   $("#settings-save").addEventListener("click", saveSettings);
   $("#settings-reset").addEventListener("click", resetSettings);
   window.addEventListener("beforeunload", (e) => { if (H.dirty) { e.preventDefault(); e.returnValue = ""; } });
-  setTab(location.hash === "#settings" ? "settings" : "sessions", false);
+  setTab(location.hash.slice(1) || "sessions", false);
+  $("#skill-envs-clean").addEventListener("click", (e) => cleanSkillEnvs(e.currentTarget));
+  $("#pane-skills").addEventListener("click", onSkillsPaneClick);
   connectWs();
   setInterval(() => { if (H.tab === "sessions" && !document.hidden) loadSessions(); }, 5000);
 }
@@ -1474,6 +2056,12 @@ if (typeof module !== "undefined" && module.exports) {
     // role catalog and starting team
     normRole, presetIdOf, roleKeyOf, roleSummary, teamRows, teamValue, catalogOf, teamComposer, teamError, onTeamEvent,
     makeRoleCards, roleCard, roleEntries, onRoleCardEvent, onRoleCardClick, CUSTOM_ROLE,
+    // skills: the Skills tab, role skills, the new-session picker, the session cards' proposals, the delete choice
+    SK, api, apiRaw, loadSkills, renderSkillsPane, libraryCard, sourceRow, skillShowHtml, skillSources, skillResolves,
+    skillSourceText, toggleSkillShow, importSkillFrom, deleteSkillModal, cleanSkillEnvs, envsCleanedText,
+    onSkillsPaneClick, pendingSkillHtml,
+    roleSkillsHtml, addRoleSkill, nsSkillsHtml, teamSkills, nsRoleSkillsHtml, renderNsSkills, onNsSkillChange,
+    sessionSkillsHtml, pendingSkillsModal, renderPendingSkills, decidePendingSkill, onPendingClick, confirmDelete,
   };
 } else if (typeof document !== "undefined") {
   init();

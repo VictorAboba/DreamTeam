@@ -8,6 +8,11 @@ services:
       - "127.0.0.1:${PORT:-8765}:8765"
     volumes:
       - "${SWARM_DIR:-./myswarm}:/swarm"
+      # skills: the host's library, read-only (`dreamteam sandbox` adds this itself; the folder must exist)
+      # - "${HOME}/.dreamteam/skills:/dreamteam/host-skills:ro"
+      # skills' dependency environments: a named volume (`dreamteam sandbox` uses dreamteam-skill-envs-<hash>;
+      # `docker volume rm` it to reset them; declare it under a top-level `volumes:` key)
+      # - "dreamteam-skill-envs:/dreamteam/skill-envs"
     environment:
       - ANTHROPIC_API_KEY
       - ANTHROPIC_BASE_URL
@@ -16,6 +21,12 @@ services:
       - OPENROUTER_API_KEY
       # the URL the board is reached at from the host (shown as the MCP URL, written to hub.json)
       - DREAMTEAM_PUBLIC_URL=http://127.0.0.1:${PORT:-8765}
+      # skills: the mounted host library is the read-only source "host-library"; the sandbox's own library is
+      # inside the mounted home (the host never reads it by itself)
+      # - DREAMTEAM_HOST_SKILLS_DIR=/dreamteam/host-skills
+      # - DREAMTEAM_SKILLS_DIR=/swarm/.dreamteam/skills-library
+      # - DREAMTEAM_SKILL_ENVS_DIR=/dreamteam/skill-envs
+      # - UV_CACHE_DIR=/dreamteam/skill-envs/.cache/uv
     # the hub always listens on 8765 inside the container, whatever dreamteam.toml says.
     # SWARM_DIR is a DreamTeam home (sessions page); for a single project made by `dreamteam init` use
     # command: ["run", "/swarm", "--host", "0.0.0.0", "--port", "8765", "--no-console"]

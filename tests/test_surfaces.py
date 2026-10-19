@@ -26,7 +26,7 @@ import anyio
 import pytest
 from proc_guard import kill_tree, read_line, read_rest, spawn
 
-from dreamteam import cli, console as console_module, docker as docker_module, hub_mcp, web
+from dreamteam import cli, console as console_module, docker as docker_module, hub_mcp, swarm_skills, web
 from dreamteam.cli import main as cli_main
 from dreamteam.config import Config
 from dreamteam.llm.scripted import ScriptedLLM
@@ -878,6 +878,127 @@ def test_console_lists_shows_and_stops_background_jobs(capsys):
         assert f"  /jobs [jN | stop jN]     — {text}" in console_module.HELP[lang].splitlines()
 
 
+class StubSkillsHub(StubHub):
+    """A hub whose GETs answer the skills routes (docs/SPEC.md §14) and record what was asked."""
+
+    def __init__(self) -> None:
+        super().__init__(MEMBERS)
+        self.gets: list[tuple[str, dict]] = []
+        self.posts: list[tuple[str, dict]] = []
+
+    def get(self, path: str, **params: Any) -> Any:
+        self.gets.append((path, params))
+        if path == "/api/skills":
+            return {"library_dir": "/lib", "attached": [{"name": "pdf", "from": "library"},
+                                                         {"name": "tidy", "from": "agent"}],
+                    "library": [{"name": "pdf", "description": "Reads PDFs."},
+                                {"name": "csv", "description": "CSV.", "changed_outside": True}],
+                    "claude": [{"name": "review", "origin": "claude-user", "description": "Reviews."}], "host": []}
+        if path.endswith("/deps-log"):
+            return {"path": "/envs/pdf-py-1/install.log", "log": "Installed pypdf\x1b[2J"}
+        if path.startswith("/api/skills/"):
+            return {"name": path.rsplit("/", 1)[1], "description": "Reads PDFs.", "skill_md": "\n".join(
+                f"line {i}" for i in range(60)), "files_list": [{"path": "SKILL.md", "size": 9}],
+                    "deps": {"python": {"files": ["requirements.txt"], "packages": ["pypdf"]}}}
+        return super().get(path, **params)
+
+    def post(self, path: str, body: dict) -> Any:
+        self.posts.append((path, body))
+        return {"removed": ["a-py-1"], "kept": [{"dirname": "b-js-2", "why": "in use"}]}
+
+    def act(self, tool: str, **args: Any) -> str:
+        return super().act(tool, **{k: v for k, v in args.items() if v is not None})   # as console.Hub.act sends
+
+
+def test_console_skills_commands(tmp_path, monkeypatch, capsys):
+    con = console_module.Console("http://127.0.0.1:9/s/001-a", "en", local=True)
+    hub = StubSkillsHub()
+    con.hub = hub
+    con.launcher = hub
+    monkeypatch.chdir(tmp_path)
+    for line in ("/skills", "/skills add pdf", "/skills add claude-user:review --replace", "/skills add ./mine",
+                 "/skills add https://github.com/o/r --pick a,b", "/skills update pdf", "/skills rm pdf",
+                 "/skills approve tidy replace", "/skills reject tidy 'not general enough'",
+                 "/skills reinstall pdf node", "/skills reinstall pdf"):
+        assert con.handle(line) is True
+    assert hub.acts == [
+        ("skills", {}), ("skill_attach", {"name": "pdf"}),
+        ("skill_attach", {"name": "claude-user:review", "replace": True}),
+        ("skill_attach", {"source": str(tmp_path / "mine")}),
+        ("skill_attach", {"source": "https://github.com/o/r", "pick": ["a", "b"]}),
+        ("skill_attach", {"name": "library:pdf", "replace": True}), ("skill_detach", {"name": "pdf"}),
+        ("skill_approve", {"name": "tidy", "approve": True, "replace": True}),
+        ("skill_approve", {"name": "tidy", "approve": False, "comment": "not general enough"}),
+        ("skill_reinstall", {"name": "pdf", "ecosystem": "node"}), ("skill_reinstall", {"name": "pdf"}),
+    ]
+    capsys.readouterr()
+    con.handle("/skills update tidy")      # a member's proposal has no source of its own
+    con.handle("/skills reject")           # a name is required, a reason is not
+    con.handle("/skills zap")
+    out = capsys.readouterr().out
+    assert "its owner proposes it again" in out and "/skills reject NAME [reason]" in out and "clean-envs]" in out
+    assert len(hub.acts) == 11
+    con.handle("/skills reject tidy")
+    assert hub.acts[-1] == ("skill_approve", {"name": "tidy", "approve": False, "comment": ""})
+    capsys.readouterr()
+    con.handle("/skills show pdf")
+    out = capsys.readouterr().out
+    assert hub.gets[-1] == ("/api/skills/pdf", {"from": "session"})   # attached: the session's copy
+    assert "pdf [session]: Reads PDFs." in out and "python: requirements.txt: pypdf" in out
+    assert "line 39" in out and "line 40" not in out
+    con.handle("/skills show claude-user:review")
+    assert hub.gets[-1] == ("/api/skills/review", {"from": "claude-user"})
+    con.handle("/skills log pdf python")
+    out = capsys.readouterr().out
+    assert hub.gets[-1] == ("/api/skills/pdf/deps-log", {"ecosystem": "python"})
+    assert "/envs/pdf-py-1/install.log" in out and "Installed pypdf" in out and "\x1b" not in out
+    con.handle("/skills lib")
+    out = capsys.readouterr().out
+    assert "  pdf [library, attached]: Reads PDFs." in out and "csv [library, changed outside DreamTeam]" in out
+    assert "claude-user:review [claude-user]: Reviews." in out
+    con.handle("/skills clean-envs")
+    assert hub.posts == [("/api/skill-envs/cleanup", {})] and "Removed 1 environment(s); kept 1 (in use)." in \
+        capsys.readouterr().out
+    hub.post = lambda path, body: {"removed": [], "kept": []}   # nothing kept: nothing said about it
+    con.handle("/skills clean-envs")
+    assert capsys.readouterr().out.strip().endswith("Removed 0 environment(s).")
+    # a single swarm has no launcher; a remote hub needs absolute paths
+    single = console_module.Console("http://10.0.0.5:9", "ru")
+    single.hub = StubSkillsHub()
+    single.handle("/skills clean-envs")
+    single.handle("/skills add ./mine")
+    out = capsys.readouterr().out
+    assert "лаунчер" in out and "абсолютный путь" in out and single.hub.acts == []
+    for lang in ("ru", "en"):
+        assert ("  /skills [lib | add X | update X | rm X | show X | approve X | reject X [reason] | reinstall X | "
+                "log X | clean-envs]") in console_module.HELP[lang].splitlines()
+
+
+async def test_console_skills_against_a_standalone_hub(tmp_path, capsys):
+    """`dreamteam run`'s own app serves the skills routes: the console attaches, shows and lists through them."""
+    from conftest import make_skill
+
+    swarm = scripted_swarm(tmp_path)
+    await swarm.start()
+    try:
+        folder = make_skill(tmp_path / "src" / "notes", "notes", "Writes notes.")
+        async with running_server(swarm) as (base, _):
+            con = console_module.Console(base, "en")
+            out = await asyncio.to_thread(con._dispatch, f"/skills add {folder}")
+            assert 'Skill "notes" attached (1 file); members are told.' in out, out
+            assert swarm.skills.get("notes").frm == "library"
+            out = await asyncio.to_thread(con._dispatch, "/skills show notes")
+            assert out.startswith("notes [session]: Writes notes.") and "Steps." in out
+            out = await asyncio.to_thread(con._dispatch, "/skills lib")
+            assert "  notes [library, attached]: Writes notes." in out
+            out = await asyncio.to_thread(con._dispatch, "/skills log notes")
+            assert "no packages installed by DreamTeam" in out   # the hub's 404, in words
+            assert "launcher" in await asyncio.to_thread(con._dispatch, "/skills clean-envs")
+    finally:
+        await swarm.stop()
+        swarm.close()
+
+
 @pytest.mark.filterwarnings("ignore::DeprecationWarning")
 async def test_launcher_mcp_forwards_calls_as_its_client(tmp_path):
     """The launcher MCP server forwards a client's calls to a session as that client (hub_mcp.serving_client): what
@@ -1012,6 +1133,69 @@ def test_sandbox_command(tmp_path, monkeypatch):
     assert cmd[cmd.index("--port") + 1] == "8765" and cmd[-2:] == ["--goal", "Build it"]
     assert "ANTHROPIC_API_KEY" in cmd and not any("sk-secret-value" in part for part in cmd)
     assert f"{project.resolve()}:/swarm" in cmd
+
+
+def test_sandbox_command_gives_each_home_a_volume_of_skill_environments(tmp_path, monkeypatch):
+    """docs/SPEC.md §19: the sandbox's skill environments live in a named volume per home (a Linux file system,
+    kept across --rm containers); the host's environments are never mounted."""
+    project = make_project(tmp_path, "sandboxed", port=9100)
+    other = make_project(tmp_path, "other", port=9101)
+    monkeypatch.setenv("DREAMTEAM_SKILL_ENVS_DIR", str(tmp_path / "host-envs"))
+    config = Config.load(project)
+    cmd = docker_module.sandbox_command(project, 9200, config, docker="docker")
+    image = cmd.index(docker_module.IMAGE)
+    mounts = [cmd[i + 1] for i in range(image) if cmd[i] == "-v"]
+    volume = docker_module.envs_volume(project)
+    assert re.fullmatch(r"dreamteam-skill-envs-[0-9a-f]{10}", volume)
+    assert f"{volume}:/dreamteam/skill-envs" in mounts
+    assert volume == docker_module.envs_volume(project) != docker_module.envs_volume(other)
+    assert "DREAMTEAM_SKILL_ENVS_DIR=/dreamteam/skill-envs" in cmd[:image]
+    assert "UV_CACHE_DIR=/dreamteam/skill-envs/.cache/uv" in cmd[:image]
+    assert not any("host-envs" in m for m in mounts)
+    passing = Config.from_dict(project, {"shell": {"pass_env": ["DREAMTEAM_SKILL_ENVS_DIR", "UV_CACHE_DIR"]}})
+    monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv"))
+    assert not set(docker_module.env_passthrough(passing)) & {"DREAMTEAM_SKILL_ENVS_DIR", "UV_CACHE_DIR"}
+
+
+def test_sandbox_command_mounts_the_host_skills_library_read_only(tmp_path, monkeypatch):
+    """docs/SPEC.md §19: agents have `shell` in the hub's container, so the host library is read-only there, the
+    sandbox gets its own writable library in the mounted home, and ~/.claude is never mounted."""
+    project = make_project(tmp_path, "sandboxed", port=9100)
+    host_library = tmp_path / "host-skills"
+    monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(host_library))
+    config = Config.load(project)
+    cmd = docker_module.sandbox_command(project, 9200, config, docker="docker")
+    image = cmd.index(docker_module.IMAGE)
+    mounts = [cmd[i + 1] for i in range(image) if cmd[i] == "-v"]
+    assert f"{host_library.resolve()}:/dreamteam/host-skills:ro" in mounts
+    assert "DREAMTEAM_HOST_SKILLS_DIR=/dreamteam/host-skills" in cmd[:image]
+    assert "DREAMTEAM_SKILLS_DIR=/swarm/.dreamteam/skills-library" in cmd[:image]
+    assert not any(".claude" in m for m in mounts) and "CLAUDE_CONFIG_DIR" not in " ".join(cmd)
+    assert not host_library.exists()  # a pure argv builder: run_sandbox creates the folder
+    # never the mounted project's folder of a session's own copies
+    data_skills = f"/swarm/{swarm_skills.skills_dir(config.data_dir).relative_to(project).as_posix()}"
+    assert docker_module.SANDBOX_SKILLS_DIR.rstrip("/") != data_skills
+    # the library's variables never reach the container from the host environment by name, not even through
+    # [shell] pass_env (a later `-e NAME` would win over the explicit values)
+    monkeypatch.setenv("DREAMTEAM_HOST_SKILLS_DIR", "/elsewhere")
+    passing = Config.from_dict(project, {"shell": {"pass_env": ["DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR",
+                                                                "ANTHROPIC_API_KEY"]}})
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    assert "DREAMTEAM_SKILLS_DIR" in os.environ and "DREAMTEAM_HOST_SKILLS_DIR" in os.environ
+    names = docker_module.env_passthrough(passing)
+    assert "ANTHROPIC_API_KEY" in names and not set(names) & {"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR"}
+    cmd = docker_module.sandbox_command(project, 9200, passing, docker="docker")
+    assert [p for p in cmd if p.startswith("DREAMTEAM_SKILLS_DIR")] == ["DREAMTEAM_SKILLS_DIR=" +
+                                                                        docker_module.SANDBOX_SKILLS_DIR]
+
+
+def test_sandbox_warns_about_a_library_inside_the_mounted_folder(tmp_path, monkeypatch):
+    project = make_project(tmp_path, "sandboxed", port=9100)
+    monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(tmp_path / "outside-skills"))
+    assert docker_module.library_inside_warning(project, Config.load(project)) == []
+    monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(project / "lib" / "skills"))
+    warning = docker_module.library_inside_warning(project, Config.load(project))
+    assert len(warning) == 1 and "writable" in warning[0]
 
 
 def _docker_ready() -> bool:

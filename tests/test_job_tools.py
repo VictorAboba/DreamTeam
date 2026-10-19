@@ -162,7 +162,7 @@ async def test_shell_results_point_at_the_tools_the_caller_has(tmp_path, fast, k
     swarm, _ = await team(tmp_path)
     try:
         new, old = agent_ctx(swarm, ANNA), agent_ctx(swarm, BORIS, revision=1)
-        assert (new.runtime.tools_rev, old.runtime.tools_rev) == (2, 1)
+        assert (new.runtime.tools_rev, old.runtime.tools_rev) == (frozen.TOOLSET_REVISION, 1)
         assert new.has_tool("jobs") and new.has_tool("job_stop") and not old.has_tool("jobs")
         # the timer path (footer T)
         text = await ok(new, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "timeout": 1})
@@ -494,7 +494,7 @@ async def test_scripted_agents_use_background_jobs_through_their_runtimes(tmp_pa
         await until(lambda: [t for t, _ in tool_results(swarm, ANNA)] == ["shell", "wait", "shell", "jobs",
                                                                           "job_stop", "wait"]
                     and [t for t, _ in tool_results(swarm, BORIS)] == ["shell", "shell", "shell", "wait"], 30)
-        assert swarm.runtimes[ANNA].tools_rev == 2 and swarm.runtimes[BORIS].tools_rev == 1
+        assert swarm.runtimes[ANNA].tools_rev == frozen.TOOLSET_REVISION and swarm.runtimes[BORIS].tools_rev == 1
         assert dumps(swarm.runtimes[BORIS].tools) == dumps(frozen.snapshot(1, "en"))
         (_, timer), (_, waited), (_, server), (_, shown), (_, stopped), _ = tool_results(swarm, ANNA)
         timer_id = re.search(r"as job (j\d+) ", timer).group(1)

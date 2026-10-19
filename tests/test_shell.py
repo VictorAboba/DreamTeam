@@ -47,6 +47,10 @@ def test_scrubbed_env(fake_swarm, monkeypatch):
     assert env["HARMLESS"] == "z" and env["DREAMTEAM_AGENT"] == "A"
     fake_swarm.config.shell.pass_env = ["MY_SERVICE_TOKEN"]
     assert scrubbed_env(fake_swarm.config)["MY_SERVICE_TOKEN"] == "y"
+    # DreamTeam's skills folders never reach agents' commands, not even through pass_env (docs/SPEC.md §19)
+    monkeypatch.setenv("DREAMTEAM_SKILL_ENVS_DIR", "/envs")
+    fake_swarm.config.shell.pass_env = ["DREAMTEAM_SKILL_ENVS_DIR"]
+    assert "DREAMTEAM_SKILL_ENVS_DIR" not in scrubbed_env(fake_swarm.config)
 
 
 def test_truncate_and_resolve():

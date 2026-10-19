@@ -166,7 +166,7 @@ def test_role_to_dict_and_catalog_view():
     tester = roles.find_role(entries, "tester", "ru")
     assert tester.to_dict() == {"key": "tester", "name": "Тестировщик",
                                 "description": roles.ROLE_PRESETS["ru"]["tester"][1], "instructions": "",
-                                "model": "fast", "builtin": True, "customized": True, "hidden": False}
+                                "model": "fast", "builtin": True, "customized": True, "hidden": False, "skills": ()}
     view = {r["key"]: r for r in roles.catalog_view(entries)}
     assert list(view) == [*roles.PRESET_IDS, "data engineer"]
     assert view["tester"]["name"] == {"ru": "Тестировщик", "en": "Tester"}
@@ -301,3 +301,34 @@ def test_template_documents_the_review_switch_and_the_role_catalog():
     cfg = Config.from_dict(".", tomllib.loads(example))
     assert [(r.name, r.model) for r in cfg.roles] == [("tester", "fast"), ("Дата-инженер", None)]
     assert roles.find_role(cfg.roles, "Тестировщик", "ru").model == "fast"
+
+
+# ------------------------------------------------------------------------------- role skills (docs/SPEC.md §19)
+def test_role_skills_are_checked_and_deduplicated():
+    entries = parse_roles([{"name": "tester", "skills": [" pdf-tools ", "csv", "pdf-tools"]},
+                           {"name": "QA", "description": "Checks things."}], PROFILES)
+    assert entries[0].skills == ["pdf-tools", "csv"] and entries[1].skills == []
+    # the library is not consulted: a role may name a skill added later
+    assert roles.find_role(entries, "Tester", "en").skills == ("pdf-tools", "csv")
+    assert roles.find_role(entries, "QA", "ru").skills == ()
+    assert all(not r.skills for r in roles.catalog(None, "en", include_hidden=True))  # the presets bring none
+    view = {r["key"]: r for r in roles.catalog_view(entries)}
+    assert view["tester"]["skills"] == ["pdf-tools", "csv"] and view["developer"]["skills"] == []
+    for bad, message in (("Bad Name", r"\[roles.1\] skills: 'Bad Name' is not a skill name \(lowercase letters"),
+                         ("a" * 65, r"is not a skill name"), ("x--y", r"is not a skill name")):
+        with pytest.raises(ValueError, match=message):
+            parse_roles([{"name": "tester", "skills": [bad]}], PROFILES)
+    with pytest.raises(ValueError, match=r"\[roles.1\] skills: at most 20 skills per role"):
+        parse_roles([{"name": "tester", "skills": [f"s{i}" for i in range(roles.MAX_ROLE_SKILLS + 1)]}], PROFILES)
+    with pytest.raises(ValueError, match=r"skills must be a list of strings"):
+        parse_roles([{"name": "tester", "skills": "pdf-tools"}], PROFILES)
+
+
+def test_role_skills_in_the_settings_view_and_update():
+    from dreamteam.settings import apply_update, public_view
+
+    raw = apply_update({}, {"roles": [{"name": "tester", "skills": ["pdf-tools"]},
+                                      {"name": "writer", "skills": [], "instructions": "Short."}]})
+    assert raw["roles"] == [{"name": "tester", "skills": ["pdf-tools"]}, {"name": "writer", "instructions": "Short."}]
+    view = public_view(raw)
+    assert view["roles"][0]["skills"] == ["pdf-tools"] and view["roles"][1]["skills"] == []

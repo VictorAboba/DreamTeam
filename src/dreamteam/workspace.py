@@ -28,6 +28,9 @@ SCRATCH_GITIGNORE = ("# DreamTeam: temporary files of the agents. Git ignores th
 # "[.]" rather than ".": git add takes an exclude spelled out literally as naming the path, and when the root
 # .gitignore ignores .scratch/ (DEFAULT_GITIGNORE does) it reports it as an ignored path and exits 1 every time.
 SCRATCH_EXCLUDES = (":(exclude)[.]scratch", ":(exclude)[.]scratch/*")
+# The swarm's skills as the agents read them: a read-only copy DreamTeam rebuilds from the session's own copies
+# (docs/SPEC.md §19). A member's scratch folder never starts with "_" (email_slug), so it cannot be one.
+SKILLS_MIRROR = f"{SCRATCH_DIR}/_skills"
 # inherited variables that would point an agent's git at another repository or index
 GIT_LOCATION_VARS = frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX"})
@@ -114,6 +117,65 @@ def _covers(lock_path: str, rel: str) -> bool:
 def in_scratch(rel: str) -> bool:
     """`rel` (workspace-relative, "/"-separated) is `.scratch` or inside it."""
     return _covers(SCRATCH_DIR, rel.rstrip("/"))
+
+
+def scratch_is_local(root: Path) -> bool:
+    """`<root>/.scratch` is a plain folder of the workspace (not a file, nor a link or junction that resolves
+    elsewhere): only then do DreamTeam's own files (job logs, the skills mirror) go there."""
+    folder = Path(root) / SCRATCH_DIR
+    try:
+        if not folder.is_dir() or folder.is_symlink():
+            return False
+        return os.path.normcase(str(folder.resolve())) == os.path.normcase(str(Path(root).resolve() / SCRATCH_DIR))
+    except OSError:
+        return False
+
+
+def is_link(entry: os.DirEntry | Path | str) -> bool:
+    """Symlinks and Windows junctions (a directory entry or a path): listed but never followed (they may point
+    outside). Reparse points that do not redirect (OneDrive/cloud placeholders, dedup) are ordinary entries."""
+    if not hasattr(entry, "is_symlink"):  # a str (DirEntry and Path have the same two methods)
+        entry = Path(entry)
+    try:
+        if entry.is_symlink():
+            return True
+        st = entry.stat(follow_symlinks=False)
+        if not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return False
+        tag = getattr(st, "st_reparse_tag", None)
+        return tag is None or bool(tag & _REPARSE_TAG_NAME_SURROGATE)
+    except OSError:
+        return False
+
+
+def long_path(path: str | os.PathLike) -> str:
+    """`path` in the extended-length form on Windows (`\\\\?\\C:\\...`, `\\\\?\\UNC\\server\\...`), so deep files
+    (git objects, a skill's nested folders under a long session path) pass the 260-character limit of plain paths;
+    the path unchanged elsewhere."""
+    target = os.fspath(path)
+    if not _WINDOWS or target.startswith("\\\\?\\"):
+        return target
+    full = os.path.abspath(target)
+    return "\\\\?\\UNC\\" + full[2:] if full.startswith("\\\\") else "\\\\?\\" + full
+
+
+def rmtree(path: Path) -> None:
+    """Remove a directory tree (best effort: what cannot be removed stays); read-only files (git objects on Windows,
+    the skills mirror) are made writable first."""
+    def on_error(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    if not Path(path).exists():
+        return
+    target = long_path(path)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(target, onexc=on_error)
+    else:
+        shutil.rmtree(target, onerror=lambda func, target, info: on_error(func, target, info[1]))
 
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # control characters other than tab and newline
@@ -639,9 +701,27 @@ class Workspace:
         return data.decode("utf-8", errors="replace"), size > len(data)
 
     # --- writing ------------------------------------------------------------------------------
+    def _refuse_skills_mirror(self, actor: str, rel: str) -> None:
+        """write_file / edit_file never change the swarm's skills: the mirror is rebuilt from the session's copies
+        (a `shell` edit there is undone by the next check, docs/SPEC.md §19). The way to propose the change is named
+        only to a caller whose tool set has skill_propose (an agent of an older revision lacks it)."""
+        if not _covers(SKILLS_MIRROR, rel.rstrip("/")):
+            return
+        text = (f"'{SKILLS_MIRROR}/' holds the swarm's skills and is rebuilt by DreamTeam. To change a skill, copy "
+                "its folder (without node_modules) into your scratch folder and edit it there")
+        try:
+            from .tools import frozen
+
+            member = self.swarm.member(actor)
+            proposes = member is not None and "skill_propose" in frozen.member_tool_names(self.swarm, member)
+        except Exception:  # noqa: BLE001 - only the wording depends on it (test doubles, a view-only swarm)
+            proposes = False
+        raise ToolError(text + (", then call skill_propose." if proposes else "."))
+
     async def write(self, actor: str, path: str, content: str) -> str:
         p = self.resolve(path)
         rel = self.rel(p)
+        self._refuse_skills_mirror(actor, rel)
         if p.is_dir():
             raise ToolError(f"'{rel}' is a directory; give a file path.")
         data = _encode(content or "", "content")
@@ -663,6 +743,7 @@ class Workspace:
         _encode(new, "new_text")
         async with self._io_lock:
             p, rel = self._existing_file(path)
+            self._refuse_skills_mirror(actor, rel)
             self.check_writable(actor, rel)
             updated, replaced = self._apply_edit(rel, self._read_bytes(p, rel), old, new, replace_all)
             if updated is None:
@@ -726,7 +807,18 @@ class Workspace:
     async def _store(self, p: Path, rel: str, data: bytes) -> None:
         def _write() -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(data)
+            try:
+                p.write_bytes(data)
+            except PermissionError:
+                # a read-only file, e.g. a copy of an attached skill (the mirror's files are read-only and a copy
+                # keeps that): write_file / edit_file is the member's explicit edit, so it is made writable first.
+                # Not a file with other hard links (a skill environment's node_modules view shares its files)
+                info = p.lstat() if p.exists() else None
+                if (info is None or not stat.S_ISREG(info.st_mode) or info.st_nlink > 1
+                        or info.st_mode & stat.S_IWUSR):
+                    raise
+                os.chmod(p, stat.S_IMODE(info.st_mode) | stat.S_IWUSR | stat.S_IRUSR)
+                p.write_bytes(data)
 
         try:
             await asyncio.to_thread(_write)
@@ -765,20 +857,7 @@ class Workspace:
         except OSError:
             return False
 
-    @staticmethod
-    def _is_link(entry: os.DirEntry) -> bool:
-        """Symlinks and Windows junctions: listed but never followed (they may point outside)."""
-        try:
-            if entry.is_symlink():
-                return True
-            st = entry.stat(follow_symlinks=False)
-            if not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-                return False
-            tag = getattr(st, "st_reparse_tag", None)
-            # junctions and other name surrogates; OneDrive/cloud placeholders are regular entries
-            return tag is None or bool(tag & _REPARSE_TAG_NAME_SURROGATE)
-        except OSError:
-            return False
+    _is_link = staticmethod(is_link)
 
     @staticmethod
     def _stat(entry: os.DirEntry) -> tuple[int, float]:

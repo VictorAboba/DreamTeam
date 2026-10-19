@@ -20,6 +20,7 @@
     </a>
     <nav class="home-tabs" role="tablist">
       <button type="button" role="tab" data-htab="sessions" class="active"><span data-i18n="tab_sessions"></span></button>
+      <button type="button" role="tab" data-htab="skills"><span data-i18n="tab_skills"></span></button>
       <button type="button" role="tab" data-htab="settings"><span data-i18n="tab_settings"></span></button>
     </nav>
     <div class="spacer"></div>
@@ -54,6 +55,34 @@
       </div>
     </section>
 
+    <section id="pane-skills" class="home-pane hidden">
+      <div class="home-hero">
+        <div class="hero-text">
+          <h1 data-i18n="sk_title"></h1>
+          <p class="muted" data-i18n="sk_hint"></p>
+        </div>
+        <button class="btn" id="skill-envs-clean" type="button" data-i18n-title="sk_envs_hint"><i class="ic ic-trash"></i> <span data-i18n="sk_envs_clean"></span></button>
+      </div>
+      <div class="skills-layout">
+        <div class="skills-col">
+          <h2 class="sk-section"><span data-i18n="sk_library"></span> <code id="skill-lib-dir"></code></h2>
+          <div class="skill-cards" id="skill-library"><div class="muted" data-i18n="loading"></div></div>
+        </div>
+        <div class="skills-col">
+          <h2 class="sk-section" data-i18n="sk_add_title"></h2>
+          <div class="skill-add-card" id="skill-add-home"></div>
+          <h2 class="sk-section" data-i18n="sk_claude"></h2>
+          <p class="field-hint" data-i18n="sk_claude_hint"></p>
+          <div class="skill-cards" id="skill-claude"></div>
+          <div class="hidden" id="skill-host-section">
+            <h2 class="sk-section" data-i18n="sk_host"></h2>
+            <p class="field-hint" data-i18n="sk_host_hint"></p>
+            <div class="skill-cards" id="skill-host"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
     <section id="pane-settings" class="home-pane hidden">
       <div class="settings-layout">
         <nav class="settings-nav" id="settings-nav"></nav>
@@ -74,6 +103,7 @@
     <div class="modal" id="modal" role="dialog" aria-modal="true"></div>
   </div>
   <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+  <script src="/static/skills.js"></script>
   <script src="/static/home.js"></script>
 </body>
 </html>

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from .. import roles
+from ..console import _SCP_URL, _SKILL_REF, resolve_folder, unquote
 from . import render
 from .client import HubError
 from .i18n import t
@@ -160,7 +161,8 @@ def _localized(lang: str, catalog: Any) -> list[dict]:
     def pick(value: Any) -> str:
         return str((value.get(lang) or value.get("en") or "") if isinstance(value, dict) else value or "")
     return [{"key": r.get("key"), "name": pick(r.get("name")), "description": pick(r.get("description")),
-             "instructions": r.get("instructions") or "", "model": r.get("model"), "builtin": bool(r.get("builtin"))}
+             "instructions": r.get("instructions") or "", "model": r.get("model"), "builtin": bool(r.get("builtin")),
+             "skills": list(r.get("skills") or [])}
             for r in catalog or [] if isinstance(r, dict) and not r.get("hidden")]
 
 
@@ -253,6 +255,165 @@ async def _jobs(c: CommandContext) -> None:
         c.error(text)
     else:
         c.print(render.job_output(c.ctx, text))
+
+
+SKILL_WORDS = {"lib": "lib", "library": "lib", "библиотека": "lib", "add": "add", "attach": "add",
+               "update": "update", "rm": "rm", "detach": "rm", "remove": "rm", "show": "show", "pending": "pending",
+               "approve": "approve", "reject": "reject", "reinstall": "reinstall", "log": "log",
+               "clean-envs": "clean-envs"}
+SKILL_ECOSYSTEMS = ("python", "node")
+
+
+def _skill_add_args(c: CommandContext, text: str) -> tuple[dict, str | None]:
+    """`add X [--pick a,b] [--replace]` -> (skill_attach arguments, the reference when X is one). A reference
+    ("pdf", "claude-user:pdf") attaches; a folder or .zip path (resolved here when the hub is on this computer)
+    or a Git URL is imported first."""
+    words, replace, pick = text.split(), False, None
+    if "--replace" in words:
+        replace, words = True, [w for w in words if w != "--replace"]
+    if "--pick" in words:
+        at = words.index("--pick")
+        if at + 1 >= len(words):
+            raise UsageError
+        pick = [p for p in words[at + 1].split(",") if p]
+        del words[at:at + 2]
+    target = unquote(" ".join(words))
+    if not target:
+        raise UsageError
+    extra = {**({"replace": True} if replace else {}), **({"pick": pick} if pick else {})}
+    if _SKILL_REF.fullmatch(target):
+        return {"name": target, **extra}, target
+    if not ("://" in target or _SCP_URL.match(target)):   # a folder or .zip path on the hub's machine
+        path = resolve_folder(target, local=c.app.local)
+        if path is None:
+            c.error(c.t("cd_remote_relative"))
+            return {}, None
+        target = path
+    return {"source": target, **extra}, None
+
+
+async def _skills(c: CommandContext) -> None:
+    """`/skills`: the session's skills (without a session: the next new one's); `lib`: the library and Claude Code's;
+    `add X [--pick a,b] [--replace]` (a name, a folder or .zip path, a Git URL; without a session: for the next new
+    one); `update X` (again from its own source); `rm X`; `show X`; `pending [id]` (proposals waiting, also of a
+    stopped session); `approve X [replace]`; `reject X [reason]`; `reinstall X [python|node]`; `log X [python|node]`;
+    `clean-envs` (the launcher removes unused skill environments)."""
+    word, _, rest = c.args.strip().partition(" ")
+    rest = rest.strip()
+    if not word:
+        if not c.app.attached:
+            c.print(render.skills_next(c.ctx, c.app.skills_override))
+            return
+        state = await c.state()
+        c.print(render.skills_table(c.ctx, state.get("skills") or []))
+        return
+    sub = SKILL_WORDS.get(word.casefold())
+    if sub is None:
+        raise UsageError
+    if sub == "clean-envs":
+        if c.client.mode != "launcher":
+            c.error(c.t("launcher_only"))
+            return
+        report = await c.client.clean_skill_envs()
+        kept = [k for k in report.get("kept") or [] if isinstance(k, dict)]
+        text = c.t("skills_envs_cleaned", removed=len(report.get("removed") or []))
+        if kept:   # each kept one says why: in use, or being built right now
+            words = {"in use": c.t("skills_why_in_use"), "being built": c.t("skills_why_being_built")}
+            why = ", ".join(dict.fromkeys(words.get(k.get("why"), str(k.get("why") or "?")) for k in kept))
+            text += c.t("skills_envs_kept", kept=len(kept), why=why)
+        c.info(text)
+        return
+    if sub == "lib":
+        c.print(render.skills_library(c.ctx, await c.client.skills(c.sid if c.app.attached else None)))
+        return
+    if sub == "pending":
+        sid = rest.split()[0] if rest else c.sid
+        if c.client.mode != "launcher" or not sid:
+            c.error(c.t("launcher_only") if c.client.mode != "launcher" else c.t("no_session"))
+            return
+        c.print(render.skills_pending(c.ctx, sid, (await c.client.session_skills(sid)).get("attached") or [],
+                                      other=not (c.app.attached and sid == c.sid)))
+        return
+    if sub in ("approve", "reject"):
+        await _skill_decide(c, sub == "approve", rest)
+        return
+    name, _, tail = rest.partition(" ")
+    tail = tail.strip()
+    if not name or (sub in ("reinstall", "log") and tail and tail not in SKILL_ECOSYSTEMS):
+        raise UsageError
+    if sub == "add":
+        args, ref = _skill_add_args(c, rest)
+        if not args:
+            return
+        if not c.app.attached:   # the next new session gets it (as `--skill`)
+            c.app.skills_override.append(args.get("source") or ref)
+            c.info(c.t("skills_added_next", name=args.get("source") or ref))
+            return
+        await c.act("skill_attach", args, report=True)
+        return
+    if sub == "show" and not c.app.attached:
+        origin, _, bare = name.rpartition(":")
+        c.print(render.skill_detail(c.ctx, await c.client.skill(None, bare, origin or "library"), origin or "library"))
+        return
+    if not c.app.attached:
+        c.error(c.t("no_session"))
+        return
+    if sub == "show":
+        await _skill_show(c, name)
+    elif sub == "update":
+        state = await c.state()
+        skill = next((s for s in state.get("skills") or [] if isinstance(s, dict) and s.get("name") == name), None)
+        if skill is None:
+            c.error(c.t("skill_not_attached", name=name))
+        elif skill.get("from") == "agent":   # a member's proposal has no source of its own
+            c.error(c.t("skill_agent_update", name=name))
+        else:
+            await c.act("skill_attach", {"name": f"{skill.get('from')}:{name}", "replace": True}, report=True)
+    elif sub == "rm":
+        await c.act("skill_detach", {"name": name}, report=True)
+    elif sub == "reinstall":
+        await c.act("skill_reinstall", {"name": name, **({"ecosystem": tail} if tail else {})}, report=True)
+    else:
+        c.print(render.skill_log(c.ctx, await c.client.skill_log(c.sid, name, tail or None)))
+
+
+async def _skill_decide(c: CommandContext, approve: bool, rest: str) -> None:
+    """`/skills approve X [replace] [--session ID]`, `/skills reject X [reason] [--session ID]`: the attached
+    session's proposal, or with --session another session's (also a stopped one, which is not started for it:
+    the launcher's decide route)."""
+    words = rest.split()
+    sid = None
+    if "--session" in words:
+        at = words.index("--session")
+        if at + 1 >= len(words):
+            raise UsageError
+        sid = words[at + 1]
+        words = words[:at] + words[at + 2:]
+    if not words:
+        raise UsageError
+    name, tail = words[0], " ".join(words[1:])
+    if sid is not None and not (c.app.attached and sid == c.sid):
+        if c.client.mode != "launcher":
+            c.error(c.t("launcher_only"))
+            return
+    elif not c.app.attached:
+        c.error(c.t("no_session"))
+        return
+    else:
+        sid = None
+    comment = "" if approve else tail.strip().strip("\"'").strip()
+    await c.app.decide_skill(name, approve, comment, replace=approve and tail.casefold() == "replace", sid=sid)
+
+
+async def _skill_show(c: CommandContext, name: str) -> None:
+    """`/skills show X`: the session's copy of an attached skill, else the library's (`claude-user:x`: that one)."""
+    origin, _, bare = name.rpartition(":")
+    where = origin or "library"
+    if not origin:
+        state = await c.state()
+        if any(isinstance(s, dict) and s.get("name") == bare for s in state.get("skills") or []):
+            where = "session"
+    c.print(render.skill_detail(c.ctx, await c.client.skill(c.sid, bare, where), where))
 
 
 async def _roles(c: CommandContext) -> None:
@@ -485,6 +646,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("agents", _agents, session=True),
     Command("roles", _roles, args=True),
     Command("jobs", _jobs, args=True, session=True),
+    Command("skills", _skills, args=True),   # without a session: the skills of the next new one, the library
     Command("to", _to, args=True, required=True, session=True),
     Command("hire", _hire, args=True, required=True, session=True),
     Command("trace", _trace, args=True, session=True),

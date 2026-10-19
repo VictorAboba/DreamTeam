@@ -105,6 +105,9 @@ SPEC_AUDIENCE = {  # docs/SPEC.md §12
     "join_swarm": "EU", "wait_for_events": "EU", "set_goal": "U", "swarm_status": "EU", "swarm_control": "U",
     "mcp_approve": "U",
     "agent_traces": "EU",  # docs/SPEC.md §16.2
+    "skills": "U", "skill_attach": "U", "skill_detach": "U", "skill_approve": "U",  # docs/SPEC.md §19
+    "skill_reinstall": "U",
+    "skill_propose": "LE",
 }
 _LETTER = {"L": "llm", "E": "external", "U": "user"}
 

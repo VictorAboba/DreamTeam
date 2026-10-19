@@ -109,9 +109,43 @@ async def agents(ctx: ToolContext, args: dict[str, Any]) -> str:
                      "and instructions may then be empty; any other name is a new role you describe in "
                      "instructions):")
         for role in catalog:
-            model = f" (model {role.model})" if role.model else ""
-            lines.append(f"- {role.name}{model}: {roles.summary(role.description)}")
+            notes = ([f"model {role.model}"] if role.model else []) + (
+                [f"skills: {', '.join(role.skills)}"] if role.skills else [])
+            extra = f" ({'; '.join(notes)})" if notes else ""
+            lines.append(f"- {role.name}{extra}: {roles.summary(role.description)}")
+    attached = _skill_names(swarm)
+    if attached:
+        lines.append(f"Skills attached to the swarm: {', '.join(attached)} (the wake-up lists them; read their "
+                     "SKILL.md with read_file).")
     return "\n".join(lines)
+
+
+def _skill_names(swarm) -> list[str]:
+    skills = getattr(swarm, "skills", None)  # (the test double has none)
+    return skills.names() if skills is not None else []
+
+
+def _role_skills_note(swarm, name: str, member: dict) -> str:
+    """What the hire did with the skills the new member's role lists (Swarm.hire, SessionSkills.ensure_role_skills):
+    "" when its role lists none."""
+    skills = getattr(swarm, "skills", None)
+    if skills is None:
+        return ""
+    report = skills.hire_report(name) or {}
+    listed = skills.role_skills(member)
+    if not listed:
+        return ""
+    role = member.get("role") or ""
+    got = [n for n in listed if n in set(skills.names())]
+    parts = [f" They also got the skills of their role: {', '.join(got)}."] if got else []
+    for key, text in (("missing", "Not found in the skills library (the user was told)"),
+                      ("detached", "Detached by the user, so not attached"),
+                      ("over_cap", f"Not attached, the swarm has the maximum of {swarm.config.skills.max_attached} "
+                                   "skills")):
+        names = (report.get(key) or {}).get(role)
+        if names:
+            parts.append(f" {text}: {', '.join(names)}.")
+    return "".join(parts)
 
 
 @tool(
@@ -149,13 +183,14 @@ async def hire_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
                             name=args.get("name") or None)
     member = swarm.member(name) or {}
     shown = member.get("role") or role
+    skills = _role_skills_note(swarm, name, member)
     if ctx.is_user:  # no agent-facing advice (task_update, welcome messages) for the user
         if entry is not None:
-            return f"Hired {name} as \"{shown}\" (catalog role, model profile {member.get('model')})."
+            return f"Hired {name} as \"{shown}\" (catalog role, model profile {member.get('model')}).{skills}"
         return (f"Hired {name} as \"{shown}\": a new role, not in the role catalog; your instructions are all they "
                 f"know about it.{similar}")
     if entry is not None:
-        source = f" They got the catalog description of the role; model profile {member.get('model')}."
+        source = f" They got the catalog description of the role; model profile {member.get('model')}.{skills}"
     else:
         source = (f" \"{shown}\" is a new role (not in the role catalog): your instructions are all they know about "
                   f"it.{similar}")
@@ -293,12 +328,15 @@ async def join_swarm(ctx: ToolContext, args: dict[str, Any]) -> str:
         if existing["kind"] != AgentKind.EXTERNAL:
             raise ToolError(f"'{existing['name']}' is an internal swarm agent; choose another name.")
         return (f"Welcome back: you continue as {existing['name']} (role: {existing['role']}). "
-                f"Pass as_agent=\"{existing['name']}\" in every call; wait_for_events returns what you missed.")
+                f"Pass as_agent=\"{existing['name']}\" in every call; wait_for_events returns what you missed."
+                + _skills_block(swarm, existing["name"]))
     name = await swarm.hire(
         USER, args["role"], args.get("instructions") or "", name=wanted or None, kind=AgentKind.EXTERNAL,
     )
     member = swarm.member(name) or {}
     role = member.get("role") or args["role"].strip()
+    if getattr(swarm, "skills", None) is not None:
+        swarm.skills.hire_report(name)  # its role's skills are marked in the list below
     text = (
         f"You joined the swarm as {name} (role: {role}). Pass as_agent=\"{name}\" in every call. "
         "Look at `board`, claim tasks with `task_claim`, talk with `send_message`, and call `wait_for_events` "
@@ -309,7 +347,17 @@ async def join_swarm(ctx: ToolContext, args: dict[str, Any]) -> str:
     entry = roles.find_role(swarm.config.roles, role, member.get("language") or swarm.language)
     if entry is not None and entry.description:
         text += f"\nYour role ({role}): {entry.description}"
-    return text
+    return text + _skills_block(swarm, name)
+
+
+def _skills_block(swarm, name: str) -> str:
+    """An external member has no system prompt nor a wake-up index: the skills are listed when it joins (and when it
+    rejoins: a reconnected client may have lost the first list), changes come with wait_for_events."""
+    if not _skill_names(swarm):
+        return ""
+    return ("\nSkills attached to the swarm: a skill is a SKILL.md with instructions for a kind of work; before work "
+            "one fits, read it with read_file and follow it. You are told when skills are attached or detached; "
+            "skill_propose proposes one you made.\n" + "\n".join(swarm.skills.item_lines(name, "en")))
 
 
 def _stopping(swarm) -> bool:
@@ -522,6 +570,18 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     running = swarm.jobs.running_of()
     if running:
         lines.append(f"Background jobs: {len(running)} running ({_job_list(running, parens=False)}).")
+    attached = _skill_names(swarm)
+    if attached:
+        pending = swarm.skills.pending()
+        waiting = f"; {len(pending)} waiting for the user's library decision" if pending else ""
+        for status, words in (("installing", "being installed"), ("failed", "failed")):
+            names = [n for n in attached if any(d["status"] == status for d in swarm.skills.deps(n))]
+            if names:
+                waiting += f"; packages {words} for {len(names)} ({', '.join(names)})"
+        lines.append(f"Skills: {len(attached)} attached ({', '.join(attached)}){waiting}.")
+        # an external member reads them by these paths; a client that checks often (brief) has them from join_swarm
+        if not ctx.is_user and not args.get("brief"):
+            lines.extend(swarm.skills.item_lines(ctx.actor, "en"))
     if not ctx.is_user:
         mine = swarm.board.open_tasks_of(ctx.actor)
         lines.append(f"You are {ctx.actor}. Your open tasks: "

@@ -485,10 +485,11 @@ def test_roles_round_trip_through_the_settings_file(tmp_path):
     view = st.public_view(raw)
     assert list(view)[-2:] == ["roles", "models"]
     assert view["roles"] == [  # stored entries, normalized: a built-in role by its id
-        {"name": "tester", "description": "", "instructions": "Пиши тесты на pytest.", "model": "fast", "hidden": False},
+        {"name": "tester", "description": "", "instructions": "Пиши тесты на pytest.", "model": "fast", "hidden": False,
+         "skills": []},
         {"name": "Дата-инженер", "description": ROLES[1]["description"], "instructions": "", "model": None,
-         "hidden": False},
-        {"name": "researcher", "description": "", "instructions": "", "model": None, "hidden": True}]
+         "hidden": False, "skills": []},
+        {"name": "researcher", "description": "", "instructions": "", "model": None, "hidden": True, "skills": []}]
     assert st.public_view(_raw(tmp_path))["roles"] == []
 
 

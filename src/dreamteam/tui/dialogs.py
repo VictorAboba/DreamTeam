@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 from .i18n import t
-from .render import cells, cut_cells
+from .render import RenderContext, _size, cells, cut_cells, skill_md_body, skill_states_preview
 
 Fragments = list[tuple[str, str]]
 
@@ -250,6 +250,17 @@ class ConfirmDialog(Dialog):
         return [[(TEXT, line)] for line in wrap(self.text, width, self.max_lines)] if self.text else []
 
 
+class ChoiceDialog(ConfirmDialog):
+    """A question with its own answers (`options`: (label, value) pairs; Esc: None), e.g. deleting a session whose
+    skill proposals wait: save them, discard them, or cancel."""
+
+    kind = "choice"
+
+    def __init__(self, lang: str, title: str, text: str, options: Sequence[tuple[str, Any]], *, index: int = 0):
+        Dialog.__init__(self, lang, title, [Option(label, value) for label, value in options], index=index)
+        self.text = text
+
+
 class BusyDialog(Dialog):
     """A line of text while something runs (a deletion): it takes the keys, so nothing typed meanwhile is
     submitted, and it cannot be answered; the app closes it."""
@@ -327,6 +338,62 @@ class MCPApprovalDialog(Dialog):
         if self.name:
             lines.append([(DIM, t(lang, "mcp_code_hint", path=code))])
         return lines
+
+
+class SkillApprovalDialog(Dialog):
+    """«1. Сохранить в библиотеку» / «2. Не сохранять (с причиной)» for a member's skill proposal; Esc = later. The
+    swarm uses the skill already: the decision is only whether the library keeps it for future runs."""
+
+    kind = "skill"
+    settle = 0.6
+    SKILL_MD_LINES = 8   # the start of SKILL.md (after its front matter) the dialog shows
+
+    def __init__(self, lang: str, skill: dict):
+        options = [Option(t(lang, "skill_yes"), APPROVE), Option(t(lang, "skill_no"), REJECT)]
+        super().__init__(lang, t(lang, "skill_title"), options, footer=t(lang, "skill_later"))
+        self.skill = dict(skill or {})
+        self.gone = False   # decided elsewhere meanwhile (the web UI, /skills approve): closed without a choice
+
+    @property
+    def name(self) -> str:
+        return str(self.skill.get("name") or "")
+
+    def body(self, width: int, unicode: bool) -> list[Fragments]:
+        s = self.skill
+        lang = self.lang
+        lines: list[Fragments] = [[("class:dialog.text bold", self.name or "?")]]
+
+        def field(key: str, value: Any, max_lines: int = 1) -> None:
+            text = " ".join(str(value).split())
+            label = t(lang, key) + ": "
+            for i, part in enumerate(wrap(text, max(10, width - len(label)), max_lines)):
+                lines.append([(DIM, label if i == 0 else " " * len(label)), (TEXT, part)])
+
+        if s.get("owner"):
+            field("skill_owner", s["owner"])
+        listed = [f for f in s.get("files_list") or [] if isinstance(f, dict) and f.get("path")]
+        if listed:   # the names and sizes (the session copy's), else the snapshot's count
+            files = ", ".join(f"{f['path']} ({_size(f.get('size'))})" for f in listed)
+            field("skill_files_label", files, max_lines=2)
+        elif s.get("files"):
+            field("skill_files_label", s["files"])
+        if s.get("description"):
+            field("mcp_description", s["description"], max_lines=4)
+        preview = self.preview()
+        if preview:
+            lines += [[(DIM, part)] for part in wrap(preview, width, 4)]
+        body = skill_md_body(str(s.get("skill_md") or "")).splitlines()
+        if body:   # the start of what the members read; /skills show has all of it
+            for line in body[:self.SKILL_MD_LINES]:
+                lines += [[(TEXT, part)] for part in wrap(line.rstrip(), width, 1)] if line.strip() else [[(TEXT, "")]]
+            if len(body) > self.SKILL_MD_LINES:
+                lines.append([(DIM, t(lang, "skill_md_more", name=self.name))])
+        lines += [[(DIM, part)] for part in wrap(t(lang, "skill_uses"), width, 2)]
+        return lines
+
+    def preview(self) -> str:
+        """What its packages install (from the snapshot's deps states)."""
+        return skill_states_preview(RenderContext(lang=self.lang), self.skill.get("deps"))
 
 
 class SessionPicker(Dialog):

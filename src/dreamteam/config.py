@@ -136,6 +136,8 @@ class RoleSettings:
     instructions: str = ""
     model: str | None = None
     hidden: bool = False
+    # skills an agent of this role gets attached to its session at hire (docs/SPEC.md §19), marked as its own
+    skills: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -189,6 +191,29 @@ class MCPSettings:
 
 
 @dataclass
+class SkillsSettings:
+    """The shared skills library and the limits of skills (docs/SPEC.md §19); global only (not a session override)."""
+
+    library_dir: str = "~/.dreamteam/skills"
+    claude: bool = True        # offer Claude Code skills ($CLAUDE_CONFIG_DIR or ~/.claude, and <workspace>/.claude)
+    max_mb: int = 10           # one skill, all its files (uncompressed)
+    max_files: int = 200       # one skill
+    max_archive_mb: int = 50   # one uploaded zip or one Git checkout, before a skill is picked from it
+    max_attached: int = 40     # skills attached to one session
+    max_proposals: int = 10    # skills proposed by members of one session (any status, replacements not counted)
+    # script dependencies (docs/SPEC.md §19): requirements.txt / pyproject.toml / package.json, one environment per
+    # skill and dependency set, shared by all sessions
+    install: bool = True
+    install_proposals: bool = True    # also for skills members propose (kept apart from the user's skills)
+    envs_dir: str = "~/.dreamteam/skill-envs"
+    python: str = ""                  # "" = the base interpreter DreamTeam runs on; a path, a command or (uv) a version
+    install_scripts: bool = False     # npm lifecycle scripts of the dependencies (postinstall, ...)
+    install_timeout: int = 900        # seconds per install command
+    env_retention_days: int = 30      # unused environments are removed after this many days (0 = never automatically)
+    install_env: list[str] = field(default_factory=list)   # extra variables the installers get (private index)
+
+
+@dataclass
 class TracingSettings:
     enabled: bool = True
     max_payload_chars: int = 200_000   # per string in a span payload
@@ -198,11 +223,14 @@ class TracingSettings:
 # TOML section of each settings class (error messages)
 _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSettings": "server",
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
-               "TracingSettings": "tracing", "ModelProfile": "models", "RoleSettings": "roles"}
-# numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm)
+               "TracingSettings": "tracing", "SkillsSettings": "skills", "ModelProfile": "models",
+               "RoleSettings": "roles"}
+# numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm; [skills] max_proposals = 0
+# turns proposals off)
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
                       "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
-                      "foreground_max", "job_log_mb"})
+                      "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
+                      "install_timeout"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 
@@ -332,8 +360,28 @@ def parse_roles(raw: Any, profiles: Iterable[str]) -> list[RoleSettings]:
         if model is not None and model not in profiles:
             raise ValueError(f"[{where}] '{name}' uses the model profile '{model}', which is not defined in [models]")
         out.append(RoleSettings(name=builtin or name, description=description,
-                                instructions=entry.instructions.strip(), model=model, hidden=entry.hidden))
+                                instructions=entry.instructions.strip(), model=model, hidden=entry.hidden,
+                                skills=_role_skills(entry.skills, where)))
     return out
+
+
+def _role_skills(raw: list[str], where: str) -> list[str]:
+    """A role's skill names: stripped, each a skill name, duplicates dropped (order kept), at most
+    roles.MAX_ROLE_SKILLS. Whether the library has them is not checked: a role may name a skill added later (the
+    hire reports a missing one)."""
+    from .skills import NAME_MAX, NAME_RE  # here: loading config stays free of the workspace modules skills needs
+
+    names: list[str] = []
+    for item in raw:
+        name = item.strip()
+        if not (len(name) <= NAME_MAX and NAME_RE.fullmatch(name)):
+            raise ValueError(f"[{where}] skills: '{name[:80]}' is not a skill name (lowercase letters, digits and "
+                             "hyphens)")
+        if name not in names:
+            names.append(name)
+    if len(names) > roles.MAX_ROLE_SKILLS:
+        raise ValueError(f"[{where}] skills: at most {roles.MAX_ROLE_SKILLS} skills per role")
+    return names
 
 
 @dataclass
@@ -346,6 +394,7 @@ class Config:
     workspace: WorkspaceSettings = field(default_factory=WorkspaceSettings)
     mcp: MCPSettings = field(default_factory=MCPSettings)
     tracing: TracingSettings = field(default_factory=TracingSettings)
+    skills: SkillsSettings = field(default_factory=SkillsSettings)
     models: dict[str, ModelProfile] = field(default_factory=lambda: {"default": ModelProfile()})
     # Not settings keys: a launcher session that works in another folder (sessions.py, session.json
     # "workspace"). None = `<project>/workspace`. `workspace_adopted`: the folder was the user's before
@@ -366,6 +415,23 @@ class Config:
     @property
     def library_dir(self) -> Path:
         return Path(os.path.expanduser(self.mcp.library_dir))
+
+    @property
+    def skills_library_dir(self) -> Path:
+        """The shared skills library; DREAMTEAM_SKILLS_DIR wins (the Docker sandbox's own library, tests)."""
+        return Path(os.environ.get("DREAMTEAM_SKILLS_DIR") or os.path.expanduser(self.skills.library_dir))
+
+    @property
+    def skills_host_library_dir(self) -> Path | None:
+        """Only inside the Docker sandbox: the host's library, mounted read-only (docs/SPEC.md §19)."""
+        value = os.environ.get("DREAMTEAM_HOST_SKILLS_DIR")
+        return Path(value) if value else None
+
+    @property
+    def skill_envs_dir(self) -> Path:
+        """The skills' dependency environments, shared by all sessions; DREAMTEAM_SKILL_ENVS_DIR wins (the Docker
+        sandbox's volume, tests)."""
+        return Path(os.environ.get("DREAMTEAM_SKILL_ENVS_DIR") or os.path.expanduser(self.skills.envs_dir))
 
     def model(self, name: str | None) -> ModelProfile:
         key = name or self.agents.default_model
@@ -406,6 +472,7 @@ class Config:
             workspace=_fill(WorkspaceSettings, raw.pop("workspace", None)),
             mcp=_fill(MCPSettings, {**mcp_raw, "external": external}),
             tracing=_fill(TracingSettings, raw.pop("tracing", None)),
+            skills=_fill(SkillsSettings, raw.pop("skills", None)),
         )
         if raw:
             raise ValueError(f"Unknown config sections: {', '.join(sorted(raw))}")
@@ -414,6 +481,9 @@ class Config:
         if cfg.agents.default_model not in cfg.models:
             raise ValueError(f"agents.default_model = '{cfg.agents.default_model}' is not defined in [models]")
         cfg.roles = parse_roles(roles_raw, cfg.models)
+        for name in cfg.skills.install_env:
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+                raise ValueError(f"skills.install_env: {name[:60]!r} is not an environment variable name")
         if cfg.swarm.language not in ("ru", "en"):
             raise ValueError("swarm.language must be 'ru' or 'en'")
         return cfg
@@ -519,6 +589,31 @@ lock_ttl_minutes = 30
 [mcp]
 require_approval = false      # true — новые MCP агентов ждут одобрения пользователя
 library_dir = "~/.dreamteam/library"   # общая библиотека MCP между запусками и роями
+
+[skills]
+# Общая библиотека скиллов (папки со SKILL.md) для всех сессий
+library_dir = "~/.dreamteam/skills"
+# Предлагать скиллы Claude Code (~/.claude/skills и .claude/skills папки сессии)
+claude = true
+max_mb = 10
+max_files = 200
+# Предел одного zip-архива или Git-копии, из которых выбирают скиллы
+max_archive_mb = 50
+max_attached = 40
+# Сколько скиллов могут предложить агенты одной сессии (0 — запретить)
+max_proposals = 10
+# Ставить зависимости скиллов (requirements.txt, pyproject.toml, package.json) в отдельные окружения
+install = true
+# То же для скиллов, предложенных агентами (в окружения отдельно от ваших скиллов)
+install_proposals = true
+# Где лежат окружения скиллов (общие для всех сессий)
+envs_dir = "~/.dreamteam/skill-envs"
+# Python окружений: "" — тот, на котором работает DreamTeam; путь, команда или (с uv) версия, например "3.12"
+python = ""
+install_scripts = false       # запускать скрипты пакетов npm (postinstall и т. п.)
+install_timeout = 900         # секунд на одну установку
+env_retention_days = 30       # неиспользуемые окружения удаляются через столько дней (0 — никогда)
+install_env = []              # доп. переменные окружения для установщиков (например, пароль частного индекса)
 
 [tracing]
 enabled = true                # трейсы агентов: каждый вызов LLM и инструмента с полными данными

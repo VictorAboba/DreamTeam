@@ -134,7 +134,7 @@ def test_sessions_rm_refusals_without_a_hub(tmp_path, capsys, monkeypatch):
     dead = home / ".dreamteam" / f"launcher-{holder.pid}.pid"
     assert dead.exists()
     # a refusal of the home is printed once (not "Could not delete session X: Could not delete session X: ...")
-    async def busy(self, sid):
+    async def busy(self, sid, **kwargs):
         raise SessionError(f"Could not delete session {sid}: its files are in use (WinError 32).", 409)
 
     monkeypatch.setattr(SessionManager, "delete", busy)

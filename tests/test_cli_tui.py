@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import os
@@ -67,7 +68,7 @@ def test_tui_options_reach_main_tui(monkeypatch, tmp_path):
 
     seen.clear()
     assert cli.main(["-r", "--home", str(tmp_path)]) == 0  # -r without an id opens the session picker
-    assert seen["initial_prompt"] == "/sessions" and seen["session"] is None
+    assert seen["initial_prompt"] == "/sessions" and seen["session"] == ""   # "": the one picked is resumed
     seen.clear()
     assert cli.main(["chat", "-r", "004-kalk", "--home", str(tmp_path), "--verbose"]) == 0
     assert seen["session"] == "004-kalk" and seen["initial_prompt"] is None and seen["verbosity"] == "verbose"
@@ -219,6 +220,153 @@ def test_workspace_option_reaches_the_session_creation(monkeypatch, tmp_path, ca
     parser = cli.build_parser()
     subcommands = parser._subparsers._group_actions[0].choices
     assert "--workspace" in subcommands["tui"].format_help() and "--workspace" in subcommands["serve"].format_help()
+
+
+def test_skill_option_reaches_the_session(monkeypatch, tmp_path, capsys):
+    """`--skill REF|PATH|URL` (repeatable; tui, -p, serve --goal): a path (or a name that is a folder here) made
+    absolute, a URL as it is, a reference checked before anything starts; with -c / -r it goes to the resumed
+    session; not a TUI-only flag (no terminal: serve)."""
+    from conftest import make_skill
+
+    home = tmp_path / "home"
+    library = Path(os.environ["DREAMTEAM_SKILLS_DIR"])
+    make_skill(library / "pdf", "pdf")
+    make_skill(Path(os.environ["CLAUDE_CONFIG_DIR"]) / "skills" / "review", "review")
+    make_skill(tmp_path / "tidy", "tidy")
+    seen: dict[str, Any] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: seen.update(kw) or 0)
+    url = "https://github.com/o/r/tree/main/skills/x"
+    assert cli.main(["--home", str(home), "Сделай змейку", "--skill", "pdf", "--skill", "./tidy", "--skill", "tidy",
+                     "--skill", "claude-user:review", "--skill", url, "--skill", "~/x.zip"]) == 0
+    tidy = str(tmp_path / "tidy")
+    assert seen["overrides"]["skills"] == ["pdf", tidy, tidy, "claude-user:review", url,
+                                           os.path.normpath(os.path.expanduser("~/x.zip"))]
+    seen.clear()
+    assert cli.main(["-c", "--home", str(home), "--skill", "pdf"]) == 0   # attached to the resumed session
+    assert seen["continue_last"] is True and seen["overrides"]["skills"] == ["pdf"]
+    seen.clear()
+    assert cli.main(["--home", str(home)]) == 0 and "skills" not in seen["overrides"]
+
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: pytest.fail("must be refused"))
+    capsys.readouterr()
+    assert cli.main(["--home", str(home), "Goal", "--skill", "nope"]) == 2
+    assert "--skill nope: No skill 'nope' in the library or in ~/.claude/skills. Library: pdf." in capsys.readouterr().err
+    assert cli.main(["--home", str(home), "Goal", "--skill", "claude-project:local"]) == 2   # no --workspace
+    project = tmp_path / "project"
+    make_skill(project / ".claude" / "skills" / "local", "local")
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: seen.update(kw) or 0)
+    assert cli.main(["--home", str(home), "Goal", "--workspace", str(project), "--skill", "claude-project:local"]) == 0
+    assert seen["overrides"]["skills"] == ["claude-project:local"]
+    seen.clear()
+    assert cli.main(["-r", "001-x", "--home", str(home), "--skill", "claude-project:local"]) == 0  # the hub resolves it
+    assert seen["session"] == "001-x" and seen["overrides"]["skills"] == ["claude-project:local"]
+
+    monkeypatch.setattr(tui, "main_print", lambda home, prompt, **kw: seen.update(kw) or 0)
+    monkeypatch.setattr(cli, "_piped_stdin", lambda: "")
+    seen.clear()
+    assert cli.main(["-p", "Goal", "--home", str(home), "--skill", "pdf"]) == 0
+    assert seen["overrides"]["skills"] == ["pdf"]
+    # not a TUI flag: without a terminal `dreamteam --skill x --goal g` serves
+    monkeypatch.setattr(cli, "_interactive", lambda: False)
+    assert cli._default_command(["--skill", "pdf", "--goal", "g"], COMMANDS)[0] == "serve"
+
+    calls: dict[str, Any] = {}
+
+    async def serve_home(home_dir, host, port, **kw):
+        calls.update(kw)
+        return 0
+
+    monkeypatch.setattr(cli, "_serve_home", serve_home)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **kw: None)
+    capsys.readouterr()
+    assert cli.main(["serve", "--home", str(home), "--skill", "pdf", "--no-browser"]) == 2
+    assert "--skill needs --goal" in capsys.readouterr().err and not calls
+    assert cli.main(["serve", "--home", str(home), "--goal", "G", "--skill", "./tidy", "--no-browser",
+                     "--no-console"]) == 0
+    assert calls["skills"] == [tidy]
+    assert cli.main(["serve", "--home", str(home), "--goal", "G", "--skill", "nope", "--no-browser"]) == 2
+
+
+async def test_print_mode_passes_the_skills_to_the_hub():
+    """`-p --skill`: the new session's body `skills`, or the start call of the resumed one (also when it runs)."""
+    from dreamteam.tui import printmode
+
+    calls: list[tuple] = []
+
+    class Client:
+        mode = "launcher"
+
+        async def create_session(self, title, goal, **kw):
+            calls.append(("create", kw.get("skills")))
+            return {"id": "001-a", "title": "A", "language": "en"}
+
+        async def sessions(self):
+            return [{"id": "001-a", "title": "A", "status": "running"}]
+
+        async def start_session(self, sid, skills=None):
+            calls.append(("start", sid, skills))
+            return {"id": sid, "title": "A", "status": "running"}
+
+    class Conn:
+        client = Client()
+
+    run = printmode._PrintRun(Conn(), "Goal", session=None, continue_last=False, title=None, overrides=None,
+                              output_format="text", verbose=False, timeout=None, auto_reply=True, lang="en",
+                              out=io.StringIO(), err=io.StringIO(), skills=["pdf"])
+    await run.prepare()
+    run = printmode._PrintRun(Conn(), "Next", session="001-a", continue_last=False, title=None, overrides=None,
+                              output_format="text", verbose=False, timeout=None, auto_reply=True, lang="en",
+                              out=io.StringIO(), err=io.StringIO(), skills=["csv"])
+    run.attach = lambda sid: asyncio.sleep(0)   # (the prompt's delivery is not this test's)
+    await run.prepare()
+    assert calls == [("create", ["pdf"]), ("start", "001-a", ["csv"])]
+
+    seen: dict[str, Any] = {}
+
+    async def fake_run_print(conn, prompt, **kw):
+        seen.update(kw)
+        return 0
+
+    original = printmode.run_print
+    printmode.run_print = fake_run_print
+    try:
+        await tui.run_print_mode(Conn(), "Goal", overrides={"model": "fast", "skills": ["pdf"]})
+    finally:
+        printmode.run_print = original
+    assert seen["skills"] == ["pdf"] and seen["overrides"] == {"agents": {"default_model": "fast"}}
+
+
+def test_sessions_rm_says_how_to_settle_waiting_proposals(monkeypatch, tmp_path, capsys):
+    from dreamteam.sessions import SessionError
+
+    home = tmp_path / "home"
+    home.mkdir()
+    st.write_raw(home, {"swarm": {"name": "Home"}})
+    (home / "sessions").mkdir()
+    deleted: list[tuple] = []
+
+    class Manager:
+        def __init__(self, home):
+            pass
+
+        def list(self):
+            return [{"id": "001-a", "title": "A", "status": "stopped"}]
+
+        async def delete(self, sid, *, skills=None, via="home"):
+            deleted.append((sid, skills, via))
+            if skills is None:
+                raise SessionError("Session 001-a has skills waiting for your library decision: tidy.", 409)
+            return None
+
+    monkeypatch.setattr("dreamteam.sessions.SessionManager", Manager)
+    monkeypatch.setattr(cli, "running_hub", lambda home: None)
+    monkeypatch.setattr(cli, "_session_holders", lambda home: [])
+    assert cli.main(["sessions", "rm", "001-a", "--yes", "--home", str(home)]) == 1
+    assert "Pass --skills save (to the skills library first) or --skills discard." in capsys.readouterr().err
+    assert cli.main(["sessions", "rm", "001-a", "--yes", "--skills", "save", "--home", str(home)]) == 0
+    assert deleted == [("001-a", None, "cli"), ("001-a", "save", "cli")]
 
 
 def test_print_mode_with_a_workspace_folder(monkeypatch, tmp_path, capsys):
