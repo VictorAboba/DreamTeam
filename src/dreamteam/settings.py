@@ -23,8 +23,8 @@ from .config import CONFIG_FILE, Config, ModelProfile, env_var_name, make_profil
 
 HOME_ENV = "DREAMTEAM_HOME"
 # `roles` is a list of tables ([[roles]], the role catalog: docs/SPEC.md §17.3); the others are tables
-SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "tracing", "roles", "models")
-_ROLE_FIELDS = ("name", "description", "instructions", "model", "hidden")
+SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "roles", "models")
+_ROLE_FIELDS = ("name", "description", "instructions", "model", "hidden", "skills")
 _PUBLIC_KEY_FIELDS = ("api_key_set", "api_key_hint", "api_key_env_set")
 # A hidden secret in the public view (`env` values of [mcp.external.*]): the mask plus the key hint.
 # An update that sends a mask back keeps the stored value.
@@ -344,7 +344,7 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
                 # unset fields are not stored: an untouched field of a built-in role keeps the built-in value
                 entries.append({k: (" ".join(v.split()) if k == "name" and isinstance(v, str) else v)
                                 for k, v in copy.deepcopy(item).items()
-                                if v is not None and v != "" and not (k == "hidden" and v is False)})
+                                if v is not None and v != "" and v != [] and not (k == "hidden" and v is False)})
             if entries:
                 result["roles"] = entries
             else:

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import prompts
 from .db import dumps, loads, utf8_safe
-from .llm.base import LLMError, LLMResponse, estimate_tokens
+from .llm.base import LLMError, LLMResponse, accepts_max_tokens, estimate_tokens
 from .mailbox import MAX_TEXT
 from .models import USER, AgentStatus, Status, ToolError
 from .shell import truncate_middle
@@ -37,7 +37,11 @@ CONTEXT_OVERFLOW_MARKERS = (
     "prompt is too long", "context length", "context_length", "context window", "maximum context",
     "too many tokens", "too many input tokens", "request too large", "request_too_large", "input is too long",
     "context size", "exceeds the context", "max_new_tokens", "max_model_len",  # llama.cpp, TGI, vLLM
+    "exceed context limit",  # Anthropic: "input length and `max_tokens` exceed context limit: ..."
 )
+# Fragments of a 400 about the output limit itself: a raised max_tokens above what the model or provider allows.
+OUTPUT_LIMIT_MARKERS = ("max_tokens", "max_completion_tokens", "max_output_tokens", "max_new_tokens",
+                        "maximum output", "output tokens", "completion tokens")
 
 
 def is_context_overflow(error: LLMError | None) -> bool:
@@ -45,6 +49,13 @@ def is_context_overflow(error: LLMError | None) -> bool:
         return False
     text = error.message.lower()
     return any(marker in text for marker in CONTEXT_OVERFLOW_MARKERS)
+
+
+def is_output_limit_error(error: LLMError | None) -> bool:
+    if error is None or error.retryable or error.kind != "bad_request":
+        return False
+    text = error.message.lower()
+    return any(marker in text for marker in OUTPUT_LIMIT_MARKERS)
 
 
 class AgentRuntime:
@@ -82,6 +93,9 @@ class AgentRuntime:
         self.profile_name: str | None = member.get("model") or None
         self.last_prompt_tokens: int = int(member.get("context_tokens") or 0)
         self.last_output_tokens = 0
+        self.last_max_tokens = 0  # the output limit of the last successful LLM call
+        # the LLM client whose provider refused a raised output limit: no more raising until it is rebuilt
+        self._limit_refused_by: Any = None
         # its frozen tool set (tools/frozen.py): sent unchanged, so the prompt prefix stays the same
         self.tools_rev = 0
         self.tools: list[dict[str, Any]] = []
@@ -172,6 +186,7 @@ class AgentRuntime:
 
     async def _close_llm(self) -> None:
         llm, self._llm = self._llm, None
+        self._limit_refused_by = None
         await self._aclose(llm)
 
     async def _aclose(self, llm: Any) -> None:
@@ -187,6 +202,7 @@ class AgentRuntime:
         The old client is closed in the background when an event loop runs; a client with a call in flight only
         when that call returns (closing it under the call fails it: "the client has been closed")."""
         llm, self._llm = self._llm, None
+        self._limit_refused_by = None  # the new profile may allow a larger output limit
         if llm is not None and not self._llm_calls.get(id(llm)):
             self._close_soon(llm)
 
@@ -198,15 +214,18 @@ class AgentRuntime:
         except RuntimeError:
             pass
 
-    async def _complete(self, messages: list[dict[str, Any]]) -> tuple[LLMResponse, Any]:
+    async def _complete(self, messages: list[dict[str, Any]],
+                        max_tokens: int | None = None) -> tuple[LLMResponse, Any]:
         """One request on the current client, which stays open until it returns even if the settings change
-        meanwhile (reset_llm); the response and the client that produced it (its profile prices the usage)."""
+        meanwhile (reset_llm); the response and the client that produced it (its profile prices the usage).
+        `max_tokens`: a raised output limit (None: the profile's; the keyword is then not passed at all)."""
         llm = self.llm
         key = id(llm)  # (a test double may be unhashable)
         self._llm_calls[key] = self._llm_calls.get(key, 0) + 1
+        kwargs = {"max_tokens": max_tokens} if max_tokens else {}
         try:
             async with self.swarm.llm_semaphore:
-                return await llm.complete(self.system_prompt, messages, self.tools), llm
+                return await llm.complete(self.system_prompt, messages, self.tools, **kwargs), llm
         finally:
             left = self._llm_calls.pop(key) - 1
             if left:
@@ -407,6 +426,7 @@ class AgentRuntime:
         reply: list[str] = []  # plain text for the user, including parts cut off by the output limit
         nudged: set[int] = set()  # in-progress task ids this activation was already nudged about
         overflow_handled = False
+        out_limit: int | None = None  # the output limit asked for the step after a cut-off reply (None: profile's)
         self.stalled = frozenset()
         outcome = "done"  # done | step_limit | interrupted | failed | refusal
         status, summary = "done", ""  # of the trace
@@ -431,7 +451,7 @@ class AgentRuntime:
                 if self._stopping or swarm.paused:
                     outcome, status, summary = "interrupted", "stopped", self._stop_reason()
                     break
-            response = await self._call_llm(self.history)
+            response = await self._call_llm(self.history, max_tokens=out_limit)
             if response is None and is_context_overflow(self._last_error) and not overflow_handled:
                 overflow_handled = True  # the estimate missed: compact without the LLM and try once more
                 self._compact_without_llm()
@@ -449,6 +469,10 @@ class AgentRuntime:
                 trace.record("event", "refusal", output=response.text or "refusal", status="error")
                 outcome, status, summary = "refusal", "refusal", "The model declined the request."
                 break
+            # A reply cut off by the output limit without a tool call (often all thinking): the next step may write
+            # twice as much, up to the profile's ceiling (_output_limit); any other reply goes back to the profile's.
+            cut_off = response.stop_reason == "max_tokens" and not response.tool_calls
+            out_limit = 2 * self.last_max_tokens if cut_off else None
             if not response.tool_calls:
                 text = (response.text or "").strip()
                 if text:
@@ -564,21 +588,29 @@ class AgentRuntime:
 
     # ---- LLM ----------------------------------------------------------------------------------
     async def _call_llm(self, messages: list[dict[str, Any]], *, purpose: str = "step",
-                        extra: list[dict[str, Any]] | None = None, parent: Span | None = None) -> LLMResponse | None:
+                        extra: list[dict[str, Any]] | None = None, parent: Span | None = None,
+                        max_tokens: int | None = None) -> LLMResponse | None:
         """One LLM call with backoff for retryable errors. None on failure (`_last_error` says why) or
         when the agent was stopped / the swarm paused during the backoff (`_last_error` is None).
-        `extra`: the messages at the end of `messages` that are not part of the history (traces)."""
+        `extra`: the messages at the end of `messages` that are not part of the history (traces).
+        `max_tokens`: the output limit asked for after a cut-off reply (None: the profile's; see _output_limit)."""
         swarm = self.swarm
         trace = self._tr
         self._last_error = None
-        for attempt in range(len(RETRY_DELAYS) + 1):
+        attempt = 0
+        while attempt <= len(RETRY_DELAYS):
+            limit = self._output_limit(max_tokens)
             span = trace.llm_start(len(messages), purpose=purpose, extra=extra, attempt=attempt + 1, parent=parent,
-                                   tools_rev=self.tools_rev)
+                                   tools_rev=self.tools_rev, max_tokens=limit)
             try:
-                response, llm = await self._complete(messages)
+                response, llm = await self._complete(messages, limit)
             except LLMError as exc:
+                if limit is not None and self._raise_refused(exc, limit, span):
+                    max_tokens = None  # the same request once more with the profile's limit (not a counted attempt)
+                    continue
                 if exc.retryable and attempt < len(RETRY_DELAYS):
                     delay = RETRY_DELAYS[attempt]
+                    attempt += 1
                     trace.llm_error(span, exc.message, kind=exc.kind, retry_in=delay, model=self._model_id())
                     self._activity("error", f"{exc.kind}: {exc.message} — retrying in {delay}s")
                     await asyncio.sleep(delay)
@@ -598,6 +630,7 @@ class AgentRuntime:
                 raise
             cost = swarm.record_usage(self.name, response.usage, llm.profile, response.model)
             trace.llm_end(span, response, cost)
+            self.last_max_tokens = limit or max(int(getattr(llm.profile, "max_tokens", 0) or 0), 1)
             usage = response.usage
             self.last_prompt_tokens = usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens
             self.last_output_tokens = usage.output_tokens
@@ -606,6 +639,47 @@ class AgentRuntime:
             swarm.db.execute("UPDATE agents SET context_tokens = ? WHERE name = ?", (self.last_prompt_tokens, self.name))
             return response
         return None
+
+    def _output_limit(self, requested: int | None) -> int | None:
+        """The output limit of a request that asks for `requested` tokens after a cut-off reply: at most the
+        profile's ceiling (max_tokens_ceiling, else 2 x max_tokens) and never more than the context leaves for the
+        answer (vLLM & co. count prompt + max_tokens against the window). None: the profile's own max_tokens (no
+        raise asked for, none possible, the provider refused one before, or a client without the keyword)."""
+        if not requested:
+            return None
+        try:
+            llm = self.llm
+        except Exception:  # a client that cannot be built fails in _complete, where the caller handles it
+            return None
+        profile = llm.profile
+        if self._limit_refused_by is llm or not accepts_max_tokens(llm):
+            return None
+        base = int(getattr(profile, "max_tokens", 0) or 0)
+        ceiling = getattr(profile, "output_ceiling", None) or 2 * base  # (a test double's profile may lack it)
+        room = self._context_limit() - self._prompt_estimate()
+        limit = min(int(requested), ceiling, room)
+        return limit if limit > base else None
+
+    def _raise_refused(self, exc: LLMError, limit: int, span: Span | None) -> bool:
+        """A request with a raised output limit failed: True (retry with the profile's limit) when the error is about
+        that limit, or a context overflow the larger answer may have caused. A refused limit is not raised again on
+        this client (until settings rebuild it); an overflow only costs this one retry."""
+        # An overflow first: vLLM's and Anthropic's overflow messages also name max_tokens, but they mean that
+        # prompt + limit did not fit this time, not that the provider never allows the limit.
+        overflow = is_context_overflow(exc)
+        refused = is_output_limit_error(exc) and not overflow
+        if not refused and not overflow:
+            return False
+        if refused:
+            self._limit_refused_by = self._llm
+        trace = self._tr
+        trace.llm_error(span, exc.message, kind=exc.kind, model=self._model_id())
+        note = (f"The request with a raised output limit of {limit} tokens failed ({exc.kind}: {exc.message}); "
+                "retrying with the profile's limit" + (" and not raising it again" if refused else "") + ".")
+        trace.record("event", "output_limit_fallback", output=note, meta={"max_tokens": limit, "refused": refused})
+        self._activity("error", note)
+        log.info("agent %s: %s", self.name, note)
+        return True
 
     def _context_limit(self) -> int:
         profile = self.llm.profile
@@ -626,15 +700,19 @@ class AgentRuntime:
         prompt + max_tokens against it), the summary call must still fit, or the agent could never compact."""
         return self._prompt_room() - estimate_tokens(prompts.t(self.language, "compaction_request"))
 
-    def _needs_compaction(self) -> bool:
-        if len(self.history) < 3:
-            return False
+    def _prompt_estimate(self) -> int:
+        """The size of the next step's prompt: the last prompt plus the response to it (its output tokens), then
+        everything appended since (an estimate of the whole history before the first call)."""
         recent = self.history[self._len_at_last_call:] if self._len_at_last_call <= len(self.history) else self.history
         if self.last_prompt_tokens:
-            # the last prompt plus the response to it (its output tokens), then everything appended since
             base = self.last_prompt_tokens + self.last_output_tokens
         else:
             base = estimate_tokens(self.history[: self._len_at_last_call]) + self._fixed_tokens()
+        return base + estimate_tokens(recent)
+
+    def _needs_compaction(self) -> bool:
+        if len(self.history) < 3:
+            return False
         limit = self._compaction_budget()
         if self._compaction_floor > limit * 3 // 4:
             # A fresh compaction already fills (nearly) all of the limit (system prompt + tool schemas +
@@ -646,7 +724,7 @@ class AgentRuntime:
             room = self._prompt_room()
             grown = self._compaction_floor + limit // 2
             limit = grown if self._compaction_floor >= room else min(grown, room)
-        return base + estimate_tokens(recent) > limit
+        return self._prompt_estimate() > limit
 
     async def _compact(self) -> None:
         """Simple compaction (SPEC §6.1). On failure the history is kept and `_last_error` is set, except
@@ -698,8 +776,12 @@ class AgentRuntime:
         # turn (no thinking block) bound to the old one. `!=`: after a code downgrade it realigns here too.
         upgrade = frozen.current_record(self.language) if self.tools_rev != frozen.TOOLSET_REVISION else None
         added = [n for n in frozen.names(upgrade["tools"]) if n not in self.tool_names] if upgrade else []
+        # the attached skills too: the compacted context forgets the index an earlier wake-up showed
+        skills = getattr(self.swarm, "skills", None)
+        index = skills.index_text(self.name) if skills is not None else ""
         text = (prompts.t(self.language, "compacted", summary=summary)
                 + ("\n\n" + prompts.t(self.language, "notes", notes=notes) if notes else "")
+                + ("\n\n" + index if index else "")
                 + ("\n\n" + prompts.t(self.language, "tools_added", tools=", ".join(f"`{n}`" for n in added))
                    if added else "")
                 + "\n\n" + prompts.t(self.language, "continue"))
@@ -708,6 +790,8 @@ class AgentRuntime:
         # (Before _fixed_tokens below: the compaction floor counts the new tool set.)
         epoch = self._replace_history([{"role": "user", "content": text}, *self._tail_to_keep()], tools=upgrade)
         self.swarm.notes_shown(self.name, notes)
+        if skills is not None:  # True: the summary holds the full index; None: forgotten, the next wake shows it
+            self.swarm.skills_shown(self.name, True if index else None)
         self.last_prompt_tokens = self._compaction_floor = estimate_tokens(self.history) + self._fixed_tokens()
         self.last_output_tokens = 0
         self._len_at_last_call = len(self.history)

@@ -160,6 +160,7 @@ PRESET_IDS: tuple[str, ...] = tuple(ROLE_PRESETS["en"])
 DEFAULT_ROLE_ID = "generalist"
 # a role name (at most), a description or instructions, [[roles]] entries, agents per /team item, agents per team
 NAME_LIMIT, TEXT_LIMIT, MAX_ROLES, TEAM_ITEM_MAX, TEAM_MAX = 60, 4000, 100, 50, 200
+MAX_ROLE_SKILLS = 20  # skill names one role lists (docs/SPEC.md §19)
 
 # casefolded id or name (either language) of a preset -> its id
 _PRESET_OF = {key.casefold(): rid for rid in PRESET_IDS
@@ -179,6 +180,7 @@ class Role:
     builtin: bool = False
     customized: bool = False    # a built-in role with a [[roles]] entry
     hidden: bool = False
+    skills: tuple[str, ...] = ()  # skill names its agents get attached at hire (built-in presets list none)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -195,6 +197,11 @@ def _field(entry: Any, key: str) -> Any:
 
 def _text(value: Any) -> str:
     return value.strip() if isinstance(value, str) else ""
+
+
+def _skills(entry: Any) -> tuple[str, ...]:
+    value = _field(entry, "skills")
+    return tuple(s for s in value if isinstance(s, str)) if isinstance(value, (list, tuple)) else ()
 
 
 def normalize(name: Any) -> str:
@@ -237,11 +244,12 @@ def catalog(entries: Iterable[Any] | None, language: str, *, include_hidden: boo
         out.append(Role(rid, name, _text(_field(entry, "description")) or description,
                         instructions=_text(_field(entry, "instructions")),
                         model=_text(_field(entry, "model")) or None, builtin=True, customized=True,
-                        hidden=bool(_field(entry, "hidden"))))
+                        hidden=bool(_field(entry, "hidden")), skills=_skills(entry)))
     for key, entry in own:
         out.append(Role(key, normalize(_field(entry, "name")), _text(_field(entry, "description")),
                         instructions=_text(_field(entry, "instructions")),
-                        model=_text(_field(entry, "model")) or None, hidden=bool(_field(entry, "hidden"))))
+                        model=_text(_field(entry, "model")) or None, hidden=bool(_field(entry, "hidden")),
+                        skills=_skills(entry)))
     return out if include_hidden else [role for role in out if not role.hidden]
 
 
@@ -367,5 +375,5 @@ def catalog_view(entries: Iterable[Any] | None) -> list[dict]:
     en = catalog(entries, "en", include_hidden=True)
     return [{"key": r.key, "builtin": r.builtin, "customized": r.customized, "hidden": r.hidden,
              "name": {"ru": r.name, "en": e.name}, "description": {"ru": r.description, "en": e.description},
-             "instructions": r.instructions, "model": r.model}
+             "instructions": r.instructions, "model": r.model, "skills": list(r.skills)}
             for r, e in zip(ru, en)]

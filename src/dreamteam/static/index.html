@@ -53,6 +53,7 @@
         <button type="button" role="tab" data-tab="feed"><span data-i18n="tab_feed"></span></button>
         <button type="button" role="tab" data-tab="files"><span data-i18n="tab_files"></span></button>
         <button type="button" role="tab" data-tab="mcp"><span data-i18n="tab_mcp"></span><span class="tab-badge warn hidden" id="mcp-badge"></span></button>
+        <button type="button" role="tab" data-tab="skills"><span data-i18n="tab_skills"></span><span class="tab-badge warn hidden" id="skills-badge"></span></button>
         <button type="button" role="tab" data-tab="triggers"><span data-i18n="tab_triggers"></span><span class="tab-badge hidden" id="triggers-badge"></span></button>
         <button type="button" role="tab" data-tab="jobs"><span data-i18n="tab_jobs"></span><span class="tab-badge hidden" id="jobs-badge"></span></button>
         <button type="button" role="tab" data-tab="traces"><span data-i18n="tab_traces"></span></button>
@@ -73,6 +74,11 @@
         </div>
       </section>
       <section class="tab-pane hidden" id="pane-mcp"><div id="mcp-list" class="cards-list"></div></section>
+      <section class="tab-pane hidden" id="pane-skills">
+        <div class="skills-bar"><button class="btn small" id="skill-attach-btn" type="button"><i class="ic ic-plus"></i><span data-i18n="sk_attach"></span></button><span class="muted" data-i18n="sk_tab_hint"></span></div>
+        <div id="skill-list" class="cards-list"></div>
+        <div id="skill-library"></div>
+      </section>
       <section class="tab-pane hidden" id="pane-triggers"><div id="trigger-list" class="cards-list"></div></section>
       <section class="tab-pane hidden" id="pane-jobs"><div id="job-list" class="cards-list"></div></section>
       <section class="tab-pane traces-pane hidden" id="pane-traces"></section>
@@ -121,6 +127,7 @@
   <div class="toasts" id="toasts" aria-live="polite"></div>
   <script src="/static/highlight.js"></script>
   <script src="/static/markdown.js"></script>
+  <script src="/static/skills.js"></script>
   <script src="/static/app.js"></script>
   <script src="/static/traces.js"></script>
 </body>

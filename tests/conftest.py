@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from dreamteam import prompts
+from dreamteam import prompts, skill_deps
 from dreamteam.board import Board
 from dreamteam.config import Config
 from dreamteam.db import Database, dumps, loads
@@ -19,6 +19,7 @@ from dreamteam.events import EventBus
 from dreamteam.goal_text import split_goal
 from dreamteam.models import USER, AgentKind, AgentStatus, ToolError
 from dreamteam.swarm import QUIET_KEY, resolve_member_in
+from helpers import fake_installers
 
 
 class FakeSwarm:
@@ -148,6 +149,39 @@ class FakeSwarm:
         return goal
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "real_installers: runs uv, pip or npm offline against local packages")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_skill_dirs(tmp_path_factory, monkeypatch):
+    """No test reads or writes the real skills library (~/.dreamteam/skills), the skills' environments
+    (~/.dreamteam/skill-envs) or Claude Code's ~/.claude/skills; no real installer runs unless a test opts in."""
+    base = tmp_path_factory.mktemp("skillhome")
+    monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(base / "library"))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(base / "claude"))
+    monkeypatch.delenv("DREAMTEAM_HOST_SKILLS_DIR", raising=False)
+    monkeypatch.setenv("DREAMTEAM_SKILL_ENVS_DIR", str(base / "envs"))
+    monkeypatch.setattr(skill_deps, "INSTALLERS", fake_installers.default())
+
+
+def make_skill(folder: Path, name: str | None = "demo", description: str = "Does a demo thing.",
+               files: dict[str, str | bytes] | None = None, *, body: str = "Steps.\n", extra: str = "") -> Path:
+    """A skill folder: `folder` with a SKILL.md (front matter `name` unless None, `description`, `extra` lines) and
+    `files` ({relative path: text or bytes})."""
+    folder.mkdir(parents=True, exist_ok=True)
+    head = "---\n" + (f"name: {name}\n" if name is not None else "") + f"description: {description}\n" + extra + "---\n"
+    (folder / "SKILL.md").write_text(head + body, encoding="utf-8")
+    for rel, data in (files or {}).items():
+        path = folder / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(data, bytes):
+            path.write_bytes(data)
+        else:
+            path.write_text(data, encoding="utf-8")
+    return folder
+
+
 @pytest.fixture
 def fake_swarm(tmp_path: Path) -> FakeSwarm:
     swarm = FakeSwarm(tmp_path / "project")
@@ -169,4 +203,4 @@ def make_fake_swarm(tmp_path: Path):
         s.db.close()
 
 
-__all__ = ["FakeSwarm", "loads"]
+__all__ = ["FakeSwarm", "loads", "make_skill"]

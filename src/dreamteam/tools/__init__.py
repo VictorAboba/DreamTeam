@@ -26,7 +26,7 @@ _AUDIENCE_NAMES = {"llm": "swarm agents", "external": "external members", "user"
 # everything is loaded, so the tool list never depends on which module happened to be imported first
 # (a reordered tool list would invalidate the LLM prompt cache).
 _MODULE_ORDER = ("board_tools", "comm_tools", "file_tools", "job_tools", "mcp_tools", "swarm_tools", "trigger_tools",
-                 "trace_tools")
+                 "trace_tools", "skill_tools")
 _seq = itertools.count()
 
 
@@ -35,6 +35,9 @@ class ToolContext:
     swarm: "Swarm"
     actor: str
     runtime: "AgentRuntime | None" = None
+    # the surface the call came through, recorded where the user's changes are audited (skills): "act" (web
+    # /api/act: the web UI, the TUI, the console), "mcp" (hub_call), "launcher-mcp"
+    via: str = "act"
 
     @property
     def kind(self) -> str:
@@ -368,8 +371,8 @@ def _load() -> None:
     global _loaded
     if _loaded:
         return
-    from . import (board_tools, comm_tools, file_tools, job_tools, mcp_tools, swarm_tools, trace_tools,  # noqa: F401
-                   trigger_tools)
+    from . import (board_tools, comm_tools, file_tools, job_tools, mcp_tools, skill_tools, swarm_tools,  # noqa: F401
+                   trace_tools, trigger_tools)
 
     ordered = sorted(REGISTRY.values(), key=lambda s: s.order)
     REGISTRY.clear()

@@ -517,6 +517,44 @@ label.field .hint { font-weight: 400; color: var(--faint); }
 :is(.file-view pre, .md pre) .hl-add { color: var(--hl-add); background: var(--hl-add-bg); }
 :is(.file-view pre, .md pre) .hl-del { color: var(--hl-del); background: var(--hl-del-bg); }
 
+/* skills (both pages): the add form of skills.js, SKILL.md and file lists, the packages rows of the session's tab */
+.skill-add { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.sk-tabs { display: inline-flex; gap: 2px; align-self: flex-start; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 2px; }
+.sk-tabs > button { border: none; background: none; height: 24px; padding: 0 11px; border-radius: 4px; color: var(--muted); font: 500 12px var(--mono); }
+.sk-tabs > button:hover { color: var(--text); }
+.sk-tabs > button.active { background: var(--panel-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--border-strong); }
+.sk-pane { display: flex; flex-direction: column; gap: 4px; }
+.sk-pane input { width: 100%; }
+.sk-go { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sk-status { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.sk-pick { display: flex; flex-direction: column; gap: 6px; padding: 10px 12px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.sk-pick-head { font-size: 12px; font-weight: 600; color: var(--muted); }
+.sk-pick label.check, .sk-picker label.check { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; cursor: pointer; }
+.sk-pick label.check.dim { opacity: .55; cursor: default; }
+.sk-pick label.check input, .sk-picker label.check input { width: auto; margin: 2px 0 0; }
+.sk-pick .hint, .sk-picker .hint { font-size: 11.5px; color: var(--faint); }
+pre.skill-md { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 var(--mono); max-height: 360px; overflow: auto; margin: 8px 0 0;
+  background: var(--field); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 11px; color: var(--text); }
+.sk-show { margin-top: 8px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.sk-show .md { max-height: 420px; overflow: auto; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 11px; background: var(--field); }
+.sk-files ul { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 12px; max-height: 120px; overflow: auto; }
+.sk-label { font: 600 11px var(--mono); color: var(--faint); text-transform: uppercase; letter-spacing: .04em; }
+.sk-deps { font-size: 12px; color: var(--muted); }
+.sk-pkgs { margin-top: 8px; display: flex; flex-direction: column; gap: 5px; font-size: 12px; }
+.sk-pkg { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.sk-pkg code { font-size: 11.5px; }
+.sk-pkg .muted { font-size: 12px; }
+.sk-pkg-err { color: var(--err); font: 11.5px/1.5 var(--mono); overflow-wrap: anywhere; flex-basis: 100%; }
+.item pre.sk-log { max-height: 320px; background: var(--field); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 9px 11px; color: var(--muted); word-break: break-word; }
+.skills-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; max-width: 980px; }
+.skills-bar .muted { font-size: 12.5px; }
+.skill-roles-chips { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
+.skills-mark { color: var(--muted); font: 11px var(--mono); display: inline-flex; align-items: center; gap: 2px; }
+.skill-lib { margin-top: 18px; max-width: 980px; }
+.skill-lib > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; font-weight: 600; margin-bottom: 8px; }
+.sk-attach-list { display: flex; flex-direction: column; gap: 8px; max-height: 52vh; overflow: auto; }
+.sk-attach-row { border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; background: var(--bg); }
+
 /* toasts */
 .toasts { position: fixed; bottom: 16px; left: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 40; max-width: min(420px, calc(100vw - 32px)); }
 .toast { background: var(--panel); border: 1px solid var(--border-strong); box-shadow: inset 2px 0 0 var(--accent-fill), var(--shadow-pop); border-radius: var(--radius); padding: 10px 12px 10px 14px; font-size: 13px; animation: slide .2s ease-out; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 40vh; overflow: auto; }

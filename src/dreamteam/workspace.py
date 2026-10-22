@@ -28,6 +28,9 @@ SCRATCH_GITIGNORE = ("# DreamTeam: temporary files of the agents. Git ignores th
 # "[.]" rather than ".": git add takes an exclude spelled out literally as naming the path, and when the root
 # .gitignore ignores .scratch/ (DEFAULT_GITIGNORE does) it reports it as an ignored path and exits 1 every time.
 SCRATCH_EXCLUDES = (":(exclude)[.]scratch", ":(exclude)[.]scratch/*")
+# The swarm's skills as the agents read them: a read-only copy DreamTeam rebuilds from the session's own copies
+# (docs/SPEC.md §19). A member's scratch folder never starts with "_" (email_slug), so it cannot be one.
+SKILLS_MIRROR = f"{SCRATCH_DIR}/_skills"
 # inherited variables that would point an agent's git at another repository or index
 GIT_LOCATION_VARS = frozenset({"GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
                                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_PREFIX"})
@@ -39,6 +42,8 @@ GIT_TIMEOUT = 120.0
 COMMIT_SUBJECT_MAX = 72   # the subject of an autocommit that names what changed: "shell: src/app.py, x.json (+3 more)"
 COMMIT_PATH_MAX = 40      # one path in it; a longer one keeps its end: "…/models/user.py"
 COMMIT_DETAIL_MAX = 2000  # its body (the command that made the change), cut in the middle beyond this
+NESTED_SHOWN = 5          # nested repositories named in the note about what an autocommit left out
+NESTED_PATHSPECS_MAX = 100  # untracked folders passed to `git ls-files` by name; more: it lists all untracked files
 # Directories shown but never expanded in listings (dependency caches, virtualenvs).
 NO_EXPAND = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
                        ".pytest_cache", ".ruff_cache", ".tox"})
@@ -112,6 +117,65 @@ def _covers(lock_path: str, rel: str) -> bool:
 def in_scratch(rel: str) -> bool:
     """`rel` (workspace-relative, "/"-separated) is `.scratch` or inside it."""
     return _covers(SCRATCH_DIR, rel.rstrip("/"))
+
+
+def scratch_is_local(root: Path) -> bool:
+    """`<root>/.scratch` is a plain folder of the workspace (not a file, nor a link or junction that resolves
+    elsewhere): only then do DreamTeam's own files (job logs, the skills mirror) go there."""
+    folder = Path(root) / SCRATCH_DIR
+    try:
+        if not folder.is_dir() or folder.is_symlink():
+            return False
+        return os.path.normcase(str(folder.resolve())) == os.path.normcase(str(Path(root).resolve() / SCRATCH_DIR))
+    except OSError:
+        return False
+
+
+def is_link(entry: os.DirEntry | Path | str) -> bool:
+    """Symlinks and Windows junctions (a directory entry or a path): listed but never followed (they may point
+    outside). Reparse points that do not redirect (OneDrive/cloud placeholders, dedup) are ordinary entries."""
+    if not hasattr(entry, "is_symlink"):  # a str (DirEntry and Path have the same two methods)
+        entry = Path(entry)
+    try:
+        if entry.is_symlink():
+            return True
+        st = entry.stat(follow_symlinks=False)
+        if not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            return False
+        tag = getattr(st, "st_reparse_tag", None)
+        return tag is None or bool(tag & _REPARSE_TAG_NAME_SURROGATE)
+    except OSError:
+        return False
+
+
+def long_path(path: str | os.PathLike) -> str:
+    """`path` in the extended-length form on Windows (`\\\\?\\C:\\...`, `\\\\?\\UNC\\server\\...`), so deep files
+    (git objects, a skill's nested folders under a long session path) pass the 260-character limit of plain paths;
+    the path unchanged elsewhere."""
+    target = os.fspath(path)
+    if not _WINDOWS or target.startswith("\\\\?\\"):
+        return target
+    full = os.path.abspath(target)
+    return "\\\\?\\UNC\\" + full[2:] if full.startswith("\\\\") else "\\\\?\\" + full
+
+
+def rmtree(path: Path) -> None:
+    """Remove a directory tree (best effort: what cannot be removed stays); read-only files (git objects on Windows,
+    the skills mirror) are made writable first."""
+    def on_error(func, target, _exc):
+        try:
+            os.chmod(target, stat.S_IWRITE)
+            func(target)
+        except OSError:
+            pass
+
+    if not Path(path).exists():
+        return
+    target = long_path(path)
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(target, onexc=on_error)
+    else:
+        shutil.rmtree(target, onerror=lambda func, target, info: on_error(func, target, info[1]))
 
 
 _CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # control characters other than tab and newline
@@ -269,6 +333,18 @@ def git_output(proc: subprocess.CompletedProcess) -> str:
     return ((proc.stdout or b"") + (proc.stderr or b"")).decode("utf-8", "replace").strip()
 
 
+def nested_repo_paths(root: Path, listed: bytes) -> list[str]:
+    """The nested repositories in `git ls-files --others -z` output: git does not descend into a folder with its
+    own .git and names it with a trailing "/" (`git add -A` would commit it as a gitlink, mode 160000, without a
+    .gitmodules entry: an empty reference nobody can clone). Paths outside `.scratch/` only."""
+    found: list[str] = []
+    for name in listed.decode("utf-8", "replace").split("\0"):
+        path = name.rstrip("/")
+        if name.endswith("/") and path and not in_scratch(path) and os.path.lexists(Path(root) / path / ".git"):
+            found.append(path)
+    return found
+
+
 def init_repo(root: Path, git: str | None = None, *, adopted: bool = False) -> str | None:
     """`git init` in `root` with a `.gitignore` (unless one exists) and an initial commit of what is there,
     as for a new workspace (synchronous). `adopted`: a folder of the user (its files are committed with the user's
@@ -279,7 +355,14 @@ def init_repo(root: Path, git: str | None = None, *, adopted: bool = False) -> s
     gitignore = root / ".gitignore"
     if not gitignore.exists():
         gitignore.write_bytes(DEFAULT_GITIGNORE.encode("utf-8"))
-    run_git(root, "add", "-A", "--ignore-errors", git=git, adopted=adopted)
+    # An adopted folder may hold cloned or generated projects: left out like in every autocommit (the next shell
+    # call's autocommit tells the agent about them), not committed as gitlinks without a .gitmodules
+    listed = run_git(root, "ls-files", "--others", "--exclude-standard", "-z", git=git, adopted=adopted)
+    nested = nested_repo_paths(root, listed.stdout) if listed.returncode == 0 else []
+    if nested:
+        log.info("initial commit of %s leaves out nested repositories: %s", root, ", ".join(nested))
+    run_git(root, "add", "-A", "--ignore-errors", "--", ".", *(f":(exclude,literal){path}" for path in nested),
+            git=git, adopted=adopted, literal=False)
     proc = run_git(root, "commit", "-q", "--no-verify", "--allow-empty", "-m", "Initialize workspace", git=git,
                    adopted=adopted)
     if proc.returncode != 0:
@@ -401,6 +484,8 @@ class Workspace:
         self._git_lock = asyncio.Lock()
         self._io_lock = asyncio.Lock()  # read-modify-write of files by concurrent agents
         self._running_git: set[asyncio.Future] = set()  # git commands in threads (they outlive a cancelled caller)
+        # member -> nested repositories (untracked folders with their own .git) already named in its tool results
+        self._nested_reported: dict[str, set[str]] = {}
 
     # --- setup -----------------------------------------------------------------------------
     @property
@@ -616,9 +701,27 @@ class Workspace:
         return data.decode("utf-8", errors="replace"), size > len(data)
 
     # --- writing ------------------------------------------------------------------------------
+    def _refuse_skills_mirror(self, actor: str, rel: str) -> None:
+        """write_file / edit_file never change the swarm's skills: the mirror is rebuilt from the session's copies
+        (a `shell` edit there is undone by the next check, docs/SPEC.md §19). The way to propose the change is named
+        only to a caller whose tool set has skill_propose (an agent of an older revision lacks it)."""
+        if not _covers(SKILLS_MIRROR, rel.rstrip("/")):
+            return
+        text = (f"'{SKILLS_MIRROR}/' holds the swarm's skills and is rebuilt by DreamTeam. To change a skill, copy "
+                "its folder (without node_modules) into your scratch folder and edit it there")
+        try:
+            from .tools import frozen
+
+            member = self.swarm.member(actor)
+            proposes = member is not None and "skill_propose" in frozen.member_tool_names(self.swarm, member)
+        except Exception:  # noqa: BLE001 - only the wording depends on it (test doubles, a view-only swarm)
+            proposes = False
+        raise ToolError(text + (", then call skill_propose." if proposes else "."))
+
     async def write(self, actor: str, path: str, content: str) -> str:
         p = self.resolve(path)
         rel = self.rel(p)
+        self._refuse_skills_mirror(actor, rel)
         if p.is_dir():
             raise ToolError(f"'{rel}' is a directory; give a file path.")
         data = _encode(content or "", "content")
@@ -640,6 +743,7 @@ class Workspace:
         _encode(new, "new_text")
         async with self._io_lock:
             p, rel = self._existing_file(path)
+            self._refuse_skills_mirror(actor, rel)
             self.check_writable(actor, rel)
             updated, replaced = self._apply_edit(rel, self._read_bytes(p, rel), old, new, replace_all)
             if updated is None:
@@ -703,7 +807,18 @@ class Workspace:
     async def _store(self, p: Path, rel: str, data: bytes) -> None:
         def _write() -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_bytes(data)
+            try:
+                p.write_bytes(data)
+            except PermissionError:
+                # a read-only file, e.g. a copy of an attached skill (the mirror's files are read-only and a copy
+                # keeps that): write_file / edit_file is the member's explicit edit, so it is made writable first.
+                # Not a file with other hard links (a skill environment's node_modules view shares its files)
+                info = p.lstat() if p.exists() else None
+                if (info is None or not stat.S_ISREG(info.st_mode) or info.st_nlink > 1
+                        or info.st_mode & stat.S_IWUSR):
+                    raise
+                os.chmod(p, stat.S_IMODE(info.st_mode) | stat.S_IWUSR | stat.S_IRUSR)
+                p.write_bytes(data)
 
         try:
             await asyncio.to_thread(_write)
@@ -742,20 +857,7 @@ class Workspace:
         except OSError:
             return False
 
-    @staticmethod
-    def _is_link(entry: os.DirEntry) -> bool:
-        """Symlinks and Windows junctions: listed but never followed (they may point outside)."""
-        try:
-            if entry.is_symlink():
-                return True
-            st = entry.stat(follow_symlinks=False)
-            if not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
-                return False
-            tag = getattr(st, "st_reparse_tag", None)
-            # junctions and other name surrogates; OneDrive/cloud placeholders are regular entries
-            return tag is None or bool(tag & _REPARSE_TAG_NAME_SURROGATE)
-        except OSError:
-            return False
+    _is_link = staticmethod(is_link)
 
     @staticmethod
     def _stat(entry: os.DirEntry) -> tuple[int, float]:
@@ -933,19 +1035,53 @@ class Workspace:
         return len(rows)
 
     # --- git --------------------------------------------------------------------------------
-    async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "") -> str | None:
+    async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",
+                         skipped: list[str] | None = None) -> str | None:
         """Commit every change outside `.scratch/` as `actor`, one commit per call. The message is `message` as
         given or, with `kind` (e.g. "shell", "job j3"), commit_message() of what is committed: the subject names the
-        changed files, the body holds `detail` (the command that changed them)."""
+        changed files, the body holds `detail` (the command that changed them). Untracked folders with their own
+        .git (nested repositories) are left out; `skipped` receives their paths (nested_repos_note)."""
         if not self.git_enabled:
             return None
         async with self._git_lock:
-            return await self._commit_locked(actor, message, None, kind=kind, detail=detail)
+            return await self._commit_locked(actor, message, None, kind=kind, detail=detail, skipped=skipped)
+
+    def nested_repos_note(self, actor: str, paths: list[str]) -> str:
+        """One line for `actor`'s tool result about nested repositories an autocommit left out ("" when there are
+        none): each path is named once per session, so a repository the agent keeps does not repeat at every call."""
+        seen = self._nested_reported.setdefault(actor, set())
+        new = [path for path in dict.fromkeys(paths) if path not in seen]
+        if not new:
+            return ""
+        seen.update(new)
+        shown = ", ".join(new[:NESTED_SHOWN]) + (f" and {len(new) - NESTED_SHOWN} more" if len(new) > NESTED_SHOWN
+                                                  else "")
+        return (f"Not committed: {shown} — folders with their own .git (nested repositories). Delete their .git or "
+                f"move them into your scratch folder {scratch_rel(actor)} if they are temporary.")
+
+    async def _nested_repos(self, actor: str, entries: list[tuple[str, str]]) -> list[str]:
+        """Untracked folders (outside `.scratch/`) that git sees as repositories of their own: `git add -A` would
+        commit each as a gitlink (mode 160000) without a .gitmodules entry, i.e. an empty reference nobody can clone.
+        A nested repository inside an untracked folder shows only as that folder in `git status`, so `git ls-files
+        --others` (which stops at a nested repository and names it with a trailing "/") looks inside. Tracked
+        submodules are tracked, so never listed. Caller holds the git lock."""
+        folders = [path for xy, path in entries if xy == "??" and path and not in_scratch(path)
+                   and os.path.isdir(self.root / path) and not os.path.islink(self.root / path)]
+        if not folders:
+            return []
+        # literal pathspecs after "--": a folder named "--help" or "a[1]" is a path, not an option or a glob
+        spec = ("--", *(f"{path}/" for path in folders)) if len(folders) <= NESTED_PATHSPECS_MAX else ()
+        listed = await self._git(actor, "ls-files", "--others", "--exclude-standard", "-z", *spec)
+        if listed.returncode != 0:
+            log.info("git ls-files --others failed: %s", self._output(listed))
+            return []
+        return nested_repo_paths(self.root, listed.stdout)
 
     async def _commit_locked(self, actor: str, message: str, rel: str | None, *, kind: str = "",
-                             detail: str = "") -> str | None:
-        """Commit everything except `.scratch/` (rel None) or just `rel` as `actor`. Caller holds the git lock.
-        Nothing under `.scratch/` is ever committed. `kind`, `detail`: see autocommit (rel None only)."""
+                             detail: str = "", skipped: list[str] | None = None) -> str | None:
+        """Commit everything except `.scratch/` and nested repositories (rel None) or just `rel` as `actor`. Caller
+        holds the git lock. Nothing under `.scratch/` is ever committed. `kind`, `detail`, `skipped`: see autocommit
+        (rel None only)."""
         if not self.git_enabled:
             return None
         if rel is not None and in_scratch(rel):
@@ -954,7 +1090,8 @@ class Workspace:
         try:
             if rel:
                 spec = ("--", rel)
-                status = await self._git(actor, "status", "--porcelain", *spec)
+                # (a new file must show even with the user's status.showUntrackedFiles=no)
+                status = await self._git(actor, "status", "--porcelain", "--untracked-files=normal", *spec)
                 if status.returncode != 0:
                     log.warning("git status failed: %s", self._output(status))
                     return None
@@ -967,7 +1104,9 @@ class Workspace:
                 commit = await self._git(actor, "commit", "-q", "--no-verify", "-m", message or "update", *spec)
             else:
                 self.ensure_scratch()  # an agent may have deleted the marker in its last command
-                status = await self._git(actor, "status", "--porcelain", "-z")
+                # --untracked-files=normal: a user's status.showUntrackedFiles=no (or =all) must not hide untracked
+                # folders (or split them into files) from the nested-repository check; `git add -A` ignores it
+                status = await self._git(actor, "status", "--porcelain", "-z", "--untracked-files=normal")
                 if status.returncode != 0:
                     log.warning("git status failed: %s", self._output(status))
                     return None
@@ -978,9 +1117,15 @@ class Workspace:
                     await self._git(actor, "reset", "-q", "--", SCRATCH_DIR)
                 if not outside:
                     return None
-                # the exclude pathspecs need pathspec magic (literal=False); all the pathspecs are fixed strings
+                nested = await self._nested_repos(actor, entries)
+                if nested:
+                    log.info("autocommit for %s leaves out nested repositories: %s", actor, ", ".join(nested))
+                    if skipped is not None:
+                        skipped.extend(nested)
+                # the exclude pathspecs need pathspec magic (literal=False); all the pathspecs are fixed strings, and
+                # a nested repository's path is matched literally (`literal` magic: "a[1]" is no glob)
                 add = await self._git(actor, "add", "-A", "--ignore-errors", "--", ".", *SCRATCH_EXCLUDES,
-                                      literal=False)
+                                      *(f":(exclude,literal){path}" for path in nested), literal=False)
                 if add.returncode != 0:
                     log.warning("git add reported errors (committing what it could add): %s", self._output(add))
                 # no pathspec: the index is committed (a merge an agent left in progress concludes as before)

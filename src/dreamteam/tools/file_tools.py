@@ -129,15 +129,22 @@ async def shell(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm.workspace.ensure_scratch(ctx.actor)  # .scratch/<slug>/ exists for redirects like `> .scratch/...`
     root = swarm.workspace.root
     # git in the shell: the workspace repository (GIT_DIR & co. dropped) and the member as author and committer
-    env = agent_git_env(scrubbed_env(swarm.config, {"DREAMTEAM_AGENT": ctx.actor, "DREAMTEAM_WORKSPACE": str(root),
-                                                    "DREAMTEAM_SCRATCH": str(root / scratch_rel(ctx.actor))}),
-                        ctx.actor)
+    extra = {"DREAMTEAM_AGENT": ctx.actor, "DREAMTEAM_WORKSPACE": str(root),
+             "DREAMTEAM_SCRATCH": str(root / scratch_rel(ctx.actor))}
+    skills = getattr(swarm, "skills", None)
+    if skills is not None:  # the folder of the swarm's skills (the read-only mirror, or the session copies)
+        extra["DREAMTEAM_SKILLS"] = skills.agent_dir()
+    env = agent_git_env(scrubbed_env(swarm.config, extra), ctx.actor)
     # the command's result, or (still running at its timeout, background=true, processes it left running) a job
     outcome = await swarm.jobs.run(ctx.actor, command, timeout=timeout, env=env, max_output=ctx.output_cap,
                                    background=bool(args.get("background")))
+    skipped: list[str] = []
     if outcome.state != "killed":  # killed: the session stops or the member leaves, so no git work may start now
         # one commit per call: the subject names the files it changed, the body keeps the command
-        await swarm.workspace.autocommit(ctx.actor, kind="shell", detail=command)
+        await swarm.workspace.autocommit(ctx.actor, kind="shell", detail=command, skipped=skipped)
     # the footer of a job points at the tools the caller has (`jobs`, `job_stop` or the console commands; `wait`,
     # or `wait_for_events` for an external member)
-    return outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=cfg, has_wait=ctx.has_tool("wait"))
+    text = outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=cfg, has_wait=ctx.has_tool("wait"))
+    # nested repositories the commit left out (a generated project with its own `git init`): named once each
+    note = swarm.workspace.nested_repos_note(ctx.actor, skipped)
+    return f"{text}\n{note}" if note else text

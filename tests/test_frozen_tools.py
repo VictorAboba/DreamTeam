@@ -34,6 +34,9 @@ RELEASED = {
     # background jobs: shell(background), jobs, job_stop; new shell and wait descriptions
     2: {"en": "92f7a5df2601bc26eb4d3414afa6117cfda5eddc45624e741d187266075cba70",
         "ru": "768d9936471b80ec2fec0922e9e853a06d9ef3e689dce186ea3bacba6054b032"},
+    # skills: skill_propose (revision 2's array unchanged before it)
+    3: {"en": "f27151511893a8f72bb26b609ad7cf9ef0cf8eb30f592b27e2d24a590e934863",
+        "ru": "477db524ae479c2e5da88e4bbe233194e8c0ac03381500e1f8747869f7973d45"},
 }
 # the digest tests/test_tools.py pinned for the tool set agents had before tool sets were frozen
 BASELINE_SORTED = "e3c5cbc798e3aafddcd44284bb515d9655e68b953e6ca707f67063dcad7cda85"
@@ -398,10 +401,10 @@ async def test_compaction_moves_an_agent_to_the_current_tool_set(tmp_path, later
         await shutdown(swarm)
 
 
-async def test_agents_of_revision_1_keep_it_when_revision_2_is_released(tmp_path):
-    """Revision 2 (background jobs) changes nothing for an agent that already ran: one with a history but no record
-    (it ran before tool sets were frozen) and one frozen at revision 1 send revision 1 byte for byte, run after run;
-    only a new agent gets revision 2."""
+async def test_agents_of_revision_1_keep_it_when_later_revisions_are_released(tmp_path):
+    """Revisions 2 (background jobs) and 3 (skill_propose) change nothing for an agent that already ran: one with a
+    history but no record (it ran before tool sets were frozen) and one frozen at revision 1 send revision 1 byte for
+    byte, run after run; only a new agent gets the current revision."""
     swarm, rec = make_swarm(tmp_path, lambda m, t: call("wait"), swarm={"start_agents": 3})
     await swarm.start(run_agents=False)
     names = [m["name"] for m in swarm.members()]
@@ -418,24 +421,54 @@ async def test_agents_of_revision_1_keep_it_when_revision_2_is_released(tmp_path
             await run_until(lambda: all(len(rec.tools(n)) > counts.get(n, 0) for n in names))
             counts = {n: len(rec.tools(n)) for n in names}
             await swarm.stop()
-        for name, rev in ((before, 1), (kept, 1), (new, 2)):
+        for name, rev in ((before, 1), (kept, 1), (new, frozen.TOOLSET_REVISION)):
             assert {dumps(t) for t in rec.tools(name)} == {dumps(frozen.snapshot(rev, "en"))}, name
             assert frozen.read(swarm.db, name)["rev"] == rev
         assert "jobs" not in frozen.names(rec.tools(before)[0]) and "jobs" in frozen.names(rec.tools(new)[0])
+        assert "skill_propose" not in frozen.names(rec.tools(kept)[0])
+        assert frozen.names(rec.tools(new)[0])[-1] == "skill_propose"
     finally:
         swarm.close()
 
 
-async def test_a_compaction_moves_a_revision_1_agent_to_revision_2(tmp_path):
+async def test_an_agent_of_revision_2_keeps_it_and_compacts_into_revision_3(tmp_path):
+    """Revision 3 adds only skill_propose, at the end: an agent frozen at revision 2 sends revision 2 byte for byte
+    until its compaction, which moves it to revision 3 and names the new tool."""
+
+    def policy(messages, tools):
+        if is_compaction_request(messages):
+            return "SUMMARY of older work"
+        return call("wait")
+
+    swarm, rec = make_swarm(tmp_path, policy, agents={"context_tokens": 20000})
+    await swarm.start(run_agents=False)
+    agent = swarm.members()[0]["name"]
+    frozen.write(swarm.db, agent, frozen.record(2, "en", frozen.snapshot(2, "en")))
+    seed_history(swarm, agent, pairs=20, size=4000)
+    await swarm.stop()
+    await swarm.start()
+    try:
+        swarm.notify(agent, "n_restart")
+        await run_until(lambda: len(rec.calls.get(agent, [])) >= 2)
+        (compaction, old_tools), (after, new_tools) = rec.calls[agent][:2]
+        assert is_compaction_request(compaction) and dumps(old_tools) == dumps(frozen.snapshot(2, "en"))
+        assert dumps(new_tools) == dumps(frozen.snapshot(3, "en")) and frozen.read(swarm.db, agent)["rev"] == 3
+        assert prompts.t("en", "tools_added", tools="`skill_propose`") in after[0]["content"]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_compaction_moves_a_revision_1_agent_to_the_current_revision(tmp_path):
     swarm, rec, agent = await _upgrade_run(tmp_path, tool="jobs")
     try:
         (compaction, old_tools), (after, new_tools) = rec.calls[agent][:2]
         assert is_compaction_request(compaction)
         assert dumps(old_tools) == dumps(frozen.snapshot(1, "en"))  # the compaction request: still revision 1
-        assert dumps(new_tools) == dumps(frozen.snapshot(2, "en"))
-        assert frozen.read(swarm.db, agent)["rev"] == 2 == swarm.runtimes[agent].tools_rev
-        # it is told about the new tools; `background` (a new parameter of shell) is in shell's own description
-        assert prompts.t("en", "tools_added", tools="`jobs`, `job_stop`") in after[0]["content"]
+        assert dumps(new_tools) == dumps(frozen.snapshot(frozen.TOOLSET_REVISION, "en"))
+        assert frozen.read(swarm.db, agent)["rev"] == frozen.TOOLSET_REVISION == swarm.runtimes[agent].tools_rev
+        # it is told about the new tools (those of revisions 2 and 3); `background` (a new parameter of shell) is in
+        # shell's own description
+        assert prompts.t("en", "tools_added", tools="`jobs`, `job_stop`, `skill_propose`") in after[0]["content"]
         result = next(m for m in rec.calls[agent][2][0] if m.get("role") == "tool" and m.get("name") == "jobs")
         assert result["content"] == "No background jobs are running." and not result["is_error"]
     finally:

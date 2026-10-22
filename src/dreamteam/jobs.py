@@ -32,7 +32,7 @@ from .models import USER, AgentKind, Status, ToolError
 from .procs import alive_all, sweep_token
 from .shell import (KILL_SETTLE, PENDING_MAX, SETTLE_POLL, RunningCommand, kill_after_cancel, start_command,
                     truncate_middle)
-from .workspace import SCRATCH_DIR, format_size, scratch_rel
+from .workspace import format_size, scratch_is_local, scratch_rel
 
 log = logging.getLogger(__name__)
 
@@ -57,6 +57,9 @@ DETAIL_LINES_MAX = 400
 STOP_RESULT_LINES = 15
 COMMAND_CHARS = 200        # the command in the public dict
 JOB_LOG_MB_MAX = 64
+# a running job that printed nothing for this long is shown as silent (jobs, swarm_status, its owner's wake-up, the
+# UI): it may hang, and its owner decides whether to stop it (nothing is done automatically)
+SILENT_MINUTES = 10
 DAEMON_ENV = {"MSBUILDDISABLENODEREUSE": "1"}  # MSBuild node reuse leaves daemons that would become jobs
 # the thread pools of numeric libraries (OpenMP, MKL, OpenBLAS, numexpr, Accelerate, Rayon): each would take every
 # core, so a few agents running numpy or a solver at once overload the machine ([shell] cpu_threads)
@@ -272,10 +275,30 @@ class Job:
     ended_at: float | None = None
     tail: str = ""
     exited_seen_at: float | None = None  # the monitor first saw the shell's exit
+    silent_shown: bool = False           # the UI was last told that the job is silent (the monitor's job.silent)
 
     @property
     def label(self) -> str:
         return f"j{self.id}"
+
+    @property
+    def last_output_at(self) -> float | None:
+        return getattr(getattr(self.cmd, "capture", None), "last_output_at", None)
+
+    def silent_for(self, now: float | None = None) -> float | None:
+        """Seconds without output (since its start when it never printed) of a running job silent for more than
+        SILENT_MINUTES, else None. Not once its output reached EOF: what its shell left running prints elsewhere or
+        nowhere (a detached server), and cannot print here any more, so "no output" would only invite a stop."""
+        if self.status != RUNNING or self.finishing or getattr(self.cmd, "eof", False):
+            return None
+        since = max(self.last_output_at or 0.0, self.started_at)
+        silent = (now or time.time()) - since
+        return silent if silent > SILENT_MINUTES * 60 else None
+
+    def silent_phrase(self, lang: str = "en", now: float | None = None) -> str:
+        """"no output for 40 min" (ru «40 мин без вывода») for a silent job, else ""."""
+        silent = self.silent_for(now)
+        return "" if silent is None else prompts.t(lang, "job_silent", duration=fmt_duration(silent, lang))
 
     @property
     def log_shown(self) -> str:
@@ -290,15 +313,18 @@ class Job:
 
     def public(self, now: float | None = None) -> dict:
         """The job for the snapshot, events and the UI (docs/SPEC.md §14.1). `processes` is read live while the job
-        runs; `now` is accepted for symmetry with rows (a running job has no end yet)."""
+        runs; `silent_since` is when a job silent for more than SILENT_MINUTES last printed (or started), else None."""
         processes = self.processes
         if self.status == RUNNING and not self.finishing:
             with contextlib.suppress(Exception):
                 processes = self.cmd.tree.processes() or processes
+        now = now or time.time()
+        silent = self.silent_for(now)
         return {"id": self.id, "label": self.label, "owner": self.owner, "command": self.command[:COMMAND_CHARS],
                 "origin": self.origin, "status": self.status, "reason": self.reason, "stopped_by": self.stopped_by,
                 "exit_code": self.exit_code, "started_at": self.started_at, "background_at": self.background_at,
-                "ended_at": self.ended_at, "log": self.log, "processes": list(processes)}
+                "ended_at": self.ended_at, "log": self.log, "processes": list(processes),
+                "last_output_at": self.last_output_at, "silent_since": None if silent is None else now - silent}
 
 
 def _row_public(row: Any) -> dict:
@@ -306,7 +332,8 @@ def _row_public(row: Any) -> dict:
             "command": (row["command"] or "")[:COMMAND_CHARS], "origin": row["origin"], "status": row["status"],
             "reason": row["reason"], "stopped_by": row["stopped_by"], "exit_code": row["exit_code"],
             "started_at": row["started_at"], "background_at": row["background_at"], "ended_at": row["ended_at"],
-            "log": row["log"], "processes": loads(row["processes"], []) or []}
+            "log": row["log"], "processes": loads(row["processes"], []) or [], "last_output_at": None,
+            "silent_since": None}
 
 
 @dataclass
@@ -619,15 +646,6 @@ class JobManager:
         return None
 
     # --- adoption -----------------------------------------------------------------------------------------------
-    def _scratch_is_local(self, root: Path) -> bool:
-        folder = root / SCRATCH_DIR
-        try:
-            if not folder.is_dir() or folder.is_symlink():
-                return False
-            return os.path.normcase(str(folder.resolve())) == os.path.normcase(str(root.resolve() / SCRATCH_DIR))
-        except OSError:
-            return False
-
     def _log_location(self, owner: str, job_id: int) -> tuple[str, Path]:
         """(the `log` column, the file) of job `job_id`: `.scratch/<member>/jobs/j<N>.log`, or
         `<data_dir>/jobs/j<N>.log` when `.scratch` is not a plain folder of the workspace (a link, a file)."""
@@ -636,7 +654,7 @@ class JobManager:
         root = Path(workspace.root)
         with contextlib.suppress(Exception):
             workspace.ensure_scratch(owner)
-        if self._scratch_is_local(root):
+        if scratch_is_local(root):
             folder = root / scratch_rel(owner) / "jobs"
             try:
                 folder.mkdir(parents=True, exist_ok=True)
@@ -742,6 +760,18 @@ class JobManager:
             deadline = self._deadline(job)
             if deadline is not None and now >= deadline:
                 self._begin_stop(job, "lifetime")
+                continue
+            self._check_silence(job, now)
+
+    def _check_silence(self, job: Job, now: float) -> None:
+        """A job turned silent (SILENT_MINUTES without output) or printed again: a live-only job.silent event, so
+        the UI refreshes its marker (the state it holds is not reloaded otherwise). Never a notice to anyone."""
+        silent = job.silent_for(now) is not None
+        if silent == job.silent_shown:
+            return
+        job.silent_shown = silent
+        with contextlib.suppress(Exception):
+            self.swarm.bus.publish("job.silent", job.owner, job=job.public(now))
 
     def _deadline(self, job: Job) -> float | None:
         if job.origin == "timeout":
@@ -1103,9 +1133,13 @@ class JobManager:
 
     def _running_phrase(self, job: Job, now: float) -> str:
         if job.command_done and job.command_ended_at is not None and job.exit_code is not None:
-            return (f"ended with exit code {job.exit_code} after {fmt_duration(job.command_ended_at - job.started_at)}"
-                    f"; processes it started still run: {format_names(job.processes)}")
-        return f"running for {fmt_duration(now - job.started_at)} ({ORIGIN_PHRASES.get(job.origin, job.origin)})"
+            phrase = (f"ended with exit code {job.exit_code} after "
+                      f"{fmt_duration(job.command_ended_at - job.started_at)}; processes it started still run: "
+                      f"{format_names(job.processes)}")
+        else:
+            phrase = f"running for {fmt_duration(now - job.started_at)} ({ORIGIN_PHRASES.get(job.origin, job.origin)})"
+        silent = job.silent_phrase("en", now)
+        return f"{phrase}; {silent}" if silent else phrase
 
     def listing(self, actor: str) -> str:
         """The `jobs` tool without job_id: the swarm's running jobs, the caller's marked "you", then the jobs that
@@ -1120,6 +1154,9 @@ class JobManager:
                 who = f"{job.owner} (you)" if mine else job.owner
                 text = (f"- {job.label} {short_command(job.command, 60)}: {who}, running "
                         f"{fmt_duration(now - job.started_at)}, {ORIGIN_PHRASES.get(job.origin, job.origin)}")
+                silent = job.silent_phrase("en", now)
+                if silent:
+                    text += f", {silent}"
                 if mine or actor == USER:
                     text += f"; log {job.log_shown}"
                 lines.append(text)

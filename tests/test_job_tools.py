@@ -147,7 +147,7 @@ def commit_spy(swarm, monkeypatch) -> list[tuple[str, str]]:
     """Record every autocommit (actor, kind) instead of making it."""
     commits: list[tuple[str, str]] = []
 
-    async def autocommit(actor: str, message: str = "", *, kind: str = "", detail: str = ""):
+    async def autocommit(actor: str, message: str = "", *, kind: str = "", detail: str = "", skipped=None):
         commits.append((actor, kind or message))
 
     monkeypatch.setattr(swarm.workspace, "autocommit", autocommit)
@@ -162,7 +162,7 @@ async def test_shell_results_point_at_the_tools_the_caller_has(tmp_path, fast, k
     swarm, _ = await team(tmp_path)
     try:
         new, old = agent_ctx(swarm, ANNA), agent_ctx(swarm, BORIS, revision=1)
-        assert (new.runtime.tools_rev, old.runtime.tools_rev) == (2, 1)
+        assert (new.runtime.tools_rev, old.runtime.tools_rev) == (frozen.TOOLSET_REVISION, 1)
         assert new.has_tool("jobs") and new.has_tool("job_stop") and not old.has_tool("jobs")
         # the timer path (footer T)
         text = await ok(new, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "timeout": 1})
@@ -387,6 +387,68 @@ async def test_goal_complete_agents_and_swarm_status_show_the_jobs(tmp_path, fas
         await shutdown(swarm)
 
 
+async def test_silent_jobs_are_shown_but_left_alone(tmp_path, fast, kids):
+    """A running job that printed nothing for more than SILENT_MINUTES (run 006: one ran an hour without output)
+    says so in `jobs` (list and one job), swarm_status, its owner's wake-up and the state for the UI, counted from
+    its last output or its start; a live job.silent event marks each change. Nothing stops it, nobody is notified."""
+    swarm, _ = await team(tmp_path)
+    flips: list[tuple[int, Any]] = []
+    swarm.bus.listen(lambda ev: ev["type"] == "job.silent"
+                     and flips.append((ev["data"]["job"]["id"], ev["data"]["job"]["silent_since"])))
+    try:
+        anna, user = agent_ctx(swarm, ANNA), ToolContext(swarm, USER)
+        for _ in range(2):
+            await ok(anna, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "background": True})
+        await apid(kids, 1)
+        quiet, talking = swarm.jobs.running_of(ANNA)
+        await until(lambda: quiet.last_output_at and talking.last_output_at)  # "child up"
+        now = time.time()
+        quiet.started_at, quiet.cmd.capture.last_output_at = now - 41 * 60, None  # never printed: since its start
+        talking.started_at, talking.cmd.capture.last_output_at = now - 50 * 60, now - 5 * 60
+        assert quiet.silent_phrase("en") == "no output for 41 min" and talking.silent_phrase("en") == ""
+        assert quiet.silent_phrase("ru") == "41 мин без вывода"
+        text = await ok(anna, "jobs")
+        assert re.search(r"^- j1 .+: Anna Smith \(you\), running 41 min, started in the background, no output for "
+                         r"41 min; log ", text, re.M), text
+        assert re.search(r"^- j2 .+: Anna Smith \(you\), running 50 min, started in the background; log ", text,
+                         re.M), text
+        text = await ok(user, "jobs", {"job_id": "j1"})
+        assert "\nState: running for 41 min (started in the background); no output for 41 min" in text, text
+        assert "no output" not in await ok(user, "jobs", {"job_id": "j2"})
+        text = await ok(user, "swarm_status")
+        assert re.search(r"^Background jobs: 2 running \(j1 Anna Smith: .+, 41 min, no output for 41 min; j2 Anna "
+                         r"Smith: .+, 50 min\)\.$", text, re.M), text
+        wake = swarm.render_wake(ANNA)
+        assert re.search(r"Your background jobs: j1 .+ \(running 41 min, no output for 41 min\); j2 .+ \(running 50 "
+                         r"min\)\n", wake), wake
+        jobs = {j["id"]: j for j in swarm.snapshot()["jobs"]}
+        assert jobs[1]["silent_since"] == pytest.approx(quiet.started_at, abs=1) and jobs[1]["last_output_at"] is None
+        assert jobs[2]["silent_since"] is None and jobs[2]["last_output_at"] == pytest.approx(now - 300, abs=1)
+        await until(lambda: (1, pytest.approx(quiet.started_at, abs=2)) in flips)
+        assert [job_id for job_id, _ in flips] == [1]
+        quiet.cmd.capture.last_output_at = time.time()  # it prints again: the marker goes
+        await until(lambda: flips[-1] == (1, None))
+        assert "no output" not in await ok(anna, "jobs") and quiet.status == "running"
+        assert not any("no output" in r["text"] for r in swarm.db.all("SELECT text FROM notifications"))
+        assert not swarm.db.scalar("SELECT COUNT(*) FROM events WHERE type = 'job.silent'")  # live only
+    finally:
+        await shutdown(swarm)
+
+
+def test_a_job_whose_output_ended_is_not_silent():
+    """Its shell ended and what it left running has its own or no stdout: it cannot print here any more, so it is
+    not shown as silent (the marker would invite stopping a healthy server)."""
+    from types import SimpleNamespace
+
+    cmd = SimpleNamespace(eof=False, capture=SimpleNamespace(last_output_at=None))
+    now = time.time()
+    job = jobs_module.Job(id=1, owner=ANNA, command="npm run dev", origin="detached", cmd=cmd, log="j1.log",
+                          log_path=Path("j1.log"), started_at=now - 41 * 60, background_at=now - 41 * 60)
+    assert job.silent_phrase("en", now) == "no output for 41 min"
+    cmd.eof = True
+    assert job.silent_for(now) is None and job.silent_phrase("en", now) == ""
+
+
 # --- scripted agents ---------------------------------------------------------------------------------------------
 
 async def test_scripted_agents_use_background_jobs_through_their_runtimes(tmp_path, fast, kids):
@@ -432,7 +494,7 @@ async def test_scripted_agents_use_background_jobs_through_their_runtimes(tmp_pa
         await until(lambda: [t for t, _ in tool_results(swarm, ANNA)] == ["shell", "wait", "shell", "jobs",
                                                                           "job_stop", "wait"]
                     and [t for t, _ in tool_results(swarm, BORIS)] == ["shell", "shell", "shell", "wait"], 30)
-        assert swarm.runtimes[ANNA].tools_rev == 2 and swarm.runtimes[BORIS].tools_rev == 1
+        assert swarm.runtimes[ANNA].tools_rev == frozen.TOOLSET_REVISION and swarm.runtimes[BORIS].tools_rev == 1
         assert dumps(swarm.runtimes[BORIS].tools) == dumps(frozen.snapshot(1, "en"))
         (_, timer), (_, waited), (_, server), (_, shown), (_, stopped), _ = tool_results(swarm, ANNA)
         timer_id = re.search(r"as job (j\d+) ", timer).group(1)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .. import prompts
 from ..board import MAX_POST, UNSET
 from ..models import PRIORITIES, USER, Status, Task, ToolError
 from . import ToolContext, tool
@@ -148,7 +149,19 @@ async def task_create(ctx: ToolContext, args: dict[str, Any]) -> str:
         priority=1 if args.get("priority") is None else args["priority"],
         tags=args.get("tags") or None,
     )
-    return f"Created task {task_line(task, with_goal=False)}"
+    text = f"Created task {task_line(task, with_goal=False)}"
+    # members that got one message at once may each create a task for it (run 006: three alike tasks from one
+    # message to all): the task stays, and its creator is shown the likely duplicates (not the user)
+    similar = [] if ctx.is_user else ctx.swarm.board.similar_open(task)
+    if similar:
+        text += "\n" + prompts.t(ctx.lang, "similar_tasks", tasks=", ".join(_similar_item(t) for t in similar))
+    return text
+
+
+def _similar_item(task: Task) -> str:
+    """#33 "Fix the parser" [in_progress, Anna Smith]"""
+    who = f", {task.assignee}" if task.assignee else ""
+    return f'#{task.id} "{trim(task.title, 80)}" [{task.status}{who}]'
 
 
 @tool(

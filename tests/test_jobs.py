@@ -45,6 +45,7 @@ from dreamteam.tools import ToolContext, call_tool
 from dreamteam.tui.client import connect
 from dreamteam.tui.printmode import run_print
 from dreamteam.workspace import Workspace
+from proc_guard import kill_tree, spawn
 from test_procs import Children, kill_pid, pid_alive, wait_until
 from test_runtime import call, history, kinds_for, make_swarm, shutdown
 
@@ -171,7 +172,7 @@ def job_notices(swarm, name: str) -> list[tuple[str, bool, str]]:
 
 
 PUBLIC_KEYS = {"id", "label", "owner", "command", "origin", "status", "reason", "stopped_by", "exit_code",
-               "started_at", "background_at", "ended_at", "log", "processes"}
+               "started_at", "background_at", "ended_at", "log", "processes", "last_output_at", "silent_since"}
 
 
 # --- parsing and texts ---------------------------------------------------------------------------------------------
@@ -467,8 +468,7 @@ async def test_views(setup, kids):
         manager.describe(7, actor=ANNA)
     snap = manager.snapshot()
     assert [j["label"] for j in snap] == ["j2", "j1"] and snap[0]["status"] == "running"
-    assert set(snap[0]) == {"id", "label", "owner", "command", "origin", "status", "reason", "stopped_by",
-                            "exit_code", "started_at", "background_at", "ended_at", "log", "processes"}
+    assert set(snap[0]) == PUBLIC_KEYS and set(snap[1]) == PUBLIC_KEYS   # a running job and an ended row
     assert manager.get(1)["status"] == "stopped" and manager.get(2)["origin"] == "background"
     assert manager.get(5) is None
 
@@ -661,15 +661,15 @@ async def test_recover_marks_lost(setup, kids, monkeypatch):
     lost = []
     monkeypatch.setattr(manager, "_announce_lost", lambda r: lost.append(r["id"]))
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
-    dead.wait()
+    dead.wait(60)
     tokens = {"dead": "deadhub" + os.urandom(4).hex(), "alive": "livehub" + os.urandom(4).hex()}
     procs_by_token = {}
     if LINUX:  # only Linux sweeps by token
         for key, token in tokens.items():
             pidfile = kids.pidfile()
-            procs_by_token[key] = subprocess.Popen([sys.executable, kids.script, "30", pidfile],
-                                                   env={**os.environ, "DREAMTEAM_PROCESS_TOKEN": token})
-    hub = subprocess.Popen([sys.executable, kids.script, "30", kids.pidfile()])  # a live "other hub"
+            procs_by_token[key] = spawn([sys.executable, kids.script, "30", pidfile],
+                                        env={**os.environ, "DREAMTEAM_PROCESS_TOKEN": token})
+    hub = spawn([sys.executable, kids.script, "30", kids.pidfile()])  # a live "other hub"
     try:
         for owner, token, hub_pid in ((ANNA, tokens["dead"], dead.pid), ("Gone Member", tokens["alive"], hub.pid)):
             swarm.db.insert("INSERT INTO jobs(owner, command, origin, status, token, hub_pid, started_at)"
@@ -684,8 +684,7 @@ async def test_recover_marks_lost(setup, kids, monkeypatch):
             assert procs_by_token["alive"].poll() is None
     finally:
         for proc in [hub, *procs_by_token.values()]:
-            proc.kill()
-            proc.wait(10)
+            kill_tree(proc)  # with the children of kids.script (and of a venv launcher)
 
 
 async def test_cancelled_caller_kills_the_foreground_but_not_a_job(setup, kids):

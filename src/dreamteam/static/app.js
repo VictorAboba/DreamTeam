@@ -80,6 +80,7 @@ const I18N = {
     job_stopped_session: "остановлен вместе с сессией", job_stopped_retired: "остановлен: агент ушёл из роя", job_lost: "потерян при сбое",
     job_output: "Вывод", job_hide: "Скрыть вывод", job_stop: "Остановить", job_stop_confirm: "Остановить процесс {id} и всё, что он запустил?",
     job_log_hint: "Открыть журнал на вкладке «Файлы»", job_took: "проработал {t}", agent_jobs: "фоновых процессов: {n}",
+    job_silent: "{t} без вывода", job_silent_hint: "Процесс давно ничего не выводит и, возможно, завис: посмотрите его вывод и остановите, если он застрял.",
     ev_job_started: "{who}: фоновый процесс {id} — {command}", ev_job_ended: "{who}: процесс {id} {result} ({t})",
     dur_s: "{n} с", dur_min: "{n} мин", dur_h: "{h} ч {m} мин",
     sg_jobs: "Фоновые процессы", sf_jobs: "Фоновых процессов на участника", sf_jobs_total: "Фоновых процессов на сессию",
@@ -93,6 +94,52 @@ const I18N = {
     sf_bad_auto: "«{field}»: auto или целое число ≥ 0", sf_load_failed: "Не удалось загрузить параметры сессии: {error}",
     sf_not_loaded: "Параметры сессии (фоновые процессы, агенты) не загрузились — откройте окно ещё раз.",
     sf_saved_part: "Параметры сессии сохранены, бюджет и максимум агентов — нет",
+    // skills: the Skills tab, the attach dialog, the library of a standalone run, the feed
+    tab_skills: "Скиллы", sk_attach: "Подключить скилл",
+    sk_tab_hint: "Скиллы видны всем агентам сессии. У сессии своя копия: изменения в библиотеке или в ~/.claude/skills доходят до неё, только когда вы нажмёте «Обновить».",
+    sk_empty: "К сессии не подключено ни одного скилла. «Подключить скилл» — из библиотеки, Claude Code, папки, .zip или Git; скиллы ролей подключаются сами.",
+    sk_detach: "Отключить", sk_detach_confirm: "Отключить скилл «{name}»? Агенты получат уведомление.",
+    sk_save: "Сохранить в библиотеку", sk_nosave: "Не сохранять", sk_nosave_reason: "Почему не сохранять (необязательно)",
+    sk_replace_lib: "В библиотеке уже есть другой скилл «{name}». Заменить его?",
+    sk_update: "Обновить", sk_update_hint: "Источник скилла изменился: скопировать его заново (агенты получат уведомление)",
+    sk_source_gone: "источника нет", sk_source_gone_hint: "Источника скилла больше нет; копия сессии остаётся.",
+    sk_lib_pending: "ждёт вашего решения", sk_lib_saved: "в библиотеке", sk_lib_rejected: "не сохранён",
+    sk_role: "роль: {role}", sk_by_role: "от роли {role}", sk_owner: "автор: {owner}",
+    sk_manual: "только по запросу", sk_manual_hint: "disable-model-invocation: агенты берут его, только когда вы попросите",
+    sk_files: "файлов: {n} · {size}", sk_show: "Показать", sk_hide: "Скрыть", sk_files_title: "Файлы",
+    sk_pkgs: "Пакеты", sk_pkgs_ready: "готовы", sk_pkgs_installing: "ставятся…", sk_pkgs_queued: "в очереди",
+    sk_pkgs_other: "ставит другой процесс DreamTeam", sk_pkgs_failed: "ошибка", sk_pkgs_manual: "вручную",
+    sk_pkgs_log: "Журнал", sk_pkgs_hide_log: "Скрыть журнал", sk_pkgs_reinstall: "Переустановить",
+    sk_reason_off: "установка выключена в настройках", sk_reason_proposals: "выключено для скиллов, предложенных агентами",
+    sk_reason_unavailable: "на этой машине нет: {detail}", sk_reason_python: "нужен Python {need}, а окружения используют {have}",
+    sk_reason_unsupported: "не поддерживается: {detail}",
+    sk_attach_title: "Подключить скилл", sk_attach_none: "Все скиллы библиотеки и Claude Code уже подключены.", sk_attach_btn: "Подключить",
+    sk_agent_writable: "из workspace: агенты могут его менять", sk_changed_outside: "изменён вне DreamTeam",
+    sk_attach_anyway: "Скилл «{name}»: {why}. Подключить всё равно?", sk_add_new: "Добавить новый: папка, zip или Git",
+    sk_in_lib: "в библиотеке", sk_diff_lib: "в библиотеке другой",
+    sk_library: "Библиотека скиллов", sk_lib_delete: "Удалить из библиотеки",
+    sk_lib_delete_confirm: "Удалить скилл «{name}» из библиотеки? Сессии, к которым он подключён, сохранят свою копию.",
+    sk_lib_deleted: "Скилл «{name}» удалён из библиотеки", sk_lib_empty: "Библиотека пуста ({dir}).", sk_role_skills: "скиллы роли:",
+    ev_skill_attached: "{who} подключил(а) скилл {name}", ev_skill_updated: "{who} обновил(а) скилл {name}",
+    ev_skill_detached: "{who} отключил(а) скилл {name}", ev_skill_proposed: "{who} предложил(а) скилл {name}",
+    ev_skill_saved: "{who} сохранил(а) {name} в библиотеку", ev_skill_not_saved: "{who} не стал(а) сохранять {name} в библиотеку",
+    ev_skill_saved_of: "{who} сохранил(а) в библиотеку скилл {name} (автор: {owner})",
+    ev_skill_not_saved_of: "{who} не стал(а) сохранять в библиотеку скилл {name} (автор: {owner})",
+    ev_via: " (через {via})", via_mcp: "MCP", "via_launcher-mcp": "MCP лаунчера",
+    ev_skill_deps_ready: "установлены пакеты скилла {name} ({files}{t})", ev_skill_deps_failed: "не удалось установить пакеты скилла {name}: {error}",
+    ev_skill_deps_installing: "ставятся пакеты скилла {name} ({files})",
+    // the add form (skills.js, shared with the home page)
+    sk_src_folder: "Папка", sk_src_zip: "Zip", sk_src_git: "Git", sk_folder_ph: "Путь к папке или .zip на компьютере сервера",
+    sk_folder_sandbox: "Хаб работает в песочнице Docker: это путь внутри контейнера. Папку со своего компьютера проще загрузить как .zip.",
+    sk_git_hint: "Ветка и подпапка: URL#ветка:папка; ссылки GitHub и GitLab на tree/blob тоже подходят.",
+    sk_add: "Добавить", sk_add_attach: "Добавить и подключить", sk_pick: "В источнике несколько скиллов — выберите нужные:",
+    sk_pick_go: "Взять выбранные", sk_cancel: "Отмена", sk_replace_q: "В библиотеке уже есть другие скиллы с этими именами: {names}. Заменить?",
+    sk_zip_big: "Архив больше {mb} МБ ([skills] max_archive_mb).", sk_need_source: "Укажите папку, файл или URL.",
+    sk_importing: "Загружаю…", sk_imported: "В библиотеке: {names}.", sk_attached: "Подключён: {name}.", sk_attached_same: "Уже подключён: {name}.",
+    sk_skipped: "Пропущено {path}: {error}", sk_pkgs_preview: "Установится автоматически: {packages} ({files}).",
+    sk_pkgs_trust: "Установка запускает собственный код пакетов с вашими правами (вне песочницы Docker).",
+    sk_pkgs_unsupported: "Его {files} не ставится автоматически: {reason}; нужное агенты поставят сами.",
+    sk_pkgs_off: "Установка пакетов выключена в настройках.",
   },
   en: {
     goal: "Goal", budget: "Budget", budget_hint: "Spent / budget limit", agents: "Agents", team: "Team",
@@ -172,6 +219,7 @@ const I18N = {
     job_stopped_session: "stopped with the session", job_stopped_retired: "stopped: its agent left the swarm", job_lost: "lost in a crash",
     job_output: "Output", job_hide: "Hide output", job_stop: "Stop", job_stop_confirm: "Stop job {id} and everything it started?",
     job_log_hint: "Open the log in the Files tab", job_took: "ran {t}", agent_jobs: "background jobs: {n}",
+    job_silent: "no output for {t}", job_silent_hint: "It has printed nothing for a long time and may hang: look at its output, and stop it if it is stuck.",
     ev_job_started: "{who}: background job {id} — {command}", ev_job_ended: "{who}: job {id} {result} ({t})",
     dur_s: "{n} s", dur_min: "{n} min", dur_h: "{h} h {m} min",
     sg_jobs: "Background jobs", sf_jobs: "Background jobs per member", sf_jobs_total: "Background jobs per session",
@@ -185,6 +233,50 @@ const I18N = {
     sf_bad_auto: "“{field}”: auto or a whole number ≥ 0", sf_load_failed: "Could not load the session parameters: {error}",
     sf_not_loaded: "The session parameters (background jobs, agents) did not load: open the dialog again.",
     sf_saved_part: "The session parameters are saved, the budget and max agents are not",
+    tab_skills: "Skills", sk_attach: "Attach a skill",
+    sk_tab_hint: "Every agent of the session sees these skills. The session keeps its own copy: a change in the library or in ~/.claude/skills reaches it only when you press Update.",
+    sk_empty: "No skill is attached to this session. Attach one from the library, Claude Code, a folder, a .zip or Git; the roles' skills come by themselves.",
+    sk_detach: "Detach", sk_detach_confirm: "Detach skill “{name}”? The members are told.",
+    sk_save: "Save to library", sk_nosave: "Don't save", sk_nosave_reason: "Why not save it (optional)",
+    sk_replace_lib: "The library already has another skill “{name}”. Replace it?",
+    sk_update: "Update", sk_update_hint: "The skill's source changed: copy it again (the members are told)",
+    sk_source_gone: "source gone", sk_source_gone_hint: "The skill's source no longer exists; the session's copy stays.",
+    sk_lib_pending: "waits for your decision", sk_lib_saved: "saved to the library", sk_lib_rejected: "not saved",
+    sk_role: "role: {role}", sk_by_role: "brought by role {role}", sk_owner: "by {owner}",
+    sk_manual: "only when asked", sk_manual_hint: "disable-model-invocation: agents use it only when you ask",
+    sk_files: "files: {n} · {size}", sk_show: "Show", sk_hide: "Hide", sk_files_title: "Files",
+    sk_pkgs: "Packages", sk_pkgs_ready: "ready", sk_pkgs_installing: "installing…", sk_pkgs_queued: "queued",
+    sk_pkgs_other: "in another DreamTeam process", sk_pkgs_failed: "failed", sk_pkgs_manual: "manual",
+    sk_pkgs_log: "Show log", sk_pkgs_hide_log: "Hide log", sk_pkgs_reinstall: "Reinstall",
+    sk_reason_off: "installation is off in the settings", sk_reason_proposals: "off for skills that members propose",
+    sk_reason_unavailable: "{detail} is not available on this machine", sk_reason_python: "it needs Python {need}, the environments use {have}",
+    sk_reason_unsupported: "not supported: {detail}",
+    sk_attach_title: "Attach a skill", sk_attach_none: "Every skill of the library and Claude Code is attached already.", sk_attach_btn: "Attach",
+    sk_agent_writable: "from the workspace (agents can write here)", sk_changed_outside: "changed outside DreamTeam",
+    sk_attach_anyway: "Skill “{name}”: {why}. Attach it anyway?", sk_add_new: "Add a new one: folder, zip or Git",
+    sk_in_lib: "in the library", sk_diff_lib: "different in the library",
+    sk_library: "Skills library", sk_lib_delete: "Delete from the library",
+    sk_lib_delete_confirm: "Delete skill “{name}” from the library? Sessions it is attached to keep their copy.",
+    sk_lib_deleted: "Skill “{name}” deleted from the library", sk_lib_empty: "The library is empty ({dir}).", sk_role_skills: "role skills:",
+    ev_skill_attached: "{who} attached skill {name}", ev_skill_updated: "{who} updated skill {name}",
+    ev_skill_detached: "{who} detached skill {name}", ev_skill_proposed: "{who} proposed skill {name}",
+    ev_skill_saved: "{who} saved {name} to the library", ev_skill_not_saved: "{who} did not save {name} to the library",
+    ev_skill_saved_of: "{who} saved {owner}'s skill {name} to the library",
+    ev_skill_not_saved_of: "{who} did not save {owner}'s skill {name} to the library",
+    ev_via: " (via {via})", via_mcp: "MCP", "via_launcher-mcp": "the launcher MCP",
+    ev_skill_deps_ready: "installed the packages of skill {name} ({files}{t})", ev_skill_deps_failed: "could not install the packages of skill {name}: {error}",
+    ev_skill_deps_installing: "installing the packages of skill {name} ({files})",
+    sk_src_folder: "Folder", sk_src_zip: "Zip", sk_src_git: "Git", sk_folder_ph: "A folder or .zip path on the server's computer",
+    sk_folder_sandbox: "The hub runs in the Docker sandbox: this is a path inside the container. A folder on your computer is easier to upload as a .zip.",
+    sk_git_hint: "A branch and a subfolder: URL#branch:folder; GitHub and GitLab tree/blob links work too.",
+    sk_add: "Add", sk_add_attach: "Add and attach", sk_pick: "The source holds several skills: pick the ones to take:",
+    sk_pick_go: "Take the selected", sk_cancel: "Cancel", sk_replace_q: "The library already has other skills named {names}. Replace them?",
+    sk_zip_big: "The archive is larger than {mb} MB ([skills] max_archive_mb).", sk_need_source: "Give a folder, a file or a URL.",
+    sk_importing: "Importing…", sk_imported: "In the library: {names}.", sk_attached: "Attached: {name}.", sk_attached_same: "Already attached: {name}.",
+    sk_skipped: "Left out {path}: {error}", sk_pkgs_preview: "Installs automatically: {packages} ({files}).",
+    sk_pkgs_trust: "Installing runs the packages' own install code with your rights (outside the Docker sandbox).",
+    sk_pkgs_unsupported: "Its {files} is not installed automatically: {reason}; agents install what they need themselves.",
+    sk_pkgs_off: "Package installation is off in the settings.",
   },
 };
 
@@ -192,7 +284,7 @@ const COLUMNS = ["todo", "in_progress", "waiting", "review", "done", "closed"];
 const ALL_STATUSES = ["todo", "in_progress", "waiting", "review", "done", "failed", "cancelled"];
 const ACTIVITY_PROSE = new Set(["text", "thinking", "compacted"]);   // activity kinds the LLM wrote: shown as Markdown
 // the feed asks the server only for these types: agent.activity / agent.usage would crowd everything else out
-const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*"];
+const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*", "skill.*"];
 const FEED_SKIP = new Set(["agent.activity", "agent.usage", "notification", "agent.status", "agent.compacted"]);
 const DND_TYPE = "application/x-dreamteam-task";
 const MAX_SEEN = 5000;
@@ -208,6 +300,9 @@ const S = {
   boardDirty: false, appliedSeq: 0, modalInitial: null, markingRead: new Set(), drafts: {},
   jobOpen: new Set(), jobOutputs: {}, jobLoading: new Set(),   // Jobs tab: ids whose output is shown, its text
   fileText: "", fileSource: false,   // Files tab: the open file's text; a Markdown file shown as its source
+  // Skills tab: GET /api/skills (source digests, the attach dialog's lists, the standalone library), the cards and
+  // dialog rows shown open (name or ref → their files and SKILL.md), the install logs shown ("name|python" → text)
+  skillData: null, skillShown: {}, attachShown: {}, libShown: {}, skillLogs: {}, skillLibOpen: false,
 };
 
 /* ---------------------------------------------------------------- utils */
@@ -278,6 +373,7 @@ function linkify(text, names) { return decorate(esc(text), names); }
 // markdown.js: a global of the page (loaded before this script), a module in the Node tests
 const MARKDOWN = typeof Markdown !== "undefined" ? Markdown : require("./markdown.js");
 const HIGHLIGHT = typeof Highlight !== "undefined" ? Highlight : require("./highlight.js");   // highlight.js, the same way
+const SK = typeof Skills !== "undefined" ? Skills : require("./skills.js");   // skills.js: the add form, the previews
 const MD_CACHE = new Map();
 const MD_CACHE_MAX = 400;      // rendered texts kept (the chat alone re-renders up to 300 messages on a refresh)
 const MD_CACHE_CHARS = 50000;  // longer texts (a big .md file) are rendered every time instead of being kept
@@ -341,12 +437,23 @@ async function act(tool, args, quiet = false) {
     scheduleRefresh();
     return res;
   } catch (e) {
-    // a stopped session answers every action with 409 (English text from the launcher): say it in the UI language
-    const stopped = S.state && S.state.swarm && S.state.swarm.session && S.state.swarm.session.status === "stopped";
-    const text = stopped ? t("session_stopped") : errText(e);
+    const text = actError(e);
     toast(text, "err");
     return { ok: false, result: text };
   }
+}
+/** The text of an action that failed: a stopped session answers every action with 409 (English text from the
+ * launcher), said in the UI language. */
+function actError(e) {
+  const stopped = S.state && S.state.swarm && S.state.swarm.session && S.state.swarm.session.status === "stopped";
+  return stopped ? t("session_stopped") : errText(e);
+}
+/** {status, data} of a POST that answers in several ways (the skills import flow, skills.js runImport). */
+async function apiRaw(path, body) {
+  const resp = await fetch(BASE + path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  return { status: resp.status || (resp.ok ? 200 : 0), data: data || {} };
 }
 function members(includeRetired = false) {
   return (S.state?.agents || []).filter((a) => includeRetired || a.status !== "retired");
@@ -446,10 +553,12 @@ function renderAll() {
   renderAgents();
   if (S.tab === "board") renderBoard();
   if (S.tab === "mcp") renderMcp();
+  if (S.tab === "skills") renderSkills();
   if (S.tab === "triggers") renderTriggers();
   if (S.tab === "jobs") renderJobs();
   if (S.tab === "files") renderFileList();
   if (S.chatWith) renderDrawerHead();
+  if (modalOpen() && $("#sk-attach-list")) renderAttachList();   // (what is attached changed meanwhile)
 }
 
 /* ---------------------------------------------------------------- header */
@@ -511,6 +620,10 @@ function renderHeader() {
   const mcpBadge = $("#mcp-badge");
   mcpBadge.textContent = pending || "";
   mcpBadge.classList.toggle("hidden", !pending);
+  const proposals = (S.state.skills || []).filter((s) => s.library === "pending").length;   // waiting for the user
+  const skBadge = $("#skills-badge");
+  skBadge.textContent = proposals || "";
+  skBadge.classList.toggle("hidden", !proposals);
   const triggers = (S.state.triggers || []).length;
   const trBadge = $("#triggers-badge");
   trBadge.textContent = triggers || "";
@@ -699,9 +812,11 @@ function renderAgents() {
     const jobs = Number(a.jobs) || 0;   // its running background jobs: ⚙N (a member asleep while they work)
     const tip = `${a.name} — ${a.role} · ${status}${tasks ? " · " + tasks : ""}${jobs ? " · " + t("agent_jobs", { n: jobs }) : ""}`;
     const mark = jobs ? `<span class="jobs-mark">⚙${jobs}</span> ` : "";
+    const own = roleSkillsOf(a.role);   // the skills its role lists: marked as its own in its index
+    const skills = own.length ? ` <span class="skills-mark" title="${esc(t("sk_role_skills") + " " + own.join(", "))}"><i class="ic ic-skill"></i>${own.length}</span>` : "";
     return `<button type="button" class="agent ${a.status === "retired" ? "retired" : ""}${S.chatWith === a.name ? " active" : ""}" data-agent="${esc(a.name)}" title="${esc(tip)}">
       <span class="avatar-wrap">${avatar(a.name)}<span class="status-dot ${esc(a.status)}"></span></span>
-      <span class="agent-info"><span class="agent-name">${esc(a.name)}</span><span class="agent-role">${esc(a.role)}${a.kind === "external" ? " · MCP" : ""}</span></span>
+      <span class="agent-info"><span class="agent-name">${esc(a.name)}</span><span class="agent-role">${esc(a.role)}${a.kind === "external" ? " · MCP" : ""}${skills}</span></span>
       <span class="agent-side"><span>${esc(status)}</span><span>${mark}${esc(tasks)} $${(a.cost_usd || 0).toFixed(2)}</span></span>
       ${unread ? `<span class="unread">${unread}</span>` : ""}
     </button>`;
@@ -734,7 +849,7 @@ function renderDrawerHead() {
     html = `${avatar(name)}<div class="drawer-who"><b>${esc(displayName(name))}</b></div>`;
   } else {
     html = `${avatar(a.name)}<div class="drawer-who"><b>${esc(a.name)}</b>
-      <div class="sub">${esc(a.role)} · <span class="status-dot ${esc(a.status)}"></span> ${esc(t("a_" + a.status))} · ${esc(a.model || a.kind)} · $${(a.cost_usd || 0).toFixed(3)}</div></div>
+      <div class="sub">${esc(a.role)} · <span class="status-dot ${esc(a.status)}"></span> ${esc(t("a_" + a.status))} · ${esc(a.model || a.kind)} · $${(a.cost_usd || 0).toFixed(3)}</div>${skillChipsHtml(roleSkillsOf(a.role))}</div>
       <button class="btn small" type="button" data-traces="${esc(a.name)}"><i class="ic ic-pulse"></i>${esc(t("traces"))}</button>
       ${a.status !== "retired" ? `<button class="btn small danger" type="button" data-retire="${esc(a.name)}">${esc(t("retire"))}</button>` : ""}`;
   }
@@ -1380,7 +1495,8 @@ function rolePreviewHtml(catalog, name) {
   if (!String(name || "").trim()) return "";
   const role = findRole(catalog, name);
   if (!role) return esc(t("role_new"));
-  return md(role.description) + (role.model ? `<span class="badge plain">${esc(t("role_model", { model: role.model }))}</span>` : "");
+  return md(role.description) + (role.model ? `<span class="badge plain">${esc(t("role_model", { model: role.model }))}</span>` : "")
+    + skillChipsHtml(role.skills || []);
 }
 /** hire_agent arguments of the hire form. `instructions` is always sent ("" is fine for a catalog role, but the
  * tool requires the parameter); `model` only when one is chosen, so that the role's own profile applies. */
@@ -1591,6 +1707,269 @@ function renderTriggers() {
   </div>`).join("") : `<div class="empty">${esc(t("no_triggers"))}</div>`);
 }
 
+/* ---------------------------------------------------------------- skills (docs/SPEC.md §18.4, §19) */
+/** GET /api/skills of this session: the library and Claude Code's skills (the attach dialog, the standalone library)
+ * and, per attached skill, the digest of its own source now (the cards' Update and "source gone"). */
+async function loadSkillData() {
+  const seq = S.skillSeq = (S.skillSeq || 0) + 1;
+  try {
+    const data = await api("/api/skills");
+    if (seq !== S.skillSeq) return null;
+    S.skillData = data;
+    if (S.tab === "skills" && S.state) renderSkills();
+    return data;
+  } catch (e) { console.error(e); return null; }
+}
+const scheduleSkillData = makeScheduler(() => loadSkillData());
+
+/** The skills an agent of `role` has as its own: the attached ones whose catalog roles include it. */
+function roleSkillsOf(role) {
+  const key = String(role || "").trim().replace(/\s+/g, " ").toLowerCase();
+  if (!key) return [];
+  return (S.state?.skills || []).filter((s) => (s.roles || []).some((r) => String(r).trim().replace(/\s+/g, " ").toLowerCase() === key))
+    .map((s) => s.name);
+}
+function skillChipsHtml(names) {
+  return names && names.length ? `<div class="skill-roles-chips">${names.map((n) => `<span class="badge plain"><i class="ic ic-skill"></i>${esc(n)}</span>`).join("")}</div>` : "";
+}
+/** "changed" when the skill's own source (the library entry for `library`, the Claude Code folder for
+ * claude-user / claude-project, the host's library) has another digest now, "gone" when it no longer exists, "same";
+ * null for a member's proposal (it has no source: its owner proposes again) or while the digests are not loaded. */
+function skillSourceState(skill, data = S.skillData) {
+  if (!skill || skill.from === "agent" || !data) return null;
+  const item = (data.attached || []).find((a) => a.name === skill.name);
+  if (!item || !("source_digest" in item)) return null;
+  if (item.source_digest === null) return "gone";
+  return item.source_digest !== skill.digest ? "changed" : "same";
+}
+/** Why a skill's packages are not installed automatically (skill_deps reasons), in the UI language. */
+function depsReason(reason) {
+  const r = reason || {};
+  const code = { off: "sk_reason_off", proposals: "sk_reason_proposals", unavailable: "sk_reason_unavailable",
+                 python: "sk_reason_python", unsupported: "sk_reason_unsupported" }[r.code] || "sk_reason_off";
+  return t(code, { detail: r.detail || "", need: r.need || "", have: r.have || "" });
+}
+/** The "Packages" rows of an attached skill (snapshot `deps`, one per ecosystem): ready (the Python to run its
+ * scripts with, click to copy), installing, failed (the error, the log, Reinstall) or manual (why). */
+function skillDepsHtml(skill) {
+  const rows = (skill.deps || []).map((d) => {
+    const eco = String(d.ecosystem || "");
+    const key = `${skill.name}|${eco}`;
+    const files = esc((d.files || []).join(", "));
+    const head = `<span class="sk-label">${esc(t("sk_pkgs"))} · ${esc(eco)}</span>`;
+    let body = "", after = "";
+    if (d.status === "ready") {
+      const path = d.python || d.view || d.node_modules || "";
+      body = `<span class="badge done">${esc(t("sk_pkgs_ready"))}</span><span class="muted">${files}</span>`
+        + (path ? `<code class="copy" data-copy="${esc(path)}" title="${esc(t("copy_hint"))}">${esc(path)}</code>` : "");
+    } else if (d.status === "installing") {
+      const hint = d.other_process ? t("sk_pkgs_other") : d.queued ? t("sk_pkgs_queued") : "";
+      body = `<span class="badge">${esc(t("sk_pkgs_installing"))}</span><span class="muted">${files}${hint ? " · " + esc(hint) : ""}</span>`;
+    } else if (d.status === "failed") {
+      const log = S.skillLogs[key];
+      body = `<span class="badge err">${esc(t("sk_pkgs_failed"))}</span><span class="muted">${files}</span>
+        <button class="btn small" type="button" data-skill-log="${esc(key)}">${esc(t(log ? "sk_pkgs_hide_log" : "sk_pkgs_log"))}</button>
+        <button class="btn small" type="button" data-skill-reinstall="${esc(key)}"><i class="ic ic-refresh"></i>${esc(t("sk_pkgs_reinstall"))}</button>
+        ${d.error ? `<div class="sk-pkg-err">${esc(d.error)}</div>` : ""}`;
+      if (log) after = `<pre class="sk-log">${esc(log.loading ? "…" : log.text)}</pre>`;
+    } else {
+      body = `<span class="badge plain">${esc(t("sk_pkgs_manual"))}</span><span class="muted">${files} · ${esc(depsReason(d.reason))}</span>`;
+    }
+    return `<div class="sk-pkg">${head}${body}</div>${after}`;
+  });
+  return rows.length ? `<div class="sk-pkgs">${rows.join("")}</div>` : "";
+}
+/** The files, the package preview and SKILL.md (formatted: markdown.js) of a skill shown open. */
+function skillPreviewHtml(data, proposal = false) {
+  if (!data) return "";
+  if (data.loading) return `<div class="sk-show muted">…</div>`;
+  if (data.failed) return `<div class="sk-show err-text">${esc(data.failed)}</div>`;
+  const files = (data.files_list || []).map((f) => `<li><code>${esc(f.path)}</code> <span class="muted">${esc(SK.fmtSize(f.size))}</span></li>`).join("");
+  const deps = SK.previewLine(t, data.deps, data.install || (S.skillData && S.skillData.install), proposal);
+  return `<div class="sk-show">${files ? `<div class="sk-files"><span class="sk-label">${esc(t("sk_files_title"))}</span><ul>${files}</ul></div>` : ""}
+    ${deps ? `<div class="sk-deps">${esc(deps)}</div>` : ""}${md(SK.bodyOf(data.skill_md))}</div>`;
+}
+/** One attached skill: its badges (where it came from, its owner, the library decision of a proposal, the roles
+ * that list it or brought it, only-when-asked, its size), its buttons and its packages. */
+function skillCardHtml(s) {
+  const badges = [`<span class="badge plain">${esc(s.from)}</span>`];
+  if (s.owner) badges.push(`<span class="muted">${esc(t("sk_owner", { owner: s.owner }))}</span>`);
+  if (s.library === "pending") badges.push(`<span class="badge warn">${esc(t("sk_lib_pending"))}</span>`);
+  else if (s.library === "saved") badges.push(`<span class="badge done">${esc(t("sk_lib_saved"))}</span>`);
+  else if (s.library === "rejected") badges.push(`<span class="badge plain" title="${esc(s.comment || "")}">${esc(t("sk_lib_rejected"))}</span>`);
+  for (const role of s.roles || []) badges.push(`<span class="badge">${esc(t("sk_role", { role }))}</span>`);
+  const brought = /^role:(.+)$/.exec(String(s.attached_via || ""));
+  if (brought) badges.push(`<span class="badge plain">${esc(t("sk_by_role", { role: brought[1] }))}</span>`);
+  if (s.manual) badges.push(`<span class="badge plain" title="${esc(t("sk_manual_hint"))}">${esc(t("sk_manual"))}</span>`);
+  badges.push(`<span class="badge plain">${esc(t("sk_files", { n: Number(s.files) || 0, size: SK.fmtSize(s.size) }))}</span>`);
+  const source = skillSourceState(s);
+  if (source === "gone") badges.push(`<span class="badge warn" title="${esc(t("sk_source_gone_hint"))}">${esc(t("sk_source_gone"))}</span>`);
+  const shown = S.skillShown[s.name];
+  const buttons = [`<button class="btn small" type="button" data-skill-show="${esc(s.name)}">${esc(t(shown ? "sk_hide" : "sk_show"))}</button>`];
+  if (s.library === "pending") {
+    buttons.push(`<button class="btn small primary" type="button" data-skill-save="${esc(s.name)}">${esc(t("sk_save"))}</button>`,
+                 `<button class="btn small" type="button" data-skill-nosave="${esc(s.name)}">${esc(t("sk_nosave"))}</button>`);
+  }
+  if (source === "changed") buttons.push(`<button class="btn small" type="button" data-skill-update="${esc(s.name)}" title="${esc(t("sk_update_hint"))}"><i class="ic ic-refresh"></i>${esc(t("sk_update"))}</button>`);
+  buttons.push(`<button class="btn small danger" type="button" data-skill-detach="${esc(s.name)}">${esc(t("sk_detach"))}</button>`);
+  return `<div class="item skill" data-skill="${esc(s.name)}">
+    <div class="item-head"><i class="ic ic-skill"></i><b>${esc(s.name)}</b>${badges.join("")}<span class="spacer"></span>${buttons.join("")}</div>
+    <div class="desc">${md(s.description || "")}</div>
+    ${skillDepsHtml(s)}
+    ${skillPreviewHtml(shown, s.from === "agent")}
+  </div>`;
+}
+/** The library section of a standalone `dreamteam run` (no home page to manage it): Show and Delete per entry. */
+function skillLibraryHtml(data) {
+  if (BASE || !data) return "";
+  const entries = data.library || [];
+  const rows = entries.map((e) => {
+    const shown = S.libShown[e.name];
+    return `<div class="item${e.error ? " dim" : ""}"><div class="item-head"><i class="ic ic-skill"></i><b>${esc(e.name)}</b><span class="badge plain">${esc(e.origin || "folder")}</span>
+      ${e.changed_outside ? `<span class="badge warn">${esc(t("sk_changed_outside"))}</span>` : ""}<span class="spacer"></span>
+      ${e.error ? "" : `<button class="btn small" type="button" data-skill-libshow="${esc(e.name)}">${esc(t(shown ? "sk_hide" : "sk_show"))}</button>`}
+      <button class="btn small danger" type="button" data-skill-libdel="${esc(e.name)}">${esc(t("sk_lib_delete"))}</button></div>
+      <div class="desc">${e.error ? `<span class="err-text">${esc(e.error)}</span>` : md(e.description || "")}</div>${skillPreviewHtml(shown)}</div>`;
+  }).join("") || `<div class="empty">${esc(t("sk_lib_empty", { dir: data.library_dir || "" }))}</div>`;
+  return `<details class="skill-lib"${S.skillLibOpen ? " open" : ""}><summary>${esc(t("sk_library"))} · <code>${esc(data.library_dir || "")}</code></summary>
+    <div class="cards-list">${rows}</div></details>`;
+}
+function renderSkills() {
+  const items = (S.state && S.state.skills) || [];
+  setHtml($("#skill-list"), items.length ? items.map(skillCardHtml).join("") : `<div class="empty">${esc(t("sk_empty"))}</div>`);
+  setHtml($("#skill-library"), skillLibraryHtml(S.skillData));
+}
+
+/** What the attach dialog offers: every skill of the library, Claude Code's (the workspace's .claude/skills too,
+ * labelled) and the host's library that is not attached under its name, each with its reference. */
+function attachRows(data, attached) {
+  const names = new Set((attached || []).map((s) => s.name));
+  const out = [];
+  const add = (entry, origin) => {
+    if (!entry || entry.error || names.has(entry.name)) return;
+    out.push({ entry, origin, ref: origin === "library" ? `library:${entry.name}` : `${origin}:${entry.name}` });
+  };
+  for (const e of (data && data.library) || []) add(e, "library");
+  for (const e of (data && data.claude) || []) add(e, e.origin || "claude-user");
+  for (const e of (data && data.host) || []) add(e, "host-library");
+  return out;
+}
+/** Why attaching a row asks first: a library entry changed outside DreamTeam, a workspace skill agents can write. */
+function attachWarnings(entry) {
+  return [entry.changed_outside ? t("sk_changed_outside") : "", entry.agent_writable ? t("sk_agent_writable") : ""].filter(Boolean);
+}
+function attachRowHtml(row) {
+  const e = row.entry;
+  const shown = S.attachShown[row.ref];
+  const lib = { same: t("sk_in_lib"), different: t("sk_diff_lib") }[e.library];
+  const warns = attachWarnings(e).map((w) => `<span class="badge warn"><i class="ic ic-alert"></i>${esc(w)}</span>`).join("");
+  return `<div class="sk-attach-row"><div class="item-head"><i class="ic ic-skill"></i><b>${esc(e.name)}</b><span class="badge plain">${esc(row.origin)}</span>
+      ${lib ? `<span class="badge plain">${esc(lib)}</span>` : ""}${warns}${e.manual ? `<span class="badge plain">${esc(t("sk_manual"))}</span>` : ""}<span class="spacer"></span>
+      <button class="btn small" type="button" data-skill-preview="${esc(row.ref)}">${esc(t(shown ? "sk_hide" : "sk_show"))}</button>
+      <button class="btn small primary" type="button" data-skill-attach="${esc(row.ref)}">${esc(t("sk_attach_btn"))}</button></div>
+    <div class="desc">${md(e.description || "")}</div>${skillPreviewHtml(shown)}</div>`;
+}
+function renderAttachList() {
+  const box = $("#sk-attach-list");
+  if (!box) return;
+  const rows = attachRows(S.skillData, S.state && S.state.skills);
+  setHtml(box, rows.map(attachRowHtml).join("") || `<div class="empty">${esc(t("sk_attach_none"))}</div>`);
+}
+/** «Подключить скилл»: the library's and Claude Code's skills not attached yet (each with its preview), and the add
+ * form whose imports are attached at once. */
+async function attachSkillModal() {
+  await loadSkillData();
+  S.attachShown = {};
+  openModal(`<div class="modal-head"><h3><i class="ic ic-skill"></i> ${esc(t("sk_attach_title"))}</h3><button class="icon-btn" type="button" data-close title="${esc(t("close"))}" aria-label="${esc(t("close"))}"><i class="ic ic-close"></i></button></div>
+    <div class="sk-attach-list" id="sk-attach-list"></div>
+    <div class="section-title">${esc(t("sk_add_new"))}</div>
+    <div id="sk-attach-add"></div>
+    <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("close"))}</button></div>`, { focus: false });
+  renderAttachList();
+  const box = $("#sk-attach-add");
+  if (box && box.querySelector) {
+    SK.mount(box, { t, esc, attach: true, post: (body) => apiRaw("/api/skills", body), limits: () => S.skillData && S.skillData.limits,
+                    sandbox: () => S.skillData && S.skillData.sandbox,
+                    onImported: () => { scheduleRefresh(); loadSkillData().then(renderAttachList); } });
+  }
+}
+/** The preview of a row (attach dialog: `ref` "origin:name"), of an attached skill (its session copy) or of a
+ * library entry (standalone): GET /api/skills/{name}?from=… */
+async function toggleSkillPreview(store, key, name, from, render) {
+  if (store[key]) { delete store[key]; render(); return; }
+  store[key] = { loading: true };
+  render();
+  try { store[key] = await api(`/api/skills/${encodeURIComponent(name)}?from=${encodeURIComponent(from)}`); }
+  catch (e) { store[key] = { failed: errText(e) }; }
+  render();
+}
+async function attachSkill(ref) {
+  const row = attachRows(S.skillData, S.state && S.state.skills).find((r) => r.ref === ref);
+  if (!row) return null;
+  const warns = attachWarnings(row.entry);
+  if (warns.length && !confirm(t("sk_attach_anyway", { name: row.entry.name, why: warns.join("; ") }))) return null;
+  const res = await act("skill_attach", { name: ref });
+  if (res.ok) { await refresh(); await loadSkillData(); renderAttachList(); }
+  return res;
+}
+async function detachSkill(name) {
+  if (!confirm(t("sk_detach_confirm", { name }))) return null;
+  const res = await act("skill_detach", { name });
+  scheduleSkillData(300);
+  return res;
+}
+/** Save a member's proposal to the library; another skill of that name there asks before replacing it. */
+async function saveSkill(name) {
+  let res;
+  try { res = await post("/api/act/skill_approve", { name, approve: true }); }
+  catch (e) { toast(actError(e), "err"); return { ok: false }; }
+  if (!res.ok && /already has a different skill/i.test(String(res.result || "")) && confirm(t("sk_replace_lib", { name }))) {
+    return act("skill_approve", { name, approve: true, replace: true });
+  }
+  toast(res.result, res.ok ? "" : "err");
+  scheduleRefresh();
+  return res;
+}
+function rejectSkill(name) {
+  const comment = prompt(t("sk_nosave_reason"), "");
+  if (comment === null) return null;   // cancelled: nothing decided
+  return act("skill_approve", { name, approve: false, comment: comment.trim() });
+}
+/** «Обновить»: copied again from the skill's own source (`<from>:<name>`), never from another source of that name. */
+async function updateSkill(name) {
+  const skill = ((S.state && S.state.skills) || []).find((s) => s.name === name);
+  if (!skill || skill.from === "agent") return null;
+  const res = await act("skill_attach", { name: `${skill.from}:${name}`, replace: true });
+  scheduleSkillData(300);
+  return res;
+}
+async function toggleSkillLog(key) {
+  if (S.skillLogs[key]) { delete S.skillLogs[key]; renderSkills(); return; }
+  const [name, ecosystem] = key.split("|");
+  S.skillLogs[key] = { loading: true };
+  renderSkills();
+  try {
+    const data = await api(`/api/skills/${encodeURIComponent(name)}/deps-log?ecosystem=${encodeURIComponent(ecosystem)}`);
+    S.skillLogs[key] = { text: `${data.path || ""}\n${data.log || ""}`.trim() };
+  } catch (e) { S.skillLogs[key] = { text: errText(e) }; }
+  renderSkills();
+}
+function reinstallSkill(key) {
+  const [name, ecosystem] = key.split("|");
+  delete S.skillLogs[key];
+  return act("skill_reinstall", { name, ecosystem });
+}
+async function deleteLibrarySkill(name) {
+  if (!confirm(t("sk_lib_delete_confirm", { name }))) return;
+  try {
+    const resp = await fetch(`${BASE}/api/skills/${encodeURIComponent(name)}?confirm=${encodeURIComponent(name)}`, { method: "DELETE" });
+    if (!resp.ok) throw new Error(responseError(resp.status, await resp.text()));
+    toast(t("sk_lib_deleted", { name }));
+    delete S.libShown[name];
+  } catch (e) { toast(errText(e), "err"); }
+  loadSkillData();
+}
+
 /* ---------------------------------------------------------------- background jobs */
 function nowSeconds() { return Date.now() / 1000; }
 /** "45 с", "12 мин", "2 ч 05 мин": a duration as the hub words it for the agents (jobs.fmt_duration). */
@@ -1636,9 +2015,12 @@ function jobCardHtml(job) {
   if (!running && job.ended_at) meta.push(`${esc(t("job_took", { t: fmtDur(job.ended_at - job.started_at) }))} · ${esc(fmtTime(job.ended_at))}`);
   if (job.log) meta.push(workspaceLog(job.log) ? `<button type="button" class="link" data-job-log="${esc(job.log)}" title="${esc(t("job_log_hint"))}">${esc(job.log)}</button>` : `<code>${esc(job.log)}</code>`);
   const output = S.jobOutputs[id];
+  // silent for more than jobs.SILENT_MINUTES (the hub says since when; a job.silent event refreshes the state)
+  const silentSince = running ? Number(job.silent_since) || 0 : 0;
+  const silent = silentSince ? `<span class="badge warn" title="${esc(t("job_silent_hint"))}"><i class="ic ic-clock"></i>${esc(t("job_silent", { t: fmtDur(nowSeconds() - silentSince) }))}</span>` : "";
   return `<div class="item job${running ? "" : " dim"}" data-job="${id}">
     <div class="item-head"><b>${esc(jobLabel(job))}</b><span class="chip">${avatar(job.owner, "sm")}${esc(displayName(job.owner))}</span>
-      <span class="badge ${cls}">${esc(state)}</span><span class="badge plain">${esc(tv("job_origin_", job.origin))}</span>
+      <span class="badge ${cls}">${esc(state)}</span>${silent}<span class="badge plain">${esc(tv("job_origin_", job.origin))}</span>
       <span class="spacer"></span><button class="btn small" type="button" data-job-out="${id}" aria-expanded="${open}">${esc(t(open ? "job_hide" : "job_output"))}</button>
       ${running ? `<button class="btn small danger" type="button" data-job-stop="${id}">${esc(t("job_stop"))}</button>` : ""}</div>
     <div class="job-cmd"><code>${esc(job.command)}</code></div>
@@ -1757,8 +2139,33 @@ function describeEvent(ev) {
       const took = job.duration ?? (Number(job.ended_at) || 0) - (Number(job.started_at) || 0);
       return t("ev_job_ended", { who: displayName(job.owner || ev.actor), id: jobLabel(job), result: jobState(job)[1], t: fmtDur(took) });
     }
+    case "skill.attached": return t(d.replaced ? "ev_skill_updated" : "ev_skill_attached", { who, name: d.name }) + viaText(d.via);
+    case "skill.detached": return t("ev_skill_detached", { who, name: d.name }) + viaText(d.via);
+    case "skill.proposed": return t("ev_skill_proposed", { who: displayName(d.owner || ev.actor), name: d.name });
+    case "skill.library": {
+      // whose skill and through which surface: a save no click in a page made shows as such (SPEC §19)
+      const key = d.status === "saved" ? "ev_skill_saved" : "ev_skill_not_saved";
+      const of = d.owner && d.owner !== ev.actor;
+      return t(of ? key + "_of" : key, { who, name: d.name, owner: of ? displayName(d.owner) : "" }) + viaText(d.via);
+    }
+    case "skill.deps": {   // (DreamTeam's own event: no actor)
+      const files = (d.files || []).join(", ");
+      // an environment another session built already (reused) took no time here
+      const took = d.seconds !== undefined && d.seconds !== null ? ", " + fmtDur(d.seconds) : "";
+      if (d.status === "ready") return t("ev_skill_deps_ready", { name: d.name, files, t: took });
+      if (d.status === "failed") return t("ev_skill_deps_failed", { name: d.name, error: short(d.error, 200) });
+      return t("ev_skill_deps_installing", { name: d.name, files });
+    }
     default: return `${ev.type} ${short(JSON.stringify(d), 120)}`;
   }
+}
+
+// the user's own surfaces (the pages, the terminal; a role's attach): the feed names only the others (MCP clients)
+const PLAIN_VIA = new Set(["", "act", "home", "cli", "role", "create"]);
+/** " (via MCP)" for a skill change an MCP client made; "" for the user's own surfaces. */
+function viaText(via) {
+  via = String(via ?? "");
+  return PLAIN_VIA.has(via) ? "" : t("ev_via", { via: tv("via_", via) });
 }
 
 function feedLine(ev) {
@@ -1899,6 +2306,8 @@ function handleEvent(ev) {
     if (ev.type === "file.changed" && d.path === S.openFile) openFile(S.openFile, true);
   }
   if (ev.type.startsWith("job.") && d.job && S.jobOpen.has(Number(d.job.id))) loadJobOutput(Number(d.job.id));
+  // the source digests (Update, "source gone") and the attach dialog's lists follow what was attached or saved
+  if (/^skill\.(attached|detached|library)$/.test(ev.type) && (S.tab === "skills" || modalOpen())) scheduleSkillData(400);
   scheduleRefresh(ev.type === "agent.usage" ? 1000 : 250);
 }
 
@@ -1947,8 +2356,9 @@ function connect() {
 function setTab(tab) {
   S.tab = tab;
   $$("#tabs > button[data-tab]").forEach((b) => { b.classList.toggle("active", b.dataset.tab === tab); b.setAttribute("aria-selected", b.dataset.tab === tab); });
-  for (const name of ["board", "feed", "files", "mcp", "triggers", "jobs", "traces"]) $("#pane-" + name).classList.toggle("hidden", name !== tab);
+  for (const name of ["board", "feed", "files", "mcp", "skills", "triggers", "jobs", "traces"]) $("#pane-" + name).classList.toggle("hidden", name !== tab);
   if (tab === "traces" && typeof loadTraces === "function") loadTraces();
+  if (tab === "skills") loadSkillData();
   if (tab === "feed") loadFeed();
   if (tab === "files") { openDir(S.fileDir); if (S.openFile) openFile(S.openFile, true); }
   renderAll();
@@ -1975,7 +2385,9 @@ function applyTheme(theme) {
 }
 
 function onDocumentClick(e) {
-  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path");
+  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path,"
+    + "[data-skill-show],[data-skill-save],[data-skill-nosave],[data-skill-update],[data-skill-detach],[data-skill-log],[data-skill-reinstall],"
+    + "[data-skill-preview],[data-skill-attach],[data-skill-libshow],[data-skill-libdel],[data-copy]");
   if (!target) {
     if (document.body.classList.contains("team-open") && !e.target.closest(".sidebar, #team-btn")) toggleTeamOverlay(false);
     return;
@@ -1997,6 +2409,21 @@ function onDocumentClick(e) {
   else if ("retire" in ds) { if (confirm(t("retire_confirm"))) act("retire_agent", { name: ds.retire, reason: "retired by the user" }); }
   else if ("traces" in ds) { if (typeof openTraces === "function") { if (isNarrow()) closeDrawer(); openTraces(ds.traces); } }
   else if ("agent" in ds) openChat(ds.agent);
+  else if ("skillShow" in ds) toggleSkillPreview(S.skillShown, ds.skillShow, ds.skillShow, "session", renderSkills);
+  else if ("skillSave" in ds) saveSkill(ds.skillSave);
+  else if ("skillNosave" in ds) rejectSkill(ds.skillNosave);
+  else if ("skillUpdate" in ds) updateSkill(ds.skillUpdate);
+  else if ("skillDetach" in ds) detachSkill(ds.skillDetach);
+  else if ("skillLog" in ds) toggleSkillLog(ds.skillLog);
+  else if ("skillReinstall" in ds) reinstallSkill(ds.skillReinstall);
+  else if ("skillPreview" in ds) {   // "origin:name"
+    const at = ds.skillPreview.indexOf(":");
+    toggleSkillPreview(S.attachShown, ds.skillPreview, ds.skillPreview.slice(at + 1), ds.skillPreview.slice(0, at), renderAttachList);
+  }
+  else if ("skillAttach" in ds) attachSkill(ds.skillAttach);
+  else if ("skillLibshow" in ds) toggleSkillPreview(S.libShown, ds.skillLibshow, ds.skillLibshow, "library", renderSkills);
+  else if ("skillLibdel" in ds) deleteLibrarySkill(ds.skillLibdel);
+  else if ("copy" in ds) navigator.clipboard?.writeText(ds.copy).then(() => toast(t("copied")));
   else if (target.id === "mcp-cmd" || target.id === "ws-path") navigator.clipboard?.writeText(target.textContent).then(() => toast(t("copied")));
 }
 
@@ -2024,6 +2451,11 @@ function init() {
   $$("#tabs > button[data-tab]").forEach((b) => b.addEventListener("click", () => setTab(b.dataset.tab)));
   $$(".drawer-tabs button").forEach((b) => b.addEventListener("click", () => setDrawerTab(b.dataset.dtab)));
   $("#new-task-btn").addEventListener("click", newTaskModal);
+  $("#skill-attach-btn").addEventListener("click", () => { if (S.state) attachSkillModal(); });
+  // the standalone library section stays open or closed across the re-renders of the tab
+  $("#skill-library").addEventListener("toggle", (e) => {
+    if (e.target.matches && e.target.matches("details.skill-lib")) S.skillLibOpen = e.target.open;
+  }, true);
   $("#goal-btn").addEventListener("click", () => { if (S.state) goalModal(); });
   $("#hire-btn").addEventListener("click", () => { if (S.state) hireModal(); });
   $("#settings-btn").addEventListener("click", () => { if (S.state) settingsModal(); });
@@ -2083,6 +2515,11 @@ if (typeof module !== "undefined" && module.exports) {
     // Markdown (markdown.js) where agents', members' and the user's texts are shown
     md, decorate, MD_CACHE, mdFieldHtml, syncMdField, editMdField, taskResultHtml, renderTaskModal, updateTaskModal,
     renderMcp, renderTriggers, fileView, renderFileContent, toggleFileSource, openFile, isMarkdownPath, codeHtml,
+    // skills: the Skills tab, its packages rows, the attach dialog, the standalone library, the role chips
+    SK, apiRaw, actError, loadSkillData, roleSkillsOf, skillChipsHtml, skillSourceState, depsReason, skillDepsHtml,
+    skillPreviewHtml, skillCardHtml, skillLibraryHtml, renderSkills, attachRows, attachWarnings, attachRowHtml, renderAttachList,
+    attachSkillModal, toggleSkillPreview, attachSkill, detachSkill, saveSkill, rejectSkill, updateSkill, toggleSkillLog,
+    reinstallSkill, deleteLibrarySkill,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

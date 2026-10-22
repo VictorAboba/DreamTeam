@@ -1417,3 +1417,145 @@ async def test_reconfigure_retries_an_agent_stuck_on_a_configuration_error(tmp_p
         await run_until(lambda: swarm.member(agent)["status"] == AgentStatus.IDLE)
     finally:
         await shutdown(swarm)
+
+
+# ------------------------------------------------------------------ output limit after a cut-off reply
+CUT = {"text": "", "thinking": "a long chain of thought", "stop_reason": "max_tokens"}
+
+
+def limit_swarm(tmp_path: Path, handler: Callable[..., Any], llm_class: type = ScriptedLLM,
+                **profile: Any) -> tuple[Swarm, dict[str, list]]:
+    """A swarm whose model profile has max_tokens=1000 (+ `profile`); its LLM clients by agent."""
+    llms: dict[str, list] = {}
+
+    def factory(profile, agent: str):
+        llm = llm_class(handler, profile)
+        llms.setdefault(agent, []).append(llm)
+        return llm
+
+    model = {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0,
+             "cache_read_price": 0, "cache_write_price": 0, "max_tokens": 1000, **profile}
+    return Swarm(config=make_config(tmp_path, models={"default": model}), llm_factory=factory), llms
+
+
+def llm_span_limits(swarm: Swarm, agent: str) -> list[tuple[str, Any]]:
+    rows = swarm.db.all("SELECT status, meta FROM spans WHERE agent = ? AND kind = 'llm' ORDER BY id", (agent,))
+    return [(r["status"], json.loads(r["meta"]).get("max_tokens")) for r in rows]
+
+
+async def test_cut_off_reply_doubles_the_output_limit_up_to_the_ceiling(tmp_path):
+    answers = [CUT, CUT, CUT, CUT, call("board"), CUT, "Done."]
+    swarm, llms = limit_swarm(tmp_path, lambda *a: answers.pop(0) if answers else call("wait"),
+                              max_tokens_ceiling=3000)
+    await swarm.start()
+    try:
+        agent = swarm.members()[0]["name"]
+        swarm.notify(agent, "n_restart")
+        await run_until(lambda: not answers and swarm.member(agent)["status"] == AgentStatus.IDLE)
+        # None = the profile's own 1000; a reply with a tool call or a normal end goes back to it
+        expected = [None, 2000, 3000, 3000, 3000, None, 2000]
+        assert [c["max_tokens"] for c in llms[agent][0].calls][:7] == expected
+        assert [limit for _status, limit in llm_span_limits(swarm, agent)][:7] == expected  # the trace shows it
+        assert "cut off" in llms[agent][0].calls[1]["messages"][-1]["content"]  # the nudge stays as it was
+    finally:
+        await shutdown(swarm)
+
+
+async def test_output_limit_respects_ceiling_room_and_clients(tmp_path):
+    swarm, llms = limit_swarm(tmp_path, lambda *a: call("wait"))
+    await swarm.start()
+    try:
+        agent = swarm.members()[0]["name"]
+        rt = swarm.runtimes[agent]
+        rt._prompt_estimate = lambda: 10_000
+        assert rt._output_limit(None) is None
+        assert rt._output_limit(2000) == 2000
+        assert rt._output_limit(8000) == 2000  # no max_tokens_ceiling: 2 x max_tokens
+        # the context window leaves room for the answer only: prompt + max_tokens must fit
+        assert rt._context_limit() == 120_000
+        rt._prompt_estimate = lambda: 118_500
+        assert rt._output_limit(2000) == 1500
+        rt._prompt_estimate = lambda: 119_200
+        assert rt._output_limit(2000) is None  # less room than the profile's own limit: that one, as before
+        rt._prompt_estimate = lambda: 10_000
+        rt._limit_refused_by = rt.llm  # the provider refused a raised limit on this client
+        assert rt._output_limit(2000) is None
+        rt.reset_llm()  # new settings, a new client: raising is tried again
+        assert rt._limit_refused_by is None and rt._output_limit(2000) == 2000
+
+        class OldClient:  # a client (test double) whose complete() has no max_tokens keyword
+            profile = rt.llm.profile
+
+            async def complete(self, system, messages, tools):
+                raise AssertionError("not called")
+
+        rt._llm = OldClient()
+        assert rt._output_limit(2000) is None
+    finally:
+        await shutdown(swarm)
+
+
+class CappedLLM(ScriptedLLM):
+    """A provider that rejects an output limit above 1500 tokens with `ERROR` (None: accepts every limit)."""
+    ERROR = "max_tokens is too large: 2000. This model supports at most 1500 completion tokens."
+    tried: list[int | None] = []
+
+    async def complete(self, system, messages, tools, *, max_tokens=None):
+        type(self).tried.append(max_tokens)
+        if max_tokens and max_tokens > 1500 and self.ERROR:
+            raise LLMError(f"Provider rejected the request (profile 'default', model 'x'): 400: {self.ERROR}",
+                           retryable=False, kind="bad_request")
+        return await super().complete(system, messages, tools, max_tokens=max_tokens)
+
+
+@pytest.mark.parametrize("error, refused", [
+    (CappedLLM.ERROR, True),
+    ("max_tokens: 2000 > 1500, which is the maximum allowed number of output tokens for x", True),
+    # vLLM: prompt + max_tokens over the window; the raise may be the cause, so the profile's limit is tried
+    ("This model's maximum context length is 4096 tokens. However, you requested 4500 tokens.", False),
+    # newer vLLM and Anthropic overflows name max_tokens too: still an overflow, not a refused limit
+    ("'max_tokens' or 'max_completion_tokens' is too large: 2000. This model's maximum context length is 4096 "
+     "tokens and your request has 3000 input tokens (2000 > 4096 - 3000).", False),
+    ("input length and `max_tokens` exceed context limit: 3000 + 2000 > 4096, decrease input length or "
+     "`max_tokens` and try again", False),
+])
+async def test_refused_raised_limit_falls_back_to_the_profile_limit(tmp_path, monkeypatch, error, refused):
+    monkeypatch.setattr(CappedLLM, "ERROR", error)
+    monkeypatch.setattr(CappedLLM, "tried", [])
+    answers = [CUT, call("board"), CUT, "Done."]
+    swarm, llms = limit_swarm(tmp_path, lambda *a: answers.pop(0) if answers else call("wait"), CappedLLM)
+    await swarm.start()
+    try:
+        agent = swarm.members()[0]["name"]
+        swarm.notify(agent, "n_restart")
+        await run_until(lambda: not answers and swarm.member(agent)["status"] == AgentStatus.IDLE)
+        # the raised request fails, the same step goes again with the profile's limit and the agent never fails
+        if refused:  # remembered for this client: the second cut-off does not raise again
+            assert CappedLLM.tried[:5] == [None, 2000, None, None, None]
+        else:  # an overflow only costs that one retry
+            assert CappedLLM.tried[:6] == [None, 2000, None, None, 2000, None]
+        assert (swarm.runtimes[agent]._limit_refused_by is not None) == refused
+        assert "u_agent_error" not in kinds_for(swarm, USER)
+        assert llm_span_limits(swarm, agent)[1] == ("error", 2000)
+        events = swarm.db.all("SELECT output FROM spans WHERE agent = ? AND name = 'output_limit_fallback'", (agent,))
+        assert events and "retrying with the profile's limit" in json.loads(events[0]["output"])
+    finally:
+        await shutdown(swarm)
+
+
+async def test_other_errors_of_a_raised_request_fail_as_before(tmp_path, monkeypatch):
+    monkeypatch.setattr(CappedLLM, "ERROR", "tools.0.input_schema: invalid JSON schema")
+    monkeypatch.setattr(CappedLLM, "tried", [])
+    answers = [CUT]
+    swarm, llms = limit_swarm(tmp_path, lambda *a: answers.pop(0) if answers else call("wait"), CappedLLM)
+    await swarm.start()
+    try:
+        agent = swarm.members()[0]["name"]
+        swarm.notify(agent, "n_restart")
+        await run_until(lambda: swarm.member(agent)["status"] == AgentStatus.ERROR)
+        assert CappedLLM.tried[:2] == [None, 2000]
+        assert swarm.runtimes[agent]._limit_refused_by is None
+        assert "u_agent_error" in kinds_for(swarm, USER)
+        assert not swarm.db.all("SELECT id FROM spans WHERE name = 'output_limit_fallback'")
+    finally:
+        await shutdown(swarm)

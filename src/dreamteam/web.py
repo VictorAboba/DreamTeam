@@ -21,14 +21,17 @@ from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__, roles
+from . import skills as skill_lib
 from .db import loads
-from .hub_mcp import LOOPBACK_HOSTS, MCPHttpEndpoint
+from .hub_mcp import LIBRARY_TOOLS, LOOPBACK_HOSTS, MCPHttpEndpoint
 from .httpjson import JSONResponse, json_text
 from .models import USER, ToolError
+from .skills import Library, Limits, SkillError
 from .tools import ToolContext, call_tool
 from .trace_api import trace_routes
 
 if TYPE_CHECKING:
+    from .config import Config
     from .swarm import Swarm
 
 log = logging.getLogger(__name__)
@@ -165,9 +168,164 @@ def _int(request: Request, name: str, default: int, lo: int = 0, hi: int = 10_00
     return max(lo, min(value, hi))
 
 
-def create_app(swarm: "Swarm", host: str = "127.0.0.1") -> Starlette:
+STOPPED_SKILLS_TEXT = "The session is stopped: start it to attach skills (importing into the library works)."
+
+
+def skill_error_response(exc: Exception) -> JSONResponse:
+    """A SkillError, or a skills ToolError / SessionError carrying `status` and `extra` (`exists`, ...), as the JSON
+    answer `{"error", **extra}`."""
+    return JSONResponse({"error": str(exc), **(getattr(exc, "extra", None) or {})},
+                        status_code=getattr(exc, "status", 400))
+
+
+def skill_routes(config_of: Callable[[], "Config"], workspace_of: Callable[[Request], Path | None], *, via: str,
+                 swarm: "Swarm | None" = None, changed: Callable[[], None] | None = None) -> list[Route]:
+    """The skills library routes of both apps (docs/SPEC.md §14, §18.1): GET / POST `/api/skills`, GET / DELETE
+    `/api/skills/{name}` and, in a session, GET `/api/skills/{name}/deps-log`. `config_of()`: the settings (the
+    launcher's global ones, the swarm's own); `workspace_of(request)`: the folder whose .claude/skills is the
+    project's (the session's workspace; the launcher's `?workspace=`); `swarm`: the session (its attached skills,
+    `attach`, `from=session`, the install logs); `changed()` after a library change; `via` is recorded in the
+    library. Every `{name}` goes through skills.check_name first (400)."""
+
+    def limits_view(config: "Config") -> dict[str, int]:
+        s = config.skills
+        return {"max_mb": s.max_mb, "max_files": s.max_files, "max_attached": s.max_attached,
+                "max_archive_mb": s.max_archive_mb}
+
+    async def index(request: Request):
+        try:
+            config = config_of()
+            workspace = workspace_of(request)
+            if request.method == "POST":
+                return await import_skills(request, config, workspace)
+            attached = swarm.skills.public() if swarm is not None else []   # (on the loop: deps read live state)
+            current = swarm.skills.list() if swarm is not None else []
+
+            def gather() -> dict[str, Any]:
+                lib = Library.from_config(config)
+                out: dict[str, Any] = {
+                    "library_dir": str(lib.root), "library": lib.list(),
+                    "claude": skill_lib.claude_skills(config, workspace), "host": skill_lib.host_skills(config),
+                    "sandbox": config.skills_host_library_dir is not None, "limits": limits_view(config),
+                    "install": skill_lib.install_info(config)}
+                if swarm is not None:   # "Update" compares with the skill's own source only, never by name elsewhere
+                    digests = {s.name: swarm.skills.source_digest(s) for s in current}
+                    out["attached"] = [{**item, "source_digest": digests.get(item["name"])} for item in attached]
+                return out
+
+            return JSONResponse(await asyncio.to_thread(gather))
+        except (SkillError, ToolError) as exc:
+            return skill_error_response(exc)
+
+    async def import_skills(request: Request, config: "Config", workspace: Path | None):
+        body = await skill_lib.read_import_body(request, config)
+        attach = body.pop("attach", False)
+        if not isinstance(attach, bool):
+            raise SkillError("'attach' must be true or false.")
+        if attach and swarm is None:
+            raise SkillError("'attach' attaches to a session: post to the session's /api/skills.")
+        if attach and not swarm.started:
+            raise SkillError(STOPPED_SKILLS_TEXT, 409)
+        report = await asyncio.to_thread(skill_lib.import_request, config, body, workspace, by=USER, via=via)
+        if report["imported"] and changed is not None:
+            changed()
+        report["install"] = skill_lib.install_info(config)
+        if attach:
+            attached, failed = [], []
+            for entry in report["imported"]:
+                try:   # one refusal (the cap, a clash) leaves the others attached: all of it is reported
+                    skill, status = await swarm.skills.attach(USER, f"library:{entry['name']}",
+                                                              replace=body.get("replace") is True, via=via)
+                except ToolError as exc:
+                    failed.append({"name": entry["name"], "error": str(exc), "status": getattr(exc, "status", 400)})
+                    continue
+                attached.append({"name": skill.name, "status": status, "files": skill.files})
+            report.update(attached=attached, failed=failed)
+        return JSONResponse(report)
+
+    def show(config: "Config", name: str, frm: str, workspace: Path | None) -> dict[str, Any]:
+        limits = Limits.from_config(config)
+        if frm == "library":
+            return Library.from_config(config).show(name)
+        if frm == "host-library":
+            host = Library.host(config)
+            if host is None:
+                raise SkillError("The host's skills library exists only inside the Docker sandbox.", 404)
+            entry = host.show(name)
+            return {**entry, "origin": "host-library", "host_origin": entry.get("origin"), "read_only": True}
+        if frm in ("claude-user", "claude-project"):
+            if not config.skills.claude:
+                raise SkillError("Claude Code skills are off ([skills] claude = false).", 404)
+            found = next((i for i in skill_lib.claude_skills(config, workspace)
+                          if i["origin"] == frm and i["name"] == name), None)
+            if found is None:
+                where = "~/.claude/skills" if frm == "claude-user" else "the workspace's .claude/skills"
+                raise SkillError(f"No skill '{name}' in {where}.", 404)
+            if "error" in found:
+                return {**found, "files_list": [], "skill_md": "", "deps": {}}
+            return {**found, **skill_lib.show_folder(Path(found["path"]), limits)}
+        if frm == "session" and swarm is not None:
+            skill = swarm.skills.get(name)
+            if skill is None:
+                raise SkillError(f"No skill '{name}' is attached to this swarm.", 404)
+            return {**skill.meta(), "path": swarm.skills.shown_path(name)[0],
+                    **skill_lib.show_folder(swarm.skills.dir / name, limits)}
+        allowed = "library, claude-user, claude-project, host-library" + (" or session" if swarm is not None else "")
+        raise SkillError(f"'from' must be {allowed}.")
+
+    async def item(request: Request):
+        try:
+            name = skill_lib.check_name(request.path_params["name"])   # before any path is built
+            config = config_of()
+            if request.method == "DELETE":
+                if request.query_params.get("confirm") != name:
+                    raise SkillError(f"Pass ?confirm={name} to delete the skill from the library.")
+                await asyncio.to_thread(Library.from_config(config).remove, name)
+                if changed is not None:
+                    changed()
+                return JSONResponse({"removed": name})
+            shown = await asyncio.to_thread(show, config, name, request.query_params.get("from") or "library",
+                                            workspace_of(request))
+            return JSONResponse({**shown, "install": skill_lib.install_info(config)})
+        except (SkillError, ToolError) as exc:
+            return skill_error_response(exc)
+
+    async def deps_log(request: Request):
+        try:
+            name = skill_lib.check_name(request.path_params["name"])
+            ecosystem = request.query_params.get("ecosystem") or None
+            if ecosystem not in (None, "python", "node"):
+                raise SkillError("ecosystem is python or node.")
+            if swarm.skills.get(name) is None:
+                raise SkillError(f"No skill '{name}' is attached to this swarm.", 404)
+            states = [s for s in swarm.skills.deps(name)
+                      if s.get("env") and ecosystem in (None, s.get("ecosystem"))]
+            if not states:
+                what = {"python": "Python ", "node": "Node "}.get(ecosystem or "", "")
+                raise SkillError(f"Skill '{name}' has no {what}packages installed by DreamTeam, so no install log.",
+                                 404)
+            state = next((s for s in states if s.get("status") == "failed"), states[0])
+            dirname = Path(state["env"]).name
+            manager = swarm.skills.manager
+            text = await asyncio.to_thread(manager.log_tail, dirname)
+            return JSONResponse({"name": name, "ecosystem": state["ecosystem"], "status": state["status"],
+                                 "path": str(manager.log_path(dirname)), "log": text})
+        except (SkillError, ToolError) as exc:
+            return skill_error_response(exc)
+
+    routes = [Route("/api/skills", index, methods=["GET", "POST"]),
+              Route("/api/skills/{name}", item, methods=["GET", "DELETE"])]
+    if swarm is not None:
+        routes.append(Route("/api/skills/{name}/deps-log", deps_log))
+    return routes
+
+
+def create_app(swarm: "Swarm", host: str = "127.0.0.1", *,
+               on_library_change: Callable[[], None] | None = None) -> Starlette:
+    """The app of one swarm. `on_library_change`: called after this app changed the skills library (the launcher
+    tells its home page)."""
     extra_hosts = env_allowed_hosts()
-    endpoint = MCPHttpEndpoint(swarm, host, extra_hosts=extra_hosts)
+    endpoint = MCPHttpEndpoint(swarm, host, extra_hosts=extra_hosts, on_library_change=on_library_change)
 
     async def index(request: Request):
         return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
@@ -187,15 +345,18 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1") -> Starlette:
             if r.builtin:  # its id and its name in either language
                 names += [r.key, *(roles.ROLE_PRESETS[lang][r.key][0] for lang in roles.ROLE_PRESETS)]
             return {"key": r.key, "name": r.name, "description": r.description, "instructions": r.instructions,
-                    "model": r.model, "builtin": r.builtin, "names": list(dict.fromkeys(names))}
+                    "model": r.model, "builtin": r.builtin, "names": list(dict.fromkeys(names)),
+                    "skills": list(r.skills)}
 
         return JSONResponse({"language": swarm.language, "roles": [view(r) for r in found if not r.hidden],
                              "hidden": [view(r) for r in found if r.hidden]})
 
     async def hub_info(request: Request):
         # identity of this hub process: `dreamteam` commands compare it with hub.json (stale file, pid reuse)
+        # sandbox: inside the Docker sandbox (the host library is a read-only source; folder paths are the container's)
         return JSONResponse({"pid": os.getpid(), "project": str(swarm.config.project_dir),
-                             "name": swarm.config.swarm.name, "version": __version__})
+                             "name": swarm.config.swarm.name, "version": __version__,
+                             "sandbox": swarm.config.skills_host_library_dir is not None})
 
     async def task_detail(request: Request):
         task_id = request.path_params["task_id"]
@@ -288,6 +449,9 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1") -> Starlette:
         if not isinstance(body, dict):
             return JSONResponse({"ok": False, "result": "Body must be a JSON object."}, status_code=400)
         text, is_error = await call_tool(ToolContext(swarm, USER), tool_name, body)
+        # these may have changed the library (a proposal saved, a source imported first): the home page reloads it
+        if not is_error and on_library_change is not None and tool_name in LIBRARY_TOOLS:
+            on_library_change()
         return JSONResponse({"ok": not is_error, "result": text})
 
     async def ws_endpoint(websocket: WebSocket):
@@ -329,6 +493,8 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1") -> Starlette:
         Route("/api/agents/{name}/activity", activity),
         Route("/api/files", files),
         Route("/api/act/{tool}", act, methods=["POST"]),
+        *skill_routes(lambda: swarm.config, lambda request: swarm.workspace.root, via="act", swarm=swarm,
+                      changed=on_library_change),
         *trace_routes(swarm),
         WebSocketRoute("/ws", ws_endpoint),
         Route("/mcp", endpoint),

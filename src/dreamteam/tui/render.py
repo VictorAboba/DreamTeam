@@ -45,6 +45,7 @@ EVENT_TYPES = (
     "agent.compacted", "agent.usage", "file.changed", "file.locked", "file.unlocked", "trigger.created",
     "trigger.fired", "trigger.deleted", "mcp.created", "mcp.status", "swarm.paused", "swarm.resumed",
     "swarm.wrap_up", "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
+    "job.silent", "skill.attached", "skill.detached", "skill.proposed", "skill.library", "skill.deps",
     "sessions.changed", "_connection",
 )
 ACTIVITY_KINDS = ("wake", "thinking", "text", "tool_call", "tool_result", "error", "nudge", "compacted")
@@ -663,7 +664,8 @@ def _ev_message(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 _QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined"})  # the goal panel / hire line say it
 # the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user
 _WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
-                         "u_review_handed_over", "u_reviews_waiting"})
+                         "u_review_handed_over", "u_reviews_waiting", "u_skill_proposed", "u_skill_deps_failed",
+                         "u_role_skills_missing", "u_role_skills_over_cap"})
 
 
 def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -943,6 +945,76 @@ def _ev_job(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     return _line(ctx, ctx.sym["job"], "dim", Text(text, style="dim"))
 
 
+def _ev_skill(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """`⏺ вы · подключил(а) скилл pdf` (attached, updated, detached, proposed, the library decision): quiet leaves
+    them out (a proposal reaches it through the u_skill_proposed notification)."""
+    if ctx.quiet:
+        return None
+    typ, name = ev.get("type"), clean(d.get("name")) or "?"
+    actor = ev.get("actor") or "user"
+    via = _via_text(ctx, d.get("via"))
+    if typ == "skill.attached":
+        text = ctx.t("ev_skill_updated" if d.get("replaced") else "ev_skill_attached", name=name)
+        tails = [clean(d.get("from")), via]
+    elif typ == "skill.detached":
+        text, tails = ctx.t("ev_skill_detached", name=name), [via]
+    elif typ == "skill.proposed":
+        return _bullet(ctx, d.get("owner") or ev.get("actor"),
+                       Text(f" {ctx.sym['dot']} {ctx.t('ev_skill_proposed', name=name)}", style=theme.WARN))
+    else:
+        # whose skill and through which surface: a save no UI click made shows as such (docs/SPEC.md §19)
+        key = "ev_skill_saved" if d.get("status") == "saved" else "ev_skill_not_saved"
+        owner = clean(d.get("owner"))
+        if owner and owner != actor:
+            text = ctx.t(key + "_of", name=name, owner=owner)
+        else:
+            text = ctx.t(key, name=name)
+        tails = [via, clean(d.get("comment"))]
+    body = Text(f" {ctx.sym['dot']} {text}")
+    for tail in tails:
+        if tail:
+            body.append(f" {ctx.sym['dot']} {ctx.short(tail, 160)}", style="dim")
+    return _bullet(ctx, actor, body)
+
+
+# the user's own surfaces (the pages, the terminal; a role's attach): the feed names only the others (MCP clients)
+_PLAIN_VIA = frozenset({"", "act", "home", "cli", "role", "create"})
+
+
+def _via_text(ctx: RenderContext, via: Any) -> str:
+    """`via MCP` for a change an MCP client made (MCP, the launcher MCP); "" for the user's own surfaces."""
+    via = clean(via)
+    if via in _PLAIN_VIA:
+        return ""
+    label = ctx.t(f"via_{via}")
+    return ctx.t("ev_skill_via", via=via if label == f"via_{via}" else label)
+
+
+def _ev_skill_deps(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """A skill's packages: ready (a dim line), failed (red; quiet: the u_skill_deps_failed notification says it);
+    a build starting and the manual states only in verbose."""
+    status = clean(d.get("status"))
+    name, files = clean(d.get("name")) or "?", ", ".join(_names(d.get("files")))
+    if status == "failed":
+        if ctx.quiet:
+            return None
+        text = ctx.t("ev_skill_deps_failed", name=name, error=ctx.short(d.get("error"), 200) or "?")
+        return _line(ctx, ctx.sym["warn"], theme.ERROR, Text(text, style=theme.ERROR))
+    if status == "ready":
+        if ctx.quiet:
+            return None
+        took = "" if d.get("reused") or d.get("seconds") is None else f", {fmt_elapsed(d.get('seconds'))}"
+        return _line(ctx, ctx.sym["check"], theme.OK, Text(ctx.t("ev_skill_deps_ready", name=name, files=files,
+                                                                 t=took), style="dim"))
+    if not ctx.verbose:
+        return None
+    if status == "installing":
+        text = ctx.t("ev_skill_deps_installing", name=name, files=files)
+    else:
+        text = f"{name}: {clean(d.get('ecosystem'))} {_deps_word(ctx, status)} ({_deps_reason(d.get('reason'))})"
+    return _line(ctx, ctx.sym["dot"], "dim", Text(text, style="dim"))
+
+
 def _ev_session(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     if not ctx.verbose:
         return None
@@ -991,6 +1063,12 @@ _HANDLERS: dict[str, Callable[[RenderContext, dict, dict], RenderableType | None
     "swarm.limits": _ev_limits,
     "job.started": _ev_job,
     "job.ended": _ev_job,
+    "job.silent": _none,        # (live only) refreshes the state: /jobs shows the silent marker
+    "skill.attached": _ev_skill,
+    "skill.detached": _ev_skill,
+    "skill.proposed": _ev_skill,
+    "skill.library": _ev_skill,
+    "skill.deps": _ev_skill_deps,
     "sessions.changed": _ev_session,
     "_connection": _ev_connection,
 }
@@ -1426,6 +1504,12 @@ def jobs_table(ctx: RenderContext, jobs: list[dict]) -> RenderableType:
             row.append(Text(clean(owner) or "?", style=theme.agent_style(owner)))
         text, style = _job_state(ctx, job)
         state = Text(text, style=style)
+        silent_since = _float(job.get("silent_since")) if running else 0.0
+        if silent_since:  # silent for more than jobs.SILENT_MINUTES: it may hang
+            from ..jobs import fmt_duration
+
+            state.append("\n" + prompts.t(ctx.lang, "job_silent", duration=fmt_duration(now - silent_since, ctx.lang)),
+                         style=theme.WARN)
         if running and job.get("origin"):
             state.append("\n" + _status_label(ctx, "job_origin_", job.get("origin")), style="dim")
         row.append(state)
@@ -1614,8 +1698,248 @@ def role_detail(ctx: RenderContext, role: dict) -> RenderableType:
         rows += [Text(""), Text(ctx.t("role_instructions", text=clean(role.get("instructions"))), style="dim")]
     if role.get("model"):
         rows += [Text(""), Text(ctx.t("role_model", model=clean(role.get("model"))), style="dim")]
+    if _names(role.get("skills")):   # attached from the library to a session with a member of the role
+        rows += [Text(""), Text(ctx.t("role_skills", names=", ".join(_names(role.get("skills")))), style="dim")]
     return _out(ctx, Panel(Group(*rows), title=title, title_align="left", box=_box(ctx), border_style=theme.ACCENT,
                            padding=(0, 1)))
+
+
+# ---- skills (docs/SPEC.md §19) ----------------------------------------------------------------------
+_DEPS_STYLE = {"ready": theme.OK, "installing": theme.WARN, "failed": theme.ERROR}
+SKILL_MD_LINES = 40   # /skills show: the start of SKILL.md
+
+
+def _deps_word(ctx: RenderContext, status: Any) -> str:
+    """ready / installing… / failed / manual (off, unsupported, unavailable: the agents install by hand)."""
+    status = clean(status)
+    return ctx.t("skp_" + status) if status in ("ready", "installing", "failed") else ctx.t("skp_manual")
+
+
+def _deps_reason(value: Any) -> str:
+    """The detail of an off / unsupported / unavailable state: {code, detail | need, have} or a plain string."""
+    if not isinstance(value, dict):
+        return clean(value)
+    if value.get("need"):
+        return f"{clean(value.get('need'))} ({clean(value.get('have'))})" if value.get("have") else clean(value["need"])
+    return clean(value.get("detail") or value.get("code"))
+
+
+def _skill_packages(ctx: RenderContext, deps: Any) -> Text:
+    """The Packages cell: one line per ecosystem, "python: ready", the error or the reason under a failed or manual
+    one ("-" for a skill without manifests)."""
+    out = Text()
+    for state in _list(deps):
+        state = _d(state)
+        if not state:
+            continue
+        status = clean(state.get("status"))
+        if out:
+            out.append("\n")
+        out.append(f"{clean(state.get('ecosystem')) or '?'}: ", style="dim")
+        out.append(_deps_word(ctx, status), style=_DEPS_STYLE.get(status, "dim"))
+        if status == "installing" and (state.get("queued") or state.get("other_process")):
+            out.append(f" {ctx.sym['ellipsis']}", style="dim")
+        detail = ctx.short(state.get("error"), 120) if status == "failed" else (
+            "" if status in _DEPS_STYLE else ctx.short(_deps_reason(state.get("reason")), 120))
+        if detail:
+            out.append("\n" + detail, style=theme.ERROR if status == "failed" else "dim")
+    return out if out else Text("-", style="dim")
+
+
+def _library_word(ctx: RenderContext, status: Any) -> tuple[str, str]:
+    status = clean(status)
+    if status not in ("pending", "saved", "rejected"):
+        return "-", "dim"
+    return ctx.t("skill_lib_" + status), {"pending": theme.WARN, "saved": theme.OK}.get(status, "dim")
+
+
+def skills_table(ctx: RenderContext, skills: list[dict]) -> RenderableType:
+    """/skills: the session's attached skills (state "skills"): the name and description, where it came from (and a
+    member's proposal's owner), its library decision, the roles it was attached for and its packages."""
+    items = [_d(s) for s in _list(skills) if isinstance(s, dict)]
+    if not items:
+        return _out(ctx, info(ctx, ctx.t("skills_none")))
+    wide = ctx.width >= 80
+    table = _table(ctx)
+    table.add_column(ctx.t("col_skill"), overflow="fold")
+    table.add_column(ctx.t("col_from"), overflow="fold")
+    table.add_column(ctx.t("col_library"), overflow="fold")
+    if wide:
+        table.add_column(ctx.t("col_roles"), overflow="fold", style="dim")
+    table.add_column(ctx.t("col_packages"), overflow="fold")
+    for skill in items:
+        cell = Text(clean(skill.get("name")) or "?", style="bold")
+        if skill.get("manual"):
+            cell.append(f" {ctx.sym['dot']} {ctx.t('skill_manual')}", style="dim")
+        if skill.get("description"):
+            cell.append("\n" + ctx.short(skill.get("description"), 160), style="dim")
+        frm = Text(clean(skill.get("from")) or "?")
+        if skill.get("from") == "agent" and skill.get("owner"):
+            frm.append("\n" + first_name(skill.get("owner")), style=theme.agent_style(clean(skill.get("owner"))))
+        word, style = _library_word(ctx, skill.get("library"))
+        library = Text(word, style=style)
+        if skill.get("comment") and skill.get("library") == "rejected":
+            library.append("\n" + ctx.short(skill.get("comment"), 120), style="dim")
+        row: list[RenderableType] = [cell, frm, library]
+        if wide:
+            row.append(Text(", ".join(_names(skill.get("roles"))) or "-"))
+        row.append(_skill_packages(ctx, skill.get("deps")))
+        table.add_row(*row)
+    return _out(ctx, Group(table, Text(ctx.t("skills_hint"), style="dim")))
+
+
+def skills_next(ctx: RenderContext, names: list[str]) -> RenderableType:
+    """/skills without a session: what the next new session gets attached (`--skill`, /skills add)."""
+    if not names:
+        return _out(ctx, info(ctx, ctx.t("skills_next_none")))
+    return _out(ctx, info(ctx, ctx.t("skills_next", names=", ".join(clean(n) for n in names))))
+
+
+def skill_refs(data: dict) -> list[tuple[dict, str, str]]:
+    """The skills GET /api/skills offers to attach as (entry, origin, the reference that attaches it): the library's
+    (a bare name), the host's library inside the sandbox, Claude Code's (`claude-user:pdf`)."""
+    data = _d(data)
+    rows = [(_d(e), "library") for e in _list(data.get("library"))]
+    rows += [(_d(e), "host-library") for e in _list(data.get("host"))]
+    rows += [(_d(e), clean(_d(e).get("origin")) or "claude-user") for e in _list(data.get("claude"))]
+    out = []
+    for entry, origin in rows:
+        name = clean(entry.get("name")) or "?"
+        out.append((entry, origin, name if origin == "library" else f"{origin}:{name}"))
+    return out
+
+
+def skills_library(ctx: RenderContext, data: dict) -> RenderableType:
+    """/skills lib: the library, the host's library (in the sandbox) and Claude Code's skills, each with what
+    attaches it and its marks (attached here, changed outside DreamTeam, writable by the agents)."""
+    data = _d(data)
+    rows = skill_refs(data)
+    title = ctx.t("skills_lib_title", dir=clean(data.get("library_dir")) or "?")
+    if not rows:
+        return _out(ctx, Group(Text(title, style="bold"), info(ctx, ctx.t("skills_lib_empty"))))
+    attached = {clean(_d(s).get("name")) for s in _list(data.get("attached"))}
+    table = _table(ctx, title)
+    table.add_column(ctx.t("col_skill"), overflow="fold")
+    table.add_column(ctx.t("col_description"), overflow="fold")
+    for entry, origin, ref in rows:
+        cell = Text(ref, style="bold")
+        marks = [ctx.t("skill_attached_mark")] if origin == "library" and clean(entry.get("name")) in attached else []
+        if entry.get("changed_outside"):
+            marks.append(ctx.t("skill_changed_outside"))
+        if entry.get("agent_writable"):
+            marks.append(ctx.t("skill_agent_writable"))
+        if marks:   # (a copy someone else can change is worth a look before attaching it)
+            warn = entry.get("changed_outside") or entry.get("agent_writable")
+            cell.append("\n" + ", ".join(marks), style=theme.WARN if warn else "dim")
+        text = Text(ctx.short(entry.get("error"), 200), style=theme.ERROR) if entry.get("error") else Text(
+            ctx.short(entry.get("description"), 200), style="dim")
+        table.add_row(cell, text)
+    return _out(ctx, Group(table, Text(ctx.t("skills_lib_hint"), style="dim")))
+
+
+def skill_deps_preview(ctx: RenderContext, deps: Any, install: Any = None, proposal: bool = False) -> str:
+    """What attaching a skill installs (its `deps` {python|node: {files, packages, unsupported?}}; `install` the
+    settings' switches; `proposal`: a member's skill, under install.proposals) — "" without manifests. As the web
+    pages' Skills.previewLine."""
+    deps, install = _d(deps), _d(install) if install is not None else None
+    found = [eco for eco in ("python", "node") if _d(deps.get(eco))]
+    if not found:
+        return ""
+    if install is not None and (install.get("enabled") is False or (proposal and install.get("proposals") is False)):
+        return ctx.t("skp_off")
+    parts, installs = [], False
+    for eco in found:
+        d = _d(deps[eco])
+        files = ", ".join(_names(d.get("files")))
+        if d.get("unsupported"):
+            parts.append(ctx.t("skp_unsupported", files=files, reason=clean(d.get("unsupported"))))
+        elif _names(d.get("packages")):
+            names = _names(d.get("packages"))
+            shown = ", ".join(names[:8]) + (", " + ctx.sym["ellipsis"] if len(names) > 8 else "")
+            parts.append(ctx.t("skp_preview", packages=shown, files=files))
+            installs = True
+    if installs:
+        parts.append(ctx.t("skp_trust"))
+    return " ".join(parts)
+
+
+def skill_states_preview(ctx: RenderContext, states: Any) -> str:
+    """The same line from the snapshot's deps states of an attached skill (a proposal waiting for the library
+    decision): off when its installation is switched off, the manual reason of an unsupported manifest."""
+    states = [_d(s) for s in _list(states) if isinstance(s, dict)]
+    if any(s.get("status") == "off" for s in states):
+        return ctx.t("skp_off")
+    deps: dict[str, dict] = {}
+    for s in states:
+        manual = s.get("status") in ("unsupported", "unavailable")
+        deps[clean(s.get("ecosystem"))] = {"files": _names(s.get("files")), "packages": _names(s.get("packages")),
+                                           **({"unsupported": _deps_reason(s.get("reason")) or "?"} if manual else {})}
+    return skill_deps_preview(ctx, deps)
+
+
+def skill_detail(ctx: RenderContext, data: dict, where: str) -> RenderableType:
+    """/skills show X: a panel with the skill's description, its files, what its packages need and the start of its
+    SKILL.md (as text: the swarm's skills are read by the agents, not rendered)."""
+    data = _d(data)
+    title = Text(clean(data.get("name")) or "?", style=f"bold {theme.ACCENT}")
+    title.append(f" {ctx.sym['dot']} {clean(where)}", style="dim")
+    rows: list[RenderableType] = [Text(clean(data.get("description")) or "—")]
+    files = [clean(_d(f).get("path")) for f in _list(data.get("files_list")) if isinstance(f, dict)]
+    if files:
+        shown = ", ".join(files[:50]) + (" " + ctx.sym["ellipsis"] if len(files) > 50 else "")
+        rows.append(Text(ctx.t("skill_files", n=len(files), files=shown), style="dim"))
+    preview = skill_deps_preview(ctx, data.get("deps"), data.get("install"), proposal=data.get("from") == "agent")
+    if preview:
+        rows.append(Text(preview, style=theme.WARN))
+    text = clean(data.get("skill_md")).rstrip()
+    if text:
+        rows += [Text(""), _clipped_text(ctx, text, SKILL_MD_LINES)]
+    return _out(ctx, Panel(Group(*rows), title=title, title_align="left", box=_box(ctx), border_style=theme.ACCENT,
+                           padding=(0, 1)))
+
+
+def skill_md_body(text: str) -> str:
+    """SKILL.md without its YAML front matter (the name and description are shown already) and leading blank lines;
+    an unclosed block stays (it is not front matter)."""
+    lines = clean(text).splitlines()
+    if lines and lines[0].strip() == "---":
+        end = next((i for i, line in enumerate(lines[1:], 1) if line.strip() == "---"), None)
+        if end is not None:
+            lines = lines[end + 1:]
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+def skills_pending(ctx: RenderContext, sid: str, attached: list[dict], *, other: bool = False) -> RenderableType:
+    """/skills pending: a session's members' proposals waiting for the library decision (also of a stopped one).
+    `other`: not the attached session, so the commands it shows name it (`--session`)."""
+    items = [_d(s) for s in _list(attached) if isinstance(s, dict) and _d(s).get("library") == "pending"]
+    if not items:
+        return _out(ctx, info(ctx, ctx.t("skills_pending_none", id=clean(sid))))
+    title = ctx.t("skills_pending_title_other" if other else "skills_pending_title", id=clean(sid))
+    rows: list[RenderableType] = [Text(title, style=f"bold {theme.WARN}")]
+    for skill in items:
+        body = Text(clean(skill.get("name")) or "?", style="bold")
+        if skill.get("owner"):
+            body.append(f" {ctx.sym['dot']} {first_name(skill.get('owner'))}", style=theme.agent_style(
+                clean(skill.get("owner"))))
+        if skill.get("description"):
+            body.append(f" {ctx.sym['dot']} {ctx.short(skill.get('description'), 200)}", style="dim")
+        rows.append(_line(ctx, ctx.sym["bullet"], theme.WARN, body))
+    return _out(ctx, Group(*rows))
+
+
+def skill_log(ctx: RenderContext, data: dict) -> RenderableType:
+    """/skills log X: the install log's path and its end."""
+    data = _d(data)
+    head = Text(f"{clean(data.get('name'))} {ctx.sym['dot']} {clean(data.get('ecosystem'))}: ", style="bold")
+    status = clean(data.get("status"))
+    head.append(_deps_word(ctx, status), style=_DEPS_STYLE.get(status, "dim"))
+    rows: list[RenderableType] = [head, Text(clean(data.get("path")), style="dim")]
+    text = clean(data.get("log")).rstrip()
+    rows.append(Text(text) if text else Text(ctx.t("skill_log_empty"), style="dim"))
+    return _out(ctx, Group(*rows))
 
 
 def _key_state(ctx: RenderContext, profile: dict) -> Text:

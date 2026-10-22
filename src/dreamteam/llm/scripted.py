@@ -65,7 +65,8 @@ def to_response(result: Any, *, model: str, call_no: int, prompt_tokens: int = 0
 class ScriptedLLM:
     """LLMClient whose answers come from `handler(system, messages, tools)` (sync or async).
 
-    Every call is recorded in `calls` ({"system", "messages", "tools"} deep copies) for assertions.
+    Every call is recorded in `calls` ({"system", "messages", "tools"} deep copies, and "max_tokens": the
+    request's output limit, None for the profile's) for assertions.
     Without an explicit usage, tokens are estimated from the request and the answer.
     """
 
@@ -85,8 +86,10 @@ class ScriptedLLM:
 
         return cls(handler, profile)
 
-    async def complete(self, system: str, messages: list[dict], tools: list[dict]) -> LLMResponse:
-        self.calls.append({"system": system, "messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools)})
+    async def complete(self, system: str, messages: list[dict], tools: list[dict], *,
+                       max_tokens: int | None = None) -> LLMResponse:
+        self.calls.append({"system": system, "messages": copy.deepcopy(messages), "tools": copy.deepcopy(tools),
+                           "max_tokens": max_tokens})
         # Taken before the handler runs: concurrent calls on one instance must not share tool-call ids.
         call_no = len(self.calls)
         prompt_tokens = estimate_tokens([system, messages, tools])

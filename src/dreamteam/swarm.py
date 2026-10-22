@@ -27,6 +27,7 @@ from .mcp_forge import MCPForge
 from .models import USER, AgentKind, AgentStatus, Status, ToolError
 from .names import generate_name
 from .shell import resolve_shell
+from .swarm_skills import SessionSkills, role_skill_pairs
 from .tools.fmt import STAMP_SPAN, item_time, stamp_range
 from .tracing import EXTERNAL_IDLE_SECONDS, Tracer
 from .triggers import TriggerEngine
@@ -106,6 +107,8 @@ class Swarm:
         self.runtimes: dict[str, AgentRuntime] = {}
         self._signals: dict[str, asyncio.Event] = {}
         self._background: list[asyncio.Task] = []
+        self._role_skills_task: asyncio.Task | None = None  # a reconfigure attaching the roles' skills (one at a time)
+        self._role_skills_again = False   # the roles changed again: that task runs once more
         self._timers: set[asyncio.TimerHandle] = set()
         self._started = False
         self._run_agents = True
@@ -122,6 +125,8 @@ class Swarm:
         self._review_lapsed: dict[int, set[str]] = {}  # task in review -> reviewers it was taken from (hand-over)
         self._user_reviews_key: frozenset[int] | None = None  # the user's reviews it was last told about
         self._notes_shown: dict[str, str] = {}  # agent -> digest of the notes last put into its context
+        # agent -> True: a full Skills index is in its context (a wake-up or a compaction); False: "none" was shown
+        self._skills_shown: dict[str, bool] = {}
         # agents a broadcast reached without a wake while they wait for their own job (Mailbox.send): woken by the
         # scheduler if that wait ends without the job's end waking them (_wake_deferred)
         self._deferred: set[str] = set()
@@ -134,6 +139,8 @@ class Swarm:
         self.triggers = TriggerEngine(self)
         self.forge = MCPForge(self)
         self.jobs = JobManager(self)  # the background jobs of the members' shell commands
+        self.skills = SessionSkills(self)  # the skills attached to this session (docs/SPEC.md §19)
+        self.skills.load()
 
     # ---- lifecycle ----------------------------------------------------------------------------
     async def start(self, run_agents: bool = True) -> None:
@@ -143,11 +150,17 @@ class Swarm:
         self._prune_traces()
         await self.workspace.init()
         await self.forge.start()
+        await self.skills.start()  # the agents' mirror is rebuilt from the session copies at every start
+        # the skills' script dependencies (docs/SPEC.md §19): built in the background, never waited for
+        self._background.append(asyncio.create_task(self.skills.ensure_deps(), name="skill-deps"))
         existing = self.members(include_retired=True)
         if not existing:
             # member i gets starting_roles[i], the rest are generalists (the role catalog resolves the names)
             for role in roles.starting_team(self.config.swarm.starting_roles, self.config.swarm.start_agents):
                 self._create_member(USER, role, kind=AgentKind.LLM)
+        # the skills the members' roles list (docs/SPEC.md §19), untold: every first wake-up after a start shows the
+        # full index anyway
+        await self.skills.ensure_role_skills(announce=False)
         self._started = True
         self._run_agents = run_agents
         if run_agents:
@@ -211,9 +224,16 @@ class Swarm:
             try:
                 await self.jobs.stop_all()
             finally:
-                await self.forge.stop()
-                await self.workspace.settle()  # a commit a stopped agent started finishes before the files may move
-                self._started = False
+                try:
+                    await self.forge.stop()
+                    await self.workspace.settle()  # a commit a stopped agent started finishes before files may move
+                finally:
+                    await self.skills.stop_deps()  # never raises: no more build news, the in-use set released
+                    if self.config.workspace_adopted:
+                        # the user's own folder: no copy of a library or a private Claude Code skill stays in it,
+                        # whatever failed above (remove_mirror never raises)
+                        await self.skills.remove_mirror()
+                    self._started = False
 
     def reconfigure(self, config: Config) -> None:
         """Hot-apply new settings (docs/SPEC.md §16.1). The project directory, the workspace folder, the swarm
@@ -244,6 +264,30 @@ class Swarm:
                 runtime.wake()  # e.g. the API key was fixed: retry the failed activation now
         if self.paused and self.pause_reason == "budget" and not self.budget_exceeded():
             self.resume(USER)  # the new default budget is enough again (as with set_limits)
+        if self._started and not self.stopping and role_skill_pairs(config) != role_skill_pairs(old):
+            self._attach_role_skills()
+
+    def _attach_role_skills(self) -> None:
+        """The roles' skills changed under a running swarm: the missing ones are attached in the background (stop()
+        cancels it). A run still going is never cancelled (its copy thread would go on past the lock): it runs once
+        more with the newer roles."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # not called from the event loop: the next start attaches them
+            return
+        self._role_skills_again = True
+        old = self._role_skills_task
+        if old is not None and not old.done():
+            return
+        if old in self._background:
+            self._background.remove(old)
+        self._role_skills_task = loop.create_task(self._role_skills_runs(), name="role-skills")
+        self._background.append(self._role_skills_task)
+
+    async def _role_skills_runs(self) -> None:
+        while self._role_skills_again:
+            self._role_skills_again = False
+            await self.skills.ensure_role_skills()
 
     def _prune_traces(self) -> None:
         self._last_prune = time.time()
@@ -427,6 +471,9 @@ class Swarm:
                     head, _, rest = text.partition("\n")
                     text = head.rstrip(":") + prompts.t(lang, "msg_reply", reply_to=m["reply_to"]) + ":\n" + rest
                 lines.append("• " + at(m["ts"]) + text)
+            # every member reads a message to all at once: only with one, not at every wake-up
+            if any(m.get("to_all") for m in messages):
+                lines.append(prompts.t(lang, "all_hint"))
         if not incoming:
             goal = self.goal()
             if goal:
@@ -447,15 +494,26 @@ class Swarm:
             jobs = self.jobs.running_of(name)
             if jobs:
                 now = time.time()
-                lines.append(prompts.t(lang, "my_jobs", jobs="; ".join(
-                    prompts.t(lang, "my_job", id=j.id, command=short_command(j.command, 60),
-                              duration=fmt_duration(now - j.started_at, lang)) for j in jobs)))
+                lines.append(prompts.t(lang, "my_jobs", jobs="; ".join(self._my_job(j, lang, now) for j in jobs)))
             ready = self.board.ready_unassigned()[:8]
             if ready:
                 lines.append(prompts.t(lang, "ready", tasks="; ".join(f"#{t.id} {t.title}" for t in ready)))
             member = self.member(name) or {}
             notes_text = (member.get("notes") or "").strip()
             if member.get("kind") == AgentKind.LLM:
+                # The full Skills index (up to ~15 KB) once per agent memory (the first wake-up, after a restart, in
+                # a compaction text); every later wake-up one line of names: changes arrive as notifications with
+                # their descriptions, and the history is append-only.
+                index = self.skills.index_text(name)
+                if index:
+                    if self._skills_shown.get(name) is True:
+                        lines.append(self.skills.names_line(name))
+                    else:  # never shown, or only "none" since
+                        lines.append(index)
+                        self.skills_shown(name, True)
+                elif self._skills_shown.get(name) is True:  # it had seen some: all were detached since
+                    lines.append(prompts.t(lang, "skills_none"))
+                    self.skills_shown(name, False)
                 # The history is append-only: the full notebook (up to 20000 chars) at every wake-up would grow
                 # it by that much each time. It is shown again only when it changed since it was last shown
                 # (once more after a restart; a compaction puts it into the compacted context).
@@ -468,9 +526,27 @@ class Swarm:
                     self.notes_shown(name, notes_text)
         return "\n".join(lines)
 
+    @staticmethod
+    def _my_job(job: Any, lang: str, now: float) -> str:
+        """One job of the my_jobs line; a silent one (jobs.SILENT_MINUTES) says for how long."""
+        kw = {"id": job.id, "command": short_command(job.command, 60),
+              "duration": fmt_duration(now - job.started_at, lang)}
+        silent = job.silent_for(now)
+        if silent is None:
+            return prompts.t(lang, "my_job", **kw)
+        return prompts.t(lang, "my_job_silent", silent=fmt_duration(silent, lang), **kw)
+
     def notes_shown(self, name: str, notes: str) -> None:
         """The agent's context now holds these notes (a wake-up text or a compaction summary)."""
         self._notes_shown[name] = _digest((notes or "").strip())
+
+    def skills_shown(self, name: str, value: bool | None) -> None:
+        """What the agent's context holds of the Skills index: True the full index, False "none attached", None
+        nothing known (its next wake-up shows the full index)."""
+        if value is None:
+            self._skills_shown.pop(name, None)
+        else:
+            self._skills_shown[name] = value
 
     # ---- goal ---------------------------------------------------------------------------------
     def goal(self) -> dict | None:
@@ -638,6 +714,8 @@ class Swarm:
             raise ToolError("The budget is exhausted; hiring is not possible.")
         name = self._create_member(by, role, instructions, model, name, language, kind)
         role = (self.member(name) or {}).get("role") or role  # canonical: "tester" -> "Tester"
+        # its role's skills before it is woken: its first wake-up lists them (hire_agent reports them)
+        self.skills.note_hire(name, await self.skills.ensure_role_skills([name]))
         if by != USER:
             self.notify(USER, "u_member_joined", name=name, role=role, by=by, wake=False)
         if kind == AgentKind.LLM:
@@ -717,6 +795,11 @@ class Swarm:
     def budget_exceeded(self) -> bool:
         limit = self.limits()["max_cost_usd"]
         return limit > 0 and self.spent_usd() >= limit
+
+    @property
+    def started(self) -> bool:
+        """start() ran and stop() did not: a loaded swarm that is only viewed is not started."""
+        return self._started
 
     @property
     def paused(self) -> bool:
@@ -800,6 +883,8 @@ class Swarm:
             await asyncio.sleep(SCHEDULER_SECONDS)
             try:
                 self.workspace.expire_locks()
+                await self.skills.check()  # a mirror copy changed by a command is rebuilt (at most once a minute)
+                await self.skills.touch_envs()  # hourly: the environments' `used` stamps, retries, repairs
                 if time.time() - self._last_prune >= TRACE_PRUNE_SECONDS:
                     self._prune_traces()
                 # an external member that stopped calling: its session trace ends at its last call
@@ -1071,6 +1156,7 @@ class Swarm:
             "triggers": self.triggers.list(include_inactive=False),
             "jobs": jobs,
             "mcp": self.forge.list(USER),
+            "skills": self.skills.public(),  # from memory: no query
             "locks": self.workspace.locks(),
             "user": {"unread": unread.get(USER, 0)},
         }

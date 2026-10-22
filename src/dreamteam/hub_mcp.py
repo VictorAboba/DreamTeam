@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 import weakref
-from typing import TYPE_CHECKING, Any, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Iterator
 
 import mcp.types as types
 from mcp.server.lowlevel import Server
@@ -24,7 +24,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from . import __version__
 from .mailbox import sent_as_seen_by
 from .models import USER, AgentKind, ToolError
-from .tools import REGISTRY, ToolContext, call_tool, tools_for
+from .tools import REGISTRY, ToolContext, _coerce, call_tool, tools_for
 
 if TYPE_CHECKING:
     from .swarm import Swarm
@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1", "[::1]"}
+# user tools that can change the skills library (a proposal saved, a source imported first): the launcher's home page
+# reloads its Skills tab after one, whichever surface called it (the board's /api/act, MCP, the launcher MCP)
+LIBRARY_TOOLS = frozenset({"skill_attach", "skill_approve"})
 
 INSTRUCTIONS = """You are connected to a DreamTeam swarm: a self-organizing team of AI agents with human names that
 work on a shared task board toward one global goal, talk through direct messages and per-task discussions,
@@ -43,7 +46,11 @@ By default every call acts as the human USER of the swarm: you can read the boar
 tasks with what it has and starts no new computations or background jobs) and change limits (`swarm_control`),
 approve MCP servers (`mcp_approve`) and wait for messages addressed to the user (`wait_for_events`; with
 `progress=true` it also returns when the board moves on). `jobs` and `job_stop` list and stop every member's
-background jobs.
+background jobs. `skills`, `skill_attach` and `skill_detach` list, attach and detach the swarm's skills (folders with
+a SKILL.md from the skills library, Claude Code's skills, a folder, a .zip or a Git URL); every member sees them.
+`skill_approve` decides whether a skill a member proposed is saved to the skills library (not for a member this
+client acts as: the user decides that one in the web UI, the TUI or the console). A skill's packages (its
+requirements.txt, pyproject.toml or package.json) are installed automatically; `skill_reinstall` installs them again.
 
 To work INSIDE the swarm as a member, call `join_swarm(role=...)`: you get a unique human name; then pass
 `as_agent="<that name>"` in every call. Members claim tasks (`task_claim`), write shared files (`write_file`,
@@ -53,7 +60,9 @@ not count toward the swarm's agent limit (max_agents). A `shell` command still r
 seconds over MCP) continues as a background job, and background=true starts one at once; processes a command leaves
 running become a job too. `jobs` shows jobs and their output, `job_stop` stops one, and a job's end reaches you
 through `wait_for_events`, so don't poll. In the user's wrap-up mode no new background job starts: finish your tasks
-with what you have."""
+with what you have. Skills (SKILL.md folders under .scratch/_skills/) are listed by `join_swarm` and
+`swarm_status`; read the one that fits before such work. `skill_propose` proposes a skill you made: every member can
+use it at once, and the user decides whether it is saved to the skills library."""
 
 AS_AGENT = {
     "type": "string",
@@ -164,10 +173,35 @@ def _externals(swarm: "Swarm") -> set[str]:
     return {m["name"] for m in swarm.members() if m["kind"] == AgentKind.EXTERNAL}
 
 
-async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any], client: str | None = None) -> tuple[str, bool]:
+def _self_approval(swarm: "Swarm", name: str, args: dict[str, Any], actor: str, client: str | None,
+                   members: frozenset[str]) -> str:
+    """The refusal of a client saving to the skills library a proposal of a member it acts as ("" otherwise): the
+    library save is the user's decision (docs/SPEC.md §19). Rejecting one's own proposal stays allowed. A client
+    nothing names (client_key None) cannot be told from any external member, so it saves none of theirs."""
+    skills = getattr(swarm, "skills", None)
+    if name != "skill_approve" or actor != USER or skills is None or (client and not members):
+        return ""
+    if _coerce(args.get("approve"), {"type": "boolean"}) is not True:
+        return ""
+    skill = skills.get(" ".join(str(args.get("name") or "").split()))
+    if skill is None or not skill.owner:
+        return ""
+    if client and skill.owner in members:
+        return (f"Error: skill '{skill.name}' was proposed by {skill.owner}, the member this MCP client acts as; the "
+                "user decides it in the web UI, the TUI or the console.")
+    if not client and swarm.is_member(skill.owner) and swarm.kind_of(skill.owner) == AgentKind.EXTERNAL:
+        return (f"Error: skill '{skill.name}' was proposed by {skill.owner}, an MCP member, and this MCP client cannot "
+                f"be told apart from it (it sends no {CLIENT_HEADER} header and has no MCP session); the user decides "
+                "it in the web UI, the TUI or the console.")
+    return ""
+
+
+async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any], client: str | None = None, *,
+                   via: str = "mcp") -> tuple[str, bool]:
     """Run a tool over MCP with the hub actor rules (`as_agent`); calls of external members are traced. `client`
     (client_key; default: serving_client's): a message the client sends reaches the external members it acts as
-    already read, so it never comes back to it as news (user broadcasts still reach every other member)."""
+    already read, so it never comes back to it as news (user broadcasts still reach every other member). `via`: the
+    surface recorded where the user's changes are audited (ToolContext.via; the launcher MCP: "launcher-mcp")."""
     args = dict(args or {})
     try:
         actor = resolve_actor(swarm, args.pop("as_agent", None))
@@ -177,11 +211,14 @@ async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any], client: str 
     clients = hub_clients(swarm)
     if actor != USER:
         clients.acted_as(client, actor)
+    refused = _self_approval(swarm, name, args, actor, client, clients.members_of(client))
+    if refused:
+        return refused, True
     joining = bool(client) and actor == USER and name == "join_swarm"
     before = _externals(swarm) if joining else set()
     started = time.time()
     with sent_as_seen_by(clients.members_of(client), actor):
-        text, is_error = await call_tool(ToolContext(swarm, actor), name, args)
+        text, is_error = await call_tool(ToolContext(swarm, actor, via=via), name, args)
     if joining and not is_error:
         # the member it became: a new one, or the one it continues as after a reconnect (join_swarm with its name)
         joined = _externals(swarm) - before
@@ -200,7 +237,9 @@ async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any], client: str 
     return text, is_error
 
 
-def build_hub_server(swarm: "Swarm") -> Server:
+def build_hub_server(swarm: "Swarm", on_library_change: Callable[[], None] | None = None) -> Server:
+    """`on_library_change`: called after a call that may have changed the skills library (LIBRARY_TOOLS; the
+    launcher tells its home page, as for the board's /api/act)."""
     local = f"local:{uuid.uuid4().hex}"  # the client of a connection without HTTP (stdio, in-process)
 
     async def on_list_tools(ctx, params) -> types.ListToolsResult:
@@ -209,6 +248,11 @@ def build_hub_server(swarm: "Swarm") -> Server:
     async def on_call_tool(ctx, params: types.CallToolRequestParams) -> types.CallToolResult:
         text, is_error = await hub_call(swarm, params.name, dict(params.arguments or {}),
                                         client=client_key(ctx, local))
+        if not is_error and on_library_change is not None and params.name in LIBRARY_TOOLS:
+            try:
+                on_library_change()
+            except Exception:  # the home page's reload never fails the call
+                log.exception("library change listener failed")
         return _text_result(text, is_error)
 
     return Server("dreamteam", version=__version__, title="DreamTeam swarm", instructions=INSTRUCTIONS,
@@ -320,8 +364,9 @@ def security_settings(host: str, extra_hosts: Iterable[str] = ()) -> TransportSe
 class MCPHttpEndpoint:
     """ASGI app serving the hub over streamable HTTP; mount at /mcp and run `manager.run()` in the lifespan."""
 
-    def __init__(self, swarm: "Swarm", host: str, extra_hosts: Iterable[str] = ()):
-        self.server = build_hub_server(swarm)
+    def __init__(self, swarm: "Swarm", host: str, extra_hosts: Iterable[str] = (),
+                 on_library_change: Callable[[], None] | None = None):
+        self.server = build_hub_server(swarm, on_library_change)
         self.manager = StreamableHTTPSessionManager(app=self.server,
                                                     security_settings=security_settings(host, extra_hosts))
 

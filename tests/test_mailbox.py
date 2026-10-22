@@ -52,7 +52,8 @@ def test_send_as_seen_by_delivers_as_read_without_waking(swarm, mail):
 
 def test_send_to_one(swarm, mail):
     msg = mail.send(ANNA, "bob  brown", "  hello  ")
-    assert set(msg) == {"id", "ts", "sender", "recipients", "text", "reply_to"}
+    assert set(msg) == {"id", "ts", "sender", "recipients", "text", "reply_to", "to_all"}
+    assert msg["to_all"] is False
     assert msg["sender"] == ANNA and msg["recipients"] == [BOB] and msg["text"] == "hello"
     assert msg["reply_to"] is None and msg["id"] == 1
     assert inbox(swarm, BOB) == [1]
@@ -233,3 +234,27 @@ def test_unicode_roundtrip(swarm, mail):
     assert mail.get(msg["id"])["text"] == "Привет, как дела? ✓"
     assert mail.get(msg["id"])["recipients"] == [ANNA]
     assert sent_events(swarm)[0]["data"]["message"]["text"] == "Привет, как дела? ✓"
+
+
+def test_to_all_is_recorded_and_an_older_file_gets_the_column(swarm, mail, tmp_path):
+    import sqlite3
+
+    from dreamteam.db import Database
+
+    assert mail.send(ANNA, ["all"], "news")["to_all"] is True
+    assert mail.send(ANNA, [BOB, CARL], "named")["to_all"] is False   # the same people, but named
+    assert [m["to_all"] for m in mail.unread(BOB)] == [True, False]
+    # a swarm.db made before the column: it is added at open, the old rows read as not to all
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, sender TEXT, recipients TEXT,"
+                 " text TEXT, reply_to INTEGER)")
+    conn.execute("INSERT INTO messages(ts, sender, recipients, text) VALUES (1, 'a', '[\"b\"]', 'old')")
+    conn.commit()
+    conn.close()
+    db = Database(path)
+    try:
+        assert db.one("SELECT to_all FROM messages")["to_all"] == 0
+    finally:
+        db.close()
+    Database(path).close()  # opened again: nothing to add

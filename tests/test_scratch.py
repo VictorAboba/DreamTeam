@@ -479,3 +479,163 @@ async def test_shell_commit_names_the_files_and_keeps_the_command(make_swarm):
     assert git(root, "log", "-1", "--format=%b").strip() == command
     await shell(swarm, agent, "echo nothing changes")
     assert len(commits(root)) == 2  # no commit for a call that changed nothing
+
+
+# ------------------------------------------------------------------------ nested repositories
+def nested_repo(root: Path, rel: str, *, commit: bool = True) -> Path:
+    """A folder with its own repository (an agent's `git init` of a generated project)."""
+    path = root / rel
+    path.mkdir(parents=True, exist_ok=True)
+    git(path, "init", "-q")
+    if commit:
+        put(path, "main.py", "print(1)\n")
+        git(path, "add", "-A")
+        git(path, "commit", "-q", "-m", "own history")
+    return path
+
+
+def gitlinks(root: Path) -> list[str]:
+    """Paths HEAD records as gitlinks (mode 160000)."""
+    return [line.split("\t", 1)[1] for line in git(root, "ls-tree", "-r", "HEAD").splitlines()
+            if line.startswith("160000 ")]
+
+
+@needs_git
+async def test_autocommit_leaves_nested_repositories_out(repo):
+    root = repo.root
+    put(root, "src/app.py", "print(0)\n")
+    assert await repo.autocommit(ANNA, "seed")
+    nested_repo(root, "examples/lab_project/a")
+    nested_repo(root, "examples/lab_project/b", commit=False)  # no commit yet
+    nested_repo(root, "--help")  # a folder name git would read as an option
+    nested_repo(root, "src/vendored")  # inside a tracked folder
+    nested_repo(root, scratch_rel(ANNA) + "tmp_repo")  # .scratch/ is never committed anyway
+    put(root, "examples/plain/p.txt", "p\n")
+    put(root, "top.txt", "t\n")
+    skipped: list[str] = []
+    assert await repo.autocommit(ANNA, kind="shell", detail="python gen.py", skipped=skipped)
+    assert sorted(skipped) == ["--help", "examples/lab_project/a", "examples/lab_project/b", "src/vendored"]
+    assert commits(root)[0] == (ANNA, "shell: examples/plain/p.txt, top.txt", ["examples/plain/p.txt", "top.txt"])
+    assert gitlinks(root) == [] and not (root / ".gitmodules").exists()
+    status = git(root, "status", "--porcelain")
+    assert "?? --help/" in status and "?? examples/lab_project/" in status and "?? src/vendored/" in status
+    # each nested repository is named to the member once; a new one later is named alone
+    note = repo.nested_repos_note(ANNA, skipped)
+    assert note.startswith("Not committed: ") and "--help" in note and "examples/lab_project/a" in note
+    assert "nested repositories" in note and scratch_rel(ANNA) in note
+    put(root, "top.txt", "t2\n")
+    again: list[str] = []
+    assert await repo.autocommit(ANNA, kind="shell", detail="echo", skipped=again)
+    assert sorted(again) == sorted(skipped) and repo.nested_repos_note(ANNA, again) == ""
+    assert commits(root)[0][2] == ["top.txt"]
+    nested_repo(root, "examples/c")
+    later: list[str] = []
+    assert await repo.autocommit(ANNA, kind="shell", detail="echo", skipped=later) is None  # nothing else changed
+    assert "examples/c" in later
+    assert repo.nested_repos_note(ANNA, later) == (
+        "Not committed: examples/c — folders with their own .git (nested repositories). Delete their .git or move "
+        f"them into your scratch folder {scratch_rel(ANNA)} if they are temporary.")
+    assert repo.nested_repos_note("Boris King", later).startswith("Not committed: ")  # per member
+    # once its .git is gone, the folder is an ordinary one and is committed
+    shutil.rmtree(root / "--help" / ".git", onerror=lambda func, path, _: (os.chmod(path, 0o700), func(path)))
+    gone: list[str] = []
+    assert await repo.autocommit(ANNA, "shell: rm", skipped=gone)
+    assert "--help" not in gone and commits(root)[0][2] == ["--help/main.py"]
+    assert gitlinks(root) == []
+
+
+def test_nested_repos_note_caps_the_list(ws):
+    paths = [f"p{i}" for i in range(7)]
+    note = ws.nested_repos_note(ANNA, paths + ["p0"])
+    assert note.startswith("Not committed: p0, p1, p2, p3, p4 and 2 more — folders with their own .git")
+    assert ws.nested_repos_note(ANNA, paths) == ""
+
+
+@needs_git
+async def test_tracked_submodule_of_an_adopted_project_is_left_alone(fake_swarm):
+    root = user_repo(fake_swarm, {"README.md": "mine\n"})
+    nested_repo(root, "lib")
+    put(root, ".gitmodules", '[submodule "lib"]\n\tpath = lib\n\turl = ./lib\n')
+    git(root, "add", ".gitmodules", "lib")  # the user's own submodule: a gitlink with its .gitmodules entry
+    git(root, "commit", "-q", "-m", "add lib")
+    ws = Workspace(fake_swarm)
+    await ws.init()
+    put(root, "lib/untracked_inside.txt", "x\n")  # changes inside the submodule are the submodule's business
+    put(root, "new.txt", "n\n")
+    skipped: list[str] = []
+    assert await ws.autocommit(ANNA, kind="shell", detail="make", skipped=skipped)
+    assert skipped == [] and ws.nested_repos_note(ANNA, skipped) == ""
+    assert commits(root)[0] == (ANNA, "shell: new.txt", ["new.txt"])
+    assert gitlinks(root) == ["lib"]
+    assert git(root, "show", "HEAD:.gitmodules") == '[submodule "lib"]\n\tpath = lib\n\turl = ./lib\n'
+
+
+@needs_git
+@pytest.mark.parametrize("mode", ["no", "all"])
+async def test_users_show_untracked_setting_does_not_hide_nested_repositories(fake_swarm, mode):
+    # `git add -A` ignores status.showUntrackedFiles, so the check must not depend on it either
+    root = user_repo(fake_swarm, {"README.md": "mine\n"})
+    git(root, "config", "--local", "status.showUntrackedFiles", mode)
+    ws = Workspace(fake_swarm)
+    await ws.init()
+    nested_repo(root, "gen/proj")
+    put(root, "README.md", "mine, changed\n")
+    skipped: list[str] = []
+    assert await ws.autocommit(ANNA, kind="shell", detail="make", skipped=skipped)
+    assert skipped == ["gen/proj"] and gitlinks(root) == []
+    assert commits(root)[0][2] == ["README.md"]
+    # a new file written with write_file is committed although the user's `git status` hides untracked files
+    await ws.write(ANNA, "notes/new.txt", "n\n")
+    assert commits(root)[0][2] == ["notes/new.txt"]
+
+
+@needs_git
+async def test_initial_commit_of_an_adopted_folder_leaves_nested_repositories_out(fake_swarm):
+    root = fake_swarm.config.workspace_dir
+    put(root, "notes.txt", "n\n")
+    nested_repo(root, "clones/lib")
+    nested_repo(root, "--help")
+    fake_swarm.config.workspace_adopted = True  # a folder of the user that is not a repository yet
+    ws = Workspace(fake_swarm)
+    await ws.init()
+    assert gitlinks(root) == [] and "notes.txt" in commits(root)[0][2]
+    assert not any(path.startswith(("clones/", "--help")) for path in commits(root)[0][2])
+    # the next autocommit names them to the agent
+    put(root, "notes.txt", "n2\n")
+    skipped: list[str] = []
+    assert await ws.autocommit(ANNA, kind="shell", detail="echo", skipped=skipped)
+    assert sorted(skipped) == ["--help", "clones/lib"] and gitlinks(root) == []
+
+
+@needs_git
+async def test_shell_names_nested_repositories_once(make_swarm):
+    swarm = await make_swarm(git_on=True)
+    agent = agent_of(swarm)
+    root = swarm.workspace.root
+    nested_repo(root, "examples/lab_project/a")
+    nested_repo(root, "--help")
+    put(root, "out.txt", "o\n")
+    text = await shell(swarm, agent, "echo hi")
+    last = text.rstrip().splitlines()[-1]
+    assert last.startswith("Not committed: ") and "--help" in last and "examples/lab_project/a" in last
+    assert commits(root)[0][2] == ["out.txt"] and gitlinks(root) == []
+    put(root, "out.txt", "o2\n")
+    assert "Not committed" not in await shell(swarm, agent, "echo again")
+    assert commits(root)[0][2] == ["out.txt"] and gitlinks(root) == []
+
+
+@needs_git
+async def test_nested_repository_excludes_are_literal_and_skip_ignored_folders(repo, caplog):
+    # `:(exclude,literal)`: the repository "a[1]" is no glob that would also leave out the file "a1"; a nested
+    # repository in an ignored folder is not excluded by name (git add would warn about the ignored path)
+    root = repo.root
+    put(root, ".gitignore", (root / ".gitignore").read_text(encoding="utf-8") + "ign/\n")
+    assert await repo.autocommit(ANNA, "seed")
+    nested_repo(root, "a[1]")
+    nested_repo(root, "ign/repo")
+    put(root, "a1", "y\n")
+    skipped: list[str] = []
+    assert await repo.autocommit(ANNA, kind="shell", detail="make", skipped=skipped)
+    assert skipped == ["a[1]"]
+    assert commits(root)[0][2] == ["a1"] and gitlinks(root) == []
+    assert "git add reported errors" not in caplog.text

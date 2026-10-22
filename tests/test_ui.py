@@ -136,7 +136,7 @@ def test_jobs_tab_feed_and_settings_fields():
     assert pane in INDEX
     assert 'id="drawer-jobs"' in INDEX
     panes = json.loads(re.search(r'for \(const name of (\[.*?\])\) \$\("#pane-"', APP_JS).group(1))
-    assert panes == ["board", "feed", "files", "mcp", "triggers", "jobs", "traces"]
+    assert panes == ["board", "feed", "files", "mcp", "skills", "triggers", "jobs", "traces"]
     for name in panes:
         assert f'id="pane-{name}"' in INDEX, name
     # one line: the API contract test below reads it
@@ -191,7 +191,7 @@ def test_home_i18n_is_complete():
     used |= set(re.findall(r'\bfield\("([a-z0-9_]+)"', HOME_JS))                     # settings field labels
     used |= set(re.findall(r'\bhint: "([a-z0-9_]+)"', HOME_JS))
     sections = set(re.findall(r'\["\w+", "(s_\w+)"\]', HOME_JS))
-    assert len(sections) == 9 and "s_roles" in sections
+    assert len(sections) == 10 and {"s_roles", "s_skills"} <= sections
     used |= sections | {s + "_hint" for s in sections}
     used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending")}  # sessionState() + pending goal
     used |= WORKSPACE_KINDS_KEYS  # workspaceLine(): t("ws_" + kind), t("ws_" + kind + "_hint")
@@ -1418,8 +1418,10 @@ def test_home_card_shows_the_session_folder_and_delete_keeps_an_outside_one():
       document.createElement = () => ({ className: "", textContent: "", remove() {} });
       el("toasts", { appendChild: (box) => toasts.push(box.textContent) });
       el("modal"); el("modal-backdrop");
-      let confirmDelete = null;
-      el("confirm-delete", { addEventListener: (type, fn) => { confirmDelete = fn; } });
+      // the dialog's buttons: Delete (or, with pending proposals, Save then delete / Delete them too)
+      let onActions = null;
+      el("delete-actions", { addEventListener: (type, fn) => { onActions = fn; } });
+      const confirmDelete = () => onActions({ target: { closest: () => ({ dataset: { deleteSkills: "" } }) } });
       answers.confirm = true;
       home.H.sessions = [{ id: "proj", title: "Proj", status: "stopped", workspace: { path: "/home/u/code/my-app", default: false, adopted: true, exists: true } },
                          { id: "own", title: "Own", status: "stopped", workspace: { path: "/x/own/workspace", default: true, adopted: false, exists: true } },
@@ -1631,6 +1633,38 @@ def test_jobs_tab_cards_output_and_stop():
     assert out["empty"].startswith('<div class="empty">No background jobs. A job appears when')
     assert out["dur"] == ["5 с", "59 с", "1 мин", "12 мин", "1 ч 00 мин", "2 ч 05 мин"]
     assert out["ru"] == "работает 25 мин"
+
+
+@needs_node
+def test_jobs_tab_marks_a_silent_job():
+    """A running job the hub reports silent (silent_since: jobs.SILENT_MINUTES without output) gets a warn badge
+    with how long it has been silent; a talking or ended job gets none."""
+    out = run_js(r"""
+      el("job-list");
+      const now = Date.now() / 1000;
+      const job = (id, extra) => Object.assign({ id, label: "j" + id, owner: "Ann Lee", command: "serve", origin: "background",
+        status: "running", reason: null, exit_code: null, started_at: now - 3000, ended_at: null, log: "", processes: [] }, extra);
+      app.S.state = { jobs: [job(1, { silent_since: now - 2430, last_output_at: null }),
+                             job(2, { silent_since: null, last_output_at: now - 30 }),
+                             job(3, { status: "ended", exit_code: 0, ended_at: now - 10, silent_since: now - 2000 })] };
+      app.S.tab = "jobs";
+      app.S.lang = "en";
+      app.renderJobs();
+      out.en = elements["job-list"].innerHTML;
+      app.S.lang = "ru";
+      app.renderJobs();
+      out.ru = elements["job-list"].innerHTML;
+      app.handleEvent({ id: null, ts: 0, type: "job.silent", actor: "Ann Lee", data: { job: job(2, { silent_since: now - 700 }) } });
+      out.feed = app.S.feed.length;
+    """)
+    cards = {int(c.split('"', 1)[0]): c for c in out["en"].split('data-job="')[1:]}
+    hint = "It has printed nothing for a long time and may hang: look at its output, and stop it if it is stuck."
+    assert (f'<span class="badge warn" title="{hint}"><i class="ic ic-clock"></i>no output for 40 min</span>'
+            in cards[1])
+    assert "ic-clock" not in cards[2] and "ic-clock" not in cards[3]
+    assert out["en"].count("no output for") == 1
+    assert "<i class=\"ic ic-clock\"></i>40 мин без вывода</span>" in out["ru"]
+    assert out["feed"] == 0   # a job.silent event (live only, it schedules a state reload) is no feed line
 
 
 @needs_node
@@ -2542,6 +2576,18 @@ async def test_api_provides_every_field_the_ui_reads(tmp_path):
         file = await get(base, "/api/files?path=docs/readme.md")
         assert file["type"] == "file" and file["content"] == "# hi\n" and file["truncated"] is False
 
+        # the Skills tab: a library skill attached (imported from a folder first); the keys the cards read
+        from conftest import make_skill
+        make_skill(tmp_path / "skill-src" / "pdf", "pdf", "Reads PDFs.", {"run.py": "print(1)\n"})
+        await act(base, "skill_attach", source=str(tmp_path / "skill-src" / "pdf"))
+        skill = (await get(base, "/api/state"))["skills"][0]
+        assert {"name", "description", "from", "owner", "library", "comment", "attached_via", "files", "size", "digest",
+                "manual", "path", "roles", "deps"} <= set(skill)
+        assert skill["from"] == "library" and skill["files"] == 2 and isinstance(skill["deps"], list)
+        listing = await get(base, "/api/skills")
+        assert {"library_dir", "library", "claude", "host", "sandbox", "limits", "install", "attached"} <= set(listing)
+        assert listing["attached"][0]["source_digest"] == skill["digest"]   # "Update" compares with it
+
         await act(base, "trigger_delete", trigger_id=state["triggers"][0]["id"])
         await act(base, "task_update", task_id=2, status=Status.CANCELLED)
         state = await get(base, "/api/state")
@@ -2859,3 +2905,430 @@ def test_settings_saved_by_the_ui_keep_and_remove_keys_as_shown(tmp_path):
             assert view["models"]["secret"]["api_key_set"] is False and view["models"]["main-model"]["api_key_set"] is True
         finally:
             c.portal.call(c.manager.shutdown)
+
+
+# ------------------------------------------------------------------------------------------------ skills (§18.4)
+SKILLS_JS = (STATIC / "skills.js").read_text(encoding="utf-8")
+
+
+def test_skills_texts_exist_on_both_pages_and_the_settings_cover_the_config():
+    """skills.js takes each page's t(): every key it uses is in both pages' dictionaries, in both languages; the home
+    settings' «Скиллы» section names every [skills] setting."""
+    from dreamteam.config import SkillsSettings
+
+    used = used_keys(SKILLS_JS)
+    assert {"sk_pkgs_preview", "sk_pkgs_trust", "sk_replace_q", "sk_add_attach", "sk_zip_big"} <= used
+    for name, blocks in (("home", home_i18n()), ("board", i18n_blocks())):
+        for lang in ("ru", "en"):
+            missing = sorted(used - blocks[lang])
+            assert not missing, (name, lang, missing)
+    fields = set(re.findall(r'field\("sk_f_\w+", "skills\.(\w+)"', HOME_JS))
+    assert fields == {f.name for f in dataclasses.fields(SkillsSettings)}
+    # the shared script comes before the page scripts; the board's skills tab and the home tab exist
+    assert HOME_HTML.index("/static/skills.js") < HOME_HTML.index("/static/home.js")
+    assert INDEX.index("/static/markdown.js") < INDEX.index("/static/skills.js") < INDEX.index("/static/app.js")
+    assert 'data-tab="skills"' in INDEX and 'id="pane-skills"' in INDEX and 'id="pane-skills"' in HOME_HTML
+    assert ".ic-skill" in (STATIC / "icons.css").read_text(encoding="utf-8")
+
+
+@needs_node
+def test_skills_js_import_flow_preview_and_base64():
+    out = run_js(r"""
+      const SK = require(staticDir + "/skills.js");
+      const T = { sk_pkgs_preview: "P:{packages}({files})", sk_pkgs_trust: "TRUST", sk_pkgs_off: "OFF",
+                  sk_pkgs_unsupported: "U:{files}:{reason}", sk_imported: "I:{names}", sk_attached: "A:{name}",
+                  sk_attached_same: "S:{name}", sk_skipped: "K:{path}:{error}" };
+      const t = (k, v) => (T[k] || k).replace(/\{(\w+)\}/g, (m, n) => (v && n in v ? v[n] : m));
+      out.b64 = [SK.toBase64(new Uint8Array([0, 1, 2, 250, 255])), SK.toBase64(new Uint8Array(70000).fill(65)).length];
+      const deps = { python: { files: ["requirements.txt"], packages: ["a", "b", "c", "d", "e", "f", "g", "h", "i"] },
+                     node: { files: ["package.json"], unsupported: "a git dependency" } };
+      out.preview = [SK.previewLine(t, deps, { enabled: true, proposals: false }),
+                     SK.previewLine(t, deps, { enabled: true, proposals: false }, true),
+                     SK.previewLine(t, { node: deps.node }, null), SK.previewLine(t, {}, null), SK.fmtSize(2048)];
+      // a source with several skills asks which; a clash asks before replacing; "no" cancels
+      const posted = [];
+      const answers = [
+        { status: 200, data: { need_pick: true, candidates: [{ name: "pdf" }, { name: "csv" }], imported: [] } },
+        { status: 409, data: { error: "clash", exists: ["pdf"] } },
+        { status: 200, data: { imported: [{ name: "pdf" }], attached: [{ name: "pdf", status: "attached" }],
+                               failed: [{ name: "csv", error: "cap" }], skipped: [{ path: "x.bin", error: "too big" }] } },
+      ];
+      const post = async (body) => { posted.push(body); return answers.shift(); };
+      const asked = [];
+      const res = await SK.runImport(post, { git: "https://g/r" }, {
+        pick: async (c) => { asked.push(["pick", c.map((x) => x.name)]); return ["pdf"]; },
+        replace: async (names) => { asked.push(["replace", names]); return true; } });
+      out.flow = [posted, asked, res.ok, SK.reportLines(t, res.data)];
+      const cancelled = await SK.runImport(async () => ({ status: 409, data: { exists: ["x"] } }), { path: "/p" },
+                                           { replace: async () => false, pick: async () => null });
+      const failed = await SK.runImport(async () => ({ status: 400, data: { error: "bad zip" } }), { zip: "", filename: "a.zip" },
+                                        { replace: async () => true, pick: async () => null });
+      out.ends = [cancelled, failed.ok, failed.error];
+      out.form = SK.formHtml(t, (s) => String(s), { attach: true });
+      out.sandboxForm = SK.formHtml(t, (s) => String(s), { sandbox: true });
+      // the hint of a form mounted before the listing said `sandbox` is shown afterwards
+      const hint = { on: false, classList: { toggle: (c, hidden) => { hint.on = !hidden; } } };
+      SK.setSandbox({ querySelectorAll: (sel) => (sel === "[data-sk-sandbox]" ? [hint] : []) }, true);
+      out.hintOn = hint.on;
+      SK.setSandbox(null, true);   // no root: nothing to do
+    """)
+    assert out["b64"] == ["AAEC+v8=", 93336]                        # chunked: a large buffer does not overflow
+    p, proposal, unsupported, nothing, size = out["preview"]
+    assert p == "P:a, b, c, d, e, f, g, h, …(requirements.txt) U:package.json:a git dependency TRUST"
+    assert proposal == "OFF"                                         # install_proposals off: a member's skill
+    assert unsupported == "U:package.json:a git dependency" and nothing == "" and size == "2.0 KB"
+    posted, asked, ok, lines = out["flow"]
+    assert posted == [{"git": "https://g/r"}, {"git": "https://g/r", "pick": ["pdf"]},
+                      {"git": "https://g/r", "pick": ["pdf"], "replace": True}]
+    assert asked == [["pick", ["pdf", "csv"]], ["replace", ["pdf"]]] and ok is True
+    assert lines == [{"text": "I:pdf"}, {"text": "A:pdf"}, {"text": "csv: cap", "warn": True},
+                     {"text": "K:x.bin:too big", "warn": True}]
+    assert out["ends"] == [{"cancelled": True}, False, "bad zip"]
+    assert 'data-sk-src="folder"' in out["form"] and 'data-sk-in="zip"' in out["form"] and "sk_add_attach" in out["form"]
+    # in the Docker sandbox a folder path is the container's: the hint says so (hidden otherwise)
+    assert 'class="field-hint hidden" data-sk-sandbox>sk_folder_sandbox' in out["form"]
+    assert 'class="field-hint" data-sk-sandbox>sk_folder_sandbox' in out["sandboxForm"] and out["hintOn"] is True
+
+
+@needs_node
+def test_skills_js_enter_imports_and_never_submits_the_enclosing_form():
+    # regression: the add form sits inside the new-session <form>; Enter in its folder or Git field submitted the
+    # whole form, so the session was created without the skill being added
+    out = run_js(r"""
+      const SK = require(staticDir + "/skills.js");
+      const handlers = {};
+      const field = (props) => Object.assign({ tagName: "INPUT", type: "text", value: "", dataset: {} }, props);
+      const folder = field({ dataset: { skIn: "folder" }, value: " /x/pdf " });
+      const go = { dataset: { skGo: "" }, disabled: false, click: () => handlers.click({ target: { closest: () => go } }) };
+      const nodes = { "[data-sk-status]": { textContent: "", classList: classList() }, "[data-sk-pick]": { classList: classList() },
+                      "[data-sk-go]": go, '[data-sk-in="folder"]': folder };
+      const box = { classList: classList(), contains: () => true, querySelector: (s) => nodes[s] || null,
+                    querySelectorAll: () => [], addEventListener: (type, fn) => { handlers[type] = fn; } };
+      const posted = [];
+      SK.mount(box, { t: (k) => k, esc: String, attach: true,
+                      post: async (body) => { posted.push(body); return { status: 200, data: { imported: [{ name: "pdf" }] } }; } });
+      const press = (target, extra) => { const e = Object.assign({ key: "Enter", target, prevented: false,
+                                                                   preventDefault() { this.prevented = true; } }, extra);
+                                         handlers.keydown(e); return e.prevented; };
+      out.folder = press(folder);
+      await new Promise((r) => setImmediate(r));
+      out.posted = posted.slice();
+      out.cleared = folder.value;
+      out.checkbox = press(field({ type: "checkbox", value: "pdf" }));       // a pick-list row: no submit, no import
+      out.file = press(field({ type: "file", dataset: { skIn: "zip" } }));   // Enter opens the file picker as usual
+      out.composing = press(folder, { isComposing: true });
+      out.otherKey = press(folder, { key: "a" });
+      out.count = posted.length;
+    """)
+    assert out["folder"] is True and out["posted"] == [{"path": "/x/pdf", "attach": True}] and out["cleared"] == ""
+    assert out["checkbox"] is True and out["file"] is False and out["composing"] is False and out["otherKey"] is False
+    assert out["count"] == 1
+
+
+@needs_node
+def test_home_proposal_preview_and_cleanup_toast_without_the_skills_tab_loaded():
+    # regressions: the proposal dialog read the install switches only from the Skills tab's data (null until that
+    # tab or Settings opened), so with install_proposals off it promised an automatic install; the cleanup toast
+    # said "(in use)" whatever was kept, even nothing
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.skills = null;
+      const deps = { python: { files: ["requirements.txt"], packages: ["pypdf"] } };
+      home.H.pendingShown = { tidy: { files_list: [], skill_md: "x", deps, origin: "agent",
+                                      install: { enabled: true, proposals: false } } };
+      out.off = home.pendingSkillHtml({ name: "tidy", owner: "Ann", files: 1, size: 9 });
+      home.H.pendingShown.tidy.install = { enabled: true, proposals: true };
+      out.on = home.pendingSkillHtml({ name: "tidy", owner: "Ann", files: 1, size: 9 });
+      out.toasts = [home.envsCleanedText({ removed: ["a"], kept: [] }),
+                    home.envsCleanedText({ removed: [], kept: [{ why: "in use" }, { why: "being built" }, { why: "in use" }] }),
+                    home.envsCleanedText({})];
+      home.H.lang = "ru";
+      out.ru = home.envsCleanedText({ removed: [], kept: [{ why: "being built" }] });
+    """)
+    assert "Package installation is off in the settings." in out["off"] and "own install code" not in out["off"]
+    assert "Installs automatically: pypdf (requirements.txt)." in out["on"] and "own install code" in out["on"]
+    assert out["toasts"] == ["Removed 1 environment(s)", "Removed 0 environment(s); kept 3 (in use, being built)",
+                             "Removed 0 environment(s)"]
+    assert out["ru"] == "Удалено окружений: 0; оставлено: 1 (собираются)"
+
+
+@needs_node
+def test_board_skill_md_is_shown_without_its_front_matter():
+    out = run_js(r"""
+      const SK = require(staticDir + "/skills.js");
+      out.bodies = [SK.bodyOf("---\nname: pdf\ndescription: Reads\n---\n# PDF\nSteps."),
+                    SK.bodyOf("﻿---\r\nname: x\r\n---\r\nBody"), SK.bodyOf("---\n---\nEmpty"),
+                    SK.bodyOf("---\nnot closed\n# T"), SK.bodyOf("Text\n---\nname: x\n---\n"), SK.bodyOf(null)];
+      app.S.lang = "en";
+      out.html = app.skillPreviewHtml({ files_list: [], deps: {},
+                                        skill_md: "---\nname: pdf\ndescription: Reads **PDF** <img src=x>\n---\n# PDF\nSteps." });
+    """)
+    assert out["bodies"] == ["# PDF\nSteps.", "Body", "Empty", "---\nnot closed\n# T", "Text\n---\nname: x\n---\n", ""]
+    html = out["html"]
+    assert "<hr>" not in html and "name: pdf" not in html and "<h1>PDF</h1>" in html and "Steps." in html
+
+
+def test_ui_sources_carry_no_mojibake():
+    # regression: a "→" saved through the CP1251 codepage came back as "в†’" in app.js
+    marks = ("в†", "вЂ", "Ð°", "Ñ€")
+    paths = [*STATIC.glob("*.js"), *STATIC.glob("*.html"), *STATIC.glob("*.css"),
+             *(STATIC.parent / "tui").glob("*.py"), STATIC.parent / "prompts.py"]
+    found = [(p.name, m) for p in paths for m in marks if m in p.read_text(encoding="utf-8")]
+    assert not found
+
+
+SKILLS_PRE = r"""
+  globalThis.skillsState = (E) => [
+    { name: "pdf", description: "Reads **PDF**. " + E, from: "library", owner: null, library: "none", digest: "d1",
+      attached_via: "role:Tester", roles: ["Tester"], files: 3, size: 4096, manual: false,
+      deps: [{ ecosystem: "python", status: "ready", files: ["requirements.txt"], packages: ["pypdf"], python: "/envs/p/bin/python" },
+             { ecosystem: "node", status: "failed", files: ["package.json"], packages: ["sharp"], error: E }] },
+    { name: "notes", description: "Notes", from: "claude-user", owner: null, library: "none", digest: "n1",
+      attached_via: "user", roles: [], files: 1, size: 10, manual: true,
+      deps: [{ ecosystem: "python", status: "installing", files: ["requirements.txt"], packages: [], queued: true },
+             { ecosystem: "node", status: "unsupported", files: ["package.json"], reason: { code: "unsupported", detail: "a git dependency" } }] },
+    { name: "csv-cleanup", description: "Cleans CSV", from: "agent", owner: E, library: "pending", digest: "c1",
+      attached_via: "create", roles: [], files: 2, size: 20, manual: false,
+      deps: [{ ecosystem: "python", status: "off", files: ["requirements.txt"], reason: { code: "proposals" } }] },
+  ];
+  globalThis.skillsData = (E) => ({
+    library_dir: "/lib", install: { enabled: true, proposals: false }, limits: { max_archive_mb: 50 },
+    library: [{ name: "pdf", description: "x" }, { name: "web", description: E, changed_outside: true }, { name: "bad", error: "broken" }],
+    claude: [{ name: "notes", origin: "claude-user", description: "n" }, { name: "proj", origin: "claude-project", description: "p", agent_writable: true }],
+    host: [],
+    attached: [{ name: "pdf", source_digest: "d2" }, { name: "notes", source_digest: null }, { name: "csv-cleanup", source_digest: "zz" }],
+  });
+"""
+
+
+@needs_node
+def test_board_skills_tab_cards_attach_dialog_and_decisions():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      app.S.lang = "en";
+      el("skill-list"); el("skill-library");
+      app.S.state = { swarm: { name: "S", goal: null, limits: { max_cost_usd: 0, max_agents: 3 }, spent_usd: 0 },
+                      agents: [], mcp: [], triggers: [], jobs: [], skills: skillsState(E) };
+      app.S.skillData = skillsData(E);
+      app.S.tab = "skills";
+      app.renderSkills();
+      out.html = elements["skill-list"].innerHTML;
+      out.cards = app.S.state.skills.map((s) => app.skillCardHtml(s));
+      out.sources = app.S.state.skills.map((s) => app.skillSourceState(s));
+      out.unloaded = app.skillSourceState(app.S.state.skills[0], null);
+      out.rows = app.attachRows(app.S.skillData, app.S.state.skills).map((r) => [r.ref, r.origin]);
+      out.rowHtml = app.attachRows(app.S.skillData, []).map(app.attachRowHtml).join("");
+      out.roleSkills = [app.roleSkillsOf("tester"), app.roleSkillsOf(" Tester "), app.roleSkillsOf("Coder")];
+      // Save to the library: the clash text asks, then approves with replace
+      const results = [{ ok: false, result: "The library already has a different skill 'csv-cleanup'. Approve with replace=true to replace it." },
+                       { ok: true, result: "Saved" }];
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
+        const r = url.includes("/api/act/") ? (results.shift() || { ok: true, result: "done" }) : { ok: true };
+        return { ok: true, status: 200, json: async () => r, text: async () => JSON.stringify(r) };
+      };
+      calls.length = 0;
+      answers.confirm = true;
+      await app.saveSkill("csv-cleanup");
+      out.save = calls.filter((c) => c.url.includes("/api/act/")).map((c) => [c.url, c.body]);
+      calls.length = 0;
+      await app.updateSkill("pdf");
+      await app.updateSkill("csv-cleanup");             // a member's proposal: nothing to update from
+      answers.prompt = "too narrow";
+      await app.rejectSkill("csv-cleanup");
+      answers.prompt = null;
+      out.rejectCancelled = await app.rejectSkill("csv-cleanup");
+      await app.reinstallSkill("pdf|node");
+      answers.confirm = false;
+      out.detachCancelled = await app.detachSkill("pdf");
+      out.acts = calls.filter((c) => c.url.includes("/api/act/")).map((c) => [c.url, c.body]);
+      // attaching a row a member could have written asks first
+      calls.length = 0;
+      answers.confirm = false;
+      out.attachNo = await app.attachSkill("claude-project:proj");
+      answers.confirm = true;
+      await app.attachSkill("claude-project:proj");
+      out.attach = calls.filter((c) => c.url.includes("/api/act/")).map((c) => [c.url, c.body]);
+      const ev = (type, data, actor = "user") => app.describeEvent({ id: 1, ts: 0, type, actor, data });
+      out.events = [ev("skill.attached", { name: "pdf", replaced: false, from: "library" }),
+                    ev("skill.attached", { name: "pdf", replaced: true }),
+                    ev("skill.detached", { name: "pdf" }),
+                    ev("skill.proposed", { name: "x", owner: "Ann Lee" }, "Ann Lee"),
+                    ev("skill.library", { name: "x", status: "saved" }),
+                    ev("skill.library", { name: "x", status: "rejected" }),
+                    ev("skill.deps", { name: "pdf", status: "ready", files: ["requirements.txt"], seconds: 14 }, null),
+                    ev("skill.deps", { name: "pdf", status: "failed", error: "boom", files: [] }, null),
+                    // whose skill, and a save an MCP client made says so
+                    ev("skill.library", { name: "x", owner: "Ann Lee", status: "saved", via: "mcp" }),
+                    ev("skill.library", { name: "x", owner: "Ann Lee", status: "rejected", via: "act" }),
+                    ev("skill.attached", { name: "pdf", replaced: false, via: "launcher-mcp" })];
+      out.feed = app.FEED_TYPES;
+    """, pre=SKILLS_PRE, env={"EVIL": EVIL})
+    html = out["html"]
+    assert_escaped(html, at_least=3)                                 # description, an error, an owner
+    pdf, notes, proposal = out["cards"]
+    assert out["sources"] == ["changed", "gone", None] and out["unloaded"] is None
+    assert "data-skill-update=\"pdf\"" in pdf and "data-skill-update" not in notes + proposal   # Update: own source changed
+    assert "source gone" in notes and "source gone" not in pdf
+    assert "<strong>PDF</strong>" in pdf                              # the description as Markdown (md())
+    assert "role: Tester" in pdf and "brought by role Tester" in pdf and "4.0 KB" in pdf
+    assert 'data-copy="/envs/p/bin/python"' in pdf and 'data-skill-log="pdf|node"' in pdf
+    assert 'data-skill-reinstall="pdf|node"' in pdf and ">failed<" in pdf
+    assert "queued" in notes and "a git dependency" in notes and "only when asked" in notes
+    assert 'data-skill-save="csv-cleanup"' in proposal and 'data-skill-nosave="csv-cleanup"' in proposal
+    assert "waits for your decision" in proposal and "data-skill-save" not in pdf + notes
+    assert out["rows"] == [["library:web", "library"], ["claude-project:proj", "claude-project"]]
+    assert "claude-project" in out["rowHtml"] and "agents can write here" in out["rowHtml"]
+    assert "changed outside DreamTeam" in out["rowHtml"] and "broken" not in out["rowHtml"]
+    assert out["roleSkills"] == [["pdf"], ["pdf"], []]
+    assert out["save"] == [["/api/act/skill_approve", {"name": "csv-cleanup", "approve": True}],
+                           ["/api/act/skill_approve", {"name": "csv-cleanup", "approve": True, "replace": True}]]
+    assert out["acts"] == [["/api/act/skill_attach", {"name": "library:pdf", "replace": True}],
+                           ["/api/act/skill_approve", {"name": "csv-cleanup", "approve": False, "comment": "too narrow"}],
+                           ["/api/act/skill_reinstall", {"name": "pdf", "ecosystem": "node"}]]
+    assert out["rejectCancelled"] is None and out["detachCancelled"] is None
+    assert out["attachNo"] is None
+    assert out["attach"] == [["/api/act/skill_attach", {"name": "claude-project:proj"}]]
+    assert out["events"][0].endswith("attached skill pdf") and out["events"][1].endswith("updated skill pdf")
+    assert out["events"][2].endswith("detached skill pdf") and "Ann Lee" in out["events"][3]
+    assert "saved x to the library" in out["events"][4] and "did not save x" in out["events"][5]
+    assert out["events"][6] == "installed the packages of skill pdf (requirements.txt, 14 s)"
+    assert out["events"][7] == "could not install the packages of skill pdf: boom"
+    assert out["events"][8].endswith("saved Ann Lee's skill x to the library (via MCP)")
+    assert out["events"][9].endswith("did not save Ann Lee's skill x to the library")
+    assert out["events"][10].endswith("attached skill pdf (via the launcher MCP)")
+    assert "via" not in out["events"][0] + out["events"][4]
+    assert "skill.*" in out["feed"]
+
+
+@needs_node
+def test_home_skills_tab_new_session_picker_cards_and_delete():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      for (const id of ["skill-library", "skill-lib-dir", "skill-claude", "skill-host-section", "skill-host", "modal",
+                        "modal-backdrop", "pending-skills"]) el(id);
+      el("toasts", { appendChild: () => {} });
+      document.createElement = () => ({ className: "", textContent: "", remove() {} });
+      home.H.skills = {
+        library_dir: "/lib", sandbox: false, install: { enabled: true, proposals: true },
+        library: [{ name: "pdf", description: E, origin: "git", files: 2, size: 100, changed_outside: true,
+                    source: { url: "https://github.com/o/r", ref: "main", subdir: "pdf" } },
+                  { name: "bad", error: "broken SKILL.md" }],
+        claude: [{ name: "notes", origin: "claude-user", description: "n", library: "different", path: "/u/.claude/skills/notes" },
+                 { name: "proj", origin: "claude-project", description: "p" }],
+        host: [],
+      };
+      home.H.skillShown["library:pdf"] = { files_list: [{ path: "SKILL.md", size: 10 }], skill_md: "# Title\n" + E,
+                                           deps: { python: { files: ["requirements.txt"], packages: ["pypdf"] } } };
+      home.renderSkillsPane();
+      out.lib = elements["skill-library"].innerHTML;
+      out.claude = elements["skill-claude"].innerHTML;
+      out.hostHidden = elements["skill-host-section"].classList.contains("hidden");
+      home.H.skills.sandbox = true;   // in the Docker sandbox: where the user's Claude Code skills come from
+      home.renderSkillsPane();
+      out.claudeSandbox = elements["skill-claude"].innerHTML;
+      out.hostShown = !elements["skill-host-section"].classList.contains("hidden");
+      home.H.skills.sandbox = false;
+      home.renderSkillsPane();
+      out.refs = home.skillSources(home.H.skills).map((s) => s.ref);
+      out.resolves = ["pdf", "notes", "proj", "bad", "nope"].map((n) => home.skillResolves(n));
+      out.picker = home.nsSkillsHtml(home.H.skills, new Set(["claude-user:notes"]));
+      // ticking a library entry changed outside DreamTeam asks first ("no" leaves it unticked)
+      home.H.nsSkills = new Set();
+      const asked = [];
+      globalThis.confirm = (q) => { asked.push(q); return answers.confirm; };
+      const tick = (ref) => { const target = { checked: true, dataset: { nsSkill: ref } }; home.onNsSkillChange({ target }); return target.checked; };
+      answers.confirm = false;
+      out.tickNo = [tick("pdf"), [...home.H.nsSkills]];
+      answers.confirm = true;
+      out.tickYes = [tick("pdf"), tick("claude-user:notes"), [...home.H.nsSkills]];
+      out.asked = asked.slice();
+      const catalog = [{ key: "tester", name: "Tester", skills: ["pdf", "ghost"] }, { key: "dev", name: "Developer", skills: ["pdf"] }];
+      const team = home.teamSkills([{ role: "tester", count: 1 }, { role: "dev", count: 2 }, { role: "x", custom: true, count: 1 }], catalog);
+      out.team = team;
+      out.teamHtml = home.nsRoleSkillsHtml(team);
+      out.card = home.sessionSkillsHtml({ id: "s1", skills: ["pdf", "csv"], skills_pending: ["csv"] });
+      out.cardNone = home.sessionSkillsHtml({ id: "s2", skills: [] });
+      // the library decision of a pending proposal: a clash asks, then replaces
+      home.H.sessions = [{ id: "s1", title: "S", status: "stopped", skills_pending: ["csv"] }];
+      const replies = [{ status: 409, body: { error: "clash", exists: ["csv"] } }, { status: 200, body: { text: "Saved csv" } },
+                       { status: 200, body: { text: "Not saved" } }];
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, method: opts && opts.method, body: opts && opts.body ? JSON.parse(opts.body) : null });
+        const r = url.includes("/decide") ? replies.shift() : { status: 200, body: { sessions: [] } };
+        return { ok: r.status < 400, status: r.status, statusText: "", json: async () => r.body };
+      };
+      answers.confirm = true;
+      await home.decidePendingSkill("s1", "csv", true);
+      answers.prompt = "meh";
+      await home.decidePendingSkill("s1", "csv", false);
+      out.decide = calls.filter((c) => c.url.includes("/decide")).map((c) => [c.url, c.body]);
+      // deleting with proposals waiting: two choices, each a DELETE with ?skills=
+      let onActions = null;
+      el("delete-actions", { addEventListener: (type, fn) => { onActions = fn; } });
+      home.H.sessions = [{ id: "s1", title: "S", status: "stopped", skills_pending: ["csv"] }];   // (a reload emptied it)
+      home.deleteModal("s1");
+      out.del = elements.modal.innerHTML;
+      calls.length = 0;
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, method: opts && opts.method });
+        return { ok: true, status: 200, json: async () => ({ ok: true, sessions: [] }) };
+      };
+      await onActions({ target: { closest: () => ({ dataset: { deleteSkills: "save" } }) } });
+      // a delete refused for proposals made meanwhile opens the dialog again with them
+      home.H.sessions = [{ id: "s2", title: "T", status: "stopped" }];
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, method: opts && opts.method });
+        if (opts && opts.method === "DELETE") return { ok: false, status: 409, statusText: "", json: async () => ({ error: "pending", pending_skills: ["late"] }) };
+        return { ok: true, status: 200, json: async () => ({ sessions: [] }) };
+      };
+      await home.confirmDelete("s2", "", null);
+      out.again = elements.modal.innerHTML;
+      out.deletes = calls.filter((c) => c.method === "DELETE").map((c) => c.url);
+      // a role card's skills: added (checked like a skill name), listed in the saved entry, cleared by Reset
+      home.H.rolePresets = JSON.parse(process.env.DT_PRESETS);
+      const cards = home.makeRoleCards([{ name: "tester", skills: ["pdf"] }, { name: "Scout", description: "Looks", skills: ["web"] }]);
+      const card = cards.find((c) => c.id === "tester");
+      out.cardSkills = card.skills.slice();
+      out.entries = home.roleEntries(cards).filter((e) => e.skills);
+      out.roleHtml = home.roleSkillsHtml({ ...card, skills: ["pdf", "ghost"] });
+      const cardEl = { querySelector: () => ({ value: " Csv-Tools " }) };
+      out.added = [home.addRoleSkill(card, cardEl), card.skills.slice()];
+      out.bad = home.addRoleSkill(card, { querySelector: () => ({ value: "not ok!" }) });
+    """, env={"EVIL": EVIL, "DT_PRESETS": json.dumps(role_presets())})
+    lib = out["lib"]
+    assert_escaped(lib, at_least=2)                                  # the description and SKILL.md (in a <pre>)
+    assert f'<pre class="skill-md"># Title\n{EVIL_ESC}</pre>' in lib  # SKILL.md stays text on the home page
+    assert "changed outside DreamTeam" in lib and "https://github.com/o/r#main:pdf" in lib
+    assert "Installs automatically: pypdf (requirements.txt)." in lib and "broken SKILL.md" in lib
+    claude = out["claude"]
+    assert "notes" in claude and "proj" not in claude and "different in the library" in claude
+    assert out["hostHidden"] is True
+    assert "does not see your ~/.claude/skills" in out["claudeSandbox"] and "notes" in out["claudeSandbox"]
+    assert "does not see" not in claude and out["hostShown"] is True
+    assert out["refs"] == ["pdf", "bad", "claude-user:notes", "claude-project:proj"]
+    assert out["resolves"] == [True, True, False, False, False]      # the workspace's skills never resolve a role's
+    assert 'data-ns-skill="claude-user:notes" checked' in out["picker"] and 'data-ns-skill="pdf"' in out["picker"]
+    assert "claude-project" not in out["picker"] and 'data-ns-skill="bad"' not in out["picker"]
+    pdf_row = out["picker"].split('data-ns-skill="pdf"')[1].split("</label>")[0]
+    assert "changed outside DreamTeam" in pdf_row and "changed outside" not in out["picker"].split('data-ns-skill="claude-user:notes"')[1]
+    assert out["tickNo"] == [False, []] and out["tickYes"] == [True, True, ["pdf", "claude-user:notes"]]
+    assert out["asked"] == ["Skill “pdf”: changed outside DreamTeam. Attach it anyway?"] * 2   # notes: no question
+    assert out["team"] == [{"name": "pdf", "resolves": True}, {"name": "ghost", "resolves": False}]
+    assert "badge warn" in out["teamHtml"] and "ghost · not in the library" in out["teamHtml"]
+    assert 'data-skills-pending="s1"' in out["card"]["warn"] and "skills: 2" in out["card"]["count"]
+    assert out["cardNone"] == {"count": "", "warn": ""}
+    url = "/api/sessions/s1/skills/csv/decide"
+    assert out["decide"] == [[url, {"approve": True, "comment": ""}], [url, {"approve": True, "comment": "", "replace": True}],
+                             [url, {"approve": False, "comment": "meh"}]]
+    assert 'data-delete-skills="save"' in out["del"] and 'data-delete-skills="discard"' in out["del"]
+    assert 'data-delete-skills=""' not in out["del"] and "csv" in out["del"]
+    assert "late" in out["again"] and 'data-delete-skills="discard"' in out["again"]
+    assert out["deletes"] == ["/api/sessions/s1?confirm=s1&skills=save", "/api/sessions/s2?confirm=s2"]
+    assert out["cardSkills"] == ["pdf"]
+    assert [(e["name"], e["skills"]) for e in out["entries"]] == [("tester", ["pdf"]), ("Scout", ["web"])]
+    assert out["added"] == [True, ["pdf", "csv-tools"]] and out["bad"] is False
+    assert 'data-rc-skill-del="ghost"' in out["roleHtml"] and "not in the library" in out["roleHtml"]

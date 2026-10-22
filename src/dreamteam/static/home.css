@@ -150,6 +150,32 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
 .role-other { font-size: 12px; }
 .add-role { margin-top: 10px; }
 
+/* Skills tab: the library on the left, adding and Claude Code's on the right */
+.skills-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 22px; align-items: start; }
+.skills-col { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.sk-section { margin: 4px 0 0; font: 600 11.5px var(--mono); color: var(--muted); text-transform: uppercase; letter-spacing: .05em; display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.sk-section code { font: 11px var(--mono); color: var(--faint); text-transform: none; letter-spacing: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-cards { display: flex; flex-direction: column; gap: 8px; }
+.skill-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 12px 14px; box-shadow: var(--shadow); min-width: 0; }
+.skill-card.broken { border-style: dashed; }
+.sk-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
+.sk-head > b { font: 600 13.5px var(--mono); }
+.sk-head > .ic { color: var(--accent); }
+.sk-head .muted { font-size: 12px; }
+.sk-desc { margin-top: 6px; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.sk-meta { margin-top: 6px; font: 11.5px var(--mono); color: var(--faint); overflow-wrap: anywhere; }
+.sk-meta code { color: var(--muted); }
+.sk-empty { padding: 14px; border: 1px dashed var(--border-strong); border-radius: var(--radius-lg); font-size: 13px; background: var(--panel); }
+.sk-actions { display: flex; gap: 6px; margin-top: 10px; }
+.skill-add-card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 12px 14px; box-shadow: var(--shadow); }
+.sk-chips { display: flex; gap: 5px; flex-wrap: wrap; margin-bottom: 6px; }
+.sk-chip { gap: 2px; padding-right: 2px; }
+.sk-chip .icon-btn.small { width: 18px; height: 18px; border: none; }
+.ns-skills .sk-picker { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
+.sk-roles { margin-top: 6px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
+.sk-add-more { margin-top: 8px; }
+.session-card .sc-warn.link { background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
+
 .new-session .form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .new-session .form-grid .two { grid-column: span 2; }
 .modal .lead { margin: -6px 0 16px; color: var(--muted); font-size: 13px; }
@@ -167,6 +193,7 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
   .session-tools .search { width: 100%; }
   .new-session .form-grid { grid-template-columns: 1fr; }
   .new-session .form-grid .two { grid-column: auto; }
+  .skills-layout { grid-template-columns: 1fr; }
 }
 .profile-head select { width: auto; max-width: 240px; }
 .settings-grid { align-items: end; }

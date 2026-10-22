@@ -7,7 +7,7 @@
 - a rounded input box at the bottom, with the status line under it;
 - slash-command and `@agent` suggestions listed under the box;
 - an animated spinner while agents work ("✻ Совещаются… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc — пауза)");
-- permission dialogs (MCP approval);
+- permission dialogs (MCP approval, a member's skill proposal);
 - `!` bash mode;
 - a non-interactive print mode `dreamteam -p "goal"`.
 
@@ -33,7 +33,7 @@ Package layout: `src/dreamteam/tui/`.
 | `render.py` | render | every renderable, the spinner line, the status line, `to_ansi()`, `to_plain()` |
 | `commands.py` | app | slash-command registry and handlers |
 | `input.py` | app | suggestions (slash commands, `@agents`, `#tasks`), input modes, history |
-| `dialogs.py` | app | session picker, MCP approval dialog, confirm dialog, select-list widget |
+| `dialogs.py` | app | session picker, MCP approval and skill proposal dialogs, confirm and choice dialogs, select-list widget |
 | `bash.py` | app | `ShellCommand`: the interruptible `!command` runner |
 | `app.py` | app | `TUI` application: layout, key bindings, event loop, view state |
 | `__init__.py` | app | `run_tui(...)`, `run_print_mode(...)` entry points used by `cli.py` |
@@ -57,13 +57,22 @@ class HubClient:
     async def sessions(self) -> list[dict]                         # GET /api/sessions -> ["sessions"]
     async def session(self, sid: str) -> dict                      # GET /api/sessions/{sid}: {"session", "config"}
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
-                             start: bool = True, workspace: str | None = None) -> dict
+                             start: bool = True, workspace: str | None = None,
+                             skills: list[str] | None = None) -> dict
         # POST /api/sessions -> ["session"]; `workspace` (an absolute folder, SPEC §17.2): the summary then has
-        # "workspace_result" (the hub's "result": mode "created" | "adopted", git, ...)
-    async def start_session(self, sid: str) -> dict                # POST /api/sessions/{sid}/start -> ["session"]
+        # "workspace_result" (the hub's "result": mode "created" | "adopted", git, ...); `skills`: references or
+        # sources attached before its first start (`--skill`, `/skills add` without a session; "via": "cli")
+    async def start_session(self, sid: str, skills: list[str] | None = None) -> dict
+        # POST /api/sessions/{sid}/start [{"skills", "via": "cli"}] -> ["session"]
     async def stop_session(self, sid: str) -> dict
-    async def delete_session(self, sid: str) -> dict               # DELETE /api/sessions/{sid}?confirm={sid}
-                                                                   # -> {"ok": true[, "workspace_kept": path]}
+    async def delete_session(self, sid: str, skills: str | None = None) -> dict
+        # DELETE /api/sessions/{sid}?confirm={sid}[&skills=save|discard&via=cli] -> {"ok": true[, "workspace_kept":
+        # path]}; members' skill proposals waiting for the user refuse it without `skills` (409, "pending_skills")
+    async def session_skills(self, sid: str, show: str | None = None) -> dict
+        # GET /api/sessions/{sid}/skills[?show=name]: {"attached", "running"} (also of a stopped session)
+    async def decide_skill(self, sid: str, name: str, approve: bool, comment: str = "", replace: bool = False) -> dict
+        # POST /api/sessions/{sid}/skills/{name}/decide -> {"text", "session"}; 409 with "exists": a library clash
+    async def clean_skill_envs(self) -> dict                       # POST /api/skill-envs/cleanup -> {removed, kept}
     async def set_workspace(self, sid: str, path: str | None) -> dict
         # POST /api/sessions/{sid}/workspace {"path": path} (None: {"default": true}) -> {"session": summary,
         # "result": {"mode", "from", "to", "git", "mcp_moved", "old_kept", "old_missing", "restarted",
@@ -78,6 +87,10 @@ class HubClient:
                                                                    # model, builtin, names}], "hidden": [...]}
                                                                    # (the visible catalog; SPEC §14)
     async def act(self, sid, tool: str, args: dict | None = None) -> tuple[bool, str]   # POST {base}/api/act/{tool}
+    async def skills(self, sid) -> dict                            # GET {base}/api/skills (library, claude, host,
+                                                                   # limits, install; in a session "attached")
+    async def skill(self, sid, name: str, frm: str = "library") -> dict   # GET {base}/api/skills/{name}?from=
+    async def skill_log(self, sid, name: str, ecosystem: str | None = None) -> dict   # GET .../{name}/deps-log
     async def inbox(self, sid, since_message: int = 0, since_notification: int = 0) -> dict
     async def messages(self, sid, with_: str | None = None, limit: int = 50) -> list[dict]
     async def mark_read(self, sid, with_: str | None = None) -> None
@@ -243,7 +256,13 @@ class RenderContext:
   verbose. Errors are always shown in red with `⚠`.
 - Notifications to the user: `🔔 text`. MCP pending → handled by the approval dialog (plus an info line). The
   review notices (`u_review_requested`, `u_review_fallback`, `u_review_handed_over`, `u_reviews_waiting`) are one
-  warning line, like `u_budget`.
+  warning line, like `u_budget`; so are the skill notices (`u_skill_proposed`, `u_skill_deps_failed`,
+  `u_role_skills_missing`, `u_role_skills_over_cap`).
+- Skills (normal and verbose; quiet has the notices): `⏺ вы · подключил(а) скилл pdf · library` (обновил(а) for a
+  replace, отключил(а)), `⏺ Анна · предлагает скилл x` (warn), `⏺ вы · сохранил(а) скилл x в библиотеку` / «не
+  стал(а) сохранять … · <the reason>». Packages (`skill.deps`): `✓ скилл pdf: пакеты установлены
+  (requirements.txt, 14s)` (no time for a reused environment), a red `⚠ скилл pdf: установка пакетов не удалась:
+  <error>`; a build starting and the manual states (off, unsupported, unavailable) only in verbose.
 - Hires: `+ Анна Смирнова (Аналитик) присоединилась` (gendered verb not required: use «в команде»).
   Retire: `− Анна покинула рой`.
 - Pause/resume renders as `⏸ Рой на паузе (причина)` / `▶ Рой продолжает работу`.
@@ -271,7 +290,8 @@ def agents_table(ctx, agents: list[dict]) -> RenderableType   # a member with ru
                                                               # its tasks (narrow: after its status)
 def jobs_table(ctx, jobs: list[dict]) -> RenderableType       # /jobs: the state's "jobs" (running, then ended in the
     # last hour): Процесс (j3), Агент, Состояние («работает» + how it went to the background / «завершился с кодом
-    # 1» / «остановлен вами» / «потерян при сбое»), Время, Команда (+ its processes; the log in verbose); narrow
+    # 1» / «остановлен вами» / «потерян при сбое»; a silent running job, `silent_since`: «40 мин без вывода» in the
+    # warn colour), Время, Команда (+ its processes; the log in verbose); narrow
     # (< 80): no agent / time columns. Footer hint «/jobs jN — вывод процесса · /jobs stop jN — остановить · пауза
     # роя их не останавливает»; none: info «Фоновых процессов нет.»
 def job_output(ctx, text: str) -> RenderableType              # /jobs jN: the hub's text (`jobs` tool), its first
@@ -280,7 +300,21 @@ def job_output(ctx, text: str) -> RenderableType              # /jobs jN: the hu
 def roles_table(ctx, catalog: list[dict]) -> RenderableType   # /roles: role, model (≥ 80 columns), the first
                                                               # sentence of the description; hint line
 def role_detail(ctx, role: dict) -> RenderableType            # /roles Роль: panel with the whole description,
-                                                              # the role's instructions and model
+                                                              # the role's instructions, model and skills
+def skills_table(ctx, skills: list[dict]) -> RenderableType   # /skills: the state's "skills": Скилл (name, «только
+    # по запросу» for a manual one, the description), Откуда (library / claude-user / … / agent + its owner),
+    # Библиотека («ждёт решения» warn / «сохранён» / «не сохранён» + the reason), Роли (≥ 80 columns), Пакеты (one
+    # line per ecosystem: «python: готовы» / «ставятся…» / «ошибка» + the error / «вручную» + the reason); hint line
+def skills_next(ctx, names: list[str]) -> RenderableType      # /skills without a session: the next session's skills
+def skills_library(ctx, data: dict) -> RenderableType         # /skills lib: GET /api/skills as rows of the reference
+    # that attaches each one (`pdf`, `host-library:pdf`, `claude-user:pdf`) with its marks (attached, changed
+    # outside DreamTeam, writable by the agents: warn) and the description (or its error)
+def skill_detail(ctx, data: dict, where: str) -> RenderableType   # /skills show: description, files, the
+    # packages line (skill_deps_preview), the first 40 lines of SKILL.md as plain text
+def skill_deps_preview(ctx, deps, install=None, proposal=False) -> str   # what attaching installs (as the web
+    # pages' Skills.previewLine); skill_states_preview(ctx, states): the same from the snapshot's deps states
+def skills_pending(ctx, sid, attached) -> RenderableType      # /skills pending: the proposals waiting
+def skill_log(ctx, data: dict) -> RenderableType              # /skills log: the install log's path and its end
 def sessions_table(ctx, sessions: list[dict], current: str | None = None) -> RenderableType
 def cost_table(ctx, state: dict) -> RenderableType       # per agent tokens in/out, cost; total vs budget
 def status_report(ctx, info: dict) -> RenderableType     # version, home, web, session, goal, models, language, agents,
@@ -404,6 +438,8 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/task N` | task with discussion |
 | `/agents` | team table |
 | `/roles [роль]` | the role catalog (`roles_table`) / one role in full (`role_detail`) |
+| `/skills`, `/skills lib`, `/skills add X [--pick a,b] [--replace]`, `/skills update X`, `/skills rm X`, `/skills show X` | the session's skills (`skills_table` from the state; without a session: the next new session's) / the library, the host's and Claude Code's skills / attach a reference (`pdf`, `claude-user:pdf`) or import a folder, .zip (a relative path or `~` resolved here when the hub is on this computer) or Git URL and attach it (`skill_attach`); without a session it is kept for the next new session, as `--skill` / again from its own source (`<from>:X` with replace; refused for a member's proposal) / `skill_detach` / the session's copy of an attached skill, else the library's (`claude-user:x`: that one) |
+| `/skills pending [id]`, `/skills approve X [replace] [--session ID]`, `/skills reject X [причина] [--session ID]`, `/skills reinstall X [python\|node]`, `/skills log X [python\|node]`, `/skills clean-envs` | the proposals waiting for the library decision (also of a stopped session; launcher; for another session than the attached one the header shows the commands with `--session ID`) / the decision (`skill_approve` in a running session, `POST …/skills/X/decide` on a stopped one; `--session ID`: another session's proposal through that route, running or stopped, without attaching or starting it; a library clash asks before replacing; the reason of a "don't save" is optional, as on the web pages) / install the packages again (`skill_reinstall`) / the install log / remove the skill environments no session uses (launcher; the line says how many were kept and why: in use or being built) |
 | `/jobs`, `/jobs jN`, `/jobs stop jN …` | the agents' background jobs (`jobs_table` from the state) / one job's output (the `jobs` tool as the user, `job_output`) / stop jobs and everything they started (`job_stop`, its result printed); `stop` also as `kill` / `стоп`; a job id as `j3`, `3`, `#3` or `%3`; anything else: the usage line |
 | `/to Имя\|all` | set the addressee |
 | `/hire Роль [\| инструкции]` | `hire_agent`; the instructions are optional for a catalog role (sent as `""`) |
@@ -470,7 +506,11 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   not be moved away on Windows) and leaves the session quietly: its stream ends while the hub deletes, and
   those connection states are not printed. A 404 means it was deleted meanwhile (success). Other refusals
   (files in use) are printed and keep the session; the hub stopped it before trying, so it is shown stopped,
-  and the connection states held back meanwhile are handled then.
+  and the connection states held back meanwhile are handled then. Members' skill proposals waiting for the
+  user's library decision (the summary's `skills_pending`, or a 409 with `pending_skills` for one proposed since)
+  are not lost silently: after the confirmation a `ChoiceDialog` «Скиллы ждут решения» names them and offers
+  «Сохранить в библиотеку и удалить» (`skills=save`; a clash with the library refuses the delete, printed) /
+  «Удалить вместе с ними» (`discard`) / «Отмена».
 - The session folder, `/cd` (launcher sessions; SPEC §17.2 "Workspace folder"). Without a current session,
   `/cd PATH` only chooses the folder of the next session created here (the same as `--workspace`, checked by
   the hub when the session is created; «Новая сессия будет работать в папке …»), `/cd --default` forgets it.
@@ -545,9 +585,18 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   queued. The dialog pops up by itself, so it waits while the user is typing (the status line says
   «MCP-сервер … ждёт одобрения — отправьте или очистите ввод»), and Enter / digits do not choose during its
   first 0.6 s.
+- A member's skill proposal (the state's skills with `library: "pending"`; `skill.proposed` asks again about one
+  put off before): the same queue, after the pending MCP servers, shows `SkillApprovalDialog` «Агент предлагает
+  скилл»: the name, owner, the files with their sizes and the first 8 lines of SKILL.md after its front matter
+  (both fetched from the session copy, `GET …/api/skills/x?from=session`; when more follows, «… весь SKILL.md:
+  /skills show x»), description, what its packages install (or that installing is off), and that the
+  swarm uses it already (the decision is only about the library). «1. Сохранить в библиотеку», «2. Не сохранять (с
+  причиной)» (the input box asks for the optional reason, its title «Скилл x»), Esc «решить позже (/skills
+  approve имя)». A decision made elsewhere (`skill.library`, the web page) closes the dialog. The library holding
+  a different skill of that name asks before replacing it.
 - On connection loss the status line shows «нет связи…» and input stays usable (commands fail with a clear
   error; a hub that does not answer: «Хаб … недоступен»). On reconnect the TUI re-syncs: state, plus the
-  journaled events of the gap (messages, notifications, goal, tasks, hires, swarm, MCP). The replay covers
+  journaled events of the gap (messages, notifications, goal, tasks, hires, swarm, MCP, skills). The replay covers
   only those types, so it is no high-water mark: a live event is dropped only when the live stream or the
   replay already handled its id. A stream the hub refuses for a session that no longer exists (404 over
   REST) ends the attachment with «Сессии … больше нет».
@@ -566,6 +615,8 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
 - Shared options: `--home`, `--lang ru|en`, `--model PROFILE`, `--agents N`, `--team "ROLE[*N],…"`,
   `--max-agents N`, `--budget USD`, `--title T`, `--workspace DIR`, `--host`, `--port`. `--team` is the starting
   team of the session this run creates (`starting_roles`; `start_agents` = its size unless `--agents` is given).
+- `--skill REF|PATH|URL` (repeatable) is a skill of the session this run creates (with `-c` / `-r`: attached to the
+  session resumed first, also when it runs); `/skills add` without a session adds to the same list.
 - `--workspace DIR` is the folder of the session this run creates (the TUI's first new session, or the
   session of `-p`): `~` and relative paths are resolved against the current directory; an empty or missing
   folder becomes its workspace, a folder with files (the user's project) is adopted (SPEC §17.2). With `-c` /

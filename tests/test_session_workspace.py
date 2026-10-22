@@ -867,6 +867,50 @@ async def test_a_file_that_appears_in_the_target_is_never_overwritten_or_deleted
     assert "workspace" not in manager.meta(sid) and not (manager.dir_of(sid) / ".dreamteam" / MOVE_JOURNAL).exists()
 
 
+async def test_a_move_across_volumes_leaves_the_skill_environments_alone(tmp_path, monkeypatch):
+    """The skills mirror's node_modules links point at a session's view of a shared environment (docs/SPEC.md §19):
+    a cross-volume move copies with copytree(symlinks=True), which follows junctions, so the mirror goes first."""
+    from dreamteam import skill_deps
+
+    manager = _manager(tmp_path)
+    sid = (await manager.create("Mover", start=False, overrides={"workspace": {"git": False}}))["id"]
+    default = manager.default_workspace(sid)
+    view = tmp_path / "envs" / "web-js-000000000000" / "views" / "abc" / "node_modules"
+    (view / "pkg").mkdir(parents=True)
+    (view / "pkg" / "index.js").write_text("shared", encoding="utf-8")
+    skill = default / ".scratch" / "_skills" / "web"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: web\ndescription: d\n---\n", encoding="utf-8")
+    assert skill_deps.link_node_modules(skill, "", view)
+    (default / "work.txt").write_text("mine", encoding="utf-8")
+    real_rename, old = os.rename, str(default)
+
+    def cross_device(a, b):  # the session's folder is on another volume
+        if str(a).startswith(old) and not str(b).startswith(old):
+            raise OSError(errno.EXDEV, "Invalid cross-device link")
+        return real_rename(a, b)
+
+    monkeypatch.setattr(sessions_mod.os, "rename", cross_device)
+    target = tmp_path / "other-volume" / "project"
+    result = await manager.set_workspace(sid, str(target))
+    assert result["mode"] == "moved"
+    real = target.resolve()
+    assert (real / "work.txt").read_text(encoding="utf-8") == "mine"
+    assert not (real / ".scratch" / "_skills").exists()   # rebuilt at the next start, never copied
+    assert (view / "pkg" / "index.js").read_text(encoding="utf-8") == "shared"
+
+
+async def test_the_skill_environments_folder_is_refused_as_a_session_folder(tmp_path, monkeypatch):
+    envs = tmp_path / "outer" / "envs"
+    envs.mkdir(parents=True)
+    monkeypatch.setenv("DREAMTEAM_SKILL_ENVS_DIR", str(envs))
+    manager = _manager(tmp_path)
+    for target in (envs, envs / "inside", tmp_path / "outer"):
+        with pytest.raises(SessionError) as err:
+            manager._plan(None, str(target), git_on=False)
+        assert "skill environments folder" in str(err.value), target
+
+
 def test_moves_never_replace_or_remove_what_they_did_not_make(tmp_path, monkeypatch):
     src = tmp_path / "src"
     src.mkdir()

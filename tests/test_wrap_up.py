@@ -362,6 +362,12 @@ async def test_tui_wrapup_command_and_event():
     app.client.act = already
     await execute(app, "/wrapup")
     assert "Done: wrap-up mode was already on." in app.text
+
+    async def refused(sid, tool, args):
+        return False, "The session is not running."
+    app.client.act = refused
+    await execute(app, "/wrapup off")
+    assert app.out[-1].lstrip().startswith(app.ctx.sym["warn"]) and "The session is not running." in app.out[-1]
     unattached = FakeApp()
     await execute(unattached, "/wrapup")
     assert "No current session" in unattached.text
@@ -393,6 +399,46 @@ def test_tui_sessions_show_wrap_up():
     assert render._session_status(ctx, {**running, "wrap_up": True, "paused": True})[0] == "paused"
     assert render._session_status(ctx, {**running, "wrap_up": True, "status": "stopped"})[0] == "stopped"
     assert session_status("en", {**running, "wrap_up": False}) == "running"
+    assert session_status("en", {**running, "wrap_up": True, "paused": True}) == "paused"
+    assert session_status("en", {**running, "wrap_up": True, "status": "stopped"}) == "stopped"
+
+
+def test_launcher_mcp_session_line_shows_wrap_up():
+    """The sessions list of the launcher's MCP tools: a running session in wrap-up mode, and a pause winning."""
+    from dreamteam.launcher_mcp import session_line
+
+    base = {"id": "001-x", "title": "X", "status": "running", "tasks": {"done": 1, "total": 3},
+            "agents": {"total": 2, "working": 1}, "spent_usd": 0.5, "max_cost_usd": 5}
+    assert session_line({**base, "wrap_up": True}).startswith("001-x [running, wrapping up] X | tasks 1/3 done")
+    assert session_line({**base, "wrap_up": True, "paused": True, "pause_reason": "budget"}).startswith(
+        "001-x [paused (budget)] X")
+    assert session_line({**base, "wrap_up": True, "status": "stopped"}).startswith("001-x [stopped] X")
+    assert session_line(base).startswith("001-x [running] X")
+
+
+def test_read_stats_defaults_without_a_readable_database(tmp_path, monkeypatch):
+    """A missing database, one that cannot be opened and a file that is no database give the same defaults: not
+    paused, no wrap-up, nothing counted (the launcher's cards and lists rely on them)."""
+    import sqlite3
+
+    import dreamteam.sessions as sessions_module
+
+    defaults = {
+        "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
+        "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
+        "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
+        "jobs": {"running": 0},
+    }
+    assert read_stats(tmp_path / "nope.db") == defaults
+    garbage = tmp_path / "garbage.db"
+    garbage.write_bytes(b"this is not a sqlite database" * 10)
+    assert read_stats(garbage) == defaults
+
+    def refuse(*args, **kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(sessions_module.sqlite3, "connect", refuse)
+    assert read_stats(garbage) == defaults
 
 
 def test_console_wrapup_command():

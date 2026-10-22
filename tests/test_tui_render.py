@@ -899,6 +899,12 @@ def test_jobs_table_and_one_job(monkeypatch):
     assert re.search(r"38;2;\d+;\d+;\d+m.*завершился с кодом 1", ansi)              # a failed job in colour
     ascii_out = plain(render.jobs_table(ctx(lang="en", width=140, unicode=False), JOBS), 140)
     assert "node.exe x2" in ascii_out and not UNICODE_SYMBOLS & set(ascii_out)
+    # a running job silent for more than jobs.SILENT_MINUTES (the hub's silent_since): how long, in warn colour
+    silent = [{**JOBS[1], "silent_since": NOW - 2430}, {**JOBS[2], "silent_since": NOW - 2430}]
+    out = plain(render.jobs_table(ctx(width=140), silent), 140)
+    assert out.count("40 мин без вывода") == 1                                    # not for the ended one
+    assert "no output for 40 min" in plain(render.jobs_table(ctx(lang="en", width=140), silent), 140)
+    assert re.search(r"38;2;\d+;\d+;\d+m40 мин без вывода", to_ansi(render.jobs_table(ctx(width=140), silent), 140))
 
     detail = plain(render.job_output(ctx(), JOB_DETAIL))
     lines = detail.split("\n")
@@ -1321,3 +1327,67 @@ def test_tools_echoed_by_their_own_line_show_only_in_verbose():
                         now=0.3)
     assert [plain(line) for line in failed] == [f"⏺ {ANNA} · send_message\n  ⎿  Unknown recipient 'Bob'."]
     assert pairs.next_due() is None
+
+
+# ---- skills ----------------------------------------------------------------------------------------------
+def test_skill_events_by_verbosity():
+    attached = ev("skill.attached", "user", name="pdf", files=3, replaced=False, via="cli", attached_via="user",
+                  **{"from": "library"})
+    assert plain(render.event(ctx(), attached)).strip() == "⏺ вы · подключил(а) скилл pdf · library"
+    updated = ev("skill.attached", "user", name="pdf", files=3, replaced=True, **{"from": "claude-user"})
+    assert "обновил(а) скилл pdf" in plain(render.event(ctx(), updated))
+    assert "отключил(а) скилл pdf" in plain(render.event(ctx(), ev("skill.detached", "user", name="pdf")))
+    proposed = ev("skill.proposed", ANNA, name="csv-cleanup", owner=ANNA, files=2, replaced=False)
+    assert plain(render.event(ctx(), proposed)).strip() == f"⏺ {ANNA} · предлагает скилл csv-cleanup"
+    saved = ev("skill.library", "user", name="csv-cleanup", owner=ANNA, status="saved", comment="", via="cli")
+    assert plain(render.event(ctx("normal", "ru"), saved)).strip() == \
+        f"⏺ вы · сохранил(а) в библиотеку скилл csv-cleanup (автор: {ANNA})"   # the terminal: no surface named
+    rejected = ev("skill.library", "user", name="x", owner=ANNA, status="rejected", comment="too broad")
+    assert f"did not save {ANNA}'s skill x to the library · too broad" in plain(render.event(ctx(lang="en"), rejected))
+    # a save an MCP client made says so (the audit of a save that no UI click made)
+    by_mcp = ev("skill.library", "user", name="x", owner=ANNA, status="saved", comment="", via="mcp")
+    assert plain(render.event(ctx(lang="en"), by_mcp)).strip() == f"⏺ you · saved {ANNA}'s skill x to the library · via MCP"
+    by_launcher = ev("skill.attached", "user", name="pdf", files=3, replaced=False, via="launcher-mcp",
+                     **{"from": "library"})
+    assert "подключил(а) скилл pdf · library · через MCP лаунчера" in plain(render.event(ctx(), by_launcher))
+    plain_owner = ev("skill.library", "user", name="x", status="saved", comment="", via="act")
+    assert plain(render.event(ctx(lang="en"), plain_owner)).strip() == "⏺ you · saved skill x to the library"
+    for e in (attached, proposed, saved):   # quiet: the u_skill_proposed notification says what matters
+        assert render.event(ctx("quiet"), e) is None
+
+    ready = ev("skill.deps", None, name="pdf", ecosystem="python", status="ready", files=["requirements.txt"],
+               seconds=14, reused=False)
+    assert plain(render.event(ctx(lang="en"), ready)).strip() == \
+        "✓ skill pdf: packages installed (requirements.txt, 14s)"
+    reused = {**ready, "data": {**ready["data"], "reused": True}}
+    assert "(requirements.txt)" in plain(render.event(ctx(lang="en"), reused))
+    failed = ev("skill.deps", None, name="pdf", ecosystem="node", status="failed", files=["package.json"],
+                error="npm ci exited with code 1")
+    assert "установка пакетов не удалась: npm ci exited with code 1" in plain(render.event(ctx(), failed))
+    assert render.event(ctx("quiet"), failed) is None   # the u_skill_deps_failed notification is the warning
+    installing = ev("skill.deps", None, name="pdf", ecosystem="python", status="installing",
+                    files=["requirements.txt"])
+    off = ev("skill.deps", None, name="pdf", ecosystem="python", status="unsupported", files=["setup.py"],
+             reason={"code": "unsupported", "detail": "setup.py runs code"})
+    for e in (installing, off):
+        assert render.event(ctx(), e) is None and render.event(ctx("verbose"), e) is not None
+    assert "setup.py runs code" in plain(render.event(ctx("verbose", "en"), off))
+    note = ev("notification", None, recipient="user", kind="u_skill_proposed", text="Анна предлагает скилл")
+    assert render._WARN_NOTES >= {"u_skill_proposed", "u_skill_deps_failed", "u_role_skills_missing"}
+    assert render.event(ctx("quiet"), note) is not None
+
+
+def test_skill_preview_lines():
+    c = ctx(lang="en")
+    deps = {"python": {"files": ["requirements.txt"], "packages": [f"p{i}" for i in range(10)]},
+            "node": {"files": ["setup.py"], "unsupported": "a setup.py runs code"}}
+    line = render.skill_deps_preview(c, deps, {"enabled": True, "proposals": True})
+    assert line.startswith("Installs automatically: p0, p1, p2, p3, p4, p5, p6, p7, … (requirements.txt).")
+    assert "setup.py is not installed automatically: a setup.py runs code" in line and "your rights" in line
+    assert render.skill_deps_preview(c, deps, {"enabled": False}) == "Package installation is off in the settings."
+    assert render.skill_deps_preview(c, deps, {"enabled": True, "proposals": False}, proposal=True).endswith("settings.")
+    assert render.skill_deps_preview(c, {}, None) == ""
+    states = [{"ecosystem": "python", "status": "ready", "files": ["requirements.txt"], "packages": ["pypdf"]}]
+    assert render.skill_states_preview(c, states).startswith("Installs automatically: pypdf (requirements.txt).")
+    assert render.skill_states_preview(c, [{**states[0], "status": "off", "reason": {"code": "proposals"}}]) == \
+        "Package installation is off in the settings."

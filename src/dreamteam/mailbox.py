@@ -35,7 +35,8 @@ def sent_as_seen_by(members: Iterable[str], sender: str) -> Iterator[None]:
 
 def _message_dict(row: Any) -> dict[str, Any]:
     return {"id": row["id"], "ts": row["ts"], "sender": row["sender"],
-            "recipients": loads(row["recipients"], []), "text": row["text"], "reply_to": row["reply_to"]}
+            "recipients": loads(row["recipients"], []), "text": row["text"], "reply_to": row["reply_to"],
+            "to_all": bool(row["to_all"])}
 
 
 def _as_id(value: Any, what: str) -> int:
@@ -77,19 +78,21 @@ class Mailbox:
             raise ToolError(f"Message is too long ({len(body)} chars, max {MAX_TEXT}). Put long content into a "
                             "workspace file and send its path.")
         recipients, broadcast = self._recipients(sender, to)
+        # sent to "all" (the wake-up text then asks to check the board before creating a task for it)
+        to_all = any(item.lower() == ALL for item in self._split(to))
         reply = self._check_reply(reply_to)
         context = _SEEN_BY.get()  # the sender's own other identities (sent_as_seen_by)
         seen = context[1] if context is not None and context[0] == sender else frozenset()
         with self.db.transaction():
             ts = time.time()
             message_id = self.db.insert(
-                "INSERT INTO messages(ts, sender, recipients, text, reply_to) VALUES (?, ?, ?, ?, ?)",
-                (ts, sender, dumps(recipients), body, reply))
+                "INSERT INTO messages(ts, sender, recipients, text, reply_to, to_all) VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, sender, dumps(recipients), body, reply, int(to_all)))
             for name in recipients:
                 self.db.execute("INSERT INTO inbox(message_id, recipient, read_at) VALUES (?, ?, ?)",
                                 (message_id, name, ts if name in seen else None))
         message = {"id": message_id, "ts": ts, "sender": sender, "recipients": recipients, "text": body,
-                   "reply_to": reply}
+                   "reply_to": reply, "to_all": to_all}
         log.info("message #%s from %s to %s", message_id, sender, ", ".join(recipients))
         self.swarm.bus.emit("message.sent", sender, message=message)
         # A member's broadcast does not wake an agent asleep while it waits for its own job: that job's end wakes it

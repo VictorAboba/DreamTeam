@@ -43,8 +43,8 @@ from . import commands, render, theme
 from .bash import ShellCommand
 from .client import Connection, HubError, HubUnreachable
 from .dialogs import (
-    APPROVE, DELETE, REJECT, BusyDialog, ConfirmDialog, Dialog, MCPApprovalDialog, SessionPicker, ascii_text,
-    border_chars, fit, frag_len,
+    APPROVE, DELETE, REJECT, BusyDialog, ChoiceDialog, ConfirmDialog, Dialog, MCPApprovalDialog, SessionPicker,
+    SkillApprovalDialog, ascii_text, border_chars, fit, frag_len,
 )
 from .i18n import LANGS, t
 from .input import (
@@ -72,8 +72,8 @@ BASH_HINT_CHARS = 40
 CD_TITLE_CELLS = 60          # a /cd question whose title is longer repeats the folder in its text
 # what is replayed after a reconnect (activity, usage and traces of the gap are skipped)
 CATCHUP_TYPES = ["message.*", "notification", "goal.*", "task.*", "agent.hired", "agent.retired", "swarm.*",
-                 "mcp.*"]
-REFRESH_ON = ("goal.", "swarm.", "task.", "mcp.", "agent.hired", "agent.retired", "job.")
+                 "mcp.*", "skill.*"]
+REFRESH_ON = ("goal.", "swarm.", "task.", "mcp.", "agent.hired", "agent.retired", "job.", "skill.")
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -139,11 +139,15 @@ class TUI:
         prefs = load_prefs(self.home)
         self._lang_fixed = lang in LANGS or prefs.get("lang") in LANGS
         start_lang = lang if lang in LANGS else prefs.get("lang") if prefs.get("lang") in LANGS else "ru"
-        self.session_arg = session
+        self.session_arg = session or None   # "": `-r` without an id (the user picks one from /sessions)
         self.continue_last = continue_last
         self.initial_prompt = initial_prompt
         self.overrides, self.title_override = commands.session_overrides(overrides)
         self.workspace_override = workspace   # the folder of the next session created here (--workspace)
+        # `--skill`: the skills of the next session created here, or (-c / -r) attached to the first one resumed
+        # (also the one picked after `-r`); one attempt, so they never land on another session later
+        self.skills_override: list[str] = list((overrides or {}).get("skills") or [])
+        self._resume_skills = session is not None or continue_last
         self._printer = printer
         self._real_terminal = output is None
         self.ctx = render.RenderContext(lang=start_lang,
@@ -151,7 +155,8 @@ class TUI:
         self.hub: dict = {}
         self.local = bool(conn.owned)
         self.dialog: Dialog | None = None
-        self.input_mode: tuple[str, Any] | None = None   # ("goal", None) | ("reject", server name)
+        # ("goal", None) | ("reject", server name) | ("skill_reject", skill name): what the input box asks for
+        self.input_mode: tuple[str, Any] | None = None
         self.suggestions: list[Suggestion] = []
         self.selected = 0
         self.hint: str | None = None
@@ -174,6 +179,7 @@ class TUI:
         self._generation = 0          # +1 on every attach: answers for an earlier view are not applied
         self._bash: ShellCommand | None = None
         self._mcp_waiting: str | None = None   # a pending server whose dialog waits for an empty input
+        self._skill_waiting: str | None = None   # the same for a member's skill proposal
         self._deleting: str | None = None      # the session this TUI is deleting: its stream ends, quietly
         self._deferred_conn: Any = None        # the last connection state of that stream (replayed if it fails)
         self._moving: str | None = None        # the session this TUI is moving (/cd): it restarts, quietly
@@ -210,6 +216,9 @@ class TUI:
         self.mcp_queue: list[dict] = []
         self.mcp_answered: set[str] = set()   # not asked about again until an agent re-creates them
         self._mcp_dialog: MCPApprovalDialog | None = None
+        self.skill_queue: list[dict] = []     # members' skill proposals waiting for the library decision
+        self.skill_answered: set[str] = set()   # not asked about again until the member proposes it again
+        self._skill_dialog: SkillApprovalDialog | None = None
         self._reject_waiter: asyncio.Future | None = None
         self._echo_pending: list[str] = []
         self.connected = True
@@ -399,6 +408,8 @@ class TUI:
         """The input box's title: the addressee («→ Анна Смирнова») or «новая сессия»."""
         if self.input_mode is not None:
             kind, name = self.input_mode
+            if kind == "skill_reject":
+                return f"{self.t('col_skill')} {name}"
             return f"MCP {name}" if kind == "reject" else self.t("box_new_session")
         if not self.attached:
             return self.t("box_new_session")
@@ -419,7 +430,8 @@ class TUI:
 
     def _placeholder(self) -> str:
         if self.input_mode is not None:
-            key = "ph_goal" if self.input_mode[0] == "goal" else "mcp_reject_reason"
+            key = {"goal": "ph_goal", "skill_reject": "skill_reject_reason"}.get(self.input_mode[0],
+                                                                                 "mcp_reject_reason")
         else:
             key = "ph_session" if self.attached else "ph_no_session"
         text = self._text(self.t(key))
@@ -458,6 +470,8 @@ class TUI:
             hint = self._text(self.t("bash_running", command=command))
         elif hint is None and self._mcp_waiting:
             hint = self._text(self.t("mcp_waiting", name=self._mcp_waiting))
+        elif hint is None and self._skill_waiting:
+            hint = self._text(self.t("skill_waiting", name=self._skill_waiting))
         left, right = render.status_line(
             self.ctx, session=session, addressee=self.addressee, agents_total=len(self.members),
             working=len(self.working), spent=self.spent, budget=self.budget,
@@ -694,6 +708,10 @@ class TUI:
             self.mcp_answered.add(mode[1])
             self.info(self.t("mcp_deferred", name=mode[1]))
             self._release_reject()
+        elif mode is not None and mode[0] == "skill_reject":
+            self.skill_answered.add(mode[1])
+            self.info(self.t("skill_deferred", name=mode[1]))
+            self._release_reject()
         self._cleared()
 
     def _release_reject(self) -> None:
@@ -824,10 +842,12 @@ class TUI:
         self.set_hint(self.t("session_creating"))
         try:
             summary = await self.client.create_session(title, goal, overrides=self.overrides, start=True,
-                                                       workspace=self.workspace_override)
+                                                       workspace=self.workspace_override,
+                                                       skills=self.skills_override or None)
         finally:
             self.set_hint(None)
         self.title_override = self.workspace_override = None  # (kept for another try when the hub refused)
+        self.skills_override = []
         self.info(self.t("session_created", title=summary.get("title") or title, id=summary.get("id")))
         if isinstance(summary.get("workspace_result"), dict):
             self._print_folder_result(summary["workspace_result"], summary.get("title") or title)
@@ -881,28 +901,48 @@ class TUI:
             text += " " + self.t("delete_running")
         failure: HubError | None = None
         answer: Any = None
+        cancelled = False
         async with self.dialog_flow():
             if not await self.ask(ConfirmDialog(self.ctx.lang, self.t("delete_title", title=title), text,
                                                 default=False)):
+                return False
+            pending = [str(n) for n in summary.get("skills_pending") or []]
+            skills = await self._pending_skills_choice(title, pending) if pending else None
+            if pending and skills is None:
                 return False
             if self.attached and self.sid == sid:
                 await self._stop_bash()  # a `!` command in its folder: Windows cannot rename the folder meanwhile
             self._deleting, self._deferred_conn = sid, None
             try:
-                async with self.busy(BusyDialog(self.ctx.lang, self.t("delete_title", title=title),
-                                                self.t("session_deleting"))):
-                    try:
-                        answer = await self.client.delete_session(sid)
-                    except HubError as exc:
-                        if exc.status != 404:  # 404: deleted meanwhile (another client): gone all the same
-                            failure = exc
-                    if failure is None and self.sid == sid:
-                        await self._detach()
-                        self._reset_session()
-                        self._update_suggestions()
+                while True:
+                    retry: list[str] = []
+                    async with self.busy(BusyDialog(self.ctx.lang, self.t("delete_title", title=title),
+                                                    self.t("session_deleting"))):
+                        try:
+                            answer = await self.client.delete_session(sid, skills=skills)
+                        except HubError as exc:
+                            data = exc.data if isinstance(exc.data, dict) else {}
+                            if exc.status == 409 and skills is None and data.get("pending_skills"):
+                                retry = [str(n) for n in data["pending_skills"]]   # proposed since the summary
+                            elif exc.status != 404:  # 404: deleted meanwhile (another client): gone all the same
+                                failure = exc
+                        if not retry and failure is None and self.sid == sid:
+                            await self._detach()
+                            self._reset_session()
+                            self._update_suggestions()
+                    if not retry:
+                        break
+                    skills = await self._pending_skills_choice(title, retry)
+                    if skills is None:
+                        cancelled = True
+                        break
             finally:
                 self._deleting = None
                 deferred, self._deferred_conn = self._deferred_conn, None
+        if cancelled:
+            if deferred is not None and self.attached and self.sid == sid:
+                await self._on_connection(deferred)
+            return False
         if failure is not None:
             self.error(self.hub_error(failure))
             if self.attached and self.sid == sid:
@@ -922,6 +962,13 @@ class TUI:
             self.info(self.t("delete_kept", path=kept))
         self.invalidate()
         return True
+
+    async def _pending_skills_choice(self, title: str, names: list[str]) -> str | None:
+        """Members' skill proposals that wait for the user: "save" them to the library, "discard" them, or None."""
+        options = [(self.t("delete_pending_save"), "save"), (self.t("delete_pending_discard"), "discard"),
+                   (self.t("delete_pending_cancel"), None)]
+        text = self.t("delete_pending_text", title=title, names=", ".join(names))
+        return await self.ask(ChoiceDialog(self.ctx.lang, self.t("delete_pending_title"), text, options))
 
     async def attach_id(self, sid: str) -> None:
         sessions = await self.client.sessions()
@@ -1095,10 +1142,15 @@ class TUI:
         cannot start because its folder is gone is attached stopped, so that /cd can move it."""
         sid = summary.get("id") if summary else None
         folder_gone = False
-        if summary and self.client.mode == "launcher" and summary.get("status") != "running":
-            self.info(self.t("session_starting", title=summary.get("title") or sid))
+        skills: list[str] = []
+        if self._resume_skills and summary and not fresh:   # the first session resumed: its one attempt
+            skills, self.skills_override, self._resume_skills = self.skills_override, [], False
+        if summary and self.client.mode == "launcher" and (summary.get("status") != "running" or skills):
+            if summary.get("status") != "running":
+                self.info(self.t("session_starting", title=summary.get("title") or sid))
             try:
-                summary = await self.client.start_session(sid)
+                summary = await (self.client.start_session(sid, skills=skills) if skills else
+                                 self.client.start_session(sid))
             except HubError as exc:
                 stopped = await self._folder_gone(sid, exc)
                 if stopped is None:
@@ -1163,12 +1215,12 @@ class TUI:
         await self._cancel(task)
         worker, self._mcp_worker = self._mcp_worker, None
         await self._cancel(worker)
-        self._mcp_waiting = None
+        self._mcp_waiting = self._skill_waiting = None
         for handle in (self._lost_handle, self._tools_timer):
             if handle is not None:
                 handle.cancel()
         self._lost_handle = self._tools_timer = None
-        if self.input_mode is not None and self.input_mode[0] == "reject":
+        if self.input_mode is not None and self.input_mode[0] in ("reject", "skill_reject"):
             self.input_mode = None
         self._release_reject()
         self.attached = False
@@ -1192,6 +1244,7 @@ class TUI:
         self.jobs = [str(j.get("label") or f"j{j.get('id')}") for j in state.get("jobs") or []
                      if isinstance(j, dict) and j.get("status") == "running"]
         self._scan_mcp()
+        self._scan_skills()
         self._update_suggestions()
         self.invalidate()
 
@@ -1237,9 +1290,12 @@ class TUI:
     async def _handle(self, text: str, mode: tuple[str, Any] | None) -> None:
         stripped = text.strip()
         if mode is not None:
-            if mode[0] == "reject":
+            if mode[0] in ("reject", "skill_reject"):
                 try:
-                    await self.decide_mcp(mode[1], False, stripped)
+                    if mode[0] == "reject":
+                        await self.decide_mcp(mode[1], False, stripped)
+                    else:
+                        await self.decide_skill(mode[1], False, stripped)
                 finally:
                     self._release_reject()
             elif stripped:
@@ -1432,6 +1488,107 @@ class TUI:
         self._update_suggestions()
         self.invalidate()
 
+    async def _ask_skill(self, skill: dict) -> None:
+        # what the user decides on: the session copy's file list and SKILL.md (docs/SPEC.md §19); without them
+        # (an older hub, the copy gone meanwhile) the dialog shows what the snapshot has
+        with contextlib.suppress(HubError):
+            detail = await self.client.skill(self.sid, str(skill.get("name") or ""), "session")
+            if isinstance(detail, dict):
+                skill = {**skill, **{k: detail[k] for k in ("files_list", "skill_md") if k in detail}}
+        dialog = SkillApprovalDialog(self.ctx.lang, skill)
+        self._skill_dialog = dialog
+        try:
+            choice = await self.ask(dialog)
+        finally:
+            self._skill_dialog = None
+        if dialog.gone:
+            return
+        self.skill_answered.add(dialog.name)
+        if choice == APPROVE:
+            with contextlib.suppress(HubError):
+                await self.decide_skill(dialog.name, True)
+        elif choice == REJECT:
+            self._reject_waiter = asyncio.get_running_loop().create_future()
+            self.input_mode = ("skill_reject", dialog.name)
+            self.buffer.reset()
+            self._cleared()
+            await self._reject_waiter
+        else:
+            self.info(self.t("skill_deferred", name=dialog.name))
+
+    async def decide_skill(self, name: str, approve: bool, comment: str = "", replace: bool = False,
+                           sid: str | None = None) -> bool:
+        """The library decision on a member's proposal: `skill_approve` in a running session, the launcher's route
+        on a stopped one. `sid`: another session than the attached one (/skills approve x --session ID; the
+        launcher's route, which decides it running or stopped, without starting it). The library holding another
+        skill of that name asks whether to replace it."""
+        here = sid is None or (self.attached and sid == self.sid)
+        if here:
+            self.skill_answered.add(name)
+        running = self.sid is None or (self.session or {}).get("status") == "running"
+        try:
+            if here and (running or self.client.mode != "launcher"):
+                args = {"name": name, "approve": approve, "comment": comment, **({"replace": True} if replace else {})}
+                ok, text = await self.client.act(self.sid, "skill_approve", args)
+            else:
+                answer = await self.client.decide_skill(self.sid if here else sid, name, approve, comment, replace)
+                ok, text = True, str(answer.get("text") or "")
+        except HubError as exc:
+            data = exc.data if isinstance(exc.data, dict) else {}
+            if exc.status != 409 or not data.get("exists"):
+                raise
+            ok, text = False, exc.message
+        if not ok and approve and not replace and "already has a different skill" in text:
+            # (the texts of skill_approve and of the launcher's route both say so)
+            if await self.ask(ConfirmDialog(self.ctx.lang, self.t("skill_title"), text, default=False)):
+                return await self.decide_skill(name, approve, comment, replace=True, sid=sid)
+            self.info(self.t("skill_deferred", name=name))
+            return False
+        if ok:
+            self.info(text)
+            if here:   # (another session's proposal of the same name leaves this one's dialog alone)
+                self._unqueue_skill(name)
+        else:
+            self.error(text)
+        return ok
+
+    def _queue_skill(self, skill: dict, *, fresh: bool = False) -> None:
+        """Ask the user about a member's proposal; `fresh`: the member proposed it (again) just now."""
+        name = str(skill.get("name") or "")
+        if not name:
+            return
+        if fresh:
+            self.skill_answered.discard(name)
+        elif name in self.skill_answered:  # a state snapshot older than the answer, or put off with Esc
+            return
+        if self._skill_dialog is not None and self._skill_dialog.name == name:
+            return
+        if self.input_mode == ("skill_reject", name):
+            return
+        for i, queued in enumerate(self.skill_queue):
+            if queued.get("name") == name:
+                self.skill_queue[i] = {**queued, **skill}
+                return
+        self.skill_queue.append(dict(skill))
+        if self._mcp_worker is None or self._mcp_worker.done():
+            self._mcp_worker = self._spawn(self._mcp_loop(), "dreamteam-tui-mcp")
+
+    def _unqueue_skill(self, name: str) -> None:
+        self.skill_queue = [s for s in self.skill_queue if s.get("name") != name]
+        dialog = self._skill_dialog
+        if dialog is not None and dialog.name == name and not dialog.done:
+            dialog.gone = True  # decided elsewhere (the web UI, /skills approve)
+            dialog.cancel()
+
+    def _scan_skills(self) -> None:
+        for skill in (self.state or {}).get("skills") or []:
+            if not isinstance(skill, dict) or not skill.get("name"):
+                continue
+            if skill.get("library") == "pending":
+                self._queue_skill(skill)
+            else:
+                self._unqueue_skill(str(skill["name"]))
+
     async def decide_mcp(self, name: str, approve: bool, comment: str = "") -> None:
         self.mcp_answered.add(name)
         ok, text = await self.client.act(self.sid, "mcp_approve",
@@ -1483,18 +1640,23 @@ class TUI:
         try:
             await self._ask_mcp()
         finally:
-            self._mcp_waiting = None
+            self._mcp_waiting = self._skill_waiting = None
             self.invalidate()
 
     async def _ask_mcp(self) -> None:
-        while self.mcp_queue and self.attached:
+        """The approval dialogs, one after another: pending MCP servers first, then members' skill proposals."""
+        while (self.mcp_queue or self.skill_queue) and self.attached:
             if self.buffer.text.strip() or self.input_mode is not None:
                 # the user is typing: a dialog now would take the keys (Enter would approve)
-                self._mcp_waiting = str(self.mcp_queue[0].get("name") or "")
+                self._mcp_waiting = str(self.mcp_queue[0].get("name") or "") if self.mcp_queue else None
+                self._skill_waiting = None if self.mcp_queue else str(self.skill_queue[0].get("name") or "")
                 self.invalidate()
                 await asyncio.sleep(MCP_WAIT_POLL)
                 continue
-            self._mcp_waiting = None
+            self._mcp_waiting = self._skill_waiting = None
+            if not self.mcp_queue:
+                await self._ask_skill(self.skill_queue.pop(0))
+                continue
             server = self.mcp_queue.pop(0)
             dialog = MCPApprovalDialog(self.ctx.lang, server)
             self._mcp_dialog = dialog
@@ -1643,6 +1805,12 @@ class TUI:
         elif etype == "mcp.status" and data.get("name"):
             if data.get("status") != "pending":
                 self._unqueue_mcp(str(data["name"]))
+        elif etype == "skill.proposed" and data.get("name"):
+            # asked again even if put off before; the snapshot item (owner, description, packages) comes with the
+            # refresh this event asks for
+            self.skill_answered.discard(str(data["name"]))
+        elif etype in ("skill.library", "skill.detached") and data.get("name"):
+            self._unqueue_skill(str(data["name"]))
 
     def _on_agent_message(self, sender: str) -> None:
         """A message to the user: its sender becomes the addressee unless the user chose one lately."""
