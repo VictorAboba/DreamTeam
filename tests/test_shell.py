@@ -59,11 +59,29 @@ def test_truncate_and_resolve():
     assert name and argv
 
 
+def _oem_word() -> str | None:
+    """A non-ASCII word the console's OEM code page can write (Cyrillic in cp866, Latin in cp437/cp850), or None."""
+    import ctypes
+
+    oem = f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+    for word in ("привет", "café"):
+        try:
+            word.encode(oem)
+            return word
+        except (UnicodeEncodeError, LookupError):
+            continue
+    return None
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe")
 async def test_cmd_output_is_decoded_with_the_oem_code_page(tmp_path):
-    """cmd.exe writes in the console's OEM code page (cp866 on a Russian Windows), not the ANSI one (cp1251)."""
-    code, out = await run_shell("echo привет", cwd=tmp_path, timeout=30, program="cmd")
-    assert code == 0 and out.strip() == "привет"
+    """cmd.exe writes in the console's OEM code page (cp866 on a Russian Windows, cp437 on an English one), not the
+    ANSI one (cp1251, cp1252). The word must exist in the OEM code page: cmd writes `?` for what does not."""
+    word = _oem_word()
+    if word is None:
+        pytest.skip("the OEM code page has neither Cyrillic nor Latin letters with accents")
+    code, out = await run_shell(f"echo {word}", cwd=tmp_path, timeout=30, program="cmd")
+    assert code == 0 and out.strip() == word
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe")

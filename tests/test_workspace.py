@@ -907,9 +907,10 @@ def test_only_redirecting_reparse_points_count_as_links():
             return SimpleNamespace(st_reparse_tag=self.tag, st_file_attributes=(
                 stat.FILE_ATTRIBUTE_REPARSE_POINT | stat.FILE_ATTRIBUTE_DIRECTORY))
 
+    # the tags by value: the stat module defines the IO_REPARSE_TAG_* names on Windows only
     assert Workspace._is_link(Entry(0x9000601A)) is False  # IO_REPARSE_TAG_CLOUD_6 (OneDrive)
-    assert Workspace._is_link(Entry(stat.IO_REPARSE_TAG_MOUNT_POINT)) is True  # junction
-    assert Workspace._is_link(Entry(stat.IO_REPARSE_TAG_SYMLINK)) is True
+    assert Workspace._is_link(Entry(0xA0000003)) is True  # IO_REPARSE_TAG_MOUNT_POINT (a junction)
+    assert Workspace._is_link(Entry(0xA000000C)) is True  # IO_REPARSE_TAG_SYMLINK
 
 
 async def test_list_truncates(ws):

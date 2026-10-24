@@ -142,6 +142,8 @@ def _remove(path: Path) -> None:
         try:
             path.unlink()
         except PermissionError:  # a read-only file on Windows
+            if is_link(path):  # chmod would follow the link and change the mode of what it points to
+                raise
             os.chmod(path, stat.S_IWRITE)
             path.unlink()
     if os.path.lexists(path):

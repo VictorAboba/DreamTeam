@@ -502,7 +502,11 @@ def _rename(src: Path | str, dst: Path | str) -> None:
 
 def _remove(path: Path) -> None:
     """Remove a folder, a file or a link (a link is never followed)."""
-    if is_link(path) or (os.path.lexists(long_path(path)) and not os.path.isdir(long_path(path))):
+    if is_link(path):
+        # no chmod first: it follows the link and would change the mode of what the link points to
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(long_path(path))
+    elif os.path.lexists(long_path(path)) and not os.path.isdir(long_path(path)):
         with contextlib.suppress(OSError):
             os.chmod(long_path(path), stat.S_IWRITE)
         with contextlib.suppress(FileNotFoundError):

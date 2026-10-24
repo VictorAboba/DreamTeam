@@ -389,10 +389,11 @@ def test_copy_skill_refuses_a_file_that_is_not_the_checked_one(tmp_path, monkeyp
     src = make_skill(tmp_path / "src", "demo", "d", {"a.txt": "a"})
     real_open = os.open
 
-    def swapped(path, flags, *args):
+    def swapped(path, *args, **kwargs):  # any signature: shutil.rmtree on Linux and macOS passes dir_fd= and more
+        flags = args[0] if args else kwargs.get("flags", 0)
         if str(path).endswith("a.txt") and not flags & os.O_WRONLY:
             path = str(outside)
-        return real_open(path, flags, *args)
+        return real_open(path, *args, **kwargs)
 
     monkeypatch.setattr(skills.os, "open", swapped)
     with pytest.raises(SkillError, match="changed while it was being copied"):
