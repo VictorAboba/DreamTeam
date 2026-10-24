@@ -264,7 +264,7 @@ def test_skill_deps_texts():
     `shell` / `read_file` (every revision has them), and the reasons render inside skills_deps_manual without a
     sentence of their own; the user's failure text points at skill_reinstall."""
     deps_keys = [k for k in prompts.TEXTS["en"] if k.startswith(("skills_deps_", "deps_reason_", "n_skill_deps_"))]
-    assert len(deps_keys) == 16
+    assert len(deps_keys) == 17   # deps_reason_network: a session without network (docs/SPEC.md §7.2)
     for lang in LANGS:
         texts = prompts.TEXTS[lang]
         # an AI member's "being installed" promises no wake-up: the news of the end reaches it quietly

@@ -79,6 +79,10 @@ LAUNCHER_TOOLS: list[dict[str, Any]] = [
                                  "start_agents unless it is given."},
          "max_cost_usd": {"type": "number", "description": "Budget in USD"},
          "model": {"type": "string", "description": "Model profile name from the settings"},
+         "network": {"type": "string", "enum": ["on", "off"],
+                     "description": "off: the agents' commands, background jobs and MCP servers get no internet "
+                                    "(the LLM keeps it); strict in the Docker sandbox and on Linux, best effort "
+                                    "(proxy and offline variables) on Windows and macOS"},
          "start": {"type": "boolean", "description": "Start right away (default true)"},
          "workspace": {"type": "string", "description": "Absolute folder to work in instead of the session's own "
                                                         "one: empty/missing = new, with files = adopted (an existing "
@@ -176,7 +180,8 @@ def session_line(s: dict[str, Any]) -> str:
             f" | tasks {tasks.get('done', 0)}/{tasks.get('total', 0)} done"
             f" | agents {agents.get('total', 0)} ({agents.get('working', 0)} working)"
             + (f" | jobs {jobs} running" if jobs and s.get("status") == "running" else "")
-            + f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}")
+            + f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}"
+            + (" | no network" if s.get("network") == "off" else ""))
     if goal:
         line += f"\n    goal [{goal.get('status', 'active')}]: {goal.get('title', '')}"
     if s.get("skills"):
@@ -384,6 +389,8 @@ async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[st
                 swarm_over["max_cost_usd"] = float(args["max_cost_usd"])
             if args.get("language"):
                 swarm_over["language"] = str(args["language"])
+            if args.get("network"):
+                swarm_over["network"] = str(args["network"])
             overrides: dict[str, Any] = {"swarm": swarm_over} if swarm_over else {}
             if args.get("model"):
                 overrides["agents"] = {"default_model": str(args["model"])}

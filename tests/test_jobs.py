@@ -781,21 +781,30 @@ def test_log_cleanup_uses_rows_not_the_folder(make_fake_swarm, monkeypatch):
 @needs_git
 async def test_job_end_commits_as_owner(git_setup, kids):
     swarm, manager = git_setup
+    root = swarm.workspace.root
+    (root / "out.txt").write_text("old", encoding="utf-8")
+    assert await swarm.workspace.autocommit(BORIS, "seed")
     script = Path(kids.folder) / "writer.py"
-    script.write_text("import pathlib, sys, time\ntime.sleep(1.5)\npathlib.Path('out.txt').write_text('made')\n",
-                      encoding="utf-8")
+    script.write_text("import pathlib, sys, time\ntime.sleep(1.5)\npathlib.Path('out.txt').write_text('made')\n"
+                      "pathlib.Path('new.txt').write_text('new')\n", encoding="utf-8")
     out = await run(manager, ANNA, py(str(script)), timeout=1)
     assert out.state == "background"
     await until(lambda: row(swarm, 1).get("status") == "ended", 15)
     await until(lambda: not manager._finishes, 15)
-    root = swarm.workspace.root
     # the subject names the job and the files it changed, the body keeps the command and how the job ended
     assert git_out(root, "log", "-1", "--format=%an|%s").strip() == f"{ANNA}|job j1: out.txt"
     body = git_out(root, "log", "-1", "--format=%b")
     assert out.job.command in body and "j1: ended with exit code 0 after" in body
-    assert "out.txt" in git_out(root, "show", "--name-only", "--format=", "HEAD")
+    assert git_out(root, "show", "--name-only", "--format=", "HEAD").split() == ["out.txt"]
     assert git_out(root, "ls-files", ".scratch").strip() == ""  # logs are never committed
     assert (root / ".scratch" / "anna.smith" / "jobs" / "j1.log").is_file()
+    # a new file waits one more command of its owner, as after `shell` (here: the end of the owner's turn)
+    assert list(swarm.workspace.held()) == ["new.txt"]
+    assert await swarm.workspace.commit_held(ANNA, f"at the end of {ANNA}'s turn")
+    assert git_out(root, "log", "-1", "--format=%an|%s").strip() == f"{ANNA}|job j1 (new files): new.txt"
+    body = git_out(root, "log", "-1", "--format=%b")
+    assert out.job.command in body and "j1: ended with exit code 0 after" in body
+    assert f"committed at the end of {ANNA}'s turn" in body
 
 
 @needs_git
@@ -815,9 +824,13 @@ async def test_a_job_ending_while_the_session_stops_is_committed_by_stop_all(git
     root = swarm.workspace.root
     assert "report.txt" in git_out(root, "status", "--porcelain")  # no git work starts while the session stops
     await manager.stop_all()
+    # report.txt is new: held for one more command, and Swarm.stop commits what is held right after stop_all
+    assert list(swarm.workspace.held()) == ["report.txt"]
+    await swarm.workspace.commit_held(None, "when the session stopped")
     assert git_out(root, "status", "--porcelain").strip() == ""
-    assert git_out(root, "log", "-1", "--format=%an|%s").strip() == f"{ANNA}|jobs j1, j2: report.txt"
+    assert git_out(root, "log", "-1", "--format=%an|%s").strip() == f"{ANNA}|jobs j1, j2 (new files): report.txt"
     body = git_out(root, "log", "-1", "--format=%b")
+    assert "committed when the session stopped" in body
     assert f"Stopped with the session:\nj2: {server.job.command}\nEnded while the session stopped:\n" in body
     assert f"j1: {tests.job.command} (ended with exit code 0 after " in body
 
@@ -1476,9 +1489,10 @@ async def test_a_test_run_in_the_background_from_task_to_goal(tmp_path, fast, ki
                                             r"Stop the ones nobody needs with job_stop; the rest stop with the "
                                             r"session\.$", done[0])
         assert "u_jobs_running" in kinds_for(swarm, USER)
-        if has_git:  # the job's end committed what it wrote under its owner, its log never
+        if has_git:  # what the job wrote is committed under its owner (a new file: one step later), its log never
             root = swarm.workspace.root
-            assert f"{ANNA}|job j1: test-report.txt" in git_out(root, "log", "--format=%an|%s").splitlines()
+            await until(lambda: f"{ANNA}|job j1 (new files): test-report.txt"
+                        in git_out(root, "log", "--format=%an|%s").splitlines(), 15)
             assert git_out(root, "ls-files", ".scratch").strip() == ""
         assert rec.violations == []
     finally:

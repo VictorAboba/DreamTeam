@@ -474,11 +474,18 @@ async def test_shell_commit_names_the_files_and_keeps_the_command(make_swarm):
                         "pathlib.Path('.scratch/notes.txt').write_text('scratch')\n")
     command = python(swarm, "gen.py")
     await shell(swarm, agent, command)
-    assert commits(root)[0] == (agent, "shell: candidates/lp_N200.json, candidates/lp_N300.json, gen.py",
+    assert len(commits(root)) == 1  # new files wait one more command (docs/SPEC.md §7 "Held new files")
+    await shell(swarm, agent, "echo nothing changes")
+    assert commits(root)[0] == (agent, "shell (new files): candidates/lp_N200.json (+2 more)",
                                 ["candidates/lp_N200.json", "candidates/lp_N300.json", "gen.py"])
-    assert git(root, "log", "-1", "--format=%b").strip() == command
+    body = git(root, "log", "-1", "--format=%b").strip()
+    assert body.startswith(command + "\n\nNew files first seen after this command of " + agent)
     await shell(swarm, agent, "echo nothing changes")
     assert len(commits(root)) == 2  # no commit for a call that changed nothing
+    put(root, "gen.py", "print('tracked now')\n")  # a change to a tracked file is committed at once, as before
+    await shell(swarm, agent, "echo edit")
+    assert commits(root)[0] == (agent, "shell: gen.py", ["gen.py"])
+    assert git(root, "log", "-1", "--format=%b").strip() == "echo edit"
 
 
 # ------------------------------------------------------------------------ nested repositories
@@ -618,10 +625,11 @@ async def test_shell_names_nested_repositories_once(make_swarm):
     text = await shell(swarm, agent, "echo hi")
     last = text.rstrip().splitlines()[-1]
     assert last.startswith("Not committed: ") and "--help" in last and "examples/lab_project/a" in last
-    assert commits(root)[0][2] == ["out.txt"] and gitlinks(root) == []
-    put(root, "out.txt", "o2\n")
     assert "Not committed" not in await shell(swarm, agent, "echo again")
-    assert commits(root)[0][2] == ["out.txt"] and gitlinks(root) == []
+    assert commits(root)[0][2] == ["out.txt"] and gitlinks(root) == []  # a new file: after one more command
+    put(root, "out.txt", "o2\n")
+    assert "Not committed" not in await shell(swarm, agent, "echo once more")
+    assert commits(root)[0][1:] == ("shell: out.txt", ["out.txt"]) and gitlinks(root) == []
 
 
 @needs_git

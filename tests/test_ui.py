@@ -642,7 +642,8 @@ def test_session_settings_fields_match_the_config():
 
     block = re.search(r"const SESSION_FIELDS = \[(.*?)\n\];", APP_JS, re.S).group(1)
     fields = re.findall(r'section: "(\w+)", key: "(\w+)", label: "(\w+)", kind: "(\w+)", min: (\d+)', block)
-    assert len(fields) == 9 == block.count("{ group:")
+    assert len(fields) == 11 and block.count("{ group:") == 12   # + the network choice (docs/SPEC.md §7.2)
+    assert '{ group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] }' in block
     known = {"shell": {f.name for f in dataclasses.fields(ShellSettings)},
              "agents": {f.name for f in dataclasses.fields(AgentSettings)}}
     for section, key, label, kind, low in fields:
@@ -651,6 +652,36 @@ def test_session_settings_fields_match_the_config():
         assert label in i18n_blocks()["en"], label
     assert ("shell", "cpu_threads", "sf_cpu", "auto", "0") in fields
     assert ("agents", "idle_nudge_seconds", "sf_nudge", "num", "0") in fields
+    # the planning hint (docs/SPEC.md §3): 0 turns a trigger off; both fields carry a hint text
+    assert ("agents", "planning_hint_steps", "sf_plan_steps", "int", "0") in fields
+    assert ("agents", "planning_hint_minutes", "sf_plan_minutes", "num", "0") in fields
+    assert block.count('hint: "sf_plan_hint"') == 2 and "sf_plan_hint" in i18n_blocks()["en"]
+
+
+@needs_node
+def test_the_session_network_choice():
+    out = run_js(r"""
+      app.S.lang = "en";
+      const f = app.SESSION_FIELDS.find((x) => x.key === "network");
+      out.parsed = [app.parseSessionField(f, ""), app.parseSessionField(f, "off"), app.parseSessionField(f, "maybe")];
+      const texts = Object.fromEntries(app.SESSION_FIELDS.map((x) => [`${x.section}.${x.key}`, ""]));
+      out.patch = app.sessionSettingsPatch({ ...texts, "swarm.network": "off" }, { swarm: { language: "ru" } }).patch;
+      out.same = app.sessionSettingsPatch({ ...texts, "swarm.network": "off" }, { swarm: { network: "off" } }).patch;
+      out.cleared = app.sessionSettingsPatch(texts, { swarm: { network: "off" } }).patch;
+      out.html = app.sessionFieldsHtml({ swarm: { network: "off" } }, { swarm: { network: "on" } }, {}, app.SESSION_FIELDS, "netns");
+      out.hints = ["docker", "netns", "env", null].map((k) => app.networkHint(k));
+    """)
+    assert out["parsed"][:2] == [{"value": None}, {"value": "off"}]
+    assert out["parsed"][2] == {"error": "“Internet for the agents' commands”: pick a value from the list"}
+    assert out["patch"] == {"swarm": {"network": "off"}} and out["same"] == {}
+    assert out["cleared"] == {"swarm": {"network": None}}   # the general setting again
+    html = out["html"]
+    assert html.index("Network") < html.index('id="sf-swarm-network"')
+    assert '<option value="">as in the general settings (on)</option>' in html
+    assert '<option value="off" selected>off</option>' in html and "network namespace" in html
+    docker, netns, env, unknown = out["hints"]
+    assert "firewall" in docker and "namespace" in netns and "Not strict isolation" in env
+    assert "Windows and macOS only proxies" in unknown
 
 
 SETTINGS_HARNESS = r"""
@@ -1159,6 +1190,10 @@ def test_home_settings_default_profile_validation_and_overrides():
       out.same = ov({});
       out.changed = ov({ lang: "en", budget: "0", team: [{ role: "generalist", count: 2 }], model: "def", steps: "12",
                          approval: true });
+      // [swarm] network (docs/SPEC.md §7.2): sent only when the box differs from the saved default
+      out.offline = ov({ offline: true }).swarm.network;
+      out.notOffline = "network" in ov({ offline: false }).swarm;
+      out.nsHint = home.networkHint("env");
     """)
     assert out["afterTyping"] == "default"
     assert out["default"] == "main" and out["models"] == ["main", "default2"] and out["renamed"] == "default"
@@ -1171,6 +1206,8 @@ def test_home_settings_default_profile_validation_and_overrides():
     assert out["changed"] == {"swarm": {"language": "en", "start_agents": 2, "starting_roles": [], "max_agents": 8,
                                         "max_cost_usd": 0},
                               "agents": {"default_model": "def", "max_steps_per_turn": 12}, "mcp": {"require_approval": True}}
+    assert out["offline"] == "off" and out["notOffline"] is False
+    assert "Not strict isolation here" in out["nsHint"] and "PowerShell 5.1" in out["nsHint"]
 
 
 TEAM_CASES = [([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 2), (["Разработчик"], 1),

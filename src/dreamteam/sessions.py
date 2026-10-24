@@ -1150,6 +1150,7 @@ class SessionManager:
             "status": "running" if sid in self.running else "stopped",
             "loaded": swarm is not None, "autostart": bool(meta.get("autostart")),
             "language": cfg.swarm.language, "model_profile": profile, "model": model.model if model else None,
+            "network": cfg.swarm.network,   # "off": the agents' commands have no internet (docs/SPEC.md §7.2)
             "max_cost_usd": _number(limits.get("max_cost_usd", cfg.swarm.max_cost_usd)),
             "max_agents": int(_number(limits.get("max_agents", cfg.swarm.max_agents))),
             "overrides": meta.get("overrides") or {}, "config_error": config_error,

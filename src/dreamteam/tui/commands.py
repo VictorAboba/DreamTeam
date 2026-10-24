@@ -41,6 +41,7 @@ FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
     "budget": ("swarm", "max_cost_usd"),
     "max_cost_usd": ("swarm", "max_cost_usd"),
     "language": ("swarm", "language"),
+    "network": ("swarm", "network"),   # --network off (docs/SPEC.md §7.2)
 }
 
 

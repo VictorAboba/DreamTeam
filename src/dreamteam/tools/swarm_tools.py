@@ -6,7 +6,7 @@ import asyncio
 import time
 from typing import Any
 
-from .. import prompts, roles
+from .. import netoff, prompts, roles
 from ..db import loads
 from ..jobs import fmt_duration, short_command
 from ..models import USER, AgentKind, Status, ToolError
@@ -474,6 +474,11 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
     timeout = args.get("timeout")
     timeout = max(0, min(WAIT_DEFAULT if timeout is None else timeout, WAIT_MAX))
     progress = bool(args.get("progress"))
+    workspace = getattr(swarm, "workspace", None)  # (the test double has none)
+    if workspace is not None and not ctx.is_user and not _stopping(swarm):
+        # an external member's wait ends its turn: the new files its last command left (held back for one more
+        # command, docs/SPEC.md §7 "Held new files") are committed now, as at the end of an AI agent's activation
+        await workspace.commit_held(ctx.actor, f"at the end of {ctx.actor}'s turn")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     queue = swarm.bus.subscribe() if progress else None  # board progress wakes the wait too
@@ -560,6 +565,12 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     if swarm.wrapping_up:
         state += ("; WRAP-UP MODE: the agents finish their tasks with what they have, no new computations or "
                   "background jobs")
+    if netoff.is_off(swarm.config):  # docs/SPEC.md §7.2
+        state += "; NO NETWORK for the members' commands, jobs and MCP servers" + {
+            "docker": " (the Docker sandbox's firewall)", "netns": " (a network namespace)",
+            "env": " (best effort: proxy and offline variables only)",
+            "container": " (best effort: proxy and offline variables only; the sandbox was started without its "
+                         "firewall)"}.get(netoff.shown(netoff.detected()) or "", "")
     lines = [
         f"Swarm \"{swarm.config.swarm.name}\" — {state}",
         goal_line(goal),

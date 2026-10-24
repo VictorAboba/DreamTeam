@@ -87,10 +87,19 @@ const I18N = {
     sf_job_minutes: "Предел жизни фонового процесса, мин (0 — без предела)", sf_cpu: "Потоков вычислений на команду (auto или число)",
     sf_steps: "Шагов за пробуждение", sf_context: "Окно контекста, токенов", sf_tool_out: "Лимит вывода инструмента (симв.)",
     sf_nudge: "Напоминание простаивающим, с", sf_parallel: "Параллельных вызовов LLM",
+    sf_plan_steps: "Подсказка планирующему агенту после шагов", sf_plan_minutes: "Подсказка планирующему агенту после, мин",
+    sf_plan_hint: "взявшему задачу планирования, если он ещё не создал ни одной задачи; 0 — выключено",
     sf_hint: "Пустое поле — значение из общих настроек (оно показано серым). Изменения действуют сразу: шаги — со следующего пробуждения агента, остальное — со следующей команды или вызова.",
     sf_context_hint: "окно контекста, заданное в профиле модели, важнее", sf_context_profile: "сейчас действует окно профиля «{profile}»: {n}",
     sf_general_only: "Остальные параметры (фоновые процессы, агенты) задаются в общих настройках.",
     sf_bad_int: "«{field}»: нужно целое число ≥ {min}", sf_bad_num: "«{field}»: нужно число ≥ {min}",
+    sg_network: "Сеть", sf_network: "Интернет для команд агентов", sf_inherit: "как в общих настройках ({value})",
+    net_on: "есть", net_off: "нет", net_badge: "Без интернета", sf_bad_choice: "«{field}»: выберите значение из списка",
+    net_hint_docker: "Команды агентов, их фоновые процессы и MCP-серверы идут от отдельного пользователя, чью сеть закрывает файрвол контейнера. LLM и localhost работают.",
+    net_hint_netns: "Команды агентов, их фоновые процессы и MCP-серверы работают в общем для них сетевом пространстве Linux, где есть только свой localhost: сервер, запущенный одной командой, виден другим, а localhost самой машины — нет. LLM работает.",
+    net_hint_env: "Здесь это не строгая изоляция: прокси указывают на закрытый порт, pip, uv, npm и git переведены в офлайн, удалённые MCP-серверы не подключаются, но программа, которая этого не учитывает (сырой сокет, веб-команды Windows PowerShell 5.1), выйдет в сеть. Строго — в Docker (dreamteam sandbox) и на Linux.",
+    net_hint_container: "Песочница запущена без файрвола, поэтому здесь это не строгая изоляция: только прокси и офлайн-настройки pip, uv, npm и git. Перезапустите dreamteam sandbox: если есть сессия без интернета, контейнер запустится с файрволом.",
+    net_hint_unknown: "Команды агентов, их фоновые процессы и MCP-серверы без интернета, LLM работает: строго — в Docker (dreamteam sandbox) и на Linux, на Windows и macOS — только прокси и офлайн-настройки.",
     sf_bad_auto: "«{field}»: auto или целое число ≥ 0", sf_load_failed: "Не удалось загрузить параметры сессии: {error}",
     sf_not_loaded: "Параметры сессии (фоновые процессы, агенты) не загрузились — откройте окно ещё раз.",
     sf_saved_part: "Параметры сессии сохранены, бюджет и максимум агентов — нет",
@@ -110,7 +119,7 @@ const I18N = {
     sk_pkgs: "Пакеты", sk_pkgs_ready: "готовы", sk_pkgs_installing: "ставятся…", sk_pkgs_queued: "в очереди",
     sk_pkgs_other: "ставит другой процесс DreamTeam", sk_pkgs_failed: "ошибка", sk_pkgs_manual: "вручную",
     sk_pkgs_log: "Журнал", sk_pkgs_hide_log: "Скрыть журнал", sk_pkgs_reinstall: "Переустановить",
-    sk_reason_off: "установка выключена в настройках", sk_reason_proposals: "выключено для скиллов, предложенных агентами",
+    sk_reason_off: "установка выключена в настройках", sk_reason_proposals: "выключено для скиллов, предложенных агентами", sk_reason_network: "в сессии нет сети: для скиллов, предложенных агентами, ничего не ставится",
     sk_reason_unavailable: "на этой машине нет: {detail}", sk_reason_python: "нужен Python {need}, а окружения используют {have}",
     sk_reason_unsupported: "не поддерживается: {detail}",
     sk_attach_title: "Подключить скилл", sk_attach_none: "Все скиллы библиотеки и Claude Code уже подключены.", sk_attach_btn: "Подключить",
@@ -226,10 +235,19 @@ const I18N = {
     sf_job_minutes: "Background job time limit, min (0 = none)", sf_cpu: "Compute threads per command (auto or a number)",
     sf_steps: "Steps per wake-up", sf_context: "Context window, tokens", sf_tool_out: "Tool output limit (chars)",
     sf_nudge: "Nudge idle agents after, s", sf_parallel: "Parallel LLM calls",
+    sf_plan_steps: "Hint the planner after steps", sf_plan_minutes: "Hint the planner after, min",
+    sf_plan_hint: "to the member holding the planning task while it has created no task; 0 = off",
     sf_hint: "An empty field takes the value of the general settings (shown in grey). Changes apply at once: the steps from the agent's next wake-up, the rest from the next command or call.",
     sf_context_hint: "a context window set in the model profile wins", sf_context_profile: "the profile “{profile}” sets {n} now",
     sf_general_only: "The other parameters (background jobs, agents) are set in the general settings.",
     sf_bad_int: "“{field}”: a whole number ≥ {min} is needed", sf_bad_num: "“{field}”: a number ≥ {min} is needed",
+    sg_network: "Network", sf_network: "Internet for the agents' commands", sf_inherit: "as in the general settings ({value})",
+    net_on: "on", net_off: "off", net_badge: "No internet", sf_bad_choice: "“{field}”: pick a value from the list",
+    net_hint_docker: "The agents' commands, their background jobs and MCP servers run as a separate user whose network the container's firewall closes. The LLM and localhost work.",
+    net_hint_netns: "The agents' commands, their background jobs and MCP servers share a separate Linux network namespace that has only its own localhost: a server one command starts is reachable from the others, the machine's own localhost is not. The LLM works.",
+    net_hint_env: "Not strict isolation here: proxies point at a closed port, pip, uv, npm and git are set offline and remote MCP servers are not connected, but a program that ignores this (a raw socket, Windows PowerShell 5.1's web cmdlets) still gets out. Strict in Docker (dreamteam sandbox) and on Linux.",
+    net_hint_container: "The sandbox was started without its firewall, so this is not strict isolation here: only proxies and offline settings of pip, uv, npm and git. Restart dreamteam sandbox: with a session without network, the container starts with the firewall.",
+    net_hint_unknown: "The agents' commands, their background jobs and MCP servers get no internet, the LLM keeps it: strictly in Docker (dreamteam sandbox) and on Linux; on Windows and macOS only proxies and offline settings.",
     sf_bad_auto: "“{field}”: auto or a whole number ≥ 0", sf_load_failed: "Could not load the session parameters: {error}",
     sf_not_loaded: "The session parameters (background jobs, agents) did not load: open the dialog again.",
     sf_saved_part: "The session parameters are saved, the budget and max agents are not",
@@ -248,7 +266,7 @@ const I18N = {
     sk_pkgs: "Packages", sk_pkgs_ready: "ready", sk_pkgs_installing: "installing…", sk_pkgs_queued: "queued",
     sk_pkgs_other: "in another DreamTeam process", sk_pkgs_failed: "failed", sk_pkgs_manual: "manual",
     sk_pkgs_log: "Show log", sk_pkgs_hide_log: "Hide log", sk_pkgs_reinstall: "Reinstall",
-    sk_reason_off: "installation is off in the settings", sk_reason_proposals: "off for skills that members propose",
+    sk_reason_off: "installation is off in the settings", sk_reason_proposals: "off for skills that members propose", sk_reason_network: "the session has no network: nothing is installed for skills members propose",
     sk_reason_unavailable: "{detail} is not available on this machine", sk_reason_python: "it needs Python {need}, the environments use {have}",
     sk_reason_unsupported: "not supported: {detail}",
     sk_attach_title: "Attach a skill", sk_attach_none: "Every skill of the library and Claude Code is attached already.", sk_attach_btn: "Attach",
@@ -597,6 +615,14 @@ function renderHeader() {
   // what max_agents counts: the AI agents (members who joined through MCP do not count)
   const counted = sw.agent_count ?? members().filter((a) => a.kind === "llm").length;
   $("#agents-count").textContent = `${counted} / ${sw.limits.max_agents}`;
+  // [swarm] network = "off" (docs/SPEC.md §7.2): a badge, its title what the isolation really is on this machine
+  const net = sw.network || {};
+  const netBadge = $("#net-badge");
+  if (netBadge) {
+    netBadge.classList.toggle("hidden", net.mode !== "off");
+    netBadge.textContent = net.mode === "off" ? t("net_badge") : "";
+    netBadge.title = net.mode === "off" ? networkHint(net.isolation) : "";
+  }
   const pause = $("#pause-btn");
   setHtml(pause, `<span aria-hidden="true">${sw.paused ? '<i class="ic ic-play"></i>' : '<i class="ic ic-pause"></i>'}</span><span class="btn-label">${esc(sw.paused ? t("resume") : t("pause"))}</span>`);
   pause.title = sw.paused ? t("resume") : t("pause");
@@ -1543,7 +1569,8 @@ function limitsArgs(costText, agentsText) {
 
 // Per-session settings of the dialog (overrides of a launcher session, PATCH /api/sessions/{sid} "settings"; the
 // budget and max agents live in the session's database instead). kind: "int" a whole number >= min, "num" a number
-// >= min, "auto" ([shell] cpu_threads) "auto" or a whole number >= 0; the minimums are config.py's.
+// >= min, "auto" ([shell] cpu_threads) "auto" or a whole number >= 0, "choice" one of `options` (a select); the
+// minimums are config.py's.
 const SESSION_FIELDS = [
   { group: "jobs", section: "shell", key: "max_jobs_per_member", label: "sf_jobs", kind: "int", min: 0 },
   { group: "jobs", section: "shell", key: "max_jobs", label: "sf_jobs_total", kind: "int", min: 0 },
@@ -1554,6 +1581,10 @@ const SESSION_FIELDS = [
   { group: "agents", section: "agents", key: "tool_output_chars", label: "sf_tool_out", kind: "int", min: 1 },
   { group: "agents", section: "agents", key: "idle_nudge_seconds", label: "sf_nudge", kind: "num", min: 0 },
   { group: "agents", section: "agents", key: "max_parallel_llm_calls", label: "sf_parallel", kind: "int", min: 1 },
+  { group: "agents", section: "agents", key: "planning_hint_steps", label: "sf_plan_steps", kind: "int", min: 0, hint: "sf_plan_hint" },
+  { group: "agents", section: "agents", key: "planning_hint_minutes", label: "sf_plan_minutes", kind: "num", min: 0, hint: "sf_plan_hint" },
+  // [swarm] network (docs/SPEC.md §7.2): "" inherits the general setting; the hint says what this machine gives
+  { group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] },
 ];
 function sessionFieldId(f) { return `sf-${f.section}-${f.key}`; }
 /** The session's own value of a field; undefined when it inherits the global one. */
@@ -1565,6 +1596,7 @@ function sessionOverride(overrides, f) {
 function parseSessionField(f, text) {
   const raw = String(text ?? "").trim();
   if (raw === "") return { value: null };
+  if (f.kind === "choice") return f.options.includes(raw) ? { value: raw } : { error: t("sf_bad_choice", { field: t(f.label) }) };
   if (f.kind === "auto" && raw.toLowerCase() === "auto") return { value: "auto" };
   const ok = f.kind === "num" ? /^\d+([.,]\d+)?$/.test(raw) : /^\d+$/.test(raw);
   const value = Number(raw.replace(",", "."));
@@ -1593,18 +1625,31 @@ function contextHint(config) {
   const own = profile && config.models && config.models[profile] ? config.models[profile].context_tokens : null;
   return t("sf_context_hint") + (own ? "; " + t("sf_context_profile", { profile, n: own }) : "");
 }
-/** The per-session groups of the dialog: each input holds the session's own value, its placeholder the global one. */
-function sessionFieldsHtml(overrides, defaults, config, fields = SESSION_FIELDS) {
+/** What a session without network gets here (netoff.shown: "docker" | "netns" | "env" | "container"; unknown: what each
+ * platform gets), said honestly: only Docker and Linux isolate. */
+function networkHint(isolation) {
+  return t(["docker", "netns", "env", "container"].includes(isolation) ? `net_hint_${isolation}` : "net_hint_unknown");
+}
+/** The per-session groups of the dialog: each input holds the session's own value, its placeholder the global one
+ * (a select: its first option, which inherits it). `isolation`: the network hint's (networkHint). */
+function sessionFieldsHtml(overrides, defaults, config, fields = SESSION_FIELDS, isolation = null) {
   const field = (f) => {
     const own = sessionOverride(overrides, f);
     const inherited = defaults && defaults[f.section] ? defaults[f.section][f.key] : undefined;
-    const hint = f.key === "context_tokens" ? ` <span class="hint">${esc(contextHint(config))}</span>` : "";
+    const text = f.key === "context_tokens" ? contextHint(config) : f.key === "network" ? networkHint(isolation) : f.hint ? t(f.hint) : "";
+    const hint = text ? ` <span class="hint">${esc(text)}</span>` : "";
+    if (f.kind === "choice") {
+      const label = (v) => t(`net_${v}`);
+      const options = [["", t("sf_inherit", { value: label(inherited ?? f.options[0]) })], ...f.options.map((v) => [v, label(v)])];
+      return `<label class="field"><span>${esc(t(f.label))}${hint}</span><select id="${sessionFieldId(f)}">${options.map(([v, l]) =>
+        `<option value="${esc(v)}"${String(own ?? "") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
+    }
     const mode = f.kind === "int" ? "numeric" : f.kind === "num" ? "decimal" : "text";
     return `<label class="field"><span>${esc(t(f.label))}${hint}</span><input id="${sessionFieldId(f)}" inputmode="${mode}" autocomplete="off" value="${esc(own ?? "")}" placeholder="${esc(inherited ?? "")}" data-empty-edit></label>`;
   };
   const group = (name, title) => `<div class="section-title">${esc(title)}</div>
     <div class="form-grid">${fields.filter((f) => f.group === name).map(field).join("")}</div>`;
-  return group("jobs", t("sg_jobs")) + group("agents", t("agents"))
+  return group("jobs", t("sg_jobs")) + group("agents", t("agents")) + group("network", t("sg_network"))
     + `<p class="muted" style="font-size:12px;margin:10px 0 0">${esc(t("sf_hint"))}</p>`;
 }
 
@@ -1622,7 +1667,8 @@ async function settingsModal() {
     if (btn) btn.disabled = true;
     try {
       const [detail, global] = await Promise.all([launcherApi(`/api/sessions/${encodeURIComponent(sid)}`), launcherApi("/api/settings")]);
-      session = { overrides: detail.session.overrides || {}, config: detail.config, defaults: global.settings };
+      session = { overrides: detail.session.overrides || {}, config: detail.config, defaults: global.settings,
+                  isolation: global.network_isolation || null };
     } catch (e) { toast(t("sf_load_failed", { error: errText(e) }), "err"); }
     finally { if (btn) btn.disabled = false; }
     // a modal opened while loading (a task with a half-typed comment, say) is not replaced behind the user's back
@@ -1634,7 +1680,7 @@ async function settingsModal() {
       <label class="field"><span>${esc(t("max_cost"))}</span><input id="s-cost" type="number" min="0" step="0.5" value="${cost}"></label>
       <label class="field"><span>${esc(t("max_agents"))}</span><input id="s-agents" type="number" min="1" step="1" value="${maxAgents}"></label>
     </div>
-    ${session ? sessionFieldsHtml(session.overrides, session.defaults, session.config)
+    ${session ? sessionFieldsHtml(session.overrides, session.defaults, session.config, SESSION_FIELDS, session.isolation)
       : muted(perSession ? "sf_not_loaded" : "sf_general_only")}
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="s-save" type="button">${esc(t("save"))}</button></div>`);
   $("#s-save").addEventListener("click", async () => {
@@ -1745,7 +1791,7 @@ function skillSourceState(skill, data = S.skillData) {
 /** Why a skill's packages are not installed automatically (skill_deps reasons), in the UI language. */
 function depsReason(reason) {
   const r = reason || {};
-  const code = { off: "sk_reason_off", proposals: "sk_reason_proposals", unavailable: "sk_reason_unavailable",
+  const code = { off: "sk_reason_off", proposals: "sk_reason_proposals", network: "sk_reason_network", unavailable: "sk_reason_unavailable",
                  python: "sk_reason_python", unsupported: "sk_reason_unsupported" }[r.code] || "sk_reason_off";
   return t(code, { detail: r.detail || "", need: r.need || "", have: r.have || "" });
 }
@@ -2511,7 +2557,7 @@ if (typeof module !== "undefined" && module.exports) {
     processNames, runningJobs, renderAgents, renderDrawerHead, handleEvent, onDocumentClick,
     // the settings dialog: the session's own background-job limits and agents' parameters
     SESSION_FIELDS, sessionSid, launcherApi, sessionFieldId, sessionOverride, parseSessionField, sessionSettingsPatch, contextHint,
-    sessionFieldsHtml, settingsModal,
+    sessionFieldsHtml, settingsModal, networkHint,
     // Markdown (markdown.js) where agents', members' and the user's texts are shown
     md, decorate, MD_CACHE, mdFieldHtml, syncMdField, editMdField, taskResultHtml, renderTaskModal, updateTaskModal,
     renderMcp, renderTriggers, fileView, renderFileContent, toggleFileSource, openFile, isMarkdownPath, codeHtml,

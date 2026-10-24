@@ -203,12 +203,26 @@ TEXTS: dict[str, dict[str, str]] = {
                      "When every task is finished, the goal is completed (`goal_complete`) with a "
                      "summary of what was achieved and what is left, without new tasks for the rest.",
         "n_wrap_up_end": "Wrap-up mode is off: background jobs are allowed again; continue the work as usual.",
+        # [swarm] network = "off" (docs/SPEC.md §7.2): each member once, quietly, at its first wake-up after the
+        # setting became "off" (Swarm._tell_network); n_network_on when the user turns it back on
+        "n_network_off": "This session has no internet (the user's setting): your commands, their background jobs "
+                         "and the MCP servers cannot reach the network; localhost works. Installing packages from "
+                         "PyPI or npm, git clone, fetch or push with a remote repository, and downloads fail: don't "
+                         "spend steps on them or on getting around it. Work with what is already in the workspace "
+                         "and installed; if something you need is missing, say so in the task's discussion.",
+        "n_network_on": "The user turned the internet back on for this session: new commands can reach the network "
+                        "again.",
         "n_restart": "The swarm was restarted. Continue your work where you left off.",
         "n_step_limit": "You reached the step limit of one wake-up. Continue where you left off; if you were "
                         "repeating yourself without progress, change your approach or ask for help.",
         "n_stalled": "Your tasks {tasks} are in progress, but you stopped working on them. Continue now. If you "
                      "are blocked, set the task to `waiting` and say why in its discussion; if you cannot do it, "
                      "set it back to `todo` (or `failed`) with a comment.",
+        "n_planning_hint": "You have held planning task #{id} for {elapsed} (steps: {steps}) and have created no task "
+                           "yet, while the other members wait for work. Create the independent tasks now with "
+                           "`task_create`: the research, experiments and environment checks you would still do "
+                           "become tasks for the others; read only what you need to split the work. Then go on "
+                           "with the plan.",
         "n_mcp_approved": "Your MCP server \"{name}\" was approved by the user and is ready to use.",
         "n_mcp_rejected": "Your MCP server \"{name}\" was rejected by the user. {comment}",
         "n_resumed": "The swarm was resumed. Continue your work.",
@@ -308,6 +322,8 @@ TEXTS: dict[str, dict[str, str]] = {
                               "yourself.",
         "deps_reason_off": "turned off in the settings",
         "deps_reason_proposals": "turned off for skills that members propose",
+        "deps_reason_network": "this session has no network, and then nothing is installed for a skill a member "
+                               "proposed",
         "deps_reason_unavailable": "{detail} is not available on this machine",
         "deps_reason_python": "it needs Python {need}, the environments use {have}",
         "deps_reason_unsupported": "not supported: {detail}",
@@ -469,12 +485,23 @@ TEXTS: dict[str, dict[str, str]] = {
                      "закрывается (`goal_complete`) с итогом: чего достигли и что осталось, без новых задач на "
                      "остальное.",
         "n_wrap_up_end": "Режим завершения выключен: фоновые процессы снова разрешены; продолжай работу как обычно.",
+        "n_network_off": "В этой сессии нет интернета (так настроил пользователь): твои команды, их фоновые процессы "
+                         "и MCP-серверы не выходят в сеть; localhost работает. Установка пакетов из PyPI или npm, "
+                         "git clone, fetch или push с удалённым репозиторием и загрузки не сработают: не трать на них "
+                         "шаги и не пытайся это обойти. Работай с тем, что уже есть в workspace и установлено; если "
+                         "нужного не хватает, скажи об этом в обсуждении задачи.",
+        "n_network_on": "Пользователь снова включил интернет в этой сессии: новые команды опять выходят в сеть.",
         "n_restart": "Рой был перезапущен. Продолжай работу с того места, где остановился.",
         "n_step_limit": "Ты исчерпал лимит шагов одного пробуждения. Продолжай с того места, где остановился; если "
                         "ты повторялся без продвижения, смени подход или попроси помощи.",
         "n_stalled": "Твои задачи {tasks} в работе, но ты перестал ими заниматься. Продолжай сейчас. Если ты "
                      "заблокирован, переведи задачу в `waiting` и объясни причину в её обсуждении; если не можешь её "
                      "выполнить, верни её в `todo` (или переведи в `failed`) с комментарием.",
+        "n_planning_hint": "Ты держишь задачу планирования #{id} уже {elapsed} (шагов: {steps}) и ещё не создал ни "
+                           "одной задачи, а остальные участники ждут работы. Создай независимые задачи прямо сейчас "
+                           "через `task_create`: исследования, эксперименты и проверки окружения, которые ты ещё "
+                           "собирался сделать, станут задачами для остальных; читай только то, что нужно, чтобы "
+                           "разбить работу. Затем продолжай план.",
         "n_mcp_approved": "Пользователь одобрил твой MCP-сервер «{name}», он готов к работе.",
         "n_mcp_rejected": "Пользователь отклонил твой MCP-сервер «{name}». {comment}",
         "n_resumed": "Работа роя возобновлена. Продолжай.",
@@ -563,6 +590,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "skills_deps_manual": " Пакеты из {files} не устанавливаются автоматически ({reason}); нужное установи сам.",
         "deps_reason_off": "выключено в настройках",
         "deps_reason_proposals": "выключено для скиллов, предложенных участниками",
+        "deps_reason_network": "в сессии нет сети, а тогда для скилла, предложенного участником, ничего не ставится",
         "deps_reason_unavailable": "на этой машине нет: {detail}",
         "deps_reason_python": "нужен Python {need}, а окружения используют {have}",
         "deps_reason_unsupported": "не поддерживается: {detail}",
@@ -621,7 +649,10 @@ PLANNING_TASK = {
            "only where a task really needs another one's result.",
            "Study the global goal (at the end of this description) and plan the work in this order:\n"
            "1. Look around. If the workspace already holds a project, learn its layout, conventions and how it "
-           "is built and tested (`list_files`, `read_file`, `shell`) before planning: the plan must fit them.\n"
+           "is built and tested (`list_files`, `read_file`, `shell`) before planning: the plan must fit them. "
+           "Read only as much as you need to split the work: research, experiments, reproducing a problem and "
+           "checks of the environment (installing, running the tests, trying approaches) are separate tasks for "
+           "the others, not your planning. The team waits for your tasks meanwhile.\n"
            "2. Independent work at once. Work that needs no contracts (literature and theory, the environment and "
            "tools, data, exploratory experiments) becomes tasks right away, before CONTRACTS.md is written, so "
            "that the members waiting for the plan start now. Only you create the tasks of the plan: the others "
@@ -665,7 +696,10 @@ PLANNING_TASK = {
            "Изучи глобальную цель (она в конце описания) и спланируй работу в таком порядке:\n"
            "1. Осмотрись. Если в workspace уже есть проект, до планирования разберись в его структуре, "
            "соглашениях и в том, как он собирается и тестируется (`list_files`, `read_file`, `shell`): план "
-           "должен им соответствовать.\n"
+           "должен им соответствовать. Читай ровно столько, сколько нужно, чтобы разбить работу: исследования, "
+           "эксперименты, воспроизведение проблемы и проверки окружения (установка, запуск тестов, проба "
+           "подходов) — это отдельные задачи для остальных, а не часть планирования. Команда тем временем ждёт "
+           "твоих задач.\n"
            "2. Независимая работа сразу. Работа, которой не нужны контракты (литература и теория, окружение и "
            "инструменты, данные, исследовательские эксперименты), сразу становится задачами, ещё до того, как "
            "написан CONTRACTS.md, чтобы участники, ждущие плана, начали работать уже сейчас. Задачи плана "

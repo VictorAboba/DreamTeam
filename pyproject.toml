@@ -1,10 +1,26 @@
 [project]
 name = "dreamteam"
 version = "0.1.0"
-description = "DreamTeam — фреймворк самоорганизующегося роя ИИ-агентов: доска задач, общий workspace, личные сообщения, триггеры, MCP-мастерская и сам рой как MCP-сервер"
+description = "A self-organizing swarm of AI agents with no leader: a shared task board, git workspace, messages, triggers, agents that write their own MCP tools, and the swarm itself as an MCP server"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
+keywords = ["ai-agents", "multi-agent", "agent-swarm", "llm", "mcp", "claude", "anthropic", "openai"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Environment :: Web Environment",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development",
+]
 dependencies = [
     "mcp>=2.3,<3",
     "anthropic>=1.12,<2",
@@ -16,6 +32,11 @@ dependencies = [
     "prompt-toolkit>=3.0.43",
     "rich>=13.7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/VictorAboba/DreamTeam"
+Documentation = "https://github.com/VictorAboba/DreamTeam/blob/master/README.ru.md"
+Issues = "https://github.com/VictorAboba/DreamTeam/issues"
 
 [project.scripts]
 dreamteam = "dreamteam.cli:main"

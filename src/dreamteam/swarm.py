@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import prompts, roles
+from . import netoff, procs, prompts, roles
 from .agent import AgentRuntime
 from .board import Board
 from .config import Config, ModelProfile
@@ -118,6 +118,10 @@ class Swarm:
         self._considering: dict[str, tuple[float, frozenset[int], frozenset[int]]] = {}
         self._all_done_key: tuple | None = None
         self._stall_woken: dict[str, frozenset[int]] = {}  # agent -> stalled task ids it was woken about
+        # planning task id -> {holder, since (first seen holding it), steps (its runtime's llm_steps then), hints sent,
+        # hinted (its llm_steps at the last hint)}: hint_planner
+        self._planning_watch: dict[int, dict[str, Any]] = {}
+        self._paused_at: float | None = None  # when this process paused the swarm: the hint's clock stops meanwhile
         # agent idle (not busy, nothing pending) holding in-progress tasks -> (their ids, idle with them since)
         self._idle_holding: dict[str, tuple[frozenset[int], float]] = {}
         # reviewer -> (ids of the reviews it was reminded about, or that waited while it was in error; since when)
@@ -149,6 +153,7 @@ class Swarm:
         self.jobs.recover()  # jobs a previous process left running died with it: lost (quiet notices)
         self._prune_traces()
         await self.workspace.init()
+        await self._prepare_offline()
         await self.forge.start()
         await self.skills.start()  # the agents' mirror is rebuilt from the session copies at every start
         # the skills' script dependencies (docs/SPEC.md §19): built in the background, never waited for
@@ -225,6 +230,11 @@ class Swarm:
                 await self.jobs.stop_all()
             finally:
                 try:
+                    # every member's held new files (docs/SPEC.md §7 "Held new files"), each under its owner, once
+                    # a commit a stopped agent started has ended; never raises
+                    if self.workspace.held():
+                        await self.workspace.settle()
+                        await self.workspace.commit_held(None, "when the session stopped")
                     await self.forge.stop()
                     await self.workspace.settle()  # a commit a stopped agent started finishes before files may move
                 finally:
@@ -266,6 +276,52 @@ class Swarm:
             self.resume(USER)  # the new default budget is enough again (as with set_limits)
         if self._started and not self.stopping and role_skill_pairs(config) != role_skill_pairs(old):
             self._attach_role_skills()
+        if self._started and not self.stopping and netoff.is_off(config) != netoff.is_off(old):
+            self._network_changed()
+
+    async def _prepare_offline(self) -> None:
+        """A session without network (docs/SPEC.md §7.2): the isolation detected (off the loop: on Linux it starts a
+        probe once per process) and, in the Docker sandbox, what root created in the workspace opened to the offline
+        user (netoff.prepare_workspace)."""
+        if not netoff.is_off(self.config):
+            return
+        await procs.daemon_call(netoff.isolation)
+        if netoff.detected() == "docker":
+            failed = await procs.daemon_call(netoff.prepare_workspace, self.workspace.root)
+            if failed:
+                log.warning("%d entries of %s stay closed to the offline user", failed, self.workspace.root)
+
+    def _network_changed(self) -> None:
+        """[swarm] network changed under a running session: commands started from now on get the new setting (running
+        jobs keep theirs), the MCP servers start again with it at their next use, the skills' dependencies are
+        planned again (a member's proposal gets no install without network) and each member is told at its next
+        wake-up (_tell_network)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # not called from the event loop: the next start applies it
+            return
+
+        async def apply() -> None:
+            try:
+                await self._prepare_offline()
+                await self.forge.close_connections()
+                await self.skills.replan()
+            except Exception:  # noqa: BLE001 - the setting itself is in place for the next commands
+                log.exception("could not apply the new network setting")
+
+        self._background = [t for t in self._background if not t.done()]
+        self._background.append(loop.create_task(apply(), name="network-changed"))
+
+    def _tell_network(self, name: str) -> None:
+        """Tell a member once that the session has no network (n_network_off), and again when it has it back
+        (n_network_on): the last of the two it got is the state it knows, also across restarts."""
+        off = netoff.is_off(self.config)
+        last = self.db.scalar("SELECT kind FROM notifications WHERE recipient = ? AND kind IN ('n_network_off', "
+                              "'n_network_on') ORDER BY id DESC LIMIT 1", (name,))
+        if off and last != "n_network_off":
+            self.notify(name, "n_network_off", wake=False)
+        elif not off and last == "n_network_off":
+            self.notify(name, "n_network_on", wake=False)
 
     def _attach_role_skills(self) -> None:
         """The roles' skills changed under a running swarm: the missing ones are attached in the background (stop()
@@ -437,6 +493,8 @@ class Swarm:
         grow): when the oldest item, or `since` (the oldest of other lines shown with this text), is more than
         STAMP_SPAN seconds old, each notification and message gets its own time and the header the range."""
         lang = self.language_of(name)
+        if name != USER:
+            self._tell_network(name)  # once per change of the session's network setting (docs/SPEC.md §7.2)
         notes = self.db.all(
             "SELECT id, ts, text FROM notifications WHERE recipient = ? AND delivered_at IS NULL ORDER BY id", (name,))
         messages = self.mail.unread(name, mark_read=True)
@@ -750,6 +808,9 @@ class Swarm:
         # its jobs and its foreground commands (an external member's call in flight): stopped, committed under its
         # name, no notice
         await self.jobs.stop_owner(name, "retired")
+        # the new files its last command left (held back for one more command, docs/SPEC.md §7): it is no suspect any
+        # more, so they are committed now unless another member's command may have written them too
+        await self.workspace.commit_held(name, f"when {name} left the team", leaving=True)
         return released
 
     # ---- budget & control ---------------------------------------------------------------------
@@ -813,6 +874,7 @@ class Swarm:
         if self.paused:
             return
         self.db.set("paused", {"paused": True, "reason": reason})
+        self._paused_at = time.time()
         self.bus.emit("swarm.paused", actor, reason=reason)
         if reason == "budget":
             self.notify(USER, "u_budget", spent=self.spent_usd(), limit=self.limits()["max_cost_usd"], wake=False)
@@ -823,6 +885,12 @@ class Swarm:
         if self.budget_exceeded():
             raise ToolError("The budget is exhausted: raise max_cost_usd before resuming.")
         self.db.set("paused", {"paused": False, "reason": ""})
+        if self._paused_at is not None:
+            # a pause is no time spent planning: the planning hint's clock (since) moves on by its length
+            shift = time.time() - self._paused_at
+            for watch in self._planning_watch.values():
+                watch["since"] += shift
+            self._paused_at = None
         self.bus.emit("swarm.resumed", actor)
         for m in self.members():
             if m["kind"] == AgentKind.LLM:
@@ -894,6 +962,7 @@ class Swarm:
                     self._nudge_idle()
                     self._wake_stalled()
                     self._wake_idle_holders()
+                    self.hint_planner()
                     self._remind_reviewers()
                     self._check_all_done()
                     self._remind_user_reviews()
@@ -1002,6 +1071,59 @@ class Swarm:
             self._stall_woken[name] = held
             self.notify(name, "n_stalled", tasks=", ".join(f"#{i}" for i in sorted(held)))
         self._idle_holding = holding
+
+    def hint_planner(self, name: str | None = None) -> None:
+        """An LLM member holding a `planning` task in progress that has created no task `agents.planning_hint_steps`
+        LLM steps or `planning_hint_minutes` after it was first seen holding it gets `n_planning_hint` (the others
+        wait for the plan's first tasks meanwhile); once more at twice either value, after at least one step since the
+        first hint; never more (a re-claim or a restart included), never with nobody else on the team, while paused
+        (the clock stops: resume) or in wrap-up mode. `name`: after one of that member's steps (the
+        hint is in the same activation's `incoming`); None: the scheduler, for every holder (the time trigger, or a
+        holder that went idle). Never raises: it runs inside activations."""
+        try:
+            self._hint_planner(name)
+        except Exception:
+            log.exception("planning hint failed")
+
+    def _hint_planner(self, name: str | None) -> None:
+        agents = self.config.agents
+        steps_n, minutes = agents.planning_hint_steps, agents.planning_hint_minutes
+        goal = self.goal()
+        # paused: no step counts (a step that ends after the pause began is not planning time); wrap-up: the team
+        # finishes with what it has, so no member is told to create tasks
+        active = (bool(steps_n or minutes) and bool(goal) and goal.get("status") == "active" and not self.paused
+                  and not self.wrapping_up)
+        if not active:
+            tasks = []
+        else:
+            tasks = self.board.open_tasks_of(name) if name else self.board.list(status=Status.IN_PROGRESS, tag="planning")
+        held = {t.id: t for t in tasks
+                if t.status == Status.IN_PROGRESS and "planning" in t.tags and t.assignee in self.runtimes}
+        if name is None:  # the scheduler sees every holder: forget the tasks nobody holds any more
+            self._planning_watch = {k: w for k, w in self._planning_watch.items() if k in held}
+        now = time.time()
+        for task in held.values():
+            holder, runtime = task.assignee, self.runtimes[task.assignee]
+            watch = self._planning_watch.get(task.id)
+            if watch is None or watch["holder"] != holder:  # claimed (or claimed by another member) since the last look
+                # the hints it already had for this task count (a re-claim, a restart): two at most, ever
+                sent = self.db.scalar("SELECT COUNT(*) FROM notifications WHERE recipient = ? AND kind = ?"
+                                      " AND json_extract(data, '$.id') = ?", (holder, "n_planning_hint", task.id))
+                watch = self._planning_watch[task.id] = {"holder": holder, "since": now, "steps": runtime.llm_steps,
+                                                         "hints": int(sent or 0), "hinted": -1}
+            level = watch["hints"] + 1
+            if level > 2 or runtime.llm_steps == watch["hinted"]:
+                continue  # hinted twice already, or no step since the last hint
+            steps, elapsed = runtime.llm_steps - watch["steps"], now - watch["since"]
+            if not ((steps_n and steps >= level * steps_n) or (minutes and elapsed >= level * minutes * 60)):
+                continue
+            if self.db.scalar("SELECT COUNT(*) FROM tasks WHERE created_by = ? AND id > ?", (holder, task.id)):
+                continue  # the planner already creates tasks: the others have work
+            if len(self.members()) < 2:
+                continue  # nobody waits for its tasks
+            watch["hints"], watch["hinted"] = level, runtime.llm_steps
+            self.notify(holder, "n_planning_hint", id=task.id, steps=steps,
+                        elapsed=fmt_duration(elapsed, self.language_of(holder)))
 
     def _remind_reviewers(self) -> None:
         """Liveness of reviews: an idle LLM reviewer whose reviews wait longer than agents.idle_nudge_seconds is
@@ -1150,6 +1272,7 @@ class Swarm:
                 "tracing": bool(self.tracer.enabled),
                 "independent_review": self.board.independent_review,
                 "workspace": self.workspace_info(),
+                "network": netoff.describe(self.config),  # {"mode": "on"|"off", "isolation": docker|netns|env}
             },
             "tasks": [t.to_dict() for t in tasks],
             "agents": members,

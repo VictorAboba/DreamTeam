@@ -1,0 +1,59 @@
+name: Bug report
+description: Something in DreamTeam doesn't work as described
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! English or Russian are both fine.
+        Security problems go to [private reporting](https://github.com/VictorAboba/DreamTeam/security/advisories/new) instead.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. dreamteam --team "developer*2" "..."
+        2. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Where
+      multiple: true
+      options:
+        - Terminal UI (dreamteam)
+        - Headless (dreamteam -p)
+        - Web board
+        - MCP client (Claude Code etc.)
+        - Docker sandbox
+        - Agents' behaviour
+  - type: input
+    id: version
+    attributes:
+      label: DreamTeam version or commit
+      placeholder: 0.1.0 / 2daa8db
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: OS, Python and model provider
+      placeholder: Ubuntu 24.04, Python 3.12, Anthropic claude-opus-5-5
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or traces
+      description: |
+        Server output, or the failing trace: `dreamteam traces "<Agent Name>" --status failed`.
+        Check it for API keys and other secrets before posting.
+      render: text

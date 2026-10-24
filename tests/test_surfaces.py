@@ -1202,15 +1202,22 @@ def _docker_ready() -> bool:
     exe = shutil.which("docker")
     if not exe:
         return False
-    try:
-        return subprocess.run([exe, "info"], capture_output=True, timeout=20).returncode == 0
+    try:  # the image is a Linux one: a daemon in Windows-containers mode (e.g. GitHub's Windows runners) can't build it
+        out = subprocess.run([exe, "info", "--format", "{{.OSType}}"], capture_output=True, text=True, timeout=20)
+        return out.returncode == 0 and out.stdout.strip() == "linux"
     except (OSError, subprocess.SubprocessError):
         return False
 
 
-@pytest.mark.skipif(not _docker_ready(), reason="Docker daemon not available")
+@pytest.mark.skipif(not _docker_ready(), reason="no Docker daemon with Linux containers")
 def test_docker_image_builds_and_runs():
-    docker_module.build_image()
-    out = subprocess.run(["docker", "run", "--rm", docker_module.IMAGE, "--version"], capture_output=True, text=True,
-                         timeout=300)
-    assert out.returncode == 0 and re.search(r"dreamteam \d", out.stdout + out.stderr)
+    # a tag of its own, removed afterwards: the user's dreamteam:latest is never rebuilt by a test run
+    image = f"dreamteam-selftest:{os.getpid()}"
+    try:
+        docker_module.build_image(image)
+        out = subprocess.run(["docker", "run", "--rm", image, "--version"], capture_output=True, text=True,
+                             timeout=300)
+        assert out.returncode == 0 and re.search(r"dreamteam \d", out.stdout + out.stderr)
+        assert docker_module.image_dockerfile(image) == docker_module.dockerfile_hash()
+    finally:
+        subprocess.run(["docker", "image", "rm", "-f", image], capture_output=True, timeout=120)

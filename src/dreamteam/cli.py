@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import logging
 import os
@@ -18,7 +19,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-from . import __version__, roles
+from . import __version__, netoff, roles
 from .config import CONFIG_FILE, PROVIDER_PRESETS, Config, render_template
 from .goal_text import split_goal
 from .models import USER
@@ -420,6 +421,8 @@ async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal
 def cmd_run(args) -> int:
     project = Path(args.dir).resolve()
     config = Config.load(project)
+    if args.network:  # for this run only: the settings file keeps its [swarm] network
+        config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, network=args.network))
     host = args.host or config.server.host
     port = args.port or config.server.port
     existing = running_hub(project)
@@ -581,7 +584,8 @@ def cmd_sandbox(args) -> int:
     if existing:  # two hubs on one home would run the same sessions (and their databases) twice
         print(f"DreamTeam is already running for {project}: {existing}/ (stop it first).", file=sys.stderr)
         return 1
-    return run_sandbox(project, args.port or config.server.port, build=args.build, goal=args.goal, home=home_mode)
+    return run_sandbox(project, args.port or config.server.port, build=args.build, goal=args.goal, home=home_mode,
+                       network=args.network)
 
 
 def cmd_status(args) -> int:
@@ -694,11 +698,12 @@ def _print_sessions(home: Path, base: str | None) -> int:
 async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_browser: bool,
                       goal: str | None = None, title: str | None = None, start: str | None = None,
                       stop: asyncio.Event | None = None, workspace: str | None = None,
-                      skills: list[str] | None = None) -> int:
+                      skills: list[str] | None = None, network: str | None = None) -> int:
     """Run the launcher (sessions page, settings, every session's board, MCP) until a stop signal, the
     console's /quit or a server failure. `goal` creates and starts a new session (working in the absolute
-    folder `workspace` when given, docs/SPEC.md §17.2; with the skills `skills`, §19); `start` starts an existing
-    one. hub.json exists exactly while the server listens; all sessions stop at the end."""
+    folder `workspace` when given, docs/SPEC.md §17.2; with the skills `skills`, §19; [swarm] network `network`,
+    §7.2); `start` starts an existing one. hub.json exists exactly while the server listens; all sessions stop at
+    the end."""
     from .launcher import serve_launcher
     from .launcher_mcp import workspace_text
     from .sessions import SessionManager
@@ -722,7 +727,9 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                 await manager.start(start)
                 focus = start
             if goal:
-                created = await manager.create(title or "", goal, workspace=workspace, skills=skills, via="cli")
+                overrides = {"swarm": {"network": network}} if network else None
+                created = await manager.create(title or "", goal, overrides=overrides, workspace=workspace,
+                                               skills=skills, via="cli")
                 focus = created["id"]
                 if created.get("workspace_result"):
                     print(f"Session {focus}: {workspace_text(created['workspace_result'])}", file=sys.stderr)
@@ -801,6 +808,10 @@ def cmd_serve(args) -> int:
         workspace = _workspace_arg(args.workspace)
         if workspace is None:
             return 2
+    if args.network and not args.goal:
+        print("--network needs --goal: it is the network of the session that --goal creates (an existing session "
+              "changes it in its settings).", file=sys.stderr)
+        return 2
     skills = None
     if args.skill:
         if not args.goal:
@@ -822,7 +833,8 @@ def cmd_serve(args) -> int:
     port = args.port or config.server.port
     try:
         return asyncio.run(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
-                                       goal=args.goal, title=args.title, workspace=workspace, skills=skills))
+                                       goal=args.goal, title=args.title, workspace=workspace, skills=skills,
+                                       network=args.network))
     except KeyboardInterrupt:
         return 0
 
@@ -1201,6 +1213,8 @@ def cmd_tui(args) -> int:
     home = _home_arg(args)
     overrides = {"model": args.model, "agents": args.agents, "max_agents": args.max_agents, "budget": args.budget,
                  "title": args.title}
+    if args.network:  # only when given (docs/SPEC.md §7.2): the TUI turns it into swarm.network
+        overrides["network"] = args.network
     if args.team is not None:
         try:  # checked here, before a session or the TUI starts (the TUI turns it into swarm.starting_roles)
             roles.parse_team(args.team)
@@ -1288,6 +1302,10 @@ def _default_command(argv: list[str], commands: list[str]) -> list[str]:
     return ["tui", *argv]
 
 
+NETWORK_HELP = ("off: the agents' commands, their background jobs and MCP servers get no internet (the LLM "
+                "keeps it): strict in the Docker sandbox and on Linux, best effort elsewhere (docs/SPEC.md §7.2)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dreamteam", description="DreamTeam — self-organizing AI agent swarm")
     p.add_argument("--version", action="version", version=f"dreamteam {__version__}")
@@ -1331,6 +1349,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "the source), or a folder, .zip or Git URL, imported into the library first")
     s.add_argument("--host", help="host of the launcher started in-process (when none runs)")
     s.add_argument("--port", type=int, help="port of the launcher started in-process")
+    s.add_argument("--network", choices=netoff.NETWORK_MODES, help="a new session's network; " + NETWORK_HELP)
     s.set_defaults(func=cmd_tui, dir=None)
 
     s = sub.add_parser("serve", help="start DreamTeam headless: the sessions page, settings, every session's "
@@ -1346,6 +1365,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "workspace, a folder with files is adopted, as for `dreamteam --workspace`)")
     s.add_argument("--skill", action="append", metavar="REF|PATH|URL",
                    help="with --goal: a skill for that session (repeatable), as for `dreamteam --skill`")
+    s.add_argument("--network", choices=netoff.NETWORK_MODES, help="with --goal: that session's network; "
+                                                                   + NETWORK_HELP)
     s.add_argument("--no-console", action="store_true")
     s.add_argument("--no-browser", action="store_true", help="do not open the browser")
     s.set_defaults(func=cmd_serve)
@@ -1390,6 +1411,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--port", type=int)
     s.add_argument("--no-console", action="store_true")
     s.add_argument("--open", action="store_true", help="open the board in a browser")
+    s.add_argument("--network", choices=netoff.NETWORK_MODES, help="the swarm's network for this run ([swarm] "
+                                                                   "network otherwise); " + NETWORK_HELP)
     s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("console", help="chat with a running swarm (session) in the terminal")
@@ -1412,6 +1435,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--build", action="store_true", help="rebuild the image")
     s.add_argument("--port", type=int)
     s.add_argument("--goal")
+    s.add_argument("--network", choices=netoff.NETWORK_MODES,
+                   help="off: the container gets the firewall of the sessions without network (also when a "
+                        "session or the settings ask for it), and the project's run or the --goal session has "
+                        "none")
     s.set_defaults(func=cmd_sandbox)
 
     s = sub.add_parser("status", help="print the swarm status (the sessions, for a home)")
@@ -1422,6 +1449,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        # in the Docker sandbox: the firewall of the sessions without network first, then DreamTeam again without
+        # NET_ADMIN (returns at once anywhere else)
+        netoff.sandbox_entry()
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
             try:

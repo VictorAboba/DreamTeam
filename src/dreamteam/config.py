@@ -124,6 +124,9 @@ class SwarmSettings:
     # a finished task of an agent goes to review by another member (or the user when nobody else can);
     # false: a task without an explicit reviewer is done at once (docs/SPEC.md §4 "Independent review")
     independent_review: bool = True
+    # "off": the members' commands, their jobs and the stdio MCP servers have no internet (benchmarks); DreamTeam
+    # itself keeps it (docs/SPEC.md §7.2, netoff.py)
+    network: str = "on"
 
 
 @dataclass
@@ -149,6 +152,10 @@ class AgentSettings:
     stagger_seconds: float = 3.0
     idle_nudge_seconds: float = 60.0
     max_parallel_llm_calls: int = 8
+    # the member holding the planning task that has created no task this many LLM steps or minutes after claiming it
+    # is told to create the independent tasks now (once more at twice the value); 0 turns that trigger off
+    planning_hint_steps: int = 8
+    planning_hint_minutes: float = 10.0
 
 
 @dataclass
@@ -486,6 +493,8 @@ class Config:
                 raise ValueError(f"skills.install_env: {name[:60]!r} is not an environment variable name")
         if cfg.swarm.language not in ("ru", "en"):
             raise ValueError("swarm.language must be 'ru' or 'en'")
+        if cfg.swarm.network not in ("on", "off"):
+            raise ValueError(f"swarm.network must be 'on' or 'off', got {cfg.swarm.network[:20]!r}")
         return cfg
 
 
@@ -558,12 +567,15 @@ max_cost_usd = 5.0            # бюджет роя в долларах; при 
 goal = {toml_string(goal)}          # глобальная задача (можно задать позже в веб-интерфейсе)
 starting_roles = []           # стартовая команда по порядку, например ["architect", "developer", "developer", "tester"]; недостающим до start_agents — «Универсал»
 independent_review = true     # задачу агента принимает другой агент (или вы, если больше некому); false — без ревьюера задача сразу готова
+network = "on"                # "off" — у команд агентов, их фоновых процессов и MCP-серверов нет интернета (LLM работает); строго только в Docker и Linux
 
 [agents]
 default_model = "default"
 max_steps_per_turn = 40       # шагов ReAct за одно «пробуждение»
 context_tokens = 120000       # при превышении история агента сжимается в резюме
 stagger_seconds = 3.0         # задержка между стартами агентов
+planning_hint_steps = 8       # если взявший задачу планирования за столько шагов не создал ни одной задачи — подсказка создать их (0 — выкл.)
+planning_hint_minutes = 10    # то же через столько минут после того, как он взял задачу (0 — выкл.)
 
 [server]
 host = "127.0.0.1"

@@ -1964,7 +1964,7 @@ def status_report(ctx: RenderContext, info: dict) -> RenderableType:  # `info` s
     grid.add_column(style="dim", no_wrap=True)
     grid.add_column(overflow="fold")
     order = ("version", "home", "web", "hub", "session", "workspace", "goal", "models", "model", "language",
-             "agents", "jobs", "budget", "tracing", "verbosity", "connected")
+             "agents", "jobs", "budget", "network", "tracing", "verbosity", "connected")
     for key in order + tuple(k for k in data if k not in order):
         if key not in data or data[key] is None:
             continue
@@ -2022,6 +2022,12 @@ def _status_value(ctx: RenderContext, key: str, value: Any) -> Text:
     if key == "budget" and isinstance(value, dict):
         spent, limit = _float(value.get("spent")), _float(value.get("limit"))
         return Text(fmt_cost(spent) + (f" / {fmt_cost(limit)}" if limit > 0 else f" ({ctx.t('unlimited')})"))
+    if key == "network" and isinstance(value, dict):  # the snapshot's {"mode", "isolation"} (docs/SPEC.md §7.2)
+        if value.get("mode") != "off":
+            return Text(ctx.t("net_on"), style="dim")
+        kind = value.get("isolation")
+        label = ctx.t(f"net_off_{kind}") if kind in ("docker", "netns", "env", "container") else ctx.t("net_off")
+        return Text(label, style=theme.WARN)
     if key == "verbosity" and isinstance(value, str):
         return Text(_status_label(ctx, "verbosity_", value))
     return Text(clean(value))

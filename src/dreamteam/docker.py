@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from . import netoff
 from .config import Config
 
 IMAGE = "dreamteam:latest"
@@ -22,16 +23,19 @@ DEPENDENCIES = ["mcp>=2.3,<3", "anthropic>=1.12,<2", "openai>=3.26,<4", "starlet
 DOCKERFILE = """FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PYTHONUTF8=1
 RUN apt-get update \\
- && apt-get install -y --no-install-recommends git curl ca-certificates build-essential \\
+ && apt-get install -y --no-install-recommends git curl ca-certificates build-essential iptables \\
  && rm -rf /var/lib/apt/lists/*
 RUN pip install uv
+# sessions without network run their members' commands as this user, whose packets a firewall rejects
+# (`dreamteam sandbox` sets it up); git's settings are the system's, so that they hold for both users
+RUN useradd --uid 10001 --user-group --create-home --shell /bin/bash dreamteam-agent
 WORKDIR /opt/dreamteam
 COPY pyproject.toml README.md ./
 COPY src ./src
 RUN pip install .
-RUN git config --global user.name dreamteam \\
- && git config --global user.email dreamteam@localhost \\
- && git config --global --add safe.directory '*'
+RUN git config --system user.name dreamteam \\
+ && git config --system user.email dreamteam@localhost \\
+ && git config --system --add safe.directory '*'
 WORKDIR /swarm
 EXPOSE 8765
 ENTRYPOINT ["dreamteam"]
@@ -95,13 +99,51 @@ def image_exists(image: str = IMAGE) -> bool:
     return result.returncode == 0
 
 
+DOCKERFILE_LABEL = "dreamteam.dockerfile"
+
+
+def dockerfile_hash() -> str:
+    """The label build_image puts on the image: an image built from another DOCKERFILE (an older DreamTeam, or
+    `docker compose build`) has another one, or none."""
+    return hashlib.sha256(DOCKERFILE.encode("utf-8")).hexdigest()[:16]
+
+
+def image_dockerfile(image: str = IMAGE) -> str:
+    """The DOCKERFILE label of an image ("" without one, or when it cannot be read)."""
+    result = subprocess.run([_docker(), "image", "inspect", "--format",
+                             "{{ index .Config.Labels \"" + DOCKERFILE_LABEL + "\" }}", image],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True)
+    value = result.stdout.strip() if result.returncode == 0 else ""
+    return "" if value == "<no value>" else value
+
+
 def build_image(image: str = IMAGE) -> None:
     with tempfile.TemporaryDirectory(prefix="dt-build-") as tmp:
         ctx = build_context(Path(tmp))
         print(f"Building {image} ...", file=sys.stderr)
-        code = subprocess.call([_docker(), "build", "-t", image, str(ctx)])
+        code = subprocess.call([_docker(), "build", "--label", f"{DOCKERFILE_LABEL}={dockerfile_hash()}", "-t", image,
+                                str(ctx)])
         if code != 0:
             raise SystemExit(f"docker build failed with code {code}")
+
+
+def wants_firewall(project_dir: Path, config: Config, network: str | None = None) -> bool:
+    """Whether the sandbox needs the firewall of the sessions without network (docs/SPEC.md §7.2): `--network off`,
+    [swarm] network = "off" in the settings, or a session of the home that has it in its overrides. A session
+    switched off later in a container started without it gets the best-effort isolation only (the UI says so)."""
+    if network == "off" or config.swarm.network == "off":
+        return True
+    sessions = project_dir / "sessions"
+    for meta in sessions.glob("*/session.json") if sessions.is_dir() else ():
+        try:
+            data = json.loads(meta.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        overrides = data.get("overrides") if isinstance(data, dict) else None
+        swarm = overrides.get("swarm") if isinstance(overrides, dict) else None
+        if isinstance(swarm, dict) and swarm.get("network") == "off":
+            return True
+    return False
 
 
 def env_passthrough(config: Config) -> list[str]:
@@ -161,12 +203,14 @@ def outside_home_warning(home: Path) -> list[str]:
 
 def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | None = None,
                     image: str = IMAGE, docker: str = "docker", tty: bool = False,
-                    home: bool | None = None) -> list[str]:
+                    home: bool | None = None, firewall: bool = False, network: str | None = None) -> list[str]:
     """`docker run` argv for the sandbox. The hub inside listens on CONTAINER_PORT, published on the host's
     127.0.0.1:port only; DREAMTEAM_PUBLIC_URL tells it that host URL, so the board shows the right MCP URL
     and hub.json (in the mounted project) lets host-side `dreamteam mcp/console/status` find it.
     `home`: serve the directory as a launcher home (True) or `run` it as a single-swarm project (False);
-    None decides by its sessions/ directory."""
+    None decides by its sessions/ directory. `firewall`: the container may set up the firewall of the sessions
+    without network (NET_ADMIN, which DreamTeam drops right after: netoff.sandbox_entry). `network`: `--network`
+    of the command inside (a project's run, or the session `goal` creates)."""
     public = f"http://127.0.0.1:{port}"
     # --init: a tiny init (tini) is PID 1 and reaps orphans (processes the agents' commands leave running), so a
     # zombie never keeps a process group alive; it forwards SIGTERM/SIGINT to dreamteam. Ports that agents' dev
@@ -182,6 +226,8 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
     # the skills' environments: never the host's (another platform, other interpreter paths); uv's cache beside them
     cmd += ["-v", f"{envs_volume(project_dir)}:{SANDBOX_ENVS_DIR}", "-e", f"DREAMTEAM_SKILL_ENVS_DIR={SANDBOX_ENVS_DIR}",
             "-e", f"UV_CACHE_DIR={SANDBOX_ENVS_DIR}/.cache/uv"]
+    if firewall:
+        cmd += ["--cap-add", "NET_ADMIN", "-e", f"{netoff.FIREWALL_ENV}=1"]
     if tty:
         cmd.append("-it")
     for name in env_passthrough(config):
@@ -195,14 +241,25 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
         cmd += [image, "run", "/swarm", "--host", "0.0.0.0", "--port", str(CONTAINER_PORT), "--no-console"]
     if goal:
         cmd += ["--goal", goal]
+    if network and (goal or not home):  # (serve takes it only for the session its --goal creates)
+        cmd += ["--network", network]
     return cmd
 
 
 def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | None = None,
-                image: str = IMAGE, home: bool | None = None) -> int:
+                image: str = IMAGE, home: bool | None = None, network: str | None = None) -> int:
     config = Config.load(project_dir)
+    firewall = wants_firewall(project_dir, config, network)
     if build or not image_exists(image):
         build_image(image)
+    elif image_dockerfile(image) != dockerfile_hash():
+        if firewall:  # the firewall needs the image's user and iptables
+            print(f"{image} was built from another Dockerfile; rebuilding it for the sessions without network.",
+                  file=sys.stderr)
+            build_image(image)
+        else:
+            print(f"Note: {image} was built from another Dockerfile; `dreamteam sandbox --build` rebuilds it.",
+                  file=sys.stderr)
     for profile in config.models.values():
         if profile.base_url and any(h in profile.base_url for h in ("localhost", "127.0.0.1")):
             print(f"Note: model profile '{profile.name}' uses {profile.base_url}; inside Docker use "
@@ -219,6 +276,9 @@ def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | N
     sandbox_host_library(config).mkdir(parents=True, exist_ok=True)
 
     cmd = sandbox_command(project_dir, port, config, goal, image, docker=_docker(), tty=_stdin_is_terminal(),
-                          home=home)
+                          home=home, firewall=firewall, network=network)
+    if firewall:
+        print("Sessions without network: their agents' commands run as a separate user whose network the "
+              "container's firewall closes (NET_ADMIN only for setting it up).", file=sys.stderr)
     print(f"Swarm UI: http://127.0.0.1:{port}  (MCP: http://127.0.0.1:{port}/mcp)", file=sys.stderr)
     return subprocess.call(cmd)
