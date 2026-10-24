@@ -176,7 +176,8 @@ def rmtree(path: Path) -> None:
     the skills mirror) are made writable first."""
     def on_error(func, target, _exc):
         try:
-            os.chmod(target, stat.S_IWRITE)
+            if not is_link(target):  # chmod follows a link: what it points to (maybe outside) keeps its mode
+                os.chmod(target, stat.S_IWRITE)
             func(target)
         except OSError:
             pass

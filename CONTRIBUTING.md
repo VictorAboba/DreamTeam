@@ -42,8 +42,10 @@ dreamteam
 2. Keep a pull request to one change, with tests for new behaviour and fixed bugs.
 3. Run `uv run pytest -q` and `uvx ruff check --select E9,F63,F7,F82 src tests` before pushing; CI runs both
    on Linux, Windows and macOS.
-4. Update the docs when behaviour visible to users changes: [README.md](README.md),
-   [README.ru.md](README.ru.md) (the full reference) and, for module contracts, [docs/SPEC.md](docs/SPEC.md).
+4. Update the docs when behaviour visible to users changes: the guide pages in [docs/en](docs/en/README.md) and
+   [docs/ru](docs/ru/README.md) (the same files in both languages — change both, or say in the PR which one needs
+   a translation), the README if the short overview changes ([README.md](README.md) and [README.ru.md](README.ru.md)
+   mirror each other) and, for module contracts, [docs/SPEC.md](docs/SPEC.md).
 
 ## Code conventions
 

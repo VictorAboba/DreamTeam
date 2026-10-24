@@ -35,7 +35,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/VictorAboba/DreamTeam"
-Documentation = "https://github.com/VictorAboba/DreamTeam/blob/master/README.ru.md"
+Documentation = "https://github.com/VictorAboba/DreamTeam/blob/master/docs/en/README.md"
 Issues = "https://github.com/VictorAboba/DreamTeam/issues"
 
 [project.scripts]

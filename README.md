@@ -55,7 +55,8 @@ uv tool install git+https://github.com/VictorAboba/DreamTeam.git
 ```
 
 This puts the `dreamteam` command on your PATH (run `uv tool update-shell` if it isn't found). To hack on it,
-clone the repository and run `uv tool install --editable .` instead — see [CONTRIBUTING.md](CONTRIBUTING.md).
+clone the repository and run `uv tool install --editable .` instead — see [CONTRIBUTING.md](CONTRIBUTING.md)
+and [Install and quick start](docs/en/getting-started.md).
 
 ## Quick start
 
@@ -71,7 +72,7 @@ dreamteam serve                             # web board only
 2. On **Sessions**, press **Start a new session** and describe the goal: the first line becomes the title, the rest the
    description. You can also pick the starting team, e.g. `--team "architect, developer*2, tester"`.
 3. Watch the swarm plan and work; write to any agent with `@Name`, review tasks it hands you with
-   `/approve 3` or `/reject 3 what to fix`.
+   `/approve 3` or `/reject 3 what to fix`. All commands and keys: [Terminal UI and console](docs/en/terminal.md).
 
 Agent prompts are in English or Russian: set `language = "en"` under `[swarm]` in `~/DreamTeam/dreamteam.toml`
 or in the new-session dialog.
@@ -83,12 +84,17 @@ git switch -c dreamteam/billing
 dreamteam --workspace ~/code/my-app "Cover the billing module with tests"
 ```
 
+The rules that keep your own work safe are in [Session folder and an existing project](docs/en/projects.md).
+
 ### Connect Claude Code
 
 ```bash
 claude mcp add --transport http dreamteam http://127.0.0.1:8765/mcp   # to a running server
 claude mcp add dreamteam -- dreamteam mcp                               # or let Claude Code start it
 ```
+
+Claude Code then acts as the user of the swarm, or joins it with `join_swarm` — see
+[Connecting Claude Code](docs/en/claude-code.md).
 
 ### Run in Docker
 
@@ -97,7 +103,7 @@ dreamteam sandbox ~/DreamTeam --goal "..."
 ```
 
 Agents' commands and their MCP servers then run inside the container. Add `--network off` to cut them off
-from the internet (strict in Docker and on Linux).
+from the internet (strict in Docker and on Linux) — see [Docker sandbox and sessions without network](docs/en/sandbox.md).
 
 ## Configuration
 
@@ -123,22 +129,30 @@ model = "qwen3:32b"
 api_key = "ollama"
 ```
 
+Every section and key: [Configuration](docs/en/configuration.md).
+
 ## Security
 
 Agents run commands and MCP server code **with your user's rights**. For untrusted goals use
 `dreamteam sandbox`. API keys and other secrets from the environment are not passed to agents' commands.
 The server listens on `127.0.0.1` and has no authentication: don't expose it without a reverse proxy that adds
-one. See [SECURITY.md](SECURITY.md) for how to report a vulnerability.
+one. Details: [Security](docs/en/security.md); to report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
-- [README.ru.md](README.ru.md) — the full reference: every command, setting, the terminal UI, skills, sessions in
-  your own project, sessions without network, traces (in Russian for now; an English translation is welcome).
-- [docs/SPEC.md](docs/SPEC.md) — how it works: module contracts, events, the agent loop.
-- [docs/TUI.md](docs/TUI.md) — the terminal UI contract.
+The full guide is in [docs/en](docs/en/README.md):
+
+- [Install and quick start](docs/en/getting-started.md) — every `dreamteam` command
+- [Features](docs/en/features.md) — everything DreamTeam does, in one table
+- [Terminal UI and console](docs/en/terminal.md) · [Session folder and an existing project](docs/en/projects.md) ·
+  [Connecting Claude Code](docs/en/claude-code.md) · [Skills](docs/en/skills.md) · [Agent traces](docs/en/traces.md)
+- [Configuration](docs/en/configuration.md) · [Docker sandbox and sessions without network](docs/en/sandbox.md) ·
+  [Security](docs/en/security.md)
+- [How it works](docs/en/architecture.md) · [Agent tools](docs/en/agent-tools.md) ·
+  [Module specification](docs/SPEC.md) · [Terminal UI contract](docs/TUI.md)
 
 Ideas are borrowed from Claude Code Agent Teams, Gas Town / Beads, CAMEL Workforce, Magentic-One, MetaGPT,
-Strands Swarm, Letta, Alita, A2A and blackboard architectures — [details](README.ru.md#как-это-устроено).
+Strands Swarm, Letta, Alita, A2A and blackboard architectures — [details](docs/en/architecture.md).
 
 ## Contributing
 

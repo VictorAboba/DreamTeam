@@ -399,6 +399,7 @@ def test_resolve_node_needs_node_exe_and_finds_npm_beside_the_real_binary(tmp_pa
     cli.parent.mkdir(parents=True)
     cli.write_text("// npm")
     (shim / real.name).write_text("shim")
+    (shim / real.name).chmod(0o755)  # on Linux and macOS which() finds executables only
     real.write_text("real")
     monkeypatch.setattr(skill_deps, "probe_node", lambda path, env, cwd: [str(real), "24.16.0", "137", "win32",
                                                                           "x64"])
