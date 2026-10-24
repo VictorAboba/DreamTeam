@@ -26,6 +26,7 @@ import threading
 import time
 from pathlib import Path
 
+from . import netoff
 from .config import Config
 from .procs import TOKEN_ENV, ProcessTree, daemon_call
 
@@ -38,8 +39,10 @@ _KNOWN_SECRETS = {
 }
 # DreamTeam's own settings that must not point agents' commands at the skills library or the skills' shared
 # environments (docs/SPEC.md §19): dropped even when shell.pass_env names them. (DREAMTEAM_SKILLS, the folder of the
-# swarm's skills, is set for the shell.)
-_INTERNAL_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR"})
+# swarm's skills, is set for the shell.) The sandbox's markers of the offline firewall (netoff.py) are no business of
+# the commands either.
+_INTERNAL_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR",
+                           "DREAMTEAM_OFFLINE_USER", "DREAMTEAM_OFFLINE_FIREWALL"})
 
 POWERSHELL_UTF8 = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                    "$OutputEncoding = [System.Text.Encoding]::UTF8; ")
@@ -431,6 +434,19 @@ class Capture:
 # --- a running command ---------------------------------------------------------------------------------------
 
 _serials = itertools.count(1)
+_last_serial = 0
+
+
+def _next_serial() -> int:
+    global _last_serial
+    _last_serial = next(_serials)
+    return _last_serial
+
+
+def last_serial() -> int:
+    """The serial of the last command started in this process (0: none yet): one with a higher serial started
+    later (the workspace's held new files, docs/SPEC.md §7)."""
+    return _last_serial
 
 
 def _set_done(future: asyncio.Future) -> None:
@@ -450,7 +466,7 @@ class RunningCommand:
         self.tree = tree
         self.capture = capture
         self.started_at = time.time()
-        self.serial = next(_serials)
+        self.serial = _next_serial()
         self._exited: asyncio.Future = self._loop.create_future()
         self._eof: asyncio.Future = self._loop.create_future()
         self._stdout = tree.proc.stdout  # referenced here, so garbage collection cannot close it under the reader
@@ -566,16 +582,20 @@ def _discard_tree(tree: ProcessTree) -> None:
 
 
 async def start_command(command: str, *, cwd: Path, program: str = "auto", env: dict[str, str] | None = None,
-                        max_output: int = 12000, token: str | None = None) -> RunningCommand:
+                        max_output: int = 12000, token: str | None = None, offline: bool = False) -> RunningCommand:
     """Start `command` through the configured shell as a contained tree and return at once. `token` goes into the
-    environment as DREAMTEAM_PROCESS_TOKEN (Linux finds escaped processes by it). ValueError: unsupported shell."""
+    environment as DREAMTEAM_PROCESS_TOKEN (Linux finds escaped processes by it). `offline`: the shell runs in the
+    session's isolation from the network (netoff.wrap; its environment is the caller's). ValueError: unsupported
+    shell."""
     name, prefix = resolve_shell(program)
     if name in ("powershell", "pwsh"):
         command = POWERSHELL_UTF8 + command
     if token:
         env = {**(os.environ if env is None else env), TOKEN_ENV: token}
-    spawn = functools.partial(ProcessTree.spawn, shell_args(name, prefix, command), cwd=cwd, env=env, token=token,
-                              breakaway=JOB_BREAKAWAY)
+    args = shell_args(name, prefix, command)
+    if offline:  # (the wrappers exec the shell: it keeps the pid, so its process group and tree stay the same)
+        args = netoff.wrap(args)
+    spawn = functools.partial(ProcessTree.spawn, args, cwd=cwd, env=env, token=token, breakaway=JOB_BREAKAWAY)
     tree = await daemon_call(spawn, on_orphan=_discard_tree)
     return RunningCommand(name, tree, Capture(max_output, program=name))
 

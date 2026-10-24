@@ -41,6 +41,13 @@ const I18N = {
     team_model: "модель: {model}", team_hidden: "(скрыта)", team_empty: "Добавьте в стартовую команду хотя бы одну роль.",
     team_over_max: "В стартовой команде {n} агентов — больше максимума ({max}).",
     f_more: "Дополнительно", f_steps: "Шагов за пробуждение", f_approval: "Подтверждать MCP-серверы агентов", f_start_now: "Запустить сразу",
+    f_network: "Без интернета для агентов", sw_network: "Интернет для команд агентов", net_on: "есть", net_off: "нет",
+    net_badge: "Без интернета",
+    net_hint_docker: "Команды агентов, их фоновые процессы и MCP-серверы идут от отдельного пользователя, чью сеть закрывает файрвол контейнера. LLM и localhost работают.",
+    net_hint_netns: "Команды агентов, их фоновые процессы и MCP-серверы работают в общем для них сетевом пространстве Linux, где есть только свой localhost: сервер, запущенный одной командой, виден другим, а localhost самой машины — нет. LLM работает.",
+    net_hint_env: "Здесь это не строгая изоляция: прокси указывают на закрытый порт, pip, uv, npm и git переведены в офлайн, удалённые MCP-серверы не подключаются, но программа, которая этого не учитывает (сырой сокет, веб-команды Windows PowerShell 5.1), выйдет в сеть. Строго — в Docker (dreamteam sandbox) и на Linux.",
+    net_hint_container: "Песочница запущена без файрвола, поэтому здесь это не строгая изоляция: только прокси и офлайн-настройки pip, uv, npm и git. Перезапустите dreamteam sandbox: если есть сессия без интернета, контейнер запустится с файрволом.",
+    net_hint_unknown: "Команды агентов, их фоновые процессы и MCP-серверы без интернета, LLM работает: строго — в Docker (dreamteam sandbox) и на Linux, на Windows и macOS — только прокси и офлайн-настройки.",
     goal_required: "Укажите цель сессии.", creating: "Создаю сессию…",
     // settings
     s_models: "Модели и эндпоинты", s_models_hint: "Профили подключения к LLM. Агенты используют профиль по умолчанию; при найме агента можно указать другой профиль (например, дешёвый «fast»).",
@@ -87,6 +94,9 @@ const I18N = {
     r_err_model: "Роль «{name}» использует профиль «{model}», которого нет.",
     ag_steps: "Шагов за пробуждение", ag_context: "Окно контекста по умолчанию", ag_tool_out: "Лимит вывода инструмента (симв.)",
     ag_stagger: "Пауза между стартами агентов, с", ag_nudge: "Напоминание простаивающим, с", ag_parallel: "Параллельных вызовов LLM",
+    ag_plan_steps: "Подсказка планирующему агенту после шагов", ag_plan_minutes: "Подсказка планирующему агенту после, мин",
+    ag_plan_hint: "Если взявший задачу планирования за столько шагов (или минут) не создал ни одной задачи, ему подсказывают создать независимые задачи сразу и отдать исследования другим; ещё раз — при удвоенном значении. 0 — выключено.",
+    ag_plan_minutes_hint: "то же по времени с момента, когда он взял задачу; 0 — выключено",
     sh_program: "Оболочка", sh_timeout: "Ожидание команды по умолчанию, с", sh_max_timeout: "Наибольший тайм-аут команды, с",
     sh_max_timeout_hint: "столько же от запуска живёт команда, ушедшая в фон по тайм-ауту; само ожидание ИИ-агента ограничено следующим полем, по MCP — 600 с",
     sh_fg_max: "ИИ-агент ждёт команду не дольше, с", sh_fg_max_hint: "дальше она работает в фоне",
@@ -212,6 +222,13 @@ const I18N = {
     team_model: "model: {model}", team_hidden: "(hidden)", team_empty: "Add at least one role to the starting team.",
     team_over_max: "The starting team has {n} agents, more than the maximum ({max}).",
     f_more: "More", f_steps: "Steps per wake-up", f_approval: "Require approval of agents' MCP servers", f_start_now: "Start right away",
+    f_network: "No internet for the agents", sw_network: "Internet for the agents' commands", net_on: "on", net_off: "off",
+    net_badge: "No internet",
+    net_hint_docker: "The agents' commands, their background jobs and MCP servers run as a separate user whose network the container's firewall closes. The LLM and localhost work.",
+    net_hint_netns: "The agents' commands, their background jobs and MCP servers share a separate Linux network namespace that has only its own localhost: a server one command starts is reachable from the others, the machine's own localhost is not. The LLM works.",
+    net_hint_env: "Not strict isolation here: proxies point at a closed port, pip, uv, npm and git are set offline and remote MCP servers are not connected, but a program that ignores this (a raw socket, Windows PowerShell 5.1's web cmdlets) still gets out. Strict in Docker (dreamteam sandbox) and on Linux.",
+    net_hint_container: "The sandbox was started without its firewall, so this is not strict isolation here: only proxies and offline settings of pip, uv, npm and git. Restart dreamteam sandbox: with a session without network, the container starts with the firewall.",
+    net_hint_unknown: "The agents' commands, their background jobs and MCP servers get no internet, the LLM keeps it: strictly in Docker (dreamteam sandbox) and on Linux; on Windows and macOS only proxies and offline settings.",
     goal_required: "Enter the session goal.", creating: "Creating the session…",
     s_models: "Models and endpoints", s_models_hint: "LLM connection profiles. Agents use the default profile; a hired agent can use another one (e.g. a cheap “fast”).",
     s_roles: "Roles",
@@ -257,6 +274,9 @@ const I18N = {
     r_err_model: "Role “{name}” uses the profile “{model}”, which does not exist.",
     ag_steps: "Steps per wake-up", ag_context: "Default context window", ag_tool_out: "Tool output limit (chars)",
     ag_stagger: "Delay between agent starts, s", ag_nudge: "Nudge idle agents after, s", ag_parallel: "Parallel LLM calls",
+    ag_plan_steps: "Hint the planner after steps", ag_plan_minutes: "Hint the planner after, min",
+    ag_plan_hint: "When the member holding the planning task has created no task after this many steps (or minutes), it is told to create the independent tasks now and hand the research to the others; once more at twice the value. 0 = off.",
+    ag_plan_minutes_hint: "the same by the time since it claimed the task; 0 = off",
     sh_program: "Shell", sh_timeout: "Default wait for a command, s", sh_max_timeout: "Largest command timeout, s",
     sh_max_timeout_hint: "a command that went to the background at its timeout lives this long from its start; an AI agent's wait itself is capped by the next field, 600 s over MCP",
     sh_fg_max: "An AI agent waits for a command at most, s", sh_fg_max_hint: "then it goes on in the background",
@@ -549,6 +569,12 @@ function workspaceLine(ws) {
     ${missing ? `<div class="sc-warn"><i class="ic ic-alert"></i>${esc(t("ws_missing"))}</div>` : ""}`;
 }
 
+/** What a session without network gets here (the launcher's network_isolation: "docker" | "netns" | "env" | "container"; unknown:
+ * what each platform gets), said honestly: only Docker and Linux isolate (docs/SPEC.md §7.2). */
+function networkHint(isolation) {
+  return t(["docker", "netns", "env", "container"].includes(isolation) ? `net_hint_${isolation}` : "net_hint_unknown");
+}
+
 function sessionCard(s) {
   const state = sessionState(s);
   const tasks = s.tasks || { total: 0, done: 0 };
@@ -569,6 +595,7 @@ function sessionCard(s) {
       <a class="sc-title" href="/s/${encodeURIComponent(s.id)}/" title="${esc(s.title)}">${esc(s.title)}</a>
       <span class="badge ${badgeCls}">${esc(t("st_" + state))}</span>
       ${state === "running" && s.wrap_up ? `<span class="badge warn" title="${esc(t("st_wrap_up_hint"))}">${esc(t("st_wrap_up"))}</span>` : ""}
+      ${s.network === "off" ? `<span class="badge warn" title="${esc(networkHint(H.isolation))}">${esc(t("net_badge"))}</span>` : ""}
     </div>
     ${goal}
     <div class="sc-progress"><div class="meter"><div style="width:${pct}%"></div></div><span>${esc(t("tasks_done", { done: Number(tasks.done) || 0, total: Number(tasks.total) || 0 }))}</span></div>
@@ -1061,6 +1088,7 @@ async function newSessionModal() {
         <div class="form-grid">
           <label class="field"><span>${esc(t("f_steps"))}</span><input id="ns-steps" type="number" min="1" max="500" value="${esc((v.agents || {}).max_steps_per_turn ?? 40)}"></label>
           <label class="check full"><input type="checkbox" id="ns-approval"${(v.mcp || {}).require_approval ? " checked" : ""}> ${esc(t("f_approval"))}</label>
+          <label class="check full"><input type="checkbox" id="ns-offline"${sw.network === "off" ? " checked" : ""}> <span>${esc(t("f_network"))} <span class="hint">${esc(networkHint(H.isolation))}</span></span></label>
         </div>
       </details>
       <div class="err-text" id="ns-error"></div>
@@ -1104,6 +1132,8 @@ function sessionOverrides(v, form) {
   if (steps && steps !== (v.agents || {}).max_steps_per_turn) agents.max_steps_per_turn = steps;
   if (Object.keys(agents).length) overrides.agents = agents;
   if (!!form.approval !== !!(v.mcp || {}).require_approval) overrides.mcp = { require_approval: !!form.approval };
+  // [swarm] network (docs/SPEC.md §7.2): only when the box differs from the saved default
+  if (form.offline !== undefined && !!form.offline !== (sw.network === "off")) swarm.network = form.offline ? "off" : "on";
   return overrides;
 }
 
@@ -1116,6 +1146,7 @@ async function submitNewSession(e) {
   const overrides = sessionOverrides(savedDefaults(), {
     lang: $("#ns-lang").value, max: $("#ns-max").value, budget: $("#ns-budget").value, team: H.teams.ns,
     model: $("#ns-model").value, steps: $("#ns-steps").value, approval: $("#ns-approval").checked,
+    offline: $("#ns-offline").checked,
   });
   const run = $("#ns-run").checked;
   const btn = $("#ns-submit");
@@ -1499,6 +1530,7 @@ async function loadSettings() {
   H.view = data.settings; H.original = clone(data.settings);
   H.providers = data.providers || []; H.path = data.path || "";
   H.rolePresets = data.role_presets || [];
+  H.isolation = data.network_isolation || null;   // what a session without network gets here
   H.settingsError = null;
   renderSettings(true);
 }
@@ -1535,6 +1567,8 @@ function renderSettings(fromServer) {
       field("sw_budget", "swarm.max_cost_usd", "float", { min: 0, step: 0.5, hint: "sw_budget_hint" }),
       teamComposer("defaults"),
       field("sw_review", "swarm.independent_review", "bool", { full: true, hint: "sw_review_hint" }),
+      field("sw_network", "swarm.network", "select", { full: true, options: [["on", t("net_on")], ["off", t("net_off")]],
+                                                       hintText: networkHint(H.isolation) }),
     ]))}
     ${section("agents", grid([
       field("ag_steps", "agents.max_steps_per_turn", "int", { min: 1 }),
@@ -1543,6 +1577,8 @@ function renderSettings(fromServer) {
       field("ag_stagger", "agents.stagger_seconds", "float", { min: 0, step: 0.5 }),
       field("ag_nudge", "agents.idle_nudge_seconds", "float", { min: 0, step: 5 }),
       field("ag_parallel", "agents.max_parallel_llm_calls", "int", { min: 1 }),
+      field("ag_plan_steps", "agents.planning_hint_steps", "int", { min: 0, hint: "ag_plan_hint" }),
+      field("ag_plan_minutes", "agents.planning_hint_minutes", "float", { min: 0, step: 1, hint: "ag_plan_minutes_hint" }),
     ]))}
     ${section("shell", grid([
       field("sh_program", "shell.program", "select", { options: ["auto", "bash", "sh", "powershell", "pwsh", "cmd"].map((x) => [x, x]) }),
@@ -1619,7 +1655,8 @@ function setPath(path, value) {
 function field(labelKey, path, type, opts = {}) {
   const value = getPath(path);
   const cls = opts.full ? " full" : "";
-  const hint = opts.hint ? ` <span class="hint">${esc(t(opts.hint))}</span>` : "";
+  const text = opts.hintText || (opts.hint ? t(opts.hint) : "");   // hintText: already in the UI language
+  const hint = text ? ` <span class="hint">${esc(text)}</span>` : "";
   const attrs = `data-path="${esc(path)}" data-type="${type}"`;
   if (type === "bool") {
     return `<label class="check${cls}"><input type="checkbox" ${attrs}${value ? " checked" : ""}> <span>${esc(t(labelKey))}${hint}</span></label>`;
@@ -2062,6 +2099,7 @@ if (typeof module !== "undefined" && module.exports) {
     onSkillsPaneClick, pendingSkillHtml,
     roleSkillsHtml, addRoleSkill, nsSkillsHtml, teamSkills, nsRoleSkillsHtml, renderNsSkills, onNsSkillChange,
     sessionSkillsHtml, pendingSkillsModal, renderPendingSkills, decidePendingSkill, onPendingClick, confirmDelete,
+    networkHint,
   };
 } else if (typeof document !== "undefined") {
   init();

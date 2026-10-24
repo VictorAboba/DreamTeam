@@ -140,8 +140,11 @@ async def shell(ctx: ToolContext, args: dict[str, Any]) -> str:
                                    background=bool(args.get("background")))
     skipped: list[str] = []
     if outcome.state != "killed":  # killed: the session stops or the member leaves, so no git work may start now
-        # one commit per call: the subject names the files it changed, the body keeps the command
-        await swarm.workspace.autocommit(ctx.actor, kind="shell", detail=command, skipped=skipped)
+        # one commit per call: the subject names the files it changed, the body keeps the command; new files wait
+        # one more command (hold: leftovers of a test run that the next run deletes never enter the history); a
+        # command that goes on as a job has not ended yet
+        await swarm.workspace.autocommit(ctx.actor, kind="shell", detail=command, skipped=skipped, hold=True,
+                                         ended=outcome.serial if outcome.job is None else None)
     # the footer of a job points at the tools the caller has (`jobs`, `job_stop` or the console commands; `wait`,
     # or `wait_for_events` for an external member)
     text = outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=cfg, has_wait=ctx.has_tool("wait"))

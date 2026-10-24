@@ -1210,7 +1210,13 @@ def _docker_ready() -> bool:
 
 @pytest.mark.skipif(not _docker_ready(), reason="Docker daemon not available")
 def test_docker_image_builds_and_runs():
-    docker_module.build_image()
-    out = subprocess.run(["docker", "run", "--rm", docker_module.IMAGE, "--version"], capture_output=True, text=True,
-                         timeout=300)
-    assert out.returncode == 0 and re.search(r"dreamteam \d", out.stdout + out.stderr)
+    # a tag of its own, removed afterwards: the user's dreamteam:latest is never rebuilt by a test run
+    image = f"dreamteam-selftest:{os.getpid()}"
+    try:
+        docker_module.build_image(image)
+        out = subprocess.run(["docker", "run", "--rm", image, "--version"], capture_output=True, text=True,
+                             timeout=300)
+        assert out.returncode == 0 and re.search(r"dreamteam \d", out.stdout + out.stderr)
+        assert docker_module.image_dockerfile(image) == docker_module.dockerfile_hash()
+    finally:
+        subprocess.run(["docker", "image", "rm", "-f", image], capture_output=True, timeout=120)

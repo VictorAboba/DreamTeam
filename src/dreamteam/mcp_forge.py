@@ -25,6 +25,7 @@ import anyio
 from mcp import Client, MCPError, StdioServerParameters, stdio_client
 from mcp import types as mcp_types
 
+from . import netoff
 from .db import dumps, loads
 from .models import USER, ToolError
 from .shell import scrubbed_env, truncate_middle
@@ -249,6 +250,7 @@ class MCPConnection:
         self.env.setdefault("COLUMNS", LOG_COLUMNS)  # readable rich logs (see LOG_COLUMNS)
         self.log_path = Path(log_path)
         self.tools: list[dict] = []
+        self.offline = False   # started in a session without network (MCPForge._new_connection)
         self._client: Client | None = None
         self._task: asyncio.Task | None = None
         self._scope: anyio.CancelScope | None = None
@@ -413,6 +415,12 @@ class MCPForge:
 
     async def stop(self) -> None:
         self._stopped = True
+        conns = list(self._conns.values())
+        self._conns.clear()
+        await asyncio.gather(*(c.close() for c in conns), return_exceptions=True)
+
+    async def close_connections(self) -> None:
+        """Close the running servers (the session's network changed): each starts again at its next use."""
         conns = list(self._conns.values())
         self._conns.clear()
         await asyncio.gather(*(c.close() for c in conns), return_exceptions=True)
@@ -775,17 +783,40 @@ class MCPForge:
                 raise ToolError("The MCP forge is stopped.")
             rec = await self._usable(actor, key)
             conn = self._conns.get(key)
-            if conn is not None and conn.alive and conn is not dead:
+            # (a server started under the other network setting, docs/SPEC.md §7.2: close_connections may have run
+            # while it was starting, so it is checked here too)
+            if conn is not None and conn.alive and conn is not dead and self._same_network(conn):
                 return conn
             if conn is not None:
                 self._conns.pop(key, None)
                 await conn.close()
             return await self._connect(actor, rec)
 
-    async def _connect(self, actor: str, rec: dict) -> MCPConnection:
+    def _isolated(self, command: list[str], env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+        """A server's command and environment in a session without network (netoff.py): run like the members'
+        commands, which wrote it or call it."""
+        return netoff.command(self.config, command, env)
+
+    def _new_connection(self, name: str, command: list[str], cwd: Path, env: dict) -> MCPConnection:
+        offline = netoff.is_off(self.config)
+        command, env = self._isolated(command, env)
+        conn = MCPConnection(name, command, cwd, env, self.log_path(name))
+        conn.offline = offline   # the setting it runs with (_same_network)
+        return conn
+
+    def _same_network(self, conn: MCPConnection) -> bool:
+        return getattr(conn, "offline", False) == netoff.is_off(self.config)
+
+    async def _connect(self, actor: str, rec: dict, again: bool = True) -> MCPConnection:
         name = rec["name"]
         command, cwd, env = self._launch_spec(rec)
-        conn = MCPConnection(name, command, cwd, env, self.log_path(name))
+        if netoff.is_off(self.config):
+            # a stdio bridge to a remote server would fail inside the isolation, or (best effort) get through it
+            url = netoff.remote_url(command)
+            if url is not None:
+                raise ToolError(f"MCP server '{name}' connects to {url}, and this session has no network ([swarm] "
+                                "network = \"off\"): it is not started.")
+        conn = self._new_connection(name, command, cwd, env)
         try:
             tools = await conn.start(self.config.mcp.startup_timeout)
         except ConnectionFailed as exc:
@@ -794,6 +825,12 @@ class MCPForge:
         if self._stopped:  # stop() ran while the server was starting
             await conn.close()
             raise ToolError("The MCP forge is stopped.")
+        if not self._same_network(conn):  # the network setting changed while it was starting: start it again
+            await conn.close()
+            if not again:
+                raise ToolError(f"MCP server '{name}': the session's network setting changed while it was starting; "
+                                "call it again.")
+            return await self._connect(actor, rec, again=False)
         self._conns[name] = conn
         self._update_runtime(actor, rec, tools, None)
         log.info("MCP server %s started (%d tools)", name, len(tools))
@@ -826,7 +863,7 @@ class MCPForge:
         syntax = _syntax_error(code)
         if syntax:
             return None, [], syntax
-        conn = MCPConnection(name, command, self.server_dir(name), scrubbed_env(self.config), self.log_path(name))
+        conn = self._new_connection(name, command, self.server_dir(name), scrubbed_env(self.config))
         try:
             tools = await conn.start(self.config.mcp.startup_timeout)
         except ConnectionFailed as exc:

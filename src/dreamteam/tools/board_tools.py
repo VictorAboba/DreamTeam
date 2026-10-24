@@ -288,6 +288,12 @@ def _diff(old: Task, new: Task) -> list[str]:
 async def task_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
     before = ctx.swarm.board.get(args["task_id"])
     task = ctx.swarm.board.complete(ctx.actor, args["task_id"], args["result"])
+    # the new files the member's last command left are committed now, when the task changes hands (a reviewer or the
+    # user looks at HEAD; the reviewer's wake-up comes later): they would otherwise wait for its next command
+    # (docs/SPEC.md §7 "Held new files"). After complete(): a refused call commits nothing
+    workspace = getattr(ctx.swarm, "workspace", None)  # (a test double may have none)
+    if workspace is not None:
+        await workspace.commit_held(ctx.actor, f"when {ctx.actor} completed task #{task.id}")
     if task.status != Status.REVIEW:
         return f"Task #{task.id} is done."
     if task.reviewer == before.reviewer:  # the task's own reviewer

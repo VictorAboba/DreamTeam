@@ -86,6 +86,7 @@ class AgentRuntime:
         # in-progress tasks the last activation stopped on with plain text even after a nudge (swarm: n_stalled)
         self.stalled: frozenset[int] = frozenset()
         self.stalled_at = 0.0
+        self.llm_steps = 0  # LLM replies of this runtime's activations (swarm: the planning hint counts them)
         self.trace: Trace | None = None  # the trace of the running activation (docs/SPEC.md §16)
         member = swarm.member(name) or {}
         self.language: str = member.get("language") or swarm.language
@@ -464,6 +465,7 @@ class AgentRuntime:
                 break
             self._append(self._assistant_message(response))
             self._log_response(response)
+            self.llm_steps += 1
             if response.stop_reason == "refusal":
                 swarm.notify(USER, "u_refusal", name=self.name, category=response.text or "refusal", wake=False)
                 trace.record("event", "refusal", output=response.text or "refusal", status="error")
@@ -504,6 +506,8 @@ class AgentRuntime:
                 summary = "Answered without tool calls"
                 break
             await self._run_tools(response)
+            # a planner that has created no task yet is told so after this step (its `incoming` below shows it)
+            swarm.hint_planner(self.name)
             if self._turn_ended or self._stopping:
                 summary = "Turn ended (wait)" if self._turn_ended else "Stopped (the agent left the swarm)."
                 status = "done" if self._turn_ended else "stopped"
@@ -530,8 +534,21 @@ class AgentRuntime:
             error = self._last_error
             status, summary = "error", f"{error.kind}: {error.message}"
             self._fail(summary, retry=error.retryable)
+        if not self._stopping:  # (a stopping swarm or a member leaving commits them itself)
+            await self._commit_held()
         self._finish_trace(status, summary)
         self._set_state(AgentStatus.ERROR if outcome == "failed" else AgentStatus.IDLE)
+
+    async def _commit_held(self) -> None:
+        """The end of an activation: the new files its last command left (held back for one more command,
+        docs/SPEC.md §7 "Held new files") are committed now; they must not wait for the agent's next wake-up."""
+        workspace = getattr(self.swarm, "workspace", None)
+        if workspace is None:
+            return
+        try:
+            await workspace.commit_held(self.name, f"at the end of {self.name}'s turn")
+        except Exception:  # noqa: BLE001 - never raises by design; a stand-in workspace must not fail the turn
+            log.exception("agent %s: could not commit its held new files", self.name)
 
     def _stop_reason(self) -> str:
         if self._stopping:

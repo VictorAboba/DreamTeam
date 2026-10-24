@@ -26,12 +26,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import prompts
+from . import netoff, prompts
 from .db import dumps, loads
 from .models import USER, AgentKind, Status, ToolError
 from .procs import alive_all, sweep_token
-from .shell import (KILL_SETTLE, PENDING_MAX, SETTLE_POLL, RunningCommand, kill_after_cancel, start_command,
-                    truncate_middle)
+from .shell import (KILL_SETTLE, PENDING_MAX, SETTLE_POLL, RunningCommand, kill_after_cancel, last_serial,
+                    start_command, truncate_middle)
 from .workspace import format_size, scratch_is_local, scratch_rel
 
 log = logging.getLogger(__name__)
@@ -359,6 +359,7 @@ class ShellOutcome:
     names: list[str] = field(default_factory=list)
     note_args: dict = field(default_factory=dict)
     max_output: int = 12000
+    serial: int | None = None  # the command's (RunningCommand.serial)
 
     def _note_text(self, has_jobs_tool: bool, cfg: Any) -> str:
         if self.note not in NOTES:
@@ -476,15 +477,19 @@ class JobManager:
         requested = BACKGROUND_GRACE if background else float(timeout)
         wait = self._wait_for(actor, requested)
         env = self.command_env(env)
+        # a session without network (docs/SPEC.md §7.2): the command, and so the job it may become, runs isolated
+        offline = netoff.is_off(self.swarm.config)
+        if offline:
+            env = netoff.environment(env)
         cmd = await start_command(command, cwd=self.swarm.workspace.root, program=cfg.program, env=env,
-                                  max_output=max_output, token=secrets.token_hex(8))
+                                  max_output=max_output, token=secrets.token_hex(8), offline=offline)
         fg = _Foreground(actor, cmd, asyncio.get_running_loop().create_future())
         self._foreground[cmd.serial] = fg
         adopted = False
 
         def outcome(state: str, **kw: Any) -> ShellOutcome:
             return ShellOutcome(state, kw.pop("code", None), kw.pop("output", "") or "", cmd.name, wait,
-                                max_output=max_output, **kw)
+                                max_output=max_output, serial=cmd.serial, **kw)
 
         try:
             if not self._may_start(actor):  # stop_all or forbid() came while the command started
@@ -805,12 +810,14 @@ class JobManager:
             await self._commit(job.owner, f"job {job.label}", detail)
         self._announce_command_done(job, previous, names)
 
-    async def _commit(self, owner: str, kind: str, detail: str) -> None:
+    async def _commit(self, owner: str, kind: str, detail: str, *, ended: int | None = None) -> None:
         """The autocommit of what a job changed, under its owner: the subject names the changed files (`kind`: "job
         j3: src/a.py, ..."), the body keeps the command and how the job ended (workspace.commit_message). Never
-        raises: a failed commit must not cost the owner its notice (the next autocommit takes the files)."""
+        raises: a failed commit must not cost the owner its notice (the next autocommit takes the files). New files
+        wait one more command, as after `shell` (hold; `ended`: the serial of the job's command when the job has
+        ended, None while processes of it still run)."""
         try:
-            await self.swarm.workspace.autocommit(owner, kind=kind, detail=detail)
+            await self.swarm.workspace.autocommit(owner, kind=kind, detail=detail, hold=True, ended=ended)
         except Exception:  # noqa: BLE001
             log.exception("autocommit of %s", kind)
 
@@ -882,7 +889,8 @@ class JobManager:
             self._announce_ended(job)
             phrase = self._end_phrase(job.public(now), now)
             if commit and not self._stopping():
-                await self._commit(job.owner, f"job {job.label}", f"{job.command}\n\n{job.label}: {phrase}")
+                await self._commit(job.owner, f"job {job.label}", f"{job.command}\n\n{job.label}: {phrase}",
+                                   ended=cmd.serial)
             elif commit:  # it ended while the session stops: stop_all commits what it changed, under its owner
                 self._uncommitted.setdefault(job.owner, []).append((job.id, job.command, phrase))
             if self.swarm.is_member(job.owner):  # a retired owner or a non-member gets no notice
@@ -1057,6 +1065,13 @@ class JobManager:
     def running_of(self, owner: str | None = None) -> list[Job]:
         jobs = sorted(self._jobs.values(), key=lambda j: j.id)
         return jobs if owner is None else [j for j in jobs if j.owner == owner]
+
+    def running_commands(self) -> tuple[dict[int, str], int]:
+        """(serial -> member of every foreground command and job running now, the serial of the last command
+        started): the workspace's held new files (docs/SPEC.md §7 "Held new files")."""
+        running = {serial: fg.actor for serial, fg in self._foreground.items()}
+        running.update((job.cmd.serial, job.owner) for job in self._jobs.values())
+        return running, last_serial()
 
     def _holds_in_progress(self, name: str) -> bool:
         board = getattr(self.swarm, "board", None)

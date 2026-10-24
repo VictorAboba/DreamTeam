@@ -13,9 +13,11 @@ import subprocess
 import sys
 import time
 import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 from typing import Any
 
+from . import netoff
 from .models import USER, ToolError
 
 log = logging.getLogger(__name__)
@@ -44,6 +46,16 @@ COMMIT_PATH_MAX = 40      # one path in it; a longer one keeps its end: "…/mod
 COMMIT_DETAIL_MAX = 2000  # its body (the command that made the change), cut in the middle beyond this
 NESTED_SHOWN = 5          # nested repositories named in the note about what an autocommit left out
 NESTED_PATHSPECS_MAX = 100  # untracked folders passed to `git ls-files` by name; more: it lists all untracked files
+# pathspecs passed on git's command line up to this many characters in all; more go through stdin
+# (--pathspec-from-file, git 2.25+): Windows limits a command line to 32767 characters, Linux and macOS to far more
+PATHSPEC_ARGV_MAX = 8000 if sys.platform == "win32" else 100_000
+MOVED_CANDIDATES_MAX = 500  # new files compared with the tracked files a call deleted (a rename by `mv`)
+# The body of a commit of held new files (docs/SPEC.md §7 "Held new files"): who it is attributed to and why it came
+# late. {others}: "" or HELD_OTHERS
+HELD_NOTE = ("New files first seen after this command of {owner}{others}, committed {when}: a new file waits until "
+             "it outlives one more command, so leftovers that the next command deletes (of a test run, say) never "
+             "enter the history.")
+HELD_OTHERS = " ({names} also had a command running then; git cannot tell who wrote a file)"
 # Directories shown but never expanded in listings (dependency caches, virtualenvs).
 NO_EXPAND = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
                        ".pytest_cache", ".ruff_cache", ".tox"})
@@ -476,6 +488,69 @@ def _check_windows_names(parts: tuple[str, ...], shown: str) -> None:
                             "(CON, PRN, AUX, NUL, COM1-9, LPT1-9, also with an extension). Choose another name.")
 
 
+@dataclass
+class HeldFile:
+    """A new untracked file an autocommit held back (Workspace.autocommit, hold=True): `owner` is the member whose
+    autocommit first saw it, `kind`/`detail` that commit's (the command), `stamp` its (size, mtime) then. `others`:
+    the other members with a command running then or an autocommit waiting for the git lock (git cannot tell who
+    wrote a file: any of them may have). `waiting`: those of the suspects (owner and others) whose next command the
+    file has not outlived yet. `running`: the commands running when it was first seen (serial -> member; the owner's
+    own job too), until each has ended and its commit is made. `after`: member -> the serial of the last command
+    started when the member had none of `running` left (first sight, or when its last one ended): only a command
+    with a higher serial, i.e. one started after anything of the member that may have written the file, counts as
+    its next command."""
+    owner: str
+    kind: str
+    detail: str
+    stamp: tuple[int, int] | None
+    others: tuple[str, ...] = ()
+    waiting: set[str] = field(default_factory=set)
+    running: dict[int, str] = field(default_factory=dict)
+    after: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def suspects(self) -> tuple[str, ...]:
+        return self.owner, *self.others
+
+
+def _stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    return info.st_size, info.st_mtime_ns
+
+
+def _collapse(paths: list[str], units: dict[str, str]) -> list[str]:
+    """`paths` (untracked files) as pathspecs: an untracked folder of `git status` (`units`: file -> its folder, or
+    itself) all of whose files are in `paths` is named once instead of file by file."""
+    chosen = set(paths)
+    members: dict[str, list[str]] = {}
+    for path, unit in units.items():
+        members.setdefault(unit, []).append(path)
+    out: list[str] = []
+    for unit, files in members.items():
+        if unit not in chosen and all(f in chosen for f in files):
+            out.append(unit)
+            chosen.difference_update(files)
+    return out + sorted(chosen)
+
+
+def _names(names: tuple[str, ...] | list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+
+
+def _held_note(held: HeldFile, when: str | None) -> str:
+    """HELD_NOTE for a commit of files held as `held` was; `when` None: at a later autocommit, once each suspect's
+    next command has left them in place."""
+    others = HELD_OTHERS.format(names=_names(held.others)) if held.others else ""
+    if when is None:
+        suspects = held.suspects
+        when = (f"after the next command{'' if len(suspects) == 1 else 's'} of {_names(suspects)} left them "
+                "in place")
+    return HELD_NOTE.format(owner=held.owner, others=others, when=when)
+
+
 class Workspace:
     def __init__(self, swarm: Any):
         self.swarm = swarm
@@ -486,6 +561,9 @@ class Workspace:
         self._running_git: set[asyncio.Future] = set()  # git commands in threads (they outlive a cancelled caller)
         # member -> nested repositories (untracked folders with their own .git) already named in its tool results
         self._nested_reported: dict[str, set[str]] = {}
+        # new untracked files the shell and job autocommits hold back for one more command (in memory)
+        self._held: dict[str, HeldFile] = {}
+        self._queued: dict[str, int] = {}  # member -> its whole-tree autocommits waiting for the git lock or in it
 
     # --- setup -----------------------------------------------------------------------------
     @property
@@ -1036,15 +1114,70 @@ class Workspace:
 
     # --- git --------------------------------------------------------------------------------
     async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",
-                         skipped: list[str] | None = None) -> str | None:
+                         skipped: list[str] | None = None, hold: bool = False, ended: int | None = None) -> str | None:
         """Commit every change outside `.scratch/` as `actor`, one commit per call. The message is `message` as
         given or, with `kind` (e.g. "shell", "job j3"), commit_message() of what is committed: the subject names the
         changed files, the body holds `detail` (the command that changed them). Untracked folders with their own
-        .git (nested repositories) are left out; `skipped` receives their paths (nested_repos_note)."""
+        .git (nested repositories) are left out; `skipped` receives their paths (nested_repos_note).
+        `hold` (the shell's and the jobs' commits): new untracked files wait until they outlive one more command
+        (_hold_new, docs/SPEC.md §7 "Held new files"); `ended` is the serial of the command whose end this commit
+        follows (None: none has ended, e.g. a call whose command goes on as a job). Without `hold` everything is
+        committed now, files held for anyone included. Returns the last commit made."""
         if not self.git_enabled:
             return None
-        async with self._git_lock:
-            return await self._commit_locked(actor, message, None, kind=kind, detail=detail, skipped=skipped)
+        # a member whose command has ended but whose commit waits for the lock may have written what this one sees
+        self._queued[actor] = self._queued.get(actor, 0) + 1
+        try:
+            async with self._git_lock:
+                return await self._commit_locked(actor, message, None, kind=kind, detail=detail, skipped=skipped,
+                                                 hold=hold, ended=ended)
+        finally:
+            left = self._queued.pop(actor, 1) - 1
+            if left > 0:
+                self._queued[actor] = left
+
+    async def commit_held(self, actor: str | None, when: str, *, leaving: bool = False) -> str | None:
+        """A flush of the new files held back (docs/SPEC.md §7 "Held new files"): `actor`'s task_complete or the end
+        of its turn counts as a command of it that they outlived, once none of its commands that were running when
+        they were first seen is left (its own job may still write them); with `leaving` (the member leaves, its
+        commands stopped) it is no suspect any more. The files that no longer wait for anyone and are still there
+        are committed, each under its owner; `actor` None (the session stops): every held file. `when` completes the
+        commit's note (HELD_NOTE: "at the end of Anna's turn"). Never raises; the last commit made or None."""
+        if not self.git_enabled or not self._held:
+            return None
+        if actor is not None and not any(actor in h.suspects or not h.waiting for h in self._held.values()):
+            return None  # the usual case: no git call at all
+        try:
+            async with self._git_lock:
+                if actor is not None:
+                    running, last = self._commands()
+                    for held in self._held.values():
+                        self._settle_held(held, running, last, None)
+                        if leaving:
+                            held.running = {s: m for s, m in held.running.items() if m != actor}
+                            held.waiting.discard(actor)
+                        elif actor in held.after:  # (none of its commands of then is left)
+                            held.waiting.discard(actor)
+                paths = [path for path, held in self._held.items() if actor is None or not held.waiting]
+                if not paths:
+                    return None  # e.g. another member's test run that may have left them still runs
+                status = await self._git(actor, "status", "--porcelain", "-z", "--untracked-files=normal")
+                if status.returncode != 0:
+                    log.warning("git status failed: %s", self._output(status))
+                    return None
+                units, _nested = await self._untracked(actor, porcelain_entries(status.stdout))
+                if units is None:
+                    return None
+                self._forget_held(units)
+                made, _done = await self._commit_held_locked([p for p in paths if p in self._held], units, when)
+                return made
+        except Exception:  # noqa: BLE001 - a flush must never fail a tool call or the session's stop
+            log.exception("commit of held new files failed")
+            return None
+
+    def held(self) -> dict[str, HeldFile]:
+        """The new files held back now (path -> HeldFile), a copy."""
+        return dict(self._held)
 
     def nested_repos_note(self, actor: str, paths: list[str]) -> str:
         """One line for `actor`'s tool result about nested repositories an autocommit left out ("" when there are
@@ -1059,34 +1192,190 @@ class Workspace:
         return (f"Not committed: {shown} — folders with their own .git (nested repositories). Delete their .git or "
                 f"move them into your scratch folder {scratch_rel(actor)} if they are temporary.")
 
-    async def _nested_repos(self, actor: str, entries: list[tuple[str, str]]) -> list[str]:
-        """Untracked folders (outside `.scratch/`) that git sees as repositories of their own: `git add -A` would
-        commit each as a gitlink (mode 160000) without a .gitmodules entry, i.e. an empty reference nobody can clone.
-        A nested repository inside an untracked folder shows only as that folder in `git status`, so `git ls-files
-        --others` (which stops at a nested repository and names it with a trailing "/") looks inside. Tracked
-        submodules are tracked, so never listed. Caller holds the git lock."""
-        folders = [path for xy, path in entries if xy == "??" and path and not in_scratch(path)
-                   and os.path.isdir(self.root / path) and not os.path.islink(self.root / path)]
+    async def _untracked(self, actor: str | None,
+                         entries: list[tuple[str, str]]) -> tuple[dict[str, str] | None, list[str]]:
+        """(the untracked files outside `.scratch/` that `git add -A` would add, each mapped to its `??` entry of
+        `git status`: an untracked folder, or the file itself; None when git could not list them) and the untracked
+        folders that git sees as repositories of their own: `git add -A` would commit each as a gitlink (mode 160000)
+        without a .gitmodules entry, i.e. an empty reference nobody can clone. A nested repository inside an
+        untracked folder shows only as that folder in `git status`, so `git ls-files --others` (which stops at a
+        nested repository and names it with a trailing "/") looks inside. Tracked submodules are tracked, so never
+        listed. Caller holds the git lock."""
+        units: dict[str, str] = {}
+        folders: list[str] = []
+        for xy, path in entries:
+            if xy != "??" or not path or in_scratch(path):
+                continue
+            if os.path.isdir(self.root / path) and not os.path.islink(self.root / path):
+                folders.append(path)
+            else:
+                units[path] = path
         if not folders:
-            return []
+            return units, []
         # literal pathspecs after "--": a folder named "--help" or "a[1]" is a path, not an option or a glob
         spec = ("--", *(f"{path}/" for path in folders)) if len(folders) <= NESTED_PATHSPECS_MAX else ()
         listed = await self._git(actor, "ls-files", "--others", "--exclude-standard", "-z", *spec)
         if listed.returncode != 0:
             log.info("git ls-files --others failed: %s", self._output(listed))
-            return []
-        return nested_repo_paths(self.root, listed.stdout)
+            return None, []
+        nested = nested_repo_paths(self.root, listed.stdout)
+
+        def top(name: str) -> str | None:
+            parts = name.split("/")
+            return next((unit for unit in ("/".join(parts[:i]) for i in range(1, len(parts))) if unit in tops), None)
+
+        tops = set(folders)
+        tops -= {top(path) for path in nested}  # a folder holding a nested repository is never named as a whole
+        for name in listed.stdout.decode("utf-8", "replace").split("\0"):
+            if name and not name.endswith("/") and not in_scratch(name):  # "/": a nested repository
+                units[name] = top(name) or name
+        return units, nested
+
+    def _forget_held(self, units: dict[str, str]) -> None:
+        """Held files that are no longer untracked (deleted, committed by hand or by write_file, ignored now) are
+        forgotten: a held file that vanished never enters the history."""
+        for path in [path for path in self._held if path not in units]:
+            del self._held[path]
+
+    def _commands(self) -> tuple[dict[int, str], int]:
+        """(serial -> member of the commands running now: foreground `shell` calls and jobs; the serial of the last
+        command started), from the JobManager."""
+        jobs = getattr(self.swarm, "jobs", None)
+        return jobs.running_commands() if hasattr(jobs, "running_commands") else ({}, 0)
+
+    def _queued_besides(self, member: str, actor: str | None) -> int:
+        """`member`'s whole-tree autocommits waiting for the git lock or in it, besides `actor`'s one under way."""
+        return self._queued.get(member, 0) - (1 if member == actor else 0)
+
+    def _settle_held(self, held: HeldFile, running: dict[int, str], last: int, actor: str | None) -> None:
+        """Forget the commands of `held.running` that have ended and whose commit is made (the end of a command
+        queues its commit at once: a member with one waiting may still have to commit what it did; `actor`: the
+        member whose commit is under way, not counted). A member whose last such command ended needs a command
+        started after now: `after` = `last`."""
+        for serial, member in list(held.running.items()):
+            if serial not in running and self._queued_besides(member, actor) <= 0:
+                del held.running[serial]
+                if member not in held.running.values():
+                    held.after[member] = last
+
+    async def _hold_new(self, actor: str, kind: str, detail: str, units: dict[str, str],
+                        entries: list[tuple[str, str]], ended: int | None) -> tuple[str | None, list[str]]:
+        """The hold step of a shell or job autocommit of `actor` (`ended`: the serial of its command that has ended,
+        or None). Held files still as they were when first seen count that command for `actor` (HeldFile: it started
+        after anything of `actor` that may have written them), and those no longer waiting for anyone are committed
+        now, a commit of their own under their owner. A held file rewritten since (deleted and written again by the
+        next run) is held anew, like a new file. A new file is held with `actor` as owner, the commands running now
+        and the members with an autocommit queued as suspects too (whoever's command left it). A new file with the
+        content of a tracked file the call deleted is not held (_moved: the call's own commit shows the rename).
+        Returns (the commit made, if any; the moved files). Caller holds the git lock."""
+        # after the file listing: a command that ended meanwhile has its commit queued, one that started is running
+        running, last = self._commands()
+        others = tuple(sorted(({*running.values()} | {m for m in self._queued if self._queued_besides(m, actor) > 0})
+                              - {actor}))
+        for path, held in list(self._held.items()):
+            if held.stamp != _stamp(self.root / path):
+                del self._held[path]  # held anew below
+                continue
+            self._settle_held(held, running, last, actor)
+            if ended is not None and actor in held.waiting and ended > held.after.get(actor, ended):
+                held.waiting.discard(actor)
+        # (also a file a failed commit kept held)
+        ready = [path for path, held in self._held.items() if not held.waiting]
+        made, done = await self._commit_held_locked(ready, units, None) if ready else (None, set())
+        new = [path for path in units if path not in done and path not in self._held]
+        moved = await self._moved(actor, entries, new)
+        busy = set(running.values())
+        for path in new:
+            if path not in moved:
+                self._held[path] = HeldFile(actor, kind, detail, _stamp(self.root / path), others, {actor, *others},
+                                            dict(running), {m: last for m in (actor, *others) if m not in busy})
+        return made, sorted(moved)
+
+    async def _moved(self, actor: str, entries: list[tuple[str, str]], new: list[str]) -> set[str]:
+        """The new files of `new` with the content of a tracked file deleted in the same call (`mv a.py b.py`): not
+        held, so the call's commit shows the rename. Exact content only, and only up to MOVED_CANDIDATES_MAX new files.
+        Caller holds the git lock."""
+        deleted = [path for xy, path in entries if "D" in xy and not in_scratch(path) and "\n" not in path]
+        new = [path for path in new if "\n" not in path]
+        if not deleted or not new or len(new) > MOVED_CANDIDATES_MAX:
+            return set()
+        # the blob ids of the deleted files in HEAD, through stdin (any number of them; `git ls-tree` would need them
+        # on the command line): "<id>" per line, "HEAD:<path> missing" for one HEAD lacks
+        tree = await self._git(actor, "cat-file", "--batch-check=%(objectname)",
+                               input="".join(f"HEAD:{path}\n" for path in deleted).encode("utf-8", "replace"))
+        if tree.returncode != 0:
+            log.info("git cat-file failed: %s", self._output(tree))
+        blobs = {line for line in tree.stdout.decode("utf-8", "replace").splitlines()
+                 if re.fullmatch(r"[0-9a-f]{40,64}", line)} if tree.returncode == 0 else set()
+        if not blobs:
+            return set()
+        # the blob ids these files would get (with the repository's filters and line-ending conversion)
+        hashed = await self._git(actor, "hash-object", "--stdin-paths",
+                                 input="".join(f"{path}\n" for path in new).encode("utf-8", "replace"))
+        if hashed.returncode != 0:
+            log.info("git hash-object failed: %s", self._output(hashed))
+            return set()
+        return {path for path, sha in zip(new, hashed.stdout.decode("ascii", "replace").split()) if sha in blobs}
+
+    async def _commit_held_locked(self, paths: list[str], units: dict[str, str],
+                                  when: str | None) -> tuple[str | None, set[str]]:
+        """Commit held `paths`, one commit per command that first left them, under its owner (their kind and detail:
+        "shell (new files): out/a.txt", the command and HELD_NOTE, _held_note(…, when), in the body). Only those
+        paths are committed (`git commit -- paths`); a failed commit unstages them again and keeps them held.
+        Returns (the last commit, the paths committed). Caller holds the git lock."""
+        groups: dict[tuple[str, str, str, tuple[str, ...]], list[str]] = {}
+        for path in paths:
+            held = self._held[path]
+            if os.path.lexists(self.root / path):  # a command running meanwhile may have deleted it
+                groups.setdefault((held.owner, held.kind, held.detail, held.others), []).append(path)
+        head: str | None = None
+        done: set[str] = set()
+        for (owner, kind, detail, _others), files in groups.items():
+            note = _held_note(self._held[files[0]], when)
+            spec = _collapse(files, units)
+            message = commit_message(f"{kind} (new files)", sorted(files),
+                                     f"{detail}\n\n{note}" if detail.strip() else note)
+            add = await self._git_paths(owner, ("add", "-A", "--ignore-errors"), spec)
+            if add.returncode != 0:
+                log.warning("git add reported errors (committing what it could add): %s", self._output(add))
+            commit = await self._git_paths(owner, ("commit", "-q", "--no-verify", "-m", message), spec)
+            if commit.returncode != 0:  # e.g. a merge in progress (no partial commit then): retried next time
+                log.info("git commit of held files skipped: %s", self._output(commit))
+                await self._git_paths(owner, ("reset", "-q"), spec)  # not left staged for someone else's commit
+                continue
+            for path in files:
+                self._held.pop(path, None)
+            done.update(files)
+            rev = await self._git(owner, "rev-parse", "HEAD")
+            head = rev.stdout.decode("ascii", "replace").strip() or head
+        return head, done
+
+    async def _git_paths(self, actor: str | None, args: tuple[str, ...], spec: list[str], *,
+                         literal: bool = True) -> subprocess.CompletedProcess:
+        """git `args` with the pathspecs `spec`: after "--", or through stdin when they are long (PATHSPEC_ARGV_MAX).
+        A git older than 2.25 has no --pathspec-from-file: then the command line after all (the limit is low only
+        on Windows, whose git is recent)."""
+        if sum(len(item) + 3 for item in spec) <= PATHSPEC_ARGV_MAX:
+            return await self._git(actor, *args, "--", *spec, literal=literal)
+        data = b"".join(item.encode("utf-8", "replace") + b"\0" for item in spec)
+        proc = await self._git(actor, *args, "--pathspec-from-file=-", "--pathspec-file-nul", literal=literal,
+                               input=data)
+        if proc.returncode == 129 and b"pathspec-from-file" in (proc.stderr or b""):  # "unknown option"
+            return await self._git(actor, *args, "--", *spec, literal=literal)
+        return proc
 
     async def _commit_locked(self, actor: str, message: str, rel: str | None, *, kind: str = "",
-                             detail: str = "", skipped: list[str] | None = None) -> str | None:
-        """Commit everything except `.scratch/` and nested repositories (rel None) or just `rel` as `actor`. Caller
-        holds the git lock. Nothing under `.scratch/` is ever committed. `kind`, `detail`, `skipped`: see autocommit
-        (rel None only)."""
+                             detail: str = "", skipped: list[str] | None = None, hold: bool = False,
+                             ended: int | None = None) -> str | None:
+        """Commit everything except `.scratch/`, nested repositories and held new files (rel None) or just `rel` as
+        `actor`. Caller holds the git lock. Nothing under `.scratch/` is ever committed. `kind`, `detail`, `skipped`,
+        `hold`, `ended`: see autocommit (rel None only)."""
         if not self.git_enabled:
             return None
         if rel is not None and in_scratch(rel):
             self.ensure_scratch()  # the file may be the marker itself: put it back at once
             return None  # a temporary file of an agent (write_file / edit_file into .scratch/)
+        made: str | None = None  # a commit of held files made before the main one
         try:
             if rel:
                 spec = ("--", rel)
@@ -1116,16 +1405,35 @@ class Workspace:
                     # a manual `git add -f`: put the index back to HEAD for .scratch/ (never deletes a tracked file)
                     await self._git(actor, "reset", "-q", "--", SCRATCH_DIR)
                 if not outside:
+                    self._held.clear()  # no untracked file is left: every held one vanished
                     return None
-                nested = await self._nested_repos(actor, entries)
+                units, nested = await self._untracked(actor, entries)
                 if nested:
                     log.info("autocommit for %s leaves out nested repositories: %s", actor, ", ".join(nested))
                     if skipped is not None:
                         skipped.extend(nested)
                 # the exclude pathspecs need pathspec magic (literal=False); all the pathspecs are fixed strings, and
                 # a nested repository's path is matched literally (`literal` magic: "a[1]" is no glob)
-                add = await self._git(actor, "add", "-A", "--ignore-errors", "--", ".", *SCRATCH_EXCLUDES,
-                                      *(f":(exclude,literal){path}" for path in nested), literal=False)
+                if units is None or not hold:
+                    # without hold, or when git could not list the untracked files: everything is committed now
+                    self._held.clear()
+                    add = await self._git(actor, "add", "-A", "--ignore-errors", "--", ".", *SCRATCH_EXCLUDES,
+                                          *(f":(exclude,literal){path}" for path in nested), literal=False)
+                else:
+                    self._forget_held(units)
+                    made, moved = await self._hold_new(actor, kind or "update", detail or message, units, entries,
+                                                       ended)
+                    if not moved and all(xy == "??" for xy, path in entries if not in_scratch(path)) \
+                            and not self._operation_in_progress():
+                        return made  # only new files (all held now): nothing to stage, no commit to try
+                    # tracked files only (`-u`), and the files a tracked one was moved to: every other untracked file
+                    # is held now (whoever's command left it: this commit must not sweep up another member's), and
+                    # one a command still running creates meanwhile waits for the next autocommit
+                    add = await self._git(actor, "add", "-u", "--ignore-errors", "--", ".", *SCRATCH_EXCLUDES,
+                                          literal=False)
+                    if moved:
+                        more = await self._git_paths(actor, ("add", "--ignore-errors"), moved)
+                        add = add if more.returncode == 0 else more
                 if add.returncode != 0:
                     log.warning("git add reported errors (committing what it could add): %s", self._output(add))
                 # no pathspec: the index is committed (a merge an agent left in progress concludes as before)
@@ -1134,12 +1442,21 @@ class Workspace:
                 commit = await self._git(actor, "commit", "-q", "--no-verify", "-m", message or "update")
             if commit.returncode != 0:
                 log.info("git commit skipped: %s", self._output(commit))
-                return None
+                return made
             head = await self._git(actor, "rev-parse", "HEAD")
             return head.stdout.decode("ascii", "replace").strip() or None
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("git autocommit failed: %s", exc)
-            return None
+            return made
+
+    def _operation_in_progress(self) -> bool:
+        """A merge, rebase, cherry-pick... stopped halfway in the workspace's own .git folder (GIT_OPERATIONS): the
+        next index commit concludes it. True also when there is no such folder here (a linked worktree, a
+        repository above an adopted folder): not known, so the commit is tried as always."""
+        git_dir = self.root / ".git"
+        if not git_dir.is_dir():
+            return True
+        return any(os.path.lexists(git_dir / name) for name, _what in GIT_OPERATIONS)
 
     async def _index_message(self, actor: str, kind: str, detail: str) -> str:
         """commit_message() for what the index holds after `git add`: the paths staged against HEAD (a rename as
@@ -1151,16 +1468,22 @@ class Workspace:
         return commit_message(kind, [name for name in names if name], detail)
 
     def _git_argv(self, actor: str | None, args: tuple[str, ...], literal: bool = True) -> list[str]:
+        if netoff.is_off(getattr(self.swarm, "config", None)):
+            # without network: hooks and an fsmonitor command are commands the members may have written
+            # (`pre-commit install`, `git config core.fsmonitor ...`), and git runs them with DreamTeam's network
+            # (docs/SPEC.md §7.2)
+            args = ("-c", f"core.hooksPath={os.devnull}", "-c", "core.fsmonitor=false", *args)
         # an adopted folder: the user's line-ending settings apply to the agents' commits as to the user's own
         return git_argv(self._git_exe or "git", self._real_root(), actor, args, adopted=self.adopted, literal=literal)
 
-    async def _git(self, actor: str | None, *args: str, literal: bool = True) -> subprocess.CompletedProcess:
+    async def _git(self, actor: str | None, *args: str, literal: bool = True,
+                   input: bytes | None = None) -> subprocess.CompletedProcess:
         argv = self._git_argv(actor, args, literal)
-        kwargs: dict[str, Any] = {}
+        kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
         if _WINDOWS:
             kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        run = functools.partial(subprocess.run, argv, cwd=str(self.root), env=git_env(), stdin=subprocess.DEVNULL,
-                                capture_output=True, timeout=GIT_TIMEOUT, **kwargs)
+        run = functools.partial(subprocess.run, argv, cwd=str(self.root), env=git_env(), capture_output=True,
+                                timeout=GIT_TIMEOUT, **kwargs)
         future = asyncio.get_running_loop().run_in_executor(None, run)
         self._running_git.add(future)
         future.add_done_callback(self._git_done)

@@ -26,7 +26,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Collection
 
-from . import procs, prompts, roles, skill_deps, skills
+from . import netoff, procs, prompts, roles, skill_deps, skills
 from .models import USER, AgentKind, ToolError
 from .skills import (META_FILE, NAME_MAX, NAME_RE, SKILL_MD, Library, Limits, SkillError, check_name, check_skill_dir,
                      clean_stale, copy_skill, for_agents)
@@ -996,7 +996,8 @@ class SessionSkills:
         session's in-use set (before anything is peeked), and the views of ready Node environments."""
         config = self.swarm.config
         manager = self.manager
-        settings_key = skill_deps.settings_hash(config.skills)
+        network = not netoff.is_off(config)   # a session without network installs no member's proposal
+        settings_key = (skill_deps.settings_hash(config.skills), network)
         made: dict[str, tuple[tuple, list]] = {}
         for skill in wanted:
             key = (skill.digest, settings_key)
@@ -1004,7 +1005,7 @@ class SessionSkills:
                 continue
             try:
                 items = manager.plan(self.dir / skill.name, skill.name, skill_deps.trust_class(skill.frm),
-                                     config.skills, config=config, proposal=skill.frm == "agent")
+                                     config.skills, config=config, proposal=skill.frm == "agent", network=network)
             except Exception:  # noqa: BLE001 - a skill's dependencies never keep it from being attached
                 log.exception("cannot plan the dependencies of the skill %s", skill.name)
                 items = []
@@ -1115,6 +1116,8 @@ class SessionSkills:
             return prompts.t(lang, "deps_reason_unsupported", detail=_no_parens(str(reason.get("detail") or "")))
         if code == "proposals":
             return prompts.t(lang, "deps_reason_proposals")
+        if code == "network":
+            return prompts.t(lang, "deps_reason_network")
         return prompts.t(lang, "deps_reason_off")
 
     def _fragment(self, state: dict, lang: str, shell: str, quiet: bool = True) -> str:
@@ -1207,6 +1210,15 @@ class SessionSkills:
             if not f.cancelled() and f.exception() is not None:
                 log.warning("a skill environment build failed: %s", f.exception())
         future.add_done_callback(done)
+
+    async def replan(self) -> None:
+        """The session's network changed: every skill's dependencies are planned again (without network a member's
+        proposal gets no install) and what the new plans lack is built."""
+        if not self._active:
+            return
+        async with self._lock:
+            await self._plan()
+        await self.ensure_deps()
 
     async def ensure_deps(self, names: list[str] | None = None, *, force: bool = False,
                           ecosystem: str | None = None) -> dict:

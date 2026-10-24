@@ -823,6 +823,8 @@ class TUI:
                 info["jobs"] = {"running": len(self.jobs), "ids": list(self.jobs)}
                 info["budget"] = {"spent": self.spent, "limit": self.budget}
                 info["tracing"] = bool(swarm.get("tracing"))
+                if isinstance(swarm.get("network"), dict):
+                    info["network"] = swarm["network"]
         info["language"] = self.ctx.lang
         info["verbosity"] = self.ctx.verbosity
         info["connected"] = self.connected

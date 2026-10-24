@@ -41,6 +41,8 @@ src/dreamteam/
   mailbox.py     Mailbox        — direct messages
   workspace.py   Workspace      — shared files, git, locks
   shell.py       run_shell, start_command, RunningCommand, Capture, scrubbed_env (§7)
+  netoff.py      sessions without network: isolation, wrap, environment, sandbox_entry (§7.2);
+                 netns_helper.py makes the offline commands' network namespace and joins a command to it
   procs.py       ProcessTree    — a command's contained process tree: Windows Job Object, POSIX process group with a
                  lifeline watchdog (§7); standard library only
   jobs.py        JobManager, ShellOutcome — background jobs of the members' shell commands (§7.1)
@@ -184,7 +186,9 @@ class Swarm:
         # tracing never keeps a session from stopping), stops the runtimes (an LLM agent's foreground command dies
         # with its cancellation), then jobs.stop_all() (every job and every foreground command, e.g. an external
         # member's call, is killed; every finish and call in flight has returned and every job log and handle is
-        # closed, §7.1), then forge.stop(), then waits for git commands still running in threads
+        # closed, §7.1), then commits every member's held new files (workspace.commit_held(None, "when the session
+        # stopped"), after a settle() when there are any; §7 "Held new files"), then forge.stop(), then waits for
+        # git commands still running in threads
         # (workspace.settle(), §7): nothing touches git or the database afterwards. stop_all, forge.stop and
         # settle run in `finally`: also when an earlier step failed or the stop was cancelled (the caller closes
         # and drops the session after a failed stop, so no process may outlive it); then skills.stop_deps() (no
@@ -248,7 +252,9 @@ class Swarm:
         # empty."); an empty board gets a planning task (PLANNING_TASK, body = its text + title + description);
         # agents are kicked off staggered: `n_kickoff` {by, title, description, team, task_id, task_title}, with
         # team = "Name — Role; ..." of all members, or `n_goal_updated` when the board was not empty.
-        # PLANNING_TASK's steps: 1 look around; 2 independent work at once (work that needs no contracts:
+        # PLANNING_TASK's steps: 1 look around (only as much as splitting the work needs: research, experiments,
+        # reproducing a problem and environment checks are separate tasks for the others, the team waits for the
+        # planner's tasks meanwhile; `hint_planner` reminds a planner that has created none); 2 independent work at once (work that needs no contracts:
         # literature and theory, the environment and tools, data, exploratory experiments, becomes tasks before
         # CONTRACTS.md, so the members waiting for the plan start now; only the planner creates the plan's tasks);
         # 3 then the contracts; 4 then the rest of the tasks; 5 no false dependencies (a final task: report,
@@ -288,7 +294,9 @@ class Swarm:
         # become a job while it leaves); then tasks and locks released, triggers deactivated, status retired,
         # `agent.retired` {name, reason, released, jobs}, n_member_retired; then its runtime stops; last
         # jobs.stop_owner(name, "retired"): its jobs and its foreground commands (an external member's call in
-        # flight) are killed and awaited, committed under its name, with no notice to it
+        # flight) are killed and awaited, committed under its name, with no notice to it; then its held new files
+        # (workspace.commit_held(name, "when <name> left the team", leaving=True): it is no suspect any more, §7
+        # "Held new files")
 
     # budget / control
     def limits(self) -> dict                             # {"max_cost_usd", "max_agents"}
@@ -347,11 +355,25 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    `_wake_stalled`, so a set is never woken about twice. Neither 2 nor 3 wakes an agent while the end of one of
    its running jobs will wake it (`JobManager.awaited`, what its `wait` result promised): it waits for that job
    (a `detached` one, or a `background` one past its busy window), it has not stalled;
-4. `_remind_reviewers` (independent review only): review reminder and hand-over (§4.1 "Liveness");
-5. `_check_all_done`: sends `n_all_done` to one idle agent when every task is finished but the goal is open
+4. `hint_planner()` (planning hint; run 008-013: a planner researched for 40 minutes before creating any task while
+   the team idled): an LLM member holding a task tagged `planning` in `in_progress` that has created no task (no
+   task with `created_by` = it and an id above the planning task's) gets `n_planning_hint` {id, steps, elapsed} once
+   it has made `agents.planning_hint_steps` (default 8) LLM steps (`AgentRuntime.llm_steps`) or
+   `agents.planning_hint_minutes` (default 10) have passed since the swarm first saw it holding the task (a claim,
+   another holder, or a restart starts the count again; a pause stops the clock: `resume` moves its start on by the
+   pause's length); once more at twice either value, and only after at least one step since the first hint; never a
+   third time for that member and task (the hints it already had are counted from the notifications table when the
+   count starts, so neither a re-claim nor a restart brings more), never with fewer than two members, never while
+   the goal is not active, the swarm is paused or in wrap-up mode (`wrapping_up`); 0 turns a trigger off. The agent
+   also calls `swarm.hint_planner(name)` after the tools of each step (§6.2), so the step trigger lands in that
+   activation's `incoming`; the scheduler pass catches the time trigger
+   and a holder that went idle (the notification wakes it). No hard limit: the planner may go on researching;
+   `_planning_watch` (in memory) holds the counts and forgets tasks nobody holds;
+5. `_remind_reviewers` (independent review only): review reminder and hand-over (§4.1 "Liveness");
+6. `_check_all_done`: sends `n_all_done` to one idle agent when every task is finished but the goal is open
    (`review` is an open status, so it waits for every review); not while any LLM member works or is busy with a
    job (with no open task only a `timeout` job can make it busy: its command may still change the result);
-6. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
+7. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
    (§4.1 "Liveness").
 
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
@@ -677,13 +699,16 @@ class AgentRuntime:
   is not the real window). Then `async with
   swarm.llm_semaphore: llm.complete(system, history, tools)`, record usage, append assistant message,
   emit `agent.activity` events (thinking summary / text / tool call / tool result, truncated 2000
-  chars), execute tool calls sequentially via `tools.call_tool`, append results; after tools, if
+  chars), count the reply in `llm_steps`, execute tool calls sequentially via `tools.call_tool`, append results,
+  call `swarm.hint_planner(name)` (§3 scheduler item 4; never raises); after tools, if
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
   called, no tool calls (a `nudge` once per in_progress task the agent holds, none while it is busy with a
   job, §7.1 "Liveness": the job's end wakes it; after plain text even then, `stalled` records those tasks and
   the scheduler wakes it once with `n_stalled`, also once the busy window ended), refusal, or
   step limit (then `notify(name, "n_step_limit")`). A reply cut off by max_tokens gets `cut_off` and
-  the loop continues. After an activation, the agent re-wakes itself if events are still pending.
+  the loop continues. At the end of an activation that is not stopping (any outcome), the new files its commands
+  left are committed unless a command still running may write them (`workspace.commit_held(name, "at the end of
+  <name>'s turn")`, §7 "Held new files"; never raises). After an activation, the agent re-wakes itself if events are still pending.
 * Output limit after a cut-off reply (`_output_limit`): a reply cut off by max_tokens **without tool calls**
   (typically all thinking) makes the next step ask for twice the limit of the cut-off call, and it keeps doubling
   while replies keep being cut off, up to the profile's ceiling `max_tokens_ceiling` (None = 2 × max_tokens; at
@@ -787,12 +812,23 @@ class Workspace:
     def release_all(self, actor: str) -> int
     def expire_locks(self) -> int
     async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",
-                         skipped: list[str] | None = None) -> str | None
+                         skipped: list[str] | None = None, hold: bool = False) -> str | None
         # commits everything except `.scratch/` and nested repositories as `actor`, one commit per call; commit hash
         # or None (nothing outside .scratch changed). The message is `message` as given or, with `kind` ("shell",
         # "job j3", "jobs j3, j5"), commit_message(kind, the paths staged after `git add`, detail): the subject names
         # the changed files, the body holds `detail` (the command that changed them). `skipped` receives the paths
-        # of the nested repositories left out
+        # of the nested repositories left out. `hold` (the `shell` tool and the jobs pass it): new untracked files
+        # wait one more command ("Held new files" below; `ended`: the serial of the command whose end the commit
+        # follows, None when none has ended); without it everything is committed now, held files of anyone
+        # included, and nothing stays held. Returns the last commit made (a commit of held files included)
+    async def commit_held(self, actor: str | None, when: str, *, leaving: bool = False) -> str | None
+        # a flush: the actor's task completion or turn end counts as its next command for the held files once none
+        # of its commands running when they were first seen is left (`leaving`: it is no suspect any more); the
+        # files no longer waiting for anyone are committed, each under its owner (None: every held file); `when`
+        # ends the note of the commit ("at the end of Anna Smith's turn"); never raises; no git call when nothing
+        # becomes committable
+    def held(self) -> dict[str, HeldFile]
+        # path -> HeldFile(owner, kind, detail, stamp, others, waiting, running, after)
     def nested_repos_note(self, actor: str, paths: list[str]) -> str
         # the line for the actor's tool result about them ("" when none is new to this actor in this session)
     def mtime(self, path: str) -> float | None
@@ -811,7 +847,8 @@ The whole-tree autocommit (after every `shell` call): `ensure_scratch()` (an age
 `git status --porcelain -z` (`porcelain_entries`), `git reset -q -- .scratch` when something under `.scratch/` is
 staged (a manual `git add -f`; it only resets index entries to HEAD), nothing more when nothing outside `.scratch/`
 changed, else `git add -A --ignore-errors -- . ":(exclude)[.]scratch" ":(exclude)[.]scratch/*"`
-(`SCRATCH_EXCLUDES`, with pathspec magic, `literal=False`) and a commit of the index without a pathspec (a merge an
+(`SCRATCH_EXCLUDES`, with pathspec magic, `literal=False`; plus the nested repositories; with `hold`, `git add -u`
+instead, "Held new files" below) and a commit of the index without a pathspec (a merge an
 agent left in progress concludes as before). With `kind`, its message is built from `git diff --cached --name-only
 --no-renames -z` (`_index_message`; a rename shows as its old and its new path, deleted files are named; a failed
 diff quotes the detail instead). The excludes are spelled with `[.]`: git add takes a literal
@@ -837,6 +874,80 @@ same way without a note (the owner's next `shell` call names them); `write_file`
 and cannot create one. The initial "Initialize workspace" commit (`init_repo`, also for an adopted folder that was
 not a repository yet) leaves them out as well (`nested_repo_paths` of `git ls-files --others --exclude-standard
 -z`); the first `shell` autocommit afterwards names them to the agent.
+
+#### Held new files
+A test run often leaves files that the next run deletes (cookiecutter's test hooks: `…/test-hooks/hooks/
+post_gen_project.bat (+2 more)` added by one `shell` commit, deleted by the next). So the `shell` and job autocommits
+(`hold=True`) commit changes to tracked files (edits, deletions, renames) at once as before, but a **new untracked
+file** only once it has outlived one more command; a held file that vanished meanwhile never enters the history, and
+history is never rewritten.
+- The untracked files are those `git add -A` would add: the `??` files of the status and, for its `??` folders,
+  `git ls-files --others --exclude-standard -z` (the listing that finds nested repositories; `_untracked` maps each
+  file to its `??` entry). Not `.scratch/`, not inside a nested repository, not ignored.
+- Commands are told apart by `RunningCommand.serial` (one counter per process, `shell.last_serial()` the last one
+  started): `jobs.running_commands()` = (serial -> member of every foreground `shell` call and running job, the last
+  serial). The `shell` tool passes `ended` = its command's serial when the command has ended (None when it goes on as
+  a job), a job's end commit its command's serial, a job commit while processes of it still run None.
+- `Workspace._held` (in memory; path -> `HeldFile(owner, kind, detail, stamp, others, waiting, running, after)`): a
+  file not held yet is held with the autocommit's actor as `owner` (the member whose commit first saw it), that
+  commit's `kind` and `detail` (the command) and its (size, mtime) `stamp`. Git cannot tell who wrote a file, so the
+  suspects are the owner and, as `others`, every member with a command running then or an autocommit of its own
+  waiting for the git lock (`_queued`: the end of a command queues its commit at once, with no await in between),
+  taken right after the file listing. `running`: the commands running then (the owner's own job too, e.g. its test
+  run that went on as a job while it reads the log). `waiting`: the suspects whose next command the file has not
+  outlived yet. A suspect's next command is one that ended (`ended`) with a serial above `after[member]`: the last
+  serial at first sight, or, for a member with commands in `running`, the last serial when the last of them had
+  ended and its commit was made (`_settle_held`, at every hold commit and flush) — so neither a command running when
+  the file appeared, nor its own end commit, nor a quick command started while it still ran counts. Every
+  whole-tree autocommit first forgets held paths no longer untracked (deleted, ignored now, committed by
+  `write_file` / `edit_file` or by hand: those commit their file at once as before).
+- At each `hold` autocommit of a member: a held file with another stamp (deleted and written again by the next run)
+  is held anew, as a new file of this commit; one with its stamp counts the command for that member. Files no longer
+  waiting for anyone have outlived the next command of every member that may have written them and are committed
+  first, in a commit of their own per command that left them, under their owner: `git add -A --ignore-errors --
+  <paths>` and `git commit -- <paths>` (only those paths), subject `commit_message(f"{kind} (new files)", paths)` ("shell (new files): src/new.py"), body the original
+  command and `HELD_NOTE`: "New files first seen after this command of Anna Smith, committed after the next command
+  of Anna Smith left them in place: a new file waits until it outlives one more command, so leftovers that the next
+  command deletes (of a test run, say) never enter the history." With `others` it adds " (Boris King also had a
+  command running then; git cannot tell who wrote a file)" after the owner and reads "after the next commands of
+  Anna Smith and Boris King". Then the call's own commit: `git add -u --ignore-errors -- . <SCRATCH_EXCLUDES>`
+  (tracked files only) and, for a tracked file moved with plain `mv` (`_moved`: a new file whose blob id, `git
+  hash-object --stdin-paths`, equals that of a file the call deleted in HEAD, `git cat-file --batch-check` of
+  `HEAD:<path>` lines through stdin, any number of them; exact content, at most `MOVED_CANDIDATES_MAX` = 500 new
+  files), `git add -- <new paths>`, so the rename stays one commit; then the index commit as before. When every
+  change outside `.scratch/` is a new file (all `??`), nothing was moved and no git operation is halfway
+  (`_operation_in_progress`: GIT_OPERATIONS in the workspace's own `.git` folder; without one the commit is tried),
+  there is nothing to stage: no `git add -u`, no index commit tried.
+- Another member's commit never sweeps them up: with `hold` no untracked file but a moved one is staged, so every
+  held file stays out, and a file a command still running creates between the status and the add waits for the next
+  autocommit. The hold belongs to the tree, not to an actor: a tester's test run that leaves files while a
+  developer's quick command ends is first seen by the developer's commit, and waits for the tester's next run too
+  (which deletes them: nothing enters the history). The commit of held files is attributed to their owner, and its
+  body names the other suspects (HELD_OTHERS). Paths of a commit of held files are collapsed: an untracked
+  folder all of whose files go into it is named once (`_collapse`; never one holding a nested repository).
+- Flush points (`commit_held(actor, when)`): the actor's boundary counts as its next command for every held file it
+  is a suspect of, once none of its commands in `running` is left (its own job may still write or delete them); the
+  files no longer waiting for anyone are committed, each under its owner. They are: its `task_complete`, right after
+  the board accepted it ("when Anna Smith completed task #4": the reviewer and the user read HEAD; a refused call
+  commits nothing); the end of an AI agent's activation (`AgentRuntime`, unless it is stopping: "at the end of Anna
+  Smith's turn"); an external member's `wait_for_events` (the same note); `Swarm.retire` after the member's jobs
+  stopped (`leaving=True`: it is no suspect any more, "when Anna Smith left the team"); `Swarm.stop` after
+  `jobs.stop_all()` for every held file ("when the session stopped"). A file another member's command may have
+  written waits for that member's next command or boundary, even at a task boundary: while its test run goes on, a
+  flush of the developer must not commit what the run deletes at its end (the tree has the file meanwhile; HEAD gets
+  it a step later). The price of the flushes: leftovers still there at one of them are committed (and their deletion
+  by the next run is a commit too). No git call when nothing becomes committable.
+- A held file that the next command rewrites (another size or mtime) is held anew rather than committed: a test run
+  recreates its leftovers each time; a file every command rewrites goes in at a flush.
+- A commit of held files that fails (e.g. git refuses a partial commit while a merge is in progress) unstages them
+  again (`git reset -q -- <paths>`, never left for someone else's index commit) and keeps them held for the next try.
+  Without a file listing (`git ls-files` failed) the autocommit commits everything as before and forgets the holds.
+- Long pathspec lists (more than `PATHSPEC_ARGV_MAX` characters: 8000 on Windows, which limits a command line to
+  32767 characters; 100000 elsewhere) go through stdin (`--pathspec-from-file=- --pathspec-file-nul`, git 2.25+;
+  magic as on the command line); a git that does not know the option (exit code 129) gets them on the command line
+  after all.
+- The agent is told nothing: tool results do not change. A restart forgets the holds (the next autocommit holds the
+  files again).
 
 #### Scratch folder
 Agents put temporary files (experiments, check scripts, test output, downloads) into **`.scratch/`** at the
@@ -952,9 +1063,10 @@ async def run_shell(command: str, *, cwd: Path, timeout: float, program: str = "
     # awaited (KILL_WAIT, 5 s) before the cancellation goes on. For callers without jobs: the `shell` tool goes
     # through JobManager.run (§7.1)
 async def start_command(command: str, *, cwd: Path, program: str = "auto", env: dict[str, str] | None = None,
-                        max_output: int = 12000, token: str | None = None) -> RunningCommand
+                        max_output: int = 12000, token: str | None = None, offline: bool = False) -> RunningCommand
     # starts the command as a contained tree (ProcessTree.spawn in a daemon thread) and returns at once; `token`
-    # goes into the environment as DREAMTEAM_PROCESS_TOKEN; ValueError for an unsupported shell
+    # goes into the environment as DREAMTEAM_PROCESS_TOKEN; `offline`: the shell's argv through netoff.wrap (§7.2;
+    # the caller sets netoff.environment); ValueError for an unsupported shell
 class RunningCommand:   # name (the shell's display name), tree, capture, started_at, serial; exited, eof, returncode
     async def wait_exit(self, timeout) -> bool          # the shell exited (its processes may run on)
     async def wait_eof(self, timeout) -> bool           # the output pipe reached EOF
@@ -1046,7 +1158,8 @@ outlive its call:
 3. `outcome = await swarm.jobs.run(actor, command, timeout=, env=, max_output=ctx.output_cap,
    background=args.background)` (§7.1): the command's result, or a job.
 4. Unless the outcome is `killed` (the session stops or the member leaves: no git work may start then):
-   `workspace.autocommit(actor, kind="shell", detail=command)`, one commit per call.
+   `workspace.autocommit(actor, kind="shell", detail=command, hold=True)`, one commit per call; new files wait
+   one more command ("Held new files" above), and the result says nothing about them.
 5. The result is `outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=[shell], has_wait=ctx.has_tool("wait"))`.
 
 An agent's command dies when the agent's task is cancelled (a stopped or retired agent) before the command became a
@@ -1074,6 +1187,8 @@ class JobManager:
     def recover(self) -> None
     def busy(self, name) -> bool; def wakes(self, job) -> bool; def awaited(self, owner) -> list[Job]
     def running_of(self, owner=None) -> list[Job]; def get(self, job_id) -> dict | None
+    def running_commands(self) -> tuple[dict[int, str], int]
+        # (serial -> member of every foreground command and running job, shell.last_serial()): §7 "Held new files"
     def snapshot(self) -> list[dict]
     def check_start(self, actor) -> str | None           # "disabled" | "limit_member" | "limit_session" | None
     def command_env(self, env) -> dict; def cpu_threads(self) -> int
@@ -1318,11 +1433,109 @@ the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone me
 **Git**: the caller's `shell` autocommit at every return, also when the command went on as a job (not for
 `killed`); the job's own commits under its owner when its shell exits with processes left, at its end and at the
 session stop (above; a job that ends by itself while the session stops is committed by `stop_all`, never left to
-another member's next commit). Files a job writes between those commits go into the next autocommit of any member, under that
-member's name (`git add -A` cannot tell writers apart): build output belongs in `.scratch/` or `.gitignore`. Job logs
-are never committed. A job's own git commands carry its owner's identity (`agent_git_env`).
+another member's next commit). Every job commit passes `hold=True`, like `shell` (§7 "Held new files"): changes to
+tracked files are committed at once, new files once they outlive one more command. Changes to tracked files a job
+makes between those commits go into the next autocommit of any member, under that member's name (git cannot tell
+writers apart); a new file is held with that member as its owner and waits for the job's owner too (it had a job
+running): build output belongs in `.scratch/` or `.gitignore`. Job logs are never
+committed. A job's own git commands carry its owner's identity (`agent_git_env`).
 
 Settings: `[shell]` in §17.1; all of them are read at each use.
+
+### 7.2 Sessions without network (netoff.py)
+`[swarm] network = "on" | "off"` (§17.1; a session override like the others, so it is set at creation and in the
+session's ⚙ and applies at once; `--network off` of `tui`, `serve --goal`, `run` and `sandbox`, §18.3;
+`session_create` `network`, §18.2). With "off" the members' commands (`JobManager.run`: the command, and so the job
+it may become) and the stdio MCP servers DreamTeam starts (`MCPForge._connect` / `_smoke_test`) lose the network;
+DreamTeam itself keeps it (the LLM calls, the hub's port, the user's skill installs). The isolation is the best the
+machine has, detected once per process (`netoff.isolation()`, cached; `Swarm.start` and the launcher's
+`GET /api/settings` call it off the loop):
+```
+"docker"  DREAMTEAM_OFFLINE_USER = "UID:GID" set (only by sandbox_entry, below; never 0), euid 0, setpriv present:
+          argv prefix  setpriv --reuid=UID --regid=GID --clear-groups --no-new-privs --
+"netns"   Linux, the namespace made (below) and `<python> -I netns_helper.py --join ... --probe` printed "ok":
+          argv prefix  <python> -I netns_helper.py --join /proc/<pid>/fd/U /proc/<pid>/fd/N UID GID --
+"env"     anything else (Windows, macOS, Linux without user namespaces, a container without the firewall): no prefix
+```
+"netns" is one network namespace per DreamTeam process, shared by all its offline commands, jobs and MCP servers:
+a dev server one command starts as a job is reachable from the next command, its tests and an MCP server, as the
+machine's localhost would be (the sessions without network of one hub share it, as they share that localhost with
+network); the machine's own localhost (the hub's port, a database the user runs) is not reachable from it. At the
+detection a holder `unshare -rn <python> -I netns_helper.py --hold` brings the new namespace's loopback up and says
+"ok"; DreamTeam opens its `/proc/<holder>/ns/{user,net}` (fds U, N, kept for the process's lifetime: an agent's
+`pkill python` cannot take the namespace away) and closes the holder's stdin, at which it exits. `--join` opens both
+fds through `/proc/<DreamTeam's pid>/fd/`, then `setns` the user namespace (its owner, this user, has every capability
+there) and the network one, and then makes a nested user namespace in which the real uid/gid are themselves again
+(files keep their owner, tools do not run as root, no capabilities). A `--join` that cannot enter the namespace exits
+126 without running the command (it would have the network).
+Every wrapper execs the shell (same pid: its process group, Job Object, token sweep and watchdog are unchanged).
+`netoff.environment(env)` is set in every mode (pip or npm then fail at once instead of retrying): `HTTP(S)_PROXY`,
+`ALL_PROXY`, `FTP_PROXY` and their lowercase forms = `http://127.0.0.1:9` (the closed discard port),
+`NO_PROXY`/`no_proxy` = `localhost,127.0.0.1,::1` (loopback works in every mode: local servers and their tests),
+`PIP_NO_INDEX=1`, `PIP_RETRIES=0`, `UV_OFFLINE=1`, `npm_config_offline=true`, `YARN_ENABLE_OFFLINE_MODE=1`,
+`CARGO_NET_OFFLINE=true`, `GOPROXY=off`, `HF_HUB_OFFLINE=1`, `CONDA_OFFLINE=true`, `DREAMTEAM_NETWORK=off`, and git
+through `GIT_CONFIG_COUNT` (appended after inherited entries; git 2.31+): `protocol.{http,https,git,ssh}.allow=never`
+and `http.proxy` = the dead proxy (local paths and file:// still clone). "docker" also sets `HOME`, `USER`, `LOGNAME`
+of the offline user and `UV_CACHE_DIR=$HOME/.cache/uv` (root's home and the skills' cache are not its to write).
+"env" is not isolation, and the UI says so: Windows PowerShell 5.1's web cmdlets ignore proxy variables, a raw
+socket ignores all of them, and the hub's HTTP API on localhost stays reachable (an agent could switch its session's
+network back on through it; "docker" rejects the hub's ports, "netns" does not reach them). `netoff.shown(kind)` is
+what the UI and the snapshot show: "env" in a container (`/.dockerenv`, `/run/.containerenv`) is "container", whose
+hint says to restart `dreamteam sandbox` (it then adds the firewall, `docker.wants_firewall`).
+- **Docker sandbox.** The image (§18.3) has `iptables` and the user `dreamteam-agent` (uid 10001, its own group);
+  git's settings are `--system`, so they hold for both users. The offline commands run as `netoff.sandbox_ids()`:
+  the owner of `/swarm` when it is not root (a bind mount on a Linux host: the agents' files are the user's own, and
+  nothing of the user's is opened to another id), else `dreamteam-agent` (Docker Desktop shows a bind mount as root's;
+  a named volume is root's); the image's home of `dreamteam-agent` is given to those ids. `docker.wants_firewall` is true for `--network off`,
+  `[swarm] network = "off"` in the home's settings, or any `sessions/*/session.json` with that override; then
+  `sandbox_command(..., firewall=True)` adds `--cap-add NET_ADMIN -e DREAMTEAM_OFFLINE_FIREWALL=1`, and an image whose
+  `dreamteam.dockerfile` label is not `dockerfile_hash()` (sha256 of DOCKERFILE, 16 hex; `build_image` sets it) is
+  rebuilt first (without the firewall only a note suggests `--build`). In the container `cli.main` calls
+  `netoff.sandbox_entry()` before anything else: as root it adds the chain `DREAMTEAM_OFFLINE` (iptables: reject
+  TCP to the hub's ports, `netoff.hub_ports(argv)` = CONTAINER_PORT and a `--port` of the command, on any address
+  (the container's own IP goes through `lo` too: its HTTP API would let a command switch the session's network back
+  on); reject Docker's DNS server 127.0.0.11; accept `-o lo`; reject the rest; ip6tables the same without the DNS
+  rule, skipped when the container has no non-loopback IPv6 address), jumped to from `OUTPUT -m owner --uid-owner
+  UID`. A chain whose jump is in place already (`iptables -C`) is kept: `docker exec <container> dreamteam ...` runs
+  the entry again (DREAMTEAM_OFFLINE_FIREWALL stays in the container's environment) and must not warn. Then it sets
+  `DREAMTEAM_OFFLINE_USER=UID:GID`, umask 002, and execs `setpriv --bounding-set=-net_admin --regid=GID --keep-groups
+  -- python -m dreamteam ARGS`: the hub never keeps NET_ADMIN, and it runs as root with the offline group, so what it
+  creates (files of `write_file`, `.git`) is the commands' to write without a set-group-id bit on any folder. A
+  failure (an old image, no owner match) prints a warning, and the sessions without network get "env".
+  `Swarm._prepare_offline` (at start, and when the setting turns "off") runs `netoff.prepare_workspace(root)` for
+  "docker": an entry root owns (or the image's `dreamteam-agent`, of an earlier run) gets the group GID with the
+  owner's bits copied to the group (a read-only entry, e.g. the skills mirror, stays read-only); what UID owns already
+  and what anyone else owns is left as it is. It walks by file descriptors (`os.fwalk`, each entry opened with
+  `O_NOFOLLOW`, then `fchown`/`fchmod`): the members' commands may run meanwhile, and a file swapped for a symlink
+  must not get root's chmod on its target. A session switched off later in a container started without the firewall
+  gets "env" (shown "container") until the sandbox restarts. `DREAMTEAM_OFFLINE_USER` and
+  `DREAMTEAM_OFFLINE_FIREWALL` never reach the agents' environment (`shell._INTERNAL_ENV`).
+- **MCP servers.** Their command and environment go through `netoff.command`. A command that names a URL of another
+  machine (`netoff.remote_url`: http(s)/ws(s), not localhost, 127.x, ::1 or *.localhost; a stdio bridge such as
+  `npx mcp-remote https://...`) is refused with a ToolError before it starts. A change of the setting closes the
+  running connections (`MCPForge.close_connections`): each starts again with the new setting at its next use. Each
+  connection records the setting it was started with (`MCPConnection.offline`): `_open` never hands out one of the
+  other setting, and `_connect` starts a server again when the setting changed while it was starting (once; a second
+  change is a ToolError to call again).
+- **Skills.** `EnvManager.plan(..., network=False)` gives a member's proposal (`frm == "agent"`) no install: state
+  `off`, reason `network` (`deps_reason_network`, UI `sk_reason_network`), unless its environment is ready on disk
+  already; the plan key includes the setting, and a change replans (`SessionSkills.replan`). The user's own skills
+  install as before: DreamTeam installs them, not an agent.
+- **Git.** The workspace's own git commands (`Workspace._git_argv`) get `-c core.hooksPath=<os.devnull>` and `-c
+  core.fsmonitor=false`: hooks and an fsmonitor command are commands the members may have written (`pre-commit
+  install`, `git config core.fsmonitor ...`) that git would run with DreamTeam's network (`commit.gpgsign=false` is
+  set always, `git_argv`). Other commands an agent can name in `.git/config` for git to run (filter, textconv and merge
+  drivers with a matching `.gitattributes`) are not covered.
+- **Telling the members.** `render_wake` (the wake-up and the incoming news) first calls `Swarm._tell_network(name)`:
+  the member's last `n_network_off` / `n_network_on` notification is the state it knows; when that differs from the
+  setting, a quiet one (wake=False) is added. Each member is told once, also across restarts, and again when the user
+  switches it back; no system prompt changes. `swarm_status` adds `; NO NETWORK for the members' commands, jobs and
+  MCP servers (<isolation>)` to the state.
+- **A change while running** (`Swarm.reconfigure` → `_network_changed`): new commands get the new setting at once;
+  running jobs keep the one they started with.
+- The snapshot's `swarm.network` is `netoff.describe(config)` = {"mode": "on"|"off", "isolation": kind or null (not
+  detected yet)}; the session summary has `network` ("on"/"off"); the launcher's `GET /api/settings` has
+  `network_isolation`.
 
 ## 8. Triggers (triggers.py)
 
@@ -1487,7 +1700,8 @@ class MCPForge:
   `["uv", "run", "--no-project", "--with", "mcp>=2.3,<3", "--with", req..., "python", "server.py"]`.
   Env = `shell.scrubbed_env` (plus `COLUMNS=200` unless set: MCPServer logs through rich, whose 80-column boxes
   would wrap the error lines). stderr → `.dreamteam/logs/mcp-<name>.log`; the log tails shown to agents drop
-  the padding and right borders of rich's boxed tracebacks.
+  the padding and right borders of rich's boxed tracebacks. In a session without network the command and the
+  environment go through `netoff.command`, and a command naming a remote URL is refused (§7.2).
 * Client: `mcp.Client(mcp.stdio_client(StdioServerParameters(...), errlog=file))`; enter/exit inside the
   connection's own task (anyio requirement); `list_tools().tools[i].input_schema`; `call_tool(name, args)`
   → `CallToolResult(content, structured_content, is_error)`; text from TextContent, placeholders for
@@ -1630,7 +1844,8 @@ Results and checks of the review and role-catalog flows:
 - `task_complete` says where the task went: `Task #N is done.`; `Task #N was sent to X for review.` (the task's
   own reviewer); `... was sent to the user for review: nobody else in the team can review it. You will be told the
   verdict; meanwhile take the next task or call wait.`; or `... was sent to X for review: a member other than you
-  checks it, and you will be told the verdict.` (picked by the board).
+  checks it, and you will be told the verdict.` (picked by the board). Once the board accepted the call (a refused
+  one commits nothing) it commits the caller's held new files (`workspace.commit_held`, §7 "Held new files").
 - Dependencies (§4 `update`): `task_get` of an open task (not in review) the caller holds while it is blocked adds `You hold it while
   it is blocked: if its result can be produced without some of #3, #4, remove those with task_update (depends_on =
   the ones still needed) and say why in its discussion.`; `task_update` in which an assignee that did not create the
@@ -1839,8 +2054,9 @@ stopped check uses `Swarm.started`.
                                        // pending_goal: the goal a never-started session gets at its first start
            "tracing": bool,
            "independent_review": bool,   // Board.independent_review, read live (§4.1)
-           "workspace": {"path","default","adopted","exists"}},   // Swarm.workspace_info(): the folder the
+           "workspace": {"path","default","adopted","exists"},    // Swarm.workspace_info(): the folder the
                                        // members work in (same shape as a session summary's "workspace", §17.2)
+           "network": {"mode": "on"|"off", "isolation": "docker"|"netns"|"env"|"container"|null}},   // netoff.describe, §7.2
  "tasks": [Task.to_dict() + {"blocked_by","comments"}],
  "agents": [{"name","kind","role","status","model","language","cost_usd","tokens_in","tokens_out","hired_by",
              "created_at","last_active","instructions","context_tokens","open_tasks":[ids],"unread",
@@ -1871,7 +2087,7 @@ Commands of a single-swarm **project** (a directory with `dreamteam.toml`, made 
 commands of a **home** are in §18.3.
 ```
 dreamteam init [DIR] [--lang ru|en] [--provider anthropic|openai|openrouter|ollama|vllm] [--name N] [--goal G] [--force]
-dreamteam run [DIR] [--goal G] [--host H] [--port P] [--no-console] [--open]
+dreamteam run [DIR] [--goal G] [--host H] [--port P] [--no-console] [--open] [--network on|off]
     # one swarm, its board at / (web.serve); refuses when a hub already runs for DIR; --goal sets the goal
     # unless the stored one is active with the same title (compared with split_goal(G)[0], so a multi-line
     # --goal does not reset the goal at every restart)
@@ -1962,7 +2178,8 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
     `overrides`, or the partial `settings` of the board's settings dialog, §17.2, §18.4). The rest is read at each
     use: `[shell]` limits at the next command or job check, `agents.max_steps_per_turn` at the agent's next
     wake-up, `context_tokens` (when the model profile has none of its own) and `tool_output_chars` at the next
-    call, `idle_nudge_seconds` at the next scheduler pass.
+    call, `idle_nudge_seconds` at the next scheduler pass, `planning_hint_steps` / `planning_hint_minutes` at the
+    planner's next step or scheduler pass.
 - `AgentRuntime`:
   - `self.trace` is the current `Trace`, or None (`_tr` is a disabled writer outside an activation).
   - `_activate` finishes a trace left open (`interrupted`), begins the trace after a non-empty wake text and
@@ -2033,6 +2250,14 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
   true` with a comment, after the `starting_roles` comment (which names the starting team rule, §17.3), and a
   commented `[[roles]]` example before the model profiles.
+- `[swarm] network` ("on" | "off", default "on"; anything else is a ValueError naming `swarm.network`): "off"
+  cuts the members' commands, their jobs and the stdio MCP servers off the network (§7.2). Read at each use;
+  session overrides apply (a running session: from its next command). The template has the line after
+  `independent_review`, with a Russian comment that says it is strict only in Docker and on Linux.
+- `[agents] planning_hint_steps = 8` (whole number ≥ 0) and `planning_hint_minutes = 10` (number ≥ 0): the planning
+  hint of §3 (scheduler item 4), after this many LLM steps or minutes of holding the planning task without creating a
+  task, once more at twice the value; 0 turns that trigger off. Read at each use; session overrides apply. The
+  template has both lines with Russian comments after `stagger_seconds`.
 - `[shell]` (`ShellSettings`, read at each use, so `reconfigure` and session overrides apply at once; §7, §7.1):
   `program = "auto"` (auto | bash | sh | powershell | pwsh | cmd), `timeout = 120` (seconds a call waits; a command
   still running then continues in the background), `max_timeout = 1800` (the largest `timeout`, and the lifetime of a
@@ -2052,7 +2277,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   `max_files = 200` (one skill), `max_archive_mb = 50` (one zip or Git checkout before a skill is picked from it),
   `max_attached = 40` (skills of one session), `max_proposals = 10` (skills the members of one session may
   propose; 0 turns proposals off). Script dependencies (§19): `install = true` (install a skill's
-  requirements.txt / pyproject.toml / package.json), `install_proposals = true` (also for members' proposals),
+  requirements.txt / pyproject.toml / package.json), `install_proposals = true` (also for members' proposals;
+  never in a session without network, §7.2),
   `envs_dir = "~/.dreamteam/skill-envs"` (`Config.skill_envs_dir`, where `DREAMTEAM_SKILL_ENVS_DIR` wins: the
   sandbox's volume and the tests), `python = ""` (the environments' interpreter: "" = the base interpreter DreamTeam
   runs on; a path, a command, or with uv a version such as "3.12"), `install_scripts = false` (npm lifecycle
@@ -2423,7 +2649,7 @@ succeeded: either may have changed the library) and everything else to the launc
 | POST `/api/sessions/{sid}/skills/{name}/decide` | body `{"approve": bool, "comment"?, "replace"?}` → `{"text", "session"}` (`decide_skill`, via home) |
 | GET / POST `/api/skills`, GET / DELETE `/api/skills/{name}` | the library routes of §14 (`skill_routes` with `manager.global_config`, via `home`, no swarm: no `attached`, no `attach`, no `from=session`, no `deps-log`); `?workspace=<absolute>` names the folder whose `.claude/skills` is offered (a relative one 400); a change emits `sessions.changed` (session None, change `skills`) |
 | POST `/api/skill-envs/cleanup` | `EnvManager.cleanup(env_retention_days, every_unused=True)` now (a daemon thread: every env no session uses, whatever its age) → `{"removed", "kept"}`; emits change `skill-envs` |
-| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home"}` (a hand edit of the file is picked up first) |
+| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home", "network_isolation": netoff.shown(netoff.isolation()) (§7.2)}` (a hand edit of the file is picked up first) |
 | PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` text for a bad role (nothing saved) |
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
@@ -2461,7 +2687,7 @@ succeeded: either may have changed the library) and everything else to the launc
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
-  start_agents?, max_agents?, team?, max_cost_usd?, model?, start?=true, workspace?, skills?)` (unset values come from the
+  start_agents?, max_agents?, team?, max_cost_usd?, model?, network?, start?=true, workspace?, skills?)` (unset values come from the
   global settings; the board URL is shown only when a web server runs; `goal`: one line, or several, split as in
   §17.2; `team`: role names in order, a name repeated per agent (§17.3) → `swarm.starting_roles` (normalized) and
   `start_agents = len(team)` unless `start_agents` is given, `[]` = no team; not a list of non-blank strings →
@@ -2476,7 +2702,8 @@ succeeded: either may have changed the library) and everything else to the launc
   the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
   shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), and for a
   running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
-  in the user's wrap-up mode is `[running, wrapping up]`; a session with skills gets `skills: a, b (waiting for your
+  in the user's wrap-up mode is `[running, wrapping up]`; a session without network ends its first line with
+  ` | no network` (summary `network`, §7.2); a session with skills gets `skills: a, b (waiting for your
   library decision: b)`. The last session tool is `skill_library(action: list | show | import | delete, name?,
   source?, pick?, replace?)`, the home page's Skills tab in words (via `launcher-mcp`): `list` the library, the
   host library and Claude Code's skills; `show` an entry (`name` may be `claude-user:x` / `host-library:x`) with
@@ -2502,16 +2729,16 @@ succeeded: either may have changed the library) and everything else to the launc
 dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|stream-json] [--timeout S]
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
           [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
-          [--skill REF|PATH|URL ...] [--host H] [--port P]
+          [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off]
 dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]
-          [--skill REF|PATH|URL ...]] [--no-console] [--no-browser]
+          [--skill REF|PATH|URL ...] [--network on|off]] [--no-console] [--no-browser]
 dreamteam sessions [DIR | --home H]
 dreamteam sessions rm SID [SID ...] [--yes] [--skills save|discard] [--home H]
 dreamteam traces [AGENT] [--home H] [--session SID] [--id N] [--span N [--context]] [--status S] [--limit N] [--json]
 dreamteam console [DIR | --home H | --url URL] [--session SID] [--lang ru|en]
 dreamteam mcp [DIR | --home H] [--no-web]
 dreamteam status [DIR | --home H]
-dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
+dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on|off]
 ```
 - Default command (`_default_command`): `dreamteam` alone runs `tui` when stdin and stdout are terminals,
   else `serve`. Options only: `tui` when one of them is a TUI option (`-p -c -r --output-format --model
@@ -2529,6 +2756,11 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   only when given), which turns it into `swarm.starting_roles` of the sessions it creates (`start_agents` = the
   team's size unless `--agents` is given). With auto-replies on, `-p` also approves the tasks that wait for the
   user's review (print mode `AUTO_REVIEW`, docs/TUI.md); with `--no-auto-reply` they wait.
+- `--network on|off` (`tui`, `-p`, `serve` with `--goal`, exit 2 without it; `run`; `sandbox`): `[swarm] network`
+  (§7.2) of the session that run creates (`overrides["network"]` → `swarm.network`, tui.commands.FLAT_OVERRIDES; serve:
+  `create(..., overrides={"swarm": {"network": ...}})`), of `run`'s swarm for this run only (the settings file keeps
+  its value), and for `sandbox` the firewall of the container (`docker.wants_firewall`) plus `--network` of the
+  command inside (a project's `run`, or `serve --goal`). Neither a TUI-only nor a serve-only flag (`_default_command`).
 - `--workspace DIR` (`tui`, `-p`, and `serve` with `--goal`): the folder the session created by that run works in
   (`create(..., workspace=)`, §17.2: an empty or missing folder becomes its workspace; a folder with files is
   adopted, its repository must be clean). `~` and a relative DIR are resolved against the current directory
@@ -2622,7 +2854,10 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
   environments are a named volume per home, `dreamteam-skill-envs-<sha256 of the home's path, 10 hex>` mounted at
   `/dreamteam/skill-envs` (`docker.envs_volume`; `DREAMTEAM_SKILL_ENVS_DIR` and `UV_CACHE_DIR=/dreamteam/skill-envs/
   .cache/uv` set; never the host's envs: another platform); `docker volume rm` resets it. Node is not in the image,
-  so Node skills show as unavailable there.
+  so Node skills show as unavailable there. The image also has `iptables` and the user `dreamteam-agent` for the
+  sessions without network, git's identity and `safe.directory '*'` as `--system` settings, and `build_image` labels
+  it `dreamteam.dockerfile=<dockerfile_hash()>`; the firewall (`--cap-add NET_ADMIN`, dropped again at once,
+  `netoff.sandbox_entry`) and the rebuild of an image with another label: §7.2.
 - `run [DIR]` stays the single-swarm server of a project (§15); it does not serve the launcher.
 
 ### 18.4 UI
@@ -2686,8 +2921,11 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     the skills design (§7.4): the modal has no workspace folder field (a new session works in its own folder), so it
     offers no `claude-project:x` rows and loads `/api/skills` without `?workspace=`; a project's `.claude/skills`
     skill is attached at create through the CLI (`--workspace` with `--skill claude-project:x`) or the launcher MCP,
-    or later on the board; under «Дополнительно» steps per wake-up and MCP
-    approval; «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
+    or later on the board; under «Дополнительно» steps per wake-up, MCP
+    approval and «Без интернета для агентов» (`swarm.network = "off"`, §7.2; sent only when it differs from the saved
+    default; its hint is `networkHint(network_isolation of GET /api/settings)`: strict only for "docker" / "netns",
+    the "env" and "container" texts say plainly that it is not isolation, "container" that a restart of the sandbox
+    adds the firewall); «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
     from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). A stray
     click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
     settings page has it; sessions can still override it through the API).
@@ -2699,7 +2937,9 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     The new-session modal sends `starting_roles` only when the saved list, at the new size, would give another
     team (the saved list may hold more roles than its `start_agents`: they would fill a larger team).
   - Settings tab: sections «Модели и эндпоинты», «Роли», «Новые сессии по умолчанию» (with the team composer and
-    the switch «Независимое ревью задач», `swarm.independent_review`), «Агенты», «Консоль», «Workspace», «MCP»,
+    the switch «Независимое ревью задач», `swarm.independent_review`, and «Интернет для команд агентов»,
+    `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
+    `agents.planning_hint_steps` / `planning_hint_minutes` and their hints), «Консоль», «Workspace», «MCP»,
     «Скиллы», «Трейсы», «Сервер», with a section navigation.
     - Roles: a card per catalog role (from `role_presets` and `settings.roles`). A built-in role: its name in
       both languages (read-only), «встроенная» / «изменена» marks, «Сбросить» and «Скрыть» / «Показать»;
@@ -2783,12 +3023,14 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     and `GET /api/settings` (launcher routes, without `BASE`) and adds the groups «Фоновые процессы»
     (`shell.max_jobs_per_member`, `max_jobs`, `job_max_minutes`, `cpu_threads`) and «Агенты»
     (`agents.max_steps_per_turn`, `context_tokens`, `tool_output_chars`, `idle_nudge_seconds`,
-    `max_parallel_llm_calls`; `SESSION_FIELDS`). Each input holds the session's own override (empty when none) and
+    `max_parallel_llm_calls`, `planning_hint_steps`, `planning_hint_minutes`) and «Сеть» (`swarm.network`, kind
+    `choice`: a select «как в общих настройках (…)» / «есть» / «нет», with the hint `networkHint` of the launcher's
+    `network_isolation`, §7.2) (`SESSION_FIELDS`, where a field's `hint` key names its hint text). Each input holds the session's own override (empty when none) and
     shows the global value (the public view of `/api/settings`, defaults filled) as its placeholder; a hint says
     that an empty field takes the general value and that changes apply at once (steps from the agent's next
     wake-up, the rest from the next command or call), the context field that a model profile's own window wins
     (naming it when the session's profile has one). Save checks the values with config.py's minimums (whole
-    numbers; `idle_nudge_seconds` a number; `cpu_threads` "auto" or a whole number ≥ 0; the first error is a toast
+    numbers; `idle_nudge_seconds` and `planning_hint_minutes` numbers; `cpu_threads` "auto" or a whole number ≥ 0; the first error is a toast
     and gets the focus), then sends `PATCH /api/sessions/{sid}` `{"settings": ...}` with only the changed keys (an
     emptied field is null) before `swarm_control`, so a stopped session takes them too; when the PATCH succeeds and
     `swarm_control` fails, a toast says the session parameters were saved and the dialog stays open with them counted
@@ -2798,6 +3040,9 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G]
     exported for the Node tests (`parseSessionField`, `sessionSettingsPatch`, `sessionFieldsHtml`, `contextHint`).
     `main` and a standalone `dreamteam run` board show only budget and max agents, with a line that the other
     parameters are in the general settings.
+  - Header: the badge «Без интернета» (`#net-badge`) while the snapshot's `swarm.network.mode` is "off", its
+    tooltip `networkHint(swarm.network.isolation)` (§7.2); the sessions page's card shows the same badge for a
+    summary with `network: "off"`.
   - Background jobs (§7.1; «фоновый процесс» in Russian, shown as j3): the tab «Процессы» (badge: the running
     ones) has a card per job of the snapshot's `jobs` (running, then ended in the last hour): label, owner chip,
     state («работает 25 мин»; at the end by status and reason: «завершён: код 0», «завершён» for a job with no

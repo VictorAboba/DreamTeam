@@ -25,7 +25,7 @@ from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, procs, roles
+from . import __version__, netoff, procs, roles
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
 from .sessions import SessionError
@@ -479,8 +479,11 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     async def settings(request: Request):
         if request.method == "GET":
             view = manager.settings_view()  # first: it picks up a hand-edited file into manager.config
+            # what [swarm] network = "off" gets on this machine (docs/SPEC.md §7.2): the dialogs say it honestly
+            isolation = netoff.shown(await procs.daemon_call(netoff.isolation))
             return JSONResponse({"settings": view, "providers": PROVIDER_CHOICES, **role_views(),
-                                 "path": str(settings_path(manager.home)), "home": str(manager.home)})
+                                 "path": str(settings_path(manager.home)), "home": str(manager.home),
+                                 "network_isolation": isolation})
         body = await _json_body(request)
         update = body.get("settings") if isinstance(body, dict) else None
         if not isinstance(update, dict):

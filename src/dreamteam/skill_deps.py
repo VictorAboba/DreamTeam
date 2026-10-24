@@ -1224,10 +1224,11 @@ class EnvManager:
 
     # ---- planning ----
     def plan(self, folder: Path, skill: str, trust: str, settings: "SkillsSettings", *, config: "Config",
-             proposal: bool = False) -> list:
+             proposal: bool = False, network: bool = True) -> list:
         """The specs of the skill folder's manifests: an EnvSpec per installable ecosystem, a state dict for the
         others (off, unsupported, unavailable). Blocking (it may probe a tool once per process): call it in a
-        daemon thread."""
+        daemon thread. `network` False (a session without network): a member's proposal gets no install, since
+        DreamTeam would download what the member could not (an environment that is ready already is used)."""
         found = detect(folder)
         out: list = []
         for ecosystem, manifest in (("python", found.python), ("node", found.node)):
@@ -1270,9 +1271,13 @@ class EnvManager:
                             material=manifest.material, tool=tool, installer=tool.label, key="", dirname="",
                             options=options)
             key = env_key(proto, tool)
-            out.append(EnvSpec(skill=skill, ecosystem=ecosystem, trust=trust, manifest=manifest,
-                               source=Path(folder), material=manifest.material, tool=tool, installer=tool.label,
-                               key=key, dirname=env_dirname(skill, ecosystem, key), options=options))
+            spec = EnvSpec(skill=skill, ecosystem=ecosystem, trust=trust, manifest=manifest, source=Path(folder),
+                           material=manifest.material, tool=tool, installer=tool.label, key=key,
+                           dirname=env_dirname(skill, ecosystem, key), options=options)
+            if proposal and not network and self._disk_state(spec.dirname) != "ready":
+                out.append({**base, "status": "off", "reason": {"code": "network"}})
+                continue
+            out.append(spec)
         return out
 
     # ---- state ----
