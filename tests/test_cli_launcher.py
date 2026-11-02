@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import io
 import json
 import os
 import signal
@@ -11,6 +12,7 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -358,6 +360,33 @@ def test_traces_offline_reads_the_most_recent_session(tmp_path, capsys):
     assert cli.main(["traces", "--home", str(home), "--session", "003-never"]) == 0
     assert "No traces." in capsys.readouterr().out
     assert not (home / "sessions" / "003-never" / ".dreamteam" / "swarm.db").exists()
+
+
+def test_traces_rejects_unknown_status(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["traces", "--status", "faild"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_traces_hub_http_errors_distinguish_404(monkeypatch, tmp_path, capsys):
+    home = make_home(tmp_path, free_port())
+    monkeypatch.setattr(cli, "running_hub", lambda path: "http://127.0.0.1:9")
+    monkeypatch.setattr(cli, "hub_identity", lambda base: {"mode": "swarm"})
+
+    def boom(base, path):
+        raise urllib.error.HTTPError(base + path, 500, "Internal Server Error", hdrs=None, fp=io.BytesIO(b"boom"))
+
+    monkeypatch.setattr(cli, "_hub_json", boom)
+    assert cli.main(["traces", "--home", str(home)]) == 1
+    assert "HTTP 500: boom" in capsys.readouterr().err
+
+    def missing(base, path):
+        raise urllib.error.HTTPError(base + path, 404, "Not Found", hdrs=None, fp=io.BytesIO(b""))
+
+    monkeypatch.setattr(cli, "_hub_json", missing)
+    assert cli.main(["traces", "--home", str(home), "--id", "1"]) == 1
+    assert "Not found (404)." in capsys.readouterr().err
 
 
 def test_sandbox_serves_a_home_without_sessions_dir(tmp_path, monkeypatch, capsys):

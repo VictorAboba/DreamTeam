@@ -1084,7 +1084,16 @@ def cmd_traces(args) -> int:
             print(str(exc), file=sys.stderr)
             return 1
         except urllib.error.HTTPError as exc:
-            print(f"Not found ({exc.code}).", file=sys.stderr)
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace").strip()
+            except OSError:
+                detail = ""
+            if exc.code == 404:
+                print(f"Not found ({exc.code}).", file=sys.stderr)
+            else:
+                msg = detail or getattr(exc, "reason", None) or "error"
+                print(f"HTTP {exc.code}: {msg}", file=sys.stderr)
             return 1
         except (OSError, ValueError) as exc:  # the hub stopped meanwhile
             print(f"Cannot read traces from {base}: {exc}", file=sys.stderr)
@@ -1383,6 +1392,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "the skills library first, or delete them with the session (refused without it)")
     s.set_defaults(func=cmd_sessions)
 
+    from .tracing import TRACE_STATUSES
+
     s = sub.add_parser("traces", help="show agent traces (LLM calls, thinking, tools, tokens, cost) of a session")
     s.add_argument("agent", nargs="?", help="only this agent")
     s.add_argument("--home", help="home or project directory")
@@ -1390,7 +1401,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--id", type=int, help="show one trace with all its steps")
     s.add_argument("--span", type=int, help="show one step in full")
     s.add_argument("--context", action="store_true", help="with --span of an LLM step: the messages the model saw")
-    s.add_argument("--status", help="filter: failed, done, error, step_limit, running, ...")
+    s.add_argument("--status", choices=(*TRACE_STATUSES, "failed"),
+                   help="filter: failed, done, error, step_limit, running, ...")
     s.add_argument("--limit", type=int, default=20)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_traces, dir=None)
