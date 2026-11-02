@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 
 from . import netoff
-from .config import Config
+from .config import SHELL_PROGRAMS, Config
 from .procs import TOKEN_ENV, ProcessTree, daemon_call
 
 log = logging.getLogger(__name__)
@@ -89,6 +89,8 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
 def resolve_shell(program: str = "auto") -> tuple[str, list[str]]:
     """Return (display name, argv prefix); the command string is appended as the last argument."""
     program = (program or "auto").lower()
+    if program not in SHELL_PROGRAMS:
+        raise ValueError(f"Unsupported shell program: {program} (must be one of: {', '.join(SHELL_PROGRAMS)})")
     if program == "auto":
         if sys.platform == "win32":
             program = "pwsh" if shutil.which("pwsh") else "powershell"
@@ -99,10 +101,8 @@ def resolve_shell(program: str = "auto") -> tuple[str, list[str]]:
         return program, [exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command"]
     if program == "cmd":
         return "cmd", [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c"]
-    if program in ("bash", "sh", "zsh"):
-        exe = shutil.which(program) or program
-        return program, [exe, "-c"]
-    raise ValueError(f"Unsupported shell program: {program}")
+    exe = shutil.which(program) or program      # bash, sh, zsh
+    return program, [exe, "-c"]
 
 
 def shell_args(name: str, prefix: list[str], command: str) -> list[str] | str:

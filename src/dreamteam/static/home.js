@@ -1581,6 +1581,7 @@ function renderSettings(fromServer) {
       field("ag_plan_minutes", "agents.planning_hint_minutes", "float", { min: 0, step: 1, hint: "ag_plan_minutes_hint" }),
     ]))}
     ${section("shell", grid([
+      // keep in sync with SHELL_PROGRAMS in src/dreamteam/config.py
       field("sh_program", "shell.program", "select", { options: ["auto", "bash", "sh", "zsh", "powershell", "pwsh", "cmd"].map((x) => [x, x]) }),
       field("sh_timeout", "shell.timeout", "int", { min: 1 }),
       field("sh_max_timeout", "shell.max_timeout", "int", { min: 1, hint: "sh_max_timeout_hint" }),

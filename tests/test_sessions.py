@@ -389,6 +389,9 @@ def test_write_raw_never_writes_invalid_settings(tmp_path):
     raw = _raw(tmp_path)
     raw["agents"]["max_steps_per_turn"] = 12.0  # a whole number written as a float by hand
     assert st.validate(home, raw).agents.max_steps_per_turn == 12
+    raw = _raw(tmp_path)
+    raw["shell"] = {"program": ""}  # an empty value still loads: resolve_shell reads it as auto
+    assert st.validate(home, raw).shell.program == ""
 
 
 def test_config_normalizes_api_key_env(tmp_path, monkeypatch):

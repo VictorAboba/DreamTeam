@@ -227,9 +227,9 @@ class TracingSettings:
     retention_days: float = 0          # delete finished traces older than this; 0 = keep forever
 
 
-# TOML section of each settings class (error messages)
-# Shells `resolve_shell` can run; `auto` picks one for the platform.
+# Shells `resolve_shell` can run; `auto` picks one for the platform. An empty value means "auto".
 SHELL_PROGRAMS = ("auto", "bash", "sh", "zsh", "powershell", "pwsh", "cmd")
+# TOML section of each settings class (error messages)
 _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSettings": "server",
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
                "TracingSettings": "tracing", "SkillsSettings": "skills", "ModelProfile": "models",
@@ -497,7 +497,7 @@ class Config:
             raise ValueError("swarm.language must be 'ru' or 'en'")
         if cfg.swarm.network not in ("on", "off"):
             raise ValueError(f"swarm.network must be 'on' or 'off', got {cfg.swarm.network[:20]!r}")
-        if cfg.shell.program.lower() not in SHELL_PROGRAMS:
+        if (cfg.shell.program or "auto").lower() not in SHELL_PROGRAMS:
             raise ValueError(f"shell.program must be one of: {', '.join(SHELL_PROGRAMS)}, got {cfg.shell.program[:20]!r}")
         return cfg
 
