@@ -737,7 +737,10 @@ async def test_bash_command_runs_aside_and_can_be_interrupted(launch):
     started = time.monotonic()
     h.tui.exit()
     assert await asyncio.wait_for(h.task, 15) == 0
-    assert time.monotonic() - started < 10 and not run.running
+    # the SIGKILL is sent on exit; the process is reaped a moment later (and Popen.poll() reads None while the
+    # output thread waits for it), so wait for it to be gone instead of expecting it gone at once
+    await h.until(lambda: not run.running, 5, "the killed command to be gone")
+    assert time.monotonic() - started < 10
 
 
 async def test_shell_command_timeout_and_decoding(tmp_path):
