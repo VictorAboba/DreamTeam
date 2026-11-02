@@ -15,10 +15,6 @@ from . import netoff
 from .config import Config
 
 IMAGE = "dreamteam:latest"
-# pyproject.toml's [project] dependencies, for an installed package (no repo pyproject.toml next to it);
-# tests/test_surfaces.py keeps the two lists equal
-DEPENDENCIES = ["mcp>=2.3,<3", "anthropic>=1.12,<2", "openai>=3.26,<4", "starlette>=0.48", "uvicorn>=0.31",
-                "httpx2>=2.10", "websockets>=13", "prompt-toolkit>=3.0.43", "rich>=13.7"]
 
 DOCKERFILE = """FROM python:3.13-slim
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 PYTHONUTF8=1
@@ -61,6 +57,19 @@ def _is_dreamteam_pyproject(path: Path) -> bool:
         return False
 
 
+def _installed_dependencies() -> list[str]:
+    """The [project] dependencies the installed dreamteam was built with (its package metadata): what an
+    installed package without the repository's pyproject.toml next to it has to declare in the image."""
+    from importlib import metadata
+
+    try:
+        requires = metadata.requires("dreamteam") or []
+    except metadata.PackageNotFoundError:
+        raise SystemExit("dreamteam is neither installed nor run from its repository: cannot tell the image "
+                         "which packages it needs.") from None
+    return [r for r in requires if "extra ==" not in r]
+
+
 def build_context(dest: Path) -> Path:
     """Assemble a docker build context with the installed dreamteam sources."""
     pkg = _package_root()
@@ -75,7 +84,7 @@ def build_context(dest: Path) -> Path:
 
         (dest / "pyproject.toml").write_text(
             "[project]\nname = \"dreamteam\"\nversion = \"" + __version__ + "\"\nrequires-python = \">=3.11\"\n"
-            "dependencies = " + json.dumps(DEPENDENCIES) + "\n[project.scripts]\n"
+            "dependencies = " + json.dumps(_installed_dependencies()) + "\n[project.scripts]\n"
             "dreamteam = \"dreamteam.cli:main\"\n[build-system]\nrequires = [\"hatchling\"]\n"
             "build-backend = \"hatchling.build\"\n[tool.hatch.build.targets.wheel]\npackages = [\"src/dreamteam\"]\n",
             encoding="utf-8",

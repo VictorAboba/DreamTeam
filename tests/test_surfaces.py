@@ -1107,18 +1107,38 @@ def test_docker_build_context(tmp_path):
     assert not docker_module._is_dreamteam_pyproject(other)
 
 
+def _requirement(text: str) -> tuple[str, frozenset[str]]:
+    """A requirement string as (normalized name, its version clauses): package metadata writes
+    `mcp>=2.3,<3` as `mcp<3,>=2.3`."""
+    name, spec = re.fullmatch(r"\s*([A-Za-z0-9._-]+)\s*(.*)", text).groups()
+    return re.sub(r"[-_.]+", "-", name).lower(), frozenset(c.strip() for c in spec.split(",") if c.strip())
+
+
 def test_docker_build_context_without_repo_pyproject(tmp_path, monkeypatch):
     """Installed from a wheel there is no pyproject.toml next to the package: the generated one must
-    declare the same dependencies and package layout."""
+    declare the same dependencies (taken from the installed package's metadata) and package layout."""
     import tomllib
 
     monkeypatch.setattr(docker_module, "_is_dreamteam_pyproject", lambda path: False)
     ctx = docker_module.build_context(tmp_path / "ctx")
     generated = tomllib.loads((ctx / "pyproject.toml").read_text(encoding="utf-8"))
     repo = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
-    assert generated["project"]["dependencies"] == repo["project"]["dependencies"]
+    assert ({_requirement(r) for r in generated["project"]["dependencies"]}
+            == {_requirement(r) for r in repo["project"]["dependencies"]})
     assert generated["project"]["scripts"] == repo["project"]["scripts"]
     assert generated["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["src/dreamteam"]
+
+
+def test_docker_build_context_without_repo_pyproject_or_installed_package(tmp_path, monkeypatch):
+    from importlib import metadata
+
+    def missing(name):
+        raise metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(docker_module, "_is_dreamteam_pyproject", lambda path: False)
+    monkeypatch.setattr(metadata, "requires", missing)
+    with pytest.raises(SystemExit, match="cannot tell the image"):
+        docker_module.build_context(tmp_path / "ctx")
 
 
 def test_sandbox_command(tmp_path, monkeypatch):
