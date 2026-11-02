@@ -23,12 +23,12 @@ classifiers = [
 ]
 dependencies = [
     "mcp>=2.3,<3",
-    "anthropic>=1.12,<2",
-    "openai>=3.26,<4",
-    "starlette>=0.48",
+    "anthropic>=1.17.0,<2",
+    "openai>=3.41.0,<4",
+    "starlette>=1.10.0",
     "uvicorn>=0.31",
-    "httpx2>=2.10",
-    "websockets>=13",
+    "httpx2>=2.16.0",
+    "websockets>=17.3",
     "prompt-toolkit>=3.0.43",
     "rich>=13.7",
 ]
@@ -42,7 +42,7 @@ Issues = "https://github.com/VictorAboba/DreamTeam/issues"
 dreamteam = "dreamteam.cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24"]
+dev = ["pytest>=9.2.0", "pytest-asyncio>=1.4.1"]
 
 [build-system]
 requires = ["hatchling"]
