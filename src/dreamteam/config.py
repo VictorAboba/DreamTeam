@@ -228,6 +228,8 @@ class TracingSettings:
 
 
 # TOML section of each settings class (error messages)
+# Shells `resolve_shell` can run; `auto` picks one for the platform.
+SHELL_PROGRAMS = ("auto", "bash", "sh", "zsh", "powershell", "pwsh", "cmd")
 _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSettings": "server",
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
                "TracingSettings": "tracing", "SkillsSettings": "skills", "ModelProfile": "models",
@@ -495,6 +497,8 @@ class Config:
             raise ValueError("swarm.language must be 'ru' or 'en'")
         if cfg.swarm.network not in ("on", "off"):
             raise ValueError(f"swarm.network must be 'on' or 'off', got {cfg.swarm.network[:20]!r}")
+        if cfg.shell.program.lower() not in SHELL_PROGRAMS:
+            raise ValueError(f"shell.program must be one of: {', '.join(SHELL_PROGRAMS)}, got {cfg.shell.program[:20]!r}")
         return cfg
 
 
@@ -582,7 +586,7 @@ host = "127.0.0.1"
 port = 8765
 
 [shell]
-program = "auto"              # auto | bash | sh | powershell | pwsh | cmd
+program = "auto"              # auto | bash | sh | zsh | powershell | pwsh | cmd
 timeout = 120                 # сколько секунд вызов shell ждёт команду; не завершившаяся за это время продолжает работать в фоне
 max_timeout = 1800            # наибольший timeout команды; столько же (от запуска) живёт команда, ушедшая в фон по тайм-ауту (само ожидание ИИ-агента ограничивает foreground_max, по MCP — 600 с)
 background_on_timeout = true  # false — команду, не уложившуюся в timeout, убивать, как раньше

@@ -364,6 +364,7 @@ def test_write_raw_never_writes_invalid_settings(tmp_path):
         ("server", "port", 70000), ("server", "resume_sessions", "no"), ("workspace", "git", "yes"),
         ("tracing", "retention_days", -1), ("tracing", "max_payload_chars", "big"),
         ("swarm", "name", "bad\ud800"), ("swarm", "max_cost_usd", float("inf")), ("swarm", "language", "de"),
+        ("shell", "program", "fish"),
     ]
     for section, key, value in bad_values:
         raw = _raw(tmp_path)
