@@ -40,8 +40,8 @@ dreamteam
 
 - **Pick an issue.** [`good first issue`](https://github.com/VictorAboba/DreamTeam/labels/good%20first%20issue)
   issues are small and self-contained, each with the files involved and what "done" means;
-  [`help wanted`](https://github.com/VictorAboba/DreamTeam/labels/help%20wanted) ones are bigger. Say in the issue
-  that you're taking it, so two people don't do the same work. Questions in the issue are welcome.
+  [`help wanted`](https://github.com/VictorAboba/DreamTeam/labels/help%20wanted) ones are bigger. Ask for it first
+  (see [Taking an issue](#taking-an-issue)), so two people don't do the same work. Questions in the issue are welcome.
 - **Run only the tests you need.** The whole suite takes 8–16 minutes; while you work, run the files for the
   module you change, e.g. `uv run pytest -q tests/test_board.py`, or one test with `-k name`. Run everything
   once before you open the pull request (or let CI do it).
@@ -67,16 +67,39 @@ dreamteam
 
 `docs/SPEC.md` describes every module's contract: read the section of the module you change first.
 
+## Taking an issue
+
+1. Comment on the issue that you'd like to work on it, and wait until a maintainer assigns it to you. A pull
+   request for an issue assigned to someone else may be closed.
+2. **`good first issue` issues are for people making their first contribution to DreamTeam.** Take one at a
+   time. Once your first pull request is merged, move on to `help wanted` or any other issue and leave the rest
+   to the next newcomer.
+3. If you can't go on, say so in the issue. An assigned issue with no activity for two weeks goes back to the pool.
+
+## AI tools and automated accounts
+
+- **AI coding assistants are fine as tools.** Say in the pull request which one you used. You must have run the
+  tests yourself, understand every line you submit and answer review comments yourself. A pull request whose
+  author can't explain it is closed.
+- **`good first issue` issues are not open to automated accounts**: bots and agents that claim issues and open
+  pull requests across many repositories. Their claims are ignored and their pull requests are closed without
+  review. These issues exist so that people can learn the project.
+
 ## Pull requests
 
 1. Open an issue first for anything bigger than a small fix, so we can agree on the approach.
-2. Keep a pull request to one change, with tests for new behaviour and fixed bugs.
-3. Run `uv run pytest -q` and `uvx ruff check src tests` before pushing; CI runs both on Linux, Windows and
-   macOS.
-4. Update the docs when behaviour visible to users changes: the guide pages in [docs/en](docs/en/README.md) and
+2. One pull request, one issue: write `Fixes #N` in the description, and leave unrelated changes for another pull
+   request. Add tests for new behaviour and fixed bugs.
+3. Write code like the code around it, and reuse existing helpers instead of copying them. If you have to
+   duplicate something (because of a circular import, say), explain why in the pull request.
+4. Run `uv run pytest -q` and `uvx ruff check src tests` before pushing; CI runs both on Linux, Windows and
+   macOS. On your first pull request, CI waits until a maintainer approves the run (GitHub's protection for new
+   contributors): that's expected, there's nothing to fix and no need to reopen the pull request.
+5. Update the docs when behaviour visible to users changes: the guide pages in [docs/en](docs/en/README.md) and
    [docs/ru](docs/ru/README.md) (the same files in both languages — change both, or say in the PR which one needs
    a translation), the README if the short overview changes ([README.md](README.md) and [README.ru.md](README.ru.md)
-   mirror each other) and, for module contracts, [docs/SPEC.md](docs/SPEC.md).
+   mirror each other) and, for module contracts, [docs/SPEC.md](docs/SPEC.md). For a change to the web board or
+   the terminal UI, add a screenshot.
 
 ## Code conventions
 
