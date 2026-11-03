@@ -31,6 +31,8 @@ _JOB_REF = re.compile(r"[jJ%#]?(\d+)")          # "/jobs j3", "/jobs stop 3": a 
 JOB_STOP = ("stop", "kill", "стоп")
 WRAP_UP_ON = ("", "on", "вкл")                  # /wrapup: the user's wrap-up mode on ...
 WRAP_UP_OFF = ("off", "выкл", "stop", "стоп")   # ... or back off
+CLARIFY_ON = ("on", "вкл")                      # /clarify: clarify mode ([swarm] clarify) on ...
+CLARIFY_OFF = ("off", "выкл")                   # ... or off
 
 # CLI flags that become session overrides of a new session (the sections of the launcher's modal)
 FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
@@ -42,6 +44,7 @@ FLAT_OVERRIDES: dict[str, tuple[str, str]] = {
     "max_cost_usd": ("swarm", "max_cost_usd"),
     "language": ("swarm", "language"),
     "network": ("swarm", "network"),   # --network off (docs/SPEC.md §7.2)
+    "clarify": ("swarm", "clarify"),   # --clarify / --no-clarify (docs/SPEC.md §3 "Clarify mode")
 }
 
 
@@ -560,6 +563,50 @@ async def _wrapup(c: CommandContext) -> None:
         c.info(text)
 
 
+async def _clarify(c: CommandContext) -> None:
+    """`/clarify [on|off]`: clarify mode ([swarm] clarify, docs/SPEC.md §3): the attached session's own setting
+    (changed at once, PATCH), or without a session that of the sessions this window creates next (like --clarify
+    and /team); without an argument, the state and where it comes from."""
+    arg = c.args.strip().casefold()
+    if arg in CLARIFY_ON:
+        on: bool | None = True
+    elif arg in CLARIFY_OFF:
+        on = False
+    elif not arg:
+        on = None
+    else:
+        raise UsageError
+    if c.app.attached:
+        from ..sessions import LEGACY_ID   # (here only: the TUI of another hub needs no session code otherwise)
+
+        if on is None:   # also for main: it has no overrides, so its state is the general settings' one
+            data = await c.client.session(c.sid)
+            own = ((data.get("session") or {}).get("overrides") or {}).get("swarm") or {}
+            value = own.get("clarify", ((data.get("config") or {}).get("swarm") or {}).get("clarify"))
+            c.info(c.t("clarify_session_state", state=c.t("on" if value else "off"),
+                       source=c.t("clarify_own" if "clarify" in own else "clarify_inherited")))
+            return
+        if c.sid == LEGACY_ID:
+            c.info(c.t("clarify_main"))
+            return
+        data = await c.client.update_session(c.sid, {"swarm": {"clarify": on}})
+        if isinstance(data.get("session"), dict):
+            c.app.session = {**(c.app.session or {}), **data["session"]}
+        c.info(c.t("clarify_session_on" if on else "clarify_session_off"))
+        return
+    swarm = c.app.overrides.get("swarm") or {}
+    if on is None:
+        if "clarify" in swarm:
+            value, source = swarm["clarify"], "clarify_window"
+        else:
+            view = (await c.client.settings()).get("settings") or {}
+            value, source = (view.get("swarm") or {}).get("clarify"), "clarify_inherited"
+        c.info(c.t("clarify_new_state", state=c.t("on" if value else "off"), source=c.t(source)))
+        return
+    c.app.overrides.setdefault("swarm", {})["clarify"] = on
+    c.info(c.t("clarify_new_on" if on else "clarify_new_off"))
+
+
 async def _budget(c: CommandContext) -> None:
     value = number(c.args)
     if value is None or value < 0:
@@ -660,6 +707,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("model", _model, args=True, launcher=True),
     Command("pause", _pause, session=True),
     Command("wrapup", _wrapup, args=True, session=True),
+    Command("clarify", _clarify, args=True, launcher=True),   # without a session: the next new ones (as --clarify)
     Command("budget", _budget, args=True, required=True, session=True),
     Command("max", _max, args=True, required=True, session=True),
     Command("approve", _approve, args=True, required=True, session=True),

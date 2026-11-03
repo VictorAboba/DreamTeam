@@ -487,7 +487,11 @@ class AgentRuntime:
                 if from_user:
                     self._forward_reply(reply)
                 reply.clear()
-                in_progress = [t for t in swarm.board.open_tasks_of(self.name) if t.status == Status.IN_PROGRESS]
+                # a clarify planner that waits for the user's answers is not nudged (Swarm.asks_user; getattr: test
+                # doubles have none)
+                asks = getattr(swarm, "asks_user", None)
+                in_progress = [t for t in swarm.board.open_tasks_of(self.name) if t.status == Status.IN_PROGRESS
+                               and not (asks is not None and asks(self.name, t))]
                 # a command of the agent went on as a job it waits for (JobManager.busy): no nudge now; its end
                 # wakes the agent, and the stall below is still recorded for once the busy window ends
                 jobs = getattr(swarm, "jobs", None)
@@ -553,6 +557,9 @@ class AgentRuntime:
     def _stop_reason(self) -> str:
         if self._stopping:
             return "Stopped during the activation."
+        pause_text = getattr(self.swarm, "pause_text", None)  # (test doubles have none)
+        if pause_text is not None:
+            return f"The swarm was paused ({pause_text()})."
         return f"The swarm was paused ({self.swarm.pause_reason or 'no reason given'})."
 
     def _forward_reply(self, parts: list[str]) -> None:

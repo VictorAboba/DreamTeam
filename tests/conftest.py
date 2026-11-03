@@ -129,9 +129,11 @@ class FakeSwarm:
         self.db.set("goal", goal)
         self.bus.emit("goal.set", actor, goal=goal)
         if isinstance(self.board, Board) and not self.board.list():
-            p_title, p_goal, p_desc = prompts.PLANNING_TASK[self.language]
+            clarify = bool(self.config.swarm.clarify)  # no auto-reply lease here (Swarm.clarifying)
+            p_title, p_goal, p_desc = prompts.planning_task(self.language, clarify)
             body = f"{p_desc}\n\n{title}" + (f"\n{goal['description']}" if goal["description"] else "")
-            self.board.create(actor, p_title, goal=p_goal, description=body, priority=2, tags=["planning"])
+            self.board.create(actor, p_title, goal=p_goal, description=body, priority=2,
+                              tags=["planning", prompts.CLARIFY_TAG] if clarify else ["planning"])
         return goal
 
     def complete_goal(self, actor: str, summary: str) -> dict:

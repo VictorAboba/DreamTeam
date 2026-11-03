@@ -25,7 +25,7 @@ from . import skills as skill_lib
 from .db import loads
 from .hub_mcp import LIBRARY_TOOLS, LOOPBACK_HOSTS, MCPHttpEndpoint
 from .httpjson import JSONResponse, json_text
-from .models import USER, ToolError
+from .models import AUTO_REPLY_HEADER, USER, ToolError
 from .skills import Library, Limits, SkillError
 from .tools import ToolContext, call_tool
 from .trace_api import trace_routes
@@ -528,6 +528,8 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1", *,
         body = await _json(request)
         if not isinstance(body, dict):
             return JSONResponse({"ok": False, "result": "Body must be a JSON object."}, status_code=400)
+        if request.headers.get(AUTO_REPLY_HEADER) == "1":  # a `dreamteam -p` client with automatic replies
+            swarm.auto_reply_seen()
         text, is_error = await call_tool(ToolContext(swarm, USER), tool_name, body)
         # these may have changed the library (a proposal saved, a source imported first): the home page reloads it
         if not is_error and on_library_change is not None and tool_name in LIBRARY_TOOLS:
@@ -535,25 +537,29 @@ def create_app(swarm: "Swarm", host: str = "127.0.0.1", *,
         return JSONResponse({"ok": not is_error, "result": text})
 
     async def ws_endpoint(websocket: WebSocket):
-        await websocket.accept()
-        queue = swarm.bus.subscribe()
+        # the event stream of a `dreamteam -p` client with automatic replies holds the swarm's auto-reply lease while
+        # it is open, and for the grace after (Swarm.auto_reply_stream; docs/SPEC.md §3 "Clarify mode")
+        auto_reply = websocket.headers.get(AUTO_REPLY_HEADER) == "1"
+        with swarm.auto_reply_stream() if auto_reply else contextlib.nullcontext():
+            await websocket.accept()
+            queue = swarm.bus.subscribe()
 
-        async def pump():
-            while True:
-                event = await queue.get()
-                await websocket.send_text(json_text(event))
+            async def pump():
+                while True:
+                    event = await queue.get()
+                    await websocket.send_text(json_text(event))
 
-        sender = asyncio.create_task(pump())
-        try:
-            while True:
-                await websocket.receive_text()
-        except (WebSocketDisconnect, RuntimeError):
-            pass
-        finally:
-            sender.cancel()
-            swarm.bus.unsubscribe(queue)
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await sender
+            sender = asyncio.create_task(pump())
+            try:
+                while True:
+                    await websocket.receive_text()
+            except (WebSocketDisconnect, RuntimeError):
+                pass
+            finally:
+                sender.cancel()
+                swarm.bus.unsubscribe(queue)
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await sender
 
     @contextlib.asynccontextmanager
     async def lifespan(app):

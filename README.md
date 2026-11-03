@@ -23,6 +23,9 @@ dreamteam "Build a snake game in Python with tests"
 - **No orchestrator.** Setting a goal puts a planning task on the board; whoever is free takes it, the others
   pick up tasks as they appear. Claiming is atomic, dependencies block, and every task is accepted by a
   *different* member (independent review) — or by you, if nobody else is left.
+- **It asks before it builds.** In clarify mode the planner asks you about the goal's open points in one message
+  before it creates any task, while the other agents wait without spending tokens; an agent whose question decides
+  how the whole team goes on can pause the swarm until you answer, and your answer reaches every member.
 - **Agents build their own tools.** The built-in tool set is small: the board, messages, files, a console and
   triggers. Anything else an agent writes as an MCP server (`mcp_create`); it is checked, registered for
   itself, its task or the whole swarm, and kept in a library for later runs.
@@ -70,7 +73,8 @@ dreamteam serve                             # web board only
 1. Open **Settings → Models and endpoints** on `http://127.0.0.1:8765`, pick a provider and model, give the key
    (an environment variable name or the key itself) and press **Check**.
 2. On **Sessions**, press **Start a new session** and describe the goal: the first line becomes the title, the rest the
-   description. You can also pick the starting team, e.g. `--team "architect, developer*2, tester"`.
+   description. You can also pick the starting team, e.g. `--team "architect, developer*2, tester"`. Tick **Clarify
+   the goal first** (in the terminal: `--clarify` or `/clarify on`) to be asked about the goal before the swarm plans.
 3. Watch the swarm plan and work; write to any agent with `@Name`, review tasks it hands you with
    `/approve 3` or `/reject 3 what to fix`. All commands and keys: [Terminal UI and console](docs/en/terminal.md).
 

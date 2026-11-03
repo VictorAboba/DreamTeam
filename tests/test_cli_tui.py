@@ -97,6 +97,62 @@ def test_team_option_reaches_the_new_session(monkeypatch, tmp_path, capsys):
     assert seen == {} and "--team: 'tester*0': the count must be a whole number" in capsys.readouterr().err
 
 
+def test_the_cli_clarify_flags(monkeypatch, tmp_path, capsys):
+    """`--clarify` / `--no-clarify` ([swarm] clarify, docs/SPEC.md §3): a new session's setting (the interactive TUI:
+    its window's new sessions, also with -c / -r); `-p --clarify` needs --no-auto-reply, and -p with -c / -r creates
+    no session, so it refuses both flags there before anything starts."""
+    from dreamteam.tui.commands import session_overrides
+
+    parser = cli.build_parser()
+    for argv, value in ((["tui", "--clarify"], True), (["tui", "--no-clarify"], False), (["tui"], None),
+                        (["serve", "--goal", "G", "--clarify"], True), (["serve"], None),
+                        (["run", ".", "--no-clarify"], False), (["run", "."], None)):
+        assert parser.parse_args(argv).clarify is value, argv
+    seen: dict[str, Any] = {}
+    home = str(tmp_path)
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: seen.update(kw) or 0)
+    assert cli.main(["--home", home, "Snake", "--clarify"]) == 0
+    assert seen["overrides"]["clarify"] is True
+    assert session_overrides(seen["overrides"])[0] == {"swarm": {"clarify": True}}
+    seen.clear()
+    assert cli.main(["--home", home, "Snake"]) == 0 and "clarify" not in seen["overrides"]
+    seen.clear()
+    assert cli.main(["-c", "--home", home, "--no-clarify"]) == 0   # the window's setting for its new sessions
+    assert seen["continue_last"] is True and seen["overrides"]["clarify"] is False
+    assert session_overrides({"clarify": False}) == ({"swarm": {"clarify": False}}, None)
+    assert session_overrides({"clarify": True, "network": "off"}) == (
+        {"swarm": {"clarify": True, "network": "off"}}, None)
+
+    monkeypatch.setattr(cli, "_piped_stdin", lambda: "")
+    monkeypatch.setattr(tui, "main_print", lambda *a, **kw: pytest.fail("must be refused"))
+    capsys.readouterr()
+    assert cli.main(["-p", "Snake", "--home", home, "--clarify"]) == 2
+    assert "dreamteam -p: --clarify needs --no-auto-reply" in capsys.readouterr().err
+    for argv in (["-p", "x", "-c", "--home", home, "--clarify", "--no-auto-reply"],
+                 ["-p", "x", "-c", "--home", home, "--clarify"],
+                 ["-p", "x", "-r", "001-x", "--home", home, "--no-clarify"]):
+        assert cli.main(argv) == 2, argv
+        assert "dreamteam -p: --clarify is a setting of a new session" in capsys.readouterr().err, argv
+    monkeypatch.setattr(tui, "main_print", lambda home, prompt, **kw: seen.update(kw) or 0)
+    seen.clear()
+    assert cli.main(["-p", "Snake", "--home", home, "--clarify", "--no-auto-reply"]) == 0
+    assert seen["overrides"]["clarify"] is True and seen["auto_reply"] is False
+    seen.clear()
+    assert cli.main(["-p", "Snake", "--home", home, "--no-clarify"]) == 0   # (with automatic replies: as before)
+    assert seen["overrides"]["clarify"] is False and seen["auto_reply"] is True
+    seen.clear()
+    assert cli.main(["-p", "x", "-c", "--home", home]) == 0 and "clarify" not in seen["overrides"]
+    # neither a TUI nor a serve flag: the terminal decides, as for --network
+    assert cli._default_command(["--clarify"], COMMANDS)[0] == "tui"
+    monkeypatch.setattr(cli, "_interactive", lambda: False)
+    assert cli._default_command(["--clarify", "--goal", "g"], COMMANDS)[0] == "serve"
+    assert "--clarify" not in cli.TUI_FLAGS | cli.SERVE_FLAGS
+    subcommands = parser._subparsers._group_actions[0].choices
+    for name in ("tui", "serve", "run"):
+        assert "--no-clarify" in subcommands[name].format_help(), name
+
+
 def test_tui_needs_a_terminal(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "_interactive", lambda: False)
     monkeypatch.setattr(tui, "main_tui", lambda home, **kw: pytest.fail("the TUI must not start"))

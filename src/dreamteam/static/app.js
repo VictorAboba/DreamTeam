@@ -72,6 +72,13 @@ const I18N = {
     ws_moved_hint: "Сессия перенесена в эту папку (/cd). При удалении сессии папка остаётся.",
     ws_missing: "Папка сессии не найдена: {path}. Сессия не запустится, пока её не перенесут в другую папку: /cd ПАПКА или /cd --default в dreamteam tui.",
     "reason_budget": "исчерпан бюджет — увеличьте его в настройках", "reason_paused by the user": "остановлен вами",
+    // a member's question that pauses the swarm (send_message pause_swarm), a clarify planner waiting for your answers
+    reason_question: "ждёт вашего ответа",
+    paused_question: "Рой на паузе: {name} ждёт вашего ответа на вопрос #{id} — ответ получат все участники. Нажмите, чтобы ответить; «Продолжить» снимает паузу без ответа",
+    resume_no_answer: "Продолжить без ответа: агент выберет вариант сам",
+    q_chat_hint: "Ваше следующее сообщение — ответ на вопрос #{id}: его получат все участники, и рой продолжит работу.",
+    q_still_waiting: "Рой всё ещё ждёт вашего ответа агенту {name} (вопрос #{id})",
+    clarify_wait: "{name} ждёт ваших ответов на вопросы по цели — ответьте в чате",
     tab_jobs: "Процессы",
     jobs_empty: "Фоновых процессов нет. Процесс появляется, когда команда агента работает дольше своего тайм-аута, запущена в фоне или оставляет работать запущенные процессы.",
     job_running: "работает {t}", job_origin_timeout: "ушёл в фон по тайм-ауту", job_origin_background: "запущен в фоне",
@@ -95,6 +102,8 @@ const I18N = {
     sf_bad_int: "«{field}»: нужно целое число ≥ {min}", sf_bad_num: "«{field}»: нужно число ≥ {min}",
     sg_network: "Сеть", sf_network: "Интернет для команд агентов", sf_inherit: "как в общих настройках ({value})",
     net_on: "есть", net_off: "нет", net_badge: "Без интернета", sf_bad_choice: "«{field}»: выберите значение из списка",
+    sg_clarify: "Уточнение цели", sf_clarify: "Сначала уточнять цель", b_on: "вкл", b_off: "выкл",
+    sf_clarify_hint: "Вкл: важный вопрос агента ставит рой на паузу до вашего ответа, а новая задача планирования начинается с вопросов вам. Уже созданная задача планирования не меняется.",
     net_hint_docker: "Команды агентов, их фоновые процессы и MCP-серверы идут от отдельного пользователя, чью сеть закрывает файрвол контейнера. LLM и localhost работают.",
     net_hint_netns: "Команды агентов, их фоновые процессы и MCP-серверы работают в общем для них сетевом пространстве Linux, где есть только свой localhost: сервер, запущенный одной командой, виден другим, а localhost самой машины — нет. LLM работает.",
     net_hint_env: "Здесь это не строгая изоляция: прокси указывают на закрытый порт, pip, uv, npm и git переведены в офлайн, удалённые MCP-серверы не подключаются, но программа, которая этого не учитывает (сырой сокет, веб-команды Windows PowerShell 5.1), выйдет в сеть. Строго — в Docker (dreamteam sandbox) и на Linux.",
@@ -220,6 +229,12 @@ const I18N = {
     ws_moved_hint: "The session was moved to this folder (/cd). Deleting the session keeps the folder.",
     ws_missing: "The session folder is missing: {path}. The session cannot start until it is moved to another folder: /cd FOLDER or /cd --default in dreamteam tui.",
     "reason_budget": "the budget is spent — raise it in the settings", "reason_paused by the user": "paused by you",
+    reason_question: "waiting for your answer",
+    paused_question: "The swarm is paused: {name} waits for your answer to question #{id}; every member will get it. Click to answer; Resume goes on without an answer",
+    resume_no_answer: "Resume without an answer: the agent takes its own default",
+    q_chat_hint: "Your next message answers question #{id}: every member gets it, and the swarm goes on.",
+    q_still_waiting: "The swarm still waits for your answer to {name} (question #{id})",
+    clarify_wait: "{name} waits for your answers about the goal: reply in the chat",
     tab_jobs: "Jobs",
     jobs_empty: "No background jobs. A job appears when an agent's command runs past its timeout, is started in the background or leaves processes running.",
     job_running: "running {t}", job_origin_timeout: "went to the background at its timeout", job_origin_background: "started in the background",
@@ -243,6 +258,8 @@ const I18N = {
     sf_bad_int: "“{field}”: a whole number ≥ {min} is needed", sf_bad_num: "“{field}”: a number ≥ {min} is needed",
     sg_network: "Network", sf_network: "Internet for the agents' commands", sf_inherit: "as in the general settings ({value})",
     net_on: "on", net_off: "off", net_badge: "No internet", sf_bad_choice: "“{field}”: pick a value from the list",
+    sg_clarify: "Clarifying the goal", sf_clarify: "Clarify the goal first", b_on: "on", b_off: "off",
+    sf_clarify_hint: "On: an agent's critical question pauses the swarm until you answer, and a new planning task starts with questions to you. A planning task already on the board stays as it is.",
     net_hint_docker: "The agents' commands, their background jobs and MCP servers run as a separate user whose network the container's firewall closes. The LLM and localhost work.",
     net_hint_netns: "The agents' commands, their background jobs and MCP servers share a separate Linux network namespace that has only its own localhost: a server one command starts is reachable from the others, the machine's own localhost is not. The LLM works.",
     net_hint_env: "Not strict isolation here: proxies point at a closed port, pip, uv, npm and git are set offline and remote MCP servers are not connected, but a program that ignores this (a raw socket, Windows PowerShell 5.1's web cmdlets) still gets out. Strict in Docker (dreamteam sandbox) and on Linux.",
@@ -586,6 +603,12 @@ function toggleWrapUp() {
   return act("swarm_control", { wrap_up: !S.state.swarm.wrap_up });
 }
 
+/** The member's question that holds the swarm (send_message pause_swarm): {asker, message_id, since, text}, else
+ * null. The user's next message to the asker (or to all) answers it; Resume goes on without an answer. */
+function pendingQuestion(sw = S.state && S.state.swarm) {
+  return sw && sw.paused && sw.pause_reason === "question" && sw.question && sw.question.asker ? sw.question : null;
+}
+
 function renderHeader() {
   const sw = S.state.swarm;
   const session = sw.session || null;
@@ -623,13 +646,31 @@ function renderHeader() {
     netBadge.textContent = net.mode === "off" ? t("net_badge") : "";
     netBadge.title = net.mode === "off" ? networkHint(net.isolation) : "";
   }
+  // a member's question to the user holds the swarm (send_message pause_swarm): Resume goes on without an answer.
+  // The banner says so at every width (no tooltip on a touch screen, no label on a phone); the label stays short
+  // for the bar
+  const question = pendingQuestion(sw);
   const pause = $("#pause-btn");
-  setHtml(pause, `<span aria-hidden="true">${sw.paused ? '<i class="ic ic-play"></i>' : '<i class="ic ic-pause"></i>'}</span><span class="btn-label">${esc(sw.paused ? t("resume") : t("pause"))}</span>`);
-  pause.title = sw.paused ? t("resume") : t("pause");
+  const pauseLabel = sw.paused ? t("resume") : t("pause");
+  setHtml(pause, `<span aria-hidden="true">${sw.paused ? '<i class="ic ic-play"></i>' : '<i class="ic ic-pause"></i>'}</span><span class="btn-label">${esc(pauseLabel)}</span>`);
+  pause.title = question ? t("resume_no_answer") : sw.paused ? t("resume") : t("pause");
   pause.classList.toggle("primary", !!sw.paused);
+  // the banner names the asker and opens its chat (onDocumentClick); not paused, a clarify planner that waits for the
+  // user's answers about the goal gets a quiet one (the others wait for its plan: docs/SPEC.md §3 "Clarify mode")
+  const waiting = !sw.paused && sw.clarify_wait && sw.clarify_wait.name ? sw.clarify_wait : null;
+  const asker = question ? question.asker : waiting ? waiting.name : "";
   const banner = $("#paused-banner");
-  banner.classList.toggle("hidden", !sw.paused);
-  banner.textContent = sw.paused ? `${t("paused")}${sw.pause_reason ? ": " + tv("reason_", sw.pause_reason) : ""}` : "";
+  banner.classList.toggle("hidden", !sw.paused && !waiting);
+  banner.classList.toggle("question", !!question);
+  banner.classList.toggle("quiet", !!waiting);
+  banner.textContent = question ? t("paused_question", { name: question.asker, id: question.message_id })
+    : waiting ? t("clarify_wait", { name: waiting.name })
+    : sw.paused ? `${t("paused")}${sw.pause_reason ? ": " + tv("reason_", sw.pause_reason) : ""}` : "";
+  if (asker) banner.dataset.asker = asker;
+  else delete banner.dataset.asker;
+  // a button for the keyboard too (onKeydown)
+  if (asker) { banner.setAttribute?.("role", "button"); banner.tabIndex = 0; }
+  else { banner.removeAttribute?.("role"); banner.removeAttribute?.("tabindex"); }
   // the user's wrap-up mode: a toggle next to Pause (pressed while on) and a line under the header
   const wrapping = !!sw.wrap_up;
   const wrap = $("#wrap-btn");
@@ -895,6 +936,14 @@ function renderDrawerHead() {
   box.disabled = retired;
   box.placeholder = retired ? t("retired_chat") : t("type_message");
   $("#composer button[type=submit]").disabled = retired;
+  // the chat with the member whose question holds the swarm (or with everyone): the next message is the answer
+  const question = pendingQuestion();
+  const answers = !!question && !retired && (name === question.asker || name === "all");
+  const hint = $("#chat-hint");
+  if (hint) {
+    hint.classList.toggle("hidden", !answers);
+    hint.textContent = answers ? t("q_chat_hint", { id: question.message_id }) : "";
+  }
 }
 
 async function openChat(name) {
@@ -1014,12 +1063,18 @@ async function sendComposer() {
   if (!text || !name || box.disabled) return;
   const btn = $("#composer button[type=submit]");
   btn.disabled = true;
+  const question = pendingQuestion();   // read before the send: the answer lifts the pause
   const res = await act("send_message", { to: [name === "all" ? "all" : name], text }, true);
   btn.disabled = false;
   if (res.ok) {
     if (S.chatWith === name && box.value.trim() === text) box.value = "";
     delete S.drafts[name];
     loadMessages(true);
+    // only a message to the asker (or to all) answers its question: this one did not
+    if (question && name !== question.asker && name !== "all") {
+      const text = t("q_still_waiting", { name: question.asker, id: question.message_id });
+      toast(text, "", () => openChat(question.asker));
+    }
   }
 }
 
@@ -1572,8 +1627,8 @@ function limitsArgs(costText, agentsText) {
 
 // Per-session settings of the dialog (overrides of a launcher session, PATCH /api/sessions/{sid} "settings"; the
 // budget and max agents live in the session's database instead). kind: "int" a whole number >= min, "num" a number
-// >= min, "auto" ([shell] cpu_threads) "auto" or a whole number >= 0, "choice" one of `options` (a select); the
-// minimums are config.py's.
+// >= min, "auto" ([shell] cpu_threads) "auto" or a whole number >= 0, "choice" one of `options` (a select), "bool"
+// true or false (a select: on, off); the minimums are config.py's.
 const SESSION_FIELDS = [
   { group: "jobs", section: "shell", key: "max_jobs_per_member", label: "sf_jobs", kind: "int", min: 0 },
   { group: "jobs", section: "shell", key: "max_jobs", label: "sf_jobs_total", kind: "int", min: 0 },
@@ -1588,6 +1643,8 @@ const SESSION_FIELDS = [
   { group: "agents", section: "agents", key: "planning_hint_minutes", label: "sf_plan_minutes", kind: "num", min: 0, hint: "sf_plan_hint" },
   // [swarm] network (docs/SPEC.md §7.2): "" inherits the general setting; the hint says what this machine gives
   { group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] },
+  // [swarm] clarify (docs/SPEC.md §3 "Clarify mode"): questions pause the swarm, a new planning task asks first
+  { group: "clarify", section: "swarm", key: "clarify", label: "sf_clarify", kind: "bool", hint: "sf_clarify_hint" },
 ];
 function sessionFieldId(f) { return `sf-${f.section}-${f.key}`; }
 /** The session's own value of a field; undefined when it inherits the global one. */
@@ -1600,6 +1657,10 @@ function parseSessionField(f, text) {
   const raw = String(text ?? "").trim();
   if (raw === "") return { value: null };
   if (f.kind === "choice") return f.options.includes(raw) ? { value: raw } : { error: t("sf_bad_choice", { field: t(f.label) }) };
+  if (f.kind === "bool") {
+    if (raw === "true" || raw === "false") return { value: raw === "true" };
+    return { error: t("sf_bad_choice", { field: t(f.label) }) };
+  }
   if (f.kind === "auto" && raw.toLowerCase() === "auto") return { value: "auto" };
   const ok = f.kind === "num" ? /^\d+([.,]\d+)?$/.test(raw) : /^\d+$/.test(raw);
   const value = Number(raw.replace(",", "."));
@@ -1641,9 +1702,12 @@ function sessionFieldsHtml(overrides, defaults, config, fields = SESSION_FIELDS,
     const inherited = defaults && defaults[f.section] ? defaults[f.section][f.key] : undefined;
     const text = f.key === "context_tokens" ? contextHint(config) : f.key === "network" ? networkHint(isolation) : f.hint ? t(f.hint) : "";
     const hint = text ? ` <span class="hint">${esc(text)}</span>` : "";
-    if (f.kind === "choice") {
+    if (f.kind === "choice" || f.kind === "bool") {
       const label = (v) => t(`net_${v}`);
-      const options = [["", t("sf_inherit", { value: label(inherited ?? f.options[0]) })], ...f.options.map((v) => [v, label(v)])];
+      const options = f.kind === "bool"
+        ? [["", t("sf_inherit", { value: t(inherited ? "b_on" : "b_off") })],
+           ["true", t("b_on")], ["false", t("b_off")]]
+        : [["", t("sf_inherit", { value: label(inherited ?? f.options[0]) })], ...f.options.map((v) => [v, label(v)])];
       return `<label class="field"><span>${esc(t(f.label))}${hint}</span><select id="${sessionFieldId(f)}">${options.map(([v, l]) =>
         `<option value="${esc(v)}"${String(own ?? "") === v ? " selected" : ""}>${esc(l)}</option>`).join("")}</select></label>`;
     }
@@ -1653,6 +1717,7 @@ function sessionFieldsHtml(overrides, defaults, config, fields = SESSION_FIELDS,
   const group = (name, title) => `<div class="section-title">${esc(title)}</div>
     <div class="form-grid">${fields.filter((f) => f.group === name).map(field).join("")}</div>`;
   return group("jobs", t("sg_jobs")) + group("agents", t("agents")) + group("network", t("sg_network"))
+    + group("clarify", t("sg_clarify"))
     + `<p class="muted" style="font-size:12px;margin:10px 0 0">${esc(t("sf_hint"))}</p>`;
 }
 
@@ -2174,8 +2239,32 @@ function describeEvent(ev) {
     case "trigger.deleted": return ru ? `${who} удалил(а) триггер: ${short(d.trigger && d.trigger.condition, 100)}` : `${who} deleted a trigger: ${short(d.trigger && d.trigger.condition, 100)}`;
     case "mcp.created": return ru ? `${who} создал(а) MCP «${d.server && d.server.name}»` : `${who} created MCP "${d.server && d.server.name}"`;
     case "mcp.status": return `MCP ${d.name}: ${tv("mcp_", d.status)}`;
-    case "swarm.paused": return ru ? `рой на паузе (${tv("reason_", d.reason)})` : `swarm paused (${tv("reason_", d.reason)})`;
-    case "swarm.resumed": return ru ? "рой продолжил работу" : "swarm resumed";
+    case "swarm.paused":
+      // a member's question to the user (send_message pause_swarm); a budget pause it turned into reads as one
+      if (d.reason === "question" && d.asker) {
+        return ru ? `${d.asker} задаёт вам вопрос #${d.message_id} — рой на паузе до вашего ответа`
+                  : `${d.asker} asks you question #${d.message_id}: the swarm is paused until you answer`;
+      }
+      return ru ? `рой на паузе (${tv("reason_", d.reason)})` : `swarm paused (${tv("reason_", d.reason)})`;
+    case "swarm.resumed": {
+      // the end of a question pause: answered, or gone on without an answer (Resume, clarifying off, the asker left)
+      const q = d.question;
+      if (!q) return ru ? "рой продолжил работу" : "swarm resumed";
+      if (q.outcome === "answered") {
+        return ru ? `ваш ответ на вопрос #${q.message_id} получили все участники, рой продолжил работу`
+                  : `every member got your answer to question #${q.message_id}; swarm resumed`;
+      }
+      if (q.why === "clarify_off") {
+        return ru ? `уточнение цели выключено: рой продолжил работу без ответа на вопрос #${q.message_id}`
+                  : `clarifying is off: swarm resumed without an answer to question #${q.message_id}`;
+      }
+      if (q.why === "left") {
+        return ru ? `${q.asker} покинул(а) рой: рой продолжил работу без ответа на вопрос #${q.message_id}`
+                  : `${q.asker} left: swarm resumed without an answer to question #${q.message_id}`;
+      }
+      return ru ? `рой продолжил работу без ответа на вопрос #${q.message_id}`
+                : `swarm resumed without an answer to question #${q.message_id}`;
+    }
     case "swarm.wrap_up": return d.on ? (ru ? `${who} включил(а) режим завершения: агенты завершают задачи с тем, что есть` : `${who} switched wrap-up mode on: the agents finish their tasks with what they have`)
                                       : (ru ? `${who} выключил(а) режим завершения` : `${who} switched wrap-up mode off`);
     case "swarm.limits": return ru ? `лимиты: $${d.max_cost_usd}, агентов ${d.max_agents}` : `limits: $${d.max_cost_usd}, ${d.max_agents} agents`;
@@ -2218,7 +2307,9 @@ function viaText(via) {
 }
 
 function feedLine(ev) {
-  return `<div class="ev"><time>${esc(fmtTime(ev.ts))}</time><span class="ev-text">${linkify(describeEvent(ev))}</span></div>`;
+  // the swarm's own lines name no task: a number there is a question's message id (swarm.paused, swarm.resumed)
+  const text = ev.type.startsWith("swarm.") ? esc(describeEvent(ev)) : linkify(describeEvent(ev));
+  return `<div class="ev"><time>${esc(fmtTime(ev.ts))}</time><span class="ev-text">${text}</span></div>`;
 }
 
 async function loadFeed() {
@@ -2329,7 +2420,8 @@ function handleEvent(ev) {
     if (S.chatWith === d.agent && S.dtab === "activity") appendActivity(ev);
     return;
   }
-  if (ev.type === "notification" && d.recipient === "user") toast(short(d.text, 400));
+  // (a question that pauses the swarm: its banner and the message's own toast say it)
+  if (ev.type === "notification" && d.recipient === "user" && d.kind !== "u_question") toast(short(d.text, 400));
   if (ev.type === "message.sent") {
     const m = d.message || {};
     const rcpt = m.recipients || [];
@@ -2436,7 +2528,8 @@ function applyTheme(theme) {
 function onDocumentClick(e) {
   const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path,"
     + "[data-skill-show],[data-skill-save],[data-skill-nosave],[data-skill-update],[data-skill-detach],[data-skill-log],[data-skill-reinstall],"
-    + "[data-skill-preview],[data-skill-attach],[data-skill-libshow],[data-skill-libdel],[data-copy]");
+    + "[data-skill-preview],[data-skill-attach],[data-skill-libshow],[data-skill-libdel],[data-copy],"
+    + "#paused-banner[data-asker]");
   if (!target) {
     if (document.body.classList.contains("team-open") && !e.target.closest(".sidebar, #team-btn")) toggleTeamOverlay(false);
     return;
@@ -2458,6 +2551,7 @@ function onDocumentClick(e) {
   else if ("retire" in ds) { if (confirm(t("retire_confirm"))) act("retire_agent", { name: ds.retire, reason: "retired by the user" }); }
   else if ("traces" in ds) { if (typeof openTraces === "function") { if (isNarrow()) closeDrawer(); openTraces(ds.traces); } }
   else if ("agent" in ds) openChat(ds.agent);
+  else if ("asker" in ds) openChat(ds.asker);   // the question banner: answer in the asker's chat
   else if ("skillShow" in ds) toggleSkillPreview(S.skillShown, ds.skillShow, ds.skillShow, "session", renderSkills);
   else if ("skillSave" in ds) saveSkill(ds.skillSave);
   else if ("skillNosave" in ds) rejectSkill(ds.skillNosave);
@@ -2483,7 +2577,10 @@ function onKeydown(e) {
     else if (S.chatWith) closeDrawer();
     return;
   }
-  if ((e.key === "Enter" || e.key === " ") && e.target.matches && e.target.matches(".file-entry")) { e.preventDefault(); e.target.click(); }
+  const pressable = ".file-entry, #paused-banner[data-asker]";   // (the question banner opens the asker's chat)
+  if ((e.key === "Enter" || e.key === " ") && e.target.matches && e.target.matches(pressable)) {
+    e.preventDefault(); e.target.click();
+  }
 }
 
 function init() {
@@ -2525,6 +2622,8 @@ function init() {
   $("#drawer-close").addEventListener("click", closeDrawer);
   $("#start-session-btn").addEventListener("click", startSession);
   $("#file-mode").addEventListener("click", toggleFileSource);
+  // the line above the composer while a question holds the swarm (renderDrawerHead)
+  $("#composer").insertAdjacentHTML("beforebegin", '<div class="chat-hint hidden" id="chat-hint" role="status"></div>');
   $("#composer").addEventListener("submit", (e) => { e.preventDefault(); sendComposer(); });
   $("#composer-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendComposer(); } });
   $("#search").addEventListener("input", (e) => { S.search = e.target.value.trim(); if (S.tab === "board") renderBoard(); });
@@ -2553,6 +2652,8 @@ if (typeof module !== "undefined" && module.exports) {
     // used by traces.js (the tests load it on top of these) and by the session-chrome tests
     BASE, $, $$, api, post, act, toast, avatar, agentColor, members, fmtTime, short, openModal, closeModal, setTab, store, setHtml,
     renderHeader, toggleWrapUp, responseError, errText, startSession, connect,
+    // a member's question that pauses the swarm: the banner, the chat hint, the composer's toast, the feed
+    pendingQuestion, sendComposer, openChat, feedLine,
     // the session folder (the Files tab head, the missing-folder banner)
     workspaceKind, workspaceMissing, workspaceHtml, syncWorkspace, openDir, renderAll,
     // background jobs: the Jobs tab, the agent marker and the drawer, live events

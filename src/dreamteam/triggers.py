@@ -936,7 +936,8 @@ class TriggerEngine:
         kind = action.get("type")
         try:
             if kind == "message":
-                self._require("mail").send(owner, action["to"], action["text"])
+                # automatic: a user-owned trigger's message never answers a member's question (Mailbox.send)
+                self._require("mail").send(owner, action["to"], action["text"], automatic=True)
             elif kind == "set_status":
                 self._require("board").update(owner, action["task_id"], status=action["status"])
             elif kind == "create_task":

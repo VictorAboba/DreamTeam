@@ -200,6 +200,15 @@ code { font-family: var(--mono); font-size: .92em; }
   border-bottom: 1px solid color-mix(in srgb, var(--warn) 22%, var(--border));
 }
 .conn-banner { background: color-mix(in srgb, var(--err) 9%, var(--bg)); color: var(--err); border-bottom-color: color-mix(in srgb, var(--err) 22%, var(--border)); }
+/* a member's question holds the swarm (click: answer it in the asker's chat); quiet: a clarify planner waits for the
+   user's answers about the goal, nothing is paused */
+.paused-banner.question, .paused-banner.quiet { cursor: pointer; }
+.paused-banner.question:hover, .paused-banner.quiet:hover { text-decoration: underline; text-underline-offset: 2px; }
+.paused-banner[data-asker]:focus-visible { outline: 2px solid var(--accent-fill); outline-offset: -2px; }
+.paused-banner.quiet {
+  background: color-mix(in srgb, var(--info) 7%, var(--bg)); color: var(--muted);
+  border-bottom-color: color-mix(in srgb, var(--info) 18%, var(--border));
+}
 
 /* layout */
 .layout { flex: 1; display: flex; min-height: 0; }
@@ -338,6 +347,13 @@ code { font-family: var(--mono); font-size: .92em; }
 .msg { max-width: 86%; padding: 8px 12px 9px; border-radius: 12px 12px 12px 4px; background: var(--panel-2); border: 1px solid var(--border); white-space: pre-wrap; overflow-wrap: anywhere; }
 .msg.me { align-self: flex-end; background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent-fill) 30%, transparent); border-radius: 12px 12px 4px 12px; }
 .msg .meta { font: 10.5px var(--mono); color: var(--faint); margin-bottom: 3px; letter-spacing: .01em; }
+/* the chat whose next message answers the question that holds the swarm */
+.chat-hint {
+  padding: 7px 16px; font-size: 12px; font-weight: 500; color: var(--warn);
+  background: color-mix(in srgb, var(--warn) 9%, var(--panel));
+  border-top: 1px solid color-mix(in srgb, var(--warn) 22%, var(--border));
+}
+.chat-hint:not(.hidden) + .composer { border-top: none; }
 .composer { display: flex; gap: 8px; padding: 10px 12px 12px; border-top: 1px solid var(--border); align-items: flex-end; }
 .composer textarea { min-height: 42px; }
 /* activity in the look of the terminal UI: a bullet per step, a result hangs under its call (⎿) */

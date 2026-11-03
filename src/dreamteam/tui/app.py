@@ -209,6 +209,10 @@ class TUI:
         self.tokens_in = self.tokens_out = 0
         self.work_cost = 0.0
         self.paused = False
+        self.pause_reason = ""
+        # {asker, message_id, ...}: the member's question the swarm is paused for (send_message pause_swarm)
+        self.question: dict | None = None
+        self._question_forced: int | None = None   # the question whose asker was made the addressee
         self.spent = 0.0
         self.budget = 0.0
         self.last_sender: str | None = None
@@ -259,6 +263,17 @@ class TUI:
         self._addressee = name
         self._addressee_at = time.monotonic()
         self.invalidate()
+
+    def _set_question(self, question: Any) -> None:
+        """The member's question the swarm is now paused for ({asker, message_id, ...}), or None. A new one makes its
+        asker the addressee, even over the user's recent choice: plain text then answers it (docs/TUI.md §4.2)."""
+        q = question if isinstance(question, dict) else None
+        if q is not None and not (q.get("asker") and isinstance(q.get("message_id"), int)):
+            q = None
+        if q is not None and q["message_id"] != self._question_forced:
+            self._addressee, self._addressee_at = str(q["asker"]), None
+            self._question_forced = q["message_id"]
+        self.question = q
 
     # ---- output ------------------------------------------------------------------------------------
     def print(self, renderable: Any) -> None:
@@ -415,6 +430,10 @@ class TUI:
         if not self.attached:
             return self.t("box_new_session")
         name = self.addressee or ALL
+        q = self.question
+        if q is not None and name == q.get("asker"):   # «→ Анна · ответ на #12 — его получат все»
+            return (f"{self.ctx.sym['arrow']} {render.first_name(name)} {self.ctx.sym['dot']} "
+                    f"{self.t('box_answer', id=q['message_id'])}")
         return f"{self.ctx.sym['arrow']} {self.t('everyone') if name == ALL else name}"
 
     def _box_top(self) -> list[tuple[str, str]]:
@@ -455,7 +474,7 @@ class TUI:
         verb = verbs[(self._verb_offset + int(elapsed // VERB_SECONDS)) % len(verbs)]
         return render.spinner_line(self.ctx, frame=self.frame, verb=verb, working=sorted(self.working),
                                    elapsed=elapsed, tokens_in=self.tokens_in, tokens_out=self.tokens_out,
-                                   cost=self.work_cost, paused=self.paused)
+                                   cost=self.work_cost, paused=self.paused, question=self.question)
 
     def _status_text(self) -> list[tuple[str, str]]:
         width = self.width
@@ -827,6 +846,13 @@ class TUI:
                 info["tracing"] = bool(swarm.get("tracing"))
                 if isinstance(swarm.get("network"), dict):
                     info["network"] = swarm["network"]
+                if isinstance(swarm.get("clarify"), bool):   # [swarm] clarify (docs/SPEC.md §3 "Clarify mode")
+                    info["clarify"] = swarm["clarify"]
+                question = swarm.get("question") if isinstance(swarm.get("question"), dict) else None
+                if question and question.get("asker"):   # the swarm waits for the user's answer to it
+                    text = " ".join(str(question.get("text") or "").split())
+                    text = text if len(text) <= 80 else text[:79].rstrip() + "…"
+                    info["question"] = f"{question['asker']}, #{question.get('message_id')}: «{text}»"
         info["language"] = self.ctx.lang
         info["verbosity"] = self.ctx.verbosity
         info["connected"] = self.connected
@@ -987,6 +1013,8 @@ class TUI:
         self.session = summary
         self._sync_working(set())
         self.paused = False
+        self.pause_reason = ""
+        self._set_question(None)
         self.info(self.t("session_stopped", title=summary.get("title") or self.sid, id=self.sid))
         self.invalidate()
 
@@ -1234,6 +1262,8 @@ class TUI:
         self._last_refresh = time.monotonic()
         swarm = state.get("swarm") or {}
         self.paused = bool(swarm.get("paused"))
+        self.pause_reason = str(swarm.get("pause_reason") or "") if self.paused else ""
+        self._set_question(swarm.get("question") if self.pause_reason == "question" else None)
         self.spent = _float(swarm.get("spent_usd"))
         self.budget = _float((swarm.get("limits") or {}).get("max_cost_usd"))
         session = swarm.get("session") if isinstance(swarm.get("session"), dict) else None
@@ -1364,6 +1394,10 @@ class TUI:
             with contextlib.suppress(ValueError):
                 self._echo_pending.remove(text)
             self.error(result)
+            return
+        q = self.question
+        if q is not None and to not in (q["asker"], ALL):   # it answers nothing: the swarm still waits
+            self.info(self.t("q_still_waiting", name=q["asker"], id=q["message_id"]))
 
     async def start_bash(self, command: str) -> asyncio.Task | None:
         """`!command`: run it in the session workspace with the configured shell (local hubs only), as a
@@ -1786,9 +1820,16 @@ class TUI:
             self.invalidate()
         elif etype == "swarm.paused":
             self.paused = True
+            self.pause_reason = str(data.get("reason") or "")
+            # a member's question (its asker becomes the addressee); any other reason ends one, e.g. an answer that
+            # came when the budget was spent: swarm.paused {reason: budget, question: {...}}
+            self._set_question({"asker": data.get("asker"), "message_id": data.get("message_id"),
+                                "since": data.get("since")} if self.pause_reason == "question" else None)
             self.invalidate()
         elif etype == "swarm.resumed":
             self.paused = False
+            self.pause_reason = ""
+            self._set_question(None)
             self._ensure_ticker()
             self.invalidate()
         elif etype == "swarm.limits":
@@ -1817,9 +1858,12 @@ class TUI:
             self._unqueue_skill(str(data["name"]))
 
     def _on_agent_message(self, sender: str) -> None:
-        """A message to the user: its sender becomes the addressee unless the user chose one lately."""
+        """A message to the user: its sender becomes the addressee unless the user chose one lately, or the swarm
+        waits for the user's answer to another member's question (its asker stays the addressee)."""
         self.last_sender = sender
-        if self._addressee_at is None or time.monotonic() - self._addressee_at > EXPLICIT_ADDRESSEE_SECONDS:
+        held = self.question is not None and sender != self.question.get("asker")
+        if not held and (self._addressee_at is None
+                         or time.monotonic() - self._addressee_at > EXPLICIT_ADDRESSEE_SECONDS):
             self._addressee, self._addressee_at = sender, None
         self._spawn(self._mark_read(sender))
         self.invalidate()
@@ -1966,6 +2010,9 @@ class TUI:
                 self.print(render.tips(self.ctx, bool(sessions)))
             if self.workspace_override and self.client.mode == "launcher" and not self.attached:
                 self.info(self.t("cd_new_session", path=self.workspace_override))
+            if (self.overrides.get("swarm") or {}).get("clarify") is True and self.client.mode == "launcher" \
+                    and not self.attached:   # --clarify: the window's new sessions (/clarify off undoes it)
+                self.info(self.t("clarify_new_on"))
         except HubError as exc:
             self.error(self.hub_error(exc))
         finally:

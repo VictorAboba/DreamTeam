@@ -438,8 +438,8 @@ def session_status(lang: str, s: dict) -> str:
     if goal.get("status") == "done":
         return t(lang, "sess_done")
     if s.get("status") == "running":
-        if s.get("paused"):
-            return t(lang, "sess_paused")
+        if s.get("paused"):   # a member's question waits for the user's answer, or another pause
+            return t(lang, "sess_question" if s.get("pause_reason") == "question" else "sess_paused")
         return t(lang, "sess_wrap_up") if s.get("wrap_up") else t(lang, "sess_running")
     return t(lang, "sess_stopped")
 

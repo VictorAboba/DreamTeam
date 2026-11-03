@@ -12,6 +12,7 @@ const I18N = {
     no_match: "Ничего не найдено.", loading: "Загрузка…",
     st_running: "Работает", st_paused: "На паузе", st_stopped: "Остановлена", st_done: "Цель достигнута", st_pending: "ждёт запуска",
     st_wrap_up: "Завершается", st_wrap_up_hint: "Режим завершения: агенты завершают задачи с тем, что есть, без новых вычислений",
+    st_question: "Ждёт вашего ответа", question_tip: "{name} ждёт вашего ответа на вопрос #{id}",
     no_goal: "Цель не задана", tasks_done: "{done} из {total} задач", agents_n: "агентов", working_n: "работают",
     spent: "Потрачено", model: "Модель", last_activity: "Активность", created: "Создана",
     open: "Открыть", start: "Запустить", stop: "Остановить", delete: "Удалить", legacy: "проект",
@@ -43,6 +44,8 @@ const I18N = {
     f_more: "Дополнительно", f_steps: "Шагов за пробуждение", f_approval: "Подтверждать MCP-серверы агентов", f_start_now: "Запустить сразу",
     f_network: "Без интернета для агентов", sw_network: "Интернет для команд агентов", net_on: "есть", net_off: "нет",
     net_badge: "Без интернета",
+    f_clarify: "Сначала уточнить цель",
+    f_clarify_hint: "планировщик сначала задаст вам вопросы по неясным местам цели, остальные агенты подождут план и не потратят токены; важный вопрос агента поставит весь рой на паузу до вашего ответа",
     net_hint_docker: "Команды агентов, их фоновые процессы и MCP-серверы идут от отдельного пользователя, чью сеть закрывает файрвол контейнера. LLM и localhost работают.",
     net_hint_netns: "Команды агентов, их фоновые процессы и MCP-серверы работают в общем для них сетевом пространстве Linux, где есть только свой localhost: сервер, запущенный одной командой, виден другим, а localhost самой машины — нет. LLM работает.",
     net_hint_env: "Здесь это не строгая изоляция: прокси указывают на закрытый порт, pip, uv, npm и git переведены в офлайн, удалённые MCP-серверы не подключаются, но программа, которая этого не учитывает (сырой сокет, веб-команды Windows PowerShell 5.1), выйдет в сеть. Строго — в Docker (dreamteam sandbox) и на Linux.",
@@ -82,6 +85,8 @@ const I18N = {
     sw_budget: "Бюджет сессии, $", sw_budget_hint: "0 — без лимита",
     sw_review: "Независимое ревью задач",
     sw_review_hint: "Задачу агента принимает другой агент, а если больше некому — вы. Выключите для дешёвых прогонов: тогда задача без ревьюера сразу готова.",
+    sw_clarify: "Сначала уточнять цель",
+    sw_clarify_hint: "По умолчанию для новых сессий: планировщик сначала задаёт вам вопросы, а важный вопрос агента ставит рой на паузу до вашего ответа. В dreamteam -p с автоответами не действует: там всё как раньше.",
     r_builtin: "встроенная", r_custom: "своя", r_customized: "изменена", r_hidden: "скрыта", r_name: "Название",
     r_name_ph: "Например: Дата-инженер", r_other_lang: "en: {name}", r_desc: "Описание",
     r_desc_hint: "что делает роль, что производит, как проверяет результат, что оставляет другим",
@@ -193,6 +198,7 @@ const I18N = {
     no_match: "Nothing found.", loading: "Loading…",
     st_running: "Running", st_paused: "Paused", st_stopped: "Stopped", st_done: "Goal reached", st_pending: "waiting to start",
     st_wrap_up: "Wrapping up", st_wrap_up_hint: "Wrap-up mode: the agents finish their tasks with what they have, no new computations",
+    st_question: "Waiting for your answer", question_tip: "{name} waits for your answer to question #{id}",
     no_goal: "No goal yet", tasks_done: "{done} of {total} tasks", agents_n: "agents", working_n: "working",
     spent: "Spent", model: "Model", last_activity: "Activity", created: "Created",
     open: "Open", start: "Start", stop: "Stop", delete: "Delete", legacy: "project",
@@ -224,6 +230,8 @@ const I18N = {
     f_more: "More", f_steps: "Steps per wake-up", f_approval: "Require approval of agents' MCP servers", f_start_now: "Start right away",
     f_network: "No internet for the agents", sw_network: "Internet for the agents' commands", net_on: "on", net_off: "off",
     net_badge: "No internet",
+    f_clarify: "Clarify the goal first",
+    f_clarify_hint: "the planner first asks you about the unclear points of the goal while the other agents wait for the plan without spending tokens; an agent's critical question pauses the whole swarm until you answer",
     net_hint_docker: "The agents' commands, their background jobs and MCP servers run as a separate user whose network the container's firewall closes. The LLM and localhost work.",
     net_hint_netns: "The agents' commands, their background jobs and MCP servers share a separate Linux network namespace that has only its own localhost: a server one command starts is reachable from the others, the machine's own localhost is not. The LLM works.",
     net_hint_env: "Not strict isolation here: proxies point at a closed port, pip, uv, npm and git are set offline and remote MCP servers are not connected, but a program that ignores this (a raw socket, Windows PowerShell 5.1's web cmdlets) still gets out. Strict in Docker (dreamteam sandbox) and on Linux.",
@@ -262,6 +270,8 @@ const I18N = {
     sw_budget: "Session budget, $", sw_budget_hint: "0 — no limit",
     sw_review: "Independent review of tasks",
     sw_review_hint: "An agent's task is approved by another agent, or by you when there is nobody else. Turn it off for cheap runs: a task without a reviewer is then done at once.",
+    sw_clarify: "Clarify the goal first",
+    sw_clarify_hint: "The default of new sessions: the planner asks you first, and an agent's critical question pauses the swarm until you answer. No effect in dreamteam -p with automatic replies: it works as before.",
     r_builtin: "built-in", r_custom: "your own", r_customized: "changed", r_hidden: "hidden", r_name: "Name",
     r_name_ph: "e.g. Data engineer", r_other_lang: "ru: {name}", r_desc: "Description",
     r_desc_hint: "what the role does, what it produces, how it checks its work, what it leaves to others",
@@ -589,11 +599,15 @@ function sessionCard(s) {
   const error = s.error || s.config_error;
   const busy = H.busy.has(s.id) ? " disabled" : "";
   const skills = sessionSkillsHtml(s);
+  // paused for a member's question (send_message pause_swarm): the badge says the swarm waits for the user
+  const asks = state === "paused" && s.pause_reason === "question";
+  const q = asks && s.question && s.question.asker ? s.question : null;
+  const badgeTip = q ? ` title="${esc(t("question_tip", { name: q.asker, id: q.message_id }))}"` : "";
   return `<article class="session-card ${state}" data-sid="${esc(s.id)}">
     <div class="sc-head">
       <span class="dot ${state === "done" ? "" : state}"></span>
       <a class="sc-title" href="/s/${encodeURIComponent(s.id)}/" title="${esc(s.title)}">${esc(s.title)}</a>
-      <span class="badge ${badgeCls}">${esc(t("st_" + state))}</span>
+      <span class="badge ${badgeCls}"${badgeTip}>${esc(asks ? t("st_question") : t("st_" + state))}</span>
       ${state === "running" && s.wrap_up ? `<span class="badge warn" title="${esc(t("st_wrap_up_hint"))}">${esc(t("st_wrap_up"))}</span>` : ""}
       ${s.network === "off" ? `<span class="badge warn" title="${esc(networkHint(H.isolation))}">${esc(t("net_badge"))}</span>` : ""}
     </div>
@@ -1071,6 +1085,7 @@ async function newSessionModal() {
         <label class="field full"><span>${esc(t("f_title"))}</span><input id="ns-title" maxlength="120" placeholder="${esc(t("f_title_ph"))}"></label>
         <label class="field full"><span><i class="ic ic-goal"></i>${esc(t("f_goal"))} * <span class="hint">${esc(t("f_goal_hint"))}</span></span><textarea id="ns-goal" rows="4" placeholder="${esc(t("f_goal_ph"))}"></textarea></label>
         <label class="field full"><span>${esc(t("f_desc"))}</span><textarea id="ns-desc" rows="3" placeholder="${esc(t("f_desc_ph"))}"></textarea></label>
+        <label class="check full"><input type="checkbox" id="ns-clarify"${sw.clarify ? " checked" : ""}> <span>${esc(t("f_clarify"))} <span class="hint">${esc(t("f_clarify_hint"))}</span></span></label>
         <label class="field two"><span>${esc(t("f_model"))} <span class="hint">${esc(t("f_model_hint"))}</span></span><select id="ns-model">${modelOpts}</select></label>
         <label class="field"><span>${esc(t("f_lang"))}</span><select id="ns-lang">
           <option value="ru"${sw.language === "ru" ? " selected" : ""}>Русский</option>
@@ -1134,6 +1149,8 @@ function sessionOverrides(v, form) {
   if (!!form.approval !== !!(v.mcp || {}).require_approval) overrides.mcp = { require_approval: !!form.approval };
   // [swarm] network (docs/SPEC.md §7.2): only when the box differs from the saved default
   if (form.offline !== undefined && !!form.offline !== (sw.network === "off")) swarm.network = form.offline ? "off" : "on";
+  // [swarm] clarify (docs/SPEC.md §3 "Clarify mode"): the same, as an explicit bool (false overrides a saved true)
+  if (form.clarify !== undefined && !!form.clarify !== !!sw.clarify) swarm.clarify = !!form.clarify;
   return overrides;
 }
 
@@ -1146,7 +1163,7 @@ async function submitNewSession(e) {
   const overrides = sessionOverrides(savedDefaults(), {
     lang: $("#ns-lang").value, max: $("#ns-max").value, budget: $("#ns-budget").value, team: H.teams.ns,
     model: $("#ns-model").value, steps: $("#ns-steps").value, approval: $("#ns-approval").checked,
-    offline: $("#ns-offline").checked,
+    offline: $("#ns-offline").checked, clarify: $("#ns-clarify").checked,
   });
   const run = $("#ns-run").checked;
   const btn = $("#ns-submit");
@@ -1567,6 +1584,7 @@ function renderSettings(fromServer) {
       field("sw_budget", "swarm.max_cost_usd", "float", { min: 0, step: 0.5, hint: "sw_budget_hint" }),
       teamComposer("defaults"),
       field("sw_review", "swarm.independent_review", "bool", { full: true, hint: "sw_review_hint" }),
+      field("sw_clarify", "swarm.clarify", "bool", { full: true, hint: "sw_clarify_hint" }),
       field("sw_network", "swarm.network", "select", { full: true, options: [["on", t("net_on")], ["off", t("net_off")]],
                                                        hintText: networkHint(H.isolation) }),
     ]))}

@@ -28,6 +28,8 @@ TICK = 0.5               # deadlines are checked at least this often
 EVENTS_PAGE = 2000       # /api/events page size when catching up after a (re)connect
 FINAL_STATE_TIMEOUT = 5.0
 AUTO_REPLY_MAX = 50      # a safety net against an endless question / auto-answer ping-pong (not approvals)
+HEAL_AFTER = 2.0         # s after a failed auto-reply before the state is read again (doubling up to HEAL_MAX)
+HEAL_MAX = 30.0
 PROGRESS_SKIP = ("agent.status", "agent.usage", "agent.activity", "trace.")  # fallback feed: too noisy
 
 AUTO_REPLY = {
@@ -53,6 +55,12 @@ TEXTS = {
         "error": "Ошибка: {error}",
         "jobs_running": "Ещё работают фоновые процессы агентов: {jobs}. Они остановятся вместе с сессией "
                         "(остановить раньше можно командой /jobs stop jN в dreamteam tui).",
+        "question": "Рой ждёт вашего ответа: {name} спрашивает (сообщение #{id}). Ответьте на доске ({url}) или в "
+                    "dreamteam tui — ответ получат все участники. До тех пор этот запуск ждёт (или до --timeout).",
+        "asked": "{name} спрашивает вас (сообщение #{id}): ответьте на доске ({url}) или в dreamteam tui. До тех пор "
+                 "рой может ждать вас (и этот запуск тоже ждёт).",
+        "asked_timeout": "{name} спрашивает вас (сообщение #{id}): ответьте на доске ({url}) или в dreamteam tui. До "
+                         "тех пор рой может ждать вас (а этот запуск закончится по --timeout).",
     },
     "en": {
         "timeout": "Timed out after {seconds:g} s: the goal is not achieved.",
@@ -68,6 +76,12 @@ TEXTS = {
         "error": "Error: {error}",
         "jobs_running": "Background jobs of the agents are still running: {jobs}. They stop when the session stops "
                         "(to stop one earlier: /jobs stop jN in dreamteam tui).",
+        "question": "The swarm waits for your answer: {name} asks (message #{id}). Answer on the board ({url}) or in "
+                    "dreamteam tui; every member gets the answer. Until then this run waits (or ends at --timeout).",
+        "asked": "{name} asks you (message #{id}): answer on the board ({url}) or in dreamteam tui. Until then the "
+                 "swarm may wait for you (and this run waits too).",
+        "asked_timeout": "{name} asks you (message #{id}): answer on the board ({url}) or in dreamteam tui. Until "
+                         "then the swarm may wait for you (and this run ends at --timeout).",
     },
 }
 
@@ -232,6 +246,16 @@ class _PrintRun:
         self.verbose = verbose
         self.timeout = timeout
         self.auto_reply = auto_reply
+        # with auto-replies every request says so (the hub's lease, docs/SPEC.md §3 "Clarify mode"): the session
+        # then never pauses for a member's question and plans as usual; run_print gives the client its old value back
+        self._header_before = getattr(self.client, "auto_reply", False)
+        self.client.auto_reply = auto_reply
+        self.replied_to: set[int] = set()     # questions (message ids) answered by this run
+        self._heal_at: float | None = None    # an auto-reply failed: when the state is read again (heal)
+        self._heal_delay = HEAL_AFTER
+        self.question_told: set[int] = set()  # question pauses announced on stderr (no auto-replies)
+        self.asked_told: set[int] = set()     # agents' messages to the user announced on stderr (the same)
+        self.clarify = False                  # the session's [swarm] clarify (its summary, then its state)
         self.ui_lang = lang
         self.lang = lang or "ru"            # the session's language once known (auto-replies)
         self.out, self.err = _Out(out), _Out(err)
@@ -295,6 +319,7 @@ class _PrintRun:
                                                   workspace=self.workspace, skills=self.skills)
             self.started_session(summary["id"])
             self.lang = summary.get("language") or self.lang
+            self.clarify = bool(summary.get("clarify"))
             self.progress(_text(self.text_lang, "session", sid=self.sid, title=summary.get("title", "")))
             if self.workspace:
                 folder = (summary.get("workspace_result") or {}).get("to") or self.workspace
@@ -314,35 +339,45 @@ class _PrintRun:
                              client.start_session(summary["id"]))
         self.started_session(summary["id"])
         self.lang = summary.get("language") or self.lang
+        self.clarify = bool(summary.get("clarify"))
         self.progress(_text(self.text_lang, "session", sid=summary["id"], title=summary.get("title", "")))
         await self.attach(summary["id"])
 
     async def attach(self, sid: str | None) -> None:
         """An existing session: the prompt becomes the goal when there is none, reopens a completed goal,
-        else goes to the coordinator as a message. Only what happens from now on is followed."""
+        else goes to the coordinator as a message (to the asker when the swarm waits for the user's answer to a
+        member's question: the prompt is the answer). Only what happens from now on is followed."""
         client = self.client
         self.sid = sid
         latest = await client.events(sid, limit=1)
         self.last_event = max([e.get("id") or 0 for e in latest], default=0)
         state = await client.state(sid)
         self.state = state
-        self.lang = (state.get("swarm") or {}).get("language") or self.lang
+        swarm = state.get("swarm") or {}
+        self.lang = swarm.get("language") or self.lang
+        if isinstance(swarm.get("clarify"), bool):
+            self.clarify = swarm["clarify"]
+        question = swarm.get("question") if isinstance(swarm.get("question"), dict) else None
+        if question is not None and not (question.get("asker") and isinstance(question.get("message_id"), int)):
+            question = None
         for task in state.get("tasks") or []:  # reviews that were already waiting for the user
             if isinstance(task, dict):
                 await self.on_task(task)
-        goal = (state.get("swarm") or {}).get("goal")
+        goal = swarm.get("goal")
         if not goal:
             ok, text = await client.act(sid, "set_goal", {"title": self.prompt})
         elif goal.get("status") == "done":
             ok, text = await client.act(sid, "swarm_control", {"reopen_goal_comment": self.prompt})
         else:
-            to = _coordinator(state) or "all"
+            to = question["asker"] if question else (_coordinator(state) or "all")
             ok, text = await client.act(sid, "send_message", {"to": [to], "text": self.prompt})
+            if ok and question:
+                self.replied_to.add(question["message_id"])
         if not ok:
             raise _Finished("error", _text(self.text_lang, "error", error=text))
-        swarm = state.get("swarm") or {}
-        if swarm.get("paused") and swarm.get("pause_reason") != "budget":
-            # paused by the user: the new instruction is meant to be worked on (a budget pause ends the run)
+        if swarm.get("paused") and swarm.get("pause_reason") not in ("budget", "question"):
+            # paused by the user: the new instruction is meant to be worked on (a budget pause ends the run; the
+            # answer ends a question pause by itself, and a resume would drop the question)
             ok, text = await client.act(sid, "swarm_control", {"action": "resume"})
             if not ok:
                 raise _Finished("error", _text(self.text_lang, "error", error=text))
@@ -382,6 +417,8 @@ class _PrintRun:
                     ev = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     self.flush_progress()
+                    if self._heal_at is not None and time.monotonic() >= self._heal_at and lost_since is None:
+                        await self.bounded(self.heal())   # (not while the stream is lost: it waits for the hub)
                     remaining = self.remaining()
                     try:
                         async with asyncio.timeout(TICK if remaining is None else min(TICK, remaining)):
@@ -433,6 +470,8 @@ class _PrintRun:
         state = await self.client.state(self.sid)
         self.state = state
         swarm = state.get("swarm") or {}
+        if isinstance(swarm.get("clarify"), bool):
+            self.clarify = swarm["clarify"]
         goal = swarm.get("goal")
         stopped = (swarm.get("session") or {}).get("status") == "stopped"
         if (goal and goal.get("status") == "done") or swarm.get("paused") or stopped:
@@ -446,6 +485,10 @@ class _PrintRun:
             raise _Finished("budget", _text(self.text_lang, "budget"))
         if stopped:
             raise _Finished("error", _text(self.text_lang, "stopped"))
+        question = swarm.get("question") if isinstance(swarm.get("question"), dict) else None
+        if swarm.get("paused") and swarm.get("pause_reason") == "question" and question:
+            # e.g. one that paused before the stream connected while the hub had no lease of this run yet
+            await self.on_question(question.get("asker"), question.get("message_id"))
 
     async def replay(self) -> None:
         """Handle the journaled events newer than the last one handled."""
@@ -474,6 +517,12 @@ class _PrintRun:
             raise _Finished("done")
         elif etype == "swarm.paused" and data.get("reason") == "budget":
             raise _Finished("budget", _text(self.text_lang, "budget"))
+        elif etype == "swarm.paused" and data.get("reason") == "question":
+            await self.on_question(data.get("asker"), data.get("message_id"))
+
+    def board_url(self) -> str:
+        """The session's board, where a human can answer the agents' questions."""
+        return self.client.base_url + self.client.session_base(self.sid) + "/"
 
     async def on_message(self, msg: dict) -> None:
         mid = msg.get("id")
@@ -483,13 +532,66 @@ class _PrintRun:
         sender = msg.get("sender")
         if sender == USER or USER not in (msg.get("recipients") or []):
             return
-        if not self.auto_reply or self.replies >= AUTO_REPLY_MAX:
+        if not self.auto_reply:
+            # a clarifying session: the planner asks before it plans (no pause), and nobody here answers
+            if self.clarify and self.format != "stream-json" and mid not in self.asked_told:
+                self.asked_told.add(mid)
+                key = "asked" if self.timeout is None else "asked_timeout"
+                self.err.write(_text(self.text_lang, key, name=sender, id=mid, url=self.board_url()) + "\n")
+            return
+        if self.replies >= AUTO_REPLY_MAX or mid in self.replied_to:
             return
         self.replies += 1
-        ok, text = await self.client.act(self.sid, "send_message", {
-            "to": [sender], "text": AUTO_REPLY.get(self.lang, AUTO_REPLY["en"]), "reply_to": mid})
-        if not ok:
-            log.warning("auto-reply to %s failed: %s", sender, text)
+        self.replied_to.add(mid)
+        if not await self.send_auto_reply(sender, mid):
+            self.replied_to.discard(mid)   # not answered: if it paused the swarm, heal answers it
+            self.replies -= 1
+
+    async def on_question(self, asker: Any, mid: Any, *, recheck: bool = False) -> None:
+        """The swarm is paused for a member's question (send_message pause_swarm). With auto-replies it is answered
+        at once, even past AUTO_REPLY_MAX: it only pauses in a gap of the hub's lease (a hub restart, a session
+        reload), and an unanswered one would hold the run until --timeout. After a failed auto-reply only heal
+        answers (`recheck`): it reads the state first, so an answer the hub took although its call failed is not
+        sent twice. Without auto-replies, one stderr line says that the run waits (stream-json carries the
+        swarm.paused event itself)."""
+        if not asker or not isinstance(mid, int):
+            return
+        if self.auto_reply:
+            if mid in self.replied_to or (self._heal_at is not None and not recheck):
+                return
+            self.replied_to.add(mid)
+            if not await self.send_auto_reply(asker, mid):
+                self.replied_to.discard(mid)
+            return
+        if mid not in self.question_told and self.format != "stream-json":
+            self.question_told.add(mid)
+            self.err.write(_text(self.text_lang, "question", name=asker, id=mid, url=self.board_url()) + "\n")
+
+    async def send_auto_reply(self, to: Any, mid: int) -> bool:
+        """AUTO_REPLY to `to` in reply to message `mid`; False when it failed. A failure (a hub error too) ends
+        here, so a catch-up goes on with the next events, and it schedules heal."""
+        try:
+            ok, text = await self.client.act(self.sid, "send_message", {
+                "to": [to], "text": AUTO_REPLY.get(self.lang, AUTO_REPLY["en"]), "reply_to": mid})
+        except HubError as exc:
+            ok, text = False, exc.message
+        if ok:
+            self._heal_delay = HEAL_AFTER
+        else:
+            log.warning("auto-reply to message #%s of %s failed: %s", mid, to, text)
+            self._heal_at = time.monotonic() + self._heal_delay
+            self._heal_delay = min(self._heal_delay * 2, HEAL_MAX)
+        return ok
+
+    async def heal(self) -> None:
+        """An auto-reply failed: a question pause that still waits (the state says so) is answered again."""
+        self._heal_at = time.monotonic() + self._heal_delay   # (in case the state cannot be read either)
+        state = await self.client.state(self.sid)
+        self._heal_at = None
+        swarm = state.get("swarm") or {}
+        question = swarm.get("question") if isinstance(swarm.get("question"), dict) else None
+        if swarm.get("paused") and swarm.get("pause_reason") == "question" and question:
+            await self.on_question(question.get("asker"), question.get("message_id"), recheck=True)
 
     async def on_task(self, task: dict) -> None:
         """A task waiting for the user's review would block the run: with auto-replies on, approve it (the
@@ -594,6 +696,8 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
             if task is not None:
                 task.uncancel()  # Ctrl+C under asyncio.run cancels the main task: report and exit 130
         status, reason = "interrupted", _text(run.text_lang, "interrupted")
+    finally:   # a caller's client (shared with other runs) sends no auto-reply header after this one
+        run.client.auto_reply = run._header_before
     return await run.report(status, reason)
 
 

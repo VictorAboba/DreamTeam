@@ -66,8 +66,8 @@ src/dreamteam/
   tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
   tools/skill_tools.py the skills tools: the user's `skills`, `skill_attach`, `skill_detach`, `skill_approve`,
                  `skill_reinstall`, and the members' `skill_propose` (frozen revision 3; §19)
-  tools/frozen.py    frozen LLM tool sets: revisions, the kv record of each agent, `python -m dreamteam.tools.frozen`
-                     (§6.1)
+  tools/frozen.py    frozen LLM tool sets: revisions (now 4), the kv record of each agent,
+                     `python -m dreamteam.tools.frozen` (§6.1)
   tools/snapshots/   llm_r<N>.json: every released LLM tool set (revision N, en and ru), never edited
   agent.py       AgentRuntime   — ReAct loop of one LLM agent
   swarm.py       Swarm          — composition root
@@ -148,7 +148,9 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
   an older database gets it at its next open.
 * `traces`, `spans`, `history_archive(agent, epoch, seq, msg, archived_at)`: tracing.py SCHEMA (§16).
 * kv keys: `goal` → `{"title","description","status":"active"|"done","summary","set_by","updated_at"}`,
-  `limits` → `{"max_cost_usd": float, "max_agents": int}` (overrides config), `paused` → `{"paused": bool, "reason": str}`,
+  `limits` → `{"max_cost_usd": float, "max_agents": int}` (overrides config), `paused` → `{"paused": bool,
+  "reason": str}` (a member's question, §3.1: `{"paused": true, "reason": "question", "asker": str, "message_id":
+  int, "since": float}`),
   `tools:<agent name>` → `{"rev": int, "language": "en"|"ru", "tools": [{"name","description","parameters"}]}` (the
   agent's frozen tool set, §6.1; kept for retired agents, traces read it), `wait_progress:<actor>` → the last events
   id whose board progress `wait_for_events(progress=true)` returned to that actor (§12).
@@ -253,7 +255,9 @@ class Swarm:
         # non-empty line is the title, at most 200 chars; the other lines open the description, followed by
         # `description`; an empty title takes the text from the description), and the goal dict stores the split
         # values, so the goal line of every wake-up is one line; empty title -> ToolError("The goal title is
-        # empty."); an empty board gets a planning task (PLANNING_TASK, body = its text + title + description);
+        # empty."); an empty board gets a planning task (`prompts.planning_task(language, clarifying)`: PLANNING_TASK
+        # with the tag planning, or in clarify mode its clarify variant with the tags planning and clarify, §3.1;
+        # body = its text + title + description);
         # agents are kicked off staggered: `n_kickoff` {by, title, description, team, task_id, task_title}, with
         # team = "Name — Role; ..." of all members, or `n_goal_updated` when the board was not empty.
         # PLANNING_TASK's steps: 1 look around (only as much as splitting the work needs: research, experiments,
@@ -264,7 +268,8 @@ class Swarm:
         # 3 then the contracts; 4 then the rest of the tasks; 5 no false dependencies (a final task: report,
         # summary, documentation, release, depends only on the tasks it cannot be written without; exploratory and
         # optional tasks do not block it); 6 tests by someone else; 7 reviews; 8 team; 9 finish quickly. n_kickoff
-        # tells the others that the first tasks come before the plan is complete
+        # tells the others that the first tasks come before the plan is complete. A clarify card wakes only the first
+        # LLM member; the others get the same n_kickoff quietly (§3.1 "Kickoff")
     def complete_goal(self, actor: str, summary: str) -> dict
         # ToolError when there is no goal, it is already done, or the summary is empty; notifies USER u_goal_done;
         # background jobs keep running (a dev server may be for the user): when some run, USER also gets the quiet
@@ -296,7 +301,8 @@ class Swarm:
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
         # before the first await: the ids of its running jobs, and jobs.forbid(name) (none of its commands may
         # become a job while it leaves); then tasks and locks released, triggers deactivated, status retired,
-        # `agent.retired` {name, reason, released, jobs}, n_member_retired; then its runtime stops; last
+        # `agent.retired` {name, reason, released, jobs}, its pending question dropped (`_drop_question(by, "left")`,
+        # §3.1), n_member_retired; then its runtime stops; last
         # jobs.stop_owner(name, "retired"): its jobs and its foreground commands (an external member's call in
         # flight) are killed and awaited, committed under its name, with no notice to it; then its held new files
         # (workspace.commit_held(name, "when <name> left the team", leaving=True): it is no suspect any more, §7
@@ -309,10 +315,33 @@ class Swarm:
     def record_usage(self, agent: str, usage: Usage, profile: ModelProfile, model: str | None = None) -> float
     def budget_exceeded(self) -> bool
     paused: bool; pause_reason: str
-    def pause(self, actor: str, reason: str) -> None
-    def resume(self, actor: str) -> None
+    def pause(self, actor: str, reason: str, **details) -> bool
+        # False (a no-op) when already paused; `details` go into kv `paused` and the `swarm.paused` data (reason
+        # "question": asker, message_id, since; §3.1)
+    def _set_pause(self, actor: str, reason: str, *, outcome: dict | None = None, **details) -> None
+        # writes the pause slot even while paused (a question pause turned into a budget pause: `outcome` is then the
+        # event's `question` data); USER gets the quiet u_budget (reason "budget") or u_question (reason "question")
+    def resume(self, actor: str, *, question: dict | None = None) -> None
         # n_resumed to LLM agents with open tasks, reviews waiting for them, pending events or an activation the
-        # pause cut short (runtime.interrupted); a reply owed to the user by that activation is still forwarded
+        # pause cut short (runtime.interrupted); a reply owed to the user by that activation is still forwarded.
+        # No-op when not paused; ToolError while the budget is exhausted. `question`: the `swarm.resumed` data of the
+        # question this resume ends (§3.1); a resume without it while a question is pending drops that question
+        # (outcome "dropped", why "resumed"): its asker gets a waking n_question_unanswered instead of n_resumed.
+        # A pause is no planning or decision time: the pause's length (`_paused_at`, in memory, so a pause that began
+        # before a restart is not counted) moves on the planning hint's clock (scheduler item 4) and every
+        # `_considering` start (`_nudge_idle`'s decision window; an offer made during the pause counts from the resume)
+    def pending_question(self) -> dict | None            # {asker, message_id, since} of the question holding the
+                                                         # pause (kv `paused` with reason "question"), else None
+    def pause_text(self) -> str                          # "waiting for the user's answer to X's question #N" for a
+                                                         # question, else the reason (swarm_status, traces)
+    def ask_user(self, asker: str, message: dict) -> tuple[str, dict]
+        # send_message(pause_swarm=true) after `message` was stored: the outcome (asked, user, no_user, off, auto,
+        # pending, own, paused, budget; §3.1) and the details of its result note; synchronous
+    def question_answered(self, message: dict, question: dict) -> None
+        # Mailbox.send's hook (§5): the user's `message` answers `question`; tells the others, then resumes (or turns
+        # the pause into a budget pause); never raises
+    def asks_user(self, name: str, task: Task) -> bool   # the clarify planner waits for the user's answers (§3.1)
+    clarifying: bool                                     # [swarm] clarify and no auto-reply lease (§3.1)
     wrapping_up: bool                                    # the user's wrap-up mode (kv "wrap_up" {"on", "by", "since"})
     def wrap_up(self, actor: str) -> bool
         # wrap-up mode on (False when it was on already): the team finishes with what it has. Emits `swarm.wrap_up`
@@ -338,7 +367,10 @@ member, members, is_member, kind_of, resolve_member, language_of, notify, signal
 board, mail, workspace, triggers, goal, set_goal, complete_goal` (attributes may be None until a test
 wires them), and records notifications in `fake.notified: list[tuple[recipient, key, kw]]`. Its
 resolve_member is the real `resolve_member_in`; set_goal / complete_goal validate, split the goal and notify
-like the real ones (the planning task is created when a real Board is wired).
+like the real ones (the planning task is created when a real Board is wired: `prompts.planning_task(language,
+config.swarm.clarify)` with its tags, §3.1). It has no `pending_question`, `ask_user`, `asks_user` or `pause_text`:
+their callers (Mailbox.send, send_message, the in-activation nudge, `_stop_reason`) look them up with getattr, so
+with FakeSwarm a message never answers or pauses anything.
 
 Scheduler (every 3 s): expires file locks, compares the skills mirror with its manifest (`skills.check()`, at most
 every `SKILLS_CHECK_SECONDS` = 60 s, §19), prunes old traces (every 6 h) and closes idle external trace
@@ -358,7 +390,8 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    `last_active` when that is later: an activation in between restarts it); the woken sets are shared with
    `_wake_stalled`, so a set is never woken about twice. Neither 2 nor 3 wakes an agent while the end of one of
    its running jobs will wake it (`JobManager.awaited`, what its `wait` result promised): it waits for that job
-   (a `detached` one, or a `background` one past its busy window), it has not stalled;
+   (a `detached` one, or a `background` one past its busy window), it has not stalled. Nor do they count a clarify
+   planning task whose holder waits for the user's answers (`asks_user`, §3.1);
 4. `hint_planner()` (planning hint; run 008-013: a planner researched for 40 minutes before creating any task while
    the team idled): an LLM member holding a task tagged `planning` in `in_progress` that has created no task (no
    task with `created_by` = it and an id above the planning task's) gets `n_planning_hint` {id, steps, elapsed} once
@@ -366,9 +399,18 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    `agents.planning_hint_minutes` (default 10) have passed since the swarm first saw it holding the task (a claim,
    another holder, or a restart starts the count again; a pause stops the clock: `resume` moves its start on by the
    pause's length); once more at twice either value, and only after at least one step since the first hint; never a
-   third time for that member and task (the hints it already had are counted from the notifications table when the
-   count starts, so neither a re-claim nor a restart brings more), never with fewer than two members, never while
-   the goal is not active, the swarm is paused or in wrap-up mode (`wrapping_up`); 0 turns a trigger off. The agent
+   third time for that member and task (the hints it already had, `n_planning_hint` and `n_clarify_hint` below, are
+   counted from the notifications table when the count starts, so neither a re-claim nor a restart brings more),
+   never with fewer than two members, never while the goal is not active, the swarm is paused or in wrap-up mode
+   (`wrapping_up`), never while the holder of a clarify card waits for the user's answers (`asks_user`, §3.1: the
+   watch is dropped on every pass, the scheduler's and the planner's own `hint_planner(name)`, so its clock starts
+   again after the answer); 0 turns a trigger off. While `[swarm] clarify` is on, the holder of a clarify card that
+   has not messaged the user since the card was created (it is still finding the forks) gets `n_clarify_hint` {id,
+   steps, elapsed} in its place, with the same watch and triggers: if the goal has forks, send the user all the
+   questions in one message now, then the task `waiting` and `wait`, no task before the answer; with nothing to
+   ask, plan now with `task_create`. So the clarify planner is never told to create tasks before its questions. The
+   two kinds share the count (two hints at most in all), and once the planner has asked, its later hint is
+   `n_planning_hint`. The agent
    also calls `swarm.hint_planner(name)` after the tools of each step (§6.2), so the step trigger lands in that
    activation's `incoming`; the scheduler pass catches the time trigger
    and a holder that went idle (the notification wakes it). No hard limit: the planner may go on researching;
@@ -382,7 +424,119 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
 
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
 agents in ERROR; a changed role catalog (§17.3) and `[swarm] independent_review` apply at once (new hires use the
-new catalog; existing members keep their frozen prompts).
+new catalog; existing members keep their frozen prompts); `[swarm] clarify` switched off lifts a question pause and
+tells a clarify planner that waits for the user (§3.1).
+
+### 3.1 Clarify mode and questions that pause the swarm
+
+One session option, `[swarm] clarify` (bool, default false, §17.1), read live (`config.swarm.clarify`: a session
+override or a PATCH reaches it through `reconfigure`), turns on two things: the planner asks the user first, and a
+member's critical question pauses the whole swarm until the user answers. **Effective clarify** is
+`Swarm.clarifying` = `config.swarm.clarify and not auto_reply_active` (the lease below: `dreamteam -p` with automatic
+replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and the `swarm_status` CLARIFY line use it.
+
+- **The clarify planning card.** `set_goal` on an empty board with `clarifying` creates
+  `prompts.planning_task(language, True)` (`PLANNING_CLARIFY`, tags `["planning", "clarify"]`: `prompts.CLARIFY_TAG`)
+  instead of PLANNING_TASK (tags `["planning"]`; `planning_task(language, False)` is PLANNING_TASK itself). It is
+  board data like PLANNING_TASK, never the system prompt or a tool schema, so no frozen prefix depends on the option.
+  Title «Уточнить цель у пользователя, затем спланировать: …» / "Clarify the goal with the user, then plan: …"; the
+  goal starts with a clarify prefix (the user was asked in one message about the forks of the goal, and the task's
+  result says what was asked); a head replaces the first line of the classic description, then steps 1-9 follow
+  verbatim. The head: find the forks (readings of the goal that change the result or the plan); none → write
+  nothing to the user and plan at once; else ONE `send_message` to ["user"] with numbered questions (at most seven),
+  each with its options and the default, then the task `waiting` and `wait`; on the answer back to `in_progress`;
+  the default where the user leaves a point open or says "decide yourself" («прими решение сам»); the decisions and
+  the defaults (as assumptions) into CONTRACTS.md and the task descriptions; the result says what was asked; until
+  the answer no task, no CONTRACTS.md, no research (this overrides the system prompt's rule to go on with the work
+  that does not depend on the answer). The card is never rewritten: the option switched later changes only the
+  next card (a new goal on an empty board).
+- **Kickoff.** With a clarify card (its tag decides, not the live option) only the first LLM member gets a waking
+  `n_kickoff`; the others get the same notice quietly, so they spend nothing until the first tasks reach them
+  (`n_ready`). Only the planner is in `_nudged[card]`, and it is put into `_considering` with the card: if it never
+  claims, `_nudge_idle` offers the card to the next idle member once the planner is idle without it or
+  `NUDGE_DECISION_SECONDS` passed. A pause stops that clock (`resume`, §3), so neither a kickoff made during a pause
+  (`set_goal` on an empty board while paused) nor a long pause before the claim offers the card (`n_ready`) to the
+  quiet members while the planner's first call is in flight (a pause that began before a restart is not counted).
+- **Before the questions.** A clarify planner that explores longer than `agents.planning_hint_steps` /
+  `planning_hint_minutes` before it has messaged the user gets `n_clarify_hint` (ask now, or plan if there is nothing
+  to ask), never the classic `n_planning_hint` that says to create tasks (§3 scheduler item 4).
+- **The nag guard** `asks_user(name, task)`: clarify is on, `task` has the tags planning and clarify, `name` has
+  created no task since it (an id above the card's), and `name`'s last message to the user since the card was
+  created is newer than the user's last message to it (named or through "all"), and that message is no question the
+  user went on without (below). Then `_wake_stalled`, `_wake_idle_holders`, `hint_planner` (§3 scheduler) and the
+  in-activation nudge (§6.2) leave the planner alone. Both bounds keep an old message (an earlier goal) or a note to
+  the user after planning started from silencing the nags for ever; a comment on the task is no message and does
+  not count. A question the user went on without is one that a `swarm.resumed` event, or the `swarm.paused` event of
+  the budget pause it turned into, carries as `question` with outcome "dropped" (a manual resume, clarify switched
+  off; the `_DROPPED` query, on the events type index, runs only when the guard would hold otherwise): its asker was
+  told `n_question_unanswered` (take your defaults), so it waits for nothing, and the board's quiet `clarify_wait`
+  banner (§14.1) hides; its next message to the user turns the guard on again.
+- **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm` (toolset revision 4,
+  §6.1). The message is always stored first; then `ask_user(asker, message)` pauses only after these checks, in this
+  order, each giving its outcome and result note (§12): `user` (the sender is the user), `no_user` ("user" is not a
+  recipient), `off` (`[swarm] clarify` is off), `auto` (the auto-reply lease), `own` / `pending` (a question is
+  pending already: one at a time), `paused` (paused for another reason, which stays), `budget` (spent), else
+  `asked`: `pause(asker, "question", asker=, message_id=, since=)`. Every outcome but `asked` leaves an ordinary
+  message. AI agents of revision 4 and external MCP members can pause; for an agent of revision 1-3 `call_tool`
+  drops the argument (§12) until its next compaction. There is no cap per member.
+  - State: the question lives only in kv `paused` (`{"paused": true, "reason": "question", "asker", "message_id",
+    "since"}`); `pending_question()` reads it. Every exit rewrites that one slot, so a stale question never captures
+    a later message. `swarm.paused` {reason: "question", asker, message_id, since}, actor the asker; USER gets the
+    quiet `u_question` {name, id}.
+  - It pauses like any pause (§6.2): an LLM call in flight and all tool calls of its response finish, the next step
+    breaks, a woken agent goes to `paused`, the scheduler skips its passes; jobs, triggers and external members go
+    on. The asker reads its result only after the resume, together with the answer.
+- **The answer rule.** While `pending_question()` is {asker A, message_id Q}, the **first** message from USER (any
+  surface: the board's chat, the TUI, the console, MCP) whose resolved recipients include A (named, or through
+  "all") is the answer; `reply_to` alone does not count. `Mailbox.send` (§5) fills `reply_to = Q` when it has none (A
+  sees "(reply to #Q)"), stores and signals, then calls `question_answered`: every other active member gets
+  `n_user_answer` {asker, id, question, answer} (both texts cut to `QUESTION_CHARS` = 4000), or
+  `n_user_answer_seen` {asker, id, question, answer_id} when the answer reached it as a message too; quiet for AI
+  agents, waking for external members. Then `resume(USER, question={asker, message_id, outcome: "answered",
+  answer_id})`: its usual `n_resumed` wakes the members with work (A among them: the answer is unread). No answer: a
+  user message only to other members (they read it after the resume), task comments, `task_review`, `set_goal`,
+  anything after the pause ended, and a message of a user-owned trigger (`Mailbox.send(..., automatic=True)`). The
+  user's `send_message` result then ends with the A-ok or A-budget note (§12).
+- **Lifecycle** (A the asker, Q the question):
+
+  | situation | what happens |
+  |---|---|
+  | the answer arrives with the budget spent (steps in flight crossed it) | the notices as above, then `_set_pause(USER, "budget", outcome=…)`: a budget pause, `swarm.paused` {reason: "budget", question: {asker, message_id, outcome: "answered", answer_id}} and `u_budget`; raising the limit resumes it as any budget pause |
+  | a manual resume (the board's «Продолжить», `/pause` in the TUI, `/resume` in the console, `swarm_control` action=resume) | the question is dropped: `swarm.resumed` {question: {asker, message_id, outcome: "dropped", why: "resumed"}}; A gets a waking `n_question_unanswered` {id} (take your defaults, write them down) instead of `n_resumed`; a later user message to A is ordinary; when A holds a clarify card, the nag guard no longer waits for Q (`asks_user` false, no `clarify_wait` banner) until A messages the user again |
+  | `swarm_control` action=pause meanwhile | nothing changes: `Done: already paused (waiting for the user's answer to A's question #Q).` |
+  | `[swarm] clarify` switched off (PATCH, ⚙, `/clarify off`, the global settings) | `reconfigure` → `_clarify_switched_off()`: the holder of a clarify card that has created no task since it (`_plans`, the bound the nag guard uses) and whose card is `waiting` (also after a reply that answered nothing) or `asks_user` gets a waking `n_clarify_off` {task_id} (plan now with your defaults); a holder that created a task plans already, so its `waiting` card waits for something else (research, a follow-up question): it gets none, and its tasks' events or the user's answer wake it; then `_drop_question(USER, "clarify_off")` resumes (why `clarify_off`) or, with the budget spent, turns it into a budget pause; A gets `n_question_unanswered` either way |
+  | clarify off while the session was stopped | the end of `start()` runs `_clarify_switched_off(once=True)`: the same, with at most one `n_clarify_off` per card |
+  | clarify switched on later | nothing is rewritten: `pause_swarm` works from its next call, the next card is the clarify one |
+  | A retires or leaves | `retire` → `_drop_question(by, "left")` (why `left`, no notice to A); USER gets `u_question_left` {name, id} unless USER retired it |
+  | a session restart | kv persists: still paused for the question, and `start()` sends no kickoff and no `n_restart`, as for any pause (the resume's `n_resumed` covers them); the answer and a manual resume work as before; the lease is lost |
+  | `set_goal` / `reopen_goal` meanwhile | the pause stays until it is answered or resumed |
+  | wrap-up mode | independent: both can be on |
+  | an external member asks (`hub_call` with `as_agent`) | as an agent; its result says to call `wait_for_events`, where the answer comes; it is not paused itself |
+  | the user acts through MCP | `send_message` as USER answers through the same choke point, `swarm_control` resume drops, `wait_for_events` returns `u_question`, `sessions_list` shows the question (§18.2) |
+
+- **The auto-reply lease.** The print client (`dreamteam -p`, docs/TUI.md §2) sends the header
+  `X-DreamTeam-Auto-Reply: 1` (`models.AUTO_REPLY_HEADER`, while `HubClient.auto_reply`) on every request and on
+  the WebSocket handshake, only with automatic replies on. The Swarm keeps an in-memory lease:
+  `auto_reply_stream()` (a context manager around an event WebSocket whose handshake carried the header),
+  `auto_reply_seen()` (the launcher's `POST /api/sessions` and `/start` before `swarm.start()` and again right
+  before the pending `set_goal`; `POST /api/act/{tool}`), and `auto_reply_active`: a stream is open, or less than
+  `AUTO_REPLY_GRACE` (90 s, longer than print mode's 60 s without the hub) passed since the last sign (the clock is
+  the module's `_monotonic`). Nothing is persisted: a hub or session restart forgets it, a dead client's lease ends
+  90 s after its socket closed. Under the lease `clarifying` is false (the classic card) and `ask_user` gives `auto`
+  ("the user is not available"). A gap in the lease (a hub restart, a session reload) can still give a short
+  question pause, which print mode answers at once (an answer that failed is sent again after a state read that
+  still shows the pause, never twice for one question: docs/TUI.md §2).
+- **No stuck states.** A question pause ends with an answer (every surface can send one), a manual resume, the asker
+  leaving, or clarify switched off (live or at start); after a conversion the budget auto-resume takes over.
+  `resume` is idempotent, and the hook acts only while `pending_question()` still equals the question it read.
+  `question_answered` checks the budget before it resumes and logs every failure: the user's message, stored
+  already, never fails. The nag guard counts only messages since the card, ends once the holder created a task, and
+  ignores a question the user went on without; `n_clarify_off` goes only to a holder that has created no task.
+  `-p --clarify --no-auto-reply` prints a line per question instead of hanging silently (docs/TUI.md §2).
+
+Readable texts: `pause_text()` (`swarm_status`, a trace's pause outcome, §16.1). The UIs read the snapshot's
+`swarm.question`, `clarify`, `auto_reply` and `clarify_wait` (§14.1) and the summary's `clarify` and `question`
+(§17.2).
 
 ## 4. Board (board.py)
 
@@ -495,8 +649,10 @@ reviews when no other member can. `false` keeps the legacy rules above (a task w
 `Board.independent_review` reads `swarm.config.swarm.independent_review` on every call, so `reconfigure()` and
 session overrides apply at once; turning it off leaves tasks already in review alone (their reviewers still review
 them). Tool descriptions and system prompts are mode-neutral (§12 R0′), so no frozen prompt or tools array depends on
-the switch. A resumed session follows the current setting too: its existing members' completions go to review, and
-the tool results and notifications explain it.
+the switch. The same holds for `[swarm] clarify` (§3.1): `send_message` says the session *may* pause for
+`pause_swarm`, its result says whether it did, and the clarify planning card is board data. A resumed session
+follows the current setting too: its existing members' completions go to review, and the tool results and
+notifications explain it.
 
 - **Valid reviewer** of a task: not None, not its assignee, and USER or an active member (an external member only
   when designated explicitly).
@@ -592,7 +748,8 @@ the tool results and notifications explain it.
 ```python
 class Mailbox:
     def __init__(self, swarm): ...
-    def send(self, sender: str, to: str | list[str], text: str, reply_to: int | None = None) -> dict
+    def send(self, sender: str, to: str | list[str], text: str, reply_to: int | None = None, *,
+             automatic: bool = False) -> dict
         # to: name, list of names, "all" (all active members except sender; USER not included) or USER.
         # Resolves via swarm.resolve_member; duplicates removed; sender cannot be the only recipient.
         # text non-empty, <= 50000 chars. Inserts message + inbox rows; emits "message.sent" {message};
@@ -602,6 +759,11 @@ class Mailbox:
         # too, so the message is in their history but is no news to them. Only that sender's: a task started inside
         # the block inherits the context (an agent runtime starts in a context of its own anyway, §6.2), and the
         # messages of every other sender reach those members as news.
+        # The answer to a question pause (§3.1): a message from USER, not `automatic` (a user-owned trigger's message
+        # action passes it, §8), whose resolved recipients include the asker of `swarm.pending_question()` (looked up
+        # with getattr: FakeSwarm has none) gets `reply_to` = the question's id when it has none; after the store and
+        # the signals `swarm.question_answered(message, question)` runs (it never raises). The emitted message dict
+        # is never changed after the emit.
     def get(self, message_id: int) -> dict
     def unread(self, name: str, mark_read: bool = True, limit: int = 100) -> list[dict]
     def mark_read(self, name: str, message_ids: list[int]) -> int   # returns how many were unread
@@ -649,9 +811,9 @@ reach existing members through tool results and notifications, and new tools at 
 to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
 it:
 - Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
-  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 3: `skill_propose`) is what `schemas_for("llm",
-  language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were frozen (sorted digest
-  `e3c5cbc7…`).
+  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 4: `send_message` gains `pause_swarm`, §3.1) is what
+  `schemas_for("llm", language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were
+  frozen (sorted digest `e3c5cbc7…`).
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
   tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without one gets
   `frozen.initial_record(language, has_history)`, written at once: the baseline revision when it already has a
@@ -662,8 +824,9 @@ it:
   `frozen.current_record(language)` (`!=`: after a code downgrade it realigns too); the record is written in the same
   `db.transaction()` as the history rewrite (`_replace_history(messages, tools=)`), and the new history holds no
   assistant turn bound to the old array. The compaction request itself still sends the old array. When tools were
-  added, the summary message gets `tools_added` {tools: "`jobs`, `job_stop`"} before `continue`. `agent.compacted`
-  data and the compaction span meta carry `tools_revision`.
+  added, the summary message gets `tools_added` {tools: "`jobs`, `job_stop`"} before `continue` (revision 3 → 4 adds
+  no tool, only the `pause_swarm` property, so no such line). `agent.compacted` data and the compaction span meta
+  carry `tools_revision`.
 - Existing agents keep revision 1 until their next compaction: they get timer backgrounding, the adoption of
   processes a command leaves running, the console intercept, the job notices and the wake line at once (§7.1), and
   texts that point at a tool are tailored with `ToolContext.has_tool` (§12). Downgrading the code below a session's
@@ -689,8 +852,8 @@ class AgentRuntime:
     def end_turn(self) -> None         # called by the `wait` tool
     def note_sent_to_user(self) -> None  # called by send_message when USER is a recipient
 ```
-* Waits for `wake()`. Skips if swarm paused or nothing pending (unless the last activation was cut
-  short: `interrupted`). Activation: `render_wake(name)` →
+* Waits for `wake()`. Skips if swarm paused (for any reason, a member's question too: §3.1) or nothing pending
+  (unless the last activation was cut short: `interrupted`). Activation: `render_wake(name)` →
   user message; loop up to `max_steps_per_turn`: budget check (exceeded → `swarm.pause`), compaction
   check: last prompt tokens + its output tokens (or, without reported usage, an estimate of the history
   + system prompt + tool schemas) + estimate of appended messages > budget, where budget = context
@@ -706,7 +869,8 @@ class AgentRuntime:
   chars), count the reply in `llm_steps`, execute tool calls sequentially via `tools.call_tool`, append results,
   call `swarm.hint_planner(name)` (§3 scheduler item 4; never raises); after tools, if
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
-  called, no tool calls (a `nudge` once per in_progress task the agent holds, none while it is busy with a
+  called, no tool calls (a `nudge` once per in_progress task the agent holds, except a clarify planning task it
+  waits for the user's answers about, `swarm.asks_user` looked up with getattr, §3.1; none while it is busy with a
   job, §7.1 "Liveness": the job's end wakes it; after plain text even then, `stalled` records those tasks and
   the scheduler wakes it once with `n_stalled`, also once the busy window ended), refusal, or
   step limit (then `notify(name, "n_step_limit")`). A reply cut off by max_tokens gets `cut_off` and
@@ -1551,7 +1715,7 @@ them).`; a blank job_id lists. The user lists and stops every member's jobs thro
 | `Swarm.stop` (session stop, delete, `/cd` move, launcher shutdown, `dreamteam run` end, stdio `mcp` end, the end of print mode with an owned launcher, a failed start) | `stop_all()`: no new command or job (`closing`), the monitor cancelled; every job tree and every foreground tree terminated, after `STOP_ALL_TERM` (3 s) the survivors killed and awaited up to `STOP_ALL_KILL` (2 s); every job finished as `stopped`/`session` (quiet `n_job_gone`, no commit of its own), every finish, stop and foreground call in flight awaited; then one autocommit per owner of its stopped jobs and of its jobs that ended by themselves since the session began to stop (`Swarm.stop` sets `stopping` first and stops the runtimes before `stop_all`: such an end makes no commit of its own), kind `job j3` or `jobs j3, j4, j5`, detail `Stopped with the session:\nj3: <command>…` and `Ended while the session stopped:\nj4: <command> (<how it ended>)…`; every tree released, every log closed. About 5 s plus git; idempotent; nothing touches git or the database after it returned (`hub_call` also skips its trace while the swarm stops, §13). `Swarm.stop` runs it in `finally`, also after a failed step |
 | `Swarm.retire` | §3 `retire`: `forbid`, then the runtime, then `stop_owner(name, "retired")` |
 | `Swarm.start` | `recover()` (below) |
-| pause | nothing: a pause stops LLM spending only |
+| pause | nothing: a pause (a question pause too, §3.1) stops LLM spending only |
 | `complete_goal` | the jobs go on; USER gets `u_jobs_running`; their later ends are quiet |
 | `reopen_goal` | nothing (the goal is active again, so ends wake again) |
 | `reconfigure` | nothing: the limits are read at each use; turning `background_on_timeout` off kills no job |
@@ -1736,7 +1900,8 @@ canonical names; an unknown member is a ToolError at creation. Evaluation compar
 Fires on false→true edge (and on every evaluation where it is true if it uses `every`); a trigger
 true at creation fires on the first evaluation. `once` → deactivated after firing. Actions
 (default `[{"type": "wake"}]`): `wake` → `notify(owner, "n_trigger", id, condition, note)`;
-`message` {to, text} → `mail.send(owner, to, text)`; `set_status` {task_id, status} →
+`message` {to, text} → `mail.send(owner, to, text, automatic=True)` (a user-owned trigger's message never answers
+a question pause, §3.1); `set_status` {task_id, status} →
 `board.update(owner, ...)`; `create_task` {title, goal?, description?, assignee?, tags?, priority?}.
 Action errors are stored in `last_error` and reported to the owner via `n_trigger` note. Evaluation
 errors are stored in `last_error`, not fired. After a fire, `message()`/`comment()`/`file_changed()`/`every()`
@@ -1767,6 +1932,14 @@ dependencies").
 
 `swarm.wrap_up` {on: bool}, actor = who switched it (the user, or the actor of the set_goal / reopen_goal that ended
 it).
+
+`swarm.paused` {reason, asker?, message_id?, since?, question?}, actor = who paused it: reason `question` (a
+member's question, §3.1) carries asker, message_id and since, actor the asker; a budget pause that ends a question
+pause carries `question` {asker, message_id, outcome, answer_id?, why?} of that question. `swarm.resumed`
+{question?: {asker, message_id, outcome: answered | dropped, answer_id?, why?: resumed | clarify_off | left}}, actor
+= who resumed (the user for an answer); `question` only when the resume ends a question pause. There are no event
+types of their own for questions: the question and the answer are `message.sent` events, and the notices are
+`notification` events (kinds in §3.1).
 
 `job.started` {job} and `job.ended` {job: … + `duration` (seconds)} carry the public job dict (§7.1), actor = the
 job's owner; a job's output is never sent as events. `agent.retired` also carries `jobs` (the ids of the jobs it
@@ -1927,7 +2100,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `task_review` | task_id, approve, comment? | LEU |
 | `task_comment` | task_id, text, reply_to? | LEU |
 | `task_discussion` | task_id, since_id? | LEU |
-| `send_message` | to (string or array), text, reply_to? | LEU |
+| `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean, revision 4: a question to "user" that may pause the swarm, §3.1) | LEU |
 | `read_messages` | with?, limit?, include_read? | LEU |
 | `agents` | — (the roster, then the role catalog) | LEU |
 | `hire_agent` | role, instructions ("" for a catalog role), model?, name? | LEU |
@@ -1954,7 +2127,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `wait_for_events` | timeout? (s, default 50, max 600; an error at once when the swarm stops meanwhile), progress? (below) | EU |
 | `set_goal` | title (a multi-line title is split: §3 `set_goal`), description? | U |
 | `swarm_status` | brief? (the goal as one line) | EU |
-| `swarm_control` | action (pause/resume), wrap_up? (true/false: the user's wrap-up mode, §3), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
+| `swarm_control` | action (pause/resume; pause while paused changes nothing and says `already paused (<pause_text>)`; resume during a question pause goes on without the answer, §3.1), wrap_up? (true/false: the user's wrap-up mode, §3), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
 | `mcp_approve` | name, approve, comment? | U |
 | `agent_traces` | agent?, trace_id?, span_id?, context?, status?, task?, limit?, offset? | EU (§16.2) |
 | `skills` | available? (also the library's and Claude Code's skills not attached) | U (§19) |
@@ -1967,6 +2140,32 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
 `ctx.runtime.note_sent_to_user()` when USER is a recipient.
+
+`send_message` and `pause_swarm` (§3.1). The description (en and ru, revision 4) keeps "wakes its recipients" and
+adds that `pause_swarm=true` is only for a question to ["user"] whose answer decides how the team goes on, so that
+work under way would otherwise be redone: the session *may* then pause the whole swarm until the user answers, and
+every member gets the question with the answer; never for what the agent can decide itself, a question about its
+own task, or a report; ask everything in that one message and make it the only tool call of the response; the
+result says whether the swarm was paused, and if not, go on with the work that doesn't depend on the answer. The
+property is last, after `reply_to`, not required, without `default`, its description English in both arrays; the
+usage line is `send_message(to, text, reply_to?, pause_swarm?)`. The result starts as always, `Sent message #N to
+….` (a call without `pause_swarm` is byte for byte as before); one note follows, starting with a space:
+- `asked`, an AI agent: ` The swarm is paused until the user answers this question; the user's answer then reaches
+  every member with your question, and the swarm goes on.`; an external member (no runtime): ` The swarm is paused
+  until the user answers this question; every member then gets the answer with your question. Call wait_for_events:
+  the answer comes there.`
+- otherwise ` pause_swarm was ignored: …`: `off` (this session does not pause for questions, the user's setting, so
+  the others keep working; go on with the work that doesn't depend on the answer), `auto` (the user is not
+  available: questions get an automatic reply), `pending` (the swarm already waits for the user's answer to
+  {asker}'s question #{id}; yours was sent as an ordinary message, which the user sees too; don't send it again),
+  `own` (… to your question #{id}), `paused` (the swarm is already paused ({reason})), `budget` (the budget is
+  exhausted), `no_user` (it pauses the swarm only for a question to "user"), `user` (only a member's question to the
+  user pauses the swarm).
+- The user's message that answers a question: ` This answers {asker}'s question #{id}: every member got the question
+  and your answer, and the swarm goes on.` (A-ok), or with the budget spent `…, but the budget is exhausted, so the
+  swarm stays paused until you raise max_cost_usd.` (A-budget).
+- An agent of revision 1-3 passing `pause_swarm` gets the argument dropped by `call_tool`: `[Ignored unknown
+  argument(s): pause_swarm. Usage: send_message(to, text, reply_to?)]`, and nothing pauses.
 
 **R0′: LLM tool schemas are released as revisions.** Every LLM agent sends its own frozen tools array (§6.1), and
 Anthropic thinking blocks bind to the exact prefix, so a changed name, description, parameter, `required` list, enum
@@ -1983,7 +2182,8 @@ still validated against the current registry, so the registry must keep serving 
 never gains an enum. Revisions: 1 = the tools before background jobs (sorted digest `e3c5cbc7…`, the baseline of
 agents created before tool sets were frozen), 2 = background jobs (`shell` gains `background`, new `jobs` and
 `job_stop`, new `shell` and `wait` descriptions), 3 = `skill_propose` (appended last; the array of revision 2
-before it is unchanged). Notifications and wake-up texts reach agents of every revision, so
+before it is unchanged), 4 = `send_message` gains `pause_swarm` and its new description (the array of revision 3
+otherwise unchanged; §3.1). Notifications and wake-up texts reach agents of every revision, so
 they name only tools of every released revision (tests/test_prompts.py); tool results that point at a newer tool
 check `ToolContext.has_tool`. `allow_empty` is validation only, not part of the schema. Tools of the
 `user`/`external` audiences only (e.g. `set_goal`) are not in the LLM tools array, and external members and the user
@@ -2046,11 +2246,17 @@ Results and checks of the review and role-catalog flows:
 Results of the team, wait and job flows:
 - `agents` starts with `AI agents: 2 of max 6, plus 1 external member (not counted).` and the budget line (the
   same team line in `swarm_status`); a member line ends with `, background jobs: j3, j5` while it has running jobs.
-- `swarm_status`: its first line `Swarm "<name>" — running` (or `PAUSED: <reason>`) ends with `; WRAP-UP MODE: the
-  agents finish their tasks with what they have, no new computations or background jobs` while the user's wrap-up mode
-  is on.
+- `swarm_status`: its first line `Swarm "<name>" — running` (or `PAUSED: <Swarm.pause_text()>`: `PAUSED: waiting
+  for the user's answer to Anna Smith's question #12` for a question, §3.1; for the user it adds ` (your next
+  send_message to {asker} or to all is the answer: every member gets it with the question; swarm_control
+  action=resume goes on without it)`) ends with `; WRAP-UP MODE: the agents finish their tasks with what they have, no
+  new computations or background jobs` while the user's wrap-up mode is on, and with `; CLARIFY MODE: the planning
+  task first asks the user, and a member's question to the user with pause_swarm=true pauses the swarm until the user
+  answers` while `clarifying`.
 - `swarm_control`: the limits, then `reopen_goal_comment` (which ends wrap-up mode), then `action`, then `wrap_up`;
-  `Done: ...` lists what was done: `wrap-up mode on: every agent was told to finish its tasks with what it has, and no
+  `pause` while paused changes nothing and is listed as `already paused (<pause_text>)`, so `Done: already paused
+  (waiting for the user's answer to Anna Smith's question #12).` during a question pause; `Done: ...` lists what was
+  done: `wrap-up mode on: every agent was told to finish its tasks with what it has, and no
   new background jobs start` / `wrap-up mode was already on` / `wrap-up mode off` / `wrap-up mode was not on`. Nothing
   to do: `Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.`
 - `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run (a
@@ -2143,9 +2349,13 @@ background jobs; and the members' side that members who join do not count toward
 still running at its timeout (at most 600 seconds over MCP) continues as a background job, that `background=true`
 starts one at once, that processes a command leaves running become a job too, and that a job's end arrives through
 `wait_for_events` (no polling); `swarm_control` also switches wrap-up mode (§3), in which no new background job
-starts. The user's side also learns `skills`, `skill_attach`, `skill_detach` and `skill_approve` (not for a member
-the client acts as); the members' side that skills (SKILL.md folders under `.scratch/_skills/`) are listed by
-`join_swarm` and `swarm_status`, and that `skill_propose` proposes one.
+starts. After the pause/resume sentence they say: "When `swarm_status` says the swarm is paused waiting for your
+answer to a member's question, your next `send_message` to that member (or to all) is the answer: every member gets
+it with the question and the swarm goes on; `swarm_control` action=resume goes on without it." (§3.1; the tool list
+is live, so external members see `pause_swarm` at once). The user's side also learns `skills`, `skill_attach`,
+`skill_detach` and `skill_approve` (not for a member the client acts as); the members' side that skills (SKILL.md
+folders under `.scratch/_skills/`) are listed by `join_swarm` and `swarm_status`, and that `skill_propose` proposes
+one.
 
 ## 14. Web (web.py) — REST for the UI and the console
 
@@ -2179,15 +2389,24 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/api/events?since=&limit=&types=` | events |
 | GET `/api/agents/{name}/activity?limit=` | `agent.activity` events of that agent |
 | GET `/api/files?path=` | dir → {"type":"dir","entries":[...]}; file → {"type":"file","content","truncated"} |
-| POST `/api/act/{tool}` | run tool as USER: body = args → {"ok": bool, "result": str}; the user's `jobs` and `job_stop` (§7.1) go through it too: background jobs have no endpoint of their own |
+| POST `/api/act/{tool}` | run tool as USER: body = args → {"ok": bool, "result": str}; the user's `jobs` and `job_stop` (§7.1) go through it too: background jobs have no endpoint of their own; with `X-DreamTeam-Auto-Reply: 1` it first calls `swarm.auto_reply_seen()` (below) |
 | GET `/api/skills` | `{library_dir, library: [entry], claude: [item], host: [entry], sandbox, limits: {max_mb, max_files, max_attached, max_archive_mb}, install, attached: [snapshot item + source_digest]}` (§19): the Skills tab; `source_digest` is the attached skill's own source now (`SessionSkills.source_digest`: "Update" compares with it only) |
 | POST `/api/skills` | an import body (§19 "Requests": exactly one of `path`, `zip`, `git`, `claude`, `host`; `pick`, `replace`) plus `attach?: bool` → the import report + `install`; with `attach` every imported skill is attached as `library:<name>` (`attached: [{name, status, files}]`, `failed: [{name, error, status}]`, as `attach_source`); `attach` on a stopped session is 409 `STOPPED_SKILLS_TEXT` (importing works) |
 | GET `/api/skills/{name}?from=library\|claude-user\|claude-project\|host-library\|session` | the entry + `files_list`, `skill_md`, `deps` (`show_folder`) + `install`; `session`: the session copy with its metadata and shown path |
 | DELETE `/api/skills/{name}?confirm={name}` | `{"removed": name}` (`Library.remove`; the sessions keep their copies); 400 without a matching confirm |
 | GET `/api/skills/{name}/deps-log?ecosystem=python\|node` | `{name, ecosystem, status, path, log}`: the install log of the attached skill's environment (the failed one first; `EnvManager.log_tail` / `log_path`); 404 when DreamTeam installs nothing for it |
 | `/api/traces...`, `/api/spans/...`, `/api/agents/{name}/traces.jsonl` | traces (§16.3) |
-| WS `/ws` | pushes every bus event as JSON (also the live-only `trace.*` events) |
+| WS `/ws` | pushes every bus event as JSON (also the live-only `trace.*` events); a handshake with `X-DreamTeam-Auto-Reply: 1` runs the whole connection, `accept()` included, inside `swarm.auto_reply_stream()` (below) |
 | `/mcp` | hub MCP over streamable HTTP |
+
+**The auto-reply header** `X-DreamTeam-Auto-Reply: 1` (`models.AUTO_REPLY_HEADER`) is sent only by the print client
+of `dreamteam -p` while its automatic replies are on (`HubClient.auto_reply`, docs/TUI.md §2), on every request and on
+the WebSocket handshake; the interactive TUI, the web UI, the console and MCP clients never send it. It holds the
+session's auto-reply lease (§3.1): no planning card asks the user first and no question pauses the swarm. The
+launcher forwards it to the session apps unchanged (`SessionRouter` passes the scope's headers), and reads it itself
+on `POST /api/sessions` and `/start` (§18.1). Only these refresh the lease: those two launcher routes, `POST
+/api/act/{tool}` and the `/ws` event stream (held while open, then `AUTO_REPLY_GRACE`); the GET routes and `/mcp`
+never do, so a `-p` client keeps it through its stream and its acts. Nothing about it is persisted.
 
 The skills routes are `skill_routes(config_of, workspace_of, *, via, swarm=None, changed=None) -> [Route]`, shared
 with the launcher (§18.1): `config_of()` the settings (here the swarm's), `workspace_of(request)` the folder whose
@@ -2203,6 +2422,13 @@ stopped check uses `Swarm.started`.
 ### 14.1 snapshot
 ```json
 {"swarm": {"name","language","paused","pause_reason","wrap_up": bool,   // the user's wrap-up mode (§3)
+           "question": {"asker","message_id","since","text"}|null,   // the question holding the pause (§3.1),
+                                       // text: the question message cut to QUESTION_PREVIEW_CHARS (600)
+           "clarify": bool,                // [swarm] clarify, the setting (§3.1)
+           "auto_reply": bool,             // the auto-reply lease of `dreamteam -p` is active (clarify does not apply)
+           "clarify_wait": {"name","task_id"}|null,   // the first open clarify planning card whose holder waits for
+                                       // the user's answers (asks_user, §3.1; null again once the user went on
+                                       // without its question): the board's quiet banner
            "limits":{"max_cost_usd","max_agents"},
            "agent_count": n,               // what limits.max_agents counts (Swarm.agent_count: external members do not)
            "spent_usd","goal": {...}|null, "counts": {status: n}, "mcp_url", "models": [profile names],
@@ -2442,7 +2668,8 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
   - Finish statuses: `stopped` (the agent stopped or left, or the swarm was paused), `paused` (budget),
     `step_limit`, `refusal`, `error` (the LLM failed after retries), `done` otherwise.
   - Outcome: `"Turn ended (wait)"`, `"Answered without tool calls"`, `"Step limit reached (N steps)."`,
-    `"The model declined the request."`, the stop or pause reason, or `"{kind}: {message}"` of the LLM error.
+    `"The model declined the request."`, the stop or pause reason (`_stop_reason`: `The swarm was paused
+    (<Swarm.pause_text()>).`, looked up with getattr, §3.1), or `"{kind}: {message}"` of the LLM error.
   - A crash inside `_activate` is caught by `_run`: it records `event/crash` and finishes the trace with `error`;
     a stop records `event/stopped` and finishes with `stopped`.
   - `_call_llm(messages, *, purpose="step", extra=None, parent=None)` opens one llm span per attempt:
@@ -2507,9 +2734,16 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   cuts the members' commands, their jobs and the stdio MCP servers off the network (§7.2). Read at each use;
   session overrides apply (a running session: from its next command). The template has the line after
   `independent_review`, with a Russian comment that says it is strict only in Docker and on Linux.
+- `[swarm] clarify` (bool, default false; a non-bool is a ValueError, "true or false"): clarify mode (§3.1): a new
+  planning task first asks the user about the goal's forks while the others wait, and a member's `send_message` with
+  `pause_swarm` pauses the swarm until the user answers. Read live; session overrides and the partial `settings`
+  update apply (`clean_overrides` keeps `false`, so a session can switch off a global `true`); switching it off on a
+  running swarm lifts a question pause (`reconfigure`). Under the auto-reply lease of `dreamteam -p` it does not
+  apply. The template has the line `clarify = false` after `network`, with a Russian comment.
 - `[agents] planning_hint_steps = 8` (whole number ≥ 0) and `planning_hint_minutes = 10` (number ≥ 0): the planning
-  hint of §3 (scheduler item 4), after this many LLM steps or minutes of holding the planning task without creating a
-  task, once more at twice the value; 0 turns that trigger off. Read at each use; session overrides apply. The
+  hint of §3 (scheduler item 4; in clarify mode, before the planner has asked, its `n_clarify_hint`), after this
+  many LLM steps or minutes of holding the planning task without creating a task, once more at twice the value; 0
+  turns that trigger off. Read at each use; session overrides apply. The
   template has both lines with Russian comments after `stagger_seconds`.
 - `[shell]` (`ShellSettings`, read at each use, so `reconfigure` and session overrides apply at once; §7, §7.1):
   `program = "auto"` (auto | bash | sh | powershell | pwsh | cmd), `timeout = 120` (seconds a call waits; a command
@@ -2595,7 +2829,8 @@ settings; ValueError when they are invalid):
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
-  workspace=None, skills=None, via="home")`, `async load(sid)`, `async start(sid, *, skills=None, via="home")`,
+  workspace=None, skills=None, via="home", auto_reply=False)`, `async load(sid)`, `async start(sid, *, skills=None,
+  via="home", auto_reply=False)`,
   `async stop(sid, *, remember=False)`, `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None,
   settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`, `global_config()`,
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
@@ -2633,7 +2868,11 @@ settings; ValueError when they are invalid):
   split as `pending_goal` {title, description, actor} (only with a non-empty title); the first `start` sets it
   once the members exist (a failure keeps it). Module function `pending_goal(meta)` → {title, description} | None
   splits again on read (a `session.json` written before the split may hold a multi-line title); the summary and
-  the snapshot's `session.pending_goal` use it. `start` marks `autostart`; an explicit `stop` clears it
+  the snapshot's `session.pending_goal` use it. `auto_reply=True` (the request carried the auto-reply header, §14;
+  passed on by `create` to its `start`): `_start_locked(sid, auto_reply)` calls `swarm.auto_reply_seen()` right after
+  loading (also when the session runs already), so before `swarm.start()`, and again right before the pending
+  `set_goal`, so a `dreamteam -p` session gets the classic planning card even when its start outlasts the grace
+  (§3.1). `start` marks `autostart`; an explicit `stop` clears it
   (`remember=True`, used at shutdown, keeps it), and `resume()` starts the marked sessions except finished ones
   (`finished(sid)`: the goal is done and no task is open, read from the summary without loading it; False when it
   cannot be read), which stay stopped until started by hand. `stop` unloads the swarm (stop + close its database).
@@ -2665,8 +2904,13 @@ settings; ValueError when they are invalid):
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
+   "question":{"asker","message_id"}|null,"clarify":bool,
    "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names]}
   ```
+  `question` (`read_stats`, from kv `paused`, default None): the member's question that holds the pause, set only
+  for a paused slot with reason `question`, a non-empty asker and an integer message_id (the test of
+  `Swarm.pending_question`, §3.1); `clarify`: the session's `[swarm] clarify` setting (its own override, else the
+  global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
@@ -2893,12 +3137,12 @@ succeeded: either may have changed the library) and everything else to the launc
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
 | GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox"}` |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
-| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
+| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
 | GET `/api/sessions/{sid}` | `{"session": summary, "config": manager.config_view(sid)}` |
-| PATCH `/api/sessions/{sid}` | body `{title?, overrides?, settings?}` → `{"session": summary, "config": config_view(sid)}`; `overrides` replaces all of them, `settings` `{section: {key: value \| null}}` changes only those keys (null: the global value again; §17.2 "Partial update"); both at once, a bad value or `main` → 400 and nothing changes |
+| PATCH `/api/sessions/{sid}` | body `{title?, overrides?, settings?}` → `{"session": summary, "config": config_view(sid)}`; `overrides` replaces all of them, `settings` `{section: {key: value \| null}}` changes only those keys (null: the global value again; §17.2 "Partial update"; `{"swarm": {"clarify": true \| false \| null}}` is the ⚙ field and the TUI's `/clarify`, §3.1); both at once, a bad value or `main` → 400 and nothing changes |
 | DELETE `/api/sessions/{sid}?confirm={sid}&skills=save\|discard&via=` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm; 409 `{"error", "pending_skills"}` when members' proposals wait for the user's decision and `skills` is not given (§17.2) |
 | POST `/api/sessions/{sid}/workspace` | body `{"path": "<absolute>"}` or `{"default": true}`, optionally `"expect": "moved"\|"adopted"` (the mode the user agreed to, §17.2) → `{"session": summary, "result": set_workspace result}`; 400 bad body or target, 404 unknown session, 409 dirty repository, MCP name conflict, a folder of another session, a folder that is not what `expect` says, a file in use, `main` |
-| POST `/api/sessions/{sid}/start` / `/stop` | `{"session"}`; another action → 404; start takes an optional body `{"skills": [...], "via"?}` (attached first; live when it is running; `via` as for create; the delete's `?via=` too) |
+| POST `/api/sessions/{sid}/start` / `/stop` | `{"session"}`; another action → 404; start takes an optional body `{"skills": [...], "via"?}` (attached first; live when it is running; `via` as for create; the delete's `?via=` too); start with the auto-reply header → `start(..., auto_reply=True)`, also for a running session |
 | GET `/api/sessions/{sid}/skills?show=` | `manager.session_skills(sid, show)`: the attached skills (snapshot items, §14.1), also of a stopped session |
 | POST `/api/sessions/{sid}/skills/{name}/decide` | body `{"approve": bool, "comment"?, "replace"?}` → `{"text", "session"}` (`decide_skill`, via home) |
 | GET / POST `/api/skills`, GET / DELETE `/api/skills/{name}` | the library routes of §14 (`skill_routes` with `manager.global_config`, via `home`, no swarm: no `attached`, no `attach`, no `from=session`, no `deps-log`); `?workspace=<absolute>` names the folder whose `.claude/skills` is offered (a relative one 400); a change emits `sessions.changed` (session None, change `skills`) |
@@ -2941,23 +3185,28 @@ succeeded: either may have changed the library) and everything else to the launc
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
-  start_agents?, max_agents?, team?, max_cost_usd?, model?, network?, start?=true, workspace?, skills?)` (unset values come from the
-  global settings; the board URL is shown only when a web server runs; `goal`: one line, or several, split as in
-  §17.2; `team`: role names in order, a name repeated per agent (§17.3) → `swarm.starting_roles` (normalized) and
-  `start_agents = len(team)` unless `start_agents` is given, `[]` = no team; not a list of non-blank strings →
+  start_agents?, max_agents?, team?, max_cost_usd?, model?, network?, clarify?, start?=true, workspace?,
+  skills?)` (unset values come from the global settings; the board URL is shown only when a web server runs;
+  `goal`: one line, or several, split as in §17.2; `team`: role names in order, a name repeated per agent (§17.3) →
+  `swarm.starting_roles` (normalized) and `start_agents = len(team)` unless `start_agents` is given, `[]` = no team;
+  not a list of non-blank strings →
   "team must be a list of role names, e.g. [...]", more than 200 → "A team has at most 200 agents.", a name over
   60 characters → "'<name>': a role name cannot be longer than 60 characters.", a name with `,` or `*` (the
   `--team` syntax) → "'<name>': a role name cannot contain ',' or '*'; give one item per agent and repeat a name
-  for several agents, e.g. [...]."; `workspace`: an absolute folder, §17.2; `skills`: names or sources attached
-  before the first start, §17.2 "Skills"),
+  for several agents, e.g. [...]."; `clarify`: a boolean, `swarm.clarify` (§3.1; `false` overrides a global
+  `true`), any other value → "clarify must be true or false." and nothing is created; `workspace`: an absolute
+  folder, §17.2; `skills`: names or sources attached before the first start, §17.2 "Skills"),
   `session_start(session, skills?)` (the skills attached first, live when it runs), `session_stop(session)` and `session_cd(session, path)` (`set_workspace`; `path`
   absolute or `"default"`; the result in words by `workspace_text(result)`, worded as the TUI and the console
   word it: "Moved the session's files to X" only when they moved, "The session now works in X" after a folder of
   the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
   shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), and for a
   running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
-  in the user's wrap-up mode is `[running, wrapping up]`; a session without network ends its first line with
-  ` | no network` (summary `network`, §7.2); a session with skills gets `skills: a, b (waiting for your
+  in the user's wrap-up mode is `[running, wrapping up]`; one paused for a member's question (summary `question`,
+  §3.1) is `[paused (waiting for your answer to Anna Smith, question #12)]`; a session without network ends its first
+  line with ` | no network` (summary `network`, §7.2), one in clarify mode with ` | clarify` (summary `clarify`,
+  after ` | no network`); a
+  session with skills gets `skills: a, b (waiting for your
   library decision: b)`. The last session tool is `skill_library(action: list | show | import | delete, name?,
   source?, pick?, replace?)`, the home page's Skills tab in words (via `launcher-mcp`): `list` the library, the
   host library and Claude Code's skills; `show` an entry (`name` may be `claude-user:x` / `host-library:x`) with
@@ -2974,8 +3223,10 @@ succeeded: either may have changed the library) and everything else to the launc
   so the session's `hub_call` knows the MCP client (§13: its own messages never come back to it as news).
 - `dispatch_launcher_call(manager, name, args)` answers a tool name nobody knows (close matches + the list);
   `call_launcher_tool` turns SessionError / ToolError / unexpected failures into error results.
-- `INSTRUCTIONS` explain sessions (with `skill_library` and the `skills` of `session_create` / `session_start`),
-  then the hub instructions.
+- `INSTRUCTIONS` explain sessions (with `skill_library` and the `skills` of `session_create` / `session_start`,
+  and: "A session created with clarify=true first asks you about its goal; `sessions_list` shows a session that waits
+  for your answer as "paused (waiting for your answer to X, question #N)"."), then the hub instructions (they hold
+  the answer rule, §13).
 - `/s/{sid}/mcp` keeps the per-session hub MCP (§13).
 
 ### 18.3 CLI (cli.py)
@@ -2983,9 +3234,9 @@ succeeded: either may have changed the library) and everything else to the launc
 dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|stream-json] [--timeout S]
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
           [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
-          [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off]
+          [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off] [--clarify | --no-clarify]
 dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]
-          [--skill REF|PATH|URL ...] [--network on|off]] [--no-console] [--no-browser]
+          [--skill REF|PATH|URL ...] [--network on|off] [--clarify | --no-clarify]] [--no-console] [--no-browser]
 dreamteam sessions [DIR | --home H]
 dreamteam sessions rm SID [SID ...] [--yes] [--skills save|discard] [--home H]
 dreamteam traces [AGENT] [--home H] [--session SID] [--id N] [--span N [--context]] [--status S] [--limit N] [--json]
@@ -3015,6 +3266,20 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   `create(..., overrides={"swarm": {"network": ...}})`), of `run`'s swarm for this run only (the settings file keeps
   its value), and for `sandbox` the firewall of the container (`docker.wants_firewall`) plus `--network` of the
   command inside (a project's `run`, or `serve --goal`). Neither a TUI-only nor a serve-only flag (`_default_command`).
+- `--clarify` / `--no-clarify` (`argparse.BooleanOptionalAction`, default None: the settings decide; help
+  `cli.CLARIFY_HELP`; `tui`, `-p`, `serve` with `--goal`, `run`): `[swarm] clarify` (§3.1). `tui`:
+  `overrides["clarify"]` (only when given; tui.commands.FLAT_OVERRIDES → `swarm.clarify`) of the sessions this window
+  creates, also with `-c` / `-r` (there it is the window's setting for new sessions, as `/clarify` without a
+  session, docs/TUI.md §4.5); `serve`: `create(..., overrides={"swarm": {"clarify": ...}})`, exit 2 without `--goal`
+  (`--clarify needs --goal: it is a setting of the session that --goal creates (an existing session changes it in
+  its ⚙ settings or with /clarify).`); `run`: its swarm for this run only (the settings file keeps its value, as
+  with `run --network`). The help of `serve` and `run` is built from the same phrase as `CLARIFY_HELP`, without its
+  `-p` clause. `-p` refuses with exit 2, before anything
+  starts: first `--clarify` or `--no-clarify` with `-c` / `-r` (`dreamteam -p: --clarify is a setting of a new
+  session; change an existing one with /clarify in dreamteam tui or in its ⚙ settings on the board.`), then
+  `--clarify` without `--no-auto-reply` (`dreamteam -p: --clarify needs --no-auto-reply: with automatic replies
+  nobody answers the questions, and the session plans as usual.`). Neither a TUI-only nor a serve-only flag;
+  `sandbox` does not forward it (the dialog or the ⚙ settings set it).
 - `--workspace DIR` (`tui`, `-p`, and `serve` with `--goal`): the folder the session created by that run works in
   (`create(..., workspace=)`, §17.2: an empty or missing folder becomes its workspace; a folder with files is
   adopted, its repository must be clean). `~` and a relative DIR are resolved against the current directory
@@ -3150,7 +3415,10 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   - Sessions tab: a big «Начать новую сессию» button, search and the filters all / running / stopped, and a
     card per session.
     - Card: title (link to the board), goal (or «ждёт запуска» for a pending goal), status badge (running /
-      paused / stopped / goal done) and, for a running session in the user's wrap-up mode (summary `wrap_up`, read
+      paused / stopped / goal done; a session paused for a member's question, summary `pause_reason` "question",
+      stays in the paused state, its badge reads «Ждёт вашего ответа» / "Waiting for your answer" with the tooltip
+      «{name} ждёт вашего ответа на вопрос #{id}» from the summary's `question`) and, for a running session in the
+      user's wrap-up mode (summary `wrap_up`, read
       from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity,
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
       and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved with /cd); a folder
@@ -3170,9 +3438,13 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
       and decides again with `replace`).
   - New-session modal: title (default: the goal's first line, derived by the server); goal (required,
     multi-line: the first line is the title, the other lines its description, explained by a hint);
-    description; model profile (from the saved settings; a role with its own profile keeps it); language, max
-    agents, budget; the starting team composer (below; from the saved catalog); «Скиллы»: a checkbox per skill
-    of the library and of Claude Code (a library skill is sent as its name, Claude Code's as `claude-user:x`;
+    description; the checkbox «Сначала уточнить цель» / "Clarify the goal first" (`#ns-clarify`, in the main grid
+    right after the description, with the hint «планировщик сначала задаст вам вопросы по неясным местам цели,
+    остальные агенты подождут план и не потратят токены; важный вопрос агента поставит весь рой на паузу до вашего
+    ответа»; ticked from the saved `swarm.clarify`, sent as `swarm.clarify` only when it differs, §3.1); model
+    profile (from the saved settings; a role with its own profile keeps it); language, max agents, budget; the
+    starting team composer (below; from the saved catalog); «Скиллы»: a checkbox per skill of the library and of
+    Claude Code (a library skill is sent as its name, Claude Code's as `claude-user:x`;
     one changed outside DreamTeam carries the warn badge «изменён вне DreamTeam» and ticking it asks «подключить всё
     равно?», as the board's attach dialog does), the skills the chosen team's roles bring (from the catalog's
     `skills`; one not in the library or ~/.claude/skills gets a warning chip «нет в библиотеке») and «Добавить новый:
@@ -3196,7 +3468,8 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     The new-session modal sends `starting_roles` only when the saved list, at the new size, would give another
     team (the saved list may hold more roles than its `start_agents`: they would fill a larger team).
   - Settings tab: sections «Модели и эндпоинты», «Роли», «Новые сессии по умолчанию» (with the team composer and
-    the switch «Независимое ревью задач», `swarm.independent_review`, and «Интернет для команд агентов»,
+    the switch «Независимое ревью задач», `swarm.independent_review`, «Сначала уточнять цель», `swarm.clarify`, whose
+    hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для команд агентов»,
     `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
     `agents.planning_hint_steps` / `planning_hint_minutes` and their hints), «Консоль», «Workspace», «MCP»,
     «Скиллы», «Трейсы», «Сервер», with a section navigation.
@@ -3265,6 +3538,26 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     pressed (class `on`, `aria-pressed`, the warning colour, tooltip: click to switch it off) and a banner under the
     header says what it means (`#wrapup-banner`). The feed shows `swarm.wrap_up` («… включил(а) режим завершения:
     агенты завершают задачи с тем, что есть» / «… выключил(а) режим завершения»).
+  - Pause and questions (§3.1): «Пауза» / «Продолжить» calls `swarm_control`; the banner `#paused-banner` names the
+    reason. A question pause (snapshot `swarm.question`) reads «Рой на паузе: {name} ждёт вашего ответа на вопрос #{id}
+    — ответ получат все участники. Нажмите, чтобы ответить; «Продолжить» снимает паузу без ответа» (class `question`,
+    `data-asker`; a click, or Enter / Space on the focused banner (`role="button"`, `tabindex` 0), opens the chat with
+    the asker: `onDocumentClick`, `onKeydown`). The banner says what Resume does before the click at every width (a
+    touch screen shows no tooltip, a phone hides the button's label); the resume button keeps its short label
+    «Продолжить» (a longer one would overflow the top bar), and its tooltip is «Продолжить без ответа: агент выберет
+    вариант сам». The chat with
+    the asker, and the «Все сообщения» chat (a message to all answers too), shows above its composer (`#chat-hint`,
+    added at init) «Ваше следующее сообщение — ответ на вопрос #{id}: его получат все участники, и рой продолжит
+    работу.»; a message sent meanwhile to someone else (not the asker, not all) gets the toast «Рой всё ещё ждёт
+    вашего ответа агенту {name} (вопрос #{id})», and a click on it opens the asker's chat. The `u_question`
+    notification shows no toast (the banner says it). While not paused, `swarm.clarify_wait` {name, task_id} (the
+    server's `asks_user`, not the card's status) shows a quiet banner (class `quiet`) «{name} ждёт ваших ответов на
+    вопросы по цели — ответьте в чате», and a click opens that chat too; it hides when the field is null. The feed
+    shows `swarm.paused` for a question («{asker} задаёт вам вопрос #N — рой на паузе до вашего ответа») and
+    `swarm.resumed` with `question`: «ваш ответ на вопрос #N получили все участники, рой продолжил работу» (answered),
+    «рой продолжил работу без ответа на вопрос #N» (dropped), with «уточнение цели выключено: …» (why `clarify_off`)
+    and «{asker} покинул(а) рой: …» (why `left`); the feed's `swarm.*` lines are escaped, not linkified, so `#N` (a
+    message id) is no task link.
   - Reviews (§4.1): a card waiting for the user's review has the badge «ждёт вашего ревью», another one in review
     names its reviewer; the task card's «Принять» / «Вернуть» (a return needs a comment: what to fix; for a
     task another member reviews, the card says the user may decide instead). Dragging a task from «review» to
@@ -3284,7 +3577,11 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     (`agents.max_steps_per_turn`, `context_tokens`, `tool_output_chars`, `idle_nudge_seconds`,
     `max_parallel_llm_calls`, `planning_hint_steps`, `planning_hint_minutes`) and «Сеть» (`swarm.network`, kind
     `choice`: a select «как в общих настройках (…)» / «есть» / «нет», with the hint `networkHint` of the launcher's
-    `network_isolation`, §7.2) (`SESSION_FIELDS`, where a field's `hint` key names its hint text). Each input holds the session's own override (empty when none) and
+    `network_isolation`, §7.2) and «Уточнение цели» (`swarm.clarify`, field «Сначала уточнять цель», kind `bool`: a
+    select «как в общих настройках (вкл|выкл)» / «вкл» / «выкл», parsed to null / true / false; its hint says that an
+    agent's critical question then pauses the swarm until the user answers, that a new planning task starts with
+    questions, and that a planning task already on the board stays as it is, §3.1) (`SESSION_FIELDS`, where a field's
+    `hint` key names its hint text). Each input holds the session's own override (empty when none) and
     shows the global value (the public view of `/api/settings`, defaults filled) as its placeholder; a hint says
     that an empty field takes the general value and that changes apply at once (steps from the agent's next
     wake-up, the rest from the next command or call), the context field that a model profile's own window wins

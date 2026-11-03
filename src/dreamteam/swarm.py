@@ -4,6 +4,7 @@ and the agent runtimes, and implements team, goal, budget and notification logic
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import difflib
 import hashlib
@@ -26,7 +27,7 @@ from .mailbox import Mailbox
 from .mcp_forge import MCPForge
 from .models import USER, AgentKind, AgentStatus, Status, ToolError
 from .names import generate_name
-from .shell import resolve_shell
+from .shell import resolve_shell, truncate_middle
 from .swarm_skills import SessionSkills, role_skill_pairs
 from .tools.fmt import STAMP_SPAN, item_time, stamp_range
 from .tracing import EXTERNAL_IDLE_SECONDS, Tracer
@@ -43,6 +44,21 @@ TRACE_PRUNE_SECONDS = 6 * 3600
 # this much time passes. No more agents consider offers than there are ready tasks, so one free task
 # does not wake the whole idle team at once.
 NUDGE_DECISION_SECONDS = 300.0
+# A member's critical question (send_message pause_swarm; docs/SPEC.md §3 "Clarify mode")
+QUESTION = "question"            # the pause reason of a member's critical question (send_message pause_swarm)
+QUESTION_CHARS = 4000            # the question and the answer as quoted to the other members (n_user_answer)
+QUESTION_PREVIEW_CHARS = 600     # snapshot swarm.question.text
+AUTO_REPLY_GRACE = 90.0          # s a `dreamteam -p` client with auto-reply still counts after its last sign
+                                 # (> printmode.LOST_LIMIT, 60 s: a client that lost the hub gives up first)
+_LAST_TO = ("SELECT MAX(m.id) FROM messages m JOIN inbox i ON i.message_id = m.id "
+            "WHERE m.sender = ? AND i.recipient = ? AND m.ts >= ?")      # (sender, recipient, since)
+# the question (its message id) ended without an answer: the swarm.resumed event that went on without it (a manual
+# resume, clarify switched off, the asker left) or the swarm.paused event of the budget pause it turned into (the
+# events_type index; few such events)
+_DROPPED = ("SELECT 1 FROM events WHERE type IN ('swarm.resumed', 'swarm.paused') "
+            "AND json_extract(data, '$.question.message_id') = ? "
+            "AND json_extract(data, '$.question.outcome') = 'dropped' LIMIT 1")
+_monotonic = time.monotonic      # the lease's clock; tests patch swarm._monotonic, never time.monotonic itself
 
 
 def _digest(text: str) -> str:
@@ -122,6 +138,10 @@ class Swarm:
         # hinted (its llm_steps at the last hint)}: hint_planner
         self._planning_watch: dict[int, dict[str, Any]] = {}
         self._paused_at: float | None = None  # when this process paused the swarm: the hint's clock stops meanwhile
+        # the auto-reply lease of a `dreamteam -p` client (models.AUTO_REPLY_HEADER; never persisted): its open event
+        # streams, and the _monotonic() deadline of the grace after its last sign
+        self._auto_reply_streams = 0
+        self._auto_reply_until = 0.0
         # agent idle (not busy, nothing pending) holding in-progress tasks -> (their ids, idle with them since)
         self._idle_holding: dict[str, tuple[frozenset[int], float]] = {}
         # reviewer -> (ids of the reviews it was reminded about, or that waited while it was in error; since when)
@@ -195,6 +215,10 @@ class Swarm:
                         or (goal_active and (self.board.open_tasks_of(m["name"]) or self.board.reviews_of(m["name"])
                                              or self.has_pending(m["name"])))):
                     self.notify(m["name"], "n_restart")
+        if not self.config.swarm.clarify:
+            # [swarm] clarify may have been switched off while the session was stopped: a clarify planner waiting for
+            # the user is told once per card, a question pause is lifted (its n_resumed covers the skipped n_restart)
+            self._clarify_switched_off(once=True)
 
     async def stop(self) -> None:
         self._wake_waiters()
@@ -275,6 +299,8 @@ class Swarm:
                 runtime.wake()  # e.g. the API key was fixed: retry the failed activation now
         if self.paused and self.pause_reason == "budget" and not self.budget_exceeded():
             self.resume(USER)  # the new default budget is enough again (as with set_limits)
+        if self._started and not self.stopping and old.swarm.clarify and not config.swarm.clarify:
+            self._clarify_switched_off()
         if self._started and not self.stopping and role_skill_pairs(config) != role_skill_pairs(old):
             self._attach_role_skills()
         if self._started and not self.stopping and netoff.is_off(config) != netoff.is_off(old):
@@ -644,9 +670,13 @@ class Swarm:
         self.end_wrap_up(actor)  # a new goal is new work (its kickoff follows the quiet notice)
         planning = None
         if not self.board.list():
-            p_title, p_goal, p_desc = prompts.PLANNING_TASK[self.language]
+            # a session that clarifies the goal first gets the clarify card (its tag drives the kickoff and the nag
+            # guard, asks_user); it is never rewritten when the setting changes later
+            clarify = self.clarifying
+            p_title, p_goal, p_desc = prompts.planning_task(self.language, clarify)
             body = f"{p_desc}\n\n{title}" + (f"\n{goal['description']}" if goal["description"] else "")
-            planning = self.board.create(actor, p_title, goal=p_goal, description=body, priority=2, tags=["planning"])
+            planning = self.board.create(actor, p_title, goal=p_goal, description=body, priority=2,
+                                         tags=["planning", prompts.CLARIFY_TAG] if clarify else ["planning"])
         if self._started:
             self._kickoff(actor, goal, planning)
         log.info("goal set by %s (previous: %s)", actor, (previous or {}).get("title"))
@@ -658,17 +688,28 @@ class Swarm:
         llm_members = [m for m in members if m["kind"] == AgentKind.LLM]
         # who has which role: the planner sees the team without a tool call
         team = "; ".join(f"{m['name']} — {m['role']}" for m in members)
+        clarify = planning is not None and prompts.CLARIFY_TAG in planning.tags
         for i, m in enumerate(llm_members):
             if planning is not None:
-                # the kickoff is everybody's offer of the planning task: no "ready task" nudge about it
-                # before (stagger) or after the kickoff
-                self._nudged.setdefault(planning.id, set()).add(m["name"])
-                self.notify_later(i * stagger, m["name"], "n_kickoff", by=actor, title=goal["title"],
-                                  description=goal.get("description", ""), team=team, task_id=planning.id,
-                                  task_title=planning.title)
+                # clarify: one member asks the user and plans; the others get the kickoff quietly and spend nothing
+                # until its first tasks wake them (n_ready)
+                quiet = clarify and i > 0
+                if not quiet:
+                    # the kickoff is everybody's offer of the planning task: no "ready task" nudge about it
+                    # before (stagger) or after the kickoff
+                    self._nudged.setdefault(planning.id, set()).add(m["name"])
+                self.notify_later(0 if quiet else i * stagger, m["name"], "n_kickoff", wake=not quiet, by=actor,
+                                  title=goal["title"], description=goal.get("description", ""), team=team,
+                                  task_id=planning.id, task_title=planning.title)
             else:
                 self.notify_later(i * stagger, m["name"], "n_goal_updated", by=actor, title=goal["title"],
                                   description=goal.get("description", ""))
+        if clarify and llm_members:
+            planner = llm_members[0]["name"]
+            # nobody else is offered the card while the planner decides (_nudge_idle); if it never claims, the card
+            # is offered to the next idle member once it is idle without it or NUDGE_DECISION_SECONDS passed
+            self._considering[planner] = (time.time(), frozenset(t.id for t in self.board.open_tasks_of(planner)),
+                                          frozenset({planning.id}))
 
     def complete_goal(self, actor: str, summary: str) -> dict:
         goal = self.goal()
@@ -815,6 +856,9 @@ class Swarm:
         self.db.execute("UPDATE triggers SET active = 0 WHERE owner = ?", (name,))
         self.db.execute("UPDATE agents SET status = ? WHERE name = ?", (AgentStatus.RETIRED, name))
         self.bus.emit("agent.retired", by, name=name, reason=reason, released=released, jobs=jobs)
+        q = self.pending_question()
+        if q is not None and q["asker"] == name:
+            self._drop_question(by, "left")  # a question cannot outlive its asker
         hirer = member.get("hired_by")
         if hirer and hirer not in (USER, by, name) and self.is_member(hirer):
             self.notify(hirer, "n_member_retired", name=name, reason=reason or "-",
@@ -890,30 +934,58 @@ class Swarm:
     def pause_reason(self) -> str:
         return (self.db.get("paused") or {}).get("reason", "")
 
-    def pause(self, actor: str, reason: str) -> None:
+    def pause(self, actor: str, reason: str, **details: Any) -> bool:
+        """No-op (False) when already paused; details go into kv `paused` and the swarm.paused event."""
         if self.paused:
-            return
-        self.db.set("paused", {"paused": True, "reason": reason})
-        self._paused_at = time.time()
-        self.bus.emit("swarm.paused", actor, reason=reason)
+            return False
+        self._set_pause(actor, reason, **details)
+        return True
+
+    def _set_pause(self, actor: str, reason: str, *, outcome: dict | None = None, **details: Any) -> None:
+        """Write the pause slot even while paused (a question turned into a budget pause). `outcome`: the event's
+        `question` data of a question that ends with this pause."""
+        was_paused = self.paused
+        self.db.set("paused", {"paused": True, "reason": reason, **details})
+        if not was_paused or self._paused_at is None:
+            self._paused_at = time.time()
+        self.bus.emit("swarm.paused", actor, reason=reason, **details, **({"question": outcome} if outcome else {}))
         if reason == "budget":
             self.notify(USER, "u_budget", spent=self.spent_usd(), limit=self.limits()["max_cost_usd"], wake=False)
+        elif reason == QUESTION:
+            self.notify(USER, "u_question", name=details["asker"], id=details["message_id"], wake=False)
 
-    def resume(self, actor: str) -> None:
+    def resume(self, actor: str, *, question: dict | None = None) -> None:
+        """`question`: the event's data of the question this resume ends (answered, or dropped by its caller); a
+        resume without it while a question holds the pause (Resume, /pause, swarm_control) drops the question."""
         if not self.paused:
             return
         if self.budget_exceeded():
             raise ToolError("The budget is exhausted: raise max_cost_usd before resuming.")
+        pending = self.pending_question()
+        if pending is not None and question is None:
+            question = {"asker": pending["asker"], "message_id": pending["message_id"], "outcome": "dropped",
+                        "why": "resumed"}
         self.db.set("paused", {"paused": False, "reason": ""})
         if self._paused_at is not None:
             # a pause is no time spent planning: the planning hint's clock (since) moves on by its length
-            shift = time.time() - self._paused_at
+            now = time.time()
+            shift = now - self._paused_at
             for watch in self._planning_watch.values():
                 watch["since"] += shift
+            # nor time to decide on an offer (_nudge_idle; the clarify planner's from its kickoff): an offer made
+            # during the pause counts from the resume
+            for agent, (since, owned, offered) in list(self._considering.items()):
+                self._considering[agent] = (since + now - max(since, self._paused_at), owned, offered)
             self._paused_at = None
-        self.bus.emit("swarm.resumed", actor)
+        self.bus.emit("swarm.resumed", actor, **({"question": question} if question else {}))
+        told = None
+        if (question and question["outcome"] == "dropped" and question.get("why") != "left"
+                and self.is_member(question["asker"])):
+            # the asker takes its defaults: told in place of n_resumed (a wake, also for an external member)
+            told = question["asker"]
+            self.notify(told, "n_question_unanswered", id=question["message_id"])
         for m in self.members():
-            if m["kind"] == AgentKind.LLM:
+            if m["kind"] == AgentKind.LLM and m["name"] != told:
                 runtime = self.runtimes.get(m["name"])
                 # an agent whose activation the pause cut short continues it even with nothing pending
                 if (self.board.open_tasks_of(m["name"]) or self.board.reviews_of(m["name"])
@@ -921,6 +993,160 @@ class Swarm:
                     self.notify(m["name"], "n_resumed")
                 elif runtime is not None:
                     runtime.wake()  # paused -> idle
+
+    # ---- a member's question to the user (docs/SPEC.md §3 "Clarify mode") -----------------------------------
+    def pending_question(self) -> dict | None:
+        """{asker, message_id, since} of the question that holds the pause, else None."""
+        p = self.db.get("paused") or {}
+        if p.get("paused") and p.get("reason") == QUESTION and p.get("asker") and isinstance(p.get("message_id"), int):
+            return {"asker": p["asker"], "message_id": p["message_id"], "since": p.get("since")}
+        return None
+
+    def pause_text(self) -> str:
+        """The pause reason as readable text (swarm_status, an agent's trace)."""
+        q = self.pending_question()
+        if q is not None:
+            return f"waiting for the user's answer to {q['asker']}'s question #{q['message_id']}"
+        return self.pause_reason or "no reason given"
+
+    def ask_user(self, asker: str, message: dict) -> tuple[str, dict]:
+        """send_message(pause_swarm=true) after `message` was stored: the outcome and the details of its result note.
+        Synchronous: nothing can slip in between the send and the pause."""
+        if asker == USER:
+            return "user", {}
+        if USER not in message["recipients"]:
+            return "no_user", {}
+        if not self.config.swarm.clarify:
+            return "off", {}
+        if self.auto_reply_active:
+            return "auto", {}
+        q = self.pending_question()
+        if q is not None:
+            return ("own" if q["asker"] == asker else "pending"), {"asker": q["asker"], "id": q["message_id"]}
+        if self.paused:
+            return "paused", {"reason": self.pause_text()}
+        if self.budget_exceeded():
+            return "budget", {}
+        self.pause(asker, "question", asker=asker, message_id=message["id"], since=time.time())
+        return "asked", {"id": message["id"]}
+
+    def question_answered(self, message: dict, question: dict) -> None:
+        """Mailbox.send hook: the user's `message` answers `question`. Tell the others, then resume (or turn into a
+        budget pause). Never raises: the user's message is stored already."""
+        try:
+            self._tell_answer(message, question)
+        except Exception:
+            log.exception("could not tell the members the answer to question #%s", question["message_id"])
+        try:
+            if self.pending_question() != question:
+                return  # something ended this pause meanwhile
+            outcome = {"asker": question["asker"], "message_id": question["message_id"], "outcome": "answered",
+                       "answer_id": message["id"]}
+            if self.budget_exceeded():
+                self._set_pause(USER, "budget", outcome=outcome)
+            else:
+                self.resume(USER, question=outcome)
+        except Exception:
+            log.exception("could not lift the question pause #%s", question["message_id"])
+
+    def _tell_answer(self, message: dict, question: dict) -> None:
+        """Every other member gets the question with the answer: quietly for AI agents (they are paused; the resume
+        wakes those with work), with a wake for external members (they are not paused)."""
+        asked = self.db.scalar("SELECT text FROM messages WHERE id = ?", (question["message_id"],)) or ""
+        q_text = truncate_middle(asked, QUESTION_CHARS)
+        a_text = truncate_middle(message["text"], QUESTION_CHARS)
+        for m in self.members():
+            name = m["name"]
+            if name == question["asker"]:
+                continue                            # it has its question and gets the answer as the message itself
+            wake = m["kind"] != AgentKind.LLM       # external members are not paused: wait_for_events returns
+            if name in message["recipients"]:       # e.g. the user answered "all": no second copy of the answer
+                self.notify(name, "n_user_answer_seen", wake=wake, asker=question["asker"], id=question["message_id"],
+                            question=q_text, answer_id=message["id"])
+            else:
+                self.notify(name, "n_user_answer", wake=wake, asker=question["asker"], id=question["message_id"],
+                            question=q_text, answer=a_text)
+
+    def _drop_question(self, actor: str, why: str) -> None:
+        """End a question pause without an answer: why "clarify_off" | "left"."""
+        q = self.pending_question()
+        if q is None:
+            return
+        outcome = {"asker": q["asker"], "message_id": q["message_id"], "outcome": "dropped", "why": why}
+        if self.budget_exceeded():
+            self._set_pause(actor, "budget", outcome=outcome)
+            if why != "left" and self.is_member(q["asker"]):
+                self.notify(q["asker"], "n_question_unanswered", id=q["message_id"])
+        else:
+            self.resume(actor, question=outcome)
+        if why == "left" and actor != USER:
+            self.notify(USER, "u_question_left", name=q["asker"], id=q["message_id"], wake=False)
+
+    def _plans(self, name: str, task: Any) -> bool:
+        """`name` has created a task since the planning card `task`: it plans already (as _hint_planner's check)."""
+        return bool(self.db.scalar("SELECT 1 FROM tasks WHERE created_by = ? AND id > ? LIMIT 1", (name, task.id)))
+
+    def _awaits_user_answer(self, name: str, task: Any) -> bool:
+        """`task` is a clarify planning card, `name` has created no task since it (it plans already: the ordinary nags
+        apply again), and `name`'s last message to the user since the card was created is newer than the user's last
+        message to it (named or through "all"). Both bounds keep an old message (an earlier goal) or a note to the user
+        after planning started from silencing the nags for ever. A question the user went on without (a manual
+        resume, a budget pause in its place: n_question_unanswered told the planner so) waits for nothing."""
+        if "planning" not in task.tags or prompts.CLARIFY_TAG not in task.tags:
+            return False
+        if self._plans(name, task):
+            return False
+        asked = self.db.scalar(_LAST_TO, (name, USER, task.created_at))
+        if not asked or asked <= (self.db.scalar(_LAST_TO, (USER, name, task.created_at)) or 0):
+            return False
+        return not self.db.scalar(_DROPPED, (asked,))
+
+    def asks_user(self, name: str, task: Any) -> bool:
+        """The nag guard (docs/SPEC.md §3 "Clarify mode"): the clarify planner waits for the user's answers, so it
+        gets no n_stalled, n_planning_hint or in-activation nudge about its planning card meanwhile."""
+        return bool(self.config.swarm.clarify) and self._awaits_user_answer(name, task)
+
+    def _clarify_switched_off(self, once: bool = False) -> None:
+        """[swarm] clarify is off: a clarify planner that waits for the user is told to plan now (n_clarify_off), and a
+        question pause is lifted. `once` (at start(): nothing records whether the setting changed while the session was
+        stopped): not again for a card whose holder already got n_clarify_off about it."""
+        for t in self.board.list(tag="planning"):
+            # it waits for the user: the card is `waiting` (also after a reply that answered nothing) or the guard
+            # holds; a holder that created a task plans already, so its `waiting` card waits for something else
+            if not (prompts.CLARIFY_TAG in t.tags and t.assignee and self.is_member(t.assignee)
+                    and not self._plans(t.assignee, t)
+                    and (t.status == Status.WAITING or self._awaits_user_answer(t.assignee, t))):
+                continue
+            if once and self.db.scalar("SELECT 1 FROM notifications WHERE recipient = ? AND kind = 'n_clarify_off'"
+                                       " AND json_extract(data, '$.task_id') = ? LIMIT 1", (t.assignee, t.id)):
+                continue
+            self.notify(t.assignee, "n_clarify_off", task_id=t.id)
+        self._drop_question(USER, "clarify_off")
+
+    # the auto-reply lease of a `dreamteam -p` client (docs/SPEC.md §3 "Clarify mode"): in memory only, so a hub or
+    # session restart forgets it, and it ends AUTO_REPLY_GRACE seconds after the client's last sign
+    def auto_reply_seen(self) -> None:
+        self._auto_reply_until = max(self._auto_reply_until, _monotonic() + AUTO_REPLY_GRACE)
+
+    @contextlib.contextmanager
+    def auto_reply_stream(self):
+        """An event stream (WebSocket) of such a client: the lease holds while it is open, and for the grace after."""
+        self._auto_reply_streams += 1
+        self.auto_reply_seen()
+        try:
+            yield
+        finally:
+            self._auto_reply_streams = max(0, self._auto_reply_streams - 1)
+            self.auto_reply_seen()
+
+    @property
+    def auto_reply_active(self) -> bool:
+        return self._auto_reply_streams > 0 or _monotonic() < self._auto_reply_until
+
+    @property
+    def clarifying(self) -> bool:
+        """Effective clarify: [swarm] clarify, unless a `dreamteam -p` client answers questions automatically."""
+        return bool(self.config.swarm.clarify) and not self.auto_reply_active
 
     @property
     def wrapping_up(self) -> bool:
@@ -1059,7 +1285,9 @@ class Swarm:
             if self.jobs.awaited(name):
                 continue  # the end of its job will wake it: it waits for that job, it has not stalled
             runtime.stalled = frozenset()
-            still = [t for t in self.board.open_tasks_of(name) if t.status == Status.IN_PROGRESS and t.id in stalled]
+            # a clarify planner that waits for the user's answers has not stalled (asks_user)
+            still = [t for t in self.board.open_tasks_of(name)
+                     if t.status == Status.IN_PROGRESS and t.id in stalled and not self.asks_user(name, t)]
             if not still or self._stall_woken.get(name) == stalled:
                 continue
             self._stall_woken[name] = stalled
@@ -1076,7 +1304,8 @@ class Swarm:
         holding: dict[str, tuple[frozenset[int], float]] = {}
         for m in self._idle_llm_members():
             name = m["name"]
-            held = frozenset(t.id for t in self.board.open_tasks_of(name) if t.status == Status.IN_PROGRESS)
+            held = frozenset(t.id for t in self.board.open_tasks_of(name)
+                             if t.status == Status.IN_PROGRESS and not self.asks_user(name, t))
             if not held or self.jobs.awaited(name):
                 continue
             key, since = self._idle_holding.get(name, (None, now))
@@ -1097,7 +1326,9 @@ class Swarm:
         LLM steps or `planning_hint_minutes` after it was first seen holding it gets `n_planning_hint` (the others
         wait for the plan's first tasks meanwhile); once more at twice either value, after at least one step since the
         first hint; never more (a re-claim or a restart included), never with nobody else on the team, while paused
-        (the clock stops: resume) or in wrap-up mode. `name`: after one of that member's steps (the
+        (the clock stops: resume) or in wrap-up mode. While [swarm] clarify is on, the holder of a clarify card that
+        has not messaged the user since the card was created gets `n_clarify_hint` in its place (ask now, or plan if
+        there is nothing to ask); the two kinds share the count. `name`: after one of that member's steps (the
         hint is in the same activation's `incoming`); None: the scheduler, for every holder (the time trigger, or a
         holder that went idle). Never raises: it runs inside activations."""
         try:
@@ -1119,6 +1350,11 @@ class Swarm:
             tasks = self.board.open_tasks_of(name) if name else self.board.list(status=Status.IN_PROGRESS, tag="planning")
         held = {t.id: t for t in tasks
                 if t.status == Status.IN_PROGRESS and "planning" in t.tags and t.assignee in self.runtimes}
+        # a clarify planner that waits for the user's answers is not planning yet (asks_user): its watch is dropped,
+        # so the clock starts again once the answer came
+        for task_id in [k for k, t in held.items() if self.asks_user(t.assignee, t)]:
+            del held[task_id]
+            self._planning_watch.pop(task_id, None)
         if name is None:  # the scheduler sees every holder: forget the tasks nobody holds any more
             self._planning_watch = {k: w for k, w in self._planning_watch.items() if k in held}
         now = time.time()
@@ -1126,9 +1362,11 @@ class Swarm:
             holder, runtime = task.assignee, self.runtimes[task.assignee]
             watch = self._planning_watch.get(task.id)
             if watch is None or watch["holder"] != holder:  # claimed (or claimed by another member) since the last look
-                # the hints it already had for this task count (a re-claim, a restart): two at most, ever
-                sent = self.db.scalar("SELECT COUNT(*) FROM notifications WHERE recipient = ? AND kind = ?"
-                                      " AND json_extract(data, '$.id') = ?", (holder, "n_planning_hint", task.id))
+                # the hints it already had for this task count (a re-claim, a restart): two at most, ever, of
+                # both kinds
+                sent = self.db.scalar("SELECT COUNT(*) FROM notifications WHERE recipient = ?"
+                                      " AND kind IN ('n_planning_hint', 'n_clarify_hint')"
+                                      " AND json_extract(data, '$.id') = ?", (holder, task.id))
                 watch = self._planning_watch[task.id] = {"holder": holder, "since": now, "steps": runtime.llm_steps,
                                                          "hints": int(sent or 0), "hinted": -1}
             level = watch["hints"] + 1
@@ -1142,8 +1380,12 @@ class Swarm:
             if len(self.members()) < 2:
                 continue  # nobody waits for its tasks
             watch["hints"], watch["hinted"] = level, runtime.llm_steps
-            self.notify(holder, "n_planning_hint", id=task.id, steps=steps,
-                        elapsed=fmt_duration(elapsed, self.language_of(holder)))
+            # a clarify planner that has not asked the user yet is still finding the forks: it is told to ask now
+            # (or, with nothing to ask, to plan), never to create tasks before the questions
+            asking = (bool(self.config.swarm.clarify) and prompts.CLARIFY_TAG in task.tags
+                      and not self.db.scalar(_LAST_TO, (holder, USER, task.created_at)))
+            key = "n_clarify_hint" if asking else "n_planning_hint"
+            self.notify(holder, key, id=task.id, steps=steps, elapsed=fmt_duration(elapsed, self.language_of(holder)))
 
     def _remind_reviewers(self) -> None:
         """Liveness of reviews: an idle LLM reviewer whose reviews wait longer than agents.idle_nudge_seconds is
@@ -1278,6 +1520,14 @@ class Swarm:
             })
         pause = self.db.get("paused") or {}
         goal = self.goal()
+        question = self.pending_question()
+        if question is not None:
+            asked = self.db.scalar("SELECT text FROM messages WHERE id = ?", (question["message_id"],)) or ""
+            question["text"] = truncate_middle(asked, QUESTION_PREVIEW_CHARS)
+        # the clarify planner waits for the user's answers (asks_user): the board's quiet banner
+        clarify_wait = next(({"name": t.assignee, "task_id": t.id} for t in tasks
+                             if t.status in Status.OPEN and "planning" in t.tags and prompts.CLARIFY_TAG in t.tags
+                             and t.assignee and self.asks_user(t.assignee, t)), None)
         return {
             "swarm": {
                 "name": self.config.swarm.name, "language": self.language, "paused": bool(pause.get("paused")),
@@ -1296,6 +1546,11 @@ class Swarm:
                 "independent_review": self.board.independent_review,
                 "workspace": self.workspace_info(),
                 "network": netoff.describe(self.config),  # {"mode": "on"|"off", "isolation": docker|netns|env}
+                # a member's question that holds the pause: {asker, message_id, since, text} | None
+                "question": question,
+                "clarify": bool(self.config.swarm.clarify),  # the setting ([swarm] clarify)
+                "auto_reply": self.auto_reply_active,  # a `dreamteam -p` client answers questions automatically
+                "clarify_wait": clarify_wait,  # {name, task_id} | None
             },
             "tasks": [t.to_dict() for t in tasks],
             "agents": members,

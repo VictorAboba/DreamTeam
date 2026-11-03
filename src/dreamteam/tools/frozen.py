@@ -33,8 +33,9 @@ from ..db import dumps
 
 log = logging.getLogger(__name__)
 
-# what schemas_for("llm", ...) builds; bump it with EVERY LLM schema change (2: background jobs; 3: skill_propose)
-TOOLSET_REVISION = 3
+# what schemas_for("llm", ...) builds; bump it with EVERY LLM schema change (2: background jobs; 3: skill_propose;
+# 4: send_message pause_swarm)
+TOOLSET_REVISION = 4
 BASELINE_REVISION = 1  # the array agents created before tool sets were frozen last sent (sorted digest e3c5cbc7…)
 KV_PREFIX = "tools:"
 LANGUAGES = ("en", "ru")

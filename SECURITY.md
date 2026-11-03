@@ -11,6 +11,12 @@ Please **don't open a public issue**. Report it privately through
 (the **Security** tab → **Report a vulnerability**). Include the version or commit, your OS, and steps to
 reproduce. You should get an answer within a week.
 
+## Audits
+
+- [Security self-audit, November 2026](docs/en/audits/2026-11-self-audit.md): a DreamTeam swarm audited
+  DreamTeam's own source code, and every finding was checked independently. Fixed issues are published as
+  [security advisories](https://github.com/VictorAboba/DreamTeam/security/advisories).
+
 ## Known limits (not vulnerabilities)
 
 These are documented and expected:
