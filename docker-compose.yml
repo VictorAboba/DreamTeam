@@ -8,6 +8,8 @@ services:
   dreamteam:
     build: .
     image: dreamteam:latest
+    # as `dreamteam sandbox`: no program in the container gains privileges through a set-user-ID bit or file capabilities
+    security_opt: ["no-new-privileges:true"]
     ports:
       - "127.0.0.1:${PORT:-8765}:8765"
     volumes:

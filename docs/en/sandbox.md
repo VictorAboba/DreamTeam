@@ -93,7 +93,11 @@ interface says so plainly:
   network (the `--network off` flag, the settings or an existing session), and DreamTeam drops it right after it sets
   up the firewall. An image built from an old Dockerfile is rebuilt automatically in this case. A session whose network
   was turned off later, in a container without the firewall, gets only the "best effort" option (see below) until the
-  sandbox is restarted: the interface says so.
+  sandbox is restarted: the interface says so. The container runs with `no-new-privileges`: no program in it gains
+  rights through a set-user-ID bit or file capabilities. The hub runs as root, and so do the agents' commands in a
+  session with network (and in one switched off without the firewall): with a rootful Docker daemon on Linux, what
+  they create in the mounted folder belongs to root on the host. For an untrusted goal start the sandbox with the
+  network off, or use rootless Docker, Docker Desktop or `userns-remap`.
 * **Linux**: commands run in a separate network namespace that has only its own localhost, as your own user, as
   before. There is one namespace per DreamTeam process: a server that one command started in the background is
   reachable from the next commands, tests and MCP servers, but the machine's own localhost (the board, your local

@@ -778,6 +778,29 @@ def test_log_cleanup_uses_rows_not_the_folder(make_fake_swarm, monkeypatch):
     assert sorted(p.name for p in folder.iterdir()) == ["j1.log", "j4.log", "j5.log"]
 
 
+def test_log_location_refuses_scratch_swapped_to_link(make_fake_swarm, tmp_path):
+    """A member's `jobs` folder that is a link out of the workspace: the log goes to the data dir instead."""
+    swarm = make_fake_swarm({"workspace": {"git": False}})
+    swarm.workspace = Workspace(swarm)
+    manager = JobManager(swarm)
+    root = swarm.workspace.root
+    outside = tmp_path / "escape"
+    outside.mkdir()
+    jobs_dir = root / ".scratch" / "anna.smith" / "jobs"
+    jobs_dir.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.symlink(outside, jobs_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        if WINDOWS:
+            subprocess.run(["cmd", "/c", "mklink", "/J", str(jobs_dir), str(outside)], capture_output=True)
+        if not jobs_dir.exists():
+            pytest.skip("neither symlinks nor junctions are available")
+    log_value, log_path = manager._log_location(ANNA, 7)
+    assert not str(log_path.resolve()).startswith(str(outside.resolve()))
+    assert Path(log_value).is_absolute()  # the data-dir fallback, not a path under the junction
+    assert list(outside.iterdir()) == []
+
+
 @needs_git
 async def test_job_end_commits_as_owner(git_setup, kids):
     swarm, manager = git_setup

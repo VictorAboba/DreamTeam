@@ -230,9 +230,11 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
     # --init: a tiny init (tini) is PID 1 and reaps orphans (processes the agents' commands leave running), so a
     # zombie never keeps a process group alive; it forwards SIGTERM/SIGINT to dreamteam. Ports that agents' dev
     # servers open inside the container are not published.
-    cmd = [docker, "run", "--rm", "--init", "--name", container_name(port), "-p",
-           f"127.0.0.1:{port}:{CONTAINER_PORT}", "-v", f"{project_dir.resolve()}:/swarm",
-           "-e", f"DREAMTEAM_PUBLIC_URL={public}", "-e", hubauth.DIGEST_ENV]
+    # --security-opt no-new-privileges: no program in the container gains privileges through a set-user-ID bit or
+    # file capabilities; the firewall's NET_ADMIN (given at the start) is kept, and setpriv only drops privileges.
+    cmd = [docker, "run", "--rm", "--init", "--security-opt", "no-new-privileges:true", "--name",
+           container_name(port), "-p", f"127.0.0.1:{port}:{CONTAINER_PORT}", "-v",
+           f"{project_dir.resolve()}:/swarm", "-e", f"DREAMTEAM_PUBLIC_URL={public}", "-e", hubauth.DIGEST_ENV]
     # Skills (docs/SPEC.md §19): the agents have `shell` in the hub's container, so the host's library is mounted
     # read-only (the source `host-library` inside); the sandbox's own library is <home>/.dreamteam/skills-library,
     # which the host never reads by itself. ~/.claude/skills is not mounted: it would show all the user's personal

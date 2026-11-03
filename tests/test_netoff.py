@@ -448,6 +448,24 @@ def test_sandbox_command_grants_net_admin_only_for_the_firewall(tmp_path, monkey
     assert single[-2:] == ["--network", "off"] and "run" in single
 
 
+def test_sandbox_command_sets_no_new_privileges(tmp_path, monkeypatch):
+    monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(tmp_path / "lib"))
+    project = tmp_path / "home"
+    (project / "sessions").mkdir(parents=True)
+    (project / "dreamteam.toml").write_text("", encoding="utf-8")
+    config = Config.load(project)
+    plain = docker_module.sandbox_command(project, 9200, config, docker="docker")
+    i = plain.index("--security-opt")
+    assert plain[i:i + 2] == ["--security-opt", "no-new-privileges:true"]
+    assert plain[:4] == ["docker", "run", "--rm", "--init"]  # inserted after --init, nothing else shifts
+    # the firewall container carries both: NET_ADMIN (granted at start) and no-new-privileges coexist
+    fw = docker_module.sandbox_command(project, 9200, config, docker="docker", firewall=True, network="off")
+    j = fw.index("--security-opt")
+    assert fw[j:j + 2] == ["--security-opt", "no-new-privileges:true"]
+    k = fw.index("--cap-add")
+    assert fw[k:k + 2] == ["--cap-add", "NET_ADMIN"]
+
+
 def test_the_firewall_is_wanted_by_the_flag_the_settings_or_a_session(tmp_path):
     home = tmp_path / "home"
     (home / "sessions" / "001-a").mkdir(parents=True)

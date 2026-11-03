@@ -23,6 +23,11 @@ These are documented and expected:
 
 - Agents run commands with the rights of the user who started the swarm. Use `dreamteam sandbox` (Docker)
   for untrusted goals. Outside Docker they can therefore read whatever that user can read.
+- In `dreamteam sandbox` the hub and the agents' commands of a session with network run as root in the container
+  (those of a session that is without network when the sandbox starts run as an unprivileged user); the
+  container runs with `no-new-privileges`. With a rootful Docker daemon on Linux, what root in the container creates
+  in the mounted folder belongs to root on the host: for untrusted goals start the sandbox with the network off, or
+  use rootless Docker, Docker Desktop or `userns-remap`.
 - A session without network (`network = "off"`) is cut off strictly only in Docker and on Linux. On Windows
   and macOS it is a best-effort setup (proxy variables and offline modes of package managers), not isolation.
 - The server listens on `127.0.0.1` and has no authentication by default. Exposing it to a network without a token

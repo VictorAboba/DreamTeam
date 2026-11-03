@@ -401,7 +401,7 @@ async def test_a_copy_of_the_mirror_can_be_edited_and_proposed(swarm, tmp_path):
     text, is_error = await call_tool(ctx, "skill_propose", {"path": "drafts/fold-copy"})
     assert not is_error, text
     assert swarm.skills.get("fold-better").owner == member
-    # the mirror itself stays refused and read-only; a file with other hard links is not made writable
+    # the mirror itself stays refused and read-only; a file with other hard links is refused, never made writable
     text, is_error = await call_tool(ctx, "write_file", {"path": ".scratch/_skills/fold/SKILL.md", "content": "x"})
     assert is_error and not writable(mirror(swarm, "fold") / "SKILL.md")
     shared = Path(swarm.workspace.root, "shared.txt")
@@ -413,7 +413,7 @@ async def test_a_copy_of_the_mirror_can_be_edited_and_proposed(swarm, tmp_path):
     os.chmod(shared, stat.S_IREAD)
     try:
         text, is_error = await call_tool(ctx, "write_file", {"path": "shared.txt", "content": "two\n"})
-        assert is_error and "Permission denied" in text and (tmp_path / "other-link.txt").read_text() == "one\n"
+        assert is_error and "hard link" in text and (tmp_path / "other-link.txt").read_text() == "one\n"
     finally:
         os.chmod(shared, stat.S_IREAD | stat.S_IWRITE)
 

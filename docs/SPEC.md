@@ -971,6 +971,9 @@ class Workspace:
         # a read-only file elsewhere (a copy of a mirror folder keeps its read-only files) is made writable first
         # (owner write bit), unless it has other hard links; the write is the member's explicit edit
         # old must occur exactly once unless replace_all; ToolError with hints otherwise
+        # write and edit write in one checked step: refused when the file's folder now resolves outside the
+        # workspace, the file became a link, or it has another hard link (st_nlink > 1, checked on the opened file
+        # before it is truncated; resolve() cannot see a hard link); reading such a file is allowed
     def list(self, path: str = ".", depth: int = 2) -> str   # tree text, dirs end with "/", skips .git, sizes;
         # folders named `.scratch` are shown collapsed like the NO_EXPAND ones (".scratch/ (2 entries)"), so the
         # agents' temporary files do not inflate every listing; list(".scratch/<slug>") lists them; tree() (the
@@ -1602,9 +1605,10 @@ HH:MM:SS: all its processes exited` (a job whose shell had ended before it: deta
 exited within the grace) or `# stopped HH:MM:SS (<reason>)`. At half of `job_log_mb` MiB (at
 most 64) the file is renamed to `j<N>.prev.log` and a new one starts with `[earlier output: jN.prev.log]`; while
 someone holds it open (Windows), the rename is retried at every chunk, and at the full size the log ends with `[log
-limit reached: further output is not saved]` (the pipe is still drained). When `.scratch` is not a plain folder of
-the workspace (a file, a link elsewhere) the log is `<data_dir>/jobs/j<N>.log`, shown as `<path> (outside the
-workspace: read it with shell)`. At each adoption the owner's ended logs beyond `JOB_LOGS_KEPT` (20) are deleted (both
+limit reached: further output is not saved]` (the pipe is still drained). When `.scratch` or the member's `jobs`
+folder is not a plain folder of the workspace (a file, a link elsewhere) the log is `<data_dir>/jobs/j<N>.log`,
+shown as `<path> (outside the workspace: read it with shell)`; a stored relative log path is used only while it
+resolves inside the workspace. At each adoption the owner's ended logs beyond `JOB_LOGS_KEPT` (20) are deleted (both
 files), chosen by rows, never by listing the folder (two names may share a slug); a file in use is skipped.
 
 **The monitor**: one task, started at an adoption and ended when no job is left; every `JOB_TICK` (1 s) it checks all
@@ -1872,7 +1876,7 @@ chars / 200 AST nodes.
 | `all_done(tag=None, parent=None)` | ≥1 matching task and all done |
 | `message(sender=None, contains=None)` | a message to the owner arrived after creation/last fire |
 | `comment(task=None, sender=None, contains=None)` | a discussion post (not by the owner) after creation/last fire |
-| `file_exists(path)` / `file_changed(path)` | workspace file exists / mtime > creation/last fire |
+| `file_exists(path)` / `file_changed(path)` | workspace file exists / mtime > creation/last fire; a path outside the workspace (a UNC or device path included, never resolved) is false |
 | `after("2026-10-09 18:00")` | local time reached (ISO) |
 | `elapsed(seconds)` | seconds since creation |
 | `every(seconds)` | ≥ seconds since last fire (min 10); makes the trigger periodic |
@@ -1890,7 +1894,8 @@ class TriggerEngine:
     def list(self, owner: str | None = None, include_inactive: bool = False) -> list[dict]
     def mark_dirty(self) -> None
     def evaluate_all(self) -> int                            # returns number fired
-    async def run(self) -> None                              # loop: wait dirty-or-tick, evaluate_all
+    async def run(self) -> None                              # loop: wait dirty-or-tick, evaluate_all; the files
+                                                             # the active triggers watch are stat'd in a thread first
 ```
 `create` resolves member names in the condition (`sender=` of message/comment, `assignee=` of count,
 `agent_status(name)`) with `swarm.resolve_member(allow_retired=True)` (a unique first name, `@Name`, any
@@ -3365,7 +3370,9 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   process group alive) and forwards `docker stop`'s SIGTERM to dreamteam, whose `Swarm.stop` ends the jobs within
   Docker's 10 s grace (a launcher home unloads its sessions one after another, so with jobs in several sessions the
   last final commits may be cut off; the processes die with the container anyway). Ports that agents' dev servers
-  open inside the container are not published. Only the directory is mounted: for a home,
+  open inside the container are not published. `--security-opt no-new-privileges:true`: no program in the
+  container gains privileges through a set-user-ID bit or file capabilities (the firewall's `NET_ADMIN` is given at
+  the start, `setpriv` only drops). Only the directory is mounted: for a home,
   `docker.outside_home_warning(home)` prints a warning listing the sessions whose workspace folder is outside it
   (`external_workspaces`): they cannot start in the container (their start reports the missing folder). A folder
   inside the home is found in the container (session.json `in_home`, §17.2). The host's skills library is mounted
