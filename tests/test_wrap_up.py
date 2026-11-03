@@ -418,7 +418,7 @@ def test_launcher_mcp_session_line_shows_wrap_up():
 
 def test_read_stats_defaults_without_a_readable_database(tmp_path, monkeypatch):
     """A missing database, one that cannot be opened and a file that is no database give the same defaults: not
-    paused, no wrap-up, nothing counted (the launcher's cards and lists rely on them)."""
+    paused, no question, no wrap-up, nothing counted (the launcher's cards and lists rely on them)."""
     import sqlite3
 
     import dreamteam.sessions as sessions_module
@@ -427,7 +427,7 @@ def test_read_stats_defaults_without_a_readable_database(tmp_path, monkeypatch):
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
-        "jobs": {"running": 0},
+        "jobs": {"running": 0}, "question": None,
     }
     assert read_stats(tmp_path / "nope.db") == defaults
     garbage = tmp_path / "garbage.db"

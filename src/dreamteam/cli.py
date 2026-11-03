@@ -446,6 +446,8 @@ def cmd_run(args) -> int:
     config = Config.load(project)
     if args.network:  # for this run only: the settings file keeps its [swarm] network
         config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, network=args.network))
+    if args.clarify is not None:  # the same for [swarm] clarify (--clarify / --no-clarify)
+        config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, clarify=args.clarify))
     host = args.host or config.server.host
     port = args.port or config.server.port
     existing = running_hub(project)  # (before the token check: it creates nothing, and needs no token of this process)
@@ -724,12 +726,13 @@ def _print_sessions(home: Path, base: str | None) -> int:
 async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_browser: bool,
                       goal: str | None = None, title: str | None = None, start: str | None = None,
                       stop: asyncio.Event | None = None, workspace: str | None = None,
-                      skills: list[str] | None = None, network: str | None = None) -> int:
+                      skills: list[str] | None = None, network: str | None = None,
+                      clarify: bool | None = None) -> int:
     """Run the launcher (sessions page, settings, every session's board, MCP) until a stop signal, the
     console's /quit or a server failure. `goal` creates and starts a new session (working in the absolute
     folder `workspace` when given, docs/SPEC.md §17.2; with the skills `skills`, §19; [swarm] network `network`,
-    §7.2); `start` starts an existing one. hub.json exists exactly while the server listens; all sessions stop at
-    the end."""
+    §7.2; [swarm] clarify `clarify` when not None, §3); `start` starts an existing one. hub.json exists exactly
+    while the server listens; all sessions stop at the end."""
     from .launcher import serve_launcher
     from .launcher_mcp import workspace_text
     from .sessions import SessionManager
@@ -753,7 +756,9 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                 await manager.start(start)
                 focus = start
             if goal:
-                overrides = {"swarm": {"network": network}} if network else None
+                swarm_over = {**({"network": network} if network else {}),
+                              **({"clarify": clarify} if clarify is not None else {})}
+                overrides = {"swarm": swarm_over} if swarm_over else None
                 created = await manager.create(title or "", goal, overrides=overrides, workspace=workspace,
                                                skills=skills, via="cli")
                 focus = created["id"]
@@ -838,6 +843,10 @@ def cmd_serve(args) -> int:
         print("--network needs --goal: it is the network of the session that --goal creates (an existing session "
               "changes it in its settings).", file=sys.stderr)
         return 2
+    if args.clarify is not None and not args.goal:
+        print("--clarify needs --goal: it is a setting of the session that --goal creates (an existing session "
+              "changes it in its ⚙ settings or with /clarify).", file=sys.stderr)
+        return 2
     skills = None
     if args.skill:
         if not args.goal:
@@ -862,7 +871,7 @@ def cmd_serve(args) -> int:
     try:
         return asyncio.run(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
                                        goal=args.goal, title=args.title, workspace=workspace, skills=skills,
-                                       network=args.network))
+                                       network=args.network, clarify=args.clarify))
     except KeyboardInterrupt:
         return 0
 
@@ -1243,6 +1252,8 @@ def cmd_tui(args) -> int:
                  "title": args.title}
     if args.network:  # only when given (docs/SPEC.md §7.2): the TUI turns it into swarm.network
         overrides["network"] = args.network
+    if args.clarify is not None:  # the same for swarm.clarify (also --no-clarify over a global true)
+        overrides["clarify"] = args.clarify
     if args.team is not None:
         try:  # checked here, before a session or the TUI starts (the TUI turns it into swarm.starting_roles)
             roles.parse_team(args.team)
@@ -1269,6 +1280,15 @@ def cmd_tui(args) -> int:
     if args.print:
         from .tui import main_print
 
+        # (the interactive TUI keeps --clarify with -c / -r: there it is the window's setting for new sessions)
+        if args.clarify is not None and (args.continue_last or args.resume is not None):
+            print("dreamteam -p: --clarify is a setting of a new session; change an existing one with /clarify in "
+                  "dreamteam tui or in its ⚙ settings on the board.", file=sys.stderr)
+            return 2
+        if args.clarify and not args.no_auto_reply:
+            print("dreamteam -p: --clarify needs --no-auto-reply: with automatic replies nobody answers the "
+                  "questions, and the session plans as usual.", file=sys.stderr)
+            return 2
         piped = _piped_stdin()  # `cat log.txt | dreamteam -p "что тут не так?"`: the piped text goes along
         if piped:
             prompt = f"{prompt}\n\n{piped}" if prompt else piped
@@ -1332,6 +1352,10 @@ def _default_command(argv: list[str], commands: list[str]) -> list[str]:
 
 NETWORK_HELP = ("off: the agents' commands, their background jobs and MCP servers get no internet (the LLM "
                 "keeps it): strict in the Docker sandbox and on Linux, best effort elsewhere (docs/SPEC.md §7.2)")
+_CLARIFY_WHAT = ("the planner asks you about its forks before any task while the other agents wait, and an agent's "
+                 "critical question pauses the swarm until you answer")
+CLARIFY_HELP = (f"a new session clarifies its goal first: {_CLARIFY_WHAT} ([swarm] clarify; with -p only together "
+                "with --no-auto-reply)")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1378,6 +1402,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host", help="host of the launcher started in-process (when none runs)")
     s.add_argument("--port", type=int, help="port of the launcher started in-process")
     s.add_argument("--network", choices=netoff.NETWORK_MODES, help="a new session's network; " + NETWORK_HELP)
+    s.add_argument("--clarify", action=argparse.BooleanOptionalAction, default=None, help=CLARIFY_HELP)
     s.set_defaults(func=cmd_tui, dir=None)
 
     s = sub.add_parser("serve", help="start DreamTeam headless: the sessions page, settings, every session's "
@@ -1395,6 +1420,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --goal: a skill for that session (repeatable), as for `dreamteam --skill`")
     s.add_argument("--network", choices=netoff.NETWORK_MODES, help="with --goal: that session's network; "
                                                                    + NETWORK_HELP)
+    s.add_argument("--clarify", action=argparse.BooleanOptionalAction, default=None,
+                   help=f"with --goal: that session clarifies its goal first: {_CLARIFY_WHAT} ([swarm] clarify)")
     s.add_argument("--no-console", action="store_true")
     s.add_argument("--no-browser", action="store_true", help="do not open the browser")
     s.set_defaults(func=cmd_serve)
@@ -1441,6 +1468,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--open", action="store_true", help="open the board in a browser")
     s.add_argument("--network", choices=netoff.NETWORK_MODES, help="the swarm's network for this run ([swarm] "
                                                                    "network otherwise); " + NETWORK_HELP)
+    s.add_argument("--clarify", action=argparse.BooleanOptionalAction, default=None,
+                   help=f"for this run ([swarm] clarify otherwise): a new goal is clarified first: {_CLARIFY_WHAT}")
     s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("console", help="chat with a running swarm (session) in the terminal")

@@ -6,11 +6,12 @@ Global settings live in `<home>/dreamteam.toml`. It is easier to change them on 
 the values before saving and keeps the previous version in `dreamteam.toml.bak`. Editing the file by hand also works,
 but comments are not kept when you save from the UI; an edit of the file while the server runs is picked up. When you
 create a session, you can override the language, the starting team (roles and number of agents), the budget, the
-model profile, the number of steps and MCP approval. These values are stored in `sessions/<id>/session.json`; the rest
-comes from the global settings.
+model profile, the number of steps, MCP approval and [clarify mode](features.md). These values are stored in
+`sessions/<id>/session.json`; the rest comes from the global settings.
 For a session that already exists, the ⚙ button on its page changes the budget and max agents, as well as the
-session's own background job limits (per member, per session, time limit, compute threads) and agent parameters
-(steps per wake-up, context window, tool output limit, nudging idle agents, parallel LLM calls). An empty field means
+session's own background job limits (per member, per session, time limit, compute threads), agent parameters
+(steps per wake-up, context window, tool output limit, nudging idle agents, parallel LLM calls), the network and
+clarify mode. An empty field means
 the value from the general settings; changes apply at once, with no restart. For the `main` session (and the
 `dreamteam run` board), ⚙ changes only the budget and max agents: the rest is set in the general settings.
 The goal is set when you create a session (the `goal` key in `[swarm]` is used only in `dreamteam run` mode and in the
@@ -26,6 +27,7 @@ max_cost_usd = 5.0       # budget; when it runs out, the swarm pauses
 starting_roles = []      # the starting team in order: ["architect", "developer", "developer", "tester"]
 independent_review = true # another member accepts an agent's task (or you, if there is no one else)
 network = "on"           # "off": the agents' commands and MCP servers have no internet (see "Session without internet")
+clarify = false          # true: the planner asks you about the goal first; a critical question pauses the swarm
 
 [[roles]]                # your own role in the catalog (to change a built-in one, give its id: name = "tester")
 name = "Designer"

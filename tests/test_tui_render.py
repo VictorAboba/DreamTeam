@@ -587,6 +587,87 @@ def test_team_pause_and_notification_lines():
     assert render.event(c, {"type": "_connection", "data": {"state": "connected"}}) is None
 
 
+def test_question_pause_rendering():
+    """A member's question that pauses the swarm (send_message pause_swarm, docs/SPEC.md §3 "Clarify mode"): its
+    pause line at every verbosity, the four ways it ends, the spinner, the session status and the notifications."""
+    from dreamteam.tui.dialogs import session_status
+
+    paused = ev("swarm.paused", ANNA, reason="question", asker=ANNA, message_id=12, since=NOW)
+    for verbosity in render.VERBOSITY:
+        assert plain(render.event(ctx(verbosity), paused)) == "⏸ Рой ждёт вашего ответа агенту Анна"
+        assert plain(render.event(ctx(verbosity, lang="en"), paused)) == "⏸ The swarm waits for your answer to Анна"
+    assert plain(render.event(ctx(lang="en"), ev("swarm.paused", None, reason="question"))) == \
+        "⏸ The swarm is paused (waiting for your answer)"            # (no asker: the reason)
+    # the answer came when the budget was spent: a budget pause, as any other
+    turned = ev("swarm.paused", "user", reason="budget",
+                question={"asker": ANNA, "message_id": 12, "outcome": "answered", "answer_id": 14})
+    assert plain(render.event(ctx(), turned)) == "⏸ Рой на паузе (исчерпан бюджет)"
+    ends = {(("outcome", "answered"), ("answer_id", 14)): ("▶ Рой продолжает работу: ваш ответ на вопрос #12 получили "
+                                                           "все участники",
+                                                           "▶ The swarm is back to work: every member got your answer "
+                                                           "to question #12"),
+            (("outcome", "dropped"), ("why", "resumed")): ("▶ Рой продолжает работу без ответа на вопрос #12",
+                                                           "▶ The swarm is back to work without an answer to question "
+                                                           "#12"),
+            (("outcome", "dropped"), ("why", "clarify_off")): ("▶ Уточнение цели выключено: рой продолжает работу без "
+                                                               "ответа на вопрос #12",
+                                                               "▶ Clarifying is off: the swarm is back to work without "
+                                                               "an answer to question #12"),
+            (("outcome", "dropped"), ("why", "left")): ("▶ Анна покинул(а) рой: рой продолжает работу без ответа на "
+                                                        "вопрос #12",
+                                                        "▶ Анна left the swarm: it is back to work without an answer "
+                                                        "to question #12")}
+    for items, (ru, en) in ends.items():
+        resumed = ev("swarm.resumed", "user", question={"asker": ANNA, "message_id": 12, **dict(items)})
+        for verbosity in render.VERBOSITY:
+            assert plain(render.event(ctx(verbosity), resumed), 200) == ru
+            assert plain(render.event(ctx(verbosity, lang="en"), resumed), 200) == en
+    assert plain(render.event(ctx(), ev("swarm.resumed", "user"))) == "▶ Рой продолжает работу"
+
+    def spinner(question=None, paused=True, lang="en") -> str:
+        line = render.spinner_line(ctx(lang=lang, width=200), frame=0, verb="Working", working=[], elapsed=3.0,
+                                   tokens_in=0, tokens_out=0, cost=0.0, paused=paused, question=question)
+        return "".join(text for _, text in line)
+
+    question = {"asker": ANNA, "message_id": 12}
+    assert spinner(question) == "⏸ The swarm waits for your answer to Анна (answer Анна, or /pause to go on without " \
+                                "an answer)"
+    assert spinner(question, lang="ru") == "⏸ Рой ждёт вашего ответа агенту Анна (ответьте агенту Анна или /pause — " \
+                                           "без ответа)"
+    assert spinner() == "⏸ The swarm is paused (/pause to resume)"
+    assert "esc to pause" in spinner(question, paused=False)         # (a stale question of a running swarm)
+
+    running = {"status": "running", "paused": True, "pause_reason": "question", "question": question}
+    assert render._session_status(ctx(), running) == ("ждёт ответа", theme.WARN)
+    assert render._session_status(ctx(), {**running, "pause_reason": "budget"}) == ("пауза", theme.WARN)
+    assert session_status("en", running) == "waits for you" and session_status("en", {**running, "pause_reason": ""}) \
+        == "paused"
+    assert "waits for you" in plain(render.sessions_table(ctx(lang="en"), [{**SESSIONS[0], **running}]))
+
+    for verbosity in render.VERBOSITY:   # the pause line, the spinner and the box's title say it
+        note = ev("notification", None, recipient="user", kind="u_question", text="Анна Смирнова asked you a question")
+        assert render.event(ctx(verbosity), note) is None
+    left = ev("notification", None, recipient="user", kind="u_question_left", text="Анна Смирнова left the swarm")
+    assert plain(render.event(ctx(lang="en"), left)) == "🔔 Анна Смирнова left the swarm"
+    assert "u_question_left" in render._WARN_NOTES and "u_question" in render._QUIET_SKIP_NOTES
+
+    report = plain(render.status_report(ctx(lang="en"), {"network": {"mode": "on"}, "clarify": True,
+                                                        "question": "Анна Смирнова, #12: «Which colour?»",
+                                                        "tracing": False}), 120)
+    lines = [line.strip() for line in report.splitlines()]
+    names = [line.split("  ")[0] for line in lines[1:]]
+    assert names == ["Agents' internet", "Clarify first", "Question for you", "Traces"]
+    assert any(line.startswith("Clarify first") and line.endswith("on") for line in lines)
+    assert any(line.endswith("Анна Смирнова, #12: «Which colour?»") for line in lines)
+    # no new event types: the question rides on swarm.paused / swarm.resumed
+    assert not [t for t in render.EVENT_TYPES if "question" in t or "clarify" in t]
+    fields = lambda s: {f for _, f, _, _ in string.Formatter().parse(s) if f}  # noqa: E731
+    for key, names_ in {"paused_question": {"name"}, "sp_answer": {"name"}, "box_answer": {"id"},
+                        "q_still_waiting": {"name", "id"}, "resumed_answered": {"id"}, "resumed_left": {"name", "id"},
+                        "clarify_session_state": {"state", "source"}, "clarify_new_state": {"state", "source"}}.items():
+        assert fields(i18n.TEXTS["ru"][key]) == fields(i18n.TEXTS["en"][key]) == names_, key
+
+
 def test_background_job_lines():
     c = ctx()
     assert plain(render.event(c, ev("job.started", ANNA, job=job()))) == \

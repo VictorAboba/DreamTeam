@@ -53,11 +53,17 @@ class HubClient:
         # launcher's own address when connect() started it in this process
     base_url: str
     mode: str                              # "launcher" | "swarm" (after hub_info())
+    auto_reply: bool = False               # True: every request and the WebSocket handshake carry
+                                           # `X-DreamTeam-Auto-Reply: 1` (models.AUTO_REPLY_HEADER; only print mode
+                                           # with automatic replies sets it, §2)
     async def aclose(self) -> None
     async def hub_info(self) -> dict       # GET /api/hub; sets .mode ("launcher" if data["mode"] == "launcher")
     # launcher level (HubError(404/405) on a single-swarm hub)
     async def sessions(self) -> list[dict]                         # GET /api/sessions -> ["sessions"]
     async def session(self, sid: str) -> dict                      # GET /api/sessions/{sid}: {"session", "config"}
+    async def update_session(self, sid: str, settings: dict) -> dict
+        # PATCH /api/sessions/{sid} {"settings": settings} -> {"session", "config"} (`/clarify on|off`: {"swarm":
+        # {"clarify": bool}}; SPEC §17.2 "Partial update")
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
                              start: bool = True, workspace: str | None = None,
                              skills: list[str] | None = None) -> dict
@@ -161,7 +167,8 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     started if stopped. The prompt is then sent as a user message to the session's coordinator: the
     assignee of the planning task, else the first LLM agent. When that session has no goal yet, the prompt
     becomes its goal (`set_goal`). A session paused by the user (not by the budget) is resumed: the prompt
-    is a new instruction to work on.
+    is a new instruction to work on. A session paused for a member's question (the state's `swarm.question`,
+    SPEC §3.1) is not resumed: the prompt goes to the asker instead, which makes it the answer.
 - It follows the session's WebSocket stream until it ends:
   - `goal.completed` → exit code 0;
   - `swarm.paused` with reason "budget" → 2;
@@ -188,6 +195,51 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
 
   `--no-auto-reply` leaves such a task in review: the run then waits until `--timeout` (exit 3), and without a
   timeout until it is interrupted.
+- Questions that pause the swarm (`[swarm] clarify`, SPEC §3.1):
+  - With `auto_reply` the client sends `X-DreamTeam-Auto-Reply: 1` (`client.auto_reply`; `run_print` gives it back
+    its earlier value at the end) on every request and on the stream's handshake. That holds the session's
+    auto-reply lease: the session plans with the classic planning card and `pause_swarm` is ignored, so `-p` works
+    as before, even with a global `clarify = true`.
+  - Self-heal: a question pause that slips through a gap of the lease (a hub restart, a session reload) is answered
+    by the run itself. A `swarm.paused` event with reason `question`, or such a pause found in the state at catch-up
+    (after every (re)connect), gets the auto-reply above sent to the asker with `reply_to` = the question
+    (`on_question`; past `AUTO_REPLY_MAX` too, never twice for one question: an auto-reply `on_message` already sent
+    counts). At attach (`-c`/`-r`) the prompt itself is the answer (above); a completed goal is reopened instead, and
+    catch-up then answers the question. The run never resumes a question pause by hand.
+  - A failed auto-reply (a `HubError` or `ok` false; `send_auto_reply` is the only sender of `AUTO_REPLY`) is logged
+    and never aborts a catch-up's replay: the message id is taken back out of `replied_to` (`on_message` also takes
+    back its count against `AUTO_REPLY_MAX`), and a re-check is scheduled `HEAL_AFTER` (2 s) later, the delay
+    doubling on each failure up to `HEAL_MAX` (30 s) and back to 2 s after a success. `heal()` runs from the idle
+    branch of the follow loop when it is due and only while the stream is connected: it moves the next re-check on
+    first (a failed state read never loops), reads the state and, while a question pause is still pending, answers
+    it (`on_question(..., recheck=True)`). While a re-check is pending, only `heal` answers a question (the
+    `swarm.paused` event and catch-up wait for it), so an answer the hub took although its response was lost is not
+    sent twice; an answer that succeeded is never sent again. (Only a hub that finishes a timed-out act after that
+    state read could get one more `AUTO_REPLY`: an ordinary message then, since the first one answered.)
+  - `--no-auto-reply` sends no header. With clarify on (`--clarify`, the global or the session's setting) a question
+    pause waits, like an unanswered question, until a human answers on the board or in `dreamteam tui`, else until
+    `--timeout` (exit 3). In the `text` and `json` formats `err` gets one line per question pause:
+    - ru: «Рой ждёт вашего ответа: {name} спрашивает (сообщение #{id}). Ответьте на доске ({url}) или в dreamteam
+      tui — ответ получат все участники. До тех пор этот запуск ждёт (или до --timeout).»
+    - en: "The swarm waits for your answer: {name} asks (message #{id}). Answer on the board ({url}) or in dreamteam
+      tui; every member gets the answer. Until then this run waits (or ends at --timeout)."
+
+    and, in a session that clarifies (the summary's or the state's `clarify`), one line per agent message to the
+    user, the clarify planner's ordinary questions included (they never pause); without `--timeout` (`asked`):
+    - ru: «{name} спрашивает вас (сообщение #{id}): ответьте на доске ({url}) или в dreamteam tui. До тех пор рой может
+      ждать вас (и этот запуск тоже ждёт).»
+    - en: "{name} asks you (message #{id}): answer on the board ({url}) or in dreamteam tui. Until then the swarm may
+      wait for you (and this run waits too)."
+
+    and with `--timeout` (`asked_timeout`):
+    - ru: «{name} спрашивает вас (сообщение #{id}): ответьте на доске ({url}) или в dreamteam tui. До тех пор рой может
+      ждать вас (а этот запуск закончится по --timeout).»
+    - en: "{name} asks you (message #{id}): answer on the board ({url}) or in dreamteam tui. Until then the swarm may
+      wait for you (and this run ends at --timeout)."
+
+    `{url}` is the session board. A `pause_swarm` question in a clarifying session gets both lines for the same
+    message: `asked` or `asked_timeout` (the message) first, then `question` (the pause). `stream-json` gets no such
+    lines: its events show the pause.
 - Output:
   - `text`: on success, the goal summary is printed to `out` (plain text); on failure, a one-line reason goes
     to `err`. With `verbose`, a compact progress feed goes to `err`: the plain-text rendering of the
@@ -270,7 +322,13 @@ class RenderContext:
   <error>`; a build starting and the manual states (off, unsupported, unavailable) only in verbose.
 - Hires: `+ Анна Смирнова (Аналитик) присоединилась` (gendered verb not required: use «в команде»).
   Retire: `− Анна покинула рой`.
-- Pause/resume renders as `⏸ Рой на паузе (причина)` / `▶ Рой продолжает работу`.
+- Pause/resume renders as `⏸ Рой на паузе (причина)` / `▶ Рой продолжает работу`. A pause for a member's question
+  (reason `question`, SPEC §3.1) is a warning line at every verbosity, `⏸ Рой ждёт вашего ответа агенту Анна` / "The
+  swarm waits for your answer to Anna" (the first name); a resume that ends one says how: «Рой продолжает работу: ваш
+  ответ на вопрос #12 получили все участники» (answered), «Рой продолжает работу без ответа на вопрос #12» (resumed by
+  hand), «Уточнение цели выключено: рой продолжает работу без ответа на вопрос #12» (`clarify_off`), «Анна покинул(а)
+  рой: рой продолжает работу без ответа на вопрос #12» (`left`). The `u_question` notice is not printed (the pause
+  line says it); `u_question_left` is a warning line.
 - Wrap-up mode (`swarm.wrap_up`) renders as a warning line `⚠ вы: режим завершения — агенты завершают задачи с тем,
   что есть, без новых вычислений и фоновых процессов` / a dim `· вы: режим завершения выключен`.
 - Quiet shows only messages to/from the user, the goal, errors, approvals and pause/budget/wrap-up lines.
@@ -324,7 +382,9 @@ def sessions_table(ctx, sessions: list[dict], current: str | None = None) -> Ren
 def cost_table(ctx, state: dict) -> RenderableType       # per agent tokens in/out, cost; total vs budget
 def status_report(ctx, info: dict) -> RenderableType     # version, home, web, session, goal, models, language, agents,
                                                          # jobs ({"running": N, "ids": ["j3", "j5"]}: «2 работают
-                                                         # (j3, j5)»), tracing
+                                                         # (j3, j5)»), tracing, clarify («Уточнение цели»: on/off),
+                                                         # question («Вопрос к вам»: «Анна Смирнова, #12: «…»», the
+                                                         # first 80 characters)
 def traces_list(ctx, traces: list[dict]) -> RenderableType
 def trace_detail(ctx, trace: dict) -> RenderableType     # header + spans as ⏺/⎿ lines (llm: tokens, cost, stop, calls)
 def span_detail(ctx, span: dict) -> RenderableType
@@ -349,8 +409,10 @@ SPINNER_FRAMES = ("·", "✢", "✳", "✶", "✻", "✽")  # ping-pong like Cla
 def spinner_verbs(lang) -> list[str]   # ru: Совещаются, Планируют, Размышляют, Колдуют, Мозгуют, Кодят, Шуршат…;
                                        # en: Huddling, Scheming, Pondering, Tinkering, Swarming, Brewing…
 def spinner_line(ctx, *, frame: int, verb: str, working: list[str], elapsed: float, tokens_in: int,
-                 tokens_out: int, cost: float, paused: bool) -> list[tuple[str, str]]
-    # "✻ Совещаются… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc — пауза)  Анна, Борис"
+                 tokens_out: int, cost: float, paused: bool, question: dict | None = None) -> list[tuple[str, str]]
+    # "✻ Совещаются… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc — пауза)  Анна, Борис"; with `question` ({asker,
+    # message_id}, only while paused): "⏸ Рой ждёт вашего ответа агенту Анна" and the hint «ответьте агенту Анна
+    # или /pause — без ответа» / "answer Anna, or /pause to go on without an answer"
 def status_line(ctx, *, session: dict | None, addressee: str | None, agents_total: int, working: int,
                 spent: float, budget: float, model: str | None, verbosity: str, connected: bool,
                 hint: str | None, jobs: int = 0) -> tuple[list, list]   # (left, right) parts
@@ -387,6 +449,8 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 
 - The border is accent-coloured. It is pink in bash mode (input starts with `!`) and yellow while a dialog is
   open.
+- While the addressee is the asker of a question pause (SPEC §3.1), the title reads `→ Анна · ответ на #12 — его
+  получат все` / "→ Anna · answer to #12: everyone gets it".
 - Placeholder (one line: cut with `…` to the free width of the box):
   - without a session: «Опишите цель (первая строка — заголовок, Alt+Enter — новая строка) — DreamTeam соберёт
     команду и начнёт работу»;
@@ -412,7 +476,11 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 - `@Имя Фамилия текст` / `@all текст` sends to that member and makes them the sticky addressee. A first
   name alone is enough when unique, as in console.match_addressee.
 - The default addressee is the agent who last messaged the user, else the planning task's assignee, else
-  `all`. It is shown in the box title.
+  `all`. It is shown in the box title. A question pause (SPEC §3.1) makes its asker the addressee at once (even
+  within the 60 s of an explicit choice; once per question, so a later `@Name` of the user stands, and a state
+  refresh does not take it back), and other agents' messages do not take it away while the question is pending,
+  so plain text answers it. A message sent to someone else meanwhile (not the asker, not `all`) prints
+  «Рой всё ещё ждёт вашего ответа агенту Анна (вопрос #12): @Анна <ответ>».
 - `!command` is bash mode. It runs `command` in the session's folder when the hub is local
   (`conn.owned` or the hub's home == conn.home) with a 120 s timeout, using the shell from settings
   (`shell.resolve_shell`), and prints `bash_result`. The folder is the path of `swarm.workspace` in the state
@@ -436,7 +504,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/help` | commands table + key hints |
 | `/new [цель]` | new session (asks for the goal when omitted: the next input is the goal); first line = title, the rest = description |
 | `/team [роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); without an argument shows it; the settings stay as they are |
-| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза») or, in the user's wrap-up mode, «завершается» / "wrapping up" |
+| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" (warn) while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up" |
 | `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
 | `/board` | the board (`board`) |
@@ -454,8 +522,9 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/cost` | spending per agent |
 | `/status` | setup and session status (with the session folder) |
 | `/model [профиль]` | list model profiles (✓ default); with an argument set the default profile in the settings (new sessions and new hires) |
-| `/pause` | pause / resume the swarm (toggle, `swarm_control`) |
+| `/pause` | pause / resume the swarm (toggle, `swarm_control`); during a question pause it resumes without the answer (the asker takes its own defaults) |
 | `/wrapup [off]` | wrap-up mode on (`on`/`вкл` or nothing) or off (`off`/`выкл`): the agents finish their tasks with what they have, start no new computations, and no new background jobs start (`swarm_control` wrap_up; the `swarm.wrap_up` event prints the change, a no-op prints the tool's answer) |
+| `/clarify [on\|off]` | clarify mode, `[swarm] clarify` (SPEC §3.1): questions before the plan, and an agent's critical question pauses the swarm (`on`/`вкл`, `off`/`выкл`; anything else: the usage line). In a session: that session's setting (`update_session` {"swarm": {"clarify": bool}}; «В этой сессии цель уточняется: …» / «…не уточняется: …»; the planning task already on the board stays as it is), without an argument its state («Уточнение цели в этой сессии: вкл (своя настройка сессии)», or «как в общих настройках»); `main` has no settings of its own: without an argument it shows the general setting as its state («Уточнение цели в этой сессии: вкл (как в общих настройках)»: main has no overrides), and `on` / `off` change nothing and send no PATCH («У сессии main нет своих настроек: уточнение цели задаётся в общих настройках»). Without a session: the window's new sessions (§4.5), without an argument their state (source «настройка этого окна» or «как в общих настройках»). Launcher only |
 | `/budget N`, `/max N` | limits |
 | `/approve имя`, `/approve N [комментарий]` | MCP approval; accept a task in review (`task_review`) |
 | `/reject имя [почему]`, `/reject N что исправить` | MCP rejection; return a task in review (the comment is required; after N it is free text taken as typed, without one pair of quotes around all of it) |
@@ -477,7 +546,7 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
 | Alt+Enter, Ctrl+J, `\`+Enter | newline |
 | Tab | complete the selected suggestion |
 | ↑/↓ | move in suggestions, else history |
-| Esc | close suggestions or a dialog; else interrupt a running `!command`; else, while agents work: pause the swarm (prints `⏸ …`). Neither Esc nor `/pause` stops the agents' background jobs (`/jobs stop jN` does) |
+| Esc | close suggestions or a dialog; else interrupt a running `!command`; else, while agents work: pause the swarm (prints `⏸ …`). Neither Esc nor `/pause` stops the agents' background jobs (`/jobs stop jN` does); `/pause` during a question pause goes on without the answer |
 | Shift+Tab | cycle verbosity quiet → normal → verbose (shown in the status line) |
 | Ctrl+O | toggle verbose |
 | Ctrl+C | clear the input; else interrupt a running `!command`; on an empty input "Нажмите Ctrl+C ещё раз для выхода" (2 s), twice → exit |
@@ -516,6 +585,15 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   are not lost silently: after the confirmation a `ChoiceDialog` «Скиллы ждут решения» names them and offers
   «Сохранить в библиотеку и удалить» (`skills=save`; a clash with the library refuses the delete, printed) /
   «Удалить вместе с ними» (`discard`) / «Отмена».
+- Clarify mode of new sessions (SPEC §3.1): `--clarify` / `--no-clarify` and `/clarify on|off` without a session are
+  window-wide, like `/team` (not one-shot, like `/cd`): both set `overrides["swarm"]["clarify"]` (an explicit bool)
+  of every session this window creates from then on («Новые сессии из этого окна сначала уточняют цель (/clarify off
+  — выключить)» / «…не уточняют цель (/clarify on — включить)»; with a launcher, nothing attached and clarify on, the
+  start prints the first line too). `/clarify on|off` in a session changes only that session.
+- A question pause (SPEC §3.1; `swarm.paused` with reason `question`, or the state's `swarm.question` after an
+  attach or a reconnect) sets the TUI's `question` {asker, message_id}: the asker becomes the addressee (§4.2), the
+  box title and the spinner say whom to answer; any other `swarm.paused` (a budget pause that ended the question
+  included) or a `swarm.resumed` clears it.
 - The session folder, `/cd` (launcher sessions; SPEC §17.2 "Workspace folder"). Without a current session,
   `/cd PATH` only chooses the folder of the next session created here (the same as `--workspace`, checked by
   the hub when the session is created; «Новая сессия будет работать в папке …»), `/cd --default` forgets it.
@@ -626,5 +704,10 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   session of `-p`): `~` and relative paths are resolved against the current directory; an empty or missing
   folder becomes its workspace, a folder with files (the user's project) is adopted (SPEC §17.2). With `-c` /
   `-r`, or for a file, it is refused (exit 2): an existing session moves with `/cd`.
+- `--clarify` / `--no-clarify` (default: the settings) is `[swarm] clarify` of the sessions this window creates
+  (`overrides["clarify"]`, window-wide like `/clarify` without a session, §4.5; with `-c` / `-r` too). With `-p`,
+  `--clarify` needs `--no-auto-reply` (else exit 2: with automatic replies nobody answers the questions, and the
+  session plans as usual), and either flag is refused with `-c` / `-r` (exit 2, checked first: change an existing
+  session with `/clarify` or in its ⚙ settings).
 - `dreamteam tui` (alias `chat`) is the explicit subcommand with the same options.
 - `serve` stays the headless web server; `run` stays the legacy single-swarm mode.

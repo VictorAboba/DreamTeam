@@ -661,11 +661,12 @@ def _ev_message(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     return _mail_line(ctx, sender, recipients, msg.get("text"), full=ctx.verbose)
 
 
-_QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined"})  # the goal panel / hire line say it
+# the goal panel / hire line / the question's pause line (with the spinner and the input box's title) say it
+_QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined", "u_question"})
 # the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user
 _WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
                          "u_review_handed_over", "u_reviews_waiting", "u_skill_proposed", "u_skill_deps_failed",
-                         "u_role_skills_missing", "u_role_skills_over_cap"})
+                         "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left"})
 
 
 def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -883,18 +884,32 @@ def _ev_mcp(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 
 def _reason(ctx: RenderContext, reason: Any) -> str:
     raw = clean(reason)
-    key = {"budget": "reason_budget", "paused by the user": "reason_user"}.get(raw)
+    key = {"budget": "reason_budget", "paused by the user": "reason_user", "question": "reason_question"}.get(raw)
     return ctx.t(key) if key else raw
 
 
 def _ev_paused(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
-    reason = _reason(ctx, d.get("reason"))
-    text = ctx.t("paused") + (f" ({reason})" if reason else "")
+    if d.get("reason") == "question" and d.get("asker"):  # a member's question (send_message pause_swarm)
+        text = ctx.t("paused_question", name=first_name(d.get("asker")))
+    else:
+        reason = _reason(ctx, d.get("reason"))
+        text = ctx.t("paused") + (f" ({reason})" if reason else "")
     return _line(ctx, ctx.sym["pause"], theme.WARN, Text(text, style=f"bold {theme.WARN}"))
 
 
 def _ev_resumed(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
-    return _line(ctx, ctx.sym["play"], theme.OK, Text(ctx.t("resumed"), style=theme.OK))
+    q = _d(d.get("question"))   # the question this resume ended: answered, or gone on without an answer
+    if not q:
+        text = ctx.t("resumed")
+    elif q.get("outcome") == "answered":
+        text = ctx.t("resumed_answered", id=clean(q.get("message_id")) or "?")
+    elif q.get("why") == "clarify_off":
+        text = ctx.t("resumed_clarify_off", id=clean(q.get("message_id")) or "?")
+    elif q.get("why") == "left":
+        text = ctx.t("resumed_left", name=first_name(q.get("asker")) or "?", id=clean(q.get("message_id")) or "?")
+    else:
+        text = ctx.t("resumed_unanswered", id=clean(q.get("message_id")) or "?")
+    return _line(ctx, ctx.sym["play"], theme.OK, Text(text, style=theme.OK))
 
 
 def _ev_wrap_up(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -1547,8 +1562,8 @@ def _session_status(ctx: RenderContext, s: dict) -> tuple[str, str]:
     if goal.get("status") == "done":
         return ctx.t("sess_done"), theme.OK
     if s.get("status") == "running":
-        if s.get("paused"):
-            return ctx.t("sess_paused"), theme.WARN
+        if s.get("paused"):   # a member's question waits for the user's answer, or another pause
+            return ctx.t("sess_question" if s.get("pause_reason") == "question" else "sess_paused"), theme.WARN
         if s.get("wrap_up"):  # the user's wrap-up mode (as the launcher's card shows it)
             return ctx.t("sess_wrap_up"), theme.WARN
         return ctx.t("sess_running"), theme.ACCENT
@@ -1964,7 +1979,7 @@ def status_report(ctx: RenderContext, info: dict) -> RenderableType:  # `info` s
     grid.add_column(style="dim", no_wrap=True)
     grid.add_column(overflow="fold")
     order = ("version", "home", "web", "hub", "session", "workspace", "goal", "models", "model", "language",
-             "agents", "jobs", "budget", "network", "tracing", "verbosity", "connected")
+             "agents", "jobs", "budget", "network", "clarify", "question", "tracing", "verbosity", "connected")
     for key in order + tuple(k for k in data if k not in order):
         if key not in data or data[key] is None:
             continue
@@ -2030,6 +2045,8 @@ def _status_value(ctx: RenderContext, key: str, value: Any) -> Text:
         return Text(label, style=theme.WARN)
     if key == "verbosity" and isinstance(value, str):
         return Text(_status_label(ctx, "verbosity_", value))
+    if key == "question":   # "Анна Смирнова, #12: «…»": the swarm waits for the user's answer to it
+        return Text(clean(value), style=theme.WARN)
     return Text(clean(value))
 
 
@@ -2522,9 +2539,12 @@ def _flen(parts: list[tuple[str, str]]) -> int:
 
 
 def spinner_line(ctx: RenderContext, *, frame: int, verb: str, working: list[str], elapsed: float,
-                 tokens_in: int, tokens_out: int, cost: float, paused: bool) -> list[tuple[str, str]]:
-    """`✻ Совещаются… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc — пауза)  Анна, Борис`."""
+                 tokens_in: int, tokens_out: int, cost: float, paused: bool,
+                 question: dict | None = None) -> list[tuple[str, str]]:
+    """`✻ Совещаются… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc — пауза)  Анна, Борис`; `question` ({asker, message_id}):
+    the pause waits for the user's answer to that member's question (`⏸ Рой ждёт вашего ответа агенту Анна`)."""
     s = ctx.sym
+    asker = first_name(_d(question).get("asker")) if paused else ""
     stats: list[str] = []
     if not paused or _names(working):  # a paused swarm with nobody finishing a step has nothing to count
         stats.append(fmt_elapsed(elapsed))
@@ -2532,9 +2552,14 @@ def spinner_line(ctx: RenderContext, *, frame: int, verb: str, working: list[str
             stats.append(f"{s['up']} {fmt_tokens(tokens_in)} {s['down']} {fmt_tokens(tokens_out)}")
         if _float(cost) > 0:
             stats.append(fmt_cost(cost))
-    stats.append(ctx.t("sp_resume") if paused else ctx.t("sp_esc"))
+    if asker:   # plain text goes to the asker: it is the answer
+        stats.append(ctx.t("sp_answer", name=asker))
+    else:
+        stats.append(ctx.t("sp_resume") if paused else ctx.t("sp_esc"))
     dot = f" {s['dot']} "
-    if paused:
+    if asker:
+        head = [("class:spinner.paused", f"{s['pause']} {ctx.t('paused_question', name=asker)}")]
+    elif paused:
         head = [("class:spinner.paused", f"{s['pause']} {ctx.t('paused')}")]
     else:
         head = [("class:spinner", spinner_frame(ctx, frame) + " "),

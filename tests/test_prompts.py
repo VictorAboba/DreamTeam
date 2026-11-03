@@ -130,6 +130,82 @@ def test_planning_task_title_follows_its_steps():
         assert title.index(independent) < title.index(contracts) < title.index(rest), (lang, title)
 
 
+def test_clarify_planning_task_keeps_the_steps_and_asks_first():
+    """The clarify card ([swarm] clarify) asks the user first: its head replaces the first line of the classic
+    description and the nine steps follow verbatim, so every snippet of the classic card still holds; the head
+    overrides the system prompt's "continue with the work that doesn't depend on the answer" and names only tools
+    every revision has (no pause_swarm: the card never relies on it)."""
+    from dreamteam.tools import frozen
+    from dreamteam.tui.printmode import AUTO_REPLY
+
+    shared: set[str] | None = None
+    for rev in frozen.revisions():
+        for lang in LANGS:
+            names = set(frozen.names(frozen.snapshot(rev, lang)))
+            shared = names if shared is None else shared & names
+    allowed = (shared or set()) | set(Status.ALL)
+    idents = {}
+    for lang, words in {"en": ("independent tasks", "contracts", "the rest", "asked", "decide yourself",
+                               "This time, unlike the usual rule, do not continue with the work that doesn't depend "
+                               "on the answer"),
+                        "ru": ("независимые задачи", "контракты", "остальное", "заданы вопросы", "прими решение сам",
+                               "На этот раз, в отличие от обычного правила, не продолжай работу, которая не зависит "
+                               "от ответа")}.items():
+        independent, contracts, rest, asked, decide, override = words
+        card = prompts.planning_task(lang, True)
+        assert card == prompts.PLANNING_CLARIFY[lang] and len(card) == 3
+        title, goal, description = card
+        assert len(title) <= 200 and title.index(independent) < title.index(contracts) < title.index(rest)
+        assert "depends_on" in description and "CONTRACTS.md" in description and "CONTRACTS.md" in goal
+        assert "`agents`" in description
+        assert goal.endswith(prompts.PLANNING_TASK[lang][1]) and asked in goal[:160]
+        # the numbered steps are exactly the classic ones, and nothing before step 1 is numbered
+        steps = {int(m.group(1)): m.group(2) for m in re.finditer(r"^(\d+)\. (.*)$", description, re.M)}
+        classic = {int(m.group(1)): m.group(2)
+                   for m in re.finditer(r"^(\d+)\. (.*)$", prompts.PLANNING_TASK[lang][2], re.M)}
+        assert sorted(steps) == list(range(1, 10)) and steps == classic
+        head = description[:description.index("\n1. ")]
+        assert not re.search(r"^\d+\. ", head, re.M)
+        assert description.endswith(prompts.PLANNING_TASK[lang][2].split("\n", 1)[1])
+        for number, snippets in PLANNING_SNIPPETS.items():
+            for snippet in snippets[LANGS.index(lang)]:
+                assert snippet in steps[number], (lang, number, snippet)
+        assert override in head and '["user"]' in head
+        assert decide in head and decide in AUTO_REPLY[lang]  # what -p answers in place of the user
+        idents[lang] = code_idents(title + goal + description)
+        assert "pause_swarm" not in idents[lang] and "pause_swarm" not in description
+        assert idents[lang] <= allowed, (lang, idents[lang] - allowed)
+        assert {"send_message", "waiting", "task_update", "wait", "in_progress"} <= code_idents(head)
+        # the classic card is unchanged, byte for byte (tests and the TUI compare with PLANNING_TASK)
+        assert prompts.planning_task(lang, False) is prompts.PLANNING_TASK[lang]
+        assert prompts.planning_task(lang) is prompts.PLANNING_TASK[lang]
+    assert idents["en"] == idents["ru"]
+    assert prompts.planning_task("de", True) == prompts.PLANNING_CLARIFY["en"]
+    assert prompts.CLARIFY_TAG == "clarify"
+
+
+def test_question_texts():
+    """The texts of a member's question that pauses the swarm (docs/SPEC.md §3 "Clarify mode"): the same
+    placeholders in both languages; only the user's notice names a tool (swarm_control, a registry tool)."""
+    expected = {"n_user_answer": {"asker", "id", "question", "answer"},
+                "n_user_answer_seen": {"asker", "id", "question", "answer_id"},
+                "n_question_unanswered": {"id"}, "n_clarify_off": {"task_id"},
+                "u_question": {"name", "id"}, "u_question_left": {"name", "id"}}
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        for key, fields in expected.items():
+            assert placeholders(texts[key]) == fields, (lang, key)
+            assert "pause_swarm" not in texts[key], (lang, key)
+        assert code_idents(texts["u_question"]) == {"swarm_control"}
+        assert code_idents(texts["n_clarify_off"]) == {"in_progress", "waiting"}
+        for key in ("n_user_answer", "n_user_answer_seen", "n_question_unanswered"):
+            assert not code_idents(texts[key]), (lang, key)
+        # the user is told what answers the question and how to go on without an answer
+        assert "/pause" in texts["u_question"] and "/resume" in texts["u_question"]
+        rendered = prompts.t(lang, "n_user_answer", asker="Anna Smith", id=7, question="Q {x}?", answer="A {y}")
+        assert "Anna Smith" in rendered and "#7" in rendered and "Q {x}?" in rendered and "A {y}" in rendered
+
+
 def test_texts_reference_only_real_tools():
     llm_tools = {s.name for s in tools_for("llm")}
     params = {p for spec in REGISTRY.values() for p in spec.parameters.get("properties", {})}

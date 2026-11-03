@@ -7,7 +7,9 @@ themselves as MCP servers.
 
 * Board: `board`, `task_get`, `task_create`, `task_claim`, `task_update`, `task_complete`, `task_review`,
   `task_comment`, `task_discussion`.
-* Communication: `send_message`, `read_messages`.
+* Communication: `send_message` (in [clarify mode](features.md), `[swarm] clarify`, `pause_swarm=true` on a critical
+  question to the user pauses the whole swarm until the user answers; the answer reaches every member),
+  `read_messages`.
 * Team: `agents`, `hire_agent`, `retire_agent`, `update_notes` (notes that survive context compaction),
   `wait`, `goal_complete`.
 * Triggers: `trigger_create`, `trigger_list`, `trigger_delete`.

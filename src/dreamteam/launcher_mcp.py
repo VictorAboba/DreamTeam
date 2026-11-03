@@ -38,6 +38,8 @@ independent swarm with its own goal, task board, agents, messages and workspace.
 
 Session tools: `sessions_list` shows the sessions; `session_create(title, goal, ...)` starts a new swarm
 on a goal; `session_start` / `session_stop` resume or stop one.
+A session created with clarify=true first asks you about its goal; `sessions_list` shows a session that waits for
+your answer as "paused (waiting for your answer to X, question #N)".
 A session works in its own folder by default. `session_cd(session, path)` moves it to another absolute folder:
 an empty or missing folder gets the session's files (and git history); a folder with files, e.g. an existing
 project, is adopted: the agents work with its files and commit to its current branch (its git repository must
@@ -83,6 +85,11 @@ LAUNCHER_TOOLS: list[dict[str, Any]] = [
                      "description": "off: the agents' commands, background jobs and MCP servers get no internet "
                                     "(the LLM keeps it); strict in the Docker sandbox and on Linux, best effort "
                                     "(proxy and offline variables) on Windows and macOS"},
+         "clarify": {"type": "boolean",
+                     "description": "true: the planner first asks you about the forks of the goal before any task "
+                                    "while the other agents wait, and an agent's critical question pauses the whole "
+                                    "swarm until you answer (send_message to that agent in the session answers it); "
+                                    "false: off. Default: the global setting ([swarm] clarify, off)."},
          "start": {"type": "boolean", "description": "Start right away (default true)"},
          "workspace": {"type": "string", "description": "Absolute folder to work in instead of the session's own "
                                                         "one: empty/missing = new, with files = adopted (an existing "
@@ -168,7 +175,10 @@ def workspace_text(result: dict[str, Any]) -> str:
 
 def session_line(s: dict[str, Any]) -> str:
     status = s.get("status", "?")
-    if status == "running" and s.get("paused"):
+    question = s.get("question")  # a member's question that holds the pause (read_stats)
+    if status == "running" and s.get("paused") and isinstance(question, dict):
+        status = f"paused (waiting for your answer to {question.get('asker')}, question #{question.get('message_id')})"
+    elif status == "running" and s.get("paused"):
         status = f"paused ({s.get('pause_reason') or 'user'})"
     if status == "running" and s.get("wrap_up"):
         status = "running, wrapping up"
@@ -181,7 +191,8 @@ def session_line(s: dict[str, Any]) -> str:
             f" | agents {agents.get('total', 0)} ({agents.get('working', 0)} working)"
             + (f" | jobs {jobs} running" if jobs and s.get("status") == "running" else "")
             + f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}"
-            + (" | no network" if s.get("network") == "off" else ""))
+            + (" | no network" if s.get("network") == "off" else "")
+            + (" | clarify" if s.get("clarify") else ""))   # [swarm] clarify: questions may pause it
     if goal:
         line += f"\n    goal [{goal.get('status', 'active')}]: {goal.get('title', '')}"
     if s.get("skills"):
@@ -391,6 +402,10 @@ async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[st
                 swarm_over["language"] = str(args["language"])
             if args.get("network"):
                 swarm_over["network"] = str(args["network"])
+            if args.get("clarify") is not None:  # a bool: false overrides a global true
+                if not isinstance(args["clarify"], bool):
+                    raise ToolError("clarify must be true or false.")
+                swarm_over["clarify"] = args["clarify"]
             overrides: dict[str, Any] = {"swarm": swarm_over} if swarm_over else {}
             if args.get("model"):
                 overrides["agents"] = {"default_model": str(args["model"])}

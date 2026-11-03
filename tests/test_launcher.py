@@ -440,7 +440,7 @@ async def test_session_mcp_endpoint_tells_the_home_page_about_library_changes(tm
 async def test_launcher_mcp_create_reports_start_failures(tmp_path, monkeypatch):
     manager = _manager(tmp_path)
 
-    async def broken_start(sid):
+    async def broken_start(sid, **kwargs):   # (create passes auto_reply)
         raise RuntimeError("git is not installed")
 
     monkeypatch.setattr(manager, "start", broken_start)

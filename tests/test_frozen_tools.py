@@ -37,6 +37,9 @@ RELEASED = {
     # skills: skill_propose (revision 2's array unchanged before it)
     3: {"en": "f27151511893a8f72bb26b609ad7cf9ef0cf8eb30f592b27e2d24a590e934863",
         "ru": "477db524ae479c2e5da88e4bbe233194e8c0ac03381500e1f8747869f7973d45"},
+    # clarify mode: send_message gains pause_swarm (revision 3's array otherwise unchanged)
+    4: {"en": "f20f4105ea7b5e56617f08a51a3bfae09f9c3162ac6eaa2293371403f9d21e0b",
+        "ru": "d44f7431d93b9c59e3b514eac9faec16f6e31b001e5aeaa732ac2642cb55ebb9"},
 }
 # the digest tests/test_tools.py pinned for the tool set agents had before tool sets were frozen
 BASELINE_SORTED = "e3c5cbc798e3aafddcd44284bb515d9655e68b953e6ca707f67063dcad7cda85"
@@ -402,9 +405,9 @@ async def test_compaction_moves_an_agent_to_the_current_tool_set(tmp_path, later
 
 
 async def test_agents_of_revision_1_keep_it_when_later_revisions_are_released(tmp_path):
-    """Revisions 2 (background jobs) and 3 (skill_propose) change nothing for an agent that already ran: one with a
-    history but no record (it ran before tool sets were frozen) and one frozen at revision 1 send revision 1 byte for
-    byte, run after run; only a new agent gets the current revision."""
+    """Revisions 2 (background jobs), 3 (skill_propose) and 4 (send_message pause_swarm) change nothing for an agent
+    that already ran: one with a history but no record (it ran before tool sets were frozen) and one frozen at
+    revision 1 send revision 1 byte for byte, run after run; only a new agent gets the current revision."""
     swarm, rec = make_swarm(tmp_path, lambda m, t: call("wait"), swarm={"start_agents": 3})
     await swarm.start(run_agents=False)
     names = [m["name"] for m in swarm.members()]
@@ -431,9 +434,10 @@ async def test_agents_of_revision_1_keep_it_when_later_revisions_are_released(tm
         swarm.close()
 
 
-async def test_an_agent_of_revision_2_keeps_it_and_compacts_into_revision_3(tmp_path):
-    """Revision 3 adds only skill_propose, at the end: an agent frozen at revision 2 sends revision 2 byte for byte
-    until its compaction, which moves it to revision 3 and names the new tool."""
+async def test_an_agent_of_revision_2_keeps_it_and_compacts_into_the_current_revision(tmp_path):
+    """Revision 3 adds only skill_propose, at the end, and revision 4 only a parameter: an agent frozen at revision 2
+    sends revision 2 byte for byte until its compaction, which moves it to the current revision and names the new
+    tool."""
 
     def policy(messages, tools):
         if is_compaction_request(messages):
@@ -452,8 +456,79 @@ async def test_an_agent_of_revision_2_keeps_it_and_compacts_into_revision_3(tmp_
         await run_until(lambda: len(rec.calls.get(agent, [])) >= 2)
         (compaction, old_tools), (after, new_tools) = rec.calls[agent][:2]
         assert is_compaction_request(compaction) and dumps(old_tools) == dumps(frozen.snapshot(2, "en"))
-        assert dumps(new_tools) == dumps(frozen.snapshot(3, "en")) and frozen.read(swarm.db, agent)["rev"] == 3
+        assert dumps(new_tools) == dumps(frozen.snapshot(frozen.TOOLSET_REVISION, "en"))
+        assert frozen.read(swarm.db, agent)["rev"] == frozen.TOOLSET_REVISION
         assert prompts.t("en", "tools_added", tools="`skill_propose`") in after[0]["content"]
+    finally:
+        await shutdown(swarm)
+
+
+def _send_message(rev: int, lang: str) -> dict:
+    return next(t for t in frozen.snapshot(rev, lang) if t["name"] == "send_message")
+
+
+def test_revision_4_only_adds_pause_swarm():
+    """Revision 4 (clarify mode) changes one tool: send_message gains the optional boolean pause_swarm, last, and
+    a longer description; every other tool, the names and their order are revision 3's."""
+    for lang in LANGS:
+        r3, r4 = frozen.snapshot(3, lang), frozen.snapshot(4, lang)
+        assert frozen.names(r3) == frozen.names(r4)
+        changed = [a["name"] for a, b in zip(r3, r4) if dumps(a) != dumps(b)]
+        assert changed == ["send_message"], (lang, changed)
+        old, new = _send_message(3, lang), _send_message(4, lang)
+        props = new["parameters"]["properties"]
+        assert list(props) == [*old["parameters"]["properties"], "pause_swarm"]
+        assert {k: v for k, v in props.items() if k != "pause_swarm"} == old["parameters"]["properties"]
+        assert props["pause_swarm"]["type"] == "boolean" and "default" not in props["pause_swarm"]
+        assert new["parameters"]["required"] == old["parameters"]["required"] == ["to", "text"]
+        assert len(new["description"]) <= 2000 and new["description"].startswith(old["description"])
+        assert "pause_swarm=true" in new["description"]
+    # one shared English property text in both arrays (tools/__init__.py: the registry keeps one schema)
+    assert _send_message(4, "en")["parameters"] == _send_message(4, "ru")["parameters"]
+
+
+async def test_an_agent_of_revision_3_ignores_pause_swarm_until_it_compacts(tmp_path):
+    """An agent frozen at revision 3 has no pause_swarm: call_tool strips it (the existing note names the r3 usage),
+    so its question is an ordinary message and the swarm keeps working, even in clarify mode. An agent of revision 4
+    pauses the swarm. A compaction moves the r3 agent to revision 4 with no tools_added line (no new tool)."""
+
+    def policy(messages, tools):
+        if is_compaction_request(messages):
+            return "SUMMARY of older work"
+        return call("wait")
+
+    swarm, rec = make_swarm(tmp_path, policy, swarm={"start_agents": 2, "clarify": True},
+                            agents={"context_tokens": 20000})
+    await swarm.start(run_agents=False)
+    old, new = [m["name"] for m in swarm.members()]
+    frozen.write(swarm.db, old, frozen.record(3, "en", frozen.snapshot(3, "en")))
+    try:
+        ctx = ToolContext(swarm, old, AgentRuntime(swarm, old))
+        args = {"to": ["user"], "text": "Postgres or SQLite?", "pause_swarm": True}
+        text, is_error = await call_tool(ctx, "send_message", args)
+        assert not is_error, text
+        assert text.startswith("Sent message #1 to user.")
+        assert text.endswith("\n[Ignored unknown argument(s): pause_swarm. Usage: send_message(to, text, reply_to?)]")
+        assert "pause_swarm was ignored" not in text and not swarm.paused
+        # an agent of the current revision pauses the swarm with the same call
+        text, is_error = await call_tool(ToolContext(swarm, new, AgentRuntime(swarm, new)), "send_message", args)
+        assert not is_error and " The swarm is paused until the user answers" in text, text
+        assert swarm.paused and swarm.pending_question()["asker"] == new
+        swarm.resume(USER)
+        assert not swarm.paused
+    finally:
+        await swarm.stop()
+    # the r3 agent compacts: it moves to revision 4, and no tool is named as new (pause_swarm is a parameter)
+    seed_history(swarm, old, pairs=20, size=4000)
+    await swarm.start()
+    try:
+        swarm.notify(old, "n_restart")
+        await run_until(lambda: len(rec.calls.get(old, [])) >= 2)
+        (compaction, old_tools), (after, new_tools) = rec.calls[old][:2]
+        assert is_compaction_request(compaction) and dumps(old_tools) == dumps(frozen.snapshot(3, "en"))
+        assert dumps(new_tools) == dumps(frozen.snapshot(4, "en")) and frozen.read(swarm.db, old)["rev"] == 4
+        assert prompts.t("en", "tools_added", tools="x").split("x")[0] not in after[0]["content"]
+        assert "pause_swarm" in swarm.runtimes[old].tool_parameters("send_message")["properties"]
     finally:
         await shutdown(swarm)
 

@@ -51,7 +51,8 @@ def test_registry_lookup_and_texts():
     assert len(names) == len(set(names))
     for required in ("help", "new", "team", "sessions", "resume", "goal", "board", "task", "agents", "roles", "jobs",
                      "to", "hire", "trace", "span", "files", "cat", "cd", "cost", "status", "model", "pause", "budget",
-                     "max", "approve", "reject", "stop", "web", "settings", "verbose", "lang", "clear", "exit"):
+                     "max", "approve", "reject", "stop", "web", "settings", "verbose", "lang", "clear", "exit",
+                     "clarify"):
         assert required in names
     for lang in ("ru", "en"):
         for cmd in COMMANDS:
@@ -529,6 +530,111 @@ async def test_team_sets_the_starting_team_of_new_sessions():
     assert app.overrides == {}
     swarm_hub = HubApp(mode="swarm", attached=True)
     await execute(swarm_hub, "/team tester")
+    assert "needs a session launcher" in swarm_hub.text and swarm_hub.overrides == {}
+
+
+class ClarifyApp(HubApp):
+    """HubApp whose hub client also answers GET and PATCH /api/sessions/{sid} like the launcher, for a session whose
+    own [swarm] overrides are `own` (the global [swarm] clarify is `inherited`)."""
+
+    def __init__(self, attached: bool = False, sid: str = "001-x", own: dict | None = None, inherited: bool = False):
+        super().__init__(attached=attached)
+        self.sid = sid if attached else None
+        self.session = {"id": sid, "title": "X", "clarify": inherited} if attached else None
+        self.own = dict(own or {})
+
+        def answer(sid: str) -> dict:
+            overrides = {"swarm": dict(self.own)} if self.own else {}
+            clarify = self.own.get("clarify", inherited)
+            return {"session": {"id": sid, "title": "X", "clarify": clarify, "overrides": overrides},
+                    "config": {"swarm": {"clarify": clarify}}}
+
+        async def session(sid):
+            self.calls.append(("session", sid))
+            return answer(sid)
+
+        async def update_session(sid, settings):
+            self.calls.append(("update_session", sid, settings))
+            for key, value in settings["swarm"].items():
+                if value is None:
+                    self.own.pop(key, None)
+                else:
+                    self.own[key] = value
+            return answer(sid)
+
+        async def settings():
+            self.calls.append(("settings",))
+            return {"settings": {"swarm": {"clarify": inherited}}}
+
+        self.client.session, self.client.update_session, self.client.settings = session, update_session, settings
+
+
+def said(app: FakeApp) -> str:
+    """The app's last output line as one line (the info lines wrap at the stand-in's width)."""
+    return " ".join(app.out[-1].split())
+
+
+async def test_clarify_command():
+    """`/clarify [on|off]` (docs/TUI.md §4.3): in a session its own setting (PATCH); without one the window's new
+    sessions (like --clarify and /team); without an argument the state and where it comes from."""
+    assert find("clarify").usage("en") == "/clarify [on|off]" and find("clarify").launcher
+    app = ClarifyApp()
+    await execute(app, "/clarify")
+    assert said(app).endswith("Clarifying the goal in this window's new sessions: off (as in the general settings)")
+    await execute(app, "/clarify on")
+    assert app.overrides == {"swarm": {"clarify": True}}
+    assert said(app).endswith("New sessions from this window clarify the goal first (/clarify off to switch it off)")
+    await execute(app, "/clarify")
+    assert said(app).endswith("Clarifying the goal in this window's new sessions: on (this window's setting)")
+    assert app.calls.count(("settings",)) == 1                     # the window's own value needs no hub
+    await execute(app, "/clarify OFF")
+    assert app.overrides == {"swarm": {"clarify": False}}   # an explicit false: also over a global true
+    assert said(app).endswith("New sessions from this window do not clarify the goal (/clarify on to switch it on)")
+    assert commands.session_overrides({"clarify": False}) == ({"swarm": {"clarify": False}}, None)
+    await execute(app, "/clarify maybe")
+    assert app.out[-1] == "⚠ Usage: /clarify [on|off]" and app.overrides == {"swarm": {"clarify": False}}
+    inherited = ClarifyApp(inherited=True)
+    inherited.ctx.lang = "ru"
+    await execute(inherited, "/clarify")
+    assert said(inherited).endswith("Уточнение цели в новых сессиях этого окна: вкл (как в общих настройках)")
+    await execute(inherited, "/clarify выкл")
+    assert inherited.overrides == {"swarm": {"clarify": False}}
+    assert said(inherited).endswith("Новые сессии из этого окна не уточняют цель (/clarify on — включить)")
+
+    session = ClarifyApp(attached=True)
+    await execute(session, "/clarify")
+    assert said(session).endswith("Clarifying the goal in this session: off (as in the general settings)")
+    await execute(session, "/clarify on")
+    assert ("update_session", "001-x", {"swarm": {"clarify": True}}) in session.calls
+    assert said(session).endswith("This session clarifies the goal: an agent's critical question pauses the swarm "
+                                    "until you answer, and a new planning task starts with questions (the one on "
+                                    "the board stays as it is)")
+    assert session.session["clarify"] is True and session.session["overrides"] == {"swarm": {"clarify": True}}
+    assert session.overrides == {}                                 # the window's new sessions are not changed
+    await execute(session, "/clarify")
+    assert said(session).endswith("Clarifying the goal in this session: on (this session's own setting)")
+    await execute(session, "/clarify off")
+    assert session.calls[-1] == ("update_session", "001-x", {"swarm": {"clarify": False}})
+    assert said(session).endswith("This session no longer clarifies the goal: agents' questions no longer pause "
+                                    "the swarm")
+
+    # main has no settings of its own: the state is the general settings' one, and on / off point to them
+    main = ClarifyApp(attached=True, sid="main", inherited=True)
+    await execute(main, "/clarify")
+    assert said(main).endswith("Clarifying the goal in this session: on (as in the general settings)")
+    assert main.calls == [("session", "main")]
+    for arg in ("on", "off"):
+        await execute(main, f"/clarify {arg}")
+        assert said(main).endswith("The main session has no settings of its own: clarifying is set in the general "
+                                     "settings")
+    main.ctx.lang = "ru"
+    await execute(main, "/clarify")
+    assert said(main).endswith("Уточнение цели в этой сессии: вкл (как в общих настройках)")
+    await execute(main, "/clarify выкл")
+    assert said(main).endswith("У сессии main нет своих настроек: уточнение цели задаётся в общих настройках")
+    assert not [c for c in main.calls if c[0] == "update_session"]
+    swarm_hub = HubApp(mode="swarm", attached=True)
+    await execute(swarm_hub, "/clarify on")
     assert "needs a session launcher" in swarm_hub.text and swarm_hub.overrides == {}
 
 

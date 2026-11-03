@@ -410,7 +410,7 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
-        "jobs": {"running": 0},
+        "jobs": {"running": 0}, "question": None,
     }
     own = conn is None
     if own:
@@ -447,6 +447,10 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
         paused = paused if isinstance(paused, dict) else {}
         stats["paused"] = bool(paused.get("paused"))
         stats["pause_reason"] = paused.get("reason", "") or ""
+        # a member's question that holds the pause (Swarm.pending_question): the launcher's card and session_line
+        if (stats["paused"] and paused.get("reason") == "question" and paused.get("asker")
+                and isinstance(paused.get("message_id"), int)):
+            stats["question"] = {"asker": paused["asker"], "message_id": paused["message_id"]}
         wrap_up = kv("wrap_up")  # the user's wrap-up mode (Swarm.wrap_up)
         stats["wrap_up"] = bool(wrap_up.get("on")) if isinstance(wrap_up, dict) else False
         row = conn.execute("SELECT ts FROM events ORDER BY id DESC LIMIT 1").fetchone()
@@ -1163,6 +1167,7 @@ class SessionManager:
             "loaded": swarm is not None, "autostart": bool(meta.get("autostart")),
             "language": cfg.swarm.language, "model_profile": profile, "model": model.model if model else None,
             "network": cfg.swarm.network,   # "off": the agents' commands have no internet (docs/SPEC.md §7.2)
+            "clarify": cfg.swarm.clarify,   # the planner asks the user first (docs/SPEC.md §3 "Clarify mode")
             "max_cost_usd": _number(limits.get("max_cost_usd", cfg.swarm.max_cost_usd)),
             "max_agents": int(_number(limits.get("max_agents", cfg.swarm.max_agents))),
             "overrides": meta.get("overrides") or {}, "config_error": config_error,
@@ -1420,14 +1425,16 @@ class SessionManager:
     async def create(self, title: str, goal: str = "", description: str = "", *,
                      overrides: dict[str, Any] | None = None, start: bool = True, actor: str = USER,
                      workspace: str | os.PathLike | None = None, skills: list[str] | None = None,
-                     via: str = "home") -> dict[str, Any]:
+                     via: str = "home", auto_reply: bool = False) -> dict[str, Any]:
         """Create a session (and start it with the goal unless start=False). Returns its summary.
         `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
         an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
         "workspace_result" (set_workspace's result, mode "created" for a new folder).
         `skills`: skills attached before the first start, references (`x`, `claude-user:x`, `claude-project:x` from
         the `workspace` folder) or sources (absolute folder or .zip paths, Git URLs: imported into the library, `by`
-        the user, `via` the surface); all of them are resolved and staged before anything is created."""
+        the user, `via` the surface); all of them are resolved and staged before anything is created.
+        `auto_reply`: a `dreamteam -p` client with automatic replies asks (models.AUTO_REPLY_HEADER): see
+        _start_locked."""
         # the goal split as set_goal splits it: its first line also names the session (cut at a word)
         goal_title, goal_description = split_goal(_text(goal), _text(description))
         title = (_one_line(title) or shorten_title(goal_title, 60) or "Session")[:TITLE_LIMIT].strip()
@@ -1446,14 +1453,14 @@ class SessionManager:
                                                Path(workspace) if workspace is not None else None)
         try:
             summary = await self._create(title, goal_title, goal_description, overrides, start, actor, workspace,
-                                         prepared, via)
+                                         prepared, via, auto_reply=auto_reply)
         finally:
             _discard(prepared)   # (whatever a failure left staged)
         return summary
 
     async def _create(self, title: str, goal_title: str, goal_description: str, overrides: dict[str, Any],
                       start: bool, actor: str, workspace: str | os.PathLike | None, prepared: list[_SkillItem],
-                      via: str) -> dict[str, Any]:
+                      via: str, *, auto_reply: bool = False) -> dict[str, Any]:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         for _attempt in range(100):  # another process (a second launcher, the CLI) may take the same id
             sid = self._new_id(title)
@@ -1492,7 +1499,7 @@ class SessionManager:
                 result["old_kept"] = None
         self._changed(sid, "created")
         if start:
-            await self.start(sid)
+            await self.start(sid, auto_reply=auto_reply)
         summary = self.summary(sid)
         if result is not None:
             summary["workspace_result"] = result
@@ -1539,25 +1546,32 @@ class SessionManager:
         async with self._lock(sid):
             return self._load_locked(sid)
 
-    async def start(self, sid: str, *, skills: list[str] | None = None, via: str = "home") -> "Swarm":
+    async def start(self, sid: str, *, skills: list[str] | None = None, via: str = "home",
+                    auto_reply: bool = False) -> "Swarm":
         """Start the session (a no-op when it runs). `skills`: references or sources, as `create` takes them,
         attached first: live to a running session, written into a stopped one before it starts (`via`: the surface,
-        recorded in the library for a source). SessionError before anything changes when one of them cannot be."""
+        recorded in the library for a source). SessionError before anything changes when one of them cannot be.
+        `auto_reply`: as `create` takes it (see _start_locked)."""
         self._check(sid)
         async with self._lock(sid):
             written: list[str] = []
             if skills:
                 written = await self._skills_at_start(sid, self._load_locked(sid), skills, via)
-            swarm = await self._start_locked(sid)
+            swarm = await self._start_locked(sid, auto_reply=auto_reply)
             if written:
                 swarm.skills.attached_again(written)
         self._changed(sid, "started")
         return swarm
 
-    async def _start_locked(self, sid: str) -> "Swarm":
-        """Start the session (if it is not running). The caller holds the session's lock."""
+    async def _start_locked(self, sid: str, auto_reply: bool = False) -> "Swarm":
+        """Start the session (if it is not running). The caller holds the session's lock. `auto_reply`: a
+        `dreamteam -p` client with automatic replies asks for it, so the swarm's auto-reply lease holds before its
+        start (also of a running session): no question pauses it, and its goal gets the classic planning task
+        (Swarm.clarifying; docs/SPEC.md §3 "Clarify mode")."""
         # loaded under the lock: a swarm fetched before waiting could have been unloaded meanwhile
         swarm = self._load_locked(sid)
+        if auto_reply:
+            swarm.auto_reply_seen()
         if sid not in self.running:
             if sid != LEGACY_ID:
                 self._check_workspace_ready(sid, self.meta(sid))
@@ -1583,6 +1597,8 @@ class SessionManager:
             if not isinstance(pending, dict) or not str(pending.get("title") or "").strip():
                 meta.pop("pending_goal", None)
             elif not swarm.goal():
+                if auto_reply:  # again: swarm.start() (workspace, MCP servers, skills) may outlast the grace
+                    swarm.auto_reply_seen()
                 try:  # the goal first, then forget it: a failure keeps it for the next start
                     swarm.set_goal(pending.get("actor") or USER, str(pending["title"]),
                                    str(pending.get("description") or ""))

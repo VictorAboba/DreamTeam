@@ -223,9 +223,35 @@ TEXTS: dict[str, dict[str, str]] = {
                            "`task_create`: the research, experiments and environment checks you would still do "
                            "become tasks for the others; read only what you need to split the work. Then go on "
                            "with the plan.",
+        # in its place for a clarify planning card whose holder has neither asked the user nor created a task
+        "n_clarify_hint": "You have held planning task #{id} for {elapsed} (steps: {steps}) without asking the user "
+                          "anything or creating a task, while the other members wait. If the goal has forks that "
+                          "change the plan, send the user all your questions in one message now (`send_message` to "
+                          "[\"user\"]), then set the task to `waiting` and call `wait`; create no task before the "
+                          "answer. If there is nothing to ask, plan now: create the independent tasks with "
+                          "`task_create`.",
         "n_mcp_approved": "Your MCP server \"{name}\" was approved by the user and is ready to use.",
         "n_mcp_rejected": "Your MCP server \"{name}\" was rejected by the user. {comment}",
         "n_resumed": "The swarm was resumed. Continue your work.",
+        # a member's question paused the swarm (send_message pause_swarm, docs/SPEC.md §3 "Clarify mode"): the others
+        # get the question with the answer (quiet for AI agents), or only the question when the answer reached them
+        # as a message too (n_user_answer_seen)
+        "n_user_answer": "The user answered {asker}'s question #{id}, for which the swarm was paused.\nQuestion: "
+                         "{question}\nAnswer: {answer}\nIf the answer changes what you are doing, adjust your work and "
+                         "your tasks; otherwise continue.",
+        "n_user_answer_seen": "Message #{answer_id} from the user below answers {asker}'s question #{id}, for which "
+                              "the swarm was paused.\nQuestion: {question}\nIf the answer changes what you are doing, "
+                              "adjust your work and your tasks; otherwise continue.",
+        # to the asker: the swarm was resumed (or clarifying switched off) before the user answered
+        "n_question_unanswered": "The swarm goes on without the user's answer to your question #{id}. Don't wait for "
+                                 "it: where you need the answer, take the option you would choose, write it down as an "
+                                 "assumption where the others read it (CONTRACTS.md, a task's description or result) "
+                                 "and continue. Should the user answer later, the answer comes as a message.",
+        # to the holder of a clarify planning card that waits for the user, when [swarm] clarify was switched off
+        "n_clarify_off": "The user no longer wants the goal clarified before the work starts: don't wait for answers "
+                         "to your questions about it. Take your defaults, write them down as assumptions "
+                         "(CONTRACTS.md, the task descriptions), set planning task #{task_id} back to `in_progress` if "
+                         "it is `waiting`, and plan now. Should the user answer later, the answer comes as a message.",
         "n_workspace_moved": "The user moved the shared workspace to the folder {path}. Its files and git history "
                              "are the same; only the folder changed.",
         "n_workspace_changed": "The user switched the shared workspace to the folder {path}. It holds other files "
@@ -352,6 +378,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_agent_error": "Agent {name} hit an error: {error}",
         "u_budget": "Budget exhausted: spent ${spent:.2f} of ${limit:.2f}. The swarm is paused; raise the limit to "
                     "continue.",
+        "u_question": "{name} asked you a question (message #{id}), and the whole swarm is paused until you answer. "
+                      "Your next message to {name} (or to all) is the answer: every member gets it with the question, "
+                      "then the swarm goes on. To go on without an answer, resume the swarm (Resume on the board, "
+                      "/pause in dreamteam tui, /resume in the console, `swarm_control` action=resume).",
+        "u_question_left": "{name} left the swarm, so it no longer waits for your answer to question #{id} and goes "
+                           "on.",
         "u_goal_done": "{by} reports that the global goal is achieved: {summary}",
         "u_refusal": "Agent {name}: the model declined the request ({category}).",
         "u_member_joined": "{name} joined the swarm as \"{role}\" (hired by {by}).",
@@ -502,9 +534,29 @@ TEXTS: dict[str, dict[str, str]] = {
                            "через `task_create`: исследования, эксперименты и проверки окружения, которые ты ещё "
                            "собирался сделать, станут задачами для остальных; читай только то, что нужно, чтобы "
                            "разбить работу. Затем продолжай план.",
+        "n_clarify_hint": "Ты держишь задачу планирования #{id} уже {elapsed} (шагов: {steps}) и ещё ничего не "
+                          "спросил у пользователя и не создал ни одной задачи, а остальные участники ждут. Если у "
+                          "цели есть развилки, которые меняют план, отправь пользователю все вопросы одним "
+                          "сообщением прямо сейчас (`send_message` с [\"user\"]), затем переведи задачу в `waiting` и "
+                          "вызови `wait`; до ответа задач не создавай. Если спрашивать не о чем, планируй сейчас: "
+                          "создай независимые задачи через `task_create`.",
         "n_mcp_approved": "Пользователь одобрил твой MCP-сервер «{name}», он готов к работе.",
         "n_mcp_rejected": "Пользователь отклонил твой MCP-сервер «{name}». {comment}",
         "n_resumed": "Работа роя возобновлена. Продолжай.",
+        "n_user_answer": "Пользователь ответил на вопрос #{id}, который задал(а) {asker}; ради него рой ставили на "
+                         "паузу.\nВопрос: {question}\nОтвет: {answer}\nЕсли ответ меняет то, что ты делаешь, поправь "
+                         "свою работу и свои задачи; иначе продолжай.",
+        "n_user_answer_seen": "Сообщение #{answer_id} от пользователя ниже — ответ на вопрос #{id}, который задал(а) "
+                              "{asker}; ради него рой ставили на паузу.\nВопрос: {question}\nЕсли ответ меняет то, "
+                              "что ты делаешь, поправь свою работу и свои задачи; иначе продолжай.",
+        "n_question_unanswered": "Рой продолжает работу без ответа пользователя на твой вопрос #{id}. Не жди его: где "
+                                 "ответ нужен, выбери вариант, который выбрал бы сам, запиши его как допущение там, "
+                                 "где его прочтут остальные (CONTRACTS.md, описание или итог задачи), и продолжай. "
+                                 "Если пользователь ответит позже, ответ придёт сообщением.",
+        "n_clarify_off": "Пользователь больше не хочет уточнять цель до начала работы: не жди ответов на свои вопросы "
+                         "о ней. Выбери варианты по умолчанию, запиши их как допущения (CONTRACTS.md, описания задач), "
+                         "верни задачу планирования #{task_id} в `in_progress`, если она в `waiting`, и планируй "
+                         "сейчас. Если пользователь ответит позже, ответ придёт сообщением.",
         "n_workspace_moved": "Пользователь перенёс общий workspace в папку {path}. Файлы и история git те же, "
                              "изменилась только папка.",
         "n_workspace_changed": "Пользователь переключил общий workspace на папку {path}. В ней другие файлы, чем "
@@ -617,6 +669,13 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_agent_error": "У агента {name} ошибка: {error}",
         "u_budget": "Бюджет исчерпан: потрачено ${spent:.2f} из ${limit:.2f}. Рой на паузе; увеличьте лимит, чтобы "
                     "продолжить.",
+        "u_question": "{name} задаёт вам вопрос (сообщение #{id}), и весь рой на паузе до вашего ответа. Ваше "
+                      "следующее сообщение для {name} (или для всех) и будет ответом: его вместе с вопросом получат "
+                      "все участники, затем рой продолжит работу. Чтобы продолжить без ответа, снимите рой с паузы "
+                      "(«Продолжить» на доске, /pause в dreamteam tui, /resume в консоли, `swarm_control` "
+                      "action=resume).",
+        "u_question_left": "{name} покинул(а) рой, поэтому рой больше не ждёт вашего ответа на вопрос #{id} и "
+                           "продолжает работу.",
         "u_goal_done": "{by} сообщает, что глобальная цель достигнута: {summary}",
         "u_refusal": "Агент {name}: модель отказалась выполнять запрос ({category}).",
         "u_member_joined": "{name} присоединился(ась) к рою в роли «{role}» (нанял(а) {by}).",
@@ -737,6 +796,83 @@ PLANNING_TASK = {
            "контрактов и перечисли задачи. Затем возьми одну подходящую тебе задачу — только одну: не забирай "
            "себе цепочку задач, пока другие участники ждут работы."),
 }
+
+# The planning card of a session that clarifies the goal first ([swarm] clarify, docs/SPEC.md §3 "Clarify mode"):
+# board data like PLANNING_TASK (never the system prompt or a tool schema). Its head replaces the first line of
+# PLANNING_TASK's description, steps 1-9 follow verbatim; its goal starts with what the reviewer checks.
+CLARIFY_TAG = "clarify"   # tag of the planning card of a session that clarifies the goal first (docs/SPEC.md §3)
+_CLARIFY_TITLE = {
+    "en": "Clarify the goal with the user, then plan: independent tasks first, then contracts, then the rest",
+    "ru": "Уточнить цель у пользователя, затем спланировать: сначала независимые задачи, затем контракты, затем "
+          "остальное",
+}
+_CLARIFY_GOAL = {  # followed by PLANNING_TASK[lang][1]
+    "en": "Before any task was created, the user was asked in one message about the forks of the goal that change "
+          "the plan (unless it had none), and this task's result says what was asked; the user's decisions, and the "
+          "defaults taken where the user left a point open, are written down. ",
+    "ru": "До создания первой задачи пользователю одним сообщением заданы вопросы о развилках цели, которые меняют "
+          "план (если они были), и в итоге этой задачи сказано, о чём спросили; решения пользователя и варианты по "
+          "умолчанию там, где он оставил вопрос открытым, записаны. ",
+}
+_CLARIFY_HEAD = {  # replaces the first line of PLANNING_TASK[lang][2]
+    "en": "Study the global goal (at the end of this description). The user wants its open points settled before any "
+          "work starts: ask first, then plan. This time, unlike the usual rule, do not continue with the work that "
+          "doesn't depend on the answer: until the user answers, create no task, don't write CONTRACTS.md and start "
+          "no research. The team waits for the plan and spends nothing meanwhile.\n"
+          "- Find the forks: the unclear points where different readings of the goal lead to different results or "
+          "plans (the scope and what counts as done, the platform and the stack, interfaces and formats others will "
+          "rely on, the data, the quality bar, limits). Look at the workspace only as far as good questions need. "
+          "What you can find out in the workspace or settle by a sensible convention is not a question for the "
+          "user.\n"
+          "- If there is no such fork, write nothing to the user and plan at once.\n"
+          "- Otherwise send the user ONE message (`send_message` to [\"user\"]): a line on how you understand the "
+          "goal, then the questions numbered (at most seven), each with its options and the one you would take by "
+          "default, so that a few words answer it. Then set this task to `waiting` with `task_update` and call "
+          "`wait`: the answer wakes you.\n"
+          "- When the answer comes, set this task back to `in_progress` and plan with it. Where the user tells you "
+          "to decide yourself, is not available or leaves a question open, take your default. Ask again only if an "
+          "answer opens a new fork that really changes the plan.\n"
+          "- Write the user's decisions, and your defaults marked as assumptions, into CONTRACTS.md (into this "
+          "task's result when the whole goal is one task) and into the descriptions of the tasks they concern: the "
+          "other members never see your messages with the user.\n"
+          "- In this task's result, say what you asked the user, or that there was nothing to ask: its reviewer "
+          "cannot see your messages either.\n"
+          "Once the user has answered (or there was nothing to ask), plan the work in this order:\n",
+    "ru": "Изучи глобальную цель (она в конце описания). Пользователь хочет решить её открытые вопросы до начала "
+          "работы: сначала спроси, затем планируй. На этот раз, в отличие от обычного правила, не продолжай работу, "
+          "которая не зависит от ответа: пока пользователь не ответил, не создавай задач, не пиши CONTRACTS.md и не "
+          "начинай исследований. Команда ждёт плана и тем временем ничего не тратит.\n"
+          "- Найди развилки: неясные места, где разное прочтение цели ведёт к разным результатам или планам (объём "
+          "работы и что считать готовым, платформа и стек, интерфейсы и форматы, на которые будут опираться "
+          "другие, данные, планка качества, ограничения). В workspace заглядывай ровно настолько, насколько это "
+          "нужно для хороших вопросов. То, что можно выяснить в workspace или решить по разумному соглашению, — не "
+          "вопрос для пользователя.\n"
+          "- Если таких развилок нет, ничего не пиши пользователю и сразу планируй.\n"
+          "- Иначе отправь пользователю ОДНО сообщение (`send_message` с [\"user\"]): строка о том, как ты понял "
+          "цель, затем вопросы с номерами (не больше семи), у каждого — варианты и тот, который ты выберешь по "
+          "умолчанию, чтобы на каждый можно было ответить в двух словах. Затем переведи эту задачу в `waiting` "
+          "через `task_update` и вызови `wait`: ответ тебя разбудит.\n"
+          "- Когда придёт ответ, верни эту задачу в `in_progress` и планируй с его учётом. Где пользователь просит "
+          "принять решение самому («прими решение сам»), недоступен или оставил вопрос открытым, бери свой вариант "
+          "по умолчанию. Спрашивай ещё раз, только если ответ открыл новую развилку, которая действительно меняет "
+          "план.\n"
+          "- Запиши решения пользователя и свои варианты по умолчанию (помеченные как допущения) в CONTRACTS.md (в "
+          "итог этой задачи, если вся цель — одна задача) и в описания задач, которых они касаются: остальные "
+          "участники твою переписку с пользователем не видят.\n"
+          "- В итоге этой задачи напиши, о чём ты спросил пользователя, или что спрашивать было не о чем: ревьюер "
+          "этой задачи твоих сообщений тоже не видит.\n"
+          "Когда пользователь ответил (или спрашивать было не о чем), спланируй работу в таком порядке:\n",
+}
+PLANNING_CLARIFY = {lang: (_CLARIFY_TITLE[lang], _CLARIFY_GOAL[lang] + goal,
+                           _CLARIFY_HEAD[lang] + description.split("\n", 1)[1])
+                    for lang, (_title, goal, description) in PLANNING_TASK.items()}
+
+
+def planning_task(language: str, clarify: bool = False) -> tuple[str, str, str]:
+    """The planning card (title, goal, description): PLANNING_TASK itself, or its clarify variant."""
+    lang = _lang(language)
+    return PLANNING_CLARIFY[lang] if clarify else PLANNING_TASK[lang]
+
 
 # the name of the role catalog's generalist preset (roles.ROLE_PRESETS), the role of a member nobody chose
 DEFAULT_ROLE = {"en": "Generalist", "ru": "Универсал"}

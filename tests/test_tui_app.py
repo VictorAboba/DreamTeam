@@ -594,6 +594,92 @@ async def test_escape_pauses_a_working_swarm(launch):
         release.set()
 
 
+async def test_a_question_pause_makes_the_asker_the_addressee(launch):
+    """Clarify mode (docs/TUI.md §4.2): a member's question that pauses the swarm makes its asker the addressee, even
+    over the user's choice of a moment ago; the box, the spinner and /status say so, a message to someone else says
+    that the swarm still waits, plain text answers the question, and a pause that ends otherwise clears it."""
+    go = asyncio.Event()
+    asking: list[str] = []
+
+    async def planner(system, messages, tools):   # the clarify planner asks once it is let go
+        seen = texts(messages)
+        if not asking and any("haiku" in t for t in seen):
+            asking.append(re.match(r"You are (.+?), a member", system).group(1))
+            await go.wait()
+            return call("send_message", to=["user"], text="Which colour should the haiku be?", pause_swarm=True)
+        return call("wait")
+
+    conn = await launch(planner)
+    try:
+        sid = (await conn.client.create_session("Haiku", "Write a haiku",
+                                                overrides={"swarm": {"clarify": True, "start_agents": 2}}))["id"]
+        h = launch.tui(conn, session=sid)
+        await h.until(lambda: h.tui.attached and len(h.tui.members) == 2 and asking, 20, "the planner's first step")
+        anna = asking[0]
+        boris = next(m for m in h.tui.members if m != anna)
+        await h.run(f"@{boris}", f"Now writing to: {boris}")   # the user's own choice, a moment ago
+        assert h.tui.box_title() == f"→ {boris}"
+        go.set()
+        await h.until(lambda: h.tui.question, what="the question pause")
+        question_id = h.tui.question["message_id"]
+        assert h.tui.question["asker"] == anna and h.tui.paused and h.tui.pause_reason == "question"
+        assert h.tui.addressee == anna
+        assert h.tui.box_title() == f"→ {anna.split()[0]} · answer to #{question_id}: everyone gets it"
+        await h.see(f"The swarm waits for your answer to {anna.split()[0]}")
+        # (the hint after it, test_tui_render, may be cut at the 80 columns of DummyOutput while a step finishes)
+        spinner = "".join(text for _, text in h.tui._spinner_text())
+        assert spinner.startswith(f"⏸ The swarm waits for your answer to {anna.split()[0]} (")
+        await h.run("/status", "Question for you")
+        report = next(chunk for chunk in reversed(h.out) if "Question for you" in chunk)
+        assert f"{anna}, #{question_id}: «Which colour should the haiku be?»" in " ".join(report.split())
+
+        await h.tui.send_message(boris, "hold on")   # (the TUI's send of `@Boris text`, the addressee kept)
+        still = f"The swarm still waits for your answer to {anna} (question #{question_id}): @{anna} <answer>"
+        await h.until(lambda: still in " ".join(h.text.split()), what="q_still_waiting")
+        assert (await conn.client.state(sid))["swarm"]["paused"] is True and h.tui.addressee == anna
+
+        h.type("blue, please\r")   # plain text: the answer
+        await h.until(lambda: messages_from_user(conn, sid, "blue, please"), what="the answer")
+        answer = (await messages_from_user(conn, sid, "blue, please"))[0]
+        assert answer["recipients"] == [anna] and answer["reply_to"] == question_id
+        await h.see(f"every member got your answer to question #{question_id}")
+        await h.until(lambda: not h.tui.paused and h.tui.question is None, what="the resume")
+        assert h.tui.box_title() == f"→ {anna}"
+
+        # a pause that ends a question otherwise (its answer came when the budget was spent): no question any more
+        await h.tui.on_event({"type": "swarm.paused", "actor": anna,
+                              "data": {"reason": "question", "asker": anna, "message_id": 999, "since": 1.0}})
+        assert h.tui.question == {"asker": anna, "message_id": 999, "since": 1.0}
+        await h.tui.on_event({"type": "swarm.paused", "actor": "user", "data": {
+            "reason": "budget", "question": {"asker": anna, "message_id": 999, "outcome": "answered",
+                                             "answer_id": 1000}}})
+        assert h.tui.question is None and h.tui.paused and h.tui.pause_reason == "budget"
+        assert await h.quit() == 0
+    finally:
+        go.set()
+
+
+async def test_clarify_flag_and_command_against_the_hub(launch):
+    """`--clarify` is the window's setting for its new sessions (said at the start, like --workspace); in the session
+    it created, `/clarify` reads and changes that session's own setting through PATCH /api/sessions/{sid}."""
+    conn = await launch()
+    h = launch.tui(conn, overrides={"clarify": True})
+    await h.see("New sessions from this window clarify the goal first (/clarify off to switch it off)")
+    h.type("Write a haiku\r")
+    await h.until(lambda: h.tui.attached and h.tui.members, 30, "the new session")
+    sid = h.tui.sid
+    summary = (await conn.client.session(sid))["session"]
+    assert summary["overrides"] == {"swarm": {"clarify": True}}
+    planning = next(t for t in (await conn.client.state(sid))["tasks"] if "planning" in t["tags"])
+    assert planning["tags"] == ["planning", "clarify"]
+    await h.run("/clarify", "Clarifying the goal in this session: on (this session's own setting)")
+    await h.run("/clarify off", "This session no longer clarifies the goal")
+    assert (await conn.client.session(sid))["session"]["overrides"] == {"swarm": {"clarify": False}}
+    assert h.tui.overrides == {"swarm": {"clarify": True}}   # the window's next sessions: unchanged
+    await h.run("/clarify", "Clarifying the goal in this session: off (this session's own setting)")
+    assert await h.quit() == 0
+
+
 async def test_connection_loss_is_reported_and_resynced(launch, monkeypatch):
     monkeypatch.setattr(app_module, "LOST_GRACE", 0.05)
     conn = await launch()

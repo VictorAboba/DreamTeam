@@ -10,6 +10,9 @@ from .db import loads
 
 USER = "user"
 ALL = "all"
+# a `dreamteam -p` client with automatic replies sends it ("1") on every request and WebSocket handshake: the session
+# then neither asks the user first nor pauses for a member's question (the auto-reply lease, Swarm.auto_reply_seen)
+AUTO_REPLY_HEADER = "X-DreamTeam-Auto-Reply"
 
 
 class ToolError(Exception):
