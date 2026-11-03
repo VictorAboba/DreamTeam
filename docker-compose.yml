@@ -1,5 +1,9 @@
-# Run DreamTeam inside Docker: SWARM_DIR=./dreamteam-home docker compose up --build
-# (or simply: dreamteam sandbox ./dreamteam-home)
+# Run DreamTeam inside Docker (the hub asks for a token, see DREAMTEAM_HUB_TOKEN below):
+#   export DREAMTEAM_HUB_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+#   SWARM_DIR=./dreamteam-home docker compose up --build
+#   then open http://127.0.0.1:8765/?token=<the token>
+# (PowerShell: $env:DREAMTEAM_HUB_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))")
+# (or simply: dreamteam sandbox ./dreamteam-home, which makes a new token at every start)
 services:
   dreamteam:
     build: .
@@ -21,6 +25,12 @@ services:
       - OPENROUTER_API_KEY
       # the URL the board is reached at from the host (shown as the MCP URL, written to hub.json)
       - DREAMTEAM_PUBLIC_URL=http://127.0.0.1:${PORT:-8765}
+      # the hub token, from the host (see the top of this file): the hub listens on 0.0.0.0 in the container, so the
+      # other containers of its network reach it; with a token they need it (`dreamteam sandbox` makes one per
+      # start). Without it the hub does not start and says why (`docker compose logs`); `docker compose ps`, `logs`
+      # and `down` work without it. The host's `dreamteam console/tui/mcp/status` send it, the board opens with
+      # http://127.0.0.1:8765/?token=<token>. (`dreamteam sandbox` gives the container only the token's SHA-256.)
+      - DREAMTEAM_HUB_TOKEN
       # skills: the mounted host library is the read-only source "host-library"; the sandbox's own library is
       # inside the mounted home (the host never reads it by itself)
       # - DREAMTEAM_HOST_SKILLS_DIR=/dreamteam/host-skills

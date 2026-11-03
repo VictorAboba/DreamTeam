@@ -38,6 +38,7 @@ from .. import __version__
 from ..console import (
     cd_expect, cd_moves_files, cd_preview, cd_result_lines, folder_kind, resolve_folder, same_folder,
 )
+from ..hubauth import browser_url
 from ..models import USER
 from . import commands, render, theme
 from .bash import ShellCommand
@@ -762,7 +763,8 @@ class TUI:
     def open_url(self, url: str) -> None:
         self.info(self.t("opened_browser", url=url))
         try:
-            webbrowser.open(url)
+            # (a sandbox's hub token, or that of the hub this process serves: the browser gets its cookie; not shown)
+            webbrowser.open(browser_url(url, user_url=self.client.user_url))
         except Exception as exc:
             self.error(str(exc))
 
@@ -1835,18 +1837,22 @@ class TUI:
                 self._moving_conn = state      # (change_folder handles a loss not made good by then)
                 return
             self._moving_conn = None
-        if state == "rejected" and self.sid is not None:
-            # the hub refused the stream: if the session is gone (deleted in the web UI), stop following it
+        if state == "rejected":
+            # the hub refused the stream: if the session is gone (deleted in the web UI), stop following it; a hub
+            # that takes no token this computer may send says so over REST too (also a single swarm's: sid None,
+            # `dreamteam sandbox <project>`)
             try:
                 await self.client.state(self.sid)
             except HubError as exc:
-                if exc.status == 404 and self.attached:
+                if exc.status == 404 and self.sid is not None and self.attached:
                     self.error(self.t("session_gone", id=self.sid))
                     await self._detach()
                     self._reset_session()
                     self._update_suggestions()
                     self.invalidate()
                     return
+                if exc.status == 401:  # a sandbox's hub takes none of the tokens this computer has: what to set
+                    self.error(exc.message)
             state = "lost"
         if state in ("lost", "rejected"):
             if self.connected and self._lost_handle is None:

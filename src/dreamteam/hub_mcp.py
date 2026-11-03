@@ -319,13 +319,19 @@ async def serve_stdio(swarm: "Swarm") -> None:
 PROXY_READ_TIMEOUT = 700.0
 
 
-def proxy_http_client():
-    """The HTTP client of a stdio proxy. Its CLIENT_HEADER names the proxy's one client to the hub, whatever
-    protocol version the proxy speaks (the 2026-07-28 one has no session id)."""
+def proxy_http_client(url: str):
+    """The HTTP client of a stdio proxy for the hub at `url`. Its CLIENT_HEADER names the proxy's one client to the
+    hub, whatever protocol version the proxy speaks (the 2026-07-28 one has no session id); every request carries the
+    hub token of a Docker sandbox's hub, looked up anew (hubauth.httpx_auth): Claude Code keeps the proxy running
+    while the sandbox restarts with a new one. A loopback URL (hubauth.is_loopback_url) is reached directly, never
+    through the environment's proxy (HTTP_PROXY...), which would see the token."""
     import httpx2
 
+    from .hubauth import httpx_auth, is_loopback_url
+
     return httpx2.AsyncClient(timeout=httpx2.Timeout(30.0, read=PROXY_READ_TIMEOUT),
-                              headers={CLIENT_HEADER: uuid.uuid4().hex})
+                              headers={CLIENT_HEADER: uuid.uuid4().hex}, auth=httpx_auth(),
+                              trust_env=not is_loopback_url(url))
 
 
 async def serve_stdio_proxy(url: str, instructions: str | None = None) -> None:
@@ -334,7 +340,7 @@ async def serve_stdio_proxy(url: str, instructions: str | None = None) -> None:
     from mcp import Client
     from mcp.client.streamable_http import streamable_http_client
 
-    http = proxy_http_client()
+    http = proxy_http_client(url)
     async with http, Client(streamable_http_client(url, http_client=http)) as client:
         async def on_list_tools(ctx, params) -> types.ListToolsResult:
             return await client.list_tools()

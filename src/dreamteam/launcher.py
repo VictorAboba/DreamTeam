@@ -18,7 +18,6 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
@@ -33,8 +32,8 @@ from .settings import PROVIDER_CHOICES, check_profile, profile_from_view, settin
 from .skill_deps import EnvManager
 from .skills import SkillError
 from .web import (
-    GRACEFUL_SECONDS, STATIC_DIR, GuardMiddleware, HubServer, UIStaticFiles, create_app, env_allowed_hosts,
-    public_base, skill_routes,
+    GRACEFUL_SECONDS, STATIC_DIR, GuardMiddleware, HubServer, UIStaticFiles, check_hub_token, create_app,
+    env_allowed_hosts, hub_server_config, public_base, skill_routes,
 )
 
 if TYPE_CHECKING:
@@ -591,9 +590,9 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
     `on_listening` is called as soon as the port is open (write hub.json there: other `dreamteam` commands then
     find this hub during a long resume instead of starting a second one), `on_started` after the resume, so
     callers see the resumed sessions running."""
+    check_hub_token(host)
     app = create_launcher_app(manager, host)
-    config = uvicorn.Config(app, host=host, port=port, log_level=log_level, access_log=False,
-                            log_config=None, lifespan="on", ws="auto", timeout_graceful_shutdown=GRACEFUL_SECONDS)
+    config = hub_server_config(app, host, port, log_level)
     listening = asyncio.Event()
     server = HubServer(config, listening.set)
     manager.hub_url = public_base(host, port)

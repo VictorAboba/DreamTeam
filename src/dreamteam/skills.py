@@ -1297,7 +1297,7 @@ def clone(src: GitSource, dest: Path, limits: Limits, git: str | None = None,
               "-c", "advice.detachedHead=false", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always",
               "-c", "protocol.ssh.allow=always",
               *(("-c", "protocol.file.allow=always") if src.scheme == "file" else ()),
-              "-c", f"core.hooksPath={hooks.as_posix()}", "-c", "submodule.recurse=false",
+              "-c", f"core.hooksPath={hooks.as_posix()}", "-c", "core.fsmonitor=", "-c", "submodule.recurse=false",
               "-c", "fetch.recurseSubmodules=false"]
     branch = [f"--branch={src.ref}"] if src.ref else []
     deadline = time.monotonic() + timeout

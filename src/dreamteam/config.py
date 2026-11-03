@@ -37,6 +37,15 @@ def env_var_name(value: Any) -> str | None:
     match = _ENV_NAME.match(value.strip()) if isinstance(value, str) else None
     return next((g for g in match.groups() if g), None) if match else None
 
+
+# every `api_key_env` a model profile of this process has named (make_profile): secrets, whatever the name, for
+# the environment of DreamTeam's own helper processes (shell.secret_free_env), also where no config is at hand
+_KEY_ENV_NAMES: set[str] = set()
+
+
+def key_env_names() -> frozenset[str]:
+    return frozenset(_KEY_ENV_NAMES)
+
 # USD per 1M tokens: (input, output, cache_read, cache_write_5m). Used when a profile sets no prices.
 KNOWN_PRICES: dict[str, tuple[float, float, float, float]] = {
     "claude-fable-5-1": (10.0, 50.0, 0.25, 12.5),
@@ -323,6 +332,7 @@ def make_profile(name: str, spec: dict[str, Any]) -> ModelProfile:
         # hints) sees a plain variable name and never treats a key as one
         if env_var_name(env) is not None:
             spec["api_key_env"] = env_var_name(env)
+            _KEY_ENV_NAMES.add(spec["api_key_env"].upper())
         else:
             spec["api_key_env"] = None
             if env.strip() and not spec.get("api_key"):  # a key written into the variable-name field

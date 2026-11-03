@@ -23,6 +23,8 @@ import httpx2
 from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from .. import hubauth
+
 if TYPE_CHECKING:
     from ..sessions import SessionManager
 
@@ -82,14 +84,20 @@ def _is_loopback(url: str) -> bool:
 
 
 class HubClient:
-    """Async client of a DreamTeam hub (launcher or single-swarm `dreamteam run`)."""
+    """Async client of a DreamTeam hub (launcher or single-swarm `dreamteam run`). `user_url`: an address that may
+    have DREAMTEAM_HUB_TOKEN whatever its host (hubauth.client_tokens): the hub this process serves itself."""
 
-    def __init__(self, base_url: str, *, timeout: float = 30.0, http: httpx2.AsyncClient | None = None):
+    def __init__(self, base_url: str, *, timeout: float = 30.0, http: httpx2.AsyncClient | None = None,
+                 user_url: str | None = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.mode = ""   # "launcher" | "swarm" after hub_info()
+        self.user_url = user_url
         self._loopback = _is_loopback(self.base_url)
         self._own_http = http is None
+        # the hub token of a Docker sandbox's hub (hubauth.py), looked up for every request and every (re)connect of
+        # the stream: a sandbox started again on the same port has a new one
+        self._auth = hubauth.httpx_auth(user_url)
         # a hub on this machine never goes through the proxy of the environment
         self.http = http or httpx2.AsyncClient(timeout=timeout, trust_env=not self._loopback)
         self._closed = False
@@ -131,10 +139,12 @@ class HubClient:
         if timeout is not None:
             kwargs["timeout"] = max(timeout, self.timeout)
         try:
-            resp = await self.http.request(method, self.base_url + path, **kwargs)
+            resp = await self.http.request(method, self.base_url + path, auth=self._auth, **kwargs)
         except (httpx2.HTTPError, OSError) as exc:
             raise HubUnreachable(0, f"The hub at {self.base_url} is not reachable: "
                                     f"{str(exc) or type(exc).__name__}") from None
+        if hubauth.refused(resp.status_code, resp.headers):  # every token it may send was refused (or none was)
+            raise HubError(401, str(hubauth.TokenRequired(self.base_url, user_url=self.user_url)))
         try:
             data = resp.json()
         except ValueError:
@@ -324,6 +334,22 @@ class HubClient:
         return urllib.parse.urlunsplit((scheme, parts.netloc, parts.path.rstrip("/") + self.session_base(sid) + "/ws",
                                         "", ""))
 
+    async def _ws_open(self, url: str, options: dict[str, Any]) -> Any:
+        """ws_connect with the hub token (hubauth.client_tokens), looked up at every (re)connect, and the next one when
+        the hub refuses the handshake: it closes a WebSocket without its token before accepting it (HTTP 403)."""
+        tokens: list[str | None] = [*hubauth.client_tokens(url, user_url=self.user_url)] or [None]
+        for index, token in enumerate(tokens):
+            headers = {"Authorization": f"Bearer {token}"} if token else None
+            try:
+                ws = await ws_connect(url, **options, additional_headers=headers)
+            except InvalidStatus as exc:
+                if index + 1 < len(tokens) and exc.response.status_code in (401, 403):
+                    continue
+                raise
+            hubauth.token_taken(url, token)
+            return ws
+        raise AssertionError("_ws_open: no attempt")   # (the last attempt returns or raises)
+
     async def _pause(self, delay: float) -> None:
         """Sleep `delay` seconds, or less if the client gets closed."""
         with contextlib.suppress(asyncio.TimeoutError):
@@ -336,8 +362,9 @@ class HubClient:
         restarted) and 1001 reconnect at once. Yields {"type": "_connection", "data": {"state": ...}}
         with "connected" on every (re)connect and "lost" when the connection goes (or cannot be made);
         "rejected" (with "status") follows when the hub answers the handshake with an HTTP error instead of
-        a stream, e.g. 403 for a session that no longer exists: the caller may check over REST whether
-        retrying makes sense. Ends when the iterator is closed or the client is closed."""
+        a stream, e.g. 403 for a session that no longer exists or for a hub that takes none of the tokens tried
+        (_ws_open): the caller may check over REST whether retrying makes sense. Ends when the iterator is closed
+        or the client is closed."""
         url = self.ws_url(sid)
         options: dict[str, Any] = {"open_timeout": 10, "close_timeout": 2, "max_size": WS_MAX_SIZE}
         if self._loopback and _WS_PROXY_OPTION:
@@ -349,7 +376,7 @@ class HubClient:
             code: int | None = None
             refused: int | None = None
             try:
-                async with ws_connect(url, **options) as ws:
+                async with await self._ws_open(url, options) as ws:
                     if self._closed:
                         return
                     self._sockets.add(ws)
@@ -449,6 +476,18 @@ async def _stop_task(task: asyncio.Task) -> BaseException | None:
     return None if task.cancelled() else task.exception()
 
 
+async def _running_hub(home: Path) -> str | None:
+    """cli.running_hub in a thread; a hub that asks for a token this computer lacks is a HubError, never "none runs"
+    (a second launcher on the same home would run its sessions twice)."""
+    from .. import cli
+    from ..hubauth import TokenRequired
+
+    try:
+        return await asyncio.to_thread(cli.running_hub, home)
+    except TokenRequired as exc:
+        raise HubError(401, str(exc)) from None
+
+
 async def connect(home: Path | str, *, host: str | None = None, port: int | None = None, start: bool = True,
                   web: bool = True, llm_factory: Callable | None = None, resume: bool | None = None) -> Connection:
     """Connect to the hub of `home`, starting the launcher in this process when none runs.
@@ -458,13 +497,13 @@ async def connect(home: Path | str, *, host: str | None = None, port: int | None
        host/port (defaults: the home settings) -> owned=True. hub.json is written as soon as the server
        listens, before the sessions resume, so that another `dreamteam` finds this hub meanwhile. When the
        configured port is busy (or is lost in a race), a hub of this home that shows up within HUB_WAIT is
-       used instead (owned=False); else a free ephemeral port on 127.0.0.1. web=False binds 127.0.0.1 on an
-       ephemeral port and writes no hub.json. `resume` overrides server.resume_sessions of the settings.
-    3. Else HubError(0, ...)."""
-    from .. import cli
-
+       used instead (owned=False); else a free ephemeral port on 127.0.0.1. A free configured port on an address
+       other than loopback without a hub token is HubError(0, web.NoTokenError's text) before anything starts.
+       web=False binds 127.0.0.1 on an ephemeral port and writes no hub.json. `resume` overrides
+       server.resume_sessions of the settings.
+    3. Else HubError(0, ...); HubError(401, ...) when the home's hub asks for a token this computer lacks."""
     home = Path(home).expanduser().resolve()
-    base = await asyncio.to_thread(cli.running_hub, home)
+    base = await _running_hub(home)
     if base:
         return await _attach(home, base)
     if not start:
@@ -491,7 +530,7 @@ async def _wait_for_hub(home: Path, timeout: float | None = None) -> str | None:
     begin = loop.time()
     timeout = HUB_WAIT if timeout is None else timeout
     while True:
-        base = await asyncio.to_thread(cli.running_hub, home)
+        base = await _running_hub(home)
         elapsed = loop.time() - begin
         if base or elapsed >= timeout:
             return base
@@ -505,18 +544,27 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
     from .. import cli
     from ..launcher import serve_launcher
     from ..sessions import SessionManager
-    from ..web import display_host, public_base
+    from ..web import NoTokenError, check_hub_token, display_host, public_base
 
     try:
         manager = SessionManager(home, llm_factory=llm_factory)
     except (ValueError, OSError) as exc:
         raise HubError(0, f"Invalid settings in {home}: {exc}") from None
-    marker = cli.write_launcher_marker(home)  # the sessions of this home run here (also without the web UI)
     configured: tuple[str, int] | None = None
     if web:
         bind_port = manager.config.server.port if port is None else port
         if bind_port:
             configured = (host or manager.config.server.host, bind_port)
+    configured_free = configured is not None and cli._port_free(*configured)
+    if configured is not None and configured_free:
+        # before anything runs, and never the fallback to 127.0.0.1 below: that one is for a busy port, where
+        # nothing of this process would listen on the configured address
+        try:
+            check_hub_token(configured[0], warn=False)
+        except NoTokenError as exc:
+            raise HubError(0, f"The DreamTeam web server cannot start on {configured[0]}:{configured[1]}: "
+                              f"{exc}") from None
+    marker = cli.write_launcher_marker(home)  # the sessions of this home run here (also without the web UI)
     hub_written = False
 
     def listening(base: str) -> None:
@@ -545,7 +593,7 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
     chosen: tuple[str, int] | None = None
     try:
         if configured is not None:
-            if cli._port_free(*configured):
+            if configured_free:
                 server, error = await launch(*configured)
                 chosen = configured
             if server is None:  # busy, or lost the race for it
@@ -570,7 +618,8 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
 
     bind_host, bind_port = chosen
     base = f"http://{display_host(bind_host)}:{bind_port}"
-    conn = Connection(HubClient(base), base, home, owned=True, manager=manager, _server=server,
+    # (its own bind address, never a hub.json's: DREAMTEAM_HUB_TOKEN goes there, also to a LAN address it serves on)
+    conn = Connection(HubClient(base, user_url=base), base, home, owned=True, manager=manager, _server=server,
                       _hub_file=hub_written, _marker=marker)
     try:
         await conn.client.hub_info()

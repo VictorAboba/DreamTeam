@@ -19,9 +19,10 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-from . import __version__, netoff, roles
+from . import __version__, hubauth, netoff, roles
 from .config import CONFIG_FILE, PROVIDER_PRESETS, Config, render_template
 from .goal_text import split_goal
+from .hubauth import open_hub
 from .models import USER
 
 log = logging.getLogger("dreamteam")
@@ -87,11 +88,16 @@ def _same_path(a: str, b: str) -> bool:
     return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
 
 
-def hub_identity(base_url: str, timeout: float = 3.0) -> dict | None:
-    """What the hub at base_url says about itself (GET /api/hub): {"pid", "project", "name", "version"}."""
+def hub_identity(base_url: str, timeout: float = 3.0, *, user_url: str | None = None) -> dict | None:
+    """What the hub at base_url says about itself (GET /api/hub): {"pid", "project", "name", "version"}.
+    hubauth.TokenRequired when a DreamTeam hub answers there but takes no token this computer may send it.
+    `user_url`: the hub address the user typed (hubauth.client_tokens)."""
+    url = base_url.rstrip("/") + "/api/hub"
     try:
-        with urllib.request.urlopen(base_url.rstrip("/") + "/api/hub", timeout=timeout) as resp:
+        with open_hub(urllib.request.Request(url), timeout, user_url=user_url) as resp:
             data = json.loads(resp.read().decode("utf-8"))
+    except hubauth.TokenRequired:
+        raise
     except Exception:
         return None
     return data if isinstance(data, dict) else None
@@ -275,6 +281,21 @@ async def _wait_started(server: asyncio.Task, started: asyncio.Event, stop: asyn
     return started.is_set() and not server.done()
 
 
+def _token_missing(host: str, port: int) -> bool:
+    """web.check_hub_token before a command creates or starts anything (a session of --goal, the swarm): True, with
+    the reason printed, when its hub could not start for want of a token. serve() and serve_launcher() check again.
+    After running_hub: a hub of the home that runs already is reported whether this process has a token or not
+    (`serve` also opens it)."""
+    from .web import NoTokenError, check_hub_token
+
+    try:
+        check_hub_token(host, warn=False)
+    except NoTokenError as exc:
+        print(f"The web server cannot start on {host}:{port}: {exc}", file=sys.stderr)
+        return True
+    return False
+
+
 def _server_error(server: asyncio.Task | None) -> BaseException | None:
     if server is None or not server.done() or server.cancelled():
         return None
@@ -283,7 +304,9 @@ def _server_error(server: asyncio.Task | None) -> BaseException | None:
 
 def _start_console(loop: asyncio.AbstractEventLoop, base: str, lang: str, stop: threading.Event) -> asyncio.Future:
     """Run the terminal console in a daemon thread: a thread blocked in input() must not keep the process
-    alive after the hub stopped (asyncio.to_thread would make asyncio.run wait for it forever)."""
+    alive after the hub stopped (asyncio.to_thread would make asyncio.run wait for it forever). `base` is this
+    process's own hub (its bind address or DREAMTEAM_PUBLIC_URL, never a hub.json's): the console sends it
+    DREAMTEAM_HUB_TOKEN even when it is not a loopback one (`serve --host <a LAN address>`)."""
     from . import console as console_module
 
     done = loop.create_future()
@@ -294,7 +317,7 @@ def _start_console(loop: asyncio.AbstractEventLoop, base: str, lang: str, stop: 
 
     def target() -> None:
         try:
-            console_module.run_console(base, lang, stop=stop, local=True)  # (in the hub's own process)
+            console_module.run_console(base, lang, stop=stop, local=True, user_url=base)  # (in the hub's own process)
         except Exception:
             log.exception("console failed")
         finally:
@@ -387,8 +410,8 @@ async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal
             return code
         _write_hub_file(project, base, config)
         print(f"DreamTeam \"{config.swarm.name}\" is running.\n  Board: {base}\n  MCP:   {base}/mcp", file=sys.stderr)
-        if open_browser:
-            webbrowser.open(base)
+        if open_browser:  # (its own address: DREAMTEAM_HUB_TOKEN goes there, as a cookie, whatever its host)
+            webbrowser.open(hubauth.browser_url(base, user_url=base))
         stopper = asyncio.ensure_future(stop.wait())
         waiters = {server, stopper}
         if console:
@@ -425,9 +448,11 @@ def cmd_run(args) -> int:
         config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, network=args.network))
     host = args.host or config.server.host
     port = args.port or config.server.port
-    existing = running_hub(project)
+    existing = running_hub(project)  # (before the token check: it creates nothing, and needs no token of this process)
     if existing:
         print(f"A hub is already running for {project}: {existing}", file=sys.stderr)
+        return 1
+    if _token_missing(host, port):  # (before the swarm starts and the goal is set)
         return 1
     setup_logging(project)
     console = not args.no_console and _stdin_is_terminal()
@@ -441,8 +466,9 @@ def cmd_console(args) -> int:
     from .console import run_console
 
     local: bool | None = None  # the hub's address decides (a loopback one is local)
+    user_url = None  # an address the user typed: DREAMTEAM_HUB_TOKEN may go there, whatever its host (hubauth.py)
     if args.url:
-        base = args.url.rstrip("/")
+        base = user_url = args.url.rstrip("/")
         lang = args.lang or "ru"
     else:
         project = _home_arg(args)
@@ -456,13 +482,13 @@ def cmd_console(args) -> int:
             lang = args.lang or Config.load(project).swarm.language
         except (ValueError, OSError):
             lang = "ru"
-    ident = hub_identity(base)
+    ident = hub_identity(base, user_url=user_url)
     if ident is None:  # (the console would retry for a minute against nothing)
         print(f"No DreamTeam hub answers at {base}.", file=sys.stderr)
         return 1
     if ident.get("mode") == "launcher":
         try:
-            session = _pick_session(base, args.session)
+            session = _pick_session(base, args.session, user_url=user_url)
         except LookupError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -482,7 +508,7 @@ def cmd_console(args) -> int:
                   f"({base}/).", file=sys.stderr)
         base = f"{base}/s/{session['id']}"
         lang = args.lang or session.get("language") or lang
-    run_console(base, lang, local=local)
+    run_console(base, lang, local=local, user_url=user_url)
     return 0
 
 
@@ -596,7 +622,7 @@ def cmd_status(args) -> int:
     if base:
         req = urllib.request.Request(base + "/api/act/swarm_status", data=b"{}", method="POST",
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with open_hub(req, 10) as resp:
             print(json.loads(resp.read().decode("utf-8"))["result"])
         print(f"Hub: {base}")
         return 0
@@ -647,14 +673,14 @@ def _load_home(home: Path) -> Config:
     return validate(ensure_home(home), read_raw(home))
 
 
-def _hub_json(base: str, path: str, timeout: float = 15.0):
-    with urllib.request.urlopen(base.rstrip("/") + path, timeout=timeout) as resp:
+def _hub_json(base: str, path: str, timeout: float = 15.0, *, user_url: str | None = None):
+    with open_hub(urllib.request.Request(base.rstrip("/") + path), timeout, user_url=user_url) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _pick_session(base: str, sid: str | None) -> dict:
+def _pick_session(base: str, sid: str | None, *, user_url: str | None = None) -> dict:
     """The session a command works with: `sid`, else the running one (most recently active)."""
-    sessions = _hub_json(base, "/api/sessions").get("sessions", [])
+    sessions = _hub_json(base, "/api/sessions", user_url=user_url).get("sessions", [])
     if sid:
         for item in sessions:
             if item["id"] == sid:
@@ -750,8 +776,8 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
             return code
         print(f"DreamTeam is running.\n  Sessions: {base}/\n  MCP:      {base}/mcp\n  Home:     {home}",
               file=sys.stderr)
-        if open_browser:
-            webbrowser.open(base + (f"/s/{focus}/" if focus else "/"))
+        if open_browser:  # (its own address: DREAMTEAM_HUB_TOKEN goes there, as a cookie, whatever its host)
+            webbrowser.open(hubauth.browser_url(base + (f"/s/{focus}/" if focus else "/"), user_url=base))
         stopper = asyncio.ensure_future(stop.wait())
         waiters = {server, stopper}
         if console:
@@ -821,16 +847,18 @@ def cmd_serve(args) -> int:
         skills = _skill_items(args.skill, home, workspace)
         if skills is None:
             return 2
-    existing = running_hub(home)
+    existing = running_hub(home)  # (before the token check: it creates nothing, and needs no token of this process)
     if existing:
         print(f"DreamTeam is already running for {home}: {existing}/", file=sys.stderr)
         if not args.no_browser:
-            webbrowser.open(existing + "/")
+            webbrowser.open(hubauth.browser_url(existing + "/"))   # (a sandbox's hub: its token, as a cookie)
+        return 1
+    host = args.host or config.server.host
+    port = args.port or config.server.port
+    if _token_missing(host, port):  # (before --goal creates and starts a session and imports its --skill)
         return 1
     setup_logging(home)
     console = not args.no_console and _stdin_is_terminal()
-    host = args.host or config.server.host
-    port = args.port or config.server.port
     try:
         return asyncio.run(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
                                        goal=args.goal, title=args.title, workspace=workspace, skills=skills,
@@ -868,7 +896,7 @@ def _hub_delete_session(base: str, sid: str, skills: str | None = None) -> dict:
     extra = f"&skills={skills}&via=cli" if skills else ""   # (the library records the CLI as the surface)
     request = urllib.request.Request(f"{base}/api/sessions/{quoted}?confirm={quoted}{extra}", method="DELETE")
     try:
-        with urllib.request.urlopen(request, timeout=120) as resp:
+        with open_hub(request, 120) as resp:
             answer = json.loads(resp.read().decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
         try:
@@ -1453,6 +1481,8 @@ def main(argv: list[str] | None = None) -> int:
         # in the Docker sandbox: the firewall of the sessions without network first, then DreamTeam again without
         # NET_ADMIN (returns at once anywhere else)
         netoff.sandbox_entry()
+    # the hub token (`dreamteam sandbox`): out of the environment before anything starts a process
+    hubauth.take_env_token()
     if sys.platform == "win32":
         for stream in (sys.stdout, sys.stderr):
             try:
@@ -1469,7 +1499,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("unrecognized arguments: " + " ".join(extra))
     try:
         return int(args.func(args) or 0)
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, hubauth.TokenRequired) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 

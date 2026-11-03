@@ -269,11 +269,11 @@ def _has_global_ipv6() -> bool:
 
 
 def _offline_home() -> str:
-    import pwd
-
     try:
+        import pwd
+
         return pwd.getpwnam(OFFLINE_USER).pw_dir
-    except KeyError:
+    except (ImportError, KeyError):   # (no pwd: Windows, only where a test pretends to be the sandbox)
         return "/tmp"
 
 
@@ -451,6 +451,8 @@ def prepare_workspace(root: Path) -> int:
             os.close(fd)
 
     fix(str(root), None)
+    if not os.path.isdir(root):   # not created yet (a new session): Workspace.init makes it with the offline group
+        return failed
     for _folder, dirs, files, dirfd in os.fwalk(root, follow_symlinks=False):
         for name in dirs + files:
             fix(name, dirfd)

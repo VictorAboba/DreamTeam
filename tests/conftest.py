@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from dreamteam import prompts, skill_deps
+from dreamteam import hubauth, prompts, skill_deps
 from dreamteam.board import Board
 from dreamteam.config import Config
 from dreamteam.db import Database, dumps, loads
@@ -163,6 +163,17 @@ def _isolated_skill_dirs(tmp_path_factory, monkeypatch):
     monkeypatch.delenv("DREAMTEAM_HOST_SKILLS_DIR", raising=False)
     monkeypatch.setenv("DREAMTEAM_SKILL_ENVS_DIR", str(base / "envs"))
     monkeypatch.setattr(skill_deps, "INSTALLERS", fake_installers.default())
+
+
+@pytest.fixture(autouse=True)
+def _isolated_hub_tokens(tmp_path_factory, monkeypatch):
+    """No test reads or writes the real store of sandbox tokens (~/.dreamteam/hub-tokens), and no hub of a test asks
+    for a token unless the test gives it one (hubauth.py)."""
+    monkeypatch.setenv(hubauth.TOKENS_DIR_ENV, str(tmp_path_factory.mktemp("hubtokens")))
+    for name in (hubauth.TOKEN_ENV, hubauth.DIGEST_ENV, hubauth.NO_TOKEN_ENV):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(hubauth, "_taken", None)
+    monkeypatch.setattr(hubauth, "_taken_digest", None)
 
 
 def make_skill(folder: Path, name: str | None = "demo", description: str = "Does a demo thing.",

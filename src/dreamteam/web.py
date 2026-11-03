@@ -20,7 +20,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.staticfiles import StaticFiles
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, roles
+from . import __version__, hubauth, roles
 from . import skills as skill_lib
 from .db import loads
 from .hub_mcp import LIBRARY_TOOLS, LOOPBACK_HOSTS, MCPHttpEndpoint
@@ -43,6 +43,8 @@ ALLOWED_HOSTS_ENV = "DREAMTEAM_ALLOWED_HOSTS"   # extra Host names (comma-separa
 PUBLIC_URL_ENV = "DREAMTEAM_PUBLIC_URL"         # base URL users reach the hub at (e.g. a Docker port mapping)
 GRACEFUL_SECONDS = 3                            # open connections (long polls) get this long on shutdown
 INBOX_PAGE = 500                                # messages / notifications per /api/inbox response
+TOKEN_TEXT = ("This DreamTeam hub needs its token: open the board URL with ?token=<token> (`dreamteam sandbox` prints "
+              "it), or send the header Authorization: Bearer <token>.")
 
 
 def _split_hostport(value: str) -> tuple[str, int | None] | None:
@@ -92,29 +94,93 @@ def env_allowed_hosts() -> frozenset[str]:
 
 
 class GuardMiddleware:
-    """DNS-rebinding guard (Host check), cross-site guard (Origin check, also for WebSockets) and
+    """DNS-rebinding guard (Host check), cross-site guard (Origin check, also for WebSockets), the hub token and
     JSON-only POSTs (blocks cross-site form posts).
 
     Loopback bind: Host must be localhost / 127.0.0.1 / [::1]. Any other bind (0.0.0.0 in Docker, a LAN
-    address): Host may also be an IP literal (a rebinding attack always arrives with the attacker's domain
-    name) or the bind address. Names in DREAMTEAM_ALLOWED_HOSTS are accepted in both cases. An Origin must be
-    a loopback origin, an allowed name, or the very origin the request was made to.
+    address): Host may also be the bind address, or an IP literal (a rebinding attack always arrives with the
+    attacker's domain name) that is the address the connection reached, or any IP literal on a request with the
+    token (a port mapping that rewrites the address). Names in DREAMTEAM_ALLOWED_HOSTS are accepted in both cases.
+    An Origin must be a loopback origin, an allowed name, or the very origin the request was made to.
+
+    `token` (hubauth.py; default: hubauth.hub_digest(), from DREAMTEAM_HUB_TOKEN_SHA256 or DREAMTEAM_HUB_TOKEN): every
+    HTTP and WebSocket request from a peer that is not the hub's own loopback needs it, as `Authorization: Bearer
+    <token>` or as the cookie a board URL's one-time `?token=` sets (HttpOnly, SameSite=Strict; the hub redirects to
+    the URL without it). 401, or a closed WebSocket, without it. The guard keeps only the token's SHA-256. A request the
+    cookie authorizes takes no Origin but its own (host and port): browsers send a cookie to every port of a host, and
+    a page on another port of 127.0.0.1 is the same site for SameSite. No token: nothing is asked (a hub on 127.0.0.1
+    only has loopback peers anyway).
     """
 
     def __init__(self, app, loopback: bool | None = None, *, host: str = "127.0.0.1",
-                 extra_hosts: frozenset[str] | set[str] = frozenset()):
+                 extra_hosts: frozenset[str] | set[str] = frozenset(), token: str | None | object = hubauth.FROM_ENV):
         self.app = app
         self.loopback = (host in LOOPBACK_HOSTS) if loopback is None else loopback
         bind = _split_hostport(host if not (":" in host and not host.startswith("[")) else f"[{host}]")
         self.bind_host = bind[0] if bind else ""
         self.extra = frozenset(h.lower() for h in extra_hosts)
+        # the token's SHA-256 only: the guard never holds the token itself, and its digest lets nobody in
+        self.digest: str | None = (hubauth.hub_digest() if token is hubauth.FROM_ENV
+                                   else hubauth.digest(token) if token else None)  # type: ignore[arg-type]
+        self.cookie = hubauth.cookie_name(self.digest) if self.digest else ""
 
-    def host_allowed(self, hostname: str) -> bool:
+    def host_allowed(self, hostname: str, local: str = "", authorized: bool = False) -> bool:
+        """`local`: the address the connection reached (ASGI "server"); `authorized`: the request has the token."""
         if hostname in LOOPBACK_NAMES or hostname in self.extra:
             return True
         if self.loopback:
             return False
-        return hostname == self.bind_host or _is_ip(hostname)
+        if hostname == self.bind_host:
+            return True
+        return _is_ip(hostname) and (authorized or hubauth.same_ip(hostname, local))
+
+    def credential(self, scope, headers: dict[str, str]) -> str | None:
+        """How the request carries the token: "header", "cookie", "query" (a GET's `?token=`), or None."""
+        if self.digest is None:
+            return None
+        scheme, _, value = headers.get("authorization", "").partition(" ")
+        if scheme.lower() == "bearer" and hubauth.matches(value.strip(), self.digest):
+            return "header"
+        for item in headers.get("cookie", "").split(";"):
+            name, _, value = item.strip().partition("=")
+            if name == self.cookie and hubauth.matches(value.strip(), self.digest):
+                return "cookie"
+        if scope["type"] == "http" and scope.get("method") in ("GET", "HEAD") and self._query_token(scope):
+            return "query"
+        return None
+
+    def _query_token(self, scope) -> str | None:
+        query = urllib.parse.parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+        return next((v for k, v in query if k == hubauth.QUERY_PARAM and hubauth.matches(v, self.digest or "")), None)
+
+    async def _token_cookie(self, scope, receive, send) -> None:
+        """A board URL with the right `?token=`: the cookie (the token the URL brought: the hub has only its digest),
+        and the same URL without it (never in the history)."""
+        query = urllib.parse.parse_qsl(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+        rest = urllib.parse.urlencode([(k, v) for k, v in query if k != hubauth.QUERY_PARAM])
+        raw = scope.get("raw_path")
+        # a path, never another host: "//host" and "/\host" both leave the hub in a browser (which also drops tabs
+        # and newlines), so whatever is not plainly a path character is escaped, and leading slashes become one
+        path = (urllib.parse.quote(raw.decode("latin-1"), safe="/%:@!$&'()*+,;=-._~", encoding="latin-1") if raw
+                else urllib.parse.quote(scope.get("path") or "/"))
+        location = "/" + path.lstrip("/") + (f"?{rest}" if rest else "")
+        response = PlainTextResponse("", status_code=303, headers={"Location": location, "Cache-Control": "no-store"})
+        response.set_cookie(self.cookie, self._query_token(scope) or "", path="/", httponly=True, samesite="strict")
+        await response(scope, receive, send)
+
+    @staticmethod
+    def same_origin(origin: str, host: tuple[str, int | None], scheme: str) -> bool:
+        """`origin` is exactly the one the request was made to (scheme, host and port)."""
+        parsed = _parse_origin(origin)
+        secure = scheme in ("https", "wss")
+        return (parsed is not None and origin.strip().lower().startswith("https:" if secure else "http:")
+                and parsed == (host[0], host[1] or (443 if secure else 80)))
+
+    def cookie_origin_allowed(self, origin: str, host: tuple[str, int | None], scheme: str) -> bool:
+        """The Origin of a request the cookie authorizes: its own, or a name of DREAMTEAM_ALLOWED_HOSTS (a reverse
+        proxy that ends TLS changes the scheme)."""
+        parsed = _parse_origin(origin)
+        return self.same_origin(origin, host, scheme) or (parsed is not None and parsed[0] in self.extra)
 
     def origin_allowed(self, origin: str, host: tuple[str, int | None], scheme: str) -> bool:
         parsed = _parse_origin(origin)
@@ -136,12 +202,26 @@ class GuardMiddleware:
         if scope["type"] in ("http", "websocket"):
             headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
             host = _split_hostport(headers.get("host", ""))
-            if host is None or not self.host_allowed(host[0]):
+            credential = self.credential(scope, headers)
+            local = str((scope.get("server") or ("",))[0] or "")
+            if host is None or not self.host_allowed(host[0], local, credential is not None):
                 await self._reject(scope, receive, send, "Forbidden host", 403)
                 return
             origin = headers.get("origin")
-            if origin is not None and not self.origin_allowed(origin, host, scope.get("scheme", "http")):
+            scheme = scope.get("scheme", "http")
+            if origin is not None and not (self.cookie_origin_allowed(origin, host, scheme) if credential == "cookie"
+                                           else self.origin_allowed(origin, host, scheme)):
                 await self._reject(scope, receive, send, "Forbidden origin", 403)
+                return
+            if self.digest is not None and credential is None and not hubauth.peer_is_loopback(scope):
+                if scope["type"] == "http":
+                    await PlainTextResponse(TOKEN_TEXT, status_code=401, headers={
+                        "WWW-Authenticate": 'Bearer realm="DreamTeam"'})(scope, receive, send)
+                else:
+                    await send({"type": "websocket.close", "code": 1008})
+                return
+            if credential == "query":
+                await self._token_cookie(scope, receive, send)
                 return
             if (scope["type"] == "http" and scope.get("method") == "POST" and scope.get("path", "").startswith("/api/")
                     and not headers.get("content-type", "").lower().startswith("application/json")):
@@ -524,6 +604,54 @@ def display_host(host: str) -> str:
     return host
 
 
+class NoTokenError(RuntimeError):
+    """A hub on an address other hosts reach, without a token: it does not start (hubauth.NO_TOKEN_ENV allows it)."""
+
+
+def _loopback_bind(host: str) -> bool:
+    """A server bound to `host` listens on loopback alone: one of LOOPBACK_NAMES, or a loopback IP literal exactly as
+    written (127.0.0.2, ::1 however written, ::ffff:127.0.0.1), which the server binds as an address. A string with
+    brackets or a `%` scope is no IP literal ([::1] and 127.0.0.2%x.example are names to the server, not addresses),
+    so it needs a token like any other bind; unlike hubauth.is_loopback, which reads a peer's address."""
+    if host in LOOPBACK_NAMES:
+        return True
+    if "%" in host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
+
+
+def check_hub_token(host: str, *, warn: bool = True) -> None:
+    """A hub other hosts can reach that asks nothing of them does not start (the image's default command, a plain
+    `docker run` or compose without DREAMTEAM_HUB_TOKEN; `dreamteam sandbox` always sets one), unless the user allows
+    it with DREAMTEAM_HUB_NO_TOKEN=1: then it says so (`warn`). Every loopback IP literal is loopback (_loopback_bind:
+    127.0.0.2 too), not only the names: no other host reaches it, GuardMiddleware takes such a bind's own address as
+    its Host, and its peers come from loopback (peer_is_loopback). The commands that serve a hub call it before they
+    create or start anything (cli._token_missing, the TUI's in-process launcher), serve() and serve_launcher() once
+    more."""
+    if _loopback_bind(host) or hubauth.hub_digest() is not None:
+        return
+    if not hubauth.no_token_allowed():
+        raise NoTokenError(f"a hub on {host} needs a token: whoever reaches the port would control the swarm. Set "
+                           f"{hubauth.TOKEN_ENV} (e.g. python -c \"import secrets; print(secrets.token_urlsafe(32))\"), "
+                           f"use `dreamteam sandbox`, which makes one, or set {hubauth.NO_TOKEN_ENV}=1 to serve "
+                           "without one")
+    if warn:
+        log.warning("listening on %s without a hub token (%s): whoever reaches the port controls the swarm", host,
+                    hubauth.NO_TOKEN_ENV)
+
+
+def hub_server_config(app, host: str, port: int, log_level: str) -> uvicorn.Config:
+    """The uvicorn config of a hub. proxy_headers=False: X-Forwarded-For must never decide who is a loopback peer
+    (uvicorn trusts it from FORWARDED_ALLOW_IPS, which the environment sets, e.g. to *), and the hub token exempts
+    loopback peers."""
+    return uvicorn.Config(app, host=host, port=port, log_level=log_level, access_log=False, log_config=None,
+                          lifespan="on", ws="auto", timeout_graceful_shutdown=GRACEFUL_SECONDS, proxy_headers=False)
+
+
 def public_base(host: str, port: int) -> str:
     """Base URL users open for a hub bound to host:port (DREAMTEAM_PUBLIC_URL wins, e.g. in Docker)."""
     env = os.environ.get(PUBLIC_URL_ENV, "").strip().rstrip("/")
@@ -560,9 +688,9 @@ async def serve(swarm: "Swarm", host: str, port: int, log_level: str = "warning"
     """Run the web server until the task is cancelled; then shut it down gracefully (listening socket
     closed, connections ended, lifespan finished) before re-raising. Raises OSError if it cannot listen.
     `on_started` is called once the port is open."""
+    check_hub_token(host)
     app = create_app(swarm, host)
-    config = uvicorn.Config(app, host=host, port=port, log_level=log_level, access_log=False,
-                            log_config=None, lifespan="on", ws="auto", timeout_graceful_shutdown=GRACEFUL_SECONDS)
+    config = hub_server_config(app, host, port, log_level)
     server = HubServer(config, on_started)
     swarm.hub_url = public_base(host, port) + "/mcp"
     task = asyncio.ensure_future(server.serve())

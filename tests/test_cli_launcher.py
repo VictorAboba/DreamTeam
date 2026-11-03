@@ -234,7 +234,7 @@ def test_serve_home_hub_end_to_end(tmp_path, capsys, monkeypatch):
         sessions_module._rmtree(tmp_path / "usb")  # (git objects are read-only on Windows)
         consoles: list[tuple] = []
         monkeypatch.setattr(console_module, "run_console",
-                            lambda url, lang, stop=None, local=None: consoles.append((url, local)))
+                            lambda url, lang, stop=None, local=None, user_url=None: consoles.append((url, local)))
         assert (await asyncio.to_thread(cli.main, ["console", "--home", str(home), "--session", usb_sid])) == 0
         assert consoles == [(f"{base}/s/{usb_sid}", True)]
         await asyncio.to_thread(lambda: urllib.request.urlopen(urllib.request.Request(

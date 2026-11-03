@@ -17,6 +17,8 @@ import urllib.request
 from datetime import datetime
 from typing import Any, Iterable
 
+from .hubauth import TokenRequired, open_hub
+
 HELP = {
     "ru": """Команды:
   @Имя Фамилия текст      — написать агенту (или /msg Имя Фамилия: текст)
@@ -340,18 +342,23 @@ def cd_result_lines(result: dict, title: str) -> list[tuple[str, dict[str, Any]]
 
 
 class Hub:
-    def __init__(self, base_url: str):
+    """`user_url`: the hub address the user typed (`--url`). Every request carries the hub token of a Docker
+    sandbox's hub, looked up anew (hubauth.open_hub: the sandbox makes a new one at every start); TokenRequired when
+    the hub takes none of them."""
+
+    def __init__(self, base_url: str, user_url: str | None = None):
         self.base = base_url.rstrip("/")
+        self.user_url = user_url
 
     def get(self, path: str, **params: Any) -> Any:
         query = ("?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})) if params else ""
-        with urllib.request.urlopen(self.base + path + query, timeout=30) as resp:
+        with open_hub(urllib.request.Request(self.base + path + query), 30, user_url=self.user_url) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def post(self, path: str, body: dict[str, Any]) -> Any:
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode("utf-8"), method="POST",
                                      headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=660) as resp:
+        with open_hub(req, 660, user_url=self.user_url) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
     def act(self, tool: str, **args: Any) -> str:
@@ -398,16 +405,17 @@ _SCP_URL = re.compile(r"[^@/\\\s]+@[^:/\\\s]+:")
 
 class Console:
     def __init__(self, base_url: str, lang: str = "ru", stop: threading.Event | None = None,
-                 local: bool | None = None):
-        self.hub = Hub(base_url)
+                 local: bool | None = None, user_url: str | None = None):
+        self.hub = Hub(base_url, user_url)
         self.lang = lang if lang in HELP else "en"
         self.chat_with: str | None = None
         self.since_message = 0
         self.since_note = 0
         self.stop = stop or threading.Event()
+        self._token_refused = False   # the poll told the user that the hub takes no token it may send
         # a launcher session (`{hub}/s/{sid}`): `/cd` talks to the launcher itself
         found = _SESSION_BASE.match(self.hub.base)
-        self.launcher: Hub | None = Hub(found.group("hub")) if found else None
+        self.launcher: Hub | None = Hub(found.group("hub"), user_url) if found else None
         self.session_id = urllib.parse.unquote(found.group("sid")) if found else None
         # the hub runs on this computer: `~` and relative `/cd` paths are resolved here (`local` True: the hub was
         # found through the home's hub.json, or this console runs inside the hub's process; else a loopback address)
@@ -446,6 +454,11 @@ class Console:
                         return
                     _print(_color("note", "• " + clean(n["text"])))
                     self.since_note = max(self.since_note, n["id"])
+                self._token_refused = False
+            except TokenRequired as exc:  # (once: the poll goes on, and takes the new token when there is one)
+                if not self._token_refused:
+                    self._token_refused = True
+                    _print(_color("err", str(exc)))
             except (urllib.error.URLError, OSError, ValueError, KeyError, TypeError):
                 pass
             self.stop.wait(1.5)
@@ -464,6 +477,8 @@ class Console:
             out = _color("err", f"HTTP {exc.code}: {clean(exc.read().decode('utf-8', 'replace')[:300])}")
         except (urllib.error.URLError, OSError) as exc:
             out = _color("err", f"Hub is not reachable: {exc}")
+        except TokenRequired as exc:
+            out = _color("err", str(exc))
         except ValueError as exc:  # "/show abc", "/budget x", unbalanced quotes, a non-JSON reply...
             out = _color("err", (f"Не понял команду ({exc}). /help — список команд." if self.lang == "ru"
                                  else f"Could not parse the command ({exc}). See /help."))
@@ -831,6 +846,10 @@ class Console:
                 break
             except (urllib.error.URLError, OSError):
                 time.sleep(0.25)
+            except TokenRequired as exc:  # said once, as the poll does: never the end of the console (in the hub's
+                self._token_refused = True  # own process: of the hub with it)
+                _print(_color("err", str(exc)))
+                break
         _print(HELP[self.lang])
         poller = threading.Thread(target=self._poll, daemon=True)
         poller.start()
@@ -852,7 +871,8 @@ class Console:
 
 
 def run_console(base_url: str, lang: str = "ru", stop: threading.Event | None = None,
-                local: bool | None = None) -> None:
+                local: bool | None = None, user_url: str | None = None) -> None:
     """Interactive console; returns on /quit, EOF or Ctrl+C, or after `stop` is set (checked between lines).
-    `local`: the hub runs on this computer (None: decided by the address)."""
-    Console(base_url, lang, stop, local).run()
+    `local`: the hub runs on this computer (None: decided by the address). `user_url`: the hub address the user
+    typed (`--url`: hubauth.client_tokens)."""
+    Console(base_url, lang, stop, local, user_url).run()

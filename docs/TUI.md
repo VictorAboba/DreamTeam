@@ -48,7 +48,9 @@ class HubUnreachable(HubError)     # the hub did not answer at all (status 0); t
 
 class HubClient:
     """Async client of a DreamTeam hub (launcher or single-swarm `dreamteam run`)."""
-    def __init__(self, base_url: str, *, timeout: float = 30.0, http=None): ...
+    def __init__(self, base_url: str, *, timeout: float = 30.0, http=None, user_url: str | None = None): ...
+        # user_url: an address that may get DREAMTEAM_HUB_TOKEN whatever its host (hubauth.client_tokens): the
+        # launcher's own address when connect() started it in this process
     base_url: str
     mode: str                              # "launcher" | "swarm" (after hub_info())
     async def aclose(self) -> None
@@ -108,7 +110,8 @@ class HubClient:
         # backoff (0.5 s .. 10 s). On every (re)connect and loss it yields pseudo events
         # {"type": "_connection", "data": {"state": "connected" | "lost"}}. When the hub answers the handshake
         # with an HTTP error instead (403: e.g. the session was deleted), {"state": "rejected", "status": N}
-        # follows the "lost" (once per streak): consumers check over REST whether the session still exists.
+        # follows the "lost" (once per streak): consumers check over REST whether the session still exists, or
+        # (also for a single swarm) whether the hub takes none of the tokens tried (HubError 401: its text is shown).
         # It stops when the iterator is closed (aclose) or the client is closed. Server close codes 1012
         # (session restarted) / 1001 mean "reconnect now".
 
@@ -131,7 +134,9 @@ async def connect(home: Path, *, host: str | None = None, port: int | None = Non
     #    finds this hub instead of resuming the same sessions. When the configured port is busy (or lost in
     #    a race), a hub of this home that shows up within ~2 s is used (owned=False); else a free ephemeral
     #    port on 127.0.0.1. Wait until it started -> owned=True. The server task runs in the current loop.
-    # 3. Else raise HubError(0, ...).
+    #    A free configured port on an address other than loopback without a hub token: HubError(0, the
+    #    reason) before anything starts (never the 127.0.0.1 fallback, which is for a busy port).
+    # 3. Else raise HubError(0, ...); HubError(401, ...) when the home's hub takes no token this computer has.
     # web=False still runs the HTTP server (the TUI needs it) but binds 127.0.0.1 on an ephemeral port and
     # writes no hub.json.
 ```

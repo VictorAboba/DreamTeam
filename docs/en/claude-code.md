@@ -15,6 +15,11 @@ see ["Install"](getting-started.md#install)). If the server is already running, 
 claude mcp add dreamteam -- dreamteam mcp
 ```
 
+The hub of the Docker sandbox asks for a token (see [Docker sandbox](sandbox.md#access-token)): add the header that
+`dreamteam sandbox` prints, `--header "Authorization: Bearer <token>"`, to the HTTP command. The token is new at every
+start of the sandbox; the stdio command finds it itself, for every request, so it keeps working when the sandbox
+restarts (`dreamteam mcp --home <home>` for a home outside the default one).
+
 Through `/mcp` you get the session tools: `sessions_list`, `session_create(title, goal, ..., workspace)`,
 `session_start`, `session_stop` and `session_cd(session, path)` (move to another folder, `path="default"` moves it
 back to its own folder), and also `skill_library` (the skill library); `session_create` and `session_start` accept

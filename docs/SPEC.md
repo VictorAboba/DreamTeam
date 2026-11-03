@@ -40,7 +40,11 @@ src/dreamteam/
   board.py       Board          — tasks, goal field, discussion, independent review (§4)
   mailbox.py     Mailbox        — direct messages
   workspace.py   Workspace      — shared files, git, locks
-  shell.py       run_shell, start_command, RunningCommand, Capture, scrubbed_env (§7)
+  hubgit.py      DreamTeam's own git in the members' folders: environment, fixed options, the repository's
+                 commands disarmed (§7 "DreamTeam's own git")
+  hubauth.py     the hub token: what a hub asks of peers outside its loopback, where `dreamteam sandbox` keeps it,
+                 what DreamTeam's clients send (§14.2); standard library only
+  shell.py       run_shell, start_command, RunningCommand, Capture, scrubbed_env, secret_free_env (§7)
   netoff.py      sessions without network: isolation, wrap, environment, sandbox_entry (§7.2);
                  netns_helper.py makes the offline commands' network namespace and joins a command to it
   procs.py       ProcessTree    — a command's contained process tree: Windows Job Object, POSIX process group with a
@@ -781,6 +785,10 @@ class Workspace:
     def __init__(self, swarm): ...
     async def init(self) -> None                 # mkdir; ensure_scratch() (with or without git); if git
                                                  # enabled+available: init repo, .gitignore, initial commit
+                                                 # (Swarm.start decides git_isolated before: _prepare_offline)
+    git_isolated: bool                           # DreamTeam's git here may run isolated ("Defense in depth")
+    def hold_git(self) -> None                   # the network went off: _git() waits (counted holds) until
+    def release_git(self) -> None                # Swarm._network_changed's _prepare_offline has decided
     def ensure_scratch(self, actor: str | None = None) -> None
         # `.scratch/` with its marker `.scratch/.gitignore` (rewritten when missing or changed) and, for `actor`,
         # the member's folder scratch_rel(actor); synchronous, best effort (an OSError is logged); a `.scratch`
@@ -993,14 +1001,139 @@ another folder (§17.2 "Workspace folder"). Then:
   an unplugged drive, a host path inside the Docker sandbox) is not replaced by an empty stand-in.
 - `adopted` (= `config.workspace_adopted`, the folder was the user's): `init()` never writes the repo-local
   settings, not even into a repository it initialized there. Every git call of the workspace passes its identity
-  and settings per command (`-c user.name=<actor> -c user.email=… -c core.autocrlf=false -c commit.gpgsign=false
-  -c core.quotepath=false -c safe.directory=<root>`), so autocommits never need the repository's config. In an
+  and settings per command (`-c user.name=<actor> -c user.email=… -c core.autocrlf=false -c core.quotepath=false
+  -c safe.directory=<root>`, after hubgit's fixed options, "DreamTeam's own git" below), so autocommits never need
+  the repository's config. In an
   adopted folder `-c core.autocrlf=false` is left out: the user's own line-ending settings apply to the agents'
   commits as to the user's (Git for Windows sets `core.autocrlf=true` system-wide; overriding it would commit
   CRLF rewrites of the user's LF files and make a clean checkout look modified). `Workspace.resolve` refuses any
-  path with a `.git` component, so the agents never write into the repository database.
+  path with a `.git` component; the members' shell can change `.git` anyway (below).
 - `async settle(timeout=GIT_TIMEOUT)`: waits for git commands whose caller was cancelled (they run in threads);
   `Swarm.stop()` calls it, so no commit is still writing when a stopped session's files move or are deleted.
+
+#### DreamTeam's own git (hubgit.py)
+Every git process DreamTeam starts in a folder the members can write is built by hubgit.py: the autocommits and path
+commits (`Workspace._git` → `_run_git`, in a thread) and `run_git` (`init_repo`, `repo_state`, `tracked`,
+`commit_paths`: `init()` and sessions.py's checks of a folder of the user). A member's shell reaches `.git`, so what
+the repository's config names for git to run is the members' to choose: hooks, `core.fsmonitor`, filter, textconv,
+diff and merge drivers with a matching `.gitattributes`, ssh, credential and askpass helpers, an included config
+file, config-based hooks (`hook.<name>.*`, git 2.54+), and the same in a submodule's own config (git runs a child
+git in every checked-out submodule for status, add and commit). None of it may run with DreamTeam's rights,
+environment or network.
+- **Environment** (`hubgit.environment(secret_names=())`): `shell.secret_free_env(names)`, i.e. os.environ without
+  `_INTERNAL_ENV` and without the variables taken for secrets, whatever `shell.pass_env` lets through to the agents
+  (`_KNOWN_SECRETS`, `names`, every `api_key_env` a model profile of this process named, `config.key_env_names()`,
+  and `_SECRET_RE`);
+  minus every inherited `GIT_*`; plus `hubgit.ENV`: `GIT_TERMINAL_PROMPT=0`, `GIT_ALLOW_PROTOCOL=` (empty: every
+  transport refused, so no fetch, lazy or not (`GIT_NO_LAZY_FETCH=1` as well), and no ssh command, remote or
+  credential helper ever starts), `GIT_EDITOR=:`, `GIT_SEQUENCE_EDITOR=:` (never launched), `GIT_ASKPASS=` (set
+  and empty: `core.askPass` is not consulted), `GIT_PAGER=cat`, `GIT_LFS_SKIP_SMUDGE=1`. `Workspace` passes its
+  config's `api_key_env` names. (`git_env()`, os.environ minus `GIT_*`, stays for the user's own skill clones.)
+- **Fixed options** (`hubgit.fixed_args()`, in every `git_argv`): `--no-pager -c core.hooksPath=<hooks_dir()>
+  -c core.fsmonitor= -c commit.gpgSign=false -c tag.gpgSign=false -c credential.helper=`. `hooks_dir()` is
+  `os.devnull` on POSIX (`/dev/null`: a device only root can replace, below which no hook can ever be; a folder would
+  be the members' to write under "env" and "netns", where they have DreamTeam's uid). On Windows it is an empty
+  folder `dreamteam-nohooks-*` in the system temp folder (outside every workspace; the members' commands have
+  DreamTeam's account there anyway), made once per process and anew when anything appears in it or it is no folder
+  any more; removed at exit while empty. An empty `core.fsmonitor` is off for every git (2.35 and older take `false`
+  for a hook path). The autocommit's message diff has `--no-ext-diff --no-textconv`.
+- **The repository's own config** (`hubgit.guard(git, root, env, offline=False)` → `Guard(env, args, excludes,
+  filters)`): `git config --list --show-scope --show-origin -z --includes` (which runs nothing) in the repository and,
+  recursively, in each checked-out submodule (the gitlinks of its index: the index files' bytes are searched for mode
+  160000 first, then `git ls-files -s -z`; only the latter where the index's folder is not known, "Cache" below). The
+  `system` and `global` scopes are the user's; `local`, `worktree`
+  (and the files they include) the repository's; `command` DreamTeam's. A scan run offline in the Docker sandbox
+  (`netoff.isolation() == "docker"`) reads the offline user's home, which the members can write: its `global` scope
+  counts as the repository's there (`parse(..., trust_global=False)`), only `system` values come back. Every key of the repository's for which
+  `hubgit.inert_value(key)` is not None (`filter.<d>.clean|smudge|process|required`, `diff.<d>.textconv|command`,
+  `diff.external`, `merge.<d>.driver`, `core.sshCommand|alternateRefsCommand|askPass`, `credential[.<url>].helper`,
+  `gpg[.<format>].program`, `gpg.ssh.defaultKeyCommand`, `remote.<n>.uploadpack|receivepack`,
+  `trailer.<key>.cmd|command`, `lfs.extension.<n>.clean|smudge`) is set again for the call: to the user's own
+  (global or system) value of that key when there is one (a member's override of the user's git-lfs filter gets
+  git-lfs back), else to the inert value (`""`; `required` `false`); a credential helper is always reset. Each
+  config-based hook, of any scope, gets `hook.<name>.enabled=false` and `hook.<name>.command=` (no hook runs for
+  DreamTeam's commits, as with `core.hooksPath`). `gc.recentObjectsHook` in the repository's config (several values,
+  which `-c` cannot take back) turns automatic maintenance off for the call (`maintenance.auto=false`, `gc.auto=0`).
+  git hands its settings on to the child git of a submodule, so the submodules' keys go into the same call. They
+  travel as `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` (`Guard.env`: a driver's name may hold
+  "=", at which `-c` would split it); a git older than 2.31 gets `-c` (`Guard.args`; a key with "=" is then logged
+  and left), one older than 2.26 (no `--show-scope`) the local keys disarmed without the user's values back.
+- **A required filter only the repository defines** (`filter.<d>.required` true and no clean or process command of
+  the user's: git-crypt, git-lfs installed with `--local`, or a member's): disarmed like the rest, and its files are
+  never stored unfiltered: each command that stages, commits or checks pathspecs gets
+  `:(exclude,attr:filter=<d>)` (`Guard.excludes`; `hubgit.run_unfiltered`, through `_git(..., unfiltered=True)`:
+  the whole-tree `add -A` / `add -u`, the add of moved files, the path commits of write_file / edit_file and of held
+  files, the autocommits' `git status` and their `ls-files --others` of untracked folders; through
+  `run_git(..., unfiltered=True)`: `init_repo`'s add, `commit_paths`' commit, `repo_state`'s status;
+  `hubgit.with_excludes` turns literal pathspecs into `:(literal)...`, also those read through
+  `--pathspec-from-file`). Those files stay uncommitted, are never held, and never count as changes of a folder of
+  the user (with the filter off, a file of it merely touched, or racily clean, would look modified, and an agent's
+  edit of it, which DreamTeam does not commit, would refuse the next start); a member's own git, which runs the
+  filter with the member's rights, can commit them, and so can the user. So the user's own uncommitted edits of them
+  do not refuse an adoption or a start either (docs/en/projects.md asks the user to commit them first). `guard()`
+  logs once per folder and filter (a warning) that DreamTeam leaves those files out there. The excludes apply to the
+  repository's own paths: in a checked-out submodule with such a filter of its own, the child git that
+  `repo_state`'s status starts there sees its touched files as the submodule's modified content (until the user's
+  own git status has refreshed that index). A driver whose name the attr magic cannot spell keeps
+  `required=true`: git refuses its files instead.
+- **git older than 2.44** (`hubgit.ATTR_IN_ADD`; macOS's `/usr/bin/git`, Debian 12, Ubuntu 22.04 and 24.04): its
+  `git add` rejects the attr magic ("pathspec magic not supported by this command: 'attr'"; `status`, `commit` and
+  `ls-files` take it since it exists, 2.13). Such an add gets the files of those filters by name instead:
+  `git ls-files -z -s --cached --others --exclude-standard -- :(attr:filter=<d>)...` (reads no content) lists them,
+  each becomes `:(exclude,literal)<path>`, and every pathspec goes through stdin (`--pathspec-from-file=-`, git 2.25+;
+  the command line before that). A file made, or given that filter, between the listing and the add would be staged
+  unfiltered: the same listing (`--cached` only) runs after the add, and every file of those filters in the index
+  that the first one did not name is put back as HEAD has it (`git reset -q`) before any commit (OSError, so no
+  commit follows, when that check or reset fails). Where git cannot list them (older than 2.13), the attr excludes
+  stay: that add fails as a whole and nothing is stored unfiltered.
+- **Cache**: a repository's scan is reused while the content of every config file it read is the same, and of those a
+  member may create or change to make git read another config (`hubgit._locate`): where `folder/.git` leads (the
+  folder itself, or the git dir a `.git` file's `gitdir: <path>` names: a checked-out submodule, a linked worktree;
+  the `.git` file's own bytes), `<git dir>/config`, `config.worktree` and `commondir` (git then reads the config of
+  the folder it names: a linked worktree's), `<common dir>/config`, and the global `~/.gitconfig` and
+  `$XDG_CONFIG_HOME/git/config` of the environment git gets (members can write them under "netns" and in the Docker
+  sandbox) (a few small reads per call). They are watched by their real paths, resolved as git resolves them, so a
+  `.git` file pointing elsewhere or a link a member swaps further up is a change. Never reused when its config
+  includes other files, when `folder` has no `.git` of its own or it is a link, or when the config git read is not
+  the one of the repository found there (`Scan.git_dir` against the common or git dir; with `.git/config` deleted or
+  emptied there is none, and the gitlinks come from `ls-files`). Members make these files: `hubgit._read` opens them
+  non-blocking, reads only a regular file of at most 1 MiB (`CONFIG_LIMIT`), and of it the size `fstat` gives and
+  one byte more (never a buffer of the limit's size), and closes the descriptor on every path; a folder (POSIX opens
+  one, on Windows the open fails with PermissionError), a FIFO (whose open would wait for a writer), a device (whose
+  read may never end), a larger file or one longer when read than `fstat` said (it grew meanwhile: its first bytes
+  could equal an old stamp) is `NOT_A_FILE`, and the scan is not reused while one is there (a FIFO that git itself
+  opens holds up only that git, until its timeout). A `gitdir:` or `commondir` that holds no path (a NUL, at which git
+  stops reading and which Python's calls refuse; on Windows bytes that are no UTF-8) makes `_locate` give None: that
+  folder is scanned every time, the guard never fails on it. The gitlinks are
+  reused while the index files' stat is the same (mtime, size, inode and, on POSIX, the change time, which no writer
+  can put back): `<git dir>/index` and its `sharedindex.*` (`Scan.index_dir`, set only when that check holds; else
+  `git ls-files -s` every time; also for an index file that is no regular file or larger than 64 MiB,
+  `INDEX_LIMIT`). Warm, a call costs one git process in a plain repository and a linked worktree; in a repository
+  with checked-out submodules a call after one that rewrote the index (`add`, `commit`, `status`) costs one
+  `git ls-files -s` more.
+  `hubgit.forget()` (tests).
+- **Defense in depth**: a key a member's command adds while DreamTeam's git is starting is not seen in time, and under
+  the "netns" isolation the members can write the user's global config. So in a session without network under
+  "docker" or "netns" every git DreamTeam runs for it runs like the members' commands: `hubgit.run(...,
+  offline=True)` = `netoff.wrap(argv)` with `netoff.environment(env)` (the offline user's ids and home, or the
+  session's network namespace as the user): whatever slips through runs with the members' rights. Nothing relies on
+  no member's command running at that moment:
+  * the workspace's git (`Workspace._run_git`, its `init()` included) while `Workspace.git_isolated` (and the
+    session's network still off). `Swarm.start` runs `_prepare_offline` before `Workspace.init()`, which then creates
+    what is missing with the offline user's group; when the setting turns "off" mid-session, `_network_changed`
+    calls `Workspace.hold_git()` at once (the members' next commands are offline at once) and the `_git()` calls
+    that start meanwhile wait until `_prepare_offline` has set `git_isolated` (`release_git()`, also when the task is
+    cancelled before it ran);
+  * sessions.py's git for a session without network (`_Plan.network_off`): the checks of a folder before it is
+    adopted (the first one while the session still runs), `tracked`, the initial commit of an adopted folder, the
+    commit that removes the session's MCP servers from the folder it leaves, the check at every start
+    (`_check_adopted_repo`). `run_git`, `init_repo`, `repo_state`, `tracked` and `commit_paths` take `offline`;
+    `isolated_git(network_off, folder=None)` decides it in the thread (`netoff.isolation()` in "docker", "netns")
+    and, in the Docker sandbox, first opens the `folder` that git writes to the offline user
+    (`netoff.prepare_workspace`, as at every start).
+  Under "env" (Windows, macOS) and under "netns" the members' commands have DreamTeam's uid anyway: there the
+  disarmed config keeps DreamTeam's git from running the members' code, and what slips through gets the filtered
+  environment above, not DreamTeam's own.
 
 Module helpers (synchronous, for code without a swarm, e.g. sessions.py; run them in a thread):
 ```python
@@ -1030,25 +1163,33 @@ def agent_git_env(env, actor) -> dict[str, str]      # a new env: GIT_LOCATION_V
                                                      # and GIT_COMMITTER_NAME/EMAIL = git_identity(actor)
 def porcelain_entries(data: bytes) -> list[tuple[str, str]]   # (XY, path) of `git status --porcelain -z`; a
                                                      # rename or copy yields its new and its old path
-def git_env() -> dict[str, str]                      # os.environ without GIT_*, GIT_TERMINAL_PROMPT=0
-def git_argv(git, root, actor, args, safe_directory=None, *, adopted=False, literal=True) -> list[str]
-    # identity from git_identity(actor); adopted: no core.autocrlf override; literal=False: pathspec magic such as
-    # `:(exclude)` works (only the autocommit's fixed pathspecs use it; Workspace._git(..., literal=) passes it on)
+def git_env() -> dict[str, str]                      # os.environ without GIT_*, GIT_TERMINAL_PROMPT=0: the user's
+                                                     # skill clones only (DreamTeam's own git: hubgit.environment)
+def git_argv(git, root, actor, args, safe_directory=None, *, adopted=False, literal=True, guard=()) -> list[str]
+    # hubgit.fixed_args(), identity from git_identity(actor); adopted: no core.autocrlf override; literal=False:
+    # pathspec magic such as `:(exclude)` works (only the autocommit's fixed pathspecs use it; Workspace._git(...,
+    # literal=) passes it on); guard: hubgit.Guard.args (a git older than 2.31)
 def run_git(root, *args, actor=None, git=None, safe_directory=None, timeout=GIT_TIMEOUT, adopted=False,
-            literal=True) -> CompletedProcess
-def init_repo(root, git=None, *, adopted=False) -> str | None   # git init + .gitignore if missing + initial
-    # commit of what is there (with the user's line endings when adopted); None = ok, else git's error text
+            literal=True, unfiltered=False, offline=False) -> CompletedProcess   # hardened: hubgit.environment(),
+    # hubgit.guard() ("DreamTeam's own git"); unfiltered: the command stages, commits or checks pathspecs,
+    # hubgit.run_unfiltered leaves out the files of a disarmed required filter (init_repo's add, commit_paths'
+    # commit, repo_state's status); offline: hubgit.run(offline=True), "Defense in depth"
+def isolated_git(network_off, folder=None) -> bool     # network_off and netoff.isolation() in ("docker", "netns");
+    # in the Docker sandbox `folder` (where that git writes) is opened to the offline user first. Synchronous
+def init_repo(root, git=None, *, adopted=False, offline=False) -> str | None   # git init + .gitignore if missing +
+    # initial commit of what is there (with the user's line endings when adopted); None = ok, else git's error text
 def looks_like_git_dir(folder) -> bool                 # a repository database itself (HEAD + objects/ + refs/)
-def repo_state(root, git=None, exclude=()) -> dict     # what an existing folder is to git (the user's config
-    # applies, read-only, safe.directory=*): {"toplevel": work tree root containing root | None, "git_dir": a bare
-    # repository or a .git folder, "branch": current branch | None (detached), "operation": "merge" | "rebase" |
+def repo_state(root, git=None, exclude=(), *, offline=False) -> dict
+    # what an existing folder is to git (the user's config applies, read-only, safe.directory=*): {"toplevel":
+    # work tree root containing root | None, "git_dir": a bare repository or a .git folder, "branch": current branch | None (detached), "operation": "merge" | "rebase" |
     # "cherry-pick" | "revert" | "bisect" ... stopped halfway (GIT_OPERATIONS: MERGE_HEAD, CHERRY_PICK_HEAD,
     # REVERT_HEAD, rebase-merge/, rebase-apply/, sequencer/, BISECT_LOG in the git dir) | None, "changes":
     # `git status --porcelain --untracked-files=normal --ignore-submodules=none` lines (the user's
     # status.showUntrackedFiles or submodule settings cannot hide what `git add -A` would commit; `exclude`:
-    # folders relative to root left out, e.g. the session's own `mcp/<name>`), "error": str | None}
-def tracked(root, paths, git=None) -> list[str]        # which of `paths` hold files the repository tracks
-def commit_paths(root, paths, message, git=None) -> (commit | None, error | None)
+    # folders relative to root left out, e.g. the session's own `mcp/<name>`; so are the files of a disarmed
+    # required filter, as from DreamTeam's commits: git-crypt's after `git-crypt unlock`), "error": str | None}
+def tracked(root, paths, git=None, *, offline=False) -> list[str]   # which of `paths` hold files the repository tracks
+def commit_paths(root, paths, message, git=None, *, offline=False) -> (commit | None, error | None)
     # commit only the current state of `paths` (e.g. their removal) as DreamTeam, other changes left as they are;
     # refused on a detached HEAD or while an operation is in progress
 ```
@@ -1088,8 +1229,12 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
     # os.environ minus secrets (model api_key_env vars, *_API_KEY, *_TOKEN, *SECRET*, *PASSWORD*)
     # except config.shell.pass_env, and always minus _INTERNAL_ENV (DREAMTEAM_SKILLS_DIR, DREAMTEAM_HOST_SKILLS_DIR,
     # DREAMTEAM_SKILL_ENVS_DIR: agents' commands are never pointed at the skills library or the skills'
-    # environments, even through pass_env); plus
+    # environments, even through pass_env; the offline markers; DREAMTEAM_HUB_TOKEN(_SHA256), §14.2); plus
     # PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
+def secret_free_env(names=()) -> dict[str, str]
+    # os.environ minus _INTERNAL_ENV and the secrets whatever pass_env says (the known names, `names`, each
+    # api_key_env a model profile of this process named: config.key_env_names(), the patterns): DreamTeam's own
+    # processes in the members' folders (hubgit.environment, §7 "DreamTeam's own git")
 def kill_tree(proc) -> None   # tui/bash.py's `!` commands: POSIX os.killpg(proc.pid, SIGKILL); Windows taskkill /T /F
 
 # procs.py (standard library only; kernel32 through ctypes, loaded lazily)
@@ -1502,7 +1647,8 @@ hint says to restart `dreamteam sandbox` (it then adds the firewall, `docker.wan
   -- python -m dreamteam ARGS`: the hub never keeps NET_ADMIN, and it runs as root with the offline group, so what it
   creates (files of `write_file`, `.git`) is the commands' to write without a set-group-id bit on any folder. A
   failure (an old image, no owner match) prints a warning, and the sessions without network get "env".
-  `Swarm._prepare_offline` (at start, and when the setting turns "off") runs `netoff.prepare_workspace(root)` for
+  `Swarm._prepare_offline` (at start, before `Workspace.init()`, and when the setting turns "off") runs
+  `netoff.prepare_workspace(root)` for
   "docker": an entry root owns (or the image's `dreamteam-agent`, of an earlier run) gets the group GID with the
   owner's bits copied to the group (a read-only entry, e.g. the skills mirror, stays read-only); what UID owns already
   and what anyone else owns is left as it is. It walks by file descriptors (`os.fwalk`, each entry opened with
@@ -1521,11 +1667,16 @@ hint says to restart `dreamteam sandbox` (it then adds the firewall, `docker.wan
   `off`, reason `network` (`deps_reason_network`, UI `sk_reason_network`), unless its environment is ready on disk
   already; the plan key includes the setting, and a change replans (`SessionSkills.replan`). The user's own skills
   install as before: DreamTeam installs them, not an agent.
-- **Git.** The workspace's own git commands (`Workspace._git_argv`) get `-c core.hooksPath=<os.devnull>` and `-c
-  core.fsmonitor=false`: hooks and an fsmonitor command are commands the members may have written (`pre-commit
-  install`, `git config core.fsmonitor ...`) that git would run with DreamTeam's network (`commit.gpgsign=false` is
-  set always, `git_argv`). Other commands an agent can name in `.git/config` for git to run (filter, textconv and merge
-  drivers with a matching `.gitattributes`) are not covered.
+- **Git.** DreamTeam's own git never runs hooks, an fsmonitor command or what else the members may have named in the
+  repository's config (filter, textconv, diff and merge drivers, ssh and credential helpers, included files,
+  config-based hooks, a submodule's own), with or without network, and its environment is filtered of secrets like
+  the agents', whatever `shell.pass_env` lets through to them (§7 "DreamTeam's own git"). Under "docker" and "netns"
+  every git DreamTeam runs for the session also runs like the members' commands (the workspace's from before `init()`
+  on, held while the setting turns "off" until `_prepare_offline` is done; sessions.py's checks and commits:
+  `Workspace.git_isolated`, `_Plan.network_off`, `hubgit.run(offline=True)`: the offline user's ids or the session's
+  namespace; §7 "Defense in depth"): a key added at the very moment of DreamTeam's call, or one in the "global" config
+  the members can write under "netns", runs with their rights and without network (the offline user's global config in
+  the Docker sandbox is disarmed like the repository's).
 - **Telling the members.** `render_wake` (the wake-up and the incoming news) first calls `Swarm._tell_network(name)`:
   the member's last `n_network_off` / `n_network_on` notification is the state it knows; when that differs from the
   setting, a quiet one (wake=False) is added. Each member is told once, also across restarts, and again when the user
@@ -1968,7 +2119,9 @@ def client_key(ctx, local: str) -> str | None
 def serving_client(client) -> ContextManager       # hub_call inside it (and in tasks it starts) comes from `client`
 def hub_clients(swarm) -> HubClients               # external member -> the client that last acted as it (as_agent,
                                                    # or join_swarm: a new member or a welcome-back)
-def proxy_http_client()                            # the stdio proxy's httpx client, with a random CLIENT_HEADER
+def proxy_http_client(url: str)                    # the stdio proxy's httpx client, with a random CLIENT_HEADER
+                                                   # and hubauth.httpx_auth() (a sandbox hub's token, per request:
+                                                   # §14.2); a loopback `url` never through the environment's proxy
 async def serve_stdio(swarm) -> None
 async def serve_stdio_proxy(url: str, instructions: str | None = None) -> None
     # stdio server forwarding to a running hub's /mcp (a swarm's or the launcher's); the client gets the
@@ -2000,8 +2153,12 @@ the client acts as); the members' side that skills (SKILL.md folders under `.scr
 per-session app the launcher serves under `/s/{sid}/` (§18.1). All JSON (`httpjson.JSONResponse`; the
 WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json`. Guard
 (`GuardMiddleware`, every bind, also 0.0.0.0 in Docker): Host must be localhost/127.0.0.1/[::1]; for
-non-loopback binds also an IP literal or the bind address; plus names in `DREAMTEAM_ALLOWED_HOSTS`
-(comma-separated). Origin must be loopback, an allowed name, or same-origin (WebSockets too).
+non-loopback binds also the bind address, or an IP literal that is the address the connection reached (ASGI
+`server`; any IP literal only on a request with the hub token: a port mapping that rewrites the address); plus names
+in `DREAMTEAM_ALLOWED_HOSTS` (comma-separated). Origin must be loopback, an allowed name, or same-origin (WebSockets
+too; only same-origin or an allowed name for a request the hub token's cookie authorizes). Then the hub token
+(§14.2): with one, a peer that is not the hub's own loopback needs it (401 / WebSocket closed 1008 before accept);
+without one, `serve` refuses a non-loopback bind.
 `DREAMTEAM_PUBLIC_URL` is the base URL users reach the hub at (shown as the MCP URL and written to
 hub.json; `dreamteam sandbox` sets it). `serve(swarm, host, port, ..., on_started=)` sets
 `swarm.hub_url = public_base(host, port) + "/mcp"`, calls back once listening and shuts down gracefully when
@@ -2049,6 +2206,8 @@ stopped check uses `Swarm.started`.
            "limits":{"max_cost_usd","max_agents"},
            "agent_count": n,               // what limits.max_agents counts (Swarm.agent_count: external members do not)
            "spent_usd","goal": {...}|null, "counts": {status: n}, "mcp_url", "models": [profile names],
+           "mcp_token": bool,              // the hub has a token (§14.2): the board's MCP command shows the header
+                                           // with a `<token>` placeholder; never the token itself
            "session": {"id","title","status": "running"|"stopped",
                        "pending_goal": {"title","description"}|null}|null,   // null outside a SessionManager;
                                        // pending_goal: the goal a never-started session gets at its first start
@@ -2080,6 +2239,100 @@ stopped check uses `Swarm.started`.
  "locks": [...],
  "user": {"unread": n}}
 ```
+
+### 14.2 Hub token (hubauth.py)
+Inside the Docker sandbox the hub listens on 0.0.0.0: a published port reaches the container's interface, never its
+loopback (a hub bound to 127.0.0.1 there answers no one outside), so every container on the same Docker network
+reaches it as well. The token closes that.
+
+- **The hub.** Its guard keeps only the token's SHA-256: `DREAMTEAM_HUB_TOKEN_SHA256` (`DIGEST_ENV`, 64 hex; what
+  `dreamteam sandbox` passes, so the token itself is never in the container's environment) or else the digest of
+  `DREAMTEAM_HUB_TOKEN` (`TOKEN_ENV`, the token itself: docker compose, the host's clients). `cli.main` moves both out
+  of os.environ first (`take_env_token`, after
+  `netoff.sandbox_entry`, whose re-exec still carries them): no process DreamTeam starts inherits them, and
+  `shell._INTERNAL_ENV` drops both from the agents' environment and DreamTeam's git (`secret_free_env`) whatever
+  `shell.pass_env` says. `hub_digest()` is the hub's digest (a `DIGEST_ENV` that is no SHA-256 becomes the digest of a
+  random token: never "no token"); `env_token()` is the token for clients. `GuardMiddleware(token=FROM_ENV)` of
+  both apps (and of every session app; `token="..."` is a raw token, hashed) keeps `digest` and asks every HTTP and
+  WebSocket request whose peer (ASGI `client`) is not a loopback address (`peer_is_loopback`; IPv4-mapped included;
+  a peer that is not an IP address is not loopback) for one of: `Authorization: Bearer <token>`, the cookie
+  `dreamteam_hub_<sha256(token)[:12]>` (`cookie_name(digest)`; one name per hub: browsers send cookies to every port
+  of a host), or, on a GET/HEAD, `?token=<token>`, which is answered with 303 to the same path and query without it,
+  `Set-Cookie: <name>=<the token the URL brought>; Path=/; HttpOnly; SameSite=Strict`, `Cache-Control: no-store`. The
+  `Location` is always a path on the hub: the raw path is percent-encoded except plain path characters (`\`, tab and
+  newline included: a browser reads `/\host` as `//host`) and its leading slashes become one. Without a token: 401
+  `TOKEN_TEXT` with `WWW-Authenticate: Bearer realm="DreamTeam"`, or `websocket.close` 1008 before accept
+  (WebSockets: header or cookie, never the query). A request the cookie authorizes takes an `Origin` only if it is
+  its own (`same_origin`: scheme, host and port) or an allowed name (`cookie_origin_allowed`): SameSite counts every
+  port of 127.0.0.1 as the same site. Comparisons are `hmac.compare_digest` of `sha256(given)` with the digest
+  (`matches`). Loopback peers need no token (the token protects a direct non-loopback bind only: a same-host reverse
+  proxy or port forwarder needs an authentication of its own). `hub_server_config` gives uvicorn `proxy_headers=False`,
+  so `X-Forwarded-For` / `FORWARDED_ALLOW_IPS` never decide who is loopback. No token on a loopback bind (127.0.0.1,
+  localhost, ::1, or another loopback IP literal exactly as written, `web._loopback_bind`: 127.0.0.2 too, whose own
+  address the guard takes as the Host and whose peers are all loopback; a string with brackets or a `%` scope is no IP
+  literal and needs a token): nothing changes. The token is never logged, never in the
+  snapshot (`mcp_token` says only that there
+  is one), the settings or `/api/hub`. `web.check_hub_token(host)` raises `NoTokenError` for a non-loopback bind
+  without a token (fail closed: the image's default CMD, a plain `docker run`, compose without `DREAMTEAM_HUB_TOKEN`,
+  which compose passes by name, so that `docker compose ps`, `logs` and `down` work without it, and the container's
+  log shows the reason); `DREAMTEAM_HUB_NO_TOKEN=1` (`NO_TOKEN_ENV`) lets it start with a warning. It runs before
+  anything is created or started, after `running_hub` (a hub of the home that runs already is reported whether this
+  process has a token or not, and `serve` opens it in the browser unless `--no-browser`; one that asks for a token no
+  client here may send stops the command with `TokenRequired`'s text): `cli._token_missing` (`warn=False`) in
+  `cmd_serve` (before `--goal`
+  creates and starts a session and imports its `--skill`) and in `cmd_run` (before the swarm starts and the goal is
+  set) prints `The web server cannot start on <host>:<port>: <its text>` and exits 1; the TUI's
+  `_start_launcher` checks a free configured port before its launcher marker (`HubError(0, ...)`, which `dreamteam`
+  and `dreamteam -p` print; a busy port keeps the fallback to an ephemeral port on 127.0.0.1); `dreamteam mcp`, whose
+  web part is optional, logs serve()'s refusal and goes on over stdio. `serve` and `serve_launcher` check once more.
+- **`dreamteam sandbox`** (`docker.run_sandbox`): refuses when a container `dreamteam-<port>` exists
+  (`container_exists`); makes `new_token()` (`secrets.token_urlsafe(32)`) per container; `store_token(port, token,
+  mounted, also_mounted=[sandbox_host_library(config)])` writes `<tokens_dir>/<port>.json` `{"port","token","home"}`
+  (mode 0600, folder 0700 on POSIX) unless the folder is inside any mounted directory (`_inside`: `os.path.normcase`,
+  and `os.path.samefile` per ancestor for a case-insensitive file system Python does not know about; then None:
+  nothing stored, the printed lines name `DREAMTEAM_HUB_TOKEN` instead); `tokens_dir()` is `DREAMTEAM_TOKENS_DIR` or
+  `~/.dreamteam/hub-tokens`. `sandbox_command` passes `-e DREAMTEAM_HUB_TOKEN_SHA256` by name and
+  `subprocess.call(cmd, env={...without TOKEN_ENV/DIGEST_ENV, DIGEST_ENV: digest(token)})` gives the value (never on
+  a command line, never the token itself; `env_passthrough` never passes the host's own). `access_lines` prints the board URL with
+  `?token=`, the MCP URL and `claude mcp add --transport http dreamteam <base>/mcp --header "Authorization: Bearer
+  <token>"`, and the stdio registration `claude mcp add dreamteam -- dreamteam mcp ...` that survives restarts.
+  `forget_token(port, token)` removes the file when the container ends (only if it still holds this token).
+- **Clients.** `client_tokens(url, user_url=None)` is the one rule of where a token may go, in the order a client
+  tries them: the token stored for the URL's port only to a loopback URL (127.0.0.1, localhost, [::1]); `env_token()`
+  to a loopback URL or to the hub address the user typed (`user_url`, `dreamteam console --url`: the same scheme, host
+  and port), whatever its host; nothing to any other URL (a hub.json sits in the mounted folder, and the agents must
+  not be able to send a client's token anywhere else). The clients of a hub in their own process pass its own address
+  as `user_url`: `cli._start_console` (the console of `serve`/`run`: `public_base`, the bind address or
+  `DREAMTEAM_PUBLIC_URL`), the board `serve` and `run --open` open in the browser once they listen
+  (`browser_url(<board>, user_url=public_base)`) and the TUI's `_start_launcher` (`HubClient(base, user_url=base)`,
+  also for its stream and its `/web`), so that `serve --host <a LAN address>` with `DREAMTEAM_HUB_TOKEN` lets its own
+  console, browser and TUI in.
+  Duplicates go; the token a hub took last (`token_taken`, per
+  scheme, host and port; ws counts as http) goes first while it is still a candidate, so a stale stored token (a
+  sandbox killed before its `forget_token`) costs one refused request before `DREAMTEAM_HUB_TOKEN`. Clients look the
+  tokens up for every request, since `dreamteam sandbox` makes a new one at every start on the same port while they
+  stay attached: `open_hub(request, timeout, user_url=)` (urllib: `cli.hub_identity`, so `running_hub`, `_hub_json`,
+  `cmd_status`, `_hub_delete_session`, `console.Hub`) and `httpx_auth(user_url=None)` (an `httpx2.Auth`, imported
+  lazily: the TUI's `HubClient` per request, `hub_mcp.proxy_http_client(url)`, which Claude Code keeps running) send
+  the first candidate
+  and retry with the next one on `refused(status, headers)` (401 with `WWW-Authenticate: Bearer realm="DreamTeam"`;
+  another server's 401 is no refusal); the TUI's stream computes the header at every (re)connect
+  (`HubClient._ws_open`) and tries the next candidate on a refused handshake (401/403: the guard closes before accept).
+  A redirect never takes the token along: `open_hub` sends it as an unredirected header (urllib copies the others to
+  the redirect's target), httpx2 and websockets drop it on a cross-origin redirect. A loopback URL (`is_loopback_url`)
+  never goes through the environment's proxy (`HTTP_PROXY` without `NO_PROXY` for loopback would get the request and
+  its token): `open_hub` opens it with an opener without proxies (`_urlopen`), `proxy_http_client(url)` and the
+  TUI's `HubClient` set `trust_env=False` for it, the stream `proxy=None`. When the hub refuses every candidate (or
+  none may go there), `open_hub` raises `TokenRequired(url, user_url=)`, whose text names what was tried (the stored
+  file, `DREAMTEAM_HUB_TOKEN`) and what to set, or, for a URL no token may go to, that a token goes only to loopback
+  or to an address typed with `dreamteam console --url`, and that an address read from a hub.json gets none (never a
+  ready-made `--url <that address>`: whoever wrote the hub.json would get the user's token from it); `HubClient`
+  raises `HubError(401, <that text>)`, the console prints it once per outage (at its first read of the inbox too: a
+  console that ended there would end `serve` or `run` with it), the TUI when its stream is refused (it asks the hub
+  over REST, for a single swarm's stream too), `main()` for the other commands; `running_hub` never takes such a hub
+  for a dead one. `browser_url(url, user_url=None)` adds `?token=` (the first candidate) for `webbrowser.open` (the
+  TUI's `/web`, `serve` finding a running hub, `serve` and `run --open` opening their own board); what is shown on
+  screen is the URL without it.
 
 ## 15. CLI (cli.py)
 
@@ -2466,7 +2719,8 @@ next start, which checks the folder).
   when the repository has uncommitted changes or untracked, not ignored files (`repo_state`, §7: `git status
   --porcelain --untracked-files=normal`, whatever the user's status settings; the agents commit with
   `git add -A`; the `mcp/<name>` folders of the session's own servers, absent there, are left out as at every
-  start: a folder the session worked in before may track them, and their move brings them back), is in a
+  start: a folder the session worked in before may track them, and their move brings them back; so are the files of
+  a required filter DreamTeam's git does not run, which no commit of DreamTeam takes, §7), is in a
   detached HEAD, has a merge, rebase, cherry-pick, revert or bisect stopped halfway (the
   agents' next commit would conclude it), or git cannot read it; refused (400) when the folder is inside a
   repository but not its root; a folder that is not in a repository gets one (`init_repo`: git init, `.gitignore`
@@ -2799,11 +3053,15 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   removed at exit (only by the process that wrote it). `running_hub(dir)` trusts it only when `GET /api/hub`
   confirms the pid and the directory.
 - `serve`: refuses when a hub already runs for the home (opening that one in the browser unless
-  `--no-browser`) or when the port is busy;
+  `--no-browser`, whether this process has a hub token or not; a hub that asks for a token no client here may send
+  ends it with `TokenRequired`'s text) or when the port is busy, and, right after the check
+  for a running hub and before anything is created or started, an address other than loopback without a hub token
+  (`run` too; §14.2);
   `--goal` creates and starts a session (its first line becomes the title unless `--title`) and opens its board;
   the terminal console attaches to the running session when stdin is a real terminal (on Windows the NUL device
   is not one). Settings errors and unusable homes are messages, not tracebacks.
-- `console`: with a launcher hub it works against `{base}/s/{sid}` (`--session`, else the running one); it
+- `console`: with a launcher hub it works against `{base}/s/{sid}` (`--session`, else the running one); `--url` is
+  an address the user typed, so `DREAMTEAM_HUB_TOKEN` goes there whatever its host (§14.2); it
   refuses a URL where no hub answers and a stopped session, except a stopped session whose folder outside it
   does not exist (it cannot start, and `/cd` is what fixes it: the console attaches and says so). Commands include `/trace [Name|#id]`,
   `/span N [ctx]` and `/session` (the current session; another one is `dreamteam console --session ID`),
@@ -2836,7 +3094,8 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   that never started prints "No traces." without creating its database).
 - `status` of a home lists the sessions (from the hub, or read from the home); of a project, `swarm_status`.
 - `sandbox` refuses when a hub runs for the directory; the container runs `serve /swarm` for a home and
-  `run /swarm` for a project. `docker.sandbox_command` starts it with `docker run --rm --init ...`: a tiny init
+  `run /swarm` for a project, on `--host 0.0.0.0` with a hub token of its own (§14.2: printed with the board URL and
+  the MCP command, kept on the host outside the mounted folders for the host's `dreamteam` commands; the container gets only its SHA-256). `docker.sandbox_command` starts it with `docker run --rm --init ...`: a tiny init
   (tini) is PID 1, reaps the orphans of agents' commands (dreamteam never does, and a zombie would keep a job's
   process group alive) and forwards `docker stop`'s SIGTERM to dreamteam, whose `Swarm.stop` ends the jobs within
   Docker's 10 s grace (a launcher home unloads its sessions one after another, so with jobs in several sessions the
@@ -3230,7 +3489,8 @@ relative: 400), `{"zip": base64, "filename"}`, `{"git": url}`, `{"claude": name,
   installed: …"; `-c` options before the subcommand: `credential.interactive=never`, `core.symlinks=false`,
   `core.longpaths=true`, `protocol.allow=never` with `https` and `ssh` allowed (`file` only for a `file://` URL: a
   user `url.<base>.insteadOf` can never reach a remote helper), `core.hooksPath=<staging>/nohooks` (an empty folder:
-  no global or system hook runs), `submodule.recurse=false`, `fetch.recurseSubmodules=false`. With git ≥ 2.35:
+  no global or system hook runs), `core.fsmonitor=` (no daemon for the staging folder), `submodule.recurse=false`,
+  `fetch.recurseSubmodules=false`. With git ≥ 2.35:
   `clone --depth 1 --single-branch --no-tags --filter=blob:none --no-checkout [--branch=<ref>] -- URL DEST`, then
   `sparse-checkout set --no-cone -- /<subdir>/` (or `/*`) and `checkout` (only the folder's blobs are fetched; a
   server without filter support falls back to a full shallow clone); older git: a plain shallow clone. The
@@ -3577,8 +3837,8 @@ themselves (the index header says so). SKILL.md prose is never parsed.
   actions for them, a size cap; Node in the Docker image.
 
 **Security.** "Only the user attaches, imports, deletes and saves to the library" is a user-interface convention,
-not a security boundary, as `mcp_approve` is: the hub has no authentication (GuardMiddleware stops browsers on
-other sites, not local processes), and without the sandbox agents run as the user and can write
+not a security boundary, as `mcp_approve` is: the hub has no authentication for its own loopback (GuardMiddleware
+stops browsers on other sites, not local processes; the hub token of §14.2 is for other hosts only), and without the sandbox agents run as the user and can write
 `~/.dreamteam/skills` directly. What DreamTeam does: the sandbox mounts the host library read-only; library entries
 changed outside DreamTeam are flagged (`changed_outside`); a hub MCP client cannot save to the library a proposal of
 a member it acts as, nor one of any external member when nothing names the client (§13); the library gets only
@@ -3587,7 +3847,8 @@ attach the surface it came through (`skill.attached` `via`); agents' shells neve
 `DREAMTEAM_HOST_SKILLS_DIR` or `DREAMTEAM_SKILL_ENVS_DIR` (§7);
 `<workspace>/.claude/skills` is never used implicitly; Git URLs are hardened and redacted; zips and folders are
 checked as above; sizes are capped per skill (`max_mb`, `max_files`), per archive or checkout (`max_archive_mb`) and
-for SKILL.md (100 KB). A per-launch hub token, which would make "only the user" a real boundary, is out of scope.
+for SKILL.md (100 KB). A token for the hub's own loopback, which would make "only the user" a real boundary, is out
+of scope.
 
 **Not in v1**: Claude Code plugin skills; automatic updates of library skills from their Git source (the recorded
 `commit` makes a later check possible); per-role visibility; mounting the MCP library or `~/.claude/skills` into the
