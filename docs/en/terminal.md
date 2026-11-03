@@ -54,7 +54,8 @@
   - `Ctrl+C` twice or `Ctrl+D` exits;
   - `?` shows the key help.
 - **MCP approval.** When an agent creates an MCP server and approval is on in the settings, the input box is
-  replaced by an "allow / reject" dialog.
+  replaced by an "allow / reject" dialog with the server's description, tools and the SHA-256 of its code. Esc puts
+  the decision off: `/approve name` then approves only the code that dialog showed.
 
 If a server for the home folder is already running (`dreamteam serve`), the UI connects to it. Otherwise the server
 starts in the same process, and the sessions stop on exit; `dreamteam -c` continues the last one.
@@ -95,7 +96,9 @@ Exit codes:
 `/show N` (a task and its discussion), `/comment N text`, `/hire Role [| instructions]`, `/pause`, `/resume` (while
 the swarm waits for your answer to an agent's question, `@Name text` to that agent answers it, and `/resume` goes on
 without an answer), `/wrapup [off]` (wrap-up mode),
-`/budget 10`, `/max 6`, `/approve name|N`, `/reject name|N` (an MCP server or a task in review),
+`/budget 10`, `/max 6`, `/approve name|N`, `/reject name|N` (an MCP server or a task in review; `/approve name sha256`
+approves the server only while its code still has that SHA-256 (the one the dialog, `mcp_list` and the MCP card
+show), given in full or by its first 8 or more characters),
 `/jobs [jN | stop jN]` (agents' background jobs: list, one job's output, stop),
 `/trace [Name | N]` (traces), `/span N [ctx]` (a trace step
 and the request context), `/session` (the current session), `/cd [path | --default]` (the session folder; a move asks

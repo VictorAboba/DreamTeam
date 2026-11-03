@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS triggers (
 CREATE TABLE IF NOT EXISTS mcp_servers (
     name TEXT PRIMARY KEY, owner TEXT, scope TEXT, task_id INTEGER, description TEXT DEFAULT '',
     command TEXT, cwd TEXT, requirements TEXT DEFAULT '[]', origin TEXT, status TEXT, tools TEXT DEFAULT '[]',
-    error TEXT, created_at REAL, updated_at REAL);
+    error TEXT, created_at REAL, updated_at REAL, digest TEXT, approved_digest TEXT);
 CREATE TABLE IF NOT EXISTS file_locks (path TEXT PRIMARY KEY, owner TEXT, acquired_at REAL, expires_at REAL);
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, command TEXT NOT NULL, shell TEXT,
@@ -57,7 +57,8 @@ CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, status);
 """
 # columns added to a table after its first release, (table, column, declaration): a file made by an older version
 # gets them when it is opened
-ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"),)
+ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"), ("mcp_servers", "digest", "TEXT"),
+                 ("mcp_servers", "approved_digest", "TEXT"))
 
 
 class Database:

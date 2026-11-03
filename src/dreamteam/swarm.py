@@ -1535,7 +1535,7 @@ class Swarm:
                 "agent_count": self.agent_count(),  # what limits.max_agents counts: external members do not
                 "spent_usd": round(self.spent_usd(), 4), "goal": goal, "counts": counts,
                 "mcp_url": self.hub_url, "models": list(self.config.models),
-                # the hub asks for its token from outside (hubauth.py): the board's MCP command needs the header;
+                # the hub asks every peer for its token (hubauth.py): the board's MCP command needs the header;
                 # never the token itself
                 "mcp_token": hubauth.hub_digest() is not None,
                 "session": None if self.session_id is None else {

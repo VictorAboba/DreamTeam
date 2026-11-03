@@ -34,7 +34,16 @@ from .procs import TOKEN_ENV, ProcessTree, daemon_call
 
 log = logging.getLogger(__name__)
 
-_SECRET_RE = re.compile(r"(API_?KEY|_TOKEN$|^TOKEN$|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH_TOKEN)", re.IGNORECASE)
+# names taken for secrets: keys (private, access, *_KEY), tokens (npm's _authToken and _auth, Yarn's npmAuthIdent
+# too), passwords and passphrases (*_PASS, *_PWD), personal access tokens (*_PAT), credentials
+_SECRET_RE = re.compile(r"(API_?KEY|ACCESS_?KEY|PRIVATE_?KEY|_KEY$|_TOKEN$|^TOKEN$|AUTH_?TOKEN|AUTH_IDENT|_AUTH$|"
+                        r"SECRET|PASSWORD|PASSWD|PASSPHRASE|(^|_)PASS$|_PWD$|(^|_)PAT$|CREDENTIAL)", re.IGNORECASE)
+# a URL's user information, `scheme://user:password@` up to the last `@` before the path, query or fragment, as URL
+# parsers read it: `https://a@b.example:pw@host` has the password `pw` (strip_url_credentials)
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^/?#\s]+)@")
+# a proxy's user information without a scheme, `user:password@host:port` (HTTPS_PROXY...), which curl, pip and
+# urllib take too (_strip_credentials)
+_BARE_USERINFO = re.compile(r"^[^/\s]*@")
 _KNOWN_SECRETS = {
     "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY",
     "GITHUB_TOKEN", "GH_TOKEN", "HF_TOKEN", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN",
@@ -64,9 +73,13 @@ LOG_LIMIT_LINE = "[log limit reached: further output is not saved]\n"
 JOB_BREAKAWAY = False
 
 
-def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[str, str]:
+def scrubbed_env(config: Config, extra: dict[str, str] | None = None, *,
+                 keep_url_credentials: bool = False) -> dict[str, str]:
     """Environment for agent processes: everything except secrets, unless whitelisted in shell.pass_env, and never
-    DreamTeam's skills variables (_INTERNAL_ENV)."""
+    DreamTeam's skills variables (_INTERNAL_ENV). The other values lose the credentials of their URLs
+    (_strip_credentials) unless `keep_url_credentials`: the installers of the user's own skills and the
+    [mcp.external] servers, the user's own processes, keep a private index's or a database's password. They lose
+    the secrets too: those reach them only through [skills] install_env, the server's `env` (`extra`) or pass_env."""
     allowed = set(config.shell.pass_env)
     secret_names = set(_KNOWN_SECRETS)
     for profile in config.models.values():
@@ -81,7 +94,7 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
             continue
         if _is_secret(key, secret_names):
             continue
-        env[key] = value
+        env[key] = value if keep_url_credentials else _strip_credentials(key, value)
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
     if extra:
@@ -93,12 +106,38 @@ def _is_secret(key: str, names: set[str]) -> bool:
     return key.upper() in names or key in names or bool(_SECRET_RE.search(key))
 
 
+def strip_url_credentials(value: str) -> str:
+    """`value` with the credentials of every URL in it removed (`https://user:password@host/simple` ->
+    `https://host/simple`): a private index's, a database's or a proxy's URL still points at the same place, without
+    the password, so a command fails there instead of turning to another index. A lone user name stays except at
+    http(s), where it is often a token (`ssh://git@host` stays)."""
+    if "://" not in value or "@" not in value:
+        return value
+    return _URL_USERINFO.sub(_drop_userinfo, value)
+
+
+def _drop_userinfo(match: re.Match[str]) -> str:
+    scheme, userinfo = match.group(1), match.group(2)
+    if ":" in userinfo or scheme.lower().rstrip(":/").rpartition("+")[2] in ("http", "https"):
+        return scheme
+    return match.group(0)
+
+
+def _strip_credentials(key: str, value: str) -> str:
+    """strip_url_credentials, and for a proxy's variable (a name ending in PROXY) the user information of an
+    address without a scheme too: `HTTPS_PROXY=user:password@proxy:3128` -> `proxy:3128`."""
+    if key.upper().endswith("PROXY") and "://" not in value:
+        return _BARE_USERINFO.sub("", value, count=1)
+    return strip_url_credentials(value)
+
+
 def secret_free_env(names: Iterable[str] = ()) -> dict[str, str]:
     """os.environ without the secrets, whatever shell.pass_env lets through to the agents (the known names, `names`,
-    every variable a model profile of this process names as its key, the name patterns), and without DreamTeam's
-    internal variables: the environment of DreamTeam's own processes in the members' folders (hubgit.py)."""
+    every variable a model profile of this process names as its key, the name patterns), without the credentials of
+    URLs (_strip_credentials) and without DreamTeam's internal variables: the environment of DreamTeam's own
+    processes in the members' folders (hubgit.py)."""
     secret = {*_KNOWN_SECRETS, *key_env_names(), *(n.upper() for n in names)}
-    return {key: value for key, value in os.environ.items()
+    return {key: _strip_credentials(key, value) for key, value in os.environ.items()
             if key.upper() not in _INTERNAL_ENV and not _is_secret(key, secret)}
 
 

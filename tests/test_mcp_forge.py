@@ -27,7 +27,7 @@ from dreamteam.shell import scrubbed_env
 
 ALICE, BOB, CAROL, DAVE = "Alice Smith", "Bob Jones", "Carol White", "Dave Brown"
 SERVER_KEYS = {"name", "owner", "scope", "task_id", "description", "status", "origin", "tools", "error",
-               "requirements", "command", "created_at"}
+               "requirements", "command", "created_at", "digest"}
 
 CALC = '''
 import os
@@ -308,7 +308,8 @@ def test_read_log_tail_uses_last_start(tmp_path: Path):
 
 def test_notification_texts_accept_forge_kwargs():
     for lang in ("ru", "en"):
-        assert "calc" in prompts.t(lang, "u_mcp_pending", owner=ALICE, name="calc", description="d")
+        pending = prompts.t(lang, "u_mcp_pending", owner=ALICE, name="calc", description="d", digest="3f2a9c01d4e5")
+        assert "calc" in pending and "/approve calc 3f2a9c01d4e5" in pending
         assert "calc" in prompts.t(lang, "n_mcp_approved", name="calc")
         assert "why" in prompts.t(lang, "n_mcp_rejected", name="calc", comment="why")
 
@@ -412,6 +413,21 @@ async def test_create_and_call(env):
     add = next(t for t in tools if t["name"] == "add")
     assert set(add) == {"name", "description", "input_schema"}
     assert add["input_schema"]["required"] == ["a", "b"]
+
+
+async def test_create_runs_a_snapshot_with_its_digest(env):
+    swarm, forge = env
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    digest = mcp_forge.snapshot_digest(CALC.encode("utf-8"), [])
+    snapshot = swarm.config.data_dir / "mcp" / "calc" / "server.py"
+    assert forge.snapshot_dir("calc") == snapshot.parent and snapshot.read_bytes() == CALC.encode("utf-8")
+    row = swarm.db.one("SELECT digest, approved_digest FROM mcp_servers WHERE name = 'calc'")
+    assert row["digest"] == digest and row["approved_digest"] is None  # an agent's server, approval off
+    assert forge.get("calc")["digest"] == digest
+    conn = forge.connection("calc")  # the snapshot runs, in the working copy's folder
+    assert conn.command[-1] == str(snapshot) and conn.cwd == forge.server_dir("calc")
+    # the digest covers the requirements (and the start command), not only the code
+    assert mcp_forge.snapshot_digest(CALC.encode("utf-8"), ["httpx"]) != digest
 
 
 async def test_call_errors_and_truncation(forge_factory):
@@ -520,6 +536,32 @@ async def test_interrupted_create_does_not_activate_unapproved_code(forge_factor
     assert forge.get("calc")["status"] == "pending"
 
 
+async def test_an_interrupted_test_of_the_working_copy_leaves_the_record_as_it_was(forge_factory):
+    swarm, forge = await forge_factory(mcp={"require_approval": True})
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    await forge.approve(USER, "calc", True)
+    approved = forge.get("calc")["digest"]
+
+    # the working copy changes, and the caller is cancelled (the session stops...) while it is tested again
+    slow_v2 = "import time\ntime.sleep(3)\n" + CALC_V2
+    (forge.server_dir("calc") / "server.py").write_bytes(slow_v2.encode("utf-8"))
+    calling = asyncio.create_task(forge.call(BOB, "calc", "add", {"a": 1, "b": 2}))
+    await asyncio.sleep(1)
+    calling.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await calling
+
+    # not marked failed: nothing about the server changed, and nothing new was verified or approved
+    server = forge.get("calc")
+    assert server["status"] == "active" and server["error"] is None and server["digest"] == approved
+    assert forge.connection("calc") is None
+    # its digest is not the snapshot's now, so the next start tests the working copy again: it waits for the user
+    with pytest.raises(ToolError, match="waiting for the user's approval"):
+        await forge.call(BOB, "calc", "add", {"a": 1, "b": 2})
+    server = forge.get("calc")
+    assert server["status"] == "pending" and server["digest"] == mcp_forge.snapshot_digest(slow_v2.encode(), [])
+
+
 async def test_pending_server_is_announced_even_if_create_is_cancelled_late(forge_factory, monkeypatch):
     swarm, forge = await forge_factory(mcp={"require_approval": True})
     original = forge._write_workspace_meta
@@ -539,7 +581,8 @@ async def test_pending_server_is_announced_even_if_create_is_cancelled_late(forg
         await creating
     assert forge.get("calc")["status"] == "pending"
     assert swarm.notifications_for(USER) == [
-        ("u_mcp_pending", {"owner": ALICE, "name": "calc", "description": "Arithmetic helpers"})]
+        ("u_mcp_pending", {"owner": ALICE, "name": "calc", "description": "Arithmetic helpers",
+                           "digest": forge.get("calc")["digest"][:12]})]
     assert [e["data"]["server"]["status"] for e in events(swarm) if e["type"] == "mcp.created"] == ["pending"]
     await asyncio.sleep(1.6)  # let the meta thread finish before the tmp dir goes away
 
@@ -581,6 +624,15 @@ def test_external_string_command_splitting(fake_swarm):
         assert rec["command"] == ["C:\\tools\\srv.exe", "--root", "C:\\data\\#1"]
     rec = forge._external_record("x", {"command": ["a"], "cwd": "tools/ext"})
     assert rec["cwd"] == str(fake_swarm.config.project_dir / "tools" / "ext")
+
+
+def test_url_credentials_reach_only_the_users_own_servers(fake_swarm, monkeypatch):
+    monkeypatch.setenv("DT_FORGE_DB_URL", "postgres://app:sekret@db.example/app")
+    forge = MCPForge(fake_swarm)
+    _command, _cwd, env = forge._launch_spec(forge._external_record("ext", {"command": ["a"]}))
+    assert env["DT_FORGE_DB_URL"] == "postgres://app:sekret@db.example/app"   # [mcp.external]: the user's own
+    _command, _cwd, env = forge._launch_spec({"name": "calc", "origin": "workspace", "requirements": []})
+    assert env["DT_FORGE_DB_URL"] == "postgres://db.example/app"   # an agent's server
 
 
 async def test_external_string_command_with_quoted_executable(forge_factory, tmp_path: Path):
@@ -706,7 +758,8 @@ async def test_approval_flow(forge_factory):
     assert forge.get("calc")["status"] == "pending"
     assert forge.connection("calc") is None  # the smoke-test process is not kept
     assert swarm.notifications_for(USER) == [
-        ("u_mcp_pending", {"owner": ALICE, "name": "calc", "description": "Arithmetic helpers"})]
+        ("u_mcp_pending", {"owner": ALICE, "name": "calc", "description": "Arithmetic helpers",
+                           "digest": forge.get("calc")["digest"][:12]})]
     assert not (swarm.config.library_dir / "calc").exists()
 
     with pytest.raises(ToolError, match="waiting for the user's approval"):
@@ -743,6 +796,68 @@ async def test_approval_flow(forge_factory):
     # servers built by the user need no approval
     await forge.create(USER, "usertool", "User tool", SERVER_TEMPLATE)
     assert forge.get("usertool")["status"] == "active"
+
+
+async def test_an_approval_holds_for_the_reviewed_snapshot_only(forge_factory, monkeypatch):
+    swarm, forge = await forge_factory(mcp={"require_approval": True})
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    working = forge.server_dir("calc") / "server.py"
+
+    # the working copy changes before the user decides: what the user reads there is not the snapshot
+    working.write_bytes(CALC_V2.encode("utf-8"))
+    with pytest.raises(ToolError, match="not approved.*tested again and waits for your approval"):
+        await forge.approve(USER, "calc", True)
+    v2 = mcp_forge.snapshot_digest(CALC_V2.encode("utf-8"), [])
+    server = forge.get("calc")
+    assert server["status"] == "pending" and server["digest"] == v2
+    assert [kind for kind, _ in swarm.notifications_for(USER)] == ["u_mcp_pending", "u_mcp_pending"]
+    assert not (swarm.config.library_dir / "calc").exists()
+
+    # approving stores the digest; the library gets the snapshot, not the working copy as it is afterwards
+    read_copies = forge._read_copies
+
+    def read_then_change(name):
+        copies = read_copies(name)
+        working.write_bytes(TEXTKIT.encode("utf-8"))  # a write right after the check
+        return copies
+
+    monkeypatch.setattr(forge, "_read_copies", read_then_change)
+    assert "Saved to the shared MCP library" in await forge.approve(USER, "calc", True)
+    monkeypatch.undo()
+    row = swarm.db.one("SELECT digest, approved_digest FROM mcp_servers WHERE name = 'calc'")
+    assert row["digest"] == row["approved_digest"] == v2
+    library = swarm.config.library_dir / "calc"
+    assert (library / "server.py").read_bytes() == CALC_V2.encode("utf-8")
+    meta = json.loads((library / "meta.json").read_text("utf-8"))
+    assert meta["digest"] == meta["approved_digest"] == v2 and meta["project"] == str(swarm.config.project_dir)
+
+    # the edit after the approval does not run unreviewed: at the next start the server waits again
+    with pytest.raises(ToolError, match="waiting for the user's approval"):
+        await forge.call(BOB, "calc", "add", {"a": 1, "b": 2})
+    server = forge.get("calc")
+    assert server["status"] == "pending" and server["digest"] == mcp_forge.snapshot_digest(TEXTKIT.encode(), [])
+    assert forge.connection("calc") is None
+
+    # the approved code again needs no new question
+    working.write_bytes(CALC_V2.encode("utf-8"))
+    assert await forge.call(USER, "calc", "add", {"a": 1, "b": 2}) == ("1003", False)
+    assert forge.get("calc")["status"] == "active"
+    assert await forge.call(BOB, "calc", "add", {"a": 2, "b": 2}) == ("1004", False)
+
+
+async def test_an_approval_names_the_digest_the_user_was_shown(forge_factory):
+    swarm, forge = await forge_factory(mcp={"require_approval": True})
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    shown = forge.get("calc")["digest"]
+    # the owner creates it again while the dialog (or the card) still shows the first code
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC_V2)
+    with pytest.raises(ToolError, match="does not match its current digest") as refused:
+        await forge.approve(USER, "calc", True, digest=shown)
+    v2 = forge.get("calc")["digest"]
+    assert forge.get("calc")["status"] == "pending" and v2 != shown and v2[:12] in str(refused.value)
+    # the digest shown now, in full or its start (as /approve in the console takes it), approves that code
+    assert "approved and active" in await forge.approve(USER, "calc", True, digest=v2[:12].upper())
+    assert swarm.db.one("SELECT approved_digest FROM mcp_servers WHERE name = 'calc'")["approved_digest"] == v2
 
 
 async def test_approval_respects_save_to_library_flag(forge_factory):
@@ -804,6 +919,57 @@ async def test_library_import_respects_require_approval(forge_factory):
     assert ("user", "u_mcp_pending") in [(r, k) for r, k, _ in swarm2.notified]
     await forge2.approve(USER, "calc", True)
     assert "add" in [t["name"] for t in await forge2.tools(BOB, "calc")]
+
+
+async def test_library_import_of_the_approved_snapshot_asks_no_more(forge_factory):
+    swarm1, forge1 = await forge_factory(subdir="p1", mcp={"require_approval": True})
+    await forge1.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    await forge1.approve(USER, "calc", True)
+    library = swarm1.config.library_dir
+
+    # the same snapshot (same digest) in another session: active at once, although approval is on there too
+    swarm2, forge2 = await forge_factory(subdir="p2", members=(BOB,), mcp={"require_approval": True})
+    assert await forge2.call(BOB, "calc", "add", {"a": 1, "b": 2}) == ("3", False)
+    row = swarm2.db.one("SELECT status, digest, approved_digest FROM mcp_servers WHERE name = 'calc'")
+    assert row["status"] == "active" and row["digest"] == row["approved_digest"]
+    assert swarm2.notifications_for(USER) == []
+
+    # other code under the same entry: the approval does not cover it
+    (library / "calc" / "server.py").write_bytes(CALC_V2.encode("utf-8"))
+    swarm3, forge3 = await forge_factory(subdir="p3", members=(CAROL,), mcp={"require_approval": True})
+    with pytest.raises(ToolError, match="waiting for the user's approval"):
+        await forge3.tools(CAROL, "calc")
+    assert forge3.get("calc")["status"] == "pending"
+    assert [kind for kind, _ in swarm3.notifications_for(USER)] == ["u_mcp_pending"]
+
+    # approving that import records it in the library: the next session imports it without a question
+    assert "records the approval" in await forge3.approve(USER, "calc", True)
+    swarm4, forge4 = await forge_factory(subdir="p4", members=(DAVE,), mcp={"require_approval": True})
+    assert await forge4.call(DAVE, "calc", "add", {"a": 1, "b": 2}) == ("1003", False)
+    assert swarm4.notifications_for(USER) == []
+
+
+async def test_another_project_cannot_overwrite_a_library_entry(forge_factory):
+    swarm1, forge1 = await forge_factory(subdir="p1")
+    swarm2, forge2 = await forge_factory(subdir="p2")
+    await forge2.create(ALICE, "calc", "Private calc", CALC_V2, scope="private")
+    await forge1.create(ALICE, "calc", "Arithmetic helpers", CALC)  # the library's entry, saved by p1
+    library = swarm1.config.library_dir / "calc"
+
+    # the same owner's name in another project does not make the entry its own
+    text = await forge2.create(ALICE, "calc", "Arithmetic helpers v2", CALC_V2)
+    assert "is active" in text and "of another project; it was not replaced" in text
+    assert (library / "server.py").read_bytes() == CALC.encode("utf-8")
+    meta = json.loads((library / "meta.json").read_text("utf-8"))
+    assert meta["project"] == str(swarm1.config.project_dir) and meta["description"] == "Arithmetic helpers"
+
+    # nor can it replace an imported copy of that entry
+    swarm3, forge3 = await forge_factory(subdir="p3")
+    await forge3.tools(BOB, "calc")  # the import keeps the owner's name of p1
+    assert forge3.get("calc")["owner"] == ALICE
+    with pytest.raises(ToolError, match="imported from the shared library"):
+        await forge3.create(ALICE, "calc", "Mine now", CALC_V2)
+    assert (library / "server.py").read_bytes() == CALC.encode("utf-8")
 
 
 async def test_user_can_replace_library_server(forge_factory):
@@ -907,6 +1073,77 @@ async def test_stop_during_lazy_start(env):
     with pytest.raises(ToolError, match="stopped"):
         await pending
     assert forge.connection("slowstart") is None
+
+
+async def test_working_copy_edit_is_tested_again_at_the_next_start(env):
+    swarm, forge = env
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    working = forge.server_dir("calc") / "server.py"
+    working.write_bytes(CALC_V2.encode("utf-8"))  # an edit_file of the working copy
+    assert await forge.call(BOB, "calc", "add", {"a": 1, "b": 2}) == ("3", False)  # the running snapshot
+    await forge.connection("calc").close()
+    # approval is off: the next start takes the edit as a new mcp_create, without a question to the user
+    assert await forge.call(BOB, "calc", "add", {"a": 1, "b": 2}) == ("1003", False)
+    server = forge.get("calc")
+    assert server["status"] == "active" and server["digest"] == mcp_forge.snapshot_digest(CALC_V2.encode(), [])
+    assert (forge.snapshot_dir("calc") / "server.py").read_bytes() == CALC_V2.encode("utf-8")
+    assert swarm.notifications_for(USER) == []
+    # a working copy that is gone is written back from the snapshot
+    working.unlink()
+    await forge.connection("calc").close()
+    assert await forge.call(BOB, "calc", "add", {"a": 1, "b": 2}) == ("1003", False)
+    assert working.read_bytes() == CALC_V2.encode("utf-8")
+
+
+async def test_a_working_copy_saved_with_a_bom_is_tested_as_python_runs_it(env):
+    swarm, forge = env
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    # PowerShell 5.1's Set-Content -Encoding utf8 (or an editor) writes a BOM, which Python ignores
+    (forge.server_dir("calc") / "server.py").write_bytes(b"\xef\xbb\xbf" + CALC_V2.encode("utf-8"))
+    await forge.connection("calc").close()
+    assert await forge.call(BOB, "calc", "add", {"a": 1, "b": 2}) == ("1003", False)
+    assert forge.get("calc")["status"] == "active"
+
+
+async def test_a_record_without_a_digest_is_tested_again_before_it_runs(forge_factory, tmp_path):
+    import sqlite3
+
+    from dreamteam.db import Database
+
+    # a swarm.db of an older version: its mcp_servers table gets the digest columns when opened
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE mcp_servers (name TEXT PRIMARY KEY, owner TEXT, scope TEXT, task_id INTEGER, "
+                "description TEXT DEFAULT '', command TEXT, cwd TEXT, requirements TEXT DEFAULT '[]', origin TEXT, "
+                "status TEXT, tools TEXT DEFAULT '[]', error TEXT, created_at REAL, updated_at REAL)")
+    old.close()
+    db = Database(path)
+    assert {"digest", "approved_digest"} <= {row[1] for row in db.conn.execute("PRAGMA table_info(mcp_servers)")}
+    db.close()
+
+    # such a record has no digest: with approval on, its first start waits for the user
+    swarm, forge = await forge_factory(mcp={"require_approval": True})
+    await forge.create(USER, "calc", "Arithmetic helpers", CALC)
+    swarm.db.execute("UPDATE mcp_servers SET digest = NULL, approved_digest = NULL WHERE name = 'calc'")
+    await forge.connection("calc").close()
+    with pytest.raises(ToolError, match="waiting for the user's approval"):
+        await forge.call(BOB, "calc", "add", {"a": 1, "b": 1})
+    assert forge.get("calc")["status"] == "pending"
+
+
+async def test_approving_a_pending_record_of_an_older_version_says_so(forge_factory):
+    swarm, forge = await forge_factory(mcp={"require_approval": True})
+    await forge.create(ALICE, "calc", "Arithmetic helpers", CALC)
+    # pending before the upgrade: no digest and no snapshot
+    swarm.db.execute("UPDATE mcp_servers SET digest = NULL WHERE name = 'calc'")
+    (forge.snapshot_dir("calc") / "server.py").unlink()
+    with pytest.raises(ToolError, match="recorded it without a snapshot") as info:
+        await forge.approve(USER, "calc", True)
+    assert "is not the code that passed" not in str(info.value)
+    server = forge.get("calc")
+    assert server["status"] == "pending" and server["digest"] == mcp_forge.snapshot_digest(CALC.encode("utf-8"), [])
+    assert server["digest"][:12] in str(info.value)
+    assert "approved and active" in await forge.approve(USER, "calc", True, digest=server["digest"])
 
 
 async def test_restart_after_process_death(env):

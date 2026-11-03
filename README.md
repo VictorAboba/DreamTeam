@@ -140,8 +140,8 @@ Every section and key: [Configuration](docs/en/configuration.md).
 Agents run commands and MCP server code **with your user's rights**. For untrusted goals use
 `dreamteam sandbox`. API keys and other secrets from the environment are not passed to agents' commands.
 The server listens on `127.0.0.1` and has no authentication: don't expose it without a reverse proxy that adds
-one (the Docker sandbox's hub asks for a token of everything outside its container). Details:
-[Security](docs/en/security.md); to report a vulnerability, see [SECURITY.md](SECURITY.md).
+one. A hub with a token (the Docker sandbox, docker compose) asks every client for it, inside its container too.
+Details: [Security](docs/en/security.md); to report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Documentation
 

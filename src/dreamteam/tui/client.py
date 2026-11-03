@@ -634,7 +634,9 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
 
     bind_host, bind_port = chosen
     base = f"http://{display_host(bind_host)}:{bind_port}"
-    # (its own bind address, never a hub.json's: DREAMTEAM_HUB_TOKEN goes there, also to a LAN address it serves on)
+    # (its own bind address, never a hub.json's: DREAMTEAM_HUB_TOKEN goes there, also to a LAN address it serves on;
+    # and hubauth.own_token(), the one a hub with the digest alone takes from this process: it asks its own loopback)
+    hubauth.serving(base)
     conn = Connection(HubClient(base, user_url=base), base, home, owned=True, manager=manager, _server=server,
                       _hub_file=hub_written, _marker=marker)
     try:

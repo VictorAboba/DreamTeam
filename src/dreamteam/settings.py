@@ -18,6 +18,7 @@ import time
 import tomllib
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import CONFIG_FILE, Config, ModelProfile, env_var_name, make_profile, render_template, toml_string
 
@@ -415,7 +416,8 @@ def stored_profile(raw: dict[str, Any], name: str) -> ModelProfile | None:
 
 def profile_from_view(raw: dict[str, Any], data: dict[str, Any], name: str | None = None) -> ModelProfile:
     """A ModelProfile from a (possibly unsaved) UI profile; a missing api_key falls back to the stored
-    key of profile `name`. Raises ValueError for unknown fields or wrong value types."""
+    key of profile `name`. A key the request does not carry (stored, or from the hub's environment) goes only to
+    an endpoint saved with it. Raises ValueError for unknown fields, wrong value types or another endpoint."""
     if not isinstance(data, dict):
         raise ValueError("The model profile must be an object")
     data = {k: v for k, v in data.items()
@@ -429,9 +431,11 @@ def profile_from_view(raw: dict[str, Any], data: dict[str, Any], name: str | Non
             data["api_key_env"] = env_name(env)
     if isinstance(data.get("api_key"), str):
         data["api_key"] = data["api_key"].strip()
+    stored = None
     if not data.get("api_key") and name:
         old = (raw.get("models") or {}).get(name)
         if isinstance(old, dict) and _stored_key(old):
+            stored = old
             data["api_key"] = _stored_key(old)
     profile_name = str(name or data.get("name") or "check")
     data.pop("name", None)
@@ -439,7 +443,126 @@ def profile_from_view(raw: dict[str, Any], data: dict[str, Any], name: str | Non
     unknown = set(data) - known
     if unknown:
         raise ValueError(f"Unknown model profile fields: {', '.join(sorted(map(str, unknown)))}")
-    return make_profile(profile_name, data)
+    profile = make_profile(profile_name, data)
+    # the stored key goes only to the endpoint it is saved with: checking another provider or base_url needs
+    # the key entered again (or the settings saved first)
+    if stored is not None and _endpoint(profile) != _endpoint(make_profile(profile_name, stored)):
+        raise ValueError(f"The stored API key of model profile '{profile_name}' is sent only to its saved endpoint "
+                         "(provider and base_url). Save the settings first, or enter the key again to check "
+                         "another endpoint.")
+    # so does a key from the hub's environment (its variable, or the SDK's own one when no key is given): it goes
+    # to the provider's default endpoint, a preset's endpoint for that variable, or an endpoint saved with it
+    if _takes_env_key(profile) and not _env_key_endpoint(raw, profile):
+        variable = profile.api_key_env or ("ANTHROPIC_API_KEY" if _endpoint(profile)[0] == "anthropic"
+                                           else "OPENAI_API_KEY")
+        raise ValueError(f"The API key of model profile '{profile_name}' comes from the environment ({variable}) "
+                         "and is sent only to the provider's default endpoint or to an endpoint saved with that "
+                         "variable. Save the settings first, or enter the key to check another endpoint.")
+    # the SDKs add ANTHROPIC_CUSTOM_HEADERS / OPENAI_CUSTOM_HEADERS from the hub's environment to every request
+    # (often a gateway's credentials), whatever the key: they go only where a run sends them, the default endpoint
+    # or the endpoint of a saved profile
+    if _env_headers(profile) and not _default_endpoint(_endpoint(profile)) \
+            and not any(_endpoint(saved) == _endpoint(profile) for _, saved in _saved_profiles(raw)):
+        raise ValueError(f"Model profile '{profile_name}' would send the headers of {_headers_env(profile)} from "
+                         "the hub's environment, which go only to the provider's default endpoint or to an endpoint "
+                         "saved in the settings. Save the settings first to check another endpoint.")
+    return profile
+
+
+def _endpoint(profile: ModelProfile) -> tuple[str, str | None]:
+    """Where a profile's requests go: its provider and base_url (a trailing "/" does not count)."""
+    return (profile.provider or "").strip().lower(), (profile.base_url or "").strip().rstrip("/") or None
+
+
+# the providers served by the OpenAI client (_client_for)
+_OPENAI_PROVIDERS = ("openai", "openrouter", "ollama", "vllm")
+
+
+def _takes_env_key(profile: ModelProfile) -> bool:
+    """Whether the profile's requests carry a key from the hub's environment: the variable it names, or with no
+    key at all the one its SDK reads (ANTHROPIC_API_KEY; OPENAI_API_KEY for the official OpenAI endpoint)."""
+    if profile.api_key:
+        return False
+    provider = (profile.provider or "").strip().lower()
+    if profile.api_key_env or provider == "anthropic":
+        return True
+    if provider not in _OPENAI_PROVIDERS:
+        return False
+    from .llm.openai_llm import is_official_openai
+
+    return is_official_openai(profile.base_url)
+
+
+def _default_endpoint(endpoint: tuple[str, str | None]) -> bool:
+    """Whether an endpoint (_endpoint) is its provider's default one: no base_url, or the official URL spelled
+    out (https://api.openai.com with or without /v1 for the OpenAI client, https://api.anthropic.com), compared
+    by the exact parsed host and path, never as a substring."""
+    provider, base_url = endpoint
+    if base_url is None:
+        return True
+    if provider == "anthropic":
+        host, paths = "api.anthropic.com", ("",)
+    elif provider in _OPENAI_PROVIDERS:
+        host, paths = "api.openai.com", ("", "/v1")
+    else:
+        return False
+    try:
+        parts = urlsplit(base_url)
+        port = parts.port
+    except ValueError:  # a malformed URL or port
+        return False
+    return (parts.scheme.lower() == "https" and parts.hostname == host and port in (None, 443)
+            and parts.username is None and parts.password is None and parts.path.rstrip("/") in paths
+            and not parts.query and not parts.fragment)
+
+
+def _saved_profiles(raw: dict[str, Any]):
+    """(stored spec, ModelProfile) of each valid saved profile."""
+    for pname, spec in (raw.get("models") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        try:
+            yield spec, make_profile(str(pname), spec)
+        except (ValueError, TypeError):
+            continue
+
+
+def _env_key_endpoint(raw: dict[str, Any], profile: ModelProfile) -> bool:
+    """Whether a key from the environment may go to the profile's endpoint: the provider's default one
+    (_default_endpoint), or that of a preset or of a saved profile without a stored key that names the same
+    variable."""
+    endpoint, variable = _endpoint(profile), profile.api_key_env
+    if _default_endpoint(endpoint):
+        return True
+    for preset in PROVIDER_CHOICES:
+        if preset.get("api_key_env") and preset["api_key_env"] == variable \
+                and _endpoint(ModelProfile(provider=preset["provider"], base_url=preset["base_url"])) == endpoint:
+            return True
+    # a stored key wins over the variable
+    return any(not _stored_key(spec) and saved.api_key_env == variable and _endpoint(saved) == endpoint
+               for spec, saved in _saved_profiles(raw))
+
+
+def _headers_env(profile: ModelProfile) -> str:
+    """The variable of the hub's environment whose headers the profile's SDK adds to each request:
+    ANTHROPIC_CUSTOM_HEADERS (the Anthropic SDK), OPENAI_CUSTOM_HEADERS (the OpenAI SDK); "" for other providers."""
+    provider = (profile.provider or "").strip().lower()
+    if provider == "anthropic":
+        return "ANTHROPIC_CUSTOM_HEADERS"
+    return "OPENAI_CUSTOM_HEADERS" if provider in _OPENAI_PROVIDERS else ""
+
+
+def _env_headers(profile: ModelProfile) -> dict[str, str]:
+    """The headers the profile's SDK adds to each request from its _headers_env variable ("Name: value" lines,
+    parsed as the SDKs do)."""
+    variable, headers = _headers_env(profile), {}
+    if not variable:
+        return headers
+    for line in (os.environ.get(variable) or "").split("\n"):
+        name, colon, value = line.partition(":")
+        if colon:
+            headers[name.strip()] = value.strip()
+    return headers
 
 
 # ---- endpoint checks --------------------------------------------------------------------------
@@ -516,7 +639,7 @@ async def check_profile(profile: ModelProfile, *, live: bool = False, timeout: f
 def scrub_keys(text: str, profile: ModelProfile) -> str:
     """`text` without the API keys the profile can send (some endpoints echo a rejected key)."""
     candidates = {profile.api_key, profile.resolve_api_key(), os.environ.get("OPENAI_API_KEY"),
-                  os.environ.get("ANTHROPIC_API_KEY")}
+                  os.environ.get("ANTHROPIC_API_KEY"), *_env_headers(profile).values()}
     for key in sorted((k for k in candidates if k and len(k) >= 8), key=len, reverse=True):
         text = text.replace(key, key_hint(key) or "…")
     return text
@@ -528,7 +651,7 @@ def _client_for(profile: ModelProfile):
         from .llm.anthropic_llm import AnthropicLLM
 
         return AnthropicLLM(profile, max_retries=0)
-    if provider in ("openai", "openrouter", "ollama", "vllm"):
+    if provider in _OPENAI_PROVIDERS:
         from .llm.openai_llm import OpenAILLM
 
         return OpenAILLM(profile, max_retries=0)

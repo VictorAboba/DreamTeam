@@ -9,7 +9,7 @@ import types
 
 import pytest
 
-from dreamteam import shell as shell_module
+from dreamteam import netoff, shell as shell_module
 from dreamteam.shell import (PENDING_MAX, Capture, StreamDecoder, kill_tree, resolve_shell, run_shell, scrubbed_env,
                              truncate_middle)
 
@@ -51,6 +51,49 @@ def test_scrubbed_env(fake_swarm, monkeypatch):
     monkeypatch.setenv("DREAMTEAM_SKILL_ENVS_DIR", "/envs")
     fake_swarm.config.shell.pass_env = ["DREAMTEAM_SKILL_ENVS_DIR"]
     assert "DREAMTEAM_SKILL_ENVS_DIR" not in scrubbed_env(fake_swarm.config)
+
+
+def test_scrubbed_env_drops_more_secret_names_and_url_credentials(fake_swarm, monkeypatch):
+    for name in ("SSH_PRIVATE_KEY", "AWS_ACCESS_KEY_ID", "STRIPE_KEY", "GITLAB_PAT", "NPM_CONFIG__AUTHTOKEN",
+                 "NPM_CONFIG__AUTH", "YARN_NPM_AUTH_IDENT", "DB_PASS", "MYSQL_PWD", "GPG_PASSPHRASE"):
+        monkeypatch.setenv(name, "s3cret")
+    # a URL keeps pointing at the same index or database, without the password (or a token as the user name)
+    urls = {"PIP_INDEX_URL": ("https://user:s3cret@idx.example/simple", "https://idx.example/simple"),
+            "UV_INDEX": ("internal=https://__token__:s3cret@idx.example/simple", "internal=https://idx.example/simple"),
+            "DATABASE_URL": ("postgres://app:s3cret@db.example:5432/app", "postgres://db.example:5432/app"),
+            "DT_TEST_REPO_URL": ("git+https://s3cret@github.com/o/r", "git+https://github.com/o/r")}
+    kept = {"SSH_AUTH_SOCK": "/tmp/agent.sock", "SSH_ASKPASS": "/usr/bin/askpass", "OLDPWD": "/home",
+            "NPM_CONFIG_REGISTRY": "https://registry.example/", "DT_TEST_SSH_URL": "ssh://git@github.com/o/r.git",
+            "DT_TEST_PAGE": "https://example.com/?email=a@b.example", **netoff.OFFLINE_ENV}
+    for name, value in {**{n: v for n, (v, _) in urls.items()}, **kept}.items():
+        monkeypatch.setenv(name, value)
+    env = {k.upper(): v for k, v in scrubbed_env(fake_swarm.config).items()}
+    assert "s3cret" not in "".join(env.values())
+    assert {n: env[n] for n in urls} == {n: stripped for n, (_, stripped) in urls.items()}
+    assert {n.upper(): env[n.upper()] for n in kept} == {n.upper(): v for n, v in kept.items()}
+    # shell.pass_env passes a variable unchanged; so does keep_url_credentials (the user's own installers, servers)
+    fake_swarm.config.shell.pass_env = ["DATABASE_URL"]
+    assert scrubbed_env(fake_swarm.config)["DATABASE_URL"] == urls["DATABASE_URL"][0]
+    assert scrubbed_env(fake_swarm.config, keep_url_credentials=True)["PIP_INDEX_URL"] == urls["PIP_INDEX_URL"][0]
+
+
+def test_url_user_info_ends_at_the_last_at_and_bare_proxies_lose_it(fake_swarm, monkeypatch):
+    # the user info runs to the last `@` before the path, as URL parsers read it (an e-mail as the user name, a raw
+    # `@` in the password); a proxy written without a scheme, which curl, pip and urllib take, loses it too
+    urls = {"DT_TEST_INDEX_URL": ("https://a@b.example:s3cret@idx.example/simple", "https://idx.example/simple"),
+            "DT_TEST_LONE_URL": ("https://alice@corp.example@idx.example/simple", "https://idx.example/simple"),
+            "DT_TEST_DB_URL": ("postgres://app:p@s3cret@db.example/app", "postgres://db.example/app"),
+            "DT_TEST_PROXY": ("alice:s3cret@proxy.example:3128", "proxy.example:3128")}
+    kept = {"DT_TEST_SSH_URL": "ssh://git@github.com/o/r.git", "DT_TEST_MAIL": "alice@example.com",
+            "DT_TEST_PAGE": "https://example.com/?email=a@b.example"}
+    for name, value in {**{n: v for n, (v, _) in urls.items()}, **kept}.items():
+        monkeypatch.setenv(name, value)
+    stripped = {n: v for n, (_, v) in urls.items()}
+    env, own = scrubbed_env(fake_swarm.config), shell_module.secret_free_env()
+    assert {n: env[n] for n in urls} == stripped and {n: own[n] for n in urls} == stripped
+    assert {n: env[n] for n in kept} == kept
+    # the user's own installers and [mcp.external] servers keep them
+    assert scrubbed_env(fake_swarm.config, keep_url_credentials=True)["DT_TEST_PROXY"] == urls["DT_TEST_PROXY"][0]
 
 
 def test_truncate_and_resolve():

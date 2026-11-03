@@ -335,6 +335,9 @@ class MCPApprovalDialog(Dialog):
         tools = [str(x) for x in s.get("tools") or [] if x]
         if tools:
             field("mcp_tools", ", ".join(tools), max_lines=2)
+        if s.get("digest"):
+            # the snapshot an approval covers; approving checks that the file /cat shows is that same code
+            field("mcp_digest", str(s["digest"])[:16])
         if self.name:
             lines.append([(DIM, t(lang, "mcp_code_hint", path=code))])
         return lines

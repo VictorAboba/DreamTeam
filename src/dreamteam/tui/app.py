@@ -38,7 +38,7 @@ from .. import __version__
 from ..console import (
     cd_expect, cd_moves_files, cd_preview, cd_result_lines, folder_kind, resolve_folder, same_folder,
 )
-from ..hubauth import browser_url
+from ..hubauth import DIGEST_ENV, browser_url, token_link_needed
 from ..models import USER
 from . import commands, render, theme
 from .bash import ShellCommand
@@ -220,6 +220,7 @@ class TUI:
         self._addressee_at: float | None = None
         self.mcp_queue: list[dict] = []
         self.mcp_answered: set[str] = set()   # not asked about again until an agent re-creates them
+        self.mcp_shown: dict[str, str] = {}   # the digest each server's last dialog showed: a typed /approve sends it
         self._mcp_dialog: MCPApprovalDialog | None = None
         self.skill_queue: list[dict] = []     # members' skill proposals waiting for the library decision
         self.skill_answered: set[str] = set()   # not asked about again until the member proposes it again
@@ -783,9 +784,13 @@ class TUI:
         self.info(self.t("opened_browser", url=url))
         try:
             # (a sandbox's hub token, or that of the hub this process serves: the browser gets its cookie; not shown)
-            webbrowser.open(browser_url(url, user_url=self.client.user_url))
+            opened = browser_url(url, user_url=self.client.user_url)
+            webbrowser.open(opened)
         except Exception as exc:
             self.error(str(exc))
+            return
+        if self.conn.owned and token_link_needed(url, opened):   # its own launcher with the token's digest alone
+            self.info(self.t("board_token_link", env=DIGEST_ENV))
 
     async def refresh_state(self) -> dict:
         """Fetch /api/state of the current session and update the view."""
@@ -1627,10 +1632,15 @@ class TUI:
             else:
                 self._unqueue_skill(str(skill["name"]))
 
-    async def decide_mcp(self, name: str, approve: bool, comment: str = "") -> None:
+    async def decide_mcp(self, name: str, approve: bool, comment: str = "", digest: str = "") -> None:
+        """`digest`: the code the dialog showed; the hub refuses the approval when the server has other code now.
+        A typed `/approve name` without one sends the digest of the last dialog shown for that server."""
+        name = name.strip().lower()   # as the hub names servers: a typed "/approve Calc" finds the dialog of "calc"
         self.mcp_answered.add(name)
-        ok, text = await self.client.act(self.sid, "mcp_approve",
-                                         {"name": name, "approve": approve, "comment": comment})
+        if approve and not digest:
+            digest = self.mcp_shown.get(name, "")
+        args = {"name": name, "approve": approve, "comment": comment, **({"digest": digest} if digest else {})}
+        ok, text = await self.client.act(self.sid, "mcp_approve", args)
         if ok:
             self.info(text)
             self._unqueue_mcp(name)
@@ -1646,8 +1656,13 @@ class TUI:
             self.mcp_answered.discard(name)
         elif name in self.mcp_answered:  # a state snapshot older than the answer
             return
-        if self._mcp_dialog is not None and self._mcp_dialog.name == name:
-            return
+        dialog = self._mcp_dialog
+        if dialog is not None and dialog.name == name:
+            if not fresh or not server.get("digest") or server.get("digest") == dialog.server.get("digest"):
+                return
+            if not dialog.done:  # created again with other code while the dialog shows the old: ask about the new
+                dialog.gone = True
+                dialog.cancel()
         if self.input_mode == ("reject", name):
             return
         for i, queued in enumerate(self.mcp_queue):
@@ -1660,6 +1675,7 @@ class TUI:
 
     def _unqueue_mcp(self, name: str) -> None:
         self.mcp_queue = [s for s in self.mcp_queue if s.get("name") != name]
+        self.mcp_shown.pop(name, None)
         dialog = self._mcp_dialog
         if dialog is not None and dialog.name == name and not dialog.done:
             dialog.gone = True  # decided elsewhere (web UI, /approve)
@@ -1705,9 +1721,10 @@ class TUI:
             if dialog.gone:
                 continue
             self.mcp_answered.add(dialog.name)
+            self.mcp_shown[dialog.name] = str(dialog.server.get("digest") or "")
             if choice == APPROVE:
                 with contextlib.suppress(HubError):
-                    await self.decide_mcp(dialog.name, True)
+                    await self.decide_mcp(dialog.name, True, digest=str(dialog.server.get("digest") or ""))
             elif choice == REJECT:
                 self._reject_waiter = asyncio.get_running_loop().create_future()
                 self.input_mode = ("reject", dialog.name)

@@ -91,6 +91,72 @@ def test_git_refuses_its_network_transports_and_still_clones_a_local_repository(
     assert local.returncode == 0, local.stderr
 
 
+def git_pairs(env: dict[str, str]) -> list[tuple[str, str]]:
+    """The GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n pairs of `env`, in order (KeyError: a pair GIT_CONFIG_COUNT counts is
+    missing)."""
+    return [(env[f"GIT_CONFIG_KEY_{i}"], env[f"GIT_CONFIG_VALUE_{i}"])
+            for i in range(int(env.get("GIT_CONFIG_COUNT") or 0))]
+
+
+def test_a_session_trusts_its_own_workspace_in_a_container_only(tmp_path, monkeypatch):
+    root = tmp_path / "workspace"
+    path = root.resolve().as_posix()
+    env = {"PATH": "p"}
+    monkeypatch.setattr(netoff, "in_container", lambda: False)
+    assert netoff.trust_workspace(env, root) == env   # on the host git's ownership check stays the user's
+    monkeypatch.setattr(netoff, "in_container", lambda: True)
+    out = netoff.trust_workspace(env, root)
+    assert env == {"PATH": "p"}   # the caller's dict is untouched
+    assert out["GIT_CONFIG_COUNT"] == "2" and out["PATH"] == "p"
+    assert git_pairs(out) == [("safe.directory", path), ("safe.directory", f"{path}/*")]
+
+
+def test_a_workspace_without_git_of_its_own_also_trusts_the_repository_around_it(tmp_path, monkeypatch):
+    # a session with git off adopted inside a repository: its members' git finds that work tree, trusted exactly
+    # (no /*: the folders next to the workspace stay as they are); a workspace with a .git of its own looks no higher
+    monkeypatch.setattr(netoff, "in_container", lambda: True)
+    app = tmp_path / "app"
+    (app / ".git").mkdir(parents=True)
+    root = app / "frontend"
+    (root / "src").mkdir(parents=True)
+    path, outer = root.resolve().as_posix(), app.resolve().as_posix()
+    own = [("safe.directory", path), ("safe.directory", f"{path}/*")]
+    assert git_pairs(netoff.trust_workspace({}, root)) == [*own, ("safe.directory", outer)]
+    assert git_pairs(netoff.trust_workspace({}, root / "src"))[2:] == [("safe.directory", outer)]   # deeper too
+    (root / ".git").write_text("gitdir: elsewhere\n", encoding="utf-8")   # its own repository (a worktree's file)
+    assert git_pairs(netoff.trust_workspace({}, root)) == own
+
+
+def test_the_image_marker_turns_the_workspace_trust_on_without_a_marker_file(tmp_path, monkeypatch):
+    # a container runtime that creates neither /.dockerenv nor /run/.containerenv still runs the image, whose
+    # Dockerfile sets IMAGE_ENV
+    root = tmp_path / "workspace"
+    path = root.resolve().as_posix()
+    monkeypatch.setattr(netoff, "in_container", lambda: False)
+    monkeypatch.delenv(netoff.IMAGE_ENV, raising=False)
+    assert netoff.trust_workspace({}, root) == {}
+    monkeypatch.setenv(netoff.IMAGE_ENV, "1")
+    out = netoff.trust_workspace({}, root)
+    assert git_pairs(out)[:2] == [("safe.directory", path), ("safe.directory", f"{path}/*")]
+
+
+@pytest.mark.parametrize("trust_first", [True, False])
+def test_the_workspace_trust_and_the_offline_settings_compose_in_either_order(tmp_path, monkeypatch, trust_first):
+    force("env")
+    monkeypatch.setattr(netoff, "in_container", lambda: True)
+    root = tmp_path / "workspace"
+    path = root.resolve().as_posix()
+    env = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.x", "GIT_CONFIG_VALUE_0": "y"}
+    out = (netoff.environment(netoff.trust_workspace(env, root)) if trust_first
+           else netoff.trust_workspace(netoff.environment(env), root))
+    count = 1 + 2 + len(netoff.GIT_OFFLINE)
+    assert out["GIT_CONFIG_COUNT"] == str(count) and f"GIT_CONFIG_KEY_{count}" not in out
+    trust = [("safe.directory", path), ("safe.directory", f"{path}/*")]
+    # the inherited entry first, then each caller's pairs in the order they ran: no index used twice
+    later = [*trust, *netoff.GIT_OFFLINE] if trust_first else [*netoff.GIT_OFFLINE, *trust]
+    assert git_pairs(out) == [("core.x", "y"), *later]
+
+
 def test_the_docker_isolation_gives_the_offline_user_its_own_home(monkeypatch):
     force("docker", ["setpriv", "--"])
     fake_pwd = types.SimpleNamespace(getpwnam=lambda name: types.SimpleNamespace(pw_dir=f"/home/{name}"))
@@ -568,6 +634,39 @@ async def test_a_command_and_its_job_run_wrapped_with_the_offline_environment(tm
         await shutdown(swarm)
 
 
+TRUST_PROBE = ("import os\n"
+               "count = int(os.environ.get('GIT_CONFIG_COUNT') or 0)\n"
+               "keys = [os.environ['GIT_CONFIG_KEY_%d' % i] for i in range(count)]\n"
+               "safe = [os.environ['GIT_CONFIG_VALUE_%d' % i] for i in range(count) if keys[i] == 'safe.directory']\n"
+               "print('KEYS=' + ','.join(keys), 'SAFE=' + ('|'.join(safe) or '-'))\n")
+
+
+async def test_a_command_trusts_its_workspace_in_a_container_only(tmp_path, monkeypatch, fast):
+    """In the Docker image git trusts no repository of another owner: a member's command gets its session's
+    workspace (before the offline settings of a session without network, under one count); on the host nothing."""
+    monkeypatch.setenv("PYEXE", sys.executable)
+    probe = tmp_path / "trust.py"
+    probe.write_text(TRUST_PROBE, encoding="utf-8")
+    command = f"& $env:PYEXE '{probe}'" if WINDOWS else f"\"$PYEXE\" '{probe}'"
+    swarm = await _offline_team(tmp_path, network="on")
+    try:
+        ctx = agent_ctx(swarm, ANNA)
+        path = Path(swarm.workspace.root).resolve().as_posix()
+        monkeypatch.setattr(netoff, "in_container", lambda: False)
+        out = await ok(ctx, "shell", {"command": command})
+        assert "SAFE=-" in out, out
+        monkeypatch.setattr(netoff, "in_container", lambda: True)
+        out = await ok(ctx, "shell", {"command": command})
+        assert f"SAFE={path}|{path}/*" in out, out
+        _fake_namespace(tmp_path)
+        swarm.reconfigure(with_network(swarm.config, "off"))
+        out = await ok(ctx, "shell", {"command": command})
+        assert "WRAPPED" in out and f"SAFE={path}|{path}/*" in out, out
+        assert "safe.directory,safe.directory,protocol.http.allow" in out, out
+    finally:
+        await shutdown(swarm)
+
+
 def with_network(config: Config, network: str) -> Config:
     """`config` with another [swarm] network (what a settings change hands Swarm.reconfigure)."""
     return dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, network=network))
@@ -643,6 +742,60 @@ async def test_a_server_started_while_the_setting_changes_never_keeps_the_old_on
     assert starts[-1] == [sys.executable, "server.py"] and not conn.alive
 
 
+async def test_a_smoke_test_started_while_the_setting_changes_is_not_pooled(forge_factory, monkeypatch):
+    """The same for a forged server's smoke test (mcp_create, and the test again of an edited working copy): the
+    process started under the old setting is closed, and the next use starts the snapshot under the new one."""
+    conns: list[_FakeConnection] = []
+    flip: list[Config] = []
+
+    class Slow(_FakeConnection):
+        async def start(self, timeout):
+            conns.append(self)
+            if flip:   # the user switches the network while this one starts
+                forge.swarm.config = flip.pop()
+                await forge.close_connections()
+            return list(self.tools)
+
+    monkeypatch.setattr(forge_module, "MCPConnection", Slow)
+    force("netns", ["unshare", "-rn", "--"])
+    swarm, forge = await forge_factory()
+    on = swarm.config
+    flip.append(with_network(on, "off"))
+    await forge.create(USER, "calc", "Arithmetic helpers", forge_module.SERVER_TEMPLATE, save_to_library=False)
+    assert forge.get("calc")["status"] == "active"
+    assert forge.connection("calc") is None and not conns[-1].alive and not conns[-1].offline
+    await forge.tools(USER, "calc")
+    assert forge.connection("calc") is conns[-1] and conns[-1].offline and conns[-1].command[:2] == ["unshare", "-rn"]
+
+    # an edit of the working copy, tested again while the network goes back on
+    (forge.server_dir("calc") / "server.py").write_bytes((forge_module.SERVER_TEMPLATE + "# v2\n").encode("utf-8"))
+    await forge.close_connections()
+    flip.append(on)
+    await forge.tools(USER, "calc")
+    conn = forge.connection("calc")
+    assert conn is conns[-1] and not conn.offline and not conns[-2].alive
+
+
+async def test_mcp_servers_and_their_smoke_test_trust_the_workspace_in_a_container_only(forge_factory, monkeypatch):
+    _FakeConnection.seen = []
+    monkeypatch.setattr(forge_module, "MCPConnection", _FakeConnection)
+    monkeypatch.setattr(netoff, "in_container", lambda: True)
+    external = {"local": {"command": [sys.executable, "server.py"]}}
+    swarm, forge = await forge_factory(mcp={"external": external})
+    path = Path(forge.config.workspace_dir).resolve().as_posix()
+    trusted = [("safe.directory", path), ("safe.directory", f"{path}/*")]
+    await forge.tools(USER, "local")
+    assert git_pairs(_FakeConnection.seen[-1][1])[-2:] == trusted
+    conn, _tools, error = await forge._smoke_test("demo", "x = 1\n", [sys.executable, "server.py"])
+    assert error is None and git_pairs(_FakeConnection.seen[-1][1])[-2:] == trusted
+    await conn.close()
+    # on the host: nothing added
+    monkeypatch.setattr(netoff, "in_container", lambda: False)
+    await forge.close_connections()
+    await forge.tools(USER, "local")
+    assert ("safe.directory", path) not in git_pairs(_FakeConnection.seen[-1][1])
+
+
 # ---- skills ------------------------------------------------------------------------------------------------
 async def test_a_members_proposal_gets_no_install_without_network(tmp_path):
     config = Config.from_dict(tmp_path / "project", {})
@@ -666,6 +819,23 @@ async def test_a_members_proposal_gets_no_install_without_network(tmp_path):
     for lang in ("en", "ru"):
         reason = prompts.t(lang, "deps_reason_network")
         assert reason and "." not in reason
+
+
+async def test_a_workspace_claude_skill_gets_no_install_without_network(tmp_path):
+    swarm = await _offline_team(tmp_path)
+    try:
+        claude = Path(os.environ["CLAUDE_CONFIG_DIR"]) / "skills"
+        make_skill(claude / "pdf", "pdf", "Reads PDFs.", {"requirements.txt": "pypdf\n"})
+        make_skill(swarm.workspace.root / ".claude" / "skills" / "notes", "notes", "Takes notes.",
+                   {"requirements.txt": "pypdf\n"})
+        await swarm.skills.attach(USER, "claude-project:notes")   # agents can write there: gated like a proposal
+        (refused,) = swarm.skills.deps("notes")
+        assert refused["status"] == "off" and refused["reason"] == {"code": "network"}
+        await swarm.skills.attach(USER, "claude-user:pdf")   # the user's own skills install as before
+        assert [spec.trust for spec in swarm.skills._specs("pdf")] == ["user"]
+        await until(lambda: not swarm.skills._tasks, 30)
+    finally:
+        await shutdown(swarm)
 
 
 # ---- telling the members, DreamTeam's git ------------------------------------------------------------------
@@ -968,6 +1138,59 @@ def _docker_tests() -> bool:
         return subprocess.run(["docker", "info"], capture_output=True, timeout=20).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+DOCKER_GIT_CHECK = r"""
+import json, os, subprocess
+from dreamteam import netoff
+
+
+def repo(path):
+    os.makedirs(path, exist_ok=True)
+    subprocess.run(["git", "init", "-q", path], check=True)
+    for folder, dirs, files in os.walk(path):
+        for name in [folder, *(os.path.join(folder, n) for n in dirs + files)]:
+            os.lchown(name, 1000, 1000)   # a bind mount of a Linux host's user
+
+
+def status(path, env):
+    return subprocess.run(["git", "-C", path, "status", "--porcelain"], env=env, capture_output=True).returncode
+
+
+workspace, other = "/swarm/sessions/s1/workspace", "/swarm/sessions/s2/workspace"
+repo(workspace)
+repo(workspace + "/nested")
+repo(other)
+netoff._detected.update(kind="env", prefix=[])   # the offline settings, without probing
+plain = dict(os.environ)
+env = netoff.trust_workspace(plain, workspace)
+system = subprocess.run(["git", "config", "--system", "--get-all", "safe.directory"], capture_output=True, text=True)
+print(json.dumps({"container": netoff.in_container(), "system": system.stdout.strip(),
+                  "plain": status(workspace, plain), "session": status(workspace, env),
+                  "nested": status(workspace + "/nested", env), "other": status(other, env),
+                  "offline": status(workspace, netoff.environment(env)),
+                  "offline_first": status(workspace, netoff.trust_workspace(netoff.environment(plain), workspace))}))
+"""
+
+
+@pytest.mark.skipif(not _docker_tests(), reason="opt-in: DREAMTEAM_DOCKER_TESTS=1 and a Docker daemon (builds an "
+                                                "image under a tag of its own)")
+def test_git_in_the_image_trusts_only_the_sessions_own_workspace(tmp_path):
+    """The sandbox image under a test tag has no safe.directory of its own: plain git refuses a session's repository
+    owned by another uid (a Linux host's bind mount); the session's environment (netoff.trust_workspace, the offline
+    settings appended in either order or not) works there and in a repository nested in it, never in another
+    session's."""
+    (tmp_path / "check.py").write_text(DOCKER_GIT_CHECK, encoding="utf-8")
+    try:
+        docker_module.build_image(DOCKER_IMAGE)
+        out = subprocess.run(["docker", "run", "--rm", "-v", f"{tmp_path}:/check:ro", "--entrypoint", "python",
+                              DOCKER_IMAGE, "/check/check.py"], capture_output=True, text=True, timeout=300)
+        result = json.loads(out.stdout.strip().splitlines()[-1])
+        assert result["container"] and result["system"] == "", result
+        assert result["plain"] == 128 and result["other"] == 128, result   # "dubious ownership"
+        assert result["session"] == result["nested"] == result["offline"] == result["offline_first"] == 0, result
+    finally:
+        subprocess.run(["docker", "image", "rm", "-f", DOCKER_IMAGE], capture_output=True, timeout=120)
 
 
 DOCKER_CHECK = r"""

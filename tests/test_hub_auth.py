@@ -1,6 +1,6 @@
 """The hub token (docs/SPEC.md §14 "Hub token", src/dreamteam/hubauth.py): in the Docker sandbox the hub listens on
-0.0.0.0, so every container on the same bridge reaches it; with a token every request from a peer that is not the
-hub's own loopback needs it (a header, or the cookie of a one-time `?token=` URL). `dreamteam sandbox` makes a token per
+0.0.0.0, so every container on the same bridge reaches it; with a token every request needs it, from the hub's own
+loopback too (a header, or the cookie of a one-time `?token=` URL). `dreamteam sandbox` makes a token per
 container, keeps it on the host outside the folders it mounts, and DreamTeam's clients send it; the container gets only
 its SHA-256. The real-Docker check is opt-in (DREAMTEAM_DOCKER_TESTS=1: it builds an image under a tag of its own and
 removes it)."""
@@ -134,16 +134,26 @@ async def test_a_board_url_with_the_token_sets_the_cookie_and_redirects_to_the_c
     assert status == 303 and headers["location"] == ["/evil.example.com/"]
 
 
-@pytest.mark.parametrize("peer, needs", [
-    (("127.0.0.1", 5), False), (("127.8.0.1", 5), False), (("::1", 5), False), (("::ffff:127.0.0.1", 5), False),
-    (PEER, True), (NEIGHBOUR, True), (("10.0.0.5", 5), True), (("testclient", 5), True), (None, True),
+@pytest.mark.parametrize("peer", [
+    ("127.0.0.1", 5), ("127.8.0.1", 5), ("::1", 5), ("::ffff:127.0.0.1", 5), PEER, NEIGHBOUR, ("10.0.0.5", 5),
+    ("testclient", 5), None,
 ])
-async def test_only_the_hubs_own_loopback_goes_without_the_token(token, peer, needs):
-    """Only a peer on the hub's own loopback goes without the token. A peer that is not an IP address is not
-    loopback."""
+async def test_a_hub_with_a_token_asks_every_peer_for_it(token, peer):
+    """The hub's own loopback too (docs/SPEC.md §14.2): the agents' commands in the sandbox's container come from
+    there. With the header or the cookie any peer gets in; a hub without a token asks no peer, loopback or not."""
     guard = web.GuardMiddleware(_ok_app, host="0.0.0.0")
-    assert (await _call(guard, client=peer))[0] == (401 if needs else 200)
-    assert (await _call(guard, client=peer, kind="websocket", path="/ws"))[0] == (1008 if needs else 200)
+    assert (await _call(guard, client=peer))[0] == 401
+    assert (await _call(guard, client=peer, path="/mcp", method="POST",
+                        headers={"content-type": "application/json"}))[0] == 401
+    assert (await _call(guard, client=peer, kind="websocket", path="/ws"))[0] == 1008
+    assert (await _call(guard, client=peer, headers=BEARER))[0] == 200
+    assert (await _call(guard, client=peer, headers={"cookie": f"{COOKIE}={TOKEN}"}))[0] == 200
+    assert (await _call(guard, client=peer, kind="websocket", path="/ws", headers=BEARER))[0] == 200
+    assert (await _call(guard, client=peer, kind="websocket", path="/ws",
+                        headers={"cookie": f"{COOKIE}={TOKEN}"}))[0] == 200
+    without = web.GuardMiddleware(_ok_app, host="0.0.0.0", token=None)
+    assert (await _call(without, client=peer))[0] == 200
+    assert (await _call(without, client=peer, kind="websocket", path="/ws"))[0] == 200
 
 
 async def test_without_a_token_nothing_changes():
@@ -221,7 +231,7 @@ async def test_the_token_redirect_never_leaves_the_hub(token, raw, location):
 async def test_the_cookie_takes_no_other_origin_than_the_hubs_own(token):
     """Browsers send the cookie to every port of 127.0.0.1, and SameSite counts them as the same site: a page on
     another port (a dev server, another local tool) must not read the board's stream with it. The header is no
-    browser's: it keeps the usual Origin rule."""
+    browser's: it keeps the usual Origin rule (host and port, any scheme), which takes no other port either."""
     guard = web.GuardMiddleware(_ok_app, host="0.0.0.0")
     with_cookie = {"cookie": f"{COOKIE}={TOKEN}"}
     for kind, path in (("websocket", "/ws"), ("http", "/api/state")):
@@ -231,7 +241,9 @@ async def test_the_cookie_takes_no_other_origin_than_the_hubs_own(token):
         for origin in ("http://127.0.0.1:5173", "http://localhost:8765", "https://127.0.0.1:8765", "null"):
             assert (await _call(guard, kind=kind, path=path, headers={**with_cookie, "origin": origin}))[0] == refused
         assert (await _call(guard, kind=kind, path=path,
-                            headers={**BEARER, "origin": "http://127.0.0.1:5173"}))[0] == 200
+                            headers={**BEARER, "origin": "https://127.0.0.1:8765"}))[0] == 200
+        assert (await _call(guard, kind=kind, path=path,
+                            headers={**BEARER, "origin": "http://127.0.0.1:5173"}))[0] == refused
     status, _ = await _call(guard, method="POST", path="/api/act/board",
                             headers={**with_cookie, "origin": "http://127.0.0.1:5173", "content-type": "application/json"})
     assert status == 403
@@ -305,7 +317,15 @@ async def test_a_swarm_hub_with_a_token_from_outside(tmp_path, token, caplog):
                 pass
         local_app = web.create_app(swarm, "0.0.0.0")   # (an MCP manager runs once per app)
         with TestClient(local_app, base_url=BASE, client=("127.0.0.1", 50000)) as local:   # the container's loopback
-            assert local.get("/api/state").status_code == 200
+            assert local.get("/api/state").status_code == 401   # (the agents' commands come from there)
+            mcp = local.post("/mcp", content=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+                             headers={"content-type": "application/json",
+                                      "accept": "application/json, text/event-stream"})
+            assert mcp.status_code == 401
+            _expect_ws_refused(local, "/ws")
+            assert local.get("/api/state", headers=BEARER).status_code == 200
+            assert local.get(f"/?token={TOKEN}", follow_redirects=False).status_code == 303
+            assert local.get("/api/state").status_code == 200   # the cookie
     finally:
         await swarm.stop()
         swarm.close()
@@ -358,6 +378,33 @@ def test_the_launcher_and_its_sessions_with_a_token_from_outside(tmp_path, token
     _no_token_logged(caplog)
 
 
+def test_the_launcher_and_its_sessions_ask_their_own_loopback_for_the_token(tmp_path, token):
+    """A launcher with a token (the sandbox's, compose's) asks a peer on its own loopback for it too: the sessions API,
+    the launcher's and a session's MCP endpoint, a session's API and both streams; the header or the cookie let it in."""
+    manager = _manager(tmp_path)
+    with TestClient(create_launcher_app(manager, "0.0.0.0"), base_url=BASE, client=("127.0.0.1", 50000)) as c:
+        try:
+            rpc = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"})
+            mcp_headers = {"content-type": "application/json", "accept": "application/json, text/event-stream"}
+            assert c.get("/api/sessions").status_code == 401
+            assert c.post("/mcp", content=rpc, headers=mcp_headers).status_code == 401
+            _expect_ws_refused(c, "/ws")
+            made = c.post("/api/sessions", content=json.dumps({"title": "T", "goal": "G"}),
+                          headers={"content-type": "application/json", **BEARER})
+            assert made.status_code == 201, made.text
+            sid = made.json()["session"]["id"]
+            assert c.get(f"/s/{sid}/api/state").status_code == 401
+            assert c.post(f"/s/{sid}/mcp", content=rpc, headers=mcp_headers).status_code == 401
+            _expect_ws_refused(c, f"/s/{sid}/ws")
+            assert c.get(f"/s/{sid}/api/state", headers=BEARER).status_code == 200
+            assert c.get(f"/s/{sid}/?token={TOKEN}", follow_redirects=False).status_code == 303
+            assert c.get("/api/sessions").status_code == 200   # the cookie, now
+            with c.websocket_connect(f"{WS}/s/{sid}/ws", headers={"cookie": f"{COOKIE}={TOKEN}"}):
+                pass
+        finally:
+            c.portal.call(manager.shutdown)
+
+
 def test_a_hub_reachable_from_other_hosts_does_not_start_without_a_token(caplog, monkeypatch):
     """Fail closed: the image's default command, a plain `docker run` or compose without a token would let every
     container of the network in. DREAMTEAM_HUB_NO_TOKEN=1 allows it, with a warning."""
@@ -378,11 +425,39 @@ def test_a_hub_reachable_from_other_hosts_does_not_start_without_a_token(caplog,
     assert not caplog.records
 
 
+def test_the_no_token_error_in_the_image_names_the_digest_first(monkeypatch):
+    """docker-compose.yml passes DREAMTEAM_HUB_TOKEN_SHA256 alone: a compose user who exported DREAMTEAM_HUB_TOKEN
+    was told to set it, and it never reaches the container. In the image (its marker DREAMTEAM_IMAGE=1) the error
+    names the digest first."""
+    from dreamteam import netoff
+
+    monkeypatch.setenv(netoff.IMAGE_ENV, "1")
+    with pytest.raises(web.NoTokenError) as error:
+        web.check_hub_token("0.0.0.0")
+    assert f"Set {hubauth.DIGEST_ENV} " in str(error.value) and "docker-compose.yml" in str(error.value)
+    monkeypatch.delenv(netoff.IMAGE_ENV)
+    monkeypatch.setattr(netoff, "in_container", lambda: False)
+    with pytest.raises(web.NoTokenError, match=f"Set {hubauth.TOKEN_ENV} "):
+        web.check_hub_token("0.0.0.0")
+
+
+def test_the_no_token_error_in_another_container_names_either_variable(monkeypatch):
+    """A pip install in a devcontainer or a CI container (/.dockerenv, no image marker) is not compose: there
+    DREAMTEAM_HUB_TOKEN works as on any host, so the error names it and its digest, not docker-compose.yml."""
+    from dreamteam import netoff
+
+    monkeypatch.delenv(netoff.IMAGE_ENV, raising=False)
+    monkeypatch.setattr(netoff, "in_container", lambda: True)
+    with pytest.raises(web.NoTokenError, match=f"Set {hubauth.TOKEN_ENV} ") as error:
+        web.check_hub_token("0.0.0.0")
+    assert hubauth.DIGEST_ENV in str(error.value) and "docker-compose.yml" not in str(error.value)
+
+
 async def test_every_loopback_address_is_a_loopback_bind(caplog):
     """A hub on 127.0.0.2 (any address of 127.0.0.0/8, ::1 however written) is reached from this computer alone: it
     starts without a token, as before there were tokens; only the names 127.0.0.1, localhost and ::1 did. The guard
-    agrees: it takes the bind's own address as the Host, and its peers are loopback, so a token, when there is one,
-    is asked of none of them. Besides the names, only an IP literal exactly as written counts: a string with brackets
+    agrees: it takes the bind's own address as the Host (a token, when there is one, is asked of its loopback peers
+    all the same). Besides the names, only an IP literal exactly as written counts: a string with brackets
     or a `%` scope is a name to the server (on Linux [::1] too), so it needs a token.
     (Nothing binds such an address here: macOS has 127.0.0.1 alone.)"""
     caplog.set_level(logging.WARNING)
@@ -398,7 +473,8 @@ async def test_every_loopback_address_is_a_loopback_bind(caplog):
         for peer in (("127.0.0.2", 5), ("127.0.0.1", 5)):
             for host, status in (("127.0.0.2:8765", 200), ("localhost:8765", 200), ("127.0.0.3:8765", 403),
                                  ("rebind.example.com:8765", 403)):
-                assert (await _call(guard, client=peer, server="127.0.0.2", host=host))[0] == status, (secret, host)
+                expected = 401 if secret and status == 200 else status   # a token: asked of loopback peers too
+                assert (await _call(guard, client=peer, server="127.0.0.2", host=host))[0] == expected, (secret, host)
 
 
 async def test_serve_refuses_a_non_loopback_address_without_a_token(tmp_path):
@@ -1058,8 +1134,7 @@ def test_the_clients_in_a_hubs_own_process_send_its_token_to_its_own_address(tmp
         run = _console_of_the_hub(base, monkeypatch)
         asyncio.run(run(lambda: seen))
     assert seen and all(sent == f"Bearer {TOKEN}" for _, sent in seen), seen
-    # the TUI's launcher in this process, whose every peer comes as over the LAN address
-    monkeypatch.setattr(hubauth, "peer_is_loopback", lambda scope: False)
+    # the TUI's launcher in this process, which asks every peer for its token (its own loopback too)
     home = tmp_path / "home"
     cli._load_home(home)
     headers: list = []
@@ -1097,6 +1172,67 @@ def test_the_clients_in_a_hubs_own_process_send_its_token_to_its_own_address(tmp
     own = asyncio.run(attach())
     assert headers == [{"Authorization": f"Bearer {TOKEN}"}]
     assert opened == [f"{own}/?token={TOKEN}"]
+
+
+def test_a_hub_with_the_tokens_digest_alone_lets_its_own_console_and_tui_in(tmp_path, monkeypatch):
+    """A hub started with DREAMTEAM_HUB_TOKEN_SHA256 alone never has the token, and asks its own loopback for it too:
+    the console of `serve`/`run` and the TUI's launcher in its process get in with hubauth.own_token(), which lives
+    in that process's memory alone. A browser never gets it, and the guard takes it only as a header."""
+    monkeypatch.setenv(hubauth.DIGEST_ENV, DIGEST)
+    assert hubauth.env_token() is None and hubauth.own_digest() is None
+    own = hubauth.own_token()
+    with _fake_hub(accept=own) as (base, seen):
+        assert hubauth.client_tokens(base) == []   # (not before the console says it serves that hub)
+        run = _console_of_the_hub(base, monkeypatch)
+        asyncio.run(run(lambda: seen))
+        assert hubauth.browser_url(base + "/") == base + "/" and hubauth.client_token(base) is None
+    assert seen and all(sent == f"Bearer {own}" for _, sent in seen), seen
+
+    async def guard() -> None:
+        hub = web.GuardMiddleware(_ok_app, host="127.0.0.1")
+        mine = {"authorization": f"Bearer {own}"}
+        loopback = ("127.0.0.1", 5)
+        assert (await _call(hub, client=loopback))[0] == 401
+        assert (await _call(hub, client=loopback, headers=mine))[0] == 200
+        assert (await _call(hub, client=loopback, kind="websocket", path="/ws", headers=mine))[0] == 200
+        assert (await _call(hub, client=loopback, headers={"cookie": f"{COOKIE}={own}"}))[0] == 401   # never a cookie
+        assert (await _call(hub, client=loopback, path="/", query=f"token={own}"))[0] == 401      # nor a board URL's
+
+    asyncio.run(guard())
+    # the TUI's launcher in this process: REST and the stream with the own token; anyone else on loopback: 401
+    home = tmp_path / "home"
+    cli._load_home(home)
+
+    def factory(profile, agent):
+        return ScriptedLLM(lambda system, messages, tools: "Nothing to do.", profile)
+
+    async def attach() -> None:
+        conn = await tui_client.connect(home, host="127.0.0.1", port=_free_port(), llm_factory=factory)
+        try:
+            assert conn.owned and (await conn.client.sessions()) == []
+            stream = conn.client.stream(None)
+            assert (await asyncio.wait_for(stream.__anext__(), 15))["data"]["state"] == "connected"
+            await stream.aclose()
+            assert (await asyncio.to_thread(_status, conn.base_url + "/api/sessions"))[0] == 401
+            printed: list = []
+            with create_pipe_input() as pipe:   # its /web: no token for the browser, so it says how to get in
+                TUI(conn, lang="en", input=pipe, output=DummyOutput(), printer=printed.append).open_url(
+                    conn.base_url + "/")
+            assert opened == [conn.base_url + "/"]
+            assert f"?token=<the token whose SHA-256 is in {hubauth.DIGEST_ENV}>" in " ".join(
+                tui_render.to_plain(r, 300) for r in printed)
+        finally:
+            await conn.close()
+
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from dreamteam.tui import render as tui_render
+    from dreamteam.tui.app import TUI
+
+    opened: list[str] = []
+    monkeypatch.setattr(webbrowser, "open", opened.append)
+    asyncio.run(attach())
 
 
 def test_serve_and_run_open_their_own_board_with_its_token(tmp_path, monkeypatch, capsys, token):
@@ -1148,6 +1284,12 @@ def test_serve_and_run_open_their_own_board_with_its_token(tmp_path, monkeypatch
     assert f"Sessions: {lan}/" in err and f"Board: {lan}" in err and TOKEN not in err
     monkeypatch.setattr(hubauth, "_taken", None)
     assert boards("127.0.0.1") == (f"http://127.0.0.1:{port}/", f"http://127.0.0.1:{port}")
+    assert "SHA-256" not in capsys.readouterr().err   # (a hub without a token: nothing to say)
+    # the digest alone: the browser has no token for the board, which answers 401, so they say how to get in
+    monkeypatch.setenv(hubauth.DIGEST_ENV, DIGEST)
+    assert boards("127.0.0.1") == (f"http://127.0.0.1:{port}/", f"http://127.0.0.1:{port}")
+    link = f"http://127.0.0.1:{port}/?token=<the token whose SHA-256 is in {hubauth.DIGEST_ENV}>"
+    assert capsys.readouterr().err.count(link) == 2
 
 
 async def test_a_loopback_hub_is_reached_directly_never_through_the_environments_proxy(tmp_path, monkeypatch):
@@ -1238,6 +1380,16 @@ def test_the_sandbox_command_passes_the_tokens_digest_by_name_only(tmp_path, mon
     assert hubauth.TOKEN_ENV not in cmd   # never the token itself, only its digest
     assert not {hubauth.TOKEN_ENV, hubauth.DIGEST_ENV} & set(docker_module.env_passthrough(config))  # nor the host's
     assert cmd[cmd.index("--host") + 1] == "0.0.0.0"   # a published port never reaches the container's loopback
+
+
+def test_compose_gives_the_container_the_tokens_digest_only():
+    """docker-compose.yml passes DREAMTEAM_HUB_TOKEN_SHA256 by name, as `dreamteam sandbox` does: the container's
+    environment never holds the token itself (the agents' commands run there); the host's clients keep the token."""
+    compose = (Path(__file__).resolve().parents[1] / "docker-compose.yml").read_text(encoding="utf-8")
+    passed = {line.strip()[2:].strip('"').split("=", 1)[0] for line in compose.splitlines()
+              if line.strip().startswith("- ")}
+    assert hubauth.DIGEST_ENV in passed and hubauth.TOKEN_ENV not in passed
+    assert "hashlib.sha256(os.environ['DREAMTEAM_HUB_TOKEN']" in compose   # how to compute it on the host
 
 
 def test_run_sandbox_makes_a_token_per_container_and_prints_how_to_use_it(tmp_path, monkeypatch, capsys):

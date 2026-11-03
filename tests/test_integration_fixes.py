@@ -532,4 +532,7 @@ def test_docker_compose_context_sends_only_the_sources():
              if line.strip() and not line.startswith("#")]
     assert rules[0] == "*"
     assert {"!pyproject.toml", "!README.md", "!src/"} <= set(rules)
+    assert "!uv.lock" in rules                   # the Dockerfile installs the locked versions
+
+
     assert "**/.dreamteam" in rules and "**/__pycache__" in rules

@@ -37,7 +37,8 @@ const Skills = (() => {
   }
 
   /** What attaching a skill installs, for its preview (`deps` of GET /api/skills/{name} or of a candidate; `install`
-   * the settings' switches; `proposal`: a member's skill, which `install.proposals` covers). "" without manifests. */
+   * the settings' switches; `proposal`: a skill agents can write, a member's proposal or the workspace's
+   * .claude/skills one, which `install.proposals` covers). "" without manifests. */
   function previewLine(t, deps, install, proposal = false) {
     const found = ["python", "node"].filter((eco) => deps && deps[eco]);
     if (!found.length) return "";

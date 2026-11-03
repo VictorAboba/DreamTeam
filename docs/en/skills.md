@@ -43,7 +43,8 @@ templates, reference). Agents see the names and descriptions of the attached ski
   packages, `/skills log name` shows the install log. Unused environments are removed after `env_retention_days` days
   (the server checks this once a day); to remove them now, use `/skills clean-envs` or the button on the start page.
   Installing packages runs their code with your rights, so `[skills] install = false` turns it off, and
-  `install_proposals = false` turns it off only for skills that agents proposed.
+  `install_proposals = false` turns it off only for skills that agents can write: their proposals and the
+  `claude-project:` skills from `<project folder>/.claude/skills`.
 - **Docker sandbox.** The host's library is mounted into the container read-only (the source `host-library:name`); the
   sandbox has its own library in `<home>/.dreamteam/skills-library`. `~/.claude/skills` is not mounted: first add such
   a skill to the library on the host. Folder paths in the sandbox are container paths, so a zip is more convenient for
@@ -56,6 +57,6 @@ claude = true             # offer Claude Code skills
 max_attached = 40         # skills in one session
 max_proposals = 10        # members' proposals in one session (0 means no proposals)
 install = true            # install script dependencies automatically
-install_proposals = true  # also for skills proposed by agents
+install_proposals = true  # also for agents' proposals and claude-project skills
 env_retention_days = 30   # unused environments are removed after this many days (0 means never)
 ```

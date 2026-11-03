@@ -123,6 +123,19 @@ def test_settings_api(client):
     check = _post(c, "/api/settings/check", {"profile": {"provider": "scripted", "model": "x"}, "name": "default"})
     assert check.status_code == 200 and check.json()["ok"] is False
     assert _post(c, "/api/settings/check", {"profile": {"provider": "openai", "zzz": 1}}).status_code == 400
+    # the stored key is used only with the provider and base_url the profile is saved with
+    moved = _post(c, "/api/settings/check", {"profile": {"provider": "openai", "model": "x",
+                                                         "base_url": "http://127.0.0.1:9/v1"}, "name": "default"})
+    assert moved.status_code == 400 and "stored API key" in moved.json()["error"]
+    assert "sk-hidden" not in moved.text
+
+
+    # a key from the hub's environment goes only to the default endpoint or to one saved with its variable
+    from_env = _post(c, "/api/settings/check", {"profile": {"provider": "openai", "model": "x", "api_key_env": "DT_KEY",
+                                                            "base_url": "http://127.0.0.1:9/v1"}})
+    assert from_env.status_code == 400 and "Save the settings first" in from_env.json()["error"]
+
+
     # JSON-only POSTs and host guard still apply
     assert c.post("/api/sessions", data={"a": "b"}).status_code == 415
     assert c.get("/api/sessions", headers={"host": "evil.example"}).status_code == 403

@@ -486,7 +486,8 @@ class JobManager:
                 raise ToolError(BACKGROUND_ERRORS[note].format(**self._note_args(actor, note)))
         requested = BACKGROUND_GRACE if background else float(timeout)
         wait = self._wait_for(actor, requested)
-        env = self.command_env(env)
+        # in a container git trusts the session's own workspace only (netoff.trust_workspace, docs/SPEC.md §18.3)
+        env = netoff.trust_workspace(self.command_env(env), self.swarm.workspace.root)
         # a session without network (docs/SPEC.md §7.2): the command, and so the job it may become, runs isolated
         offline = netoff.is_off(self.swarm.config)
         if offline:

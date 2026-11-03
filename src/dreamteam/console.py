@@ -34,7 +34,7 @@ HELP = {
   /pause  /resume          — пауза / продолжить
   /wrapup [off]            — режим завершения: агенты завершают задачи с тем, что есть (off — выключить)
   /budget 10               — лимит бюджета в $;  /max 6 — максимум агентов
-  /approve имя|N [комментарий]  /reject имя|N [что исправить] — MCP-сервер или задача на ревью
+  /approve имя [sha256]|N [комментарий]  /reject имя|N [что исправить] — MCP-сервер или задача на ревью
   /trace [Имя | N]         — трейсы агентов: последние, агента или трейс N по шагам
   /span N [ctx]            — шаг трейса полностью (ctx — сообщения, которые видела модель)
   /session                 — текущая сессия (другая: dreamteam console --session ID)
@@ -57,7 +57,7 @@ HELP = {
   /pause  /resume          — pause / resume
   /wrapup [off]            — wrap-up mode: the agents finish their tasks with what they have (off: switch it off)
   /budget 10               — budget limit in $;  /max 6 — max agents
-  /approve name|N [comment]  /reject name|N [what to fix] — an MCP server or a task in review
+  /approve name [sha256]|N [comment]  /reject name|N [what to fix] — an MCP server or a task in review
   /trace [Name | N]        — agent traces: recent ones, an agent's, or trace N step by step
   /span N [ctx]            — one trace step in full (ctx — the messages the model saw)
   /session                 — the current session (another: dreamteam console --session ID)
@@ -582,7 +582,12 @@ class Console:
                 return hub.act("task_review", task_id=int(head.lstrip("#")), approve=cmd == "/approve",
                                comment=comment)
             parts = shlex.split(arg)
-            return hub.act("mcp_approve", name=parts[0], approve=cmd == "/approve", comment=" ".join(parts[1:]))
+            extra: dict[str, str] = {}
+            if cmd == "/approve" and len(parts) > 1 and re.fullmatch(r"[0-9a-fA-F]{8,64}", parts[1]):
+                # "/approve name <sha256>": approved only while the server's code still has that digest (or its start)
+                extra["digest"] = parts.pop(1)
+            return hub.act("mcp_approve", name=parts[0], approve=cmd == "/approve", comment=" ".join(parts[1:]),
+                           **extra)
         if cmd == "/trace":
             if arg.lstrip("#").isdigit():
                 return hub.act("agent_traces", trace_id=int(arg.lstrip("#")))

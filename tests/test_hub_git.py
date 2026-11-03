@@ -117,14 +117,14 @@ def test_the_environment_has_no_secret_and_refuses_every_transport(monkeypatch):
 
     monkeypatch.setenv("ANTHROPIC_API_KEY", FAKE_ANTHROPIC)
     monkeypatch.setenv("OPENAI_API_KEY", FAKE_OPENAI)
-    monkeypatch.setenv("DEEPSEEK_KEY", FAKE_CUSTOM)   # a name no pattern matches, named by a profile below
-    monkeypatch.setenv("MY_OTHER_KEY", FAKE_CUSTOM)   # one passed explicitly
+    monkeypatch.setenv("DEEPSEEK_LOGIN", FAKE_CUSTOM)   # a name no pattern matches, named by a profile below
+    monkeypatch.setenv("MY_OTHER_LOGIN", FAKE_CUSTOM)   # one passed explicitly
     monkeypatch.setenv("GIT_DIR", "/elsewhere")
     monkeypatch.setenv("DREAMTEAM_OFFLINE_USER", "1:1")
     monkeypatch.setenv("PLAIN_SETTING", "kept")
     Config.from_dict(Path("p"), {"models": {"default": {"provider": "openai", "model": "m",
-                                                      "api_key_env": "$DEEPSEEK_KEY"}}})
-    env = hubgit.environment(["my_other_key"])
+                                                      "api_key_env": "$DEEPSEEK_LOGIN"}}})
+    env = hubgit.environment(["my_other_login"])
     for value in (FAKE_ANTHROPIC, FAKE_OPENAI, FAKE_CUSTOM, "/elsewhere", "1:1"):
         assert value not in env.values()
     assert env["PLAIN_SETTING"] == "kept"
@@ -1124,7 +1124,9 @@ async def main():
     fresh = Workspace(Swarm(Config.from_dict(Path("/swarm/q"), {"swarm": {"network": "off"}})))
     fresh.git_isolated = True
     await fresh.init()
-    out["fresh"] = subprocess.run(["git", "-C", str(fresh.root), "log", "--format=%s|%an", "-1"],
+    # (the image trusts no repository of another uid: the check says which one, as DreamTeam's own git does)
+    out["fresh"] = subprocess.run(["git", "-c", f"safe.directory={fresh.root}", "-C", str(fresh.root), "log",
+                                   "--format=%s|%an", "-1"],
                                   capture_output=True, text=True).stdout.strip()
     out["fresh_owner"] = (fresh.root / ".git" / "HEAD").stat().st_uid
     ws.git_isolated = False   # the control: DreamTeam's git as the hub itself (root, its network)

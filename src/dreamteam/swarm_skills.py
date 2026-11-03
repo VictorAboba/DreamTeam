@@ -996,16 +996,19 @@ class SessionSkills:
         session's in-use set (before anything is peeked), and the views of ready Node environments."""
         config = self.swarm.config
         manager = self.manager
-        network = not netoff.is_off(config)   # a session without network installs no member's proposal
+        network = not netoff.is_off(config)   # a session without network installs nothing agents can write
         settings_key = (skill_deps.settings_hash(config.skills), network)
         made: dict[str, tuple[tuple, list]] = {}
         for skill in wanted:
             key = (skill.digest, settings_key)
             if known.get(skill.name, ((),))[0] == key:
                 continue
+            # the source's trust decides, not only `agent`: the workspace's .claude/skills is agent-writable too, so
+            # install_proposals and a session without network decide for it as for a member's proposal
+            trust = skill_deps.trust_class(skill.frm)
             try:
-                items = manager.plan(self.dir / skill.name, skill.name, skill_deps.trust_class(skill.frm),
-                                     config.skills, config=config, proposal=skill.frm == "agent", network=network)
+                items = manager.plan(self.dir / skill.name, skill.name, trust, config.skills, config=config,
+                                     proposal=trust == "agent", network=network)
             except Exception:  # noqa: BLE001 - a skill's dependencies never keep it from being attached
                 log.exception("cannot plan the dependencies of the skill %s", skill.name)
                 items = []
@@ -1213,7 +1216,8 @@ class SessionSkills:
 
     async def replan(self) -> None:
         """The session's network changed: every skill's dependencies are planned again (without network a member's
-        proposal gets no install) and what the new plans lack is built."""
+        proposal or a skill of the workspace's .claude/skills gets no install) and what the new plans lack is
+        built."""
         if not self._active:
             return
         async with self._lock:

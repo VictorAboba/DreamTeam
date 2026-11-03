@@ -526,7 +526,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/wrapup [off]` | wrap-up mode on (`on`/`вкл` or nothing) or off (`off`/`выкл`): the agents finish their tasks with what they have, start no new computations, and no new background jobs start (`swarm_control` wrap_up; the `swarm.wrap_up` event prints the change, a no-op prints the tool's answer) |
 | `/clarify [on\|off]` | clarify mode, `[swarm] clarify` (SPEC §3.1): questions before the plan, and an agent's critical question pauses the swarm (`on`/`вкл`, `off`/`выкл`; anything else: the usage line). In a session: that session's setting (`update_session` {"swarm": {"clarify": bool}}; «В этой сессии цель уточняется: …» / «…не уточняется: …»; the planning task already on the board stays as it is), without an argument its state («Уточнение цели в этой сессии: вкл (своя настройка сессии)», or «как в общих настройках»); `main` has no settings of its own: without an argument it shows the general setting as its state («Уточнение цели в этой сессии: вкл (как в общих настройках)»: main has no overrides), and `on` / `off` change nothing and send no PATCH («У сессии main нет своих настроек: уточнение цели задаётся в общих настройках»). Without a session: the window's new sessions (§4.5), without an argument their state (source «настройка этого окна» or «как в общих настройках»). Launcher only |
 | `/budget N`, `/max N` | limits |
-| `/approve имя`, `/approve N [комментарий]` | MCP approval; accept a task in review (`task_review`) |
+| `/approve имя [sha256]`, `/approve N [комментарий]` | MCP approval (`mcp_approve`; `sha256`: the digest the dialog, `mcp_list` or the MCP card shows, in full or its first 8 or more hex digits; without it, the digest of the last dialog shown for that server, put off with Esc, so code created again since is refused); accept a task in review (`task_review`) |
 | `/reject имя [почему]`, `/reject N что исправить` | MCP rejection; return a task in review (the comment is required; after N it is free text taken as typed, without one pair of quotes around all of it) |
 | `/stop` | stop the session (agents stop; resumable) |
 | `/web` | open the session board in the browser (`webbrowser.open`) |
@@ -664,7 +664,8 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   is replaced by the approval dialog (dialogs.py). The dialog shows: server name, owner, scope (translated),
   description, command (the forge's public record has none yet: `python mcp/<name>/server.py` plus the
   requirements, and a «/cat mcp/<name>/server.py» hint), tools. Options: «1. Да, разрешить», «2. Нет,
-  отклонить (с комментарием)». Esc keeps it pending for later (`/approve`). Several pending servers are
+  отклонить (с комментарием)». Esc keeps it pending for later (`/approve <name>`, which then sends the digest this
+  dialog showed: code created again meanwhile is not approved unseen). Several pending servers are
   queued. The dialog pops up by itself, so it waits while the user is typing (the status line says
   «MCP-сервер … ждёт одобрения — отправьте или очистите ввод»), and Enter / digits do not choose during its
   first 0.6 s.

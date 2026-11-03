@@ -320,6 +320,19 @@ def test_redact():
     assert "https://***@idx.example" in out and "git+https://***@h" in out
 
 
+def test_redact_takes_the_user_info_up_to_the_last_at():
+    out = redact("Looking in indexes: https://a@b.example:pa55word@idx.example/simple, see https://h/?to=a@b")
+    assert "pa55word" not in out and "b.example" not in out
+    assert "https://***@idx.example/simple" in out and "https://h/?to=a@b" in out
+
+
+def test_redact_masks_a_password_with_a_question_mark_or_a_hash():
+    # a log may over-mask (a query that holds an `@`), never show a password: an installer echoes a URL it cannot parse
+    for password in ("pa?ss", "pa#ss", "p@?#ss"):
+        assert redact(f"Looking in indexes: https://user:{password}@idx.example/simple") == \
+            "Looking in indexes: https://***@idx.example/simple"
+
+
 def test_venv_paths():
     root = Path("env")
     if os.name == "nt":
@@ -346,6 +359,14 @@ def test_installer_env(tmp_path, monkeypatch):
     assert user["PYTHONNOUSERSITE"] == "1" and user["PIP_NO_INPUT"] == "1" and user["UV_NO_PROGRESS"] == "1"
     agent = installer_env(config, "agent")
     assert "MY_INDEX_TOKEN" not in agent and agent["PIP_INDEX_URL"] == "https://idx/simple"
+
+
+def test_installer_env_keeps_url_credentials_for_the_users_own_skills(tmp_path, monkeypatch):
+    monkeypatch.setenv("PIP_INDEX_URL", "https://user:s3cret@idx.example/simple")
+    config = Config.from_dict(tmp_path, {})
+    assert installer_env(config, "user")["PIP_INDEX_URL"] == "https://user:s3cret@idx.example/simple"
+    # an agent's skill gets the same index without the password: its install fails there, never at another index
+    assert installer_env(config, "agent")["PIP_INDEX_URL"] == "https://idx.example/simple"
 
 
 def test_the_pip_probe_gets_the_installers_environment(tmp_path, monkeypatch):

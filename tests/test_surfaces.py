@@ -221,7 +221,11 @@ async def _ok_app(scope, receive, send):
     ("192.168.1.20:8765", None, 403),       # loopback bind: only loopback names
     (None, None, 403),
     ("127.0.0.1:8765", "http://127.0.0.1:8765", 200),
-    ("127.0.0.1:8765", "http://localhost:3000", 200),   # another local page: allowed like the MCP SDK does
+    ("127.0.0.1:8765", "http://localhost:3000", 403),   # another local program's page: was allowed (any loopback port)
+    ("127.0.0.1:8765", "http://127.0.0.1:5173", 403),
+    ("127.0.0.1:8765", "http://localhost:8765", 403),   # another name: not the origin the request was made to
+    ("localhost:8765", "http://localhost:8765", 200),
+    ("[::1]:8765", "http://[::1]:8765", 200),
     ("127.0.0.1:8765", "http://evil.example.com", 403),
     ("127.0.0.1:8765", "null", 403),
     ("127.0.0.1:8765", "http://127.0.0.1:8765.evil.example.com", 403),   # used to pass (split on ':')
@@ -230,6 +234,36 @@ async def _ok_app(scope, receive, send):
 async def test_guard_loopback_bind(host, origin, expected):
     guard = web.GuardMiddleware(_ok_app, host="127.0.0.1")
     assert await _asgi(guard, host=host, origin=origin) == expected
+    assert await _asgi(guard, host=host, origin=origin, kind="websocket",
+                       path="/ws") == (1008 if expected == 403 else 200)
+
+
+async def test_guard_portless_host_takes_either_default_port():
+    """A Host without a port came in on 80 or 443: a proxy that ends TLS on 443 and keeps the Host sends the origin
+    https://<name> to a hub that sees http and ws. Other ports of that name are still refused."""
+    for bind in ("0.0.0.0", "192.168.1.20"):
+        guard = web.GuardMiddleware(_ok_app, host=bind)
+        for kind, path, refused in (("http", "/api/state", 403), ("websocket", "/ws", 1008)):
+            for origin in ("https://192.168.1.20", "http://192.168.1.20", "https://192.168.1.20:443"):
+                assert await _asgi(guard, host="192.168.1.20", origin=origin, kind=kind, path=path,
+                                   server="192.168.1.20") == 200
+            for origin in ("https://192.168.1.20:8443", "http://192.168.1.20:8765", "https://192.168.1.21",
+                           "http://evil.example.com"):
+                assert await _asgi(guard, host="192.168.1.20", origin=origin, kind=kind, path=path,
+                                   server="192.168.1.20") == refused
+            assert await _asgi(guard, host="192.168.1.20:8443", origin="https://192.168.1.20", kind=kind, path=path,
+                               server="192.168.1.20") == refused
+
+
+async def test_guard_portless_loopback_host_keeps_the_schemes_default_port():
+    """A loopback name without a port takes its scheme's default port alone: a hub on 127.0.0.1:80 takes no page of
+    https://127.0.0.1, which is another program on this computer (a proxy there sets DREAMTEAM_PUBLIC_URL)."""
+    for bind in ("127.0.0.1", "0.0.0.0"):
+        guard = web.GuardMiddleware(_ok_app, host=bind)
+        for kind, path, refused in (("http", "/api/state", 403), ("websocket", "/ws", 1008)):
+            for name in ("127.0.0.1", "localhost", "[::1]"):
+                assert await _asgi(guard, host=name, origin=f"http://{name}", kind=kind, path=path) == 200
+                assert await _asgi(guard, host=name, origin=f"https://{name}", kind=kind, path=path) == refused
 
 
 @pytest.mark.parametrize("host, origin, server, expected", [
@@ -243,6 +277,8 @@ async def test_guard_loopback_bind(host, origin, expected):
     ("evil.example.com:8765", None, "172.17.0.2", 403),     # DNS rebinding: was accepted for 0.0.0.0 binds
     ("127.0.0.1:8765", "http://evil.example.com", "172.17.0.2", 403),   # cross-site: was accepted for 0.0.0.0 binds
     ("127.0.0.1:8765", "http://1.2.3.4:8765", "172.17.0.2", 403),       # an IP origin of someone else's page
+    ("127.0.0.1:8765", "http://127.0.0.1:5173", "172.17.0.2", 403),     # another port of the host's loopback
+    ("127.0.0.1:9000", "http://127.0.0.1:9000", "172.17.0.2", 200),     # docker -p 127.0.0.1:9000:8765
     ("192.168.1.20:8765", "http://192.168.1.20:8765", "192.168.1.20", 200),   # same origin
     ("192.168.1.20:8765", "http://192.168.1.20:9999", "192.168.1.20", 403),
     ("192.168.1.20", "http://192.168.1.20", "192.168.1.20", 200),         # default port
@@ -270,6 +306,23 @@ async def test_guard_allowed_hosts_env_and_content_type(monkeypatch):
     settings = hub_mcp.security_settings("127.0.0.1", {"swarm.example.com"})
     assert "swarm.example.com:*" in settings.allowed_hosts and "https://swarm.example.com" in settings.allowed_origins
     assert hub_mcp.security_settings("0.0.0.0") is None   # GuardMiddleware covers wildcard binds
+
+
+async def test_guard_public_url_origin(monkeypatch):
+    """A proxy on this computer that rewrites the Host: the origin of DREAMTEAM_PUBLIC_URL (its path aside) is the
+    board's own; another port of a loopback name is still refused, over HTTP and WebSockets alike."""
+    monkeypatch.setenv(web.PUBLIC_URL_ENV, "https://localhost:8443/board/")
+    assert web.env_public_origin() == ("localhost", 8443)
+    for bind in ("127.0.0.1", "0.0.0.0"):
+        guard = web.GuardMiddleware(_ok_app, host=bind)
+        for kind, path, refused in (("http", "/api/state", 403), ("websocket", "/ws", 1008)):
+            assert await _asgi(guard, host="127.0.0.1:8765", origin="https://localhost:8443", kind=kind,
+                               path=path) == 200
+            assert await _asgi(guard, host="127.0.0.1:8765", origin="http://localhost:3000", kind=kind,
+                               path=path) == refused
+    for raw in ("", "not a url", "http://[bad"):
+        monkeypatch.setenv(web.PUBLIC_URL_ENV, raw)
+        assert web.env_public_origin() is None
 
 
 def test_display_and_public_urls(monkeypatch):
@@ -865,8 +918,21 @@ def test_console_settles_reviews_and_hires_from_the_catalog(capsys):
         ("hire_agent", {"role": "Тестировщик", "instructions": ""}),
         ("hire_agent", {"role": "QA", "instructions": "гоняй тесты"}),
     ]
-    assert "/approve имя|N [комментарий]  /reject имя|N [что исправить]" in console_module.HELP["ru"]
+    assert "/approve имя [sha256]|N [комментарий]  /reject имя|N [что исправить]" in console_module.HELP["ru"]
     assert "/hire Role [| instructions] — hire an agent (a catalog role or a new one)" in console_module.HELP["en"]
+
+
+def test_console_approves_an_mcp_server_by_its_digest():
+    con = console_module.Console("http://127.0.0.1:9", "en")
+    hub = StubHub(MEMBERS)
+    con.hub = hub
+    con.handle("/approve calc 3f2a9c01d4e5")
+    con.handle("/approve calc looks fine")   # not a digest: a comment, as before
+    assert hub.acts == [
+        ("mcp_approve", {"name": "calc", "approve": True, "comment": "", "digest": "3f2a9c01d4e5"}),
+        ("mcp_approve", {"name": "calc", "approve": True, "comment": "looks fine"}),
+    ]
+    assert "/approve name [sha256]|N [comment]" in console_module.HELP["en"]
 
 
 def test_console_lists_shows_and_stops_background_jobs(capsys):
@@ -1099,6 +1165,11 @@ async def test_console_against_a_real_hub(tmp_path):
 def test_docker_build_context(tmp_path):
     ctx = docker_module.build_context(tmp_path / "ctx")
     assert (ctx / "Dockerfile").read_text(encoding="utf-8") == (REPO / "Dockerfile").read_text(encoding="utf-8")
+    # the image installs the locked versions: the lockfile goes into the context with the repository's pyproject
+    assert (ctx / "uv.lock").read_bytes() == (REPO / "uv.lock").read_bytes()
+    assert "uv export --locked" in docker_module.DOCKERFILE
+
+
     assert docker_module._is_dreamteam_pyproject(ctx / "pyproject.toml")
     assert (ctx / "README.md").exists()
     pkg = ctx / "src" / "dreamteam"
@@ -1113,6 +1184,22 @@ def test_docker_build_context(tmp_path):
     other = tmp_path / "pyproject.toml"
     other.write_text('[project]\nname = "something-else"\n', encoding="utf-8")
     assert not docker_module._is_dreamteam_pyproject(other)
+
+
+def test_the_image_trusts_no_repository_of_another_owner():
+    # git's ownership check stays on in the image: the processes of a session get their own workspace instead
+    # (netoff.trust_workspace); the changed DOCKERFILE changes the image's label (dockerfile_hash)
+    dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+    assert dockerfile == docker_module.DOCKERFILE
+    assert "safe.directory '*'" not in dockerfile and "--add safe.directory" not in dockerfile
+    assert "git config --system user.email dreamteam@localhost" in dockerfile
+
+
+def test_the_image_pins_a_debian_release_with_git_2_46_and_carries_its_marker():
+    # netoff.trust_workspace's <root>/* needs git 2.46: the bare python:3.13-slim tag was bookworm's (git 2.39) and
+    # may still be cached; the image's marker turns that trust on under any container runtime
+    dockerfile = (REPO / "Dockerfile").read_text(encoding="utf-8")
+    assert "\nFROM python:3.13-slim-trixie\n" in dockerfile and "\nENV DREAMTEAM_IMAGE=1\n" in dockerfile
 
 
 def _requirement(text: str) -> tuple[str, frozenset[str]]:
@@ -1133,6 +1220,9 @@ def test_docker_build_context_without_repo_pyproject(tmp_path, monkeypatch):
     repo = tomllib.loads((REPO / "pyproject.toml").read_text(encoding="utf-8"))
     assert ({_requirement(r) for r in generated["project"]["dependencies"]}
             == {_requirement(r) for r in repo["project"]["dependencies"]})
+    assert not (ctx / "uv.lock").exists()      # no lockfile for the generated pyproject: the image takes its ranges
+
+
     assert generated["project"]["scripts"] == repo["project"]["scripts"]
     assert generated["tool"]["hatch"]["build"]["targets"]["wheel"]["packages"] == ["src/dreamteam"]
 

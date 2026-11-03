@@ -1854,7 +1854,7 @@ def skills_library(ctx: RenderContext, data: dict) -> RenderableType:
 
 def skill_deps_preview(ctx: RenderContext, deps: Any, install: Any = None, proposal: bool = False) -> str:
     """What attaching a skill installs (its `deps` {python|node: {files, packages, unsupported?}}; `install` the
-    settings' switches; `proposal`: a member's skill, under install.proposals) — "" without manifests. As the web
+    settings' switches; `proposal`: a skill agents can write, under install.proposals) — "" without manifests. As the web
     pages' Skills.previewLine."""
     deps, install = _d(deps), _d(install) if install is not None else None
     found = [eco for eco in ("python", "node") if _d(deps.get(eco))]
@@ -1903,7 +1903,10 @@ def skill_detail(ctx: RenderContext, data: dict, where: str) -> RenderableType:
     if files:
         shown = ", ".join(files[:50]) + (" " + ctx.sym["ellipsis"] if len(files) > 50 else "")
         rows.append(Text(ctx.t("skill_files", n=len(files), files=shown), style="dim"))
-    preview = skill_deps_preview(ctx, data.get("deps"), data.get("install"), proposal=data.get("from") == "agent")
+    # a source agents can write (a member's proposal, the workspace's .claude/skills) is under install_proposals; a
+    # library entry imported from there (origin claude-project) is the user's own, as on the web pages
+    agent = data.get("from") in ("agent", "claude-project") or bool(data.get("agent_writable"))
+    preview = skill_deps_preview(ctx, data.get("deps"), data.get("install"), proposal=agent)
     if preview:
         rows.append(Text(preview, style=theme.WARN))
     text = clean(data.get("skill_md")).rstrip()

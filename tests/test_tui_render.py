@@ -1458,6 +1458,23 @@ def test_skill_events_by_verbosity():
     assert render.event(ctx("quiet"), note) is not None
 
 
+def test_skill_detail_gates_only_a_source_agents_can_write():
+    """/skills show: a member's proposal and a skill of the workspace's .claude/skills (agent_writable, or a session
+    copy from claude-project) are under install_proposals; a library entry imported from there (origin
+    claude-project) is the user's own, as on the web pages and in the backend, and installs its packages."""
+    c = ctx(lang="en")
+    deps = {"python": {"files": ["requirements.txt"], "packages": ["pypdf"]}}
+    base = {"name": "notes", "description": "Takes notes.", "deps": deps,
+            "install": {"enabled": True, "proposals": False}}
+    off = "Package installation is off in the settings."
+    assert off in plain(render.skill_detail(c, {**base, "origin": "claude-project", "agent_writable": True},
+                                            "claude-project"))
+    assert off in plain(render.skill_detail(c, {**base, "from": "agent"}, "session"))
+    assert off in plain(render.skill_detail(c, {**base, "from": "claude-project"}, "session"))
+    library = plain(render.skill_detail(c, {**base, "origin": "claude-project"}, "library"))
+    assert off not in library and "Installs automatically: pypdf (requirements.txt)." in library
+
+
 def test_skill_preview_lines():
     c = ctx(lang="en")
     deps = {"python": {"files": ["requirements.txt"], "packages": [f"p{i}" for i in range(10)]},
