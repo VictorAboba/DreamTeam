@@ -65,7 +65,7 @@ class FakeMail:
         self.sent: list[tuple] = []
         self.fail: Exception | None = None
 
-    def send(self, sender: str, to: Any, text: str, reply_to: int | None = None) -> dict:
+    def send(self, sender: str, to: Any, text: str, reply_to: int | None = None, *, automatic: bool = False) -> dict:
         self.sent.append((sender, to, text))
         if self.fail:
             raise self.fail
@@ -885,7 +885,7 @@ class InsertingMail:
     def __init__(self, swarm: Any, clock: Clock) -> None:
         self.swarm, self.clock, self.sent = swarm, clock, 0
 
-    def send(self, sender: str, to: Any, text: str, reply_to: int | None = None) -> dict:
+    def send(self, sender: str, to: Any, text: str, reply_to: int | None = None, *, automatic: bool = False) -> dict:
         self.sent += 1
         recipients = [to] if isinstance(to, str) else list(to)
         return {"id": add_message(self.swarm, sender, recipients, text, self.clock.now)}

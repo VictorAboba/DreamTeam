@@ -70,7 +70,10 @@ class Mailbox:
 
     # --- sending ---------------------------------------------------------------------------------------
 
-    def send(self, sender: str, to: str | list[str], text: str, reply_to: int | None = None) -> dict:
+    def send(self, sender: str, to: str | list[str], text: str, reply_to: int | None = None, *,
+             automatic: bool = False) -> dict:
+        """`automatic`: sent by a trigger's action, not by its owner in person: a user-owned trigger's message never
+        answers a member's question (Swarm.question_answered)."""
         body = str(text if text is not None else "").strip()
         if not body:
             raise ToolError("Message text must not be empty.")
@@ -81,6 +84,16 @@ class Mailbox:
         # sent to "all" (the wake-up text then asks to check the board before creating a task for it)
         to_all = any(item.lower() == ALL for item in self._split(to))
         reply = self._check_reply(reply_to)
+        # The user's first message to the asker of the question that holds the pause (named or through "all") is the
+        # answer (docs/SPEC.md §5): the asker sees it as a reply to the question, and every member gets both.
+        answering = None
+        if sender == USER and not automatic:
+            pending = getattr(self.swarm, "pending_question", None)  # (test doubles have none)
+            q = pending() if pending is not None else None
+            if q is not None and q["asker"] in recipients:
+                answering = q
+                if reply is None:
+                    reply = q["message_id"]
         context = _SEEN_BY.get()  # the sender's own other identities (sent_as_seen_by)
         seen = context[1] if context is not None and context[0] == sender else frozenset()
         with self.db.transaction():
@@ -106,6 +119,8 @@ class Mailbox:
                 self.swarm.defer_wake(name)
                 continue
             self.swarm.signal(name)
+        if answering is not None:
+            self.swarm.question_answered(message, answering)  # never raises: the message is stored
         return message
 
     def _recipients(self, sender: str, to: str | list[str] | None) -> tuple[list[str], set[str]]:

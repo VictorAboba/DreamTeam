@@ -7,7 +7,8 @@
 
 * Доска: `board`, `task_get`, `task_create`, `task_claim`, `task_update`, `task_complete`, `task_review`,
   `task_comment`, `task_discussion`.
-* Общение: `send_message`, `read_messages`.
+* Общение: `send_message` (в [режиме уточнения цели](features.md), `[swarm] clarify`, `pause_swarm=true` у важного
+  вопроса пользователю ставит весь рой на паузу до ответа; ответ получают все участники), `read_messages`.
 * Команда: `agents`, `hire_agent`, `retire_agent`, `update_notes` (блокнот, который переживает сжатие контекста),
   `wait`, `goal_complete`.
 * Триггеры: `trigger_create`, `trigger_list`, `trigger_delete`.

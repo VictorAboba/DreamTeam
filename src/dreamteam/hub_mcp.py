@@ -45,7 +45,10 @@ By default every call acts as the human USER of the swarm: you can read the boar
 (`send_message`, `read_messages`), hire or retire agents, pause/resume, switch wrap-up mode (the team finishes its
 tasks with what it has and starts no new computations or background jobs) and change limits (`swarm_control`),
 approve MCP servers (`mcp_approve`) and wait for messages addressed to the user (`wait_for_events`; with
-`progress=true` it also returns when the board moves on). `jobs` and `job_stop` list and stop every member's
+`progress=true` it also returns when the board moves on). When `swarm_status` says the swarm is paused waiting for
+your answer to a member's question, your next `send_message` to that member (or to all) is the answer: every member
+gets it with the question and the swarm goes on; `swarm_control` action=resume goes on
+without it. `jobs` and `job_stop` list and stop every member's
 background jobs. `skills`, `skill_attach` and `skill_detach` list, attach and detach the swarm's skills (folders with
 a SKILL.md from the skills library, Claude Code's skills, a folder, a .zip or a Git URL); every member sees them.
 `skill_approve` decides whether a skill a member proposed is saved to the skills library (not for a member this

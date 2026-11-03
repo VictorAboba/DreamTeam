@@ -27,6 +27,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 from . import __version__, netoff, procs, roles
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
+from .models import AUTO_REPLY_HEADER
 from .sessions import SessionError
 from .settings import PROVIDER_CHOICES, check_profile, profile_from_view, settings_path
 from .skill_deps import EnvManager
@@ -298,6 +299,12 @@ def _via(value: Any) -> str:
     return value
 
 
+def _auto_reply(request: Request) -> bool:
+    """A `dreamteam -p` client that answers the agents' questions automatically sends AUTO_REPLY_HEADER: the session's
+    auto-reply lease then holds before it starts (SessionManager._start_locked). The bodies stay as they are."""
+    return request.headers.get(AUTO_REPLY_HEADER) == "1"
+
+
 def _workspace_query(request: Request) -> Path | None:
     """`?workspace=<absolute folder>`: the folder whose .claude/skills a new session would offer (claude-project)."""
     value = (request.query_params.get("workspace") or "").strip()
@@ -352,7 +359,7 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                                            body.get("description") or "", overrides=body.get("overrides") or {},
                                            start=body.get("start") is not False,
                                            workspace=body.get("workspace") or None, skills=body.get("skills") or None,
-                                           via=_via(body.get("via")))
+                                           via=_via(body.get("via")), auto_reply=_auto_reply(request))
         except (SessionError, ValueError) as exc:
             return _error(exc)
         except Exception as exc:  # e.g. the swarm failed to start: show it in the UI
@@ -421,7 +428,8 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                 problem = _body_error(body, strings=("via",), lists=("skills",))
                 if problem:
                     return JSONResponse({"error": problem}, status_code=400)
-                await manager.start(sid, skills=body.get("skills") or None, via=_via(body.get("via")))
+                await manager.start(sid, skills=body.get("skills") or None, via=_via(body.get("via")),
+                                    auto_reply=_auto_reply(request))
             elif action == "stop":
                 await manager.stop(sid)
             else:

@@ -24,6 +24,7 @@ from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from .. import hubauth
+from ..models import AUTO_REPLY_HEADER
 
 if TYPE_CHECKING:
     from ..sessions import SessionManager
@@ -93,6 +94,10 @@ class HubClient:
         self.timeout = timeout
         self.mode = ""   # "launcher" | "swarm" after hub_info()
         self.user_url = user_url
+        # True: every request and the stream's handshake say that this client answers the agents' questions
+        # automatically (`dreamteam -p`, models.AUTO_REPLY_HEADER): the session then never pauses for one
+        # (docs/SPEC.md §3 "Clarify mode"); the TUI, the web UI, the console and MCP clients never send it
+        self.auto_reply = False
         self._loopback = _is_loopback(self.base_url)
         self._own_http = http is None
         # the hub token of a Docker sandbox's hub (hubauth.py), looked up for every request and every (re)connect of
@@ -138,6 +143,8 @@ class HubClient:
             kwargs["json"] = body  # also sets Content-Type: application/json (the hub requires it on POST)
         if timeout is not None:
             kwargs["timeout"] = max(timeout, self.timeout)
+        if self.auto_reply:
+            kwargs["headers"] = {AUTO_REPLY_HEADER: "1"}
         try:
             resp = await self.http.request(method, self.base_url + path, auth=self._auth, **kwargs)
         except (httpx2.HTTPError, OSError) as exc:
@@ -173,6 +180,13 @@ class HubClient:
     async def session(self, sid: str) -> dict:
         """GET /api/sessions/{sid}: {"session": summary, "config": public view of its settings}."""
         return await self._get(f"/api/sessions/{urllib.parse.quote(sid, safe='')}")
+
+    async def update_session(self, sid: str, settings: dict) -> dict:
+        """PATCH /api/sessions/{sid} {"settings": {section: {key: value or None}}}: change some of the session's own
+        settings (None: inherit the global value again), applied to a running session at once -> {"session",
+        "config"} as session() answers."""
+        return await self._call("PATCH", f"/api/sessions/{urllib.parse.quote(sid, safe='')}",
+                                body={"settings": settings})
 
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
                              start: bool = True, workspace: str | None = None,
@@ -339,9 +353,11 @@ class HubClient:
         the hub refuses the handshake: it closes a WebSocket without its token before accepting it (HTTP 403)."""
         tokens: list[str | None] = [*hubauth.client_tokens(url, user_url=self.user_url)] or [None]
         for index, token in enumerate(tokens):
-            headers = {"Authorization": f"Bearer {token}"} if token else None
+            headers = {"Authorization": f"Bearer {token}"} if token else {}
+            if self.auto_reply:
+                headers[AUTO_REPLY_HEADER] = "1"
             try:
-                ws = await ws_connect(url, **options, additional_headers=headers)
+                ws = await ws_connect(url, **options, additional_headers=headers or None)
             except InvalidStatus as exc:
                 if index + 1 < len(tokens) and exc.response.status_code in (401, 403):
                     continue

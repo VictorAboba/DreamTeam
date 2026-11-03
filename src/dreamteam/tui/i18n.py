@@ -72,11 +72,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "retired": "больше не в команде",
         "paused": "Рой на паузе",
         "resumed": "Рой продолжает работу",
+        # a member's question the swarm is paused for (send_message pause_swarm, docs/SPEC.md §3 "Clarify mode")
+        "paused_question": "Рой ждёт вашего ответа агенту {name}",
+        "resumed_answered": "Рой продолжает работу: ваш ответ на вопрос #{id} получили все участники",
+        "resumed_unanswered": "Рой продолжает работу без ответа на вопрос #{id}",
+        "resumed_clarify_off": "Уточнение цели выключено: рой продолжает работу без ответа на вопрос #{id}",
+        "resumed_left": "{name} покинул(а) рой: рой продолжает работу без ответа на вопрос #{id}",
         "wrap_up_on": "{who}: режим завершения — агенты завершают задачи с тем, что есть, без новых вычислений и "
                       "фоновых процессов",
         "wrap_up_off": "{who}: режим завершения выключен",
         "reason_budget": "исчерпан бюджет",
         "reason_user": "остановлен вами",
+        "reason_question": "ждёт вашего ответа",
         "limits": "Лимиты: бюджет {budget}, агентов не больше {agents}",
         "file_locked": "заблокирован",
         "file_unlocked": "разблокирован",
@@ -203,6 +210,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_running": "работает",
         "sess_stopped": "остановлена",
         "sess_paused": "пауза",
+        "sess_question": "ждёт ответа",
         "sess_wrap_up": "завершается",
         "sess_done": "цель достигнута",
         "sess_error": "ошибка конфигурации",
@@ -242,6 +250,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "team_set": "Новые сессии из этого окна стартуют с командой: {team} — всего {n}",
         "team_reset": "Стартовая команда новых сессий — из настроек.",
         "team_bad": "{error}. Пример: /team architect, developer*2, tester",
+        # ---- clarify mode (/clarify, --clarify)
+        "clarify_session_on": "В этой сессии цель уточняется: важный вопрос агента ставит рой на паузу до вашего "
+                              "ответа, новая задача планирования начнётся с вопросов (уже созданная не меняется)",
+        "clarify_session_off": "В этой сессии цель не уточняется: вопросы агентов больше не ставят рой на паузу",
+        "clarify_session_state": "Уточнение цели в этой сессии: {state} ({source})",
+        "clarify_new_on": "Новые сессии из этого окна сначала уточняют цель (/clarify off — выключить)",
+        "clarify_new_off": "Новые сессии из этого окна не уточняют цель (/clarify on — включить)",
+        "clarify_new_state": "Уточнение цели в новых сессиях этого окна: {state} ({source})",
+        "clarify_own": "своя настройка сессии",
+        "clarify_inherited": "как в общих настройках",
+        "clarify_window": "настройка этого окна",
+        "clarify_main": "У сессии main нет своих настроек: уточнение цели задаётся в общих настройках",
         # ---- status report
         "sr_title": "Статус",
         "sr_version": "Версия",
@@ -259,6 +279,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "sr_budget": "Бюджет",
         "sr_tracing": "Трейсы",
         "sr_network": "Интернет агентов",
+        "sr_clarify": "Уточнение цели",
+        "sr_question": "Вопрос к вам",
         "net_on": "есть",
         "net_off_docker": "нет: файрвол контейнера закрывает сеть отдельного пользователя команд агентов",
         "net_off_netns": "нет: команды агентов в отдельном сетевом пространстве Linux (только localhost)",
@@ -320,12 +342,15 @@ TEXTS: dict[str, dict[str, str]] = {
         # ---- spinner, status line
         "sp_esc": "esc — пауза",
         "sp_resume": "/pause — продолжить",
+        "sp_answer": "ответьте агенту {name} или /pause — без ответа",
         "st_shortcuts": "? — горячие клавиши",
         "st_disconnected": "нет связи…",
         "st_no_session": "нет сессии",
         "st_mode": "вывод: {mode} (shift+tab)",
         # ---- app (input box, dialogs, commands)
         "box_new_session": "новая сессия",
+        "box_answer": "ответ на #{id} — его получат все",
+        "q_still_waiting": "Рой всё ещё ждёт вашего ответа агенту {name} (вопрос #{id}): @{name} <ответ>",
         "ph_no_session": "Опишите цель (первая строка — заголовок, Alt+Enter — новая строка) — DreamTeam соберёт "
                          "команду и начнёт работу",
         "ph_session": "Напишите сообщение… (@имя — кому, / — команды, ! — консоль)",
@@ -545,6 +570,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "cmd_model": "профили моделей / профиль по умолчанию",
         "cmd_pause": "пауза / продолжить работу роя",
         "cmd_wrapup": "режим завершения: агенты завершают задачи с тем, что есть (off — выключить)",
+        "cmd_clarify": "сначала уточнять цель: вопросы до плана, важный вопрос агента ставит рой на паузу (в сессии — "
+                       "для неё, без сессии — для новых сессий окна)",
         "cmd_budget": "бюджет в $ (0 — без лимита)",
         "cmd_max": "максимум агентов",
         "cmd_approve": "одобрить MCP-сервер или принять задачу на ревью",
@@ -568,6 +595,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cmdargs_skills": "[lib | add X | update X | rm X | show X | pending | approve X | reject X [причина] | "
                           "reinstall X | log X | clean-envs]",
         "cmdargs_wrapup": "[off]",
+        "cmdargs_clarify": "[on|off]",
         "cmdargs_hire": "Роль [| инструкции]",
         "cmdargs_trace": "[Имя|N]",
         "cmdargs_span": "N [ctx]",
@@ -643,11 +671,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "retired": "left the team",
         "paused": "The swarm is paused",
         "resumed": "The swarm is back to work",
+        # a member's question the swarm is paused for (send_message pause_swarm, docs/SPEC.md §3 "Clarify mode")
+        "paused_question": "The swarm waits for your answer to {name}",
+        "resumed_answered": "The swarm is back to work: every member got your answer to question #{id}",
+        "resumed_unanswered": "The swarm is back to work without an answer to question #{id}",
+        "resumed_clarify_off": "Clarifying is off: the swarm is back to work without an answer to question #{id}",
+        "resumed_left": "{name} left the swarm: it is back to work without an answer to question #{id}",
         "wrap_up_on": "{who}: wrap-up mode — the agents finish their tasks with what they have, with no new "
                       "computations or background jobs",
         "wrap_up_off": "{who}: wrap-up mode off",
         "reason_budget": "the budget is spent",
         "reason_user": "paused by you",
+        "reason_question": "waiting for your answer",
         "limits": "Limits: budget {budget}, at most {agents} agents",
         "file_locked": "locked",
         "file_unlocked": "unlocked",
@@ -774,6 +809,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_running": "running",
         "sess_stopped": "stopped",
         "sess_paused": "paused",
+        "sess_question": "waits for you",
         "sess_wrap_up": "wrapping up",
         "sess_done": "goal achieved",
         "sess_error": "config error",
@@ -813,6 +849,19 @@ TEXTS: dict[str, dict[str, str]] = {
         "team_set": "New sessions from this window start with: {team} ({n} in all)",
         "team_reset": "The starting team of new sessions comes from the settings.",
         "team_bad": "{error}. Example: /team architect, developer*2, tester",
+        # ---- clarify mode (/clarify, --clarify)
+        "clarify_session_on": "This session clarifies the goal: an agent's critical question pauses the swarm until "
+                              "you answer, and a new planning task starts with questions (the one on the board stays "
+                              "as it is)",
+        "clarify_session_off": "This session no longer clarifies the goal: agents' questions no longer pause the swarm",
+        "clarify_session_state": "Clarifying the goal in this session: {state} ({source})",
+        "clarify_new_on": "New sessions from this window clarify the goal first (/clarify off to switch it off)",
+        "clarify_new_off": "New sessions from this window do not clarify the goal (/clarify on to switch it on)",
+        "clarify_new_state": "Clarifying the goal in this window's new sessions: {state} ({source})",
+        "clarify_own": "this session's own setting",
+        "clarify_inherited": "as in the general settings",
+        "clarify_window": "this window's setting",
+        "clarify_main": "The main session has no settings of its own: clarifying is set in the general settings",
         # ---- status report
         "sr_title": "Status",
         "sr_version": "Version",
@@ -830,6 +879,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "sr_budget": "Budget",
         "sr_tracing": "Traces",
         "sr_network": "Agents' internet",
+        "sr_clarify": "Clarify first",
+        "sr_question": "Question for you",
         "net_on": "on",
         "net_off_docker": "off: the container's firewall closes the network of the agents' commands' own user",
         "net_off_netns": "off: the agents' commands run in a separate Linux network namespace (localhost only)",
@@ -891,12 +942,15 @@ TEXTS: dict[str, dict[str, str]] = {
         # ---- spinner, status line
         "sp_esc": "esc to pause",
         "sp_resume": "/pause to resume",
+        "sp_answer": "answer {name}, or /pause to go on without an answer",
         "st_shortcuts": "? for shortcuts",
         "st_disconnected": "no connection…",
         "st_no_session": "no session",
         "st_mode": "output: {mode} (shift+tab)",
         # ---- app (input box, dialogs, commands)
         "box_new_session": "new session",
+        "box_answer": "answer to #{id}: everyone gets it",
+        "q_still_waiting": "The swarm still waits for your answer to {name} (question #{id}): @{name} <answer>",
         "ph_no_session": "Describe a goal (the first line is its title, Alt+Enter for a new line) — DreamTeam "
                          "assembles a team and gets to work",
         "ph_session": "Write a message… (@name to address, / for commands, ! for shell)",
@@ -1121,6 +1175,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "cmd_model": "model profiles / the default profile",
         "cmd_pause": "pause / resume the swarm",
         "cmd_wrapup": "wrap-up mode: the agents finish their tasks with what they have (off: switch it off)",
+        "cmd_clarify": "clarify the goal first: questions before the plan, an agent's critical question pauses the "
+                       "swarm (in a session: that session; without one: this window's new sessions)",
         "cmd_budget": "budget in $ (0 = no limit)",
         "cmd_max": "max agents",
         "cmd_approve": "approve an MCP server or a task in review",
@@ -1144,6 +1200,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cmdargs_skills": "[lib | add X | update X | rm X | show X | pending | approve X | reject X [reason] | reinstall "
                           "X | log X | clean-envs]",
         "cmdargs_wrapup": "[off]",
+        "cmdargs_clarify": "[on|off]",
         "cmdargs_hire": "Role [| instructions]",
         "cmdargs_trace": "[Name|N]",
         "cmdargs_span": "N [ctx]",

@@ -89,9 +89,10 @@ def test_i18n_covers_every_value_the_backend_emits():
     assert {"create", "write", "edit"} <= ops
     task_fields = {"title", "goal", "description", "status", "assignee", "reviewer", "priority", "tags",
                    "depends_on", "result", "parent_id"}
+    # (a member's question passes its details after the reason: .pause(asker, "question", asker=…))
     pause_reasons = {r for f in SRC.rglob("*.py")
-                     for r in re.findall(r"\.pause\(\w+, \"([^\"]+)\"\)", f.read_text(encoding="utf-8"))}
-    assert "budget" in pause_reasons
+                     for r in re.findall(r"\.pause\(\w+, \"([^\"]+)\"[,)]", f.read_text(encoding="utf-8"))}
+    assert {"budget", "question"} <= pause_reasons
     # background jobs (the Jobs tab): how one went to the background, why one was stopped
     job_origins = set(jobs_module.ORIGIN_PHRASES)
     stop_reasons = set(re.findall(r'"(\w+)": f?"stopped', (SRC / "jobs.py").read_text(encoding="utf-8")))
@@ -642,8 +643,13 @@ def test_session_settings_fields_match_the_config():
 
     block = re.search(r"const SESSION_FIELDS = \[(.*?)\n\];", APP_JS, re.S).group(1)
     fields = re.findall(r'section: "(\w+)", key: "(\w+)", label: "(\w+)", kind: "(\w+)", min: (\d+)', block)
-    assert len(fields) == 11 and block.count("{ group:") == 12   # + the network choice (docs/SPEC.md §7.2)
+    # + the network choice (docs/SPEC.md §7.2) and the clarify bool (docs/SPEC.md §3 "Clarify mode")
+    assert len(fields) == 11 and block.count("{ group:") == 13
     assert '{ group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] }' in block
+    assert ('{ group: "clarify", section: "swarm", key: "clarify", label: "sf_clarify", kind: "bool", '
+            'hint: "sf_clarify_hint" }') in block
+    from dreamteam.config import SwarmSettings
+    assert {"network", "clarify"} <= {f.name for f in dataclasses.fields(SwarmSettings)}
     known = {"shell": {f.name for f in dataclasses.fields(ShellSettings)},
              "agents": {f.name for f in dataclasses.fields(AgentSettings)}}
     for section, key, label, kind, low in fields:
@@ -682,6 +688,223 @@ def test_the_session_network_choice():
     docker, netns, env, unknown = out["hints"]
     assert "firewall" in docker and "namespace" in netns and "Not strict isolation" in env
     assert "Windows and macOS only proxies" in unknown
+
+
+@needs_node
+def test_session_field_bool():
+    """[swarm] clarify in the ⚙ dialog: a select of inherit / on / off that sends true, false or null (the general
+    setting again), never a string (config.py accepts only a bool)."""
+    out = run_js(r"""
+      app.S.lang = "en";
+      const f = app.SESSION_FIELDS.find((x) => x.key === "clarify");
+      out.field = [f.group, f.section, f.kind, f.label, f.hint];
+      out.parsed = ["", " true ", "false", "maybe", "on"].map((v) => app.parseSessionField(f, v));
+      const texts = Object.fromEntries(app.SESSION_FIELDS.map((x) => [`${x.section}.${x.key}`, ""]));
+      out.on = app.sessionSettingsPatch({ ...texts, "swarm.clarify": "true" }, {}).patch;
+      out.off = app.sessionSettingsPatch({ ...texts, "swarm.clarify": "false" }, { swarm: { clarify: true } }).patch;
+      const patch = (text, own) => app.sessionSettingsPatch({ ...texts, "swarm.clarify": text }, { swarm: own }).patch;
+      out.same = [patch("true", { clarify: true }), patch("false", { clarify: false })];
+      out.cleared = app.sessionSettingsPatch(texts, { swarm: { clarify: false } }).patch;
+      out.bad = app.sessionSettingsPatch({ ...texts, "swarm.clarify": "yes" }, {}).errors.map((e) => e.text);
+      const html = (own, saved) => app.sessionFieldsHtml({ swarm: own }, { swarm: saved }, {}, app.SESSION_FIELDS);
+      out.html = html({ clarify: false }, { clarify: true });
+      out.inherits = html({}, {});
+      app.S.lang = "ru";
+      out.ru = html({ clarify: true }, { clarify: false });
+    """)
+    assert out["field"] == ["clarify", "swarm", "bool", "sf_clarify", "sf_clarify_hint"]
+    assert out["parsed"][:3] == [{"value": None}, {"value": True}, {"value": False}]
+    assert out["parsed"][3] == out["parsed"][4] == {"error": "“Clarify the goal first”: pick a value from the list"}
+    assert out["on"] == {"swarm": {"clarify": True}} and out["off"] == {"swarm": {"clarify": False}}
+    assert out["same"] == [{}, {}] and out["cleared"] == {"swarm": {"clarify": None}}
+    assert out["bad"] == ["“Clarify the goal first”: pick a value from the list"]
+    html = out["html"]
+    # its own group after the network one, the hint says what it does
+    assert html.index("Network") < html.index("Clarifying the goal") < html.index('id="sf-swarm-clarify"')
+    assert ('<select id="sf-swarm-clarify"><option value="">as in the general settings (on)</option>'
+            '<option value="true">on</option><option value="false" selected>off</option></select>') in html
+    assert "an agent&#39;s critical question pauses the swarm until you answer" in html
+    assert "A planning task already on the board stays as it is." in html
+    assert '<option value="" selected>as in the general settings (off)</option>' in out["inherits"]
+    ru = out["ru"]
+    assert "Уточнение цели" in ru and "Сначала уточнять цель" in ru
+    assert '<option value="">как в общих настройках (выкл)</option><option value="true" selected>вкл</option>' in ru
+
+
+QUESTION_HARNESS = r"""
+  for (const id of ["back-link", "stopped-banner", "paused-banner", "workspace-banner", "wrapup-banner", "goal-status",
+                    "mcp-badge", "triggers-badge", "jobs-badge", "team-unread", "chat-hint"])
+    el(id, { classList: classList(["hidden"]) });
+  for (const id of ["swarm-name", "mcp-hint", "pause-btn", "budget-bar", "goal-btn", "agents-count", "workspace-info",
+                    "drawer-title", "messages", "activity", "drawer"]) el(id);
+  el("wrap-btn", { setAttribute() {} });
+  el("composer-text", { focus() {} });
+  el("drawer-jobs", { classList: classList(["hidden"]) });
+  const toasts = [];   // [class, text, its click handler]
+  const toasted = (box) => toasts.push([box.className.replace(/\s+/g, " ").trim(), box.textContent, box.onClick]);
+  el("toasts", { children: [], appendChild: toasted });
+  document.createElement = () => ({ className: "", textContent: "", remove() {},
+                                    addEventListener(type, fn) { this.onClick = fn; } });
+  const agents = [{ name: "Anna Smith", role: "Planner", status: "paused", kind: "llm", cost_usd: 0, open_tasks: [1] },
+                  { name: "Boris Lee", role: "Dev", status: "paused", kind: "llm", cost_usd: 0, open_tasks: [] }];
+  const swarm = (extra) => Object.assign({ name: "S", goal: null, limits: { max_cost_usd: 0, max_agents: 3 },
+                                           spent_usd: 0, mcp_url: "http://h/mcp", paused: false, pause_reason: "",
+                                           wrap_up: false, question: null, clarify: true, clarify_wait: null,
+                                           session: { id: "s", title: "S", status: "running" } }, extra);
+  const QUESTION = { asker: "Anna Smith", message_id: 12, since: 1, text: "Which database?" };
+  const banner = () => { const b = elements["paused-banner"];
+    return { hidden: b.classList.contains("hidden"), text: b.textContent, asker: b.dataset.asker ?? null,
+             question: b.classList.contains("question"), quiet: b.classList.contains("quiet") }; };
+  // the pause button: its visible label and its tooltip
+  const pauseBtn = () => { const b = elements["pause-btn"];
+    return [(b.innerHTML.match(/class="btn-label">([^<]*)</) || [])[1], b.title]; };
+"""
+
+
+@needs_node
+def test_board_shows_a_question_that_pauses_the_swarm():
+    """A member's question to the user (send_message pause_swarm): the banner names the asker and opens its chat, the
+    chat says the next message answers it, Resume goes on without an answer, a message to someone else is told it
+    answers nothing; the quiet banner of a clarify planner waiting for the user (snapshot clarify_wait)."""
+    out = run_js(QUESTION_HARNESS + r"""
+      app.S.lang = "en";
+      app.S.userInbox = [];
+      // the question holds the swarm
+      const paused = swarm({ paused: true, pause_reason: "question", question: QUESTION });
+      app.S.state = { swarm: paused, agents, mcp: [], triggers: [], jobs: [] };
+      app.renderHeader();
+      out.asked = [banner(), pauseBtn(), elements["paused-banner"].tabIndex, app.pendingQuestion()];
+      // a click on the banner opens the asker's chat, with the hint above the composer
+      const hint = () => [elements["chat-hint"].classList.contains("hidden"), elements["chat-hint"].textContent];
+      app.onDocumentClick({ target: { closest: () => elements["paused-banner"] } });
+      await new Promise((r) => setImmediate(r));
+      out.chat = [app.S.chatWith, ...hint()];
+      app.S.chatWith = "Boris Lee"; app.renderDrawerHead();
+      out.otherHint = hint();
+      app.S.chatWith = "all"; app.renderDrawerHead();
+      out.allHint = elements["chat-hint"].textContent;
+      // a message to Boris does not answer: a toast says so (a click opens the asker's chat); to Anna or all: no toast
+      const send = async (to) => {
+        app.S.chatWith = to; elements["composer-text"].value = "hello"; calls.length = 0;
+        await app.sendComposer();
+        return calls.filter((c) => c.url.includes("/act/")).map((c) => c.body);
+      };
+      out.toBoris = [await send("Boris Lee"), toasts.map((x) => x.slice(0, 2))];
+      app.S.chatWith = null; toasts[toasts.length - 1][2](); await new Promise((r) => setImmediate(r));
+      out.toastOpens = app.S.chatWith;
+      toasts.length = 0;
+      out.toAnna = [await send("Anna Smith"), toasts.length];
+      out.toAll = [await send("all"), toasts.length];
+      // the user's own notice of the question is no toast (the banner and the message's toast say it); others are
+      app.handleEvent({ id: 501, ts: 0, type: "notification", actor: null,
+                        data: { recipient: "user", kind: "u_question", text: "Anna Smith asked you a question" } });
+      app.handleEvent({ id: 502, ts: 0, type: "notification", actor: null,
+                        data: { recipient: "user", kind: "u_budget", text: "The budget is spent" } });
+      out.notices = toasts.map((x) => x[1]);
+      // a budget pause: the banner as before, no asker, Resume as before
+      app.S.state.swarm = swarm({ paused: true, pause_reason: "budget", question: null });
+      app.renderHeader();
+      out.budget = [banner(), pauseBtn()];
+      app.S.chatWith = "Anna Smith"; app.renderDrawerHead();
+      out.budgetHint = elements["chat-hint"].classList.contains("hidden");
+      // a clarify planner waiting for the user's answers, nothing paused: the quiet banner opens its chat
+      app.S.state.swarm = swarm({ clarify_wait: { name: "Anna Smith", task_id: 1 } });
+      app.renderHeader();
+      out.waiting = [banner(), pauseBtn()];
+      app.S.state.swarm = swarm({ clarify_wait: null });
+      app.renderHeader();
+      out.running = banner();
+      // an older hub (no question in the state): the reason's text
+      app.S.state.swarm = swarm({ paused: true, pause_reason: "question" });
+      delete app.S.state.swarm.question;
+      app.renderHeader();
+      out.older = banner();
+      app.S.lang = "ru";
+      app.S.state.swarm = swarm({ paused: true, pause_reason: "question", question: QUESTION });
+      app.renderHeader();
+      out.ru = [banner().text, pauseBtn()];
+      app.S.state.swarm = swarm({ clarify_wait: { name: "Anna Smith", task_id: 1 } });
+      app.renderHeader();
+      out.ruWaiting = banner().text;
+    """)
+    asked, button, tab_index, question = out["asked"]
+    # the banner says before the click what Resume does (no tooltip on a touch screen, no label on a phone); the
+    # button's label stays as short as before, so the top bar does not overflow
+    assert asked == {"hidden": False, "asker": "Anna Smith", "question": True, "quiet": False,
+                     "text": "The swarm is paused: Anna Smith waits for your answer to question #12; every member will "
+                             "get it. Click to answer; Resume goes on without an answer"}
+    assert button == ["Resume", "Resume without an answer: the agent takes its own default"]
+    assert tab_index == 0
+    assert question == {"asker": "Anna Smith", "message_id": 12, "since": 1, "text": "Which database?"}
+    hint = "Your next message answers question #12: every member gets it, and the swarm goes on."
+    assert out["chat"] == ["Anna Smith", False, hint]
+    assert out["otherHint"] == [True, ""] and out["allHint"] == hint   # a message to all answers it too
+    sent, toasts = out["toBoris"]
+    assert sent == [{"to": ["Boris Lee"], "text": "hello"}]
+    assert toasts == [["toast clickable", "The swarm still waits for your answer to Anna Smith (question #12)"]]
+    assert out["toastOpens"] == "Anna Smith"
+    assert out["toAnna"] == [[{"to": ["Anna Smith"], "text": "hello"}], 0]
+    assert out["toAll"] == [[{"to": ["all"], "text": "hello"}], 0]
+    assert out["notices"] == ["The budget is spent"]
+    budget, budget_button = out["budget"]
+    assert budget == {"hidden": False, "asker": None, "question": False, "quiet": False,
+                      "text": "The swarm is paused: the budget is spent — raise it in the settings"}
+    assert budget_button == ["Resume", "Resume"] and out["budgetHint"] is True
+    waiting, waiting_button = out["waiting"]
+    assert waiting == {"hidden": False, "asker": "Anna Smith", "question": False, "quiet": True,
+                       "text": "Anna Smith waits for your answers about the goal: reply in the chat"}
+    assert waiting_button == ["Pause", "Pause"]
+    assert out["running"] == {"hidden": True, "text": "", "asker": None, "question": False, "quiet": False}
+    assert out["older"]["text"] == "The swarm is paused: waiting for your answer" and out["older"]["asker"] is None
+    assert out["ru"] == ["Рой на паузе: Anna Smith ждёт вашего ответа на вопрос #12 — ответ получат все участники. "
+                         "Нажмите, чтобы ответить; «Продолжить» снимает паузу без ответа",
+                         ["Продолжить", "Продолжить без ответа: агент выберет вариант сам"]]
+    assert out["ruWaiting"] == "Anna Smith ждёт ваших ответов на вопросы по цели — ответьте в чате"
+
+
+@needs_node
+def test_feed_tells_how_a_question_pause_ends():
+    out = run_js(r"""
+      const ev = (type, data) => ({ id: 1, ts: 0, type, actor: "user", data });
+      const q = (extra) => ({ question: Object.assign({ asker: "Anna Smith", message_id: 12 }, extra) });
+      const events = [
+        ev("swarm.paused", { reason: "question", asker: "Anna Smith", message_id: 12, since: 1 }),
+        ev("swarm.resumed", q({ outcome: "answered", answer_id: 14 })),
+        ev("swarm.resumed", q({ outcome: "dropped", why: "resumed" })),
+        ev("swarm.resumed", q({ outcome: "dropped", why: "clarify_off" })),
+        ev("swarm.resumed", q({ outcome: "dropped", why: "left" })),
+        ev("swarm.resumed", {}),
+        ev("swarm.paused", { reason: "budget", ...q({ outcome: "answered", answer_id: 14 }) }),   // a budget conversion
+        ev("swarm.paused", { reason: "paused by the user" }),
+      ];
+      for (const lang of ["en", "ru"]) { app.S.lang = lang; out[lang] = events.map(app.describeEvent); }
+      app.S.lang = "en";
+      out.line = app.feedLine(events[0]);
+      out.task = app.feedLine(ev("task.comment", { task_id: 3, post: { text: "see #12" } }));
+    """)
+    assert out["en"] == [
+        "Anna Smith asks you question #12: the swarm is paused until you answer",
+        "every member got your answer to question #12; swarm resumed",
+        "swarm resumed without an answer to question #12",
+        "clarifying is off: swarm resumed without an answer to question #12",
+        "Anna Smith left: swarm resumed without an answer to question #12",
+        "swarm resumed",
+        "swarm paused (the budget is spent — raise it in the settings)",
+        "swarm paused (paused by you)",
+    ]
+    assert out["ru"] == [
+        "Anna Smith задаёт вам вопрос #12 — рой на паузе до вашего ответа",
+        "ваш ответ на вопрос #12 получили все участники, рой продолжил работу",
+        "рой продолжил работу без ответа на вопрос #12",
+        "уточнение цели выключено: рой продолжил работу без ответа на вопрос #12",
+        "Anna Smith покинул(а) рой: рой продолжил работу без ответа на вопрос #12",
+        "рой продолжил работу",
+        "рой на паузе (исчерпан бюджет — увеличьте его в настройках)",
+        "рой на паузе (остановлен вами)",
+    ]
+    # a question's #12 is a message, not a task: no task link (a task's discussion keeps its links)
+    assert "data-open-task" not in out["line"] and "question #12" in out["line"]
+    assert 'data-open-task="12"' in out["task"]
 
 
 SETTINGS_HARNESS = r"""
@@ -1208,6 +1431,90 @@ def test_home_settings_default_profile_validation_and_overrides():
                               "agents": {"default_model": "def", "max_steps_per_turn": 12}, "mcp": {"require_approval": True}}
     assert out["offline"] == "off" and out["notOffline"] is False
     assert "Not strict isolation here" in out["nsHint"] and "PowerShell 5.1" in out["nsHint"]
+
+
+@needs_node
+def test_home_clarify_checkbox_overrides():
+    """«Сначала уточнить цель» (docs/SPEC.md §3 "Clarify mode"): in the main grid right after the details, checked as
+    the saved default; sent only when it differs, as a bool (false overrides a saved true); the settings field."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      const base = { lang: "en", max: "8", budget: "5", team: home.teamRows([], 3), model: "default", steps: "40",
+                     approval: false };
+      const saved = (clarify) => ({ swarm: { language: "en", start_agents: 3, max_agents: 8, max_cost_usd: 5, clarify },
+                                    agents: { default_model: "default", max_steps_per_turn: 40 }, mcp: {},
+                                    models: {} });
+      const ov = (clarify, form) => home.sessionOverrides(saved(clarify), Object.assign({}, base, form)).swarm;
+      out.on = ov(false, { clarify: true }).clarify;
+      out.equal = ["clarify" in ov(false, { clarify: false }), "clarify" in ov(true, { clarify: true }),
+                   "clarify" in ov(undefined, { clarify: false }), "clarify" in ov(true, {})];
+      out.off = ov(true, { clarify: false }).clarify;
+      el("modal"); el("modal-backdrop");
+      for (const clarify of [false, true]) {
+        home.H.original = saved(clarify);
+        await home.newSessionModal();
+        out["ns_" + clarify] = elements.modal.innerHTML;
+      }
+      home.H.lang = "ru";
+      await home.newSessionModal();
+      out.ru = elements.modal.innerHTML;
+      home.H.lang = "en";
+      el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
+      const v = { swarm: { name: "S", language: "en", clarify: true }, agents: {}, shell: {}, workspace: {}, server: {},
+                  tracing: {}, mcp: { external: {} }, models: {} };
+      home.H.view = JSON.parse(JSON.stringify(v)); home.H.original = JSON.parse(JSON.stringify(v));
+      home.renderSettings(true);
+      out.settings = elements["settings-form"].innerHTML;
+    """)
+    assert out["on"] is True and out["off"] is False and out["equal"] == [False, False, False, False]
+    html = out["ns_false"]
+    box = ('<label class="check full"><input type="checkbox" id="ns-clarify"> <span>Clarify the goal first '
+           '<span class="hint">the planner first asks you about the unclear points of the goal while the other agents '
+           'wait for the plan without spending tokens; an agent&#39;s critical question pauses the whole swarm until '
+           'you answer</span></span></label>')
+    assert box in html
+    # the main grid, right after the details (not under "More", where the network box is)
+    assert html.index('id="ns-desc"') < html.index('id="ns-clarify"') < html.index('id="ns-model"')
+    assert html.index('id="ns-clarify"') < html.index('class="more"') < html.index('id="ns-offline"')
+    assert '<input type="checkbox" id="ns-clarify" checked>' in out["ns_true"]
+    assert "Сначала уточнить цель" in out["ru"] and "остальные агенты подождут план и не потратят токены" in out["ru"]
+    settings = out["settings"]
+    field = '<input type="checkbox" data-path="swarm.clarify" data-type="bool" checked> <span>Clarify the goal first'
+    assert field in settings
+    assert "No effect in dreamteam -p with automatic replies" in settings
+    assert settings.index('data-path="swarm.independent_review"') < settings.index('data-path="swarm.clarify"')
+
+
+@needs_node
+def test_home_card_shows_a_question():
+    """A session paused for a member's question: still the "paused" card (home.css, the state list), its badge says it
+    waits for the user and names the asker; a budget pause and a stopped session stay as they were."""
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      const card = (extra) => home.sessionCard(Object.assign({ id: "s1", title: "S", status: "running", paused: true,
+                                                               pause_reason: "question", tasks: { total: 0, done: 0 },
+                                                               agents: { total: 0, working: 0 } }, extra));
+      out.asked = card({ question: { asker: "Anna Smith", message_id: 12 } });
+      out.noDetail = card({ question: null });
+      out.budget = card({ pause_reason: "budget", question: null });
+      out.stopped = card({ status: "stopped", question: { asker: "Anna Smith", message_id: 12 } });
+      out.evil = card({ question: { asker: E, message_id: E } });
+      out.state = home.sessionState({ status: "running", paused: true, pause_reason: "question" });
+      home.H.lang = "ru";
+      out.ru = card({ question: { asker: "Anna Smith", message_id: 12 } });
+    """, env={"EVIL": EVIL})
+    asked = out["asked"]
+    assert asked.startswith('<article class="session-card paused" data-sid="s1">') and out["state"] == "paused"
+    assert ('<span class="badge warn" title="Anna Smith waits for your answer to question #12">'
+            'Waiting for your answer</span>') in asked
+    assert '<span class="badge warn">Waiting for your answer</span>' in out["noDetail"]
+    assert '<span class="badge warn">Paused</span>' in out["budget"] and "your answer" not in out["budget"]
+    assert '<span class="badge plain">Stopped</span>' in out["stopped"] and "your answer" not in out["stopped"]
+    assert_escaped(out["evil"], at_least=1)
+    assert 'title="Anna Smith ждёт вашего ответа на вопрос #12">Ждёт вашего ответа</span>' in out["ru"]
 
 
 TEAM_CASES = [([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 2), (["Разработчик"], 1),
@@ -2565,6 +2872,9 @@ async def test_api_provides_every_field_the_ui_reads(tmp_path):
         sw = state["swarm"]
         assert {"name", "language", "paused", "pause_reason", "limits", "spent_usd", "goal", "mcp_url", "models"} <= set(sw)
         assert {"max_cost_usd", "max_agents"} <= set(sw["limits"]) and sw["models"] == ["default"]
+        # a member's question that pauses the swarm (the banner, the chat hint) and a clarify planner waiting for
+        # the user (the quiet banner): none here
+        assert sw["question"] is None and sw["clarify_wait"] is None and sw["clarify"] is False
         assert sw["workspace"] == {"path": str(swarm.workspace.root), "default": True, "adopted": False, "exists": True}
         assert {"title", "description", "status", "summary"} <= set(sw["goal"])
         task_keys = {"id", "title", "goal", "description", "status", "assignee", "reviewer", "created_by", "parent_id",
@@ -2800,8 +3110,9 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             sid = session["id"]
             card_fields = {"id", "title", "status", "paused", "legacy", "dir", "created_at", "last_activity", "model",
                            "model_profile", "max_cost_usd", "spent_usd", "config_error", "goal", "tasks", "agents", "url",
-                           "workspace"}
+                           "workspace", "pause_reason", "question", "clarify"}
             assert card_fields <= set(session) and session["url"] == f"/s/{sid}/"
+            assert session["question"] is None and session["clarify"] is False   # the card's question badge
             folder_fields = {"path", "default", "adopted", "exists"}  # the folder line of the card / the Files tab
             assert set(session["workspace"]) == folder_fields and session["workspace"]["default"] is True
             assert {"title", "description", "status"} <= set(session["goal"])

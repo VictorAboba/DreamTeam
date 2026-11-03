@@ -561,7 +561,14 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     goal = swarm.goal()
     if args.get("brief") and goal:  # a client that checks often needs no repeat of a long goal text
         goal = {"title": goal.get("title"), "status": goal.get("status", "active")}
-    state = "PAUSED: " + swarm.pause_reason if swarm.paused else "running"
+    state = "PAUSED: " + swarm.pause_text() if swarm.paused else "running"
+    question = swarm.pending_question() if ctx.is_user else None
+    if question is not None:  # the user's next message to the asker answers it (Mailbox.send)
+        state += (f" (your next send_message to {question['asker']} or to all is the answer: every member gets it with "
+                  "the question; swarm_control action=resume goes on without it)")
+    if getattr(swarm, "clarifying", False):  # docs/SPEC.md §3 "Clarify mode"
+        state += ("; CLARIFY MODE: the planning task first asks the user, and a member's question to the user with "
+                  "pause_swarm=true pauses the swarm until the user answers")
     if swarm.wrapping_up:
         state += ("; WRAP-UP MODE: the agents finish their tasks with what they have, no new computations or "
                   "background jobs")
@@ -643,8 +650,8 @@ async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
         done.append("goal reopened")
     action = args.get("action")
     if action == "pause":
-        swarm.pause(ctx.actor, "paused by the user")
-        done.append("paused")
+        done.append("paused" if swarm.pause(ctx.actor, "paused by the user")
+                    else f"already paused ({swarm.pause_text()})")
     elif action == "resume":
         swarm.resume(ctx.actor)
         done.append("resumed")

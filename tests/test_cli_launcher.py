@@ -556,6 +556,63 @@ def test_team_option_is_a_tui_option_checked_before_anything_starts(tmp_path, mo
     assert not seen  # neither the TUI nor print mode ran
 
 
+def test_serve_clarify_needs_a_goal(tmp_path, monkeypatch, capsys):
+    """`serve --clarify` / `--no-clarify` ([swarm] clarify): a setting of the session that --goal creates, refused
+    without --goal (docs/SPEC.md §18.3); _serve_home makes it that session's own setting. `run --clarify` sets it for
+    that run only."""
+    from dreamteam import launcher as launcher_module
+
+    home = make_home(tmp_path, free_port())
+    real_serve_home = cli._serve_home
+    calls: dict = {}
+
+    async def serve_home(home_dir, host, port, **kw):
+        calls.update(kw)
+        return 0
+
+    monkeypatch.setattr(cli, "_serve_home", serve_home)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **kw: None)
+    for flag in ("--clarify", "--no-clarify"):
+        assert cli.main(["serve", "--home", str(home), flag, "--no-browser", "--no-console"]) == 2
+        assert "--clarify needs --goal: it is a setting of the session that --goal creates" in capsys.readouterr().err
+    assert not calls
+    for flags, value in ((["--clarify"], True), (["--no-clarify"], False), ([], None)):
+        calls.clear()
+        assert cli.main(["serve", "--home", str(home), "--goal", "G", *flags, "--no-browser", "--no-console"]) == 0
+        assert calls["goal"] == "G" and calls["clarify"] is value, flags
+
+    async def no_server(manager, host, port, **kw):   # the web server is not what this is about
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(launcher_module, "serve_launcher", no_server)
+
+    async def serve(**kw) -> int:
+        stop = asyncio.Event()
+        stop.set()   # stops right after --goal created and started its session
+        return await real_serve_home(home, "127.0.0.1", free_port(), console=False, open_browser=False, goal="G",
+                                     stop=stop, **kw)
+
+    for kw in ({"clarify": False}, {"clarify": True}, {}):
+        assert asyncio.run(serve(**kw)) == 0, kw
+    sessions = sorted(SessionManager(home).list(), key=lambda s: s["id"])
+    assert [s["overrides"] for s in sessions] == [{"swarm": {"clarify": False}}, {"swarm": {"clarify": True}}, {}]
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "dreamteam.toml").write_text('[swarm]\nname = "Run"\n', encoding="utf-8")
+    seen: list = []
+
+    async def serve_swarm(project_dir, config, host, port, goal, console, open_browser):
+        seen.append(config.swarm.clarify)
+        return 0
+
+    monkeypatch.setattr(cli, "_serve_swarm", serve_swarm)
+    monkeypatch.setattr(cli, "_token_missing", lambda host, port: False)
+    for flags in (["--clarify"], ["--no-clarify"], []):
+        assert cli.main(["run", str(project), *flags, "--no-console"]) == 0, flags
+    assert seen == [True, False, False]   # (the settings file says nothing: the default, off)
+
+
 def test_help_explains_the_goal_split_and_the_team():
     choices = next(iter(cli.build_parser()._subparsers._group_actions)).choices
     tui_help = " ".join(choices["tui"].format_help().split())

@@ -136,6 +136,9 @@ class SwarmSettings:
     # "off": the members' commands, their jobs and the stdio MCP servers have no internet (benchmarks); DreamTeam
     # itself keeps it (docs/SPEC.md §7.2, netoff.py)
     network: str = "on"
+    # true: a new planning task first asks the user about the goal's forks (prompts.PLANNING_CLARIFY), and a member's
+    # send_message with pause_swarm pauses the swarm until the user answers (docs/SPEC.md §3 "Clarify mode")
+    clarify: bool = False
 
 
 @dataclass
@@ -578,6 +581,7 @@ goal = {toml_string(goal)}          # глобальная задача (мож�
 starting_roles = []           # стартовая команда по порядку, например ["architect", "developer", "developer", "tester"]; недостающим до start_agents — «Универсал»
 independent_review = true     # задачу агента принимает другой агент (или вы, если больше некому); false — без ревьюера задача сразу готова
 network = "on"                # "off" — у команд агентов, их фоновых процессов и MCP-серверов нет интернета (LLM работает); строго только в Docker и Linux
+clarify = false               # true — сначала уточнить цель: планировщик задаёт вам вопросы до плана, остальные ждут; важный вопрос агента ставит рой на паузу до ответа
 
 [agents]
 default_model = "default"
