@@ -16,8 +16,12 @@ reproduce. You should get an answer within a week.
 These are documented and expected:
 
 - Agents run commands with the rights of the user who started the swarm. Use `dreamteam sandbox` (Docker)
-  for untrusted goals.
+  for untrusted goals. Outside Docker they can therefore read whatever that user can read.
 - A session without network (`network = "off"`) is cut off strictly only in Docker and on Linux. On Windows
   and macOS it is a best-effort setup (proxy variables and offline modes of package managers), not isolation.
-- The server listens on `127.0.0.1` and has no authentication. Exposing it to a network without a reverse proxy
-  with authentication gives everyone control over the swarm.
+- The server listens on `127.0.0.1` and has no authentication by default. Exposing it to a network without a token
+  (`DREAMTEAM_HUB_TOKEN`) or a reverse proxy with authentication gives everyone control over the swarm; a hub on a
+  non-loopback address refuses to start without a token unless `DREAMTEAM_HUB_NO_TOKEN=1`. `dreamteam sandbox`
+  always gives its hub a token for everything outside its container (and the container only the token's SHA-256).
+- The token protects a direct non-loopback bind only: loopback peers never need it, so a reverse proxy or port
+  forwarder on the hub's own computer makes all its clients loopback and needs authentication of its own.

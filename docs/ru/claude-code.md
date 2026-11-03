@@ -15,6 +15,11 @@ claude mcp add --transport http dreamteam http://127.0.0.1:8765/mcp
 claude mcp add dreamteam -- dreamteam mcp
 ```
 
+Хаб песочницы Docker требует токен (см. [Песочница Docker](sandbox.md#токен-доступа)): добавьте к HTTP-команде
+заголовок, который печатает `dreamteam sandbox`, — `--header "Authorization: Bearer <токен>"`. Токен новый при каждом
+запуске песочницы; stdio-команда находит его сама, для каждого запроса, поэтому продолжает работать и после
+перезапуска песочницы (`dreamteam mcp --home <папка>` для домашней папки не по умолчанию).
+
 Через `/mcp` доступны инструменты сессий: `sessions_list`, `session_create(title, goal, ..., workspace)`,
 `session_start`, `session_stop` и `session_cd(session, path)` (перенос в другую папку, `path="default"` — в
 собственную), а также `skill_library` (библиотека скиллов); `session_create` и `session_start` принимают

@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import netoff, procs, prompts, roles
+from . import hubauth, netoff, procs, prompts, roles
 from .agent import AgentRuntime
 from .board import Board
 from .config import Config, ModelProfile
@@ -152,8 +152,9 @@ class Swarm:
         self.tracer.recover()  # traces left open by a previous process
         self.jobs.recover()  # jobs a previous process left running died with it: lost (quiet notices)
         self._prune_traces()
-        await self.workspace.init()
+        # the isolation first: DreamTeam's git in init() already runs like the members' commands (hubgit.py)
         await self._prepare_offline()
+        await self.workspace.init()
         await self.forge.start()
         await self.skills.start()  # the agents' mirror is rebuilt from the session copies at every start
         # the skills' script dependencies (docs/SPEC.md §19): built in the background, never waited for
@@ -282,7 +283,9 @@ class Swarm:
     async def _prepare_offline(self) -> None:
         """A session without network (docs/SPEC.md §7.2): the isolation detected (off the loop: on Linux it starts a
         probe once per process) and, in the Docker sandbox, what root created in the workspace opened to the offline
-        user (netoff.prepare_workspace)."""
+        user (netoff.prepare_workspace; at a start before Workspace.init, which creates what is missing with the
+        offline user's group); then, under "docker" or "netns", DreamTeam's git there runs isolated too
+        (Workspace.git_isolated)."""
         if not netoff.is_off(self.config):
             return
         await procs.daemon_call(netoff.isolation)
@@ -290,6 +293,8 @@ class Swarm:
             failed = await procs.daemon_call(netoff.prepare_workspace, self.workspace.root)
             if failed:
                 log.warning("%d entries of %s stay closed to the offline user", failed, self.workspace.root)
+        # from now on DreamTeam's own git in the workspace runs like the members' commands (hubgit.py)
+        self.workspace.git_isolated = netoff.detected() in ("docker", "netns")
 
     def _network_changed(self) -> None:
         """[swarm] network changed under a running session: commands started from now on get the new setting (running
@@ -300,17 +305,32 @@ class Swarm:
             loop = asyncio.get_running_loop()
         except RuntimeError:  # not called from the event loop: the next start applies it
             return
+        # the members' next commands are offline at once: DreamTeam's git waits until it may run isolated too (else
+        # it would run as itself, with the network, beside them until _prepare_offline is done)
+        held = [netoff.is_off(self.config)]
+        if held[0]:
+            self.workspace.hold_git()
+
+        def release(_task: Any = None) -> None:
+            if held[0]:
+                held[0] = False
+                self.workspace.release_git()
 
         async def apply() -> None:
             try:
-                await self._prepare_offline()
+                try:
+                    await self._prepare_offline()
+                finally:
+                    release()
                 await self.forge.close_connections()
                 await self.skills.replan()
             except Exception:  # noqa: BLE001 - the setting itself is in place for the next commands
                 log.exception("could not apply the new network setting")
 
         self._background = [t for t in self._background if not t.done()]
-        self._background.append(loop.create_task(apply(), name="network-changed"))
+        task = loop.create_task(apply(), name="network-changed")
+        task.add_done_callback(release)   # also when it is cancelled before it ran
+        self._background.append(task)
 
     def _tell_network(self, name: str) -> None:
         """Tell a member once that the session has no network (n_network_off), and again when it has it back
@@ -1265,6 +1285,9 @@ class Swarm:
                 "agent_count": self.agent_count(),  # what limits.max_agents counts: external members do not
                 "spent_usd": round(self.spent_usd(), 4), "goal": goal, "counts": counts,
                 "mcp_url": self.hub_url, "models": list(self.config.models),
+                # the hub asks for its token from outside (hubauth.py): the board's MCP command needs the header;
+                # never the token itself
+                "mcp_token": hubauth.hub_digest() is not None,
                 "session": None if self.session_id is None else {
                     "id": self.session_id, "title": self.session_title or self.session_id,
                     "status": "running" if self._started else "stopped",

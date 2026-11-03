@@ -33,7 +33,7 @@ const I18N = {
     no_messages: "Сообщений пока нет", no_activity: "Активности пока нет", created_by: "Создал(а)", updated: "изменено",
     approve_mcp: "Одобрить", reject_mcp: "Отклонить", tools: "Инструменты", no_mcp: "MCP-серверов пока нет. Агенты создают их сами через mcp_create.",
     no_triggers: "Активных триггеров нет", delete: "Удалить", owner: "Владелец", fired: "срабатываний",
-    mcp_hint: "Подключить рой к Claude Code:", copy_hint: "Нажмите, чтобы скопировать", saved: "Сохранено", copied: "Скопировано",
+    mcp_hint: "Подключить рой к Claude Code:", mcp_token_hint: "<token> — токен хаба (его напечатала команда dreamteam sandbox, или ваш DREAMTEAM_HUB_TOKEN).", copy_hint: "Нажмите, чтобы скопировать", saved: "Сохранено", copied: "Скопировано",
     tab_traces: "Трейсы", traces: "Трейсы", sessions: "Все сессии", session_stopped: "Сессия остановлена: агенты не работают, доска только для просмотра.",
     session_not_started: "Сессия ещё не запускалась: агенты появятся и возьмутся за цель после запуска.",
     goal_pending: "при запуске", goal_pending_hint: "Рой получит эту цель, когда вы запустите сессию.",
@@ -181,7 +181,7 @@ const I18N = {
     no_messages: "No messages yet", no_activity: "No activity yet", created_by: "Created by", updated: "updated",
     approve_mcp: "Approve", reject_mcp: "Reject", tools: "Tools", no_mcp: "No MCP servers yet. Agents build them with mcp_create.",
     no_triggers: "No active triggers", delete: "Delete", owner: "Owner", fired: "fired",
-    mcp_hint: "Connect the swarm to Claude Code:", copy_hint: "Click to copy", saved: "Saved", copied: "Copied",
+    mcp_hint: "Connect the swarm to Claude Code:", mcp_token_hint: "<token> is the hub's token (the one dreamteam sandbox printed, or your DREAMTEAM_HUB_TOKEN).", copy_hint: "Click to copy", saved: "Saved", copied: "Copied",
     tab_traces: "Traces", traces: "Traces", sessions: "All sessions", session_stopped: "The session is stopped: agents are not working, the board is read-only.",
     session_not_started: "The session has not been started yet: the agents appear and take up the goal once you start it.",
     goal_pending: "on start", goal_pending_hint: "The swarm gets this goal when you start the session.",
@@ -641,7 +641,10 @@ function renderHeader() {
   wrapBanner.classList.toggle("hidden", !wrapping);
   wrapBanner.textContent = wrapping ? t("wrap_up_banner") : "";
   const mcpUrl = sw.mcp_url || `${location.origin}${BASE}/mcp`;
-  setHtml($("#mcp-hint"), `${esc(t("mcp_hint"))}<br><code id="mcp-cmd" title="${esc(t("copy_hint"))}">claude mcp add --transport http dreamteam ${esc(mcpUrl)}</code>`);
+  // a hub that asks for its token (the Docker sandbox, or DREAMTEAM_HUB_TOKEN): the header, with a placeholder
+  const mcpHeader = sw.mcp_token ? ` --header "Authorization: Bearer &lt;token&gt;"` : "";
+  const mcpNote = sw.mcp_token ? `<br>${esc(t("mcp_token_hint"))}` : "";
+  setHtml($("#mcp-hint"), `${esc(t("mcp_hint"))}<br><code id="mcp-cmd" title="${esc(t("copy_hint"))}">claude mcp add --transport http dreamteam ${esc(mcpUrl)}${mcpHeader}</code>${mcpNote}`);
   const pending = (S.state.mcp || []).filter((s) => s.status === "pending").length;
   const mcpBadge = $("#mcp-badge");
   mcpBadge.textContent = pending || "";

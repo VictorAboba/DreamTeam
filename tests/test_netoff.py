@@ -10,6 +10,7 @@ removes it). Neither sends anything to the internet: the addresses are TEST-NET 
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import json
 import os
@@ -417,6 +418,16 @@ def test_prepare_workspace_never_follows_a_symlink_swapped_in_meanwhile(tmp_path
     assert _mode(target) == 0o600
 
 
+@pytest.mark.skipif(WINDOWS, reason="POSIX ownership and modes")
+def test_prepare_workspace_of_a_folder_not_created_yet_has_nothing_to_do(tmp_path, monkeypatch):
+    """A new session's start opens its workspace before Workspace.init creates it (DreamTeam's git in init() already
+    runs as the offline user): nothing to open yet, and never an error."""
+    _fake_pwd(monkeypatch, uid=os.getuid())
+    force("docker", ["setpriv", "--"], ids=(os.getuid() + 4242, os.getgid()))
+    assert netoff.prepare_workspace(tmp_path / "project" / "workspace") == 0
+    assert not (tmp_path / "project").exists()
+
+
 def test_sandbox_command_grants_net_admin_only_for_the_firewall(tmp_path, monkeypatch):
     monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(tmp_path / "lib"))
     project = tmp_path / "home"
@@ -464,7 +475,8 @@ def test_run_sandbox_rebuilds_an_image_of_another_dockerfile_when_the_firewall_n
     monkeypatch.setattr(docker_module, "image_exists", lambda image=docker_module.IMAGE: True)
     monkeypatch.setattr(docker_module, "image_dockerfile", lambda image=docker_module.IMAGE: "old")
     monkeypatch.setattr(docker_module, "build_image", lambda image=docker_module.IMAGE: built.append(image))
-    monkeypatch.setattr(docker_module.subprocess, "call", lambda cmd: ran.append(cmd) or 0)
+    monkeypatch.setattr(docker_module, "container_exists", lambda name: False)
+    monkeypatch.setattr(docker_module.subprocess, "call", lambda cmd, **kw: ran.append(cmd) or 0)
     monkeypatch.setattr(cli, "_stdin_is_terminal", lambda: False)
     assert docker_module.run_sandbox(project, 9200, image="dreamteam-offline-test:x") == 0
     assert built == ["dreamteam-offline-test:x"] and "NET_ADMIN" in ran[0]
@@ -699,13 +711,15 @@ def test_shown_isolation(monkeypatch):
 
 @pytest.mark.skipif(not shutil.which("git"), reason="git is not installed")
 async def test_dreamteam_commits_without_hooks_in_a_session_without_network(tmp_path):
+    # (with network or without: docs/SPEC.md §7 "DreamTeam's own git", tests/test_hub_git.py)
+    from dreamteam import hubgit
+
     force("env")
     swarm = await _offline_team(tmp_path, workspace={"git": True})
     try:
         root = swarm.workspace.root
         argv = swarm.workspace._git_argv(None, ("status",))
-        assert argv[argv.index("status") - 4:argv.index("status")] == ["-c", f"core.hooksPath={os.devnull}", "-c",
-                                                                       "core.fsmonitor=false"]
+        assert f"core.hooksPath={hubgit.hooks_dir()}" in argv and "core.fsmonitor=" in argv
         # an fsmonitor command a member wrote into .git/config: git would run it at every status and add
         subprocess.run(["git", "-C", str(root), "-c", f"safe.directory={root.as_posix()}", "config", "core.fsmonitor",
                         "echo FSMONITOR-RAN > fsmonitor-ran.txt; false"], check=True, timeout=60)
@@ -718,6 +732,72 @@ async def test_dreamteam_commits_without_hooks_in_a_session_without_network(tmp_
                               "--format=%s", "-1"], capture_output=True, text=True, timeout=60).stdout
         assert "notes.md" in log and not (root / "hook-ran.txt").exists()
         assert not (root / "fsmonitor-ran.txt").exists()
+    finally:
+        await shutdown(swarm)
+
+
+@pytest.mark.skipif(not shutil.which("git"), reason="git is not installed")
+async def test_when_the_network_goes_off_dreamteams_git_waits_until_it_runs_isolated(tmp_path, monkeypatch):
+    """The members' next commands are offline at once; DreamTeam's git started after the switch waits for
+    _prepare_offline (which opens the workspace to the offline user in Docker) and then runs isolated, never as
+    DreamTeam itself beside them. At a start the isolation is decided before init() runs any git."""
+    from dreamteam import hubgit
+
+    force("netns", [])
+    real_run = hubgit.run
+    seen: list[tuple[str, bool]] = []
+
+    def run(argv, *, offline=False, **kw):
+        seen.append((argv[-1], offline))
+        return real_run(argv, offline=offline, **kw)
+
+    monkeypatch.setattr(hubgit, "run", run)
+    started = await _offline_team(tmp_path / "off", workspace={"git": True})
+    try:
+        assert started.workspace.git_isolated
+        assert seen and all(offline for _cmd, offline in seen), seen   # init()'s git included
+    finally:
+        await shutdown(started)
+    seen.clear()
+    swarm = await _offline_team(tmp_path / "on", network="on", workspace={"git": True})
+    try:
+        assert not swarm.workspace.git_isolated
+        gate = asyncio.Event()
+        prepare = swarm._prepare_offline
+
+        async def slow_prepare():
+            await gate.wait()
+            await prepare()
+
+        monkeypatch.setattr(swarm, "_prepare_offline", slow_prepare)
+        swarm.reconfigure(with_network(swarm.config, "off"))
+        seen.clear()
+        status = asyncio.create_task(swarm.workspace._git(None, "status", "--porcelain"))
+        await asyncio.sleep(0.3)
+        assert not status.done() and seen == []   # held: not as DreamTeam, with the network
+        gate.set()
+        assert (await asyncio.wait_for(status, 30)).returncode == 0
+        # (the repository's config is read first, isolated too: hubgit.guard)
+        assert swarm.workspace.git_isolated and seen[-1] == ("--porcelain", True), seen
+        assert all(offline for _cmd, offline in seen), seen
+        # back on: at once, nothing to wait for
+        swarm.reconfigure(with_network(swarm.config, "on"))
+        assert (await asyncio.wait_for(swarm.workspace._git(None, "status", "--porcelain"), 30)).returncode == 0
+        assert seen[-1] == ("--porcelain", False)
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_network_change_cancelled_before_it_ran_never_leaves_dreamteams_git_waiting(tmp_path):
+    force("env")
+    swarm = await _offline_team(tmp_path, network="on")
+    try:
+        swarm.reconfigure(with_network(swarm.config, "off"))
+        assert not swarm.workspace._git_ready.is_set()
+        swarm._background[-1].cancel()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert swarm.workspace._git_ready.is_set()
     finally:
         await shutdown(swarm)
 

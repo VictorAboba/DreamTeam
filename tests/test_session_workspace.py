@@ -986,7 +986,7 @@ async def test_a_create_that_fails_in_its_folder_says_what_is_left_there(tmp_pat
     manager = _manager(tmp_path)
     target = tmp_path / "proj"
 
-    def failing_init(root, git=None, *, adopted=False):
+    def failing_init(root, git=None, *, adopted=False, offline=False):
         (root / ".git").mkdir()
         (root / ".git" / "config").write_text("x", encoding="utf-8")
         return "fatal: something went wrong"
@@ -1007,7 +1007,7 @@ async def test_a_create_that_fails_in_its_folder_says_what_is_left_there(tmp_pat
     assert MOVE_JOURNAL not in text and "sessions" not in text, text  # no advice about a session that is gone
     assert manager.ids() == []
     monkeypatch.setattr(sessions_mod, "_remove", real_remove)
-    monkeypatch.setattr(sessions_mod, "init_repo", lambda root, git=None, adopted=False: "fatal: no")
+    monkeypatch.setattr(sessions_mod, "init_repo", lambda root, git=None, adopted=False, offline=False: "fatal: no")
     sessions_mod._rmtree(target)
     with pytest.raises(SessionError) as err:
         await manager.create("Broken", workspace=str(target))
@@ -1125,6 +1125,49 @@ async def test_the_scratch_folder_does_not_block_the_next_start(tmp_path):
         await manager.start(sid)
         assert git(project, "status", "--porcelain") == ""  # the start wrote the marker again
         assert (project / ".scratch" / "notes" / "todo.txt").read_text(encoding="utf-8") == "temp\n"
+    finally:
+        await manager.shutdown()
+
+
+@needs_git
+async def test_a_required_filter_the_hub_does_not_run_never_blocks_the_folder(tmp_path):
+    """git-crypt after `git-crypt unlock`, as git sees it: a transforming filter (rot13 here) that only the
+    repository's own config defines, required. DreamTeam's git does not run it and leaves its files out of the agents'
+    commits (docs/SPEC.md §7 "DreamTeam's own git"), so the checks before adopting the folder and at every start
+    leave them out too: a file of it changed by an agent, or merely touched (an editor's save), does not refuse the
+    folder. The user's own git, which runs the filter, commits the agent's change."""
+    project = _user_repo(tmp_path / "project")
+    rot13 = "tr A-Za-z N-ZA-Mn-za-m"
+    for key, value in (("filter.crypt.clean", rot13), ("filter.crypt.smudge", rot13), ("filter.crypt.required", "true")):
+        git(project, "config", "--local", key, value)
+    (project / ".gitattributes").write_bytes(b"secret/** filter=crypt\n")
+    (project / "secret").mkdir()
+    key = project / "secret" / "key.txt"
+    key.write_bytes(b"hello\n")
+    earlier = time.time() - 10   # older than the index: not "racily clean" (git would compare its content)
+    os.utime(key, (earlier, earlier))
+    _commit(project, "Secrets")
+    assert _blob(project, "HEAD:secret/key.txt") == b"uryyb\n"
+    manager = _manager(tmp_path)
+    try:
+        sid = (await manager.create("Crypt", start=False, workspace=str(project)))["id"]
+        swarm = await manager.start(sid)
+        member = swarm.members()[0]["name"]
+        await swarm.workspace.write(member, "secret/key.txt", "changed by an agent\n")
+        await swarm.workspace.write(member, "notes.txt", "n\n")
+        await manager.stop(sid)
+        assert "notes.txt" in git(project, "log", "--name-only", "--format=%s")
+        assert _blob(project, "HEAD:secret/key.txt") == b"uryyb\n"   # DreamTeam never stored it
+        await manager.start(sid)   # not refused: that change is the user's to commit
+        await manager.stop(sid)
+        assert git(project, "status", "--porcelain") == " M secret/key.txt\n"   # the user's git sees it
+        _commit(project, "The agent's change")
+        assert _blob(project, "HEAD:secret/key.txt") == b"punatrq ol na ntrag\n"   # filtered
+        key.write_bytes(key.read_bytes())   # touched: the same content, a new mtime
+        later = time.time() + 5
+        os.utime(key, (later, later))
+        await manager.start(sid)
+        assert git(project, "status", "--porcelain") == ""
     finally:
         await manager.shutdown()
 

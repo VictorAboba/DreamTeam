@@ -24,10 +24,12 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterable
 from pathlib import Path
 
 from . import netoff
-from .config import Config
+from .config import Config, key_env_names
+from .hubauth import DIGEST_ENV as HUB_DIGEST_ENV, TOKEN_ENV as HUB_TOKEN_ENV
 from .procs import TOKEN_ENV, ProcessTree, daemon_call
 
 log = logging.getLogger(__name__)
@@ -40,9 +42,10 @@ _KNOWN_SECRETS = {
 # DreamTeam's own settings that must not point agents' commands at the skills library or the skills' shared
 # environments (docs/SPEC.md §19): dropped even when shell.pass_env names them. (DREAMTEAM_SKILLS, the folder of the
 # swarm's skills, is set for the shell.) The sandbox's markers of the offline firewall (netoff.py) are no business of
-# the commands either.
+# the commands either, and the hub token (hubauth.py) never reaches them, whatever shell.pass_env says.
 _INTERNAL_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR",
-                           "DREAMTEAM_OFFLINE_USER", "DREAMTEAM_OFFLINE_FIREWALL"})
+                           "DREAMTEAM_OFFLINE_USER", "DREAMTEAM_OFFLINE_FIREWALL", HUB_TOKEN_ENV,
+                           HUB_DIGEST_ENV})
 
 POWERSHELL_UTF8 = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                    "$OutputEncoding = [System.Text.Encoding]::UTF8; ")
@@ -76,7 +79,7 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
         if key in allowed:
             env[key] = value
             continue
-        if key.upper() in secret_names or _SECRET_RE.search(key):
+        if _is_secret(key, secret_names):
             continue
         env[key] = value
     env["PYTHONIOENCODING"] = "utf-8"
@@ -84,6 +87,19 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
     if extra:
         env.update(extra)
     return env
+
+
+def _is_secret(key: str, names: set[str]) -> bool:
+    return key.upper() in names or key in names or bool(_SECRET_RE.search(key))
+
+
+def secret_free_env(names: Iterable[str] = ()) -> dict[str, str]:
+    """os.environ without the secrets, whatever shell.pass_env lets through to the agents (the known names, `names`,
+    every variable a model profile of this process names as its key, the name patterns), and without DreamTeam's
+    internal variables: the environment of DreamTeam's own processes in the members' folders (hubgit.py)."""
+    secret = {*_KNOWN_SECRETS, *key_env_names(), *(n.upper() for n in names)}
+    return {key: value for key, value in os.environ.items()
+            if key.upper() not in _INTERNAL_ENV and not _is_secret(key, secret)}
 
 
 def resolve_shell(program: str = "auto") -> tuple[str, list[str]]:

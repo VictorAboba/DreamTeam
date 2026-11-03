@@ -176,7 +176,9 @@ def hub_process(project: Path, port: int, log: Path):
 
 # ---------------------------------------------------------------------------------------------- guard (unit)
 async def _asgi(guard: web.GuardMiddleware, *, host: str | None, origin: str | None = None, method: str = "GET",
-                path: str = "/api/state", kind: str = "http", content_type: str | None = None) -> int:
+                path: str = "/api/state", kind: str = "http", content_type: str | None = None,
+                server: str | None = None) -> int:
+    """`server`: the address the connection reached (ASGI "server")."""
     headers = []
     if host is not None:
         headers.append((b"host", host.encode("latin-1")))
@@ -186,6 +188,8 @@ async def _asgi(guard: web.GuardMiddleware, *, host: str | None, origin: str | N
         headers.append((b"content-type", content_type.encode()))
     scope = {"type": kind, "method": method, "path": path, "headers": headers, "scheme": "ws" if kind == "websocket" else "http",
              "query_string": b"", "root_path": ""}
+    if server is not None:
+        scope["server"] = (server, 8765)
     sent: list[dict] = []
 
     async def receive():
@@ -228,22 +232,26 @@ async def test_guard_loopback_bind(host, origin, expected):
     assert await _asgi(guard, host=host, origin=origin) == expected
 
 
-@pytest.mark.parametrize("host, origin, expected", [
-    ("127.0.0.1:8765", None, 200),            # docker -p 127.0.0.1:8765:8765, browser on the host
-    ("localhost:8765", None, 200),
-    ("192.168.1.20:8765", None, 200),         # LAN by IP: an IP literal cannot be DNS-rebound
-    ("[fe80::1]:8765", None, 200),
-    ("evil.example.com:8765", None, 403),     # DNS rebinding: was accepted for 0.0.0.0 binds
-    ("127.0.0.1:8765", "http://evil.example.com", 403),   # cross-site: was accepted for 0.0.0.0 binds
-    ("127.0.0.1:8765", "http://1.2.3.4:8765", 403),       # an IP origin of someone else's page
-    ("192.168.1.20:8765", "http://192.168.1.20:8765", 200),   # same origin
-    ("192.168.1.20:8765", "http://192.168.1.20:9999", 403),
-    ("192.168.1.20", "http://192.168.1.20", 200),         # default port
+@pytest.mark.parametrize("host, origin, server, expected", [
+    ("127.0.0.1:8765", None, "172.17.0.2", 200),            # docker -p 127.0.0.1:8765:8765, browser on the host
+    ("localhost:8765", None, "172.17.0.2", 200),
+    ("192.168.1.20:8765", None, "192.168.1.20", 200),       # LAN by IP: an IP literal cannot be DNS-rebound...
+    ("192.168.1.20:8765", None, "172.17.0.2", 403),         # ...but only the address the connection reached
+    ("10.9.9.9:8765", None, None, 403),
+    ("[fe80::1]:8765", None, "fe80::1", 200),
+    ("[fe80::1]:8765", None, "fe80::2", 403),
+    ("evil.example.com:8765", None, "172.17.0.2", 403),     # DNS rebinding: was accepted for 0.0.0.0 binds
+    ("127.0.0.1:8765", "http://evil.example.com", "172.17.0.2", 403),   # cross-site: was accepted for 0.0.0.0 binds
+    ("127.0.0.1:8765", "http://1.2.3.4:8765", "172.17.0.2", 403),       # an IP origin of someone else's page
+    ("192.168.1.20:8765", "http://192.168.1.20:8765", "192.168.1.20", 200),   # same origin
+    ("192.168.1.20:8765", "http://192.168.1.20:9999", "192.168.1.20", 403),
+    ("192.168.1.20", "http://192.168.1.20", "192.168.1.20", 200),         # default port
 ])
-async def test_guard_wildcard_bind(host, origin, expected):
+async def test_guard_wildcard_bind(host, origin, server, expected):
     guard = web.GuardMiddleware(_ok_app, host="0.0.0.0")
-    assert await _asgi(guard, host=host, origin=origin) == expected
-    assert await _asgi(guard, host=host, origin=origin, kind="websocket", path="/ws") == (1008 if expected == 403 else 200)
+    assert await _asgi(guard, host=host, origin=origin, server=server) == expected
+    assert await _asgi(guard, host=host, origin=origin, server=server, kind="websocket",
+                       path="/ws") == (1008 if expected == 403 else 200)
 
 
 async def test_guard_allowed_hosts_env_and_content_type(monkeypatch):
@@ -692,7 +700,7 @@ def test_serve_swarm_exits_although_console_blocks_in_input(tmp_path, monkeypatc
     never = threading.Event()
     calls: list[str] = []
 
-    def blocking_console(base, lang, stop=None, local=None):
+    def blocking_console(base, lang, stop=None, local=None, user_url=None):
         calls.append(base)
         never.wait()   # like input() with nobody typing
 

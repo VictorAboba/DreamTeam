@@ -154,7 +154,8 @@ async def test_a_stdio_proxy_names_its_client():
     """`dreamteam mcp` with a hub running is a stdio proxy: one client, named by a header of its own."""
     from dreamteam.hub_mcp import PROXY_READ_TIMEOUT, proxy_http_client
 
-    async with proxy_http_client() as first, proxy_http_client() as second:
+    url = "http://127.0.0.1:8765/mcp"
+    async with proxy_http_client(url) as first, proxy_http_client(url) as second:
         assert first.headers[CLIENT_HEADER] and first.headers[CLIENT_HEADER] != second.headers[CLIENT_HEADER]
         assert first.timeout.read == PROXY_READ_TIMEOUT
 

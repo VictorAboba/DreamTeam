@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import netoff
 from . import skills as skill_lib
 from .config import Config
 from .db import loads
@@ -45,8 +46,8 @@ from .settings import (
 )
 from .skills import Library, Limits, SkillError, SkillInfo, Staged
 from .swarm_skills import attach_files, decide_files, read_session_skills, skills_dir, source_spec, stopped_public
-from .workspace import (SCRATCH_DIR, SKILLS_MIRROR, commit_paths, init_repo, is_link, looks_like_git_dir, repo_state,
-                        rmtree, tracked)
+from .workspace import (SCRATCH_DIR, SKILLS_MIRROR, commit_paths, init_repo, is_link, isolated_git, looks_like_git_dir,
+                        repo_state, rmtree, tracked)
 
 if TYPE_CHECKING:
     from .swarm import Swarm
@@ -244,6 +245,8 @@ class _Plan:
     # leaving a folder of the user: the `mcp/<name>` folders its repository tracks (the agents committed them
     # there), whose removal is committed there after the move so that the user's repository stays clean
     old_tracked: list[str] = field(default_factory=list)
+    # the session has no network: DreamTeam's git in both folders runs like its members' commands (isolated_git)
+    network_off: bool = False
 
     def result(self, git: str | None = None) -> dict[str, Any]:
         # old_kept: the previous folder still holds its files (an adopt, or the user's folder left as it was)
@@ -822,17 +825,19 @@ class SessionManager:
             f"or move the session to another folder: /cd <folder> (/cd --default for its own folder) in `dreamteam` "
             f"or `dreamteam console --session {sid}`, session_cd in MCP.", 409)
 
-    def _check_adopted_repo(self, sid: str, folder: Path, mcp: list[str]) -> None:
+    def _check_adopted_repo(self, sid: str, folder: Path, mcp: list[str], network_off: bool = False) -> None:
         """Before a start in a folder the session adopted, with git on: the same rules as when it was adopted, since
         the user may have worked in it meanwhile (or git was off then). Its repository must be clean (the agents
         commit with `git add -A`; the session's own `mcp/<name>` folders are left out: they are the agents' work, and
         so is `.scratch/`, which no commit takes and whose marker the start writes again if an agent removed it),
         on a branch, with no merge or rebase halfway, and not inside another repository (a folder that is in no
-        repository gets one at the start, as when it was adopted). Blocking (git): run it in a thread."""
+        repository gets one at the start, as when it was adopted). `network_off`: the session's setting (its git
+        then runs isolated, isolated_git). Blocking (git): run it in a thread."""
         git_exe = shutil.which("git")
         if git_exe is None:
             return
-        state = repo_state(folder, git_exe, exclude=[*(f"mcp/{name}" for name in mcp), SCRATCH_DIR])
+        state = repo_state(folder, git_exe, exclude=[*(f"mcp/{name}" for name in mcp), SCRATCH_DIR],
+                           offline=isolated_git(network_off))
         refusal = _repo_refusal(folder, state, starting=sid)
         if refusal is not None:
             raise refusal
@@ -868,10 +873,12 @@ class SessionManager:
                 continue  # a damaged session: its own summary shows the error
         return found
 
-    def _plan(self, sid: str | None, path: Any, *, git_on: bool, mcp: list[str] | None = None) -> _Plan:
+    def _plan(self, sid: str | None, path: Any, *, git_on: bool, mcp: list[str] | None = None,
+              network_off: bool = False) -> _Plan:
         """Check a new workspace folder for a session (sid None: a session about to be created) and decide what
-        to do; SessionError (400 bad target, 409 conflict) before anything changes. Blocking (git): run it in a
-        thread."""
+        to do; SessionError (400 bad target, 409 conflict) before anything changes. `network_off`: the session's
+        setting, for its git checks here and later (_Plan.network_off; the first check runs while the session's
+        members may still run commands). Blocking (git): run it in a thread."""
         meta = self.meta(sid) if sid is not None else {}
         if sid is not None:
             old, old_stored, old_adopted = self._workspace_entry(sid, meta)
@@ -985,10 +992,12 @@ class SessionManager:
         git_exe = shutil.which("git")
         plan = _Plan(target=target, old=old_real if old_real is not None else target, mode="moved",
                      default=is_default, adopted=False, git="none", old_exists=old_exists,
-                     old_is_default=old_stored is None and old is not None, old_adopted=old_adopted)
+                     old_is_default=old_stored is None and old is not None, old_adopted=old_adopted,
+                     network_off=network_off)
         carried = [name for name in (mcp or []) if old_exists and (old_real / "mcp" / name).is_dir()]
         if old_adopted and carried and git_exe:  # leaving the user's folder: did the agents commit the servers there?
-            plan.old_tracked = tracked(old_real, [f"mcp/{name}" for name in carried], git_exe)
+            plan.old_tracked = tracked(old_real, [f"mcp/{name}" for name in carried], git_exe,
+                                       offline=isolated_git(network_off))
         if empty and not old_adopted:
             # the session's own files (its default folder, or a folder they were moved to) move along
             plan.move_all = True
@@ -1017,7 +1026,8 @@ class SessionManager:
         else:
             # the session's own servers (absent there: checked above) are left out, as at every start: a folder it
             # worked in before may track them, and their move brings them back (else it could never return there)
-            state = repo_state(target, git_exe, exclude=[f"mcp/{name}" for name in carried])
+            state = repo_state(target, git_exe, exclude=[f"mcp/{name}" for name in carried],
+                               offline=isolated_git(network_off))
             refusal = _repo_refusal(target, state)
             if refusal is not None:
                 raise refusal
@@ -1077,7 +1087,7 @@ class SessionManager:
             if not os.path.lexists(plan.target / ".gitignore"):
                 undo.gitignore = plan.target / ".gitignore"
             undo.git_dir = plan.target / ".git"
-            error = init_repo(plan.target, adopted=plan.adopted)
+            error = init_repo(plan.target, adopted=plan.adopted, offline=isolated_git(plan.network_off, plan.target))
             if error:
                 raise OSError(f"git init in {plan.target} failed: {error}")
         return plan.git
@@ -1424,8 +1434,9 @@ class SessionManager:
         self._refresh_settings()
         overrides = self._validated_overrides(overrides)
         if workspace is not None:  # checked before anything is created
-            git_on = validate(self.sessions_dir / "new", self._merged(self.raw, overrides)).workspace.git
-            await asyncio.to_thread(self._plan, None, workspace, git_on=git_on)
+            new = validate(self.sessions_dir / "new", self._merged(self.raw, overrides))
+            await asyncio.to_thread(self._plan, None, workspace, git_on=new.workspace.git,
+                                    network_off=netoff.is_off(new))
         prepared: list[_SkillItem] = []
         if skills:
             if isinstance(skills, list) and len(skills) > self.config.skills.max_attached:
@@ -1553,7 +1564,8 @@ class SessionManager:
                 cfg = swarm.config  # what this start will use (the loaded swarm got any new settings)
                 if cfg.workspace_adopted and cfg.workspace.git:
                     servers = [r["name"] for r in swarm.db.all("SELECT name FROM mcp_servers WHERE origin != 'config'")]
-                    await asyncio.to_thread(self._check_adopted_repo, sid, cfg.workspace_dir, servers)
+                    await asyncio.to_thread(self._check_adopted_repo, sid, cfg.workspace_dir, servers,
+                                            netoff.is_off(cfg))
             try:
                 await swarm.start()
             except Exception:
@@ -1751,12 +1763,14 @@ class SessionManager:
             meta = self.meta(sid)
             self._check_journal(sid, meta)
             try:
-                git_on = self.config_for(sid).workspace.git
+                cfg = self.config_for(sid)
             except SessionError:
                 raise
             except ValueError as exc:
                 raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
-            first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid))
+            git_on, network_off = cfg.workspace.git, netoff.is_off(cfg)
+            first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
+                                            network_off=network_off)
             if first.mode == "unchanged":
                 return {**first.result(), "restarted": False, "start_error": None}
             self._check_expected(sid, first, expect)
@@ -1769,7 +1783,8 @@ class SessionManager:
                 self._changed(sid, "stopped")
             try:
                 async with self._claims:  # no other session takes a folder until this one's session.json names it
-                    plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating)
+                    plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating,
+                                                                       network_off)
             except BaseException:
                 if was_running:
                     with contextlib.suppress(Exception):
@@ -1794,13 +1809,14 @@ class SessionManager:
         return result
 
     async def _change_folder(self, sid: str, path: Any, git_on: bool, first: _Plan, expect: str | None,
-                             creating: bool) -> tuple[_Plan, str, dict[str, Any] | None]:
+                             creating: bool, network_off: bool = False) -> tuple[_Plan, str, dict[str, Any] | None]:
         """The change itself, with the session unloaded and the home's workspace claims held: the final check, the
         moves, session.json. Returns (plan, git outcome, what changed in the user's folder it left); raises with
         everything put back (or, when that failed too, an error that says where the files are)."""
         # checked again with nothing running: an agent may have forged a server, the folder may have changed, and
         # another session may have taken the folder meanwhile (it is in its session.json now)
-        plan = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid))
+        plan = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
+                                       network_off=network_off)
         if plan.mode == "unchanged":
             raise SessionError(f"The folder of session {sid} changed meanwhile; try again.", 409)
         self._check_expected(sid, plan, expect, first)
@@ -1834,7 +1850,8 @@ class SessionManager:
                            "moved with it to another folder")
                 try:
                     old_changed["commit"], old_changed["error"] = await asyncio.to_thread(
-                        commit_paths, plan.old, plan.old_tracked, message)
+                        lambda: commit_paths(plan.old, plan.old_tracked, message,
+                                             offline=isolated_git(plan.network_off, plan.old)))
                 except (OSError, subprocess.SubprocessError) as exc:
                     old_changed["error"] = str(exc)
             if old_changed["error"]:

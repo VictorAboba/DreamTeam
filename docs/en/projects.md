@@ -51,9 +51,13 @@ Safety rules for a folder that is not the session's own:
 
 - If the repository has uncommitted changes or untracked files (not in `.gitignore`; you can't hide them with the
   `status.showUntrackedFiles` setting), the move is refused: the agents commit with `git add -A`, and your changes
-  would get mixed into their commits. Commit or `git stash` first. A repository in detached HEAD state is refused too,
-  as is an unfinished merge, rebase, cherry-pick or revert (the agent's next commit would finish it under the agent's
-  name), and a subfolder of a repository (give its root).
+  would get mixed into their commits. Commit or `git stash` first. The files of a filter that only your repository's
+  config defines and marks required (git-crypt after `git-crypt unlock`, git-lfs installed with `--local`) do not
+  count: DreamTeam never commits them (see [Security](security.md)), you do. So your own uncommitted edits to them
+  don't stop the move or a start either, and an agent's own `git commit` in its console can still take them where
+  that filter runs for it (git-crypt installed and unlocked on this machine): commit them first. A repository in
+  detached HEAD state is refused too, as is an unfinished merge, rebase, cherry-pick or revert (the agent's next
+  commit would finish it under the agent's name), and a subfolder of a repository (give its root).
 - These checks run again at every start of the session, also when it resumes after a server restart: if, while the
   session was stopped, you left uncommitted changes in the project or switched to a detached HEAD, the session does
   not start and says why. Commit or `git stash` and start it again. If the session connected to the project with git

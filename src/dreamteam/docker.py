@@ -11,7 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from . import netoff
+from . import hubauth, netoff
 from .config import Config
 
 IMAGE = "dreamteam:latest"
@@ -159,8 +159,9 @@ def env_passthrough(config: Config) -> list[str]:
     """Names of environment variables to pass into the container (values are taken from the host env)."""
     names = {p.api_key_env for p in config.models.values() if p.api_key_env}
     names |= {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} | set(config.shell.pass_env)
-    # the skills variables are set by sandbox_command; a host value passed by name would come later and win
-    names -= SKILLS_ENV
+    # the skills variables are set by sandbox_command; a host value passed by name would come later and win. The
+    # hub token is run_sandbox's own, never the host's
+    names -= SKILLS_ENV | {hubauth.TOKEN_ENV, hubauth.DIGEST_ENV}
     return sorted(n for n in names if n and n in os.environ)
 
 
@@ -219,13 +220,19 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
     `home`: serve the directory as a launcher home (True) or `run` it as a single-swarm project (False);
     None decides by its sessions/ directory. `firewall`: the container may set up the firewall of the sessions
     without network (NET_ADMIN, which DreamTeam drops right after: netoff.sandbox_entry). `network`: `--network`
-    of the command inside (a project's run, or the session `goal` creates)."""
+    of the command inside (a project's run, or the session `goal` creates).
+
+    The hub token's SHA-256 (hubauth.DIGEST_ENV) is passed by name, its value from the environment of the docker
+    command (run_sandbox): the hub has to listen on 0.0.0.0 (a published port reaches the container's interface, never
+    its loopback), and so every container on the same bridge reaches it too unless it asks for the token. Only the
+    digest: the container's environment never holds the token itself."""
     public = f"http://127.0.0.1:{port}"
     # --init: a tiny init (tini) is PID 1 and reaps orphans (processes the agents' commands leave running), so a
     # zombie never keeps a process group alive; it forwards SIGTERM/SIGINT to dreamteam. Ports that agents' dev
     # servers open inside the container are not published.
-    cmd = [docker, "run", "--rm", "--init", "--name", f"dreamteam-{port}", "-p", f"127.0.0.1:{port}:{CONTAINER_PORT}",
-           "-v", f"{project_dir.resolve()}:/swarm", "-e", f"DREAMTEAM_PUBLIC_URL={public}"]
+    cmd = [docker, "run", "--rm", "--init", "--name", container_name(port), "-p",
+           f"127.0.0.1:{port}:{CONTAINER_PORT}", "-v", f"{project_dir.resolve()}:/swarm",
+           "-e", f"DREAMTEAM_PUBLIC_URL={public}", "-e", hubauth.DIGEST_ENV]
     # Skills (docs/SPEC.md §19): the agents have `shell` in the hub's container, so the host's library is mounted
     # read-only (the source `host-library` inside); the sandbox's own library is <home>/.dreamteam/skills-library,
     # which the host never reads by itself. ~/.claude/skills is not mounted: it would show all the user's personal
@@ -255,9 +262,44 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
     return cmd
 
 
+def container_name(port: int) -> str:
+    return f"dreamteam-{port}"
+
+
+def container_exists(name: str) -> bool:
+    try:
+        result = subprocess.run([_docker(), "container", "inspect", name], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def access_lines(project_dir: Path, port: int, token: str, stored: Path | None, home: bool) -> list[str]:
+    """What `dreamteam sandbox` prints: the board URL with its one-time `?token=` (the hub turns it into a cookie),
+    the MCP URL with the header Claude Code needs, and how DreamTeam's commands on the host get the token."""
+    base = f"http://127.0.0.1:{port}"
+    where = f'--home "{project_dir}"' if home else f'"{project_dir}"'
+    lines = [f"Swarm UI: {base}/?{hubauth.QUERY_PARAM}={token}",
+             f"MCP:      {base}/mcp  (header Authorization: Bearer {token})",
+             f'  claude mcp add --transport http dreamteam {base}/mcp --header "Authorization: Bearer {token}"',
+             "  The token is new for every start of the sandbox; a registration that survives restarts:",
+             f"  claude mcp add dreamteam -- dreamteam mcp {where}"]
+    if stored is not None:
+        lines.append(f"`dreamteam console`, `tui`, `mcp` and `status` on this computer read the token from {stored}.")
+    else:
+        lines.append(f"Warning: {hubauth.tokens_dir()} is inside a mounted folder, so the token is not stored: set "
+                     f"{hubauth.TOKEN_ENV} to it for `dreamteam console`, `tui`, `mcp` and `status`.")
+    return lines
+
+
 def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | None = None,
                 image: str = IMAGE, home: bool | None = None, network: str | None = None) -> int:
     config = Config.load(project_dir)
+    if container_exists(container_name(port)):  # (its stored token must not be replaced by one nobody asks for)
+        print(f"A DreamTeam sandbox already runs on port {port} (container {container_name(port)}): stop it first, "
+              "or choose another --port.", file=sys.stderr)
+        return 1
     firewall = wants_firewall(project_dir, config, network)
     if build or not image_exists(image):
         build_image(image)
@@ -289,5 +331,14 @@ def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | N
     if firewall:
         print("Sessions without network: their agents' commands run as a separate user whose network the "
               "container's firewall closes (NET_ADMIN only for setting it up).", file=sys.stderr)
-    print(f"Swarm UI: http://127.0.0.1:{port}  (MCP: http://127.0.0.1:{port}/mcp)", file=sys.stderr)
-    return subprocess.call(cmd)
+    # a fresh token per container: kept on the host outside every mounted folder (the agents must not read it
+    # there); the hub gets only its SHA-256, through docker's environment, never on a command line
+    token = hubauth.new_token()
+    stored = hubauth.store_token(port, token, project_dir, also_mounted=[sandbox_host_library(config)])
+    env = {k: v for k, v in os.environ.items() if k not in (hubauth.TOKEN_ENV, hubauth.DIGEST_ENV)}
+    try:
+        for line in access_lines(project_dir.resolve(), port, token, stored, is_home):
+            print(line, file=sys.stderr)
+        return subprocess.call(cmd, env={**env, hubauth.DIGEST_ENV: hubauth.digest(token)})
+    finally:
+        hubauth.forget_token(port, token)
