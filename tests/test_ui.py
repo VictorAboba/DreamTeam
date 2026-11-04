@@ -231,6 +231,14 @@ def test_no_hardcoded_user_visible_text_in_home_html():
     assert texts == ["DreamTeam — сессии", "DreamTeam"], texts  # <title> (replaced by applyI18n) and the brand
 
 
+def test_icon_buttons_on_home_have_accessible_names():
+    html_buttons = re.findall(r'<button\b[^>]*class="icon-btn[^>]*>', HOME_HTML, re.S)
+    js_buttons = re.findall(r'<button\b[^>]*class="icon-btn[^>]*>', HOME_JS, re.S)
+    for button in html_buttons + js_buttons:
+        assert re.search(r'\baria-label=|\bdata-i18n-title=', button), button
+    assert 'setAttribute("aria-label", t(el.dataset.i18nTitle))' in HOME_JS
+
+
 def test_ids_used_by_home_and_traces_exist():
     home_ids = set(re.findall(r'\bid="([\w-]+)"', HOME_HTML)) | set(re.findall(r'\bid="([\w-]+)"', HOME_JS))
     used = {u for u in re.findall(r'\$\("#([\w-]+)[" .]', HOME_JS) if not u.endswith("-")}

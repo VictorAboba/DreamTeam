@@ -448,7 +448,7 @@ function applyI18n() {
   document.documentElement.lang = H.lang;
   $$("[data-i18n]").forEach((el) => { el.textContent = t(el.dataset.i18n); });
   $$("[data-i18n-placeholder]").forEach((el) => { el.placeholder = t(el.dataset.i18nPlaceholder); });
-  $$("[data-i18n-title]").forEach((el) => { el.title = t(el.dataset.i18nTitle); });
+  $$("[data-i18n-title]").forEach((el) => { el.title = t(el.dataset.i18nTitle); el.setAttribute("aria-label", t(el.dataset.i18nTitle)); });
   $("#lang-btn").textContent = H.lang.toUpperCase();
   document.title = "DreamTeam — " + t("tab_" + (TABS.includes(H.tab) ? H.tab : "sessions"));
 }
@@ -629,7 +629,7 @@ function sessionCard(s) {
                 : `<button class="btn small" type="button" data-start="${esc(s.id)}"${busy}><i class="ic ic-play"></i>${esc(t("start"))}</button>`}
       <span class="spacer"></span>
       <span class="sc-id" title="${esc(s.dir || "")}">${esc(s.legacy ? t("legacy") + " · " + s.id : s.id)}</span>
-      ${s.legacy ? "" : `<button class="icon-btn small" type="button" data-delete="${esc(s.id)}" title="${esc(t("delete"))}"><i class="ic ic-trash"></i></button>`}
+      ${s.legacy ? "" : `<button class="icon-btn small" type="button" data-delete="${esc(s.id)}" title="${esc(t("delete"))}" aria-label="${esc(t("delete"))}"><i class="ic ic-trash"></i></button>`}
     </div>
   </article>`;
 }
@@ -1078,7 +1078,7 @@ async function newSessionModal() {
   const def = (v.agents || {}).default_model || "default";
   const modelOpts = profiles.map(([name, p]) =>
     `<option value="${esc(name)}"${name === def ? " selected" : ""}>${esc(name)} — ${esc(p.model || "?")}${name === def ? ` (${esc(t("default_marker"))})` : ""}</option>`).join("");
-  openModal(`<div class="modal-head"><h3>${esc(t("ns_title"))}</h3><button class="icon-btn small" type="button" data-close><i class="ic ic-close"></i></button></div>
+  openModal(`<div class="modal-head"><h3>${esc(t("ns_title"))}</h3><button class="icon-btn small" type="button" data-close aria-label="${esc(t("cancel"))}"><i class="ic ic-close"></i></button></div>
     <p class="lead">${esc(t("ns_lead"))}</p>
     <form class="new-session" id="ns-form" novalidate>
       <div class="form-grid">
@@ -1453,7 +1453,7 @@ async function pendingSkillsModal(sid) {
   H.pendingSid = sid;
   H.pendingItems = attached.filter((a) => a.library === "pending");
   H.pendingShown = {};
-  openModal(`<div class="modal-head"><h3>${esc(t("pend_title"))} · ${esc(s.title)}</h3><button class="icon-btn small" type="button" data-close><i class="ic ic-close"></i></button></div>
+  openModal(`<div class="modal-head"><h3>${esc(t("pend_title"))} · ${esc(s.title)}</h3><button class="icon-btn small" type="button" data-close aria-label="${esc(t("cancel"))}"><i class="ic ic-close"></i></button></div>
     <p class="lead">${esc(t("pend_text"))}</p><div id="pending-skills"></div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button></div>`);
   renderPendingSkills();
@@ -1531,6 +1531,8 @@ async function onPendingClick(e) {
 function openModal(html) {
   $("#modal").innerHTML = html;
   $("#modal-backdrop").classList.remove("hidden");
+  const focusTarget = $("#modal").querySelector("input, textarea, select, button, [tabindex]:not([tabindex='-1'])");
+  if (focusTarget) focusTarget.focus();
 }
 /** Closes the modal; a new-session form with typed text asks first (a stray click must not lose a long goal). */
 function closeModal(force = false) {
@@ -1783,7 +1785,7 @@ function profileCard(p) {
       ${isDefault ? `<span class="badge"><i class="ic ic-star-fill"></i>${esc(t("p_default"))}</span>` : `<button class="btn small" type="button" data-make-default><i class="ic ic-star"></i>${esc(t("p_make_default"))}</button>`}
       <span class="spacer"></span>
       <select data-apply-preset><option value="">${esc(t("p_preset"))}</option>${H.providers.map((x) => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join("")}</select>
-      ${H.profiles.length > 1 && !isDefault ? `<button class="icon-btn small" type="button" data-del-profile title="${esc(t("p_delete"))}"><i class="ic ic-trash"></i></button>` : ""}
+      ${H.profiles.length > 1 && !isDefault ? `<button class="icon-btn small" type="button" data-del-profile title="${esc(t("p_delete"))}" aria-label="${esc(t("p_delete"))}"><i class="ic ic-trash"></i></button>` : ""}
     </div>
     <div class="settings-grid">
       <label class="field"><span>${esc(t("p_provider"))}</span>${sel("provider", providers, d.provider)}</label>
