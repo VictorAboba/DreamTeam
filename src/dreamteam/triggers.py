@@ -116,6 +116,8 @@ def safe_path(root: Path, path: str) -> Path | None:
     """Resolve `path` inside the workspace root; None if it escapes, touches .git or is malformed. A UNC or
     Windows device anchor (\\\\host\\share, \\\\?\\..., \\\\.\\...) outside the workspace is refused before any
     resolve(), so no other host is contacted and nothing stalls (as in Workspace.resolve)."""
+    if "\x00" in path:          # resolve() lets it through on Windows with Python 3.13, then stat() raises
+        return None
     try:
         base = root.resolve()
         given = Path(path)
@@ -194,7 +196,7 @@ def _file_probe(root: Path, path: str) -> tuple[int, int, float] | None:
         return None
     try:
         st = os.stat(target)
-    except OSError:
+    except (OSError, ValueError):
         return None
     return st.st_mtime_ns, st.st_size, st.st_mtime
 
