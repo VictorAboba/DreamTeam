@@ -223,7 +223,7 @@ class SkillsSettings:
     # script dependencies (docs/SPEC.md §19): requirements.txt / pyproject.toml / package.json, one environment per
     # skill and dependency set, shared by all sessions
     install: bool = True
-    install_proposals: bool = True    # also for skills members propose (kept apart from the user's skills)
+    install_proposals: bool = True    # also for skills agents can write: proposals, the workspace's .claude/skills
     envs_dir: str = "~/.dreamteam/skill-envs"
     python: str = ""                  # "" = the base interpreter DreamTeam runs on; a path, a command or (uv) a version
     install_scripts: bool = False     # npm lifecycle scripts of the dependencies (postinstall, ...)
@@ -630,7 +630,7 @@ max_attached = 40
 max_proposals = 10
 # Ставить зависимости скиллов (requirements.txt, pyproject.toml, package.json) в отдельные окружения
 install = true
-# То же для скиллов, предложенных агентами (в окружения отдельно от ваших скиллов)
+# То же для скиллов, в которые могут писать агенты: их предложений и .claude/skills проекта (отдельно от ваших)
 install_proposals = true
 # Где лежат окружения скиллов (общие для всех сессий)
 envs_dir = "~/.dreamteam/skill-envs"

@@ -1,6 +1,7 @@
 """MCP forge: agent-built stdio MCP servers, a shared connection pool and a cross-run library.
 
-Agents write `workspace/mcp/<name>/server.py` (mcp 2.x `MCPServer`), the forge smoke-tests it, keeps one
+Agents write `workspace/mcp/<name>/server.py` (mcp 2.x `MCPServer`); the forge smoke-tests and runs a snapshot of
+it kept outside the workspace (`.dreamteam/mcp/<name>/`, the code an approval covers), keeps one
 live connection per server shared by every agent and copies swarm-scoped servers to the library
 (`config.library_dir`) so later runs and other swarms can import them. External servers from
 `[mcp.external]` in `dreamteam.toml` go through the same pool.
@@ -9,12 +10,14 @@ live connection per server shared by every agent and copies swarm-scoped servers
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 import textwrap
 import time
@@ -37,6 +40,9 @@ NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,39}$")
 EXTERNAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_.\-]{0,63}$")
 SCOPES = ("private", "task", "swarm")
 MCP_REQUIREMENT = "mcp>=2.3,<3"
+# a forged server's start command as its digest has it (snapshot_digest): build_command without the interpreter's
+# path, which belongs to the machine, not to the server
+DIGEST_COMMAND = ("python", "server.py")
 
 ACTIVE, PENDING, FAILED, REJECTED = "active", "pending", "failed", "rejected"
 AVAILABLE = "available"  # library entry not imported into this project yet
@@ -48,6 +54,7 @@ ORIGIN_WORKSPACE, ORIGIN_CONFIG, ORIGIN_LIBRARY = "workspace", "config", "librar
 _REQ_SPLIT_RE = re.compile(r"[\r\n]+|,(?=\s*[A-Za-z0-9])(?![^\[\]]*\])")
 
 MAX_CODE_CHARS = 200_000
+MAX_CODE_BYTES = MAX_CODE_CHARS * 4  # its UTF-8 encoding at most
 MAX_DESCRIPTION_CHARS = 1000
 MAX_REQUIREMENTS = 30
 MAX_ERROR_CHARS = 4000
@@ -58,6 +65,13 @@ CRASH_PREFIX = "Error executing tool"
 # a traceback is wrapped inside narrow boxes, and the log tails shown to agents lose the error line.
 LOG_COLUMNS = "200"
 _CAUSE_RE = re.compile(r"The\s+above\s+exception\s+was\s+the\s+direct\s+cause")  # also when wrapped
+# a forged server runs its snapshot's server.py (snapshot_dir holds that file only) in the working copy's folder: the
+# note of a smoke test that failed on a missing file or module (_create_report)
+SNAPSHOT_ERRORS = ("FileNotFoundError", "No such file", "ModuleNotFoundError")
+SNAPSHOT_HINT = ("\nNote: server.py runs from a snapshot outside the workspace, with mcp/{name}/ as its working "
+                 "directory. Open the files kept next to it by paths relative to the working directory, not via "
+                 "__file__, and keep the server in one file: a module of your own next to it is not imported "
+                 "(packages go in requirements).")
 
 SERVER_TEMPLATE = '''from mcp.server.mcpserver import MCPServer
 
@@ -446,27 +460,17 @@ class MCPForge:
             rec = {
                 "name": name, "owner": owner, "scope": scope, "task_id": task_id, "description": description,
                 "command": command, "cwd": str(self.server_dir(name)), "requirements": reqs,
-                "origin": ORIGIN_WORKSPACE, "status": FAILED, "tools": [], "error": None,
+                "origin": ORIGIN_WORKSPACE, "status": FAILED, "tools": [], "error": None, "digest": None,
+                # the snapshot the user approved last: the same code again needs no new approval (_build)
+                "approved_digest": existing["approved_digest"] if existing else None,
                 "created_at": existing["created_at"] if existing else None,
             }
             # From here on server.py may already hold the new, untested code: if this call is interrupted
             # (the agent is cancelled, the hub client disconnects...) the old record must not stay active.
             try:
                 await self._drop_connection(name)
-                await asyncio.to_thread(self._write_code, name, code)
-                conn, tools, error = await self._smoke_test(name, code, command)
-                if error:
-                    status = FAILED
-                elif self.config.mcp.require_approval and actor != USER:
-                    status = PENDING
-                else:
-                    status = ACTIVE
-                if conn is not None and (status != ACTIVE or self._stopped):
-                    await conn.close()
-                    conn = None
-                if conn is not None:
-                    self._conns[name] = conn
-                rec.update(status=status, tools=tools, error=error[:MAX_ERROR_CHARS] if error else None)
+                data = await asyncio.to_thread(self._write_code, name, code)
+                status = await self._build(rec, data, code, by_user=actor == USER)
                 self._save(rec)
             except BaseException as exc:
                 self._record_interrupted(actor, rec, exc)
@@ -474,11 +478,12 @@ class MCPForge:
             # announce before the next await so a late cancellation cannot leave a silent pending server
             self.swarm.bus.emit("mcp.created", actor, server=self._public(self._record(name)))
             if status == PENDING:
-                self.swarm.notify(USER, "u_mcp_pending", owner=owner, name=name, description=description)
+                self.swarm.notify(USER, "u_mcp_pending", owner=owner, name=name, description=description,
+                                  digest=rec["digest"][:12])
             await asyncio.to_thread(self._write_workspace_meta, rec, save_to_library)
             note = ""
             if status == ACTIVE and scope == "swarm" and save_to_library:
-                note = await self._save_library(rec)
+                note = await self._save_library(rec, data, replace=actor == USER)
             return self._create_report(rec, note)
 
     def _record_interrupted(self, actor: str, rec: dict, exc: BaseException) -> None:
@@ -544,19 +549,35 @@ class MCPForge:
                 text, is_error = f"{exc} It crashed again after a restart.\n--- server log (tail) ---\n{tail}", True
         return truncate_middle(text, max_chars or self.config.agents.tool_output_chars), is_error
 
-    async def approve(self, actor: str, name: str, approve: bool, comment: str = "") -> str:
+    async def approve(self, actor: str, name: str, approve: bool, comment: str = "", digest: str = "") -> str:
+        """`digest`: the snapshot_digest (or its start) the user was shown by the dialog, the card or mcp_list; an
+        approval is refused when the server's snapshot has another one now (its owner created it again meanwhile)."""
         if actor != USER:
             raise ToolError("Only the user can approve or reject MCP servers.")
         key = _norm(name)
         comment = str(comment or "").strip()
+        digest = str(digest or "").strip().lower()
         async with self._lock(key):
             rec = self._record(key)
             if rec is None:
                 raise self._unknown(actor, key)
             if rec["status"] != PENDING:
                 raise ToolError(f"MCP server '{key}' is not waiting for approval (status: {rec['status']}).")
+            code = None
             if approve:
-                rec.update(status=ACTIVE, error=None)
+                recorded = rec.get("digest") or ""  # none: a record of an older version (_changed_report)
+                if digest and recorded and not recorded.startswith(digest):
+                    raise ToolError(
+                        f"MCP server '{key}' was not approved: digest {digest[:12]} does not match its current digest "
+                        f"{recorded[:12]} (the one mcp_list and the MCP card show now; its owner may have created it "
+                        "again since). It still waits for your approval."
+                    )
+                # the user approves the snapshot that passed the smoke test, while the working copy (what /cat and
+                # the Files tab show) is that same code; a changed one is tested again instead (_sync_snapshot)
+                code = await self._sync_snapshot(rec)
+                if code is None:
+                    raise ToolError(self._changed_report(rec, recorded=bool(recorded)))
+                rec.update(status=ACTIVE, error=None, approved_digest=rec["digest"])
             else:
                 await self._drop_connection(key)  # the user may have started it to try it out
                 rec.update(status=REJECTED, error=f"Rejected by the user. {comment}".strip())
@@ -569,8 +590,10 @@ class MCPForge:
             if rec["owner"] != USER:
                 self.swarm.notify(rec["owner"], "n_mcp_approved", name=key)
             note = ""
-            if rec["scope"] == "swarm" and self._wants_library(key):
-                note = await self._save_library(rec)
+            if rec["scope"] == "swarm" and rec["origin"] == ORIGIN_LIBRARY:
+                note = await self._approve_in_library(rec)
+            elif rec["scope"] == "swarm" and self._wants_library(key):
+                note = await self._save_library(rec, code)
             return f"MCP server '{key}' approved and active.{note}"
 
     async def remove(self, actor: str, name: str) -> str:
@@ -592,6 +615,7 @@ class MCPForge:
             await self._drop_connection(key)
             self.db.execute("DELETE FROM mcp_servers WHERE name = ?", (key,))
             await asyncio.to_thread(shutil.rmtree, self.server_dir(key), True)
+            await asyncio.to_thread(shutil.rmtree, self.snapshot_dir(key), True)
             note = ""
             lib = self._library_entry(key)
             if lib is not None:
@@ -614,13 +638,19 @@ class MCPForge:
 
     # --- paths / commands -----------------------------------------------------------------------
     def server_dir(self, name: str) -> Path:
+        """The members' working copy of a forged or imported server."""
         return self.config.workspace_dir / "mcp" / name
+
+    def snapshot_dir(self, name: str) -> Path:
+        """The snapshot that runs and that an approval covers: outside the workspace, where write_file and edit_file
+        do not reach (docs/SPEC.md §11)."""
+        return self.config.data_dir / "mcp" / name
 
     def log_path(self, name: str) -> Path:
         return self.config.data_dir / "logs" / f"mcp-{name}.log"
 
     @staticmethod
-    def build_command(requirements: list[str]) -> list[str]:
+    def build_command(requirements: list[str], script: str = "server.py") -> list[str]:
         uv = shutil.which("uv")
         # On Windows a .cmd/.bat shim would route agent-controlled requirement strings through cmd.exe,
         # where < and > are redirections; only a real uv.exe is used there.
@@ -628,17 +658,23 @@ class MCPForge:
             command = [uv, "run", "--no-project", "--with", MCP_REQUIREMENT]
             for req in requirements:
                 command += ["--with", req]
-            return command + ["python", "server.py"]
-        return [sys.executable, "server.py"]
+            return command + ["python", script]
+        return [sys.executable, script]
 
     def _launch_spec(self, rec: dict) -> tuple[list[str], Path, dict[str, str]]:
         name = rec["name"]
         if rec["origin"] == ORIGIN_CONFIG:
             extra = self._external.get(name, {}).get("env") or {}
             cwd = Path(rec["cwd"]) if rec["cwd"] else self.config.workspace_dir
-            env = scrubbed_env(self.config, extra={str(k): str(v) for k, v in extra.items()})
+            # the user's own server from [mcp.external]: the credentials of URLs in its environment stay
+            env = scrubbed_env(self.config, extra={str(k): str(v) for k, v in extra.items()},
+                               keep_url_credentials=True)
             return list(rec["command"]), cwd, env
-        return self.build_command(rec["requirements"]), self.server_dir(name), scrubbed_env(self.config)
+        # the snapshot's server.py, run in the working copy's folder (files a server keeps next to itself stay there)
+        return self._snapshot_command(rec), self.server_dir(name), scrubbed_env(self.config)
+
+    def _snapshot_command(self, rec: dict) -> list[str]:
+        return self.build_command(rec["requirements"], str(self.snapshot_dir(rec["name"]) / "server.py"))
 
     # --- validation ---------------------------------------------------------------------------
     @staticmethod
@@ -720,6 +756,11 @@ class MCPForge:
                     f"MCP server '{name}' belongs to {existing['owner']}; only its owner or the user can "
                     "replace it. Choose another name."
                 )
+            if actor != USER and existing["origin"] == ORIGIN_LIBRARY and not self._library_entry_here(name):
+                raise ToolError(
+                    f"MCP server '{name}' was imported from the shared library, where another project keeps it; "
+                    "only the user can replace it. Choose another name."
+                )
             return
         entry = self._library_entry(name)
         if actor != USER and entry is not None:
@@ -755,6 +796,11 @@ class MCPForge:
             rec = await self._import_from_library(actor, name)
         if not self._can_use(actor, rec):
             raise self._unknown(actor, name)
+        return self._gate(actor, name, rec)
+
+    @staticmethod
+    def _gate(actor: str, name: str, rec: dict) -> dict:
+        """`rec` when its status lets `actor` use it (the user may try a pending server), else the reason."""
         status = rec["status"]
         if status == ACTIVE or (status == PENDING and actor == USER):
             return rec
@@ -790,6 +836,15 @@ class MCPForge:
             if conn is not None:
                 self._conns.pop(key, None)
                 await conn.close()
+            if rec["origin"] != ORIGIN_CONFIG and await self._sync_snapshot(rec) is None:
+                # the working copy was taken as a new mcp_create: failed or pending now, or active and started
+                self._gate(actor, key, rec)
+                conn = self._conns.get(key)
+                if conn is not None and conn.alive and self._same_network(conn):
+                    return conn
+                if conn is not None:  # (started under the other network setting, as above)
+                    self._conns.pop(key, None)
+                    await conn.close()
             return await self._connect(actor, rec)
 
     def _isolated(self, command: list[str], env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
@@ -799,7 +854,8 @@ class MCPForge:
 
     def _new_connection(self, name: str, command: list[str], cwd: Path, env: dict) -> MCPConnection:
         offline = netoff.is_off(self.config)
-        command, env = self._isolated(command, env)
+        # in a container git trusts the session's own workspace only, as in the members' commands
+        command, env = self._isolated(command, netoff.trust_workspace(env, self.config.workspace_dir))
         conn = MCPConnection(name, command, cwd, env, self.log_path(name))
         conn.offline = offline   # the setting it runs with (_same_network)
         return conn
@@ -873,6 +929,109 @@ class MCPForge:
             return None, [], "the server started but exposes no tools: decorate functions with @mcp.tool()."
         return conn, tools, None
 
+    # --- snapshots (docs/SPEC.md §11) -------------------------------------------------------------
+    async def _build(self, rec: dict, data: bytes, code: str, *, by_user: bool) -> str:
+        """Smoke-test the snapshot just written (`data`; `code`, its text) and set the record's digest, status, tools
+        and error; returns the status: failed, else active when the user wrote it (`by_user`), approval is off or the
+        user approved that very snapshot (approved_digest), else pending. An active server keeps its smoke-test
+        process as the pooled connection, unless it started under the other network setting."""
+        name = rec["name"]
+        rec["digest"] = snapshot_digest(data, rec["requirements"])
+        conn, tools, error = await self._smoke_test(name, code, self._snapshot_command(rec))
+        if error:
+            status = FAILED
+        elif self.config.mcp.require_approval and not by_user and rec.get("approved_digest") != rec["digest"]:
+            status = PENDING
+        else:
+            status = ACTIVE
+        if status == ACTIVE and by_user:
+            rec["approved_digest"] = rec["digest"]  # the user's own code
+        # (close_connections may have run while the smoke test was starting: a process of the other network setting
+        # is not kept, docs/SPEC.md §7.2)
+        if conn is not None and (status != ACTIVE or self._stopped or not self._same_network(conn)):
+            await conn.close()
+            conn = None
+        if conn is not None:
+            self._conns[name] = conn
+        rec.update(status=status, tools=tools, error=error[:MAX_ERROR_CHARS] if error else None)
+        return status
+
+    async def _sync_snapshot(self, rec: dict) -> bytes | None:
+        """Before a forged or imported server starts, and before it is approved: its snapshot is used only while it
+        still has the recorded digest and the working copy (workspace/mcp/<name>/server.py) is that same code.
+        Returns the snapshot's bytes then (a missing working copy is written back from it). Otherwise the working
+        copy is taken as an mcp_create of that code by the server's owner (_rebuild): `rec` is updated in place and
+        None is returned."""
+        name = rec["name"]
+        snap, work = await asyncio.to_thread(self._read_copies, name)
+        valid = (snap is not None and bool(rec.get("digest"))
+                 and snapshot_digest(snap, rec["requirements"]) == rec["digest"])
+        if valid and work is None:
+            try:
+                await asyncio.to_thread(self._restore_working_copy, name, snap)
+            except OSError as exc:
+                log.warning("Could not write back mcp/%s/server.py: %s", name, exc)
+            return snap
+        if valid and work == snap:
+            return snap
+        if work is None:
+            raise ToolError(f"MCP server '{name}' has no code to run (mcp/{name}/server.py is missing); its owner "
+                            f"({rec['owner']}) must call mcp_create again.")
+        await self._rebuild(rec, work)
+        return None
+
+    async def _rebuild(self, rec: dict, data: bytes) -> None:
+        """The working copy `data` is not the snapshot: it is taken as an mcp_create of that code by the server's
+        owner. A new snapshot and digest, smoke-tested: failed, pending (approval on and that digest not approved by
+        the user) or active. Announced like a create; the library is not written."""
+        name, owner = rec["name"], rec["owner"]
+        try:
+            # utf-8-sig: a BOM (an editor's, PowerShell's) is no syntax error, as when Python runs the file; the text
+            # is only checked, the snapshot keeps the bytes
+            code = data.decode("utf-8-sig") if len(data) <= MAX_CODE_BYTES else None
+        except UnicodeDecodeError:
+            code = None
+        try:
+            await self._drop_connection(name)
+            if code is None:
+                rec.update(digest=None, status=FAILED, tools=[],
+                           error=f"mcp/{name}/server.py is not UTF-8 text of at most {MAX_CODE_CHARS} characters.")
+            else:
+                await asyncio.to_thread(self._write_snapshot, name, data)
+                await self._build(rec, data, code, by_user=False)
+            self._save(rec)
+        except BaseException:
+            # interrupted (the caller was cancelled, the session stops...): the stored record stays as it was, not
+            # failed, since its code did not change. Its digest is not the snapshot just written, so the next start
+            # or approval tests the working copy again, and the untested code does not run meanwhile.
+            conn = self._conns.pop(name, None)
+            if conn is not None:
+                conn._closing.set()  # its task stops the process; close() cannot be awaited here
+            raise
+        log.info("MCP server %s: its working copy changed and was tested again (%s)", name, rec["status"])
+        self.swarm.bus.emit("mcp.created", owner, server=self._public(self._record(name)))
+        if rec["status"] == PENDING:
+            self.swarm.notify(USER, "u_mcp_pending", owner=owner, name=name, description=rec["description"],
+                              digest=rec["digest"][:12])
+
+    @staticmethod
+    def _changed_report(rec: dict, recorded: bool = True) -> str:
+        """approve(): the working copy was not the snapshot under review, so it was tested again (_rebuild);
+        `recorded`: the record had a digest (a record of an older version has none, nor a snapshot)."""
+        name = rec["name"]
+        if recorded:
+            head = (f"MCP server '{name}' was not approved: mcp/{name}/server.py is not the code that passed the "
+                    "smoke test. That file was tested again")
+        else:
+            head = (f"MCP server '{name}' was not approved yet: an older version of DreamTeam recorded it without a "
+                    f"snapshot of its code, so mcp/{name}/server.py was tested now")
+        if rec["status"] == PENDING:
+            return f"{head} and waits for your approval (digest {rec['digest'][:12]})."
+        if rec["status"] == FAILED:
+            reason = (rec["error"] or "unknown error").strip().splitlines()[0][:300]
+            return f"{head} and failed ({reason})."
+        return f"{head} (status: {rec['status']})."
+
     # --- storage -------------------------------------------------------------------------------
     def _record(self, name: str) -> dict | None:
         row = self.db.one("SELECT * FROM mcp_servers WHERE name = ?", (name,))
@@ -890,16 +1049,17 @@ class MCPForge:
         now = time.time()
         self.db.execute(
             "INSERT INTO mcp_servers(name, owner, scope, task_id, description, command, cwd, requirements, origin,"
-            " status, tools, error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            " status, tools, error, created_at, updated_at, digest, approved_digest)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             " ON CONFLICT(name) DO UPDATE SET owner = excluded.owner, scope = excluded.scope,"
             " task_id = excluded.task_id, description = excluded.description, command = excluded.command,"
             " cwd = excluded.cwd, requirements = excluded.requirements, origin = excluded.origin,"
             " status = excluded.status, tools = excluded.tools, error = excluded.error,"
-            " updated_at = excluded.updated_at",
+            " updated_at = excluded.updated_at, digest = excluded.digest, approved_digest = excluded.approved_digest",
             (
                 rec["name"], rec["owner"], rec["scope"], rec["task_id"], rec["description"], dumps(rec["command"]),
                 rec["cwd"], dumps(rec["requirements"]), rec["origin"], rec["status"], dumps(rec["tools"]),
-                rec["error"], rec.get("created_at") or now, now,
+                rec["error"], rec.get("created_at") or now, now, rec.get("digest"), rec.get("approved_digest"),
             ),
         )
 
@@ -912,6 +1072,7 @@ class MCPForge:
             # a configured server's argv; [] for a forged one (it runs its server.py, see build_command)
             "command": list(rec["command"] or []) if rec["origin"] == ORIGIN_CONFIG else [],
             "created_at": rec["created_at"],
+            "digest": rec.get("digest"),  # the snapshot's sha256 (snapshot_digest); None for a configured server
         }
 
     @staticmethod
@@ -925,10 +1086,28 @@ class MCPForge:
         ).lower()
         return all(term in hay for term in terms)
 
-    def _write_code(self, name: str, code: str) -> None:
+    def _write_code(self, name: str, code: str) -> bytes:
+        """server.py as the members' working copy (server_dir) and as the snapshot that runs; returns its bytes."""
+        data = code.encode("utf-8")
         folder = self.server_dir(name)
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / "server.py").write_bytes(code.encode("utf-8"))
+        (folder / "server.py").write_bytes(data)
+        self._write_snapshot(name, data)
+        return data
+
+    def _write_snapshot(self, name: str, data: bytes) -> None:
+        folder = self.snapshot_dir(name)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "server.py").write_bytes(data)
+
+    def _read_copies(self, name: str) -> tuple[bytes | None, bytes | None]:
+        """(snapshot, working copy) of server.py; None for one that is missing."""
+        return _read_server_py(self.snapshot_dir(name)), _read_server_py(self.server_dir(name))
+
+    def _restore_working_copy(self, name: str, data: bytes) -> None:
+        folder = self.server_dir(name)
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "server.py").write_bytes(data)
 
     def _write_workspace_meta(self, rec: dict, save_to_library: bool) -> None:
         meta = {
@@ -1014,6 +1193,7 @@ class MCPForge:
             "requirements": [str(r) for r in reqs] if isinstance(reqs, list) else [],
             "tools": [t for t in tools if isinstance(t, dict)] if isinstance(tools, list) else [],
             "created_at": meta.get("created_at"), "project": meta.get("project"),
+            "digest": _str_or_none(meta.get("digest")), "approved_digest": _str_or_none(meta.get("approved_digest")),
         }
 
     def _library_entries(self) -> dict[str, dict]:
@@ -1035,51 +1215,96 @@ class MCPForge:
             "name": entry["name"], "owner": entry["owner"], "scope": "swarm", "task_id": None,
             "description": entry["description"], "status": AVAILABLE, "origin": ORIGIN_LIBRARY,
             "tools": _tool_names(entry["tools"]), "error": None, "requirements": list(entry["requirements"]),
-            "command": [], "created_at": entry["created_at"],
+            "command": [], "created_at": entry["created_at"], "digest": entry["digest"],
         }
 
-    async def _save_library(self, rec: dict) -> str:
+    def _library_entry_here(self, name: str) -> bool:
+        """The library has no entry `name`, or this project saved it (an owner's name proves nothing: another project
+        may have a member of that name)."""
+        entry = self._library_entry(name)
+        return entry is None or entry.get("project") == str(self.config.project_dir)
+
+    async def _save_library(self, rec: dict, code: bytes, *, replace: bool = False) -> str:
+        """Copy the snapshot `code`, not the working copy, to the library. An entry another project saved is replaced
+        only by the user's own mcp_create (`replace`)."""
+        if not replace and not self._library_entry_here(rec["name"]):
+            return (f" The shared library keeps the MCP server '{rec['name']}' of another project; it was not "
+                    "replaced.")
         try:
-            await asyncio.to_thread(self._copy_to_library, rec)
+            await asyncio.to_thread(self._copy_to_library, rec, code)
         except OSError as exc:
             log.warning("Could not save MCP server %s to the library: %s", rec["name"], exc)
             return f" Could not save it to the library: {exc}."
         return " Saved to the shared MCP library."
 
-    def _copy_to_library(self, rec: dict) -> None:
+    def _copy_to_library(self, rec: dict, code: bytes) -> None:
         dest = self.config.library_dir / rec["name"]
         dest.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self.server_dir(rec["name"]) / "server.py", dest / "server.py")
+        (dest / "server.py").write_bytes(code)
         previous = self._library_entry(rec["name"])
+        approved = rec.get("approved_digest")
         meta = {
             "name": rec["name"], "description": rec["description"], "owner": rec["owner"],
             "requirements": rec["requirements"], "tools": rec["tools"],
             "created_at": (previous or {}).get("created_at") or time.time(), "updated_at": time.time(),
             "project": str(self.config.project_dir), "swarm": self.config.swarm.name,
+            # approved_digest: the user approved (or wrote) this very snapshot, so importing it asks no new approval
+            "digest": rec["digest"], "approved_digest": approved if approved == rec["digest"] else None,
         }
         (dest / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _copy_from_library(self, name: str) -> None:
+    async def _approve_in_library(self, rec: dict) -> str:
+        try:
+            marked = await asyncio.to_thread(self._mark_library_approved, rec)
+        except (OSError, ValueError) as exc:
+            log.warning("Could not record the approval of MCP server %s in the library: %s", rec["name"], exc)
+            return ""
+        return " The shared MCP library records the approval of this code." if marked else ""
+
+    def _mark_library_approved(self, rec: dict) -> bool:
+        """The user approved an imported snapshot: the library entry records it (approved_digest) while its server.py
+        is still that code, so importing it again asks no more."""
+        folder = self.config.library_dir / rec["name"]
+        entry = self._library_entry(rec["name"])
+        data = _read_server_py(folder)
+        if entry is None or data is None or snapshot_digest(data, entry["requirements"]) != rec["digest"]:
+            return False
+        meta = json.loads((folder / "meta.json").read_text("utf-8"))
+        meta.update(digest=rec["digest"], approved_digest=rec["digest"])
+        (folder / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+
+    def _copy_from_library(self, name: str) -> bytes:
+        """The library's server.py, written as the working copy and as the snapshot; returns its bytes."""
+        data = _read_server_py(self.config.library_dir / name)
+        if data is None or len(data) > MAX_CODE_BYTES:
+            raise OSError("its server.py cannot be read or is too long")
         folder = self.server_dir(name)
         folder.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(self.config.library_dir / name / "server.py", folder / "server.py")
+        (folder / "server.py").write_bytes(data)
+        self._write_snapshot(name, data)
+        return data
 
     async def _import_from_library(self, actor: str, name: str) -> dict:
         entry = self._library_entry(name)
         if entry is None:
             raise self._unknown(actor, name)
         try:
-            await asyncio.to_thread(self._copy_from_library, name)
+            data = await asyncio.to_thread(self._copy_from_library, name)
         except OSError as exc:
             raise ToolError(f"Could not import MCP server '{name}' from the library: {exc}") from None
+        digest = snapshot_digest(data, entry["requirements"])
+        approved = digest if entry["approved_digest"] == digest else None
         rec = {
             "name": name, "owner": entry["owner"], "scope": "swarm", "task_id": None,
             "description": entry["description"], "command": self.build_command(entry["requirements"]),
             "cwd": str(self.server_dir(name)), "requirements": entry["requirements"], "origin": ORIGIN_LIBRARY,
             "status": ACTIVE, "tools": entry["tools"], "error": None, "created_at": None,
+            "digest": digest, "approved_digest": approved,
         }
-        # Library code was approved (if at all) in another swarm; honour this swarm's approval policy.
-        needs_approval = self.config.mcp.require_approval and actor != USER
+        # Library code was approved (if at all) in another swarm: this swarm's approval policy holds, unless the
+        # user approved this very snapshot (the entry's approved_digest is the digest of what was copied)
+        needs_approval = self.config.mcp.require_approval and actor != USER and approved is None
         if needs_approval:
             rec["status"] = PENDING
         self._save(rec)
@@ -1087,7 +1312,7 @@ class MCPForge:
         self.swarm.bus.emit("mcp.created", actor, server=self._public(self._record(name)))
         if needs_approval:
             self.swarm.notify(USER, "u_mcp_pending", owner=actor, name=name, description=entry["description"],
-                              wake=False)
+                              digest=digest[:12], wake=False)
         log.info("Imported MCP server %s from the library", name)
         return self._record(name)
 
@@ -1099,6 +1324,8 @@ class MCPForge:
             hint = ""
             if rec["requirements"] and not shutil.which("uv"):
                 hint = "\nNote: uv is not on PATH, so the requirements were not installed automatically."
+            if any(word in (rec["error"] or "") for word in SNAPSHOT_ERRORS):
+                hint += SNAPSHOT_HINT.format(name=name)
             return (f"MCP server '{name}' was saved but FAILED its smoke test (status: failed).\n{rec['error']}{hint}\n"
                     "Fix the code and call mcp_create again with the same name.")
         lines = []
@@ -1128,6 +1355,43 @@ def _split_command(command: str) -> list[str]:
     return list(lexer)
 
 
+def snapshot_digest(code: bytes, requirements: list[str]) -> str:
+    """The digest of a forged server's snapshot (docs/SPEC.md §11): sha256 over its start command and requirements
+    (compact ASCII JSON), a NUL byte and the bytes of its server.py."""
+    head = json.dumps({"command": list(DIGEST_COMMAND), "requirements": list(requirements)}, separators=(",", ":"))
+    return hashlib.sha256(head.encode("ascii") + b"\0" + code).hexdigest()
+
+
+def _read_server_py(folder: Path) -> bytes | None:
+    """server.py of `folder`, at most MAX_CODE_BYTES + 1 bytes (longer than any accepted code); None when it is
+    missing or not a regular file (a FIFO there would block the read)."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(folder / "server.py", flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks: list[bytes] = []
+        size = 0
+        while size <= MAX_CODE_BYTES:
+            chunk = os.read(fd, MAX_CODE_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def _syntax_error(code: str) -> str | None:
     try:
         compile(code, "server.py", "exec")
@@ -1143,5 +1407,5 @@ def _syntax_error(code: str) -> str | None:
 
 __all__ = [
     "MCPConnection", "MCPForge", "ConnectionFailed", "ConnectionLost", "SERVER_TEMPLATE", "NAME_RE",
-    "render_result", "tool_signature", "read_log_tail",
+    "render_result", "tool_signature", "read_log_tail", "snapshot_digest",
 ]

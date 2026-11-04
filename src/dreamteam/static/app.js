@@ -128,7 +128,7 @@ const I18N = {
     sk_pkgs: "Пакеты", sk_pkgs_ready: "готовы", sk_pkgs_installing: "ставятся…", sk_pkgs_queued: "в очереди",
     sk_pkgs_other: "ставит другой процесс DreamTeam", sk_pkgs_failed: "ошибка", sk_pkgs_manual: "вручную",
     sk_pkgs_log: "Журнал", sk_pkgs_hide_log: "Скрыть журнал", sk_pkgs_reinstall: "Переустановить",
-    sk_reason_off: "установка выключена в настройках", sk_reason_proposals: "выключено для скиллов, предложенных агентами", sk_reason_network: "в сессии нет сети: для скиллов, предложенных агентами, ничего не ставится",
+    sk_reason_off: "установка выключена в настройках", sk_reason_proposals: "выключено для скиллов, в которые могут писать агенты (их предложения, .claude/skills проекта)", sk_reason_network: "в сессии нет сети: для скиллов, в которые могут писать агенты (их предложения, .claude/skills проекта), ничего не ставится",
     sk_reason_unavailable: "на этой машине нет: {detail}", sk_reason_python: "нужен Python {need}, а окружения используют {have}",
     sk_reason_unsupported: "не поддерживается: {detail}",
     sk_attach_title: "Подключить скилл", sk_attach_none: "Все скиллы библиотеки и Claude Code уже подключены.", sk_attach_btn: "Подключить",
@@ -283,7 +283,7 @@ const I18N = {
     sk_pkgs: "Packages", sk_pkgs_ready: "ready", sk_pkgs_installing: "installing…", sk_pkgs_queued: "queued",
     sk_pkgs_other: "in another DreamTeam process", sk_pkgs_failed: "failed", sk_pkgs_manual: "manual",
     sk_pkgs_log: "Show log", sk_pkgs_hide_log: "Hide log", sk_pkgs_reinstall: "Reinstall",
-    sk_reason_off: "installation is off in the settings", sk_reason_proposals: "off for skills that members propose", sk_reason_network: "the session has no network: nothing is installed for skills members propose",
+    sk_reason_off: "installation is off in the settings", sk_reason_proposals: "off for skills agents can write (their proposals, the project's .claude/skills)", sk_reason_network: "the session has no network: nothing is installed for skills agents can write (their proposals, the project's .claude/skills)",
     sk_reason_unavailable: "{detail} is not available on this machine", sk_reason_python: "it needs Python {need}, the environments use {have}",
     sk_reason_unsupported: "not supported: {detail}",
     sk_attach_title: "Attach a skill", sk_attach_none: "Every skill of the library and Claude Code is attached already.", sk_attach_btn: "Attach",
@@ -1790,7 +1790,8 @@ function renderMcp() {
       <span class="badge plain">${esc(tv("origin_", s.origin))}</span>
       <span class="badge plain">${esc(tv("scope_", s.scope))}${s.scope === "task" && s.task_id ? ` <button type="button" class="link" data-open-task="${Number(s.task_id)}">#${Number(s.task_id)}</button>` : ""}</span>
       ${s.owner ? `<span class="muted">${esc(t("owner"))}: ${esc(displayName(s.owner))}</span>` : ""}
-      ${s.status === "pending" ? `<span class="spacer"></span><button class="btn small primary" data-mcp-approve="${esc(s.name)}" type="button">${esc(t("approve_mcp"))}</button>
+      ${s.digest ? `<span class="muted" title="sha256 ${esc(s.digest)}">sha256 ${esc(s.digest.slice(0, 12))}</span>` : ""}
+      ${s.status === "pending" ? `<span class="spacer"></span><button class="btn small primary" data-mcp-approve="${esc(s.name)}" data-mcp-digest="${esc(s.digest || "")}" type="button">${esc(t("approve_mcp"))}</button>
       <button class="btn small danger" data-mcp-reject="${esc(s.name)}" type="button">${esc(t("reject_mcp"))}</button>` : ""}</div>
     <div class="desc">${md(s.description || "")}</div>
     ${(s.tools || []).length ? `<div class="tools">${s.tools.map((x) => `<code>${esc(x)}</code>`).join("")}</div>` : ""}
@@ -1930,7 +1931,7 @@ function skillCardHtml(s) {
     <div class="item-head"><i class="ic ic-skill"></i><b>${esc(s.name)}</b>${badges.join("")}<span class="spacer"></span>${buttons.join("")}</div>
     <div class="desc">${md(s.description || "")}</div>
     ${skillDepsHtml(s)}
-    ${skillPreviewHtml(shown, s.from === "agent")}
+    ${skillPreviewHtml(shown, s.from === "agent" || s.from === "claude-project")}
   </div>`;
 }
 /** The library section of a standalone `dreamteam run` (no home page to manage it): Show and Delete per entry. */
@@ -1981,7 +1982,7 @@ function attachRowHtml(row) {
       ${lib ? `<span class="badge plain">${esc(lib)}</span>` : ""}${warns}${e.manual ? `<span class="badge plain">${esc(t("sk_manual"))}</span>` : ""}<span class="spacer"></span>
       <button class="btn small" type="button" data-skill-preview="${esc(row.ref)}">${esc(t(shown ? "sk_hide" : "sk_show"))}</button>
       <button class="btn small primary" type="button" data-skill-attach="${esc(row.ref)}">${esc(t("sk_attach_btn"))}</button></div>
-    <div class="desc">${md(e.description || "")}</div>${skillPreviewHtml(shown)}</div>`;
+    <div class="desc">${md(e.description || "")}</div>${skillPreviewHtml(shown, !!e.agent_writable)}</div>`;
 }
 function renderAttachList() {
   const box = $("#sk-attach-list");
@@ -2541,7 +2542,7 @@ function onDocumentClick(e) {
   else if ("file" in ds) openFile(ds.file);
   else if ("reply" in ds) setReply(Number(ds.reply));
   else if ("gotoPost" in ds) gotoPost(ds.gotoPost);
-  else if ("mcpApprove" in ds) act("mcp_approve", { name: ds.mcpApprove, approve: true });
+  else if ("mcpApprove" in ds) act("mcp_approve", { name: ds.mcpApprove, approve: true, digest: ds.mcpDigest || "" });
   else if ("mcpReject" in ds) rejectMcp(ds.mcpReject);
   else if ("triggerDel" in ds) deleteTrigger(Number(ds.triggerDel));
   else if ("jobOut" in ds) toggleJobOutput(Number(ds.jobOut));

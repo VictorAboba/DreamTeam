@@ -569,6 +569,49 @@ async def test_mcp_approval_dialog(launch, monkeypatch):
     assert await h.quit() == 0
 
 
+async def test_a_typed_approve_names_the_code_its_dialog_showed(launch, monkeypatch):
+    conn = await launch()
+    sid = (await conn.client.create_session("Tools", "Make tools"))["id"]
+    h = launch.tui(conn, session=sid)
+    await h.until(lambda: h.tui.attached and h.tui.members, 20, "the attach")
+    agent = h.tui.members[0]
+    forge = conn.manager.swarms[sid].forge
+
+    async def smoke_test(name, code, command):  # no server process: the code is never run
+        return None, [{"name": "add", "description": "Add two numbers"}], None
+
+    monkeypatch.setattr(forge, "_smoke_test", smoke_test)
+
+    def dialog_for(name: str, digest: str) -> bool:
+        return (isinstance(h.tui.dialog, MCPApprovalDialog) and h.tui.dialog.name == name
+                and h.tui.dialog.server.get("digest") == digest)
+
+    await forge.create(agent, "calc", "Arithmetic helpers", "print('calc')\n")
+    shown = forge.get("calc")["digest"]
+    await h.until(lambda: dialog_for("calc", shown), what="the first dialog")
+    h.type(ESC)  # put off: a typed /approve later names this code
+    await h.until(lambda: h.tui.mcp_shown.get("calc") == shown, what="the shown digest")
+
+    # the owner creates it again while the user types /approve (the name in any case, as the hub takes it): the new
+    # dialog waits, the old code is named
+    h.type("/approve Calc")
+    await h.until(lambda: h.tui.buffer.text == "/approve Calc")
+    await forge.create(agent, "calc", "Arithmetic helpers", "print('calc v2')\n")
+    v2 = forge.get("calc")["digest"]
+    assert v2 != shown
+    await h.until(lambda: h.tui._mcp_waiting == "calc", what="the new dialog held back")
+    await h.run("", "was not approved")
+    assert forge.get("calc")["status"] == "pending"
+
+    # the new code gets its own dialog; put off too, /approve then approves that code
+    await h.until(lambda: dialog_for("calc", v2), what="the dialog of the new code")
+    h.type(ESC)
+    await h.until(lambda: h.tui.mcp_shown.get("calc") == v2, what="the new shown digest")
+    await h.run("/approve calc", "approved and active")
+    assert forge.get("calc")["status"] == "active" and "calc" not in h.tui.mcp_shown
+    assert await h.quit() == 0
+
+
 async def test_escape_pauses_a_working_swarm(launch):
     release = asyncio.Event()
 

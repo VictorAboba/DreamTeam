@@ -56,6 +56,8 @@ HELD_NOTE = ("New files first seen after this command of {owner}{others}, commit
              "it outlives one more command, so leftovers that the next command deletes (of a test run, say) never "
              "enter the history.")
 HELD_OTHERS = " ({names} also had a command running then; git cannot tell who wrote a file)"
+HARD_LINK_REFUSED = ("'{rel}' has another hard link, which may be a file outside the workspace or inside .git: "
+                     "write_file and edit_file do not change it. Write the content to a new path instead.")
 # Directories shown but never expanded in listings (dependency caches, virtualenvs).
 NO_EXPAND = frozenset({".git", "node_modules", ".venv", "venv", "__pycache__", ".mypy_cache",
                        ".pytest_cache", ".ruff_cache", ".tox"})
@@ -73,6 +75,18 @@ _TRANSLIT = dict(zip(
     ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s",
      "t", "u", "f", "kh", "ts", "ch", "sh", "shch", "", "y", "", "e", "yu", "ya"],
 ))
+
+
+def network_anchor(given: Path) -> bool:
+    """True on Windows when `given` has a UNC or device anchor (\\\\host\\share, \\\\?\\..., \\\\.\\...):
+    resolving it would contact another host and can stall for seconds."""
+    return _WINDOWS and given.drive.startswith("\\\\")
+
+
+def lexically_inside(given: Path, *roots: Path) -> bool:
+    """True when `given` normalizes (no I/O) to one of `roots` or a path under one."""
+    norm = PurePath(os.path.normpath(given))
+    return any(norm == base or norm.is_relative_to(base) for base in roots)
 
 
 def email_slug(name: str) -> str:
@@ -158,6 +172,23 @@ def is_link(entry: os.DirEntry | Path | str) -> bool:
         return tag is None or bool(tag & _REPARSE_TAG_NAME_SURROGATE)
     except OSError:
         return False
+
+
+def _write_inside(p: Path, rel: str, data: bytes, root: Path) -> None:
+    """Write `data` to `p` as one checked step, whatever changed since the path was resolved: refused when its
+    folder now resolves outside the workspace or the file became a link. The file is opened without truncating it
+    and checked by its descriptor: one with another hard link is refused before a byte changes. O_NOFOLLOW (where
+    the platform has it) never follows a symlink in the final component."""
+    parent = p.parent.resolve()
+    if (parent != root and not parent.is_relative_to(root)) or is_link(p):
+        raise ToolError(f"Refusing to write '{rel}': its folder or the file now resolves outside the workspace.")
+    flags = os.O_WRONLY | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    with os.fdopen(os.open(p, flags, 0o666), "wb") as f:   # (the mode open() gives a new file)
+        info = os.fstat(f.fileno())
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            raise ToolError(HARD_LINK_REFUSED.format(rel=rel))
+        f.truncate(0)
+        f.write(data)
 
 
 def long_path(path: str | os.PathLike) -> str:
@@ -693,7 +724,7 @@ class Workspace:
             if given.anchor:
                 # Never touch a network path (\\host\share, \\?\..., \\.\...) that is not the workspace:
                 # resolving it would contact the host (NTLM credential leak) and can stall for seconds.
-                if _WINDOWS and given.drive.startswith("\\\\") and not self._lexically_inside(given, root):
+                if network_anchor(given) and not self._lexically_inside(given, root):
                     raise outside
                 candidate = given
             else:
@@ -712,8 +743,7 @@ class Workspace:
         return real
 
     def _lexically_inside(self, given: Path, real_root: Path) -> bool:
-        norm = PurePath(os.path.normpath(given))
-        return any(norm == base or norm.is_relative_to(base) for base in (real_root, self.root))
+        return lexically_inside(given, real_root, self.root)
 
     def rel(self, p: Path) -> str:
         """Workspace-relative posix path ("." for the root)."""
@@ -839,10 +869,23 @@ class Workspace:
             proposes = False
         raise ToolError(text + (", then call skill_propose." if proposes else "."))
 
+    @staticmethod
+    def _refuse_hardlink(rel: str, p: Path) -> None:
+        """write_file / edit_file refuse a regular file with another hard link: a hard link is no reparse point, so
+        resolve() cannot see where the other link is. Checked before the work, and again by _write_inside on the
+        opened file. A new file and a single-linked one pass."""
+        try:
+            info = p.lstat()
+        except OSError:
+            return
+        if stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            raise ToolError(HARD_LINK_REFUSED.format(rel=rel))
+
     async def write(self, actor: str, path: str, content: str) -> str:
         p = self.resolve(path)
         rel = self.rel(p)
         self._refuse_skills_mirror(actor, rel)
+        self._refuse_hardlink(rel, p)
         if p.is_dir():
             raise ToolError(f"'{rel}' is a directory; give a file path.")
         data = _encode(content or "", "content")
@@ -865,6 +908,7 @@ class Workspace:
         async with self._io_lock:
             p, rel = self._existing_file(path)
             self._refuse_skills_mirror(actor, rel)
+            self._refuse_hardlink(rel, p)
             self.check_writable(actor, rel)
             updated, replaced = self._apply_edit(rel, self._read_bytes(p, rel), old, new, replace_all)
             if updated is None:
@@ -926,10 +970,12 @@ class Workspace:
         return ""
 
     async def _store(self, p: Path, rel: str, data: bytes) -> None:
+        root = self._real_root()
+
         def _write() -> None:
             p.parent.mkdir(parents=True, exist_ok=True)
             try:
-                p.write_bytes(data)
+                _write_inside(p, rel, data, root)
             except PermissionError:
                 # a read-only file, e.g. a copy of an attached skill (the mirror's files are read-only and a copy
                 # keeps that): write_file / edit_file is the member's explicit edit, so it is made writable first.
@@ -939,7 +985,7 @@ class Workspace:
                         or info.st_mode & stat.S_IWUSR):
                     raise
                 os.chmod(p, stat.S_IMODE(info.st_mode) | stat.S_IWUSR | stat.S_IRUSR)
-                p.write_bytes(data)
+                _write_inside(p, rel, data, root)
 
         try:
             await asyncio.to_thread(_write)

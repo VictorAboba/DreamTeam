@@ -63,7 +63,7 @@ def test_registry_lookup_and_texts():
         assert rows[0]["name"] == "help" and rows[0]["description"] == TEXTS[lang]["cmd_help"]
     assert find("task").usage("en") == "/task N"
     assert find("hire").usage("ru") == "/hire Роль [| инструкции]"
-    assert find("approve").usage("en") == "/approve name | N [comment]"
+    assert find("approve").usage("en") == "/approve name [sha256] | N [comment]"
     assert names.index("roles") == names.index("agents") + 1 and names.index("team") == names.index("new") + 1
     assert names.index("jobs") == names.index("roles") + 1
     assert find("jobs").usage("en") == "/jobs [jN | stop jN]" and find("jobs").session and not find("jobs").required
@@ -204,10 +204,11 @@ async def test_select_list_and_dialog_results():
 
     mcp = MCPApprovalDialog("ru", {"name": "calc", "owner": ANNA, "scope": "task", "task_id": 3,
                                    "description": "Arithmetic helpers", "tools": ["add", "sub"],
-                                   "command": ["python", "server.py"]})
+                                   "command": ["python", "server.py"], "digest": "0123456789abcdef" * 4})
     text = plain(mcp.fragments(70))
     for needle in ("MCP-сервер ждёт одобрения", "calc", "Владелец: Анна Смирнова", "Область: участники задачи #3",
                    "Описание: Arithmetic helpers", "Команда: python server.py", "Инструменты: add, sub",
+                   "SHA-256 кода: 0123456789abcdef",
                    "❯ 1. Да, разрешить", "2. Нет, отклонить (с комментарием)", "Esc — решить позже"):
         assert needle in text
     assert all(len(line) == 70 for line in text.split("\n"))
@@ -373,8 +374,8 @@ class HubApp(FakeApp):
 
         self.client = SimpleNamespace(mode=mode, act=act, roles=roles, settings=settings)
 
-    async def decide_mcp(self, name, approve, comment=""):
-        self.calls.append(("mcp", name, approve, comment))
+    async def decide_mcp(self, name, approve, comment="", digest=""):
+        self.calls.append(("mcp", name, approve, comment, digest))
 
 
 async def test_approve_and_reject_settle_tasks_or_mcp_servers():
@@ -394,7 +395,18 @@ async def test_approve_and_reject_settle_tasks_or_mcp_servers():
     ]
     assert "Say what to fix: /reject 12 what to fix" in app.text   # a return needs a reason: no call
     assert "task_review ok" in app.text
-    assert [c for c in app.calls if c[0] == "mcp"] == [("mcp", "calc", True, ""), ("mcp", "calc", False, "not safe")]
+    assert [c for c in app.calls if c[0] == "mcp"] == [("mcp", "calc", True, "", ""), ("mcp", "calc", False, "not safe", "")]
+
+
+async def test_approve_passes_a_typed_digest_of_an_mcp_server():
+    app = HubApp(attached=True)
+    await execute(app, "/approve calc 3f2a9c01d4e5")
+    await execute(app, "/approve calc 3F2A9C01")
+    await execute(app, "/approve calc looks fine")   # not a digest: nothing more is sent, as before
+    await execute(app, "/approve calc 3f2a9c")       # under 8 hex digits: not a digest either
+    assert [c for c in app.calls if c[0] == "mcp"] == [
+        ("mcp", "calc", True, "", "3f2a9c01d4e5"), ("mcp", "calc", True, "", "3F2A9C01"),
+        ("mcp", "calc", True, "", ""), ("mcp", "calc", True, "", "")]
 
 
 JOB_STATE = {"jobs": [

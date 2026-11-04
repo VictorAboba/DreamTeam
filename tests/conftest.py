@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from dreamteam import hubauth, prompts, skill_deps
+from dreamteam import hubauth, prompts, skill_deps, web
 from dreamteam.board import Board
 from dreamteam.config import Config
 from dreamteam.db import Database, dumps, loads
@@ -169,13 +169,25 @@ def _isolated_skill_dirs(tmp_path_factory, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_hub_tokens(tmp_path_factory, monkeypatch):
-    """No test reads or writes the real store of sandbox tokens (~/.dreamteam/hub-tokens), and no hub of a test asks
-    for a token unless the test gives it one (hubauth.py)."""
+    """No test reads or writes the real store of sandbox tokens (~/.dreamteam/hub-tokens), no hub of a test asks
+    for a token unless the test gives it one (hubauth.py), and no guard takes an origin or a host name from the
+    environment (DREAMTEAM_PUBLIC_URL, DREAMTEAM_ALLOWED_HOSTS: the sandbox and docker-compose.yml set the first)."""
     monkeypatch.setenv(hubauth.TOKENS_DIR_ENV, str(tmp_path_factory.mktemp("hubtokens")))
-    for name in (hubauth.TOKEN_ENV, hubauth.DIGEST_ENV, hubauth.NO_TOKEN_ENV):
+    for name in (hubauth.TOKEN_ENV, hubauth.DIGEST_ENV, hubauth.NO_TOKEN_ENV, web.PUBLIC_URL_ENV, web.ALLOWED_HOSTS_ENV):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(hubauth, "_taken", None)
     monkeypatch.setattr(hubauth, "_taken_digest", None)
+    for name in ("_own_token", "_own_digest"):   # (the token of a hub's own clients: hubauth.own_token)
+        monkeypatch.setattr(hubauth, name, None)
+    monkeypatch.setattr(hubauth, "_own", set())
+
+
+@pytest.fixture(autouse=True)
+def _no_gateway_headers(monkeypatch):
+    """No settings check of a test meets an ANTHROPIC_CUSTOM_HEADERS or OPENAI_CUSTOM_HEADERS of the developer's
+    shell: they limit where a check may go (settings.profile_from_view)."""
+    for name in ("ANTHROPIC_CUSTOM_HEADERS", "OPENAI_CUSTOM_HEADERS"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def make_skill(folder: Path, name: str | None = "demo", description: str = "Does a demo thing.",

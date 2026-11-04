@@ -27,6 +27,8 @@ TEAM_RESET = ("-", "default", "reset", "сброс")   # /team: back to the star
 # "/approve 12", "/reject #12 ...": a task in review. Agent-built MCP servers are named like mcp_forge.NAME_RE
 # (they start with a letter) and external servers are never pending, so a number is never an MCP server.
 _TASK_REF = re.compile(r"#?\d+")
+# "/approve calc 3f2a9c01": the digest (or its start) the dialog, mcp_list or the MCP card show; the console takes it too
+_DIGEST = re.compile(r"[0-9a-fA-F]{8,64}")
 _JOB_REF = re.compile(r"[jJ%#]?(\d+)")          # "/jobs j3", "/jobs stop 3": a background job of an agent
 JOB_STOP = ("stop", "kill", "стоп")
 WRAP_UP_ON = ("", "on", "вкл")                  # /wrapup: the user's wrap-up mode on ...
@@ -628,7 +630,11 @@ async def _approve(c: CommandContext) -> None:
     if task_id is not None:
         await c.act("task_review", {"task_id": task_id, "approve": True, "comment": comment}, report=True)
         return
-    await c.app.decide_mcp(c.args.split()[0], True)
+    parts = c.args.split()
+    # "/approve name <sha256>": approved only while the server still has that digest; without one, decide_mcp sends
+    # the digest of the last dialog shown for that server (put off with Esc)
+    digest = parts[1] if len(parts) > 1 and _DIGEST.fullmatch(parts[1]) else ""
+    await c.app.decide_mcp(parts[0], True, digest=digest)
 
 
 async def _reject(c: CommandContext) -> None:

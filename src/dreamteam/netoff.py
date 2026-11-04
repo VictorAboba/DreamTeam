@@ -40,6 +40,7 @@ NETWORK_MODES = ("on", "off")
 OFFLINE_USER = "dreamteam-agent"            # the sandbox image's user for the commands of sessions without network
 OFFLINE_USER_ENV = "DREAMTEAM_OFFLINE_USER"  # "UID:GID", set by sandbox_entry once the firewall is in place
 FIREWALL_ENV = "DREAMTEAM_OFFLINE_FIREWALL"  # docker.sandbox_command: set it up (the container has NET_ADMIN)
+IMAGE_ENV = "DREAMTEAM_IMAGE"                # "1" in the sandbox image (Dockerfile): trust_workspace, check_hub_token
 CHAIN = "DREAMTEAM_OFFLINE"
 DOCKER_DNS = "127.0.0.11"                    # Docker's embedded DNS server on a user-defined network: on loopback
 DEAD_PROXY = "http://127.0.0.1:9"            # the discard port: closed, so a connection is refused at once
@@ -182,6 +183,21 @@ def reset() -> None:
 
 
 # ---- a command ---------------------------------------------------------------------------------------------------
+def git_config(env: dict[str, str], pairs: tuple[tuple[str, str], ...]) -> dict[str, str]:
+    """`env` with git settings as GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n pairs appended after those it holds already
+    (GIT_CONFIG_COUNT raised; an invalid count starts over at 0): environment() and trust_workspace() compose in
+    either order. GIT_CONFIG_COUNT needs git 2.31."""
+    out = dict(env)
+    try:
+        count = max(int(out.get("GIT_CONFIG_COUNT") or 0), 0)
+    except ValueError:
+        count = 0
+    for i, (key, value) in enumerate(pairs, count):
+        out[f"GIT_CONFIG_KEY_{i}"], out[f"GIT_CONFIG_VALUE_{i}"] = key, value
+    out["GIT_CONFIG_COUNT"] = str(count + len(pairs))
+    return out
+
+
 def environment(env: dict[str, str]) -> dict[str, str]:
     """`env` for a command without network: proxies at a closed port (loopback exempt), the package managers
     offline, git's network transports refused; in the sandbox the offline user's home."""
@@ -190,13 +206,7 @@ def environment(env: dict[str, str]) -> dict[str, str]:
         out[name] = out[name.lower()] = DEAD_PROXY
     out["NO_PROXY"] = out["no_proxy"] = LOOPBACK_HOSTS
     out.update(OFFLINE_ENV)
-    try:
-        count = max(int(out.get("GIT_CONFIG_COUNT") or 0), 0)
-    except ValueError:
-        count = 0
-    for i, (key, value) in enumerate(GIT_OFFLINE, count):
-        out[f"GIT_CONFIG_KEY_{i}"], out[f"GIT_CONFIG_VALUE_{i}"] = key, value
-    out["GIT_CONFIG_COUNT"] = str(count + len(GIT_OFFLINE))
+    out = git_config(out, GIT_OFFLINE)
     if isolation() == "docker":
         home = _offline_home()
         # root's home and the skills' uv cache are not the offline user's to write
@@ -223,6 +233,34 @@ def command(config: Any, argv: list[str] | str, env: dict[str, str]) -> tuple[li
 def in_container() -> bool:
     """Whether this process runs in a container (Docker's /.dockerenv, Podman's /run/.containerenv)."""
     return _POSIX and (os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"))
+
+
+def _enclosing_work_tree(root: Path) -> Path | None:
+    """The work tree git finds from `root` when `root` has no .git of its own: its first ancestor with a .git entry
+    (a folder, or the file of a worktree or a submodule), else None."""
+    if os.path.exists(root / ".git"):
+        return None
+    return next((parent for parent in root.parents if os.path.exists(parent / ".git")), None)
+
+
+def trust_workspace(env: dict[str, str], root: Path | str) -> dict[str, str]:
+    """`env` of a process DreamTeam starts for a session (a member's command or job, a stdio MCP server, with network
+    or without): in the Docker image (in_container(), or IMAGE_ENV, which the image sets for a runtime that leaves
+    no marker file; its git trusts no repository of another owner) git trusts the session's workspace `root` and the
+    repositories nested in it, whoever owns them (a Linux host's bind mount: the host's user, not root):
+    safe.directory=<root> and <root>/* (the prefix form needs git 2.46) as git_config pairs. A workspace without a
+    .git of its own (git off, adopted inside a repository) also trusts the work tree git finds from it, that path
+    exactly (_enclosing_work_tree). Unchanged elsewhere: git's ownership check stays as the user has it. DreamTeam's
+    own git names its repository per command instead (workspace.git_argv)."""
+    if not (in_container() or os.environ.get(IMAGE_ENV) == "1"):
+        return env
+    resolved = Path(root).resolve()
+    path = resolved.as_posix()
+    pairs = [("safe.directory", path), ("safe.directory", f"{path}/*")]
+    enclosing = _enclosing_work_tree(resolved)
+    if enclosing is not None:
+        pairs.append(("safe.directory", enclosing.as_posix()))
+    return git_config(env, tuple(pairs))
 
 
 def shown(kind: str | None) -> str | None:

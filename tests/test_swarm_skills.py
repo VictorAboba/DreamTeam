@@ -401,7 +401,7 @@ async def test_a_copy_of_the_mirror_can_be_edited_and_proposed(swarm, tmp_path):
     text, is_error = await call_tool(ctx, "skill_propose", {"path": "drafts/fold-copy"})
     assert not is_error, text
     assert swarm.skills.get("fold-better").owner == member
-    # the mirror itself stays refused and read-only; a file with other hard links is not made writable
+    # the mirror itself stays refused and read-only; a file with other hard links is refused, never made writable
     text, is_error = await call_tool(ctx, "write_file", {"path": ".scratch/_skills/fold/SKILL.md", "content": "x"})
     assert is_error and not writable(mirror(swarm, "fold") / "SKILL.md")
     shared = Path(swarm.workspace.root, "shared.txt")
@@ -413,7 +413,7 @@ async def test_a_copy_of_the_mirror_can_be_edited_and_proposed(swarm, tmp_path):
     os.chmod(shared, stat.S_IREAD)
     try:
         text, is_error = await call_tool(ctx, "write_file", {"path": "shared.txt", "content": "two\n"})
-        assert is_error and "Permission denied" in text and (tmp_path / "other-link.txt").read_text() == "one\n"
+        assert is_error and "hard link" in text and (tmp_path / "other-link.txt").read_text() == "one\n"
     finally:
         os.chmod(shared, stat.S_IREAD | stat.S_IWRITE)
 
@@ -1519,12 +1519,34 @@ async def test_a_proposals_packages_install_apart_from_the_users_skills(tmp_path
     await off.start(run_agents=False)
     try:
         text, _ = await propose(off, first(off), draft(off, "reader", "Reads PDFs.", files=dict(REQS)))
-        assert text.endswith(" Its requirements.txt is not installed automatically: turned off for skills that "
-                             "members propose."), text
+        assert text.endswith(" Its requirements.txt is not installed automatically: turned off for members' "
+                             "proposals and the workspace's Claude Code skills, which agents can write."), text
         assert "installed automatically" not in notes_of(off, USER)[-1]["text"]
     finally:
         await off.stop()
         off.close()
+
+
+async def test_a_workspace_claude_skill_is_installed_like_a_proposal(tmp_path):
+    # agents can write the workspace's .claude/skills: install_proposals decides for it; the user's own skills install
+    fake = fake_installers()
+    s = new_swarm(make_config(tmp_path, skills={"install_proposals": False}))
+    await s.start(run_agents=False)
+    try:
+        make_skill(s.workspace.root / ".claude" / "skills" / "notes", "notes", "Takes notes.", dict(REQS))
+        skill, _ = await s.skills.attach(USER, "claude-project:notes")
+        assert skill.frm == "claude-project"
+        (state,) = s.skills.deps("notes")
+        assert state["status"] == "off" and state["reason"] == {"code": "proposals"}
+        assert s.skills.deps_fragment("notes", "en") == prompts.t(
+            "en", "skills_deps_manual", files="requirements.txt", reason=prompts.t("en", "deps_reason_proposals"))
+        add_to_library(s, tmp_path, "pdf", "Reads PDFs.", REQS)
+        await s.skills.attach(USER, "pdf")
+        await settled(s, "pdf")
+        assert [c["trust"] for c in fake.calls] == ["user"]   # only the library skill was built
+    finally:
+        await s.stop()
+        s.close()
 
 
 async def test_a_node_skill_gets_a_link_to_this_sessions_view(swarm, tmp_path):

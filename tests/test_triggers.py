@@ -478,6 +478,54 @@ def test_file_functions_unsafe_paths_are_false(engine, swarm, clock):
     assert env.fn_file_exists("bad\x00name") is False
 
 
+def test_safe_path_resolves_relative_and_rejects_escapes(swarm):
+    from dreamteam.triggers import safe_path
+    root = swarm.config.workspace_dir
+    assert safe_path(root, "docs/report.md") == root.resolve() / "docs" / "report.md"
+    assert safe_path(root, "../secret.txt") is None
+    assert safe_path(root, ".git/config") is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows UNC/device path rules")
+def test_safe_path_refuses_unc_and_device_paths_without_contacting_host(swarm, monkeypatch):
+    # a UNC or device path is refused before anything resolves it
+    from dreamteam.triggers import safe_path
+    root = swarm.config.workspace_dir
+    seen: list[str] = []
+    real = os.path.realpath
+
+    def spy(p, *a, **k):
+        seen.append(os.fspath(p))
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(os.path, "realpath", spy)
+    for bad in (r"\\host.invalid\share\x", "//host.invalid/share/x",
+                r"\\?\C:\Windows\win.ini", r"\\.\C:\Windows\win.ini"):
+        assert safe_path(root, bad) is None
+    assert not any(p.startswith(("\\\\", "//")) for p in seen)
+
+
+async def test_evaluate_pass_probes_files_off_the_event_loop(engine, swarm, monkeypatch):
+    # the trigger loop stats the watched files in a thread, so a slow path cannot block it
+    import threading
+    import dreamteam.triggers as triggers_mod
+    root = swarm.config.workspace_dir
+    (root / "watched.txt").write_text("hi", encoding="utf-8")
+    trig = engine.create(ANNA, "file_exists('watched.txt')")   # compiled and cached on the loop
+    main = threading.get_ident()
+    threads: list[int] = []
+    real_probe = triggers_mod._file_probe
+
+    def spy(r, p):
+        threads.append(threading.get_ident())
+        return real_probe(r, p)
+
+    monkeypatch.setattr(triggers_mod, "_file_probe", spy)
+    fired = await engine._evaluate_pass()
+    assert fired == 1 and engine.get(trig["id"])["fire_count"] == 1
+    assert threads and all(t != main for t in threads)   # every file stat ran off the loop thread
+
+
 def test_time_functions(engine, clock):
     past = datetime.fromtimestamp(clock.now - 3600).strftime("%Y-%m-%d %H:%M")
     future = datetime.fromtimestamp(clock.now + 3600).strftime("%Y-%m-%dT%H:%M:%S")

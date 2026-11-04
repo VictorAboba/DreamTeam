@@ -32,7 +32,7 @@ from .models import USER, AgentKind, Status, ToolError
 from .procs import alive_all, sweep_token
 from .shell import (KILL_SETTLE, PENDING_MAX, SETTLE_POLL, RunningCommand, kill_after_cancel, last_serial,
                     start_command, truncate_middle)
-from .workspace import format_size, scratch_is_local, scratch_rel
+from .workspace import format_size, is_link, scratch_is_local, scratch_rel
 
 log = logging.getLogger(__name__)
 
@@ -224,6 +224,16 @@ def shown_log(log_value: str | None) -> str:
     if log_value and Path(log_value).is_absolute():
         return f"{log_value} (outside the workspace: read it with shell)"
     return log_value or ""
+
+
+def _inside(path: Path, root: Path) -> bool:
+    """`path` resolves to `root` or inside it (a job-log folder may have become a link or junction out of the
+    workspace since it was made)."""
+    try:
+        real, base = path.resolve(), root.resolve()
+    except (OSError, RuntimeError):   # (RuntimeError: a link loop, Python before 3.13)
+        return False
+    return real == base or real.is_relative_to(base)
 
 
 def _clock(ts: float) -> str:
@@ -476,7 +486,8 @@ class JobManager:
                 raise ToolError(BACKGROUND_ERRORS[note].format(**self._note_args(actor, note)))
         requested = BACKGROUND_GRACE if background else float(timeout)
         wait = self._wait_for(actor, requested)
-        env = self.command_env(env)
+        # in a container git trusts the session's own workspace only (netoff.trust_workspace, docs/SPEC.md §18.3)
+        env = netoff.trust_workspace(self.command_env(env), self.swarm.workspace.root)
         # a session without network (docs/SPEC.md §7.2): the command, and so the job it may become, runs isolated
         offline = netoff.is_off(self.swarm.config)
         if offline:
@@ -653,7 +664,8 @@ class JobManager:
     # --- adoption -----------------------------------------------------------------------------------------------
     def _log_location(self, owner: str, job_id: int) -> tuple[str, Path]:
         """(the `log` column, the file) of job `job_id`: `.scratch/<member>/jobs/j<N>.log`, or
-        `<data_dir>/jobs/j<N>.log` when `.scratch` is not a plain folder of the workspace (a link, a file)."""
+        `<data_dir>/jobs/j<N>.log` when `.scratch` or the `jobs` folder is not a plain folder of the workspace
+        (a link or junction out of it, a file)."""
         name = f"j{job_id}.log"
         workspace = self.swarm.workspace
         root = Path(workspace.root)
@@ -663,7 +675,9 @@ class JobManager:
             folder = root / scratch_rel(owner) / "jobs"
             try:
                 folder.mkdir(parents=True, exist_ok=True)
-                return f"{scratch_rel(owner)}jobs/{name}", folder / name
+                if _inside(folder, root) and not is_link(folder):
+                    return f"{scratch_rel(owner)}jobs/{name}", folder / name
+                log.warning("job log folder %s is not inside the workspace; using the data dir", folder)
             except OSError as exc:
                 log.warning("cannot create %s: %s", folder, exc)
         folder = Path(self.swarm.config.data_dir) / "jobs"
@@ -677,7 +691,11 @@ class JobManager:
         if not log_value:
             return None
         path = Path(log_value)
-        return path if path.is_absolute() else Path(self.swarm.workspace.root) / log_value
+        if path.is_absolute():
+            return path
+        root = Path(self.swarm.workspace.root)
+        full = root / log_value
+        return full if _inside(full, root) else None
 
     def _adopt(self, owner: str, command: str, cmd: RunningCommand, origin: str, *, exit_code: int | None = None,
                command_done: bool = False) -> Job:

@@ -296,6 +296,17 @@ def _token_missing(host: str, port: int) -> bool:
     return False
 
 
+def _open_board(url: str, base: str) -> None:
+    """Open this process's own hub at `url` in the browser, with `?token=` when a token is known here (its own address
+    `base`: DREAMTEAM_HUB_TOKEN goes there, as a cookie, whatever its host). A hub started with
+    DREAMTEAM_HUB_TOKEN_SHA256 alone never has the token, and its board answers 401: say how to get in."""
+    opened = hubauth.browser_url(url, user_url=base)
+    webbrowser.open(opened)
+    if hubauth.token_link_needed(url, opened):
+        print(f"  The board asks for the hub's token: open {url.rstrip('/')}/?token=<the token whose SHA-256 is in "
+              f"{hubauth.DIGEST_ENV}>", file=sys.stderr)
+
+
 def _server_error(server: asyncio.Task | None) -> BaseException | None:
     if server is None or not server.done() or server.cancelled():
         return None
@@ -306,9 +317,12 @@ def _start_console(loop: asyncio.AbstractEventLoop, base: str, lang: str, stop: 
     """Run the terminal console in a daemon thread: a thread blocked in input() must not keep the process
     alive after the hub stopped (asyncio.to_thread would make asyncio.run wait for it forever). `base` is this
     process's own hub (its bind address or DREAMTEAM_PUBLIC_URL, never a hub.json's): the console sends it
-    DREAMTEAM_HUB_TOKEN even when it is not a loopback one (`serve --host <a LAN address>`)."""
+    DREAMTEAM_HUB_TOKEN even when it is not a loopback one (`serve --host <a LAN address>`), and hubauth.own_token()
+    (hubauth.serving): a hub with a token asks its own loopback too, and one started with DREAMTEAM_HUB_TOKEN_SHA256
+    alone has no other token for its console."""
     from . import console as console_module
 
+    hubauth.serving(base)
     done = loop.create_future()
 
     def finished() -> None:
@@ -410,8 +424,8 @@ async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal
             return code
         _write_hub_file(project, base, config)
         print(f"DreamTeam \"{config.swarm.name}\" is running.\n  Board: {base}\n  MCP:   {base}/mcp", file=sys.stderr)
-        if open_browser:  # (its own address: DREAMTEAM_HUB_TOKEN goes there, as a cookie, whatever its host)
-            webbrowser.open(hubauth.browser_url(base, user_url=base))
+        if open_browser:
+            _open_board(base, base)
         stopper = asyncio.ensure_future(stop.wait())
         waiters = {server, stopper}
         if console:
@@ -781,8 +795,8 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
             return code
         print(f"DreamTeam is running.\n  Sessions: {base}/\n  MCP:      {base}/mcp\n  Home:     {home}",
               file=sys.stderr)
-        if open_browser:  # (its own address: DREAMTEAM_HUB_TOKEN goes there, as a cookie, whatever its host)
-            webbrowser.open(hubauth.browser_url(base + (f"/s/{focus}/" if focus else "/"), user_url=base))
+        if open_browser:
+            _open_board(base + (f"/s/{focus}/" if focus else "/"), base)
         stopper = asyncio.ensure_future(stop.wait())
         waiters = {server, stopper}
         if console:

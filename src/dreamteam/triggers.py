@@ -19,6 +19,7 @@ from typing import Any, Callable
 
 from .db import dumps, loads
 from .models import USER, Status, ToolError
+from .workspace import lexically_inside, network_anchor
 
 log = logging.getLogger(__name__)
 
@@ -112,9 +113,16 @@ def parse_when(text: str) -> float:
 
 
 def safe_path(root: Path, path: str) -> Path | None:
-    """Resolve `path` inside the workspace root; None if it escapes, touches .git or is malformed."""
+    """Resolve `path` inside the workspace root; None if it escapes, touches .git or is malformed. A UNC or
+    Windows device anchor (\\\\host\\share, \\\\?\\..., \\\\.\\...) outside the workspace is refused before any
+    resolve(), so no other host is contacted and nothing stalls (as in Workspace.resolve)."""
+    if "\x00" in path:          # resolve() lets it through on Windows with Python 3.13, then stat() raises
+        return None
     try:
         base = root.resolve()
+        given = Path(path)
+        if given.anchor and network_anchor(given) and not lexically_inside(given, base, root):
+            return None
         target = (base / path).resolve()
         rel = target.relative_to(base)
     except (ValueError, OSError, RuntimeError, TypeError):
@@ -181,15 +189,21 @@ class _Marks:
     files: dict[str, tuple[int, int] | None] = field(default_factory=dict)  # path -> (mtime_ns, size)
 
 
-def _file_signature(root: Path, path: str) -> tuple[int, int] | None:
+def _file_probe(root: Path, path: str) -> tuple[int, int, float] | None:
+    """(mtime_ns, size, mtime) of the workspace file, or None if the path is unsafe or cannot be stat'd."""
     target = safe_path(root, path)
     if target is None:
         return None
     try:
         st = os.stat(target)
-    except OSError:
+    except (OSError, ValueError):
         return None
-    return st.st_mtime_ns, st.st_size
+    return st.st_mtime_ns, st.st_size, st.st_mtime
+
+
+def _file_signature(root: Path, path: str) -> tuple[int, int] | None:
+    probe = _file_probe(root, path)
+    return None if probe is None else probe[:2]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -198,7 +212,7 @@ def _file_signature(root: Path, path: str) -> tuple[int, int] | None:
 
 class _Env:
     def __init__(self, swarm: Any, owner: str, created_at: float, reference: float, now: float,
-                 marks: _Marks | None = None):
+                 marks: _Marks | None = None, fs: dict[str, tuple[int, int, float] | None] | None = None):
         self.swarm = swarm
         self.db = swarm.db
         self.owner = owner
@@ -206,6 +220,7 @@ class _Env:
         self.reference = reference      # creation or last fire
         self.now = now
         self.marks = marks              # what was already seen at the reference point
+        self.fs = fs or {}              # file stats probed off the loop; empty for a direct (sync) call
 
     def _statuses(self, ids: tuple[int, ...]) -> dict[int, str]:
         marks = ",".join("?" for _ in ids)
@@ -283,24 +298,24 @@ class _Env:
             for r in self.db.all(sql, params)
         )
 
-    def _file(self, path: str) -> Path | None:
-        return safe_path(self.swarm.config.workspace_dir, path)
+    def _probe(self, path: str) -> tuple[int, int, float] | None:
+        """The file's (mtime_ns, size, mtime) from the pass cache, or a direct stat when the engine is
+        driven synchronously (tests); None if the path is unsafe or cannot be stat'd."""
+        if path in self.fs:
+            return self.fs[path]
+        return _file_probe(self.swarm.config.workspace_dir, path)
 
     def fn_file_exists(self, path: str) -> bool:
-        target = self._file(path)
-        return bool(target and target.exists())
+        return self._probe(path) is not None
 
     def fn_file_changed(self, path: str) -> bool:
-        target = self._file(path)
-        if target is None:
+        probe = self._probe(path)
+        if probe is None:
             return False
-        try:
-            st = os.stat(target)
-        except OSError:
-            return False
+        mtime_ns, size, mtime = probe
         if self.marks is not None and path in self.marks.files:
-            return (st.st_mtime_ns, st.st_size) != self.marks.files[path]   # appeared or modified
-        return st.st_mtime > self.reference
+            return (mtime_ns, size) != self.marks.files[path]   # appeared or modified
+        return mtime > self.reference
 
     def fn_after(self, when: str) -> bool:
         return self.now >= parse_when(when)
@@ -349,6 +364,7 @@ class CompiledCondition:
     every: tuple[float, ...]          # periods of every() calls; non-empty -> periodic trigger
     functions: frozenset[str]
     files: tuple[str, ...] = ()       # paths watched by file_changed()
+    probes: tuple[str, ...] = ()      # workspace paths probed by file_exists()/file_changed()
 
     @property
     def periodic(self) -> bool:
@@ -365,6 +381,7 @@ class _Compiler:
         self.root = workspace_root
         self.every: list[float] = []
         self.files: list[str] = []
+        self.probes: list[str] = []
         self.functions: set[str] = set()
 
     def compile(self, source: str) -> CompiledCondition:
@@ -390,7 +407,7 @@ class _Compiler:
         if not self.functions:
             raise _fail("it calls no function, so it never changes; use e.g. done(3) or every(600)")
         return CompiledCondition(source, fn, tuple(self.every), frozenset(self.functions),
-                                 tuple(dict.fromkeys(self.files)))
+                                 tuple(dict.fromkeys(self.files)), tuple(dict.fromkeys(self.probes)))
 
     # --- expressions --------------------------------------------------------------------------
     def expr(self, node: ast.expr) -> Evaluator:
@@ -471,6 +488,8 @@ class _Compiler:
             self.every.append(float(named["seconds"]))
         elif name == "file_changed":
             self.files.append(named["path"])
+        if name in ("file_exists", "file_changed"):
+            self.probes.append(named["path"])
         self.functions.add(name)
         method = getattr(_Env, f"fn_{name}")
         return lambda env: method(env, *pos, **named)
@@ -703,6 +722,7 @@ class TriggerEngine:
         self._cache: dict[str, CompiledCondition] = {}
         self._marks: dict[int, _Marks] = {}     # trigger id -> what it had seen at its reference point
         self._fires: dict[int, collections.deque[float]] = {}   # recent fire times of repeating triggers
+        self._probes: dict[str, tuple[int, int, float] | None] = {}   # file stats for the current pass (off loop)
         swarm.bus.listen(self._on_event)
 
     # --- conditions ---------------------------------------------------------------------------
@@ -823,12 +843,37 @@ class TriggerEngine:
         finally:
             self._evaluating = False
 
+    def _watched_paths(self) -> set[str]:
+        """Workspace paths the active triggers probe, stat'd together off the loop before a pass."""
+        paths: set[str] = set()
+        for row in self.swarm.db.all("SELECT condition FROM triggers WHERE active = 1"):
+            try:
+                paths.update(self.compile(row["condition"]).probes)
+            except ToolError:
+                pass
+        return paths
+
+    def _probe_files(self, paths: set[str]) -> dict[str, tuple[int, int, float] | None]:
+        root = self.swarm.config.workspace_dir
+        return {path: _file_probe(root, path) for path in paths}
+
+    async def _evaluate_pass(self) -> int:
+        """Stat the watched files off the event loop, then evaluate on it: no file resolve/stat blocks the
+        loop, so a slow path cannot stall the swarm."""
+        paths = self._watched_paths()
+        self._probes = await asyncio.to_thread(self._probe_files, paths) if paths else {}
+        try:
+            return self.evaluate_all()
+        finally:
+            self._probes = {}
+
     def _evaluate_one(self, row: Any) -> int:
         now = self.clock()
         reference = row["last_fired"] if row["last_fired"] is not None else row["created_at"]
         try:
             compiled = self.compile(row["condition"])
-            env = _Env(self.swarm, row["owner"], row["created_at"], reference, now, self._marks.get(row["id"]))
+            env = _Env(self.swarm, row["owner"], row["created_at"], reference, now, self._marks.get(row["id"]),
+                       self._probes)
             value = bool(compiled.evaluate(env))
         except Exception as e:  # any failure of a user condition is reported, never raised
             self._set_error(row["id"], f"{EVAL_ERROR_PREFIX}{_describe(e)}")
@@ -850,15 +895,22 @@ class TriggerEngine:
         self.swarm.db.execute("UPDATE triggers SET last_error = ? WHERE id = ? AND last_error IS NOT ?",
                               (error, trigger_id, error))
 
+    def _signature(self, path: str) -> tuple[int, int] | None:
+        """file_changed() mark for `path`, from the pass cache when one populated it, else a direct stat."""
+        if path in self._probes:
+            probe = self._probes[path]
+            return None if probe is None else probe[:2]
+        return _file_signature(self.swarm.config.workspace_dir, path)
+
     def _capture_marks(self, compiled: CompiledCondition) -> _Marks | None:
         functions = compiled.functions
         if "message" not in functions and "comment" not in functions and not compiled.files:
             return None
-        db, root = self.swarm.db, self.swarm.config.workspace_dir
+        db = self.swarm.db
         return _Marks(
             message_id=db.scalar("SELECT COALESCE(MAX(id), 0) FROM messages") if "message" in functions else None,
             comment_id=db.scalar("SELECT COALESCE(MAX(id), 0) FROM comments") if "comment" in functions else None,
-            files={path: _file_signature(root, path) for path in compiled.files},
+            files={path: self._signature(path) for path in compiled.files},
         )
 
     def _forget(self, trigger_id: int) -> None:
@@ -885,7 +937,7 @@ class TriggerEngine:
         leave the trigger true (and silent) forever."""
         try:
             env = _Env(self.swarm, row["owner"], row["created_at"], fired_at, max(self.clock(), fired_at),
-                       self._marks.get(row["id"]))
+                       self._marks.get(row["id"]), self._probes)
             value = bool(compiled.evaluate(env))
         except Exception:  # reported by the next regular evaluation
             return
@@ -980,7 +1032,7 @@ class TriggerEngine:
                 pass
             self._dirty.clear()
             try:
-                self.evaluate_all()
+                await self._evaluate_pass()
             except Exception:
                 log.exception("trigger evaluation failed")
             # Event.wait() returns without suspending when the event is already set, and actions mark

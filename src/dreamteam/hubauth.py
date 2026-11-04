@@ -1,16 +1,18 @@
-"""The hub token (docs/SPEC.md §14 "Hub token"): what a hub reachable from other hosts asks of every request that does
-not come from its own loopback, and how DreamTeam's own clients find it.
+"""The hub token (docs/SPEC.md §14 "Hub token"): what a hub that has one asks of every request, from its own loopback
+too, and how DreamTeam's own clients find it.
 
 Inside the Docker sandbox the hub has to listen on 0.0.0.0: a published port reaches the container's interface, never
 its loopback. Every other container on the same bridge then reaches it too, so `dreamteam sandbox` makes a fresh token
 for each container, keeps it on the host, outside every folder it mounts, for `dreamteam console`, `tui`, `mcp` and
 `status` (store_token), and gives the container only its SHA-256 (DIGEST_ENV): the container's environment never
 holds the token itself, and a digest lets nobody in. The hub compares the digest of what a request sends with it.
-TOKEN_ENV, the token itself, is for the clients on the host and for a hub started without `dreamteam sandbox` (docker
-compose). DreamTeam takes both out of its os.environ at once (take_env_token): no process it starts inherits them.
-Which token a client sends where is decided in client_tokens alone.
-A peer on the hub's own loopback needs none. Anything on the hub's computer that forwards connections to it (a reverse
-proxy, an ssh tunnel) needs an authentication of its own: its clients arrive from loopback too."""
+TOKEN_ENV, the token itself, is for the clients on the host and for a hub started with it there (docker compose gives
+its container DIGEST_ENV, computed on the host). DreamTeam takes both out of its os.environ at once (take_env_token):
+no process it starts inherits them. Which token a client sends where is decided in client_tokens alone.
+A peer on the hub's own loopback needs the token too: the agents' commands in the sandbox's container come from
+there. The clients in the hub's own process (the console of `serve`/`run`, the TUI's launcher) can send own_token(),
+kept in memory, besides: a hub with DIGEST_ENV alone never has the token itself. A hub without a token (`dreamteam
+serve` on 127.0.0.1 by default) asks nothing of anyone."""
 
 from __future__ import annotations
 
@@ -39,6 +41,9 @@ FROM_ENV = object()   # web.GuardMiddleware's default token: hub_digest()
 
 _taken: str | None = None          # TOKEN_ENV as main() found it (take_env_token)
 _taken_digest: str | None = None   # DIGEST_ENV as main() found it
+_own_token: str | None = None      # the token of the clients in this process's own hub (own_token)
+_own_digest: str | None = None
+_own: set[tuple[str, str, int]] = set()   # (scheme, host, port) of the hubs with a token this process serves
 
 
 class TokenRequired(RuntimeError):
@@ -109,6 +114,23 @@ def new_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+def own_token() -> str:
+    """The token of the clients in a hub's own process (the console of `serve`/`run`, the TUI's launcher: serving),
+    made at first use and kept in this process's memory alone: never stored, logged or put in a URL. Every guard of
+    this process that has a token takes it as a header (web.GuardMiddleware, own_digest): a hub started with
+    DIGEST_ENV alone never has the token itself, and asks its own console for one too."""
+    global _own_token, _own_digest
+    if _own_token is None:
+        _own_token = new_token()
+        _own_digest = digest(_own_token)
+    return _own_token
+
+
+def own_digest() -> str | None:
+    """The SHA-256 of own_token(); None while this process has made none (no client here serves its own hub)."""
+    return _own_digest
+
+
 def matches(given: str | None, token_digest: str) -> bool:
     """`given` is the token whose SHA-256 is `token_digest`, compared in constant time."""
     if not given:
@@ -131,20 +153,9 @@ def _ip(text: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     return mapped or ip
 
 
-def is_loopback(address: str) -> bool:
-    ip = _ip(address)
-    return ip is not None and ip.is_loopback
-
-
 def same_ip(a: str, b: str) -> bool:
     ip_a, ip_b = _ip(a), _ip(b)
     return ip_a is not None and ip_a == ip_b
-
-
-def peer_is_loopback(scope) -> bool:
-    """The ASGI connection comes from the hub's own loopback (a peer that is not an IP address does not)."""
-    client = scope.get("client")
-    return bool(client) and is_loopback(str(client[0]))
 
 
 # ---- clients on the host ------------------------------------------------------------------------
@@ -243,10 +254,20 @@ def _env_allowed(url: str, user_url: str | None) -> bool:
     return endpoint is not None and (endpoint[1] in LOOPBACK_NAMES or _endpoint(user_url or "") == endpoint)
 
 
+def serving(url: str) -> None:
+    """This process serves the hub at `url` and is its client too (cli._start_console, the TUI's _start_launcher):
+    client_tokens offers own_token() to its scheme, host and port. Nothing for a hub without a token, which asks
+    nothing."""
+    endpoint = _endpoint(url)
+    if endpoint is not None and hub_digest() is not None:
+        own_token()
+        _own.add(endpoint)
+
+
 _accepted: dict[tuple[str, str, int], str] = {}   # the token each hub took last (tried first while still allowed)
 
 
-def client_tokens(url: str, *, user_url: str | None = None) -> list[str]:
+def client_tokens(url: str, *, user_url: str | None = None, own: bool = True) -> list[str]:
     """The tokens DreamTeam's clients may send to the hub at `url`, in the order they try them. Every client looks
     them up for each request (or WebSocket connect) and tries the next one when the hub refuses (`refused`): a
     `dreamteam sandbox` started again on the same port has a new token while the console, the TUI or the
@@ -256,14 +277,18 @@ def client_tokens(url: str, *, user_url: str | None = None) -> list[str]:
       localhost, [::1]: where the sandbox publishes its hub), and so only to that port's own hub;
     - TOKEN_ENV (env_token): to a loopback URL, or to the hub address the user typed on the command line
       (`user_url`: `dreamteam console --url`; its scheme, host and port), whatever its host; the clients of a hub
-      in their own process (the console of `serve`/`run`, the TUI's launcher) pass its own address as `user_url`.
+      in their own process (the console of `serve`/`run`, the TUI's launcher) pass its own address as `user_url`;
+    - own_token(): to the hub this process serves itself (serving), after the others: a hub started with DIGEST_ENV
+      alone takes no other token from its own console and TUI. `own=False` leaves it out, for a browser, which is no
+      client in this process (browser_url, client_token).
 
     Every other URL gets none, above all one read from a hub.json: it sits in the folder the container mounts, the
     agents can write it, and it must not take a client's token anywhere else. The stored token comes before
     TOKEN_ENV (a stale one, left by a sandbox killed before it could remove it, costs one refused request), except
     that the token the hub took last goes first."""
     tokens = [stored_token(_port(url)) if is_loopback_url(url) else None,
-              env_token() if _env_allowed(url, user_url) else None]
+              env_token() if _env_allowed(url, user_url) else None,
+              _own_token if own and _endpoint(url) in _own else None]
     allowed = [t for t in tokens if t]
     last = _accepted.get(_endpoint(url))  # type: ignore[arg-type]
     return list(dict.fromkeys([last, *allowed] if last in allowed else allowed))
@@ -284,7 +309,7 @@ def refused(status: int, headers) -> bool:
 
 def client_token(url: str) -> str | None:
     """The token a client that cannot try another one sends to the hub at `url` (a browser URL)."""
-    return next(iter(client_tokens(url)), None)
+    return next(iter(client_tokens(url, own=False)), None)
 
 
 def auth_headers(url: str) -> dict[str, str]:
@@ -361,7 +386,7 @@ def httpx_auth(user_url: str | None = None):
 def browser_url(url: str, *, user_url: str | None = None) -> str:
     """`url` with `?token=` when its hub has a token known here (client_tokens): the hub sets its cookie and
     redirects to `url`."""
-    token = next(iter(client_tokens(url, user_url=user_url)), None)
+    token = next(iter(client_tokens(url, user_url=user_url, own=False)), None)   # (own_token: this process's alone)
     if not token:
         return url
     parts = urllib.parse.urlsplit(url)
@@ -370,8 +395,16 @@ def browser_url(url: str, *, user_url: str | None = None) -> str:
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path or "/", query, parts.fragment))
 
 
+def token_link_needed(url: str, opened: str) -> bool:
+    """browser_url gave this process's own hub's `url` back as it is (`opened`: no token known here for a browser)
+    although the hub asks for one: a hub started with DIGEST_ENV alone never has the token, and its board answers 401
+    until it is opened with `?token=` of the token whose SHA-256 the hub was given. Its callers (cli's `serve` and
+    `run --open`, the TUI's /web on its own launcher) say so."""
+    return opened == url and hub_digest() is not None
+
+
 __all__ = ["DIGEST_ENV", "NO_TOKEN_ENV", "TOKEN_ENV", "TOKENS_DIR_ENV", "TokenRequired", "auth_headers", "browser_url",
            "client_token", "client_tokens", "cookie_name", "digest", "env_token", "forget_token", "httpx_auth",
-           "hub_digest", "is_loopback_url", "matches", "new_token", "no_token_allowed", "open_hub",
-           "peer_is_loopback", "refused",
-           "store_token", "stored_token", "take_env_token", "token_taken"]
+           "hub_digest", "is_loopback_url", "matches", "new_token", "no_token_allowed", "open_hub", "own_digest",
+           "own_token", "refused", "serving", "store_token", "stored_token", "take_env_token", "token_link_needed",
+           "token_taken"]

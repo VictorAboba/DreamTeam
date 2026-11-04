@@ -80,6 +80,8 @@ async def mcp_list(ctx: ToolContext, args: dict[str, Any]) -> str:
         tools = ", ".join(s.get("tools") or []) or "tools discovered on first use"
         line = f"{s['name']} [{s['status']}, {s['origin']}, scope={s['scope']}] by {s.get('owner') or '-'}: {s.get('description') or ''}"
         line += f"\n    tools: {tools}"
+        if s.get("digest"):  # what mcp_approve's digest names (the MCP card shows it too); a configured server has none
+            line += f"\n    digest (sha256): {s['digest'][:12]}"
         if s.get("error") and s["status"] != "active":
             line += f"\n    error: {trim(s['error'], 200)}"
         lines.append(line)
@@ -126,9 +128,14 @@ async def mcp_call(ctx: ToolContext, args: dict[str, Any]) -> str:
     en="Approve or reject an MCP server that waits for the user's approval (status pending in mcp_list).",
     ru="Одобрить или отклонить MCP-сервер, ожидающий одобрения пользователя (статус pending в mcp_list).",
     properties={"name": {"type": "string"}, "approve": {"type": "boolean"},
-                "comment": {"type": "string", "description": "Shown to the owner (e.g. why it was rejected)"}},
+                "comment": {"type": "string", "description": "Shown to the owner (e.g. why it was rejected)"},
+                "digest": {"type": "string", "description": "The digest mcp_list and the MCP card show (in full or "
+                           "its first 8 or more hex digits): a SHA-256 over the start command, the requirements and "
+                           "server.py, not of server.py alone. The approval is refused when the server's current "
+                           "digest is another one"}},
     required=["name", "approve"],
     audience=("user",),
 )
 async def mcp_approve(ctx: ToolContext, args: dict[str, Any]) -> str:
-    return await ctx.swarm.forge.approve(ctx.actor, args["name"], args["approve"], args.get("comment") or "")
+    return await ctx.swarm.forge.approve(ctx.actor, args["name"], args["approve"], args.get("comment") or "",
+                                         digest=args.get("digest") or "")

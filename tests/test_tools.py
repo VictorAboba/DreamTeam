@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import json
 import re
 import subprocess
@@ -1285,6 +1286,22 @@ async def test_mcp_approval_by_the_user(swarm):
     assert "n_mcp_approved" in notifications(swarm, a)
     assert await ok(swarm, a, "mcp_call", {"server": "calc_two", "tool": "add", "arguments": {"a": 1, "b": 1}}) == "2"
     assert "not waiting for approval" in await err(swarm, USER, "mcp_approve", {"name": "calc_two", "approve": False})
+
+
+async def test_mcp_list_shows_the_digest_that_mcp_approve_takes(swarm):
+    a = llm_members(swarm)[0]
+    swarm.config.mcp.require_approval = True
+    await ok(swarm, a, "mcp_create", {"name": "calc_three", "description": "Arithmetic", "code": SERVER})
+    digest = swarm.forge.get("calc_three")["digest"]
+    listing = await ok(swarm, USER, "mcp_list")
+    assert "calc_three [pending, workspace, scope=swarm]" in listing
+    assert f"\n    digest (sha256): {digest[:12]}" in listing
+    # the digest covers the start command and the requirements too: a SHA-256 of server.py alone does not match
+    text = await err(swarm, USER, "mcp_approve", {"name": "calc_three", "approve": True,
+                                                   "digest": hashlib.sha256(SERVER.encode()).hexdigest()})
+    assert "does not match its current digest" in text and digest[:12] in text
+    assert "approved and active" in await ok(swarm, USER, "mcp_approve", {"name": "calc_three", "approve": True,
+                                                                         "digest": digest[:12]})
 
 
 # ================================================================== through a real agent loop

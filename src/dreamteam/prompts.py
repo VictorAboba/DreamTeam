@@ -347,9 +347,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "skills_deps_manual": " Packages from {files}: not installed automatically ({reason}); install what you need "
                               "yourself.",
         "deps_reason_off": "turned off in the settings",
-        "deps_reason_proposals": "turned off for skills that members propose",
-        "deps_reason_network": "this session has no network, and then nothing is installed for a skill a member "
-                               "proposed",
+        "deps_reason_proposals": "turned off for members' proposals and the workspace's Claude Code skills, which "
+                                 "agents can write",
+        "deps_reason_network": "this session has no network, and then nothing is installed for members' proposals and "
+                               "the workspace's Claude Code skills, which agents can write",
         "deps_reason_unavailable": "{detail} is not available on this machine",
         "deps_reason_python": "it needs Python {need}, the environments use {have}",
         "deps_reason_unsupported": "not supported: {detail}",
@@ -360,8 +361,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_skill_not_saved": "The user decided not to save your skill \"{name}\" to the library; it stays attached "
                              "to this swarm.{comment}",
         # notifications for the user (shown in the UI / console / MCP)
-        "u_mcp_pending": "{owner} created MCP server \"{name}\": {description}. Approve or reject it (MCP tab or "
-                         "`mcp_approve`).",
+        "u_mcp_pending": "{owner} created MCP server \"{name}\": {description}. Approve or reject it (MCP tab, "
+                         "`/approve {name} {digest}` or `mcp_approve` with digest {digest}).",
         "u_skill_proposed": "{owner} proposed the skill \"{name}\" (files: {files}): {description}. The swarm uses it "
                             "already.{installs} Save it to the skills library for future runs, or not: Skills tab, "
                             "/skills approve {name} or `skill_approve`.",
@@ -641,8 +642,10 @@ TEXTS: dict[str, dict[str, str]] = {
                               "`shell`); нужное установи сам.",
         "skills_deps_manual": " Пакеты из {files} не устанавливаются автоматически ({reason}); нужное установи сам.",
         "deps_reason_off": "выключено в настройках",
-        "deps_reason_proposals": "выключено для скиллов, предложенных участниками",
-        "deps_reason_network": "в сессии нет сети, а тогда для скилла, предложенного участником, ничего не ставится",
+        "deps_reason_proposals": "выключено для предложений участников и скиллов Claude Code из workspace, в которые "
+                                 "могут писать агенты",
+        "deps_reason_network": "в сессии нет сети, а тогда ничего не ставится для предложений участников и скиллов "
+                               "Claude Code из workspace, в которые могут писать агенты",
         "deps_reason_unavailable": "на этой машине нет: {detail}",
         "deps_reason_python": "нужен Python {need}, а окружения используют {have}",
         "deps_reason_unsupported": "не поддерживается: {detail}",
@@ -653,7 +656,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_skill_not_saved": "Пользователь решил не сохранять твой скилл «{name}» в библиотеку; к этому рою он "
                              "остаётся подключённым.{comment}",
         "u_mcp_pending": "{owner} создал(а) MCP-сервер «{name}»: {description}. Одобрите или отклоните его (вкладка "
-                         "MCP или `mcp_approve`).",
+                         "MCP, `/approve {name} {digest}` или `mcp_approve` с дайджестом {digest}).",
         "u_skill_proposed": "{owner} предлагает скилл «{name}» (файлов: {files}): {description}. Рой уже пользуется "
                             "им.{installs} Сохранить ли его в библиотеку скиллов для будущих запусков — вкладка «Скиллы», "
                             "/skills approve {name} или `skill_approve`.",

@@ -416,6 +416,80 @@ def make_dir_link(link: Path, target: Path) -> None:
         pytest.skip("neither symlinks nor junctions are available")
 
 
+async def test_write_and_edit_refuse_a_file_with_another_hard_link(ws, tmp_path):
+    # a hard link is no reparse point, so resolve() lets it through: write_file / edit_file still refuse a file
+    # whose other link is outside the workspace; reading it is not refused
+    outside = tmp_path / "other.txt"
+    outside.write_text("keep me", encoding="utf-8")
+    try:
+        os.link(outside, ws.root / "linked.txt")
+    except OSError:
+        pytest.skip("the filesystem cannot make a hard link")
+    with pytest.raises(ToolError, match="hard link"):
+        await ws.write(ANNA, "linked.txt", "new")
+    with pytest.raises(ToolError, match="hard link"):
+        await ws.edit(ANNA, "linked.txt", "keep", "drop")
+    assert outside.read_text(encoding="utf-8") == "keep me"
+    assert ws.read("linked.txt").endswith("keep me")
+    await ws.write(ANNA, "plain.txt", "hello")
+    assert ws.read("plain.txt").endswith("hello")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX file modes")
+async def test_a_new_file_gets_the_usual_mode(ws):
+    p = ws.root / "made.txt"
+    await ws.write(ANNA, "made.txt", "x")
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o666 & ~_umask()
+
+
+def _umask() -> int:
+    mask = os.umask(0)
+    os.umask(mask)
+    return mask
+
+
+async def test_the_write_checks_the_opened_file_for_another_hard_link(ws, tmp_path, monkeypatch):
+    """The link count is checked again on the opened file, before it is truncated: a file that got another hard
+    link after write() looked at it is left alone."""
+    outside = tmp_path / "other.txt"
+    outside.write_text("keep me", encoding="utf-8")
+    put(ws, "notes.txt", "old")
+    try:
+        os.link(outside, tmp_path / "probe.txt")
+    except OSError:
+        pytest.skip("the filesystem cannot make a hard link")
+    real_store = ws._store
+
+    async def link_then_store(p, rel, data):
+        p.unlink()
+        os.link(outside, p)
+        return await real_store(p, rel, data)
+
+    monkeypatch.setattr(ws, "_store", link_then_store)
+    with pytest.raises(ToolError, match="hard link"):
+        await ws.write(ANNA, "notes.txt", "new")
+    assert outside.read_text(encoding="utf-8") == "keep me"
+
+
+async def test_write_refuses_a_folder_that_became_a_link(ws, tmp_path, monkeypatch):
+    """write() checks the path, then _store writes it: a parent folder that became a link out of the workspace in
+    between is refused, and nothing is written outside."""
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (ws.root / "sub").mkdir()
+    real_store = ws._store
+
+    async def relink_then_store(p, rel, data):
+        (ws.root / "sub").rmdir()
+        make_dir_link(ws.root / "sub", elsewhere)   # the folder write() checked is a link now
+        return await real_store(p, rel, data)
+
+    monkeypatch.setattr(ws, "_store", relink_then_store)
+    with pytest.raises(ToolError):
+        await ws.write(ANNA, "sub/file.txt", "text")
+    assert list(elsewhere.iterdir()) == []
+
+
 async def test_resolve_rejects_nul(ws):
     with pytest.raises(ToolError):
         ws.resolve("a\x00b.txt")

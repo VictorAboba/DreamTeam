@@ -827,9 +827,10 @@ def trust_class(frm: str) -> str:
 
 
 def installer_env(config: "Config", trust: str) -> dict[str, str]:
-    """The installers' environment: the agents' shell environment (scrubbed_env), plus [skills] install_env for the
-    user's own skills, without what would point them at another environment."""
-    env = scrubbed_env(config)
+    """The installers' environment: the agents' shell environment (scrubbed_env; the user's own skills keep the
+    credentials of URLs, such as a private index's in PIP_INDEX_URL), plus [skills] install_env for the user's own
+    skills, without what would point them at another environment."""
+    env = scrubbed_env(config, keep_url_credentials=trust == "user")
     if trust == "user":
         for name in config.skills.install_env:
             if name in os.environ:
@@ -908,7 +909,9 @@ def shell_ready(path: str, shell_name: str) -> str:
     return shlex.quote(path)
 
 
-_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@]+@")
+# a URL's user information up to the last `@` before the path or a space, so a `?` or `#` in a password too (a log
+# may also mask a query that holds an `@`; shell._URL_USERINFO, for values a program reads, stops at `?` and `#`)
+_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s]+@")
 
 
 def redact(text: str, secrets: Iterable[str] = ()) -> str:
@@ -1227,8 +1230,10 @@ class EnvManager:
              proposal: bool = False, network: bool = True) -> list:
         """The specs of the skill folder's manifests: an EnvSpec per installable ecosystem, a state dict for the
         others (off, unsupported, unavailable). Blocking (it may probe a tool once per process): call it in a
-        daemon thread. `network` False (a session without network): a member's proposal gets no install, since
-        DreamTeam would download what the member could not (an environment that is ready already is used)."""
+        daemon thread. `proposal`: a skill of the agent trust class (a member's proposal, the workspace's
+        .claude/skills), which [skills] install_proposals covers. `network` False (a session without network): such
+        a skill gets no install, since DreamTeam would download what the members could not (an environment that is
+        ready already is used)."""
         found = detect(folder)
         out: list = []
         for ecosystem, manifest in (("python", found.python), ("node", found.node)):

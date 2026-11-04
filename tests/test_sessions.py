@@ -123,11 +123,123 @@ def test_write_raw_validates_and_backs_up(tmp_path):
 
 def test_profile_from_view_uses_stored_key(tmp_path):
     raw = _raw(tmp_path)
-    profile = st.profile_from_view(raw, {"provider": "openai", "model": "x", "api_key": None,
+    profile = st.profile_from_view(raw, {"provider": "scripted", "model": "x", "api_key": None,
                                          "api_key_set": True}, name="default")
     assert profile.api_key == "sk-secret-123456" and profile.name == "default"
     with pytest.raises(ValueError):
         st.profile_from_view(raw, {"provider": "openai", "nonsense": 1})
+
+
+def test_profile_from_view_sends_the_stored_key_only_to_its_endpoint(tmp_path):
+    raw = _raw(tmp_path)
+    raw["models"]["fast"]["api_key"] = "sk-fast-7654321"
+    # the card of a saved profile, other fields edited: the stored key is used (a trailing "/" does not count)
+    same = st.profile_from_view(raw, {"provider": "openai", "model": "other", "base_url": "http://127.0.0.1:9/v1/"},
+                                name="fast")
+    assert same.api_key == "sk-fast-7654321"
+    for changed in ({"provider": "openai", "base_url": "http://127.0.0.1:10/v1"}, {"provider": "openai"},
+                    {"provider": "anthropic", "base_url": "http://127.0.0.1:9/v1"}):
+        with pytest.raises(ValueError, match="stored API key"):
+            st.profile_from_view(raw, {**changed, "model": "m"}, name="fast")
+    # a key typed into the form goes to the endpoint of the form; without a name no stored key is used
+    typed = st.profile_from_view(raw, {"provider": "openai", "model": "m", "base_url": "http://127.0.0.1:10/v1",
+                                       "api_key": "sk-typed-000000"}, name="fast")
+    assert typed.api_key == "sk-typed-000000"
+    assert st.profile_from_view(raw, {"provider": "openai", "model": "m",
+                                      "base_url": "http://127.0.0.1:10/v1"}).api_key is None
+    # once the new base_url is saved, the stored key is checked against it
+    view = st.public_view(raw)
+    view["models"]["fast"]["base_url"] = "http://127.0.0.1:10/v1"
+    saved = st.apply_update(raw, {"models": view["models"]})
+    moved = st.profile_from_view(saved, {"provider": "openai", "model": "m", "base_url": "http://127.0.0.1:10/v1"},
+                                 name="fast")
+    assert moved.api_key == "sk-fast-7654321"
+
+
+def test_profile_from_view_sends_an_environment_key_only_to_known_endpoints(tmp_path):
+    raw = _raw(tmp_path)
+    # the saved card "fast" in env mode (the UI sends no name then), renamed or not: its endpoint takes its variable
+    fast = {"provider": "openai", "model": "m", "base_url": "http://127.0.0.1:9/v1/",
+            "api_key_env": "DT_TEST_KEY_ENV"}
+    assert st.profile_from_view(raw, fast).api_key_env == "DT_TEST_KEY_ENV"
+    assert st.profile_from_view(raw, {**fast, "name": "renamed"}).name == "renamed"
+    # another base_url or variable, or the SDK's own variable (no key given), needs the settings saved first
+    for changed in ({"base_url": "http://127.0.0.1:10/v1"}, {"api_key_env": "DT_OTHER_KEY_ENV"},
+                    {"provider": "anthropic", "api_key_env": None},
+                    {"base_url": "http://127.0.0.1:10/api.openai.com/v1", "api_key_env": None},
+                    {"base_url": "https://openrouter.ai/api/v1"}):
+        with pytest.raises(ValueError, match="Save the settings first"):
+            st.profile_from_view(raw, {**fast, **changed})
+    # the provider's default endpoint, a preset's endpoint with its variable, a typed key, and a local endpoint
+    # without a key (nothing from the environment is sent)
+    for allowed in ({"provider": "anthropic", "model": "m", "api_key_env": "ANTHROPIC_API_KEY"},
+                    {"provider": "openai", "model": "m"},
+                    {"provider": "openai", "model": "m", "base_url": "https://openrouter.ai/api/v1",
+                     "api_key_env": "OPENROUTER_API_KEY"},
+                    {**fast, "base_url": "http://127.0.0.1:10/v1", "api_key": "sk-typed-000000"},
+                    {"provider": "openai", "model": "m", "base_url": "http://127.0.0.1:10/v1"}):
+        assert st.profile_from_view(raw, allowed).model == "m"
+    # a saved profile with a stored key does not send its variable: its endpoint is not one for that variable
+    raw["models"]["fast"]["api_key"] = "sk-fast-7654321"
+    with pytest.raises(ValueError, match="Save the settings first"):
+        st.profile_from_view(raw, fast)
+
+
+def test_profile_from_view_counts_the_official_url_as_the_default_endpoint(tmp_path):
+    raw = _raw(tmp_path)
+    # the official endpoint spelled out takes a key from the environment like no base_url at all
+    for allowed in ({"provider": "openai", "base_url": "https://api.openai.com/v1"},
+                    {"provider": "openai", "base_url": "https://API.openai.com/v1/", "api_key_env": "OPENAI_API_KEY"},
+                    {"provider": "openai", "base_url": "https://api.openai.com"},
+                    {"provider": "anthropic", "base_url": "https://api.anthropic.com/"},
+                    {"provider": "anthropic", "base_url": "https://api.anthropic.com:443",
+                     "api_key_env": "ANTHROPIC_API_KEY"}):
+        assert st.profile_from_view(raw, {"model": "m", **allowed}).model == "m"
+    # scheme, host and path are compared exactly, never as substrings, and per provider
+    for refused in ({"provider": "openai", "base_url": "https://api.openai.com.example.net/v1"},
+                    {"provider": "openai", "base_url": "https://example.net/api.openai.com/v1"},
+                    {"provider": "openai", "base_url": "http://api.openai.com/v1"},
+                    {"provider": "openai", "base_url": "https://api.openai.com/v2", "api_key_env": "OPENAI_API_KEY"},
+                    {"provider": "openai", "base_url": "https://api.anthropic.com", "api_key_env": "OPENAI_API_KEY"},
+                    {"provider": "anthropic", "base_url": "https://api.anthropic.com.example.net"},
+                    {"provider": "anthropic", "base_url": "https://api.anthropic.com/v1"}):
+        with pytest.raises(ValueError, match="Save the settings first"):
+            st.profile_from_view(raw, {"model": "m", **refused})
+
+
+def test_profile_from_view_sends_custom_headers_from_the_environment_only_to_known_endpoints(tmp_path, monkeypatch):
+    raw = _raw(tmp_path)
+    raw["models"]["gateway"] = {"provider": "anthropic", "model": "m", "base_url": "https://gw.example/anthropic",
+                                "api_key": "sk-gw-1234567"}
+    typed = {"provider": "anthropic", "model": "m", "api_key": "sk-typed-000000"}
+    other = {**typed, "base_url": "https://other.example"}
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    assert st.profile_from_view(raw, other).base_url == "https://other.example"  # nothing from the environment
+    # the SDK adds these headers to every request, so a typed key does not let them go to another endpoint
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "x-gateway-key: gw-secret-98765")
+    with pytest.raises(ValueError, match="ANTHROPIC_CUSTOM_HEADERS.*Save the settings first"):
+        st.profile_from_view(raw, other)
+    # the default endpoint (spelled out or not) and a saved endpoint get them on a run anyway
+    for allowed in (typed, {**typed, "base_url": "https://api.anthropic.com"},
+                    {**typed, "base_url": "https://gw.example/anthropic/"}):
+        assert st.profile_from_view(raw, allowed).model == "m"
+    # the OpenAI client does not read them
+    assert st.profile_from_view(raw, {**other, "provider": "openai"}).provider == "openai"
+    # an endpoint echoing them gets them masked
+    profile = st.profile_from_view(raw, typed)
+    assert "gw-secret-98765" not in st.scrub_keys("rejected x-gateway-key: gw-secret-98765", profile)
+    # the OpenAI SDK adds OPENAI_CUSTOM_HEADERS the same way, for every provider it serves
+    raw["models"]["router"] = {"provider": "openrouter", "model": "m", "base_url": "https://or.example/api/v1",
+                               "api_key": "sk-or-1234567"}
+    monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "x-gateway-key: gw-openai-24680")
+    for provider in ("openai", "openrouter", "ollama", "vllm"):
+        with pytest.raises(ValueError, match="OPENAI_CUSTOM_HEADERS.*Save the settings first"):
+            st.profile_from_view(raw, {**other, "provider": provider})
+    for allowed in ({**typed, "provider": "openai"},
+                    {**typed, "provider": "openai", "base_url": "https://api.openai.com/v1"},
+                    {**typed, "provider": "openrouter", "base_url": "https://or.example/api/v1"}):
+        profile = st.profile_from_view(raw, allowed)
+        assert "gw-openai-24680" not in st.scrub_keys("rejected x-gateway-key: gw-openai-24680", profile)
 
 
 async def test_check_profile_reports_unreachable_endpoint(tmp_path):

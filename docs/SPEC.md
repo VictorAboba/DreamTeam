@@ -42,7 +42,7 @@ src/dreamteam/
   workspace.py   Workspace      — shared files, git, locks
   hubgit.py      DreamTeam's own git in the members' folders: environment, fixed options, the repository's
                  commands disarmed (§7 "DreamTeam's own git")
-  hubauth.py     the hub token: what a hub asks of peers outside its loopback, where `dreamteam sandbox` keeps it,
+  hubauth.py     the hub token: what a hub with one asks of every peer, where `dreamteam sandbox` keeps it,
                  what DreamTeam's clients send (§14.2); standard library only
   shell.py       run_shell, start_command, RunningCommand, Capture, scrubbed_env, secret_free_env (§7)
   netoff.py      sessions without network: isolation, wrap, environment, sandbox_entry (§7.2);
@@ -971,6 +971,9 @@ class Workspace:
         # a read-only file elsewhere (a copy of a mirror folder keeps its read-only files) is made writable first
         # (owner write bit), unless it has other hard links; the write is the member's explicit edit
         # old must occur exactly once unless replace_all; ToolError with hints otherwise
+        # write and edit write in one checked step: refused when the file's folder now resolves outside the
+        # workspace, the file became a link, or it has another hard link (st_nlink > 1, checked on the opened file
+        # before it is truncated; resolve() cannot see a hard link); reading such a file is allowed
     def list(self, path: str = ".", depth: int = 2) -> str   # tree text, dirs end with "/", skips .git, sizes;
         # folders named `.scratch` are shown collapsed like the NO_EXPAND ones (".scratch/ (2 entries)"), so the
         # agents' temporary files do not inflate every listing; list(".scratch/<slug>") lists them; tree() (the
@@ -1187,7 +1190,7 @@ environment or network.
 - **Environment** (`hubgit.environment(secret_names=())`): `shell.secret_free_env(names)`, i.e. os.environ without
   `_INTERNAL_ENV` and without the variables taken for secrets, whatever `shell.pass_env` lets through to the agents
   (`_KNOWN_SECRETS`, `names`, every `api_key_env` a model profile of this process named, `config.key_env_names()`,
-  and `_SECRET_RE`);
+  and `_SECRET_RE`), the credentials of URLs removed from the other values (`strip_url_credentials`);
   minus every inherited `GIT_*`; plus `hubgit.ENV`: `GIT_TERMINAL_PROMPT=0`, `GIT_ALLOW_PROTOCOL=` (empty: every
   transport refused, so no fetch, lazy or not (`GIT_NO_LAZY_FETCH=1` as well), and no ssh command, remote or
   credential helper ever starts), `GIT_EDITOR=:`, `GIT_SEQUENCE_EDITOR=:` (never launched), `GIT_ASKPASS=` (set
@@ -1389,8 +1392,15 @@ def resolve_shell(program: str = "auto") -> tuple[str, list[str]]   # (display n
 def shell_args(name: str, prefix: list[str], command: str) -> list[str] | str
     # Popen args: prefix + [command]; for cmd on Windows one string `<prefix> "<command>"` (list2cmdline would
     # escape the command's quotes as \", which cmd does not understand; /s strips exactly the outer pair)
-def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[str, str]
-    # os.environ minus secrets (model api_key_env vars, *_API_KEY, *_TOKEN, *SECRET*, *PASSWORD*)
+def scrubbed_env(config: Config, extra: dict[str, str] | None = None, *,
+                 keep_url_credentials: bool = False) -> dict[str, str]
+    # os.environ minus secrets (model api_key_env vars and the _SECRET_RE names: *API_KEY*, *ACCESS_KEY*,
+    # *PRIVATE_KEY*, *_KEY, *_TOKEN, *AUTH_TOKEN*, npm's *_authToken and *_auth, *AUTH_IDENT*, *SECRET*, *PASSWORD*,
+    # *PASSWD*, *PASSPHRASE*, *_PASS, *_PWD, *_PAT, *CREDENTIAL*), the other values without the credentials of their
+    # URLs (strip_url_credentials: PIP_INDEX_URL, UV_INDEX, DATABASE_URL or a proxy still point at the same place;
+    # a *PROXY value without a scheme loses a leading `user:password@` too; keep_url_credentials keeps them:
+    # skill_deps.installer_env of the user's own skills, the [mcp.external] servers, which still lose the secret
+    # names: those reach them through [skills] install_env, the server's `env` table or pass_env)
     # except config.shell.pass_env, and always minus _INTERNAL_ENV (DREAMTEAM_SKILLS_DIR, DREAMTEAM_HOST_SKILLS_DIR,
     # DREAMTEAM_SKILL_ENVS_DIR: agents' commands are never pointed at the skills library or the skills'
     # environments, even through pass_env; the offline markers; DREAMTEAM_HUB_TOKEN(_SHA256), §14.2); plus
@@ -1398,7 +1408,11 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None) -> dict[st
 def secret_free_env(names=()) -> dict[str, str]
     # os.environ minus _INTERNAL_ENV and the secrets whatever pass_env says (the known names, `names`, each
     # api_key_env a model profile of this process named: config.key_env_names(), the patterns): DreamTeam's own
-    # processes in the members' folders (hubgit.environment, §7 "DreamTeam's own git")
+    # processes in the members' folders (hubgit.environment, §7 "DreamTeam's own git"); URL credentials removed
+def strip_url_credentials(value: str) -> str
+    # every URL in `value` without its credentials: `scheme://user:password@host` -> `scheme://host` (the user info
+    # runs up to the last `@` before the path, query or fragment, as URL parsers read it), a lone name at http(s)
+    # (often a token) too; `ssh://git@host` and `https://host/?email=a@b` stay
 def kill_tree(proc) -> None   # tui/bash.py's `!` commands: POSIX os.killpg(proc.pid, SIGKILL); Windows taskkill /T /F
 
 # procs.py (standard library only; kernel32 through ctypes, loaded lazily)
@@ -1602,9 +1616,10 @@ HH:MM:SS: all its processes exited` (a job whose shell had ended before it: deta
 exited within the grace) or `# stopped HH:MM:SS (<reason>)`. At half of `job_log_mb` MiB (at
 most 64) the file is renamed to `j<N>.prev.log` and a new one starts with `[earlier output: jN.prev.log]`; while
 someone holds it open (Windows), the rename is retried at every chunk, and at the full size the log ends with `[log
-limit reached: further output is not saved]` (the pipe is still drained). When `.scratch` is not a plain folder of
-the workspace (a file, a link elsewhere) the log is `<data_dir>/jobs/j<N>.log`, shown as `<path> (outside the
-workspace: read it with shell)`. At each adoption the owner's ended logs beyond `JOB_LOGS_KEPT` (20) are deleted (both
+limit reached: further output is not saved]` (the pipe is still drained). When `.scratch` or the member's `jobs`
+folder is not a plain folder of the workspace (a file, a link elsewhere) the log is `<data_dir>/jobs/j<N>.log`,
+shown as `<path> (outside the workspace: read it with shell)`; a stored relative log path is used only while it
+resolves inside the workspace. At each adoption the owner's ended logs beyond `JOB_LOGS_KEPT` (20) are deleted (both
 files), chosen by rows, never by listing the folder (two names may share a slug); a file in use is skipped.
 
 **The monitor**: one task, started at an adoption and ended when no job is left; every `JOB_TICK` (1 s) it checks all
@@ -1827,7 +1842,8 @@ hint says to restart `dreamteam sandbox` (it then adds the firewall, `docker.wan
   connection records the setting it was started with (`MCPConnection.offline`): `_open` never hands out one of the
   other setting, and `_connect` starts a server again when the setting changed while it was starting (once; a second
   change is a ToolError to call again).
-- **Skills.** `EnvManager.plan(..., network=False)` gives a member's proposal (`frm == "agent"`) no install: state
+- **Skills.** `EnvManager.plan(..., network=False)` gives a skill of the agent trust class (`trust_class(frm)`, §19:
+  a member's proposal, a `claude-project` skill) no install: state
   `off`, reason `network` (`deps_reason_network`, UI `sk_reason_network`), unless its environment is ready on disk
   already; the plan key includes the setting, and a change replans (`SessionSkills.replan`). The user's own skills
   install as before: DreamTeam installs them, not an agent.
@@ -1872,7 +1888,7 @@ chars / 200 AST nodes.
 | `all_done(tag=None, parent=None)` | ≥1 matching task and all done |
 | `message(sender=None, contains=None)` | a message to the owner arrived after creation/last fire |
 | `comment(task=None, sender=None, contains=None)` | a discussion post (not by the owner) after creation/last fire |
-| `file_exists(path)` / `file_changed(path)` | workspace file exists / mtime > creation/last fire |
+| `file_exists(path)` / `file_changed(path)` | workspace file exists / mtime > creation/last fire; a path outside the workspace (a UNC or device path included, never resolved) is false |
 | `after("2026-10-09 18:00")` | local time reached (ISO) |
 | `elapsed(seconds)` | seconds since creation |
 | `every(seconds)` | ≥ seconds since last fire (min 10); makes the trigger periodic |
@@ -1890,7 +1906,8 @@ class TriggerEngine:
     def list(self, owner: str | None = None, include_inactive: bool = False) -> list[dict]
     def mark_dirty(self) -> None
     def evaluate_all(self) -> int                            # returns number fired
-    async def run(self) -> None                              # loop: wait dirty-or-tick, evaluate_all
+    async def run(self) -> None                              # loop: wait dirty-or-tick, evaluate_all; the files
+                                                             # the active triggers watch are stat'd in a thread first
 ```
 `create` resolves member names in the condition (`sender=` of message/comment, `assignee=` of count,
 `agent_status(name)`) with `swarm.resolve_member(allow_retired=True)` (a unique first name, `@Name`, any
@@ -2013,15 +2030,21 @@ class MCPForge:
     async def call(self, actor: str, server: str, tool: str, arguments: dict | None = None,
                    timeout: float | None = None, max_chars: int | None = None) -> tuple[str, bool]
         # result cut to max_chars (default agents.tool_output_chars); mcp_call passes ToolContext.output_cap
-    async def approve(self, actor: str, name: str, approve: bool, comment: str = "") -> str
+    async def approve(self, actor: str, name: str, approve: bool, comment: str = "", digest: str = "") -> str
     async def remove(self, actor: str, name: str) -> str
     def get(self, name: str) -> dict | None
 ```
 * Server code uses the mcp 2.x high-level API: `from mcp.server.mcpserver import MCPServer`,
   `mcp = MCPServer("name")`, `@mcp.tool()`, `mcp.run()` (stdio). Files: `workspace/mcp/<name>/server.py`,
-  `meta.json`. Name: `^[a-z][a-z0-9_]{1,39}$`.
-* Command: `[sys.executable, "server.py"]`, or with requirements and `uv` on PATH:
-  `["uv", "run", "--no-project", "--with", "mcp>=2.3,<3", "--with", req..., "python", "server.py"]`.
+  `meta.json` (the members' working copy, `server_dir`) and the snapshot `.dreamteam/mcp/<name>/server.py`
+  (`snapshot_dir`: outside the workspace, where write_file and edit_file do not reach), the code that runs. Name:
+  `^[a-z][a-z0-9_]{1,39}$`.
+* Command: `[sys.executable, "<snapshot_dir>/server.py"]`, or with requirements and `uv` on PATH:
+  `["uv", "run", "--no-project", "--with", "mcp>=2.3,<3", "--with", req..., "python", "<snapshot_dir>/server.py"]`;
+  cwd: the working copy's folder (files a server keeps next to itself stay there and are opened by relative paths:
+  `__file__` is the snapshot's; other modules there are not imported: sys.path[0] is the snapshot's folder, which
+  holds server.py only). A smoke test that failed with FileNotFoundError or ModuleNotFoundError adds this note
+  (`SNAPSHOT_HINT`) to the create report.
   Env = `shell.scrubbed_env` (plus `COLUMNS=200` unless set: MCPServer logs through rich, whose 80-column boxes
   would wrap the error lines). stderr → `.dreamteam/logs/mcp-<name>.log`; the log tails shown to agents drop
   the padding and right borders of rich's boxed tracebacks. In a session without network the command and the
@@ -2033,17 +2056,52 @@ class MCPForge:
 * `create`: write files, smoke test (start + list tools, startup_timeout), on failure status `failed`
   and return the error plus the log tail so the agent can fix and call create again (same name
   overwrites, only by owner or USER). Success → status `active` (or `pending` if
-  `config.mcp.require_approval` and actor != USER → notify USER kind `u_mcp_pending`). Statuses:
+  `config.mcp.require_approval`, actor != USER and the snapshot's digest is not the record's `approved_digest` →
+  notify USER kind `u_mcp_pending`). Statuses:
   `active`, `pending`, `failed`, `rejected`, `removed`, and `available` for library entries not yet
   imported. Origins: `workspace` (built here), `library`, `config`. Importing from the library also honours
   `require_approval`. Swarm-scoped servers
   are copied to the library (`config.library_dir/<name>/` server.py + meta.json) when save_to_library.
+* Snapshots: `snapshot_digest(code, requirements)` = sha256 over `{"command":["python","server.py"],
+  "requirements":[...]}` (compact ASCII JSON), a NUL byte and the bytes of server.py (the interpreter's path is the
+  machine's, so it is left out). Columns `digest` (the snapshot's) and `approved_digest` (the last snapshot the user
+  approved, or created: a USER `create` that becomes active). `create` writes the code to the working copy and the
+  snapshot, smoke-tests the snapshot and records its digest; `remove` deletes the snapshot too. Before a forged or
+  imported server starts (no live connection) and before `approve`, `_sync_snapshot` checks that the snapshot still
+  hashes to `digest` and that the working copy is the same bytes (a missing working copy is written back from the
+  snapshot). Otherwise the working copy is taken as a `create` of that code by the server's owner (`_rebuild`): a
+  new snapshot, smoke-tested, then `failed`, `pending` (with `require_approval`, unless its digest is
+  `approved_digest`; `u_mcp_pending` to USER) or `active`, announced as `mcp.created`; the library is not written
+  then; an interrupted `_rebuild` (its caller cancelled) leaves the stored record as it was: its digest is not the
+  new snapshot's, so the next start or `approve` tests the working copy again. A smoke-test process that started
+  under the other network setting is closed instead of pooled (§7.2), in `create` too. So with `require_approval` an
+  edit of the working copy never runs before the user approves it, and without it the edit is tested and used at
+  the next start with no question. `approve` of a pending server whose working copy changed raises (the user is
+  asked about the new snapshot); otherwise it approves the current snapshot (`approved_digest = digest`; a running
+  connection stays, it runs that snapshot). Its `digest` (mcp_approve's optional argument: the record's
+  `snapshot_digest`, in full or its first 8 or more hex digits, as `mcp_list`, the MCP card, the TUI dialog and
+  `u_mcp_pending` show it; the dialog and the web card send the one they show, `/approve <name> <sha256>` in the
+  console and the TUI takes it, and the TUI's `/approve <name>` alone sends the one of the last dialog shown for
+  that server) refuses the approval when the record's digest does not start with it (the message shows the
+  current one): the owner created the server again meanwhile. The TUI closes an open dialog whose server is created again with another
+  digest and asks about the new code. A record of an older version has no digest: its first start tests the working
+  copy again (with `require_approval` it waits for approval once); an `approve` of such a pending record tests it,
+  raises with a plain message (recorded by an older version, without a snapshot) and leaves it pending with its new
+  digest.
+* Library and snapshots: `_copy_to_library` writes the snapshot's bytes, not the working copy, and meta.json gets
+  `digest`, `approved_digest` (equal to `digest` when the user approved or created that code, else null) and
+  `project`. An entry that another project saved is replaced only by the user's own `create` (an agent's save is
+  skipped with a note), and an agent cannot replace an imported server whose entry another project keeps, whatever
+  its owner's name. An import hashes the library's server.py: when that equals the entry's `approved_digest`, the
+  server is `active` without a question even with `require_approval`; any other import as before. Approving a
+  pending import records `approved_digest` in the entry while its server.py is still that code.
 * Scopes: `private` (owner only), `task` (owner + creator/assignee/reviewer of task_id), `swarm` (all).
   USER sees all. `list` merges project servers and library entries not in the project (`origin: "library"`);
   using a library server imports it into the project first.
 * Events: `mcp.created` {server}, `mcp.status` {name, status}. Server dict: {"name","owner","scope",
-  "task_id","description","status","origin","tools":[names],"error","requirements","command","created_at"}
-  (`command`: a configured server's argv; `[]` for a forged one, which runs its `server.py`).
+  "task_id","description","status","origin","tools":[names],"error","requirements","command","created_at",
+  "digest"} (`command`: a configured server's argv; `[]` for a forged one, which runs its snapshot's `server.py`;
+  `digest`: the snapshot's, null for a configured server).
 
 ## 12. Tools (tools/)
 
@@ -2128,7 +2186,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `set_goal` | title (a multi-line title is split: §3 `set_goal`), description? | U |
 | `swarm_status` | brief? (the goal as one line) | EU |
 | `swarm_control` | action (pause/resume; pause while paused changes nothing and says `already paused (<pause_text>)`; resume during a question pause goes on without the answer, §3.1), wrap_up? (true/false: the user's wrap-up mode, §3), max_cost_usd?, max_agents?, reopen_goal_comment? | U |
-| `mcp_approve` | name, approve, comment? | U |
+| `mcp_approve` | name, approve, comment?, digest? (the `snapshot_digest`, or its start, that `mcp_list` and the MCP card show: refused when the server's differs, §11) | U |
 | `agent_traces` | agent?, trace_id?, span_id?, context?, status?, task?, limit?, offset? | EU (§16.2) |
 | `skills` | available? (also the library's and Claude Code's skills not attached) | U (§19) |
 | `skill_attach` | name? (a reference: `x`, `library:x`, `claude-user:x`, `claude-project:x`) or source? (a folder or .zip path on the hub's machine, or a Git URL: imported into the library first), pick?, replace? | U (§19) |
@@ -2365,10 +2423,12 @@ WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type:
 (`GuardMiddleware`, every bind, also 0.0.0.0 in Docker): Host must be localhost/127.0.0.1/[::1]; for
 non-loopback binds also the bind address, or an IP literal that is the address the connection reached (ASGI
 `server`; any IP literal only on a request with the hub token: a port mapping that rewrites the address); plus names
-in `DREAMTEAM_ALLOWED_HOSTS` (comma-separated). Origin must be loopback, an allowed name, or same-origin (WebSockets
-too; only same-origin or an allowed name for a request the hub token's cookie authorizes). Then the hub token
-(§14.2): with one, a peer that is not the hub's own loopback needs it (401 / WebSocket closed 1008 before accept);
-without one, `serve` refuses a non-loopback bind.
+in `DREAMTEAM_ALLOWED_HOSTS` (comma-separated). Origin must be the host and port the request was made to, the origin
+of `DREAMTEAM_PUBLIC_URL` (`env_public_origin`, its path aside: a same-host proxy that rewrites the Host) or an
+allowed name, WebSockets and `/mcp` too: never another port of a loopback name, which is another program on the
+computer (for a request the hub token's cookie authorizes, same-origin also by scheme). Then the hub token
+(§14.2): with one, every peer needs it, the hub's own loopback too (401 / WebSocket closed 1008 before accept);
+without one, nothing is asked, and `serve` refuses a non-loopback bind.
 `DREAMTEAM_PUBLIC_URL` is the base URL users reach the hub at (shown as the MCP URL and written to
 hub.json; `dreamteam sandbox` sets it). `serve(swarm, host, port, ..., on_started=)` sets
 `swarm.hub_url = public_base(host, port) + "/mcp"`, calls back once listening and shuts down gracefully when
@@ -2472,16 +2532,17 @@ loopback (a hub bound to 127.0.0.1 there answers no one outside), so every conta
 reaches it as well. The token closes that.
 
 - **The hub.** Its guard keeps only the token's SHA-256: `DREAMTEAM_HUB_TOKEN_SHA256` (`DIGEST_ENV`, 64 hex; what
-  `dreamteam sandbox` passes, so the token itself is never in the container's environment) or else the digest of
-  `DREAMTEAM_HUB_TOKEN` (`TOKEN_ENV`, the token itself: docker compose, the host's clients). `cli.main` moves both out
+  `dreamteam sandbox` and docker-compose.yml pass, so the token itself is never in the container's environment) or
+  else the digest of `DREAMTEAM_HUB_TOKEN` (`TOKEN_ENV`, the token itself: a hub started with it on the host, the
+  host's clients). `cli.main` moves both out
   of os.environ first (`take_env_token`, after
   `netoff.sandbox_entry`, whose re-exec still carries them): no process DreamTeam starts inherits them, and
   `shell._INTERNAL_ENV` drops both from the agents' environment and DreamTeam's git (`secret_free_env`) whatever
   `shell.pass_env` says. `hub_digest()` is the hub's digest (a `DIGEST_ENV` that is no SHA-256 becomes the digest of a
   random token: never "no token"); `env_token()` is the token for clients. `GuardMiddleware(token=FROM_ENV)` of
   both apps (and of every session app; `token="..."` is a raw token, hashed) keeps `digest` and asks every HTTP and
-  WebSocket request whose peer (ASGI `client`) is not a loopback address (`peer_is_loopback`; IPv4-mapped included;
-  a peer that is not an IP address is not loopback) for one of: `Authorization: Bearer <token>`, the cookie
+  WebSocket request, whatever its peer (the hub's own loopback too: the agents' commands in the sandbox's container
+  come from there), for one of: `Authorization: Bearer <token>`, the cookie
   `dreamteam_hub_<sha256(token)[:12]>` (`cookie_name(digest)`; one name per hub: browsers send cookies to every port
   of a host), or, on a GET/HEAD, `?token=<token>`, which is answered with 303 to the same path and query without it,
   `Set-Cookie: <name>=<the token the URL brought>; Path=/; HttpOnly; SameSite=Strict`, `Cache-Control: no-store`. The
@@ -2489,19 +2550,24 @@ reaches it as well. The token closes that.
   newline included: a browser reads `/\host` as `//host`) and its leading slashes become one. Without a token: 401
   `TOKEN_TEXT` with `WWW-Authenticate: Bearer realm="DreamTeam"`, or `websocket.close` 1008 before accept
   (WebSockets: header or cookie, never the query). A request the cookie authorizes takes an `Origin` only if it is
-  its own (`same_origin`: scheme, host and port) or an allowed name (`cookie_origin_allowed`): SameSite counts every
-  port of 127.0.0.1 as the same site. Comparisons are `hmac.compare_digest` of `sha256(given)` with the digest
-  (`matches`). Loopback peers need no token (the token protects a direct non-loopback bind only: a same-host reverse
-  proxy or port forwarder needs an authentication of its own). `hub_server_config` gives uvicorn `proxy_headers=False`,
-  so `X-Forwarded-For` / `FORWARDED_ALLOW_IPS` never decide who is loopback. No token on a loopback bind (127.0.0.1,
+  its own (`same_origin`: scheme, host and port), the public URL's or an allowed name (`cookie_origin_allowed`):
+  SameSite counts every port of 127.0.0.1 as the same site. Comparisons are `hmac.compare_digest` of `sha256(given)`
+  with the digest
+  (`matches`). The header may also carry `own_token()`, the token of the clients in the hub's own process
+  (`serving`, below): made in memory at first use, never stored, logged or put in a URL, and taken by every guard of
+  that process that has a digest (`own_digest()`), never as the cookie or `?token=`; a hub started with `DIGEST_ENV`
+  alone has no other token for its own console. A same-host reverse proxy or port forwarder gets nothing for its
+  clients either: they need the token like everyone else's. `hub_server_config` gives uvicorn `proxy_headers=False`,
+  so `X-Forwarded-For` / `FORWARDED_ALLOW_IPS` never change the peer. No token on a loopback bind (127.0.0.1,
   localhost, ::1, or another loopback IP literal exactly as written, `web._loopback_bind`: 127.0.0.2 too, whose own
-  address the guard takes as the Host and whose peers are all loopback; a string with brackets or a `%` scope is no IP
-  literal and needs a token): nothing changes. The token is never logged, never in the
+  address the guard takes as the Host; a string with brackets or a `%` scope is no IP literal and needs a token):
+  nothing is asked of anyone, as before there were tokens (the default `dreamteam serve`); a loopback bind with a
+  token (`DREAMTEAM_HUB_TOKEN` set on the host) asks every peer like any other. The token is never logged, never in the
   snapshot (`mcp_token` says only that there
   is one), the settings or `/api/hub`. `web.check_hub_token(host)` raises `NoTokenError` for a non-loopback bind
-  without a token (fail closed: the image's default CMD, a plain `docker run`, compose without `DREAMTEAM_HUB_TOKEN`,
-  which compose passes by name, so that `docker compose ps`, `logs` and `down` work without it, and the container's
-  log shows the reason); `DREAMTEAM_HUB_NO_TOKEN=1` (`NO_TOKEN_ENV`) lets it start with a warning. It runs before
+  without a token (fail closed: the image's default CMD, a plain `docker run`, compose without
+  `DREAMTEAM_HUB_TOKEN_SHA256`, which compose passes by name, so that `docker compose ps`, `logs` and `down` work
+  without it, and the container's log shows the reason); `DREAMTEAM_HUB_NO_TOKEN=1` (`NO_TOKEN_ENV`) lets it start with a warning. It runs before
   anything is created or started, after `running_hub` (a hub of the home that runs already is reported whether this
   process has a token or not, and `serve` opens it in the browser unless `--no-browser`; one that asks for a token no
   client here may send stops the command with `TokenRequired`'s text): `cli._token_missing` (`warn=False`) in
@@ -2532,7 +2598,10 @@ reaches it as well. The token closes that.
   `DREAMTEAM_PUBLIC_URL`), the board `serve` and `run --open` open in the browser once they listen
   (`browser_url(<board>, user_url=public_base)`) and the TUI's `_start_launcher` (`HubClient(base, user_url=base)`,
   also for its stream and its `/web`), so that `serve --host <a LAN address>` with `DREAMTEAM_HUB_TOKEN` lets its own
-  console, browser and TUI in.
+  console, browser and TUI in. The console and the TUI's launcher also call `serving(base)` for a hub with a token:
+  `client_tokens` then offers `own_token()` to that scheme, host and port, after the others (`own=False`, which
+  `browser_url` and `client_token` pass, leaves it out: a browser is no client in this process), so that a hub
+  started with `DREAMTEAM_HUB_TOKEN_SHA256` alone lets its own console and TUI in.
   Duplicates go; the token a hub took last (`token_taken`, per
   scheme, host and port; ws counts as http) goes first while it is still a candidate, so a stale stored token (a
   sandbox killed before its `forget_token`) costs one refused request before `DREAMTEAM_HUB_TOKEN`. Clients look the
@@ -2764,8 +2833,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   `max_files = 200` (one skill), `max_archive_mb = 50` (one zip or Git checkout before a skill is picked from it),
   `max_attached = 40` (skills of one session), `max_proposals = 10` (skills the members of one session may
   propose; 0 turns proposals off). Script dependencies (§19): `install = true` (install a skill's
-  requirements.txt / pyproject.toml / package.json), `install_proposals = true` (also for members' proposals;
-  never in a session without network, §7.2),
+  requirements.txt / pyproject.toml / package.json), `install_proposals = true` (also for the agent trust
+  class, §19: members' proposals and `claude-project` skills; never in a session without network, §7.2),
   `envs_dir = "~/.dreamteam/skill-envs"` (`Config.skill_envs_dir`, where `DREAMTEAM_SKILL_ENVS_DIR` wins: the
   sandbox's volume and the tests), `python = ""` (the environments' interpreter: "" = the base interpreter DreamTeam
   runs on; a path, a command, or with uv a version such as "3.12"), `install_scripts = false` (npm lifecycle
@@ -2811,7 +2880,18 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   - renaming the default profile (`renamed_from`) moves `agents.default_model` along (`profile_renames(update)`
     gives `{old: new}`).
 - `profile_from_view(raw, data, name=None) -> ModelProfile` (an unsaved UI profile; a missing key falls back to
-  the stored key of profile `name`; ValueError for unknown fields or wrong types).
+  the stored key of profile `name`, only when `data` has the provider and base_url that profile is saved with
+  (a trailing `/` aside), else a ValueError. A key from the hub's environment (`api_key_env`, or with no key the
+  SDK's own `ANTHROPIC_API_KEY`, or `OPENAI_API_KEY` for the official OpenAI endpoint) goes only to the
+  provider's default endpoint (no base_url), or to the endpoint of a `PROVIDER_CHOICES` preset or of a saved
+  profile without a stored key that names the same variable, else a ValueError (save first); a key in `data`
+  goes anywhere. ValueError for unknown fields or wrong types).
+  The official URL spelled out (`https://api.openai.com` with or without `/v1` for the OpenAI client,
+  `https://api.anthropic.com` for anthropic; parsed host and path compared exactly, never as a substring) counts
+  as the default endpoint. `ANTHROPIC_CUSTOM_HEADERS` (provider anthropic) and `OPENAI_CUSTOM_HEADERS` (the
+  OpenAI client's providers) from the hub's environment (the SDKs add them to every request; `_headers_env`)
+  go, whatever the key, only to the default endpoint or to that of a saved profile, else a ValueError (save
+  first); `scrub_keys()` masks their values too.
 - `async list_models(profile, timeout=20)` (GET /models, free; ValueError with a readable message).
 - `async check_profile(profile, *, live=False, timeout=30)` → `{ok, models, models_error, model_found, error,
   reply, latency_ms, cost_usd}`. `live=True` sends one tiny request (max_tokens <= 512; effort `low` only when
@@ -3149,7 +3229,7 @@ succeeded: either may have changed the library) and everything else to the launc
 | POST `/api/skill-envs/cleanup` | `EnvManager.cleanup(env_retention_days, every_unused=True)` now (a daemon thread: every env no session uses, whatever its age) → `{"removed", "kept"}`; emits change `skill-envs` |
 | GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home", "network_isolation": netoff.shown(netoff.isolation()) (§7.2)}` (a hand edit of the file is picked up first) |
 | PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` text for a bad role (nothing saved) |
-| POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result |
+| POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result; 400 when the fallback would send the stored key to another provider or base_url than the saved one, or a key from the hub's environment to an endpoint that neither the provider's default, a preset nor a saved profile uses with that variable |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
 | `/mcp` | launcher MCP (§18.2) |
 | GET `/s/{sid}` | 307 redirect to `/s/{sid}/` (query kept) |
@@ -3365,7 +3445,9 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   process group alive) and forwards `docker stop`'s SIGTERM to dreamteam, whose `Swarm.stop` ends the jobs within
   Docker's 10 s grace (a launcher home unloads its sessions one after another, so with jobs in several sessions the
   last final commits may be cut off; the processes die with the container anyway). Ports that agents' dev servers
-  open inside the container are not published. Only the directory is mounted: for a home,
+  open inside the container are not published. `--security-opt no-new-privileges:true`: no program in the
+  container gains privileges through a set-user-ID bit or file capabilities (the firewall's `NET_ADMIN` is given at
+  the start, `setpriv` only drops). Only the directory is mounted: for a home,
   `docker.outside_home_warning(home)` prints a warning listing the sessions whose workspace folder is outside it
   (`external_workspaces`): they cannot start in the container (their start reports the missing folder). A folder
   inside the home is found in the container (session.json `in_home`, §17.2). The host's skills library is mounted
@@ -3379,9 +3461,26 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   `/dreamteam/skill-envs` (`docker.envs_volume`; `DREAMTEAM_SKILL_ENVS_DIR` and `UV_CACHE_DIR=/dreamteam/skill-envs/
   .cache/uv` set; never the host's envs: another platform); `docker volume rm` resets it. Node is not in the image,
   so Node skills show as unavailable there. The image also has `iptables` and the user `dreamteam-agent` for the
-  sessions without network, git's identity and `safe.directory '*'` as `--system` settings, and `build_image` labels
-  it `dreamteam.dockerfile=<dockerfile_hash()>`; the firewall (`--cap-add NET_ADMIN`, dropped again at once,
-  `netoff.sandbox_entry`) and the rebuild of an image with another label: §7.2.
+  sessions without network and git's identity as `--system` settings, and `build_image` labels it
+  `dreamteam.dockerfile=<dockerfile_hash()>`; the firewall (`--cap-add NET_ADMIN`, dropped again at once,
+  `netoff.sandbox_entry`) and the rebuild of an image with another label: §7.2. The image has no `safe.directory`:
+  git's ownership check stays on there, and a manual `docker exec ... git` in a folder of the host's uid (a Linux
+  bind mount) needs `-c safe.directory=<path>`. The processes DreamTeam starts for a session (`JobManager.run`: the
+  members' commands and their jobs; `MCPForge._new_connection`: the stdio MCP servers and their smoke test) get
+  `netoff.trust_workspace(env, root)`: in the image only (`netoff.in_container()`, or `DREAMTEAM_IMAGE=1`, which
+  the image sets for a runtime that leaves no marker file; the host's git stays as the user has it),
+  `safe.directory=<root>` and `<root>/*` (the repositories nested in it; git 2.46+, hence the image's base
+  `python:3.13-slim-trixie`: git 2.47), and for a workspace without a `.git` of its own (git off, adopted inside a
+  repository) the work tree git finds from it, its first ancestor with a `.git`, exactly (no `/*`), appended as
+  `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n` pairs after those already there (`netoff.git_config`, which
+  `netoff.environment` uses too: the two compose in either order under one `GIT_CONFIG_COUNT`). DreamTeam's own
+  git keeps its per-command `-c safe.directory` (§7). git refuses only a repository of another uid: with network
+  on the commands run as root, who owns every session folder DreamTeam creates, so the check does not separate the
+  sessions. The image installs the versions of `uv.lock`
+  (`uv export --locked --no-dev`, hashes required, into the system Python; uv itself at a fixed version):
+  `build_context` copies it next to the repository's pyproject.toml, the generated one goes without it (the
+  Dockerfile copies `uv.lock*`, an installed package's image gets the ranges), and `.dockerignore` lets it into the
+  compose context.
 - `run [DIR]` stays the single-swarm server of a project (§15); it does not serve the launcher.
 
 ### 18.4 UI
@@ -3404,9 +3503,9 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   new-session dialog's), the report line of an import (imported, attached, failed, skipped files) and the
   packages preview (`previewLine`: «Установится автоматически: pypdf, … (requirements.txt).» plus the trust line
   «Установка запускает собственный код пакетов с вашими правами (вне песочницы Docker).», an unsupported manifest's
-  reason, or «Установка пакетов выключена в настройках.»; `install.proposals` decides for a member's proposal). A
-  skill's SKILL.md is shown as Markdown on the session page (`md()`, its YAML front matter left out: `bodyOf`; the
-  card shows the name and description) and escaped as preformatted text on the home
+  reason, or «Установка пакетов выключена в настройках.»; `install.proposals` decides for a member's proposal
+  and a `claude-project` skill). A skill's SKILL.md is shown as Markdown on the session page (`md()`, its YAML front
+  matter left out: `bodyOf`; the card shows the name and description) and escaped as preformatted text on the home
   page (it has no Markdown renderer); every other skill text is escaped. The icon is `ic-skill` (a book).
 - **home.html + home.js + home.css** (launcher page, `/`): header (DreamTeam, tabs «Сессии» / «Скиллы» /
   «Настройки», RU/EN, theme, connection state; the tab is kept in the URL hash, `#skills`); live updates from `/ws`
@@ -4045,9 +4144,11 @@ themselves (the index header says so). SKILL.md prose is never parsed.
   only `node.exe`), npm run as `node npm-cli.js` (never `npm.cmd`), `npm ci` with a lock else `npm install`, both
   with `--omit=dev --no-audit --no-fund` and `--ignore-scripts` unless `install_scripts`. Commands run with cwd =
   the env folder, as contained process trees (`ProcessTree`), the venv step 120 s and the install `install_timeout`
-  (then killed: "timed out after 900 s"), in `installer_env(config, trust)`: `scrubbed_env`, plus `install_env` for
-  the `user` class only, without `VIRTUAL_ENV`, `PYTHONHOME`, `PYTHONPATH`, `PIP_USER`, `UV_PYTHON` and the like,
-  with `PIP_NO_INPUT`, `PYTHONNOUSERSITE`, `UV_NO_PROGRESS`; the user's own pip / uv / npm configuration applies.
+  (then killed: "timed out after 900 s"), in `installer_env(config, trust)`: `scrubbed_env` (`keep_url_credentials`
+  for the `user` class: a private index's password in `PIP_INDEX_URL` stays; the `agent` class gets the same index
+  without it, so its install fails there), plus `install_env` for the `user` class only, without `VIRTUAL_ENV`,
+  `PYTHONHOME`, `PYTHONPATH`, `PIP_USER`, `UV_PYTHON` and the like, with `PIP_NO_INPUT`, `PYTHONNOUSERSITE`,
+  `UV_NO_PROGRESS`; the user's own pip / uv / npm configuration applies.
   On Windows with long paths off, a venv holding a path of 260 characters or more fails with a text saying so.
 - **The manager** (`EnvManager.for_config(config)`, one per process and root): `plan(folder, skill, trust,
   settings, *, config, proposal) -> [EnvSpec | state]` (blocking, a daemon thread; a state for off, unsupported,
@@ -4123,7 +4224,9 @@ themselves (the index header says so). SKILL.md prose is never parsed.
   configured, or from https and git URLs the skill names directly (including the resolved URLs of its npm
   lockfile); a skill cannot add or replace an index, or name a local path or an environment variable. Skills a
   member proposed, or taken from the workspace's agent-writable `.claude/skills`, install into environments kept
-  apart from the user's own skills and never get `install_env`. A non-sandboxed agent can still write
+  apart from the user's own skills and never get `install_env` or the credentials of the URLs in their environment
+  (§7 `scrubbed_env`); `install_proposals = false` and a session without network (§7.2) install nothing for them.
+  A non-sandboxed agent can still write
   `~/.dreamteam/skill-envs` directly, as it can write the skills library: environments are a convenience, not a
   security boundary. Logs, errors and the recorded commands are redacted (URL credentials, the values of
   `install_env` and of the index variables).
@@ -4134,8 +4237,8 @@ themselves (the index header says so). SKILL.md prose is never parsed.
   actions for them, a size cap; Node in the Docker image.
 
 **Security.** "Only the user attaches, imports, deletes and saves to the library" is a user-interface convention,
-not a security boundary, as `mcp_approve` is: the hub has no authentication for its own loopback (GuardMiddleware
-stops browsers on other sites, not local processes; the hub token of §14.2 is for other hosts only), and without the sandbox agents run as the user and can write
+not a security boundary, as `mcp_approve` is: a hub without a token (the default `dreamteam serve` on
+127.0.0.1) has no authentication (GuardMiddleware stops browsers on other sites, not local processes), and without the sandbox agents run as the user and can write
 `~/.dreamteam/skills` directly. What DreamTeam does: the sandbox mounts the host library read-only; library entries
 changed outside DreamTeam are flagged (`changed_outside`); a hub MCP client cannot save to the library a proposal of
 a member it acts as, nor one of any external member when nothing names the client (§13); the library gets only
@@ -4144,8 +4247,9 @@ attach the surface it came through (`skill.attached` `via`); agents' shells neve
 `DREAMTEAM_HOST_SKILLS_DIR` or `DREAMTEAM_SKILL_ENVS_DIR` (§7);
 `<workspace>/.claude/skills` is never used implicitly; Git URLs are hardened and redacted; zips and folders are
 checked as above; sizes are capped per skill (`max_mb`, `max_files`), per archive or checkout (`max_archive_mb`) and
-for SKILL.md (100 KB). A token for the hub's own loopback, which would make "only the user" a real boundary, is out
-of scope.
+for SKILL.md (100 KB). A hub with a token (§14.2: the Docker sandbox, docker compose, `DREAMTEAM_HUB_TOKEN`) asks its
+own loopback for it too, so the agents' commands in the sandbox's container, whose environment holds only the token's
+digest, cannot call its API; a token for every hub is out of scope.
 
 **Not in v1**: Claude Code plugin skills; automatic updates of library skills from their Git source (the recorded
 `commit` makes a later check possible); per-role visibility; mounting the MCP library or `~/.claude/skills` into the
