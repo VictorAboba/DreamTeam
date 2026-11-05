@@ -66,7 +66,7 @@ src/dreamteam/
   tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
   tools/skill_tools.py the skills tools: the user's `skills`, `skill_attach`, `skill_detach`, `skill_approve`,
                  `skill_reinstall`, and the members' `skill_propose` (frozen revision 3; §19)
-  tools/frozen.py    frozen LLM tool sets: revisions (now 4), the kv record of each agent,
+  tools/frozen.py    frozen LLM tool sets: revisions (now 5), the kv record of each agent,
                      `python -m dreamteam.tools.frozen` (§6.1)
   tools/snapshots/   llm_r<N>.json: every released LLM tool set (revision N, en and ru), never edited
   agent.py       AgentRuntime   — ReAct loop of one LLM agent
@@ -139,9 +139,10 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 
 * `tasks`: id, title, **goal** (why the task exists / success criterion), description, status,
   assignee, reviewer, created_by, parent_id, depends_on (json int list), priority (0 low,1 normal,
-  2 high,3 critical), tags (json str list), result, created_at, updated_at. A task in `review` keeps its
-  executor as `assignee` (NULL only when the executor left the swarm, §4.1); there is no
-  separate executor column.
+  2 high,3 critical), tags (json str list), result, created_at, updated_at, crew (0, or 2..8: a crew task, §4.2;
+  `INTEGER DEFAULT 0`, `db.ADDED_COLUMNS` adds it to an older file). A task in `review` keeps its
+  executor as `assignee` (NULL only when the executor left the swarm, or for a crew task that finished by itself
+  without an owner, §4.1, §4.2); there is no separate executor column.
 * `comments`: the per-task **discussion**: id, task_id, author, text, reply_to (comment id | null), ts.
 * `agents`: name, kind (`llm`|`external`), role (a catalog role by its canonical name in the member's language,
   §17.3), instructions (the hirer's own; a catalog role's instructions are only in the system prompt), model
@@ -417,7 +418,7 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
 1. `_nudge_idle`: offers ready unassigned tasks to idle LLM agents (`n_ready`), never more agents considering
    offers than there are ready tasks, and the kickoff counts as everyone's offer of the planning task; with
    independent review on, a member with reviews waiting for it is not offered more work (it is reminded of them
-   instead);
+   instead); the free directions of crew tasks are ready tasks like any other (§4.2);
 2. `_wake_stalled`: wakes once (`n_stalled`) an idle agent whose activation ended with plain text while holding
    in_progress tasks even after the nudge (§6.2);
 3. `_wake_idle_holders`: an idle agent holding in_progress tasks (e.g. after `wait` with nothing that will wake
@@ -429,7 +430,11 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    (a `detached` one, or a `background` one past its busy window), it has not stalled; nor while it waits for a
    file it was refused (`Workspace.waits_for_lock`: a `lock_waiters` row, what the refusal promised; `n_lock_free`
    wakes it, and every lock ends by unlock, expiry or retire). Nor do they count a clarify
-   planning task whose holder waits for the user's answers (`asks_user`, §3.1);
+   planning task whose holder waits for the user's answers (`asks_user`, §3.1), nor a crew task with open
+   directions (§4.2): it waits for them, so its owner has nothing to continue there (its own direction counts on
+   its own; the in-activation nudge of §6.2 skips such a crew task too). Item 3 also counts a task `in_progress` or
+   `waiting` whose subtasks are all terminal, as an entry of its own: its holder has to complete it (or, for a crew
+   task that did not finish by itself, decide what to do; §4.2 "Finishing");
 4. `hint_planner()` (planning hint; run 008-013: a planner researched for 40 minutes before creating any task while
    the team idled): an LLM member holding a task tagged `planning` in `in_progress` that has created no task (no
    task with `created_by` = it and an id above the planning task's) gets `n_planning_hint` {id, steps, elapsed} once
@@ -461,9 +466,9 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    (§4.1 "Liveness").
 
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
-agents in ERROR; a changed role catalog (§17.3) and `[swarm] independent_review` apply at once (new hires use the
-new catalog; existing members keep their frozen prompts); `[swarm] clarify` switched off lifts a question pause and
-tells a clarify planner that waits for the user (§3.1).
+agents in ERROR; a changed role catalog (§17.3), `[swarm] independent_review` and `crew_review` apply at once (new
+hires use the new catalog; existing members keep their frozen prompts); `[swarm] clarify` switched off lifts a
+question pause and tells a clarify planner that waits for the user (§3.1).
 
 ### 3.1 Clarify mode and questions that pause the swarm
 
@@ -591,18 +596,20 @@ class Board:
     def blockers(self, task: Task) -> list[int]  # dependency ids whose status != done
     def create(self, actor: str, title: str, *, goal: str = "", description: str = "",
                assignee: str | None = None, reviewer: str | None = None, parent_id: int | None = None,
-               depends_on: list[int] | None = None, priority: int = 1, tags: list[str] | None = None) -> Task
+               depends_on: list[int] | None = None, priority: int = 1, tags: list[str] | None = None,
+               crew: int = 0, directions: list[str] | None = None) -> Task   # directions: §4.2
     def claim(self, actor: str, task_id: int) -> Task
     def update(self, actor: str, task_id: int, *, title=None, goal=None, description=None, status=None,
                assignee=UNSET, reviewer=UNSET, parent_id=UNSET, priority=None, tags=None,
-               depends_on=None) -> Task
+               depends_on=None, crew=None, directions=None) -> Task   # directions: titles to add (§4.2)
     def complete(self, actor: str, task_id: int, result: str) -> Task
     def review(self, actor: str, task_id: int, approve: bool, comment: str = "") -> Task
     def post(self, actor: str, task_id: int, text: str, reply_to: int | None = None) -> dict
     def discussion(self, task_id: int, since_id: int = 0, limit: int = 200) -> list[dict]
         # [{"id","task_id","author","text","reply_to","ts"}] ascending by id
     def participants(self, task_id: int) -> set[str]   # creator, assignee, reviewer, posters (no USER filtering)
-    def ready_unassigned(self) -> list[Task]           # todo, no assignee, no blockers
+    def ready_unassigned(self) -> list[Task]           # todo, no assignee, no blockers; a direction only while its
+                                                       # crew task can take it (§4.2 "Offers")
     def open_tasks_of(self, name: str) -> list[Task]   # assignee == name and status open
     def release_all(self, name: str, actor: str) -> list[int]   # name leaves; see §4.1
         # independent review off: open tasks of name -> todo, assignee None (their ids are returned); open tasks
@@ -610,8 +617,15 @@ class Board:
         # assignee) with `n_reviewer_left` {reviewer} to its assignee
     def counts(self) -> dict[str, int]                 # per status
 
+    # subtasks and crew tasks (§4.2)
+    def subtasks_of(self, task_id: int, open_only: bool = False) -> list[Task]   # parent_id == task_id, id asc
+    def crew_working(self, task: Task) -> list[str]    # working set: its assignee while open, then the assignees of
+                                                       # its in_progress/waiting subtasks (id asc), unique
+    def contributors_of(self, task: Task) -> set[str]  # the assignees of its subtasks, any status
+
     # independent review (below)
     independent_review: bool                           # property: [swarm] independent_review, read on every call
+    crew_review: bool                                  # property: [swarm] crew_review, read on every call (§4.2)
     def reviews_of(self, name: str) -> list[Task]      # status review and reviewer == name; priority desc, id asc
     def pick_reviewer(self, task: Task, exclude: Iterable[str] = ()) -> str   # a member name or USER
     def hand_over_review(self, task_id: int, exclude: Iterable[str]) -> Task | None
@@ -625,10 +639,12 @@ Rules (USER may do anything; "member" = agent of any kind):
   (USER allowed). `depends_on` ids must exist, no self/cycles. `parent_id` must exist. priority 0..3.
   Status `todo`. Emits `task.created`. If assignee given and != actor: notify assignee `n_assigned`.
 * `claim`: status must be `todo` (if already assigned to actor and in_progress/waiting: return as is).
-  assignee must be None or actor (else ToolError naming the holder). No blockers (ToolError lists them).
+  assignee must be None or actor (else ToolError naming the holder). No blockers (ToolError lists them). A direction
+  of a crew task has more checks (§4.2 "Taking a direction").
   Sets assignee=actor, status=in_progress. Atomic (DB transaction re-reads the row).
-* `update` permissions for members: title/goal/description/priority/tags/reviewer/parent_id —
-  creator or assignee. depends_on — the creator and the current assignee (any member kind); for the assignee a new
+* `update` permissions for members: title/goal/description/priority/tags/reviewer/parent_id/crew/directions —
+  creator or assignee (crew and directions with the checks of §4.2 "Marking"); parent_id and the subtasks of
+  a parent follow §4.2 "Who controls subtasks". depends_on — the creator and the current assignee (any member kind); for the assignee a new
   order of the same ids is no change. Anyone else: ToolError `Only the creator (X) or the assignee (Y) of task #N
   can change its depends_on (the assignee may remove dependencies the task can do without). Suggest the change in
   the discussion.` When an assignee who did not create the task removes dependencies (done ones too: harmless), the
@@ -645,12 +661,14 @@ Rules (USER may do anything; "member" = agent of any kind):
   and removed assignee `n_unassigned` (never notify the actor themself).
   status transitions for members: assignee may set `in_progress` (only without blockers), `waiting`,
   `todo` (= release: assignee cleared), `failed`; creator or assignee may set `cancelled`; creator may
-  reopen a terminal task to `todo`. `done`/`review` only via `complete`/`review` (USER may set `done`; on a
-  task in review that is an approval: the assignee gets `n_review_approved` with comment "").
+  reopen a terminal task to `todo` (a `failed` subtask also its parent's creator and assignee, to `todo` or
+  `cancelled`, §4.2). `done`/`review` only via `complete`/`review`, or when a crew task finishes by
+  itself (§4.2 "Finishing"); USER may set `done` (on a task in review that is an approval: the assignee gets
+  `n_review_approved` with comment "").
   The review fields (`assignee` and `reviewer` of a task in review, a reviewer equal to the assignee) follow
   §4.1 below.
-* `complete`: actor must be the assignee (or USER); status must be open and not `review`.
-  result non-empty. With independent review on, an agent's completion always goes to `review` (reviewer
+* `complete`: actor must be the assignee (or USER); status must be open and not `review`; an agent cannot complete
+  a task whose subtasks are open, nor a direction of a crew task with an empty goal (§4.2). result non-empty. With independent review on, an agent's completion always goes to `review` (reviewer
   chosen below). Otherwise (switch off, or USER completes): if reviewer set and reviewer != actor → status
   `review`, else `done`. A task entering review notifies its reviewer: `n_review_requested` {by, id, title},
   or USER `u_review_requested` / `u_review_fallback` (below).
@@ -665,13 +683,16 @@ Rules (USER may do anything; "member" = agent of any kind):
 * Side effects whenever a task becomes `done`: each open task that depends on it and now has no
   blockers → notify its assignee `n_unblocked` (if assignee and != actor). Whenever a task becomes
   terminal: notify creator `n_task_closed` (if creator is a member, != actor); it wakes the creator only
-  when the task failed / was cancelled or the creator has a `waiting` task, otherwise wake=False. Task
-  notifications go to active members only (never the actor). USER is not notified about tasks (the UI shows them)
-  except via discussion mentions/posts and about the reviews it owns (`u_review_requested`, `u_review_fallback`,
-  `u_review_handed_over`, `u_reviews_waiting`, below).
+  when the task failed / was cancelled or the creator has a `waiting` task, otherwise wake=False. When it was the
+  last open subtask of its parent, the parent follows in the same mutation (§4.2 "Finishing"; so does a move to
+  another parent): a crew task finishes by itself when "Finishing" allows it (to the check of the whole, or `done`
+  with these side effects), else its owner (without one, its creator) is told `n_subtasks_done`, like the assignee
+  of any other parent. Task notifications go to active members only (never the actor). USER is not notified about
+  tasks (the UI shows them) except via discussion mentions/posts and about the reviews it owns
+  (`u_review_requested`, `u_review_fallback`, `u_review_handed_over`, `u_reviews_waiting`, below).
 * `post` (discussion): text non-empty (<= 20000 chars); reply_to must be a post of the same task.
-  Recipients = participants ∪ {members mentioned as `@Full Name` (case-insensitive, match against
-  member names)} − {actor}. Mentioned members get `n_mention`, other recipients `n_discussion`.
+  Recipients = participants (for a crew task also the assignees of its open directions, §4.2) ∪ {members mentioned as `@Full Name`
+  (case-insensitive, match against member names)} − {actor}. Mentioned members get `n_mention`, other recipients `n_discussion`.
   USER is notified only when mentioned (`@user`) or when USER is the task creator/assignee.
   Emits `task.comment` {task_id, post}. Text in notifications truncated to 1500 chars.
 * Events: `task.created` {task}, `task.updated` {task, changes: {field: [old, new]}}, `task.comment`.
@@ -681,7 +702,8 @@ Rules (USER may do anything; "member" = agent of any kind):
 
 With `[swarm] independent_review = true` (the default, §17.1) an agent never approves work it executed. The
 **executor** of a task in `review` is its `assignee`: agents cannot change the assignee of a task in review (R2),
-so it is the member that called `task_complete`; it is NULL only when the executor left the swarm. The creator
+so it is the member that called `task_complete` (for a crew task that finished by itself, §4.2, its owner); it is
+NULL only when the executor left the swarm or such a crew task had no owner. The creator
 (e.g. the planner) may review, but members who neither created nor executed the task are preferred, and the user
 reviews when no other member can. `false` keeps the legacy rules above (a task without a reviewer is done at once).
 `Board.independent_review` reads `swarm.config.swarm.independent_review` on every call, so `reconfigure()` and
@@ -696,10 +718,25 @@ notifications explain it.
   when designated explicitly).
 - **Reviewer selection** `pick_reviewer(task, exclude=())`: the pool is the active LLM members other than
   `task.assignee` and `exclude` (external members are never picked: they may be offline). The first by the key
-  `(is the task's creator, role rank: 0 for the catalog's reviewer role (roles.role_key == "reviewer",
-  «Ревьюер»/Reviewer) else 1, status rank: idle 0 / working 1 / other 2, open tasks held + reviews pending,
-  name)`; USER when the pool is empty. So the creator reviews only when no third member exists (in a two-agent
-  team the planner reviews the other agent's tasks); testers are not preferred (their own test tasks would starve).
+  `(cannot act now: 1 for a status other than idle or working (error, paused) else 0, is the task's creator, role
+  rank: 0 for the catalog's reviewer role (roles.role_key == "reviewer", «Ревьюер»/Reviewer) else 1, reviews
+  pending, reviews so far (tasks with reviewer = it in `review`, `done` or `failed` whose `updated_at` is not
+  before the `created_at` of the newest active LLM member: the reviews given since it joined; a review handed over
+  counts for the member that has it now), open tasks held, status rank: idle 0 / working 1, name)` (for a crew task
+  `is a contributor` comes right after `cannot act now`, §4.2); USER when the pool is empty. Grouped counts over
+  `tasks` (by reviewer, by assignee), like the open-task count. So reviews spread evenly over the members that can
+  act, by load first (the pending ones) and then by count, a member hired late does not take every review until
+  its count catches up, and members in the reviewer role get them first (evenly
+  among themselves; a backlog does not move reviews away from them, only a hand-over after a lapse does,
+  "Liveness"); the creator reviews only when no third member can act (for a crew task: none outside the crew,
+  §4.2; in a two-agent team the planner reviews the other agent's tasks); testers are not preferred (their own
+  test tasks would starve).
+- **Several reviews at once.** Reviews are not tasks in progress (rule 3 of the system prompt, one task in progress
+  at a time, counts claims): a member may have several waiting (the wake-up's `my_reviews` lists them all) and
+  settles them together, one `task_review` each, independent ones in one response. Rule 6 of the system prompt (en
+  and ru; frozen per agent, so for members created from then on) adds `Reviews are not tasks in progress: when
+  several wait for you, settle them together, one task_review each (independent ones in one response), each
+  checked against its own goal.`
 - **Operations** (the last column: the switch off):
 
   | operation | independent review on | off |
@@ -711,8 +748,9 @@ notifications explain it.
   | `update(USER, status=done)` in review | done; `n_review_approved` (comment "") to the assignee, quiet `n_review_cancelled` to the reviewer | same |
   | `complete` by an agent | always `review`: reviewer = the task's own if valid, else `pick_reviewer(task)` | `review` only with a reviewer other than the actor, else `done` |
   | `complete` by USER | as with the switch off | — |
+  | a crew task finishes by itself (§4.2 "Finishing": the mutation takes away its last open direction, it is open and not in review, a direction is `done`, none is `failed`; any operation) | `review` (the check of the whole) with a valid reviewer of its own, or with `[swarm] crew_review` on: reviewer = its own, else `pick_reviewer(task)` with the contributor key; else `done` | `review` only with a valid reviewer of its own, else `done` |
   | `review` by an agent | the task's assignee → R4 (checked before "only the reviewer", also for a row written while the switch was off with reviewer == assignee) | no R4 |
-  | `release_all(name)` | name's tasks in review: assignee NULL, they stay in review and are not in the returned ids (a reviewer equal to name, a legacy row, is re-picked); name's other open tasks: `todo`, unassigned (returned). Reviews name was to do: re-picked with `exclude={name}`, the new reviewer is notified (by = the executor, else the actor); open tasks not in review just lose the reviewer. No `n_reviewer_left` | as in the method comment above |
+  | `release_all(name)` | name's tasks in review: assignee NULL, they stay in review and are not in the returned ids (a reviewer equal to name, a legacy row, is re-picked); name's other open tasks: `todo`, unassigned (returned). Reviews name was to do: re-picked with `exclude={name}` one at a time, each pick counting the ones re-picked before it in the same call (so they spread over the team), the new reviewer is notified (by = the executor, else the actor); open tasks not in review just lose the reviewer. No `n_reviewer_left` | as in the method comment above |
 
   A task in review whose executor left is approved or returned as usual; a return makes it `todo` (claimable). The
   executor can still withdraw its work while it waits (`task_update status=in_progress|todo|failed|cancelled`,
@@ -732,7 +770,7 @@ notifications explain it.
 
   | when | to | key {placeholders} | wakes |
   |---|---|---|---|
-  | a task enters review, or gets a new reviewer while in review; the reviewer is a member | the reviewer (never the actor) | `n_review_requested` {by, id, title} | yes |
+  | a task enters review, or gets a new reviewer while in review; the reviewer is a member | the reviewer (never the actor) | `n_review_requested` {by, id, title}; for a crew task `n_crew_review_requested` {by, id, title, n} (§4.2 "Finishing") | yes |
   | same; the reviewer is USER, set explicitly (or kept from the task) | USER (unless USER is the actor) | `u_review_requested` {by, id, title} | yes |
   | same; the board chose USER because nobody else qualifies (a pick at `complete`, a re-pick in `release_all` while the executor is still a member) | USER | `u_review_fallback` {by, id, title} | yes |
   | same; the board chose USER at a hand-over, or at a re-pick in `release_all` when the executor has left too | USER | `u_review_handed_over` {id, title, reviewer} (`reviewer`: the member the review was taken from) | yes |
@@ -741,7 +779,7 @@ notifications explain it.
   | an idle reviewer's reviews wait (Liveness) | the reviewer | `n_review_reminder` {tasks} | yes |
   | only the user's reviews keep the swarm going (Liveness) | USER | `u_reviews_waiting` {tasks} | yes |
   | approved (`task_review`, or USER sets `done`) | the assignee | `n_review_approved` {by, id, title, comment} | yes |
-  | returned | the assignee | `n_review_rejected` {by, id, title, comment} | yes |
+  | returned | the assignee | `n_review_rejected` {by, id, title, comment} (for a crew task with the crew ending, §4.2 "Finishing") | yes |
   | switch off: the reviewer left | the assignee | `n_reviewer_left` {id, title, reviewer} | yes |
 
   `by` of a review request is the actor; for a re-pick or a hand-over it is the executor, or, when the executor
@@ -762,9 +800,10 @@ notifications explain it.
     with a job (e.g. its test run went on in the background, §7.1): while it is busy its reminder time is renewed
     at every tick, so the hand-over clock restarts when the busy window ends.
   - `hand_over_review(task_id, exclude)`: reviewer = `pick_reviewer(task, exclude={*exclude, current reviewer})`,
-    else USER; `task.updated` with actor None (scheduler-driven); the new reviewer is asked (`n_review_requested`
-    by the executor, else by the old reviewer) or USER gets `u_review_handed_over` (the old reviewer did not review
-    it and no other agent can take it over); the old reviewer gets the quiet `n_review_reassigned`.
+    else USER; `task.updated` with actor None (scheduler-driven); the new reviewer is asked (`n_review_requested`,
+    for a crew task `n_crew_review_requested`, §4.2, by the executor, else by the old reviewer) or USER gets
+    `u_review_handed_over` (the old reviewer did not review it and no other agent can take it over); the old
+    reviewer gets the quiet `n_review_reassigned`.
   - `_remind_user_reviews` (both modes): the goal is active, at least one task waits for USER's review, no LLM
     member is working, busy with a job (§7.1) or has pending events, no `todo` task is actionable (not blocked and
     not assigned to USER), no task is `in_progress` and no review waits for anyone but USER → USER gets
@@ -780,6 +819,245 @@ notifications explain it.
 - **The user** can always approve or return a task in review (`task_review` as USER; the web card, `/approve N
   [comment]` and `/reject N what to fix` in the TUI and the console) or set it `done` (`task_update`); print mode
   (`-p`) approves the user's reviews itself while auto-replies are on (docs/TUI.md).
+
+### 4.2 Crew tasks and subtasks
+
+A **subtask** is a task with `parent_id`: a part of its parent. A **crew task** is a task with `crew` ≥ 2
+(`tasks.crew`; 0 = an ordinary task): a deliverable too big for one member whose detailed split is not clear before
+the work starts. Whoever makes it a crew task (its creator, or its assignee once the work has started) names only its
+**directions**, the areas it splits into ("oauth2", "pkce", "oidc"); each direction is a subtask of the crew task,
+created as a draft (the direction as its title, an empty goal), and the member who takes it writes its card. Its
+assignee is its **owner**: the member that executes the crew task does one of its directions itself and keeps the
+directions consistent (the ones missing, the ones not needed, the interfaces between them). Each direction is
+handed in and reviewed by the ordinary rules (§4.1); when all of them are finished, the crew task finishes by itself:
+an independent member checks it as a whole, or, without that check ("Finishing"), it is done. Every subtask of a crew
+task is one of its directions, whoever created it. `crew` is how many members may work on the crew task at once, the
+owner included: its **working set** is its assignee (while it is open) plus the assignees of its directions in
+`in_progress` or `waiting`, each member once (the owner's own direction takes no second place); a direction in
+review has handed its work in and frees its place.
+Why: in session 016 (the authlib audit) the creator split "Verify the findings" into six subtasks by domain and wrote
+every card up front, which worked because the details were known; here the creator gives the areas and the members
+who do the work write the details. The member that executes a task may make it a crew task (and an ordinary task
+again), not only its creator: most tasks are created by the planner (§3), while it is the executor that finds out,
+once the work starts, that a task is too big for one member, or that its split is not needed after all.
+Names: Russian texts (the web board and settings, the TUI, the ru system prompt and texts for agents, docs/ru)
+call a crew task «групповая задача» and a direction «направление»; «команда» is never used for it (a team of roles,
+issue #41, is a «команда»). English texts keep "crew task" and "direction".
+
+- **Marking.** `crew` is set by the creator in `task_create`, and by the creator, the assignee and USER in
+  `task_update`: 2..`CREW_MAX` (8) makes a task a crew task (another value in that range resizes it), 0 makes it an
+  ordinary task again (its finished directions stay its subtasks). `directions` (a list of 1..20 non-empty, distinct
+  titles, each ≤ 200 characters) goes with `crew` ≥ 2 in the same call (`task_create(crew=N)`, or the
+  `task_update(crew=N)` that makes a task a crew task: the crew is set first, then the directions are added), or adds
+  more to a crew task later (`task_update(directions=[...])`: the creator, the assignee, USER). Each direction is
+  created as a todo subtask: `title` the direction, `goal` empty, `parent_id` the crew task, `created_by` the actor,
+  the crew task's priority and tags, no assignee, reviewer or `depends_on`. Exception, the owner's own part: when
+  the crew task's assignee (a member, not USER) passes `directions` while none of its directions is its own
+  (assigned to it, in any status but `cancelled`), the first of them is created `in_progress` with the owner as its
+  assignee, in the same mutation (it is in the working set already; no `n_direction_taken`), so that no other member
+  takes it first, and the result adds ` #15 "parser" is your own part: write its card (task_update), and if you have
+  done some of #N already, say in #N's discussion what is done, so nobody redoes it.` `task_create` inserts the crew
+  task and its directions in one transaction (an internal insert, not nested `create` calls: `db._Transaction` is
+  not re-entrant) and emits one `task.created` per task.
+  ToolError: `directions` on a task that is not a crew task, without `crew` ≥ 2 in the same call (`directions are
+  for crew tasks: pass crew (how many members may work on it at once, its owner included)`); `crew` by anyone but the
+  creator, the assignee or USER (`Only the creator (X) or the assignee (Y) of task #N can change its crew. Suggest it
+  in its discussion.`); `crew` 2..`CREW_MAX` on a task in `review` or terminal (`#N is {status}: it cannot become a
+  crew task now`; 0 there is accepted); `crew` 0 while the task has open subtasks, the owner's own direction included
+  (`#N has open directions: #15 [in_progress, you], #16 [in_progress, Anna Smith], #17 [review]: finish or cancel
+  them first (task_update status=cancelled); their holders are told.`); crews more than one level deep: `crew` on a
+  task with a crew task among its ancestors or descendants, or a `parent_id` that puts a crew task, or a task with a
+  crew task below it, anywhere below a crew task (`crews are one level deep`; `crew` on a direction: `#M is a
+  direction of crew task #N, and crews are one level deep: ask its owner (X | its creator X) in #N's discussion to
+  add directions (task_update directions).`); `crew` on a task tagged `planning`, and the tag `planning` on a crew
+  task (`planning stays with one member`, §3). A `crew` below the working set only stops the claims of members
+  outside it: the owner always takes its own direction.
+  Both sides see a change of `crew`: when the assignee changes the `crew` of a task it did not create, the creator
+  gets the quiet `n_crew_changed` {by, id, title, crew}, and the result asks the assignee to say why in #N's
+  discussion (a post there wakes the creator, a participant), as for removed dependencies (§4 `update`); when the
+  creator or USER changes the `crew` of a task someone else holds, the holder gets `n_crew_owner` (below) if that
+  makes the task a crew task, else the quiet `n_crew_changed`. The board does not arbitrate: the last change stands,
+  and the two settle it in the discussion.
+- **Who controls subtasks** (any parent, not only a crew task): a member may create a task under a parent
+  (`task_create parent_id`, `task_update parent_id`) only when it created that parent or is its assignee, and never
+  under a parent in `review` or terminal (`#N is {status}: it takes no new subtasks`). The parent's creator and
+  assignee may also cancel or unassign its open subtasks (unassigning not while in review, §4.1 R2), besides the
+  subtask's own creator and assignee (§4 `update`), so an open subtask nobody works on never blocks its parent;
+  they may also reopen a `failed` subtask to `todo` (unassigned, to be done again) or set it `cancelled` (the
+  parent does without it): the one move from a terminal status that is not the creator's reopening (§4). An
+  open subtask cancelled by someone other than its assignee tells its assignee (for one in review: its executor)
+  `n_subtask_cancelled` {by, id, title, parent} (wakes). USER may do anything.
+- **The owner.** The first claim of a crew task is an ordinary claim; the creator may also assign it. Claiming or
+  being assigned the crew task needs no free place: a crew task always takes an owner, and a working set above
+  `crew` only stops the claims of members outside it. The crew task gets an owner by a claim, or by `crew` set by its
+  assignee on the task it holds, which makes that assignee the owner (both: told in the result of that call); or by
+  an assignment, or `crew` set by someone else on a task someone holds (`n_crew_owner` {id, title, crew, directions,
+  own}, wakes; for an assignment it replaces `n_assigned`). The owner is told:
+  ` You own crew task #N: take one of its directions yourself (task_claim; with #N it counts as one task in
+  progress); the other members take the rest (up to K members at once, you included) and write their cards. Keep
+  its directions consistent: add the ones missing (task_update directions), cancel the ones not needed, and settle
+  the interfaces between them in #N's discussion. Each direction is handed in on its own; when all of them are
+  finished, #N finishes by itself (an independent member may check it as a whole first): you complete it only when
+  the board tells you to.` plus its directions (`#15
+  [in_progress] "pkce" @Anna Smith; #17 [todo] "oidc"`), or, with none, ` It has no directions yet: add them now
+  (task_update directions; the first one is your own part), so the others can join.`, or, with all of them finished,
+  in place of the instructions, the first of the texts of "Finishing" that applies: a direction failed, all of
+  them were cancelled, else #N did not finish by itself. In place of `take one of its directions
+  yourself (task_claim; …)`, an owner that already has one of its directions (assigned to it, in any status but
+  `cancelled`) reads `your own direction is #15 [in_progress]`, and one that has none and finds none free reads `all
+  its directions are taken: if a part of #N is left that nobody does, add it as a direction (task_update directions)
+  and it is yours; otherwise keep the directions consistent until #N finishes by itself`. `n_crew_owner` carries what
+  these variants need:
+  `directions` the rendered list ("" for none), `own` the id of the owner's own direction (0 for none). The owner
+  takes a free direction by an ordinary claim (below), which needs no free place either. Claiming a crew task
+  someone else holds gets the holder error of §4 `claim` plus ` It is a crew task: take one of its free directions
+  instead: #17 "oidc", #18 "jose".` (or ` …: none is free now.`; for a member that holds one of its directions in
+  `in_progress` or `waiting`: ` It is a crew task, and you work on #15 of it already.`).
+- **Taking a direction** is an ordinary `claim` of the subtask (`task_claim` is unchanged, so agents of every revision
+  can), with three more checks:
+  - the crew task is `todo`, `in_progress` or `waiting` and not blocked (a direction can be taken before the crew
+    task has an owner; `Direction #M belongs to #N, which is {status | blocked by #3}: …`);
+  - a free place, unless the actor is in the working set already (the owner): the working set, with the actor added,
+    is at most `crew` (`Crew task #N already has 3 of 3 members working (X, A, B): #M is free again when one of them
+    hands its direction in. Pick another task or call wait.`);
+  - the actor holds no other direction of it in `in_progress` or `waiting` (`You already work on #15, a direction of
+    #N: hand it in first (task_complete).`; one in review does not count).
+  The result adds ` #M is a direction of crew task #N (owner X | no owner yet | you own #N): first write its card
+  with task_update — title, goal (what it delivers and how it is checked), description (the files it touches) — then
+  do the work. In #N's discussion post only what another direction depends on (interfaces, shared files).` The owner,
+  unless it took the direction itself, gets the quiet `n_direction_taken` {by, id, title, parent}. A direction's
+  `goal` must be non-empty when it is completed: `complete` of a direction with an empty goal raises `Write the goal
+  of #M first (task_update goal=...): its reviewer checks the work against it.` The reviewer of the crew task
+  (designated, or kept from an earlier check of the whole) that takes one of its directions stops being its
+  reviewer in the same mutation (§4.1 claim row), and the result says ` You were the reviewer of #N; since you
+  work on one of its directions now, you do not check it as a whole: another member does, if a check applies
+  ("Finishing").` (the same ending in place of `another member will review it` when that reviewer claims the crew
+  task itself).
+- **Discussion.** The participants of a crew task (§4 `post`) also include the assignees of its open directions (in
+  review too): its discussion is the crew's channel, and a post there wakes them (the economy rules of the system
+  prompt apply). Taking a direction posts nothing: the board shows it.
+- **Finishing.** An agent cannot complete a task with open subtasks (any parent): `Task #N has open subtasks: #17
+  [in_progress, Anna Smith], #19 [review]. Complete it when they are finished; as its creator or assignee you may
+  cancel the ones no longer needed (task_update status=cancelled).`, for a crew task with `#N finishes by itself
+  when they are finished` in place of `Complete it when they are finished`. A parent that is not a crew task: when
+  its last open subtask becomes terminal and it has an assignee, that assignee is told `All 6 subtasks of #N "..."
+  are finished (5 done, 1 cancelled): assemble their results and complete it.`: as `n_subtasks_done` {id, title,
+  counts} (wakes) when someone else did it, or appended to the result of its own call (`task_review`,
+  `task_update`, `task_complete`) when it did.
+  A crew task **finishes by itself** in the mutation that takes away its last open direction (it becomes terminal
+  or moves to another parent), when the crew task is open and not in review, at least one of its directions is
+  `done` and none is `failed` (a failed one is reopened or cancelled first, "Who controls subtasks"). Its `result`
+  is made of its directions' (`#15 "pkce" — <the first line of its result, cut to 120 characters>`, `(no result)`
+  for one USER set done; one line per done direction), and then:
+  - **the check of the whole** applies when the crew task has a valid reviewer of its own (§4.1: designated, or
+    kept from an earlier check), in any mode, and otherwise with `[swarm] crew_review = true` (the default) and
+    independent review on: status `review`, reviewer = its own, else `pick_reviewer` with the contributor key
+    ("Reviews"). Every review request of a crew task with a done direction (this one, a hand-over, a re-pick in
+    `release_all`, a reviewer changed by `update`, the owner's own `task_complete`) is `n_crew_review_requested`
+    {by, id, title, n} (wakes) in place of `n_review_requested`, `n` the number of its done directions, `by` as for
+    any review request (§4.1), at the finish the owner, else the actor: `#{id} "{title}" (sent by {by}) is a crew
+    task whose {n} directions are done: check it as a whole — do the directions fit together, and does the result
+    meet its goal? Approve it, or return it with what does not fit (task_review).`; USER gets `u_review_requested`,
+    `u_review_fallback` or `u_review_handed_over` as for any task (§4.1), with the same `by`;
+  - otherwise status `done`, with the side effects of §4.
+  The owner, if it has one and is not the actor, gets the quiet `n_crew_finished` {id, title, status, reviewer}:
+  `All directions of crew task #{id} "{title}" are finished: {reviewer} checks it as a whole now.` (or `…: it is
+  done.`), and the call that settled the last direction adds ` That was the last direction of crew task #N: …` with
+  the same ending to its result; when the reviewer of the whole is that call's actor (nobody is notified of its own
+  call), the ending is `you check it as a whole now: do the directions fit together, and does the result meet its
+  goal? Approve it, or return it with what does not fit (task_review).`
+  A crew task returned from the check of the whole goes back to its owner (`in_progress`; `todo` without one), which
+  fixes it with new directions (they are reviewed, and the crew task finishes by itself again when they are) or
+  itself (then `task_complete` as usual: to review by the ordinary rules). For a crew task `n_review_rejected` ends
+  with ` #N is a crew task: fix it with new directions (task_update directions; #N goes to the check again by itself
+  when they are finished) or yourself (then task_complete).` in place of `Fix it, then call task_complete again.`;
+  an owner that gets the owner sentence with all its directions finished, none failed and not all of them
+  cancelled, reads ` All its directions are finished, but #N did not finish by itself (it was returned or
+  reopened, or became a crew task after they were finished): its discussion says what is missing; fix it with new
+  directions or yourself (then task_complete).` in place of the instructions of the owner sentence.
+  A direction that fails while another one is still open tells the crew task's owner at once (unless the owner is
+  the actor, or the direction's creator, which gets `n_task_closed`; for the last one `n_subtasks_done` below
+  says it): `n_direction_failed` {by, id, title, parent} (wakes): `#{id} "{title}", a direction of your crew task
+  #{parent}, failed ({by}): reopen it to be done again (task_update #{id} status=todo), or cancel it if #{parent}
+  does without it (status=cancelled).` When the crew task has no open direction but does not finish by itself (a
+  direction failed, or all of them were cancelled), its owner (without one, its creator) is told as for any
+  parent (`n_subtasks_done`, or in the result of its own call), with ` A direction failed: reopen it to be done
+  again (task_update #M status=todo), cancel it if #N does without it (status=cancelled; #N then finishes by
+  itself), or fail #N.` (to a creator that does not hold #N: `…, or cancel #N.`) or ` All its directions were
+  cancelled: add new ones, make it an ordinary task (crew 0), or cancel it.` in place of `assemble their results
+  and complete it.`
+  Liveness (§3 item 3): for `_wake_idle_holders` every `in_progress` or `waiting` task of the member whose subtasks
+  are all terminal enters the held set as an entry of its own, `(id, "subtasks done")`: the set then differs from
+  any the member was woken about (a holder that already got `n_stalled` for {N} while it waited), so a holder that
+  missed `n_subtasks_done` (a parent that is not a crew task, or a crew task that did not finish by itself), or the
+  owner of a crew task open again with all its directions finished, is woken once more. A trigger
+  `all_done(parent=N)` (§8) works as before.
+- **Reviews.** A direction is reviewed by the ordinary rules (§4.1), independently of the others: its own reviewer
+  if one was set and is valid, else `pick_reviewer` at its completion (any member but its executor; the owner too,
+  though for the directions it added it is their creator and comes after the others, like any creator); with
+  independent review off, a direction without a reviewer of its own is done when it is handed in. Reviews spread
+  evenly (§4.1 "Reviewer selection"), so the directions of one crew task usually go to different members. The check
+  of the whole: for a crew task the key of `pick_reviewer` gains `is a contributor` right after `cannot act now`
+  (`Board.contributors_of(task)`: the assignees of its subtasks, finished ones included; the owner is the crew
+  task's assignee and never reviews it), so a member outside the crew checks it when there is one; otherwise a
+  contributor does, before USER: "independent" means "not the owner" here, and such a contributor checks how all
+  the directions fit together, its own included (it executed a direction, not the crew task).
+- **Leaving and closing.** When the owner releases a crew task (`status todo`) or leaves (`release_all`), its
+  directions go on: the crew task goes back to `todo`, unassigned, ready, and its next claim makes a new owner. An
+  owner that releases only the crew task keeps its own direction (as that direction's assignee it stays in the
+  working set). The direction of a member that leaves goes back to `todo`, unassigned (§4.1): a free direction
+  again, and the crew task's assignee after the release, if it has one, gets the quiet `n_direction_freed` {id,
+  title, by} (nobody does when the owner itself leaves: the next owner reads the directions in the owner sentence).
+  When a task with open subtasks becomes terminal (`done` set by USER, `failed`, `cancelled`), its `todo` subtasks
+  without an assignee are cancelled in the same mutation (one `task.updated` each) and the assignees of its other
+  open subtasks get `n_parent_closed` {id, title, status, sub} (wakes): `#{id} "{title}", of which your #{sub} is a
+  part, is {status}: finish #{sub} only if it is still needed on its own; otherwise cancel it (task_update
+  status=cancelled).` The actor's own open subtask (the owner's direction, when the owner closes the crew task) gets
+  no notification: the result of its call adds the same sentence as ` Your #{sub} is still open: finish it only if
+  it is still needed on its own; otherwise cancel it (task_update status=cancelled).`
+- **Offers.** A free direction is a ready unassigned task: `ready_unassigned` (§4) returns a subtask of a crew task
+  only while that crew task is `todo`, `in_progress` or `waiting`, not blocked, and has a free place. So `_nudge_idle`
+  (`n_ready`), the wake-up's `ready` list and wrap-up mode treat directions like any ready task; no other offer
+  exists.
+- **Texts for agents.** `Task.short()` adds `crew 2/3` to a crew task (working set / `crew`; `Board` fills
+  `Task.crew_working`, like `blocked_by`); a subtask keeps its `parent #N`. `board` lists a subtask indented (`  ↳ `)
+  under its parent when the parent is listed, otherwise at the top level. `task_get` of a task with subtasks adds
+  `Subtasks:` and one line each, `#15 [done] "title" @Anna Smith — <the result's first line, cut to 120 characters>`,
+  and for a crew task `Crew task: up to 3 members at once, the owner included; 2 working now (owner X #16; Anna
+  Smith #15). Free directions: #17 "oidc".` (the owner's own direction in `in_progress` or `waiting` follows its
+  name). `n_direction_taken`: `{by} took #{id} "{title}", a direction of your crew task #{parent}.`
+  `n_direction_freed`: `#{id} "{title}", a direction of your crew task, is free again: {by} left the swarm.`
+  `n_crew_owner`: the owner sentence above; `n_crew_review_requested`, `n_crew_finished`, `n_direction_failed`:
+  "Finishing".
+  `n_crew_changed`: `{by} set the crew of #{id} "{title}" to {crew}
+  (0 = an ordinary task).` `n_subtask_cancelled`: `{by} cancelled #{id} "{title}", your part of #{parent}: stop the
+  work on it; if what you have done is still needed, say so in #{parent}'s discussion.`
+- **System prompt** (en and ru; frozen per agent, so for members created from then on). Rule 3 (which says to hold
+  one task in progress at a time) adds `A crew task ("crew 2/3" on the board) is split into directions: take a free
+  one like any task, then write its card (task_update: title, goal, description) before the work. If you take the
+  crew task itself, you own it: do one of its directions yourself and keep the directions consistent (add the
+  missing ones, cancel the unneeded, settle the interfaces in its discussion); each direction is handed in on its
+  own (task_complete), and the crew task finishes by itself when all of them are finished, so you complete it only
+  when the board tells you to. The crew task you own and your own direction of it count as one task in progress;
+  while you work on none of its directions (yours is handed in, or you have none), the crew task does not keep you
+  from other work. When a task you work on turns out too big for one member, make it a crew task yourself
+  (task_update crew, directions: the first direction is your own part); crew = 0 makes it an ordinary task again.
+  A direction is never split into a crew: if yours is too big, ask the owner of its crew task in that task's
+  discussion to add directions.`; rule 8 adds `When a deliverable is too big
+  for one member and its detailed split is unclear before the work starts, create one crew task: crew = how many
+  members may work on it at once, its owner included; directions = its areas, one per item; the members who take
+  them write the details.` The planning card (board data, §3) says the same in one sentence, and its "only one task"
+  counts a crew task the planner owns and its own direction of it as one (and the crew task alone as none while the
+  planner works on none of its directions). An agent moved to revision 5 by a
+  compaction keeps its old system prompt; it can take directions (an ordinary claim, whose result says what to do)
+  and learns `crew` and `directions` from the tool descriptions (`tools_added` names no tool: revision 5 adds
+  parameters only).
+- **Surfaces.** The web board shows subtasks in their parent's stack (§18.4 "Subtasks"). The TUI (docs/TUI.md,
+  updated with the code) does the same in text: a parent's line ends with one `●` per direct subtask in its status
+  colour, `done/total`, `crew 2/3` for a crew task (ru «группа 2/3») and the TUI's review-for-you mark when one of its
+  subtasks waits
+  for the user's review; `/task N` lists the subtasks indented; the board list shows a subtask as its own line only
+  where the web shows it as its own card.
 
 ## 5. Mailbox (mailbox.py)
 
@@ -849,7 +1127,7 @@ reach existing members through tool results and notifications, and new tools at 
 to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
 it:
 - Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
-  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 4: `send_message` gains `pause_swarm`, §3.1) is what
+  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what
   `schemas_for("llm", language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were
   frozen (sorted digest `e3c5cbc7…`).
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
@@ -908,7 +1186,8 @@ class AgentRuntime:
   call `swarm.hint_planner(name)` (§3 scheduler item 4; never raises); after tools, if
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
   called, no tool calls (a `nudge` once per in_progress task the agent holds, except a clarify planning task it
-  waits for the user's answers about, `swarm.asks_user` looked up with getattr, §3.1; none while it is busy with a
+  waits for the user's answers about, `swarm.asks_user` looked up with getattr, §3.1, and a crew task with open
+  directions, §3 item 3; none while it is busy with a
   job, §7.1 "Liveness": the job's end wakes it, nor while it waits for a file it was refused,
   `workspace.waits_for_lock`, §7 "Lock waiters": `n_lock_free` wakes it; after plain text even then, `stalled`
   records those tasks and
@@ -963,7 +1242,8 @@ already produced (it may remove those it can do without, §4), `my_reviews` (onl
 tasks wait for its review: `#id title (assignee or -)`), `my_jobs` (only while it has running background jobs,
 §7.1: `my_job` items `j3 npm run dev (running 25 min)` joined with "; ", the command cut to 60 characters, the
 duration in the member's language; a silent job, §7.1, is `my_job_silent` `j3 npm run dev (running 50 min, no output
-for 40 min)`), `ready` (up to 8), for an LLM member the Skills index (below), notes: in full only when they
+for 40 min)`), `ready` (up to 8; free directions of crew tasks included, §4.2), for an LLM member the Skills index
+(below), notes: in full only when they
 changed
 since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
 otherwise the one-line `notes_unchanged`, since the history is append-only.
@@ -2349,9 +2629,9 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 |---|---|---|
 | `board` | status?, assignee? ("me" ok), tag?, include_closed? | LEU |
 | `task_get` | task_id | LEU |
-| `task_create` | title, goal, description?, assignee?, reviewer?, depends_on?, parent_id?, priority?, tags? | LEU |
+| `task_create` | title, goal, description?, assignee?, reviewer?, depends_on?, parent_id?, priority?, tags?, crew? (integer, revision 5: 0, or how many members may work on it at once, its owner included, §4.2), directions? (array of strings, revision 5: its areas, created as draft subtasks) | LEU |
 | `task_claim` | task_id | LE |
-| `task_update` | task_id, title?, goal?, description?, status?, assignee? ("" = unassign), reviewer?, parent_id? (0 = none), priority?, tags?, depends_on?, comment? | LEU |
+| `task_update` | task_id, title?, goal?, description?, status?, assignee? ("" = unassign), reviewer?, parent_id? (0 = none), priority?, tags?, depends_on?, comment?, crew? (revision 5: the creator or the assignee; 0 = an ordinary task again), directions? (revision 5: directions to add; the creator or the assignee; the first is the assignee's own part while it has none) | LEU |
 | `task_complete` | task_id, result | LEU |
 | `task_review` | task_id, approve, comment? | LEU |
 | `task_comment` | task_id, text, reply_to? | LEU |
@@ -2440,7 +2720,16 @@ never gains an enum. Revisions: 1 = the tools before background jobs (sorted dig
 agents created before tool sets were frozen), 2 = background jobs (`shell` gains `background`, new `jobs` and
 `job_stop`, new `shell` and `wait` descriptions), 3 = `skill_propose` (appended last; the array of revision 2
 before it is unchanged), 4 = `send_message` gains `pause_swarm` and its new description (the array of revision 3
-otherwise unchanged; §3.1). Notifications and wake-up texts reach agents of every revision, so
+otherwise unchanged; §3.1), 5 = crew tasks (§4.2): `task_create` and `task_update` gain `crew` and then
+`directions` (last, after `tags` / `comment`; their descriptions English in both arrays, like the other board
+properties), and `task_create`'s description gains a last sentence (en; ru the same): `A deliverable
+too big for one member whose detailed split is unclear: pass crew (how many members may work on it at once, its
+owner included) and directions (its areas; the members who take them write the details).`, and `task_update`'s
+description a last sentence (en; ru the same): `A task you work on that turns out too big for one member: pass crew
+and directions; you then own it and the first direction is your own part; each direction is handed in on its own,
+and the task finishes by itself when all of them are finished (crew 0 makes it an ordinary task again).` (the
+array of revision 4 otherwise unchanged;
+`task_claim` is unchanged, so every revision can take a direction). Notifications and wake-up texts reach agents of every revision, so
 they name only tools of every released revision (tests/test_prompts.py); tool results that point at a newer tool
 check `ToolContext.has_tool`. `allow_empty` is validation only, not part of the schema. Tools of the
 `user`/`external` audiences only (e.g. `set_goal`) are not in the LLM tools array, and external members and the user
@@ -3021,10 +3310,15 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   true` with a comment, after the `starting_roles` comment (which names the starting team rule, §17.3), and a
   commented `[[roles]]` example before the model profiles, with a commented `[[teams]]` example before the role
   catalog's.
+- `[swarm] crew_review` (bool, default true; a non-bool is a ValueError, "true or false"): when every direction of
+  a crew task is finished, an independent member checks the crew task as a whole (§4.2 "Finishing"); false, or
+  independent review off: the crew task is done then (a valid reviewer of its own still checks it). Read at each
+  use; session overrides apply. The template has the line `crew_review = true` with a comment after
+  `independent_review`.
 - `[swarm] network` ("on" | "off", default "on"; anything else is a ValueError naming `swarm.network`): "off"
   cuts the members' commands, their jobs and the stdio MCP servers off the network (§7.2). Read at each use;
   session overrides apply (a running session: from its next command). The template has the line after
-  `independent_review`, with a Russian comment that says it is strict only in Docker and on Linux.
+  `crew_review`, with a Russian comment that says it is strict only in Docker and on Linux.
 - `[swarm] clarify` (bool, default false; a non-bool is a ValueError, "true or false"): clarify mode (§3.1): a new
   planning task first asks the user about the goal's forks while the others wait, and a member's `send_message` with
   `pause_swarm` pauses the swarm until the user answers. Read live; session overrides and the partial `settings`
@@ -4226,8 +4520,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     the first option undoes a pick, bringing back the rows from before it and their max (a max typed since stays); any
     edit of the rows resets the select and keeps those rows; the rows are what the session is created from, so no team
     name is sent. A stray
-    click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
-    settings page has it; sessions can still override it through the API).
+    click or Escape asks before discarding a typed goal. Independent review and the check of a crew task as a
+    whole are not fields of the modal (the settings page has them; sessions can still override them through the
+    API).
   - Team composer (new-session modal, settings' defaults, saved teams): one row per group of the starting team (§17.3
     `team_rows`; JS twins `teamRows` / `teamValue`): a role select over the visible catalog plus «Своя роль…» (a
     name not in the catalog), −/+ count (1..50; a row a saved team already holds above 50 keeps that count as its limit,
@@ -4245,7 +4540,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     уберите строку.»; a hidden role shows as elsewhere: selected, marked «(скрыта)», and not offered to other rows.
   - Settings tab: sections «Модели и эндпоинты», «Роли», «Команда», «Новые сессии по умолчанию» (with the team
     composer and
-    the switch «Независимое ревью задач», `swarm.independent_review`, «Сначала уточнять цель», `swarm.clarify`, whose
+    the switches «Независимое ревью задач», `swarm.independent_review`, «Проверять групповую задачу целиком»,
+    `swarm.crew_review`, whose hint says it applies with independent review on or a reviewer named on the task,
+    and «Сначала уточнять цель», `swarm.clarify`, whose
     hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для команд агентов»,
     `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
     `agents.planning_hint_steps` / `planning_hint_minutes` and their hints, and the triggers' `file_settle_seconds`,
@@ -4369,8 +4666,31 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     names its reviewer; the task card's «Принять» / «Вернуть» (a return needs a comment: what to fix; for a
     task another member reviews, the card says the user may decide instead). Dragging a task from «review» to
     «done» approves it, to another column opens the card for the return reason, and dropping onto «review» is
-    refused (a task goes there by `task_complete`). With independent review on, the empty reviewer option reads
+    refused (a task goes there by `task_complete`, a crew task also by itself, §4.2 "Finishing"). With independent
+    review on, the empty reviewer option reads
     «— (выберет доска)».
+  - Subtasks (§4.2): a subtask is not a card of its own; it is in its parent's **stack**. Exception: an open subtask
+    whose parent is terminal (or missing from the snapshot) is a card, so open work never hides in «done»; it leaves
+    its ancestors' stacks together with its own subtree. The stack holds all other descendants (depth-first by id,
+    indented by level, each task once even when `parent_id` loops). A parent card shows two thin strips under it
+    (the stack), and in its meta row a toggle button (`.stack-toggle`, `aria-expanded`) with one dot per direct
+    subtask in id order (`--c-<status>`, so a free direction is grey; up to 12, then `+N`), `done/total` in mono and
+    a chevron; the dot of an `in_progress` subtask pulses (a ring, off under `prefers-reduced-motion`). The toggle
+    expands the stack inside the card (`.stack`): a row per subtask (dot, `#id`, title, the assignee's avatar, the
+    eye icon while in review, the group chip for a crew task); a row opens that subtask's modal, the rest of the card
+    opens the parent as before. The board's keydown (Enter / Space) and dragstart handlers ignore events from the
+    toggle and the stack: Enter on the toggle toggles, Enter on a row opens that row, and rows are not draggable (a
+    subtask's status changes in its modal). Dropping a parent with open subtasks on «done» or «closed» first asks
+    («У задачи #N открыты подзадачи: #17, #19. Закрыть всё равно?», naming what happens to them, §4.2 "Leaving and
+    closing"). Expanded parents are kept in memory across renders (`S.expanded`, a set of ids). A crew task's card
+    adds a chip with the users icon and `2/3` (working / `crew`; its tooltip «Групповая задача: работают 2 из 3»;
+    the stack rows show the same chip). A subtask waiting for the user's review puts the
+    badge «ждёт вашего ревью» on its parent's card. A filter shows a parent when it or one of its descendants
+    matches, expands that stack and marks the rows that match. Column counts count cards. The task modal of a parent
+    lists its subtasks as rows and, for a crew task, «Групповая задача: до N участников, сейчас работают M»; the
+    create form gets «Участников в группе» (a number: empty or 0 = обычная задача, 2–8) and «Направления» (a
+    textarea, one per line, shown when «Участников в группе» is set), and the edit form the same, where the textarea
+    adds new directions.
   - Hire dialog: the role input offers the visible catalog (`GET api/roles`) and shows the matched role's
     description and model profile (matched as the hire resolves it: any of its `names`, hidden roles included),
     or that a typed name is a new role to describe in the instructions; the
