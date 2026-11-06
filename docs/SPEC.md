@@ -3351,8 +3351,8 @@ dreamteam console [DIR | --home H | --url URL] [--session SID] [--lang ru|en]
 dreamteam mcp [DIR | --home H] [--no-web]
 dreamteam status [DIR | --home H]
 dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on|off]
-dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] [--home H]
-dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] [--yes] [--home H]
+dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] [--home H] [--quiet]
+dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] [--yes] [--home H] [--quiet]
 ```
 - Default command (`_default_command`): `dreamteam` alone runs `tui` when stdin and stdout are terminals,
   else `serve`. Options only: `tui` when one of them is a TUI option (`-p -c -r --output-format --model
@@ -3464,6 +3464,23 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     before each session is renamed in (a process that started meanwhile fails that session). It prints
     `render_import_result` and exits with `result.exit_code` (130 when Ctrl+C stopped it; a second Ctrl+C breaks
     off and says that what was imported stays).
+  - Progress (both): `export_home`, `plan_import` and `apply_import` take `progress=`, called with a frozen
+    `transfer.Progress` (op export | plan | import; stage sizing, settings, skills, mcp, session, database, files,
+    swap, secrets, git, cleaning, replacing, done; item, index/count; done/total bytes and files, totals from a
+    stat-only pre-pass for an export and from the manifest for an import, unknown when that pre-pass fails;
+    `done_*` never above a total). An export's done comes once it is in place (after a replaced export is removed):
+    a KeyboardInterrupt from that event changes nothing; one from any earlier event removes the export. Bytes come
+    from
+    `treecopy.copy_tree(progress=)` per chunk and file, the sqlite backup in steps (immutable reads only: a live
+    database is copied in one step), the import's checked database copy and the secret scan. A KeyboardInterrupt
+    the callback raises is a Ctrl+C (in the import's staging thread it is carried out as `_Interrupted`). Each stage
+    start is also logged to `dreamteam.transfer` at INFO. The CLI renderer `_ProgressLine` writes to stderr: in a
+    terminal one line, `'\r'` plus text padded to the width less one (no ANSI escapes), byte updates at most 8 a
+    second, cut and padded in terminal cells, cleared before the plan, the question, warnings (the stderr log
+    handler's filter clears it) and the result, and closed for good at the end (a staging thread still running
+    after a Ctrl+C draws nothing); else one plain line per stage of each item (`export: session 003-snake (2/5):
+    files`). Characters that are not printable show as `?`; stdout is flushed before each write (one log of both
+    streams keeps the plan first); a failing or missing stderr only hides it. `--quiet` (`-q`) turns it off.
 - `serve`: refuses when a hub already runs for the home (opening that one in the browser unless
   `--no-browser`, whether this process has a hub token or not; a hub that asks for a token no client here may send
   ends it with `TokenRequired`'s text) or when the port is busy, and, right after the check

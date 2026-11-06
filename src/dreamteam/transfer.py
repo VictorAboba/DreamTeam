@@ -36,6 +36,7 @@ import dataclasses
 import errno
 import hashlib
 import json
+import logging
 import os
 import platform
 import re
@@ -157,6 +158,138 @@ class SecretFound(TransferError):
 class HomeTaken(TransferError):
     """Another DreamTeam process took the home while an import ran (apply_import's `before_swap` raises it): the
     import stops, the items after it are not done."""
+
+
+# ---- progress --------------------------------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Progress:
+    """One step of an export_home, plan_import or apply_import, as their `progress` callback gets it.
+
+    `op`: export | plan | import. `stage`: sizing (export: measuring what it writes), settings, skills, mcp, session
+    (one session begins), database, files and swap (of that session), secrets (export: the exported files are
+    searched for secrets), git (export: the history of an exported repository), cleaning (export: the temp folders
+    an interrupted export left are removed), replacing (export: the new export takes the place of the previous one,
+    which is removed), done. `item`: the session id, skill or MCP server the stage works on (secrets: the part of
+    the export being read; "" for a whole category);
+    `index`/`count`: its place among the items of its category (0: none). `done_bytes`/`total_bytes` and
+    `done_files`/`total_files`: what is copied so far (secrets: read); a total is None when it is not known (a dry
+    run, the plan, git), and `done_*` never exceeds it. A stage begins with an event of its own; the events in
+    between only move the counts."""
+
+    op: str
+    stage: str
+    item: str = ""
+    index: int = 0
+    count: int = 0
+    done_bytes: int = 0
+    total_bytes: int | None = None
+    done_files: int = 0
+    total_files: int | None = None
+
+    def label(self) -> str:
+        """The stage as a progress line shows it, e.g. `session 003-snake (2/5): files`."""
+        where = f" ({self.index}/{self.count})" if self.count else ""
+        if self.stage == "session":
+            return f"session {self.item}{where}"
+        if self.stage in ("database", "files"):
+            return f"session {self.item}{where}: {self.stage}"
+        if self.stage == "swap":
+            return f"session {self.item}{where}: putting it in place"
+        if self.stage == "secrets":
+            return "checking for secrets" + (f": {self.item}" if self.item else "")
+        if self.stage == "git":
+            return f"checking the git history{where}" + (f": {self.item}" if self.item else "")
+        if self.stage == "sizing":
+            return "measuring"
+        if self.stage == "cleaning":
+            return "removing what an interrupted export left"
+        if self.stage == "replacing":
+            return "replacing the previous export"
+        return self.stage + (f" {self.item}" if self.item else "") + where
+
+
+ProgressCallback = Callable[[Progress], None]
+log = logging.getLogger("dreamteam.transfer")
+
+
+class _Meter:
+    """The Progress events of one operation for its callback, and a log line (INFO) at the start of each stage.
+    Without a callback it only logs (`logged` False: not even that): counting costs nothing then."""
+
+    def __init__(self, progress: ProgressCallback | None, op: str, *, logged: bool = True):
+        self.progress = progress
+        self.op = op
+        self.logged = logged
+        self.stage = ""
+        self.item = ""
+        self.index = 0
+        self.count = 0
+        self.done_bytes = 0
+        self.done_files = 0
+        self.total_bytes: int | None = None
+        self.total_files: int | None = None
+        self.planned: dict[str, tuple[int, int]] = {}   # item -> (bytes, files) the totals counted for it
+        self._mark = (0, 0)
+
+    @property
+    def on(self) -> bool:
+        return self.progress is not None
+
+    def totals(self, nbytes: int | None, files: int | None) -> None:
+        """Start counting towards new totals (None: not known)."""
+        self.total_bytes, self.total_files = nbytes, files
+        self.done_bytes = self.done_files = 0
+
+    def start(self, stage: str, item: str = "", index: int = 0, count: int = 0) -> None:
+        """A stage begins (of the item `item`, `index` of `count`)."""
+        self.stage, self.item, self.index, self.count = stage, item, index, count
+        self._announce()
+
+    def step(self, stage: str) -> None:
+        """The next stage of the same item."""
+        self.stage = stage
+        self._announce()
+
+    def add(self, nbytes: int = 0, files: int = 0) -> None:
+        if self.progress is not None:
+            self.done_bytes += nbytes
+            self.done_files += files
+            self.progress(self._event())
+
+    def mark(self) -> None:
+        """An item with a planned size (`planned`) begins: settle() puts the counts where the totals expect them."""
+        self._mark = (self.done_bytes, self.done_files)
+
+    def settle(self, item: str) -> None:
+        planned = self.planned.get(item)
+        if planned is not None:
+            self.done_bytes, self.done_files = self._mark[0] + planned[0], self._mark[1] + planned[1]
+
+    def finish(self) -> None:
+        if self.total_bytes is not None:
+            self.done_bytes = self.total_bytes
+        if self.total_files is not None:
+            self.done_files = self.total_files
+        self.start("done")
+
+    def _announce(self) -> None:
+        if not self.logged:
+            return
+        event = self._event()
+        log.info("%s: %s", self.op, event.label())
+        if self.progress is not None:
+            self.progress(event)
+
+    def _event(self) -> Progress:
+        nbytes, files = self.total_bytes, self.total_files
+        return Progress(self.op, self.stage, self.item, self.index, self.count,
+                        self.done_bytes if nbytes is None else min(self.done_bytes, nbytes), nbytes,
+                        self.done_files if files is None else min(self.done_files, files), files)
+
+
+class _Interrupted(Exception):
+    """A KeyboardInterrupt the progress callback raised in a worker thread, carried to the coroutine that waits for
+    it (raised there as KeyboardInterrupt again: a Ctrl+C)."""
 
 
 # ---- include ---------------------------------------------------------------------------------------------------
@@ -843,14 +976,29 @@ def _search_git(git: str, git_dir: Path, matcher: _Matcher) -> list[tuple[str, b
     return found
 
 
-def scan_for_secrets(root: Path, secrets: Secrets, *, git: str | None = None) -> list[str]:
+def _counted(chunks: Iterable[bytes], meter: _Meter) -> Iterator[bytes]:
+    for chunk in chunks:
+        meter.add(len(chunk))
+        yield chunk
+
+
+def _scan_part(parts: tuple[str, ...]) -> str:
+    """The part of an export a file below `parts` belongs to, as the secrets stage names it."""
+    if len(parts) >= 2 and parts[0] == SESSIONS_DIR:
+        return f"session {parts[1]}"
+    return parts[0] if parts else ""
+
+
+def scan_for_secrets(root: Path, secrets: Secrets, *, git: str | None = None, meter: _Meter | None = None
+                     ) -> list[str]:
     """Search every file below `root` (bytes; each secret as UTF-8 and as UTF-16LE) and every object of each git
     repository database below it for `secrets`. Returns the places found, `<path>: <label>`, sorted; a database hit
     names `table.column:rowid` when it can be located. Raises TransferError when a repository exists but git is
-    missing or fails (its history could not be checked)."""
+    missing or fails (its history could not be checked). `meter`: the stages secrets and git, and the bytes read."""
     matcher = _Matcher.of(secrets)
     if matcher is None:
         return []
+    meter = meter or _Meter(None, "export", logged=False)
     root = Path(os.path.abspath(root))
     places: list[str] = []
     git_dirs: list[str] = []
@@ -866,15 +1014,22 @@ def scan_for_secrets(root: Path, secrets: Secrets, *, git: str | None = None) ->
         except OSError as exc:
             raise TransferError(f"Nothing exported: cannot read {'/'.join(parts) or root} to check it for secrets: "
                                 f"{exc.strerror or exc}") from None
+        folders: list[tuple[str, ...]] = []
         for entry in entries:
             if is_link(entry):
                 continue
             if entry.is_dir(follow_symlinks=False):
-                stack.append(parts + (entry.name,))
+                folders.append(parts + (entry.name,))
                 continue
             rel = "/".join(parts + (entry.name,))
-            try:
-                hits = matcher.search(_file_chunks(entry.path))
+            part = _scan_part(parts + (entry.name,))
+            if meter.stage != "secrets" or part != meter.item:
+                meter.start("secrets", part)
+            try:   # the file is closed whatever happens: a Ctrl+C whose traceback kept it open would keep Windows
+                # from removing the partial export
+                with contextlib.closing(_file_chunks(entry.path)) as chunks:
+                    hits = matcher.search(_counted(chunks, meter) if meter.on else chunks)
+                meter.add(files=1)
             except OSError as exc:
                 raise TransferError(f"Nothing exported: cannot read {rel} to check it for secrets: "
                                     f"{exc.strerror or exc}") from None
@@ -891,13 +1046,16 @@ def scan_for_secrets(root: Path, secrets: Secrets, *, git: str | None = None) ->
                 places.extend(f"{rel} ({', '.join(sorted(where))}): {label}" for label, where in by_label.items())
                 hits -= set(in_rows)
             places.extend(f"{rel}: {label}" for label in sorted({matcher.labels[n] for n in hits}))
+        stack.extend(reversed(folders))   # (taken in name order: the stages name the sessions as the copy did)
     if git_dirs:
         git = git or shutil.which("git")
         if git is None:
             raise TransferError("Nothing exported: git is needed to check the history of the exported repositories "
                                 f"for secrets ({', '.join(sorted(git_dirs)[:3])}); install git, or leave those "
                                 "sessions out (--session).")
-        for rel in sorted(git_dirs):
+        meter.totals(None, None)
+        for index, rel in enumerate(sorted(git_dirs), 1):
+            meter.start("git", rel, index, len(git_dirs))
             for oid, needle in _search_git(git, root.joinpath(*rel.split("/")), matcher):
                 places.append(f"{rel} (git object {oid[:12]}): {matcher.labels[needle]}")
     return sorted(set(places))
@@ -932,6 +1090,7 @@ class ExportReport:
     sizes: dict[str, int] = field(default_factory=dict)       # bytes per category
     replaced: bool = False                                     # a previous export in `dest` was replaced
     manifest: dict[str, Any] | None = None
+    planned: dict[str, tuple[int, int]] = field(default_factory=dict, repr=False)   # session id -> (bytes, files)
 
     @property
     def ok(self) -> bool:
@@ -1172,14 +1331,17 @@ def _mkdir_private(path: Path) -> None:
         os.chmod(path, 0o700)
 
 
-def _clean_stale(dest: Path) -> None:
-    """Remove the temp folders an interrupted export (or replace) left next to `dest`."""
+def _clean_stale(dest: Path, meter: _Meter | None = None) -> None:
+    """Remove the temp folders an interrupted export (or replace) left next to `dest` (`meter`: the stage
+    cleaning, when there are any)."""
     prefixes = (f".{dest.name}.export-", f".{dest.name}.old-")
     now = time.time()
     stale: list[Path] = []
     with contextlib.suppress(OSError), os.scandir(long_path(dest.parent)) as it:
         stale = [Path(dest.parent, e.name) for e in it if e.name.startswith(prefixes)
                  and now - e.stat(follow_symlinks=False).st_mtime > STALE_SECONDS]
+    if stale and meter is not None:
+        meter.start("cleaning")
     for path in stale:
         with contextlib.suppress(OSError):
             if not is_link(path):
@@ -1197,7 +1359,9 @@ def _json_bytes(data: Any) -> bytes:
     return json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8", "replace")
 
 
-def _settings_part(raw: dict[str, Any], out: Path | None, report: ExportReport, secrets: Secrets) -> None:
+def _settings_part(raw: dict[str, Any], out: Path | None, report: ExportReport, secrets: Secrets,
+                   meter: _Meter) -> None:
+    meter.start("settings")
     scrubbed, omitted, removed = scrub_settings(raw)
     secrets.update(removed)
     models = scrubbed.get("models") if isinstance(scrubbed.get("models"), dict) else {}
@@ -1234,16 +1398,18 @@ def _settings_part(raw: dict[str, Any], out: Path | None, report: ExportReport, 
     report.sizes["settings"] = len(text)
     if out is not None:
         _write_bytes(out / SETTINGS_FILE, text)
+        meter.add(len(text))
 
 
-def _skills_part(root: Path, limits: Limits, out: Path | None, report: ExportReport) -> None:
+def _skills_part(root: Path, limits: Limits, out: Path | None, report: ExportReport, meter: _Meter) -> None:
     try:
         with os.scandir(long_path(root)) as it:
             names = sorted(e.name for e in it if not e.name.startswith("."))
     except OSError:
         names = []
     total = 0
-    for name in names:
+    for index, name in enumerate(names, 1):
+        meter.start("skills", name, index, len(names))
         folder = root / name
         if not (len(name) <= NAME_MAX and NAME_RE.fullmatch(name)):
             if folder.is_dir():
@@ -1273,6 +1439,7 @@ def _skills_part(root: Path, limits: Limits, out: Path | None, report: ExportRep
             except SkillError as exc:
                 report.leave_out(f"skill {name}", str(exc))
                 continue
+            meter.add(info.size, info.files)
         for skipped in info.skipped:
             report.warnings.append(f"skill {name}: {skipped['path']} is {skipped['error']}")
         total += info.size
@@ -1282,7 +1449,8 @@ def _skills_part(root: Path, limits: Limits, out: Path | None, report: ExportRep
 
 
 def _mcp_part(raw: dict[str, Any], library: Path, projects: dict[str, str], out: Path | None, report: ExportReport,
-              secrets: Secrets) -> None:
+              secrets: Secrets, meter: _Meter) -> None:
+    meter.start("mcp")
     found = mcp_library.scan(library)
     entries = []
     total = 0
@@ -1313,6 +1481,7 @@ def _mcp_part(raw: dict[str, Any], library: Path, projects: dict[str, str], out:
     total += len(data)
     if out is not None:
         _write_bytes(out / EXTERNAL_FILE, data)
+        meter.add(total)
     report.mcp = {"library": entries,
                   "external": [{"name": n, "env_keys": s["env_keys"], "credentials_removed": n in stripped}
                                for n, s in external.items()]}
@@ -1356,16 +1525,33 @@ def _db_state(path: Path) -> tuple[Any, ...]:
     return tuple(found)
 
 
-def _copy_db(src: Path, dst: Path) -> None:
+BACKUP_PAGES = 1024   # pages per backup step when the copy reports its progress
+
+
+def _copy_db(src: Path, dst: Path, on_bytes: Callable[[int], None] | None = None) -> None:
     """The sqlite backup of `src` into the new file `dst`, read without writing anything next to `src` (_read_db).
     An immutable read sees no other connection: when the file changed meanwhile (a session started), it is read
-    again; still changing, the session is refused."""
+    again; still changing, the session is refused. `on_bytes(n)`: the bytes copied by each step. Only an immutable
+    read goes in steps (BACKUP_PAGES): a backup in steps of a database another process writes starts over after
+    each write, so a live one is copied in one step. A second read reports only what goes beyond the first."""
+    seen = [0]   # the bytes reported, of all reads
     for _attempt in range(2):
         before = _db_state(src)
         with _read_db(src) as (source, immutable):
             target = sqlite3.connect(str(dst))
             try:
-                source.backup(target)
+                if on_bytes is None:
+                    source.backup(target)
+                else:
+                    page = int(source.execute("PRAGMA page_size").fetchone()[0])
+
+                    def step(_status: int, remaining: int, pages: int) -> None:
+                        copied = (pages - remaining) * page
+                        if copied > seen[0]:
+                            on_bytes(copied - seen[0])
+                            seen[0] = copied
+
+                    source.backup(target, pages=BACKUP_PAGES if immutable else -1, progress=step)
             finally:
                 target.close()
         if not immutable or _db_state(src) == before:
@@ -1527,9 +1713,13 @@ def _command_credentials(external: Any) -> dict[str, str]:
 
 
 def _session_part(manager: SessionManager, item: _Session, out: Path | None, report: ExportReport,
-                  secrets: Secrets, running: Collection[str], credentials: dict[str, str] | None = None) -> int:
+                  secrets: Secrets, running: Collection[str], credentials: dict[str, str] | None = None,
+                  meter: _Meter | None = None) -> int:
     """Write (or measure) one session. `credentials`: {value: server} stripped from the global [mcp.external]
-    commands; this session's own servers are added (both are removed from its database copy)."""
+    commands; this session's own servers are added (both are removed from its database copy). Records its size
+    and file count in `report.planned`."""
+    meter = meter or _Meter(None, "export", logged=False)
+    counted = meter.add if meter.on else None   # (bytes, files) copied
     sid = item.sid
     data_dir = manager.dir_of(sid) / ".dreamteam"
     raw_overrides = item.meta.get("overrides") or {}
@@ -1547,6 +1737,7 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
     target = out / SESSIONS_DIR / sid if out is not None else None
     meta_bytes = _json_bytes(stored)
     size = len(meta_bytes)
+    files = 1
     entry: dict[str, Any] = {"id": sid, "uid": item.uid, "title": item.meta.get("title") or sid,
                              "created_at": item.meta.get("created_at"), "last_event": None, "events": 0,
                              "max_tools_rev": None, "db_sha256": None, "db_bytes": 0, "attached_skills": [],
@@ -1555,13 +1746,17 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
     if target is not None:
         os.mkdir(long_path(target))
         _write_bytes(target / SESSION_FILE, meta_bytes)
+        meter.add(len(meta_bytes), 1)
     db = data_dir / DB_FILE
     if db.is_file():
+        files += 1
         if target is not None:
+            meter.step("database")
             copied = target / ".dreamteam" / DB_FILE
             copied.parent.mkdir(parents=True, exist_ok=True)
             try:
-                _copy_db(db, copied)
+                _copy_db(db, copied, counted)
+                meter.add(files=1)
                 entry.update(_finish_db(copied, sid, report, secrets, credentials))
             except sqlite3.Error as exc:
                 raise _Refused(f"its database cannot be read: {exc}") from None
@@ -1571,18 +1766,21 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
             entry["db_bytes"] = sum(p.stat().st_size for p in (db, db.with_name(DB_FILE + "-wal")) if p.is_file())
     size += entry["db_bytes"]
     modes: dict[str, int] = {}
+    if target is not None:
+        meter.step("files")
     for part in SESSION_DATA_PARTS:
         folder = data_dir / part
         if is_link(folder) or not folder.is_dir():
             continue
         if target is not None:
             result = copy_tree(folder, target / ".dreamteam" / part, exclude_names=(), exclude_paths=(),
-                               modes="export")
+                               modes="export", progress=counted)
             modes.update((f".dreamteam/{part}/{rel}", bits) for rel, bits in result.modes.items())
         else:
             result = scan_tree(folder, exclude_names=(), exclude_paths=(), hash=False)
         _tree_warnings(result, f"session {sid}, .dreamteam/{part}", report)
         size += result.bytes
+        files += result.files
         if part == "attached-skills":
             with os.scandir(long_path(folder)) as it:
                 entry["attached_skills"] = sorted(e.name for e in it if e.is_dir(follow_symlinks=False)
@@ -1602,7 +1800,7 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
     else:
         if target is not None:
             result = copy_tree(item.folder, target / "workspace", exclude_names=EXPORT_EXCLUDE_NAMES,
-                               exclude_paths=EXPORT_EXCLUDE_PATHS, modes="export")
+                               exclude_paths=EXPORT_EXCLUDE_PATHS, modes="export", progress=counted)
             modes.update((f"{WORKSPACE_DIR}/{rel}", bits) for rel, bits in result.modes.items())
             workspace["compare_digest"] = compare_digest(result.entries)
         else:
@@ -1610,6 +1808,8 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
         _tree_warnings(result, f"session {sid}, workspace", report)
         workspace.update(files=result.files, bytes=result.bytes, tree_digest=result.digest)
         size += result.bytes
+        files += result.files
+    report.planned[sid] = (size, files)
     entry["workspace"] = workspace
     entry["modes"] = modes   # the executable and read-only files (an export medium may hold no POSIX bits)
     if sid in running:
@@ -1638,11 +1838,19 @@ def _manifest(report: ExportReport, home: Path) -> dict[str, Any]:
     }
 
 
-def _put_in_place(work: Path, dest: Path, state: str, report: ExportReport) -> None:
+def _put_in_place(work: Path, dest: Path, state: str, report: ExportReport, meter: _Meter) -> None:
     """Move a finished export from its temp folder `work` to `dest` (state "export": swap with the previous one,
-    which is restored if the swap fails and removed after it)."""
-    if state != "export":
-        return
+    which is restored if the swap fails and removed after it). `meter`: the stage replacing (from before the swap:
+    a Ctrl+C there still removes the new export), then done once the export is in place (a Ctrl+C its callback
+    raises then changes nothing)."""
+    if state == "export":
+        meter.start("replacing")
+        _swap_in(work, dest, report)
+    with contextlib.suppress(KeyboardInterrupt):
+        meter.finish()
+
+
+def _swap_in(work: Path, dest: Path, report: ExportReport) -> None:
     old = dest.parent / f".{dest.name}.old-{_secrets.token_hex(4)}"
     moved = False
     try:
@@ -1674,17 +1882,22 @@ def _put_in_place(work: Path, dest: Path, state: str, report: ExportReport) -> N
 
 def export_home(home: str | os.PathLike, dest: str | os.PathLike, *, include: Iterable[str] | None = None,
                 sessions: Iterable[str] | None = None, running: Collection[str] | None = None,
-                dry_run: bool = False, git: str | None = None) -> ExportReport:
+                dry_run: bool = False, git: str | None = None,
+                progress: ProgressCallback | None = None) -> ExportReport:
     """Export the DreamTeam home `home` into the folder `dest` (see the module docstring for the layout).
 
     `include`: categories (CATEGORIES; default all, parse_include). `sessions`: the sessions to export, by id or uid
     (default all; giving any implies the sessions category). `running`: ids of sessions running right now (the
     caller asks the hub): they are exported as a snapshot, with a warning. `dry_run`: plan and measure only,
     nothing is written. `git`: the git program for the history check (default: on PATH).
+    `progress(Progress)`: told each stage and, as the copy goes, the bytes written towards a total measured first
+    (from the file system only: sizes, no reads), then the bytes read by the secret check; a dry run tells the
+    stages only. What it raises stops the export as anything else does (KeyboardInterrupt: as Ctrl+C).
 
     `dest` must be missing, an empty folder, or a folder that holds an earlier export (replaced: the new one is built
     next to it and swapped in). The home is only read. Raises TransferError (SecretFound for a secret of this
     computer in the export) with nothing left at `dest`; KeyboardInterrupt removes the partial export as well."""
+    meter = _Meter(progress, "export")
     home = Path(home).expanduser()
     home = home.resolve() if home.exists() else Path(os.path.abspath(home))
     if not _is_home(home):
@@ -1723,10 +1936,11 @@ def export_home(home: str | os.PathLike, dest: str | os.PathLike, *, include: It
     state = _check_dest(home, dest, protected, session_folders)
     if dry_run:
         try:
-            _export_parts(manager, raw, config, categories, picked, None, report, Secrets(), running)
+            _export_parts(manager, raw, config, categories, picked, None, report, Secrets(), running, meter=meter)
         except OSError as exc:
             where = f" ({_plain(exc.filename)})" if exc.filename else ""
             raise TransferError(f"Cannot read the home: {exc.strerror or exc}{where}.") from None
+        meter.finish()
         return report
     overrides = {}
     for sid in manager.ids():   # every session's MCP env values, also of sessions left out
@@ -1741,7 +1955,7 @@ def export_home(home: str | os.PathLike, dest: str | os.PathLike, *, include: It
         if state == "missing":
             dest.parent.mkdir(parents=True, exist_ok=True)
         else:
-            _clean_stale(dest)
+            _clean_stale(dest, meter)
         if state == "empty":
             if os.name != "nt":
                 with contextlib.suppress(OSError):
@@ -1757,15 +1971,21 @@ def export_home(home: str | os.PathLike, dest: str | os.PathLike, *, include: It
         raise TransferError(f"Nothing exported: {dest} cannot be written: {exc.strerror or exc}{where}.") from None
     try:
         try:
-            _export_parts(manager, raw, config, categories, picked, work, report, secrets, running, credentials)
-            places = scan_for_secrets(work, secrets, git=git)
+            if meter.on:
+                _measure(manager, raw, config, categories, picked, running, report, meter)
+            _export_parts(manager, raw, config, categories, picked, work, report, secrets, running, credentials,
+                          meter=meter)
+            if meter.on:   # the secret check reads every file written
+                written = scan_tree(work, exclude_names=(), exclude_paths=(), hash=False)
+                meter.totals(written.bytes, written.files)
+            places = scan_for_secrets(work, secrets, git=git, meter=meter)
             if places:
                 raise SecretFound(places)
             report.manifest = _manifest(report, home)
             tmp = work / f"{MANIFEST}.tmp"
             _write_bytes(tmp, json.dumps(report.manifest, ensure_ascii=False, indent=1).encode("utf-8", "replace"))
             os.replace(long_path(tmp), long_path(work / MANIFEST))
-            _put_in_place(work, dest, state, report)
+            _put_in_place(work, dest, state, report, meter)
         except OSError as exc:   # e.g. the destination's disk is full, or its file system refuses a name
             where = f" ({_plain(exc.filename)})" if exc.filename else ""
             raise TransferError(f"Nothing exported: {exc.strerror or exc}{where}.") from None
@@ -1779,10 +1999,25 @@ def export_home(home: str | os.PathLike, dest: str | os.PathLike, *, include: It
                     + (", it may contain the secret named above." if isinstance(exc, SecretFound) else "."))
             if isinstance(exc, TransferError):
                 exc.args = (f"{exc}\n{note}",)
-            else:
-                print(note, file=sys.stderr)
+            else:   # (a Ctrl+C: the caller prints it, after its progress display; a traceback shows it too)
+                exc.add_note(note)
         raise
     return report
+
+
+def _measure(manager: SessionManager, raw: dict[str, Any], config, categories: tuple[str, ...],
+             picked: list[_Session], running: set[str], report: ExportReport, meter: _Meter) -> None:
+    """The totals of an export's progress: a dry run of its own (sizes from the file system; only the skills are
+    read, as their check reads them). A part that cannot be measured leaves the totals unknown."""
+    meter.start("sizing")
+    sized = ExportReport(home=report.home, dest=report.dest, include=categories, dry_run=True)
+    try:
+        _export_parts(manager, raw, config, categories, picked, None, sized, Secrets(), running)
+    except (OSError, ValueError):
+        return   # the export itself says what is wrong
+    meter.planned = dict(sized.planned)
+    meter.totals(sum(sized.sizes.values()),
+                 sum(_int(s.get("files")) for s in sized.skills) + sum(f for _b, f in sized.planned.values()))
 
 
 def _plain(path: Any) -> str:
@@ -1829,12 +2064,15 @@ def _write_refusal(exc: OSError, folder: Path) -> str | None:
 
 def _export_parts(manager: SessionManager, raw: dict[str, Any], config, categories: tuple[str, ...],
                   picked: list[_Session], out: Path | None, report: ExportReport, secrets: Secrets,
-                  running: set[str], credentials: dict[str, str] | None = None) -> None:
-    """Write (or with `out` None, measure) each category, in the manifest's order."""
+                  running: set[str], credentials: dict[str, str] | None = None, *, meter: _Meter | None = None
+                  ) -> None:
+    """Write (or with `out` None, measure) each category, in the manifest's order. `meter`: the stages and the
+    bytes written (None: nothing told, nothing logged)."""
+    meter = meter or _Meter(None, "export", logged=False)
     if "settings" in categories:
-        _settings_part(raw, out, report, secrets)
+        _settings_part(raw, out, report, secrets, meter)
     if "skills" in categories:
-        _skills_part(config.skills_library_dir, Limits.from_config(config), out, report)
+        _skills_part(config.skills_library_dir, Limits.from_config(config), out, report, meter)
     if "mcp" in categories:
         projects = {}
         for sid in manager.ids():
@@ -1844,17 +2082,19 @@ def _export_parts(manager: SessionManager, raw: dict[str, Any], config, categori
                 uid = session_uid(manager.meta(sid))
                 if uid:
                     projects[_key(manager.dir_of(sid))] = uid
-        _mcp_part(raw, config.library_dir, projects, out, report, secrets)
+        _mcp_part(raw, config.library_dir, projects, out, report, secrets, meter)
     if "sessions" in categories:
         total = 0
         if out is not None:
             (out / SESSIONS_DIR).mkdir(exist_ok=True)
-        for item in picked:
+        for index, item in enumerate(picked, 1):
+            meter.start("session", item.sid, index, len(picked))
+            meter.mark()
             mark = (len(report.warnings), len(report.not_copied), len(report.sessions))
             folder = out / SESSIONS_DIR / item.sid if out is not None else None
             try:
                 try:
-                    total += _session_part(manager, item, out, report, secrets, running, credentials)
+                    total += _session_part(manager, item, out, report, secrets, running, credentials, meter)
                 except OSError as exc:   # the destination cannot hold one of its files: this session only
                     reason = _write_refusal(exc, folder) if folder is not None else None
                     if reason is None:
@@ -1869,6 +2109,7 @@ def _export_parts(manager: SessionManager, raw: dict[str, Any], config, categori
                         report.warnings.append(f"session {item.sid} could not be removed from the export "
                                                f"completely: delete {folder} by hand")
                 report.leave_out(f"session {item.sid}", str(exc))
+            meter.settle(item.sid)
         report.sizes["sessions"] = total
 
 
@@ -2194,7 +2435,7 @@ def _restore_secret_extra(new: Any, old: Any) -> Any:
 
 
 def merge_settings(target: dict[str, Any], exported: dict[str, Any], *, home: str | os.PathLike = ".",
-                   environ: dict[str, str] | None = None) -> SettingsMerge:
+                   environ: dict[str, str] | None = None, new_home: bool = False) -> SettingsMerge:
     """The exported settings `exported` (settings/dreamteam.toml of an export) merged over this computer's `target`
     (pure; `home` only for the validation). Sections are deep-merged, the exported values winning, except:
     machine-local keys (LOCAL_KEYS) keep this computer's value; the goal stays (goals belong to sessions); keys
@@ -2202,7 +2443,9 @@ def merge_settings(target: dict[str, Any], exported: dict[str, Any], *, home: st
     Model profiles: missing ones are added, existing ones rewritten from the export, the others stay; the key
     stored here stays only while the profile's endpoint (provider, base_url) is the same, else it is removed
     ("enter the key again"); a local-endpoint preset gets its placeholder key back. Roles (by roles.role_key):
-    added or rewritten, the others stay; a role model this computer does not have is dropped."""
+    added or rewritten, the others stay; a role model this computer does not have is dropped. `new_home`: the
+    target is the template of a home the import makes, so nothing in it was configured here: removing its key
+    variable or secret extras from a profile that now points elsewhere is not warned about."""
     environ = os.environ if environ is None else environ
     m = SettingsMerge()
     target = target if isinstance(target, dict) else {}
@@ -2275,7 +2518,7 @@ def merge_settings(target: dict[str, Any], exported: dict[str, Any], *, home: st
                         entry["extra"] = restored
                 if variable_here and "api_key_env" not in spec:
                     entry["api_key_env"] = variable_here
-            else:
+            elif not new_home:
                 for place in secret_extra:
                     m.warnings.append(f"model profile '{name}' points at another endpoint now, so {place} "
                                       "configured here was removed: enter it again")
@@ -2511,7 +2754,10 @@ def _session_overrides(exported: Any, old: Any, sid: str, global_external: Any =
 
 # ---- the plan -----------------------------------------------------------------------------------------------------
 class _Planner:
-    def __init__(self, manager: SessionManager, folder: Path, manifest: dict[str, Any], plan: ImportPlan):
+    def __init__(self, manager: SessionManager, folder: Path, manifest: dict[str, Any], plan: ImportPlan,
+                 meter: _Meter | None = None, new_home: bool = False):
+        self.meter = meter or _Meter(None, "plan", logged=False)
+        self.new_home = new_home   # the target is a home this import makes (see merge_settings)
         self.manager = manager
         self.folder = folder
         self.manifest = manifest
@@ -2691,7 +2937,7 @@ def _plan_settings(p: _Planner, raw: dict[str, Any]) -> dict[str, Any]:
     except (OSError, ValueError, RecursionError) as exc:
         item.reason = f"{SETTINGS_FILE} of the export cannot be read: {exc}"
         return raw
-    m = merge_settings(raw, exported, home=p.manager.home)
+    m = merge_settings(raw, exported, home=p.manager.home, new_home=p.new_home)
     item.warnings.extend(m.warnings)
     if m.dropped:
         item.warnings.append(f"settings this DreamTeam does not know are left out: {', '.join(m.dropped)}")
@@ -2723,7 +2969,9 @@ def _plan_skills(p: _Planner) -> None:
     root = p.config.skills_library_dir
     limits = Limits.from_config(p.config)
     listed = p.manifest.get("skills") or []
-    for name in [e.get("name") for e in listed if isinstance(e, dict) and isinstance(e.get("name"), str)]:
+    names = [e.get("name") for e in listed if isinstance(e, dict) and isinstance(e.get("name"), str)]
+    for index, name in enumerate(names, 1):
+        p.meter.start("skills", name, index, len(names))
         item = ImportItem("skills", name, "refuse")
         p.plan.items.append(item)
         src = p.folder / SKILLS_DIR / name
@@ -2809,7 +3057,8 @@ def _plan_sessions(p: _Planner, wanted: list[str] | None, raw_after: dict[str, A
         if match not in chosen:
             chosen.append(match)
     claimed: dict[str, str] = {}
-    for eid in chosen:
+    for index, eid in enumerate(chosen, 1):
+        p.meter.start("session", eid, index, len(chosen))
         item = _plan_session(p, eid, entries[eid], metas.get(eid), problems.get(eid), export_uids, eid in named,
                              target_metas, target_uids, claimed, raw_after)
         p.plan.items.append(item)
@@ -2845,6 +3094,7 @@ def _plan_session(p: _Planner, eid: str, entry: dict[str, Any], meta: dict[str, 
         return refuse(f"sessions {' and '.join(export_uids[uid])} of the export have the same identity (one was copied "
                       "by hand): import them by id with --session ID; each is matched by its id here, and one that "
                       "is added gets a new identity")
+    p.meter.step("database")
     reason = _check_export_db(src / ".dreamteam" / DB_FILE, entry)
     if reason:
         return refuse(reason)
@@ -2922,6 +3172,7 @@ def _plan_session(p: _Planner, eid: str, entry: dict[str, Any], meta: dict[str, 
             exported = exported_workspace.get("compare_digest")
             return (exported or _tree(src / WORKSPACE_DIR)) == _tree(here_files)
 
+        p.meter.step("files")
         if mine == theirs and files_match():   # the same history and files: only session.json may differ
             differ = _settings_differ(meta, old, overrides)
             if not differ:
@@ -3311,7 +3562,7 @@ def check_session_names(folder: str | os.PathLike, sessions: Iterable[str] | Non
         raise TransferError(f"Nothing imported: the export holds no sessions (it was made with --include "
                             f"{','.join(held) or 'nothing'}).", usage=True)
     listed = [e for e in manifest.get("sessions") or [] if isinstance(e, dict)]
-    ids = {e.get("id") for e in listed}
+    ids = {e["id"] for e in listed if isinstance(e.get("id"), str)}
     uids = {str(e.get("uid")).lower() for e in listed if isinstance(e.get("uid"), str)}
     for text in wanted:
         if text not in ids and text.lower() not in uids:
@@ -3320,8 +3571,11 @@ def check_session_names(folder: str | os.PathLike, sessions: Iterable[str] | Non
 
 
 def plan_import(manager: SessionManager, folder: str | os.PathLike, *, include: Iterable[str] | str | None = None,
-                sessions: Iterable[str] | None = None) -> ImportPlan:
+                sessions: Iterable[str] | None = None, progress: ProgressCallback | None = None,
+                new_home: bool = False) -> ImportPlan:
     """What importing the export in `folder` into the home of `manager` would do; nothing is changed.
+    `progress(Progress)`: told each stage (op "plan"; no byte counts: a plan copies nothing). `new_home`: the home
+    is one the import makes (its settings are the template's, nothing was configured there: see merge_settings).
 
     `include`: categories (parse_include; default: every category the export holds). `sessions`: ids or uids of
     the export's sessions to import (default all; giving any implies the sessions category). Each item of the plan
@@ -3353,8 +3607,11 @@ def plan_import(manager: SessionManager, folder: str | os.PathLike, *, include: 
     categories = tuple(c for c in categories if c in held)
     plan.include = categories
     _check_source(manager, folder)
-    p = _Planner(manager, folder, manifest, plan)
+    meter = _Meter(progress, "plan")
+    p = _Planner(manager, folder, manifest, plan, meter, new_home=new_home)
     raw = copy.deepcopy(manager.raw)
+    if "settings" in categories:
+        meter.start("settings")
     raw_after = _plan_settings(p, raw) if "settings" in categories else raw
     with contextlib.suppress(ValueError):
         p.models_after = set(validate(manager.home, raw_after).models)
@@ -3369,7 +3626,9 @@ def plan_import(manager: SessionManager, folder: str | os.PathLike, *, include: 
     if "sessions" in categories:
         _plan_sessions(p, wanted, raw_after, target_metas, target_uids)
     if "mcp" in categories:
+        meter.start("mcp")
         _plan_mcp(p, raw_after)
+    meter.finish()
     for left in manifest.get("left_out") or []:
         if isinstance(left, dict) and left.get("what"):
             plan.warnings.append(f"the export left out {left['what']}: {left.get('reason') or ''}".rstrip(": "))
@@ -3383,25 +3642,38 @@ def plan_import(manager: SessionManager, folder: str | os.PathLike, *, include: 
 
 
 # ---- apply ------------------------------------------------------------------------------------------------------
-def _copy_checked(src: Path, dst: Path, expected: Any) -> None:
+def _copy_checked(src: Path, dst: Path, expected: Any, on_bytes: Callable[[int], None] | None = None) -> None:
     """Copy the file `src` to the new file `dst`, checking its sha256 against `expected` on the way: the database
-    the plan checked must be the one copied."""
+    the plan checked must be the one copied. `on_bytes(n)`: each chunk written."""
     h = hashlib.sha256()
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     with os.fdopen(os.open(long_path(dst), flags, 0o666), "wb") as out:
         for chunk in _file_chunks(long_path(src)):
             h.update(chunk)
             out.write(chunk)
+            if on_bytes is not None:
+                on_bytes(len(chunk))
     if h.hexdigest() != expected:
         raise TransferError("its database is not the one the export wrote (it changed or was damaged since the plan)")
 
 
-def _stage_session(src: Path, staged: Path, expected_sha: Any = None, modes: Any = None) -> None:
+def _stage_session(src: Path, staged: Path, expected_sha: Any = None, modes: Any = None,
+                   meter: _Meter | None = None) -> None:
     """Copy an exported session (its database, .dreamteam/{mcp,attached-skills,jobs}, workspace/) into the new
     staging folder `staged`. The permission bits the export medium reports are not taken: the files get this
     computer's defaults, and the bits the export recorded (`modes`: {path in the session: bits}) on top. A file of
     the export that cannot be read, or a database that is not the one the manifest names (`expected_sha`), fails
-    it (TransferError), and so does a folder of it that is a link (never followed)."""
+    it (TransferError), and so does a folder of it that is a link (never followed). `meter`: the stages database
+    and files, and the bytes copied; a KeyboardInterrupt its callback raises comes out as _Interrupted (this runs
+    in a worker thread)."""
+    try:
+        _stage_files(src, staged, expected_sha, modes, meter or _Meter(None, "import", logged=False))
+    except KeyboardInterrupt:
+        raise _Interrupted() from None
+
+
+def _stage_files(src: Path, staged: Path, expected_sha: Any, modes: Any, meter: _Meter) -> None:
+    counted = meter.add if meter.on else None
     linked = _linked_part(src)
     if linked:
         raise TransferError(f"its {linked} folder in the export is a link; an export holds plain folders and files only")
@@ -3412,15 +3684,19 @@ def _stage_session(src: Path, staged: Path, expected_sha: Any = None, modes: Any
     if db.is_file() and not is_link(db):
         if not isinstance(expected_sha, str):
             raise TransferError("the manifest of the export names no checksum of its database")
-        _copy_checked(db, data / DB_FILE, expected_sha)
+        meter.step("database")
+        _copy_checked(db, data / DB_FILE, expected_sha, counted)
+        meter.add(files=1)
     recorded = {k: v for k, v in modes.items() if isinstance(k, str) and valid_mode(v) is not None} \
         if isinstance(modes, dict) else {}
+    meter.step("files")
     parts = [(src / ".dreamteam" / part, data / part, f".dreamteam/{part}/") for part in SESSION_DATA_PARTS]
     for folder, target, prefix in [*parts, (src / WORKSPACE_DIR, staged / WORKSPACE_DIR, f"{WORKSPACE_DIR}/")]:
         if is_link(folder) or not folder.is_dir():
             continue
         result = copy_tree(folder, target, exclude_names=(), exclude_paths=(), modes="import",
-                           apply_modes={k[len(prefix):]: v for k, v in recorded.items() if k.startswith(prefix)})
+                           apply_modes={k[len(prefix):]: v for k, v in recorded.items() if k.startswith(prefix)},
+                           progress=counted)
         if result.errors:
             rel, reason = result.errors[0]
             raise TransferError(f"{folder / rel} cannot be read in the export ({reason})")
@@ -3438,10 +3714,46 @@ class _Applying:
     result: ImportResult
     uid_targets: dict[str, str]
     before_swap: Callable[[str], None] | None
+    meter: _Meter = field(default_factory=lambda: _Meter(None, "import", logged=False))
+
+
+def _int(value: Any) -> int:
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+def _staged_sizes(plan: ImportPlan, items: list[ImportItem]) -> dict[str, tuple[int, int]]:
+    """{export id: (bytes, files)} that staging copies of each session the import brings in: its database (from the
+    file system), its .dreamteam/ folders (sizes from the file system: small) and its workspace (the manifest's
+    figures)."""
+    entries = {e["id"]: e for e in plan.manifest.get("sessions") or []
+               if isinstance(e, dict) and isinstance(e.get("id"), str)}   # (as _plan_sessions reads them)
+    sizes: dict[str, tuple[int, int]] = {}
+    for item in items:
+        if item.category != "sessions" or item.action not in ("add", "rewrite") or item.data.get("settings_only") \
+                or not isinstance(item.data.get("src"), Path):
+            continue
+        src: Path = item.data["src"]
+        nbytes = files = 0
+        with contextlib.suppress(OSError):
+            db = src / ".dreamteam" / DB_FILE
+            if db.is_file() and not is_link(db):
+                nbytes, files = db.stat().st_size, 1
+        for part in SESSION_DATA_PARTS:
+            folder = src / ".dreamteam" / part
+            if not is_link(folder) and folder.is_dir():
+                with contextlib.suppress(OSError, NotADirectoryError):
+                    found = scan_tree(folder, exclude_names=(), exclude_paths=(), hash=False)
+                    nbytes, files = nbytes + found.bytes, files + found.files
+        workspace = (entries.get(item.name) or {}).get("workspace")
+        if isinstance(workspace, dict):
+            nbytes, files = nbytes + _int(workspace.get("bytes")), files + _int(workspace.get("files"))
+        sizes[item.name] = (nbytes, files)
+    return sizes
 
 
 async def apply_import(manager: SessionManager, plan: ImportPlan, *,
-                       before_swap: Callable[[str], None] | None = None, new_home: bool = False) -> ImportResult:
+                       before_swap: Callable[[str], None] | None = None, new_home: bool = False,
+                       progress: ProgressCallback | None = None) -> ImportResult:
     """Do what `plan` (plan_import, for the same manager) says, in this order: the settings (one save through
     SessionManager.update_settings), the skills, the sessions, the MCP library (an entry an imported session saved
     gets that session's folder here as its `project`), then the [mcp.external] servers (one save). One item that
@@ -3452,12 +3764,30 @@ async def apply_import(manager: SessionManager, plan: ImportPlan, *,
     HomeTaken also stops the import (the items after it are not done). `new_home`: the home was made for this
     import (its settings were the template: no dreamteam.toml.bak is left of them).
     Ctrl+C (the task's cancellation, or KeyboardInterrupt) finishes or undoes the item being imported, then stops:
-    the result has `interrupted` set and the items after it "not done". Returns an ImportResult."""
+    the result has `interrupted` set and the items after it "not done". `progress(Progress)`: told each item's
+    stages (op "import") and the bytes the sessions' copies write, towards the sizes the export recorded; a
+    KeyboardInterrupt it raises is a Ctrl+C. Returns an ImportResult."""
     items = [dataclasses.replace(i, warnings=list(i.warnings), data=dict(i.data)) for i in plan.items]
     result = ImportResult(plan=plan, items=items, warnings=list(plan.warnings))
     _metas, target_uids = _target_sessions(manager)
+    meter = _Meter(progress, "import")
     state = _Applying(manager, result, {uid: sids[0] for uid, sids in target_uids.items() if len(sids) == 1},
-                      before_swap)
+                      before_swap, meter)
+    if meter.on:   # (only a display: what cannot be measured leaves the totals unknown, the import is the same)
+        try:
+            meter.planned = _staged_sizes(plan, items)
+        except Exception:
+            log.debug("the progress could not measure the sessions of the import", exc_info=True)
+            meter.planned = {}
+        if meter.planned:
+            meter.totals(sum(b for b, _f in meter.planned.values()), sum(f for _b, f in meter.planned.values()))
+    counts: dict[str, int] = {}   # the items of each category applied one by one ([mcp.external]: one save)
+    external = False
+    for item in items:
+        if item.action in ("add", "rewrite") and not (external and item.data.get("kind") == "external"):
+            counts[item.category] = counts.get(item.category, 0) + 1
+            external = external or item.data.get("kind") == "external"
+    started: dict[str, int] = {}
     task = asyncio.current_task()
     stop = False
     taken: str | None = None   # HomeTaken: why the items after it are not done
@@ -3507,7 +3837,15 @@ async def apply_import(manager: SessionManager, plan: ImportPlan, *,
             if put_back and item.category == "sessions":   # the plan was made before the sessions were put back
                 item.status, item.error = "not done", "an earlier import was put in order first: import again"
                 continue
+            started[item.category] = index = started.get(item.category, 0) + 1
+            meter.mark()
             try:
+                stage = "session" if item.category == "sessions" else item.category
+                if item.category == "settings":
+                    meter.start(stage)
+                else:
+                    name = "[mcp.external]" if item.data.get("kind") == "external" else item.name
+                    meter.start(stage, name, index, counts.get(item.category, 0))
                 await _apply_item(state, item)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 stop = True
@@ -3519,8 +3857,14 @@ async def apply_import(manager: SessionManager, plan: ImportPlan, *,
                 taken = item.error
             except Exception as exc:
                 item.status, item.error = "failed", _error_text(exc)
+            if item.category == "sessions":
+                meter.settle(item.name)
             if task is not None and task.cancelling():
                 stop = True
+        try:
+            meter.finish()
+        except KeyboardInterrupt:
+            stop = True
     finally:
         saved = any(i.status in ("added", "rewritten") and (i.category == "settings" or i.data.get("kind") ==
                                                             "external") for i in items)
@@ -3581,6 +3925,7 @@ async def _apply_session(state: _Applying, item: ImportItem) -> None:
     staged = manager.staging_path(planned)
 
     def hook(sid: str) -> None:
+        state.meter.step("swap")
         if state.before_swap is not None:
             state.before_swap(sid)
 
@@ -3594,7 +3939,10 @@ async def _apply_session(state: _Applying, item: ImportItem) -> None:
         state.uid_targets[d["uid"]] = done["id"]
         return
     try:
-        await _in_thread(_stage_session, d["src"], staged, d.get("db_sha256"), d.get("modes"))
+        try:
+            await _in_thread(_stage_session, d["src"], staged, d.get("db_sha256"), d.get("modes"), state.meter)
+        except _Interrupted:   # the progress callback raised KeyboardInterrupt in the thread: a Ctrl+C
+            raise KeyboardInterrupt from None
         if item.action == "add":
             done = await manager.import_add(staged, d["meta"], d["workspace"], sid=planned, before_swap=hook)
             item.status = "added"

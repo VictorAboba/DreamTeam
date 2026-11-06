@@ -25,7 +25,7 @@ The same two commands make a backup: export the home to an external disk, and im
 ## Export
 
 ```
-dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] [--home HOME]
+dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] [--home HOME] [--quiet]
 ```
 
 ```powershell
@@ -136,7 +136,7 @@ folder is really written.
 ## Import
 
 ```
-dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] [--yes] [--home HOME]
+dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] [--yes] [--home HOME] [--quiet]
 ```
 
 ```powershell
@@ -173,6 +173,15 @@ imported." and exits 0). Without a terminal (a script, a pipe) it needs `--yes` 
 imported and the exit code is 1. `--dry-run` only prints the plan. Ctrl+C at the question exits with code 130 and
 changes nothing. Ctrl+C during the import finishes or undoes the item it is on and then stops: the result marks the rest
 `not done`, and running the import again brings them in.
+
+Both commands show their progress on stderr. In a terminal it is one line that is rewritten in place, with a bar
+when the size is known: `export  [########............]  40%  250/610 MB  session 003-snake (2/5): files`; the line
+is cleared before the plan, the question, the warnings and the result are printed. An export first measures what it
+will write (file sizes only), then counts once more while it checks the written files for secrets; a dry run shows
+the stages without a bar. When stderr is not a terminal (a pipe, a log file, a scheduler) the progress is one plain
+line per stage of each item, such as `export: session 003-snake (2/5): files`. The import also writes the lines of
+the import itself (not those of the plan) to the home's log, `.dreamteam/logs/dreamteam.log`.
+`--quiet` (`-q`) turns the progress off; the plan, the question, the warnings and the result still print.
 
 An import deletes nothing the export does not carry: whatever is not in it stays as it is. What it does remove or
 overwrite here while bringing the export in: the older backup copy of a session it rewrites (only the

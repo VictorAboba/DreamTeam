@@ -1090,6 +1090,169 @@ def _delete_sessions(args, ids: list[str]) -> int:
 YES_WORDS = ("y", "yes", "д", "да")
 
 
+def _size_pair(done: int, total: int) -> str:
+    """`250/610 MB`: both in the unit of the total."""
+    for unit, size in (("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10)):
+        if total >= size:
+            digits = 0 if total >= 10 * size else 1
+            return f"{done / size:.{digits}f}/{total / size:.{digits}f} {unit}"
+    return f"{done}/{total} B"
+
+
+def progress_text(event) -> str:
+    """One transfer.Progress as the progress line shows it, e.g.
+    `export  [########............]  41%  250/610 MB  session 003-snake: files` (no bar without a byte total)."""
+    head = f"{event.op:<7}"
+    total = event.total_bytes
+    if not total:
+        return f"{head} {event.label()}"
+    part = min(event.done_bytes, total) / total
+    filled = int(part * _ProgressLine.BAR)
+    bar = "#" * filled + "." * (_ProgressLine.BAR - filled)
+    return f"{head} [{bar}] {int(part * 100):3d}%  {_size_pair(event.done_bytes, total)}  {event.label()}"
+
+
+def _printable(text: str) -> str:
+    """`text` with each character a terminal would not print as it is (a newline, a tab, ESC ...) as '?': a folder
+    name in a label must not break the line or reach the terminal as a control sequence."""
+    return "".join(ch if ch.isprintable() else "?" for ch in text)
+
+
+def _cells(ch: str) -> int:
+    """The terminal cells a character takes: 2 for a wide one (CJK, most emoji), 0 for a combining mark."""
+    import unicodedata
+
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+
+
+def _fit(text: str, width: int) -> str:
+    """`text` (printable) cut to `width` terminal cells and padded with spaces to them."""
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        cells = _cells(ch)
+        if used + cells > width:
+            break
+        out.append(ch)
+        used += cells
+    return "".join(out) + " " * (width - used)
+
+
+class _ProgressLine:
+    """The progress of `dreamteam export` / `dreamteam import` (transfer.Progress events) on stderr.
+
+    In a terminal: one line rewritten in place, '\\r' and the text padded with spaces to the terminal's width less
+    one and cut to it, in terminal cells (no ANSI escapes: legacy Windows consoles print them as text); a new stage
+    is shown at once, the counts in between at most 1/INTERVAL times a second; clear() blanks the line, and is
+    called before anything else is printed (also before a warning the log writes to stderr: clear_before_log).
+    Elsewhere (a pipe, a file, a CI log): one plain line per stage of each item, e.g.
+    `export: session 003-snake (2/5): files`, never a carriage return. Characters a terminal would not print
+    as they are show as '?'. stdout is flushed before each write, so that in one log the text printed before (the
+    plan) comes first. close() clears the line for good: later events (a worker thread still finishing after a
+    Ctrl+C) draw nothing. A stream that fails (closed, broken, none at all) shows nothing: the progress is only a
+    display."""
+
+    INTERVAL = 0.125
+    BAR = 20
+
+    def __init__(self, stream=None, *, terminal: bool | None = None, width: int | None = None, clock=None):
+        import time
+
+        self.stream = stream if stream is not None else sys.stderr
+        if terminal is None:
+            try:
+                terminal = bool(self.stream.isatty())
+            except (AttributeError, OSError, ValueError):
+                terminal = False
+        self.terminal = terminal
+        self.width = width
+        self.clock = clock or time.monotonic
+        self.shown = False   # a line is on the screen
+        self.last: float | None = None   # when it was drawn
+        self.key: tuple | None = None    # the stage of the last event
+        self.closed = False
+
+    def __call__(self, event) -> None:
+        if self.closed:
+            return
+        key = (event.op, event.stage, event.item, event.index)
+        new = key != self.key
+        self.key = key
+        if not self.terminal:
+            if new and event.stage != "done":
+                self._write(_printable(f"{event.op}: {event.label()}") + "\n")
+            return
+        if event.stage == "done":
+            self.clear()
+            return
+        now = self.clock()
+        if not new and self.last is not None and now - self.last < self.INTERVAL:
+            return
+        self.last = now
+        self._write("\r" + _fit(_printable(progress_text(event)), self._columns()))
+        self.shown = True
+
+    def clear(self) -> None:
+        """Blank the line (in a terminal), so that what is printed next starts at the left."""
+        if self.shown:
+            self._write("\r" + " " * self._columns() + "\r")
+            self.shown = False
+            self.key = None
+
+    def close(self) -> None:
+        """Clear the line; nothing is drawn after this."""
+        self.clear()
+        self.closed = True
+
+    def clear_before_log(self) -> None:
+        """Have the log's handlers that write to stderr (setup_logging) clear the line before each record."""
+        def clearing(_record) -> bool:
+            self.clear()
+            return True
+
+        for handler in logging.getLogger().handlers:
+            if type(handler) is logging.StreamHandler and handler.stream is self.stream:
+                handler.addFilter(clearing)
+
+    def _columns(self) -> int:
+        width = self.width
+        if width is None:
+            try:
+                width = os.get_terminal_size(self.stream.fileno()).columns
+            except (AttributeError, OSError, ValueError):
+                width = 80
+        return max(width - 1, 10)
+
+    def _write(self, text: str) -> None:
+        if self.closed:
+            return
+        try:   # what was printed before comes first, also when stdout and stderr go to one pipe
+            sys.stdout.flush()
+        except (AttributeError, OSError, ValueError):
+            pass
+        try:
+            self.stream.write(text)
+            self.stream.flush()
+        except (AttributeError, OSError, ValueError):   # a closed or broken stream, or none: only a display
+            pass
+
+
+def _progress(args) -> _ProgressLine | None:
+    """The progress display of a command, or None (--quiet, or no stderr at all: pythonw, a service)."""
+    return None if getattr(args, "quiet", False) or sys.stderr is None else _ProgressLine()
+
+
+def _cleared(show: _ProgressLine | None, *, last: bool = False) -> None:
+    """Clear the progress line before something is printed (`last`: for good, see _ProgressLine.close)."""
+    if show is not None:
+        if last:
+            show.close()
+        else:
+            show.clear()
+
+
 def _hub_answering(home: Path) -> str | None:
     """running_hub(home); a DreamTeam hub that answers there but takes no token from this computer counts as
     running too (its address from hub.json)."""
@@ -1147,14 +1310,18 @@ def cmd_export(args) -> int:
         return 130
     for note in notes:
         print(f"warning: {note}", file=sys.stderr)
+    show = _progress(args)
     try:
-        report = transfer.export_home(home, args.folder, include=args.include, sessions=args.session,
-                                      running=running, dry_run=args.dry_run)
+        try:
+            report = transfer.export_home(home, args.folder, include=args.include, sessions=args.session,
+                                          running=running, dry_run=args.dry_run, progress=show)
+        finally:
+            _cleared(show, last=True)
     except transfer.TransferError as exc:  # (SecretFound too: it names the places, never the values)
         print(str(exc), file=sys.stderr)
         return 2 if exc.usage else 1
-    except KeyboardInterrupt:  # export_home removed what it had written
-        print("\nNothing exported.", file=sys.stderr)
+    except KeyboardInterrupt as exc:  # export_home removed what it had written (or names what it could not)
+        print("\n".join(["\nNothing exported.", *getattr(exc, "__notes__", ())]), file=sys.stderr)
         return 130
     print(transfer.render_export_report(report))
     return 0 if report.ok else 1
@@ -1183,31 +1350,34 @@ def _import_blockers(home: Path, *, clean: bool = True) -> list[str]:
     return _session_holders(home, clean=clean)
 
 
-def _plan_import(home: Path, target: str, args):
+def _plan_import(home: Path, target: str, args, progress=None):
     """(manager, plan, text) for importing args.folder into `home`: `text` is the plan as printed. A new home is
     planned against an empty home in a temporary folder, so that neither a dry run nor a "no" creates anything;
-    manager is None then, and the plan is only for showing (its paths name the temporary home)."""
+    manager is None then, and the plan is only for showing (its paths name the temporary home). `progress`: see
+    transfer.plan_import."""
     from . import transfer
     from .sessions import SessionManager
 
     if target == "home":
         manager = SessionManager(home)
-        plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session)
+        plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session,
+                                    progress=progress)
         return manager, plan, transfer.render_import_plan(plan)
     import tempfile
 
     with tempfile.TemporaryDirectory(prefix="dreamteam-import-", ignore_cleanup_errors=True) as scratch:
         manager = SessionManager(Path(scratch) / home.name)
-        plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session)
+        plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session,
+                                    progress=progress, new_home=True)
         text = transfer.render_import_plan(plan).replace(str(manager.home), str(home))
     return None, plan, (f"{text}\nThe import creates the DreamTeam home {home}." if plan.changes else text)
 
 
-def _apply_import(manager, plan, home: Path, new_home: bool = False):
+def _apply_import(manager, plan, home: Path, new_home: bool = False, progress=None):
     """Apply `plan` in this process with the import's own launcher marker, re-checking before each session swap
     that no hub or launcher took the home meanwhile (`new_home`: the import just made it). (result or None,
     interrupted): `interrupted` when a second Ctrl+C broke off the import itself (the first one lets it finish or
-    undo the item it is on)."""
+    undo the item it is on). `progress`: see transfer.apply_import."""
     from . import transfer
 
     def before_swap(sid: str) -> None:
@@ -1220,7 +1390,8 @@ def _apply_import(manager, plan, home: Path, new_home: bool = False):
 
     async def run() -> None:
         try:
-            done["result"] = await transfer.apply_import(manager, plan, before_swap=before_swap, new_home=new_home)
+            done["result"] = await transfer.apply_import(manager, plan, before_swap=before_swap, new_home=new_home,
+                                                         progress=progress)
         finally:
             try:
                 await manager.shutdown()
@@ -1280,8 +1451,12 @@ def cmd_import(args) -> int:
     if blockers:
         print(f"warning: DreamTeam runs {home} now ({'; '.join(blockers)}): the import itself is refused until it "
               "stops.", file=sys.stderr)
+    show = _progress(args)
     try:
-        manager, plan, text = _plan_import(home, target, args)
+        try:
+            manager, plan, text = _plan_import(home, target, args, show)
+        finally:
+            _cleared(show)
     except transfer.TransferError as exc:
         print(str(exc), file=sys.stderr)
         return 2 if exc.usage else 1
@@ -1291,7 +1466,7 @@ def cmd_import(args) -> int:
     except KeyboardInterrupt:
         print("\nNothing imported.", file=sys.stderr)
         return 130
-    print(text)
+    print(text, flush=True)   # (before the progress of the import on stderr, also in one log of both)
     if args.dry_run or not plan.changes:
         return plan.exit_code
     if not args.yes:
@@ -1318,10 +1493,11 @@ def cmd_import(args) -> int:
         return refused(blockers)
     new_home = manager is None
     if manager is None:  # a new home: create it, then plan against it (the same plan, with its real paths)
-        try:
+        try:   # (no progress: the same plan once more, its checksums read before)
             _load_home(home)
             manager = SessionManager(home)
-            plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session)
+            plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session,
+                                        new_home=True)
         except transfer.TransferError as exc:
             print(str(exc), file=sys.stderr)
             return 2 if exc.usage else 1
@@ -1332,7 +1508,12 @@ def cmd_import(args) -> int:
             print("\nNothing imported.", file=sys.stderr)
             return 130
     setup_logging(home)
-    result, broken_off = _apply_import(manager, plan, home, new_home)
+    if show is not None:
+        show.clear_before_log()
+    try:
+        result, broken_off = _apply_import(manager, plan, home, new_home, show)
+    finally:
+        _cleared(show, last=True)
     if result is None:  # (a second Ctrl+C)
         print("Import interrupted (Ctrl+C). What was imported so far stays; run the import again (--dry-run shows "
               "what is left).", file=sys.stderr)
@@ -1798,7 +1979,7 @@ def build_parser() -> argparse.ArgumentParser:
                                       "files) of a home into a folder, to move them to another computer; API keys "
                                       "and MCP env values stay on this one",
                        usage="dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] "
-                             "[--home HOME]")
+                             "[--home HOME] [--quiet]")
     s.add_argument("folder", metavar="FOLDER",
                    help="a new or empty folder (e.g. on a USB stick); a folder with an earlier export is replaced")
     s.add_argument("--include", action="append", metavar="CATEGORIES", help=include_help.format("export", ""))
@@ -1807,13 +1988,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "--include)")
     s.add_argument("--dry-run", action="store_true", help="show what would be written and its size; write nothing")
     s.add_argument("--home", help="home directory (default: $DREAMTEAM_HOME or ~/DreamTeam)")
+    quiet_help = "show no progress on stderr (the {0} still print)"
+    s.add_argument("-q", "--quiet", action="store_true", help=quiet_help.format("result and the warnings"))
     s.set_defaults(func=cmd_export, dir=None)
 
     s = sub.add_parser("import", help="bring a folder written by `dreamteam export` into a home: adds what is new, "
                                       "rewrites what changed (the last copy of a rewritten session is kept), never "
                                       "deletes what the export does not carry",
                        usage="dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] "
-                             "[--yes] [--home HOME]")
+                             "[--yes] [--home HOME] [--quiet]")
     s.add_argument("folder", metavar="FOLDER", help="the folder `dreamteam export` wrote")
     s.add_argument("--include", action="append", metavar="CATEGORIES",
                    help=include_help.format("import", " the export holds"))
@@ -1824,6 +2007,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-y", "--yes", action="store_true", help="import without asking")
     s.add_argument("--home", help="home directory to import into (default: $DREAMTEAM_HOME or ~/DreamTeam; a new "
                                   "or empty folder becomes a home)")
+    s.add_argument("-q", "--quiet", action="store_true", help=quiet_help.format("plan, the question and the result"))
     s.set_defaults(func=cmd_import, dir=None)
 
     s = sub.add_parser("init", help="create a swarm project (dreamteam.toml + workspace)")

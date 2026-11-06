@@ -1887,6 +1887,27 @@ def test_merge_settings_keeps_the_credentials_set_up_here_for_the_same_endpoint(
     text = "\n".join(m.warnings)
     assert "extra.headers.Authorization configured here was removed" in text and "Bearer" not in text
     assert "the key variable GW_KEY configured here was removed" in text
+    # a home the import makes: its profiles are the template's, so the same removal is not warned about
+    fresh = merge_settings({"models": {"gw": {**header, "api_key_env": "GW_KEY"}}}, {"models": {"gw": other}},
+                           environ={}, new_home=True)
+    assert fresh.new_raw["models"]["gw"] == m.new_raw["models"]["gw"]
+    assert not any("configured here was removed" in w for w in fresh.warnings)
+
+
+async def test_an_import_into_a_new_home_does_not_warn_about_the_templates_key_variable(tmp_path):
+    from dreamteam.settings import read_raw
+
+    home_a = _home_named(tmp_path, "a", {"models": {"default": {"provider": "openai", "model": "m",
+                                                                "base_url": "https://gw.example.com/v1"}}})
+    export_home(home_a, tmp_path / "usb", include=["settings"])
+    new = tmp_path / "new"
+    manager = SessionManager(new)   # a template home, as the CLI makes one for a new folder
+    template = read_raw(new).get("models", {}).get("default", {})
+    plan = plan_import(manager, tmp_path / "usb", new_home=True)
+    assert not any("configured here was removed" in w for w in plan.warnings + plan.items[0].warnings)
+    if template.get("api_key_env"):   # the same plan for an existing home does warn
+        plan = plan_import(manager, tmp_path / "usb")
+        assert any("configured here was removed" in w for w in plan.warnings + plan.items[0].warnings)
 
 
 def test_merge_external_compares_the_command_as_it_runs():
@@ -2129,6 +2150,15 @@ async def test_a_partial_export_that_cannot_be_removed_is_named(tmp_path, monkey
         export_home(home, tmp_path / "usb", include=["sessions"])
     assert "Could not remove the partial export" in str(err.value) and "delete it by hand" in str(err.value)
     assert "it may contain the secret named above" in str(err.value)
+
+    def ctrl_c(event: transfer.Progress) -> None:
+        if event.stage == "secrets":
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt) as stopped:   # (the caller prints the note, after its progress line)
+        export_home(home, tmp_path / "usb2", include=["sessions"], progress=ctrl_c)
+    notes = getattr(stopped.value, "__notes__", [])
+    assert len(notes) == 1 and notes[0].startswith("Could not remove the partial export") and "secret" not in notes[0]
 
 
 async def test_a_destination_in_another_case_is_still_inside_the_home(tmp_path, monkeypatch):
@@ -2873,3 +2903,234 @@ async def test_an_import_stops_when_another_process_takes_the_home(tmp_path, mon
     assert statuses[("mcp", "library helper")] == "not done"
     assert not result.interrupted and result.exit_code == 1 and not (_library_root() / "helper").exists()
     await manager.shutdown()
+
+
+# ---- progress ----------------------------------------------------------------------------------------------------
+BIG = bytes(range(256)) * (10 << 10)   # 2.5 MiB: more than two chunks of a copy
+
+
+def _stages(events: list[transfer.Progress]) -> list[tuple[str, str]]:
+    """(stage, item) of each event that begins a stage (the ones after it only move the counts)."""
+    found: list[tuple[str, str]] = []
+    for event in events:
+        if not found or found[-1] != (event.stage, event.item):
+            found.append((event.stage, event.item))
+    return found
+
+
+def _check_counts(events: list[transfer.Progress]) -> None:
+    for event in events:
+        assert event.done_bytes >= 0 and event.done_files >= 0
+        if event.total_bytes is not None:
+            assert event.done_bytes <= event.total_bytes
+        if event.total_files is not None:
+            assert event.done_files <= event.total_files
+
+
+async def _two_sessions(tmp_path: Path, monkeypatch) -> tuple[Path, str, str]:
+    _libraries(monkeypatch, tmp_path, "a")
+    home = _home_named(tmp_path, "a", _raw())
+    manager = _manager(home)
+    one, two = await _session(manager, "One"), await _session(manager, "Two")
+    await manager.shutdown()
+    for sid in (one, two):
+        _fill_db(home, sid)
+    _write(_workspace(home, one) / "data" / "big.bin", BIG)
+    _write(_workspace(home, two) / "notes.md", "two\n")
+    return home, one, two
+
+
+async def test_an_export_tells_its_progress(tmp_path, monkeypatch, caplog):
+    home, one, two = await _two_sessions(tmp_path, monkeypatch)
+    events: list[transfer.Progress] = []
+    caplog.set_level("INFO", logger="dreamteam.transfer")
+    report = export_home(home, tmp_path / "usb", progress=events.append)
+    assert report.ok
+    _check_counts(events)
+    assert {e.op for e in events} == {"export"}
+    stages = _stages(events)
+    assert stages[:3] == [("sizing", ""), ("settings", ""), ("mcp", "")]
+    assert stages[3:9] == [("session", one), ("database", one), ("files", one), ("session", two), ("database", two),
+                           ("files", two)]
+    assert [item for stage, item in stages if stage == "secrets"] == ["mcp", f"session {one}", f"session {two}",
+                                                                     "settings"]   # (in name order, each once)
+    assert stages[-1] == ("done", "") and events[-1].done_bytes == events[-1].total_bytes
+    assert [(e.index, e.count) for e in events if e.stage == "session" and e.item == one][0] == (1, 2)
+    assert [(e.index, e.count) for e in events if e.stage == "session" and e.item == two][0] == (2, 2)
+    # the copy: one total (measured first), counted up to it; the secret check: the bytes written
+    first_secret = next(i for i, e in enumerate(events) if e.stage == "secrets")
+    copying = events[1:first_secret]
+    assert len({e.total_bytes for e in copying}) == 1 and copying[0].total_bytes >= len(BIG)
+    assert [e.done_bytes for e in copying] == sorted(e.done_bytes for e in copying)
+    big = [e.done_bytes for e in copying if e.stage == "files" and e.item == one]
+    assert len(set(big)) >= 3 and big[-1] - big[0] >= len(BIG)   # chunk by chunk
+    written = scan_tree(tmp_path / "usb", exclude_names=(), exclude_paths=(), hash=False)
+    assert events[first_secret].total_bytes == written.bytes - (tmp_path / "usb" / MANIFEST).stat().st_size
+    assert f"export: session {one} (1/2): files" in caplog.text and "export: done" in caplog.text
+    # a dry run: the stages, no totals
+    events.clear()
+    export_home(home, tmp_path / "dry", dry_run=True, progress=events.append)
+    assert {e.total_bytes for e in events} == {None} and not (tmp_path / "dry").exists()
+    assert ("files", one) not in _stages(events) and _stages(events)[-1] == ("done", "")
+    assert ("session", two) in _stages(events) and ("sizing", "") not in _stages(events)
+
+
+@pytest.mark.parametrize("when", ["sizing", "database", "bytes", "secrets", "reading", "replacing"])
+async def test_ctrl_c_in_the_progress_of_an_export_removes_it(tmp_path, monkeypatch, when):
+    home, _one, _two = await _two_sessions(tmp_path, monkeypatch)
+    dest = tmp_path / "usb"
+    export_home(home, dest)
+    before, around = _all_bytes(dest), sorted(os.listdir(tmp_path))
+
+    def ctrl_c(event: transfer.Progress) -> None:
+        if event.stage == when or (when == "bytes" and event.stage == "files" and event.done_bytes > 1 << 20):
+            raise KeyboardInterrupt
+        if when == "reading" and event.stage == "secrets" and event.item.startswith("session") \
+                and event.done_bytes > 1 << 20:   # in the middle of big.bin: the file being read is open
+            raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        export_home(home, dest, progress=ctrl_c)   # replacing: the earlier export stays as it was
+    assert _all_bytes(dest) == before and sorted(os.listdir(tmp_path)) == around
+    if when == "replacing":   # (only a replace has that stage)
+        return
+    with pytest.raises(KeyboardInterrupt):
+        export_home(home, tmp_path / "new", progress=ctrl_c)
+    assert not (tmp_path / "new").exists()
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(KeyboardInterrupt):
+        export_home(home, empty, progress=ctrl_c)
+    assert os.listdir(empty) == []
+
+
+async def test_a_replace_tells_its_stage_and_a_ctrl_c_once_done_changes_nothing(tmp_path, monkeypatch):
+    home, one, _two = await _two_sessions(tmp_path, monkeypatch)
+    dest = tmp_path / "usb"
+    export_home(home, dest)
+    stale = _write(tmp_path / ".usb.export-0badc0de" / "x", "left")
+    os.utime(stale.parent, (1, 1))   # an export interrupted long ago
+    events: list[transfer.Progress] = []
+
+    def ctrl_c(event: transfer.Progress) -> None:
+        events.append(event)
+        if event.stage == "done":
+            raise KeyboardInterrupt
+
+    report = export_home(home, dest, progress=ctrl_c)
+    assert report.ok and report.replaced and not stale.parent.exists()
+    stages = [s for s, _item in _stages(events)]
+    assert stages[0] == "cleaning" and stages[-2:] == ["replacing", "done"]
+    assert [n for n in os.listdir(tmp_path) if n.startswith(".usb.")] == []
+    assert (dest / "sessions" / one / "workspace" / "data" / "big.bin").read_bytes() == BIG
+    assert transfer.Progress("export", "replacing").label() == "replacing the previous export"
+    (tmp_path / "empty").mkdir()
+    for target in (tmp_path / "new", tmp_path / "empty"):   # (a new folder, an empty one: the same)
+        assert export_home(home, target, progress=ctrl_c).ok and (target / MANIFEST).is_file()
+
+
+async def test_an_import_tells_its_progress(tmp_path, monkeypatch):
+    home_a, one, two = await _two_sessions(tmp_path, monkeypatch)
+    export_home(home_a, tmp_path / "usb")
+    _libraries(monkeypatch, tmp_path, "b")
+    home_b = _home_named(tmp_path, "b", {**_raw_b(), "mcp": {}})   # (the export's [mcp.external] server is added)
+    manager = _manager(home_b)
+    planned: list[transfer.Progress] = []
+    plan = plan_import(manager, tmp_path / "usb", progress=planned.append)
+    assert {e.op for e in planned} == {"plan"} and {e.total_bytes for e in planned} == {None}
+    assert _stages(planned) == [("settings", ""), ("session", one), ("database", one), ("session", two),
+                                ("database", two), ("mcp", ""), ("done", "")]
+    events: list[transfer.Progress] = []
+    result = await apply_import(manager, plan, progress=events.append)
+    assert result.ok
+    _check_counts(events)
+    stages = _stages(events)
+    assert stages[0] == ("settings", "")
+    sessions = [s for s in stages if s[0] in ("session", "database", "files", "swap")]
+    assert sessions == [(s, sid) for sid in (one, two) for s in ("session", "database", "files", "swap")]
+    assert stages[-2:] == [("mcp", "[mcp.external]"), ("done", "")]
+    total = events[-1].total_bytes
+    assert total is not None and total >= len(BIG) and events[-1].done_bytes == total
+    assert len({e.total_bytes for e in events}) == 1
+    assert [e.done_bytes for e in events] == sorted(e.done_bytes for e in events)
+    big = [e.done_bytes for e in events if e.stage == "files" and e.item == one]
+    assert len(set(big)) >= 3 and big[-1] - big[0] >= len(BIG)
+    assert [(e.index, e.count) for e in events if e.stage == "session"][0] == (1, 2)
+    await manager.shutdown()
+
+
+@pytest.mark.parametrize("when", ["bytes", "swap", "session"])
+async def test_ctrl_c_in_the_progress_of_an_import_stops_it_like_ctrl_c(tmp_path, monkeypatch, when):
+    home_a, one, two = await _two_sessions(tmp_path, monkeypatch)
+    export_home(home_a, tmp_path / "usb")
+    _libraries(monkeypatch, tmp_path, "b")
+    home_b = _home_named(tmp_path, "b", {**_raw_b(), "mcp": {}})
+    manager = _manager(home_b)
+    plan = plan_import(manager, tmp_path / "usb")
+
+    def ctrl_c(event: transfer.Progress) -> None:   # during the first session
+        if event.item == one and (event.stage == when or (when == "bytes" and event.stage == "files"
+                                                          and event.done_bytes > 1 << 20)):
+            raise KeyboardInterrupt
+
+    result = await apply_import(manager, plan, progress=ctrl_c)
+    statuses = _statuses(result)
+    assert result.interrupted and result.exit_code == 130
+    assert statuses[("settings", "dreamteam.toml")] == "rewritten"
+    assert statuses[("sessions", one)] == "not done" and statuses[("sessions", two)] == "not done"
+    assert statuses[("mcp", "external fetch")] == "not done"
+    assert sorted(os.listdir(home_b / "sessions")) == []   # no staged copy left
+    text = render_import_result(result)
+    assert "stopped (Ctrl+C)" in text and "run the import again" in text
+    # the next import brings the rest in
+    plan = plan_import(manager, tmp_path / "usb")
+    result = await apply_import(manager, plan)
+    assert result.ok and sorted(os.listdir(home_b / "sessions")) == [one, two]
+    assert (home_b / "sessions" / one / "workspace" / "data" / "big.bin").read_bytes() == BIG
+    await manager.shutdown()
+
+
+async def test_the_progress_does_not_change_an_import_of_an_odd_manifest(tmp_path, monkeypatch):
+    home_a, one, two = await _two_sessions(tmp_path, monkeypatch)
+    export_home(home_a, tmp_path / "usb")
+    manifest = _manifest(tmp_path / "usb")
+    manifest["sessions"].append({"id": ["x"]})   # (hand-edited: the plan ignores the entry)
+    (tmp_path / "usb" / MANIFEST).write_text(json.dumps(manifest), encoding="utf-8")
+    found = []
+    events: list[transfer.Progress] = []
+    for name, progress in (("b", None), ("c", events.append)):
+        _libraries(monkeypatch, tmp_path, name)
+        manager = _manager(_home_named(tmp_path, name, {**_raw_b(), "mcp": {}}))
+        plan = plan_import(manager, tmp_path / "usb")
+        result = await apply_import(manager, plan, progress=progress)
+        found.append(_statuses(result))
+        await manager.shutdown()
+    assert found[0] == found[1] and found[0][("sessions", one)] == found[0][("sessions", two)] == "added"
+    assert events and events[-1].stage == "done"
+
+
+def test_a_database_read_again_is_counted_once(tmp_path, monkeypatch):
+    path = tmp_path / "swarm.db"
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE t(x)")
+    conn.executemany("INSERT INTO t VALUES (?)", [("x" * 2000,) for _ in range(2000)])   # several backup steps
+    conn.commit()
+    conn.close()
+    states = iter([("a",), ("b",), ("c",), ("c",)])   # changed during the first read, not during the second
+    monkeypatch.setattr(transfer, "_db_state", lambda _path: next(states))
+    monkeypatch.setattr(transfer, "BACKUP_PAGES", 64)
+    reported: list[int] = []
+    transfer._copy_db(path, tmp_path / "copy.db", on_bytes=reported.append)
+    assert next(states, None) is None   # (read twice)
+    assert len(reported) > 1 and sum(reported) == path.stat().st_size
+
+
+def test_a_copy_tells_each_chunk_and_file(tmp_path):
+    from dreamteam.treecopy import CHUNK, copy_tree
+
+    _write(tmp_path / "src" / "a" / "big.bin", b"x" * (CHUNK * 2 + 5))
+    _write(tmp_path / "src" / "b.txt", "b")
+    calls: list[tuple[int, int]] = []
+    result = copy_tree(tmp_path / "src", tmp_path / "dst", progress=lambda n, f: calls.append((n, f)))
+    assert calls == [(1, 0), (0, 1), (CHUNK, 0), (CHUNK, 0), (5, 0), (0, 1)]   # (a folder's files first)
+    assert sum(n for n, _f in calls) == result.bytes and sum(f for _n, f in calls) == result.files == 2

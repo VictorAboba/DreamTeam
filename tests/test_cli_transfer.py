@@ -8,12 +8,14 @@ cleanly on Ctrl+C."""
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import logging
 import os
 import sqlite3
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -243,8 +245,8 @@ def test_export_names_the_sessions_a_hub_runs_and_never_removes_launcher_markers
         assert f"another DreamTeam process may be running sessions of {home} (process {holder.pid}" in err
     finally:
         kill_tree(holder)
-    assert cli.main(["export", str(dest), "--include", "settings", "--home", str(home)]) == 0
-    assert capsys.readouterr().err == "" and marker.exists()
+    assert cli.main(["export", str(dest), "--include", "settings", "--home", str(home), "--quiet"]) == 0
+    assert capsys.readouterr().err == "" and marker.exists()   # (no warning; --quiet: no progress lines)
 
 
 def test_export_failures_exit_1_and_ctrl_c_exits_130(monkeypatch, tmp_path, capsys):
@@ -329,7 +331,7 @@ def test_import_without_a_terminal_needs_yes(monkeypatch, tmp_path, capsys):
     assert _markers(home_b) == []   # the import's own launcher marker is gone again
     assert not [p for p in (home_b / "sessions").iterdir() if p.name.startswith(".importing-")]
     # the same export again: nothing to change, no question (also without --yes)
-    assert cli.main(["import", str(tmp_path / "usb"), "--home", str(home_b)]) == 0
+    assert cli.main(["import", str(tmp_path / "usb"), "--home", str(home_b), "-q"]) == 0
     captured = capsys.readouterr()
     assert "Nothing to change here." in captured.out and captured.err == ""
 
@@ -564,6 +566,260 @@ def test_an_import_into_a_new_home_keeps_no_backup_of_settings_it_never_had(monk
     other = tmp_path / "n4"
     assert cli.main(["import", str(tmp_path / "xs"), "--yes", "--include", "skills", "--home", str(other)]) == 1
     assert "The import creates the DreamTeam home" not in capsys.readouterr().out and not other.exists()
+
+
+# ---- progress -----------------------------------------------------------------------------------------------------
+class _Terminal(io.StringIO):
+    """What a terminal is given (isatty)."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _screen(text: str) -> list[str]:
+    """The lines a terminal shows for `text`: '\\r' goes back to the start of the line, what follows overwrites it."""
+    lines: list[str] = []
+    line: list[str] = []
+    col = 0
+    for ch in text:
+        if ch == "\n":
+            lines.append("".join(line).rstrip())
+            line, col = [], 0
+        elif ch == "\r":
+            col = 0
+        else:
+            if col < len(line):
+                line[col] = ch
+            else:
+                line.append(ch)
+            col += 1
+    lines.append("".join(line).rstrip())
+    return lines
+
+
+def test_the_progress_line_in_a_terminal():
+    P = transfer.Progress
+    stream, now = _Terminal(), [0.0]
+    show = cli._ProgressLine(stream, width=100, clock=lambda: now[0])
+    assert show.terminal and cli._ProgressLine(io.StringIO()).terminal is False
+    show(P("export", "files", "003-snake", 2, 5, 0, 610 << 20))
+    first = stream.getvalue()
+    assert first == "\r" + "export  [....................]   0%  0/610 MB  session 003-snake (2/5): files".ljust(99)
+    now[0] = 0.05   # the counts of the same stage: at most every INTERVAL
+    show(P("export", "files", "003-snake", 2, 5, 100 << 20, 610 << 20))
+    assert stream.getvalue() == first
+    now[0] = 0.2
+    show(P("export", "files", "003-snake", 2, 5, 250 << 20, 610 << 20))
+    line = stream.getvalue()[len(first):]
+    assert line == "\r" + "export  [########............]  40%  250/610 MB  session 003-snake (2/5): files".ljust(99)
+    now[0] = 0.21   # a new stage: at once
+    show(P("export", "secrets", "session 003-snake", 0, 0, 3 << 10, 9 << 10))
+    assert stream.getvalue().endswith("\r" + "export  [######..............]  33%  3.0/9.0 KB  checking for secrets: "
+                                             "session 003-snake".ljust(99))
+    show(P("import", "skills", "csv-tool", 1, 3))   # no byte total: no bar
+    assert stream.getvalue().endswith("\r" + "import  skills csv-tool (1/3)".ljust(99))
+    mark = len(stream.getvalue())
+    show.clear()
+    assert stream.getvalue()[mark:] == "\r" + " " * 99 + "\r"
+    show.clear()   # (nothing to clear)
+    assert len(stream.getvalue()) == mark + 101 and "\n" not in stream.getvalue() and "\x1b" not in stream.getvalue()
+    narrow = _Terminal()   # cut to the width less one
+    cli._ProgressLine(narrow, width=30)(P("import", "session", "003-a-very-long-session-name", 1, 2))
+    assert narrow.getvalue() == "\r" + "import  session 003-a-very-lon"[:29]
+    narrow.truncate(0)
+    narrow.seek(0)
+    show = cli._ProgressLine(narrow, width=30)
+    show(P("import", "session", "003-x", 1, 2))
+    show(P("import", "done"))   # done: the line goes
+    assert _screen(narrow.getvalue()) == [""] and narrow.getvalue().endswith("\r")
+
+
+def test_the_progress_lines_elsewhere_are_one_per_stage():
+    P = transfer.Progress
+    stream = io.StringIO()
+    show = cli._ProgressLine(stream)
+    for event in (P("export", "sizing"), P("export", "session", "003-snake", 2, 5, 0, 100),
+                  P("export", "files", "003-snake", 2, 5, 10, 100), P("export", "files", "003-snake", 2, 5, 60, 100),
+                  P("export", "secrets", "settings", 0, 0, 1, 50), P("export", "secrets", "settings", 0, 0, 9, 50),
+                  P("export", "git", "sessions/003-snake/workspace/.git", 1, 1), P("export", "done", "", 0, 0, 50, 50)):
+        show(event)
+    show.clear()
+    assert stream.getvalue() == ("export: measuring\nexport: session 003-snake (2/5)\n"
+                                 "export: session 003-snake (2/5): files\nexport: checking for secrets: settings\n"
+                                 "export: checking the git history (1/1): sessions/003-snake/workspace/.git\n")
+
+
+def test_export_and_import_show_their_progress_on_stderr(monkeypatch, tmp_path, capsys):
+    home_a, (one, two) = _exported(monkeypatch, tmp_path)
+    (home_a / "sessions" / one / "workspace" / "big.bin").write_bytes(b"\x01" * (3 << 20))
+    capsys.readouterr()
+    assert cli.main(["export", str(tmp_path / "usb"), "--home", str(home_a)]) == 0
+    captured = capsys.readouterr()
+    assert "\r" not in captured.err and "export: measuring\n" in captured.err
+    assert f"export: session {one} (1/2): files\n" in captured.err and f"export: session {two} (2/2)\n" in captured.err
+    assert "export:" not in captured.out and f"Exported {home_a} to" in captured.out
+    assert cli.main(["export", str(tmp_path / "dry"), "--dry-run", "--home", str(home_a)]) == 0
+    err = capsys.readouterr().err
+    assert f"export: session {one} (1/2)\n" in err and "files" not in err and "measuring" not in err
+    home_b = _computer(monkeypatch, tmp_path, "b")
+    capsys.readouterr()
+    assert cli.main(["import", str(tmp_path / "usb"), "--yes", "--home", str(home_b)]) == 0
+    captured = capsys.readouterr()
+    assert f"plan: session {one} (1/2): database\n" in captured.err and "\r" not in captured.err
+    assert f"import: session {one} (1/2): files\n" in captured.err
+    assert f"import: session {two} (2/2): putting it in place\n" in captured.err
+    assert f"sessions  {one}: added" in captured.out and "import:" not in captured.out
+    log = (home_b / ".dreamteam" / "logs" / "dreamteam.log").read_text(encoding="utf-8")
+    assert f"dreamteam.transfer: import: session {one} (1/2): files" in log
+    # --quiet: no progress; the plan, the result and the warnings still print
+    home_c = _computer(monkeypatch, tmp_path, "c")
+    capsys.readouterr()
+    assert cli.main(["import", str(tmp_path / "usb"), "--yes", "--quiet", "--home", str(home_c)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == "" and f"sessions  {one}: added" in captured.out
+    assert cli.main(["export", str(tmp_path / "usb2"), "-q", "--home", str(home_a)]) == 0
+    captured = capsys.readouterr()
+    assert captured.err == "" and f"Exported {home_a} to" in captured.out
+
+
+def test_in_a_terminal_the_progress_line_is_cleared_before_anything_is_printed(monkeypatch, tmp_path, capsys):
+    home_a, (one, _two) = _exported(monkeypatch, tmp_path)
+    (home_a / "sessions" / one / "workspace" / "big.bin").write_bytes(b"\x01" * (3 << 20))
+    monkeypatch.setattr(cli, "_stdin_is_terminal", lambda: True)
+
+    def ask(prompt=""):
+        sys.stdout.write(prompt + "y\n")   # (the terminal echoes the answer and the Enter)
+        return "y"
+
+    monkeypatch.setattr("builtins.input", ask)
+
+    def run(argv: list[str]) -> str:
+        terminal = _Terminal()   # stdout and stderr on one screen, as in a console
+        old = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = terminal
+        try:
+            assert cli.main(argv) == 0
+        finally:
+            sys.stdout, sys.stderr = old
+        return terminal.getvalue()
+
+    shown = run(["export", str(tmp_path / "t1"), "--home", str(home_a)])
+    quiet = run(["export", str(tmp_path / "t2"), "--home", str(home_a), "--quiet"])
+    assert "\r" in shown and "export  [" in shown and "\r" not in quiet and "\x1b" not in shown
+    assert _screen(shown) == _screen(quiet.replace(str(tmp_path / "t2"), str(tmp_path / "t1")))
+    home_b = _computer(monkeypatch, tmp_path, "b")
+    shown = run(["import", str(tmp_path / "t1"), "--home", str(home_b)])
+    home_c = _computer(monkeypatch, tmp_path, "c")
+    quiet = run(["import", str(tmp_path / "t1"), "--home", str(home_c), "-q"])
+    assert "\rplan    session" in shown and "\rimport  [" in shown and "Import? [y/N] " in quiet
+    assert _screen(shown) == _screen(quiet.replace(str(home_c), str(home_b)))
+    capsys.readouterr()
+
+
+def test_ctrl_c_while_the_progress_is_shown_exits_130(monkeypatch, tmp_path, capsys):
+    home_a, (one, two) = _exported(monkeypatch, tmp_path)
+    shown = cli._ProgressLine.__call__
+
+    def ctrl_c(self, event):
+        shown(self, event)
+        if event.stage == "files" and event.item == one:
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli._ProgressLine, "__call__", ctrl_c)
+    assert cli.main(["export", str(tmp_path / "new"), "--home", str(home_a)]) == 130
+    assert "Nothing exported." in capsys.readouterr().err and not (tmp_path / "new").exists()
+    home_b = _computer(monkeypatch, tmp_path, "b")
+    assert cli.main(["import", str(tmp_path / "usb"), "--yes", "--home", str(home_b)]) == 130
+    out = capsys.readouterr().out
+    assert "stopped (Ctrl+C)" in out and f"sessions  {one}: not done" in out and f"sessions  {two}: not done" in out
+    assert not (home_b / "sessions" / one).exists() and _markers(home_b) == []
+
+
+def test_the_progress_line_fits_odd_names_and_stops_when_closed():
+    P = transfer.Progress
+    stream = _Terminal()
+    show = cli._ProgressLine(stream, width=41)
+    show(P("export", "skills", "数据\x1b[2Jx\ty\n", 1, 2))   # wide characters, an escape, a tab, a newline
+    drawn = stream.getvalue()
+    assert "\x1b" not in drawn and "\t" not in drawn and "\n" not in drawn
+    text = drawn[1:]
+    assert text == "export  skills 数据?[2Jx?y? (1/2)" + " " * 7   # (40 cells: a wide character takes two)
+    narrow = _Terminal()
+    cli._ProgressLine(narrow, width=19)(P("export", "skills", "数据x"))
+    assert narrow.getvalue() == "\rexport  skills 数 "   # (cut in cells: the second one does not fit)
+    assert cli._fit("数据", 3) == "数 " and cli._fit("é", 2) == "é "   # (a combining mark takes none)
+    pipe = io.StringIO()
+    cli._ProgressLine(pipe)(P("export", "git", "a\nb", 1, 1))
+    assert pipe.getvalue() == "export: checking the git history (1/1): a?b\n"
+    show.close()   # e.g. the staging thread still copying after a Ctrl+C: nothing more is drawn
+    mark = stream.getvalue()
+    assert _screen(mark) == [""]
+    show(P("export", "files", "003-x", 1, 1, 5, 10))
+    show.clear()
+    assert stream.getvalue() == mark
+
+
+def test_a_warning_of_the_log_clears_the_progress_line_first():
+    stream = _Terminal()
+    show = cli._ProgressLine(stream, width=40)
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.WARNING)
+    root = logging.getLogger()
+    root.addHandler(handler)
+    try:
+        show.clear_before_log()
+        show(transfer.Progress("import", "session", "003-x", 1, 2))
+        logging.getLogger("dreamteam.sessions").warning("could not remove the partial copy")
+    finally:
+        root.removeHandler(handler)
+    assert _screen(stream.getvalue()) == ["could not remove the partial copy", ""]
+
+
+def test_without_stderr_the_commands_work_without_progress(monkeypatch, tmp_path, capsys):
+    home_a, (one, _two) = _exported(monkeypatch, tmp_path)
+    home_b = _computer(monkeypatch, tmp_path, "b")
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "stderr", None)   # pythonw, a service: no stderr at all
+    assert cli._progress(SimpleNamespace(quiet=False)) is None
+    cli._ProgressLine()(transfer.Progress("export", "settings"))   # (a stream that is None: nothing drawn)
+    assert cli.main(["export", str(tmp_path / "usb2"), "--home", str(home_a)]) == 0
+    assert cli.main(["import", str(tmp_path / "usb2"), "--yes", "--home", str(home_b)]) == 0
+    assert f"sessions  {one}: added" in capsys.readouterr().out
+
+
+class _Sink(io.RawIOBase):
+    """One pipe that stdout and stderr both write to (`2>&1 | tee log`)."""
+
+    def __init__(self):
+        super().__init__()
+        self.data = bytearray()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, b) -> int:
+        self.data += bytes(b)
+        return len(b)
+
+
+def test_in_one_log_of_both_streams_the_plan_comes_before_the_progress(monkeypatch, tmp_path, capsys):
+    _home_a, (one, _two) = _exported(monkeypatch, tmp_path)
+    home_b = _computer(monkeypatch, tmp_path, "b")
+    capsys.readouterr()
+    sink = _Sink()   # stdout buffered in blocks as in a pipe, stderr written at once
+    out = io.TextIOWrapper(io.BufferedWriter(sink, buffer_size=1 << 20), encoding="utf-8", line_buffering=False)
+    err = io.TextIOWrapper(io.BufferedWriter(sink), encoding="utf-8", line_buffering=True)
+    monkeypatch.setattr(sys, "stdout", out)
+    monkeypatch.setattr(sys, "stderr", err)
+    try:
+        assert cli.main(["import", str(tmp_path / "usb"), "--yes", "--home", str(home_b)]) == 0
+    finally:
+        out.flush()
+        err.flush()
+    lines = sink.data.decode("utf-8").splitlines()
+    plan = next(i for i, line in enumerate(lines) if line.startswith("Import "))
+    first = next(i for i, line in enumerate(lines) if line.startswith("import: "))
+    assert plan < first and any(f"sessions  {one}: added" in line for line in lines[first:])
 
 
 @pytest.mark.skipif(os.name == "nt", reason="EPERM of signal 0 is POSIX")

@@ -31,9 +31,12 @@ import stat
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Collection, Iterable
+from typing import Callable, Collection, Iterable
 
 from .workspace import is_link, long_path
+
+# copy_tree(progress=...): called with (bytes, files) as the copy goes
+CopyProgress = Callable[[int, int], None]
 
 # never copied by an export: rebuilt on the other computer (environments, caches)
 EXPORT_EXCLUDE_NAMES: frozenset[str] = frozenset({"node_modules", ".venv", "venv", "__pycache__"})
@@ -242,11 +245,12 @@ _within = is_within
 def copy_tree(src: str | os.PathLike, dst: str | os.PathLike, *,
               exclude_names: Iterable[str] = EXPORT_EXCLUDE_NAMES,
               exclude_paths: Iterable[str] = EXPORT_EXCLUDE_PATHS, modes: str = "keep",
-              apply_modes: dict[str, int] | None = None) -> TreeResult:
+              apply_modes: dict[str, int] | None = None, progress: CopyProgress | None = None) -> TreeResult:
     """Copy the folder `src` into `dst` (created, with its parents; an existing empty folder is used). Files keep
     their bytes, permission bits (`modes`, see the module docstring; `apply_modes`: {relative path: bits} for
     "import") and modification time; links and special files are left out and listed; a file that cannot be read
-    is left out and listed in `errors` (a running session may delete one meanwhile).
+    is left out and listed in `errors` (a running session may delete one meanwhile). `progress(bytes, files)` is
+    called after each chunk written (bytes, 0) and after each file copied (0, 1); what it raises stops the copy.
     Raises NotADirectoryError for a bad `src`, FileExistsError when `dst` is a file or a folder that is not empty,
     ValueError when `dst` lies inside `src`, and OSError when writing fails (the partial copy stays: the caller
     removes it)."""
@@ -302,6 +306,8 @@ def copy_tree(src: str | os.PathLike, dst: str | os.PathLike, *,
                         h.update(chunk)
                         size += len(chunk)
                         fout.write(chunk)
+                        if progress is not None:
+                            progress(len(chunk), 0)
             except _ReadFailed as failed:
                 os.unlink(target)
                 out.errors.append((rel, failed.exc.strerror or str(failed.exc)))
@@ -329,6 +335,8 @@ def copy_tree(src: str | os.PathLike, dst: str | os.PathLike, *,
         out.files += 1
         out.bytes += size
         out.entries.append((rel, size, h.hexdigest()))
+        if progress is not None:
+            progress(0, 1)
 
     _walk(src, exclude_names, exclude_paths, out, on_dir=on_dir, on_file=on_file)
     out.digest = tree_digest(out.entries)
