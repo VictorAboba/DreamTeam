@@ -405,7 +405,7 @@ def test_limits_refuse_the_copy_and_leave_nothing(tmp_path):
     with pytest.raises(CopyError, match=r"copy_max_files") as err:
         copy_into(Source("zip", zipped, str(zipped)), tmp_path / "zstage", CopyLimits(max_mb=1, max_files=1))
     assert err.value.status == 413 and not (tmp_path / "zstage").exists()
-    big = _write(tmp_path / "big.zip", os.urandom(2 * 2 ** 20))
+    big = _write(tmp_path / "big.zip", b"x" * (2 * 2 ** 20))   # random bytes may hold a zip's end record
     with pytest.raises(CopyError, match=r"larger than 1 MB \(\[workspace\] copy_max_mb\)") as err:
         copy_into(Source("zip", big, str(big)), tmp_path / "zstage", CopyLimits(max_mb=1, max_files=10))
     assert err.value.status == 413 and not (tmp_path / "zstage").exists()
