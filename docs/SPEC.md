@@ -79,6 +79,8 @@ src/dreamteam/
   tools/trace_tools.py  the `agent_traces` tool (§16.2)
   settings.py    global settings of a home: read/write/validate, public view, updates, endpoint checks (§17.1)
   sessions.py    SessionManager — the sessions of a home (§17.2)
+  copyfrom.py    a folder or a zip copied into a new session before its first start, and the uploaded zips
+                 (§17.2 "Copying files into a new session"); never imports sessions.py
   transfer.py    `dreamteam export` / `dreamteam import` of a home: the export folder, the secret check, the import
                  plan and its application (§20)
   treecopy.py    copy or measure a folder tree byte for byte, with a digest that is the same on every OS (§20)
@@ -1026,9 +1028,10 @@ the event's top-level `actor`), then commit that path; a path under `.scratch/` 
 `file.changed` but is never committed, and the result says so (`Created .scratch/anna.smith/c.py (1 line, 9 B)
 (in .scratch/: not committed).`). Lock events: `file.locked` {path, owner, expires_at, refreshed},
 `file.unlocked` {path, owner, forced} or {path, owner, expired: true}. Unless the folder is adopted (below),
-`init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false and a
-default identity), so that git commands run from the shell behave like the autocommits (line endings, no
-signing); an agent's own commits carry its identity from the shell environment (`agent_git_env`, below).
+`init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false, on
+Windows core.longpaths=true, and a default identity), so that git commands run from the shell behave like the
+autocommits (line endings, long paths, no signing); an agent's own commits carry its identity from the shell
+environment (`agent_git_env`, below).
 
 The whole-tree autocommit (after every `shell` call): `ensure_scratch()` (an agent may have deleted the marker),
 `git status --porcelain -z` (`porcelain_entries`), `git reset -q -- .scratch` when something under `.scratch/` is
@@ -1182,8 +1185,10 @@ another folder (§17.2 "Workspace folder"). Then:
   settings, not even into a repository it initialized there. Every git call of the workspace passes its identity
   and settings per command (`-c user.name=<actor> -c user.email=… -c core.autocrlf=false -c core.quotepath=false
   -c safe.directory=<root>`, after hubgit's fixed options, "DreamTeam's own git" below), so autocommits never need
-  the repository's config. In an
-  adopted folder `-c core.autocrlf=false` is left out: the user's own line-ending settings apply to the agents'
+  the repository's config. Outside an adopted folder, on Windows, `-c core.longpaths=true` is added too: Git for
+  Windows otherwise skips paths over 260 characters with only a warning, and a copy into a new session
+  (§17.2) lands deeper than its source. In an adopted folder `-c core.autocrlf=false` (and core.longpaths) is
+  left out: the user's own line-ending settings apply to the agents'
   commits as to the user's (Git for Windows sets `core.autocrlf=true` system-wide; overriding it would commit
   CRLF rewrites of the user's LF files and make a clean checkout look modified). `Workspace.resolve` refuses any
   path with a `.git` component; the members' shell can change `.git` anyway (below).
@@ -2431,7 +2436,8 @@ one.
 
 `create_app(swarm, host, *, on_library_change=None) -> Starlette` is the app of ONE swarm: the whole server of `dreamteam run`, and the
 per-session app the launcher serves under `/s/{sid}/` (§18.1). All JSON (`httpjson.JSONResponse`; the
-WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json`. Guard
+WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json` (the one
+exception is the launcher's zip upload, `raw_posts`, §18.1). Guard
 (`GuardMiddleware`, every bind, also 0.0.0.0 in Docker): Host must be localhost/127.0.0.1/[::1]; for
 non-loopback binds also the bind address, or an IP literal that is the address the connection reached (ASGI
 `server`; any IP literal only on a request with the hub token: a port mapping that rewrites the address); plus names
@@ -2462,7 +2468,7 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/api/agents/{name}/activity?limit=` | `agent.activity` events of that agent |
 | GET `/api/files?path=` | dir → {"type":"dir","entries":[...]}; file → {"type":"file","content","truncated"} |
 | POST `/api/act/{tool}` | run tool as USER: body = args → {"ok": bool, "result": str}; the user's `jobs` and `job_stop` (§7.1) go through it too: background jobs have no endpoint of their own; with `X-DreamTeam-Auto-Reply: 1` it first calls `swarm.auto_reply_seen()` (below) |
-| GET `/api/skills` | `{library_dir, library: [entry], claude: [item], host: [entry], sandbox, limits: {max_mb, max_files, max_attached, max_archive_mb}, install, attached: [snapshot item + source_digest]}` (§19): the Skills tab; `source_digest` is the attached skill's own source now (`SessionSkills.source_digest`: "Update" compares with it only) |
+| GET `/api/skills` | `{library_dir, library: [entry], claude: [item], host: [entry], sandbox, container, limits: {max_mb, max_files, max_attached, max_archive_mb}, install, attached: [snapshot item + source_digest]}` (§19): the Skills tab; `source_digest` is the attached skill's own source now (`SessionSkills.source_digest`: "Update" compares with it only) |
 | POST `/api/skills` | an import body (§19 "Requests": exactly one of `path`, `zip`, `git`, `claude`, `host`; `pick`, `replace`) plus `attach?: bool` → the import report + `install`; with `attach` every imported skill is attached as `library:<name>` (`attached: [{name, status, files}]`, `failed: [{name, error, status}]`, as `attach_source`); `attach` on a stopped session is 409 `STOPPED_SKILLS_TEXT` (importing works) |
 | GET `/api/skills/{name}?from=library\|claude-user\|claude-project\|host-library\|session` | the entry + `files_list`, `skill_md`, `deps` (`show_folder`) + `install`; `session`: the session copy with its metadata and shown path |
 | DELETE `/api/skills/{name}?confirm={name}` | `{"removed": name}` (`Library.remove`; the sessions keep their copies); 400 without a matching confirm |
@@ -2839,6 +2845,15 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   in any case or a whole number, also written as a string; anything else is a ValueError `[shell] cpu_threads must
   be "auto" or a whole number ...`), `pass_env = []`. `timeout`, `max_timeout`, `foreground_max` and `job_log_mb`
   are at least 1. The template lists every key with a Russian comment.
+- `[workspace]` copy limits (`WorkspaceSettings`, next to `git` and `lock_ttl_minutes`): `copy_max_mb = 1024` and
+  `copy_max_files = 100000`, the largest copy into a new session (§17.2 "Copying files into a new session"): the
+  MB and the files of a folder copy or an unpacked zip (the left-out names `.git`, `node_modules`, `.venv`, `venv`
+  and `__pycache__` do not count); `copy_max_mb` also caps a zip file's own size and an upload of `POST
+  /api/uploads` (§18.1). Both are at least 1 (`_MIN_ONE`: 0 would refuse every copy). Read from the global
+  settings at each create and each upload (`copyfrom.CopyLimits.from_config`; a hand edit of the file applies at
+  once). A session override of them passes validation but has no effect: the copy is made
+  before the session exists, and an upload has no session. The template's `[workspace]` block has both lines with
+  Russian comments.
 - `[mcp] library_dir = "~/.dreamteam/library"` (the shared MCP library, §11; `Config.library_dir`, where
   `DREAMTEAM_MCP_LIBRARY_DIR` wins, as `DREAMTEAM_SKILLS_DIR` does for the skills library: the tests set it). The
   variable is one of shell's `_INTERNAL_ENV` (never in the members' commands, §7) and of `docker.SKILLS_ENV` (never
@@ -2921,11 +2936,13 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
 settings; ValueError when they are invalid):
 - Attributes: `home`, `raw` / `config` (the global settings), `swarms` (loaded Swarm objects by sid),
   `running` (the set of started ones), `hub_url` (set by `launcher.serve_launcher`; a session swarm's `hub_url`
-  is `f"{hub_url}/s/{sid}/mcp"`), `sessions_dir`.
+  is `f"{hub_url}/s/{sid}/mcp"`), `sessions_dir`, `uploads` (`copyfrom.Uploads(<home>/.dreamteam/uploads)`, the
+  zips of `POST /api/uploads`: "Copying files into a new session" below).
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
-  workspace=None, skills=None, via="home", auto_reply=False)`, `async load(sid)`, `async start(sid, *, skills=None,
+  workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None)`,
+  `async load(sid)`, `async start(sid, *, skills=None,
   via="home", auto_reply=False)`,
   `async stop(sid, *, remember=False)`, `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None,
   settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`, `global_config()`,
@@ -2944,7 +2961,8 @@ settings; ValueError when they are invalid):
   JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid settings,
   404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
   a folder of another session, a folder that changed since the user was asked, a missing workspace folder at
-  start), 500 damaged or cannot be opened.
+  start, a `workspace` with files for a copy), 413 a copy over its limits, 500 damaged or cannot be opened (404 is
+  also an unknown or used upload of `copy_from_upload`).
 - Session ids are `NNN-slug` from the title (Cyrillic and Ukrainian transliterated, accents dropped; e.g.
   `001-snake-game`) and match `^[a-z0-9][a-z0-9-]{0,63}\Z`. `main` is the legacy session: a home that was a
   single-swarm project (`<home>/.dreamteam/swarm.db`) lives in the home itself, uses the global settings
@@ -3012,7 +3030,8 @@ settings; ValueError when they are invalid):
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
    "question":{"asker","message_id"}|null,"clarify":bool,
-   "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names]}
+   "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names],
+   "copied_from":{"source","files","bytes","at"}|null}
   ```
   `question` (`read_stats`, from kv `paused`, default None): the member's question that holds the pause, set only
   for a paused slot with reason `question`, a non-empty asker and an integer message_id (the test of
@@ -3023,7 +3042,8 @@ settings; ValueError when they are invalid):
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
   rows, in a `try` of its own: a database older than background jobs gives 0). `skills`: the attached skills' names,
   `skills_pending`: those members proposed that wait for the user's library decision (from memory when loaded,
-  else `read_session_skills` of the session's data dir).
+  else `read_session_skills` of the session's data dir). `copied_from`: the files copied in at create ("Copying
+  files into a new session" below), None for a session made without a copy.
 
 #### Workspace folder
 A session works in `<session dir>/workspace` (`default_workspace(sid)`) unless its `session.json` has
@@ -3123,10 +3143,205 @@ next start, which checks the folder).
   then the session is created in its own folder and `set_workspace` runs before the first start. A failure removes
   the new session; its error names only the folder (and what could not be removed there), never the removed
   session. The returned summary then has `"workspace_result"`: the result with mode `"created"` for an
-  empty/missing folder or `"adopted"` (`old_kept` null: the unused default folder is removed).
+  empty/missing folder or `"adopted"` (`old_kept` null: the unused default folder is removed). With a copy
+  (`copy_from` / `copy_from_upload`) the folder must be empty or missing, and the copied files move there ("Copying
+  files into a new session" below).
 - `external_workspaces(home)` → `[(sid, stored path)]` of the sessions whose folder is outside the home (no
   `in_home`; read from the `session.json` files, nothing opened): `dreamteam sandbox` warns about them (only the
   home is mounted).
+
+#### Copying files into a new session
+`copyfrom.py` (it imports treecopy, skills, workspace and hubauth, never sessions.py) copies a folder or a zip into
+the folder a new session works in, before its first start: `create(..., copy_from=<absolute folder or .zip path on
+this computer>)` or `create(..., copy_from_upload=<token of POST /api/uploads>)`, not both (400 "Give copy_from or
+copy_from_upload, not both."). The surfaces: REST `copy_from` / `copy_from_upload` (§18.1), the launcher MCP's
+`session_create(copy_from=)` (§18.2), the CLI's `--copy-from` (§18.3), the TUI's `/copy-from` (docs/TUI.md) and the
+home page's «Файлы для работы» (§18.4). The source is only read and nothing is copied back. The members are never
+told where the files came from: no source path goes into `pending_goal` or any prompt.
+- **Order** (the cheap checks first, the copy last):
+  1. an upload is claimed first (`uploads.claim`, its claimed name computed first by `claim_path`; an unknown or
+     used token is the 404 here): from now on a create that names an upload uses it up, whatever refuses it later
+     (the sessions page uploads again for each try, so failed tries never pile up);
+  2. "not both", then the overrides are validated (as without a copy);
+  3. `copy_from` is refused early, in a thread, by `resolve_source(text, home=, config=, sandbox=)`;
+  4. with `workspace`: `_plan(..., copying=True)`, where a folder with files is a 409 before any repository check
+     ("<target> already has files (it holds .git, .DS_Store; hidden files count): a copy goes into a new or empty
+     folder. Choose an empty folder, or leave out the copy to work with the files in <target> itself.": at most 5
+     entries named, `.git` and dot names first, since the user may see no files there), then
+     `check_target(source, plan.target)` for `copy_from`; then the target is reserved for this create
+     (`_creating_in`, the resolved target, checked and added with no await between; removed in `finally`): a
+     second create meanwhile (a double click, a client's retry) into the same folder, a folder inside it or one
+     containing it (compared as NFC text ignoring case, since a folder not created yet has no file identity) is 409
+     "Another session is being created in <target> right now[ (<other> is inside it or contains it)]; when it is
+     done, that folder is taken." before it copies anything; `set_workspace` of another session into such a folder
+     gets the same 409 after its first `_plan`;
+  5. the skills are prepared (unchanged, "Skills" below);
+  6. the leftovers of earlier copies are removed (`clean_copy_leftovers`: `uploads.clean()` and `_clean_copies`),
+     and `copy_into(source, staging, limits, check)` builds the copy in `sessions/.copying-<pid>-<run>-<hex8>/`
+     (`copyfrom.staging_name()`; never a session: `ids()` needs `SESSION_ID` and a session.json);
+  7. `_create` makes `sessions/<sid>/`, renames the staging to `sessions/<sid>/workspace` (one volume; a failure
+     removes `sessions/<sid>/`, 500 "Could not move the copied files into ..."), writes session.json with
+     `copied_from` and commits the skills as before; with `workspace`, `_set_workspace(creating=True,
+     expect="moved")` moves the copy into the target and `init_repo` commits it (files that appeared there
+     meanwhile: 409, and everything is removed);
+  8. `finally` (around all of the above): the staged skills are discarded, a claimed upload is released
+     (`uploads.release`, synchronous: two
+     unlinks, so no await follows a success and a cancellation cannot turn a created session into an error), and
+     a staging that was not renamed in is removed.
+- **Refusals of the source** (`resolve_source`, CopyError 400, before anything is done; one pair of matching
+  quotes around the text is dropped first, `console.unquote`, as Explorer's "Copy as path" adds them): not a
+  string or blank ("'copy_from' must be an absolute path of a folder or a .zip file."); not absolute after `~` is
+  expanded; missing ("Nothing to copy at ..."); a file whose suffix is not `.zip` (any case); neither a file nor a
+  folder; for a folder also a drive or file system root (on POSIX also a mount point directly in `/mnt` or
+  `/Volumes`, or in `/media` or `/run/media` one or two levels down: a whole disk, `_disk_mount`; a folder mounted
+  elsewhere, such as a devcontainer's `/workspaces/x`, is fine, and so on Linux is a bind mount of one folder there,
+  such as docker's `-v ./app:/mnt/app`: `_mount_root` reads its root field in `/proc/self/mountinfo`, and only "/",
+  a whole file system, is a disk; where mountinfo cannot be read the place alone decides), the user's home itself,
+  or a folder containing
+  it; for both kinds
+  a path inside or containing the DreamTeam home, or DreamTeam's own folders outside it (`config.library_dir`,
+  `skills_library_dir`, `skill_envs_dir`, `hubauth.tokens_dir()`: a `copy_from=~/.dreamteam` would put hub tokens
+  and library code where the members read them); another DreamTeam home, or a path inside one (a folder with
+  `sessions/` and `dreamteam.toml`, as `cli.is_home`: its dreamteam.toml can hold API keys; "... is a DreamTeam
+  home (<folder>) or inside one ..."); on POSIX a path inside `/proc`, `/sys` or `/dev`
+  (`/proc/self/environ` holds the hub's API keys, which the members' shell leaves out). The comparisons are
+  `treecopy.is_within` (text and file identity). `check_target`: a target inside a folder source ("... the copy
+  would copy itself"), or a source inside the target, is 400; through `create` a source inside a target with files
+  gets the 409 of step 4 first.
+- **A folder** (`copy_into`; `staging` must not exist yet, else CopyError 500 and that folder is left alone, so the
+  cleanup never removes what the call did not make): a stat-only pre-scan (`scan_tree(hash=False)`) with the
+  limits refuses a huge folder before a byte is written; then `copy_tree(src, staging,
+  exclude_names=COPY_EXCLUDE_NAMES, exclude_paths=EXPORT_EXCLUDE_PATHS, skip_files=COPY_SKIP_FILES,
+  fold_names=True, modes="writable", max_files=, max_bytes=, check=)` (§20.5). Left out: `.git`, `node_modules`,
+  `.venv`, `venv` and `__pycache__` at any depth in any letter case, a DreamTeam workspace's `.scratch/_skills` and
+  `.unavailable-workspace`, links (never followed) and special files; `.DS_Store` and `Thumbs.db` files
+  (`COPY_SKIP_FILES`, as in a zip) are skipped without a word and counted in `skipped_count`. A folder swapped for a
+  link (or another folder) while the walk runs is never walked (§20.5): an error, so the copy is refused.
+  `modes="writable"`: the owner can always read and write (a read-only file is editable in the copy; the root hub
+  of the sandbox reads a 000 file), the group and others never write, a file reported as 0o777, or any file of a
+  source on a Linux file system without POSIX bits (WSL's `/mnt/c`, Docker Desktop's 9p, FAT, exFAT, NTFS, SMB:
+  `treecopy.fs_type`, §20.5), becomes 0o644, or 0o755 when it starts with `#!`, `\x7fELF` or a Mach-O magic
+  (otherwise every file would be committed as 100755), and the setuid, setgid and sticky bits are dropped (the sandbox hub runs as
+  root: a kept setuid file would be a setuid-root program for the `dreamteam-agent` commands of an offline
+  session, §7.2).
+  `TreeLimit` is 413 "<src> holds more than N files to copy ([workspace] copy_max_files; .git, node_modules, .venv,
+  venv and __pycache__ do not count). Nothing was copied." (or "N MB ... copy_max_mb"); unreadable files (the
+  result's `errors`, without the `vanished` ones) are 400 "Cannot read N file(s) in <src>: <rel> (<reason>); ...
+  Nothing was copied: check the permissions, or close the program that holds them." (at most 5 named); a file
+  deleted while the copy runs (an editor's temporary file, build output: `vanished`, FileNotFoundError) is not
+  refused but listed in the result's `vanished`; a file replaced meanwhile (a new inode) is still refused. A folder
+  gone meanwhile (`treecopy.GONE_DIR` in `errors`, never `vanished`), or a source root that is gone, no folder or
+  another folder after the copy than the lstat taken before the count (another `(st_dev, st_ino)`: moved, renamed
+  or swapped), is 400 "<src> was moved, renamed or deleted while it was copied (<rel>, ...). Nothing was copied:
+  copy again once it stays in place." (otherwise a session would hold a part of the source). A
+  `FileExistsError` while writing in the new staging means the target's file system folded two names of the
+  source (a case-sensitive source written onto a case-insensitive home) and is 400 `skills.folded_names_text`:
+  "<src> holds names that the folder they are written to cannot tell apart (they differ only in letter case or
+  Unicode form): '<rel>'." (the path relative to the source, not the staging path); another write error is 500.
+- **A zip** (a `.zip` path or a claimed upload): a file over `copy_max_mb` is 413 "The zip is larger than N MB
+  ([workspace] copy_max_mb)."; then `skills.unpack_zip(path, staging, copyfrom.zip_rules(limits), check=)`,
+  streamed from the file (§19): the directory pre-check; at most `max(5000, 2 × copy_max_files)` entries (folders
+  and left-out ones count); the declared sizes of the planned files after planning (left-out members do not
+  count) and the streamed bytes against `copy_max_mb`; at most `copy_max_files` files; no compression ratio bound
+  (sparse, zero-filled and database files compress far better, and the streamed cap bounds a bomb);
+  `COPY_EXCLUDE_NAMES` casefolded against every path part; `__MACOSX`, `.DS_Store` and `Thumbs.db` skipped
+  (`.dreamteam.json` is copied); links left out and listed; folder entries created (empty folders kept).
+  **Unwrap**: when every planned entry lies under one top folder (one-part folder entries such as `mywork/`, which
+  `zip -r`, Finder and `shutil.make_archive` write, aside) and no excluded or link member sits beside it (`node_modules/x.js` next to
+  `app/` shows that the zip's root is the project's root: `app/` stays, as in a folder copy; `mywork/.git/HEAD`
+  does not block), that folder's contents are unpacked and the result's `top` names it; left-out paths are
+  reported as written in the zip. `EXPORT_EXCLUDE_PATHS` (`.scratch/_skills`, `.unavailable-workspace`) are left
+  out as in a folder copy, matched after the unwrap. Names stored without the UTF-8 flag (which zipfile reads as
+  cp437) are read again from their bytes (`redecode_names`), all in one encoding decided for the archive (a short
+  cp866 name such as `раб` or `тип` is valid UTF-8): the first of UTF-8 and the OEM code page of Windows
+  (`GetOEMCP`, cp866 on a Russian one) that decodes every such name, the OEM code page first when every such
+  member was made on MS-DOS / Windows (`create_system` 0, 6, 10 or 14: its old "Compressed folder", 7-Zip and
+  WinRAR without the flag), UTF-8 first otherwise (macOS Finder and Linux tools write UTF-8 without the flag); a
+  hub on another OS (the Docker sandbox included) knows no OEM code page and keeps zipfile's cp437 when the names
+  are not UTF-8. A name read again tells a folder by its own last character (`/` or `\`), not by zipfile's cp437
+  reading, which on Windows ends in `/` for a double-byte character whose second byte is 0x5C (cp932 `ソ`). The
+  Windows name rules (`_portable`, "file names in the zip
+  cannot ...") apply on Windows only; names that differ only in letter case or Unicode form collide on Windows and
+  macOS (their default file systems ignore case) and are two files on Linux, as in a folder copy. Where the file
+  system written to folds them anyway (a Linux hub whose home is a case-insensitive Docker Desktop bind mount),
+  `unpack_zip` creates the folders one by one and a name that meets one written before is 400
+  `folded_names_text("The zip", name)`: two folders are never merged. A `SkillError` becomes a CopyError with its
+  status.
+- **Result** (`copy_result` of the create's summary, transient: every caller pops it, REST answers it as `copy`):
+  `{"source", "kind": "folder" | "zip" | "upload", "files", "bytes", "links" (at most 20), "links_count",
+  "excluded" (at most 20), "excluded_count", "special_count" (folder), "skipped_count" (OS litter), "vanished" (at
+  most 20; folder: files deleted while the copy ran), "vanished_count", "top"}`.
+  `copy_text(result)` words it for the CLI and the MCP: "Copied N files (size) from <source>[ (the contents of
+  <top>/ in the zip)] into the session's folder." and, when something was left out, "Left out: N link(s) (a, b, c,
+  ...); N folder(s) by name (...); N special file(s); N file(s) deleted while they were copied (...)."; the TUI,
+  `-p` and the web toasts show the links, folders and special files only. `size_text(n)` is "N bytes", "N.N KB" or
+  "N.N MB". Names from the source (links, excluded, vanished, top) and the names in the zip refusals pass
+  `skills.printable_name` (what is
+  not printable becomes `?`): a member name with an escape sequence (OSC 52 sets the clipboard) cannot drive the
+  terminal of `dreamteam serve --copy-from` or of an MCP client.
+- **session.json** `"copied_from": {"source": str(path) | "upload: <file name>", "files", "bytes", "at"}`, written
+  with the rest of the new meta. The summary's `copied_from` is cleaned (`_copied_from`), because session.json may
+  come from an import or a hand edit: exactly those four keys, the source one line of printable characters cut to
+  300 (`SOURCE_SHOWN_MAX`, `copyfrom.printable_line`), the numbers finite and at least 0; None for anything else.
+- **The first commit**: the default workspace gets its repository at the first start (`Workspace.init` →
+  `init_repo`, "Initialize workspace"), a `workspace` at the create (§7); either way the copied files are in the
+  first commit. One copy of the source's `.gitignore` comes along (`.git` never does), so `init_repo` writes no
+  `DEFAULT_GITIGNORE`, and the files that `.gitignore` ignores are in the folder but not committed.
+- **Cancel and cleanup**: the claim, the copy and the rename run through `_in_thread(fn, ..., on_cancel=)`, which
+  waits for the thread before a CancelledError goes on; the first cancel sets an event that `check` turns into
+  `CopyCancelled` in the worker, and `copy_into` removes the staging on any exception. A cancelled or failed create
+  leaves no session, no staging and no claimed upload. A process killed outright leaves `.copying-<pid>-<run>-*`
+  (and a claim), which `clean_copy_leftovers` removes at the next create with a copy and the launcher's sweep at
+  its start and every `UPLOAD_TTL` (in a daemon thread, `procs.daemon_call`: the hub's exit does not wait for a long
+  removal, which the next sweep finishes) (`copyfrom.left_over(pid, run, name)`: of this pid, an earlier run, or this
+  run's when no longer in use; else not another live pid). `staging_name()` and `Uploads.claim_path()` add the name
+  to an in-process set until `done_with(path)` (create's finally, `release`), so a staging or claim whose removal
+  failed (a file still open on Windows) is removed by the next clean, while the hub runs. `RUN`
+  (`secrets.token_hex(4)` at import) is in the names because a pid alone is not enough: the hub of the
+  Docker sandbox has the same pid at every container start, so a killed container's leftovers would look live.
+- **Docker sandbox** (`copyfrom.hub_in_container(config)`: `config.skills_host_library_dir is not None` for
+  `dreamteam sandbox`, or `DREAMTEAM_IMAGE=1` for docker compose and a plain docker run of the image; not any
+  container, since DreamTeam run directly in a devcontainer sees its folders; the `container` of `/api/hub` and
+  `/api/skills`): a missing path or a Windows-shaped one is 400 "The hub runs in the Docker sandbox and sees only
+  its home (<home>): X is not there. Upload the folder as a .zip in the New session dialog of the sessions page
+  instead."; the refusal of a path in the home adds " In the Docker sandbox, upload the folder as a .zip
+  instead.". Other paths of the container work, as for `workspace`; uploads land in `/swarm/.dreamteam/uploads`.
+- **Uploads** (`copyfrom.Uploads(root)`, the manager's `uploads`): `receive(chunks, *, filename, length, limits)`
+  (`POST /api/uploads`, §18.1): the file name cut to its last part (`\` read as `/`) and to one printable line of
+  at most 200 characters ("upload.zip" when empty); a Content-Length of ASCII digits above `copy_max_mb` is 413
+  "The file is larger than N MB ([workspace] copy_max_mb)." before reading; `clean()`; at most 8 uploads waiting
+  or arriving (`UPLOAD_MAX_PENDING`, else 429; the count and the create are not atomic: a guard against a runaway
+  page, not a quota: "N uploads already wait for a session; each is removed when a session uses it or an hour after
+  its upload. Try again later."); `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
+  400 "The upload is empty.", a file that is not a zip 400 "The file is not a zip archive."; then `<token>.json`
+  `{"filename",
+  "bytes", "at"}` and the rename to `<token>.zip`. Any failure (an exception from `chunks`, a disconnect included,
+  goes on to the caller) removes the `.part`. The token is `secrets.token_urlsafe(18)`; a value that is not 24
+  characters of `[A-Za-z0-9_-]` is 400 "'copy_from_upload' must be a token from POST /api/uploads." before any path
+  is built. `peek` is 404 for an upload that is missing, used, or older than `UPLOAD_TTL` (3600 s, by the json's
+  `at`, else the file's mtime). `claim` renames it to `<token>.claimed-<pid>-<run>-<hex8>.zip` under a lock (a
+  rename on Windows is not exclusive: two can both succeed, the second moving the first one's file), so the loser
+  gets FileNotFoundError: 404, another create took it (a claimed file that vanishes before `copy_into` reads it is
+  the same 404). The create claims first (Order above), so from the claim on it is deleted whatever happens. `clean`
+  (best effort) removes waiting names over the TTL and the claims `left_over` names (never by age, never one a
+  create of this run uses); names of neither pattern stay.
+- **Clients that give up waiting**: a large copy may take longer than a client waits. The TUI and `-p` wait 900 s
+  (`MOVE_TIMEOUT`) on a plain REST request, which a client going away does not cancel: the hub finishes the copy
+  and creates the session anyway, so they check `dreamteam sessions` or the sessions page before trying again. An
+  MCP client has its own tool timeout, and on it sends `notifications/cancelled` (the MCP SDK's dispatcher
+  interrupts the handler; the streamable HTTP transport also cancels it on a disconnect): `session_create` awaits
+  `manager.create` unshielded, so the copy stops and nothing is kept ("Cancel and cleanup" below). The user docs
+  say to raise the client's tool timeout (Claude Code: `MCP_TOOL_TIMEOUT`) or use the CLI or the web dialog for a
+  large copy.
+- **Accepted costs**: a target on another drive is copied twice (the staging under `sessions/`, then the move
+  across volumes). The pre-check takes the largest of the plain end record's counts and those of a ZIP64 record
+  whose locator precedes it (zipfile uses the ZIP64 ones whatever the plain record says), so a lying plain record
+  cannot hide a ZIP64 directory. A forged central directory (a record that understates its entries, with a
+  directory size within the `max_entries * 512` bound) can still make `zipfile` build one `ZipInfo` per 46-byte
+  minimal entry: at the
+  default `copy_max_files` up to about 100 MB of directory, on the order of 1 GB of memory for a moment. The upload
+  is behind the hub's auth, a lower `copy_max_files` lowers the bound, and the pre-check keeps an honest huge zip
+  from getting that far.
 
 #### Skills
 The manager's side of §19, for the home page, the CLI and the launcher MCP (`via` home / cli / launcher-mcp):
@@ -3233,7 +3448,12 @@ of a home or a project, never a session override (§17.2).
 
 ### 18.1 Web (launcher.py)
 `create_launcher_app(manager, host="127.0.0.1")` returns the app wrapped in the same `GuardMiddleware`
-(host/origin, JSON POSTs). A `SessionRouter` in front sends `/s/{sid}/...` to that session's app
+(host/origin, JSON POSTs), with `raw_posts={"/api/uploads": "application/zip"}`: the guard's 415 rule lets a POST to
+`/api/...` pass when its content type starts with `application/json`, or when `raw_posts` maps that exact path (no
+prefix: `/api/uploads/` is not it) to its type without parameters, ignoring case. Host, Origin, token and cookie
+checks run before that rule and are unchanged; `application/zip` is not a CORS-safelisted type, so a cross-site
+page cannot send it without a preflight, which the hub never answers. Session apps pass no `raw_posts`. A
+`SessionRouter` in front sends `/s/{sid}/...` to that session's app
 (`web.create_app(swarm, on_library_change=...)`, §14, served with `root_path = /s/{sid}`; a library change there
 emits `sessions.changed` with change `skills`, also a `skill_attach` or `skill_approve` of `/api/act` that
 succeeded: either may have changed the library) and everything else to the launcher routes.
@@ -3242,9 +3462,10 @@ succeeded: either may have changed the library) and everything else to the launc
 |---|---|
 | GET `/` | `static/home.html` (launcher page, `no-store`) |
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
-| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox"}` |
+| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox","container"}` (`container`: `copyfrom.hub_in_container`, §17.2 "Copying files into a new session") |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
-| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
+| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`); `copy_from` (an absolute folder or .zip path on the hub's computer) or `copy_from_upload` (a token of POST `/api/uploads`), strings, not both: copied into the new session's folder before its first start (§17.2 "Copying files into a new session"), the answer then also has `"copy"` (`copy_result`); 404 for an unknown or used upload, 409 for a `workspace` with files, 413 over `[workspace] copy_max_mb` / `copy_max_files` |
+| POST `/api/uploads?filename=<name>` | the raw zip as the body (`Content-Type: application/zip`, not base64 JSON; the guard's `raw_posts`) → 201 `{"upload": token, "filename", "bytes", "expires_in": 3600}` (`manager.uploads.receive` with the limits of `manager.global_config()`); 415 JSON when not `application/zip` (the handler checks too), 413 over `copy_max_mb` (Content-Length or streamed), 429 when 8 uploads wait, 400 empty, not a zip, or interrupted (starlette's `ClientDisconnect`: "The upload was interrupted."), 500 for other failures (`_failure`); the token is used once by `POST /api/sessions` within an hour |
 | GET `/api/sessions/{sid}` | `{"session": summary, "config": manager.config_view(sid)}` |
 | PATCH `/api/sessions/{sid}` | body `{title?, overrides?, settings?}` → `{"session": summary, "config": config_view(sid)}`; `overrides` replaces all of them, `settings` `{section: {key: value \| null}}` changes only those keys (null: the global value again; §17.2 "Partial update"; `{"swarm": {"clarify": true \| false \| null}}` is the ⚙ field and the TUI's `/clarify`, §3.1); both at once, a bad value or `main` → 400 and nothing changes |
 | DELETE `/api/sessions/{sid}?confirm={sid}&skills=save\|discard&via=` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm; 409 `{"error", "pending_skills"}` when members' proposals wait for the user's decision and `skills` is not given (§17.2) |
@@ -3293,7 +3514,7 @@ succeeded: either may have changed the library) and everything else to the launc
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
   start_agents?, max_agents?, team?, max_cost_usd?, model?, network?, clarify?, start?=true, workspace?,
-  skills?)` (unset values come from the global settings; the board URL is shown only when a web server runs;
+  copy_from?, skills?)` (unset values come from the global settings; the board URL is shown only when a web server runs;
   `goal`: one line, or several, split as in §17.2; `team`: role names in order, a name repeated per agent (§17.3) →
   `swarm.starting_roles` (normalized) and `start_agents = len(team)` unless `start_agents` is given, `[]` = no team;
   not a list of non-blank strings →
@@ -3302,12 +3523,18 @@ succeeded: either may have changed the library) and everything else to the launc
   `--team` syntax) → "'<name>': a role name cannot contain ',' or '*'; give one item per agent and repeat a name
   for several agents, e.g. [...]."; `clarify`: a boolean, `swarm.clarify` (§3.1; `false` overrides a global
   `true`), any other value → "clarify must be true or false." and nothing is created; `workspace`: an absolute
-  folder, §17.2; `skills`: names or sources attached before the first start, §17.2 "Skills"),
+  folder, §17.2; `copy_from`: an absolute folder or .zip path on the hub's computer copied into the new session's
+  folder first (§17.2 "Copying files into a new session"; not a string → "copy_from must be an absolute path of a
+  folder or a .zip file.", blank = no copy; the reply adds `copy_text(copy_result)`; `copy_from_upload` is not
+  offered: an MCP client has the hub's file system or the REST route); `skills`: names or sources attached before
+  the first start, §17.2 "Skills"),
   `session_start(session, skills?)` (the skills attached first, live when it runs), `session_stop(session)` and `session_cd(session, path)` (`set_workspace`; `path`
   absolute or `"default"`; the result in words by `workspace_text(result)`, worded as the TUI and the console
   word it: "Moved the session's files to X" only when they moved, "The session now works in X" after a folder of
   the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
-  shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), and for a
+  shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), the source
+  of a session made with a copy (`copied from: <source>`, one printable line of at most 300 characters again: the
+  summary may be a remote hub's JSON), and for a
   running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
   in the user's wrap-up mode is `[running, wrapping up]`; one paused for a member's question (summary `question`,
   §3.1) is `[paused (waiting for your answer to Anna Smith, question #12)]`; a session without network ends its first
@@ -3332,7 +3559,9 @@ succeeded: either may have changed the library) and everything else to the launc
   `call_launcher_tool` turns SessionError / ToolError / unexpected failures into error results.
 - `INSTRUCTIONS` explain sessions (with `skill_library` and the `skills` of `session_create` / `session_start`,
   and: "A session created with clarify=true first asks you about its goal; `sessions_list` shows a session that waits
-  for your answer as "paused (waiting for your answer to X, question #N)"."), then the hub instructions (they hold
+  for your answer as "paused (waiting for your answer to X, question #N)".", and after the `workspace=<folder>`
+  line: "`session_create(..., copy_from=<folder or .zip>)` copies those files into the new session's folder first:
+  the agents work on the copy, the originals stay untouched."), then the hub instructions (they hold
   the answer rule, §13).
 - `/s/{sid}/mcp` keeps the per-session hub MCP (§13).
 
@@ -3341,8 +3570,9 @@ succeeded: either may have changed the library) and everything else to the launc
 dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|stream-json] [--timeout S]
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
           [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
-          [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off] [--clarify | --no-clarify]
-dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]
+          [--copy-from DIR|ZIP] [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off]
+          [--clarify | --no-clarify]
+dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR] [--copy-from DIR|ZIP]
           [--skill REF|PATH|URL ...] [--network on|off] [--clarify | --no-clarify]] [--no-console] [--no-browser]
 dreamteam sessions [DIR | --home H]
 dreamteam sessions rm SID [SID ...] [--yes] [--skills save|discard] [--home H]
@@ -3397,6 +3627,19 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   with `/cd`), and for `serve` without `--goal`. The TUI applies it to the first session it creates (and says so
   under the welcome box); `-p` names the folder on stderr with `--verbose`; `serve` prints the result
   (`launcher_mcp.workspace_text`) on stderr.
+- `--copy-from DIR|ZIP` (`tui`, `-p`, and `serve` with `--goal`): a folder or .zip copied into the folder of the
+  session that run creates before its first start (`create(..., copy_from=)`, §17.2 "Copying files into a new
+  session"; with `--workspace` into that folder, which must be empty or missing). `_copy_from_arg`: `~` and a
+  relative path are resolved against the current directory; an existing file that is not a .zip is refused here
+  (`dreamteam: --copy-from <path> is a file but not a .zip archive.`, exit 2); the hub checks the rest. Exit 2 with
+  `-c` / `-r` (`dreamteam: --copy-from copies files into a new session; it cannot be used with -c / -r.`) and for
+  `serve` without `--goal` (`--copy-from needs --goal: it fills the folder of the session that --goal creates.`).
+  The TUI applies it to the first session it creates (`TUI.copy_from_override`, as `/copy-from`; shown under the
+  welcome box); `-p` prints the copy on stderr (with or without `--verbose`, not with `stream-json`), plus the
+  left-out counts when something was left out; `serve` prints `Session <id>: <copy_text>` on
+  stderr before the workspace result. Like `--workspace`, it is neither a TUI-only nor a serve-only flag. The CLI
+  does not upload a zip to a sandboxed or remote hub itself: a host path the hub cannot see gets the hub's "upload
+  the folder as a .zip" refusal.
 - `--skill X` (repeatable; `tui`, `-p`, and `serve` with `--goal`, exit 2 without it): a skill attached to the
   session (§17.2 "Skills"). A URL (`scheme://` or `user@host:path`) is passed as given, a path (it has a separator,
   starts with `.` or `~`, ends in `.zip`, or is a folder or .zip here) is made absolute against the current
@@ -3486,7 +3729,16 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   ends it with `TokenRequired`'s text) or when the port is busy, and, right after the check
   for a running hub and before anything is created or started, an address other than loopback without a hub token
   (`run` too; §14.2);
-  `--goal` creates and starts a session (its first line becomes the title unless `--title`) and opens its board;
+  `--goal` creates and starts a session (its first line becomes the title unless `--title`) and opens its board.
+  Only the create races a stop signal (Ctrl+C): `_serve_home` runs `manager.create(..., start=False)` through
+  `_until_stopped(coro, stop)` and then `await manager.start(id)` outside the race, as `create(start=True)` would
+  (a failed start is still "Could not start the session: ..." and exit 1), so a Ctrl+C never cancels a half-done
+  swarm start. A stop during the create (a long copy) cancels it, and `create` undoes it (§17.2); the exit code is
+  130 with "Stopped before the session was created: nothing was kept." or, when the cancel came too late (a new id
+  appeared), "Stopped: session <id> was created but not started (dreamteam sessions lists it).".
+  `_until_stopped` returns `(False, result)` (the coroutine's exception goes on) or `(True, the result it still
+  returned despite the cancel, else None)`; when the race itself is cancelled, the coroutine is cancelled and
+  awaited too. Then the server starts;
   the terminal console attaches to the running session when stdin is a real terminal (on Windows the NUL device
   is not one). Settings errors and unusable homes are messages, not tracebacks.
 - `console`: with a launcher hub it works against `{base}/s/{sid}` (`--session`, else the running one); `--url` is
@@ -3606,7 +3858,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
       and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved with /cd); a folder
       outside the session that does not exist gets the badge «папки нет» and a warning that the session cannot
-      start until it is moved with `/cd`), the error of a damaged session. The search also matches the path.
+      start until it is moved with `/cd`), right after it for a session made with a copy (summary `copied_from`,
+      `copiedLine`) the line «Копия:» / "Copy of:" with the source (cut at the front when long, whole in the
+      tooltip with «Файлы скопированы при создании сессии (when), файлов: N, size. Оригиналы не менялись.»; nothing
+      for a missing or malformed value), the error of a damaged session. The search also matches the path and the
+      copy's source.
     - Card buttons: «Открыть», «Запустить» / «Остановить» (disabled while the request runs), delete (not for
       the legacy `main`) with a confirmation dialog naming the session; for a folder outside the session the
       dialog says the folder stays, and the toast names it (`workspace_kept` of the DELETE answer). The web UI
@@ -3632,14 +3888,39 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     равно?», as the board's attach dialog does), the skills the chosen team's roles bring (from the catalog's
     `skills`; one not in the library or ~/.claude/skills gets a warning chip «нет в библиотеке») and «Добавить новый:
     папка, zip или Git» (the shared form; what it imports is ticked); the ticked ones go as `skills`. Deviation from
-    the skills design (§7.4): the modal has no workspace folder field (a new session works in its own folder), so it
-    offers no `claude-project:x` rows and loads `/api/skills` without `?workspace=`; a project's `.claude/skills`
+    the skills design (§7.4): the modal still has no workspace folder field (a new session works in its own folder;
+    «Файлы для работы» below only fills that folder with a copy), so it offers no `claude-project:x` rows and loads
+    `/api/skills` without `?workspace=`; a project's `.claude/skills`
     skill is attached at create through the CLI (`--workspace` with `--skill claude-project:x`) or the launcher MCP,
     or later on the board; under «Дополнительно» steps per wake-up, MCP
     approval and «Без интернета для агентов» (`swarm.network = "off"`, §7.2; sent only when it differs from the saved
     default; its hint is `networkHint(network_isolation of GET /api/settings)`: strict only for "docker" / "netns",
     the "env" and "container" texts say plainly that it is not isolation, "container" that a restart of the sandbox
-    adds the firewall); «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
+    adds the firewall), then the block «Файлы для работы» / "Files to work on" (§17.2 "Copying files into a new
+    session"): «Скопировать из папки» (`#ns-copy-from`, an absolute path on the hub's computer), «или загрузить .zip»
+    (`#ns-copy-zip`, a file input, `accept=".zip,application/zip"`), the hint that the files are copied before the
+    first start, the originals are never changed and `.git`, `node_modules`, `.venv`, `venv`, `__pycache__` and
+    links are left out, with the limit (`copyMaxMb()`: the saved `workspace.copy_max_mb`, 1024 when missing), and a
+    second hint (`#ns-copy-sandbox`, shown only when `GET /api/skills` reports `container` (or `sandbox`):
+    `nsCopySandbox()`, at the dialog's start and again in `loadSkills()` while it is open) that the hub in a Docker
+    container sees only its home, so a folder from the user's computer goes as a .zip; «Запустить сразу» with
+    «Создать и открыть» (or
+    «Создать»). The submit refuses a path together with a zip, a file that is not `.zip` and a zip over the limit
+    before any request (the message in `#ns-error`), then disables the button and both file fields and shows
+    «Загрузка архива (N МБ)…» or «Копирование файлов…». With a zip it first calls `uploadZip(file)`: `POST
+    /api/uploads?filename=<encodeURIComponent(name)>` with `Content-Type: application/zip` and the File itself as
+    the body (a raw-body upload, unlike the skills form's base64 JSON; same-origin `fetch` sends the hub cookie),
+    which throws with the hub's `error`, `<status> <statusText>` for the guard's plain-text answers, `conn_lost`, or
+    when a 2xx answer has no `upload` token; the create then carries only `copy_from_upload`. A path goes as the
+    trimmed `copy_from`. Every submit uploads again (the create may have claimed the token). Without «Запустить
+    сразу» a success shows the toasts of `copyToasts(copy)` from the answer's `copy`: «Скопировано файлов: N (size)»
+    (`sizeText`: KB, MB) and, when something was left out, «Не скопированы: ссылки (N: a, b, c, …); папки по имени
+    (N: …); особые файлы (N)». With «Запустить сразу» the browser goes to the board, unless `links_count` or
+    `special_count` is above 0 (folders left out by name are expected): then the dialog closes on the sessions page
+    with the same toasts, the last one clickable («Сессия запущена. Нажмите, чтобы открыть её доску.», 9 s) and a
+    click opens the board. An error re-enables the fields. A stray click or Escape also asks before discarding a
+    typed path or a chosen
+    zip. Only values that differ
     from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). A stray
     click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
     settings page has it; sessions can still override it through the API).
@@ -3654,7 +3935,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     the switch «Независимое ревью задач», `swarm.independent_review`, «Сначала уточнять цель», `swarm.clarify`, whose
     hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для команд агентов»,
     `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
-    `agents.planning_hint_steps` / `planning_hint_minutes` and their hints), «Консоль», «Workspace», «MCP»,
+    `agents.planning_hint_steps` / `planning_hint_minutes` and their hints), «Консоль», «Workspace» (after the
+    file lock time «Копия в новую сессию, МБ», `workspace.copy_max_mb`, whose hint names `--copy-from` and «Файлы
+    для работы», and «Файлов в такой копии», `workspace.copy_max_files`, both at least 1), «MCP»,
     «Скиллы», «Трейсы», «Сервер», with a section navigation.
     - Roles: a card per catalog role (from `role_presets` and `settings.roles`). A built-in role: its name in
       both languages (read-only), «встроенная» / «изменена» marks, «Сбросить» and «Скрыть» / «Показать»;
@@ -3954,6 +4237,32 @@ relative: 400), `{"zip": base64, "filename"}`, `{"git": url}`, `{"claude": name,
   capped by `max_archive_mb` (413); a member over 1 MB compressed more than 200 times "looks like a zip bomb" (413);
   a damaged archive is a 400; exec bits come from `external_attr`. `max_mb` / `max_files` apply per picked skill,
   so a multi-skill "Download ZIP" of a repository fits. Origin `zip`, `source = {filename, subdir?}`.
+  `extract_zip` is a wrapper: `unpack_zip(source, dest, ZipRules.for_skills(limits)).skipped`. `unpack_zip(source:
+  bytes | path, dest, rules: ZipRules, *, check=None) -> ZipResult(files, bytes, skipped, excluded, links, top)` is
+  the one unpacker, also for a zip copied into a new session (`copyfrom.zip_rules`, §17.2 "Copying files into a new
+  session"). `ZipRules`: `max_bytes` / `too_big`, `max_entries` / `too_many_entries`, `max_files` /
+  `too_many_files`, `skip_files`, `exclude_names` (casefolded path parts left out and listed), `links` ("refuse" |
+  "skip"), `exclude_paths` (exact '/' paths after the unwrap, left out and listed), `portable` (the Windows name
+  rules), `fold_collisions` (False: exact names), `names_in` (the `_portable` message), `folders` (create folder
+  entries), `unwrap` (one top folder with no excluded or link member beside it: its contents), `redecode_names`
+  (names without the UTF-8 flag read again, once per archive, as UTF-8 or in the Windows OEM code page, the OEM
+  one first when every such member was made on MS-DOS / Windows by `create_system`; a folder then by the name's own
+  last character),
+  `max_ratio`
+  (None: no ratio bound) and `declared_first` (True: the declared sizes of all members are checked before planning,
+  as for skills; False: of the planned files after it); the skills' defaults keep the order and texts above. A
+  path is opened once and streamed (a 1 GB zip is not read into memory). Before `zipfile` parses the central
+  directory, a pre-check (`_zip_directory`) reads the entry count and the directory size from the
+  end-of-central-directory records, searched for in zipfile's window (the last 64 KiB + 22 bytes, whatever the
+  comment length says): the largest of the plain record's values, a marker left out, and those of a ZIP64 record
+  whose locator precedes it, at the locator's offset or just before it (zipfile uses those whatever the plain record
+  says); with no ZIP64 record the plain values count as stated, a 0xFFFF / 0xFFFFFFFF marker included (zipfile
+  never uses the count and reads the plain directory size). More than `max_entries` is the 413 of
+  `too_many_entries`; a directory over `max_entries * 512` bytes (zipfile reads and parses all of it, whatever
+  count the record states) is a 413 of its own, "The zip's directory (its list of entries) is larger than N MB: its
+  names, comments or extra fields are too long." (for skills 2.4 MB: a zip with long per-entry comments or extra
+  fields can be refused here). A file without a plain end record leaves it to `zipfile`, which
+  refuses it. `check()` runs before each member is written and after each chunk.
 - Git (`parse_git_source(text) -> GitSource(url, ref, subdir, shown, scheme)`, pure): `https://`, `ssh://`,
   scp-like `user@host:path` and `file://`; plain `http://`, `transport::` remote helpers, a leading `-`, spaces, a
   user or host starting with `-` and invalid hosts are refused. `URL#ref:subdir`, `URL#ref`, `URL#:subdir`; GitHub
@@ -4621,20 +4930,46 @@ nothing changed.
 ### 20.5 Tree copy (treecopy.py)
 
 `copy_tree(src, dst, *, exclude_names=EXPORT_EXCLUDE_NAMES, exclude_paths=EXPORT_EXCLUDE_PATHS, modes="keep",
-apply_modes=None) -> TreeResult` and `scan_tree(src, *, exclude_names, exclude_paths, hash=True) -> TreeResult`
-(the walk without copying). Links (symlinks, junctions) are never followed and are listed; FIFOs, sockets and
-devices are listed as special; unreadable files are listed in `errors`; Windows paths use `workspace.long_path`.
-`dst` must be missing or an empty folder and not inside `src`. `EXPORT_EXCLUDE_NAMES` = `node_modules`, `.venv`,
-`venv`, `__pycache__` (at any depth); `EXPORT_EXCLUDE_PATHS` = `.scratch/_skills`, `.unavailable-workspace`
-(relative paths); `.git` and `.scratch/<member>` are kept. `TreeResult`: files, bytes, digest, links, excluded,
-special, errors, entries `(path, size, sha256)`, modes. `tree_digest(entries)`: sha256 over the sorted lines
-`<NFC path with '/'>\0<size>\0<sha256>\n`, the same on every OS (empty folders do not count). `compare_digest`
-leaves out `volatile` files (below a `.git`: index, `*.lock`, logs, FETCH_HEAD, ORIG_HEAD, COMMIT_EDITMSG and the
-like, never objects or refs; anywhere the `-wal`/`-shm`/`-journal` file next to its database). `modes`: "keep";
-"export" copies the bits where the destination can hold them and records `mode_record` bits (POSIX: executable,
-read-only or owner-restricted files; Windows: read-only); "import" ignores the medium's bits and sets the recorded
-ones (`valid_mode`), never writable by group or others. `is_within(path, parent)` compares as text and by file
-identity. Feature #39 (`--copy-from`) reuses this module.
+apply_modes=None, progress=None, fold_names=False, max_files=None, max_bytes=None, check=None, skip_files=())
+-> TreeResult` and `scan_tree(src, *, exclude_names, exclude_paths, hash=True, fold_names=False, max_files=None,
+max_bytes=None, check=None, skip_files=()) -> TreeResult` (the walk without copying). Links (symlinks, junctions)
+are never followed and are listed; FIFOs, sockets and devices are listed as special; unreadable files are listed in
+`errors`, and the files that were gone (FileNotFoundError: deleted while the walk ran) in `vanished` too (a folder
+that was gone is only in `errors`, with the reason `GONE_DIR` "the folder was moved or deleted while it was copied");
+`skip_files` names regular files left out without a word (counted in `skipped`; `COPY_SKIP_FILES` = `.DS_Store`,
+`Thumbs.db`); Windows paths use `workspace.long_path`. On POSIX (`os.scandir` takes a descriptor) each folder is
+opened with `O_DIRECTORY | O_NOFOLLOW`, its `fstat` compared with the stat its parent's listing gave, and listed
+through that descriptor (kept open while its entries are read); elsewhere a folder that is now a link is refused.
+A folder swapped for a link or another folder while the walk runs is therefore never walked: the error "the
+folder was replaced while it was copied" (`TreeResult.errors`), as a file replaced meanwhile is. `dst` must be
+missing or an empty folder and not inside `src`. `EXPORT_EXCLUDE_NAMES` = `node_modules`, `.venv`, `venv`,
+`__pycache__` (at any depth); `EXPORT_EXCLUDE_PATHS` = `.scratch/_skills`,
+`.unavailable-workspace` (relative paths); `.git` and `.scratch/<member>` are kept. `TreeResult`: files, bytes,
+digest, links, excluded, special, errors, entries `(path, size, sha256)`, modes. `tree_digest(entries)`: sha256
+over the sorted lines `<NFC path with '/'>\0<size>\0<sha256>\n`, the same on every OS (empty folders do not
+count). `compare_digest` leaves out `volatile` files (below a `.git`: index, `*.lock`, logs, FETCH_HEAD,
+ORIG_HEAD, COMMIT_EDITMSG and the like, never objects or refs; anywhere the `-wal`/`-shm`/`-journal` file next to
+its database). `modes`: "keep"; "export" copies the bits where the destination can hold them and records
+`mode_record` bits (POSIX: executable, read-only or owner-restricted files; Windows: read-only); "import" ignores
+the medium's bits and sets the recorded ones (`valid_mode`), never writable by group or others; "writable" (a
+copy into a new session) keeps the bits as "keep" does, but the owner can always read and write (`S_IRUSR |
+S_IWUSR`; on Windows it clears read-only), the group and others never write (`& ~0o022`), a file reported as
+0o777 on POSIX, or any file when `fs_type(src)` (the longest mount point of `/proc/self/mountinfo` holding the
+source; None elsewhere) is one without POSIX bits (`9p`, `drvfs`, `vfat`, `msdos`, `exfat`, `cifs`, `smb3`,
+`smbfs`, `ntfs`, `ntfs3`, `fuseblk`: they report 0o777, 0o755 for a CIFS share, 0o555 for a read-only Windows
+file), becomes 0o644, or 0o755 when its first bytes are `#!`, `\x7fELF` or a Mach-O magic, and the setuid, setgid
+and sticky bits are dropped (folders are created with the default mode).
+`is_within(path, parent)` compares as text and by file identity. `progress(bytes, files)` is called after each
+chunk written `(bytes, 0)` and each file copied `(0, 1)`. The limits, for a copy into a new session: `fold_names`
+matches `exclude_names` ignoring case; `max_files` / `max_bytes` raise `TreeLimit(what="files" | "bytes", limit)`
+before the file that would pass them (by the size the file system reports, and again while the bytes are read: a
+file that grows; only regular files that are walked count, and reaching a limit exactly is allowed); `check()` is
+called before every file and after every chunk read, and what it raises (a cancellation) stops the walk. After a
+`TreeLimit`, or what `check` or `progress` raised, the partial copy stays for the caller to remove, as after a write
+error; an unreadable file is still only listed in `errors`. `COPY_EXCLUDE_NAMES` = `EXPORT_EXCLUDE_NAMES` plus
+`.git` (DreamTeam makes the new session's own repository and first commit). `copyfrom.py` (§17.2 "Copying files
+into a new session") uses it with `fold_names=True`, `skip_files=COPY_SKIP_FILES`, the limits, `check` and
+`modes="writable"`, after a `scan_tree(hash=False)` with the same limits.
 
 ### 20.6 MCP library on disk (mcp_library.py)
 

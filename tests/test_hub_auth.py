@@ -378,6 +378,38 @@ def test_the_launcher_and_its_sessions_with_a_token_from_outside(tmp_path, token
     _no_token_logged(caplog)
 
 
+def test_the_launchers_zip_upload_needs_the_token(tmp_path, token):
+    """POST /api/uploads (a zip for a new session's copy, the one POST that is not JSON) is behind the token as
+    every route: 401 without it; the header or the cookie let it in, and a cookie request from another origin is
+    refused like any other."""
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.txt", "A")
+    data = buf.getvalue()
+    manager = _manager(tmp_path)
+    zip_type = {"content-type": "application/zip"}
+    cookie = {"cookie": f"{COOKIE}={TOKEN}"}
+    with TestClient(create_launcher_app(manager, "0.0.0.0"), base_url=BASE, client=PEER) as c:
+        try:
+            def upload(**headers: str) -> int:
+                return c.post("/api/uploads?filename=a.zip", content=data, headers={**zip_type, **headers}).status_code
+
+            assert upload() == 401
+            assert upload(authorization="Bearer wrong") == 401
+            assert upload(**BEARER) == 201
+            assert upload(**cookie) == 201
+            assert upload(**cookie, origin=BASE) == 201
+            assert upload(**cookie, origin="https://evil.example") == 403
+            assert upload(**cookie, origin="http://127.0.0.1:9999") == 403   # another program on this computer
+            assert upload(**BEARER, **{"content-type": "text/plain"}) == 415
+            assert len([p for p in manager.uploads.root.iterdir() if p.suffix == ".zip"]) == 3
+        finally:
+            c.portal.call(manager.shutdown)
+
+
 def test_the_launcher_and_its_sessions_ask_their_own_loopback_for_the_token(tmp_path, token):
     """A launcher with a token (the sandbox's, compose's) asks a peer on its own loopback for it too: the sessions API,
     the launcher's and a session's MCP endpoint, a session's API and both streams; the header or the cookie let it in."""

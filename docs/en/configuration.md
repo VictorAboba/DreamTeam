@@ -45,6 +45,12 @@ foreground_max = 180     # an AI agent waits for a command no longer than this, 
 max_jobs = 16            # background jobs per session (0 means no background jobs)
 job_max_minutes = 480    # lifetime of a job started in the background on purpose or left running by a command (0 means no limit)
 
+[workspace]
+git = true               # the session's files under git, with autocommits
+lock_ttl_minutes = 30    # how long a file lock lasts
+copy_max_mb = 1024       # the largest copy of files into a new session (--copy-from, an uploaded .zip), MB
+copy_max_files = 100000  # files in such a copy (of a folder: .git, node_modules and the like do not count)
+
 [models.default]         # Claude
 provider = "anthropic"
 model = "claude-opus-5-5"
@@ -83,6 +89,13 @@ resume_sessions = true   # resume the sessions that were running when the server
 
 Prices of known Claude models are built in. For other models, set `input_price` and `output_price` in dollars per
 1M tokens. If the provider reports the cost itself (like OpenRouter), that cost is used.
+
+`copy_max_mb` and `copy_max_files` limit a [copy of files into a new session](projects.md#working-on-a-copy-of-files):
+the size and number of the files copied from a folder or unpacked from a .zip; `copy_max_mb` also caps the size of a
+.zip uploaded from the browser. In a folder, `.git`, `node_modules` and the like do not count; in a .zip, the
+archive's own size counts against `copy_max_mb`, and every entry (left-out ones and folders included) against a
+limit of twice `copy_max_files`. Both are at least 1. They are global settings: the copy is made before the session
+exists, so a value in a session's own settings has no effect.
 
 ## Roles and the starting team
 

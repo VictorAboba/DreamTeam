@@ -25,7 +25,7 @@
   addressee and the frame's title says `answer to #12: everyone gets it`: plain text is the answer, every member gets
   it with the question, and the swarm goes on. `/pause` goes on without an answer.
 - **Commands** (`/` opens suggestions): `/new [goal]`, `/sessions` (`Del` in the list deletes a session),
-  `/resume ID`, `/delete [ID]`, `/cd [path | --default]`, `/goal`, `/board`,
+  `/resume ID`, `/delete [ID]`, `/cd [path | --default]`, `/copy-from [path | --none]`, `/goal`, `/board`,
   `/task N`, `/agents`, `/roles [role]`, `/jobs [jN | stop jN]`, `/team [role*N, …]`, `/to Name`,
   `/hire Role [| instructions]`,
   `/trace [Name | N]`, `/span N [ctx]`, `/files [path]`, `/cat path`, `/cost`, `/status`, `/model [profile]`,
@@ -45,6 +45,8 @@
 - **`!command`** runs a command in the session folder (including after `/cd`). This works when the server is local.
 - **`/cd`** shows the session folder or moves the session to another folder, including your project
   (more in [The session folder and an existing project](projects.md)).
+- **`/copy-from`** chooses a folder or a .zip whose copy the next new session gets (the originals are never changed;
+  see [Working on a copy of files](projects.md#working-on-a-copy-of-files)).
 - **Keys:**
   - `Enter` sends;
   - `Alt+Enter`, `Ctrl+J` or `\` at the end of a line adds a new line;

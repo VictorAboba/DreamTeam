@@ -38,6 +38,7 @@ from .. import __version__
 from ..console import (
     cd_expect, cd_moves_files, cd_preview, cd_result_lines, folder_kind, resolve_folder, same_folder,
 )
+from ..copyfrom import size_text
 from ..hubauth import DIGEST_ENV, browser_url, token_link_needed
 from ..models import USER
 from . import commands, render, theme
@@ -133,7 +134,8 @@ class TUI:
     def __init__(self, conn: Connection, *, lang: str | None = None, session: str | None = None,
                  continue_last: bool = False, initial_prompt: str | None = None, verbosity: str = "normal",
                  overrides: dict | None = None, input: Any = None, output: Any = None,
-                 printer: Callable[[Any], None] | None = None, workspace: str | None = None):
+                 printer: Callable[[Any], None] | None = None, workspace: str | None = None,
+                 copy_from: str | None = None):
         self.conn = conn
         self.client = conn.client
         self.home = Path(conn.home)
@@ -145,6 +147,8 @@ class TUI:
         self.initial_prompt = initial_prompt
         self.overrides, self.title_override = commands.session_overrides(overrides)
         self.workspace_override = workspace   # the folder of the next session created here (--workspace)
+        # the files copied into the next session created here (--copy-from, /copy-from)
+        self.copy_from_override: str | None = copy_from
         # `--skill`: the skills of the next session created here, or (-c / -r) attached to the first one resumed
         # (also the one picked after `-r`); one attempt, so they never land on another session later
         self.skills_override: list[str] = list((overrides or {}).get("skills") or [])
@@ -878,15 +882,50 @@ class TUI:
         try:
             summary = await self.client.create_session(title, goal, overrides=self.overrides, start=True,
                                                        workspace=self.workspace_override,
-                                                       skills=self.skills_override or None)
+                                                       skills=self.skills_override or None,
+                                                       copy_from=self.copy_from_override)
         finally:
             self.set_hint(None)
-        self.title_override = self.workspace_override = None  # (kept for another try when the hub refused)
+        # (kept for another try when the hub refused)
+        self.title_override = self.workspace_override = self.copy_from_override = None
         self.skills_override = []
         self.info(self.t("session_created", title=summary.get("title") or title, id=summary.get("id")))
         if isinstance(summary.get("workspace_result"), dict):
             self._print_folder_result(summary["workspace_result"], summary.get("title") or title)
+        if isinstance(summary.get("copy_result"), dict):
+            self._print_copy_result(summary["copy_result"])
         await self.attach(summary, announce=False, fresh=True)
+
+    def _print_copy_result(self, result: dict) -> None:
+        """What --copy-from / /copy-from copied into the new session (and what it left out)."""
+        self.info(self.t("copy_done", files=result.get("files", 0), size=size_text(result.get("bytes") or 0),
+                         source=result.get("source") or "?"))
+        counts = {key: int(result.get(f"{key}_count") or 0) for key in ("links", "excluded", "special")}
+        if any(counts.values()):
+            self.info(self.t("copy_left_out", links=counts["links"], excluded=counts["excluded"],
+                             special=counts["special"]))
+
+    def choose_copy_source(self, text: str) -> None:
+        """`/copy-from [path|--none]`: the folder or .zip whose copy the next new session gets (the hub checks it
+        then); with or without an attached session."""
+        text = text.strip()
+        if text == "--none":
+            self.copy_from_override = None
+            self.info(self.t("copy_cleared"))
+            return
+        if text:
+            target = resolve_folder(text, local=self.local)
+            if target is None:
+                self.error(self.t("cd_remote_relative"))
+                return
+            if self.local and os.path.isfile(target) and not target.lower().endswith(".zip"):
+                self.error(self.t("copy_not_zip", path=target))
+                return
+            self.copy_from_override = target
+        if self.copy_from_override:
+            self.info(self.t("copy_next", path=self.copy_from_override))
+        else:
+            self.info(self.t("copy_none"))
 
     async def open_picker(self, *, deleting: bool = False) -> None:
         """The session picker: Enter attaches the chosen session (`deleting`: deletes it, after a
@@ -2027,6 +2066,8 @@ class TUI:
                 self.print(render.tips(self.ctx, bool(sessions)))
             if self.workspace_override and self.client.mode == "launcher" and not self.attached:
                 self.info(self.t("cd_new_session", path=self.workspace_override))
+            if self.copy_from_override and self.client.mode == "launcher" and not self.attached:
+                self.info(self.t("copy_next", path=self.copy_from_override))
             if (self.overrides.get("swarm") or {}).get("clarify") is True and self.client.mode == "launcher" \
                     and not self.attached:   # --clarify: the window's new sessions (/clarify off undoes it)
                 self.info(self.t("clarify_new_on"))
@@ -2088,14 +2129,15 @@ class TUI:
 async def run_tui(conn: Connection, *, lang: str | None = None, session: str | None = None,
                   continue_last: bool = False, initial_prompt: str | None = None, verbosity: str = "normal",
                   input: Any = None, output: Any = None, printer: Callable[[Any], None] | None = None,
-                  overrides: dict | None = None, workspace: str | None = None) -> int:
+                  overrides: dict | None = None, workspace: str | None = None, copy_from: str | None = None) -> int:
     """Run the interactive TUI on a hub connection until the user quits (docs/TUI.md §4). The connection
     is left open: the caller closes it. `printer(renderable)` replaces printing above the input box
     (tests capture `render.to_plain`); `input` / `output` are prompt_toolkit Input / Output. `workspace`: the
-    absolute folder the first session created here works in (`--workspace`)."""
+    absolute folder the first session created here works in (`--workspace`); `copy_from`: the folder or .zip
+    copied into it first (`--copy-from`)."""
     tui = TUI(conn, lang=lang, session=session, continue_last=continue_last, initial_prompt=initial_prompt,
               verbosity=verbosity, overrides=overrides, input=input, output=output, printer=printer,
-              workspace=workspace)
+              workspace=workspace, copy_from=copy_from)
     return await tui.run()
 
 

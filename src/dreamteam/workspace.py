@@ -389,6 +389,8 @@ def git_argv(git: str, root: Path, actor: str | None, args: tuple[str, ...] | li
         "-c", f"user.name={name}",
         "-c", f"user.email={email}",
         *(() if adopted else ("-c", "core.autocrlf=false")),
+        # (Git for Windows skips paths over 260 characters without it: a deep copied tree would not be committed)
+        *(("-c", "core.longpaths=true") if _WINDOWS and not adopted else ()),
         "-c", "core.quotepath=false",
         "-c", f"safe.directory={safe_directory or Path(root).resolve().as_posix()}",
         *guard,
@@ -726,11 +728,12 @@ class Workspace:
 
     async def _configure_repo(self) -> None:
         """Repo-local settings for a repository DreamTeam created, so that git commands run from the shell behave
-        like the autocommits (line endings, no signing)."""
+        like the autocommits (line endings, long paths on Windows, no signing)."""
         if not (self.root / ".git").exists():
             return
-        for key, value in (("core.autocrlf", "false"), ("user.name", "DreamTeam"),
-                           ("user.email", "swarm@dreamteam.local"), ("commit.gpgsign", "false")):
+        for key, value in (("core.autocrlf", "false"), *((("core.longpaths", "true"),) if _WINDOWS else ()),
+                           ("user.name", "DreamTeam"), ("user.email", "swarm@dreamteam.local"),
+                           ("commit.gpgsign", "false")):
             await self._git(None, "config", "--local", key, value)
 
     async def _init_repo(self) -> None:

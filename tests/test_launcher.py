@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import time
+import urllib.parse
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -17,10 +18,12 @@ import pytest
 from starlette.testclient import TestClient
 
 from conftest import make_skill
-from dreamteam import roles
+from dreamteam import copyfrom, roles
 from dreamteam import settings as st
 from dreamteam.launcher import create_launcher_app
-from dreamteam.launcher_mcp import build_launcher_server, call_launcher_tool, list_launcher_tools
+from dreamteam.launcher_mcp import (
+    INSTRUCTIONS, build_launcher_server, call_launcher_tool, list_launcher_tools, session_line,
+)
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.sessions import SessionManager
 
@@ -310,7 +313,8 @@ def test_rest_rejects_wrong_body_shapes(client):
         resp = patch(body)
         assert resp.status_code == 400 and resp.json()["error"], (body, resp.text)
     assert patch(None, raw="{not json").json() == {"error": "The body is not valid JSON."}
-    for body in ({"title": "x", "goal": "y", "overrides": [1]}, {"goal": "y", "start": "no"}, {"goal": 5}):
+    for body in ({"title": "x", "goal": "y", "overrides": [1]}, {"goal": "y", "start": "no"}, {"goal": 5},
+                 {"goal": "y", "copy_from": 1}, {"goal": "y", "copy_from_upload": []}):
         resp = _post(c, "/api/sessions", body)
         assert resp.status_code == 400, (body, resp.text)
     resp = c.post("/api/sessions", content="{oops", headers={"content-type": "application/json"})
@@ -729,7 +733,7 @@ def test_skills_library_routes(client, tmp_path):
     events: list[dict] = []
     c.manager.listen(events.append)
     data = c.get("/api/skills").json()
-    assert set(data) == {"library_dir", "library", "claude", "host", "sandbox", "limits", "install"}
+    assert set(data) == {"library_dir", "library", "claude", "host", "sandbox", "container", "limits", "install"}
     assert data["library"] == [] and data["host"] == [] and data["sandbox"] is False
     assert data["library_dir"] == str(_library_root())
     assert data["limits"] == {"max_mb": 10, "max_files": 200, "max_attached": 40, "max_archive_mb": 50}
@@ -1174,3 +1178,281 @@ async def test_the_skills_mirror_leaves_the_users_folder_with_the_session(tmp_pa
         assert not mirror.exists() and (project / "app.py").is_file()
     finally:
         await manager.shutdown()
+
+
+# ---- copying files into a new session (docs/SPEC.md §17.2 "Copying files into a new session") -------------------
+def _zip_bytes(files: dict[str, str]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, text in files.items():
+            zf.writestr(name, text)
+    return buf.getvalue()
+
+
+def _upload(c, data: Any, filename: str = "w.zip", content_type: str = "application/zip", **headers: str):
+    return c.post(f"/api/uploads?filename={urllib.parse.quote(filename)}", content=data,
+                  headers={"content-type": content_type, **headers})
+
+
+def _uploads_left(manager: SessionManager) -> list[str]:
+    root = manager.uploads.root
+    return sorted(p.name for p in root.iterdir()) if root.is_dir() else []
+
+
+def _set_global(manager: SessionManager, section: str, **values: Any) -> None:
+    """A hand edit of dreamteam.toml (the manager picks it up at its next call)."""
+    raw = st.read_raw(manager.home)
+    raw.setdefault(section, {}).update(values)
+    st.write_raw(manager.home, raw)
+    later = time.time() + 5
+    os.utime(st.settings_path(manager.home), (later, later))
+
+
+def _project(root: Path) -> Path:
+    """A folder to copy: two files, and a node_modules that is left out."""
+    (root / "node_modules" / "left").mkdir(parents=True)
+    (root / "node_modules" / "left" / "index.js").write_text("x\n", encoding="utf-8")
+    (root / "src").mkdir()
+    (root / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    (root / "README.md").write_text("# Project\n", encoding="utf-8")
+    return root
+
+
+def test_upload_then_create_with_the_token(client):
+    """POST /api/uploads takes the raw zip and gives a token; POST /api/sessions {"copy_from_upload"} unpacks it
+    into the new session's folder (a zip of one folder: that folder's files) and uses the token up."""
+    c = client
+    resp = _upload(c, _zip_bytes({"mywork/a.txt": "A", "mywork/sub/b.txt": "B", "mywork/.git/HEAD": "ref"}))
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    token = data["upload"]
+    assert copyfrom.UPLOAD_TOKEN.fullmatch(token) and data["filename"] == "w.zip" and data["expires_in"] == 3600
+    assert data["bytes"] > 0 and _uploads_left(c.manager) == [f"{token}.json", f"{token}.zip"]
+    created = _post(c, "/api/sessions", {"goal": "Work on the copy", "start": False, "copy_from_upload": token})
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["copy"]["files"] == 2 and body["copy"]["top"] == "mywork" and body["copy"]["excluded_count"] == 1
+    assert "copy_result" not in body["session"] and "result" not in body
+    sid = body["session"]["id"]
+    assert body["session"]["copied_from"]["source"] == "upload: w.zip"
+    listed = {s["id"]: s for s in c.get("/api/sessions").json()["sessions"]}
+    assert listed[sid]["copied_from"]["source"] == "upload: w.zip" and listed[sid]["copied_from"]["files"] == 2
+    folder = c.manager.default_workspace(sid)
+    assert (folder / "a.txt").read_text(encoding="utf-8") == "A" and (folder / "sub" / "b.txt").is_file()
+    assert not (folder / ".git").exists() and not (folder / "mywork").exists()
+    assert _uploads_left(c.manager) == []   # used once
+    again = _post(c, "/api/sessions", {"goal": "Again", "start": False, "copy_from_upload": token})
+    assert again.status_code == 404 and "Upload the .zip again" in again.json()["error"]
+    bad = _post(c, "/api/sessions", {"goal": "Bad", "start": False, "copy_from_upload": "../../x"})
+    assert bad.status_code == 400 and "must be a token" in bad.json()["error"]
+    assert [s["id"] for s in c.get("/api/sessions").json()["sessions"]] == [sid]
+
+
+def test_upload_guard(client):
+    """The upload is the one POST that is not JSON: only application/zip, only on its exact path; the Origin and
+    Host checks apply as everywhere."""
+    c = client
+    data = _zip_bytes({"a.txt": "A"})
+    plain = _upload(c, data, content_type="text/plain")
+    assert plain.status_code == 415
+    form = c.post("/api/uploads?filename=w.zip", data={"a": "b"})
+    assert form.status_code == 415
+    # the exemption is per path: a zip body anywhere else is refused as before
+    for path in ("/api/sessions", "/api/uploads/", "/api/skills", "/api/uploadsx"):
+        resp = c.post(path, content=data, headers={"content-type": "application/zip"})
+        assert resp.status_code == 415, path
+    for bad in ({"origin": "https://evil.example"}, {"origin": "null"}, {"host": "evil.example"}):
+        assert _upload(c, data, **bad).status_code == 403, bad
+    assert _uploads_left(c.manager) == []
+    own = _upload(c, data, origin="http://127.0.0.1:8765")
+    assert own.status_code == 201, own.text
+    with_parameter = _upload(c, data, content_type="Application/Zip; charset=binary")
+    assert with_parameter.status_code == 201, with_parameter.text
+    assert len(_uploads_left(c.manager)) == 4 and not [n for n in _uploads_left(c.manager) if n.endswith(".part")]
+
+
+def test_upload_caps(client):
+    """[workspace] copy_max_mb caps the upload: by Content-Length before reading, and while a body without it
+    streams in (nothing is left of it); an empty body or one that is not a zip is a 400."""
+    c = client
+    _set_global(c.manager, "workspace", copy_max_mb=1)
+    resp = _upload(c, b"PK" + b"\0" * (2 * 2 ** 20))
+    assert resp.status_code == 413 and resp.json()["error"] == \
+        "The file is larger than 1 MB ([workspace] copy_max_mb)."
+
+    def streamed():
+        for _ in range(4):
+            yield b"\0" * (2 ** 19 + 1)
+
+    resp = c.post("/api/uploads?filename=big.zip", content=streamed(), headers={"content-type": "application/zip"})
+    assert resp.status_code == 413 and "copy_max_mb" in resp.json()["error"]
+    assert _uploads_left(c.manager) == []
+    resp = _upload(c, b"not a zip at all")
+    assert resp.status_code == 400 and resp.json()["error"] == "The file is not a zip archive."
+    resp = _upload(c, b"")
+    assert resp.status_code == 400 and resp.json()["error"] == "The upload is empty."
+    assert _uploads_left(c.manager) == []
+    assert _upload(c, _zip_bytes({"a.txt": "A"})).status_code == 201   # under the cap
+
+
+def test_upload_pending_cap(client):
+    c = client
+    data = _zip_bytes({"a.txt": "A"})
+    for _ in range(copyfrom.UPLOAD_MAX_PENDING):
+        assert _upload(c, data).status_code == 201
+    resp = _upload(c, data)
+    assert resp.status_code == 429 and "uploads already wait for a session" in resp.json()["error"]
+    assert "Try again later" in resp.json()["error"] and "create those sessions" not in resp.json()["error"]
+
+
+def test_the_hub_sweeps_copy_leftovers_at_its_start(tmp_path):
+    """Expired uploads and the staging folders of a process that no longer runs go when the hub starts, without
+    another upload or copy (the sweep repeats hourly)."""
+    from dreamteam.workspace import pid_alive
+
+    manager = _manager(tmp_path)
+    root = manager.uploads.root
+    root.mkdir(parents=True)
+    token = "A" * 24
+    (root / f"{token}.zip").write_bytes(b"PK")
+    (root / f"{token}.json").write_text(json.dumps({"filename": "w.zip", "bytes": 2,
+                                                    "at": time.time() - copyfrom.UPLOAD_TTL - 1}), encoding="utf-8")
+    dead = 2 ** 22 + 12345
+    assert not pid_alive(dead)
+    stale = manager.sessions_dir / f".copying-{dead}-{copyfrom.RUN}-abcd0123"
+    stale.mkdir(parents=True)
+    with TestClient(create_launcher_app(manager), base_url="http://127.0.0.1:8765") as c:
+        deadline = time.monotonic() + 10
+        while (stale.exists() or (root / f"{token}.zip").exists()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not stale.exists() and sorted(p.name for p in root.iterdir()) == []
+        info = c.get("/api/hub").json()
+        assert info["container"] is copyfrom.hub_in_container(manager.config)
+        c.portal.call(manager.shutdown)
+
+
+def test_the_hubs_exit_does_not_wait_for_a_long_sweep(tmp_path):
+    """The sweep runs in a daemon thread: a long removal (a large copy a killed hub left) does not hold the exit
+    of the hub; the next sweep finishes it."""
+    import threading
+
+    manager = _manager(tmp_path)
+    started, release = threading.Event(), threading.Event()
+
+    def slow_sweep() -> None:
+        started.set()
+        release.wait(30)
+
+    manager.clean_copy_leftovers = slow_sweep
+    try:
+        with TestClient(create_launcher_app(manager), base_url="http://127.0.0.1:8765") as c:
+            assert started.wait(10)
+            c.portal.call(manager.shutdown)
+            stopping = time.monotonic()
+        assert time.monotonic() - stopping < 5 and not release.is_set()
+    finally:
+        release.set()
+
+
+async def test_upload_interrupted(tmp_path):
+    """A client that goes away in the middle of the body (starlette's ClientDisconnect): 400 "The upload was
+    interrupted.", and the partial file is gone."""
+    manager = _manager(tmp_path)
+    app = create_launcher_app(manager)
+    messages = [{"type": "http.request", "body": b"PK\x03\x04" + b"x" * 1000, "more_body": True},
+                {"type": "http.disconnect"}]
+    sent: list[dict] = []
+
+    async def receive():
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+             "scheme": "http", "path": "/api/uploads", "raw_path": b"/api/uploads", "root_path": "",
+             "query_string": b"filename=w.zip", "server": ("127.0.0.1", 8765), "client": ("127.0.0.1", 50000),
+             "headers": [(b"host", b"127.0.0.1:8765"), (b"content-type", b"application/zip")]}
+    try:
+        await app(scope, receive, send)
+    finally:
+        await manager.shutdown()
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
+    assert start["status"] == 400 and json.loads(body) == {"error": "The upload was interrupted."}
+    assert _uploads_left(manager) == []
+
+
+def test_create_with_copy_from_folder_over_rest(client, tmp_path):
+    c = client
+    src = _project(tmp_path / "project")
+    resp = _post(c, "/api/sessions", {"goal": "Improve app.py", "start": False, "copy_from": str(src)})
+    assert resp.status_code == 201, resp.text
+    copy = resp.json()["copy"]
+    assert copy["files"] == 2 and copy["excluded_count"] == 1 and copy["source"] == str(src.resolve())
+    assert copy["kind"] == "folder" and copy["top"] is None
+    sid = resp.json()["session"]["id"]
+    listed = {s["id"]: s for s in c.get("/api/sessions").json()["sessions"]}
+    copied = listed[sid]["copied_from"]
+    assert copied["source"] == str(src.resolve()) and copied["files"] == 2 and copied["bytes"] == copy["bytes"]
+    folder = c.manager.default_workspace(sid)
+    assert (folder / "src" / "app.py").is_file() and not (folder / "node_modules").exists()
+    assert (src / "node_modules" / "left" / "index.js").is_file()   # the source is only read
+    plain = _post(c, "/api/sessions", {"goal": "No copy", "start": False})
+    assert plain.status_code == 201 and "copy" not in plain.json() and plain.json()["session"]["copied_from"] is None
+
+    busy = tmp_path / "busy"
+    busy.mkdir()
+    (busy / "a.txt").write_text("a\n", encoding="utf-8")
+    refusals = (({"copy_from": "relative/path"}, 400, "must be absolute"),
+                ({"copy_from": str(tmp_path / "missing")}, 400, "Nothing to copy"),
+                ({"copy_from": str(src), "workspace": str(busy)}, 409, "already has files"),
+                ({"copy_from_upload": "A" * 24}, 404, "No upload"),
+                ({"copy_from": str(src), "copy_from_upload": "A" * 24}, 400, "not both"),
+                ({"copy_from": str(c.manager.home)}, 400, "DreamTeam home"))
+    for extra, status, words in refusals:
+        resp = _post(c, "/api/sessions", {"goal": "x", "start": False, **extra})
+        assert resp.status_code == status and words in resp.json()["error"], (extra, resp.text)
+    assert len(c.get("/api/sessions").json()["sessions"]) == 2   # nothing half-created
+    _set_global(c.manager, "workspace", copy_max_files=1)
+    resp = _post(c, "/api/sessions", {"goal": "x", "start": False, "copy_from": str(src)})
+    assert resp.status_code == 413 and "[workspace] copy_max_files" in resp.json()["error"]
+
+
+async def test_launcher_mcp_copy_from(tmp_path):
+    manager = _manager(tmp_path)
+    src = _project(tmp_path / "project")
+    try:
+        tool = next(t for t in list_launcher_tools(manager) if t.name == "session_create")
+        assert "copy_from" in tool.input_schema["properties"] and "copy_from_upload" not in tool.input_schema[
+            "properties"]
+        assert "session_create(..., copy_from=<folder or .zip>)" in INSTRUCTIONS
+        text, err = await call_launcher_tool(manager, "session_create", {"goal": "g", "start": False,
+                                                                         "copy_from": f"  {src}  "})
+        assert not err, text
+        assert "Copied 2 files (" in text and f"from {src.resolve()} into the session's folder." in text
+        assert "Left out: 1 folder(s) by name (node_modules)." in text
+        sid = manager.ids()[0]
+        assert (manager.default_workspace(sid) / "README.md").is_file()
+        for bad in (5, ["x"]):
+            text, err = await call_launcher_tool(manager, "session_create", {"goal": "g", "start": False,
+                                                                             "copy_from": bad})
+            assert err and "copy_from must be an absolute path of a folder or a .zip file." in text, text
+        text, err = await call_launcher_tool(manager, "session_create", {"goal": "g", "start": False,
+                                                                         "copy_from": "relative"})
+        assert err and "must be absolute" in text
+        assert manager.ids() == [sid]   # nothing created by the refusals
+        text, err = await call_launcher_tool(manager, "session_create", {"goal": "g", "start": False,
+                                                                         "copy_from": "  "})
+        assert not err and "Copied" not in text   # blank: no copy
+        text, err = await call_launcher_tool(manager, "sessions_list", {})
+        assert not err and text.count("copied from:") == 1 and f"copied from: {src.resolve()}" in text
+    finally:
+        await manager.shutdown()
+    line = session_line({"id": "001-x", "copied_from": {"source": "a\nb\x1b[2J" + "x" * 400}})
+    copied = [part for part in line.split("\n") if "copied from:" in part]
+    assert len(copied) == 1 and line.count("\n") == 1
+    shown = copied[0].split("copied from: ", 1)[1]
+    assert shown.startswith("a b [2J") and len(shown) == copyfrom.SOURCE_SHOWN_MAX
+    assert "copied from" not in session_line({"id": "001-x", "copied_from": {"source": 5}})
+    assert "copied from" not in session_line({"id": "001-x", "copied_from": None})

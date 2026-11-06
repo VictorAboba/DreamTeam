@@ -198,6 +198,9 @@ class ShellSettings:
 class WorkspaceSettings:
     git: bool = True
     lock_ttl_minutes: int = 30
+    # a copy into a new session (--copy-from, the upload): unpacked MB / files; global (copyfrom.py)
+    copy_max_mb: int = 1024
+    copy_max_files: int = 100000
 
 
 @dataclass
@@ -249,7 +252,7 @@ _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSetti
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
                       "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
                       "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
-                      "install_timeout"})
+                      "install_timeout", "copy_max_mb", "copy_max_files"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 
@@ -612,6 +615,8 @@ pass_env = []                 # переменные окружения с се�
 [workspace]
 git = true                    # общий workspace под git с автокоммитами
 lock_ttl_minutes = 30
+copy_max_mb = 1024            # предел копии файлов в новую сессию (--copy-from, загрузка .zip), МБ
+copy_max_files = 100000       # файлов в такой копии (папки: .git, node_modules и т. п. не считаются)
 
 [mcp]
 require_approval = false      # true — новые MCP агентов ждут одобрения пользователя

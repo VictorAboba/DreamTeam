@@ -88,7 +88,15 @@ git switch -c dreamteam/billing
 dreamteam --workspace ~/code/my-app "Cover the billing module with tests"
 ```
 
-The rules that keep your own work safe are in [Session folder and an existing project](docs/en/projects.md).
+Or give a new session a copy of the project, so your files stay untouched (`.git`, `node_modules` and the like are
+left out; nothing is copied back):
+
+```bash
+dreamteam --copy-from ~/code/my-app "Find out why the export is slow and fix it"
+```
+
+The rules that keep your own work safe are in [Session folder and an existing project](docs/en/projects.md), working
+on a copy in [Working on a copy of files](docs/en/projects.md#working-on-a-copy-of-files).
 
 ### Connect Claude Code
 

@@ -17,6 +17,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
 from . import __version__, roles
 from . import skills as skill_lib
+from .copyfrom import SOURCE_SHOWN_MAX, copy_text, printable_line
 from .hub_mcp import INSTRUCTIONS as HUB_INSTRUCTIONS
 from .hub_mcp import (LIBRARY_TOOLS, _StdinLines, client_key, hub_call, hub_specs, list_hub_tools, security_settings,
                       serving_client)
@@ -46,6 +47,8 @@ project, is adopted: the agents work with its files and commit to its current br
 have no uncommitted changes, also at every later start of the session; a folder that is not a repository gets
 one). `path="default"` moves it back.
 `session_create(..., workspace=<folder>)` creates a session that works in that folder right away.
+`session_create(..., copy_from=<folder or .zip>)` copies those files into the new session's folder first: the
+agents work on the copy, the originals stay untouched.
 `skill_library` lists, shows, imports (a folder, a .zip or a Git URL) and deletes the shared skills library;
 `session_create(..., skills=[...])` and `session_start(session, skills=[...])` attach skills to a session by name or
 source.
@@ -94,6 +97,13 @@ LAUNCHER_TOOLS: list[dict[str, Any]] = [
          "workspace": {"type": "string", "description": "Absolute folder to work in instead of the session's own "
                                                         "one: empty/missing = new, with files = adopted (an existing "
                                                         "project; its git repo must be clean)"},
+         "copy_from": {"type": "string", "description": "Absolute path of a folder or a .zip file on the hub's "
+                                                        "computer, copied into the new session's folder before its "
+                                                        "first start: the agents work on the copy and the original "
+                                                        "is never changed (.git, node_modules, .venv, venv, "
+                                                        "__pycache__ and links are left out; a zip of one folder "
+                                                        "gives that folder's files). With workspace, that folder "
+                                                        "must be empty or missing."},
          "skills": SKILLS_PROP,
      }, "required": ["goal"]}},
     {"name": "session_start", "description": "Start (resume) a stopped session: its agents continue working. "
@@ -204,6 +214,9 @@ def session_line(s: dict[str, Any]) -> str:
         notes = [n for n, on in (("adopted", workspace.get("adopted")), ("MISSING", not workspace.get("exists", True)))
                  if on]
         line += f"\n    folder: {workspace.get('path')}" + (f" ({', '.join(notes)})" if notes else "")
+    copied = s.get("copied_from")
+    if isinstance(copied, dict) and isinstance(copied.get("source"), str):   # (a remote hub's JSON: one line again)
+        line += f"\n    copied from: {printable_line(copied['source'], SOURCE_SHOWN_MAX)}"
     if s.get("error") or s.get("config_error"):
         line += f"\n    error: {s.get('error') or s.get('config_error')}"
     return line
@@ -412,14 +425,20 @@ async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[st
             workspace = args.get("workspace")
             if workspace is not None and not isinstance(workspace, str):
                 raise ToolError("workspace must be an absolute folder path.")
+            copy_from = args.get("copy_from")
+            if copy_from is not None and not isinstance(copy_from, str):
+                raise ToolError("copy_from must be an absolute path of a folder or a .zip file.")
             summary = await manager.create(str(args.get("title") or ""), goal, str(args.get("description") or ""),
                                            overrides=overrides, start=args.get("start", True) is not False,
                                            workspace=workspace.strip() if workspace and workspace.strip() else None,
-                                           skills=_skills_arg(args.get("skills")), via="launcher-mcp")
+                                           skills=_skills_arg(args.get("skills")), via="launcher-mcp",
+                                           copy_from=copy_from.strip() if copy_from and copy_from.strip() else None)
             result = summary.pop("workspace_result", None)
+            copied = summary.pop("copy_result", None)
             board = f" Board: {manager.hub_url}/s/{summary['id']}/" if manager.hub_url else ""  # no web UI: no URL
             return (f"Created session {summary['id']} ({summary['status']}).{board}\n"
                     + (workspace_text(result) + "\n" if result else "")
+                    + (copy_text(copied) + "\n" if copied else "")
                     + f"Pass session=\"{summary['id']}\" to work inside it.\n" + session_line(summary)), False
         if name == "session_cd":
             sid = str(args.get("session") or "")

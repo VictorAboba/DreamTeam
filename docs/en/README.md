@@ -10,7 +10,8 @@ Getting started:
 Working with the swarm:
 
 - [Terminal UI and console](terminal.md): slash commands, keys, headless mode (`dreamteam -p`)
-- [Session folder and an existing project](projects.md): pointing the swarm at your own repository (`/cd`, `--workspace`)
+- [Session folder and an existing project](projects.md): pointing the swarm at your own repository (`/cd`,
+  `--workspace`), working on a copy of files (`--copy-from`)
 - [Connecting Claude Code](claude-code.md): the swarm as an MCP server, `join_swarm`
 - [Skills](skills.md): Agent Skills for the swarm — library, attaching, agents' proposals, dependencies
 - [Agent traces](traces.md): every agent wake-up step by step, with tokens and cost

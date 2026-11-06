@@ -1399,6 +1399,31 @@ async def test_a_session_in_a_missing_folder_attaches_stopped_and_cd_brings_it_b
     assert await h.quit() == 0
 
 
+async def test_copy_from_fills_the_first_new_session(launch, tmp_path):
+    """`dreamteam --copy-from DIR` (and /copy-from): the next new session gets a copy of DIR in its folder before its
+    first start; the window says so at startup and after the create, and the next session gets none."""
+    conn = await launch()
+    src = tmp_path / "project"
+    (src / ".venv" / "lib").mkdir(parents=True)
+    (src / ".venv" / "lib" / "x.py").write_text("x\n", encoding="utf-8")
+    (src / "app.py").write_bytes(b"print('hi')\n")
+    h = launch.tui(conn, copy_from=str(src), width=400)
+    await h.until(lambda: h.tui.ready.is_set())
+    await h.see(f"The next new session gets a copy of the files in {src}")
+    h.type("Improve the app\r")
+    await h.until(lambda: h.tui.attached and h.tui.members, 30, "the new session")
+    sid = h.tui.sid
+    await h.see(f"Copied 1 files (12 bytes) from {src.resolve()} into the session folder")
+    await h.see("Left out: 0 links, 1 folders by name, 0 special files")
+    assert h.tui.copy_from_override is None   # only the first session
+    session = (await conn.client.session(sid))["session"]
+    assert session["copied_from"]["source"] == str(src.resolve()) and session["copied_from"]["files"] == 1
+    assert (Path(session["dir"]) / "workspace" / "app.py").is_file()
+    assert (src / ".venv" / "lib" / "x.py").is_file()
+    await h.run("/copy-from", "No copy: /copy-from <folder or .zip> copies files into the next new session")
+    assert await h.quit() == 0
+
+
 async def test_console_cd_asks_then_moves_and_comes_back(launch, tmp_path, capsys):
     """`dreamteam console`: /cd shows the folder; /cd PATH asks y/N (Enter = no), --yes does not ask."""
     from dreamteam import console as console_module
