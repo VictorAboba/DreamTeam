@@ -32,7 +32,7 @@ from .models import USER, AgentKind, Status, ToolError
 from .procs import alive_all, sweep_token
 from .shell import (KILL_SETTLE, PENDING_MAX, SETTLE_POLL, RunningCommand, kill_after_cancel, last_serial,
                     start_command, truncate_middle)
-from .workspace import format_size, is_link, scratch_is_local, scratch_rel
+from .workspace import format_size, is_link, pid_alive, scratch_is_local, scratch_rel
 
 log = logging.getLogger(__name__)
 
@@ -244,16 +244,7 @@ def _secs(value: float) -> str:
     return f"{value:g}"
 
 
-def _pid_alive(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(int(pid), 0)
-    except PermissionError:
-        return True
-    except (OSError, ValueError, OverflowError):
-        return False
-    return True
+_pid_alive = pid_alive
 
 
 # --- records -----------------------------------------------------------------------------------------------------
@@ -691,7 +682,10 @@ class JobManager:
         if not log_value:
             return None
         path = Path(log_value)
-        if path.is_absolute():
+        if path.is_absolute():   # the data-dir fallback of _log_location: only a file of this session's jobs folder
+            folder = Path(self.swarm.config.data_dir) / "jobs"
+            if path.parent.name != "jobs" or is_link(path) or not _inside(path, folder):
+                return None
             return path
         root = Path(self.swarm.workspace.root)
         full = root / log_value

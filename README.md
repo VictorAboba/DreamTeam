@@ -109,6 +109,18 @@ dreamteam sandbox ~/DreamTeam --goal "..."
 Agents' commands and their MCP servers then run inside the container. Add `--network off` to cut them off
 from the internet (strict in Docker and on Linux) — see [Docker sandbox and sessions without network](docs/en/sandbox.md).
 
+### Move to another computer
+
+```bash
+dreamteam export E:/dreamteam      # settings, skills, MCP servers and whole sessions into one folder
+dreamteam import E:/dreamteam      # on the other computer: shows the plan, asks, adds or rewrites
+```
+
+API keys and MCP `env` values stay on the first computer, and the export is checked for that computer's secrets
+before it is finished. Import adds what is new and rewrites what changed; nothing the export does not carry is
+deleted, and a session rewritten in full keeps its previous copy. Imported sessions never start by themselves.
+Both computers need DreamTeam 0.1.1 or newer. Details: [Moving to another computer and backups](docs/en/transfer.md).
+
 ## Configuration
 
 Settings live in `~/DreamTeam/dreamteam.toml` and are easiest to change on the **Settings** page.
@@ -152,7 +164,7 @@ The full guide is in [docs/en](docs/en/README.md):
 - [Terminal UI and console](docs/en/terminal.md) · [Session folder and an existing project](docs/en/projects.md) ·
   [Connecting Claude Code](docs/en/claude-code.md) · [Skills](docs/en/skills.md) · [Agent traces](docs/en/traces.md)
 - [Configuration](docs/en/configuration.md) · [Docker sandbox and sessions without network](docs/en/sandbox.md) ·
-  [Security](docs/en/security.md)
+  [Moving to another computer and backups](docs/en/transfer.md) · [Security](docs/en/security.md)
 - [How it works](docs/en/architecture.md) · [Agent tools](docs/en/agent-tools.md) ·
   [Module specification](docs/SPEC.md) · [Terminal UI contract](docs/TUI.md)
 

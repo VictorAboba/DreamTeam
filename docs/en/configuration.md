@@ -65,6 +65,7 @@ output_price = 0
 
 [mcp]
 require_approval = false
+library_dir = "~/.dreamteam/library"  # the shared MCP library (DREAMTEAM_MCP_LIBRARY_DIR wins)
 [mcp.external.fetch]     # external MCP servers for the swarm
 command = ["uvx", "mcp-server-fetch"]
 description = "Fetching web pages"
@@ -98,3 +99,17 @@ hire button on the board. **The starting team** is the roles of the agents a ses
 - with the `/team` command in the terminal.
 
 Agents beyond the list become generalists.
+
+## Shared folders and this computer's settings
+
+Some folders are shared by all sessions and live outside the home, in `~/.dreamteam`: the skills library
+(`[skills] library_dir`, by default `~/.dreamteam/skills`), the skills' dependency environments (`[skills]
+envs_dir`, `~/.dreamteam/skill-envs`) and the MCP library (`[mcp] library_dir`, `~/.dreamteam/library`). The
+environment variables `DREAMTEAM_SKILLS_DIR`, `DREAMTEAM_SKILL_ENVS_DIR` and `DREAMTEAM_MCP_LIBRARY_DIR` win over
+these settings: the Docker sandbox sets its skills folders this way, and the tests set all three. The agents'
+console never gets these variables.
+
+An [import](transfer.md) (`dreamteam import`) never changes the settings that belong to the computer itself, in
+the global settings or in a session's settings: `server.host`, `server.port`, `shell.program`, `skills.library_dir`,
+`skills.envs_dir`, `skills.python` and `mcp.library_dir` keep the value they have here, and API keys and the `env`
+values of external MCP servers never go into an export at all.

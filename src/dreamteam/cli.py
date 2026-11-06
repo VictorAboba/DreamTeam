@@ -8,6 +8,7 @@ import dataclasses
 import json
 import logging
 import os
+import platform
 import re
 import signal
 import socket
@@ -24,6 +25,7 @@ from .config import CONFIG_FILE, PROVIDER_PRESETS, Config, render_template
 from .goal_text import split_goal
 from .hubauth import open_hub
 from .models import USER
+from .workspace import pid_alive
 
 log = logging.getLogger("dreamteam")
 
@@ -54,24 +56,10 @@ def hub_file(project_dir: Path) -> Path:
     return project_dir / ".dreamteam" / "hub.json"
 
 
-def _pid_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    if sys.platform == "win32":
-        import ctypes
-
-        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
-        if not handle:
-            return False
-        code = ctypes.c_ulong()
-        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-        ctypes.windll.kernel32.CloseHandle(handle)
-        return code.value == 259  # STILL_ACTIVE
-    try:
-        os.kill(pid, 0)
-        return True
-    except OSError:
-        return False
+def _pid_alive(pid: object) -> bool:
+    """The process that wrote a hub.json or a launcher marker of this user runs: a pid that belongs to another
+    user's process now (EPERM) is a stale file, removed like one of a dead process."""
+    return pid_alive(pid, other_users=False)
 
 
 def _read_hub_file(project_dir: Path) -> dict | None:
@@ -130,20 +118,81 @@ def running_hub(project_dir: Path) -> str | None:
     return base
 
 
+def this_machine() -> str | None:
+    """The name of this computer that hub.json records ("machine"): platform.node(). None in a container (the
+    sandbox image): its name is the container's, while the folder it serves belongs to the host computer."""
+    if netoff.in_container() or os.environ.get(netoff.IMAGE_ENV) == "1":
+        return None
+    return platform.node() or None
+
+
+def _other_machine(info: dict | None) -> str | None:
+    """The computer a hub.json names when that is not this one; None for this computer's file, a file without the
+    name (an older DreamTeam, a container) and when this computer has no name to compare."""
+    name = info.get("machine") if isinstance(info, dict) else None
+    if not isinstance(name, str) or not name:
+        return None
+    here = this_machine()
+    if here is None or _machine_key(name) == _machine_key(here):
+        return None
+    return name
+
+
+def _machine_key(name: str) -> str:
+    """A computer name as compared: without its domain and case (macOS names follow the network: mbp.lan,
+    MBP.local)."""
+    return name.strip().split(".", 1)[0].casefold()
+
+
+_machine_warned: set[str] = set()  # homes this process has printed the two-computers warning for
+
+
+def _warn_other_machine(project_dir: Path) -> None:
+    """Print one warning to stderr (once per home and process) when the hub.json of `project_dir` names another
+    computer: the folder is used from two computers (a synced or shared folder). It only warns: running_hub() and
+    _session_holders() decide as before."""
+    name = _other_machine(_read_hub_file(project_dir))
+    key = os.path.normcase(os.path.abspath(project_dir))
+    if name is None or key in _machine_warned:
+        return
+    _machine_warned.add(key)
+    text = (f"warning: {project_dir} was last served by the computer {name}. Do not run one DreamTeam folder on two "
+            "computers at the same time; move sessions with dreamteam export / dreamteam import.")
+    log.info("%s", text)
+    try:
+        print(text, file=sys.stderr, flush=True)
+    except (OSError, ValueError):  # no usable stderr (a closed or detached stream): the log file has it
+        pass
+
+
 def _write_hub_file(project_dir: Path, base: str, config: Config) -> None:
+    """Write hub.json of `project_dir` for this process's hub: its address, pid, project and computer name. When the
+    file it replaces names another computer, the two-computers warning is printed first (_warn_other_machine)."""
     path = hub_file(project_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {"base_url": base, "mcp_url": base + "/mcp", "pid": os.getpid(), "project": str(config.project_dir)}
+    _warn_other_machine(project_dir)
+    data = {"base_url": base, "mcp_url": base + "/mcp", "pid": os.getpid(), "project": str(config.project_dir),
+            "machine": this_machine()}
     tmp = path.with_name(f"hub.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
+    _hub_written[os.path.normcase(os.path.abspath(project_dir))] = data["machine"]
+
+
+# project folder -> the computer name this process wrote into its hub.json (the name may change while it runs:
+# macOS takes it from the network)
+_hub_written: dict[str, str | None] = {}
 
 
 def _remove_hub_file(project_dir: Path) -> None:
-    """Remove hub.json if this process wrote it (never another live hub's file)."""
+    """Remove hub.json if this process wrote it (never another live hub's file, nor one of another computer whose
+    hub has the same pid)."""
     info = _read_hub_file(project_dir)
-    if info is not None and info.get("pid") != os.getpid():
-        return
+    if info is not None:
+        key = os.path.normcase(os.path.abspath(project_dir))
+        mine = info.get("machine") == _hub_written[key] if key in _hub_written else _other_machine(info) is None
+        if info.get("pid") != os.getpid() or not mine:
+            return
     try:
         hub_file(project_dir).unlink()
     except OSError:
@@ -170,10 +219,10 @@ def remove_launcher_marker(path: Path | None) -> None:
             pass
 
 
-def _session_holders(home: Path) -> list[str]:
+def _session_holders(home: Path, *, clean: bool = True) -> list[str]:
     """Other live DreamTeam processes that may run sessions of `home` without a hub that answers: a hub.json whose
     process is alive (busy, starting) or that a Docker sandbox wrote, and launcher markers (a marker of a dead
-    process is removed)."""
+    process is removed, unless `clean` is False: `dreamteam export` only reads the home)."""
     found: list[str] = []
     info = _read_hub_file(home)
     if info is not None:
@@ -184,7 +233,10 @@ def _session_holders(home: Path) -> list[str]:
         written_for = info.get("project")
         local = written_for is None or _same_path(str(written_for), str(Path(home).resolve()))
         if not local or (pid != os.getpid() and _pid_alive(pid)):
-            found.append(f"the server of {hub_file(home)} (pid {pid}, {info['base_url']})")
+            other = _other_machine(info)
+            found.append(f"the hub of the computer {other} ({hub_file(home)}): stop DreamTeam there, or delete that "
+                         "file if it no longer runs" if other is not None
+                         else f"the server of {hub_file(home)} (pid {pid}, {info['base_url']})")
     for marker in sorted((Path(home) / ".dreamteam").glob("launcher-*.pid")):
         try:
             pid = int(marker.stem.split("-", 1)[1])
@@ -194,7 +246,7 @@ def _session_holders(home: Path) -> list[str]:
             continue
         if _pid_alive(pid):
             found.append(f"process {pid} ({marker})")
-        else:  # crashed or killed
+        elif clean:  # crashed or killed
             remove_launcher_marker(marker)
     return found
 
@@ -1034,6 +1086,261 @@ def _delete_sessions(args, ids: list[str]) -> int:
         return 130
 
 
+# ---- export / import: moving a home to another computer (issue #38) ------------------------------------
+YES_WORDS = ("y", "yes", "д", "да")
+
+
+def _hub_answering(home: Path) -> str | None:
+    """running_hub(home); a DreamTeam hub that answers there but takes no token from this computer counts as
+    running too (its address from hub.json)."""
+    try:
+        return running_hub(home)
+    except hubauth.TokenRequired:
+        info = _read_hub_file(home)
+        return str(info["base_url"]).rstrip("/") if info else "a DreamTeam hub"
+
+
+def _running_for_export(home: Path) -> tuple[set[str], list[str]]:
+    """The ids of the sessions of `home` that run right now, as its hub lists them (/api/sessions), and notes for
+    what cannot be known: a hub that does not list its sessions, another DreamTeam process without a hub. Nothing
+    is changed: launcher markers of processes that are gone stay, since an export only reads the home."""
+    snapshot = "the sessions it runs are exported as they are on disk now (a snapshot)"
+    try:
+        base = running_hub(home)
+    except hubauth.TokenRequired:
+        return set(), [f"a DreamTeam hub serves {home} but takes no token from this computer: {snapshot}"]
+    if base:
+        try:
+            listed = _hub_json(base, "/api/sessions")
+        except (OSError, ValueError, hubauth.TokenRequired) as exc:
+            return set(), [f"the hub {base}/ did not list its sessions ({exc}): {snapshot}"]
+        sessions = listed.get("sessions") if isinstance(listed, dict) else None
+        return {str(s["id"]) for s in sessions or [] if isinstance(s, dict) and s.get("id")
+                and s.get("status") == "running"}, []
+    holders = _session_holders(home, clean=False)
+    if holders:
+        return set(), [f"another DreamTeam process may be running sessions of {home} ({'; '.join(holders)}): "
+                       + snapshot]
+    return set(), []
+
+
+def cmd_export(args) -> int:
+    """`dreamteam export FOLDER`: write the settings, skills, MCP servers and sessions of a home into one folder
+    for another computer (transfer.export_home). The home is only read; running sessions (as its hub lists them)
+    are exported as a snapshot."""
+    from . import transfer
+
+    try:
+        transfer.parse_include(args.include)
+    except transfer.TransferError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    home = _home_arg(args)
+    if not is_home(home):  # (checked here: SessionManager would create a home)
+        print(f"Nothing exported: {home} is not a DreamTeam home (there is no sessions/ folder next to {CONFIG_FILE}). "
+              "Pass the home with --home.", file=sys.stderr)
+        return 1
+    try:
+        running, notes = _running_for_export(home)
+    except KeyboardInterrupt:
+        print("\nNothing exported.", file=sys.stderr)
+        return 130
+    for note in notes:
+        print(f"warning: {note}", file=sys.stderr)
+    try:
+        report = transfer.export_home(home, args.folder, include=args.include, sessions=args.session,
+                                      running=running, dry_run=args.dry_run)
+    except transfer.TransferError as exc:  # (SecretFound too: it names the places, never the values)
+        print(str(exc), file=sys.stderr)
+        return 2 if exc.usage else 1
+    except KeyboardInterrupt:  # export_home removed what it had written
+        print("\nNothing exported.", file=sys.stderr)
+        return 130
+    print(transfer.render_export_report(report))
+    return 0 if report.ok else 1
+
+
+def _import_target(home: Path) -> str | None:
+    """"home" for a DreamTeam home, "new" for a missing or empty folder (the import makes it a home), None for
+    anything else (a file, a folder with other files, a project of `dreamteam run`)."""
+    if is_home(home):
+        return "home"
+    if not os.path.lexists(home):
+        return "new"
+    try:
+        with os.scandir(home) as entries:
+            return None if any(True for _ in entries) else "new"
+    except OSError:  # a file, or not readable
+        return None
+
+
+def _import_blockers(home: Path, *, clean: bool = True) -> list[str]:
+    """What may run sessions of `home` right now: a hub that answers, else other live DreamTeam processes
+    (_session_holders)."""
+    base = _hub_answering(home)
+    if base:
+        return [f"the DreamTeam hub {base}/"]
+    return _session_holders(home, clean=clean)
+
+
+def _plan_import(home: Path, target: str, args):
+    """(manager, plan, text) for importing args.folder into `home`: `text` is the plan as printed. A new home is
+    planned against an empty home in a temporary folder, so that neither a dry run nor a "no" creates anything;
+    manager is None then, and the plan is only for showing (its paths name the temporary home)."""
+    from . import transfer
+    from .sessions import SessionManager
+
+    if target == "home":
+        manager = SessionManager(home)
+        plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session)
+        return manager, plan, transfer.render_import_plan(plan)
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix="dreamteam-import-", ignore_cleanup_errors=True) as scratch:
+        manager = SessionManager(Path(scratch) / home.name)
+        plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session)
+        text = transfer.render_import_plan(plan).replace(str(manager.home), str(home))
+    return None, plan, (f"{text}\nThe import creates the DreamTeam home {home}." if plan.changes else text)
+
+
+def _apply_import(manager, plan, home: Path, new_home: bool = False):
+    """Apply `plan` in this process with the import's own launcher marker, re-checking before each session swap
+    that no hub or launcher took the home meanwhile (`new_home`: the import just made it). (result or None,
+    interrupted): `interrupted` when a second Ctrl+C broke off the import itself (the first one lets it finish or
+    undo the item it is on)."""
+    from . import transfer
+
+    def before_swap(sid: str) -> None:
+        blockers = _import_blockers(home)
+        if blockers:
+            raise transfer.HomeTaken(f"another DreamTeam process started meanwhile ({'; '.join(blockers)}): "
+                                     "stop it and import again")
+
+    done: dict = {}
+
+    async def run() -> None:
+        try:
+            done["result"] = await transfer.apply_import(manager, plan, before_swap=before_swap, new_home=new_home)
+        finally:
+            try:
+                await manager.shutdown()
+            except (Exception, asyncio.CancelledError):  # (the result is what counts; the log has the rest)
+                log.exception("closing the sessions after the import failed")
+
+    marker = write_launcher_marker(home)
+    try:
+        asyncio.run(run())
+        interrupted = False
+    except KeyboardInterrupt:
+        interrupted = True
+    finally:
+        remove_launcher_marker(marker)
+    return done.get("result"), interrupted
+
+
+def cmd_import(args) -> int:
+    """`dreamteam import FOLDER`: bring an export (dreamteam export) into a home: add what is new, rewrite what
+    changed (a rewritten session keeps its last previous copy as a backup), never delete what the export does not
+    carry. Prints the plan and asks
+    (or needs --yes); refused while DreamTeam runs this home, except --dry-run. Exit codes: 0 everything done or
+    unchanged, 1 something skipped, refused or failed, 2 a usage error, 130 Ctrl+C."""
+    from . import transfer
+    from .sessions import SessionManager
+
+    try:
+        transfer.parse_include(args.include)
+    except transfer.TransferError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    home = _home_arg(args)
+    target = _import_target(home)
+    if target is None:
+        print(f"Nothing imported: {home} is not a DreamTeam home (there is no sessions/ folder next to {CONFIG_FILE}) "
+              "and not an empty folder. Pass a home, or a new folder for one, with --home.", file=sys.stderr)
+        return 1
+
+    def refused(blockers: list[str]) -> int:
+        print(f"Nothing imported: another DreamTeam process may be running the sessions of {home} ("
+              + "; ".join(blockers) + "). Stop it, then import again (--dry-run shows the plan meanwhile).",
+              file=sys.stderr)
+        return 1
+
+    try:   # a mistyped --session is a usage error, whatever runs the home
+        transfer.check_session_names(args.folder, args.session)
+    except transfer.TransferError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2 if exc.usage else 1
+    try:
+        blockers = _import_blockers(home, clean=not args.dry_run) if target == "home" else []
+    except KeyboardInterrupt:
+        print("\nNothing imported.", file=sys.stderr)
+        return 130
+    if blockers and not args.dry_run:
+        return refused(blockers)
+    if blockers:
+        print(f"warning: DreamTeam runs {home} now ({'; '.join(blockers)}): the import itself is refused until it "
+              "stops.", file=sys.stderr)
+    try:
+        manager, plan, text = _plan_import(home, target, args)
+    except transfer.TransferError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2 if exc.usage else 1
+    except (OSError, ValueError) as exc:  # unreadable or invalid settings of the home
+        print(f"Nothing imported: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\nNothing imported.", file=sys.stderr)
+        return 130
+    print(text)
+    if args.dry_run or not plan.changes:
+        return plan.exit_code
+    if not args.yes:
+        if not _stdin_is_terminal():
+            print("Nothing imported: pass --yes to import without a confirmation.", file=sys.stderr)
+            return 1
+        try:
+            answer = input("Import? [y/N] ")
+        except EOFError:
+            answer = ""
+        except KeyboardInterrupt:
+            print("\nNothing imported.")
+            return 130
+        if answer.strip().lower() not in YES_WORDS:
+            print("Nothing imported.")
+            return 0
+    # a hub or a launcher may have started meanwhile (while the user answered)
+    try:
+        blockers = _import_blockers(home) if is_home(home) else []
+    except KeyboardInterrupt:
+        print("\nNothing imported.", file=sys.stderr)
+        return 130
+    if blockers:
+        return refused(blockers)
+    new_home = manager is None
+    if manager is None:  # a new home: create it, then plan against it (the same plan, with its real paths)
+        try:
+            _load_home(home)
+            manager = SessionManager(home)
+            plan = transfer.plan_import(manager, args.folder, include=args.include, sessions=args.session)
+        except transfer.TransferError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2 if exc.usage else 1
+        except (OSError, ValueError) as exc:
+            print(f"Nothing imported: cannot make {home} a DreamTeam home: {exc}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\nNothing imported.", file=sys.stderr)
+            return 130
+    setup_logging(home)
+    result, broken_off = _apply_import(manager, plan, home, new_home)
+    if result is None:  # (a second Ctrl+C)
+        print("Import interrupted (Ctrl+C). What was imported so far stays; run the import again (--dry-run shows "
+              "what is left).", file=sys.stderr)
+        return 130
+    print(transfer.render_import_result(result))
+    return 130 if broken_off else result.exit_code
+
+
 async def _mcp_launcher_in_process(home: Path, config: Config, web: bool, stop: asyncio.Event | None = None) -> None:
     """Stdio launcher MCP with the sessions in this process (plus the web UI when its port is free).
     Nothing may write to stdout here: it carries the MCP protocol."""
@@ -1342,6 +1649,28 @@ TUI_FLAGS = frozenset({"-p", "--print", "-c", "--continue", "-r", "--resume", "-
 SERVE_FLAGS = frozenset({"--no-console", "--no-browser", "--goal"})
 
 
+def _edit_distance(a: str, b: str) -> int:
+    """The optimal-string-alignment distance of two words: insertions, deletions, substitutions and swaps of two
+    neighbouring letters count 1 each."""
+    rows = [list(range(len(b) + 1))]
+    for i in range(1, len(a) + 1):
+        row = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            row[j] = min(rows[-1][j] + 1, row[j - 1] + 1, rows[-1][j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                row[j] = min(row[j], rows[-2][j - 2] + 1)
+        rows.append(row)
+    return rows[-1][-1]
+
+
+def _mistyped(word: str, command: str) -> bool:
+    """`word` is `command` with one letter wrong, missing, added or two neighbours swapped; a word of three letters
+    only with two swapped (`rnu`), since many short words are one letter from `run` or `mcp` (`fun`, `map`)."""
+    if _edit_distance(word, command) > 1:
+        return False
+    return len(word) >= 4 or sorted(word) == sorted(command)
+
+
 def _default_command(argv: list[str], commands: list[str]) -> list[str]:
     """Like `claude`: `dreamteam` alone or with TUI options opens the TUI in a terminal, `dreamteam "текст"`
     opens it with that first message; headless (no terminal, or serve-only options) it serves the launcher."""
@@ -1351,9 +1680,8 @@ def _default_command(argv: list[str], commands: list[str]) -> list[str]:
     if first in commands or first in ("-h", "--help", "--version"):
         return argv
     if not first.startswith("-"):
-        import difflib
-
-        if " " not in first.strip() and difflib.get_close_matches(first, commands, n=1, cutoff=0.75):
+        word = first.strip().lower()
+        if " " not in word and len(word) >= 3 and any(_mistyped(word, c) for c in commands):
             return argv  # a mistyped command (`dreamteam sesions`): argparse explains it, no session is created
         return ["tui", *argv]
     flags = {arg.split("=", 1)[0] for arg in argv if arg.startswith("-")}
@@ -1463,6 +1791,40 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=20)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_traces, dir=None)
+
+    include_help = ("what to {0}: a comma list of settings (with the model profiles and roles), skills, mcp (the MCP "
+                    "library and [mcp.external]), sessions; repeatable (default: everything{1})")
+    s = sub.add_parser("export", help="write the settings, skills, MCP servers and sessions (history and workspace "
+                                      "files) of a home into a folder, to move them to another computer; API keys "
+                                      "and MCP env values stay on this one",
+                       usage="dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] "
+                             "[--home HOME]")
+    s.add_argument("folder", metavar="FOLDER",
+                   help="a new or empty folder (e.g. on a USB stick); a folder with an earlier export is replaced")
+    s.add_argument("--include", action="append", metavar="CATEGORIES", help=include_help.format("export", ""))
+    s.add_argument("--session", action="append", metavar="ID",
+                   help="export only these sessions (repeatable; implies sessions; the other categories follow "
+                        "--include)")
+    s.add_argument("--dry-run", action="store_true", help="show what would be written and its size; write nothing")
+    s.add_argument("--home", help="home directory (default: $DREAMTEAM_HOME or ~/DreamTeam)")
+    s.set_defaults(func=cmd_export, dir=None)
+
+    s = sub.add_parser("import", help="bring a folder written by `dreamteam export` into a home: adds what is new, "
+                                      "rewrites what changed (the last copy of a rewritten session is kept), never "
+                                      "deletes what the export does not carry",
+                       usage="dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] "
+                             "[--yes] [--home HOME]")
+    s.add_argument("folder", metavar="FOLDER", help="the folder `dreamteam export` wrote")
+    s.add_argument("--include", action="append", metavar="CATEGORIES",
+                   help=include_help.format("import", " the export holds"))
+    s.add_argument("--session", action="append", metavar="ID|UID",
+                   help="import only these sessions of the export (repeatable; implies sessions; the other "
+                        "categories follow --include)")
+    s.add_argument("--dry-run", action="store_true", help="show the plan only; change nothing")
+    s.add_argument("-y", "--yes", action="store_true", help="import without asking")
+    s.add_argument("--home", help="home directory to import into (default: $DREAMTEAM_HOME or ~/DreamTeam; a new "
+                                  "or empty folder becomes a home)")
+    s.set_defaults(func=cmd_import, dir=None)
 
     s = sub.add_parser("init", help="create a swarm project (dreamteam.toml + workspace)")
     s.add_argument("dir", nargs="?", default=".")

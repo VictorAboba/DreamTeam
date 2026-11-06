@@ -434,7 +434,8 @@ class Config:
 
     @property
     def library_dir(self) -> Path:
-        return Path(os.path.expanduser(self.mcp.library_dir))
+        """The shared MCP library; DREAMTEAM_MCP_LIBRARY_DIR wins (tests, a library kept elsewhere)."""
+        return Path(os.environ.get("DREAMTEAM_MCP_LIBRARY_DIR") or os.path.expanduser(self.mcp.library_dir))
 
     @property
     def skills_library_dir(self) -> Path:

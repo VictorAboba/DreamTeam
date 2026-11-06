@@ -65,6 +65,7 @@ output_price = 0
 
 [mcp]
 require_approval = false
+library_dir = "~/.dreamteam/library"  # общая библиотека MCP-серверов (DREAMTEAM_MCP_LIBRARY_DIR имеет приоритет)
 [mcp.external.fetch]     # внешние MCP-серверы для роя
 command = ["uvx", "mcp-server-fetch"]
 description = "Загрузка веб-страниц"
@@ -98,3 +99,17 @@ resume_sessions = true   # возобновлять сессии, которые
 - командой `/team` в терминале.
 
 Агенты сверх списка становятся универсалами.
+
+## Общие папки и настройки этого компьютера
+
+Некоторые папки общие для всех сессий и лежат вне домашней папки, в `~/.dreamteam`: библиотека скиллов
+(`[skills] library_dir`, по умолчанию `~/.dreamteam/skills`), окружения зависимостей скиллов (`[skills] envs_dir`,
+`~/.dreamteam/skill-envs`) и библиотека MCP-серверов (`[mcp] library_dir`, `~/.dreamteam/library`). Переменные
+окружения `DREAMTEAM_SKILLS_DIR`, `DREAMTEAM_SKILL_ENVS_DIR` и `DREAMTEAM_MCP_LIBRARY_DIR` имеют приоритет над
+этими настройками: так песочница Docker задаёт свои папки скиллов, а тесты — все три. В консоль агентов эти
+переменные не попадают.
+
+[Импорт](transfer.md) (`dreamteam import`) никогда не меняет настройки, которые относятся к самому компьютеру, —
+ни в общих настройках, ни в настройках сессий: `server.host`, `server.port`, `shell.program`, `skills.library_dir`,
+`skills.envs_dir`, `skills.python` и `mcp.library_dir` сохраняют здешнее значение, а ключи API и значения `env`
+внешних MCP-серверов в экспорт вообще не попадают.

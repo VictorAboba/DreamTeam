@@ -19,6 +19,7 @@
 
 - [Конфигурация](configuration.md): `dreamteam.toml`, модели, роли и стартовая команда
 - [Песочница Docker и сессии без интернета](sandbox.md)
+- [Перенос на другой компьютер и резервные копии](transfer.md): `dreamteam export` и `dreamteam import`
 - [Безопасность](security.md) и [самоаудит безопасности, ноябрь 2026](audits/2026-11-self-audit.md)
 
 Как это работает внутри:
