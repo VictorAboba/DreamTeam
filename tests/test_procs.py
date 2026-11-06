@@ -38,7 +38,9 @@ CHILD = ("import os, pathlib, sys, time\n"
 QUICK = "cmd" if WINDOWS else "sh"  # the fastest shell to start
 
 
-def pid_alive(pid: int) -> bool:
+def pid_alive(pid: int, since: float | None = None) -> bool:
+    """`since`: when the child wrote its pid. Windows gives a freed pid to a new process after a few hundred process
+    and thread starts (a second or two in a parallel run): a process created after `since` is not that child."""
     if WINDOWS:
         import ctypes
 
@@ -49,7 +51,12 @@ def pid_alive(pid: int) -> bool:
         try:
             code = ctypes.c_ulong()
             kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
-            return code.value == 259  # STILL_ACTIVE
+            if code.value != 259:  # STILL_ACTIVE
+                return False
+            times = [ctypes.c_uint64() for _ in range(4)]
+            if since is None or not kernel32.GetProcessTimes(handle, *map(ctypes.byref, times)):
+                return True
+            return times[0].value / 1e7 - 11644473600 <= since  # FILETIME: 100 ns units since 1601
         finally:
             kernel32.CloseHandle(handle)
     try:
@@ -109,7 +116,8 @@ class Children:
         return [int(p.read_text()) for p in self.files if p.exists() and p.read_text().strip()]
 
     def check(self) -> list[int]:
-        left = [pid for pid in self.pids() if not wait_until(lambda pid=pid: not pid_alive(pid), 5)]
+        written = [(int(p.read_text()), p.stat().st_mtime) for p in self.files if p.exists() and p.read_text().strip()]
+        left = [pid for pid, since in written if not wait_until(lambda p=pid, t=since: not pid_alive(p, t), 5)]
         for pid in left:
             kill_pid(pid)
         return left

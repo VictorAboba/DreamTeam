@@ -1041,6 +1041,9 @@ async def test_wait_for_events_stamps_a_batch_that_spans_time(swarm):
     text stays as it was (its history must not grow)."""
     from dreamteam.tools.fmt import item_time, stamp_range
 
+    def headers(first: float, *nows: float) -> set[str]:
+        return {prompts.t("en", "incoming_header", time=stamp_range(first, t)) for t in nows}
+
     a, b = llm_members(swarm)
     ext = await join(swarm)
     assert (await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})).startswith("No new events")
@@ -1053,10 +1056,11 @@ async def test_wait_for_events_stamps_a_batch_that_spans_time(swarm):
     swarm.notify(a, "n_restart")
     swarm.db.execute("UPDATE notifications SET ts = ? WHERE kind = 'n_restart'", (half_hour,))
     swarm.mail.send(a, [ext], "hello")
+    before = time.time()
     text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
     lines = text.splitlines()
-    header = prompts.t("en", "incoming_header", time=stamp_range(two_hours, time.time()))
-    assert lines[0] == header and "–" in lines[0]
+    # the header ends at the hub's own clock, read between these two reads: either minute when one turns over
+    assert lines[0] in headers(two_hours, before, time.time()) and "–" in lines[0]
     assert lines[1] == "What happened:"
     assert lines[2] == f"• {item_time(half_hour, now)} " + prompts.t("en", "n_restart")
     assert re.fullmatch(rf"• \d\d:\d\d Message #\d+ from {a} to you:", lines[3]) and lines[4] == "hello"
@@ -1069,8 +1073,9 @@ async def test_wait_for_events_stamps_a_batch_that_spans_time(swarm):
     await ok(swarm, USER, "task_create", {"title": "Old", "goal": "g"})
     swarm.db.execute("UPDATE events SET ts = ? WHERE id = (SELECT MAX(id) FROM events WHERE type = 'task.created')",
                      (two_hours,))
+    before = time.time()
     text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
-    assert text.splitlines()[0] == prompts.t("en", "incoming_header", time=stamp_range(two_hours, time.time()))
+    assert text.splitlines()[0] in headers(two_hours, before, time.time())
     # the agents' own wake-up keeps one stamp and no item times
     wake = swarm.render_wake(a, incoming=True)
     assert "–" not in wake.splitlines()[0] and "\n• " + prompts.t("en", "n_restart") in wake

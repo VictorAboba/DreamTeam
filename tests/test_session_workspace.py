@@ -1004,7 +1004,9 @@ async def test_a_create_that_fails_in_its_folder_says_what_is_left_there(tmp_pat
         await manager.create("Broken", workspace=str(target))
     text = str(err.value)
     assert "the session was not created" in text and str(target.resolve() / ".git") in text and "by hand" in text
-    assert MOVE_JOURNAL not in text and "sessions" not in text, text  # no advice about a session that is gone
+    # no advice about a session that is gone (the folder's own path may contain "sessions")
+    rest = text.replace(str(target.resolve()), "").replace(str(target), "")
+    assert MOVE_JOURNAL not in text and "sessions" not in rest, text
     assert manager.ids() == []
     monkeypatch.setattr(sessions_mod, "_remove", real_remove)
     monkeypatch.setattr(sessions_mod, "init_repo", lambda root, git=None, adopted=False, offline=False: "fatal: no")
@@ -1062,7 +1064,8 @@ async def test_an_adopted_folder_is_checked_again_at_every_start(tmp_path):
         with pytest.raises(SessionError) as err:
             await manager.start(sid)
         assert err.value.status == 409 and "uncommitted" in str(err.value) and "README.md" in str(err.value)
-        assert "mcp" not in str(err.value) and sid not in manager.running
+        # only README.md is listed, not mcp/tool (the message also holds the tmp path, which may contain "mcp")
+        assert "(1:  M README.md)" in str(err.value) and sid not in manager.running
         git(project, "checkout", "--", "README.md")
         git(project, "checkout", "-q", "--detach")
         with pytest.raises(SessionError) as err:
