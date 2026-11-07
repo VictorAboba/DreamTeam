@@ -1,0 +1,25 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Ask anything about installing, setting up or running DreamTeam. English or Russian — both are fine.
+        Found a bug? Open an [issue](https://github.com/VictorAboba/DreamTeam/issues/new/choose) instead.
+        A security problem? Report it privately, see [SECURITY.md](https://github.com/VictorAboba/DreamTeam/blob/master/SECURITY.md).
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to do, and where are you stuck?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+      description: Commands, settings, the part of an agent trace that matters. Check it for keys and tokens before posting.
+  - type: input
+    id: setup
+    attributes:
+      label: Setup
+      description: OS, Python version, model provider (Anthropic, OpenAI, Ollama, …), interface (TUI, web board, MCP client).
+      placeholder: Windows 11, Python 3.13, Anthropic, web board

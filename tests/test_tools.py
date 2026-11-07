@@ -1041,6 +1041,9 @@ async def test_wait_for_events_stamps_a_batch_that_spans_time(swarm):
     text stays as it was (its history must not grow)."""
     from dreamteam.tools.fmt import item_time, stamp_range
 
+    def headers(first: float, *nows: float) -> set[str]:
+        return {prompts.t("en", "incoming_header", time=stamp_range(first, t)) for t in nows}
+
     a, b = llm_members(swarm)
     ext = await join(swarm)
     assert (await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})).startswith("No new events")
@@ -1053,10 +1056,11 @@ async def test_wait_for_events_stamps_a_batch_that_spans_time(swarm):
     swarm.notify(a, "n_restart")
     swarm.db.execute("UPDATE notifications SET ts = ? WHERE kind = 'n_restart'", (half_hour,))
     swarm.mail.send(a, [ext], "hello")
+    before = time.time()
     text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
     lines = text.splitlines()
-    header = prompts.t("en", "incoming_header", time=stamp_range(two_hours, time.time()))
-    assert lines[0] == header and "–" in lines[0]
+    # the header ends at the hub's own clock, read between these two reads: either minute when one turns over
+    assert lines[0] in headers(two_hours, before, time.time()) and "–" in lines[0]
     assert lines[1] == "What happened:"
     assert lines[2] == f"• {item_time(half_hour, now)} " + prompts.t("en", "n_restart")
     assert re.fullmatch(rf"• \d\d:\d\d Message #\d+ from {a} to you:", lines[3]) and lines[4] == "hello"
@@ -1069,8 +1073,9 @@ async def test_wait_for_events_stamps_a_batch_that_spans_time(swarm):
     await ok(swarm, USER, "task_create", {"title": "Old", "goal": "g"})
     swarm.db.execute("UPDATE events SET ts = ? WHERE id = (SELECT MAX(id) FROM events WHERE type = 'task.created')",
                      (two_hours,))
+    before = time.time()
     text = await ok(swarm, ext, "wait_for_events", {"timeout": 0, "progress": True})
-    assert text.splitlines()[0] == prompts.t("en", "incoming_header", time=stamp_range(two_hours, time.time()))
+    assert text.splitlines()[0] in headers(two_hours, before, time.time())
     # the agents' own wake-up keeps one stamp and no item times
     wake = swarm.render_wake(a, incoming=True)
     assert "–" not in wake.splitlines()[0] and "\n• " + prompts.t("en", "n_restart") in wake
@@ -1104,6 +1109,11 @@ async def test_swarm_status_brief(swarm):
     assert "Summary: all done" in await ok(swarm, USER, "swarm_status")
 
 
+# the wake-up drop hint ("my_blocked") after its placeholders: "is blocked by" alone also matches a random member
+# name ending in "is" before Task.short()'s "blocked by #1" ("review:Leo Morris blocked by #1")
+DROP_HINT = prompts.TEXTS["en"]["my_blocked"].split("{blockers}", 1)[1]
+
+
 async def test_a_blocked_task_teaches_its_assignee_to_drop_dependencies(swarm):
     """The wake-up text and task_get tell the assignee of a blocked task that it may remove what it can do without
     (Board._plan_deps); task_update then tells it to say why, and the creator learns it at its next wake-up."""
@@ -1112,8 +1122,8 @@ async def test_a_blocked_task_teaches_its_assignee_to_drop_dependencies(swarm):
     opt = swarm.board.create(USER, "optional", goal="g")
     t = swarm.board.create(b, "report", goal="g", depends_on=[dep.id, opt.id], assignee=a)
     hint = prompts.t("en", "my_blocked", id=t.id, blockers=f"#{dep.id}, #{opt.id}")
-    assert hint in swarm.render_wake(a).splitlines()
-    assert "is blocked by" not in swarm.render_wake(b)
+    assert hint in swarm.render_wake(a).splitlines() and hint.endswith(DROP_HINT)
+    assert DROP_HINT not in swarm.render_wake(b)
     assert "You hold it while it is blocked" in await ok(swarm, a, "task_get", {"task_id": t.id})
     assert "You hold it" not in await ok(swarm, b, "task_get", {"task_id": t.id})
     text = await ok(swarm, a, "task_update", {"task_id": t.id, "depends_on": [dep.id]})
@@ -1125,7 +1135,7 @@ async def test_a_blocked_task_teaches_its_assignee_to_drop_dependencies(swarm):
     text = await ok(swarm, a, "task_update", {"task_id": t.id, "depends_on": [], "comment": "the summary needs none"})
     assert f"removed #{dep.id}" in text and "Say there why" not in text
     assert swarm.has_pending(b)  # n_discussion of the comment (n_deps_removed is quiet)
-    assert "is blocked by" not in swarm.render_wake(a)
+    assert DROP_HINT not in swarm.render_wake(a)
 
 
 async def test_a_blocked_task_in_review_gets_no_drop_hint(swarm):
@@ -1136,7 +1146,7 @@ async def test_a_blocked_task_in_review_gets_no_drop_hint(swarm):
     t = swarm.board.create(b, "report", goal="g", depends_on=[dep.id], assignee=a)
     await ok(swarm, a, "task_complete", {"task_id": t.id, "result": "written"})
     assert swarm.board.get(t.id).status == Status.REVIEW and swarm.board.get(t.id).blocked_by == [dep.id]
-    assert "is blocked by" not in swarm.render_wake(a)
+    assert DROP_HINT not in swarm.render_wake(a)
     assert "You hold it" not in await ok(swarm, a, "task_get", {"task_id": t.id})
 
 

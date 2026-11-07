@@ -1,5 +1,11 @@
 blank_issues_enabled: true
 contact_links:
+  - name: Ask a question
+    url: https://github.com/VictorAboba/DreamTeam/discussions/categories/q-a
+    about: Questions about installing, setting up or using DreamTeam go to Discussions.
+  - name: Discuss an idea
+    url: https://github.com/VictorAboba/DreamTeam/discussions/categories/ideas
+    about: Ideas that are still taking shape; a concrete, agreed feature becomes an issue.
   - name: Report a security vulnerability
     url: https://github.com/VictorAboba/DreamTeam/security/advisories/new
     about: Please report vulnerabilities privately, not in a public issue.

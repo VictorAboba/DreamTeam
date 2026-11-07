@@ -1,0 +1,23 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Share what you did with DreamTeam: a project the swarm built, an experiment, a skill, an MCP server, a setup that works well.
+        Failed runs are interesting too. English or Russian — both are fine.
+  - type: textarea
+    id: what
+    attributes:
+      label: What you did
+      description: The goal, what came out of it, and links (a repository, an article, screenshots).
+    validations:
+      required: true
+  - type: textarea
+    id: swarm
+    attributes:
+      label: The swarm
+      description: Models, how many agents and roles, time and cost — whatever you can share.
+  - type: textarea
+    id: lessons
+    attributes:
+      label: What worked and what didn't
+      description: Anything the next person, or DreamTeam itself, could do better.

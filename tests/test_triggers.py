@@ -528,7 +528,9 @@ async def test_evaluate_pass_probes_files_off_the_event_loop(engine, swarm, monk
 
 def test_time_functions(engine, clock):
     past = datetime.fromtimestamp(clock.now - 3600).strftime("%Y-%m-%d %H:%M")
-    future = datetime.fromtimestamp(clock.now + 3600).strftime("%Y-%m-%dT%H:%M:%S")
+    # three hours: more than any clock change (two hours at most), so the hour that repeats when clocks go back
+    # cannot make it read back as now
+    future = datetime.fromtimestamp(clock.now + 3 * 3600).strftime("%Y-%m-%dT%H:%M:%S")
     assert ev(engine, f"after({past!r})") is True
     assert ev(engine, f"after({future!r})") is False
     utc_past = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
