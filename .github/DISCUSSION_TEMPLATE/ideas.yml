@@ -1,0 +1,23 @@
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A place for ideas that are still taking shape: let's talk them through first. English or Russian — both are fine.
+        Once an idea is concrete and agreed on, it becomes an issue that someone can take.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What you want to do
+      description: The task or workflow, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Idea
+      description: How it could work. Rough sketches are welcome.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds and alternatives
+      description: What you do now, or how other tools solve it.

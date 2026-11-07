@@ -3,6 +3,13 @@
 Thanks for your interest! Bug reports, ideas, docs fixes and code are all welcome.
 Issues and pull requests can be written in English or Russian.
 
+## Questions and ideas
+
+[Discussions](https://github.com/VictorAboba/DreamTeam/discussions) are for everything that isn't a bug or a
+concrete task: questions in **Q&A**, ideas that are still taking shape in **Ideas**, what you built with the swarm
+in **Show and tell**, everything else in **General**. An idea that the discussion turns into an agreed feature
+becomes an issue.
+
 ## Reporting a bug
 
 Open an issue with the **Bug report** template. The most useful reports include:

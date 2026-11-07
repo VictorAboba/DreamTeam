@@ -162,7 +162,8 @@ Strands Swarm, Letta, Alita, A2A and blackboard architectures — [details](docs
 ## Contributing
 
 Issues and pull requests are welcome, in English or Russian. Start with [CONTRIBUTING.md](CONTRIBUTING.md);
-tests run with a scripted LLM and need no API keys.
+tests run with a scripted LLM and need no API keys. Questions, ideas and what you built with DreamTeam go to
+[Discussions](https://github.com/VictorAboba/DreamTeam/discussions).
 
 ## License
 

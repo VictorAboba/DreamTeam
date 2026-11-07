@@ -171,7 +171,8 @@ Letta, Alita, A2A и blackboard-архитектур — [подробнее](do
 ## Участие в разработке
 
 Issues и pull requests приветствуются, на русском или английском. Начните с [CONTRIBUTING.md](CONTRIBUTING.md);
-тесты используют скриптового LLM и не требуют ключей API.
+тесты используют скриптового LLM и не требуют ключей API. Вопросы, идеи и то, что вы сделали с DreamTeam, —
+в [Discussions](https://github.com/VictorAboba/DreamTeam/discussions).
 
 ## Лицензия
 
