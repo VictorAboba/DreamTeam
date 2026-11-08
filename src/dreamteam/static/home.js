@@ -707,8 +707,18 @@ function networkHint(isolation) {
   return t(["docker", "netns", "env", "container"].includes(isolation) ? `net_hint_${isolation}` : "net_hint_unknown");
 }
 
+/** The card's clock: the last activity (the session's last event), named in the tooltip with the creation date; a
+ *  session with no event yet shows when it was created. */
+function cardTime(s) {
+  const created = `${t("created")}: ${ago(s.created_at)}`;
+  return s.last_activity
+    ? { text: ago(s.last_activity), title: `${t("last_activity")}: ${ago(s.last_activity)} · ${created}` }
+    : { text: ago(s.created_at), title: created };
+}
+
 function sessionCard(s) {
   const state = sessionState(s);
+  const time = cardTime(s);
   const tasks = s.tasks || { total: 0, done: 0 };
   const agents = s.agents || { total: 0, working: 0 };
   const pct = tasks.total ? Math.round(100 * tasks.done / tasks.total) : 0;
@@ -739,7 +749,7 @@ function sessionCard(s) {
       <span><i class="ic ic-users"></i><b>${Number(agents.total) || 0}</b> ${esc(t("agents_n"))}${agents.working ? ` · <b>${Number(agents.working) || 0}</b> ${esc(t("working_n"))}` : ""}</span>
       <span><i class="ic ic-coin"></i><b>${esc(budget)}</b></span>
       ${s.model ? `<span title="${esc(t("model"))}: ${esc(s.model_profile)}"><i class="ic ic-cpu"></i>${esc(s.model)}</span>` : ""}
-      <span title="${esc(t("created"))}: ${esc(ago(s.created_at))}"><i class="ic ic-clock"></i>${esc(ago(s.last_activity || s.created_at))}</span>
+      <span title="${esc(time.title)}"><i class="ic ic-clock"></i>${esc(time.text)}</span>
       ${skills.count}
     </div>
     ${workspaceLine(s.workspace)}

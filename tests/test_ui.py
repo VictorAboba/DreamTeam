@@ -1360,6 +1360,28 @@ def test_traces_pane_is_wired_once_and_ignores_stale_responses():
 
 
 @needs_node
+def test_home_card_names_the_time_it_shows():
+    out = run_js(r"""
+      const home = loadHomeJs();
+      const now = Date.now() / 1000;
+      const old = now - 5 * 86400;
+      for (const lang of ["ru", "en"]) {
+        home.H.lang = lang;
+        const base = { id: "s", title: "S", status: "stopped", created_at: old };
+        out[lang] = { active: home.sessionCard(Object.assign({ last_activity: now - 5 }, base)),
+                      fresh: home.sessionCard(base), date: home.ago(old) };
+      }
+    """)
+    ru, en = out["ru"], out["en"]
+    assert f'<span title="Активность: только что · Создана: {ru["date"]}"><i class="ic ic-clock"></i>только что</span>' \
+        in ru["active"]
+    assert f'<span title="Activity: just now · Created: {en["date"]}"><i class="ic ic-clock"></i>just now</span>' \
+        in en["active"]
+    assert f'<span title="Создана: {ru["date"]}"><i class="ic ic-clock"></i>{ru["date"]}</span>' in ru["fresh"]
+    assert f'<span title="Created: {en["date"]}"><i class="ic ic-clock"></i>{en["date"]}</span>' in en["fresh"]
+
+
+@needs_node
 def test_home_cards_and_dialogs_escape_session_data():
     out = run_js(r"""
       const E = process.env.EVIL;
