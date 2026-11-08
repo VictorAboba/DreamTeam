@@ -663,10 +663,11 @@ def _ev_message(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 
 # the goal panel / hire line / the question's pause line (with the spinner and the input box's title) say it
 _QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined", "u_question"})
-# the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user
+# the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user, a model
+# profile whose calls count as $0
 _WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
                          "u_review_handed_over", "u_reviews_waiting", "u_skill_proposed", "u_skill_deps_failed",
-                         "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left"})
+                         "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left", "u_cost_unknown"})
 
 
 def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -855,6 +856,9 @@ def _ev_trigger(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     key = {"trigger.created": "trigger_created", "trigger.fired": "trigger_fired"}.get(ev.get("type"),
                                                                                       "trigger_deleted")
     body = Text(ctx.t(key, id=tid, condition=ctx.short(trigger.get("condition"), 160)), style="dim")
+    if key == "trigger_fired" and _float(trigger.get("held")) > 0 and trigger.get("wake_at"):
+        # the owner's notice waits for the wake limit ([agents] trigger_wake_seconds)
+        body.append(f" ({ctx.t('trigger_held', time=_clock(trigger.get('wake_at')))})", style="dim")
     if ev.get("actor"):
         body.append(f" {ctx.sym['dot']} {_who(ctx, ev.get('actor'), short=True)}", style="dim")
     return _line(ctx, ctx.sym["trigger"], "dim", body)
@@ -1651,9 +1655,34 @@ def cost_table(ctx: RenderContext, state: dict) -> RenderableType:
     return _out(ctx, Group(table, note))
 
 
+def missing_prices(profile: dict) -> list[str]:
+    """The price fields whose tokens a profile of the public settings view counts as $0 (its price_source "none" or
+    "partial"); [] otherwise, for the scripted provider and for an older hub without price_source."""
+    profile = _d(profile)
+    if profile.get("price_source") not in ("none", "partial") or profile.get("provider") == "scripted":
+        return []
+    return [name for name in ("input_price", "output_price") if profile.get(name) is None]
+
+
+def _price_state(ctx: RenderContext, profile: dict) -> Text:
+    """The Prices cell: $in/$out of the profile, built-in, free, or (warn) what is missing; "" without price_source."""
+    source = profile.get("price_source")
+    missing = missing_prices(profile)
+    if missing:
+        key = "price_partial" if source == "partial" else "price_none"
+        return Text(ctx.t(key, fields=", ".join(missing)), style=theme.WARN)
+    if profile.get("provider") == "scripted":
+        return Text("")
+    if source == "profile":
+        return Text(f"${_float(profile.get('input_price')):g}/${_float(profile.get('output_price')):g}")
+    if source in ("table", "free"):
+        return Text(ctx.t("price_" + source), style="dim")
+    return Text("")
+
+
 def models_table(ctx: RenderContext, settings: dict) -> RenderableType:
     """Model profiles of a public settings view (GET /api/settings -> "settings"): ✓ default, model,
-    provider and key state (never the key itself)."""
+    provider, prices and key state (never the key itself)."""
     settings = _d(settings)
     models = _d(settings.get("models"))
     default = _d(settings.get("agents")).get("default_model") or "default"
@@ -1665,6 +1694,7 @@ def models_table(ctx: RenderContext, settings: dict) -> RenderableType:
     table.add_column(ctx.t("col_model"), overflow="fold")
     if ctx.width >= 80:
         table.add_column(ctx.t("col_provider"), overflow="fold", style="dim")
+    table.add_column(ctx.t("col_prices"), overflow="fold")
     table.add_column(ctx.t("col_key"), overflow="fold")
     for name, profile in models.items():
         profile = _d(profile)
@@ -1676,6 +1706,7 @@ def models_table(ctx: RenderContext, settings: dict) -> RenderableType:
             if profile.get("base_url"):
                 provider += f" {ctx.sym['dot']} {clean(profile.get('base_url'))}"
             row.append(Text(provider))
+        row.append(_price_state(ctx, profile))
         row.append(_key_state(ctx, profile))
         table.add_row(*row)
     return _out(ctx, table)
@@ -2454,6 +2485,11 @@ def info(ctx: RenderContext, text: str) -> RenderableType:
 def error(ctx: RenderContext, text: str) -> RenderableType:
     """Red `⚠ text`."""
     return _out(ctx, _line(ctx, ctx.sym["warn"], theme.ERROR, Text(clean(text), style=theme.ERROR)))
+
+
+def warning(ctx: RenderContext, text: str) -> RenderableType:
+    """`⚠ text` in the warning colour: something to fix that is not an error."""
+    return _out(ctx, _line(ctx, ctx.sym["warn"], theme.WARN, Text(clean(text), style=theme.WARN)))
 
 
 def bash_result(ctx: RenderContext, command: str, code: int | None, output: str) -> RenderableType:

@@ -35,6 +35,7 @@ HELP = {
   /wrapup [off]            — режим завершения: агенты завершают задачи с тем, что есть (off — выключить)
   /budget 10               — лимит бюджета в $;  /max 6 — максимум агентов
   /approve имя [sha256]|N [комментарий]  /reject имя|N [что исправить] — MCP-сервер или задача на ревью
+  /unlock путь             — снять блокировку участника с файла или папки (ждущих её разбудят)
   /trace [Имя | N]         — трейсы агентов: последние, агента или трейс N по шагам
   /span N [ctx]            — шаг трейса полностью (ctx — сообщения, которые видела модель)
   /session                 — текущая сессия (другая: dreamteam console --session ID)
@@ -58,6 +59,7 @@ HELP = {
   /wrapup [off]            — wrap-up mode: the agents finish their tasks with what they have (off: switch it off)
   /budget 10               — budget limit in $;  /max 6 — max agents
   /approve name [sha256]|N [comment]  /reject name|N [what to fix] — an MCP server or a task in review
+  /unlock path             — remove a member's lock on a file or folder (those waiting for it are woken)
   /trace [Name | N]        — agent traces: recent ones, an agent's, or trace N step by step
   /span N [ctx]            — one trace step in full (ctx — the messages the model saw)
   /session                 — the current session (another: dreamteam console --session ID)
@@ -588,6 +590,11 @@ class Console:
                 extra["digest"] = parts.pop(1)
             return hub.act("mcp_approve", name=parts[0], approve=cmd == "/approve", comment=" ".join(parts[1:]),
                            **extra)
+        if cmd == "/unlock":
+            # the user's file_unlock: any member's lock; a path with spaces may be quoted
+            if not unquote(arg):
+                return _color("err", "/unlock <path>" if self.lang == "en" else "/unlock <путь>")
+            return hub.act("file_unlock", path=unquote(arg))
         if cmd == "/trace":
             if arg.lstrip("#").isdigit():
                 return hub.act("agent_traces", trace_id=int(arg.lstrip("#")))

@@ -147,6 +147,49 @@ def test_member_and_task_suggestions():
     assert list(window(3, 2)) == [0, 1, 2]
 
 
+def test_unlock_suggests_the_locked_paths():
+    locks = [{"path": "docs/AUDIT.md", "owner": ANNA}, {"path": "src", "owner": BORIS}]
+    found = suggest("/unlock ", locks=locks)
+    assert [(s.kind, s.label, s.description) for s in found] == [("path", "docs/AUDIT.md", ANNA),
+                                                                  ("path", "src", BORIS)]
+    assert found[0].apply("/unlock ") == ("/unlock docs/AUDIT.md", len("/unlock docs/AUDIT.md"))
+    found = suggest("/unlock audit", locks=locks)                 # a part of the path, any case
+    assert [s.label for s in found] == ["docs/AUDIT.md"]
+    assert found[0].apply("/unlock audit")[0] == "/unlock docs/AUDIT.md"
+    assert suggest("/unlock nothing", locks=locks) == [] and suggest("/unlock ", locks=[]) == []
+    # the path typed in full comes first, then those starting with it, then the others (in the paths' order)
+    nested = [{"path": "docs/notes.md", "owner": ANNA}, {"path": "notes.md", "owner": BORIS},
+              {"path": "notes.md.bak", "owner": ANNA}]
+    found = suggest("/unlock NOTES.md", locks=nested)
+    assert [s.label for s in found] == ["notes.md", "notes.md.bak", "docs/notes.md"]
+    # the state the suggestions use is reloaded when a lock is taken or dropped
+    from dreamteam.tui.app import REFRESH_ON
+
+    assert "file.locked".startswith(REFRESH_ON) and "file.unlocked".startswith(REFRESH_ON)
+    assert not "file.changed".startswith(REFRESH_ON)
+
+
+def test_enter_after_unlock_sends_the_path_as_typed():
+    """Enter never swaps a typed path for another locked path that contains it; Tab or the arrows complete."""
+    from prompt_toolkit.buffer import Buffer
+
+    from dreamteam.tui.app import TUI
+
+    locks = [{"path": "docs/notes.md", "owner": ANNA}]
+    sent: list[str] = []
+    applied: list[str] = []
+    for text, selected in (("/unlock notes.md", 0), ("/unlock ", 0), ("/unlock notes.md", 1)):
+        buffer = Buffer()
+        buffer.text = text
+        stub = SimpleNamespace(suggestions=suggest(text, locks=locks * 2), selected=selected, buffer=buffer,
+                               input_mode=None, _submit=sent.append,
+                               _apply_suggestion=lambda s: applied.append(s.insert))
+        TUI._on_enter(stub)
+    assert sent == ["/unlock notes.md"] and applied == ["docs/notes.md", "docs/notes.md"]
+    assert [s.label for s in suggest("/unl", commands=[CommandInfo("unlock", "u", args="path", required=True)])] == \
+        ["/unlock path"]
+
+
 # ---- addressee ------------------------------------------------------------------------------------
 def test_mentions_and_addressee():
     members = members_of(STATE)
@@ -401,6 +444,18 @@ async def test_approve_and_reject_settle_tasks_or_mcp_servers():
     assert [c for c in app.calls if c[0] == "mcp"] == [("mcp", "calc", True, "", ""), ("mcp", "calc", False, "not safe", "")]
 
 
+async def test_unlock_removes_a_members_lock():
+    unlock = find("unlock")
+    assert unlock.usage("en") == "/unlock path" and unlock.usage("ru") == "/unlock путь"
+    assert unlock.session and unlock.required and not unlock.launcher
+    app = HubApp(attached=True)
+    await execute(app, "/unlock docs/AUDIT.md")
+    await execute(app, '/unlock "my docs/a b.md"')
+    await execute(app, "/unlock")
+    assert app.acts == [("file_unlock", {"path": "docs/AUDIT.md"}), ("file_unlock", {"path": "my docs/a b.md"})]
+    assert "file_unlock ok" in app.text and "Usage: /unlock path" in app.text
+
+
 async def test_approve_passes_a_typed_digest_of_an_mcp_server():
     app = HubApp(attached=True)
     await execute(app, "/approve calc 3f2a9c01d4e5")
@@ -521,6 +576,43 @@ async def test_roles_lists_the_catalog_and_one_role():
     swarm_hub = HubApp(mode="swarm")
     await execute(swarm_hub, "/roles")
     assert "No current session" in swarm_hub.text
+
+
+async def test_model_lists_prices_and_warns_about_an_unpriced_default():
+    """`/model NAME` on a profile whose tokens count as $0 (public view price_source "none" / "partial") adds a
+    warning line after setting it; a priced one, or an older hub without price_source, adds none."""
+    app = HubApp()
+    view = {"agents": {"default_model": "claude", "max_steps_per_turn": 40}, "models": {
+        "claude": {"provider": "anthropic", "model": "claude-opus-5-5", "price_source": "table"},
+        "remote": {"provider": "openai", "model": "some-model-v1", "input_price": None, "output_price": None,
+                   "price_source": "none"},
+        "half": {"provider": "openai", "model": "kimi", "input_price": 0.5, "output_price": None,
+                 "price_source": "partial"},
+        "old": {"provider": "openai", "model": "x", "input_price": None, "output_price": None}}}
+    updates: list[dict] = []
+
+    async def settings():
+        return {"settings": view}
+
+    async def update_settings(update):
+        updates.append(update)
+        return {}
+
+    app.client.settings, app.client.update_settings = settings, update_settings
+    await execute(app, "/model")
+    assert "Prices" in app.text and "no prices" in app.text and "no output_price" in app.text
+    for name in ("claude", "old"):
+        app.out.clear()
+        await execute(app, f"/model {name}")
+        assert app.out == [f"  ⎿  Default profile: {name} (new sessions and new hires)"], app.out
+    await execute(app, "/model remote")
+    assert " ".join(app.out[-1].split()) == (
+        '⚠ Profile "remote" has no input_price, output_price: those tokens count as $0 and the budget does not see '
+        "them (unless the provider reports the cost). Prices: /settings")
+    await execute(app, "/model half")
+    assert app.out[-1].startswith('⚠ Profile "half" has no output_price: ')
+    assert [u["agents"]["default_model"] for u in updates] == ["claude", "old", "remote", "half"]
+    assert updates[-1]["agents"]["max_steps_per_turn"] == 40
 
 
 async def test_team_sets_the_starting_team_of_new_sessions():

@@ -75,7 +75,8 @@ CD_TITLE_CELLS = 60          # a /cd question whose title is longer repeats the 
 # what is replayed after a reconnect (activity, usage and traces of the gap are skipped)
 CATCHUP_TYPES = ["message.*", "notification", "goal.*", "task.*", "agent.hired", "agent.retired", "swarm.*",
                  "mcp.*", "skill.*"]
-REFRESH_ON = ("goal.", "swarm.", "task.", "mcp.", "agent.hired", "agent.retired", "job.", "skill.")
+REFRESH_ON = ("goal.", "swarm.", "task.", "mcp.", "agent.hired", "agent.retired", "job.", "skill.",
+              "file.locked", "file.unlocked")   # the locks feed the /unlock suggestions
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -544,7 +545,8 @@ class TUI:
         self._dismissed = None
         found = suggest(text, self.buffer.cursor_position, commands=commands.infos(self.ctx.lang),
                         members=self.members, tasks=(self.state or {}).get("tasks") or [],
-                        everyone=self.t("everyone"), status=self._task_status)
+                        everyone=self.t("everyone"), status=self._task_status,
+                        locks=(self.state or {}).get("locks") or [])
         if not self.attached:
             found = [s for s in found if s.kind == "command"]
         self.suggestions = found
@@ -668,7 +670,11 @@ class TUI:
             if choice.kind == "command" and choice.runnable:
                 self._submit(choice.insert.strip())
                 return
-            if choice.kind == "command" or typed.strip().casefold() != choice.insert.strip().casefold():
+            # a path typed after /unlock is sent as typed (a force-unlock must not take another path that contains
+            # it); Tab or a suggestion picked with the arrows completes it
+            as_typed = choice.kind == "path" and bool(typed.strip()) and self.selected == 0
+            if not as_typed and (choice.kind == "command"
+                                 or typed.strip().casefold() != choice.insert.strip().casefold()):
                 self._apply_suggestion(choice)
                 return
             # "@Анна Смирнова" / "#12" typed in full: Enter sends

@@ -714,6 +714,18 @@ def test_verbose_only_lines():
         assert render.event(v, e) is not None, e["type"]
 
 
+def test_a_held_trigger_fire_says_when_it_wakes_the_owner():
+    """The verbose feed (docs/TUI.md): a fire whose notice waits for [agents] trigger_wake_seconds says until when."""
+    at = NOW + 120
+    hm = time.strftime("%H:%M", time.localtime(at))
+    held = ev("trigger.fired", ANNA, trigger={"id": 7, "condition": "every(60)", "held": 2, "wake_at": at}, errors=[])
+    assert f"сработал триггер #7: every(60) (пробуждение отложено до {hm}) · Анна" in plain(render.event(ctx("verbose"), held))
+    assert f"trigger #7 fired: every(60) (wake-up held until {hm})" in plain(render.event(ctx("verbose", "en"), held))
+    told = ev("trigger.fired", ANNA, trigger={"id": 7, "condition": "every(60)", "held": 0, "wake_at": None}, errors=[])
+    assert plain(render.event(ctx("verbose", "en"), told)).split("every(60)")[1].startswith(" ·")
+    assert render.event(ctx(), held) is None              # normal mode shows no trigger lines
+
+
 def test_quiet_shows_only_user_messages_goal_errors_approvals_and_pause():
     q = ctx("quiet")
     shown = {(e["type"], (e.get("data") or {}).get("kind")) for e in realistic_events()
@@ -934,6 +946,43 @@ def test_review_notices_for_the_user_are_one_warning_line():
         assert render.event(ctx("quiet", "en"), note) is not None   # the user has to act: shown even when quiet
     other = ev("notification", None, recipient=BORIS, kind="n_review_requested", text="Review task #3")
     assert render.event(c, other) is None and "Review task #3" in plain(render.event(ctx("verbose", "en"), other))
+
+
+def test_models_table_prices_and_the_unpriced_notice():
+    """/model's Prices column from the public view's price_source (docs/TUI.md): an older hub without it shows an
+    empty cell, never "no prices"; u_cost_unknown is a warning line."""
+    def profile(source: str | None, **data) -> dict:
+        return {"provider": "openai", "model": "m", "api_key_set": True, "api_key_hint": "…abcd",
+                "input_price": None, "output_price": None, **data,
+                **({"price_source": source} if source else {})}
+
+    settings = {"agents": {"default_model": "claude"}, "models": {
+        "claude": profile("table", provider="anthropic", model="claude-opus-5-5"),
+        "gpt": profile("profile", input_price=1.25, output_price=10.0),
+        "local": profile("free", input_price=0, output_price=0),
+        "remote": profile("none", model="some-model-v1"),
+        "half": profile("partial", input_price=0.5),
+        "old": profile(None),
+        "test": profile("none", provider="scripted")}}
+    out = plain(render.models_table(ctx(lang="en", width=160), settings), 160)
+    rows = {m.group(1): line for line in out.split("\n") if (m := re.search(r"│ (\w+) +│", line))}
+    assert "Prices" in out
+    assert "built-in" in rows["claude"] and "$1.25/$10" in rows["gpt"] and "free" in rows["local"]
+    assert "no prices" in rows["remote"] and "no output_price" in rows["half"]
+    for name in ("old", "test"):
+        assert not re.search(r"no prices|no \w+_price|built-in|free|\$", rows[name]), rows[name]
+    warn = re.search(r"38;2;\d+;\d+;\d+", to_ansi(render.warning(ctx(lang="en"), "x"), 80)).group(0)
+    assert warn in to_ansi(render.models_table(ctx(lang="en", width=160), settings), 160)
+    assert render.missing_prices(settings["models"]["half"]) == ["output_price"]
+    assert render.missing_prices(settings["models"]["old"]) == render.missing_prices(settings["models"]["test"]) == []
+    assert "Цены" in plain(render.models_table(ctx(width=160), settings), 160)
+    assert "нет цен" in plain(render.models_table(ctx(width=160), settings), 160)
+    assert plain(render.warning(ctx(lang="en"), "Profile has no prices")) == "⚠ Profile has no prices"
+    # the notice to the user is a warning line, shown even when quiet
+    note = ev("notification", None, recipient="user", kind="u_cost_unknown", text="DreamTeam cannot count the cost")
+    assert plain(render.event(ctx(lang="en"), note), 200) == "🔔 DreamTeam cannot count the cost"
+    assert warn in to_ansi(render.event(ctx(lang="en"), note), 200)
+    assert render.event(ctx("quiet", "en"), note) is not None
 
 
 def test_role_catalog_views():

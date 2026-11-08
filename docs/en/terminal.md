@@ -28,7 +28,8 @@
   `/resume ID`, `/delete [ID]`, `/cd [path | --default]`, `/copy-from [path | --none]`, `/goal`, `/board`,
   `/task N`, `/agents`, `/roles [role]`, `/jobs [jN | stop jN]`, `/team [role*N, …]`, `/to Name`,
   `/hire Role [| instructions]`,
-  `/trace [Name | N]`, `/span N [ctx]`, `/files [path]`, `/cat path`, `/cost`, `/status`, `/model [profile]`,
+  `/trace [Name | N]`, `/span N [ctx]`, `/files [path]`, `/cat path`, `/unlock path`, `/cost`, `/status`,
+  `/model [profile]`,
   `/pause`, `/wrapup [off]`, `/clarify [on|off]`, `/budget N`, `/max N`, `/approve name|N`, `/reject name|N`, `/stop`,
   `/web`, `/settings`, `/verbose`, `/lang ru|en`, `/clear`, `/exit`.
 - **Review.** A task the swarm handed to you for review shows as `◑ #3 … waits for your review`. `/approve 3`
@@ -37,6 +38,11 @@
 - **Agents' background jobs.** While they run, the status line shows `jobs N`, and the agent in `/agents` shows
   `⚙N`. `/jobs` lists them (and the ones that finished in the last hour), `/jobs j3` shows a job's output,
   `/jobs stop j3` stops it together with everything it started. `Esc` and `/pause` do not stop them.
+- **Locked files.** An agent locks a shared file while it edits it; an agent that runs into someone else's lock is
+  woken when the file is free. `/unlock path` removes a lock (after `/unlock ` the suggestions list the locked paths
+  and their holders; Tab completes one, Enter sends the path as typed), and the agents waiting for that file are
+  woken. On the web board the "Unlock" link on the
+  "Files" tab does the same.
 - **Wrap-up mode.** `/wrapup` (on the web board, the "Wrap up" button next to "Pause") asks the team to wrap up:
   each agent gets a notice about it once, and every wake-up reminds it not to start new computations and to finish
   its tasks with what it has. In this mode no new background jobs start: a command that does not fit in its timeout
@@ -78,7 +84,9 @@ answers such a pause at once, and `stream-json` may then show a short `swarm.pau
 `--clarify` therefore needs `--no-auto-reply`; then the planner first asks you and waits for your answer on the board
 or in `dreamteam tui`, a critical question pauses the swarm until you answer, and the run waits too (until
 `--timeout`, if you gave one). In the `text` and `json` formats each agent message to you prints a line on stderr,
-and a question that pauses the swarm one more (`stream-json` shows the events instead).
+and a question that pauses the swarm one more (`stream-json` shows the events instead). The same goes, also without
+`--verbose`, for the notice that a model profile's calls count as $0 (no prices, and the provider does not report
+the cost): one line on stderr.
 `--clarify` / `--no-clarify` do not work with `-c` / `-r`: change an existing session with `/clarify`.
 Background jobs still running at the end (for example, a dev server) are listed in the `jobs` field of the
 `--output-format json` result. A server started in the same process stops them together with the session. If the
@@ -101,7 +109,8 @@ without an answer), `/wrapup [off]` (wrap-up mode),
 `/budget 10`, `/max 6`, `/approve name|N`, `/reject name|N` (an MCP server or a task in review; `/approve name sha256`
 approves the server only while its code still has that SHA-256 (the one the dialog, `mcp_list` and the MCP card
 show), given in full or by its first 8 or more characters),
-`/jobs [jN | stop jN]` (agents' background jobs: list, one job's output, stop),
+`/unlock path` (remove a member's lock on a file or folder, a path with spaces in quotes; those waiting for it are
+woken), `/jobs [jN | stop jN]` (agents' background jobs: list, one job's output, stop),
 `/trace [Name | N]` (traces), `/span N [ctx]` (a trace step
 and the request context), `/session` (the current session), `/cd [path | --default]` (the session folder; a move asks
 for confirmation `y/N`, `--yes` skips the question),

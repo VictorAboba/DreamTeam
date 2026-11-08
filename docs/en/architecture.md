@@ -13,8 +13,9 @@
 ```
 
 * An agent sleeps while there are no events for it. It is woken by messages, assignments, posts in discussions,
-  unblocked tasks and triggers. On wake-up the agent gets a summary: what happened, the swarm goal,
-  its tasks, free tasks and its notes. Then the ReAct loop runs: LLM, tools, LLM… until the agent calls `wait`.
+  unblocked tasks, triggers and the release of a locked file it needed. On wake-up the agent gets a summary: what
+  happened, the swarm goal, its tasks, free tasks and its notes. Then the ReAct loop runs: LLM, tools, LLM… until
+  the agent calls `wait`.
 * The agent history is append-only: Claude's thinking blocks are tied to the exact prefix of the dialog, and
   the prompt cache works for the same reason. The system prompt is fixed at hiring, the agent's tool set is
   constant, and MCP tools are called through `mcp_call`. When the context overflows, the history is compacted into

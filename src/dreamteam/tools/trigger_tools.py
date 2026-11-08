@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
+from ..jobs import fmt_duration
 from ..models import Status
 from . import ToolContext, tool
-from .fmt import ago
+from .fmt import ago, item_time
 
 _DSL = (
     "Condition = a boolean expression with and/or/not, comparisons (== != < <= > >= in) and functions: "
@@ -81,7 +83,9 @@ async def trigger_create(ctx: ToolContext, args: dict[str, Any]) -> str:
         once=True if args.get("once") is None else args["once"],
     )
     kinds = [a["type"] for a in trig["actions"]]
-    text = f"Trigger #{trig['id']} created: {trig['condition']}" + (" (repeating)" if not trig["once"] else "")
+    # how it fires and wakes under the settings in force now: the frozen description cannot say it
+    parts = ([] if trig["once"] else ["repeating"]) + ctx.swarm.triggers.create_notes(trig)
+    text = f"Trigger #{trig['id']} created: {trig['condition']}" + (f" ({'; '.join(parts)})" if parts else "")
     if kinds != ["wake"]:
         text += f"; actions: {', '.join(kinds)}"
     return text + "."
@@ -107,7 +111,18 @@ async def trigger_list(ctx: ToolContext, args: dict[str, Any]) -> str:
             line += f" — {t['note']}"
         if t.get("actions") and t["actions"] != [{"type": "wake"}]:
             line += f" actions={json.dumps(t['actions'], ensure_ascii=False)}"
-        line += f" (fired {t.get('fire_count', 0)}x, last {ago(t.get('last_fired'))})"
+        held = t.get("held") or 0   # fires whose notice waits for the wake limit ([agents] trigger_wake_seconds)
+        if held:
+            wake = f", wake-up at {item_time(t['wake_at'], time.time())}" if t.get("wake_at") else ""
+            held_text = f"; {held} fire{'s' if held != 1 else ''} held{wake}"
+        else:
+            held_text = ""
+        line += f" (fired {t.get('fire_count', 0)}x, last {ago(t.get('last_fired'))}{held_text})"
+        pending = ctx.swarm.triggers.pending(t["id"])   # file_changed() changes not fired yet
+        if pending:
+            line += " pending: " + "; ".join(
+                f"{path} changed {count}x" + ("" if age is None else f", last {fmt_duration(age)} ago")
+                for path, count, age in pending)
         if t.get("last_error"):
             line += f" error: {t['last_error']}"
         lines.append(line)

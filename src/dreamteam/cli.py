@@ -416,6 +416,15 @@ def cmd_init(args) -> int:
     return 0
 
 
+def _print_unpriced(config: Config) -> None:
+    """After the `serve` / `run` banner: the model profiles whose calls count as $0 (settings.unpriced_line)."""
+    from .settings import unpriced_line
+
+    line = unpriced_line(config)
+    if line:
+        print(line, file=sys.stderr)
+
+
 ENV_CLEANUP_DELAY = 60.0   # a standalone `dreamteam run` removes unused skill environments once, this long after start
 
 
@@ -477,6 +486,7 @@ async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal
             return code
         _write_hub_file(project, base, config)
         print(f"DreamTeam \"{config.swarm.name}\" is running.\n  Board: {base}\n  MCP:   {base}/mcp", file=sys.stderr)
+        _print_unpriced(config)
         if open_browser:
             _open_board(base, base)
         stopper = asyncio.ensure_future(stop.wait())
@@ -887,6 +897,7 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
             return code
         print(f"DreamTeam is running.\n  Sessions: {base}/\n  MCP:      {base}/mcp\n  Home:     {home}",
               file=sys.stderr)
+        _print_unpriced(manager.config)
         if open_browser:
             _open_board(base + (f"/s/{focus}/" if focus else "/"), base)
         stopper = asyncio.ensure_future(stop.wait())

@@ -519,6 +519,12 @@ async def _files(c: CommandContext) -> None:
     c.print(render.files_view(c.ctx, data))
 
 
+async def _unlock(c: CommandContext) -> None:
+    """`/unlock path`: remove a member's lock on a file or folder (file_unlock); the members waiting for it are
+    woken. The path as it was locked (the suggestions list the locked ones)."""
+    await c.act("file_unlock", {"path": unquote(c.args)}, report=True)
+
+
 async def _cd(c: CommandContext) -> None:
     await c.app.change_folder(c.args)
 
@@ -548,6 +554,9 @@ async def _model(c: CommandContext) -> None:
     # a section in the update replaces the stored one: send the whole [agents] section back
     await c.client.update_settings({"agents": {**(view.get("agents") or {}), "default_model": name}})
     c.info(c.t("model_set", name=name))
+    missing = render.missing_prices(models[name])
+    if missing:
+        c.print(render.warning(c.ctx, c.t("model_no_prices", name=name, fields=", ".join(missing))))
 
 
 async def _pause(c: CommandContext) -> None:
@@ -711,6 +720,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("span", _span, args=True, required=True, session=True),
     Command("files", _files, args=True, session=True),
     Command("cat", _files, args=True, required=True, session=True),
+    Command("unlock", _unlock, args=True, required=True, session=True),
     Command("cd", _cd, args=True, launcher=True),   # without a session: the folder of the next new one
     Command("copy-from", _copy_from, args=True, launcher=True),   # always the files of the next new session
     Command("cost", _cost, session=True),

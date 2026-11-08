@@ -112,6 +112,8 @@ label.check .hint { display: block; font-size: 11px; color: var(--faint); margin
 .check-result.ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 .check-result.bad { border-color: color-mix(in srgb, var(--err) 45%, transparent); color: var(--err); }
 .profile-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+.price-warn { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; color: var(--warn); font-weight: 600; overflow-wrap: anywhere; }
+.price-warn > span { flex: 1 1 260px; min-width: 0; }
 details.more { margin-top: 12px; }
 details.more > summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600; user-select: none; }
 details.more > summary:hover { color: var(--text); }

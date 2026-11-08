@@ -261,6 +261,7 @@ class _PrintRun:
         self._heal_delay = HEAL_AFTER
         self.question_told: set[int] = set()  # question pauses announced on stderr (no auto-replies)
         self.asked_told: set[int] = set()     # agents' messages to the user announced on stderr (the same)
+        self.cost_told: set[str] = set()      # u_cost_unknown texts written to stderr
         self.clarify = False                  # the session's [swarm] clarify (its summary, then its state)
         self.ui_lang = lang
         self.lang = lang or "ru"            # the session's language once known (auto-replies)
@@ -535,6 +536,18 @@ class _PrintRun:
             raise _Finished("budget", _text(self.text_lang, "budget"))
         elif etype == "swarm.paused" and data.get("reason") == "question":
             await self.on_question(data.get("asker"), data.get("message_id"))
+        elif etype == "notification" and data.get("kind") == "u_cost_unknown" and data.get("recipient") == USER:
+            self.on_cost_unknown(data.get("text"))
+
+    def on_cost_unknown(self, text: Any) -> None:
+        """A model profile's calls count as $0 (u_cost_unknown, docs/SPEC.md §10): its text on stderr once, in the
+        `text` and `json` formats also without --verbose (whose feed shows every notice anyway); stream-json carries
+        the event itself."""
+        text = " ".join(str(text or "").split())
+        if not text or self.verbose or self.format == "stream-json" or text in self.cost_told:
+            return
+        self.cost_told.add(text)
+        self.err.write(text + "\n")
 
     def board_url(self) -> str:
         """The session's board, where a human can answer the agents' questions."""

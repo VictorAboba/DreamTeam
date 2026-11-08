@@ -30,7 +30,7 @@ import dreamteam
 from dreamteam import jobs as jobs_module
 from dreamteam import mcp_forge
 from dreamteam import swarm as swarm_module
-from dreamteam.config import Config, ShellSettings
+from dreamteam.config import _MIN_ONE, Config, ShellSettings, WorkspaceSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status
 from dreamteam.swarm import Swarm
@@ -149,6 +149,11 @@ def test_jobs_tab_feed_and_settings_fields():
     assert re.search(r'field\("sh_cpu", "shell\.cpu_threads", "auto"', HOME_JS)
     assert re.search(r'field\("sh_bg", "shell\.background_on_timeout", "bool", \{ full: true, hint: "sh_bg_hint" \}\)',
                      HOME_JS)
+    # ... and for every [workspace] setting, with config.py's minimums (lock_wanted_minutes: 0 = at once)
+    workspace = re.findall(r'\bfield\("(ws_\w+)", "workspace\.(\w+)", "\w+", \{ min: (\d+)', HOME_JS)
+    assert {key for _, key, _ in workspace} == {f.name for f in dataclasses.fields(WorkspaceSettings)} - {"git"}
+    assert all(int(low) == (1 if key in _MIN_ONE else 0) for _, key, low in workspace)
+    assert ("ws_lock_wanted", "lock_wanted_minutes", "0") in workspace and 'hint: "ws_lock_wanted_hint"' in HOME_JS
 
 
 # ------------------------------------------------------------------------------------------------ launcher / traces
@@ -596,6 +601,32 @@ def test_cancelled_dialogs_do_nothing_and_confirmed_ones_call_the_api():
 
 
 @needs_node
+def test_the_files_tab_unlocks_a_members_lock_after_a_confirmation():
+    """A locked entry of the Files tab has an "Unlock" button (file_unlock, docs/SPEC.md §18.4); it asks first."""
+    out = run_js(r"""
+      el("file-list");
+      app.S.lang = "en";
+      app.S.state = { locks: [{ path: "docs", owner: "Anna Smith" }], agents: [] };
+      app.S.fileEntries = [{ path: "docs", type: "dir" }, { path: "a.md", type: "file", size: 3 }];
+      app.renderFileList();
+      out.html = elements["file-list"].innerHTML;
+      globalThis.confirm = (text) => { out.asked = text; return answers.confirm; };
+      answers.confirm = false; out.cancelled = app.unlockFile("docs", "Anna Smith"); out.afterCancel = calls.length;
+      answers.confirm = true;
+      app.onDocumentClick({ target: { closest: () => ({ dataset: { unlock: "docs", owner: "Anna Smith" } }) } });
+      await new Promise((r) => setImmediate(r));
+      out.calls = calls;
+      out.attr = app.escAttr('a\r\nb"<c>');    // the HTML parser would turn a raw CR into LF
+    """)
+    button = '<button type="button" class="link file-unlock" data-unlock="docs" data-owner="Anna Smith">Unlock</button>'
+    assert out["html"].count(button) == 1 and out["html"].count("data-unlock") == 1
+    assert out["attr"] == "a&#13;&#10;b&quot;&lt;c&gt;"
+    assert out["cancelled"] is None and out["afterCancel"] == 0
+    assert out["asked"] == "Remove Anna Smith's lock on docs? The members waiting for this file are woken."
+    assert out["calls"] == [{"url": "/api/act/file_unlock", "body": {"path": "docs"}}]
+
+
+@needs_node
 def test_open_chat_marks_new_messages_read():
     # regression: the unread check ran before the inbox was refreshed, so a reply arriving in the open
     # chat stayed "unread" in the sidebar
@@ -637,6 +668,33 @@ def test_feed_requests_only_feed_events_and_describes_changes():
     assert out["limits"] == {"max_cost_usd": 2.5, "max_agents": 4} and out["bad"] == [None, None, None, None]
 
 
+@needs_node
+def test_held_trigger_fires_in_the_triggers_tab_and_the_feed():
+    """A repeating trigger whose notice waits for [agents] trigger_wake_seconds (docs/SPEC.md §8): the Triggers tab
+    says how many fires are held and until when, the feed line of such a fire says so too."""
+    out = run_js(r"""
+      const day = new Date(); day.setHours(18, 48, 0, 0);
+      const at = day.getTime() / 1000;
+      app.S.state = { swarm: { goal: null, session: null, limits: {} }, agents: [{ name: "Ann Lee", role: "Dev", status: "idle" }],
+                      mcp: [], triggers: [{ id: 4, condition: "every(60)", owner: "Ann Lee", once: false, fire_count: 3, held: 2, wake_at: at },
+                                          { id: 5, condition: "done(1)", owner: "Ann Lee", once: true, fire_count: 0, held: 0, wake_at: null }] };
+      const fired = (trigger) => app.describeEvent({ type: "trigger.fired", actor: "Ann Lee", data: { trigger, errors: [] } });
+      el("trigger-list");
+      for (const lang of ["en", "ru"]) {
+        app.S.lang = lang;
+        app.renderTriggers();
+        out[lang] = elements["trigger-list"].innerHTML;
+        out["feed_" + lang] = fired({ id: 4, condition: "every(60)", held: 2, wake_at: at });
+      }
+      out.plain = fired({ id: 5, condition: "done(1)", held: 0, wake_at: null });
+    """)
+    assert "fired: 3 · held: 2 until 18:48</span>" in out["en"] and out["en"].count("held:") == 1
+    assert "срабатываний: 3 · отложено: 2 до 18:48</span>" in out["ru"]
+    assert out["feed_en"].endswith("trigger #4 fired — every(60) (wake-up held until 18:48)")
+    assert out["feed_ru"].endswith("сработал триггер #4 — every(60) (пробуждение отложено до 18:48)")
+    assert out["plain"].endswith("сработал триггер #5 — done(1)")
+
+
 def test_session_settings_fields_match_the_config():
     """The settings dialog's per-session fields name real [shell] / [agents] settings, with config.py's minimums."""
     from dreamteam.config import _MIN_ONE, AgentSettings
@@ -644,7 +702,7 @@ def test_session_settings_fields_match_the_config():
     block = re.search(r"const SESSION_FIELDS = \[(.*?)\n\];", APP_JS, re.S).group(1)
     fields = re.findall(r'section: "(\w+)", key: "(\w+)", label: "(\w+)", kind: "(\w+)", min: (\d+)', block)
     # + the network choice (docs/SPEC.md §7.2) and the clarify bool (docs/SPEC.md §3 "Clarify mode")
-    assert len(fields) == 11 and block.count("{ group:") == 13
+    assert len(fields) == 14 and block.count("{ group:") == 16
     assert '{ group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] }' in block
     assert ('{ group: "clarify", section: "swarm", key: "clarify", label: "sf_clarify", kind: "bool", '
             'hint: "sf_clarify_hint" }') in block
@@ -662,6 +720,27 @@ def test_session_settings_fields_match_the_config():
     assert ("agents", "planning_hint_steps", "sf_plan_steps", "int", "0") in fields
     assert ("agents", "planning_hint_minutes", "sf_plan_minutes", "num", "0") in fields
     assert block.count('hint: "sf_plan_hint"') == 2 and "sf_plan_hint" in i18n_blocks()["en"]
+    # triggers (docs/SPEC.md §8): numbers, 0 has a meaning (at every change / no cap / at every fire)
+    for key, label in (("file_settle_seconds", "sf_file_settle"), ("file_max_wait_seconds", "sf_file_max_wait"),
+                       ("trigger_wake_seconds", "sf_trigger_wake")):
+        assert ("agents", key, label, "num", "0") in fields
+        assert f'hint: "{label}_hint"' in block
+        assert all(f"{label}_hint" in i18n_blocks()[lang] for lang in ("en", "ru"))
+
+
+def test_settings_page_agents_fields_match_the_config():
+    """The settings page's «Agents» section names real [agents] settings with config.py's minimums, among them the
+    trigger knobs (docs/SPEC.md §8), each with a hint."""
+    from dreamteam.config import _MIN_ONE, AgentSettings
+
+    agents = re.findall(r'\bfield\("(ag_\w+)", "agents\.(\w+)", "(\w+)", \{ min: (\d+)', HOME_JS)
+    known = {f.name for f in dataclasses.fields(AgentSettings)}
+    assert agents and all(key in known and (int(low) >= 1 if key in _MIN_ONE else int(low) == 0)
+                          for _, key, _, low in agents)
+    for label, key in (("ag_file_settle", "file_settle_seconds"), ("ag_file_max_wait", "file_max_wait_seconds"),
+                       ("ag_trigger_wake", "trigger_wake_seconds")):
+        assert (label, key, "float", "0") in agents
+        assert f'hint: "{label}_hint"' in HOME_JS
 
 
 @needs_node
@@ -1370,6 +1449,95 @@ def test_home_profile_key_semantics_and_no_key_is_ever_rendered():
 
 
 @needs_node
+def test_home_profile_card_warns_about_missing_prices():
+    """A profile whose tokens count as $0 (the server's price_source "none" / "partial", docs/SPEC.md §18.4) shows a
+    warning outside «More» with «Enter prices» and «Free model (0 / 0)»; typing the prices hides it; an older server
+    (no price_source), another model typed in and the scripted provider show none. The test request says how its
+    cost was obtained."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.original = { models: {} };
+      el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg");
+      const base = { provider: "openai", model: "some-model-v1", api_key_set: true, api_key_hint: "…0000",
+                     input_price: null, output_price: null, extra: {} };
+      const mk = (name, data) => home.makeProfile(name, Object.assign({}, base, data), name);
+      const none = mk("remote", { price_source: "none" });
+      const half = mk("half", { price_source: "partial", input_price: 0.5 });
+      const priced = mk("gpt", { price_source: "profile", input_price: 1.25, output_price: 10 });
+      const old = mk("old", {});
+      const test = mk("test", { provider: "scripted", price_source: "none" });
+      out.missing = [none, half, priced, old, test].map((p) => home.missingPrices(p));
+      out.cards = [none, half, priced, old].map((p) => home.profileCard(p));
+      // typing: the warning box alone is redrawn (the input keeps its focus)
+      const box = { innerHTML: "x" };
+      const card = { dataset: { uid: half.uid }, querySelector: (sel) => (sel === ".price-warn-box" ? box : null) };
+      home.H.profiles = [none, half];
+      home.onSettingsInput({ target: { dataset: { pf: "output_price", type: "float" }, value: "2", closest: () => card } });
+      out.typed = [half.data.output_price, home.missingPrices(half), box.innerHTML];
+      none.data.model = "other"; out.otherModel = home.missingPrices(none); none.data.model = "some-model-v1";
+      // «Enter prices»: «More» opens and the first missing price gets the cursor
+      const more = { open: false }, focused = [];
+      const inCard = { querySelector: (sel) => (sel === "details.more" ? more : { focus: () => focused.push(sel) }) };
+      home.enterPrices(none, inCard);
+      out.enter = [more.open, none.moreOpen, focused];
+      // «Free model (0 / 0)»: both prices 0 (free on purpose), no warning, the form is dirty
+      home.H.dirty = false;
+      home.freeModel(none, null);
+      out.free = [none.data.input_price, none.data.output_price, home.missingPrices(none), home.H.dirty];
+      out.payload = home.profilePayload(none);
+      out.how = ["provider", "profile", "table", "free", "none", "partial", undefined].map(home.costHow);
+      out.live = home.t("p_live_ok", { ms: 120, reply: "OK", cost: "0.00010", how: home.costHow("provider") });
+      home.H.lang = "ru";
+      out.ru = [home.profileCard(mk("ru1", { price_source: "none" })), home.profileCard(mk("ru2", { price_source: "partial", input_price: 1 }))];
+    """)
+    assert out["missing"] == [["input_price", "output_price"], ["output_price"], [], [], []]
+    none_card, half_card, priced_card, old_card = out["cards"]
+    assert "No prices: calls of this model count as $0 and the session budget does not see them" in none_card
+    assert "data-enter-prices" in none_card and "Enter prices" in none_card and "Free model (0 / 0)" in none_card
+    assert none_card.index("price-warn") < none_card.index('<details class="more"')   # outside «More»
+    assert "No output price: those tokens count as $0." in half_card
+    assert "price-warn\"" not in priced_card and "price-warn\"" not in old_card
+    assert out["typed"] == [2, [], ""]
+    assert out["otherModel"] == []
+    assert out["enter"] == [True, True, ['[data-pf="input_price"]']]
+    assert out["free"] == [0, 0, [], True]
+    assert out["payload"]["input_price"] == 0 and "price_source" not in out["payload"]
+    assert out["how"] == ["reported by the provider", "by the profile's prices", "by the built-in prices", "free",
+                          "unknown: the provider did not report it, and the profile has no prices",
+                          "incomplete: the provider did not report it, and the profile lacks some prices",
+                          "unknown: the provider did not report it, and the profile has no prices"]
+    assert out["live"] == "Answered in 120 ms: “OK” (cost $0.00010: reported by the provider)."
+    assert "Нет цен: вызовы этой модели считаются по $0" in out["ru"][0] and "Бесплатная модель (0 / 0)" in out["ru"][0]
+    assert "Нет цены выхода: эти токены считаются по $0." in out["ru"][1]
+
+
+@needs_node
+def test_home_fill_from_a_preset_replaces_the_prices():
+    """«Fill from a preset» on a card takes the preset's prices or none: a card from the OpenAI preset (1.25 / 10) or
+    from a local one (0 / 0) switched to Anthropic keeps neither, so the built-in prices apply after saving."""
+    from dreamteam.settings import PROVIDER_CHOICES
+
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.providers = PROVIDERS;
+      out.payloads = ["openai", "ollama"].map((first) => {
+        const p = home.makeProfile("x", home.presetData(first).data, null);
+        p.data.cache_read_price = 0.1;
+        Object.assign(p.data, home.presetData("anthropic").data);    // applyPreset's merge
+        return home.profilePayload(p);
+      });
+      out.openai = home.presetData("openai").data;
+    """, pre=f"const PROVIDERS = {json.dumps(PROVIDER_CHOICES)};")
+    for payload in out["payloads"]:
+        assert payload["provider"] == "anthropic"
+        prices = [payload[k] for k in ("input_price", "output_price", "cache_read_price", "cache_write_price")]
+        assert prices == [None] * 4, payload
+    assert (out["openai"]["input_price"], out["openai"]["output_price"]) == (1.25, 10)
+
+
+@needs_node
 def test_home_settings_default_profile_validation_and_overrides():
     out = run_js(r"""
       const home = loadHomeJs();
@@ -1524,6 +1692,47 @@ TEAM_CASES = [([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 
 def role_presets() -> list[dict]:
     from dreamteam import roles
     return roles.presets_view()
+
+
+@needs_node
+def test_home_swap_of_profile_names_sends_the_names_after_the_save():
+    """default <-> fast in one edit: the starred card and the role models go out by their names after the save, an
+    untouched role following its card and a role re-picked in the same edit kept as picked; the server keeps such
+    a name (settings.apply_update), so every value stays on its card."""
+    from dreamteam import settings as st
+
+    raw = {"agents": {"default_model": "default"},
+           "models": {"default": {"provider": "anthropic", "model": "claude-opus-5-5"},
+                      "fast": {"provider": "anthropic", "model": "claude-haiku-5-5"}},
+           "roles": [{"name": "tester", "model": "fast"}, {"name": "developer", "model": "default"},
+                     {"name": "architect", "model": "fast"}]}
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.rolePresets = JSON.parse(process.env.DT_PRESETS);
+      el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
+      const view = JSON.parse(process.env.DT_VIEW);
+      home.H.view = JSON.parse(JSON.stringify(view)); home.H.original = JSON.parse(JSON.stringify(view));
+      home.renderSettings(true);
+      const opus = home.H.profiles.find((p) => p.name === "default"), haiku = home.H.profiles.find((p) => p.name === "fast");
+      opus.name = "fast"; haiku.name = "default";                       // the star stays on the opus card
+      const card = (id) => home.H.roleCards.find((c) => c.id === id);
+      out.shown = home.roleCard(card("tester")).match(/<option value="([^"]*)" selected>/)[1];
+      const pick = (id, value) => home.onRoleCardEvent({ target: { value, dataset: { rc: "model" },
+        closest: () => ({ dataset: { roleUid: card(id).uid }, querySelector: () => null }) } });
+      pick("developer", "default");                                    // re-picked: now the haiku card
+      pick("architect", "default");                                    // re-picked to the name it shows already
+      out.payload = home.collectSettings();
+    """, env={"DT_PRESETS": json.dumps(role_presets()), "DT_VIEW": json.dumps(st.public_view(raw))})
+    payload = out["payload"]
+    assert out["shown"] == "default"  # the tester's card is the haiku one, now named "default"
+    assert payload["agents"]["default_model"] == "fast"
+    models = {r["name"]: r.get("model") for r in payload["roles"]}
+    assert (models["tester"], models["developer"], models["architect"]) == ("default", "default", "default")
+    new = st.apply_update(raw, payload)
+    assert new["models"][new["agents"]["default_model"]]["model"] == "claude-opus-5-5"
+    stored = {r["name"]: new["models"][r["model"]]["model"] for r in new["roles"]}
+    assert stored == {"tester": "claude-haiku-5-5", "developer": "claude-haiku-5-5", "architect": "claude-haiku-5-5"}
 
 
 @needs_node
@@ -1700,7 +1909,7 @@ def test_home_settings_roles_and_team():
         {"name": "developer", "description": "You write the code. Always with tests."},
         {"name": "writer", "hidden": True}, {"name": "researcher", "hidden": True},
         {"name": "Data engineer", "description": "You build data pipelines."},
-        {"name": "QA lead", "description": "You lead the testing.", "model": "fast"},
+        {"name": "QA lead", "description": "You lead the testing.", "model": "quick"},  # by its name after the save
     ]
     composer = out["composer"]
     assert ">QA lead</option>" in composer and ">Technical writer" not in composer  # the edited catalog
@@ -3529,7 +3738,7 @@ def test_settings_saved_by_the_ui_keep_and_remove_keys_as_shown(tmp_path):
             assert "api_key" not in models["envkey"] and models["envkey"]["api_key_env"] == "MY_ENV"
             assert "api_key" not in models["reuse"]                # a new card does not inherit a deleted key
             assert raw["agents"]["default_model"] == "main-model"
-            # the role follows the rename of its profile (the server maps renamed_from)
+            # the role follows the rename of its profile (sent by its name after the save)
             assert raw["roles"] == [{"name": "tester", "instructions": "Use pytest.", "model": "main-model"},
                                     {"name": "Data engineer", "description": "Pipelines."}]
             assert resp.json()["role_catalog"][2]["model"] == "main-model"

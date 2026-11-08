@@ -24,12 +24,13 @@ EXPLICIT_ADDRESSEE_SECONDS = 60.0
 
 _MENTION = re.compile(r"(?:^|(?<=\s))@([^@\n]{0,60})$")
 _TASK_REF = re.compile(r"(?:^|(?<=\s))#(\w{0,40})$")
+_UNLOCK = re.compile(r"/unlock\s+([^\n]*)\Z", re.IGNORECASE)   # "/unlock docs/A": the locked paths
 
 
 @dataclass(frozen=True)
 class Suggestion:
-    kind: str                # "command" | "member" | "task"
-    label: str               # "/board", "@Анна Смирнова", "#3 Title"
+    kind: str                # "command" | "member" | "task" | "path"
+    label: str               # "/board", "@Анна Смирнова", "#3 Title", "docs/AUDIT.md"
     description: str         # dim text after the label
     start: int               # text[start:end] is replaced by `insert`
     end: int
@@ -55,14 +56,18 @@ class CommandInfo:
 # ---- suggestions ----------------------------------------------------------------------------------
 def suggest(text: str, cursor: int | None = None, *, commands: Sequence[CommandInfo] = (),
             members: Iterable[str] = (), tasks: Iterable[dict] = (),
-            everyone: str = "", status: Callable[[str], str] | None = None) -> list[Suggestion]:
+            everyone: str = "", status: Callable[[str], str] | None = None,
+            locks: Iterable[dict] = ()) -> list[Suggestion]:
     """Suggestions for the word being typed at `cursor`: commands after a leading `/`, members (plus
-    `all`) after `@`, tasks after `#`. `everyone` describes `all` (e.g. «все»); `status` turns a task
-    status into its label (e.g. «к работе»)."""
+    `all`) after `@`, tasks after `#`, the locked paths (`locks`: {path, owner}) after `/unlock `. `everyone`
+    describes `all` (e.g. «все»); `status` turns a task status into its label (e.g. «к работе»)."""
     cursor = len(text) if cursor is None else max(0, min(cursor, len(text)))
     before = text[:cursor]
     if before.startswith("/") and not any(ch.isspace() for ch in before):
         return _command_suggestions(text, before[1:], commands)
+    unlock = _UNLOCK.match(before)
+    if unlock is not None:
+        return _lock_suggestions(text, unlock, locks)
     mention = _MENTION.search(before)
     if mention is not None:
         return _member_suggestions(text, cursor, mention, members, everyone)
@@ -142,6 +147,22 @@ def _task_suggestions(text: str, cursor: int, match: re.Match, tasks: Iterable[d
                          cursor, f"#{tid} ")
         (closed_rows if task.get("status") in ("done", "failed", "cancelled") else open_rows).append(row)
     return (open_rows + closed_rows)[:MAX_SUGGESTIONS]
+
+
+def _lock_suggestions(text: str, match: re.Match, locks: Iterable[dict]) -> list[Suggestion]:
+    """The locked paths that contain what is typed after `/unlock `; the suggestion replaces the whole argument. The
+    path typed in full comes first, then those that start with it (Enter takes the first: a typed `notes.md` must not
+    turn into `docs/notes.md`)."""
+    query = match.group(1).strip().strip("\"'").casefold()
+    out: list[tuple[int, Suggestion]] = []
+    for lock in locks:
+        path = str(lock.get("path") or "") if isinstance(lock, dict) else ""
+        folded = path.casefold()
+        if path and (not query or query in folded):
+            rank = 0 if folded == query else 1 if folded.startswith(query) else 2
+            out.append((rank, Suggestion("path", path, str(lock.get("owner") or ""), match.start(1), len(text), path)))
+    out.sort(key=lambda item: item[0])     # stable: the paths' order within a rank
+    return [s for _, s in out][:MAX_SUGGESTIONS]
 
 
 def window(count: int, selected: int, rows: int = MAX_ROWS) -> range:

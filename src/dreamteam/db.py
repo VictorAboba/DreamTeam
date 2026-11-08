@@ -46,12 +46,15 @@ CREATE INDEX IF NOT EXISTS notifications_recipient ON notifications(recipient, d
 CREATE TABLE IF NOT EXISTS triggers (
     id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, condition TEXT, note TEXT DEFAULT '',
     actions TEXT DEFAULT '[]', once INTEGER DEFAULT 1, active INTEGER DEFAULT 1, created_at REAL,
-    last_value INTEGER DEFAULT 0, last_fired REAL, fire_count INTEGER DEFAULT 0, last_error TEXT);
+    last_value INTEGER DEFAULT 0, last_fired REAL, fire_count INTEGER DEFAULT 0, last_error TEXT,
+    told_at REAL, held INTEGER DEFAULT 0, held_last REAL, held_files TEXT);
 CREATE TABLE IF NOT EXISTS mcp_servers (
     name TEXT PRIMARY KEY, owner TEXT, scope TEXT, task_id INTEGER, description TEXT DEFAULT '',
     command TEXT, cwd TEXT, requirements TEXT DEFAULT '[]', origin TEXT, status TEXT, tools TEXT DEFAULT '[]',
     error TEXT, created_at REAL, updated_at REAL, digest TEXT, approved_digest TEXT);
-CREATE TABLE IF NOT EXISTS file_locks (path TEXT PRIMARY KEY, owner TEXT, acquired_at REAL, expires_at REAL);
+CREATE TABLE IF NOT EXISTS file_locks (path TEXT PRIMARY KEY, owner TEXT, acquired_at REAL, expires_at REAL,
+    wanted_at REAL);
+CREATE TABLE IF NOT EXISTS lock_waiters (agent TEXT, path TEXT, since REAL, PRIMARY KEY (agent, path));
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, command TEXT NOT NULL, shell TEXT,
     origin TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, stopped_by TEXT, exit_code INTEGER, log TEXT,
@@ -62,7 +65,9 @@ CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, status);
 # columns added to a table after its first release, (table, column, declaration): a file made by an older version
 # gets them when it is opened
 ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"), ("mcp_servers", "digest", "TEXT"),
-                 ("mcp_servers", "approved_digest", "TEXT"))
+                 ("mcp_servers", "approved_digest", "TEXT"), ("file_locks", "wanted_at", "REAL"),
+                 ("triggers", "told_at", "REAL"), ("triggers", "held", "INTEGER DEFAULT 0"),
+                 ("triggers", "held_last", "REAL"), ("triggers", "held_files", "TEXT"))
 
 
 class Database:
@@ -301,3 +306,12 @@ def max_tools_revision(source: Source) -> int | None:
             if isinstance(rev, int) and not isinstance(rev, bool) and (best is None or rev > best):
                 best = rev
     return best
+
+
+def remap_sql(table: str, column: str, mapping: dict[str, str]) -> tuple[str, list[str]]:
+    """One UPDATE that renames every `mapping` key in `column` at once, so a swap or a chain of names (a name both
+    an old and a new one) stays correct. `table` and `column` are the caller's identifiers, never user input."""
+    whens = " ".join("WHEN ? THEN ?" for _ in mapping)
+    marks = ", ".join("?" for _ in mapping)
+    params = [value for pair in mapping.items() for value in pair] + list(mapping)
+    return f"UPDATE {table} SET {column} = CASE {column} {whens} END WHERE {column} IN ({marks})", params

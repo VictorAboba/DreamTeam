@@ -45,7 +45,7 @@ from .config import Config
 from .copyfrom import (COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError, CopyLimits, Source,
                        Uploads, check_target, copy_into, done_with, hub_in_container, left_over, printable_line,
                        resolve_source, staging_name)
-from .db import Database, loads, sqlite_uri
+from .db import Database, loads, remap_sql, sqlite_uri
 from .goal_text import shorten_title, split_goal
 from .models import USER, Status, ToolError
 from .settings import (
@@ -673,6 +673,29 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
     return stats
 
 
+def rename_member_profiles(db_path: Path, renames: dict[str, str]) -> int:
+    """agents.model of a session database that is not loaded follows profile renames ({old: new}); the number of
+    members changed. A missing file or one without an `agents` table is left alone; any error (a database held by
+    another process, a damaged file) is logged and gives 0: such a member falls back to the default profile."""
+    if not renames or not db_path.exists():
+        return 0
+    try:  # a plain path (exists() above): a file: URI of a UNC path or a mapped drive has an authority SQLite refuses
+        conn = sqlite3.connect(str(db_path), timeout=2.0)
+    except (OSError, sqlite3.Error) as exc:
+        log.warning("could not rename the model profiles of the members in %s: %s", db_path, exc)
+        return 0
+    try:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agents'").fetchone() is None:
+            return 0
+        with conn:  # one statement: in a swap or a chain a name is both an old and a new one
+            return conn.execute(*remap_sql("agents", "model", renames)).rowcount
+    except sqlite3.Error as exc:
+        log.warning("could not rename the model profiles of the members in %s: %s", db_path, exc)
+        return 0
+    finally:
+        conn.close()
+
+
 def pending_goal(meta: dict[str, Any]) -> dict[str, str] | None:
     """The goal a session was created with and that its first start has not set yet ({title, description}), split
     as set_goal will split it (a session.json written before the split may hold a multi-line title)."""
@@ -793,8 +816,9 @@ class SessionManager:
     async def update_settings(self, update: dict[str, Any]) -> dict[str, Any]:
         """Apply a settings update from the UI (settings.apply_update semantics), save it and reconfigure
         the loaded sessions. Returns {"settings": public view, "applied_to": [session ids]}.
-        A session whose model profile was renamed follows the rename; one whose profile was deleted falls
-        back to the default profile (instead of blocking the save)."""
+        A session whose model profile was renamed follows the rename, and so do the members hired on it (agents.model
+        of the loaded and the stopped sessions); one whose profile was deleted falls back to the default profile
+        (instead of blocking the save)."""
         if not isinstance(update, dict):
             raise SessionError("The settings must be an object.")
         self._refresh_settings()
@@ -814,7 +838,8 @@ class SessionManager:
                 continue
             agents = overrides.get("agents")
             profile = agents.get("default_model") if isinstance(agents, dict) else None
-            if isinstance(profile, str) and profile not in new_config.models:
+            # a renamed profile follows (also in a swap, where its old name is still a profile)
+            if isinstance(profile, str) and (profile in renames or profile not in new_config.models):
                 overrides = copy.deepcopy(overrides)
                 if profile in renames:
                     overrides["agents"]["default_model"] = renames[profile]
@@ -843,6 +868,21 @@ class SessionManager:
                 self._write_meta(sid, meta)
             except OSError:
                 log.exception("could not update the overrides of session %s", sid)
+        if renames:  # members hired on a renamed profile keep it (agents.model), before the reconfigure below
+            for sid in self.ids():
+                swarm = self.swarms.get(sid)
+                if swarm is None:  # off the loop (a busy file waits up to its timeout); no load in between
+                    async with self._lock(sid):
+                        swarm = self.swarms.get(sid)
+                        if swarm is None:
+                            await asyncio.to_thread(rename_member_profiles, self._data_dir(sid) / "swarm.db", renames)
+                            continue
+                rename = getattr(swarm, "rename_profiles", None)
+                try:
+                    if rename is not None:
+                        rename(renames)
+                except Exception:  # the settings are saved; such a member falls back to the default profile
+                    log.exception("could not rename the model profiles of the members of session %s", sid)
         applied = []
         for sid, swarm in list(self.swarms.items()):
             reconfigure = getattr(swarm, "reconfigure", None)
