@@ -112,6 +112,8 @@ label.check .hint { display: block; font-size: 11px; color: var(--faint); margin
 .check-result.ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
 .check-result.bad { border-color: color-mix(in srgb, var(--err) 45%, transparent); color: var(--err); }
 .profile-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; align-items: center; }
+.price-warn { display: flex; align-items: center; gap: 6px 8px; flex-wrap: wrap; margin-top: 12px; font-size: 12px; color: var(--warn); font-weight: 600; overflow-wrap: anywhere; }
+.price-warn > span { flex: 1 1 260px; min-width: 0; }
 details.more { margin-top: 12px; }
 details.more > summary { cursor: pointer; color: var(--muted); font-size: 12px; font-weight: 600; user-select: none; }
 details.more > summary:hover { color: var(--text); }
@@ -132,7 +134,12 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
 .team-row > select, .team-row > input { flex: 1 1 160px; width: auto; min-width: 0; }
 .team-count { display: inline-flex; align-items: center; gap: 4px; }
 .team-count input { width: 58px; text-align: center; padding-left: 4px; padding-right: 4px; font-family: var(--mono); }
-.team-model { font: 11px var(--mono); color: var(--faint); }
+.team-model { font: 11px var(--mono); color: var(--muted); min-width: 21ch; }
+.team-model.session { color: var(--faint); }
+.team-move { display: inline-flex; gap: 2px; }
+.team-move .btn.small { padding: 0 6px; }
+.team-gone { border-color: var(--err); }
+.team-gone .team-desc.hint { color: var(--err); font-style: normal; }
 .team-row > .icon-btn { margin-left: auto; }
 .team-desc { flex-basis: 100%; font-size: 12px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .team-desc.hint { white-space: normal; font-style: italic; }
@@ -149,6 +156,8 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
 .role-head input.role-name { width: 240px; max-width: 100%; }
 .role-other { font-size: 12px; }
 .add-role { margin-top: 10px; }
+.team-card .team-row { background: var(--panel); }
+.team-card .role-head input.role-name { flex: 1 1 0; width: auto; min-width: 0; max-width: none; }
 
 /* Skills tab: the library on the left, adding and Claude Code's on the right */
 .skills-layout { display: grid; grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); gap: 22px; align-items: start; }
@@ -174,6 +183,10 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
 .ns-skills .sk-picker { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
 .sk-roles { margin-top: 6px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
 .sk-add-more { margin-top: 8px; }
+/* the new-session dialog's "Files to work on": a folder path or a .zip, one under the other */
+.ns-files { display: flex; flex-direction: column; gap: 8px; font-size: 12px; color: var(--muted); }
+.ns-files > span:first-child { font-weight: 500; display: inline-flex; align-items: center; gap: 5px; }
+.sc-copied > span { flex: none; }
 .session-card .sc-warn.link { background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
 
 .new-session .form-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -194,6 +207,8 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
   .new-session .form-grid { grid-template-columns: 1fr; }
   .new-session .form-grid .two { grid-column: auto; }
   .skills-layout { grid-template-columns: 1fr; }
+  .save-bar { flex-wrap: wrap; padding: 10px 12px; }
+  .save-msg { flex: 1 1 100%; max-height: 30vh; overflow-y: auto; }
 }
 .profile-head select { width: auto; max-width: 240px; }
 .settings-grid { align-items: end; }

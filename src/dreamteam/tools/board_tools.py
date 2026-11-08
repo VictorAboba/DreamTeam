@@ -294,6 +294,12 @@ async def task_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
     workspace = getattr(ctx.swarm, "workspace", None)  # (a test double may have none)
     if workspace is not None:
         await workspace.commit_held(ctx.actor, f"when {ctx.actor} completed task #{task.id}")
+    # locks are not tied to tasks, so none is released here: the member is reminded of those it still holds
+    held = workspace.held_locks_note(ctx.actor) if workspace is not None and not ctx.is_user else ""
+    return _completed(task, before) + (f" {held}" if held else "")
+
+
+def _completed(task: Any, before: Any) -> str:
     if task.status != Status.REVIEW:
         return f"Task #{task.id} is done."
     if task.reviewer == before.reviewer:  # the task's own reviewer

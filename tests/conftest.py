@@ -156,6 +156,19 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _early_isolated_mcp_library(tmp_path_factory):
+    """No test reads or writes the real MCP library (~/.dreamteam/library): DREAMTEAM_MCP_LIBRARY_DIR (which wins
+    over `[mcp] library_dir`) names a fresh folder. It is set by a MonkeyPatch of its own, not the test's
+    `monkeypatch`, so a test calling `monkeypatch.undo()` keeps it. pytest sets up autouse fixtures of one scope in
+    the order of their names, so this name sorts before every one that uses `monkeypatch`: it is set up before
+    `monkeypatch` and undone after it (a test's own setenv of the variable is undone first)."""
+    patch = pytest.MonkeyPatch()
+    patch.setenv("DREAMTEAM_MCP_LIBRARY_DIR", str(tmp_path_factory.mktemp("mcplibrary") / "library"))
+    yield
+    patch.undo()
+
+
+@pytest.fixture(autouse=True)
 def _isolated_skill_dirs(tmp_path_factory, monkeypatch):
     """No test reads or writes the real skills library (~/.dreamteam/skills), the skills' environments
     (~/.dreamteam/skill-envs) or Claude Code's ~/.claude/skills; no real installer runs unless a test opts in."""

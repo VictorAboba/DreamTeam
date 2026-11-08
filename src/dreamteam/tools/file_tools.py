@@ -92,6 +92,20 @@ async def lock_file(ctx: ToolContext, args: dict[str, Any]) -> str:
 
 
 @tool(
+    "file_unlock",
+    en="Remove a member's lock on a file or folder of the shared workspace (the path as it was locked). The members "
+       "waiting for it are woken.",
+    ru="Снять блокировку участника с файла или папки общего workspace (путь, как он был заблокирован). Участников, "
+       "которые его ждут, разбудят.",
+    properties={"path": _PATH},
+    required=["path"],
+    audience=("user",),
+)
+async def file_unlock(ctx: ToolContext, args: dict[str, Any]) -> str:
+    return ctx.swarm.workspace.unlock(ctx.actor, args["path"], force=True)
+
+
+@tool(
     "shell",
     en="Run a console command in the workspace directory and get its exit code and output (the result names "
        "the shell). Use it to run code, tests, package managers, git, etc. There is no input (stdin is closed). "

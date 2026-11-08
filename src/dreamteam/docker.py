@@ -189,7 +189,7 @@ HOST_SKILLS_MOUNT = "/dreamteam/host-skills"        # the host's skills library 
 SANDBOX_SKILLS_DIR = "/swarm/.dreamteam/skills-library"
 SANDBOX_ENVS_DIR = "/dreamteam/skill-envs"   # the skills' dependency environments: a named volume per home
 SKILLS_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR",
-                        "UV_CACHE_DIR"})
+                        "DREAMTEAM_MCP_LIBRARY_DIR", "UV_CACHE_DIR"})
 
 
 def envs_volume(project_dir: Path) -> str:

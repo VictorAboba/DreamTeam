@@ -16,6 +16,7 @@ import sys
 import time
 from typing import Any, Callable, TextIO
 
+from ..copyfrom import size_text
 from ..models import USER
 from .client import Connection, HubError
 
@@ -52,6 +53,8 @@ TEXTS = {
         "unknown_session": "Неизвестная сессия «{sid}».",
         "session": "Сессия {sid}: {title}",
         "folder": "Папка сессии: {path}",
+        "copied": "Скопировано в папку сессии: файлов {files} ({size}) из {source}",
+        "copied_left_out": "Не скопировано: ссылок {links}, папок по имени {excluded}, особых файлов {special}",
         "error": "Ошибка: {error}",
         "jobs_running": "Ещё работают фоновые процессы агентов: {jobs}. Они остановятся вместе с сессией "
                         "(остановить раньше можно командой /jobs stop jN в dreamteam tui).",
@@ -73,6 +76,8 @@ TEXTS = {
         "unknown_session": "Unknown session '{sid}'.",
         "session": "Session {sid}: {title}",
         "folder": "Session folder: {path}",
+        "copied": "Copied {files} files ({size}) from {source} into the session folder",
+        "copied_left_out": "Left out: {links} links, {excluded} folders by name, {special} special files",
         "error": "Error: {error}",
         "jobs_running": "Background jobs of the agents are still running: {jobs}. They stop when the session stops "
                         "(to stop one earlier: /jobs stop jN in dreamteam tui).",
@@ -230,11 +235,12 @@ class _PrintRun:
                  title: str | None, overrides: dict | None, output_format: str, verbose: bool,
                  timeout: float | None, auto_reply: bool, lang: str | None, out: TextIO, err: TextIO,
                  on_session: Callable[[str], Any] | None = None, workspace: str | None = None,
-                 skills: list[str] | None = None):
+                 skills: list[str] | None = None, copy_from: str | None = None):
         self.client = conn.client
         # this process runs the launcher: main_print stops the session (and its jobs) at the end
         self.owned = getattr(conn, "owned", False)
         self.workspace = workspace
+        self.copy_from = copy_from   # `--copy-from`: copied into the new session's folder first
         self.skills = skills or None   # `--skill`: the new session's, or attached to the resumed one
         self.on_session = on_session
         self.prompt = prompt
@@ -255,6 +261,7 @@ class _PrintRun:
         self._heal_delay = HEAL_AFTER
         self.question_told: set[int] = set()  # question pauses announced on stderr (no auto-replies)
         self.asked_told: set[int] = set()     # agents' messages to the user announced on stderr (the same)
+        self.cost_told: set[str] = set()      # u_cost_unknown texts written to stderr
         self.clarify = False                  # the session's [swarm] clarify (its summary, then its state)
         self.ui_lang = lang
         self.lang = lang or "ru"            # the session's language once known (auto-replies)
@@ -316,7 +323,8 @@ class _PrintRun:
         if not (self.session or self.continue_last):
             title = self.title or ""  # "": the hub derives it from the goal's first line
             summary = await client.create_session(title, self.prompt, overrides=self.overrides, start=True,
-                                                  workspace=self.workspace, skills=self.skills)
+                                                  workspace=self.workspace, skills=self.skills,
+                                                  copy_from=self.copy_from)
             self.started_session(summary["id"])
             self.lang = summary.get("language") or self.lang
             self.clarify = bool(summary.get("clarify"))
@@ -324,6 +332,15 @@ class _PrintRun:
             if self.workspace:
                 folder = (summary.get("workspace_result") or {}).get("to") or self.workspace
                 self.progress(_text(self.text_lang, "folder", path=folder))
+            copied = summary.get("copy_result")
+            if isinstance(copied, dict) and self.format != "stream-json":
+                # (with or without --verbose: what the agents got, and what they did not, is the user's to know)
+                self.err.write(_text(self.text_lang, "copied", files=copied.get("files", 0),
+                                     size=size_text(copied.get("bytes") or 0),
+                                     source=copied.get("source") or self.copy_from) + "\n")
+                counts = {key: int(copied.get(f"{key}_count") or 0) for key in ("links", "excluded", "special")}
+                if any(counts.values()):
+                    self.err.write(_text(self.text_lang, "copied_left_out", **counts) + "\n")
             return
         sessions = await client.sessions()
         if self.session:
@@ -519,6 +536,18 @@ class _PrintRun:
             raise _Finished("budget", _text(self.text_lang, "budget"))
         elif etype == "swarm.paused" and data.get("reason") == "question":
             await self.on_question(data.get("asker"), data.get("message_id"))
+        elif etype == "notification" and data.get("kind") == "u_cost_unknown" and data.get("recipient") == USER:
+            self.on_cost_unknown(data.get("text"))
+
+    def on_cost_unknown(self, text: Any) -> None:
+        """A model profile's calls count as $0 (u_cost_unknown, docs/SPEC.md §10): its text on stderr once, in the
+        `text` and `json` formats also without --verbose (whose feed shows every notice anyway); stream-json carries
+        the event itself."""
+        text = " ".join(str(text or "").split())
+        if not text or self.verbose or self.format == "stream-json" or text in self.cost_told:
+            return
+        self.cost_told.add(text)
+        self.err.write(text + "\n")
 
     def board_url(self) -> str:
         """The session's board, where a human can answer the agents' questions."""
@@ -656,7 +685,7 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
                     verbose: bool = False, timeout: float | None = None, auto_reply: bool = True,
                     lang: str | None = None, out: TextIO | None = None, err: TextIO | None = None,
                     on_session: Callable[[str], Any] | None = None, workspace: str | None = None,
-                    skills: list[str] | None = None) -> int:
+                    skills: list[str] | None = None, copy_from: str | None = None) -> int:
     """Run `prompt` as a goal (a new session), or as the next instruction to an existing session
     (`session` / `continue_last`), follow the session until it ends and print the result.
 
@@ -665,13 +694,15 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     the session the run works in, once it is created or started (main_print stops it at the end). `workspace`:
     the absolute folder a new session works in (docs/SPEC.md §17.2: an empty or missing folder gets the files, one
     with files is adopted; a git repository with uncommitted changes is refused, an error). `skills`: references or
-    sources (docs/SPEC.md §19) for the new session, or attached to the existing one before the prompt goes there."""
+    sources (docs/SPEC.md §19) for the new session, or attached to the existing one before the prompt goes there.
+    `copy_from`: a folder or .zip (absolute, on the hub's computer) copied into the new session's folder before its
+    first start (§17.2 "Copying files into a new session")."""
     if output_format not in OUTPUT_FORMATS:
         raise ValueError(f"output_format must be one of {', '.join(OUTPUT_FORMATS)}")
     run = _PrintRun(conn, prompt, session=session, continue_last=continue_last, title=title, overrides=overrides,
                     output_format=output_format, verbose=verbose, timeout=timeout, auto_reply=auto_reply,
                     lang=lang, out=out or sys.stdout, err=err or sys.stderr, on_session=on_session,
-                    workspace=workspace, skills=skills)
+                    workspace=workspace, skills=skills, copy_from=copy_from)
     status, reason = "error", ""
     try:
         try:

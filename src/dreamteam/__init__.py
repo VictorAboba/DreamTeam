@@ -1,3 +1,3 @@
 """DreamTeam — self-organizing AI agent swarm framework."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

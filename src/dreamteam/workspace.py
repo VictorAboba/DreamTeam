@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -15,10 +16,10 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
-from typing import Any
+from typing import Any, Callable
 
-from . import hubgit, netoff
-from .models import USER, ToolError
+from . import hubgit, netoff, prompts
+from .models import USER, Status, ToolError
 
 log = logging.getLogger(__name__)
 
@@ -40,6 +41,7 @@ BINARY_PROBE_BYTES = 8192
 LIST_MAX_ENTRIES = 500
 TREE_MAX_ENTRIES = 5000
 MAX_LOCK_MINUTES = 24 * 60
+WAITERS_SHOWN = 10        # paths (or locks) one lock notice or result names; the rest as "(+N)"
 GIT_TIMEOUT = 120.0
 COMMIT_SUBJECT_MAX = 72   # the subject of an autocommit that names what changed: "shell: src/app.py, x.json (+3 more)"
 COMMIT_PATH_MAX = 40      # one path in it; a longer one keeps its end: "…/models/user.py"
@@ -134,10 +136,26 @@ def _norm(rel: str) -> str:
     return rel.casefold() if _WINDOWS else rel
 
 
+def path_key(rel: str) -> str:
+    """The form in which two workspace-relative paths are compared (case-insensitive on Windows)."""
+    return _norm(rel)
+
+
 def _covers(lock_path: str, rel: str) -> bool:
     """True if a lock on `lock_path` (file or directory) protects `rel`."""
     lock_path, rel = _norm(lock_path), _norm(rel)
     return rel == lock_path or rel.startswith(lock_path + "/")
+
+
+def _overlaps(a: str, b: str) -> bool:
+    """A lock on one of the two paths covers the other: what lock() refuses."""
+    return _covers(a, b) or _covers(b, a)
+
+
+def shown_list(items: list[str], limit: int = WAITERS_SHOWN) -> str:
+    """"a.md, b.md": at most `limit` items, the rest as " (+N)"."""
+    more = len(items) - limit
+    return ", ".join(items[:limit]) + (f" (+{more})" if more > 0 else "")
 
 
 def in_scratch(rel: str) -> bool:
@@ -172,6 +190,37 @@ def is_link(entry: os.DirEntry | Path | str) -> bool:
         return tag is None or bool(tag & _REPARSE_TAG_NAME_SURROGATE)
     except OSError:
         return False
+
+
+def pid_alive(pid: Any, *, other_users: bool = True) -> bool:
+    """A process with this id runs: on Windows asked without signalling it, on POSIX by signal 0, where a process of
+    another user (EPERM) runs too unless `other_users` is False (a marker this user's DreamTeam wrote whose pid
+    belongs to another user's process now is stale). False for no pid or one that is not a number."""
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        if pid > 0xFFFFFFFF:
+            return False
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return other_users
+    except (OSError, OverflowError):
+        return False
+    return True
 
 
 def _write_inside(p: Path, rel: str, data: bytes, root: Path) -> None:
@@ -358,6 +407,8 @@ def git_argv(git: str, root: Path, actor: str | None, args: tuple[str, ...] | li
         "-c", f"user.name={name}",
         "-c", f"user.email={email}",
         *(() if adopted else ("-c", "core.autocrlf=false")),
+        # (Git for Windows skips paths over 260 characters without it: a deep copied tree would not be committed)
+        *(("-c", "core.longpaths=true") if _WINDOWS and not adopted else ()),
         "-c", "core.quotepath=false",
         "-c", f"safe.directory={safe_directory or Path(root).resolve().as_posix()}",
         *guard,
@@ -637,6 +688,11 @@ class Workspace:
         self._git_holds = 0
         self._git_ready = asyncio.Event()
         self._git_ready.set()
+        # write_file/edit_file writes for the file_changed() probes (write_mark): a sequence number at each write's
+        # start, the latest one per path key, and the path keys written right now (until their file.changed event)
+        self._write_seq = 0
+        self._write_started: dict[str, int] = {}
+        self._writing: dict[str, int] = {}
 
     # --- setup -----------------------------------------------------------------------------
     @property
@@ -695,11 +751,12 @@ class Workspace:
 
     async def _configure_repo(self) -> None:
         """Repo-local settings for a repository DreamTeam created, so that git commands run from the shell behave
-        like the autocommits (line endings, no signing)."""
+        like the autocommits (line endings, long paths on Windows, no signing)."""
         if not (self.root / ".git").exists():
             return
-        for key, value in (("core.autocrlf", "false"), ("user.name", "DreamTeam"),
-                           ("user.email", "swarm@dreamteam.local"), ("commit.gpgsign", "false")):
+        for key, value in (("core.autocrlf", "false"), *((("core.longpaths", "true"),) if _WINDOWS else ()),
+                           ("user.name", "DreamTeam"), ("user.email", "swarm@dreamteam.local"),
+                           ("commit.gpgsign", "false")):
             await self._git(None, "config", "--local", key, value)
 
     async def _init_repo(self) -> None:
@@ -998,9 +1055,52 @@ class Workspace:
         The git lock is held from the write to the commit so that no other commit (e.g. a shell
         autocommit doing `add -A`) picks the change up under another member's name."""
         async with self._git_lock:
-            await self._store(p, rel, data)
-            self.swarm.bus.emit("file.changed", actor, path=rel, op=op)
+            key = path_key(rel)
+            self._write_seq += 1
+            self._write_started[key] = self._write_seq
+            self._writing[key] = self._writing.get(key, 0) + 1
+            store = asyncio.ensure_future(self._store(p, rel, data))
+            late = False
+            try:
+                await asyncio.shield(store)
+                self.swarm.bus.emit("file.changed", actor, path=rel, op=op)
+            except asyncio.CancelledError:
+                # cancelled (e.g. the member stopped) while the thread goes on writing: the path stays in flight until
+                # the thread ends, and a write that lands is still this member's change
+                late = True
+                store.add_done_callback(lambda done: self._late_write_ended(done, key, actor, rel, op))
+                raise
+            finally:
+                if not late:
+                    self._write_ended(key)
             return await self._commit_locked(actor, f"{op} {rel}", rel)
+
+    def _write_ended(self, key: str) -> None:
+        if self._writing[key] > 1:
+            self._writing[key] -= 1
+        else:
+            del self._writing[key]
+
+    def _late_write_ended(self, done: asyncio.Future, key: str, actor: str, rel: str, op: str) -> None:
+        self._write_ended(key)
+        if not done.cancelled() and done.exception() is None:
+            try:
+                self.swarm.bus.emit("file.changed", actor, path=rel, op=op)
+            except sqlite3.ProgrammingError:   # the session stopped and closed its database meanwhile
+                log.debug("file.changed of %s's late write of %s not recorded", actor, rel, exc_info=True)
+            except Exception:  # noqa: BLE001 - no caller is left to tell; a live session's lost event must show
+                log.exception("file.changed of %s's late write of %s not recorded", actor, rel)
+
+    def write_mark(self) -> tuple[int, frozenset[str]]:
+        """(the write sequence, the path keys being written) now. A file_changed() probe taken after this mark is
+        unreliable for a path `written_since` it: the stat may show the file before or in the middle of the write
+        (opened, truncated, then written), while the write's own file.changed event counts the change."""
+        return self._write_seq, frozenset(self._writing)
+
+    def written_since(self, mark: tuple[int, frozenset[str]], key: str) -> bool:
+        """A write_file/edit_file write of the path key was in flight at `mark` (write_mark) or started since."""
+        seq, writing = mark
+        return key in writing or self._write_started.get(key, 0) > seq
 
     @staticmethod
     def _commit_note(commit: str | None, rel: str = "") -> str:
@@ -1133,19 +1233,19 @@ class Workspace:
                 if _norm(lock["path"]) == _norm(rel):
                     mine = lock
                 continue
-            if _covers(lock["path"], rel) or _covers(rel, lock["path"]):
+            if _overlaps(lock["path"], rel):
                 where = "" if _norm(lock["path"]) == _norm(rel) else f" (lock on '{lock['path']}')"
-                raise ToolError(f"'{rel}' is {self._describe(lock)}{where}. "
-                                "Message them or wait until it is unlocked.")
+                raise ToolError(f"'{rel}' is {self._describe(lock)}{where}. " + self._refused(actor, rel, lock))
         now = time.time()
         expires = now + minutes * 60
-        if mine:
+        if mine:  # a refresh keeps acquired_at and wanted_at: the same lock
             self.swarm.db.execute("UPDATE file_locks SET expires_at = ? WHERE path = ?", (expires, mine["path"]))
             rel = mine["path"]
         else:
             self.swarm.db.execute(
                 "INSERT OR REPLACE INTO file_locks(path, owner, acquired_at, expires_at) VALUES (?, ?, ?, ?)",
                 (rel, actor, now, expires))
+        self._forget_waits(actor, lambda p: _covers(rel, p))  # it holds what it waited for: no "free" note later
         self.swarm.bus.emit("file.locked", actor, path=rel, owner=actor, expires_at=expires,
                             refreshed=bool(mine))
         verb = "Lock on" if mine else "Locked"
@@ -1154,23 +1254,41 @@ class Workspace:
                 "Unlock it when you are done.")
 
     def unlock(self, actor: str, path: str, force: bool = False) -> str:
+        """`actor`'s own lock on `path`; the user's with force=True (file_unlock: a path that is not locked is then a
+        ToolError naming what is). The members waiting for what it freed are woken at once (settle_waiters)."""
         rel = self.rel(self.resolve(path))
         self.expire_locks()
         lock = next((lk for lk in self._lock_rows() if _norm(lk["path"]) == _norm(rel)), None)
         if lock is None:
+            if force and actor == USER:
+                raise ToolError(self._not_locked(rel))
             return f"{rel} is not locked."
         forced = lock["owner"] != actor
         if forced:
             if force and actor != USER:
                 raise ToolError("Only the user can force-unlock a file locked by someone else.")
             if not force:
-                hint = " Pass force=true to unlock it anyway." if actor == USER else \
-                    " Ask them to unlock it, or wait until the lock expires."
-                raise ToolError(f"'{rel}' is {self._describe(lock)}, not by you.{hint}")
+                if actor == USER:
+                    raise ToolError(f"'{rel}' is {self._describe(lock)}, not by you. Pass force=true to unlock it "
+                                    "anyway.")
+                raise ToolError(f"'{rel}' is {self._describe(lock)}, not by you: only they can unlock it. "
+                                + self._refused(actor, rel, lock))
         self.swarm.db.execute("DELETE FROM file_locks WHERE path = ?", (lock["path"],))
         self.swarm.bus.emit("file.unlocked", actor, path=lock["path"], owner=lock["owner"], forced=forced)
-        suffix = f" (was locked by {lock['owner']})" if forced else ""
+        self.settle_waiters()
+        suffix = f" (it was locked by {lock['owner']})" if forced else ""
         return f"Unlocked {lock['path']}{suffix}."
+
+    def _not_locked(self, rel: str) -> str:
+        live = self._lock_rows()
+        above = next((lk for lk in live if _covers(lk["path"], rel)), None)
+        if above is not None:
+            return (f"'{rel}' is not locked itself: it is under the lock on '{above['path']}' ({above['owner']}); "
+                    f"unlock '{above['path']}' instead.")
+        if not live:
+            return f"'{rel}' is not locked; no file is locked now."
+        return (f"'{rel}' is not locked. Locked now: "
+                + shown_list([f"{lk['path']} ({lk['owner']})" for lk in live]) + ".")
 
     def locks(self) -> list[dict]:
         self.expire_locks()
@@ -1184,22 +1302,192 @@ class Workspace:
                 continue
             if _covers(lock["path"], rel):
                 where = "" if _norm(lock["path"]) == _norm(rel) else f" (lock on '{lock['path']}')"
-                raise ToolError(f"'{rel}' is {self._describe(lock)}{where}. "
-                                "Ask them to unlock it, or wait until the lock expires.")
+                raise ToolError(f"'{rel}' is {self._describe(lock)}{where}. " + self._refused(actor, rel, lock))
+        self._forget_waits(actor, lambda p: _norm(p) == _norm(rel))
 
     def release_all(self, actor: str) -> int:
+        """Every lock of `actor`, who leaves (retire): its own waits are dropped, and the members waiting for what
+        it held are woken."""
+        self.swarm.db.execute("DELETE FROM lock_waiters WHERE agent = ?", (actor,))
         rows = self.swarm.db.all("SELECT path FROM file_locks WHERE owner = ?", (actor,))
         for row in rows:
             self.swarm.db.execute("DELETE FROM file_locks WHERE path = ?", (row["path"],))
             self.swarm.bus.emit("file.unlocked", actor, path=row["path"], owner=actor, forced=False)
+        if rows:
+            self.settle_waiters()
         return len(rows)
 
     def expire_locks(self) -> int:
+        """Never settles: it also runs lazily inside a waiter's own retry, which would get a "free" note for what it
+        has just taken. The scheduler tick settles after it."""
         rows = self.swarm.db.all("SELECT path, owner FROM file_locks WHERE expires_at <= ?", (time.time(),))
         for row in rows:
             self.swarm.db.execute("DELETE FROM file_locks WHERE path = ?", (row["path"],))
             self.swarm.bus.emit("file.unlocked", None, path=row["path"], owner=row["owner"], expired=True)
         return len(rows)
+
+    def held_locks_note(self, actor: str) -> str:
+        """The task_complete reminder of the locks `actor` still holds ("" when none)."""
+        held = [lk for lk in self.locks() if lk["owner"] == actor]
+        if not held:
+            return ""
+        return ("You still hold locks on: "
+                + shown_list([f"{lk['path']} (until {_clock(lk['expires_at'])})" for lk in held])
+                + ". Unlock those you no longer need (`lock_file` with unlock=true).")
+
+    # --- waiting for a lock -----------------------------------------------------------------
+    # A member refused a path (lock, write or edit, someone else's unlock) is recorded in lock_waiters and woken once
+    # no other member's live lock overlaps that path (n_lock_free). A lock others wait for is named to its holder once
+    # per lock, after [workspace] lock_wanted_minutes (n_lock_wanted, file_locks.wanted_at).
+    def _refused(self, actor: str, rel: str, lock: dict) -> str:
+        """The end of the refusal text; records a member as waiting for `rel` (one row per path: a repeat keeps its
+        first `since`) and tells the holder of `lock` when it is due."""
+        if actor == USER or not self.swarm.is_member(actor):
+            return "Try again once it is unlocked."
+        mine = self.swarm.db.all("SELECT path FROM lock_waiters WHERE agent = ?", (actor,))
+        if not any(_norm(row["path"]) == _norm(rel) for row in mine):
+            self.swarm.db.execute("INSERT OR IGNORE INTO lock_waiters(agent, path, since) VALUES (?, ?, ?)",
+                                  (actor, rel, time.time()))
+        try:
+            self._tell_holders(self._waiter_rows(), only=lock["path"])
+        except Exception:  # noqa: BLE001 - the refusal stands whatever the notice does
+            log.exception("telling the holder of %s failed", lock["path"])
+        return self._wait_hint(actor)
+
+    def _wait_hint(self, actor: str) -> str:
+        """It names `wait`, or `wait_for_events` to an external member, which has no `wait`."""
+        tool = "wait"
+        try:
+            from .tools import frozen
+
+            member = self.swarm.member(actor)
+            names = frozen.member_tool_names(self.swarm, member) if member is not None else frozenset()
+            if "wait" not in names and "wait_for_events" in names:
+                tool = "wait_for_events"
+        except Exception:  # noqa: BLE001 - only the wording depends on it (test doubles, a view-only swarm)
+            pass
+        return ("You will be notified when it is free; there is no need to message them. Meanwhile do other work, "
+                f"or call `{tool}` if nothing else is left.")
+
+    def _waiter_rows(self) -> list[dict]:
+        rows = self.swarm.db.all("SELECT agent, path, since FROM lock_waiters ORDER BY since, rowid")
+        return [dict(r) for r in rows]
+
+    def _forget_waits(self, actor: str, done: Callable[[str], bool]) -> None:
+        for row in self.swarm.db.all("SELECT path FROM lock_waiters WHERE agent = ?", (actor,)):
+            if done(row["path"]):
+                self.swarm.db.execute("DELETE FROM lock_waiters WHERE agent = ? AND path = ?", (actor, row["path"]))
+
+    def waits_for_lock(self, name: str) -> bool:
+        """`name` was refused a path and will be woken when it is free (the scheduler does not nudge it meanwhile)."""
+        return bool(self.swarm.db.scalar("SELECT 1 FROM lock_waiters WHERE agent = ? LIMIT 1", (name,)))
+
+    def lock_waits(self, name: str) -> list[str]:
+        """The paths `name` waits for, the oldest first."""
+        return [r["path"] for r in self.swarm.db.all(
+            "SELECT path FROM lock_waiters WHERE agent = ? ORDER BY since, rowid", (name,))]
+
+    def awaited_locks(self, name: str) -> list[str]:
+        """lock_waits whose release will wake `name` (none once the goal is done: n_lock_free is quiet then), as
+        JobManager.awaited gives the jobs."""
+        return [] if self._goal_done() else self.lock_waits(name)
+
+    def settle_waiters(self) -> int:
+        """Wake every waiter whose path no other member's live lock overlaps any more: one waking n_lock_free per
+        member naming those paths, whose rows are then deleted (a waiter that left is dropped). Then the holders of
+        the locks still waited for are told when due (_tell_holders). Run after unlock and release_all, and by the
+        scheduler tick after expire_locks (an expiry, a lock expired lazily elsewhere, a restart). Returns the members
+        woken; never raises."""
+        try:
+            rows = self._waiter_rows()
+            if not rows:
+                return 0
+            now = time.time()
+            live = [lk for lk in self._lock_rows() if lk["expires_at"] > now]  # an expired row is free already
+            member: dict[str, bool] = {}
+            free: dict[str, list[str]] = {}
+            waiting: list[dict] = []
+            for row in rows:
+                agent = row["agent"]
+                if agent not in member:
+                    member[agent] = self.swarm.is_member(agent)
+                if not member[agent]:
+                    self.swarm.db.execute("DELETE FROM lock_waiters WHERE agent = ?", (agent,))
+                elif any(lk["owner"] != agent and _overlaps(lk["path"], row["path"]) for lk in live):
+                    waiting.append(row)
+                else:
+                    free.setdefault(agent, []).append(row["path"])
+            # once the goal is done the news is quiet, like a job's end (JobManager.wakes): the waiter reads it at
+            # its next wake-up for another reason, and a reopened finished session wakes nobody
+            done = self._goal_done()
+            for agent, paths in free.items():
+                self.swarm.notify(agent, "n_lock_free", paths=shown_list(paths), wake=not done)
+                for path in paths:
+                    self.swarm.db.execute("DELETE FROM lock_waiters WHERE agent = ? AND path = ?", (agent, path))
+            if waiting:
+                self._tell_holders(waiting)
+            return len(free)
+        except Exception:  # noqa: BLE001 - a release or the scheduler tick goes on
+            log.exception("settling the lock waiters failed")
+            return 0
+
+    def _goal_done(self) -> bool:
+        goal_of = getattr(self.swarm, "goal", None)
+        goal = goal_of() if goal_of is not None else None
+        return bool(goal) and goal.get("status") == "done"
+
+    def _tell_holders(self, waiting: list[dict], only: str | None = None) -> None:
+        """One waking n_lock_wanted per holder and pass for the locks that members wait for, once it has held each
+        for [workspace] lock_wanted_minutes (0: at once); file_locks.wanted_at marks every overlapping lock of that
+        holder told (a new lock starts untold, a refresh keeps it). `only`: just the lock on that path (a refusal).
+        Nothing while the goal is done (the lock stays untold, so a reopened goal still gets the notice)."""
+        if not waiting or self._goal_done():
+            return
+        now = time.time()
+        due = float(self.swarm.config.workspace.lock_wanted_minutes) * 60
+        locks = self.swarm.db.all("SELECT path, owner, acquired_at, wanted_at FROM file_locks WHERE expires_at > ?"
+                                  " ORDER BY acquired_at, path", (now,))
+        told = {lk["path"] for lk in locks if lk["wanted_at"] is not None}
+
+        def mark(path: str) -> None:
+            told.add(path)
+            self.swarm.db.execute("UPDATE file_locks SET wanted_at = ? WHERE path = ?", (now, path))
+
+        for lock in locks:
+            if lock["path"] in told or (only is not None and lock["path"] != only):
+                continue
+            owner = lock["owner"]
+            # a holder of nested locks (a folder and a file in it) is told once: a lock that overlaps one of its
+            # own told locks counts as told
+            if any(o["owner"] == owner and o["path"] in told and _overlaps(o["path"], lock["path"]) for o in locks):
+                mark(lock["path"])
+                continue
+            held = now - float(lock["acquired_at"] or now)
+            names = list(dict.fromkeys(w["agent"] for w in waiting
+                                       if w["agent"] != owner and _overlaps(lock["path"], w["path"])))
+            if held < due or not names or owner == USER or not self.swarm.is_member(owner):
+                continue
+            from .jobs import fmt_duration  # (jobs imports this module)
+
+            lang = self.swarm.language_of(owner)
+            # (lock_wanted_minutes = 0 tells at a refusal right after the lock: never "held for 0 s")
+            self.swarm.notify(owner, "n_lock_wanted", path=lock["path"], held=fmt_duration(max(1.0, held), lang),
+                              waiters=", ".join(self._waiter_text(name, lang) for name in names))
+            mark(lock["path"])
+            for other in locks:  # its locks nested with this one count as told too
+                if other["owner"] == owner and other["path"] not in told and _overlaps(other["path"], lock["path"]):
+                    mark(other["path"])
+
+    def _waiter_text(self, name: str, lang: str) -> str:
+        """"Anna Smith (task #7 Parser)": a waiter with its tasks in progress, if any."""
+        board = getattr(self.swarm, "board", None)
+        try:
+            tasks = [t for t in board.open_tasks_of(name) if t.status == Status.IN_PROGRESS] if board else []
+        except Exception:  # noqa: BLE001 - the name alone is enough
+            tasks = []
+        if not tasks:
+            return name
+        return prompts.t(lang, "lock_waiter_task", name=name, tasks=", ".join(f"#{t.id} {t.title}" for t in tasks))
 
     # --- git --------------------------------------------------------------------------------
     async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",

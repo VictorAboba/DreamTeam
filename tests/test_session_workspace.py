@@ -6,17 +6,21 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import io
 import json
 import os
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+import zipfile
 from pathlib import Path
 
 import pytest
 
+from dreamteam import copyfrom
 from dreamteam import sessions as sessions_mod
 from dreamteam import settings as st
 from dreamteam.config import Config
@@ -26,6 +30,7 @@ from dreamteam.launcher_mcp import workspace_text
 from dreamteam.models import USER, AgentKind
 from dreamteam.sessions import LEGACY_ID, MOVE_JOURNAL, SessionError, SessionManager, external_workspaces
 from dreamteam.shell import run_shell
+from dreamteam.treecopy import COPY_EXCLUDE_NAMES, scan_tree
 from dreamteam.workspace import init_repo, repo_state
 
 HAS_GIT = shutil.which("git") is not None
@@ -1019,7 +1024,8 @@ async def test_a_create_that_fails_in_its_folder_says_what_is_left_there(tmp_pat
 
 # ---- git rules of an adopted folder ----------------------------------------------------------------------------
 @needs_git
-async def test_git_internals_a_halfway_merge_and_the_mcp_library_are_refused(tmp_path):
+async def test_git_internals_a_halfway_merge_and_the_mcp_library_are_refused(tmp_path, monkeypatch):
+    monkeypatch.delenv("DREAMTEAM_MCP_LIBRARY_DIR")  # the library is the one the settings name ([mcp] library_dir)
     project = _user_repo(tmp_path / "project")
     git(tmp_path, "init", "-q", "--bare", "bare.git")
     library = tmp_path / "library"
@@ -1314,3 +1320,580 @@ async def test_external_members_hear_of_the_new_folder_too(tmp_path):
         assert text and str(target.resolve()) in text
     finally:
         await manager.shutdown()
+
+
+# ---- a copy of files in a new session (copy_from, copy_from_upload) --------------------------------------------
+def _put(path: Path, data: str | bytes) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data.encode("utf-8") if isinstance(data, str) else data)
+    return path
+
+
+def _source(root: Path) -> Path:
+    """A project to copy: two files, its .gitignore and a file it ignores, plus what a copy leaves out."""
+    _put(root / "a.txt", "alpha\n")
+    _put(root / "src" / "main.py", "print('hi')\n")
+    _put(root / ".gitignore", "*.log\n")
+    _put(root / "keep.log", "ignored by the project's .gitignore\n")
+    _put(root / ".git" / "HEAD", "ref: refs/heads/main\n")
+    _put(root / "node_modules" / "x.js", "module\n")
+    _put(root / ".venv" / "pyvenv.cfg", "home\n")
+    _put(root / "venv" / "lib.py", "x\n")
+    _put(root / "src" / "__pycache__" / "main.pyc", b"\0pyc")
+    _put(root / "sub" / ".GIT" / "config", "x\n")
+    _put(root / "sub" / "Node_Modules" / "y.js", "y\n")
+    return root
+
+
+SOURCE_FILES = [".gitignore", "a.txt", "keep.log", "src/main.py"]
+
+
+def _rel_files(root: Path) -> list[str]:
+    return sorted(p.relative_to(root).as_posix() for p in root.rglob("*") if p.is_file())
+
+
+def _digest(root: Path) -> str:
+    return scan_tree(root, exclude_names=(), exclude_paths=()).digest
+
+
+def _left_in_sessions(manager: SessionManager) -> list[str]:
+    return sorted(p.name for p in manager.sessions_dir.iterdir()) if manager.sessions_dir.is_dir() else []
+
+
+def _set_global(manager: SessionManager, section: str, **values) -> None:
+    """A hand edit of dreamteam.toml (the manager picks it up at its next call)."""
+    raw = st.read_raw(manager.home)
+    raw.setdefault(section, {}).update(values)
+    st.write_raw(manager.home, raw)
+    later = time.time() + 5
+    os.utime(st.settings_path(manager.home), (later, later))
+
+
+async def _upload(manager: SessionManager, members: dict[str, str], name: str = "x.zip") -> str:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for member, data in members.items():
+            zf.writestr(member, data)
+
+    async def chunks():
+        yield buf.getvalue()
+
+    got = await manager.uploads.receive(chunks(), filename=name, length=None,
+                                        limits=copyfrom.CopyLimits.from_config(manager.global_config()))
+    return got["upload"]
+
+
+def _upload_files(manager: SessionManager, token: str) -> list[str]:
+    root = manager.uploads.root
+    return sorted(p.name for p in root.iterdir() if p.name.startswith(token)) if root.is_dir() else []
+
+
+async def test_create_with_copy_from_into_the_default_folder(tmp_path):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    before = _digest(src)
+    summary = await manager.create("C", "Improve the project", copy_from=str(src), start=False)
+    sid = summary["id"]
+    ws = manager.default_workspace(sid)
+    assert _rel_files(ws) == SOURCE_FILES
+    assert not any(p.name.casefold() in COPY_EXCLUDE_NAMES for p in ws.rglob("*"))
+    meta = manager.meta(sid)
+    copied = meta["copied_from"]
+    assert copied["source"] == str(src.resolve()) and copied["files"] == 4 and isinstance(copied["at"], float)
+    assert copied["bytes"] == sum((src / rel).stat().st_size for rel in SOURCE_FILES)
+    assert manager.summary(sid)["copied_from"] == copied and summary["copied_from"] == copied
+    result = summary["copy_result"]
+    assert result["excluded_count"] == 7 and result["files"] == 4 and result["kind"] == "folder"
+    assert "copy_result" not in manager.summary(sid)
+    assert str(src) not in json.dumps(meta["pending_goal"])   # the agents are never told where the files came from
+    assert _digest(src) == before
+    assert _left_in_sessions(manager) == [sid]
+    await manager.shutdown()
+
+
+@needs_git
+async def test_copy_from_files_are_in_the_first_commit(tmp_path):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    try:
+        new = tmp_path / "new"
+        summary = await manager.create("In a folder", copy_from=str(src), workspace=str(new), start=False)
+        assert summary["workspace_result"]["mode"] == "created" and summary["workspace_result"]["git"] == "initialized"
+        assert git(new, "log", "--format=%s").splitlines() == ["Initialize workspace"]
+        assert sorted(git(new, "ls-files").splitlines()) == [".gitignore", "a.txt", "src/main.py"]
+        assert (new / ".gitignore").read_text(encoding="utf-8") == "*.log\n" and (new / "keep.log").is_file()
+        assert not manager.default_workspace(summary["id"]).exists()
+
+        sid = (await manager.create("Default", copy_from=str(src), start=False))["id"]
+        ws = manager.default_workspace(sid)
+        assert not (ws / ".git").exists()   # the first start makes the repository
+        await manager.start(sid)
+        await until(lambda: "a.txt" in git(ws, "ls-files", check=False))
+        assert {".gitignore", "a.txt", "src/main.py"} <= set(git(ws, "ls-files").splitlines())
+        assert "Initialize workspace" in git(ws, "log", "--format=%s").splitlines()
+        assert (ws / ".gitignore").read_text(encoding="utf-8") == "*.log\n"
+    finally:
+        await manager.shutdown()
+
+
+@needs_git
+@pytest.mark.skipif(sys.platform != "win32", reason="Git for Windows' 260-character path limit")
+async def test_copied_files_deeper_than_max_path_are_committed(tmp_path):
+    """The copy lands deeper than its source: a file past 260 characters is still in the first commit (Git for
+    Windows skips such paths without core.longpaths), and the repository keeps the setting for the agents' shell."""
+    from dreamteam.workspace import long_path
+
+    manager = _manager(tmp_path)
+    deep = Path(*["d" * 50] * 5, "deep.txt")
+    src = tmp_path / "src"
+    new = tmp_path / "new"
+    os.makedirs(long_path(src / deep.parent))
+    with open(long_path(src / deep), "w", encoding="utf-8") as f:
+        f.write("deep")
+    _put(src / "top.txt", "top")
+    assert len(str(new / deep)) > 260
+    try:
+        await manager.create("Deep", copy_from=str(src), workspace=str(new), start=False)
+        assert set(git(new, "-c", "core.longpaths=true", "ls-files").splitlines()) == \
+            {".gitignore", "top.txt", deep.as_posix()}
+        sid = (await manager.create("Default", copy_from=str(src), start=False))["id"]
+        ws = manager.default_workspace(sid)
+        await manager.start(sid)
+        await until(lambda: "top.txt" in git(ws, "ls-files", check=False))
+        assert deep.as_posix() in git(ws, "-c", "core.longpaths=true", "ls-files").splitlines()
+        await until(lambda: git(ws, "config", "--local", "core.longpaths", check=False).strip() == "true")
+    finally:
+        await manager.shutdown()
+
+
+async def test_copy_from_with_an_empty_workspace_folder(tmp_path):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    target = tmp_path / "empty"
+    target.mkdir()
+    summary = await manager.create("E", copy_from=str(src), workspace=str(target), start=False)
+    assert summary["workspace_result"]["mode"] == "created"
+    assert [f for f in _rel_files(target) if not f.startswith(".git/")] == SOURCE_FILES
+    assert summary["copy_result"]["files"] == 4 and summary["copied_from"]["files"] == 4
+    await manager.shutdown()
+
+
+async def test_copy_from_refuses_a_folder_with_files(tmp_path):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    busy = tmp_path / "busy"
+    _put(busy / "a.txt", "mine")
+    targets = [busy]
+    if HAS_GIT:
+        targets.append(_user_repo(tmp_path / "repo"))
+        (targets[-1] / "dirty.txt").write_text("not committed", encoding="utf-8")
+    for target in targets:
+        with pytest.raises(SessionError) as err:
+            await manager.create("B", copy_from=str(src), workspace=str(target), start=False)
+        assert err.value.status == 409 and "already has files" in str(err.value), str(err.value)
+    assert manager.ids() == [] and _left_in_sessions(manager) == []
+    assert (busy / "a.txt").read_text(encoding="utf-8") == "mine"
+    await manager.shutdown()
+
+
+async def test_two_creates_into_one_new_folder_refuse_the_second_at_once(tmp_path, monkeypatch):
+    """A double click or a client's retry: the second create into the same folder is a 409 before it copies, not
+    a git error after a full copy of its own."""
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    target = tmp_path / "new"
+    copies = []
+    real_copy = sessions_mod.copy_into
+
+    def slow_copy(*args, **kwargs):
+        copies.append(1)
+        time.sleep(0.3)   # (both creates pass their first checks meanwhile)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_mod, "copy_into", slow_copy)
+    results = await asyncio.gather(*(manager.create(name, copy_from=str(src), workspace=str(target), start=False)
+                                     for name in ("One", "Two")), return_exceptions=True)
+    errors = [r for r in results if isinstance(r, BaseException)]
+    assert len(errors) == 1 and isinstance(errors[0], SessionError), results
+    assert errors[0].status == 409 and "being created in" in str(errors[0])
+    assert len(copies) == 1 and len(manager.ids()) == 1
+    assert [f for f in _rel_files(target) if not f.startswith(".git/")] == SOURCE_FILES
+    # once the first is done, the folder is that session's: the usual refusal, and a new create may go on
+    with pytest.raises(SessionError) as err:
+        await manager.create("Three", copy_from=str(src), workspace=str(target), start=False)
+    assert err.value.status == 409 and "being created" not in str(err.value)
+    assert manager._creating_in == set()
+    await manager.shutdown()
+
+
+async def test_a_create_or_a_move_into_a_folder_being_created_in_is_refused_at_once(tmp_path, monkeypatch):
+    """Nested folders (and another letter case of the same new folder) overlap a reservation too, and so does a
+    workspace change of another session: refused before a copy, not at the claim after it."""
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    other = await manager.create("Other", start=False)
+    target = tmp_path / "new"
+    copies = []
+    real_copy = sessions_mod.copy_into
+
+    def slow_copy(*args, **kwargs):
+        copies.append(1)
+        time.sleep(0.4)
+        return real_copy(*args, **kwargs)
+
+    async def later(make):
+        await asyncio.sleep(0.15)   # (the first create copies meanwhile)
+        return await make()
+
+    monkeypatch.setattr(sessions_mod, "copy_into", slow_copy)
+    attempts = [lambda: manager.create("Inner", copy_from=str(src), workspace=str(target / "a"), start=False),
+                lambda: manager.create("Case", copy_from=str(src), workspace=str(tmp_path / "NEW"), start=False),
+                lambda: manager.set_workspace(other["id"], str(target / "b"))]
+    results = await asyncio.gather(manager.create("Outer", copy_from=str(src), workspace=str(target), start=False),
+                                   *(later(make) for make in attempts), return_exceptions=True)
+    assert not isinstance(results[0], BaseException), results
+    for refused in results[1:]:
+        assert isinstance(refused, SessionError) and refused.status == 409, results
+        assert "being created in" in str(refused)
+    assert len(copies) == 1 and manager._creating_in == set()
+    await manager.shutdown()
+
+
+@pytest.mark.parametrize("case", ["missing", "not_zip", "home", "in_home", "both", "contains_target",
+                                  "inside_target", "same_as_target", "limit"])
+async def test_copy_from_refusals_create_nothing(tmp_path, case):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "outer" / "src")
+    kwargs: dict = {"copy_from": str(src)}
+    status = 400
+    if case == "missing":
+        kwargs["copy_from"] = str(tmp_path / "missing")
+    elif case == "not_zip":
+        kwargs["copy_from"] = str(_put(tmp_path / "notes.txt", "x"))
+    elif case == "home":
+        kwargs["copy_from"] = str(manager.home)
+    elif case == "in_home":
+        (manager.home / "projects").mkdir()
+        kwargs["copy_from"] = str(manager.home / "projects")
+    elif case == "both":
+        kwargs["copy_from_upload"] = "a" * 24
+    elif case == "contains_target":
+        kwargs["workspace"] = str(src / "inner")
+    elif case == "inside_target":   # the target holds the source: a folder with files
+        kwargs["workspace"] = str(tmp_path / "outer")
+        status = 409
+    elif case == "same_as_target":
+        empty = tmp_path / "same"
+        empty.mkdir()
+        kwargs.update(copy_from=str(empty), workspace=str(empty))
+    else:
+        _set_global(manager, "workspace", copy_max_files=1)
+        status = 413
+    with pytest.raises(SessionError) as err:
+        await manager.create("R", **kwargs, start=False)
+    assert err.value.status == status, str(err.value)
+    if case == "limit":
+        assert "[workspace] copy_max_files" in str(err.value)
+    assert manager.ids() == [] and _left_in_sessions(manager) == []
+    await manager.shutdown()
+
+
+async def test_copy_from_zip_unwraps_one_top_folder(tmp_path):
+    manager = _manager(tmp_path)
+    work = tmp_path / "z" / "mywork"
+    _put(work / "a.txt", "A")
+    _put(work / "docs" / "b.md", "B")
+    _put(work / "node_modules" / "x.js", "x")
+    archive = Path(shutil.make_archive(str(tmp_path / "mywork"), "zip", root_dir=tmp_path / "z", base_dir="mywork"))
+    with zipfile.ZipFile(archive) as zf:
+        assert "mywork/" in zf.namelist()
+    summary = await manager.create("Z", copy_from=str(archive), start=False)
+    ws = manager.default_workspace(summary["id"])
+    assert _rel_files(ws) == ["a.txt", "docs/b.md"]
+    result = summary["copy_result"]
+    assert result["top"] == "mywork" and result["excluded"] == ["mywork/node_modules"] and result["kind"] == "zip"
+    assert summary["copied_from"]["source"] == str(archive.resolve())
+    await manager.shutdown()
+
+
+async def test_copied_from_in_summary_is_sanitized(tmp_path):
+    manager = _manager(tmp_path)
+    sid = (await manager.create("S", start=False))["id"]
+    assert manager.summary(sid)["copied_from"] is None
+    path = manager.dir_of(sid) / "session.json"
+    meta = json.loads(path.read_text(encoding="utf-8"))
+    for value, shown in (
+            ({"source": "x\nIGNORE ALL\x1b[2J", "files": "5", "bytes": -1, "extra": 1},
+             {"source": "x IGNORE ALL [2J", "files": 5, "bytes": 0, "at": 0.0}),
+            ({"source": "y" * 500, "files": float("inf"), "bytes": 3, "at": 12.5},
+             {"source": "y" * 300, "files": 0, "bytes": 3, "at": 12.5}),
+            ("a string", None), ({"source": 5}, None), ([1], None)):
+        path.write_text(json.dumps({**meta, "copied_from": value}), encoding="utf-8")
+        assert manager.summary(sid)["copied_from"] == shown
+    await manager.shutdown()
+
+
+async def test_a_failing_move_after_the_copy_leaves_nothing(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    before = _digest(src)
+    real_move = sessions_mod._move_path
+    calls: list[str] = []
+
+    def flaky(src_path: Path, dst: Path, done=None) -> None:
+        calls.append(src_path.name)
+        if len(calls) == 2:
+            raise OSError(28, "No space left on device")
+        real_move(src_path, dst, done)
+
+    monkeypatch.setattr(sessions_mod, "_move_path", flaky)
+    target = tmp_path / "new" / "place"
+    with pytest.raises(SessionError) as err:
+        await manager.create("M", copy_from=str(src), workspace=str(target), start=False)
+    assert err.value.status == 500, str(err.value)
+    assert manager.ids() == [] and _left_in_sessions(manager) == []
+    assert not target.exists() or not any(target.iterdir())
+    assert _digest(src) == before
+    await manager.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["folder", "upload"])
+async def test_cancelling_the_copy_leaves_nothing(tmp_path, monkeypatch, kind):
+    manager = _manager(tmp_path)
+    started = threading.Event()
+
+    def endless(source, dst, *args, check=None, **kwargs):
+        os.makedirs(dst, exist_ok=True)
+        (Path(dst) / "partial.txt").write_text("x", encoding="utf-8")
+        started.set()
+        while True:
+            check()
+            time.sleep(0.01)
+
+    if kind == "folder":
+        monkeypatch.setattr(copyfrom, "copy_tree", endless)
+        src = _source(tmp_path / "src")
+        task = asyncio.ensure_future(manager.create("X", copy_from=str(src), start=False))
+        token = None
+    else:
+        monkeypatch.setattr(copyfrom, "unpack_zip", endless)
+        token = await _upload(manager, {"a.txt": "A"})
+        task = asyncio.ensure_future(manager.create("X", copy_from_upload=token, start=False))
+    await until(started.is_set)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert manager.ids() == [] and _left_in_sessions(manager) == []
+    if token is not None:
+        assert _upload_files(manager, token) == []
+    await manager.shutdown()
+
+
+async def test_cancelling_during_the_claim_releases_it(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    token = await _upload(manager, {"a.txt": "A"})
+    claimed = threading.Event()
+    real_claim = copyfrom.Uploads.claim
+
+    def slow_claim(self, tok, path):
+        source = real_claim(self, tok, path)
+        claimed.set()
+        time.sleep(0.3)
+        return source
+
+    monkeypatch.setattr(copyfrom.Uploads, "claim", slow_claim)
+    task = asyncio.ensure_future(manager.create("X", copy_from_upload=token, start=False))
+    await until(claimed.is_set)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _upload_files(manager, token) == [] and manager.ids() == [] and _left_in_sessions(manager) == []
+    await manager.shutdown()
+
+
+async def test_cancelling_during_the_rename_leaves_nothing(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    renamed = threading.Event()
+    real_rename = sessions_mod._rename_retry
+
+    def slow_rename(a, b, done=None):
+        real_rename(a, b, done)
+        renamed.set()
+        time.sleep(0.3)
+
+    monkeypatch.setattr(sessions_mod, "_rename_retry", slow_rename)
+    task = asyncio.ensure_future(manager.create("X", copy_from=str(src), start=False))
+    await until(renamed.is_set)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert manager.ids() == [] and _left_in_sessions(manager) == []
+    monkeypatch.setattr(sessions_mod, "_rename_retry", real_rename)
+    again = await manager.create("X", copy_from=str(src), start=False)
+    assert again["id"].startswith("001-") and _rel_files(manager.default_workspace(again["id"])) == SOURCE_FILES
+    await manager.shutdown()
+
+
+async def test_a_failing_rename_is_a_500(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+
+    def refused(a, b, done=None):
+        raise PermissionError(13, "Access is denied", str(a))
+
+    monkeypatch.setattr(sessions_mod, "_rename_retry", refused)
+    with pytest.raises(SessionError, match="Could not move the copied files") as err:
+        await manager.create("X", copy_from=str(src), start=False)
+    assert err.value.status == 500 and manager.ids() == [] and _left_in_sessions(manager) == []
+    await manager.shutdown()
+
+
+async def test_create_with_an_upload_token(tmp_path):
+    manager = _manager(tmp_path)
+    members = {"mywork/": "", "mywork/a.txt": "A", "mywork/.git/HEAD": "x"}
+    # the upload is claimed first: any refusal uses it up (the sessions page uploads again for its next try)
+    for kwargs in ({"overrides": {"nope": {}}}, {"workspace": "relative"}, {"copy_from": str(tmp_path / "x")}):
+        token = await _upload(manager, members)
+        with pytest.raises(SessionError) as err:
+            await manager.create("X", copy_from_upload=token, start=False, **kwargs)
+        assert err.value.status == 400 and _upload_files(manager, token) == [], (kwargs, str(err.value))
+        if "copy_from" in kwargs:
+            assert "not both" in str(err.value)
+    token = await _upload(manager, members)
+    summary = await manager.create("X", copy_from_upload=token, start=False)
+    assert _rel_files(manager.default_workspace(summary["id"])) == ["a.txt"]
+    assert summary["copied_from"]["source"] == "upload: x.zip" and summary["copy_result"]["kind"] == "upload"
+    assert summary["copy_result"]["top"] == "mywork"
+    assert _upload_files(manager, token) == []
+    with pytest.raises(SessionError) as err:
+        await manager.create("Again", copy_from_upload=token, start=False)
+    assert err.value.status == 404
+    for bad in ("../../x", "short"):
+        with pytest.raises(SessionError) as err:
+            await manager.create("Bad", copy_from_upload=bad, start=False)
+        assert err.value.status == 400
+    # after the claim: a refusal (a limit) uses the upload up
+    token = await _upload(manager, {"a.txt": "A", "b.txt": "B"})
+    _set_global(manager, "workspace", copy_max_files=1)
+    with pytest.raises(SessionError) as err:
+        await manager.create("Y", copy_from_upload=token, start=False)
+    assert err.value.status == 413 and _upload_files(manager, token) == []
+    assert manager.ids() == [summary["id"]] and _left_in_sessions(manager) == [summary["id"]]
+    await manager.shutdown()
+
+
+async def test_failed_creates_use_their_uploads_up(tmp_path):
+    """Every create that names an upload uses it up, also one refused before the copy (a skill, a folder with
+    files): the sessions page uploads again for each try, so failed tries never pile up to the 429."""
+    manager = _manager(tmp_path)
+    busy = tmp_path / "busy"
+    _put(busy / "a.txt", "mine")
+    for i in range(copyfrom.UPLOAD_MAX_PENDING + 1):
+        token = await _upload(manager, {"a.txt": "A"})
+        kwargs = {"skills": ["no-such-skill"]} if i % 2 else {"workspace": str(busy)}
+        with pytest.raises(SessionError) as err:
+            await manager.create("F", copy_from_upload=token, start=False, **kwargs)
+        assert err.value.status in (404, 409), str(err.value)
+        assert _upload_files(manager, token) == []
+    assert manager.ids() == [] and _left_in_sessions(manager) == []
+    assert (busy / "a.txt").read_text(encoding="utf-8") == "mine"
+    await manager.shutdown()
+
+
+async def test_a_create_removes_expired_uploads(tmp_path):
+    manager = _manager(tmp_path)
+    token = await _upload(manager, {"a.txt": "A"})
+    meta = manager.uploads.root / f"{token}.json"
+    old = time.time() - copyfrom.UPLOAD_TTL - 1
+    meta.write_text(json.dumps({**json.loads(meta.read_text(encoding="utf-8")), "at": old}), encoding="utf-8")
+    src = _source(tmp_path / "src")
+    await manager.create("C", copy_from=str(src), start=False)   # no new upload: the create's sweep removes it
+    assert _upload_files(manager, token) == []
+    await manager.shutdown()
+
+
+async def test_stale_copying_folders_are_cleaned(tmp_path):
+    manager = _manager(tmp_path)
+    dead = 2 ** 22 + 12345
+    assert not sessions_mod._pid_alive(dead)
+    other_run = "0" * 8 if copyfrom.RUN != "0" * 8 else "1" * 8
+    stale = manager.sessions_dir / f".copying-{dead}-{copyfrom.RUN}-abcd0123"
+    _put(stale / "x.txt", "x")
+    # this pid but an earlier run: the Docker sandbox's hub has the same pid at every container start
+    earlier = manager.sessions_dir / f".copying-{os.getpid()}-{other_run}-abcd0123"
+    _put(earlier / "y.txt", "y")
+    own = manager.sessions_dir / copyfrom.staging_name()   # a concurrent create's
+    own.mkdir()
+    # this run's, no longer in use: its removal failed (a file still open on Windows)
+    orphan = manager.sessions_dir / f".copying-{os.getpid()}-{copyfrom.RUN}-abcd0123"
+    _put(orphan / "z.txt", "z")
+    odd = manager.sessions_dir / ".copying-notes"   # not a staging name: left alone
+    odd.mkdir()
+    src = _source(tmp_path / "src")
+    try:
+        sid = (await manager.create("C", copy_from=str(src), start=False))["id"]
+        assert _left_in_sessions(manager) == sorted([own.name, odd.name, sid])
+    finally:
+        copyfrom.done_with(own)
+        await manager.shutdown()
+
+
+async def test_a_staging_folder_whose_removal_failed_is_cleaned_later(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    real = sessions_mod._rmtree
+
+    def refused(a, b, done=None):
+        raise PermissionError(13, "Access is denied", str(a))
+
+    # the staging is not moved in, and its removal fails (a file still open on Windows): the folder stays
+    monkeypatch.setattr(sessions_mod, "_rename_retry", refused)
+    monkeypatch.setattr(sessions_mod, "_rmtree",
+                        lambda path: None if Path(path).name.startswith(copyfrom.COPYING_PREFIX) else real(path))
+    with pytest.raises(SessionError, match="Could not move the copied files"):
+        await manager.create("C", copy_from=str(src), start=False)
+    left = _left_in_sessions(manager)
+    assert len(left) == 1 and left[0].startswith(copyfrom.COPYING_PREFIX), left
+    monkeypatch.setattr(sessions_mod, "_rmtree", real)
+    manager.clean_copy_leftovers()   # (the hub's hourly sweep, or the next create)
+    assert _left_in_sessions(manager) == []
+    await manager.shutdown()
+
+
+async def test_copy_from_names_what_a_busy_folder_holds(tmp_path):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    target = tmp_path / "fresh-repo"   # `git init` of an empty folder: the user sees no files
+    (target / ".git").mkdir(parents=True)
+    _put(target / ".DS_Store", "x")
+    with pytest.raises(SessionError) as err:
+        await manager.create("B", copy_from=str(src), workspace=str(target), start=False)
+    text = str(err.value)
+    assert err.value.status == 409 and "already has files (it holds .git, .DS_Store; hidden files count)" in text
+    await manager.shutdown()
+
+
+@pytest.mark.parametrize("how", ["sandbox", "image"])
+async def test_copy_from_in_the_sandbox_suggests_the_zip(tmp_path, monkeypatch, how):
+    if how == "sandbox":   # `dreamteam sandbox`
+        monkeypatch.setenv("DREAMTEAM_HOST_SKILLS_DIR", str(tmp_path / "host-skills"))
+    else:   # docker compose / docker run of the image: only DREAMTEAM_IMAGE says so
+        monkeypatch.delenv("DREAMTEAM_HOST_SKILLS_DIR", raising=False)
+        monkeypatch.setenv("DREAMTEAM_IMAGE", "1")
+    manager = _manager(tmp_path)
+    with pytest.raises(SessionError) as err:
+        await manager.create("C", copy_from=str(tmp_path / "missing"), start=False)
+    assert err.value.status == 400 and "Docker sandbox" in str(err.value) and ".zip" in str(err.value)
+    assert manager.ids() == []
+    await manager.shutdown()
+
+
+async def test_copy_from_outside_a_container_names_the_missing_path(tmp_path, monkeypatch):
+    monkeypatch.delenv("DREAMTEAM_HOST_SKILLS_DIR", raising=False)
+    monkeypatch.delenv("DREAMTEAM_IMAGE", raising=False)   # (CI may run inside the image)
+    manager = _manager(tmp_path)
+    with pytest.raises(SessionError, match="Nothing to copy") as err:
+        await manager.create("C", copy_from=str(tmp_path / "missing"), start=False)
+    assert err.value.status == 400 and "Docker" not in str(err.value)
+    await manager.shutdown()

@@ -36,6 +36,19 @@
   same owner's name. Without `require_approval` a changed `server.py` is checked again at the next start and used
   without a question. The snapshot is out of reach of the agents' file tools, not of their console commands, and
   the approval marks in the library are only as safe as the library folder.
+* An [export](transfer.md) (`dreamteam export`) leaves out the API keys of the profiles, the `env` values of the
+  external MCP servers (only their names travel), credentials in MCP server commands and hub tokens. Before the
+  export is complete, every file it wrote, every row of the session databases and the whole history of the exported
+  git repositories are searched for the known secrets of this computer: stored keys, the values of key variables
+  and of the variables the agents' console treats as secret, `shell.pass_env` and `[skills] install_env`, the `env`
+  values and command credentials of MCP servers, the hub token, as UTF-8 and as UTF-16. Values shorter than 8
+  characters are not searched for, and a command credential that short stays in the copied session database
+  (longer ones are removed from it). When one is found, the export is removed, and the message names the place but
+  not the value. The check does not know other tokens that agents printed into a history or wrote to files, so
+  keep the export folder as private as the home itself. MCP approvals travel with the library: a server approved on
+  one computer is approved on the other, so import only your own exports. An import keeps a stored API key (and
+  the key variable and secret `extra` entries set up here) only while the profile keeps the same provider and
+  `base_url`, and an MCP server's `env` values only for the same command and folder.
 * Agents can change the session's `.git` from their console. So DreamTeam's own git commands (autocommits, the checks of
   your folder) never run what a repository names for git to run: hooks, `core.fsmonitor`, filters, textconv and merge
   drivers, ssh and credential helpers from `.git/config`, included files and submodules. They run without the variables

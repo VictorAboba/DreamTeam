@@ -7,6 +7,7 @@ import math
 import os
 import re
 import tomllib
+import unicodedata
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable
@@ -59,6 +60,8 @@ KNOWN_PRICES: dict[str, tuple[float, float, float, float]] = {
     "claude-haiku-5-5": (0.10, 0.50, 0.01, 0.125),
     "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25),
 }
+# the prices without which a call's tokens count as $0 (the cache prices default to fractions of input_price)
+PRICE_FIELDS = ("input_price", "output_price")
 
 
 @dataclass
@@ -101,8 +104,12 @@ class ModelProfile:
             return os.environ.get(self.api_key_env) or None
         return None
 
+    def _table(self, model: str | None = None) -> tuple[float, float, float, float] | None:
+        """The built-in prices (KNOWN_PRICES) of the response's model, else of the profile's model."""
+        return KNOWN_PRICES.get(model or self.model) or KNOWN_PRICES.get(self.model)
+
     def prices(self, model: str | None = None) -> tuple[float, float, float, float]:
-        known = KNOWN_PRICES.get(model or self.model) or KNOWN_PRICES.get(self.model)
+        known = self._table(model)
         inp = self.input_price if self.input_price is not None else (known[0] if known else 0.0)
         out = self.output_price if self.output_price is not None else (known[1] if known else 0.0)
         cr = self.cache_read_price if self.cache_read_price is not None else (known[2] if known else inp * 0.1)
@@ -115,9 +122,27 @@ class ModelProfile:
         limit = max(int(self.max_tokens or 0), 1)
         return max(int(self.max_tokens_ceiling or 2 * limit), limit)
 
+    def missing_prices(self, model: str | None = None) -> tuple[str, ...]:
+        """The PRICE_FIELDS that are not set while the model has no built-in prices: their tokens count as $0.
+        A price set to 0 means free and is never missing."""
+        if self._table(model) is not None:
+            return ()
+        return tuple(name for name in PRICE_FIELDS if getattr(self, name) is None)
+
+    def price_source(self, model: str | None = None) -> str:
+        """Where a call's prices come from: "profile" (both set), "free" (both set to 0), "table" (the built-in
+        prices fill what is not set), "partial" (one is missing: missing_prices), "none" (both are)."""
+        missing = self.missing_prices(model)
+        if missing:
+            return "none" if len(missing) == len(PRICE_FIELDS) else "partial"
+        if all(getattr(self, name) is not None for name in PRICE_FIELDS):
+            return "free" if all(getattr(self, name) == 0 for name in PRICE_FIELDS) else "profile"
+        return "table"
+
     @property
     def has_prices(self) -> bool:
-        return self.input_price is not None or self.model in KNOWN_PRICES
+        """Whether every token of a call has a price (nothing in missing_prices)."""
+        return not self.missing_prices()
 
 
 @dataclass
@@ -156,6 +181,15 @@ class RoleSettings:
 
 
 @dataclass
+class TeamSettings:
+    """One [[teams]] entry (docs/SPEC.md §17.3 "Saved teams"): a named, ordered list of roles, a name repeated per
+    agent. No model: an agent's profile comes from its role."""
+
+    name: str = ""
+    roles: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentSettings:
     default_model: str = "default"
     max_steps_per_turn: int = 40
@@ -168,6 +202,13 @@ class AgentSettings:
     # is told to create the independent tasks now (once more at twice the value); 0 turns that trigger off
     planning_hint_steps: int = 8
     planning_hint_minutes: float = 10.0
+    # file_changed() is true once the file has had no change this long, or the agents who changed it ended their
+    # turns, at the latest file_max_wait_seconds after the first change (0: at every change / no cap)
+    file_settle_seconds: float = 60.0
+    file_max_wait_seconds: float = 300.0
+    # a member's repeating trigger wakes it at most once this many seconds; the fires in between come in one notice
+    # (0: at every fire)
+    trigger_wake_seconds: float = 180.0
 
 
 @dataclass
@@ -198,6 +239,11 @@ class ShellSettings:
 class WorkspaceSettings:
     git: bool = True
     lock_ttl_minutes: int = 30
+    # the holder of a lock others were refused is told once, after it has held the lock this long (0: at once)
+    lock_wanted_minutes: float = 5.0
+    # a copy into a new session (--copy-from, the upload): unpacked MB / files; global (copyfrom.py)
+    copy_max_mb: int = 1024
+    copy_max_files: int = 100000
 
 
 @dataclass
@@ -243,13 +289,13 @@ class TracingSettings:
 _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSettings": "server",
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
                "TracingSettings": "tracing", "SkillsSettings": "skills", "ModelProfile": "models",
-               "RoleSettings": "roles"}
+               "RoleSettings": "roles", "TeamSettings": "teams"}
 # numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm; [skills] max_proposals = 0
 # turns proposals off)
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
                       "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
                       "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
-                      "install_timeout"})
+                      "install_timeout", "lock_ttl_minutes", "copy_max_mb", "copy_max_files"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 
@@ -404,6 +450,61 @@ def _role_skills(raw: list[str], where: str) -> list[str]:
     return names
 
 
+def _joins_text(char: str) -> bool:
+    """A format character that is a part of ordinary text: U+200C and U+200D (Persian and Indic words, emoji sequences)
+    and the tags of a subdivision flag. The form has the twin (TEAM_NAME_JOINERS in home.js)."""
+    return char in "‌‍" or "\U000e0020" <= char <= "\U000e007f"
+
+
+def parse_teams(raw: Any, entries: Iterable[RoleSettings]) -> list[TeamSettings]:
+    """The checked [[teams]] entries (docs/SPEC.md §17.3), normalized: a preset by its id, an own role as [[roles]]
+    spells it. `entries`: the checked [[roles]] entries. Whether the catalog has the roles is not checked: a file must
+    not stop the launcher over a team, which is harmless until it is chosen, and whoever chooses it refuses it then."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("[[teams]] must be a list of team tables (write each team as a [[teams]] table)")
+    if len(raw) > roles.MAX_TEAMS:
+        raise ValueError(f"At most {roles.MAX_TEAMS} teams")
+    spelled = {roles.role_key(entry.name): entry.name for entry in entries}
+    seen: dict[str, int] = {}
+    out: list[TeamSettings] = []
+    for i, item in enumerate(raw, 1):
+        where = f"teams.{i}"
+        entry = _fill(TeamSettings, item, where)
+        name = roles.normalize(entry.name)
+        if not name:
+            raise ValueError(f"[{where}] name is empty")
+        if len(name) > roles.NAME_LIMIT:
+            raise ValueError(f"[{where}] name must be at most {roles.NAME_LIMIT} characters")
+        if "," in name or "*" in name or name.startswith("-"):  # the syntax of --team and /team, and a flag
+            raise ValueError(f"[{where}] name cannot contain ',' or '*' or start with '-'")
+        if any(unicodedata.category(char) in ("Cc", "Cf") and not _joins_text(char) for char in name):
+            raise ValueError(f"[{where}] name has control or invisible characters")  # cannot be typed, and is printed
+        if all(_joins_text(char) for char in name):
+            raise ValueError(f"[{where}] name is empty")
+        if name.casefold() in roles.TEAM_RESET:
+            raise ValueError(f"[{where}] the name '{name}' is reserved: /team {name} goes back to the starting team of "
+                             "the settings")
+        key = roles.team_key(name)
+        if key in seen:
+            raise ValueError(f"[{where}] the team '{name}' is listed twice (also as team {seen[key]})")
+        seen[key] = i
+        if not entry.roles:
+            raise ValueError(f"[{where}] the team '{name}' has no roles")
+        if len(entry.roles) > roles.TEAM_MAX:
+            raise ValueError(f"[{where}] the team '{name}' has more than {roles.TEAM_MAX} agents")
+        members: list[str] = []
+        for role in entry.roles:
+            role = roles.normalize(role)
+            if not role or len(role) > roles.NAME_LIMIT or "," in role or "*" in role:
+                raise ValueError(f"[{where}] '{role[:80]}' is not a role name: write one name per agent, at most "
+                                 f"{roles.NAME_LIMIT} characters, without ',' or '*'")
+            members.append(spelled.get(roles.role_key(role)) or roles.preset_id(role) or role)
+        out.append(TeamSettings(name=name, roles=members))
+    return out
+
+
 @dataclass
 class Config:
     project_dir: Path
@@ -423,6 +524,8 @@ class Config:
     workspace_adopted: bool = False
     # [[roles]]: the role catalog's entries (docs/SPEC.md §17.3), checked and normalized by parse_roles
     roles: list[RoleSettings] = field(default_factory=list)
+    # [[teams]]: the saved teams (docs/SPEC.md §17.3), checked and normalized by parse_teams
+    teams: list[TeamSettings] = field(default_factory=list)
 
     @property
     def data_dir(self) -> Path:
@@ -434,7 +537,8 @@ class Config:
 
     @property
     def library_dir(self) -> Path:
-        return Path(os.path.expanduser(self.mcp.library_dir))
+        """The shared MCP library; DREAMTEAM_MCP_LIBRARY_DIR wins (tests, a library kept elsewhere)."""
+        return Path(os.environ.get("DREAMTEAM_MCP_LIBRARY_DIR") or os.path.expanduser(self.mcp.library_dir))
 
     @property
     def skills_library_dir(self) -> Path:
@@ -483,6 +587,7 @@ class Config:
         mcp_raw = dict(mcp_raw)
         external = mcp_raw.pop("external", None) or {}
         roles_raw = raw.pop("roles", None)  # checked once the model profiles are known
+        teams_raw = raw.pop("teams", None)  # checked once the roles are known
         cfg = cls(
             project_dir=Path(project_dir).resolve(),
             swarm=_fill(SwarmSettings, raw.pop("swarm", None)),
@@ -501,6 +606,7 @@ class Config:
         if cfg.agents.default_model not in cfg.models:
             raise ValueError(f"agents.default_model = '{cfg.agents.default_model}' is not defined in [models]")
         cfg.roles = parse_roles(roles_raw, cfg.models)
+        cfg.teams = parse_teams(teams_raw, cfg.roles)
         for name in cfg.skills.install_env:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                 raise ValueError(f"skills.install_env: {name[:60]!r} is not an environment variable name")
@@ -590,6 +696,9 @@ context_tokens = 120000       # при превышении история аг�
 stagger_seconds = 3.0         # задержка между стартами агентов
 planning_hint_steps = 8       # если взявший задачу планирования за столько шагов не создал ни одной задачи — подсказка создать их (0 — выкл.)
 planning_hint_minutes = 10    # то же через столько минут после того, как он взял задачу (0 — выкл.)
+file_settle_seconds = 60      # триггер file_changed срабатывает, когда файл столько секунд не меняется или менявшие его агенты закончили ход (0 — при каждом изменении)
+file_max_wait_seconds = 300   # но не позже, чем через столько секунд после первого изменения (0 — без предела)
+trigger_wake_seconds = 180    # повторяющийся триггер участника будит его не чаще раза в столько секунд; срабатывания между пробуждениями приходят одним уведомлением (0 — будить при каждом)
 
 [server]
 host = "127.0.0.1"
@@ -610,7 +719,10 @@ pass_env = []                 # переменные окружения с се�
 
 [workspace]
 git = true                    # общий workspace под git с автокоммитами
-lock_ttl_minutes = 30
+lock_ttl_minutes = 30         # на сколько минут блокируется файл, если агент не указал срок
+lock_wanted_minutes = 5       # напомнить держателю файла, который ждут, когда он держит его столько минут (0 — сразу)
+copy_max_mb = 1024            # предел копии файлов в новую сессию (--copy-from, загрузка .zip), МБ
+copy_max_files = 100000       # файлов в такой копии (папки: .git, node_modules и т. п. не считаются)
 
 [mcp]
 require_approval = false      # true — новые MCP агентов ждут одобрения пользователя
@@ -650,6 +762,15 @@ retention_days = 0            # 0 — хранить всегда
 # [mcp.external.fetch]
 # command = ["uvx", "mcp-server-fetch"]
 # description = "Загрузка веб-страниц"
+
+# Сохранённые команды: именованные наборы ролей; при запуске можно выбрать команду целиком. Имя роли повторяется для
+# нескольких агентов; модель каждому агенту задаёт его роль:
+# [[teams]]
+# name = "Разработка"
+# roles = ["architect", "developer", "developer", "tester"]
+# [[teams]]
+# name = "Тексты"
+# roles = ["researcher", "writer", "reviewer"]
 
 # Каталог ролей. Встроенные роли (generalist «Универсал», developer «Разработчик», tester «Тестировщик»,
 # reviewer «Ревьюер», analyst «Аналитик», architect «Архитектор», writer «Технический писатель»,

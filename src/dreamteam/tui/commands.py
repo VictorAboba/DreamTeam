@@ -23,7 +23,6 @@ Handler = Callable[["CommandContext"], Awaitable[None]]
 
 TRACES_LIMIT = 20
 CONTEXT_PAGE = 30
-TEAM_RESET = ("-", "default", "reset", "сброс")   # /team: back to the starting team of the settings
 # "/approve 12", "/reject #12 ...": a task in review. Agent-built MCP servers are named like mcp_forge.NAME_RE
 # (they start with a letter) and external servers are never pending, so a number is never an MCP server.
 _TASK_REF = re.compile(r"#?\d+")
@@ -441,10 +440,12 @@ async def _roles(c: CommandContext) -> None:
 
 
 async def _team(c: CommandContext) -> None:
-    """The starting team of the sessions this window creates next (like --team); the settings stay as they are."""
-    arg = c.args.strip()
+    """The starting team of the sessions this window creates next (like --team): roles in order, or a team saved in the
+    settings, copied now (docs/SPEC.md §17.3 "Saved teams"); the settings stay as they are."""
+    # quotes as other commands take them, around the argument or around each item of a list
+    arg = unquote(",".join(unquote(item) for item in c.args.split(",")))
     swarm = c.app.overrides.get("swarm") or {}
-    if arg.casefold() in TEAM_RESET:
+    if arg.casefold() in roles.TEAM_RESET:
         swarm.pop("starting_roles", None)
         swarm.pop("start_agents", None)
         if not swarm:
@@ -453,21 +454,42 @@ async def _team(c: CommandContext) -> None:
         return
     view = await c.client.settings()
     catalog = _localized(c.lang, view.get("role_catalog"))
+    settings = view.get("settings") or {}
+    saved = settings.get("teams") or []
     if not arg:
         own = {k: swarm[k] for k in ("starting_roles", "start_agents") if k in swarm}
-        team = {**((view.get("settings") or {}).get("swarm") or {}), **own}
+        team = {**(settings.get("swarm") or {}), **own}
         rows = roles.team_rows(team.get("starting_roles"), team.get("start_agents") or 0)
         c.info(c.t("team_set" if own else "team_line", team=_team_text(c, rows, catalog),
                    n=sum(n for _, n in rows)))
+        if saved:
+            c.info(c.t("team_saved", teams=", ".join(f"{x['name']} ({len(x['roles'])})" for x in saved),
+                       example=saved[0]["name"]))
         return
     try:
-        team = roles.parse_team(arg)
+        kind, value = roles.team_choice(arg, saved, settings.get("roles"))
     except ValueError as exc:
         c.error(c.t("team_bad", error=exc))
         return
+    if kind == "unknown":
+        known = roles.close_roles(settings.get("roles"), value, c.lang) + [x["name"] for x in saved]
+        c.error(c.t("team_unknown", name=value, known=", ".join(dict.fromkeys(known))))
+        return
+    if kind == "mixed":
+        c.error(c.t("team_mixed", name=value))
+        return
+    named = kind == "team"
+    if named:
+        missing = roles.missing_roles(value, settings.get("roles"))
+        if missing:
+            c.error(c.t("team_broken", name=value["name"], roles=", ".join(missing)))
+            return
+    team = list(value["roles"]) if named else value
     swarm = c.app.overrides.setdefault("swarm", {})
     swarm["starting_roles"], swarm["start_agents"] = team, len(team)
-    c.info(c.t("team_set", team=_team_text(c, roles.team_rows(team, len(team)), catalog), n=len(team)))
+    text = _team_text(c, roles.team_rows(team, len(team)), catalog)
+    c.info(c.t("team_picked", name=value["name"], team=text, n=len(team)) if named
+           else c.t("team_set", team=text, n=len(team)))
 
 
 async def _to(c: CommandContext) -> None:
@@ -519,8 +541,18 @@ async def _files(c: CommandContext) -> None:
     c.print(render.files_view(c.ctx, data))
 
 
+async def _unlock(c: CommandContext) -> None:
+    """`/unlock path`: remove a member's lock on a file or folder (file_unlock); the members waiting for it are
+    woken. The path as it was locked (the suggestions list the locked ones)."""
+    await c.act("file_unlock", {"path": unquote(c.args)}, report=True)
+
+
 async def _cd(c: CommandContext) -> None:
     await c.app.change_folder(c.args)
+
+
+async def _copy_from(c: CommandContext) -> None:
+    c.app.choose_copy_source(c.args)
 
 
 async def _cost(c: CommandContext) -> None:
@@ -544,6 +576,9 @@ async def _model(c: CommandContext) -> None:
     # a section in the update replaces the stored one: send the whole [agents] section back
     await c.client.update_settings({"agents": {**(view.get("agents") or {}), "default_model": name}})
     c.info(c.t("model_set", name=name))
+    missing = render.missing_prices(models[name])
+    if missing:
+        c.print(render.warning(c.ctx, c.t("model_no_prices", name=name, fields=", ".join(missing))))
 
 
 async def _pause(c: CommandContext) -> None:
@@ -707,7 +742,9 @@ COMMANDS: tuple[Command, ...] = (
     Command("span", _span, args=True, required=True, session=True),
     Command("files", _files, args=True, session=True),
     Command("cat", _files, args=True, required=True, session=True),
+    Command("unlock", _unlock, args=True, required=True, session=True),
     Command("cd", _cd, args=True, launcher=True),   # without a session: the folder of the next new one
+    Command("copy-from", _copy_from, args=True, launcher=True),   # always the files of the next new session
     Command("cost", _cost, session=True),
     Command("status", _status),
     Command("model", _model, args=True, launcher=True),
@@ -786,8 +823,8 @@ async def execute(app: "TUI", text: str) -> bool:
 def session_overrides(options: dict | None) -> tuple[dict[str, dict], str | None]:
     """CLI options of a new session -> (overrides by section, title). Flat keys (model, agents,
     max_agents, budget, language) map to swarm.start_agents / swarm.max_agents / swarm.max_cost_usd /
-    agents.default_model / swarm.language; `team` ("architect, developer*2", checked by the CLI with
-    roles.parse_team) sets swarm.starting_roles, and swarm.start_agents unless `agents` gives it; dict values
+    agents.default_model / swarm.language; `team` ("architect, developer*2" or a saved team's roles as a list, checked
+    by the CLI) sets swarm.starting_roles, and swarm.start_agents unless `agents` gives it; dict values
     are taken as sections as they are."""
     sections: dict[str, dict] = {}
     title: str | None = None

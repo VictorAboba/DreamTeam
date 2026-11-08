@@ -161,6 +161,9 @@ DEFAULT_ROLE_ID = "generalist"
 # a role name (at most), a description or instructions, [[roles]] entries, agents per /team item, agents per team
 NAME_LIMIT, TEXT_LIMIT, MAX_ROLES, TEAM_ITEM_MAX, TEAM_MAX = 60, 4000, 100, 50, 200
 MAX_ROLE_SKILLS = 20  # skill names one role lists (docs/SPEC.md §19)
+MAX_TEAMS = 100       # [[teams]] entries (docs/SPEC.md §17.3 "Saved teams")
+# /team: back to the starting team of the settings; a saved team cannot have these names
+TEAM_RESET = ("-", "default", "reset", "сброс")
 
 # casefolded id or name (either language) of a preset -> its id
 _PRESET_OF = {key.casefold(): rid for rid in PRESET_IDS
@@ -191,7 +194,8 @@ def _language(language: Any) -> str:
 
 
 def _field(entry: Any, key: str) -> Any:
-    """A field of a [[roles]] entry: a config.RoleSettings or a dict of the same keys."""
+    """A field of a [[roles]] or [[teams]] entry: a config.RoleSettings or config.TeamSettings, or a dict of the same
+    keys."""
     return entry.get(key) if isinstance(entry, dict) else getattr(entry, key, None)
 
 
@@ -357,6 +361,54 @@ def parse_team(text: Any) -> list[str]:
     if not team:
         raise ValueError("The team is empty")
     return team
+
+
+def team_key(name: Any) -> str:
+    """The name a saved team is matched by: casefolded, its whitespace collapsed (no language, no presets)."""
+    return normalize(name).casefold()
+
+
+def find_team(teams: Iterable[Any] | None, name: Any) -> Any:
+    """The saved team named `name` (a config.TeamSettings or a dict of the same keys), else None."""
+    key = team_key(name)
+    return next((team for team in teams or () if team_key(_field(team, "name")) == key), None)
+
+
+def missing_roles(team: Any, entries: Iterable[Any] | None) -> list[str]:
+    """The roles of a saved team that the catalog lacks, in order, each once (hidden roles count as present)."""
+    known = {role.key for role in catalog(entries, "en", include_hidden=True)}
+    missing: dict[str, str] = {}
+    for role in _field(team, "roles") or ():
+        key = role_key(role)
+        if key not in known:
+            missing.setdefault(key, role)
+    return list(missing.values())
+
+
+def saved_team_in(names: Iterable[Any], teams: list[Any] | None, entries: Iterable[Any] | None) -> str | None:
+    """The first of `names` (role names) that names a saved team and no catalog role, as written, else None: such a
+    list would start a blank agent instead of the team."""
+    entries = list(entries or ())
+    return next((normalize(name) for name in names
+                 if find_team(teams, name) is not None and find_role(entries, name, "en") is None), None)
+
+
+def team_choice(text: Any, teams: list[Any] | None, entries: Iterable[Any] | None) -> tuple[str, Any]:
+    """What the text of `--team` or `/team` names: ("team", the saved team), ("roles", the names in order), ("mixed", a
+    saved team's name inside a list or with *N) or ("unknown", the word). A bare word is the saved team first
+    (`writer*1` reaches a role of a team's name), then a catalog role. With no team saved a bare word is a new role;
+    once teams are saved a word that is neither is "unknown". Whether a chosen team can start is the caller's check
+    (missing_roles). ValueError: bad syntax (parse_team)."""
+    items = parse_team(text)
+    if "," in str(text) or "*" in str(text):
+        mixed = saved_team_in(items, teams, entries)
+        return ("mixed", mixed) if mixed else ("roles", items)
+    team = find_team(teams, text)
+    if team is not None:
+        return "team", team
+    if teams and find_role(entries, text, "en") is None:
+        return "unknown", normalize(text)
+    return "roles", items
 
 
 def presets_view() -> list[dict]:

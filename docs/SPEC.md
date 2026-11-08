@@ -34,8 +34,8 @@ src/dreamteam/
   events.py      EventBus                                            (exists)
   names.py       generate_name                                       (exists)
   prompts.py     system_prompt(), t(), PLANNING_TASK, DEFAULT_ROLE   (exists)
-  roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team (§17.3); imports nothing
-                 from the package
+  roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team, saved teams (§17.3); imports
+                 nothing from the package
   goal_text.py   split_goal, shorten_title: a goal typed as one text -> title + description (§3)
   board.py       Board          — tasks, goal field, discussion, independent review (§4)
   mailbox.py     Mailbox        — direct messages
@@ -79,6 +79,12 @@ src/dreamteam/
   tools/trace_tools.py  the `agent_traces` tool (§16.2)
   settings.py    global settings of a home: read/write/validate, public view, updates, endpoint checks (§17.1)
   sessions.py    SessionManager — the sessions of a home (§17.2)
+  copyfrom.py    a folder or a zip copied into a new session before its first start, and the uploaded zips
+                 (§17.2 "Copying files into a new session"); never imports sessions.py
+  transfer.py    `dreamteam export` / `dreamteam import` of a home: the export folder, the secret check, the import
+                 plan and its application (§20)
+  treecopy.py    copy or measure a folder tree byte for byte, with a digest that is the same on every OS (§20)
+  mcp_library.py the shared MCP library on disk, usable without a Swarm: list, read, add atomically, remove (§20)
   launcher.py    launcher web app: sessions page, settings, /s/{sid}/ routing (§18.1)
   launcher_mcp.py  the launcher as one MCP server (§18.2)
   static/        index.html app.js traces.js style.css traces.css (board), home.html home.js home.css (launcher),
@@ -93,13 +99,20 @@ tests/  conftest.py (FakeSwarm fixture) + test_*.py
 A **home** (launcher, §17–18; `~/DreamTeam` by default) on disk:
 ```
 <home>/dreamteam.toml               global settings (§17.1); dreamteam.toml.bak = the previous version
-<home>/sessions/<id>/session.json   {"title", "created_at", "overrides", "autostart", "pending_goal"?,
-                                     "workspace"?: {"path", "adopted", "in_home"?}, "workspace_notice"?} (§17.2)
+<home>/sessions/<id>/session.json   {"title", "uid", "created_at", "overrides", "autostart", "pending_goal"?,
+                                     "workspace"?: {"path", "adopted", "in_home"?}, "workspace_notice"?,
+                                     "origin_uid"?} (§17.2; "uid": the session's identity across homes, 32
+                                     lowercase hex; a session.json without it gets one derived from
+                                     "created_at" on read, `sessions.session_uid`; "origin_uid": §20.4)
 <home>/sessions/<id>/workspace/     the session's shared files (unless "workspace" names another folder)
 <home>/sessions/<id>/.dreamteam/workspace-move.json  only while a workspace move runs, or after one whose
                                     undo failed (§17.2 "Workspace folder")
 <home>/sessions/<id>/.dreamteam/    the session's swarm.db and logs/ (a project directory as below)
 <home>/sessions/.deleted-<id>-<ns>/ a session being deleted (renamed away first, then removed)
+<home>/sessions/.importing-<id>-<pid>-<hex8>/  a session an import stages before renaming it in (§20.4)
+<home>/sessions/.replaced-<id>-<YYYYMMDD-HHMMSS>[-N]/  the last copy of a session an import rewrote: session/
+                                    (the old session folder), workspace/ (its in_home folder, if any), swap.json
+                                    only while the swap runs or after it died halfway (§20.4)
 <home>/.dreamteam/hub.json          the running launcher (same format as below; "project" = the home)
 <home>/.dreamteam/logs/dreamteam.log
 <home>/.dreamteam/swarm.db          only in a home that was a single-swarm project before: session `main`
@@ -115,9 +128,10 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
                                 jobs (§7.1)
 <project>/.dreamteam/swarm.db   sqlite
 <project>/.dreamteam/jobs/      job logs when `.scratch` is not a plain folder of the workspace (§7.1)
-<project>/.dreamteam/hub.json   {"base_url": "...", "mcp_url": "...", "pid": 123, "project": "<abs path>"}
+<project>/.dreamteam/hub.json   {"base_url": "...", "mcp_url": "...", "pid": 123, "project": "<abs path>",
+                                "machine": "<platform.node()>" | null}
                                 written once the server listens; other commands trust it only if GET /api/hub
-                                confirms the same pid and project
+                                confirms the same pid and project; "machine" is null in a container (§18.3)
 <project>/.dreamteam/logs/      dreamteam.log, mcp-<name>.log
 ```
 
@@ -131,12 +145,22 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 * `comments`: the per-task **discussion**: id, task_id, author, text, reply_to (comment id | null), ts.
 * `agents`: name, kind (`llm`|`external`), role (a catalog role by its canonical name in the member's language,
   §17.3), instructions (the hirer's own; a catalog role's instructions are only in the system prompt), model
-  (profile name), language, status (`idle`|`working`|`paused`|`error`|`retired`), hired_by, created_at,
-  last_active, cost_usd, tokens_in, tokens_out, notes, system_prompt (frozen at creation), context_tokens.
+  (profile name, set at hire; it follows a profile rename saved through the settings, §17.2 `update_settings`;
+  NULL for an external member), language, status (`idle`|`working`|`paused`|`error`|`retired`), hired_by,
+  created_at, last_active, cost_usd, tokens_in, tokens_out, notes, system_prompt (frozen at creation),
+  context_tokens.
 * `history`: agent, seq, msg (json neutral message, §6.1) — append-only per agent except compaction.
 * `messages` + `inbox(message_id, recipient, read_at)`.
 * `notifications`: id, ts, recipient, kind (prompt key), text (rendered), data (json), delivered_at.
-* `triggers`, `mcp_servers`, `file_locks`, `kv`, `events`.
+* `triggers` (§8): id, owner, condition, note, actions (json), once, active, created_at, last_value, last_fired,
+  fire_count, last_error, and the wake limit's told_at (when the trigger last told its owner), held (fires since then
+  whose notice waits), held_last (the latest of them), held_files (json `{path: {count, by, first, last, settled}}`:
+  their file_changed() changes); the last four are in `ADDED_COLUMNS` too, so an older file gets them at its next
+  open. `mcp_servers`, `kv`, `events`.
+* `file_locks`: path (primary key, workspace-relative), owner, acquired_at, expires_at, wanted_at (when its holder
+  was told that members wait for it, `n_lock_wanted`; NULL for a new lock, kept by a refresh; an older file gets the
+  column at its next open, `ADDED_COLUMNS`). `lock_waiters` (§7 "Lock waiters"): agent, path (what it was refused,
+  as it asked for it), since; primary key (agent, path).
 * `jobs` (background jobs, §7.1; index `jobs_owner(owner, status)`): id (AUTOINCREMENT: `j<id>`, unique for the
   session's life), owner, command, shell (display name), origin (`timeout`|`background`|`detached`), status
   (`running`|`ended`|`stopped`|`lost`), reason (stopped: `owner`|`user`|`lifetime`|`retired`|`session`; lost:
@@ -300,7 +324,8 @@ class Swarm:
         # whose first wake-up lists them), the report kept for `hire_agent` (skills.note_hire / hire_report)
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
         # before the first await: the ids of its running jobs, and jobs.forbid(name) (none of its commands may
-        # become a job while it leaves); then tasks and locks released, triggers deactivated, status retired,
+        # become a job while it leaves); then tasks and locks released (workspace.release_all: its own lock waits are
+        # dropped, the members waiting for its locks woken, §7 "Lock waiters"), triggers deactivated, status retired,
         # `agent.retired` {name, reason, released, jobs}, its pending question dropped (`_drop_question(by, "left")`,
         # §3.1), n_member_retired; then its runtime stops; last
         # jobs.stop_owner(name, "retired"): its jobs and its foreground commands (an external member's call in
@@ -313,6 +338,9 @@ class Swarm:
     def set_limits(self, actor: str, max_cost_usd: float | None = None, max_agents: int | None = None) -> dict
     def spent_usd(self) -> float
     def record_usage(self, agent: str, usage: Usage, profile: ModelProfile, model: str | None = None) -> float
+        # adds cost_of(...) to the agent; a call that counted tokens as $0 (uncounted_fields, §10) gives USER the quiet
+        # u_cost_unknown {profile, model, fields} once per start() for each (profile, provider, base_url, model,
+        # fields), plus a log warning (the set `_cost_warned` lives in memory and start() clears it)
     def budget_exceeded(self) -> bool
     paused: bool; pause_reason: str
     def pause(self, actor: str, reason: str, **details) -> bool
@@ -356,8 +384,14 @@ class Swarm:
         # off (False when it was not on): `swarm.wrap_up` {on: false} and a quiet `n_wrap_up_end` to every LLM member
         # (shown at its next wake-up); called by the user (swarm_control wrap_up=false), set_goal and reopen_goal
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient
-        # a member's profile (agents.model) that no longer exists in the settings (renamed or deleted) falls back
-        # to the default profile with a warning, instead of crashing that agent at every activation
+        # a member's profile (agents.model) that no longer exists in the settings (deleted, or renamed by a hand edit
+        # of dreamteam.toml) falls back to the default profile with a warning, instead of crashing that agent at every
+        # activation
+    def rename_profiles(self, renames: dict[str, str]) -> None
+        # {old: new} profile names (settings.profile_renames): agents.model of every member (retired ones too) and
+        # the runtimes' profile_name follow, in one statement (db.remap_sql: a swap or a chain of names stays
+        # correct); no client is reset here (the reconfigure that update_settings runs next rebuilds them);
+        # u_cost_unknown already sent for the old name is not repeated (under either name)
     def snapshot(self) -> dict                           # §14.1
     def workspace_info(self) -> dict                     # {"path", "default", "adopted", "exists"} (§14.1, §17.2)
 ```
@@ -372,7 +406,9 @@ config.swarm.clarify)` with its tags, §3.1). It has no `pending_question`, `ask
 their callers (Mailbox.send, send_message, the in-activation nudge, `_stop_reason`) look them up with getattr, so
 with FakeSwarm a message never answers or pauses anything.
 
-Scheduler (every 3 s): expires file locks, compares the skills mirror with its manifest (`skills.check()`, at most
+Scheduler (every 3 s): expires file locks, then settles the lock waiters (`workspace.settle_waiters()`, §7 "Lock
+waiters": a member refused a path that is free now is woken, a long holder told; also while paused, the
+notifications then wait for the resume), compares the skills mirror with its manifest (`skills.check()`, at most
 every `SKILLS_CHECK_SECONDS` = 60 s, §19), prunes old traces (every 6 h) and closes idle external trace
 sessions (§16); unless paused, `_wake_deferred` first (an agent a broadcast reached without a wake, §5, that no longer
 `waits_for_job` while the news is still unread is woken once: e.g. the busy window of its server ended), then in this
@@ -390,7 +426,9 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    `last_active` when that is later: an activation in between restarts it); the woken sets are shared with
    `_wake_stalled`, so a set is never woken about twice. Neither 2 nor 3 wakes an agent while the end of one of
    its running jobs will wake it (`JobManager.awaited`, what its `wait` result promised): it waits for that job
-   (a `detached` one, or a `background` one past its busy window), it has not stalled. Nor do they count a clarify
+   (a `detached` one, or a `background` one past its busy window), it has not stalled; nor while it waits for a
+   file it was refused (`Workspace.waits_for_lock`: a `lock_waiters` row, what the refusal promised; `n_lock_free`
+   wakes it, and every lock ends by unlock, expiry or retire). Nor do they count a clarify
    planning task whose holder waits for the user's answers (`asks_user`, §3.1);
 4. `hint_planner()` (planning hint; run 008-013: a planner researched for 40 minutes before creating any task while
    the team idled): an LLM member holding a task tagged `planning` in `in_progress` that has created no task (no
@@ -871,7 +909,9 @@ class AgentRuntime:
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
   called, no tool calls (a `nudge` once per in_progress task the agent holds, except a clarify planning task it
   waits for the user's answers about, `swarm.asks_user` looked up with getattr, §3.1; none while it is busy with a
-  job, §7.1 "Liveness": the job's end wakes it; after plain text even then, `stalled` records those tasks and
+  job, §7.1 "Liveness": the job's end wakes it, nor while it waits for a file it was refused,
+  `workspace.waits_for_lock`, §7 "Lock waiters": `n_lock_free` wakes it; after plain text even then, `stalled`
+  records those tasks and
   the scheduler wakes it once with `n_stalled`, also once the busy window ended), refusal, or
   step limit (then `notify(name, "n_step_limit")`). A reply cut off by max_tokens gets `cut_off` and
   the loop continues. At the end of an activation that is not stopping (any outcome), the new files its commands
@@ -935,6 +975,11 @@ had none); every later wake-up shows the one-line `skills_names` (the names with
 attached, nothing, except one `skills_none` line for a member that had seen an index (`_skills_shown` False then; a
 later attach shows the full index again).
 
+For a member (never the user), before the undelivered notifications are read, `triggers.release_held(name)` turns
+the fires its repeating triggers held back (§8 "Wake limit") into one quiet `n_trigger_held` per trigger, so they come
+with this render (a wake-up, the news between two steps, a `wait_for_events` result) and need no wake-up of their own.
+An in-memory set of the owners with held fires keeps this free of queries for the others.
+
 `stamps=True` (only `wait_for_events`, whose one result may hold hours of news; an agent's wake-up stays as above so
 its history does not grow): when the oldest undelivered notification or unread message, or `since` (the oldest
 progress line shown with it), is more than `fmt.STAMP_SPAN` (60 s) older than now, each notification and message
@@ -981,11 +1026,19 @@ class Workspace:
     def tree(self, path: str = ".", depth: int = 4) -> list[dict]   # for the web UI: [{"path","type","size","mtime"}]
     def read_raw(self, path: str, max_bytes: int = 2_000_000) -> tuple[str, bool]  # (text, truncated) for UI
     def lock(self, actor: str, path: str, minutes: float | None = None) -> str
-    def unlock(self, actor: str, path: str, force: bool = False) -> str   # force for USER
+    def unlock(self, actor: str, path: str, force: bool = False) -> str   # force for USER (file_unlock)
     def locks(self) -> list[dict]                # [{"path","owner","acquired_at","expires_at"}]
     def check_writable(self, actor: str, path: str) -> None
-    def release_all(self, actor: str) -> int
-    def expire_locks(self) -> int
+    def release_all(self, actor: str) -> int     # retire: also drops the actor's own lock waits, then settles
+    def expire_locks(self) -> int                # never settles (below)
+    def settle_waiters(self) -> int              # the waiters woken; never raises ("Lock waiters" below)
+    def waits_for_lock(self, name: str) -> bool  # a lock_waiters row of `name` (one indexed query)
+    def lock_waits(self, name: str) -> list[str]  # the paths `name` waits for, the oldest first
+    def awaited_locks(self, name: str) -> list[str]  # lock_waits whose release wakes it ([] once the goal is done)
+    def write_mark(self) -> tuple[int, frozenset[str]]   # write_file/edit_file writes: sequence, paths in flight
+    # (a write whose call is cancelled stays in flight until its thread ends, then emits its file.changed)
+    def written_since(self, mark, key: str) -> bool   # ... of path key `key` in flight at `mark` or since (§8)
+    def held_locks_note(self, actor: str) -> str  # the task_complete reminder ("" when it holds no lock)
     async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",
                          skipped: list[str] | None = None, hold: bool = False) -> str | None
         # commits everything except `.scratch/` and nested repositories as `actor`, one commit per call; commit hash
@@ -1014,9 +1067,45 @@ the event's top-level `actor`), then commit that path; a path under `.scratch/` 
 `file.changed` but is never committed, and the result says so (`Created .scratch/anna.smith/c.py (1 line, 9 B)
 (in .scratch/: not committed).`). Lock events: `file.locked` {path, owner, expires_at, refreshed},
 `file.unlocked` {path, owner, forced} or {path, owner, expired: true}. Unless the folder is adopted (below),
-`init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false and a
-default identity), so that git commands run from the shell behave like the autocommits (line endings, no
-signing); an agent's own commits carry its identity from the shell environment (`agent_git_env`, below).
+`init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false, on
+Windows core.longpaths=true, and a default identity), so that git commands run from the shell behave like the
+autocommits (line endings, long paths, no signing); an agent's own commits carry its identity from the shell
+environment (`agent_git_env`, below).
+
+**Lock waiters.** A lock is advisory: only `write_file`, `edit_file` and `lock_file` check it (`shell` does not).
+A lock blocks another owner's lock on the same path, a folder above it or a path under it, and another owner's
+write or edit of a path it covers. These refusals, and a member's `lock_file` unlock=true of someone else's lock,
+are English ToolErrors that keep `'{rel}' is locked by X until HH:MM (N min left)[ (lock on '{path}')]` (the unlock:
+`…, not by you: only they can unlock it.`) and end with ``You will be notified when it is free; there is no need to
+message them. Meanwhile do other work, or call `wait` if nothing else is left.`` (`wait_for_events` for a member
+whose tools have no `wait`, an external one: `frozen.member_tool_names`). Only a member is recorded (`is_member`;
+the user's own unlock without force says `Pass force=true to unlock it anyway.`, a name outside the swarm `Try again
+once it is unlocked.`): one `lock_waiters` row per member and path (compared through `_norm`; a repeat keeps its
+first `since`). A successful own lock clears the actor's rows that it covers, a passing write or edit the row of
+that path, so no stale note follows. `settle_waiters()` (after `unlock`, after `release_all` that released
+something, and at every scheduler tick, §3): every row whose path no live lock of another owner overlaps any more
+is collected (an expired row counts as free, deleted or not; a row of a member that left is deleted silently); each
+such member gets ONE waking `n_lock_free` {paths} (at most `WAITERS_SHOWN` = 10 named, then ` (+N)`) and its rows
+are deleted; once the goal is done the notice is quiet (like a job's end, §7.1), so a finished session, also one
+reopened later, wakes nobody about a lock. Every waiter of a freed path is woken (no queue): the first to lock it
+wins, the others are refused and recorded again.
+`expire_locks()` never settles: it also runs lazily inside a waiter's own retry, which would
+otherwise get a "free" note for what it has just taken; the tick settles within 3 s (also an expiry found by
+`locks()` in a snapshot, or the rows left before a restart: the table persists). After the free rows,
+`settle_waiters` tells the holders (`_tell_holders`; also at each refusal, for the lock that refused): a live lock
+with `wanted_at` NULL that rows of other members overlap, held (`now - acquired_at`) for at least `[workspace]
+lock_wanted_minutes` (default 5; 0: at once), gets ONE waking `n_lock_wanted` {path, held (`jobs.fmt_duration` in
+the holder's language), waiters} to its owner, then `wanted_at = now`; `waiters` lists each waiting member in
+`since` order, with its in_progress tasks as `lock_waiter_task` ("Anna Smith (task #7 Parser)"). A holder of
+nested locks of its own (a folder and a file in it) gets one notice: its locks that overlap a told one are marked
+told with it (also one taken later). Nothing is told while the goal is done (the lock stays untold). A refresh keeps
+`wanted_at` (the same lock), a new lock starts untold. The user's `file_unlock` {path} (§12) calls `unlock(USER,
+path, force=True)`: `Unlocked docs (it was locked by Anna Smith).`, `file.unlocked` {path, owner, forced: true}, the
+waiters woken, the holder told nothing; a path that is not itself locked is a ToolError naming the folder lock that
+covers it (`'docs/a.md' is not locked itself: it is under the lock on 'docs' (Anna Smith); unlock 'docs'
+instead.`), or the locks there are (`Locked now: a.md (Boris King).`, up to 10), or `no file is locked now`. The
+user reaches it through the web Files tab's Unlock link (§18.4), `/unlock path` in the terminal UI (docs/TUI.md) and
+in the line console (`dreamteam console`), and an MCP user client.
 
 The whole-tree autocommit (after every `shell` call): `ensure_scratch()` (an agent may have deleted the marker),
 `git status --porcelain -z` (`porcelain_entries`), `git reset -q -- .scratch` when something under `.scratch/` is
@@ -1170,8 +1259,10 @@ another folder (§17.2 "Workspace folder"). Then:
   settings, not even into a repository it initialized there. Every git call of the workspace passes its identity
   and settings per command (`-c user.name=<actor> -c user.email=… -c core.autocrlf=false -c core.quotepath=false
   -c safe.directory=<root>`, after hubgit's fixed options, "DreamTeam's own git" below), so autocommits never need
-  the repository's config. In an
-  adopted folder `-c core.autocrlf=false` is left out: the user's own line-ending settings apply to the agents'
+  the repository's config. Outside an adopted folder, on Windows, `-c core.longpaths=true` is added too: Git for
+  Windows otherwise skips paths over 260 characters with only a warning, and a copy into a new session
+  (§17.2) lands deeper than its source. In an adopted folder `-c core.autocrlf=false` (and core.longpaths) is
+  left out: the user's own line-ending settings apply to the agents'
   commits as to the user's (Git for Windows sets `core.autocrlf=true` system-wide; overriding it would commit
   CRLF rewrites of the user's LF files and make a clean checkout look modified). `Workspace.resolve` refuses any
   path with a `.git` component; the members' shell can change `.git` anyway (below).
@@ -1888,7 +1979,7 @@ chars / 200 AST nodes.
 | `all_done(tag=None, parent=None)` | ≥1 matching task and all done |
 | `message(sender=None, contains=None)` | a message to the owner arrived after creation/last fire |
 | `comment(task=None, sender=None, contains=None)` | a discussion post (not by the owner) after creation/last fire |
-| `file_exists(path)` / `file_changed(path)` | workspace file exists / mtime > creation/last fire; a path outside the workspace (a UNC or device path included, never resolved) is false |
+| `file_exists(path)` / `file_changed(path)` | workspace file exists / the file changed since creation/last fire and that run of changes has settled, not counting the owner's own edits (below); a path outside the workspace (a UNC or device path included, never resolved) is false |
 | `after("2026-10-09 18:00")` | local time reached (ISO) |
 | `elapsed(seconds)` | seconds since creation |
 | `every(seconds)` | ≥ seconds since last fire (min 10); makes the trigger periodic |
@@ -1905,9 +1996,15 @@ class TriggerEngine:
     def delete(self, actor: str, trigger_id: int) -> None    # owner or USER
     def list(self, owner: str | None = None, include_inactive: bool = False) -> list[dict]
     def mark_dirty(self) -> None
-    def evaluate_all(self) -> int                            # returns number fired
+    def evaluate_all(self) -> int                            # returns number fired; then the held notices due
     async def run(self) -> None                              # loop: wait dirty-or-tick, evaluate_all; the files
-                                                             # the active triggers watch are stat'd in a thread first
+                                                             # the active triggers watch are stat'd (and their
+                                                             # file_changed() paths resolved) in a thread first
+    def release_held(self, owner: str) -> None               # the held fires of owner's triggers, quietly; never
+                                                             # raises (Swarm.render_wake, §6.3)
+    def pending(self, trigger_id: int) -> list[tuple[str, int, float | None]]   # file_changed() changes not fired
+                                                             # yet: (path, changes, seconds since the latest)
+    def create_notes(self, trigger: dict) -> list[str]       # the trigger_create result's notes (§12)
 ```
 `create` resolves member names in the condition (`sender=` of message/comment, `assignee=` of count,
 `agent_status(name)`) with `swarm.resolve_member(allow_retired=True)` (a unique first name, `@Name`, any
@@ -1916,7 +2013,9 @@ canonical names; an unknown member is a ToolError at creation. Evaluation compar
 (case/whitespace-insensitive).
 Fires on false→true edge (and on every evaluation where it is true if it uses `every`); a trigger
 true at creation fires on the first evaluation. `once` → deactivated after firing. Actions
-(default `[{"type": "wake"}]`): `wake` → `notify(owner, "n_trigger", id, condition, note)`;
+(default `[{"type": "wake"}]`): `wake` → `notify(owner, "n_trigger", id, condition, note)`, or
+`n_trigger_files` {id, condition, changes, note} when file_changed() files changed since the last fire, or
+`n_trigger_held` while fires are held (both below);
 `message` {to, text} → `mail.send(owner, to, text, automatic=True)` (a user-owned trigger's message never answers
 a question pause, §3.1); `set_status` {task_id, status} →
 `board.update(owner, ...)`; `create_task` {title, goal?, description?, assignee?, tags?, priority?}.
@@ -1925,7 +2024,88 @@ errors are stored in `last_error`, not fired. After a fire, `message()`/`comment
 are measured from that fire. A repeating trigger with message/set_status/create_task actions that fires 20
 times within 10 s is deactivated and its owner is told why (flood guard). The engine listens to the bus: `task.*`, `message.*`,
 `file.*`, `goal.*`, `agent.*` mark it dirty. Events: `trigger.created`, `trigger.fired`, `trigger.deleted`.
-Trigger dict: {"id","owner","condition","note","actions","once","active","created_at","last_fired","fire_count","last_error"}.
+Trigger dict: {"id","owner","condition","note","actions","once","active","created_at","last_fired","fire_count",
+"last_error","held","told_at","wake_at"} (`wake_at` = told_at + `trigger_wake_seconds` while fires are held by an
+active trigger and the limit is on, else None).
+
+**file_changed(): one fire per settled run of changes.** `file_changed(path)` is true when the file changed since
+the reference point (its signature (mtime_ns, size) differs from the one at creation or the last fire, or its run
+counted a change, also one that left the signature as it was; after a restart its mtime is newer) *and* that run of
+changes has settled. Once and repeating triggers use the same rule; the edge, `once`, `every()` and and/or/not apply
+to its value as to any function. The engine keeps a run per trigger and path in memory:
+- Count = the `file.changed` events of the path from other actors (write_file/edit_file, with the editor's name) +
+  the changes no event explains (commands, jobs). The owner's own write_file/edit_file edits do not count, so own
+  edits alone do not fire it; its commands and jobs are unattributed and count. A pass takes
+  `Workspace.write_mark()` before it probes: for a path that a write_file/edit_file write was writing then, or
+  started writing since (`written_since`), the probe may show the file before the write or in the middle of it
+  (opened, truncated, then written), so the pass is unsure of the path: its probe is not used (the run's signature
+  does not move) and it does not settle the run by the editors' turns. A sure pass's probe shows every write whose
+  event came since the previous sure pass, finished (a path stays in flight until its write's event): a new
+  signature is explained when at least one event of the path came in between, and is one change no event explains
+  when none did. So two writes of commands between two sure passes count as one, and a command's change between
+  them together with an edit is not counted apart from it; together with only the owner's own edits it is not
+  counted at all, so it is not told (the probe cannot tell it from those writes, which do not count; the command
+  has to land after the last sure pass, at most one tick before the edit). A fire in an unsure pass takes the new
+  run's baseline from the next sure probe, without counting it (the edits the new run counted by then are in it; a
+  command's change before it is not counted); an edit of another actor that the new run has counted by then (that
+  write's event came after the fire) is told as any run's count. A trigger created while a write of its file is in
+  flight takes its baseline the same way; one created while a pass waits for its stat takes nothing from that pass's
+  probe, which is older than its baseline (if another part of its condition fires it in that pass, the new run takes
+  its baseline from the next sure probe, as above). The count of a run never goes down, and its cap counts from its
+  first counted change; the times of a run followed in memory are at most now (a wall clock set back does not hold
+  it).
+  Events and probed paths are compared by `workspace.path_key` of the workspace-relative path (case-insensitive on
+  Windows), the condition's path resolved like the probe.
+- Settled when the count is > 0 and: no change (anyone's, the owner's included) for `[agents] file_settle_seconds`
+  (60; 0: at the first pass that sees a change), or every change is explained by an event and every other editor is
+  an AI agent whose runtime is not WORKING (one without a runtime, e.g. retired, counts as done; an external member
+  or the user as an editor leaves it to the quiet window), or `file_max_wait_seconds` (300; 0: no cap) passed since
+  the first counted change. The end of the editors' turns emits `agent.status`, so the fire comes at the next pass;
+  while the swarm is paused no runtime is WORKING, so a pending run settles then. During an unsettled run
+  file_changed() is false, so `not file_changed(p)` stays true until it settles. While the file is missing
+  file_changed() is false and its run stays pending, past the quiet window and the cap alike (the file's return is
+  itself a change: the run is then told by the same rule, at once if the cap has passed); a deletion alone is not a
+  change.
+- When another part of the condition fires first (`file_changed('a') or message()`, `every()`), the unsettled run is
+  absorbed: the fire starts new runs, as everything is measured from the fire, and its notice lists the file as still
+  changing.
+- The notice: `n_trigger_files` {id, condition, changes, note}, `changes` = one fragment per file with changes
+  (`trigger_file_settled` {path, count, by, quiet}: "File docs/AUDIT.md was changed (changes: 7, by Anna Smith); the
+  last change was 2 min ago."; `trigger_file_changing` {path, count, by, duration} for a run fired by the cap or
+  absorbed: "File x is still changing (changes: 11, by Anna Smith in 5 min)."; `by` = `trigger_file_by` naming at
+  most 5 editors, then "(+N)"). Without changes the plain `n_trigger`. `trigger.fired` carries `files`
+  [{path, changes, by, settled}] then.
+- After a restart (or for a trigger another engine followed) the runs are seeded from the journal: the
+  `file.changed` events since the reference point (their times, at most now; the cap counts from the first event of
+  another actor); a newer mtime with no such event counts as one change no event explains, whose quiet window and
+  cap start now, so each restart postpones both for that change (a write in flight at that pass is no such change:
+  its event counts it, and the next sure probe is the baseline). The events of any actor, the owner's included, stand
+  for the file's changes: with one in the journal, a command's change next to it is not counted, also one the run
+  had counted in memory before the restart, so it is not told. A reseeded trigger still needs an mtime newer than its
+  reference: a counted edit older than that (a write stored before the fire, a clock set back) stays pending and is
+  told with the next change, and a command's change before a clock set back can count as a change after a trigger
+  created since. No schema change.
+
+**Wake limit.** A member's (an AI agent's or an external member's) repeating trigger wakes its owner at most once per
+`[agents] trigger_wake_seconds` (180; 0: at every fire), counted from the last time it told the owner anything
+(`told_at`). A fire within the interval runs in full (fire_count, last_fired, the reference point, the actions);
+only its notice is held: `held` + 1, `held_last`, and its file_changed() changes merged into
+`held_files` (counts summed, editors joined). The user's triggers, once triggers and the flood guard's notice are
+never held; `every()` triggers are limited like the others. The held fires reach the owner in ONE `n_trigger_held`
+{id, condition, count, since, last, interval, changes, note} ("Trigger #4 fired again since it last told you at
+18:40 (fires: 3, the last at 18:46): file_changed('docs/AUDIT.md'). File … A repeating trigger wakes you at most
+once every 3 min."), whichever comes first: the owner's next render_wake for any reason (§6.3: quiet, no wake of
+its own), a fire after the interval (that fire's notice, with count = held + 1), or the end of the interval
+(evaluate_all after each pass: waking; a clock gone back, told_at in the future, releases too). A release's note
+carries the last action error (`Trigger action errors: …`, not an evaluation error). Fires held when the limit was
+switched off (`trigger_wake_seconds` = 0) come as `n_trigger_held_off` (the same text without the interval
+sentence) at the next pass or fire. Notices are never told twice:
+whichever releases first sets `told_at` and clears `held`. The set of owners with held fires is rebuilt from the
+table when the engine starts; held fires survive a restart. A trigger made inactive (its owner left) keeps them
+untold (`wake_at` None). No new event type: every fire still emits `trigger.fired`, whose trigger dict carries
+`held` / `wake_at`; a release emits only its `notification`. The limit is per trigger and only for triggers:
+lock (`n_lock_free`) and job wake-ups are not limited, and a trigger's message action still wakes its recipients at
+every fire (the flood guard limits those).
 
 ## 9. Event types (bus)
 
@@ -1946,6 +2126,11 @@ as such. `skill.deps` {name, ecosystem: python | node, status: installing | read
 failed, files, env, key, installer?, reused: bool, seconds?, error?}, actor None: a skill's script dependencies,
 emitted by every session that has the skill when a build really starts and when it ends (§19 "Script
 dependencies").
+
+`trigger.fired` {trigger, errors, files?}, actor = the trigger's owner, at every fire (also one whose notice is held
+by the wake limit, §8): `trigger` is the trigger dict, with `held` and `wake_at`; `files` [{path, changes, by,
+settled}] only when file_changed() files changed since the last fire. The web feed and the TUI's verbose feed add
+"(wake-up held until 18:48)" / «(пробуждение отложено до 18:48)» to a fire with `held` > 0.
 
 `swarm.wrap_up` {on: bool}, actor = who switched it (the user, or the actor of the set_goal / reopen_goal that ended
 it).
@@ -1989,7 +2174,20 @@ def create_llm(profile: ModelProfile) -> LLMClient   # llm/__init__.py
 # clients may also expose `async aclose()` to release their HTTP pool (called when an agent stops)
 # stop_reason "other" covers pause_turn / stop_sequence and unknown values
 def cost_of(profile: ModelProfile, usage: Usage, model: str | None = None) -> float
+    # usage.cost_usd (the provider's cost) when set, else the tokens at profile.prices(model)
+def uncounted_fields(profile: ModelProfile, usage: Usage, model: str | None = None) -> tuple[str, ...]
+    # the price fields whose tokens cost_of counted as $0: profile.missing_prices(model); () when usage.cost_usd is
+    # set and for the scripted provider (tests and demos have no bill)
 ```
+* **Prices** (config.py `ModelProfile`, USD per 1M tokens): `input_price`, `output_price`, `cache_read_price`,
+  `cache_write_price`; None = not set, 0 = free. `prices(model)` takes the profile's price, else the built-in
+  `KNOWN_PRICES` entry of the response's model or the profile's model (`_table(model)`, exact ids), else 0 (the
+  cache prices: input × 0.1 / × 1.25). `PRICE_FIELDS = ("input_price", "output_price")`.
+  `missing_prices(model)` → the PRICE_FIELDS that are None while `_table(model)` has no entry (their tokens count
+  as $0); `price_source(model)` → `"none"` (both missing), `"partial"` (one), `"table"` (the built-in prices fill
+  what is not set), `"free"` (both set to 0), `"profile"` (both set); `has_prices` = no missing prices. A call
+  whose `uncounted_fields` is not empty is reported to the user once per start (`Swarm.record_usage`, §3:
+  `u_cost_unknown`); a provider that reports the cost (`usage.cost_usd`) never is.
 * **AnthropicLLM** (`anthropic.AsyncAnthropic`, SDK 1.x): converts neutral → Messages API (consecutive
   user-side items merged into one user message, tool_result blocks first; assistant uses `raw.content`
   verbatim when `raw.provider == "anthropic"`), top-level `cache_control={"type":"ephemeral"}`,
@@ -2174,6 +2372,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `edit_file` | path, old_text, new_text, replace_all? | LE |
 | `list_files` | path?, depth? | LEU |
 | `lock_file` | path, minutes?, unlock? | LE |
+| `file_unlock` | path (as it was locked: a member's lock removed by the user, the waiters woken, §7 "Lock waiters") | U |
 | `shell` | command, timeout?, background? (its environment: §7 after `scrubbed_env`; results and jobs: §7.1) | LE |
 | `jobs` | job_id?, tail? (without job_id: the running jobs of the swarm and the caller's ended in the last hour, everyone's for the user; with it: that job, §7.1) | LEU |
 | `job_stop` | job_id (only the job's owner or the user) | LEU |
@@ -2247,6 +2446,20 @@ check `ToolContext.has_tool`. `allow_empty` is validation only, not part of the 
 `user`/`external` audiences only (e.g. `set_goal`) are not in the LLM tools array, and external members and the user
 always see the live registry.
 
+`trigger_create` and `trigger_list` say what the frozen description cannot (§8), with the settings in force:
+- `trigger_create`: `Trigger #N created: CONDITION (NOTES)` then `; actions: …` when they are not just a wake.
+  NOTES, joined with "; ": `repeating`; for a condition with file_changed() `file_changed() becomes true once the file
+  has stopped changing: after 1 min without a change or once the agents who changed it have ended their turns, at
+  the latest 5 min after the first change, and your own write_file/edit_file edits do not count` (no cap: without
+  the "at the latest" part; `file_settle_seconds` 0: `file_changed() does not count your own write_file/edit_file
+  edits`); for a member's repeating trigger with a wake action while `trigger_wake_seconds` > 0 `it wakes you at most
+  once every 3 min, with the fires in between in one notice`. Without notes no parenthesis (`Trigger #1 created:
+  done(1).`).
+- `trigger_list`: each line `#N [state, repeating] owner=… when … — note actions=… (fired Nx, last …; 2 fires held,
+  wake-up at 18:48) pending: docs/AUDIT.md changed 3x, last 40 s ago error: …`: the held part while fires are held
+  (without the wake-up time for an inactive trigger), `pending` for the file_changed() changes not fired yet (as far as
+  the last pass saw).
+
 Results and checks of the review and role-catalog flows:
 - `task_claim` by the task's designated reviewer (independent review, §4.1) adds "You were its reviewer; since
   you execute it now, another member will review it."
@@ -2254,7 +2467,10 @@ Results and checks of the review and role-catalog flows:
   own reviewer); `... was sent to the user for review: nobody else in the team can review it. You will be told the
   verdict; meanwhile take the next task or call wait.`; or `... was sent to X for review: a member other than you
   checks it, and you will be told the verdict.` (picked by the board). Once the board accepted the call (a refused
-  one commits nothing) it commits the caller's held new files (`workspace.commit_held`, §7 "Held new files").
+  one commits nothing) it commits the caller's held new files (`workspace.commit_held`, §7 "Held new files"). A
+  member that still holds file locks gets ``You still hold locks on: docs/AUDIT.md (until 14:05). Unlock those you
+  no longer need (`lock_file` with unlock=true).`` appended (`held_locks_note`, at most 10 named); locks are not
+  tied to tasks, so none is released.
 - Dependencies (§4 `update`): `task_get` of an open task (not in review) the caller holds while it is blocked adds `You hold it while
   it is blocked: if its result can be produced without some of #3, #4, remove those with task_update (depends_on =
   the ones still needed) and say why in its discussion.`; `task_update` in which an assignee that did not create the
@@ -2323,7 +2539,10 @@ Results of the team, wait and job flows:
   line, `Global goal [active]: <title>` (no description, no summary); the rest is the same.
 - `wait` (description: the end of one of its background jobs wakes it too; "End every turn with it" stays): `OK,
   waiting. You will be woken up by new events.`, plus `, also when your background job j3 ends.` / `…jobs j3, j5 end.`
-  for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet).
+  for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet), and/or
+  `, also when docs/AUDIT.md, which you were refused, is free.` (`… are free` for several, at most 10 named;
+  `Workspace.awaited_locks`: none once the goal is done, when n_lock_free is quiet; §7 "Lock waiters"); both:
+  `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.`
 - `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
   min). Stop the ones nobody needs with job_stop; the rest stop with the session.` (a caller without `job_stop`: `with
   the shell command kill jN (as a command of its own)`).
@@ -2419,7 +2638,8 @@ one.
 
 `create_app(swarm, host, *, on_library_change=None) -> Starlette` is the app of ONE swarm: the whole server of `dreamteam run`, and the
 per-session app the launcher serves under `/s/{sid}/` (§18.1). All JSON (`httpjson.JSONResponse`; the
-WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json`. Guard
+WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json` (the one
+exception is the launcher's zip upload, `raw_posts`, §18.1). Guard
 (`GuardMiddleware`, every bind, also 0.0.0.0 in Docker): Host must be localhost/127.0.0.1/[::1]; for
 non-loopback binds also the bind address, or an IP literal that is the address the connection reached (ASGI
 `server`; any IP literal only on a request with the hub token: a port mapping that rewrites the address); plus names
@@ -2450,7 +2670,7 @@ cancelled. Pages (`/`, launcher `/`) are sent with `Cache-Control: no-store`; `/
 | GET `/api/agents/{name}/activity?limit=` | `agent.activity` events of that agent |
 | GET `/api/files?path=` | dir → {"type":"dir","entries":[...]}; file → {"type":"file","content","truncated"} |
 | POST `/api/act/{tool}` | run tool as USER: body = args → {"ok": bool, "result": str}; the user's `jobs` and `job_stop` (§7.1) go through it too: background jobs have no endpoint of their own; with `X-DreamTeam-Auto-Reply: 1` it first calls `swarm.auto_reply_seen()` (below) |
-| GET `/api/skills` | `{library_dir, library: [entry], claude: [item], host: [entry], sandbox, limits: {max_mb, max_files, max_attached, max_archive_mb}, install, attached: [snapshot item + source_digest]}` (§19): the Skills tab; `source_digest` is the attached skill's own source now (`SessionSkills.source_digest`: "Update" compares with it only) |
+| GET `/api/skills` | `{library_dir, library: [entry], claude: [item], host: [entry], sandbox, container, limits: {max_mb, max_files, max_attached, max_archive_mb}, install, attached: [snapshot item + source_digest]}` (§19): the Skills tab; `source_digest` is the attached skill's own source now (`SessionSkills.source_digest`: "Update" compares with it only) |
 | POST `/api/skills` | an import body (§19 "Requests": exactly one of `path`, `zip`, `git`, `claude`, `host`; `pick`, `replace`) plus `attach?: bool` → the import report + `install`; with `attach` every imported skill is attached as `library:<name>` (`attached: [{name, status, files}]`, `failed: [{name, error, status}]`, as `attach_source`); `attach` on a stopped session is 409 `STOPPED_SKILLS_TEXT` (importing works) |
 | GET `/api/skills/{name}?from=library\|claude-user\|claude-project\|host-library\|session` | the entry + `files_list`, `skill_md`, `deps` (`show_folder`) + `install`; `session`: the session copy with its metadata and shown path |
 | DELETE `/api/skills/{name}?confirm={name}` | `{"removed": name}` (`Library.remove`; the sessions keep their copies); 400 without a matching confirm |
@@ -2638,7 +2858,7 @@ dreamteam init [DIR] [--lang ru|en] [--provider anthropic|openai|openrouter|olla
 dreamteam run [DIR] [--goal G] [--host H] [--port P] [--no-console] [--open] [--network on|off]
     # one swarm, its board at / (web.serve); refuses when a hub already runs for DIR; --goal sets the goal
     # unless the stored one is active with the same title (compared with split_goal(G)[0], so a multi-line
-    # --goal does not reset the goal at every restart)
+    # --goal does not reset the goal at every restart); after the banner, settings.unpriced_line (§17.1) on stderr
 ```
 `console`, `mcp`, `status` and `sandbox` work with a project as well as with a home (§18.3).
 
@@ -2788,8 +3008,9 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
 ### 17.1 Settings (settings.py, config.py)
 - The **home** is `$DREAMTEAM_HOME`, else `~/DreamTeam` (`default_home()`); the CLI flags `--home` / DIR
   override both. Its settings file is `<home>/dreamteam.toml` (`settings_path(home)`) with the sections
-  `SECTIONS = swarm, agents, server, shell, workspace, mcp, skills, tracing, roles, models` (same format as a project's
-  `dreamteam.toml`; `roles` is an array of tables, `[[roles]]`, the role catalog of §17.3).
+  `SECTIONS = swarm, agents, server, shell, workspace, mcp, skills, tracing, teams, roles, models` (same format as a
+  project's `dreamteam.toml`; `teams` and `roles` are arrays of tables, `[[teams]]`, the saved teams, and `[[roles]]`,
+  the role catalog, both of §17.3).
 - `ensure_home(home, language="ru", provider="anthropic")` creates the directory, `sessions/` and the settings
   file from the template; `read_raw(home)`; `validate(home, raw) -> Config` (ValueError with a readable text);
   `dump_toml(data)` (a top-level non-empty list of tables is written as `[[name]]` blocks after every table,
@@ -2798,7 +3019,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   independent_review`): an agent's finished task is approved by another member, or by the user when nobody else
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
   true` with a comment, after the `starting_roles` comment (which names the starting team rule, §17.3), and a
-  commented `[[roles]]` example before the model profiles.
+  commented `[[roles]]` example before the model profiles, with a commented `[[teams]]` example before the role
+  catalog's.
 - `[swarm] network` ("on" | "off", default "on"; anything else is a ValueError naming `swarm.network`): "off"
   cuts the members' commands, their jobs and the stdio MCP servers off the network (§7.2). Read at each use;
   session overrides apply (a running session: from its next command). The template has the line after
@@ -2814,6 +3036,14 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   many LLM steps or minutes of holding the planning task without creating a task, once more at twice the value; 0
   turns that trigger off. Read at each use; session overrides apply. The
   template has both lines with Russian comments after `stagger_seconds`.
+- `[agents] file_settle_seconds = 60`, `file_max_wait_seconds = 300` and `trigger_wake_seconds = 180` (numbers ≥ 0;
+  §8): file_changed() is true once the file has had no change for `file_settle_seconds` or the agents who changed
+  it have ended their turns, at the latest `file_max_wait_seconds` after the first counted change (0: at every
+  change / no cap); a member's repeating trigger wakes it at most once per `trigger_wake_seconds`, the fires in between come in
+  one notice (0: at every fire). The worst delay of a file_changed() notice is about settle + interval, or max_wait +
+  interval for a file that keeps changing. Read at each pass and use; session overrides apply. The template has the
+  three lines with Russian comments after `planning_hint_minutes`; the settings page's «Агенты» section and the
+  session dialog's «Агенты» group have a field for each.
 - `[shell]` (`ShellSettings`, read at each use, so `reconfigure` and session overrides apply at once; §7, §7.1):
   `program = "auto"` (auto | bash | sh | powershell | pwsh | cmd), `timeout = 120` (seconds a call waits; a command
   still running then continues in the background), `max_timeout = 1800` (the largest `timeout`, and the lifetime of a
@@ -2827,6 +3057,25 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   in any case or a whole number, also written as a string; anything else is a ValueError `[shell] cpu_threads must
   be "auto" or a whole number ...`), `pass_env = []`. `timeout`, `max_timeout`, `foreground_max` and `job_log_mb`
   are at least 1. The template lists every key with a Russian comment.
+- `[workspace]` copy limits (`WorkspaceSettings`, next to `git` and `lock_ttl_minutes`): `copy_max_mb = 1024` and
+  `copy_max_files = 100000`, the largest copy into a new session (§17.2 "Copying files into a new session"): the
+  MB and the files of a folder copy or an unpacked zip (the left-out names `.git`, `node_modules`, `.venv`, `venv`
+  and `__pycache__` do not count); `copy_max_mb` also caps a zip file's own size and an upload of `POST
+  /api/uploads` (§18.1). Both are at least 1 (`_MIN_ONE`: 0 would refuse every copy). Read from the global
+  settings at each create and each upload (`copyfrom.CopyLimits.from_config`; a hand edit of the file applies at
+  once). A session override of them passes validation but has no effect: the copy is made
+  before the session exists, and an upload has no session. The template's `[workspace]` block has both lines with
+  Russian comments.
+- `[mcp] library_dir = "~/.dreamteam/library"` (the shared MCP library, §11; `Config.library_dir`, where
+  `DREAMTEAM_MCP_LIBRARY_DIR` wins, as `DREAMTEAM_SKILLS_DIR` does for the skills library: the tests set it). The
+  variable is one of shell's `_INTERNAL_ENV` (never in the members' commands, §7) and of `docker.SKILLS_ENV` (never
+  passed into the sandbox by name).
+- `[workspace]` (`WorkspaceSettings`): `git = true` (the shared workspace under git with autocommits),
+  `lock_ttl_minutes = 30` (whole number ≥ 1: the time of a `lock_file` call without `minutes`; 0 would refuse every
+  such call), `lock_wanted_minutes = 5` (number ≥ 0: a lock members were refused is named to its holder once it has
+  held it this long, `n_lock_wanted`, §7 "Lock waiters"; 0: at the first refusal). The lock keys are read at each
+  use; session overrides apply. The template has them with Russian comments; the settings page's «Workspace»
+  section has a field for each.
 - `[skills]` (`SkillsSettings`, global only: not one of the session `OVERRIDE_SECTIONS`; §19): `library_dir =
   "~/.dreamteam/skills"` (the shared skills library; `Config.skills_library_dir`, where `DREAMTEAM_SKILLS_DIR` wins:
   the Docker sandbox and the tests set it), `claude = true` (offer Claude Code's skills), `max_mb = 10` and
@@ -2847,6 +3096,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   else None. The template has the block after `[mcp]` with Russian comments.
 - `[[roles]]` → `Config.roles: list[RoleSettings]` (`RoleSettings(name, description="", instructions="",
   model=None, hidden=False, skills=[])`), checked by `config.parse_roles(raw, profiles)` after the model profiles (§17.3).
+- `[[teams]]` → `Config.teams: list[TeamSettings]` (`TeamSettings(name, roles)`), checked by
+  `config.parse_teams(raw, entries)` after the roles (§17.3 "Saved teams").
 - `config.Config.from_dict` checks every field against its type (bool / int / float / str / list[str] /
   tables; integral floats become ints, bools are not numbers, no NaN/inf, counts and sizes >= 1, port <= 65535;
   None = the default) with messages like `[agents] max_steps_per_turn must be ...`; API keys are never echoed.
@@ -2860,16 +3111,23 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   - every section with defaults filled in; no `swarm.goal` / `swarm.goal_description`;
   - in model profiles, `api_key` is null and comes with `api_key_set`, `api_key_hint` (`…abcd`) and
     `api_key_env_set` (true/false, or null when there is no env name); `api_key_env` is a variable name or
-    null (a key pasted there is never shown);
+    null (a key pasted there is never shown); `price_source` is `ModelProfile.price_source()` (§10). These computed
+    fields (`_PUBLIC_KEY_FIELDS`) are dropped by `apply_update` and `profile_from_view`;
   - values of `mcp.external.<server>.env` are masked as `SECRET_MASK + hint` (`••••…abcd`);
   - `roles`: the stored `[[roles]]` entries `[{name, description, instructions, model, hidden, skills}]`, normalized
-    (a built-in role by its id, e.g. «Тестировщик» → `tester`); `[]` when there are none.
+    (a built-in role by its id, e.g. «Тестировщик» → `tester`); `[]` when there are none;
+  - `teams`: the stored `[[teams]]` entries `[{name, roles}]`, normalized (§17.3 "Saved teams"); `[]` when there are
+    none.
 - `apply_update(raw, update)` (a dict of sections; ValueError for bad input):
   - `roles` is the complete list of entries: not a list → "Section roles must be a list of roles", an item that
     is not an object → "Role N must be an object"; names get their whitespace collapsed; fields that are null,
     `""`, `[]` (no skills) or `hidden: false` are not stored (an untouched field of a built-in role keeps the built-in value);
     `[]` removes every customization; a role's `model` follows a profile rename; the rules themselves are
     checked by `validate` (`[roles.N] ...`);
+  - `teams` is the complete list of entries: not a list → "Section teams must be a list of teams", an item that is
+    not an object → "Team N must be an object"; only null values are dropped, so the file keeps what was sent, and
+    `Config.teams` and the view normalize it at each load; `[]` removes the key; the rules themselves are checked by
+    `validate` (`[teams.N] ...`);
   - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays;
   - masked `mcp.external.*.env` values get their stored value back (same server first, then a renamed one);
     an unknown mask is a ValueError;
@@ -2878,7 +3136,11 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
     `renamed_from`), `""` removes it, and any other string sets it (whitespace stripped); a key pasted into
     `api_key_env` becomes the `api_key`;
   - renaming the default profile (`renamed_from`) moves `agents.default_model` along (`profile_renames(update)`
-    gives `{old: new}`).
+    gives `{old: new}` of every card whose `renamed_from` differs from its name, a swap or a chain in one save
+    included, applied in one step; an old name that a card not renamed from anything still has is left out). A
+    stored value carries an old name and follows; an `agents.default_model` or role `model` sent with the update
+    that names one of its profiles is a new name and is kept (the web UI sends the names after the save: in a swap
+    a new name is also an old one).
 - `profile_from_view(raw, data, name=None) -> ModelProfile` (an unsaved UI profile; a missing key falls back to
   the stored key of profile `name`, only when `data` has the provider and base_url that profile is saved with
   (a trailing `/` aside), else a ValueError. A key from the hub's environment (`api_key_env`, or with no key the
@@ -2894,37 +3156,52 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   first); `scrub_keys()` masks their values too.
 - `async list_models(profile, timeout=20)` (GET /models, free; ValueError with a readable message).
 - `async check_profile(profile, *, live=False, timeout=30)` → `{ok, models, models_error, model_found, error,
-  reply, latency_ms, cost_usd}`. `live=True` sends one tiny request (max_tokens <= 512; effort `low` only when
-  the profile uses effort). Errors and replies pass through `scrub_keys()`: an endpoint echoing a rejected key
-  never sends it to the browser.
+  reply, latency_ms, cost_usd, cost_source}`. `live=True` sends one tiny request (max_tokens <= 512; effort `low`
+  only when the profile uses effort); `cost_source` is then `"provider"` when the response reported its cost, else
+  the probe's `price_source(response model)` (`"none"` / `"partial"`: those tokens counted as $0), null without a
+  live request. Errors and replies pass through `scrub_keys()`: an endpoint echoing a rejected key never sends it
+  to the browser.
 - `PROVIDER_CHOICES`: presets for the UI (`anthropic`, `openai`, `openrouter`, `ollama`, `vllm`, `lmstudio`,
-  `custom`), each `{id, label, provider, base_url, api_key_env | api_key, model, models, ...}`.
+  `custom`), each `{id, label, provider, base_url, api_key_env | api_key, model, models, ...}`. The `openai` preset
+  sets `input_price = 1.25` and `output_price = 10.0` (as the init template), the local ones 0 / 0.
+- `unpriced_line(config) -> str | None`: the note the `serve` and `run` banners print (§18.3), English and ASCII:
+  `Note: model profiles without prices: remote (some-model-v1), half (kimi: no output_price). Their unpriced tokens
+  count as $0 and the budget does not see them, unless the provider reports the cost. Set input_price and
+  output_price ($ per 1M tokens, 0 for a free model) in Settings > Models and endpoints or in dreamteam.toml.`; the
+  profiles with `missing_prices()`, the scripted provider aside; None when there are none.
 
 ### 17.2 Sessions (sessions.py)
 `SessionManager(home, *, llm_factory=None, language="ru", provider="anthropic")` (`ensure_home` + the
 settings; ValueError when they are invalid):
 - Attributes: `home`, `raw` / `config` (the global settings), `swarms` (loaded Swarm objects by sid),
   `running` (the set of started ones), `hub_url` (set by `launcher.serve_launcher`; a session swarm's `hub_url`
-  is `f"{hub_url}/s/{sid}/mcp"`), `sessions_dir`.
+  is `f"{hub_url}/s/{sid}/mcp"`), `sessions_dir`, `uploads` (`copyfrom.Uploads(<home>/.dreamteam/uploads)`, the
+  zips of `POST /api/uploads`: "Copying files into a new session" below).
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
-  workspace=None, skills=None, via="home", auto_reply=False)`, `async load(sid)`, `async start(sid, *, skills=None,
+  workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None)`,
+  `async load(sid)`, `async start(sid, *, skills=None,
   via="home", auto_reply=False)`,
   `async stop(sid, *, remember=False)`, `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None,
   settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`, `global_config()`,
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
-  `async set_workspace(sid, path, *, expect=None)`; module functions `read_stats(db_path, conn=None)`,
-  `slugify(title)` and `external_workspaces(home)`.
+  `async set_workspace(sid, path, *, expect=None)`; for an import (§20.4) `staging_path(sid)`, `clean_staging()`,
+  `backups(sid)`, `import_overrides(overrides, models)`, `async import_add(staged, meta, workspace, *, sid,
+  before_swap=None)`, `async import_rewrite(sid, staged, meta, workspace, *, expect=None, before_swap=None)`,
+  `async import_settings(sid, meta, *, expect=None)`, `recover_swaps()` and `interrupted_swaps()`; module functions
+  `read_stats(db_path, conn=None)`, `slugify(title)`, `external_workspaces(home)`, `new_uid()` and
+  `session_uid(meta)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
 - `SessionError(message, status=400, **extra)` (a ValueError) carries an HTTP status and `extra` (put into the
   JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid settings,
   404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
   a folder of another session, a folder that changed since the user was asked, a missing workspace folder at
-  start), 500 damaged or cannot be opened.
+  start, a `workspace` with files for a copy), 413 a copy over its limits, 500 damaged or cannot be opened (404 is
+  also an unknown or used upload of `copy_from_upload`).
 - Session ids are `NNN-slug` from the title (Cyrillic and Ukrainian transliterated, accents dropped; e.g.
   `001-snake-game`) and match `^[a-z0-9][a-z0-9-]{0,63}\Z`. `main` is the legacy session: a home that was a
   single-swarm project (`<home>/.dreamteam/swarm.db`) lives in the home itself, uses the global settings
@@ -2932,12 +3209,19 @@ settings; ValueError when they are invalid):
   `sessions/main/` is ignored. Titles are one line, at most 200 chars (default: the goal's first line,
   shortened to 60 characters at a word by `goal_text.shorten_title`, else "Session"; an empty `title` lets the
   server derive it).
+- **Identity.** The sequence id is not an identity across homes (two homes both make `017-session`). `create`
+  writes `"uid": new_uid()` (uuid4, 32 lowercase hex) into session.json; `_write_meta` keeps unknown keys, so
+  `update`, `set_workspace` and `start` keep it. `session_uid(meta)` is the stored uid when it is 32 hex characters
+  (lowercased), else `uuid5(UID_NAMESPACE, "created_at:" + repr(float(created_at))).hex`, derived on read and never
+  written (so a session made before uids existed, or a folder copied by hand, has the same identity in every home
+  it is in); None without a finite numeric `created_at` and for the legacy `main` session (never matched).
+  `summary(sid)` carries `uid` (None for a damaged session). `UID_NAMESPACE` is fixed forever.
 - Effective config of a session = the global settings without `swarm.goal` / `goal_description`, deep-merged
   with its `overrides`. Overrides may only touch the sections swarm, agents, shell, workspace, mcp and tracing
-  (`OVERRIDE_SECTIONS`; not models, server or roles: the role catalog is global, and a session chooses its
-  starting team with `swarm.starting_roles` / `start_agents`); they are validated at create and update time
-  (`update` applies them to a loaded swarm at once via `reconfigure`). `config_view(sid)` is the public view of
-  the effective settings (the global ones when the overrides are invalid now).
+  (`OVERRIDE_SECTIONS`; not models, server, roles or teams: the role catalog and the saved teams are global, and a
+  session chooses its starting team with `swarm.starting_roles` / `start_agents`); they are validated at create and
+  update time (`update` applies them to a loaded swarm at once via `reconfigure`). `config_view(sid)` is the public
+  view of the effective settings (the global ones when the overrides are invalid now).
 - Partial update (`update(sid, settings=...)`, the settings dialog of the board, §18.4): `settings` is
   `{section: {key: value | None}}`; each key is set in the stored overrides, None (or "") removes it so the session
   inherits the global value again, and a section left empty disappears. The other overrides (those given at
@@ -2969,9 +3253,17 @@ settings; ValueError when they are invalid):
   session's lock, so a `set_workspace` that ran just before counts), else None.
 - `update_settings(update)`: `apply_update` + validation; every session must still produce a valid config,
   except damaged sessions and sessions whose overrides were already invalid (skipped); a session override that
-  pins a renamed profile follows the rename, one whose profile was deleted falls back to the default (an
-  `updated` event); then the file is written and every loaded swarm is reconfigured (a failure is logged per
-  session). Returns `{"settings": public view, "applied_to": [sids]}`. Edits of the settings file made by hand
+  pins a renamed profile follows the rename (also in a swap), one whose profile was deleted falls back to the
+  default (an `updated` event); then the file is written. A profile rename (`profile_renames(update)`) then reaches
+  the members hired on it, before the reconfigure: a loaded session through `Swarm.rename_profiles`, every other one
+  (`main` too) by `rename_member_profiles(db_path, renames)` on its `.dreamteam/swarm.db`, in a thread under the
+  session's lock (opened by its plain path after an exists() check, so a home on a UNC path or a mapped drive works;
+  a 2-s busy timeout, one statement; a missing file or one without an `agents` table is left alone; an error is
+  logged and never fails the save, and such a member falls back to the default profile, `make_llm`). A deleted
+  profile keeps `agents.model` as it is; a rename by a hand edit of the file has no `renamed_from` and is not
+  followed. Then
+  every loaded swarm is reconfigured (a failure is logged per session). Returns `{"settings": public view,
+  "applied_to": [sids]}`. Edits of the settings file made by hand
   while the server runs are picked up (mtime/size) before reads and updates; an invalid hand edit is ignored
   with a warning.
 - `default_session()`: the running session (the most recently active one when several run), else the only
@@ -2985,7 +3277,8 @@ settings; ValueError when they are invalid):
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
    "question":{"asker","message_id"}|null,"clarify":bool,
-   "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names]}
+   "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names],
+   "copied_from":{"source","files","bytes","at"}|null}
   ```
   `question` (`read_stats`, from kv `paused`, default None): the member's question that holds the pause, set only
   for a paused slot with reason `question`, a non-empty asker and an integer message_id (the test of
@@ -2996,7 +3289,8 @@ settings; ValueError when they are invalid):
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
   rows, in a `try` of its own: a database older than background jobs gives 0). `skills`: the attached skills' names,
   `skills_pending`: those members proposed that wait for the user's library decision (from memory when loaded,
-  else `read_session_skills` of the session's data dir).
+  else `read_session_skills` of the session's data dir). `copied_from`: the files copied in at create ("Copying
+  files into a new session" below), None for a session made without a copy.
 
 #### Workspace folder
 A session works in `<session dir>/workspace` (`default_workspace(sid)`) unless its `session.json` has
@@ -3096,10 +3390,205 @@ next start, which checks the folder).
   then the session is created in its own folder and `set_workspace` runs before the first start. A failure removes
   the new session; its error names only the folder (and what could not be removed there), never the removed
   session. The returned summary then has `"workspace_result"`: the result with mode `"created"` for an
-  empty/missing folder or `"adopted"` (`old_kept` null: the unused default folder is removed).
+  empty/missing folder or `"adopted"` (`old_kept` null: the unused default folder is removed). With a copy
+  (`copy_from` / `copy_from_upload`) the folder must be empty or missing, and the copied files move there ("Copying
+  files into a new session" below).
 - `external_workspaces(home)` → `[(sid, stored path)]` of the sessions whose folder is outside the home (no
   `in_home`; read from the `session.json` files, nothing opened): `dreamteam sandbox` warns about them (only the
   home is mounted).
+
+#### Copying files into a new session
+`copyfrom.py` (it imports treecopy, skills, workspace and hubauth, never sessions.py) copies a folder or a zip into
+the folder a new session works in, before its first start: `create(..., copy_from=<absolute folder or .zip path on
+this computer>)` or `create(..., copy_from_upload=<token of POST /api/uploads>)`, not both (400 "Give copy_from or
+copy_from_upload, not both."). The surfaces: REST `copy_from` / `copy_from_upload` (§18.1), the launcher MCP's
+`session_create(copy_from=)` (§18.2), the CLI's `--copy-from` (§18.3), the TUI's `/copy-from` (docs/TUI.md) and the
+home page's «Файлы для работы» (§18.4). The source is only read and nothing is copied back. The members are never
+told where the files came from: no source path goes into `pending_goal` or any prompt.
+- **Order** (the cheap checks first, the copy last):
+  1. an upload is claimed first (`uploads.claim`, its claimed name computed first by `claim_path`; an unknown or
+     used token is the 404 here): from now on a create that names an upload uses it up, whatever refuses it later
+     (the sessions page uploads again for each try, so failed tries never pile up);
+  2. "not both", then the overrides are validated (as without a copy);
+  3. `copy_from` is refused early, in a thread, by `resolve_source(text, home=, config=, sandbox=)`;
+  4. with `workspace`: `_plan(..., copying=True)`, where a folder with files is a 409 before any repository check
+     ("<target> already has files (it holds .git, .DS_Store; hidden files count): a copy goes into a new or empty
+     folder. Choose an empty folder, or leave out the copy to work with the files in <target> itself.": at most 5
+     entries named, `.git` and dot names first, since the user may see no files there), then
+     `check_target(source, plan.target)` for `copy_from`; then the target is reserved for this create
+     (`_creating_in`, the resolved target, checked and added with no await between; removed in `finally`): a
+     second create meanwhile (a double click, a client's retry) into the same folder, a folder inside it or one
+     containing it (compared as NFC text ignoring case, since a folder not created yet has no file identity) is 409
+     "Another session is being created in <target> right now[ (<other> is inside it or contains it)]; when it is
+     done, that folder is taken." before it copies anything; `set_workspace` of another session into such a folder
+     gets the same 409 after its first `_plan`;
+  5. the skills are prepared (unchanged, "Skills" below);
+  6. the leftovers of earlier copies are removed (`clean_copy_leftovers`: `uploads.clean()` and `_clean_copies`),
+     and `copy_into(source, staging, limits, check)` builds the copy in `sessions/.copying-<pid>-<run>-<hex8>/`
+     (`copyfrom.staging_name()`; never a session: `ids()` needs `SESSION_ID` and a session.json);
+  7. `_create` makes `sessions/<sid>/`, renames the staging to `sessions/<sid>/workspace` (one volume; a failure
+     removes `sessions/<sid>/`, 500 "Could not move the copied files into ..."), writes session.json with
+     `copied_from` and commits the skills as before; with `workspace`, `_set_workspace(creating=True,
+     expect="moved")` moves the copy into the target and `init_repo` commits it (files that appeared there
+     meanwhile: 409, and everything is removed);
+  8. `finally` (around all of the above): the staged skills are discarded, a claimed upload is released
+     (`uploads.release`, synchronous: two
+     unlinks, so no await follows a success and a cancellation cannot turn a created session into an error), and
+     a staging that was not renamed in is removed.
+- **Refusals of the source** (`resolve_source`, CopyError 400, before anything is done; one pair of matching
+  quotes around the text is dropped first, `console.unquote`, as Explorer's "Copy as path" adds them): not a
+  string or blank ("'copy_from' must be an absolute path of a folder or a .zip file."); not absolute after `~` is
+  expanded; missing ("Nothing to copy at ..."); a file whose suffix is not `.zip` (any case); neither a file nor a
+  folder; for a folder also a drive or file system root (on POSIX also a mount point directly in `/mnt` or
+  `/Volumes`, or in `/media` or `/run/media` one or two levels down: a whole disk, `_disk_mount`; a folder mounted
+  elsewhere, such as a devcontainer's `/workspaces/x`, is fine, and so on Linux is a bind mount of one folder there,
+  such as docker's `-v ./app:/mnt/app`: `_mount_root` reads its root field in `/proc/self/mountinfo`, and only "/",
+  a whole file system, is a disk; where mountinfo cannot be read the place alone decides), the user's home itself,
+  or a folder containing
+  it; for both kinds
+  a path inside or containing the DreamTeam home, or DreamTeam's own folders outside it (`config.library_dir`,
+  `skills_library_dir`, `skill_envs_dir`, `hubauth.tokens_dir()`: a `copy_from=~/.dreamteam` would put hub tokens
+  and library code where the members read them); another DreamTeam home, or a path inside one (a folder with
+  `sessions/` and `dreamteam.toml`, as `cli.is_home`: its dreamteam.toml can hold API keys; "... is a DreamTeam
+  home (<folder>) or inside one ..."); on POSIX a path inside `/proc`, `/sys` or `/dev`
+  (`/proc/self/environ` holds the hub's API keys, which the members' shell leaves out). The comparisons are
+  `treecopy.is_within` (text and file identity). `check_target`: a target inside a folder source ("... the copy
+  would copy itself"), or a source inside the target, is 400; through `create` a source inside a target with files
+  gets the 409 of step 4 first.
+- **A folder** (`copy_into`; `staging` must not exist yet, else CopyError 500 and that folder is left alone, so the
+  cleanup never removes what the call did not make): a stat-only pre-scan (`scan_tree(hash=False)`) with the
+  limits refuses a huge folder before a byte is written; then `copy_tree(src, staging,
+  exclude_names=COPY_EXCLUDE_NAMES, exclude_paths=EXPORT_EXCLUDE_PATHS, skip_files=COPY_SKIP_FILES,
+  fold_names=True, modes="writable", max_files=, max_bytes=, check=)` (§20.5). Left out: `.git`, `node_modules`,
+  `.venv`, `venv` and `__pycache__` at any depth in any letter case, a DreamTeam workspace's `.scratch/_skills` and
+  `.unavailable-workspace`, links (never followed) and special files; `.DS_Store` and `Thumbs.db` files
+  (`COPY_SKIP_FILES`, as in a zip) are skipped without a word and counted in `skipped_count`. A folder swapped for a
+  link (or another folder) while the walk runs is never walked (§20.5): an error, so the copy is refused.
+  `modes="writable"`: the owner can always read and write (a read-only file is editable in the copy; the root hub
+  of the sandbox reads a 000 file), the group and others never write, a file reported as 0o777, or any file of a
+  source on a Linux file system without POSIX bits (WSL's `/mnt/c`, Docker Desktop's 9p, FAT, exFAT, NTFS, SMB:
+  `treecopy.fs_type`, §20.5), becomes 0o644, or 0o755 when it starts with `#!`, `\x7fELF` or a Mach-O magic
+  (otherwise every file would be committed as 100755), and the setuid, setgid and sticky bits are dropped (the sandbox hub runs as
+  root: a kept setuid file would be a setuid-root program for the `dreamteam-agent` commands of an offline
+  session, §7.2).
+  `TreeLimit` is 413 "<src> holds more than N files to copy ([workspace] copy_max_files; .git, node_modules, .venv,
+  venv and __pycache__ do not count). Nothing was copied." (or "N MB ... copy_max_mb"); unreadable files (the
+  result's `errors`, without the `vanished` ones) are 400 "Cannot read N file(s) in <src>: <rel> (<reason>); ...
+  Nothing was copied: check the permissions, or close the program that holds them." (at most 5 named); a file
+  deleted while the copy runs (an editor's temporary file, build output: `vanished`, FileNotFoundError) is not
+  refused but listed in the result's `vanished`; a file replaced meanwhile (a new inode) is still refused. A folder
+  gone meanwhile (`treecopy.GONE_DIR` in `errors`, never `vanished`), or a source root that is gone, no folder or
+  another folder after the copy than the lstat taken before the count (another `(st_dev, st_ino)`: moved, renamed
+  or swapped), is 400 "<src> was moved, renamed or deleted while it was copied (<rel>, ...). Nothing was copied:
+  copy again once it stays in place." (otherwise a session would hold a part of the source). A
+  `FileExistsError` while writing in the new staging means the target's file system folded two names of the
+  source (a case-sensitive source written onto a case-insensitive home) and is 400 `skills.folded_names_text`:
+  "<src> holds names that the folder they are written to cannot tell apart (they differ only in letter case or
+  Unicode form): '<rel>'." (the path relative to the source, not the staging path); another write error is 500.
+- **A zip** (a `.zip` path or a claimed upload): a file over `copy_max_mb` is 413 "The zip is larger than N MB
+  ([workspace] copy_max_mb)."; then `skills.unpack_zip(path, staging, copyfrom.zip_rules(limits), check=)`,
+  streamed from the file (§19): the directory pre-check; at most `max(5000, 2 × copy_max_files)` entries (folders
+  and left-out ones count); the declared sizes of the planned files after planning (left-out members do not
+  count) and the streamed bytes against `copy_max_mb`; at most `copy_max_files` files; no compression ratio bound
+  (sparse, zero-filled and database files compress far better, and the streamed cap bounds a bomb);
+  `COPY_EXCLUDE_NAMES` casefolded against every path part; `__MACOSX`, `.DS_Store` and `Thumbs.db` skipped
+  (`.dreamteam.json` is copied); links left out and listed; folder entries created (empty folders kept).
+  **Unwrap**: when every planned entry lies under one top folder (one-part folder entries such as `mywork/`, which
+  `zip -r`, Finder and `shutil.make_archive` write, aside) and no excluded or link member sits beside it (`node_modules/x.js` next to
+  `app/` shows that the zip's root is the project's root: `app/` stays, as in a folder copy; `mywork/.git/HEAD`
+  does not block), that folder's contents are unpacked and the result's `top` names it; left-out paths are
+  reported as written in the zip. `EXPORT_EXCLUDE_PATHS` (`.scratch/_skills`, `.unavailable-workspace`) are left
+  out as in a folder copy, matched after the unwrap. Names stored without the UTF-8 flag (which zipfile reads as
+  cp437) are read again from their bytes (`redecode_names`), all in one encoding decided for the archive (a short
+  cp866 name such as `раб` or `тип` is valid UTF-8): the first of UTF-8 and the OEM code page of Windows
+  (`GetOEMCP`, cp866 on a Russian one) that decodes every such name, the OEM code page first when every such
+  member was made on MS-DOS / Windows (`create_system` 0, 6, 10 or 14: its old "Compressed folder", 7-Zip and
+  WinRAR without the flag), UTF-8 first otherwise (macOS Finder and Linux tools write UTF-8 without the flag); a
+  hub on another OS (the Docker sandbox included) knows no OEM code page and keeps zipfile's cp437 when the names
+  are not UTF-8. A name read again tells a folder by its own last character (`/` or `\`), not by zipfile's cp437
+  reading, which on Windows ends in `/` for a double-byte character whose second byte is 0x5C (cp932 `ソ`). The
+  Windows name rules (`_portable`, "file names in the zip
+  cannot ...") apply on Windows only; names that differ only in letter case or Unicode form collide on Windows and
+  macOS (their default file systems ignore case) and are two files on Linux, as in a folder copy. Where the file
+  system written to folds them anyway (a Linux hub whose home is a case-insensitive Docker Desktop bind mount),
+  `unpack_zip` creates the folders one by one and a name that meets one written before is 400
+  `folded_names_text("The zip", name)`: two folders are never merged. A `SkillError` becomes a CopyError with its
+  status.
+- **Result** (`copy_result` of the create's summary, transient: every caller pops it, REST answers it as `copy`):
+  `{"source", "kind": "folder" | "zip" | "upload", "files", "bytes", "links" (at most 20), "links_count",
+  "excluded" (at most 20), "excluded_count", "special_count" (folder), "skipped_count" (OS litter), "vanished" (at
+  most 20; folder: files deleted while the copy ran), "vanished_count", "top"}`.
+  `copy_text(result)` words it for the CLI and the MCP: "Copied N files (size) from <source>[ (the contents of
+  <top>/ in the zip)] into the session's folder." and, when something was left out, "Left out: N link(s) (a, b, c,
+  ...); N folder(s) by name (...); N special file(s); N file(s) deleted while they were copied (...)."; the TUI,
+  `-p` and the web toasts show the links, folders and special files only. `size_text(n)` is "N bytes", "N.N KB" or
+  "N.N MB". Names from the source (links, excluded, vanished, top) and the names in the zip refusals pass
+  `skills.printable_name` (what is
+  not printable becomes `?`): a member name with an escape sequence (OSC 52 sets the clipboard) cannot drive the
+  terminal of `dreamteam serve --copy-from` or of an MCP client.
+- **session.json** `"copied_from": {"source": str(path) | "upload: <file name>", "files", "bytes", "at"}`, written
+  with the rest of the new meta. The summary's `copied_from` is cleaned (`_copied_from`), because session.json may
+  come from an import or a hand edit: exactly those four keys, the source one line of printable characters cut to
+  300 (`SOURCE_SHOWN_MAX`, `copyfrom.printable_line`), the numbers finite and at least 0; None for anything else.
+- **The first commit**: the default workspace gets its repository at the first start (`Workspace.init` →
+  `init_repo`, "Initialize workspace"), a `workspace` at the create (§7); either way the copied files are in the
+  first commit. One copy of the source's `.gitignore` comes along (`.git` never does), so `init_repo` writes no
+  `DEFAULT_GITIGNORE`, and the files that `.gitignore` ignores are in the folder but not committed.
+- **Cancel and cleanup**: the claim, the copy and the rename run through `_in_thread(fn, ..., on_cancel=)`, which
+  waits for the thread before a CancelledError goes on; the first cancel sets an event that `check` turns into
+  `CopyCancelled` in the worker, and `copy_into` removes the staging on any exception. A cancelled or failed create
+  leaves no session, no staging and no claimed upload. A process killed outright leaves `.copying-<pid>-<run>-*`
+  (and a claim), which `clean_copy_leftovers` removes at the next create with a copy and the launcher's sweep at
+  its start and every `UPLOAD_TTL` (in a daemon thread, `procs.daemon_call`: the hub's exit does not wait for a long
+  removal, which the next sweep finishes) (`copyfrom.left_over(pid, run, name)`: of this pid, an earlier run, or this
+  run's when no longer in use; else not another live pid). `staging_name()` and `Uploads.claim_path()` add the name
+  to an in-process set until `done_with(path)` (create's finally, `release`), so a staging or claim whose removal
+  failed (a file still open on Windows) is removed by the next clean, while the hub runs. `RUN`
+  (`secrets.token_hex(4)` at import) is in the names because a pid alone is not enough: the hub of the
+  Docker sandbox has the same pid at every container start, so a killed container's leftovers would look live.
+- **Docker sandbox** (`copyfrom.hub_in_container(config)`: `config.skills_host_library_dir is not None` for
+  `dreamteam sandbox`, or `DREAMTEAM_IMAGE=1` for docker compose and a plain docker run of the image; not any
+  container, since DreamTeam run directly in a devcontainer sees its folders; the `container` of `/api/hub` and
+  `/api/skills`): a missing path or a Windows-shaped one is 400 "The hub runs in the Docker sandbox and sees only
+  its home (<home>): X is not there. Upload the folder as a .zip in the New session dialog of the sessions page
+  instead."; the refusal of a path in the home adds " In the Docker sandbox, upload the folder as a .zip
+  instead.". Other paths of the container work, as for `workspace`; uploads land in `/swarm/.dreamteam/uploads`.
+- **Uploads** (`copyfrom.Uploads(root)`, the manager's `uploads`): `receive(chunks, *, filename, length, limits)`
+  (`POST /api/uploads`, §18.1): the file name cut to its last part (`\` read as `/`) and to one printable line of
+  at most 200 characters ("upload.zip" when empty); a Content-Length of ASCII digits above `copy_max_mb` is 413
+  "The file is larger than N MB ([workspace] copy_max_mb)." before reading; `clean()`; at most 8 uploads waiting
+  or arriving (`UPLOAD_MAX_PENDING`, else 429; the count and the create are not atomic: a guard against a runaway
+  page, not a quota: "N uploads already wait for a session; each is removed when a session uses it or an hour after
+  its upload. Try again later."); `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
+  400 "The upload is empty.", a file that is not a zip 400 "The file is not a zip archive."; then `<token>.json`
+  `{"filename",
+  "bytes", "at"}` and the rename to `<token>.zip`. Any failure (an exception from `chunks`, a disconnect included,
+  goes on to the caller) removes the `.part`. The token is `secrets.token_urlsafe(18)`; a value that is not 24
+  characters of `[A-Za-z0-9_-]` is 400 "'copy_from_upload' must be a token from POST /api/uploads." before any path
+  is built. `peek` is 404 for an upload that is missing, used, or older than `UPLOAD_TTL` (3600 s, by the json's
+  `at`, else the file's mtime). `claim` renames it to `<token>.claimed-<pid>-<run>-<hex8>.zip` under a lock (a
+  rename on Windows is not exclusive: two can both succeed, the second moving the first one's file), so the loser
+  gets FileNotFoundError: 404, another create took it (a claimed file that vanishes before `copy_into` reads it is
+  the same 404). The create claims first (Order above), so from the claim on it is deleted whatever happens. `clean`
+  (best effort) removes waiting names over the TTL and the claims `left_over` names (never by age, never one a
+  create of this run uses); names of neither pattern stay.
+- **Clients that give up waiting**: a large copy may take longer than a client waits. The TUI and `-p` wait 900 s
+  (`MOVE_TIMEOUT`) on a plain REST request, which a client going away does not cancel: the hub finishes the copy
+  and creates the session anyway, so they check `dreamteam sessions` or the sessions page before trying again. An
+  MCP client has its own tool timeout, and on it sends `notifications/cancelled` (the MCP SDK's dispatcher
+  interrupts the handler; the streamable HTTP transport also cancels it on a disconnect): `session_create` awaits
+  `manager.create` unshielded, so the copy stops and nothing is kept ("Cancel and cleanup" below). The user docs
+  say to raise the client's tool timeout (Claude Code: `MCP_TOOL_TIMEOUT`) or use the CLI or the web dialog for a
+  large copy.
+- **Accepted costs**: a target on another drive is copied twice (the staging under `sessions/`, then the move
+  across volumes). The pre-check takes the largest of the plain end record's counts and those of a ZIP64 record
+  whose locator precedes it (zipfile uses the ZIP64 ones whatever the plain record says), so a lying plain record
+  cannot hide a ZIP64 directory. A forged central directory (a record that understates its entries, with a
+  directory size within the `max_entries * 512` bound) can still make `zipfile` build one `ZipInfo` per 46-byte
+  minimal entry: at the
+  default `copy_max_files` up to about 100 MB of directory, on the order of 1 GB of memory for a moment. The upload
+  is behind the hub's auth, a lower `copy_max_files` lowers the bound, and the pre-check keeps an honest huge zip
+  from getting that far.
 
 #### Skills
 The manager's side of §19, for the home page, the CLI and the launcher MCP (`via` home / cli / launcher-mcp):
@@ -3195,18 +3684,43 @@ of a home or a project, never a session override (§17.2).
     "developer", "developer", "tester"]` (names kept as typed, normalized); ValueError `'developer*0': the count
     must be a whole number from 1 to 50`, `'*2': the role name is empty`, `'<item>': a role name cannot be longer
     than 60 characters`, `The team is empty`, `A team has at most 200 agents`.
+- **Saved teams** (`[[teams]]`, `Config.teams`): `name` and `roles`, an ordered list with a name repeated per agent;
+  the size is its length, and trailing generalists stay. No model: an agent's profile comes from its role. No limit
+  on hiring: a team sets only who starts. `config.parse_teams(raw, entries)` checks shape only (messages
+  `[teams.N] ...`, a 400 on `PUT /api/settings`) and normalizes as `[[roles]]` does at each load (`PUT` itself stores
+  what was sent, §17.1); a name holding a control or invisible character (Unicode Cc, Cf) is refused, since it cannot
+  be typed and is printed, except the format characters of ordinary text: U+200C, U+200D (Persian and Indic words,
+  emoji sequences) and the tags U+E0020-E007F (subdivision flags). A name of those alone counts as empty. Names match
+  by `team_key`: casefolded, whitespace collapsed. Whether the
+  catalog has the roles is checked where a team is chosen, and the settings form
+  refuses a save that leaves a team on a role it just lost. A team may share a role's name. `team_choice(text, teams,
+  entries)` is the rule of `--team` and `/team`: a list or `*N` is roles (a saved team's name there that is no catalog
+  role is refused); a bare word is the saved team, else a catalog role; with teams saved any other bare word is
+  refused (`word*1` makes a new role), and with none it is a new role (`--team` says so on stderr, §18.3). A team's name
+  is looked up in the home in use: `--home`, else a `dreamteam.toml` in the current folder, else `$DREAMTEAM_HOME`,
+  else `~/DreamTeam`. A team is copied where it is chosen, into
+  `swarm.starting_roles` and `start_agents`: by `--team`, `/team` and `session_create(team_name=...)`, and by the
+  new-session dialog into its rows, which it sends as `starting_roles` even when the default equals them. POST
+  `/api/sessions`, `SessionManager` and `session.json` take no team name (`overrides.swarm.team_name` and
+  `overrides.teams` are refused), and nothing looks a team up after the copy.
 - **Views**: `presets_view()` → `[{id, name: {ru, en}, description: {ru, en}}]`; `catalog_view(entries)` →
   `[{key, builtin, customized, hidden, name: {ru, en}, description: {ru, en}, instructions, model, skills}]` (hidden roles
   included; an own role has the same text under both languages). Served by `GET /api/settings` (§18.1); the
   visible roles of one swarm by `GET /api/roles` (§14).
 - **Compatibility**: no `[[roles]]` → the 8 built-in roles; existing `starting_roles` keep working (built-in names
-  now bring their description); no database change.
+  now bring their description); no database change. An older version refuses a file with `[[teams]]` (`Unknown config
+  sections: teams`), but only once a team exists: with none the file has no such key. Session folders are untouched.
 
 ## 18. Launcher: web, MCP, CLI, UI
 
 ### 18.1 Web (launcher.py)
 `create_launcher_app(manager, host="127.0.0.1")` returns the app wrapped in the same `GuardMiddleware`
-(host/origin, JSON POSTs). A `SessionRouter` in front sends `/s/{sid}/...` to that session's app
+(host/origin, JSON POSTs), with `raw_posts={"/api/uploads": "application/zip"}`: the guard's 415 rule lets a POST to
+`/api/...` pass when its content type starts with `application/json`, or when `raw_posts` maps that exact path (no
+prefix: `/api/uploads/` is not it) to its type without parameters, ignoring case. Host, Origin, token and cookie
+checks run before that rule and are unchanged; `application/zip` is not a CORS-safelisted type, so a cross-site
+page cannot send it without a preflight, which the hub never answers. Session apps pass no `raw_posts`. A
+`SessionRouter` in front sends `/s/{sid}/...` to that session's app
 (`web.create_app(swarm, on_library_change=...)`, §14, served with `root_path = /s/{sid}`; a library change there
 emits `sessions.changed` with change `skills`, also a `skill_attach` or `skill_approve` of `/api/act` that
 succeeded: either may have changed the library) and everything else to the launcher routes.
@@ -3215,9 +3729,10 @@ succeeded: either may have changed the library) and everything else to the launc
 |---|---|
 | GET `/` | `static/home.html` (launcher page, `no-store`) |
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
-| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox"}` |
+| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox","container"}` (`container`: `copyfrom.hub_in_container`, §17.2 "Copying files into a new session") |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
-| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`) |
+| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`); `copy_from` (an absolute folder or .zip path on the hub's computer) or `copy_from_upload` (a token of POST `/api/uploads`), strings, not both: copied into the new session's folder before its first start (§17.2 "Copying files into a new session"), the answer then also has `"copy"` (`copy_result`); 404 for an unknown or used upload, 409 for a `workspace` with files, 413 over `[workspace] copy_max_mb` / `copy_max_files` |
+| POST `/api/uploads?filename=<name>` | the raw zip as the body (`Content-Type: application/zip`, not base64 JSON; the guard's `raw_posts`) → 201 `{"upload": token, "filename", "bytes", "expires_in": 3600}` (`manager.uploads.receive` with the limits of `manager.global_config()`); 415 JSON when not `application/zip` (the handler checks too), 413 over `copy_max_mb` (Content-Length or streamed), 429 when 8 uploads wait, 400 empty, not a zip, or interrupted (starlette's `ClientDisconnect`: "The upload was interrupted."), 500 for other failures (`_failure`); the token is used once by `POST /api/sessions` within an hour |
 | GET `/api/sessions/{sid}` | `{"session": summary, "config": manager.config_view(sid)}` |
 | PATCH `/api/sessions/{sid}` | body `{title?, overrides?, settings?}` → `{"session": summary, "config": config_view(sid)}`; `overrides` replaces all of them, `settings` `{section: {key: value \| null}}` changes only those keys (null: the global value again; §17.2 "Partial update"; `{"swarm": {"clarify": true \| false \| null}}` is the ⚙ field and the TUI's `/clarify`, §3.1); both at once, a bad value or `main` → 400 and nothing changes |
 | DELETE `/api/sessions/{sid}?confirm={sid}&skills=save\|discard&via=` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm; 409 `{"error", "pending_skills"}` when members' proposals wait for the user's decision and `skills` is not given (§17.2) |
@@ -3227,8 +3742,8 @@ succeeded: either may have changed the library) and everything else to the launc
 | POST `/api/sessions/{sid}/skills/{name}/decide` | body `{"approve": bool, "comment"?, "replace"?}` → `{"text", "session"}` (`decide_skill`, via home) |
 | GET / POST `/api/skills`, GET / DELETE `/api/skills/{name}` | the library routes of §14 (`skill_routes` with `manager.global_config`, via `home`, no swarm: no `attached`, no `attach`, no `from=session`, no `deps-log`); `?workspace=<absolute>` names the folder whose `.claude/skills` is offered (a relative one 400); a change emits `sessions.changed` (session None, change `skills`) |
 | POST `/api/skill-envs/cleanup` | `EnvManager.cleanup(env_retention_days, every_unused=True)` now (a daemon thread: every env no session uses, whatever its age) → `{"removed", "kept"}`; emits change `skill-envs` |
-| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home", "network_isolation": netoff.shown(netoff.isolation()) (§7.2)}` (a hand edit of the file is picked up first) |
-| PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` text for a bad role (nothing saved) |
+| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home", "network_isolation": netoff.shown(netoff.isolation()) (§7.2)}` (a hand edit of the file is picked up first); `settings.teams` holds the saved teams, `[{name, roles}]` (§17.3): a REST client starts one by posting its roles as `overrides.swarm.starting_roles` and `start_agents` |
+| PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization; `settings.teams`: the complete list of `[[teams]]` entries, `[]` removes the key, shape checked only: a team may name a role the catalog lacks) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` or `[teams.N] ...` text for a bad role or team (nothing saved) |
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result; 400 when the fallback would send the stored key to another provider or base_url than the saved one, or a key from the hub's environment to an endpoint that neither the provider's default, a preset nor a saved profile uses with that variable |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
 | `/mcp` | launcher MCP (§18.2) |
@@ -3265,22 +3780,37 @@ succeeded: either may have changed the library) and everything else to the launc
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
-  start_agents?, max_agents?, team?, max_cost_usd?, model?, network?, clarify?, start?=true, workspace?,
-  skills?)` (unset values come from the global settings; the board URL is shown only when a web server runs;
+  start_agents?, max_agents?, team?, team_name?, max_cost_usd?, model?, network?, clarify?, start?=true, workspace?,
+  copy_from?, skills?)` (unset values come from the global settings; the board URL is shown only when a web server runs;
   `goal`: one line, or several, split as in §17.2; `team`: role names in order, a name repeated per agent (§17.3) →
   `swarm.starting_roles` (normalized) and `start_agents = len(team)` unless `start_agents` is given, `[]` = no team;
   not a list of non-blank strings →
   "team must be a list of role names, e.g. [...]", more than 200 → "A team has at most 200 agents.", a name over
   60 characters → "'<name>': a role name cannot be longer than 60 characters.", a name with `,` or `*` (the
   `--team` syntax) → "'<name>': a role name cannot contain ',' or '*'; give one item per agent and repeat a name
-  for several agents, e.g. [...]."; `clarify`: a boolean, `swarm.clarify` (§3.1; `false` overrides a global
+  for several agents, e.g. [...]."; `team_name`: a team saved in the settings (§17.3 "Saved teams"), looked up in
+  `manager.global_config()` and copied now: its roles become `swarm.starting_roles` and its size `start_agents`, and
+  `max_agents` is not raised, as with `team`; absent or `""` = none given; with `team` or `start_agents` → "team_name
+  sets the roles and their number: give it without team and start_agents.", not a string → "team_name must be the name
+  of a saved team.", an unknown name → "No saved team 'x'. Saved teams: a, b.", or with none saved "No saved team 'x'.
+  None are saved yet: Settings > Teams.", a team that cannot start → "The team 'X' uses roles that are not in the role
+  catalog: y, z. Fix it in Settings > Teams.", and a `team` item that names a saved team and no role
+  (`roles.saved_team_in`) → "'coding' is a saved team, not a role: pass it as team_name."; nothing is created on any of
+  these; `clarify`: a boolean, `swarm.clarify` (§3.1;
+  `false` overrides a global
   `true`), any other value → "clarify must be true or false." and nothing is created; `workspace`: an absolute
-  folder, §17.2; `skills`: names or sources attached before the first start, §17.2 "Skills"),
+  folder, §17.2; `copy_from`: an absolute folder or .zip path on the hub's computer copied into the new session's
+  folder first (§17.2 "Copying files into a new session"; not a string → "copy_from must be an absolute path of a
+  folder or a .zip file.", blank = no copy; the reply adds `copy_text(copy_result)`; `copy_from_upload` is not
+  offered: an MCP client has the hub's file system or the REST route); `skills`: names or sources attached before
+  the first start, §17.2 "Skills"),
   `session_start(session, skills?)` (the skills attached first, live when it runs), `session_stop(session)` and `session_cd(session, path)` (`set_workspace`; `path`
   absolute or `"default"`; the result in words by `workspace_text(result)`, worded as the TUI and the console
   word it: "Moved the session's files to X" only when they moved, "The session now works in X" after a folder of
   the user or a missing one, and what changed in the user's folder it left (`old_changed`)). `sessions_list`
-  shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), and for a
+  shows the folder of a session that does not work in its own one (`folder: <path> (adopted, MISSING)`), the source
+  of a session made with a copy (`copied from: <source>`, one printable line of at most 300 characters again: the
+  summary may be a remote hub's JSON), and for a
   running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
   in the user's wrap-up mode is `[running, wrapping up]`; one paused for a member's question (summary `question`,
   §3.1) is `[paused (waiting for your answer to Anna Smith, question #12)]`; a session without network ends its first
@@ -3304,8 +3834,12 @@ succeeded: either may have changed the library) and everything else to the launc
 - `dispatch_launcher_call(manager, name, args)` answers a tool name nobody knows (close matches + the list);
   `call_launcher_tool` turns SessionError / ToolError / unexpected failures into error results.
 - `INSTRUCTIONS` explain sessions (with `skill_library` and the `skills` of `session_create` / `session_start`,
+  with "`session_create(..., team_name=<name>)` starts with a team saved in the settings; an unknown name is answered
+  with the saved names.",
   and: "A session created with clarify=true first asks you about its goal; `sessions_list` shows a session that waits
-  for your answer as "paused (waiting for your answer to X, question #N)"."), then the hub instructions (they hold
+  for your answer as "paused (waiting for your answer to X, question #N)".", and after the `workspace=<folder>`
+  line: "`session_create(..., copy_from=<folder or .zip>)` copies those files into the new session's folder first:
+  the agents work on the copy, the originals stay untouched."), then the hub instructions (they hold
   the answer rule, §13).
 - `/s/{sid}/mcp` keeps the per-session hub MCP (§13).
 
@@ -3313,9 +3847,10 @@ succeeded: either may have changed the library) and everything else to the launc
 ```
 dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|stream-json] [--timeout S]
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
-          [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
-          [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off] [--clarify | --no-clarify]
-dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]
+          [--team "ROLE[*N],..." | NAME] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
+          [--copy-from DIR|ZIP] [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off]
+          [--clarify | --no-clarify]
+dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR] [--copy-from DIR|ZIP]
           [--skill REF|PATH|URL ...] [--network on|off] [--clarify | --no-clarify]] [--no-console] [--no-browser]
 dreamteam sessions [DIR | --home H]
 dreamteam sessions rm SID [SID ...] [--yes] [--skills save|discard] [--home H]
@@ -3324,23 +3859,41 @@ dreamteam console [DIR | --home H | --url URL] [--session SID] [--lang ru|en]
 dreamteam mcp [DIR | --home H] [--no-web]
 dreamteam status [DIR | --home H]
 dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on|off]
+dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] [--home H] [--quiet]
+dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] [--yes] [--home H] [--quiet]
 ```
 - Default command (`_default_command`): `dreamteam` alone runs `tui` when stdin and stdout are terminals,
   else `serve`. Options only: `tui` when one of them is a TUI option (`-p -c -r --output-format --model
   --budget --agents --team --max-agents --verbose --timeout --no-auto-reply --lang`), `serve` when one is
   serve-only (`--no-console --no-browser --goal`) or there is no terminal, else `tui`. A first word that is not a command
-  is the TUI prompt (`dreamteam "Сделай змейку"`), except a near-miss of a command name (difflib, 0.75), which
-  argparse reports.
+  is the TUI prompt (`dreamteam "Сделай змейку"`), except a mistyped command name, which argparse reports
+  (`_mistyped`: one word of at least 3 letters one edit from a command — a letter inserted, deleted or replaced, or
+  two neighbours swapped; a word of 3 letters only with two swapped, `rnu`).
 - `tui` (docs/TUI.md): `tui.main_tui` (interactive; refuses without a terminal, exit 2) or with `-p`
   `tui.main_print` (text piped into stdin — a pipe or a file, never a terminal or NUL — is appended to the
   prompt; no prompt → exit 2). `-r` without an id opens the session picker (`/sessions`). The flags `--model`,
   `--agents`, `--max-agents`, `--budget`, `--title` become the overrides of a session the TUI creates. The
   prompt is the goal: its first line becomes the title, the rest the description (split by the hub, §17.2).
-  `--team "architect, developer*2, tester"` (also with `-p`) is checked with `roles.parse_team` before anything
-  starts (`dreamteam: --team: <error>` on stderr, exit 2) and reaches the TUI as the raw text (`overrides["team"]`,
-  only when given), which turns it into `swarm.starting_roles` of the sessions it creates (`start_agents` = the
-  team's size unless `--agents` is given). With auto-replies on, `-p` also approves the tasks that wait for the
-  user's review (print mode `AUTO_REVIEW`, docs/TUI.md); with `--no-auto-reply` they wait.
+  `--team "architect, developer*2, tester"` or `--team NAME` (also with `-p`) is checked before anything starts
+  (`dreamteam: --team: <error>` on stderr, exit 2): `roles.parse_team`, then `roles.team_choice` (§17.3 "Saved teams")
+  over the home's settings (`_team_choice`). Exit 2 also for a bare word that is neither a saved team nor a role while
+  teams are saved (`no saved team or role 'codng' (there are: coding, Тексты). For a new role with no description write
+  'codng*1'`; the list is `roles.close_roles` plus all the saved names), a saved team's name that is no catalog role,
+  in a list or with `*N` (`'Тексты' is a saved team: choose it whole, with no other roles and no *N`), a team that
+  cannot start (`the team 'Тексты' uses roles that are not in the role catalog: y, z. Fix it in Settings > Teams`), a
+  team with `--agents` (`the team 'Тексты' sets the number of agents: --agents cannot go with it`), and a bare word
+  that is no built-in role when the settings cannot be read (`cannot read the settings to look up 'Тексты': <reason>`;
+  a list passes). The refusal of `--agents` adds `. For the role write 'tester*1' and keep --agents` when the word is
+  also a catalog role: `tester*1 --agents 2` is one tester and a generalist, what the word means with no such team. `-p`
+  with `-c` or `-r ID` continues a session and never reads the team, so it checks only the syntax. A note on stderr,
+  with no change in the exit code or stdout, for a bare word with no role or saved team in a home with no saved team
+  (`no role or saved team 'coding' in <home>: starting a new role with no description (write 'coding*1' to mean that)`:
+  the teams may be in another home). A saved
+  team reaches the TUI as its list of roles, copied now, anything else as the raw text (`overrides["team"]`, only when
+  given); the TUI turns it into `swarm.starting_roles` of the sessions it creates (`start_agents` = the team's size
+  unless `--agents` is given; `--max-agents` passes through, also below the size). With auto-replies on, `-p` also
+  approves the tasks that wait for the user's review (print mode `AUTO_REVIEW`, docs/TUI.md); with `--no-auto-reply`
+  they wait.
 - `--network on|off` (`tui`, `-p`, `serve` with `--goal`, exit 2 without it; `run`; `sandbox`): `[swarm] network`
   (§7.2) of the session that run creates (`overrides["network"]` → `swarm.network`, tui.commands.FLAT_OVERRIDES; serve:
   `create(..., overrides={"swarm": {"network": ...}})`), of `run`'s swarm for this run only (the settings file keeps
@@ -3367,6 +3920,19 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   with `/cd`), and for `serve` without `--goal`. The TUI applies it to the first session it creates (and says so
   under the welcome box); `-p` names the folder on stderr with `--verbose`; `serve` prints the result
   (`launcher_mcp.workspace_text`) on stderr.
+- `--copy-from DIR|ZIP` (`tui`, `-p`, and `serve` with `--goal`): a folder or .zip copied into the folder of the
+  session that run creates before its first start (`create(..., copy_from=)`, §17.2 "Copying files into a new
+  session"; with `--workspace` into that folder, which must be empty or missing). `_copy_from_arg`: `~` and a
+  relative path are resolved against the current directory; an existing file that is not a .zip is refused here
+  (`dreamteam: --copy-from <path> is a file but not a .zip archive.`, exit 2); the hub checks the rest. Exit 2 with
+  `-c` / `-r` (`dreamteam: --copy-from copies files into a new session; it cannot be used with -c / -r.`) and for
+  `serve` without `--goal` (`--copy-from needs --goal: it fills the folder of the session that --goal creates.`).
+  The TUI applies it to the first session it creates (`TUI.copy_from_override`, as `/copy-from`; shown under the
+  welcome box); `-p` prints the copy on stderr (with or without `--verbose`, not with `stream-json`), plus the
+  left-out counts when something was left out; `serve` prints `Session <id>: <copy_text>` on
+  stderr before the workspace result. Like `--workspace`, it is neither a TUI-only nor a serve-only flag. The CLI
+  does not upload a zip to a sandboxed or remote hub itself: a host path the hub cannot see gets the hub's "upload
+  the folder as a .zip" refusal.
 - `--skill X` (repeatable; `tui`, `-p`, and `serve` with `--goal`, exit 2 without it): a skill attached to the
   session (§17.2 "Skills"). A URL (`scheme://` or `user@host:path`) is passed as given, a path (it has a separator,
   starts with `.` or `~`, ends in `.zip`, or is a folder or .zip here) is made absolute against the current
@@ -3395,16 +3961,81 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   (`&skills=` on the hub's DELETE, `delete(sid, skills=, via="cli")` without one). The words
   of `sessions` are `[DIR]` or `rm SID...`, in any order with the options.
 - `hub.json` lives in `<home>/.dreamteam/hub.json`, written once the port listens (before the resume) and
-  removed at exit (only by the process that wrote it). `running_hub(dir)` trusts it only when `GET /api/hub`
-  confirms the pid and the directory.
+  removed at exit (only by the process that wrote it, and never a file of another computer whose hub has the same
+  pid). `running_hub(dir)` trusts it only when `GET /api/hub` confirms the pid and the directory. It records
+  `"machine": cli.this_machine()` (`platform.node()`; None inside a container, `netoff.in_container()` or
+  `DREAMTEAM_IMAGE=1`, whose name is the container's). Before a hub (`serve`, `run`, `mcp` with its web UI) or the
+  TUI's launcher writes its own file,
+  `_warn_other_machine` reads the one it replaces; when it names another computer (compared without the domain
+  part and case: `mbp.lan` = `MBP.local`) it prints once per home and process to stderr (and the log):
+  `warning: <home> was last served by the computer <name>. Do not run one DreamTeam folder on two computers at the
+  same time; move sessions with dreamteam export / dreamteam import.` It never refuses and never changes
+  `running_hub`'s answer. `_session_holders` names a `hub.json` of another computer as `the hub of the computer
+  <name> (<path>): stop DreamTeam there, or delete that file if it no longer runs`.
+- `export FOLDER` / `import FOLDER` (§20): the positional is `folder`, never the home (`_home_arg` with `dir`
+  None: `--home`, else the current directory when it has `dreamteam.toml`, else the default home). Both are commands for
+  `_default_command`, so `dreamteam export E:/dt` never becomes a TUI prompt (on 0.1.0 it was `['tui', 'export',
+  'E:/dt']`, which exits 2 with `unrecognized arguments`). `--include` values go through `transfer.parse_include`
+  before anything else (an unknown word: its message on stderr, exit 2).
+  - `export`: refuses a folder that is not a home (`cli.is_home`: SessionManager would create one; exit 1). The
+    sessions a hub runs come from its `GET /api/sessions` (status `running`) through `running_hub`; without an
+    answering hub, `_session_holders(home, clean=False)` only notes other processes (an export never removes
+    launcher markers). Either way the sessions are exported as they are on disk (a snapshot, warned). Then
+    `transfer.export_home(...)` and `render_export_report`. Exit 0 when `report.ok`, 1 when something asked for
+    was left out or the export failed (`TransferError`, `SecretFound`), 2 for a `TransferError` with `usage`
+    (an unknown `--session`), 130 for Ctrl+C (the partial export is removed).
+  - `import`: the target is a home, or a missing or empty folder (`_import_target`: it becomes a home only after
+    the user says yes; until then it is planned against an empty home in a temporary folder); anything else is
+    refused (exit 1). A mistyped `--session` is a usage error (exit 2, `check_session_names`) whatever runs the
+    home. `_import_blockers`: a hub that answers (`running_hub`; one that asks for a token no client here sends
+    counts too), else `_session_holders(home, clean=not dry_run)`. With a blocker everything but `--dry-run` is
+    refused (`Nothing imported: another DreamTeam process may be running the sessions of <home> (...). Stop it,
+    then import again (--dry-run shows the plan meanwhile).`, exit 1); a dry run warns and prints the plan. The
+    plan (`render_import_plan`) is printed; `--dry-run`, or a plan without changes, exits with
+    `plan.exit_code`. Otherwise `[y/N]` (`Import? [y/N] `; `y`, `yes`, `д`, `да`) when `_stdin_is_terminal()`,
+    else `--yes` is required (`Nothing imported: pass --yes to import without a confirmation.`, exit 1); another
+    answer prints `Nothing imported.` (exit 0); Ctrl+C there exits 130. The blockers are checked again after the
+    answer. The import runs in this process (`SessionManager(home)`, `asyncio.run`) with its own launcher marker
+    (`write_launcher_marker`, removed at the end) and a `before_swap` hook that checks the blockers again right
+    before each session is renamed in (a process that started meanwhile fails that session). It prints
+    `render_import_result` and exits with `result.exit_code` (130 when Ctrl+C stopped it; a second Ctrl+C breaks
+    off and says that what was imported stays).
+  - Progress (both): `export_home`, `plan_import` and `apply_import` take `progress=`, called with a frozen
+    `transfer.Progress` (op export | plan | import; stage sizing, settings, skills, mcp, session, database, files,
+    swap, secrets, git, cleaning, replacing, done; item, index/count; done/total bytes and files, totals from a
+    stat-only pre-pass for an export and from the manifest for an import, unknown when that pre-pass fails;
+    `done_*` never above a total). An export's done comes once it is in place (after a replaced export is removed):
+    a KeyboardInterrupt from that event changes nothing; one from any earlier event removes the export. Bytes come
+    from
+    `treecopy.copy_tree(progress=)` per chunk and file, the sqlite backup in steps (immutable reads only: a live
+    database is copied in one step), the import's checked database copy and the secret scan. A KeyboardInterrupt
+    the callback raises is a Ctrl+C (in the import's staging thread it is carried out as `_Interrupted`). Each stage
+    start is also logged to `dreamteam.transfer` at INFO. The CLI renderer `_ProgressLine` writes to stderr: in a
+    terminal one line, `'\r'` plus text padded to the width less one (no ANSI escapes), byte updates at most 8 a
+    second, cut and padded in terminal cells, cleared before the plan, the question, warnings (the stderr log
+    handler's filter clears it) and the result, and closed for good at the end (a staging thread still running
+    after a Ctrl+C draws nothing); else one plain line per stage of each item (`export: session 003-snake (2/5):
+    files`). Characters that are not printable show as `?`; stdout is flushed before each write (one log of both
+    streams keeps the plan first); a failing or missing stderr only hides it. `--quiet` (`-q`) turns it off.
 - `serve`: refuses when a hub already runs for the home (opening that one in the browser unless
   `--no-browser`, whether this process has a hub token or not; a hub that asks for a token no client here may send
   ends it with `TokenRequired`'s text) or when the port is busy, and, right after the check
   for a running hub and before anything is created or started, an address other than loopback without a hub token
   (`run` too; §14.2);
-  `--goal` creates and starts a session (its first line becomes the title unless `--title`) and opens its board;
+  `--goal` creates and starts a session (its first line becomes the title unless `--title`) and opens its board.
+  Only the create races a stop signal (Ctrl+C): `_serve_home` runs `manager.create(..., start=False)` through
+  `_until_stopped(coro, stop)` and then `await manager.start(id)` outside the race, as `create(start=True)` would
+  (a failed start is still "Could not start the session: ..." and exit 1), so a Ctrl+C never cancels a half-done
+  swarm start. A stop during the create (a long copy) cancels it, and `create` undoes it (§17.2); the exit code is
+  130 with "Stopped before the session was created: nothing was kept." or, when the cancel came too late (a new id
+  appeared), "Stopped: session <id> was created but not started (dreamteam sessions lists it).".
+  `_until_stopped` returns `(False, result)` (the coroutine's exception goes on) or `(True, the result it still
+  returned despite the cancel, else None)`; when the race itself is cancelled, the coroutine is cancelled and
+  awaited too. Then the server starts;
   the terminal console attaches to the running session when stdin is a real terminal (on Windows the NUL device
-  is not one). Settings errors and unusable homes are messages, not tracebacks.
+  is not one). Settings errors and unusable homes are messages, not tracebacks. Right after the `DreamTeam is
+  running.` banner (and after `run`'s, §15) stderr gets `settings.unpriced_line(config)` (§17.1) when a model
+  profile has no prices.
 - `console`: with a launcher hub it works against `{base}/s/{sid}` (`--session`, else the running one); `--url` is
   an address the user typed, so `DREAMTEAM_HUB_TOKEN` goes there whatever its host (§14.2); it
   refuses a URL where no hub answers and a stopped session, except a stopped session whose folder outside it
@@ -3518,11 +4149,17 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
       stays in the paused state, its badge reads «Ждёт вашего ответа» / "Waiting for your answer" with the tooltip
       «{name} ждёт вашего ответа на вопрос #{id}» from the summary's `question`) and, for a running session in the
       user's wrap-up mode (summary `wrap_up`, read
-      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity,
+      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity (the time of
+      the session's last event, its tooltip «Активность: … · Создана: …»; without an event, the creation time and
+      «Создана: …»),
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
       and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved with /cd); a folder
       outside the session that does not exist gets the badge «папки нет» and a warning that the session cannot
-      start until it is moved with `/cd`), the error of a damaged session. The search also matches the path.
+      start until it is moved with `/cd`), right after it for a session made with a copy (summary `copied_from`,
+      `copiedLine`) the line «Копия:» / "Copy of:" with the source (cut at the front when long, whole in the
+      tooltip with «Файлы скопированы при создании сессии (when), файлов: N, size. Оригиналы не менялись.»; nothing
+      for a missing or malformed value), the error of a damaged session. The search also matches the path and the
+      copy's source.
     - Card buttons: «Открыть», «Запустить» / «Остановить» (disabled while the request runs), delete (not for
       the legacy `main`) with a confirmation dialog naming the session; for a folder outside the session the
       dialog says the folder stays, and the toast names it (`workspace_kept` of the DELETE answer). The web UI
@@ -3548,29 +4185,74 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     равно?», as the board's attach dialog does), the skills the chosen team's roles bring (from the catalog's
     `skills`; one not in the library or ~/.claude/skills gets a warning chip «нет в библиотеке») and «Добавить новый:
     папка, zip или Git» (the shared form; what it imports is ticked); the ticked ones go as `skills`. Deviation from
-    the skills design (§7.4): the modal has no workspace folder field (a new session works in its own folder), so it
-    offers no `claude-project:x` rows and loads `/api/skills` without `?workspace=`; a project's `.claude/skills`
+    the skills design (§7.4): the modal still has no workspace folder field (a new session works in its own folder;
+    «Файлы для работы» below only fills that folder with a copy), so it offers no `claude-project:x` rows and loads
+    `/api/skills` without `?workspace=`; a project's `.claude/skills`
     skill is attached at create through the CLI (`--workspace` with `--skill claude-project:x`) or the launcher MCP,
     or later on the board; under «Дополнительно» steps per wake-up, MCP
     approval and «Без интернета для агентов» (`swarm.network = "off"`, §7.2; sent only when it differs from the saved
     default; its hint is `networkHint(network_isolation of GET /api/settings)`: strict only for "docker" / "netns",
     the "env" and "container" texts say plainly that it is not isolation, "container" that a restart of the sandbox
-    adds the firewall); «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
-    from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). A stray
+    adds the firewall), then the block «Файлы для работы» / "Files to work on" (§17.2 "Copying files into a new
+    session"): «Скопировать из папки» (`#ns-copy-from`, an absolute path on the hub's computer), «или загрузить .zip»
+    (`#ns-copy-zip`, a file input, `accept=".zip,application/zip"`), the hint that the files are copied before the
+    first start, the originals are never changed and `.git`, `node_modules`, `.venv`, `venv`, `__pycache__` and
+    links are left out, with the limit (`copyMaxMb()`: the saved `workspace.copy_max_mb`, 1024 when missing), and a
+    second hint (`#ns-copy-sandbox`, shown only when `GET /api/skills` reports `container` (or `sandbox`):
+    `nsCopySandbox()`, at the dialog's start and again in `loadSkills()` while it is open) that the hub in a Docker
+    container sees only its home, so a folder from the user's computer goes as a .zip; «Запустить сразу» with
+    «Создать и открыть» (or
+    «Создать»). The submit refuses a path together with a zip, a file that is not `.zip` and a zip over the limit
+    before any request (the message in `#ns-error`), then disables the button and both file fields and shows
+    «Загрузка архива (N МБ)…» or «Копирование файлов…». With a zip it first calls `uploadZip(file)`: `POST
+    /api/uploads?filename=<encodeURIComponent(name)>` with `Content-Type: application/zip` and the File itself as
+    the body (a raw-body upload, unlike the skills form's base64 JSON; same-origin `fetch` sends the hub cookie),
+    which throws with the hub's `error`, `<status> <statusText>` for the guard's plain-text answers, `conn_lost`, or
+    when a 2xx answer has no `upload` token; the create then carries only `copy_from_upload`. A path goes as the
+    trimmed `copy_from`. Every submit uploads again (the create may have claimed the token). Without «Запустить
+    сразу» a success shows the toasts of `copyToasts(copy)` from the answer's `copy`: «Скопировано файлов: N (size)»
+    (`sizeText`: KB, MB) and, when something was left out, «Не скопированы: ссылки (N: a, b, c, …); папки по имени
+    (N: …); особые файлы (N)». With «Запустить сразу» the browser goes to the board, unless `links_count` or
+    `special_count` is above 0 (folders left out by name are expected): then the dialog closes on the sessions page
+    with the same toasts, the last one clickable («Сессия запущена. Нажмите, чтобы открыть её доску.», 9 s) and a
+    click opens the board. An error re-enables the fields. A stray click or Escape also asks before discarding a
+    typed path or a chosen
+    zip. Only values that differ
+    from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). With teams
+    saved, the select `#ns-team` («Команда», first option «Роли ниже», right before the composer) fills the composer's
+    rows with a chosen team and sets the max to the larger of the typed value (else the saved `max_agents`) and the
+    team's size; a team with a role the catalog lacks is disabled, naming the first such role; a pick the settings no
+    longer support (another client saved while the dialog was open) changes nothing, puts the select back and says so;
+    the first option undoes a pick, bringing back the rows from before it and their max (a max typed since stays); any
+    edit of the rows resets the select and keeps those rows; the rows are what the session is created from, so no team
+    name is sent. A stray
     click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
     settings page has it; sessions can still override it through the API).
-  - Team composer (new-session modal and the settings' defaults): one row per group of the starting team (§17.3
+  - Team composer (new-session modal, settings' defaults, saved teams): one row per group of the starting team (§17.3
     `team_rows`; JS twins `teamRows` / `teamValue`): a role select over the visible catalog plus «Своя роль…» (a
-    name not in the catalog), −/+ count (1..50), the role's first sentence (full description as tooltip) and its
-    model profile, ✕; «Добавить роль»; the total. An empty team, an own role name with `,` or `*` (they separate
+    name not in the catalog), −/+ count (1..50; a row a saved team already holds above 50 keeps that count as its limit,
+    and a typed count above the limit shows as the limit), the role's first sentence (full description as tooltip) and
+    its model profile (for a role without one, muted, «модель: как у сессии»; none on a «Своя роль…» row, whose typed name may be a role with a profile), ✕; «Добавить роль»; the total. A re-render gives the focus back to the same control (keyboard
+    users). An empty team, an own role name with `,` or `*` (they separate
     team items) or more agents than the max is refused in the form; an untouched default is never written back.
-    The new-session modal sends `starting_roles` only when the saved list, at the new size, would give another
-    team (the saved list may hold more roles than its `start_agents`: they would fill a larger team).
-  - Settings tab: sections «Модели и эндпоинты», «Роли», «Новые сессии по умолчанию» (with the team composer and
+    The new-session modal sends `starting_roles` when a saved team is picked in `#ns-team`, and otherwise only when the
+    saved list, at the new size, would give another
+    team (the saved list may hold more roles than its `start_agents`: they would fill a larger team). A saved team's
+    composer (Settings → «Команда») is headed «Состав», without the hint, «Своя роль…» or its input: a team holds
+    catalog roles only. Its add button reads «Добавить строку», and ↑/↓ move a row, since the order is who is woken
+    first and who plans; the focus follows the row. A role the catalog lacks shows as a selected, disabled option in a
+    row marked in the error colour (`.team-gone`), with the hint «Этой роли больше нет в каталоге: выберите другую или
+    уберите строку.»; a hidden role shows as elsewhere: selected, marked «(скрыта)», and not offered to other rows.
+  - Settings tab: sections «Модели и эндпоинты», «Роли», «Команда», «Новые сессии по умолчанию» (with the team
+    composer and
     the switch «Независимое ревью задач», `swarm.independent_review`, «Сначала уточнять цель», `swarm.clarify`, whose
     hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для команд агентов»,
     `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
-    `agents.planning_hint_steps` / `planning_hint_minutes` and their hints), «Консоль», «Workspace», «MCP»,
+    `agents.planning_hint_steps` / `planning_hint_minutes` and their hints, and the triggers' `file_settle_seconds`,
+    `file_max_wait_seconds`, `trigger_wake_seconds` with theirs, §8), «Консоль», «Workspace» (`workspace.git`,
+    `lock_ttl_minutes` ≥ 1 and `lock_wanted_minutes` ≥ 0 with its hint, §7 "Lock waiters"; then «Копия в новую сессию,
+    МБ», `workspace.copy_max_mb`, whose hint names `--copy-from` and «Файлы для работы», and «Файлов в такой копии»,
+    `workspace.copy_max_files`, both at least 1), «MCP»,
     «Скиллы», «Трейсы», «Сервер», with a section navigation.
     - Roles: a card per catalog role (from `role_presets` and `settings.roles`). A built-in role: its name in
       both languages (read-only), «встроенная» / «изменена» marks, «Сбросить» and «Скрыть» / «Показать»;
@@ -3580,13 +4262,39 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
       plus «Добавить» (Enter too; a name must be a skill name: lowercase letters, digits and `-`). Saved as
       `settings.roles` (only what differs from the built-in texts; `skills` when not empty); client checks (names,
       duplicates, a description for an own role, a known profile, skill names) are shown in the save bar.
+    - Teams («Команда», English "Teams"): a card per saved team (`settings.teams`), with an editable name, delete and
+      the saved team's composer; «Добавить команду». A card's composer id is generated (`tm<n>`), never the team's
+      name. Saved as `settings.teams` by `teamEntries`: `{name, roles}`, the rows expanded, trailing generalists kept.
+      Client checks, the first one found shown in the save bar: no name; a name over 60 characters (code points, as the
+      server; the name inputs of team and role cards have no `maxlength`, which counts UTF-16 units and cuts with no
+      message), with `,` or `*`, or starting with `-`; a name with a control or invisible character other than the
+      joiners of §17.3 (`TEAM_NAME_JOINERS`), or of those alone; a reserved name
+      (`TEAM_RESET_WORDS`, the twin of `roles.TEAM_RESET`); two teams of one
+      name; a team with no rows; a row whose role is missing from the edited catalog, unless it was already missing
+      from the saved settings, so a team broken by a hand edit blocks no other save. More than 200 agents is refused
+      by the server only. Rows are never changed automatically: a role renamed or deleted in the form leaves its rows
+      on the old name, shown as gone, and Save refuses, naming the team and the role and going to that row, until it
+      picks another role (the new name in the same save passes) or goes. Deleting a card leaves the focus on the delete
+      button of the card now in its place, else of the last card, else on «Добавить команду».
     - Model profiles: one card per profile. Fields: name, provider, base_url, key (mode «Переменная
       окружения» with its state on the server, or «Ключ»: a password input that is never filled from the
       server, «сохранён …abcd», a button to remove it), model (input + datalist filled by «Загрузить список»),
       max_tokens, context window, the max_tokens ceiling (after a cut-off reply, §6.2), effort, thinking (Anthropic) or the max-tokens parameter (OpenAI), and under
       «Дополнительно» thinking display, prefix-mismatch handling and fallbacks (Anthropic), prices and extra
       request parameters (JSON). Buttons «Проверить» (models list) and «Тестовый запрос» (live); key-like text
-      in the results is masked. Default profile (★, cannot be deleted), add from a preset, delete.
+      in the results is masked; the live result says how its cost was obtained (`cost_source`: «сообщил
+      провайдер», «по ценам профиля», «по встроенным ценам», «бесплатно», «неизвестна…» / «неполная…»). Default
+      profile (★, cannot be deleted), add from a preset, delete. Filling a card from a preset sets its four prices
+      to the preset's (empty when it has none), so the previous preset's prices never stay on the card.
+    - Prices (the hint: empty = the built-in prices of known Claude models, otherwise those tokens count as $0
+      unless the provider reports the cost; 0 = free): a profile whose `price_source` is `none` or `partial` (and
+      whose provider is not `scripted`) shows a warning outside «Дополнительно» (`.price-warn`): «Нет цен: вызовы этой
+      модели считаются по $0, и бюджет сессии их не видит, если только провайдер не сообщает стоимость сам
+      (проверьте «Тестовым запросом»).» or «Нет цены выхода: эти токены считаются по $0.», with «Указать цены»
+      (opens «Дополнительно», the cursor in the first missing price) and «Бесплатная модель (0 / 0)» (both prices
+      0). The server computes `price_source` for the saved model: while the card's model is the saved one, typing
+      the missing prices hides the warning at once (`missingPrices`); another model typed in shows none until the
+      settings are saved.
     - The external MCP servers are a JSON field; their `env` values come masked (`••••…abcd`) and are kept
       when sent back unchanged.
     - «Консоль» (`[shell]`, §17.1): the shell; the default wait for a command (`timeout`); «Наибольший тайм-аут
@@ -3674,9 +4382,12 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     and `GET /api/settings` (launcher routes, without `BASE`) and adds the groups «Фоновые процессы»
     (`shell.max_jobs_per_member`, `max_jobs`, `job_max_minutes`, `cpu_threads`) and «Агенты»
     (`agents.max_steps_per_turn`, `context_tokens`, `tool_output_chars`, `idle_nudge_seconds`,
-    `max_parallel_llm_calls`, `planning_hint_steps`, `planning_hint_minutes`) and «Сеть» (`swarm.network`, kind
-    `choice`: a select «как в общих настройках (…)» / «есть» / «нет», with the hint `networkHint` of the launcher's
-    `network_isolation`, §7.2) and «Уточнение цели» (`swarm.clarify`, field «Сначала уточнять цель», kind `bool`: a
+    `max_parallel_llm_calls`, `planning_hint_steps`, `planning_hint_minutes`, `file_settle_seconds`,
+    `file_max_wait_seconds`, `trigger_wake_seconds`: «Повторяющийся триггер будит не чаще, с» with the hint
+    «Срабатывания между пробуждениями приходят одним уведомлением; 0 — будить при каждом») and «Сеть»
+    (`swarm.network`, kind `choice`: a select «как в общих настройках (…)» / «есть» / «нет», with the hint
+    `networkHint` of the launcher's `network_isolation`, §7.2) and «Уточнение цели» (`swarm.clarify`, field
+    «Сначала уточнять цель», kind `bool`: a
     select «как в общих настройках (вкл|выкл)» / «вкл» / «выкл», parsed to null / true / false; its hint says that an
     agent's critical question then pauses the swarm until the user answers, that a new planning task starts with
     questions, and that a planning task already on the board stays as it is, §3.1) (`SESSION_FIELDS`, where a field's
@@ -3685,9 +4396,10 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     that an empty field takes the general value and that changes apply at once (steps from the agent's next
     wake-up, the rest from the next command or call), the context field that a model profile's own window wins
     (naming it when the session's profile has one). Save checks the values with config.py's minimums (whole
-    numbers; `idle_nudge_seconds` and `planning_hint_minutes` numbers; `cpu_threads` "auto" or a whole number ≥ 0; the first error is a toast
-    and gets the focus), then sends `PATCH /api/sessions/{sid}` `{"settings": ...}` with only the changed keys (an
-    emptied field is null) before `swarm_control`, so a stopped session takes them too; when the PATCH succeeds and
+    numbers; `idle_nudge_seconds`, `planning_hint_minutes` and the three trigger keys numbers; `cpu_threads` "auto"
+    or a whole number ≥ 0; the first error is a toast and gets the focus), then sends `PATCH /api/sessions/{sid}`
+    `{"settings": ...}` with only the changed keys (an emptied field is null) before `swarm_control`, so a stopped
+    session takes them too; when the PATCH succeeds and
     `swarm_control` fails, a toast says the session parameters were saved and the dialog stays open with them counted
     as saved. An emptied field counts as an unsaved edit when the dialog is closed (it removes an override). ⚙ is
     disabled while the two requests load, and a modal opened meanwhile is not replaced; if they fail, the dialog
@@ -3712,10 +4424,17 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     drawer lists them, each with «Остановить». The feed shows `job.started` / `job.ended` (FEED_TYPES `job.*`).
     The header's agents counter is `swarm.agent_count` (members who joined through MCP do not count) against
     max_agents.
+  - Tab «Триггеры»: a card per active trigger of the snapshot (condition, a repeat badge, owner, «срабатываний: N»
+    and, while its fires are held by the wake limit, «отложено: 2 до 18:48» / "held: 2 until 18:48" from `held` and
+    `wake_at`, §8; note, actions, last error; «Удалить» asks first).
   - Tab «Файлы»: above the tree, the session folder (`swarm.workspace`): its absolute path (click to copy) and
     the badge «своя папка» / «папка проекта» / «перенесена» / «папки нет»; the tab button's tooltip is the
     path. A missing folder is not listed (no `/api/files` call). When the path (or its existence) changes
-    after a `/cd`, the tab starts again from the root of the new folder. The viewer highlights the syntax of a file
+    after a `/cd`, the tab starts again from the root of the new folder. A locked entry (its path is the path of a
+    lock in the snapshot's `locks`) shows the lock icon («Заблокирован: {owner}» as its tooltip) and the link «Снять
+    блокировку» / "Unlock" (`.file-unlock`): after a `confirm()` («Снять блокировку, которую поставил(а) {owner}, с
+    {path}? Участников, которые ждут этот файл, разбудят.») it calls `act('file_unlock', {path})` (§7 "Lock
+    waiters"); cancelling sends nothing. The viewer highlights the syntax of a file
     (and the source of a `.md`) by its name (`highlight.js`, in-house, offline, loaded before markdown.js; also
     Markdown fences that name a language): Python, JS/TS, JSON, TOML, YAML, INI/.env, shell, Dockerfile, Makefile,
     PowerShell, batch, HTML/XML/SVG, CSS, SCSS/LESS, SQL, C/C++, C#, Java, Kotlin, Go, Rust, Ruby, PHP, Lua, R, Julia, LaTeX,
@@ -3870,6 +4589,32 @@ relative: 400), `{"zip": base64, "filename"}`, `{"git": url}`, `{"claude": name,
   capped by `max_archive_mb` (413); a member over 1 MB compressed more than 200 times "looks like a zip bomb" (413);
   a damaged archive is a 400; exec bits come from `external_attr`. `max_mb` / `max_files` apply per picked skill,
   so a multi-skill "Download ZIP" of a repository fits. Origin `zip`, `source = {filename, subdir?}`.
+  `extract_zip` is a wrapper: `unpack_zip(source, dest, ZipRules.for_skills(limits)).skipped`. `unpack_zip(source:
+  bytes | path, dest, rules: ZipRules, *, check=None) -> ZipResult(files, bytes, skipped, excluded, links, top)` is
+  the one unpacker, also for a zip copied into a new session (`copyfrom.zip_rules`, §17.2 "Copying files into a new
+  session"). `ZipRules`: `max_bytes` / `too_big`, `max_entries` / `too_many_entries`, `max_files` /
+  `too_many_files`, `skip_files`, `exclude_names` (casefolded path parts left out and listed), `links` ("refuse" |
+  "skip"), `exclude_paths` (exact '/' paths after the unwrap, left out and listed), `portable` (the Windows name
+  rules), `fold_collisions` (False: exact names), `names_in` (the `_portable` message), `folders` (create folder
+  entries), `unwrap` (one top folder with no excluded or link member beside it: its contents), `redecode_names`
+  (names without the UTF-8 flag read again, once per archive, as UTF-8 or in the Windows OEM code page, the OEM
+  one first when every such member was made on MS-DOS / Windows by `create_system`; a folder then by the name's own
+  last character),
+  `max_ratio`
+  (None: no ratio bound) and `declared_first` (True: the declared sizes of all members are checked before planning,
+  as for skills; False: of the planned files after it); the skills' defaults keep the order and texts above. A
+  path is opened once and streamed (a 1 GB zip is not read into memory). Before `zipfile` parses the central
+  directory, a pre-check (`_zip_directory`) reads the entry count and the directory size from the
+  end-of-central-directory records, searched for in zipfile's window (the last 64 KiB + 22 bytes, whatever the
+  comment length says): the largest of the plain record's values, a marker left out, and those of a ZIP64 record
+  whose locator precedes it, at the locator's offset or just before it (zipfile uses those whatever the plain record
+  says); with no ZIP64 record the plain values count as stated, a 0xFFFF / 0xFFFFFFFF marker included (zipfile
+  never uses the count and reads the plain directory size). More than `max_entries` is the 413 of
+  `too_many_entries`; a directory over `max_entries * 512` bytes (zipfile reads and parses all of it, whatever
+  count the record states) is a 413 of its own, "The zip's directory (its list of entries) is larger than N MB: its
+  names, comments or extra fields are too long." (for skills 2.4 MB: a zip with long per-entry comments or extra
+  fields can be refused here). A file without a plain end record leaves it to `zipfile`, which
+  refuses it. `check()` runs before each member is written and after each chunk.
 - Git (`parse_git_source(text) -> GitSource(url, ref, subdir, shown, scheme)`, pure): `https://`, `ssh://`,
   scp-like `user@host:path` and `file://`; plain `http://`, `transport::` remote helpers, a leading `-`, spaces, a
   user or host starting with `-` and invalid hosts are refused. `URL#ref:subdir`, `URL#ref`, `URL#:subdir`; GitHub
@@ -4254,3 +4999,349 @@ digest, cannot call its API; a token for every hub is out of scope.
 **Not in v1**: Claude Code plugin skills; automatic updates of library skills from their Git source (the recorded
 `commit` makes a later check possible); per-role visibility; mounting the MCP library or `~/.claude/skills` into the
 sandbox; rendered Markdown on the home page; refs given as commit SHAs (`--branch` takes branches and tags only).
+
+## 20. Export and import (transfer.py, treecopy.py, mcp_library.py)
+
+A home moves to another computer (or into a backup) as one folder: `transfer.export_home` writes it, and
+`plan_import` / `apply_import` bring it into another home, adding what is new and rewriting what changed; nothing
+the export does not carry is ever deleted. Stage 1 is the CLI only (§18.3: `dreamteam export`, `dreamteam
+import`): no launcher route, no MCP tool, no UI. User docs: docs/en/transfer.md.
+
+```python
+# transfer.py
+CATEGORIES = ("settings", "skills", "mcp", "sessions")
+FORMAT, FORMAT_VERSION, MANIFEST = "dreamteam-export", 1, "dreamteam-export.json"
+def parse_include(values) -> tuple[str, ...]          # comma lists, repeatable; every category for None / empty;
+                                                      # an unknown word: TransferError(usage=True)
+def export_home(home, dest, *, include=None, sessions=None, running=None, dry_run=False, git=None) -> ExportReport
+def read_manifest(folder) -> dict
+def check_session_names(folder, sessions) -> None   # --session values the export holds (id or uid), else usage
+def plan_import(manager, folder, *, include=None, sessions=None) -> ImportPlan          # changes nothing
+async def apply_import(manager, plan, *, before_swap=None) -> ImportResult
+def render_export_report(report) -> str; def render_import_plan(plan) -> str; def render_import_result(r) -> str
+class TransferError(ValueError)      # (message, *, usage=False): usage → the CLI exits 2, else 1
+class SecretFound(TransferError)     # .places: where a secret was found, never the value
+```
+
+### 20.1 Categories
+
+- `settings`: every section of `dreamteam.toml` (`read_raw`), `[models.*]` and `[[roles]]` included, without
+  `[mcp.external]` and without keys (`scrub_settings`, §20.3).
+- `skills`: the skills library (`Config.skills_library_dir`).
+- `mcp`: the MCP library (`Config.library_dir`, approvals included) and `[mcp.external]` without env values.
+- `sessions`: whole sessions (database, `.dreamteam/{mcp,attached-skills,jobs}`, workspace files).
+
+`include` defaults to every category; `sessions` (ids or uids) picks sessions and adds the `sessions` category, the
+others still follow `include`. On import, `include` is intersected with the manifest's `include`; a category named
+in `include` that the export does not hold goes to `plan.missing` with a warning (the plan is not ok: exit 1).
+
+### 20.2 The export folder
+
+```
+dreamteam-export.json                 the manifest, written last (<name>.tmp + os.replace): a folder without it is an
+                                      incomplete export, which import refuses
+settings/dreamteam.toml               dump_toml(scrub_settings(raw)) after a two-line comment
+skills/<name>/                        skills.copy_skill of each valid library skill, plus .dreamteam.json {name,
+                                      description, origin, source (URL credentials stripped), by, via, added_at,
+                                      updated_at, digest}; never the stat manifest (mtimes of this computer)
+mcp/library/<name>/                   server.py + meta.json (mcp_library.write_entry_folder); an entry whose
+                                      `project` is the folder of a session of this home has `project_session: <uid>`
+                                      instead
+mcp/external.json                     {name: {command, cwd, description, env_keys}} (scrub_external)
+sessions/<id>/session.json            session.json without "id"/"legacy", with "uid" written, overrides through
+                                      scrub_overrides
+sessions/<id>/.dreamteam/swarm.db     the sqlite backup of the database (_copy_db), finished by _finish_db
+sessions/<id>/.dreamteam/{mcp,attached-skills,jobs}/   treecopy.copy_tree, no excludes
+sessions/<id>/workspace/              copy_tree of the session's own folder or its in_home folder with the export
+                                      excludes (§20.5); a folder outside the home is not copied (its path is in
+                                      session.json and the manifest)
+```
+
+- **Destination** (`_check_dest`): missing, empty (OS metadata such as `.DS_Store`, `Thumbs.db`, `desktop.ini`
+  ignored), or a previous export (only `LAYOUT` names, with the manifest): then the new export is built in the
+  sibling `.<name>.export-<hex8>` and swapped in through `.<name>.old-<hex8>` (`_put_in_place`; when the swap can be
+  neither done nor undone both folders are kept and named, `_Kept`); stale siblings of an interrupted export older
+  than `STALE_SECONDS` (1 h) are removed first. Refused: a drive or file-system root, a mount point, a link, a file,
+  any other non-empty folder, a folder inside the home's `sessions/` or `.dreamteam/`, the skills or MCP library
+  (when exported), the workspace of any session of the home (exported or not), and a folder that contains the home
+  or any of these. A new folder is created with mode 0700 on POSIX (`_mkdir_private`; on Windows it inherits its
+  access rules); an empty one is chmod 0700 and must belong to the current user on POSIX.
+- **Sessions** (`_pick_sessions`): every session but the legacy `main` (left out; refused only when named), by id
+  or uid (an unknown or ambiguous one: usage error). Left out (refused) per session: a damaged session.json, no
+  uid (`session_uid` None), `.dreamteam/workspace-move.json`. Two picked sessions with one uid are warned. The
+  workspace kind is `own`, `in_home` (`_home_relative(meta["workspace"])`) or `outside`. A session the caller lists
+  in `running` (the CLI asks the hub) is exported as a snapshot with a warning (`running_at_export`). A failure of
+  one session (`_Refused`: its database changed twice while read, is damaged or cannot be read; or an error of the
+  destination's file system: names differing only in case, a file of 4 GiB or more on FAT32, a name or path it
+  cannot hold, `_write_refusal`) removes that session from the export and the others go on; a full disk stops the
+  export.
+- **Database copy** (`_copy_db`, `_read_db`): never writes next to the source. A database with both `-wal` and
+  `-shm` is read through them (`?mode=ro`: WAL content included); one with a `-wal` only is read from a private
+  copy of both; one without either as `immutable=1`, read again once when its file changed meanwhile, then
+  refused. `_finish_db` on the copy: `journal_mode=DELETE`; command credentials stripped (§20.3); `VACUUM` (no free
+  page keeps deleted text); `PRAGMA quick_check` must be "ok"; then its figures (events, last event, MCP servers,
+  `max_tools_revision`).
+- **Order** (`_export_parts`): settings, skills, mcp, sessions; then `scan_for_secrets` over the whole folder; then
+  the manifest; then the swap. Any exception (TransferError, OSError, KeyboardInterrupt) discards what was written
+  (`_discard`: the temp folder, or the contents of the user's empty folder; retried `DISCARD_TRIES` times), naming
+  what could not be removed. `dry_run` measures the same parts without writing (no secret check).
+- **Manifest**: `{format, format_version, dreamteam_version, created_at, source: {machine: platform.node(), os:
+  sys.platform, home, python}, schema: {db_columns: sorted(db.known_columns()), toolset_revision}, include,
+  settings: {sections, models, roles, omitted} | null, skills: [{name, digest, origin, files, size,
+  changed_outside}] | null, mcp: {library: [{name, digest, approved, changed_outside, project_session}], external:
+  [{name, env_keys, credentials_removed}]} | null, sessions: [{id, uid, title, created_at, last_event: {id, ts,
+  type}, events, max_tools_rev, db_sha256, db_bytes, attached_skills, mcp_servers, running_at_export, workspace:
+  {kind, in_home, path, adopted, files, bytes, tree_digest, compare_digest, carried?}, modes}] | null, left_out:
+  [{what, reason, refused}], warnings, not_copied: [{session, path}]}`. `modes` holds the permission bits worth
+  restoring (`treecopy.mode_record`) by path inside the session; `carried: false` marks a workspace folder that was
+  missing at export (the import keeps the files the target has).
+- `ExportReport.ok`: nothing asked for was refused (the legacy `main` session left out by rule does not count).
+
+### 20.3 What never travels, and the secret check
+
+Never exported: `models.*.api_key`; a key typed into `api_key_env` (`_pasted_key`: not a variable name, or a name
+no variable has that looks like a key); secret-looking entries of `models.*.extra` at any depth (`_scrub_extra`:
+names matching shell's `_SECRET_RE` or `SECRET_NAMES` such as `authorization`, `x-api-key`, `cookie`; values like
+`Bearer <8+ chars>`), each with a warning; every `[mcp.external.*].env` value, global and in session overrides
+(`env_keys`: the sorted names only); credentials in MCP commands (below); `dreamteam.toml.bak`, `hub.json`,
+launcher markers, logs, `tui_history` and everything else of `<home>/.dreamteam/`; a session's `.dreamteam/`
+except `swarm.db` and `SESSION_DATA_PARTS`; `sessions/.deleted-*`, `.importing-*`, `.replaced-*`; skill
+environments; hub tokens; the files of workspace folders outside the home; the legacy `main` session and `dreamteam
+run` projects.
+
+`strip_command_credentials(command) -> (command, removed)`: URL user information (`shell.strip_url_credentials`),
+credential query parameters (`?api_key=`, `?token=`, `?sig=`, ...), the value of a credential flag (`--token X`,
+`--api-key=X`, `-token=X`, `--password X`, `--client-secret X`, `--auth X`; not `--no-...`), credential headers
+(`Authorization: Bearer X`, also as `--header`/`-H` with two arguments or as a JSON object), `NAME=value`
+assignments whose name the shell treats as secret, and lone `Bearer X` / `Basic X` / `Token X` arguments become
+empty; a command written as one string is split as mcp_forge splits it. It applies to `mcp/external.json`, to
+session overrides and, in each exported database, to `mcp_servers.command` of origin `config` (start() registers
+them again from the target's settings). Every removed value, and the command credentials of every `mcp.created`
+event of the journal, is also removed from every text value of the copied database (`_strip_db_credentials`:
+journal, histories); each affected server is warned (`re-enter the credentials of ... on the other computer`).
+
+`known_secrets(raw, overrides, environ) -> Secrets` (value → label; values shorter than `MIN_SECRET` = 8 and the
+`PLACEHOLDER_KEYS` of `settings.PROVIDER_CHOICES`, e.g. `lm-studio`, are not kept): the stored key of every profile
+(also one typed into `api_key_env`); the value of every variable a profile names; every environment variable
+`shell._is_secret` accepts with `_KNOWN_SECRETS`, `key_env_names()` and the profiles' variables; the header values
+of `ANTHROPIC_CUSTOM_HEADERS` / `OPENAI_CUSTOM_HEADERS`; the values of the `[shell] pass_env` and `[skills]
+install_env` variables; the env values and command credentials of the `[mcp.external]` servers of the global
+settings and of every session's overrides (also sessions not exported); `hubauth.env_token()` and the tokens in
+`hubauth.tokens_dir()`; plus everything the export itself removed.
+
+`scan_for_secrets(root, secrets, *, git=None) -> [place]`: each value is searched for as it is, JSON-escaped (with
+and without ASCII escapes) and escaped twice, each as UTF-8 and UTF-16LE (`_Matcher`, chunked with an overlap).
+Every file below `root` is searched as bytes (links skipped, `long_path`); a SQLite file is also read row by row
+(`_scan_db`: every value of every table and the schema text; a long value lies on overflow pages), a hit named
+`<file> (table.column:rowid, ...)` (at most three rows per value and column). Every git repository database below
+it (`looks_like_git_dir`) is read whole with `git cat-file --batch-all-objects --batch --unordered` (blobs, trees,
+commits, tags; packed or loose, reachable or not), run with `hubgit.fixed_args()`, `-c safe.directory=*`,
+`core.longpaths` on Windows, `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` set to the null device; a hit is named
+`<repo> (git object <id12>)`. No git on PATH or a git that cannot start or exits non-zero is a TransferError
+(the history could not be checked); on Windows a repository path longer than `GIT_PATH_MAX` (250) only picks the
+"its path in the export is too long" text of that error (git that succeeds on it is fine). Places are
+`<path>: <label>`, sorted. Any place found raises `SecretFound` (exit 1, nothing left at the destination):
+"Nothing exported: the export would contain a secret of this computer ... in: - <place> ... Remove it there, or
+leave that part out (--include, --session), then export again."
+
+### 20.4 Import
+
+**Manifest** (`read_manifest`): refused (`Nothing imported: ...`) when the folder is missing, has no manifest, has a
+link among the `LAYOUT` names or `mcp/library`, the manifest cannot be read (files an import reads whole are capped
+at `SMALL_FILE_MAX` = 64 MiB) or is not `format: dreamteam-export`, or `format_version` is not a positive int; a
+`format_version` above `FORMAT_VERSION` says `Update DreamTeam here first.`
+
+**Plan** (`plan_import`): pure. The export folder must not lie inside the target's `sessions/`, `.dreamteam/` or
+the workspace of an own or in_home session (`_check_source`). Items are `ImportItem(category, name, action, reason,
+target, warnings, status, error, backup)` with `action` add | rewrite | unchanged | skip | refuse; `ImportPlan`
+has `changes` (something is added or rewritten), `blocked` (something is skipped or refused), `ok` (not blocked
+and nothing missing), `exit_code` (0 when ok, else 1), `id_map` (exported id → id here) and `warnings` (the
+export's `left_out`; an earlier import's interrupted swap; another source OS: agents keep its shell in their
+frozen instructions and its paths in their histories).
+
+**Settings** (`merge_settings(target, exported, *, home, environ) -> SettingsMerge`): sections are deep-merged,
+exported values winning; keys this version does not know, sections not in `_SECTION_FIELDS` and invalid profile
+names are dropped and listed; `swarm.goal` / `goal_description` are not taken; the machine-local keys
+`LOCAL_KEYS` = `server.host`, `server.port`, `shell.program`, `skills.library_dir`, `skills.envs_dir`,
+`skills.python`, `mcp.library_dir` keep the target's value (listed as `kept as they are here` when they differ).
+Profiles: missing ones are added, the others rewritten from the export (an exported `api_key` is never taken);
+profiles only here stay. When the profile's endpoint (`settings._endpoint`: provider, base_url) is the same, the
+stored key stays (no `api_key` in the update), and so do its secret `extra` entries and its `api_key_env` when the
+export names none; otherwise `api_key = ""` removes the stored key (`enter the key for profile <name> again`), and
+secret extras or a key variable configured here are dropped with a warning. A local-endpoint preset without key
+gets its placeholder key back. Roles (by `roles.role_key`): added or rewritten, the others stay; a role model that
+is not a profile after the merge is dropped with a warning. Teams (by `roles.team_key`): added or rewritten, the
+others stay; a team naming a role the catalog lacks after the merge stays, with a warning (`team 'X' uses the role
+'Y', ...`): the load check is shape only, so nothing blocks the import, and the team is refused when chosen (§17.3
+"Saved teams"). An `agents.default_model` that is not a profile here
+keeps the target's value. Warnings: a profile without a key here, a base_url on localhost. The merged settings are
+validated (`validate`; an error refuses the item) and saved by one `SessionManager.update_settings(update)`, with
+`models`, `roles` and `teams` as complete lists, so `apply_update` deletes nothing.
+
+**Skills**: identity is the folder name; the exported folder must pass `check_skill_dir` with the target's limits
+and its SKILL.md must name it; a link of that name in the target library is refused. Same digest: unchanged;
+otherwise rewrite, or add. Applied by `Library.add(src, origin, source, replace=True, by=<exported by>,
+via="import")`.
+
+**MCP library**: identity is the name; `mcp_library.read_folder` and `check_requirements` must pass. `project`:
+when the entry's `project_session` uid maps to a session here (`uid_targets`, after the sessions are applied),
+`str((sessions_dir / sid).resolve())`; otherwise the target entry's own `project` stays, else none
+(`_project_updates`; `project_session` is never written). `approved_digest` travels as exported (an approval the
+target records for the same digest is kept). Unchanged iff the code and the resulting meta.json are the same; a
+link in the library is replaced (the link only). Warnings: requirements without `uv` on PATH; an approved entry
+while `[mcp] require_approval` is on here. Applied by `mcp_library.add_entry(root, src, name=, replace=True,
+meta_updates=, meta_drop=)`.
+
+**`[mcp.external]`** (`merge_external(target, exported, *, keep_others=True, where="Settings")`): identity is the
+table name; command, cwd, description and the other keys come from the export. The target's env values for a
+server (also keys only here), and its command with the credentials stored here, stay when `_same_program` holds:
+the same command credentials aside (a string command is split, so `"npx -y X"` equals `["npx", "-y", "X"]`) and the
+same cwd; otherwise they are dropped (`... the env values stored here for it were dropped: enter ... again`).
+Exported names without a value here: `enter <KEY> for <server> in <where>`; a command the export emptied of
+credentials: `re-enter the credentials of <server> ...`. Servers only here stay. Warnings: `command[0]` not on PATH,
+an absolute cwd that does not exist, a session override with env values only whose global server's command
+changes. All servers are saved by one `update_settings({"mcp": ...})`.
+
+**Sessions** (`_plan_sessions`, `_plan_session`). Identity is `session_uid` (§17.2), never the id.
+- A uid held by more than one exported session (a folder copied by hand there) is refused unless named by id with
+  `sessions`; a named copy is matched by its id only (the target session of that id when its uid or `origin_uid` is
+  that uid), else added: with a fresh uid and `origin_uid` = the shared one when a target session holds that uid or
+  this import already adds or keeps it, otherwise with the shared uid (no `origin_uid`). A uid held by more than one
+  target session is refused unless named by an id among them (when the exported id is not one of them, it is
+  refused whatever is named: delete or move the unwanted copy here). An exported session whose `origin_uid` is the
+  uid of the target session with its id comes back to that copy. Two exported sessions that would rewrite one target are
+  refused.
+- Refused per session (the others go on): an invalid id, an unreadable session.json or one whose uid does not
+  match the manifest, a link among its folders, `workspace-move.json` in the export or here, a database that
+  `_check_export_db` rejects (no `db_sha256` in the manifest, a different sha256, `-wal`/`-shm`/`-journal` files
+  next to it, `db.unknown_columns`, `db.foreign_objects`, `db.max_tools_revision` > `TOOLSET_REVISION`), overrides
+  that `import_overrides` or `validate` refuse, a placement that fails (below). A session running here is
+  `skip`.
+- No target: **add** under the exported id when it is free and not reserved by this import, else `_free_id(title)`
+  (`as <id>: <id> is taken here`).
+- A target: **unchanged** when the last events `(id, ts, type)` are equal, the files match (`compare_digest` of the
+  exported workspace equals that of the target's folder; always true when the target works outside the home or the
+  export carries no files) and `_settings_differ` finds nothing (title, overrides as the import writes them,
+  `pending_goal`); when only those differ: **rewrite** of session.json alone (`settings_only`,
+  `import_settings`, no backup). When the export carries no workspace files and the target's folder has some:
+  refused. Otherwise **rewrite**, whatever the history says, with the reason: `its files differ`, `the export has
+  newer work in it` (the export holds the target's last event), `this computer has newer work in it` (the target
+  holds the export's last event) or `both computers worked on it since they last had the same copy`.
+- Overrides (`_session_overrides`, then `SessionManager.import_overrides`): sections outside `OVERRIDE_SECTIONS`
+  and unknown keys dropped; `LOCAL_KEYS` removed from the export and the replaced copy's values put back; its
+  `[mcp.external]` merged with the replaced copy's by `merge_external(keep_others=False)`; a server overridden with
+  another command or folder than the target's global server of that name gets the inherited env values blanked;
+  an `agents.default_model` that is not a profile here is dropped (warned).
+- Placement (`_placement` → `ImportedWorkspace(kind, folder, path, adopted)`): a rewrite of a target that works
+  outside the home keeps that path (the export's workspace files go to the session's own folder, warned); `own`
+  stays own; `in_home` goes to `<home>/<in_home>`, the target's own in_home folder on a rewrite, else the first
+  free of `<in_home>-<id>`, `<in_home>-<id>-2` ... (warned), refused when it would leave the home, lie in
+  `sessions/` or `.dreamteam/`, overlap the export folder or another session's folder, or fail
+  `SessionManager._target_refusal`; `outside` keeps the path: a relative or missing folder is warned (`put the
+  project at that path, or run /cd`), a file or a folder overlapping another session or the export folder is
+  refused, an existing non-empty folder is adopted (the user's project), an empty one is used as is.
+- Warnings: names the target's file system cannot hold (`_portability_warnings`: Windows-invalid names on win32,
+  case-only clashes on win32 and darwin; copying them fails the session), agents whose model profile is missing
+  here (they use the default profile).
+
+**Apply** (`apply_import`): first `recover_swaps()` (finish or undo the swaps of an import that died halfway) and
+`clean_staging()` (stale `.importing-*` of processes that are gone); when a swap was put back, the planned sessions
+are `not done` (`import again`). Then the items in `APPLY_ORDER` = settings, skills, sessions, mcp (library entries
+before `[mcp.external]`, so a library entry's `project` can name an imported session). refuse → `refused`, skip →
+`skipped`, unchanged → `unchanged`; one item that fails is `failed` with its error and the others go on. A
+cancellation or KeyboardInterrupt lets the item in progress finish or undo (`_to_end`), marks the rest `not done`
+and sets `interrupted` (exit 130). When the settings or `[mcp.external]` were saved, `dreamteam.toml.bak` is
+rewritten with the settings from before the import. `ImportResult.exit_code`: 130 interrupted, 0 when every item
+is added, rewritten or unchanged and nothing is missing, else 1.
+
+A session is staged in `staging_path(id)` = `sessions/.importing-<id>-<pid>-<hex8>` (`_stage_session`: the
+database copied with its sha256 checked against the manifest, the data parts and `workspace/` by `copy_tree(...,
+modes="import")` with the recorded `modes`; a link or an unreadable file fails it). `_import_meta` writes the uid
+(it must be 32 hex), `autostart: false` (imported sessions never start by themselves), the overrides checked
+against this home, and the workspace entry rebuilt for this home (`_workspace_meta` for in_home, `{path, adopted}`
+for outside). `_finish_staged` opens the database once with `db.Database` (`ADDED_COLUMNS`, WAL again), points
+absolute job-log paths at the copy's own `.dreamteam/jobs/` (or clears them), and writes session.json last.
+`before_swap(id)` (the CLI's holder check) runs right before the rename; an exception fails that session with
+nothing changed.
+- `import_add`: under the id's lock; when the id is taken meanwhile, `_new_id(title)`; `_swap_added` places the
+  in_home folder and renames the staged copy in, undoing both on failure. Emits `created`.
+- `import_rewrite(sid, ...)`: under `_lock(sid)`; refused (409) when session.json changed since the plan
+  (`expect`), when a workspace move is unfinished, or when the session runs; a loaded swarm is unloaded.
+  `_swap_replaced` creates `sessions/.replaced-<id>-<YYYYMMDD-HHMMSS>[-N]/` with the journal `swap.json` {sid, pid,
+  planned, done, created}, rewritten after every step, and renames: the session folder → `session/`, its in_home
+  folder → `workspace/`, the staged `workspace/` → its in_home folder, the staged copy → the session folder. Renames
+  are retried (`RENAME_TRIES` = 10 × `RENAME_PAUSE` 0.2 s) and never replace anything; a failure undoes every done
+  rename (`Could not replace session ... its files are in use ... Nothing was changed.`, 409) and removes the
+  journal. Then `_carry_environments` moves `KEEP_ON_IMPORT` = `.venv`, `venv`, `node_modules` (at any depth, not
+  inside `.git`) from the backup's workspace to the same free place of the new one, and `_drop_old_backups` removes
+  the older backups of the same session (same uid, no journal): only the last one is kept. Returns {id, backup,
+  kept, removed_backups, warnings, dropped_model}; emits `updated`.
+- `import_settings(sid, meta, *, expect)`: the same checks, session.json rewritten in place (its workspace entry
+  kept), no backup.
+- `recover_swaps()`: for each backup with a journal whose process is gone: all renames done (also the one just
+  before the process died, seen on disk) → the journal goes; otherwise the done renames are undone newest first
+  (a place taken meanwhile is reported, the journal stays). `interrupted_swaps()` lists such backups for the plan.
+
+### 20.5 Tree copy (treecopy.py)
+
+`copy_tree(src, dst, *, exclude_names=EXPORT_EXCLUDE_NAMES, exclude_paths=EXPORT_EXCLUDE_PATHS, modes="keep",
+apply_modes=None, progress=None, fold_names=False, max_files=None, max_bytes=None, check=None, skip_files=())
+-> TreeResult` and `scan_tree(src, *, exclude_names, exclude_paths, hash=True, fold_names=False, max_files=None,
+max_bytes=None, check=None, skip_files=()) -> TreeResult` (the walk without copying). Links (symlinks, junctions)
+are never followed and are listed; FIFOs, sockets and devices are listed as special; unreadable files are listed in
+`errors`, and the files that were gone (FileNotFoundError: deleted while the walk ran) in `vanished` too (a folder
+that was gone is only in `errors`, with the reason `GONE_DIR` "the folder was moved or deleted while it was copied");
+`skip_files` names regular files left out without a word (counted in `skipped`; `COPY_SKIP_FILES` = `.DS_Store`,
+`Thumbs.db`); Windows paths use `workspace.long_path`. On POSIX (`os.scandir` takes a descriptor) each folder is
+opened with `O_DIRECTORY | O_NOFOLLOW`, its `fstat` compared with the stat its parent's listing gave, and listed
+through that descriptor (kept open while its entries are read); elsewhere a folder that is now a link is refused.
+A folder swapped for a link or another folder while the walk runs is therefore never walked: the error "the
+folder was replaced while it was copied" (`TreeResult.errors`), as a file replaced meanwhile is. `dst` must be
+missing or an empty folder and not inside `src`. `EXPORT_EXCLUDE_NAMES` = `node_modules`, `.venv`, `venv`,
+`__pycache__` (at any depth); `EXPORT_EXCLUDE_PATHS` = `.scratch/_skills`,
+`.unavailable-workspace` (relative paths); `.git` and `.scratch/<member>` are kept. `TreeResult`: files, bytes,
+digest, links, excluded, special, errors, entries `(path, size, sha256)`, modes. `tree_digest(entries)`: sha256
+over the sorted lines `<NFC path with '/'>\0<size>\0<sha256>\n`, the same on every OS (empty folders do not
+count). `compare_digest` leaves out `volatile` files (below a `.git`: index, `*.lock`, logs, FETCH_HEAD,
+ORIG_HEAD, COMMIT_EDITMSG and the like, never objects or refs; anywhere the `-wal`/`-shm`/`-journal` file next to
+its database). `modes`: "keep"; "export" copies the bits where the destination can hold them and records
+`mode_record` bits (POSIX: executable, read-only or owner-restricted files; Windows: read-only); "import" ignores
+the medium's bits and sets the recorded ones (`valid_mode`), never writable by group or others; "writable" (a
+copy into a new session) keeps the bits as "keep" does, but the owner can always read and write (`S_IRUSR |
+S_IWUSR`; on Windows it clears read-only), the group and others never write (`& ~0o022`), a file reported as
+0o777 on POSIX, or any file when `fs_type(src)` (the longest mount point of `/proc/self/mountinfo` holding the
+source; None elsewhere) is one without POSIX bits (`9p`, `drvfs`, `vfat`, `msdos`, `exfat`, `cifs`, `smb3`,
+`smbfs`, `ntfs`, `ntfs3`, `fuseblk`: they report 0o777, 0o755 for a CIFS share, 0o555 for a read-only Windows
+file), becomes 0o644, or 0o755 when its first bytes are `#!`, `\x7fELF` or a Mach-O magic, and the setuid, setgid
+and sticky bits are dropped (folders are created with the default mode).
+`is_within(path, parent)` compares as text and by file identity. `progress(bytes, files)` is called after each
+chunk written `(bytes, 0)` and each file copied `(0, 1)`. The limits, for a copy into a new session: `fold_names`
+matches `exclude_names` ignoring case; `max_files` / `max_bytes` raise `TreeLimit(what="files" | "bytes", limit)`
+before the file that would pass them (by the size the file system reports, and again while the bytes are read: a
+file that grows; only regular files that are walked count, and reaching a limit exactly is allowed); `check()` is
+called before every file and after every chunk read, and what it raises (a cancellation) stops the walk. After a
+`TreeLimit`, or what `check` or `progress` raised, the partial copy stays for the caller to remove, as after a write
+error; an unreadable file is still only listed in `errors`. `COPY_EXCLUDE_NAMES` = `EXPORT_EXCLUDE_NAMES` plus
+`.git` (DreamTeam makes the new session's own repository and first commit). `copyfrom.py` (§17.2 "Copying files
+into a new session") uses it with `fold_names=True`, `skip_files=COPY_SKIP_FILES`, the limits, `check` and
+`modes="writable"`, after a `scan_tree(hash=False)` with the same limits.
+
+### 20.6 MCP library on disk (mcp_library.py)
+
+The library is `Config.library_dir` (§17.1), one folder per server in mcp_forge's format (`server.py` of at most
+`mcp_forge.MAX_CODE_BYTES`, `meta.json` of at most `MAX_META_BYTES`). `read_folder(folder, name=None)`,
+`read_entry(root, name) -> LibraryEntry | None`, `scan(root) -> Scan(entries, skipped)`, `list_entries(root)`,
+`check_requirements(requirements)`, `write_entry_folder(folder, code, meta)`, `add_entry(root, src, *, name=None,
+replace=False, meta_updates=None, meta_drop=()) -> "added" | "rewritten" | "unchanged"` (staged in a temp folder
+of the root and renamed in, the old entry renamed away first; another entry without `replace`: `LibraryError` 409
+`exists=[name]`; an approval recorded for the same digest is kept), `remove_entry(root, name)` (renamed away, then
+deleted; a link is removed itself). `LibraryEntry`: name, path, meta, code, requirements, `digest`
+(`snapshot_digest` of the files), `stored_digest`, `approved_digest`, tools; `approved` = approved_digest ==
+digest; `changed_outside` = stored_digest != digest (content-based: it holds on another computer). Links are
+never followed. mcp_forge keeps its own library code in stage 1.
+
+### 20.7 Not in stage 1
+
+Export and import through a running hub (launcher routes), in the TUI, console or web UI; an MCP tool for either;
+`--update` of an existing export; a path map for folders outside the home; the legacy `main` session and
+`dreamteam run` projects; a command that lists or restores `.replaced-*` backups.

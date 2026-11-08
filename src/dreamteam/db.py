@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
+import os
 import re
 import sqlite3
 import threading
+import urllib.parse
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT);
@@ -42,12 +46,15 @@ CREATE INDEX IF NOT EXISTS notifications_recipient ON notifications(recipient, d
 CREATE TABLE IF NOT EXISTS triggers (
     id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT, condition TEXT, note TEXT DEFAULT '',
     actions TEXT DEFAULT '[]', once INTEGER DEFAULT 1, active INTEGER DEFAULT 1, created_at REAL,
-    last_value INTEGER DEFAULT 0, last_fired REAL, fire_count INTEGER DEFAULT 0, last_error TEXT);
+    last_value INTEGER DEFAULT 0, last_fired REAL, fire_count INTEGER DEFAULT 0, last_error TEXT,
+    told_at REAL, held INTEGER DEFAULT 0, held_last REAL, held_files TEXT);
 CREATE TABLE IF NOT EXISTS mcp_servers (
     name TEXT PRIMARY KEY, owner TEXT, scope TEXT, task_id INTEGER, description TEXT DEFAULT '',
     command TEXT, cwd TEXT, requirements TEXT DEFAULT '[]', origin TEXT, status TEXT, tools TEXT DEFAULT '[]',
     error TEXT, created_at REAL, updated_at REAL, digest TEXT, approved_digest TEXT);
-CREATE TABLE IF NOT EXISTS file_locks (path TEXT PRIMARY KEY, owner TEXT, acquired_at REAL, expires_at REAL);
+CREATE TABLE IF NOT EXISTS file_locks (path TEXT PRIMARY KEY, owner TEXT, acquired_at REAL, expires_at REAL,
+    wanted_at REAL);
+CREATE TABLE IF NOT EXISTS lock_waiters (agent TEXT, path TEXT, since REAL, PRIMARY KEY (agent, path));
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, command TEXT NOT NULL, shell TEXT,
     origin TEXT NOT NULL, status TEXT NOT NULL, reason TEXT, stopped_by TEXT, exit_code INTEGER, log TEXT,
@@ -58,7 +65,9 @@ CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, status);
 # columns added to a table after its first release, (table, column, declaration): a file made by an older version
 # gets them when it is opened
 ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"), ("mcp_servers", "digest", "TEXT"),
-                 ("mcp_servers", "approved_digest", "TEXT"))
+                 ("mcp_servers", "approved_digest", "TEXT"), ("file_locks", "wanted_at", "REAL"),
+                 ("triggers", "told_at", "REAL"), ("triggers", "held", "INTEGER DEFAULT 0"),
+                 ("triggers", "held_last", "REAL"), ("triggers", "held_files", "TEXT"))
 
 
 class Database:
@@ -166,3 +175,143 @@ def loads(value: str | None, default: Any = None) -> Any:
     if value is None or value == "":
         return default
     return json.loads(value)
+
+
+def sqlite_uri(path: str | os.PathLike, query: str) -> str:
+    """The `file:` URI sqlite3.connect(..., uri=True) opens `path` by, with the parameters `query` (e.g.
+    "mode=ro"). A UNC path (\\\\server\\share\\x.db) keeps its server in the path (file:////server/share/x.db: SQLite
+    takes no URI authority), a mapped drive stays a drive letter (no resolve()), and '?', '#' and '%' in names are
+    escaped."""
+    text = os.path.abspath(os.fspath(path)).replace("\\", "/")
+    if text.startswith("//"):
+        prefix = "file://"
+    elif text.startswith("/"):
+        prefix = "file:"
+    else:
+        prefix = "file:/"
+    # quoted as the bytes of the file system's encoding: a POSIX name that is not UTF-8 (surrogate escapes) works
+    return prefix + urllib.parse.quote(os.fsencode(text), safe="/:") + "?" + query
+
+
+# ---- schema of a database file (read-only): a file made by a newer version has tables or columns this one lacks
+Source = str | os.PathLike | sqlite3.Connection | Database
+
+
+@contextlib.contextmanager
+def _reading(source: Source) -> Iterator[sqlite3.Connection]:
+    """A connection to `source`: a Database's or a given connection (under the Database's lock), or a file opened
+    read-only (never created, nothing written to it) and closed afterwards."""
+    if isinstance(source, Database):
+        with source._lock:
+            yield source.conn
+        return
+    if isinstance(source, sqlite3.Connection):
+        yield source
+        return
+    path = Path(source)
+    if not path.is_file():
+        raise FileNotFoundError(f"no database file at {path}")
+    conn = sqlite3.connect(sqlite_uri(path, "mode=ro"), uri=True, timeout=5.0)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _columns(conn: sqlite3.Connection) -> set[str]:
+    tables = [row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\'")]
+    return {f"{table}.{row[0]}" for table in tables
+            for row in conn.execute("SELECT name FROM pragma_table_info(?)", (table,))}
+
+
+def columns_of(source: Source) -> set[str]:
+    """Every "table.column" of a session database (SQLite's own tables left out). `source` is a file path (opened
+    read-only; FileNotFoundError when it is missing), a sqlite3 connection or a Database. Raises sqlite3.Error for a
+    file that is not a readable database."""
+    with _reading(source) as conn:
+        return _columns(conn)
+
+
+@functools.lru_cache(maxsize=1)
+def _known_columns() -> frozenset[str]:
+    from .tracing import SCHEMA as TRACE_SCHEMA  # tracing imports this module
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(SCHEMA)
+        conn.executescript(TRACE_SCHEMA)
+        return frozenset(_columns(conn) | {f"{table}.{column}" for table, column, _ in ADDED_COLUMNS})
+    finally:
+        conn.close()
+
+
+def known_columns() -> frozenset[str]:
+    """Every "table.column" this version creates in a session database: SCHEMA, the trace tables and
+    ADDED_COLUMNS."""
+    return _known_columns()
+
+
+@functools.lru_cache(maxsize=1)
+def known_objects() -> frozenset[tuple[str, str]]:
+    """Every (type, name) of the indexes, triggers and views this version creates in a session database (SCHEMA
+    and the trace tables); SQLite's own automatic indexes are not listed."""
+    from .tracing import SCHEMA as TRACE_SCHEMA  # tracing imports this module
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(SCHEMA)
+        conn.executescript(TRACE_SCHEMA)
+        return frozenset((str(t), str(n)) for t, n in conn.execute(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('index', 'trigger', 'view') AND name NOT LIKE "
+            "'sqlite\\_%' ESCAPE '\\'"))
+    finally:
+        conn.close()
+
+
+def foreign_objects(source: Source) -> list[str]:
+    """The triggers, views and indexes of `source` (see columns_of) this version does not create, as
+    "type name", sorted: a database another program changed, or one made by a newer DreamTeam."""
+    with _reading(source) as conn:
+        found = {(str(t), str(n)) for t, n in conn.execute(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('index', 'trigger', 'view') AND name NOT LIKE "
+            "'sqlite\\_%' ESCAPE '\\'")}
+    return sorted(f"{t} {n}" for t, n in found - known_objects())
+
+
+def unknown_columns(source: Source) -> list[str]:
+    """The "table.column" names of `source` (see columns_of) this version does not know, sorted: not empty for a
+    database made by a newer DreamTeam."""
+    return sorted(columns_of(source) - known_columns())
+
+
+def max_tools_revision(source: Source) -> int | None:
+    """The highest frozen tool-set revision stored in the database's kv (`tools:<member>` records {"rev", ...},
+    tools/frozen.py), None when no member has one (or the file has no kv table). A revision above
+    frozen.TOOLSET_REVISION was written by a newer DreamTeam. Records that are not JSON or carry no integer "rev"
+    are ignored."""
+    from .tools.frozen import KV_PREFIX  # the tools package imports this module
+
+    best: int | None = None
+    with _reading(source) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv'").fetchone():
+            return None
+        rows = conn.execute("SELECT value FROM kv WHERE substr(key, 1, ?) = ?", (len(KV_PREFIX), KV_PREFIX))
+        for (value,) in rows:
+            try:
+                rec = json.loads(value) if isinstance(value, (str, bytes)) else None
+            except ValueError:
+                continue
+            rev = rec.get("rev") if isinstance(rec, dict) else None
+            if isinstance(rev, int) and not isinstance(rev, bool) and (best is None or rev > best):
+                best = rev
+    return best
+
+
+def remap_sql(table: str, column: str, mapping: dict[str, str]) -> tuple[str, list[str]]:
+    """One UPDATE that renames every `mapping` key in `column` at once, so a swap or a chain of names (a name both
+    an old and a new one) stays correct. `table` and `column` are the caller's identifiers, never user input."""
+    whens = " ".join("WHEN ? THEN ?" for _ in mapping)
+    marks = ", ".join("?" for _ in mapping)
+    params = [value for pair in mapping.items() for value in pair] + list(mapping)
+    return f"UPDATE {table} SET {column} = CASE {column} {whens} END WHERE {column} IN ({marks})", params

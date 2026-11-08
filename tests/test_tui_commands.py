@@ -6,15 +6,18 @@ import asyncio
 import os
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from dreamteam.tui import commands, render
+from dreamteam.tui.app import TUI
+from dreamteam.tui.client import HubError
 from dreamteam.tui.commands import COMMANDS, execute, find, session_overrides
 from dreamteam.tui.dialogs import (
     APPROVE, REJECT, ConfirmDialog, MCPApprovalDialog, SelectList, SessionPicker, Option, box, fit, frag_len, wrap,
 )
-from dreamteam.tui.i18n import TEXTS
+from dreamteam.tui.i18n import TEXTS, t
 from dreamteam.tui.input import (
     ALL, CommandInfo, bash_command, default_addressee, did_you_mean, is_bash, load_prefs, members_of, number,
     parse_command, planning_assignee, resolve_member, save_prefs, split_mention, suggest, window,
@@ -142,6 +145,49 @@ def test_member_and_task_suggestions():
     assert [s.description for s in found] == ["в работе", "к работе", "done"]
     assert list(window(20, 0)) == list(range(8)) and list(window(20, 15)) == list(range(8, 16))
     assert list(window(3, 2)) == [0, 1, 2]
+
+
+def test_unlock_suggests_the_locked_paths():
+    locks = [{"path": "docs/AUDIT.md", "owner": ANNA}, {"path": "src", "owner": BORIS}]
+    found = suggest("/unlock ", locks=locks)
+    assert [(s.kind, s.label, s.description) for s in found] == [("path", "docs/AUDIT.md", ANNA),
+                                                                  ("path", "src", BORIS)]
+    assert found[0].apply("/unlock ") == ("/unlock docs/AUDIT.md", len("/unlock docs/AUDIT.md"))
+    found = suggest("/unlock audit", locks=locks)                 # a part of the path, any case
+    assert [s.label for s in found] == ["docs/AUDIT.md"]
+    assert found[0].apply("/unlock audit")[0] == "/unlock docs/AUDIT.md"
+    assert suggest("/unlock nothing", locks=locks) == [] and suggest("/unlock ", locks=[]) == []
+    # the path typed in full comes first, then those starting with it, then the others (in the paths' order)
+    nested = [{"path": "docs/notes.md", "owner": ANNA}, {"path": "notes.md", "owner": BORIS},
+              {"path": "notes.md.bak", "owner": ANNA}]
+    found = suggest("/unlock NOTES.md", locks=nested)
+    assert [s.label for s in found] == ["notes.md", "notes.md.bak", "docs/notes.md"]
+    # the state the suggestions use is reloaded when a lock is taken or dropped
+    from dreamteam.tui.app import REFRESH_ON
+
+    assert "file.locked".startswith(REFRESH_ON) and "file.unlocked".startswith(REFRESH_ON)
+    assert not "file.changed".startswith(REFRESH_ON)
+
+
+def test_enter_after_unlock_sends_the_path_as_typed():
+    """Enter never swaps a typed path for another locked path that contains it; Tab or the arrows complete."""
+    from prompt_toolkit.buffer import Buffer
+
+    from dreamteam.tui.app import TUI
+
+    locks = [{"path": "docs/notes.md", "owner": ANNA}]
+    sent: list[str] = []
+    applied: list[str] = []
+    for text, selected in (("/unlock notes.md", 0), ("/unlock ", 0), ("/unlock notes.md", 1)):
+        buffer = Buffer()
+        buffer.text = text
+        stub = SimpleNamespace(suggestions=suggest(text, locks=locks * 2), selected=selected, buffer=buffer,
+                               input_mode=None, _submit=sent.append,
+                               _apply_suggestion=lambda s: applied.append(s.insert))
+        TUI._on_enter(stub)
+    assert sent == ["/unlock notes.md"] and applied == ["docs/notes.md", "docs/notes.md"]
+    assert [s.label for s in suggest("/unl", commands=[CommandInfo("unlock", "u", args="path", required=True)])] == \
+        ["/unlock path"]
 
 
 # ---- addressee ------------------------------------------------------------------------------------
@@ -398,6 +444,18 @@ async def test_approve_and_reject_settle_tasks_or_mcp_servers():
     assert [c for c in app.calls if c[0] == "mcp"] == [("mcp", "calc", True, "", ""), ("mcp", "calc", False, "not safe", "")]
 
 
+async def test_unlock_removes_a_members_lock():
+    unlock = find("unlock")
+    assert unlock.usage("en") == "/unlock path" and unlock.usage("ru") == "/unlock путь"
+    assert unlock.session and unlock.required and not unlock.launcher
+    app = HubApp(attached=True)
+    await execute(app, "/unlock docs/AUDIT.md")
+    await execute(app, '/unlock "my docs/a b.md"')
+    await execute(app, "/unlock")
+    assert app.acts == [("file_unlock", {"path": "docs/AUDIT.md"}), ("file_unlock", {"path": "my docs/a b.md"})]
+    assert "file_unlock ok" in app.text and "Usage: /unlock path" in app.text
+
+
 async def test_approve_passes_a_typed_digest_of_an_mcp_server():
     app = HubApp(attached=True)
     await execute(app, "/approve calc 3f2a9c01d4e5")
@@ -518,6 +576,43 @@ async def test_roles_lists_the_catalog_and_one_role():
     swarm_hub = HubApp(mode="swarm")
     await execute(swarm_hub, "/roles")
     assert "No current session" in swarm_hub.text
+
+
+async def test_model_lists_prices_and_warns_about_an_unpriced_default():
+    """`/model NAME` on a profile whose tokens count as $0 (public view price_source "none" / "partial") adds a
+    warning line after setting it; a priced one, or an older hub without price_source, adds none."""
+    app = HubApp()
+    view = {"agents": {"default_model": "claude", "max_steps_per_turn": 40}, "models": {
+        "claude": {"provider": "anthropic", "model": "claude-opus-5-5", "price_source": "table"},
+        "remote": {"provider": "openai", "model": "some-model-v1", "input_price": None, "output_price": None,
+                   "price_source": "none"},
+        "half": {"provider": "openai", "model": "kimi", "input_price": 0.5, "output_price": None,
+                 "price_source": "partial"},
+        "old": {"provider": "openai", "model": "x", "input_price": None, "output_price": None}}}
+    updates: list[dict] = []
+
+    async def settings():
+        return {"settings": view}
+
+    async def update_settings(update):
+        updates.append(update)
+        return {}
+
+    app.client.settings, app.client.update_settings = settings, update_settings
+    await execute(app, "/model")
+    assert "Prices" in app.text and "no prices" in app.text and "no output_price" in app.text
+    for name in ("claude", "old"):
+        app.out.clear()
+        await execute(app, f"/model {name}")
+        assert app.out == [f"  ⎿  Default profile: {name} (new sessions and new hires)"], app.out
+    await execute(app, "/model remote")
+    assert " ".join(app.out[-1].split()) == (
+        '⚠ Profile "remote" has no input_price, output_price: those tokens count as $0 and the budget does not see '
+        "them (unless the provider reports the cost). Prices: /settings")
+    await execute(app, "/model half")
+    assert app.out[-1].startswith('⚠ Profile "half" has no output_price: ')
+    assert [u["agents"]["default_model"] for u in updates] == ["claude", "old", "remote", "half"]
+    assert updates[-1]["agents"]["max_steps_per_turn"] == 40
 
 
 async def test_team_sets_the_starting_team_of_new_sessions():
@@ -685,6 +780,116 @@ def test_cd_folder_resolution_and_states(tmp_path):
         ["empty", "files", "file", "missing"]
     assert same_folder(tmp_path / "full", str(tmp_path / "x" / ".." / "full"))
     assert not same_folder(tmp_path / "full", tmp_path / "empty") and not same_folder(None, tmp_path)
+
+
+class CopyApp(FakeApp):
+    """A stand-in with the TUI's own /copy-from and new-session code; its hub client records the creates (and
+    answers with `answer`, or raises it)."""
+
+    choose_copy_source = TUI.choose_copy_source
+    new_session = TUI.new_session
+    _print_copy_result = TUI._print_copy_result
+    _print_folder_result = TUI._print_folder_result
+
+    def __init__(self, local: bool = True, attached: bool = False, answer: Any = None):
+        super().__init__(attached=attached)
+        self.local = local
+        self.overrides: dict = {}
+        self.title_override = self.workspace_override = self.copy_from_override = None
+        self.skills_override: list[str] = []
+        self.created: list[dict] = []
+
+        async def create_session(title, goal, **kw):
+            self.created.append(kw)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer or {"id": "001-new", "title": "New"}
+
+        self.client.create_session = create_session
+
+    def t(self, key: str, **kw: Any) -> str:
+        return t(self.ctx.lang, key, **kw)
+
+    def print(self, renderable) -> None:   # (wide: temp paths are long)
+        self.out.append(render.to_plain(renderable, 400))
+
+    def info(self, text: str) -> None:
+        self.print(render.info(self.ctx, text))
+
+    def error(self, text: str) -> None:
+        self.print(render.error(self.ctx, text))
+
+    def set_hint(self, text) -> None:
+        pass
+
+    async def attach(self, summary, **kw) -> None:
+        self.calls.append(("attach", summary["id"]))
+
+
+async def test_copy_from_command_chooses_the_next_sessions_files(tmp_path, monkeypatch):
+    """`/copy-from [path|--none]` (docs/TUI.md §4.3): the folder or .zip whose copy the next new session gets, with
+    or without an attached session; the TUI's `new_session` sends it and forgets it once the hub created the
+    session (kept for another try when the hub refused)."""
+    cmd = find("copy-from")
+    assert cmd.launcher and not cmd.session and cmd.usage("en") == "/copy-from [path|--none]"
+    assert cmd.usage("ru") == "/copy-from [путь|--none]"
+    names = [c.name for c in COMMANDS]
+    assert names.index("copy-from") == names.index("cd") + 1
+    monkeypatch.chdir(tmp_path)
+    app = CopyApp()
+    await execute(app, "/copy-from")
+    assert said(app).endswith("No copy: /copy-from <folder or .zip> copies files into the next new session")
+    await execute(app, "/copy-from proj")
+    assert app.copy_from_override == str(tmp_path / "proj")
+    assert said(app).endswith(f"The next new session gets a copy of the files in {tmp_path / 'proj'}")
+    await execute(app, "/copy-from")
+    assert said(app).endswith(f"The next new session gets a copy of the files in {tmp_path / 'proj'}")
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    await execute(app, "/copy-from notes.txt")
+    assert said(app).endswith(f"{tmp_path / 'notes.txt'} is a file but not a .zip archive")
+    assert app.out[-1].startswith("⚠") and app.copy_from_override == str(tmp_path / "proj")   # unchanged
+    (tmp_path / "work.zip").write_bytes(b"PK")
+    await execute(app, f'/copy-from "{tmp_path / "work.zip"}"')
+    assert app.copy_from_override == str(tmp_path / "work.zip")
+    await execute(app, "/copy-from --none")
+    assert app.copy_from_override is None and said(app).endswith("The next new session gets no copy of files")
+    attached = CopyApp(attached=True)   # a session is attached: still about the next new one
+    await execute(attached, "/copy-from proj")
+    assert attached.copy_from_override == str(tmp_path / "proj")
+
+    remote = CopyApp(local=False)   # another computer's hub: an absolute path only, passed on as typed
+    await execute(remote, "/copy-from proj")
+    assert remote.copy_from_override is None and remote.out[-1].startswith("⚠")
+    await execute(remote, "/copy-from /srv/work/notes.txt")
+    assert remote.copy_from_override == "/srv/work/notes.txt"   # (the hub checks it then)
+    swarm_hub = CopyApp()
+    swarm_hub.client.mode = "swarm"
+    await execute(swarm_hub, "/copy-from proj")
+    assert swarm_hub.copy_from_override is None and "needs a session launcher" in swarm_hub.text
+
+    # new_session sends it and forgets it after a success; a refusal keeps it
+    refused = CopyApp(answer=HubError(409, "already has files"))
+    refused.copy_from_override = "/w/p"
+    with pytest.raises(HubError):
+        await refused.new_session("Goal")
+    assert refused.created[-1]["copy_from"] == "/w/p" and refused.copy_from_override == "/w/p"
+    done = CopyApp(answer={"id": "001-new", "title": "New",
+                           "copy_result": {"source": "/w/p", "files": 3, "bytes": 2048, "links_count": 1,
+                                           "excluded_count": 2, "special_count": 0}})
+    done.copy_from_override = "/w/p"
+    await done.new_session("Goal")
+    assert done.created[-1]["copy_from"] == "/w/p" and done.copy_from_override is None
+    assert ("attach", "001-new") in done.calls
+    assert "Copied 3 files (2.0 KB) from /w/p into the session folder" in done.text
+    assert "Left out: 1 links, 2 folders by name, 0 special files" in done.text
+    quiet = CopyApp(answer={"id": "001-new", "title": "New", "copy_result": {"source": "/w/p", "files": 0,
+                                                                              "bytes": 0}})
+    quiet.copy_from_override = "/w/p"
+    await quiet.new_session("Goal")
+    assert "Copied 0 files (0 bytes)" in quiet.text and "Left out" not in quiet.text
+    plain = CopyApp()
+    await plain.new_session("Goal")
+    assert plain.created[-1]["copy_from"] is None and "Copied" not in plain.text
 
 
 def test_cd_preview_words_the_question(tmp_path):

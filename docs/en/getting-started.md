@@ -42,10 +42,10 @@ in the same process, so the web board at `http://127.0.0.1:8765` is available to
 1. On the **"Settings" → "Models and endpoints"** tab, choose a provider and a model, give the key (the name of an
    environment variable, for example `ANTHROPIC_API_KEY`, or the key itself) and click "Check".
 2. On the **"Sessions"** tab, click **"Start a new session"** and describe the goal: the first line becomes the title,
-   the rest becomes the description. You can also put together the starting team there. Tick **"Clarify the goal
-   first"** if the goal has open points: the planner then asks you about them before it plans, and the other agents
-   wait ([clarify mode](features.md)). The swarm makes a plan and starts working, and you land on the session board
-   `/s/<id>/`.
+   the rest becomes the description. You can also put together the starting team there or pick a saved team. Tick
+   **"Clarify the goal first"** if the goal has open points: the planner then asks you about them before it plans,
+   and the other agents wait ([clarify mode](features.md)). The swarm makes a plan and starts working, and you land on
+   the session board `/s/<id>/`.
 
 Sessions and settings are stored in the DreamTeam home folder: `~/DreamTeam` (set it with `--home` or the
 `DREAMTEAM_HOME` variable). It holds `dreamteam.toml` with the global settings and `sessions/<id>/` with the data,
@@ -56,11 +56,13 @@ Commands:
 
 | command | what it does |
 |---|---|
-| `dreamteam ["goal"]` / `dreamteam tui` | terminal interface; `-c` continues the last session, `-r [ID]` picks or opens a session; for a new session: `--model`, `--agents`, `--team "architect, developer*2"`, `--max-agents`, `--budget`, `--title`, `--workspace DIR`, `--clarify` / `--no-clarify` (clarify mode for the sessions this window creates) |
-| `dreamteam -p "goal"` | no interface: run the goal and print the result (`--output-format text/json/stream-json`, `--verbose`, `--timeout`, `-c`/`-r ID` for the next instruction to an existing session, `--workspace DIR` for the folder of a new session, `--clarify` only with `--no-auto-reply`); text from stdin is added to the request |
-| `dreamteam serve [HOME]` | home page, settings, the boards of all sessions and MCP (`--host`, `--port`, `--goal` and `--title` (with `--workspace DIR`, `--clarify`), `--no-browser`, `--no-console`); without a terminal, `dreamteam` runs this one |
+| `dreamteam ["goal"]` / `dreamteam tui` | terminal interface; `-c` continues the last session, `-r [ID]` picks or opens a session; for a new session: `--model`, `--agents`, `--team "architect, developer*2"` or `--team NAME` (a saved team), `--max-agents`, `--budget`, `--title`, `--workspace DIR`, `--copy-from DIR\|ZIP` (the session works on a [copy of these files](projects.md#working-on-a-copy-of-files)), `--clarify` / `--no-clarify` (clarify mode for the sessions this window creates) |
+| `dreamteam -p "goal"` | no interface: run the goal and print the result (`--output-format text/json/stream-json`, `--verbose`, `--timeout`, `-c`/`-r ID` for the next instruction to an existing session, `--workspace DIR` for the folder of a new session, `--copy-from DIR\|ZIP` for a copy of files in it, `--clarify` only with `--no-auto-reply`); text from stdin is added to the request |
+| `dreamteam serve [HOME]` | home page, settings, the boards of all sessions and MCP (`--host`, `--port`, `--goal` and `--title` (with `--workspace DIR`, `--copy-from DIR\|ZIP`, `--clarify`), `--no-browser`, `--no-console`); without a terminal, `dreamteam` runs this one |
 | `dreamteam sessions` / `dreamteam status` | list of sessions and whether the server is running |
 | `dreamteam sessions rm ID [ID …]` | delete sessions with their board, messages, workspace files and traces (asks for confirmation; `--yes` skips the question); a folder outside the session (your project or a folder after `/cd`) stays where it is |
+| `dreamteam export FOLDER` | write the settings, skills, MCP servers and sessions into a folder for another computer or a backup (`--include settings,skills,mcp,sessions`, `--session ID`, `--dry-run`); API keys and `env` values stay here, see [Moving to another computer](transfer.md) |
+| `dreamteam import FOLDER` | add what is new from such a folder and rewrite what changed; nothing the export does not carry is deleted (shows the plan and asks for confirmation; `--yes` or `-y` skips the question, `--dry-run` shows the plan only, `--include`, `--session ID`); refused while DreamTeam runs this home |
 | `dreamteam console [--session ID]` | console chat with a running session (`/help` lists the commands) |
 | `dreamteam traces [Agent] [--session ID] [--id N] [--span N --context] [--status failed] [--json]` | agent traces in the terminal (with or without the server) |
 | `dreamteam mcp` | DreamTeam as an MCP server over stdio (a proxy to the running server or its own process) |

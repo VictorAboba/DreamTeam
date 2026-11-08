@@ -110,6 +110,17 @@ def cost_of(profile: ModelProfile, usage: Usage, model: str | None = None) -> fl
     return total / 1_000_000
 
 
+def uncounted_fields(profile: ModelProfile, usage: Usage, model: str | None = None) -> tuple[str, ...]:
+    """The price fields whose tokens cost_of counted as $0 for want of a price (ModelProfile.missing_prices); ()
+    when the provider reported the cost and for the scripted provider (tests and demos have no bill)."""
+    if getattr(usage, "cost_usd", None) is not None:
+        return ()
+    if (getattr(profile, "provider", None) or "").strip().lower() == "scripted":
+        return ()
+    missing = getattr(profile, "missing_prices", None)
+    return tuple(missing(model)) if callable(missing) else ()
+
+
 def parse_arguments(raw: Any) -> tuple[dict, str | None]:
     """Parse tool-call arguments (JSON text or dict) into a dict; returns (args, parse_error)."""
     if isinstance(raw, dict):

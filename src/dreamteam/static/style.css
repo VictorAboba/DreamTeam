@@ -114,7 +114,7 @@ code { font-family: var(--mono); font-size: .92em; }
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
 .spacer { margin-left: auto; }
-.err-text { color: var(--err); white-space: pre-wrap; }
+.err-text { color: var(--err); white-space: pre-wrap; overflow-wrap: anywhere; } /* a long path in the message */
 /* small caps of the interface: column heads, panel and section titles, stat labels */
 .goal-label, .column-head, .sidebar-head h2, .section-title, .stat-row > span {
   font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;
@@ -474,6 +474,7 @@ label.field .hint { font-weight: 400; color: var(--faint); }
 .file-name .ic { color: var(--faint); margin-right: 3px; }
 .file-name .ic-folder { color: var(--accent); }
 .lock { color: var(--warn); }
+.file-entry .file-unlock { margin-left: auto; flex: none; font-size: 11px; font-family: var(--font); }
 .file-entry .size { color: var(--faint); font-size: 11px; flex: none; }
 .file-head { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--border); }
 .file-path { font: 600 12.5px var(--mono); overflow-wrap: anywhere; flex: 1; min-width: 0; }

@@ -53,7 +53,8 @@ _KNOWN_SECRETS = {
 # swarm's skills, is set for the shell.) The sandbox's markers of the offline firewall (netoff.py) are no business of
 # the commands either, and the hub token (hubauth.py) never reaches them, whatever shell.pass_env says.
 _INTERNAL_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR",
-                           "DREAMTEAM_OFFLINE_USER", "DREAMTEAM_OFFLINE_FIREWALL", HUB_TOKEN_ENV,
+                           "DREAMTEAM_MCP_LIBRARY_DIR", "DREAMTEAM_OFFLINE_USER", "DREAMTEAM_OFFLINE_FIREWALL",
+                           HUB_TOKEN_ENV,
                            HUB_DIGEST_ENV})
 
 POWERSHELL_UTF8 = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "

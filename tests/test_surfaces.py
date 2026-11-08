@@ -1270,9 +1270,11 @@ def test_sandbox_command_gives_each_home_a_volume_of_skill_environments(tmp_path
     assert "DREAMTEAM_SKILL_ENVS_DIR=/dreamteam/skill-envs" in cmd[:image]
     assert "UV_CACHE_DIR=/dreamteam/skill-envs/.cache/uv" in cmd[:image]
     assert not any("host-envs" in m for m in mounts)
-    passing = Config.from_dict(project, {"shell": {"pass_env": ["DREAMTEAM_SKILL_ENVS_DIR", "UV_CACHE_DIR"]}})
+    passing = Config.from_dict(project, {"shell": {"pass_env": ["DREAMTEAM_SKILL_ENVS_DIR", "UV_CACHE_DIR",
+                                                                "DREAMTEAM_MCP_LIBRARY_DIR"]}})
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv"))
-    assert not set(docker_module.env_passthrough(passing)) & {"DREAMTEAM_SKILL_ENVS_DIR", "UV_CACHE_DIR"}
+    assert not set(docker_module.env_passthrough(passing)) & {"DREAMTEAM_SKILL_ENVS_DIR", "UV_CACHE_DIR",
+                                                             "DREAMTEAM_MCP_LIBRARY_DIR"}
 
 
 def test_sandbox_command_mounts_the_host_skills_library_read_only(tmp_path, monkeypatch):

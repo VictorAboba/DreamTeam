@@ -24,6 +24,7 @@ from dreamteam.models import USER, AgentKind, AgentStatus, Status
 from dreamteam.shell import resolve_shell
 from dreamteam.swarm import Swarm
 from dreamteam.tools import REGISTRY, ToolContext, call_tool, prepare_args, schemas_for, tools_for
+from dreamteam.tools.fmt import item_time
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 
@@ -100,7 +101,7 @@ SPEC_AUDIENCE = {  # docs/SPEC.md §12
     "send_message": "LEU", "read_messages": "LEU", "agents": "LEU", "hire_agent": "LEU", "retire_agent": "LEU",
     "update_notes": "L", "wait": "L", "goal_complete": "LE", "trigger_create": "LEU", "trigger_list": "LEU",
     "trigger_delete": "LEU", "read_file": "LEU", "write_file": "LE", "edit_file": "LE", "list_files": "LEU",
-    "lock_file": "LE", "shell": "LE", "jobs": "LEU", "job_stop": "LEU",
+    "lock_file": "LE", "file_unlock": "U", "shell": "LE", "jobs": "LEU", "job_stop": "LEU",
     "mcp_create": "LE", "mcp_list": "LEU", "mcp_tools": "LEU", "mcp_call": "LE",
     # join_swarm is called before joining, i.e. as the user ("E (MCP only)")
     "join_swarm": "EU", "wait_for_events": "EU", "set_goal": "U", "swarm_status": "EU", "swarm_control": "U",
@@ -713,12 +714,56 @@ async def test_file_tools(swarm):
     assert "Locked src/app.py" in await ok(swarm, a, "lock_file", {"path": "src/app.py", "minutes": "5"})
     text = await err(swarm, b, "write_file", {"path": "src/app.py", "content": "mine"})
     assert f"locked by {a}" in text
+    # the refused member is told it will be woken, not to message the holder (docs/SPEC.md §7 "Lock waiters")
+    assert "You will be notified when it is free; there is no need to message them" in text and "`wait`" in text
+    assert "Message them" not in text and "Ask them" not in text
     assert "not by you" in await err(swarm, b, "lock_file", {"path": "src/app.py", "unlock": True})
     assert await ok(swarm, a, "lock_file", {"path": "src/app.py", "unlock": "true"}) == "Unlocked src/app.py."
+    assert notifications(swarm, b)[-1] == "n_lock_free"
     await ok(swarm, b, "write_file", {"path": "src/app.py", "content": "mine"})
     # the user reads files but does not write them
     assert "mine" in await ok(swarm, USER, "read_file", {"path": "src/app.py"})
     assert "not available to the user" in await err(swarm, USER, "write_file", {"path": "x", "content": "y"})
+
+
+async def test_lock_waits_through_the_tools_and_the_users_unlock(swarm):
+    """docs/SPEC.md §7 "Lock waiters": an external member's refusal names wait_for_events (it has no `wait`), `wait`
+    names the paths its caller was refused, task_complete reminds the member of the locks it still holds (none is
+    released), and the user's file_unlock removes a member's lock and wakes the members waiting for it."""
+    a, b = llm_members(swarm)
+    ext = await join(swarm)
+    await ok(swarm, a, "lock_file", {"path": "docs/AUDIT.md"})
+    text = await err(swarm, ext, "write_file", {"path": "docs/AUDIT.md", "content": "x"})
+    assert text.endswith("Meanwhile do other work, or call `wait_for_events` if nothing else is left.")
+    await err(swarm, b, "lock_file", {"path": "docs"})
+    runtime = FakeRuntime()
+    assert await ok(swarm, b, "wait", {}, runtime) == ("OK, waiting. You will be woken up by new events, also when "
+                                                        "docs, which you were refused, is free.")
+    assert runtime.ended == 1
+    task = swarm.board.create(USER, "Audit", goal="g", assignee=a)
+    swarm.board.claim(a, task.id)
+    text = await ok(swarm, a, "task_complete", {"task_id": task.id, "result": "done"})
+    assert text.startswith(f"Task #{task.id} ") and ". You still hold locks on: docs/AUDIT.md (until " in text
+    assert text.endswith("). Unlock those you no longer need (`lock_file` with unlock=true).")
+    assert [lk["path"] for lk in swarm.workspace.locks()] == ["docs/AUDIT.md"]
+    # the user's unlock: a user tool only (not in the LLM tools array)
+    assert "file_unlock" not in {s["name"] for s in schemas_for("llm", "en")}
+    assert "not available to swarm agents" in await err(swarm, a, "file_unlock", {"path": "docs/AUDIT.md"})
+    assert await ok(swarm, USER, "file_unlock", {"path": "docs/AUDIT.md"}) == \
+        f"Unlocked docs/AUDIT.md (it was locked by {a})."
+    assert notifications(swarm, b)[-1] == "n_lock_free" and notifications(swarm, ext)[-1] == "n_lock_free"
+    assert "n_lock_free" not in notifications(swarm, a)   # the holder gets no note
+    assert await err(swarm, USER, "file_unlock", {"path": "docs/AUDIT.md"}) == \
+        "Error: 'docs/AUDIT.md' is not locked; no file is locked now."
+    assert await ok(swarm, b, "wait", {}, FakeRuntime()) == "OK, waiting. You will be woken up by new events."
+    # once the goal is done the release is quiet (n_lock_free): `wait` promises no wake-up for the refused file
+    await ok(swarm, a, "lock_file", {"path": "notes.md"})
+    await err(swarm, b, "lock_file", {"path": "notes.md"})
+    assert "notes.md, which you were refused, is free" in await ok(swarm, b, "wait", {}, FakeRuntime())
+    swarm.set_goal(USER, "Ship")
+    swarm.complete_goal(a, "all done")
+    assert await ok(swarm, b, "wait", {}, FakeRuntime()) == "OK, waiting. You will be woken up by new events."
+    assert swarm.workspace.lock_waits(b) == ["notes.md"]
 
 
 async def test_shell_tool(swarm):
@@ -1210,7 +1255,8 @@ async def test_trigger_tools(swarm):
     assert await ok(swarm, a, "trigger_create", {"condition": "done(1)", "note": "start the integration"}) == \
         "Trigger #1 created: done(1)."
     assert await ok(swarm, a, "trigger_create", {"condition": "every(600)", "once": True}) == \
-        "Trigger #2 created: every(600) (repeating)."
+        ("Trigger #2 created: every(600) (repeating; it wakes you at most once every 3 min, with the fires in between "
+         "in one notice).")
     text = await ok(swarm, b, "trigger_create", {"condition": "status(1) == failed", "once": "false",
                                                   "actions": [{"type": "message", "to": ["user"], "text": "#1 failed"}]})
     assert text == "Trigger #3 created: status(1) == failed (repeating); actions: message."
@@ -1237,6 +1283,62 @@ async def test_trigger_tools(swarm):
     assert await ok(swarm, b, "trigger_list") == "You have no active triggers (all=true lists everyone's)."
     # the user may own triggers too
     await ok(swarm, USER, "trigger_create", {"condition": "goal_done()"})
+
+
+async def test_trigger_tools_explain_file_changed(swarm):
+    """The frozen trigger_create description cannot say how file_changed() fires: its result does, with the settings
+    in force; trigger_list shows the changes not fired yet (docs/SPEC.md §8, §12)."""
+    a, _ = llm_members(swarm)
+    assert await ok(swarm, a, "trigger_create", {"condition": "file_changed('docs/AUDIT.md')"}) == (
+        "Trigger #1 created: file_changed('docs/AUDIT.md') (file_changed() becomes true once the file has stopped "
+        "changing: after 1 min without a change or once the agents who changed it have ended their turns, at the "
+        "latest 5 min after the first change, and your own write_file/edit_file edits do not count).")
+    swarm.config.agents.file_settle_seconds, swarm.config.agents.file_max_wait_seconds = 120, 0
+    assert "(file_changed() becomes true once the file has stopped changing: after 2 min without a change or once " \
+           "the agents who changed it have ended their turns, and your own" in await ok(
+               swarm, a, "trigger_create", {"condition": "file_exists('a') and file_changed('a')"})
+    swarm.config.agents.file_settle_seconds = 0
+    assert await ok(swarm, a, "trigger_create", {"condition": "file_changed('x.md')"}) == (
+        "Trigger #3 created: file_changed('x.md') (file_changed() does not count your own write_file/edit_file edits).")
+    swarm.config.agents.file_settle_seconds = 60
+    await swarm.workspace.write(USER, "docs/AUDIT.md", "draft")   # the user's edit: the quiet window decides
+    swarm.triggers.evaluate_all()
+    line = next(x for x in (await ok(swarm, a, "trigger_list")).splitlines() if x.startswith("#1 "))
+    assert re.search(r"\(fired 0x, last never\) pending: docs/AUDIT\.md changed 1x, last \d+ s ago$", line), line
+    # a repeating one: how it fires, then the wake limit, in one parenthesis
+    swarm.config.agents.file_max_wait_seconds = 300
+    assert await ok(swarm, a, "trigger_create", {"condition": "file_changed('docs/AUDIT.md')", "once": False}) == (
+        "Trigger #4 created: file_changed('docs/AUDIT.md') (repeating; file_changed() becomes true once the file has "
+        "stopped changing: after 1 min without a change or once the agents who changed it have ended their turns, "
+        "at the latest 5 min after the first change, and your own write_file/edit_file edits do not count; it wakes "
+        "you at most once every 3 min, with the fires in between in one notice).")
+    # the user's repeating triggers are never held; without a wake action nothing wakes anyone
+    assert await ok(swarm, USER, "trigger_create", {"condition": "every(60)"}) == \
+        "Trigger #5 created: every(60) (repeating)."
+    assert await ok(swarm, a, "trigger_create", {"condition": "every(60)", "actions": [
+        {"type": "set_status", "task_id": 1, "status": "todo"}]}) == \
+        "Trigger #6 created: every(60) (repeating); actions: set_status."
+    swarm.config.agents.trigger_wake_seconds = 0
+    assert await ok(swarm, a, "trigger_create", {"condition": "every(60)"}) == "Trigger #7 created: every(60) (repeating)."
+
+
+async def test_trigger_list_shows_the_held_fires(swarm):
+    """A repeating trigger's fires within [agents] trigger_wake_seconds are held: trigger_list says how many and
+    when they wake the owner (docs/SPEC.md §8)."""
+    a, _ = llm_members(swarm)
+    flag = swarm.workspace.root / "flag"
+    trig = swarm.triggers.create(a, "file_exists('flag')", once=False)
+    for _ in range(3):                                   # three edges; nothing awaits in between (the engine loop)
+        flag.write_text("x", encoding="utf-8")
+        swarm.triggers.evaluate_all()
+        flag.unlink()
+        swarm.triggers.evaluate_all()
+    state = swarm.triggers.get(trig["id"])
+    assert state["fire_count"] == 3 and state["held"] == 2
+    line = (await ok(swarm, a, "trigger_list")).splitlines()[0]
+    wake = re.escape(item_time(state["wake_at"], time.time()))
+    assert re.search(rf"\(fired 3x, last \d+s ago; 2 fires held, wake-up at {wake}\)$", line), line
+    assert notifications(swarm, a).count("n_trigger") == 1
 
 
 # ================================================================== MCP workshop

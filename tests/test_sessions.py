@@ -7,9 +7,11 @@ import datetime
 import json
 import os
 import socket
+import sqlite3
 import sys
 import threading
 import tomllib
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -20,8 +22,8 @@ from dreamteam import settings as st
 from dreamteam.config import Config, render_template
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER
-from dreamteam.sessions import (LEGACY_ID, TRASH_PREFIX, SessionError, SessionManager, pending_goal, read_stats,
-                                slugify)
+from dreamteam.sessions import (LEGACY_ID, TRASH_PREFIX, UID_NAMESPACE, SessionError, SessionManager, new_uid,
+                                pending_goal, read_stats, rename_member_profiles, session_uid, slugify)
 
 
 def _raw(tmp_path: Path) -> dict[str, Any]:
@@ -791,12 +793,25 @@ async def test_profile_renames_and_deletions_follow_into_sessions(tmp_path):
     overrides = {"agents": {"default_model": "fast", "max_steps_per_turn": 5}}
     pinned = (await manager.create("Pinned", start=False, overrides=overrides))["id"]
     other = (await manager.create("Other", start=False, overrides={"agents": {"default_model": "fast"}}))["id"]
+    # members hired on the profile: in a running session, and in one that was stopped (its database not open)
+    live = (await manager.create("Live", start=True))["id"]
+    swarm = manager.swarms[live]
+    hired = await swarm.hire(USER, "Tester", model="fast")
+    stopped = (await manager.create("Stopped", start=True))["id"]
+    parked = await manager.swarms[stopped].hire(USER, "Tester", model="fast")
+    await manager.stop(stopped)
     events: list[dict] = []
     manager.listen(events.append)
     view = manager.settings_view()
     view["models"]["cheap"] = dict(view["models"].pop("fast"), renamed_from="fast")
     await manager.update_settings({"models": view["models"]})
     assert manager.meta(pinned)["overrides"]["agents"] == {"default_model": "cheap", "max_steps_per_turn": 5}
+    # the member keeps its profile under the new name instead of falling back to the default one
+    assert swarm.member(hired)["model"] == "cheap" and swarm.runtimes[hired].profile_name == "cheap"
+    assert swarm.runtimes[hired].llm.profile.name == "cheap"
+    assert sorted(m["model"] for m in swarm.members()) == ["cheap", "default"]  # the starter is untouched
+    assert stopped not in manager.swarms and (await manager.load(stopped)).member(parked)["model"] == "cheap"
+    assert not (manager.dir_of(other) / ".dreamteam" / "swarm.db").exists()  # a session never started: no file
     view = manager.settings_view()
     view["models"].pop("cheap")  # deleting a profile a session uses no longer blocks the save
     await manager.update_settings({"models": view["models"]})
@@ -806,6 +821,106 @@ async def test_profile_renames_and_deletions_follow_into_sessions(tmp_path):
     assert summary["model_profile"] == "default" and summary["config_error"] is None
     assert {(e["session"], e["change"]) for e in events} >= {(pinned, "updated"), (other, "updated"),
                                                              (None, "settings")}
+    # a deleted profile: agents.model keeps the name, the member's calls use the default profile (Swarm.make_llm)
+    assert swarm.member(hired)["model"] == "cheap" and swarm.runtimes[hired].llm.profile.name == "default"
+    await manager.shutdown()
+
+
+async def test_a_profile_rename_reaches_every_session_database_and_never_fails_the_save(tmp_path, caplog):
+    """A session that is not loaded is renamed in its database directly: the main session too; a damaged file is
+    logged and left alone, one without an agents table (an older version) is skipped, nothing creates a file."""
+    from dreamteam.db import Database
+
+    home = _home(tmp_path)
+    main = Database(home / ".dreamteam" / "swarm.db")
+    for name, model in (("Anna", "fast"), ("Boris", "default"), ("Vera", None)):
+        main.execute("INSERT INTO agents(name, kind, role, model, status) VALUES (?, ?, 'Tester', ?, 'idle')",
+                     (name, "llm" if model else "external", model))
+    main.close()
+    manager = _manager(home)
+    damaged, bare, fresh = [(await manager.create(t, start=False))["id"] for t in ("Damaged", "Bare", "Fresh")]
+    garbage = b"this is not a database " * 200
+    (manager.dir_of(damaged) / ".dreamteam").mkdir(parents=True, exist_ok=True)
+    (manager.dir_of(damaged) / ".dreamteam" / "swarm.db").write_bytes(garbage)
+    (manager.dir_of(bare) / ".dreamteam").mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(manager.dir_of(bare) / ".dreamteam" / "swarm.db")
+    conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
+    conn.close()
+    view = manager.settings_view()
+    view["models"]["cheap"] = dict(view["models"].pop("fast"), renamed_from="fast")
+    await manager.update_settings({"models": view["models"]})
+    assert "cheap" in st.read_raw(home)["models"]
+    conn = sqlite3.connect(home / ".dreamteam" / "swarm.db")
+    try:
+        assert dict(conn.execute("SELECT name, model FROM agents")) == {"Anna": "cheap", "Boris": "default",
+                                                                        "Vera": None}
+    finally:
+        conn.close()
+    assert (manager.dir_of(damaged) / ".dreamteam" / "swarm.db").read_bytes() == garbage
+    assert "could not rename the model profiles of the members in" in caplog.text
+    conn = sqlite3.connect(manager.dir_of(bare) / ".dreamteam" / "swarm.db")
+    try:
+        assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")] == ["kv"]
+    finally:
+        conn.close()
+    assert not (manager.dir_of(fresh) / ".dreamteam" / "swarm.db").exists()
+    assert rename_member_profiles(manager.dir_of(fresh) / ".dreamteam" / "swarm.db", {"cheap": "x"}) == 0
+    assert not (manager.dir_of(fresh) / ".dreamteam" / "swarm.db").exists()
+    assert rename_member_profiles(home / ".dreamteam" / "swarm.db", {"cheap": "fast", "nope": "x"}) == 1
+
+
+async def test_a_swap_and_a_chain_of_profile_names_in_one_save_are_followed(tmp_path):
+    """fast <-> default in one save: the members keep their own profile (a loaded session and a stopped one), a
+    session's default profile and the global default follow; a chain A -> B, B -> C moves each set of members once.
+    A card that still has its name and was not renamed keeps it."""
+    swap = {"default": {"renamed_from": "fast"}, "fast": {"renamed_from": "default"}}
+    assert st.profile_renames({"models": swap}) == {"fast": "default", "default": "fast"}
+    chain = {"B": {"renamed_from": "A"}, "C": {"renamed_from": "B"}}
+    assert st.profile_renames({"models": chain}) == {"A": "B", "B": "C"}
+    assert st.profile_renames({"models": {"A": {}, "B": {"renamed_from": "A"}}}) == {}
+    manager = _manager(_home(tmp_path))
+    pinned = (await manager.create("Pinned", start=False, overrides={"agents": {"default_model": "fast"}}))["id"]
+    live = (await manager.create("Live", start=True))["id"]
+    swarm = manager.swarms[live]
+    on_fast = await swarm.hire(USER, "Tester", model="fast")
+    on_default = await swarm.hire(USER, "Tester", model="default")
+    stopped = (await manager.create("Stopped", start=True))["id"]
+    parked = await manager.swarms[stopped].hire(USER, "Tester", model="fast")
+    await manager.stop(stopped)
+    view = manager.settings_view()
+    fast, default = view["models"]["fast"], view["models"]["default"]
+    await manager.update_settings({"models": {"default": dict(fast, renamed_from="fast"),
+                                              "fast": dict(default, renamed_from="default")}})
+    assert swarm.member(on_fast)["model"] == "default" and swarm.member(on_default)["model"] == "fast"
+    assert swarm.runtimes[on_fast].llm.profile.model == fast["model"]
+    assert (await manager.load(stopped)).member(parked)["model"] == "default"
+    assert manager.meta(pinned)["overrides"]["agents"] == {"default_model": "default"}
+    assert st.read_raw(manager.home).get("agents", {}).get("default_model", "default") == "fast"
+    await manager.shutdown()
+
+
+def test_names_sent_with_a_swap_or_a_chain_are_not_renamed_twice(tmp_path):
+    """The web UI sends agents.default_model and a re-picked role model by the names after the save; in a swap or a
+    chain such a new name is also an old one and must stay on its card. A stored value (or an old name that is no
+    profile any more) still follows the rename."""
+    opus = {"provider": "anthropic", "model": "claude-opus-5-5"}
+    haiku = {"provider": "anthropic", "model": "claude-haiku-5-5"}
+    raw = {"agents": {"default_model": "default"}, "models": {"default": dict(opus), "fast": dict(haiku)},
+           "roles": [{"name": "tester", "model": "fast"}, {"name": "developer", "model": "default"}]}
+    swap = {"fast": dict(opus, renamed_from="default"), "default": dict(haiku, renamed_from="fast")}
+    # the star stays on the opus card (now "fast"); the tester still on the haiku card, the developer re-picked opus
+    roles = [{"name": "tester", "model": "default"}, {"name": "developer", "model": "fast"}]
+    new = st.apply_update(raw, {"agents": {"default_model": "fast"}, "models": swap, "roles": roles})
+    assert new["models"][new["agents"]["default_model"]]["model"] == "claude-opus-5-5"
+    assert [new["models"][r["model"]]["model"] for r in new["roles"]] == ["claude-haiku-5-5", "claude-opus-5-5"]
+    stored = st.apply_update(raw, {"models": swap})  # nothing sent: the stored names follow
+    assert stored["agents"]["default_model"] == "fast"
+    assert [r["model"] for r in stored["roles"]] == ["default", "fast"]
+    raw2 = {"agents": {"default_model": "A"}, "models": {"A": dict(opus), "B": dict(haiku)}}
+    chain = {"B": dict(opus, renamed_from="A"), "C": dict(haiku, renamed_from="B")}
+    assert st.apply_update(raw2, {"agents": {"default_model": "B"}, "models": chain})["agents"]["default_model"] == "B"
+    assert st.apply_update(raw2, {"agents": {"default_model": "A"}, "models": chain})["agents"]["default_model"] == "B"
+    assert st.apply_update(raw2, {"models": chain})["agents"]["default_model"] == "B"
 
 
 async def test_update_overrides_apply_to_the_loaded_swarm(tmp_path):
@@ -1022,3 +1137,115 @@ def test_trash_with_paths_longer_than_windows_allows_is_removed(tmp_path):
     assert len(leaf) - 4 > 260
     sessions_module._rmtree(trash)
     assert not os.path.exists(long_form)
+
+
+# ---- session identity (uid) ---------------------------------------------------------------------------
+def _stored_meta(home: Path, sid: str) -> dict[str, Any]:
+    return json.loads((home / "sessions" / sid / "session.json").read_text(encoding="utf-8"))
+
+
+async def test_a_new_session_gets_a_uid_that_every_metadata_write_keeps(tmp_path):
+    home = _home(tmp_path)
+    manager = _manager(home)
+    a = await manager.create("Alpha", "Do it", start=False)
+    b = await manager.create("Beta", start=False)
+    uid = _stored_meta(home, a["id"])["uid"]
+    assert isinstance(uid, str) and len(uid) == 32 and int(uid, 16) >= 0 and uid == uid.lower()
+    assert a["uid"] == uid and manager.summary(a["id"])["uid"] == uid
+    assert b["uid"] != uid and session_uid(manager.meta(b["id"])) == b["uid"]
+    assert {s["id"]: s["uid"] for s in manager.list()} == {a["id"]: uid, b["id"]: b["uid"]}
+
+    sid = a["id"]
+    manager.update(sid, title="Alpha 2")
+    manager.update(sid, overrides={"swarm": {"max_cost_usd": 1.0}})
+    manager.update(sid, settings={"swarm": {"max_agents": 2}})
+    assert _stored_meta(home, sid)["uid"] == uid
+    view = manager.settings_view()
+    view["agents"]["max_steps_per_turn"] = 5
+    await manager.update_settings({"agents": view["agents"]})  # rewrites session.json of every session
+    assert _stored_meta(home, sid)["uid"] == uid
+
+    await manager.start(sid)  # the first start clears pending_goal and sets autostart
+    stored = _stored_meta(home, sid)
+    assert "pending_goal" not in stored and stored["uid"] == uid
+    await manager.stop(sid)
+    assert _stored_meta(home, sid)["uid"] == uid and _stored_meta(home, sid)["autostart"] is False
+
+    target = tmp_path / "elsewhere" / "project"
+    await manager.set_workspace(sid, str(target))
+    stored = _stored_meta(home, sid)
+    assert stored["workspace"]["path"] == str(target.resolve()) and stored["uid"] == uid
+    await manager.set_workspace(sid, None)
+    assert _stored_meta(home, sid)["uid"] == uid
+    assert manager.summary(sid)["uid"] == uid
+    await manager.shutdown()
+
+
+def _write_session(home: Path, sid: str, meta: dict[str, Any]) -> None:
+    folder = home / "sessions" / sid
+    folder.mkdir(parents=True)
+    (folder / "session.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_a_session_without_a_uid_gets_the_same_derived_uid_in_every_home(tmp_path):
+    """A session.json written before "uid" existed (or copied by hand) is identified by its created_at."""
+    meta = {"title": "Old", "created_at": 1761234567.123456, "overrides": {}, "autostart": False}
+    homes = []
+    for name in ("one", "two"):
+        home = tmp_path / name
+        home.mkdir()
+        st.write_raw(home, _raw(tmp_path))
+        homes.append(home)
+    _write_session(homes[0], "004-old", meta)
+    _write_session(homes[1], "017-renamed", meta)  # another id: identity is not the id
+    uids = [_manager(home).summary(sid)["uid"] for home, sid in zip(homes, ("004-old", "017-renamed"))]
+    assert uids[0] == uids[1] and len(uids[0]) == 32 and int(uids[0], 16) >= 0
+    assert uids[0] == session_uid(dict(meta))
+    assert "uid" not in _stored_meta(homes[0], "004-old")  # derived on read, never written by reading
+
+    # an update rewrites session.json and keeps whatever it holds (nothing new is stored)
+    manager = _manager(homes[0])
+    manager.update("004-old", title="Older")
+    assert "uid" not in _stored_meta(homes[0], "004-old")
+    assert manager.summary("004-old")["uid"] == uids[0]
+
+
+def test_session_uid_rules():
+    created = 1761234567.123456
+    derived = session_uid({"created_at": created})
+    assert derived == uuid.uuid5(UID_NAMESPACE, "created_at:" + repr(created)).hex
+    assert session_uid({"created_at": created + 0.000001}) != derived  # another created_at, another session
+    assert session_uid({"created_at": 1761234567}) == session_uid({"created_at": 1761234567.0})
+    stored = uuid.uuid4().hex
+    assert session_uid({"uid": stored, "created_at": created}) == stored  # a stored uid wins
+    assert session_uid({"uid": stored.upper()}) == stored
+    for bad_uid in ("", "abc", stored + "0", "g" * 32, 5, None, ["x"]):  # unusable: derived from created_at
+        assert session_uid({"uid": bad_uid, "created_at": created}) == derived
+    for created_at in (None, "", "yesterday", "1761234567.1", True, float("nan"), float("inf"), 10 ** 400, [1]):
+        assert session_uid({"created_at": created_at}) is None
+    assert session_uid({"title": "no created_at"}) is None
+    assert session_uid({"legacy": True, "created_at": created}) is None  # main: created_at is not stable
+    assert session_uid({"legacy": True, "uid": stored}) is None
+    assert len(new_uid()) == 32 and new_uid() != new_uid()
+
+
+async def test_a_session_json_without_created_at_has_no_uid(tmp_path):
+    home = _home(tmp_path)
+    _write_session(home, "003-bare", {"title": "Bare"})
+    manager = _manager(home)
+    assert manager.summary("003-bare")["uid"] is None
+    assert [s["uid"] for s in manager.list()] == [None]
+    (home / "sessions" / "003-bare" / "session.json").write_text("[1]", encoding="utf-8")  # damaged
+    assert manager.list()[0]["uid"] is None and "error" in manager.list()[0]
+
+
+async def test_the_main_session_has_no_uid(tmp_path):
+    from dreamteam.db import Database
+
+    home = _home(tmp_path)
+    Database(home / ".dreamteam" / "swarm.db").close()
+    manager = _manager(home)
+    assert manager.ids() == [LEGACY_ID]
+    assert manager.summary(LEGACY_ID)["uid"] is None
+    manager.update(LEGACY_ID, title="Old project")  # its own session.json keeps title/created_at/autostart only
+    assert manager.summary(LEGACY_ID)["uid"] is None

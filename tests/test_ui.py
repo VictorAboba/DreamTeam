@@ -30,7 +30,7 @@ import dreamteam
 from dreamteam import jobs as jobs_module
 from dreamteam import mcp_forge
 from dreamteam import swarm as swarm_module
-from dreamteam.config import Config, ShellSettings
+from dreamteam.config import _MIN_ONE, Config, ShellSettings, WorkspaceSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status
 from dreamteam.swarm import Swarm
@@ -149,6 +149,11 @@ def test_jobs_tab_feed_and_settings_fields():
     assert re.search(r'field\("sh_cpu", "shell\.cpu_threads", "auto"', HOME_JS)
     assert re.search(r'field\("sh_bg", "shell\.background_on_timeout", "bool", \{ full: true, hint: "sh_bg_hint" \}\)',
                      HOME_JS)
+    # ... and for every [workspace] setting, with config.py's minimums (lock_wanted_minutes: 0 = at once)
+    workspace = re.findall(r'\bfield\("(ws_\w+)", "workspace\.(\w+)", "\w+", \{ min: (\d+)', HOME_JS)
+    assert {key for _, key, _ in workspace} == {f.name for f in dataclasses.fields(WorkspaceSettings)} - {"git"}
+    assert all(int(low) == (1 if key in _MIN_ONE else 0) for _, key, low in workspace)
+    assert ("ws_lock_wanted", "lock_wanted_minutes", "0") in workspace and 'hint: "ws_lock_wanted_hint"' in HOME_JS
 
 
 # ------------------------------------------------------------------------------------------------ launcher / traces
@@ -192,7 +197,7 @@ def test_home_i18n_is_complete():
     used |= set(re.findall(r'\bfield\("([a-z0-9_]+)"', HOME_JS))                     # settings field labels
     used |= set(re.findall(r'\bhint: "([a-z0-9_]+)"', HOME_JS))
     sections = set(re.findall(r'\["\w+", "(s_\w+)"\]', HOME_JS))
-    assert len(sections) == 10 and {"s_roles", "s_skills"} <= sections
+    assert len(sections) == 11 and {"s_roles", "s_skills"} <= sections
     used |= sections | {s + "_hint" for s in sections}
     used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending")}  # sessionState() + pending goal
     used |= WORKSPACE_KINDS_KEYS  # workspaceLine(): t("ws_" + kind), t("ws_" + kind + "_hint")
@@ -596,6 +601,32 @@ def test_cancelled_dialogs_do_nothing_and_confirmed_ones_call_the_api():
 
 
 @needs_node
+def test_the_files_tab_unlocks_a_members_lock_after_a_confirmation():
+    """A locked entry of the Files tab has an "Unlock" button (file_unlock, docs/SPEC.md §18.4); it asks first."""
+    out = run_js(r"""
+      el("file-list");
+      app.S.lang = "en";
+      app.S.state = { locks: [{ path: "docs", owner: "Anna Smith" }], agents: [] };
+      app.S.fileEntries = [{ path: "docs", type: "dir" }, { path: "a.md", type: "file", size: 3 }];
+      app.renderFileList();
+      out.html = elements["file-list"].innerHTML;
+      globalThis.confirm = (text) => { out.asked = text; return answers.confirm; };
+      answers.confirm = false; out.cancelled = app.unlockFile("docs", "Anna Smith"); out.afterCancel = calls.length;
+      answers.confirm = true;
+      app.onDocumentClick({ target: { closest: () => ({ dataset: { unlock: "docs", owner: "Anna Smith" } }) } });
+      await new Promise((r) => setImmediate(r));
+      out.calls = calls;
+      out.attr = app.escAttr('a\r\nb"<c>');    // the HTML parser would turn a raw CR into LF
+    """)
+    button = '<button type="button" class="link file-unlock" data-unlock="docs" data-owner="Anna Smith">Unlock</button>'
+    assert out["html"].count(button) == 1 and out["html"].count("data-unlock") == 1
+    assert out["attr"] == "a&#13;&#10;b&quot;&lt;c&gt;"
+    assert out["cancelled"] is None and out["afterCancel"] == 0
+    assert out["asked"] == "Remove Anna Smith's lock on docs? The members waiting for this file are woken."
+    assert out["calls"] == [{"url": "/api/act/file_unlock", "body": {"path": "docs"}}]
+
+
+@needs_node
 def test_open_chat_marks_new_messages_read():
     # regression: the unread check ran before the inbox was refreshed, so a reply arriving in the open
     # chat stayed "unread" in the sidebar
@@ -637,6 +668,33 @@ def test_feed_requests_only_feed_events_and_describes_changes():
     assert out["limits"] == {"max_cost_usd": 2.5, "max_agents": 4} and out["bad"] == [None, None, None, None]
 
 
+@needs_node
+def test_held_trigger_fires_in_the_triggers_tab_and_the_feed():
+    """A repeating trigger whose notice waits for [agents] trigger_wake_seconds (docs/SPEC.md §8): the Triggers tab
+    says how many fires are held and until when, the feed line of such a fire says so too."""
+    out = run_js(r"""
+      const day = new Date(); day.setHours(18, 48, 0, 0);
+      const at = day.getTime() / 1000;
+      app.S.state = { swarm: { goal: null, session: null, limits: {} }, agents: [{ name: "Ann Lee", role: "Dev", status: "idle" }],
+                      mcp: [], triggers: [{ id: 4, condition: "every(60)", owner: "Ann Lee", once: false, fire_count: 3, held: 2, wake_at: at },
+                                          { id: 5, condition: "done(1)", owner: "Ann Lee", once: true, fire_count: 0, held: 0, wake_at: null }] };
+      const fired = (trigger) => app.describeEvent({ type: "trigger.fired", actor: "Ann Lee", data: { trigger, errors: [] } });
+      el("trigger-list");
+      for (const lang of ["en", "ru"]) {
+        app.S.lang = lang;
+        app.renderTriggers();
+        out[lang] = elements["trigger-list"].innerHTML;
+        out["feed_" + lang] = fired({ id: 4, condition: "every(60)", held: 2, wake_at: at });
+      }
+      out.plain = fired({ id: 5, condition: "done(1)", held: 0, wake_at: null });
+    """)
+    assert "fired: 3 · held: 2 until 18:48</span>" in out["en"] and out["en"].count("held:") == 1
+    assert "срабатываний: 3 · отложено: 2 до 18:48</span>" in out["ru"]
+    assert out["feed_en"].endswith("trigger #4 fired — every(60) (wake-up held until 18:48)")
+    assert out["feed_ru"].endswith("сработал триггер #4 — every(60) (пробуждение отложено до 18:48)")
+    assert out["plain"].endswith("сработал триггер #5 — done(1)")
+
+
 def test_session_settings_fields_match_the_config():
     """The settings dialog's per-session fields name real [shell] / [agents] settings, with config.py's minimums."""
     from dreamteam.config import _MIN_ONE, AgentSettings
@@ -644,7 +702,7 @@ def test_session_settings_fields_match_the_config():
     block = re.search(r"const SESSION_FIELDS = \[(.*?)\n\];", APP_JS, re.S).group(1)
     fields = re.findall(r'section: "(\w+)", key: "(\w+)", label: "(\w+)", kind: "(\w+)", min: (\d+)', block)
     # + the network choice (docs/SPEC.md §7.2) and the clarify bool (docs/SPEC.md §3 "Clarify mode")
-    assert len(fields) == 11 and block.count("{ group:") == 13
+    assert len(fields) == 14 and block.count("{ group:") == 16
     assert '{ group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] }' in block
     assert ('{ group: "clarify", section: "swarm", key: "clarify", label: "sf_clarify", kind: "bool", '
             'hint: "sf_clarify_hint" }') in block
@@ -662,6 +720,27 @@ def test_session_settings_fields_match_the_config():
     assert ("agents", "planning_hint_steps", "sf_plan_steps", "int", "0") in fields
     assert ("agents", "planning_hint_minutes", "sf_plan_minutes", "num", "0") in fields
     assert block.count('hint: "sf_plan_hint"') == 2 and "sf_plan_hint" in i18n_blocks()["en"]
+    # triggers (docs/SPEC.md §8): numbers, 0 has a meaning (at every change / no cap / at every fire)
+    for key, label in (("file_settle_seconds", "sf_file_settle"), ("file_max_wait_seconds", "sf_file_max_wait"),
+                       ("trigger_wake_seconds", "sf_trigger_wake")):
+        assert ("agents", key, label, "num", "0") in fields
+        assert f'hint: "{label}_hint"' in block
+        assert all(f"{label}_hint" in i18n_blocks()[lang] for lang in ("en", "ru"))
+
+
+def test_settings_page_agents_fields_match_the_config():
+    """The settings page's «Agents» section names real [agents] settings with config.py's minimums, among them the
+    trigger knobs (docs/SPEC.md §8), each with a hint."""
+    from dreamteam.config import _MIN_ONE, AgentSettings
+
+    agents = re.findall(r'\bfield\("(ag_\w+)", "agents\.(\w+)", "(\w+)", \{ min: (\d+)', HOME_JS)
+    known = {f.name for f in dataclasses.fields(AgentSettings)}
+    assert agents and all(key in known and (int(low) >= 1 if key in _MIN_ONE else int(low) == 0)
+                          for _, key, _, low in agents)
+    for label, key in (("ag_file_settle", "file_settle_seconds"), ("ag_file_max_wait", "file_max_wait_seconds"),
+                       ("ag_trigger_wake", "trigger_wake_seconds")):
+        assert (label, key, "float", "0") in agents
+        assert f'hint: "{label}_hint"' in HOME_JS
 
 
 @needs_node
@@ -1281,6 +1360,28 @@ def test_traces_pane_is_wired_once_and_ignores_stale_responses():
 
 
 @needs_node
+def test_home_card_names_the_time_it_shows():
+    out = run_js(r"""
+      const home = loadHomeJs();
+      const now = Date.now() / 1000;
+      const old = now - 5 * 86400;
+      for (const lang of ["ru", "en"]) {
+        home.H.lang = lang;
+        const base = { id: "s", title: "S", status: "stopped", created_at: old };
+        out[lang] = { active: home.sessionCard(Object.assign({ last_activity: now - 5 }, base)),
+                      fresh: home.sessionCard(base), date: home.ago(old) };
+      }
+    """)
+    ru, en = out["ru"], out["en"]
+    assert f'<span title="Активность: только что · Создана: {ru["date"]}"><i class="ic ic-clock"></i>только что</span>' \
+        in ru["active"]
+    assert f'<span title="Activity: just now · Created: {en["date"]}"><i class="ic ic-clock"></i>just now</span>' \
+        in en["active"]
+    assert f'<span title="Создана: {ru["date"]}"><i class="ic ic-clock"></i>{ru["date"]}</span>' in ru["fresh"]
+    assert f'<span title="Created: {en["date"]}"><i class="ic ic-clock"></i>{en["date"]}</span>' in en["fresh"]
+
+
+@needs_node
 def test_home_cards_and_dialogs_escape_session_data():
     out = run_js(r"""
       const E = process.env.EVIL;
@@ -1367,6 +1468,95 @@ def test_home_profile_key_semantics_and_no_key_is_ever_rendered():
         assert "sk-LEAK" not in html
     assert "…0000" in out["card"] and "will be removed on save" in out["envCard"]
     assert out["redacted"] == "401: invalid key …1234 given"
+
+
+@needs_node
+def test_home_profile_card_warns_about_missing_prices():
+    """A profile whose tokens count as $0 (the server's price_source "none" / "partial", docs/SPEC.md §18.4) shows a
+    warning outside «More» with «Enter prices» and «Free model (0 / 0)»; typing the prices hides it; an older server
+    (no price_source), another model typed in and the scripted provider show none. The test request says how its
+    cost was obtained."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.original = { models: {} };
+      el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg");
+      const base = { provider: "openai", model: "some-model-v1", api_key_set: true, api_key_hint: "…0000",
+                     input_price: null, output_price: null, extra: {} };
+      const mk = (name, data) => home.makeProfile(name, Object.assign({}, base, data), name);
+      const none = mk("remote", { price_source: "none" });
+      const half = mk("half", { price_source: "partial", input_price: 0.5 });
+      const priced = mk("gpt", { price_source: "profile", input_price: 1.25, output_price: 10 });
+      const old = mk("old", {});
+      const test = mk("test", { provider: "scripted", price_source: "none" });
+      out.missing = [none, half, priced, old, test].map((p) => home.missingPrices(p));
+      out.cards = [none, half, priced, old].map((p) => home.profileCard(p));
+      // typing: the warning box alone is redrawn (the input keeps its focus)
+      const box = { innerHTML: "x" };
+      const card = { dataset: { uid: half.uid }, querySelector: (sel) => (sel === ".price-warn-box" ? box : null) };
+      home.H.profiles = [none, half];
+      home.onSettingsInput({ target: { dataset: { pf: "output_price", type: "float" }, value: "2", closest: () => card } });
+      out.typed = [half.data.output_price, home.missingPrices(half), box.innerHTML];
+      none.data.model = "other"; out.otherModel = home.missingPrices(none); none.data.model = "some-model-v1";
+      // «Enter prices»: «More» opens and the first missing price gets the cursor
+      const more = { open: false }, focused = [];
+      const inCard = { querySelector: (sel) => (sel === "details.more" ? more : { focus: () => focused.push(sel) }) };
+      home.enterPrices(none, inCard);
+      out.enter = [more.open, none.moreOpen, focused];
+      // «Free model (0 / 0)»: both prices 0 (free on purpose), no warning, the form is dirty
+      home.H.dirty = false;
+      home.freeModel(none, null);
+      out.free = [none.data.input_price, none.data.output_price, home.missingPrices(none), home.H.dirty];
+      out.payload = home.profilePayload(none);
+      out.how = ["provider", "profile", "table", "free", "none", "partial", undefined].map(home.costHow);
+      out.live = home.t("p_live_ok", { ms: 120, reply: "OK", cost: "0.00010", how: home.costHow("provider") });
+      home.H.lang = "ru";
+      out.ru = [home.profileCard(mk("ru1", { price_source: "none" })), home.profileCard(mk("ru2", { price_source: "partial", input_price: 1 }))];
+    """)
+    assert out["missing"] == [["input_price", "output_price"], ["output_price"], [], [], []]
+    none_card, half_card, priced_card, old_card = out["cards"]
+    assert "No prices: calls of this model count as $0 and the session budget does not see them" in none_card
+    assert "data-enter-prices" in none_card and "Enter prices" in none_card and "Free model (0 / 0)" in none_card
+    assert none_card.index("price-warn") < none_card.index('<details class="more"')   # outside «More»
+    assert "No output price: those tokens count as $0." in half_card
+    assert "price-warn\"" not in priced_card and "price-warn\"" not in old_card
+    assert out["typed"] == [2, [], ""]
+    assert out["otherModel"] == []
+    assert out["enter"] == [True, True, ['[data-pf="input_price"]']]
+    assert out["free"] == [0, 0, [], True]
+    assert out["payload"]["input_price"] == 0 and "price_source" not in out["payload"]
+    assert out["how"] == ["reported by the provider", "by the profile's prices", "by the built-in prices", "free",
+                          "unknown: the provider did not report it, and the profile has no prices",
+                          "incomplete: the provider did not report it, and the profile lacks some prices",
+                          "unknown: the provider did not report it, and the profile has no prices"]
+    assert out["live"] == "Answered in 120 ms: “OK” (cost $0.00010: reported by the provider)."
+    assert "Нет цен: вызовы этой модели считаются по $0" in out["ru"][0] and "Бесплатная модель (0 / 0)" in out["ru"][0]
+    assert "Нет цены выхода: эти токены считаются по $0." in out["ru"][1]
+
+
+@needs_node
+def test_home_fill_from_a_preset_replaces_the_prices():
+    """«Fill from a preset» on a card takes the preset's prices or none: a card from the OpenAI preset (1.25 / 10) or
+    from a local one (0 / 0) switched to Anthropic keeps neither, so the built-in prices apply after saving."""
+    from dreamteam.settings import PROVIDER_CHOICES
+
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.providers = PROVIDERS;
+      out.payloads = ["openai", "ollama"].map((first) => {
+        const p = home.makeProfile("x", home.presetData(first).data, null);
+        p.data.cache_read_price = 0.1;
+        Object.assign(p.data, home.presetData("anthropic").data);    // applyPreset's merge
+        return home.profilePayload(p);
+      });
+      out.openai = home.presetData("openai").data;
+    """, pre=f"const PROVIDERS = {json.dumps(PROVIDER_CHOICES)};")
+    for payload in out["payloads"]:
+        assert payload["provider"] == "anthropic"
+        prices = [payload[k] for k in ("input_price", "output_price", "cache_read_price", "cache_write_price")]
+        assert prices == [None] * 4, payload
+    assert (out["openai"]["input_price"], out["openai"]["output_price"]) == (1.25, 10)
 
 
 @needs_node
@@ -1524,6 +1714,47 @@ TEAM_CASES = [([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 
 def role_presets() -> list[dict]:
     from dreamteam import roles
     return roles.presets_view()
+
+
+@needs_node
+def test_home_swap_of_profile_names_sends_the_names_after_the_save():
+    """default <-> fast in one edit: the starred card and the role models go out by their names after the save, an
+    untouched role following its card and a role re-picked in the same edit kept as picked; the server keeps such
+    a name (settings.apply_update), so every value stays on its card."""
+    from dreamteam import settings as st
+
+    raw = {"agents": {"default_model": "default"},
+           "models": {"default": {"provider": "anthropic", "model": "claude-opus-5-5"},
+                      "fast": {"provider": "anthropic", "model": "claude-haiku-5-5"}},
+           "roles": [{"name": "tester", "model": "fast"}, {"name": "developer", "model": "default"},
+                     {"name": "architect", "model": "fast"}]}
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.rolePresets = JSON.parse(process.env.DT_PRESETS);
+      el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
+      const view = JSON.parse(process.env.DT_VIEW);
+      home.H.view = JSON.parse(JSON.stringify(view)); home.H.original = JSON.parse(JSON.stringify(view));
+      home.renderSettings(true);
+      const opus = home.H.profiles.find((p) => p.name === "default"), haiku = home.H.profiles.find((p) => p.name === "fast");
+      opus.name = "fast"; haiku.name = "default";                       // the star stays on the opus card
+      const card = (id) => home.H.roleCards.find((c) => c.id === id);
+      out.shown = home.roleCard(card("tester")).match(/<option value="([^"]*)" selected>/)[1];
+      const pick = (id, value) => home.onRoleCardEvent({ target: { value, dataset: { rc: "model" },
+        closest: () => ({ dataset: { roleUid: card(id).uid }, querySelector: () => null }) } });
+      pick("developer", "default");                                    // re-picked: now the haiku card
+      pick("architect", "default");                                    // re-picked to the name it shows already
+      out.payload = home.collectSettings();
+    """, env={"DT_PRESETS": json.dumps(role_presets()), "DT_VIEW": json.dumps(st.public_view(raw))})
+    payload = out["payload"]
+    assert out["shown"] == "default"  # the tester's card is the haiku one, now named "default"
+    assert payload["agents"]["default_model"] == "fast"
+    models = {r["name"]: r.get("model") for r in payload["roles"]}
+    assert (models["tester"], models["developer"], models["architect"]) == ("default", "default", "default")
+    new = st.apply_update(raw, payload)
+    assert new["models"][new["agents"]["default_model"]]["model"] == "claude-opus-5-5"
+    stored = {r["name"]: new["models"][r["model"]]["model"] for r in new["roles"]}
+    assert stored == {"tester": "claude-haiku-5-5", "developer": "claude-haiku-5-5", "architect": "claude-haiku-5-5"}
 
 
 @needs_node
@@ -1700,7 +1931,7 @@ def test_home_settings_roles_and_team():
         {"name": "developer", "description": "You write the code. Always with tests."},
         {"name": "writer", "hidden": True}, {"name": "researcher", "hidden": True},
         {"name": "Data engineer", "description": "You build data pipelines."},
-        {"name": "QA lead", "description": "You lead the testing.", "model": "fast"},
+        {"name": "QA lead", "description": "You lead the testing.", "model": "quick"},  # by its name after the save
     ]
     composer = out["composer"]
     assert ">QA lead</option>" in composer and ">Technical writer" not in composer  # the edited catalog
@@ -1805,6 +2036,289 @@ def test_home_card_shows_the_session_folder_and_delete_keeps_an_outside_one():
     assert_escaped(out["delEvil"])
     assert out["toasts"] == ["Session deleted. The folder /home/u/code/my-app stays where it is.", "Session deleted"]
     assert out["calls"] == ["/api/sessions/proj?confirm=proj", "/api/sessions/own?confirm=own"]
+
+
+# the new-session dialog's form fields, as submitNewSession reads them (issue #39: files to work on)
+NS_FORM = r"""
+  const nsForm = (props) => {
+    for (const [id, value] of [["ns-title", ""], ["ns-goal", "Ship it"], ["ns-desc", ""], ["ns-lang", "en"],
+                               ["ns-max", "8"], ["ns-budget", "5"], ["ns-model", "default"], ["ns-steps", "40"]]) {
+      el(id, { value });
+    }
+    for (const id of ["ns-approval", "ns-offline", "ns-clarify", "ns-run"]) el(id, { checked: false });
+    el("ns-submit", { disabled: false }); el("ns-error");
+    el("ns-copy-from", { value: (props && props.path) || "", disabled: false });
+    el("ns-copy-zip", { files: (props && props.zip) ? [props.zip] : [], disabled: false });
+    el("modal"); el("modal-backdrop");
+  };
+  const seen = [];
+  const replies = {
+    upload: { status: 201, body: { upload: "t".repeat(24), filename: "w.zip", bytes: 10, expires_in: 3600 } },
+    create: { status: 201, body: { session: { id: "001-x", url: "/s/001-x/" }, copy: { files: 3, bytes: 2048 } } },
+  };
+  globalThis.fetch = async (url, opts) => {
+    const body = opts && opts.body;
+    seen.push({ url, method: opts && opts.method, type: opts && opts.headers && opts.headers["Content-Type"], body,
+                json: typeof body === "string" ? JSON.parse(body) : null });
+    if (globalThis.offline) throw new TypeError("Failed to fetch");
+    const create = url === "/api/sessions" && opts && opts.method === "POST";
+    const r = url.startsWith("/api/uploads") ? replies.upload : create ? replies.create
+            : { status: 200, body: { sessions: [] } };
+    return { ok: r.status < 400, status: r.status, statusText: r.statusText || "",
+             json: async () => { if (r.body === undefined) throw new SyntaxError("not JSON"); return r.body; } };
+  };
+  const toasts = [], toastEls = [];
+  document.createElement = () => ({ className: "", textContent: "", remove() {},
+                                    addEventListener(type, fn) { this.clicked = fn; } });
+  el("toasts", { appendChild: (box) => { toasts.push(box.textContent); toastEls.push(box); } });
+  const submit = async () => {   // (require caches home.js: the same module as the test body's `home`)
+    await loadHomeJs().submitNewSession({ preventDefault() {} });
+    await new Promise((r) => setImmediate(r));
+  };
+  const posts = () => seen.filter((c) => c.method === "POST").map((c) => c.url);
+"""
+
+
+@needs_node
+def test_home_new_session_files_block():
+    """«Файлы для работы» under «Дополнительно» (issue #39): a folder path or a .zip, the limit in the hint, the
+    sandbox hint shown only when the hub runs in the Docker sandbox; the two settings fields."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      el("modal"); el("modal-backdrop");
+      home.H.original = { swarm: { language: "en" }, agents: {}, mcp: {}, models: {}, workspace: { copy_max_mb: 50 } };
+      await home.newSessionModal();
+      await new Promise((r) => setImmediate(r));   // the dialog's own GET /api/skills settles first
+      out.html = elements.modal.innerHTML;
+      home.H.original = { swarm: {}, agents: {}, models: {}, mcp: {} };   // savedDefaults() before the settings load
+      out.defaultMb = home.copyMaxMb();
+      const hint = el("modal #ns-copy-sandbox", { hidden: true });
+      home.H.skills = { sandbox: true };
+      home.nsCopySandbox();
+      out.sandboxShown = hint.hidden === false;
+      home.H.skills = { sandbox: false };
+      home.nsCopySandbox();
+      out.sandboxHidden = hint.hidden === true;
+      home.H.skills = { sandbox: false, container: true };   // docker compose / docker run: no host library
+      home.nsCopySandbox();
+      out.containerShown = hint.hidden === false;
+      home.H.skills = null;
+      home.nsCopySandbox();
+      out.noSkills = hint.hidden === true;
+      home.H.lang = "ru";
+      await home.newSessionModal();
+      out.ru = elements.modal.innerHTML;
+      home.H.lang = "en";
+      // a chosen .zip or a typed folder path counts as typed text: closing the dialog asks first
+      answers.confirm = false;
+      el("modal #ns-goal", { value: "" }); el("modal #ns-desc", { value: "" });
+      el("modal #ns-copy-from", { value: "  " });
+      el("modal #ns-copy-zip", { files: [{ name: "w.zip", size: 1 }] });
+      out.closeZip = home.closeModal();
+      el("modal #ns-copy-zip", { files: [] });
+      out.closeBlank = home.closeModal();
+      el("modal #ns-copy-from", { value: "/data/p" });
+      out.closePath = home.closeModal();
+      el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
+      const v = { swarm: { name: "S", language: "en" }, agents: {}, shell: {}, server: {}, tracing: {},
+                  mcp: { external: {} }, models: {},
+                  workspace: { git: true, lock_ttl_minutes: 10, copy_max_mb: 1024, copy_max_files: 100000 } };
+      home.H.view = JSON.parse(JSON.stringify(v)); home.H.original = JSON.parse(JSON.stringify(v));
+      home.renderSettings(true);
+      out.settings = elements["settings-form"].innerHTML;
+    """)
+    html = out["html"]
+    assert 'id="ns-copy-from" spellcheck="false" autocomplete="off"' in html
+    assert 'placeholder="Full path on the computer the hub runs on, e.g. /home/me/project"' in html
+    assert '<input id="ns-copy-zip" type="file" accept=".zip,application/zip">' in html
+    assert "<summary>More</summary>" in html  # (the skills picker's own "more" comes earlier)
+    assert html.index("<summary>More</summary>") < html.index('id="ns-offline"') < html.index('id="ns-copy-from"')
+    assert html.index('id="ns-copy-from"') < html.index('id="ns-copy-zip"') < html.index('id="ns-error"')
+    assert "Files to work on" in html and "Copy from a folder" in html and "or upload a .zip" in html
+    assert "the originals are never changed" in html and "__pycache__ and links are left out; up to 50 MB." in html
+    assert '<span class="field-hint" id="ns-copy-sandbox" hidden>The hub runs in the Docker sandbox' in html
+    assert out["defaultMb"] == 1024
+    assert out["sandboxShown"] is True and out["sandboxHidden"] is True and out["noSkills"] is True
+    assert out["containerShown"] is True
+    ru = out["ru"]
+    assert "Файлы для работы" in ru and "Скопировать из папки" in ru and "или загрузить .zip" in ru
+    assert "оригиналы не меняются" in ru and "например C:\\work\\project" in ru
+    assert out["closeZip"] is False and out["closeBlank"] is True and out["closePath"] is False
+    settings = out["settings"]
+    assert 'data-path="workspace.copy_max_mb"' in settings and 'data-path="workspace.copy_max_files"' in settings
+    assert "Copy into a new session, MB" in settings and "the largest copy and uploaded .zip" in settings
+    assert "Files in such a copy" in settings
+    lock, copy_mb = (settings.index(f'data-path="workspace.{key}"') for key in ("lock_ttl_minutes", "copy_max_mb"))
+    assert lock < copy_mb
+
+
+@needs_node
+def test_home_submit_uploads_then_creates():
+    """A chosen .zip goes to POST /api/uploads as the raw body first; the create then carries only its token."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.original = { swarm: { language: "en", start_agents: 3, max_agents: 8, max_cost_usd: 5 },
+                          agents: { default_model: "default", max_steps_per_turn: 40 }, mcp: {}, models: {},
+                          workspace: {} };
+      home.H.teams.ns = home.teamRows([], 3); home.H.nsSkills = new Set();
+      const file = { name: "my work&1.zip", size: 10 };
+      nsForm({ zip: file });
+      await submit();
+      out.calls = seen.map((c) => [c.method, c.url.split("?")[0]]);
+      const up = seen.find((c) => c.url.startsWith("/api/uploads"));
+      out.upload = [up.url, up.type, up.body === file];
+      out.create = seen.find((c) => c.url === "/api/sessions" && c.method === "POST").json;
+      out.toasts = toasts.slice();
+      out.closed = elements.modal.innerHTML === "" && elements["modal-backdrop"].classList.contains("hidden");
+      // started right away: the browser goes to the board, no toast
+      toasts.length = 0; seen.length = 0;
+      nsForm({ zip: file }); elements["ns-run"].checked = true;
+      globalThis.location = { href: "" };
+      await submit();
+      out.started = [globalThis.location.href, toasts.length, posts()];
+      // started, but the copy left out links or special files: shown first, a click opens the board
+      const created = replies.create;
+      for (const [name, extra] of [["links", { links: ["cfg"], links_count: 1 }], ["special", { special_count: 1 }],
+                                   ["byName", { excluded: [".git"], excluded_count: 1 }]]) {
+        toasts.length = 0; toastEls.length = 0; seen.length = 0;
+        replies.create = { status: 201, body: { session: { id: "001-x", url: "/s/001-x/" },
+                                                copy: { files: 3, bytes: 2048, ...extra } } };
+        nsForm({ zip: file }); elements["ns-run"].checked = true;
+        globalThis.location = { href: "" };
+        await submit();
+        const last = toastEls[toastEls.length - 1];
+        out[name] = { href: globalThis.location.href, toasts: toasts.slice(),
+                      clickable: !!(last && last.clicked), cls: last ? last.className : "" };
+        if (last && last.clicked) { last.clicked(); out[name].afterClick = globalThis.location.href; }
+      }
+      replies.create = created;
+      // without data.copy (an older hub): no toast
+      toasts.length = 0; seen.length = 0;
+      replies.create = { status: 201, body: { session: { id: "002-y", url: "/s/002-y/" } } };
+      nsForm({ zip: file });
+      await submit();
+      out.noCopy = toasts.length;
+      // the upload helper itself: a guard refusal in plain text, a lost connection
+      replies.upload = { status: 403, statusText: "Forbidden" };
+      try { await home.uploadZip(file); } catch (e) { out.forbidden = [e.message, e.status]; }
+      globalThis.offline = true;
+      try { await home.uploadZip(file); } catch (e) { out.lost = e.message; }
+      globalThis.offline = false;
+      out.sizes = [0, 100, 2048, 1048575, 1.5 * 2 ** 20, -5, "x"].map(home.sizeText);
+      // what was left out gets a toast of its own
+      out.left = home.copyToasts({ files: 2, bytes: 10, links: ["a", "b", "c", "d"], links_count: 5,
+                                   excluded: ["node_modules"], excluded_count: 1, special_count: 2 });
+      out.nothingLeft = home.copyToasts({ files: 1, bytes: 1, links_count: 0, excluded_count: 0 });
+      out.noCopyToasts = [home.copyToasts(null), home.copyToasts("x")];
+      home.H.lang = "ru";
+      out.leftRu = home.copyToasts({ files: 1, bytes: 1, excluded: [".venv"], excluded_count: 1 })[1];
+    """, pre=NS_FORM)
+    assert out["calls"][:2] == [["POST", "/api/uploads"], ["POST", "/api/sessions"]]
+    assert out["upload"] == ["/api/uploads?filename=my%20work%261.zip", "application/zip", True]
+    create = out["create"]
+    assert create["copy_from_upload"] == "t" * 24 and "copy_from" not in create
+    assert create["goal"] == "Ship it" and create["start"] is False
+    assert out["toasts"] == ["Copied 3 files (2 KB)"] and out["closed"] is True
+    assert out["started"] == ["/s/001-x/", 0, ["/api/uploads?filename=my%20work%261.zip", "/api/sessions"]]
+    links = out["links"]
+    assert links["href"] == "" and links["clickable"] is True and "clickable" in links["cls"]
+    assert links["toasts"] == ["Copied 3 files (2 KB)",
+                               "Left out: 1 link(s) (cfg)\nThe session is running. Click to open its board."]
+    assert links["afterClick"] == "/s/001-x/"
+    assert out["special"]["href"] == "" and out["special"]["afterClick"] == "/s/001-x/"
+    assert out["special"]["toasts"][1].startswith("Left out: 1 special file(s)\n")
+    assert out["byName"]["href"] == "/s/001-x/" and out["byName"]["toasts"] == []   # .git and the like: expected
+    assert out["noCopy"] == 0
+    assert out["forbidden"] == ["403 Forbidden", 403] and out["lost"] == "No connection to the server"
+    assert out["sizes"] == ["0 KB", "1 KB", "2 KB", "1024 KB", "1.5 MB", "0 KB", "0 KB"]
+    assert out["left"] == ["Copied 2 files (1 KB)", "Left out: 5 link(s) (a, b, c, …); 1 folder(s) by name "
+                                                    "(node_modules); 2 special file(s)"]
+    assert out["nothingLeft"] == ["Copied 1 files (1 KB)"] and out["noCopyToasts"] == [[], []]
+    assert out["leftRu"] == "Не скопированы: папки по имени (1: .venv)"
+
+
+@needs_node
+def test_home_submit_copy_errors():
+    """The dialog's checks before any request, an upload refused by the hub (no create), a folder path sent as is."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.original = { swarm: { language: "en", start_agents: 3, max_agents: 8, max_cost_usd: 5 },
+                          agents: { default_model: "default", max_steps_per_turn: 40 }, mcp: {}, models: {},
+                          workspace: { copy_max_mb: 1 } };
+      home.H.teams.ns = home.teamRows([], 3); home.H.nsSkills = new Set();
+      const err = () => elements["ns-error"].textContent;
+      nsForm({ path: "/data/p", zip: { name: "w.zip", size: 10 } });
+      await submit();
+      out.both = [err(), seen.length, elements["ns-submit"].disabled];
+      nsForm({ zip: { name: "a.txt", size: 10 } });
+      await submit();
+      out.notZip = [err(), seen.length];
+      nsForm({ zip: { name: "W.ZIP", size: 2 * 2 ** 20 } });
+      await submit();
+      out.big = [err(), seen.length];
+      // the hub refuses the upload: its message, the form usable again, no create
+      replies.upload = { status: 413, body: { error: "X" } };
+      nsForm({ zip: { name: "w.zip", size: 10 } });
+      await submit();
+      out.refused = [err(), elements["ns-submit"].disabled, elements["ns-copy-from"].disabled,
+                     elements["ns-copy-zip"].disabled, posts()];
+      // a folder path: sent trimmed as copy_from, no upload
+      seen.length = 0;
+      nsForm({ path: "  /data/my project  " });
+      await submit();
+      out.path = [posts(), seen.find((c) => c.url === "/api/sessions" && c.method === "POST").json];
+      // a create the hub refuses (e.g. 409 "already has files"): the message, the fields enabled again
+      seen.length = 0;
+      replies.create = { status: 409, body: { error: "D:\\w already has files" } };
+      nsForm({ path: "/data/p" });
+      await submit();
+      out.conflict = [err(), elements["ns-submit"].disabled, elements["ns-copy-from"].disabled, posts()];
+    """, pre=NS_FORM)
+    assert out["both"] == ["Give a folder or a .zip, not both.", 0, False]
+    assert out["notZip"] == ["Choose a .zip file.", 0]
+    assert out["big"] == ["The archive is larger than 1 MB ([workspace] copy_max_mb).", 0]
+    assert out["refused"] == ["X", False, False, False, ["/api/uploads?filename=w.zip"]]
+    posted, body = out["path"]
+    assert posted == ["/api/sessions"] and body["copy_from"] == "/data/my project" and "copy_from_upload" not in body
+    assert out["conflict"] == ["D:\\w already has files", False, False, ["/api/sessions"]]
+
+
+@needs_node
+def test_home_card_shows_copied_from():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      const card = (copied_from) => home.sessionCard({ id: "s", title: "T", status: "stopped", copied_from,
+                                                      tasks: { total: 0, done: 0 }, agents: { total: 0, working: 0 } });
+      out.copied = card({ source: "C:\\w\\p", files: 3, bytes: 2048, at: 1 });
+      out.upload = card({ source: "upload: work.zip", files: 1, bytes: 3 * 2 ** 20, at: 1 });
+      out.long = card({ source: "/home/someone/projects/a-very-long-folder-name/and-a-deeper-one/project", files: 1,
+                        bytes: 1, at: 1 });
+      out.evil = card({ source: E, files: E, bytes: E, at: E });
+      out.none = [card(undefined), card(null), card("C:\\w"), card({ files: 3 })];
+      const listed = [{ id: "a", title: "A", copied_from: { source: "/data/Snake" } }, { id: "b", title: "B" }];
+      out.search = home.filterSessions(listed, "all", "snake").map((s) => s.id);
+      home.H.lang = "ru";
+      out.ru = card({ source: "C:\\w\\p", files: 3, bytes: 2048, at: 1 });
+    """, env={"EVIL": EVIL})
+    copied = out["copied"]
+    assert '<div class="sc-folder sc-copied"' in copied and "<span>Copy of:</span>" in copied
+    assert '<code><bdi dir="ltr">C:\\w\\p</bdi></code>' in copied
+    assert 'title="C:\\w\\p\nFiles copied when the session was created (' in copied
+    assert "3 files, 2 KB. The originals were not changed." in copied
+    assert copied.index("sc-copied") < copied.index("sc-actions")
+    assert "upload: work.zip" in out["upload"] and "1 files, 3.0 MB" in out["upload"]
+    assert '<bdi dir="ltr">…/a-very-long-folder-name/and-a-deeper-one/project</bdi>' in out["long"]
+    assert 'title="/home/someone/projects/a-very-long-folder-name/and-a-deeper-one/project\n' in out["long"]
+    assert_escaped(out["evil"], at_least=2)  # the shown path and the tooltip
+    assert "0 files, 0 KB" in out["evil"]   # non-numeric counters are not injected
+    assert all("sc-copied" not in html for html in out["none"])
+    assert out["search"] == ["a"]
+    assert "Копия:" in out["ru"] and "Оригиналы не менялись" in out["ru"] and "2 КБ" in out["ru"]
 
 
 @needs_node
@@ -3110,8 +3624,9 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             sid = session["id"]
             card_fields = {"id", "title", "status", "paused", "legacy", "dir", "created_at", "last_activity", "model",
                            "model_profile", "max_cost_usd", "spent_usd", "config_error", "goal", "tasks", "agents", "url",
-                           "workspace", "pause_reason", "question", "clarify"}
+                           "workspace", "pause_reason", "question", "clarify", "copied_from"}
             assert card_fields <= set(session) and session["url"] == f"/s/{sid}/"
+            assert session["copied_from"] is None   # the card's "copy of" line: only a session made with copy_from
             assert session["question"] is None and session["clarify"] is False   # the card's question badge
             folder_fields = {"path", "default", "adopted", "exists"}  # the folder line of the card / the Files tab
             assert set(session["workspace"]) == folder_fields and session["workspace"]["default"] is True
@@ -3245,7 +3760,7 @@ def test_settings_saved_by_the_ui_keep_and_remove_keys_as_shown(tmp_path):
             assert "api_key" not in models["envkey"] and models["envkey"]["api_key_env"] == "MY_ENV"
             assert "api_key" not in models["reuse"]                # a new card does not inherit a deleted key
             assert raw["agents"]["default_model"] == "main-model"
-            # the role follows the rename of its profile (the server maps renamed_from)
+            # the role follows the rename of its profile (sent by its name after the save)
             assert raw["roles"] == [{"name": "tester", "instructions": "Use pytest.", "model": "main-model"},
                                     {"name": "Data engineer", "description": "Pipelines."}]
             assert resp.json()["role_catalog"][2]["model"] == "main-model"
