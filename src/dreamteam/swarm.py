@@ -17,12 +17,12 @@ from . import hubauth, netoff, procs, prompts, roles
 from .agent import AgentRuntime
 from .board import Board
 from .config import Config, ModelProfile
-from .db import Database, dumps, loads, utf8_safe
+from .db import Database, dumps, loads, remap_sql, utf8_safe
 from .events import EventBus
 from .goal_text import split_goal
 from .jobs import JobManager, fmt_duration, short_command
 from .llm import create_llm
-from .llm.base import LLMClient, Usage, cost_of
+from .llm.base import LLMClient, Usage, cost_of, uncounted_fields
 from .mailbox import Mailbox
 from .mcp_forge import MCPForge
 from .models import USER, AgentKind, AgentStatus, Status, ToolError
@@ -155,6 +155,8 @@ class Swarm:
         # scheduler if that wait ends without the job's end waking them (_wake_deferred)
         self._deferred: set[str] = set()
         self._missing_profiles: set[str] = set()  # members' profiles gone from the settings (warned once)
+        # (profile, provider, base_url, model, missing prices) whose $0 calls the user was told about since the start
+        self._cost_warned: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
         self.stopping = False  # stop() runs or ran: long polls (wait_for_events) end without touching the db
         self.hub_url: str | None = None
         self.board = Board(self)
@@ -169,6 +171,7 @@ class Swarm:
     # ---- lifecycle ----------------------------------------------------------------------------
     async def start(self, run_agents: bool = True) -> None:
         self.stopping = False
+        self._cost_warned.clear()  # u_cost_unknown comes again once per start
         self.tracer.recover()  # traces left open by a previous process
         self.jobs.recover()  # jobs a previous process left running died with it: lost (quiet notices)
         self._prune_traces()
@@ -541,6 +544,8 @@ class Swarm:
         lang = self.language_of(name)
         if name != USER:
             self._tell_network(name)  # once per change of the session's network setting (docs/SPEC.md §7.2)
+            # the fires its repeating triggers held back ([agents] trigger_wake_seconds), quietly: it reads its news now
+            self.triggers.release_held(name)
         notes = self.db.all(
             "SELECT id, ts, text FROM notifications WHERE recipient = ? AND delivered_at IS NULL ORDER BY id", (name,))
         messages = self.mail.unread(name, mark_read=True)
@@ -877,6 +882,21 @@ class Swarm:
         await self.workspace.commit_held(name, f"when {name} left the team", leaving=True)
         return released
 
+    def rename_profiles(self, renames: dict[str, str]) -> None:
+        """The settings renamed model profiles ({old: new}, settings.profile_renames): the members hired on one keep
+        it (agents.model, the runtimes' profile_name). No client is reset here: the reconfigure with the new settings
+        that follows (SessionManager.update_settings) rebuilds them all."""
+        if not renames:
+            return
+        # one step: in a swap or a chain a name is both an old and a new one
+        self.db.execute(*remap_sql("agents", "model", renames))
+        for runtime in self.runtimes.values():
+            if runtime.profile_name in renames:
+                runtime.profile_name = renames[runtime.profile_name]
+        # the same profile under its new name: its u_cost_unknown is not sent again in this start; the old keys stay
+        # for a call that was in flight with the old client (the key also holds provider, base_url and model)
+        self._cost_warned |= {(renames[key[0]], *key[1:]) for key in self._cost_warned if key[0] in renames}
+
     # ---- budget & control ---------------------------------------------------------------------
     def limits(self) -> dict:
         stored = self.db.get("limits") or {}
@@ -915,7 +935,22 @@ class Swarm:
         self.bus.emit("agent.usage", agent, agent=agent, cost=cost, input_tokens=usage.input_tokens,
                       output_tokens=usage.output_tokens, cache_read_tokens=usage.cache_read_tokens,
                       spent=self.spent_usd())
+        fields = uncounted_fields(profile, usage, model)
+        if fields:
+            self._cost_unknown(profile, model or profile.model, fields)
         return cost
+
+    def _cost_unknown(self, profile: ModelProfile, model: str, fields: tuple[str, ...]) -> None:
+        """A call of `profile` counted (some of) its tokens as $0: no price and no cost from the provider. The user
+        is told once per start for each profile, endpoint, model and set of missing prices (docs/SPEC.md §10)."""
+        key = (profile.name, (profile.provider or "").strip().lower(), (profile.base_url or "").strip().rstrip("/"),
+               model, fields)
+        if key in self._cost_warned:
+            return
+        self._cost_warned.add(key)
+        log.warning("model profile '%s' (model %s) has no %s and its provider reports no cost: those tokens count "
+                    "as $0", profile.name, model, ", ".join(fields))
+        self.notify(USER, "u_cost_unknown", profile=profile.name, model=model, fields=", ".join(fields), wake=False)
 
     def budget_exceeded(self) -> bool:
         limit = self.limits()["max_cost_usd"]
@@ -1179,8 +1214,9 @@ class Swarm:
 
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient:
         if profile_name and profile_name not in self.config.models:
-            # the member's profile (agents.model) was renamed or deleted in the settings: an error here would
-            # crash the agent at every activation, so it falls back to the default profile
+            # the member's profile (agents.model) was deleted in the settings, or renamed by a hand edit of
+            # dreamteam.toml (a rename saved through the settings follows: rename_profiles): an error here would crash
+            # the agent at every activation, so it falls back to the default profile
             if profile_name not in self._missing_profiles:
                 self._missing_profiles.add(profile_name)
                 log.warning("model profile '%s' no longer exists; %s uses the default profile '%s'",
@@ -1197,6 +1233,7 @@ class Swarm:
             await asyncio.sleep(SCHEDULER_SECONDS)
             try:
                 self.workspace.expire_locks()
+                self.workspace.settle_waiters()  # wakes the members refused what is free now; tells long holders
                 await self.skills.check()  # a mirror copy changed by a command is rebuilt (at most once a minute)
                 await self.skills.touch_envs()  # hourly: the environments' `used` stamps, retries, repairs
                 if time.time() - self._last_prune >= TRACE_PRUNE_SECONDS:
@@ -1274,7 +1311,7 @@ class Swarm:
     def _wake_stalled(self) -> None:
         """An agent that stopped with plain text holding in-progress tasks even after the in-activation nudge
         is idle with nothing pending, so no event would ever wake it: wake it once per such set of tasks (not while
-        the end of one of its jobs will wake it)."""
+        the end of one of its jobs, or a file it was refused becoming free, will wake it)."""
         now = time.time()
         for m in self._idle_llm_members():
             name = m["name"]
@@ -1282,8 +1319,8 @@ class Swarm:
             stalled = getattr(runtime, "stalled", frozenset())
             if not stalled or now - runtime.stalled_at < self.config.agents.idle_nudge_seconds:
                 continue
-            if self.jobs.awaited(name):
-                continue  # the end of its job will wake it: it waits for that job, it has not stalled
+            if self.jobs.awaited(name) or self.workspace.waits_for_lock(name):
+                continue  # the end of its job (or n_lock_free) will wake it: it waits, it has not stalled
             runtime.stalled = frozenset()
             # a clarify planner that waits for the user's answers has not stalled (asks_user)
             still = [t for t in self.board.open_tasks_of(name)
@@ -1299,14 +1336,15 @@ class Swarm:
         agents.idle_nudge_seconds it is woken once per such set of tasks (n_stalled, shared with _wake_stalled, so
         a set is never woken about twice). The clock starts when it was last seen going idle with that set. A
         member whose running job's end will wake it (JobManager.awaited, what `wait` promised it) is waiting for
-        that job: no clock runs for it meanwhile."""
+        that job, and one refused a file waits for it to be free (Workspace.waits_for_lock, what the refusal
+        promised): no clock runs for it meanwhile."""
         now, wait = time.time(), self.config.agents.idle_nudge_seconds
         holding: dict[str, tuple[frozenset[int], float]] = {}
         for m in self._idle_llm_members():
             name = m["name"]
             held = frozenset(t.id for t in self.board.open_tasks_of(name)
                              if t.status == Status.IN_PROGRESS and not self.asks_user(name, t))
-            if not held or self.jobs.awaited(name):
+            if not held or self.jobs.awaited(name) or self.workspace.waits_for_lock(name):
                 continue
             key, since = self._idle_holding.get(name, (None, now))
             if key != held:

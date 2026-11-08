@@ -459,6 +459,26 @@ def test_console_wrapup_command():
     assert all("/wrapup [off]" in HELP[lang] for lang in ("en", "ru"))
 
 
+def test_console_unlock_command():
+    """`/unlock path` calls the user tool file_unlock through the hub's act route and prints its result (an error
+    text too); a quoted path loses its quotes; no path shows the usage. The help lists it in both languages."""
+    from dreamteam.console import HELP, Console
+
+    console = Console("http://127.0.0.1:9/s/001-x", "en")
+    acts: list[tuple[str, dict]] = []
+    replies = iter(["Unlocked docs/AUDIT.md (it was locked by Anna Smith).", "Error: docs/x.md is not locked."])
+    console.hub = SimpleNamespace(act=lambda tool, **args: acts.append((tool, args)) or next(replies))
+    assert console._dispatch("/unlock docs/AUDIT.md") == "Unlocked docs/AUDIT.md (it was locked by Anna Smith)."
+    assert console._dispatch('/unlock "docs/x.md"') == "Error: docs/x.md is not locked."
+    assert "/unlock <path>" in console._dispatch("/unlock") and "/unlock <path>" in console._dispatch("/unlock ''")
+    assert acts == [("file_unlock", {"path": "docs/AUDIT.md"}), ("file_unlock", {"path": "docs/x.md"})]
+    acts.clear()
+    replies = iter(["ok"])
+    console._dispatch("/unlock 'my notes/plan v2.md'")
+    assert acts == [("file_unlock", {"path": "my notes/plan v2.md"})]
+    assert all("/unlock " in HELP[lang] for lang in ("en", "ru"))
+
+
 @needs_node
 def test_board_wrap_up_button_banner_and_feed():
     out = run_js(r"""

@@ -10,6 +10,7 @@ from .. import netoff, prompts, roles
 from ..db import loads
 from ..jobs import fmt_duration, short_command
 from ..models import USER, AgentKind, Status, ToolError
+from ..workspace import shown_list
 from . import ToolContext, tool
 from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
 
@@ -252,13 +253,20 @@ async def update_notes(ctx: ToolContext, args: dict[str, Any]) -> str:
 async def wait(ctx: ToolContext, args: dict[str, Any]) -> str:
     if ctx.runtime is not None:
         ctx.runtime.end_turn()
-    # the caller's running jobs whose end will wake it (never one whose end is quiet, e.g. once the goal is done)
+    # the caller's running jobs whose end will wake it (never one whose end is quiet, e.g. once the goal is done), and
+    # the files it was refused whose release will (n_lock_free)
     awaited = [j.label for j in ctx.swarm.jobs.awaited(ctx.actor)]
+    workspace = getattr(ctx.swarm, "workspace", None)  # (a test double may have none)
+    refused = workspace.awaited_locks(ctx.actor) if workspace is not None else []
+    also = []
     if len(awaited) == 1:
-        return f"OK, waiting. You will be woken up by new events, also when your background job {awaited[0]} ends."
-    if awaited:
-        return (f"OK, waiting. You will be woken up by new events, also when your background jobs "
-                f"{', '.join(awaited)} end.")
+        also.append(f"your background job {awaited[0]} ends")
+    elif awaited:
+        also.append(f"your background jobs {', '.join(awaited)} end")
+    if refused:
+        also.append(f"{shown_list(refused)}, which you were refused, {'is' if len(refused) == 1 else 'are'} free")
+    if also:
+        return "OK, waiting. You will be woken up by new events, also when " + " and when ".join(also) + "."
     return "OK, waiting. You will be woken up by new events."
 
 

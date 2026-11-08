@@ -10,8 +10,9 @@ model profile, the number of steps, MCP approval and [clarify mode](features.md)
 `sessions/<id>/session.json`; the rest comes from the global settings.
 For a session that already exists, the ⚙ button on its page changes the budget and max agents, as well as the
 session's own background job limits (per member, per session, time limit, compute threads), agent parameters
-(steps per wake-up, context window, tool output limit, nudging idle agents, parallel LLM calls), the network and
-clarify mode. An empty field means
+(steps per wake-up, context window, tool output limit, nudging idle agents, parallel LLM calls, how long a
+`file_changed` trigger waits for the file to stop changing, how often a repeating trigger may wake its owner), the
+network and clarify mode. An empty field means
 the value from the general settings; changes apply at once, with no restart. For the `main` session (and the
 `dreamteam run` board), ⚙ changes only the budget and max agents: the rest is set in the general settings.
 The goal is set when you create a session (the `goal` key in `[swarm]` is used only in `dreamteam run` mode and in the
@@ -38,12 +39,20 @@ model = ""               # model profile for this role ("" means the default)
 default_model = "default"
 max_steps_per_turn = 40
 context_tokens = 120000  # threshold for compacting an agent's history into a summary
+file_settle_seconds = 60 # file_changed fires once the file has not changed this long or the agents who changed it ended their turns (0 means at every change)
+file_max_wait_seconds = 300 # ...but no later than this after the first change (0 means no limit)
+trigger_wake_seconds = 180  # a member's repeating trigger wakes it at most this often; the fires in between come in one notice (0 means at every fire)
 
 [shell]                  # the agents' shell (the full list is on the "Settings" tab)
 timeout = 120            # a call waits this many seconds for a command; after that it runs as a background job
 foreground_max = 180     # an AI agent waits for a command no longer than this, whatever timeout it sets
 max_jobs = 16            # background jobs per session (0 means no background jobs)
 job_max_minutes = 480    # lifetime of a job started in the background on purpose or left running by a command (0 means no limit)
+
+[workspace]
+git = true               # the shared workspace under git with automatic commits
+lock_ttl_minutes = 30    # how long a file stays locked when the agent gives no time (at least 1)
+lock_wanted_minutes = 5  # tell the holder of a lock others wait for once it has held it this many minutes (0 means at the first refusal)
 
 [models.default]         # Claude
 provider = "anthropic"
@@ -81,7 +90,21 @@ resume_sessions = true   # resume the sessions that were running when the server
 ```
 
 Prices of known Claude models are built in. For other models, set `input_price` and `output_price` in dollars per
-1M tokens. If the provider reports the cost itself (like OpenRouter), that cost is used.
+1M tokens; `0` means a free model (a local one, for example), while an empty field means "not set". If the provider
+reports the cost of a call itself, that cost is used. A profile that has neither prices nor a provider-reported
+cost has its tokens counted as $0: the spending shown is lower than the real one, and the session budget does not
+see those calls. DreamTeam says so:
+
+- in the settings, the profile card shows a warning with the "Enter prices" and "Free model (0 / 0)" buttons, and
+  the "Test request" result says how its cost was obtained;
+- after the first such call of a session start, you get a notice naming the profile, the model and the missing
+  prices (also on stderr in `dreamteam -p`);
+- `dreamteam serve` and `dreamteam run` print a note after their startup message, and `/model` in the terminal shows a
+  "Prices" column.
+
+An agent keeps the model profile it was hired with. When that profile is renamed on the "Settings" tab, the agent
+stays on it under the new name, in running and in stopped sessions. An agent whose profile was deleted (or renamed
+by hand in `dreamteam.toml`) uses the default profile.
 
 ## Roles and the starting team
 

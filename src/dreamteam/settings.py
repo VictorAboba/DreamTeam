@@ -20,13 +20,23 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .config import CONFIG_FILE, Config, ModelProfile, env_var_name, make_profile, render_template, toml_string
+from .config import (
+    CONFIG_FILE,
+    PRICE_FIELDS,
+    Config,
+    ModelProfile,
+    env_var_name,
+    make_profile,
+    render_template,
+    toml_string,
+)
 
 HOME_ENV = "DREAMTEAM_HOME"
 # `roles` is a list of tables ([[roles]], the role catalog: docs/SPEC.md §17.3); the others are tables
 SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "roles", "models")
 _ROLE_FIELDS = ("name", "description", "instructions", "model", "hidden", "skills")
-_PUBLIC_KEY_FIELDS = ("api_key_set", "api_key_hint", "api_key_env_set")
+# fields the public view computes for each model profile; never stored (an update or a check drops them)
+_PUBLIC_KEY_FIELDS = ("api_key_set", "api_key_hint", "api_key_env_set", "price_source")
 # A hidden secret in the public view (`env` values of [mcp.external.*]): the mask plus the key hint.
 # An update that sends a mask back keeps the stored value.
 SECRET_MASK = "••••"
@@ -40,7 +50,7 @@ PROVIDER_CHOICES: list[dict[str, Any]] = [
      "api_key_env": "ANTHROPIC_API_KEY", "model": "claude-opus-5-5", "effort": "medium",
      "models": ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-1"]},
     {"id": "openai", "label": "OpenAI", "provider": "openai", "base_url": None,
-     "api_key_env": "OPENAI_API_KEY", "model": "gpt-5.1", "models": []},
+     "api_key_env": "OPENAI_API_KEY", "model": "gpt-5.1", "input_price": 1.25, "output_price": 10.0, "models": []},
     {"id": "openrouter", "label": "OpenRouter", "provider": "openai", "base_url": "https://openrouter.ai/api/v1",
      "api_key_env": "OPENROUTER_API_KEY", "model": "anthropic/claude-opus-5.5", "models": []},
     {"id": "ollama", "label": "Ollama", "provider": "openai", "base_url": "http://localhost:11434/v1",
@@ -251,7 +261,8 @@ def _mask(value: Any) -> str:
 
 def public_view(raw: dict[str, Any]) -> dict[str, Any]:
     """Settings for the UI: every section filled with defaults, API keys replaced by
-    api_key_set / api_key_hint, api_key_env_set tells whether the named variable exists. Values of
+    api_key_set / api_key_hint, api_key_env_set tells whether the named variable exists, price_source where a
+    call's prices come from (ModelProfile.price_source: "none" / "partial" count tokens as $0). Values of
     `env` tables of external MCP servers (usually tokens) are masked too. `roles`: the [[roles]] entries as
     stored, normalized (a built-in role by its id)."""
     cfg = validate(".", raw)
@@ -278,21 +289,26 @@ def public_view(raw: dict[str, Any]) -> dict[str, Any]:
         data["api_key_set"] = bool(key)
         data["api_key_hint"] = key_hint(key)
         data["api_key_env_set"] = bool(os.environ.get(env)) if env else None
+        data["price_source"] = profile.price_source()
         models[name] = data
     view["models"] = models
     return view
 
 
 def profile_renames(update: dict[str, Any]) -> dict[str, str]:
-    """{old name: new name} of the model profiles an update renames (`renamed_from`)."""
+    """{old name: new name} of the model profiles an update renames (`renamed_from`). A swap (fast <-> default) or
+    a chain (A -> B, B -> C) in one save is kept whole, so the map must be applied in one step (a name may be both an
+    old and a new one: db.remap_sql). An old name that a card not renamed from anything still has is not renamed."""
     models = update.get("models") if isinstance(update, dict) else None
     if not isinstance(models, dict):
         return {}
-    renames = {}
+    kept = {name for name, profile in models.items()
+            if not isinstance(profile, dict) or profile.get("renamed_from") in (None, "", name)}
+    renames: dict[str, str] = {}
     for name, profile in models.items():
         old = profile.get("renamed_from") if isinstance(profile, dict) else None
-        if isinstance(old, str) and old and old != name and old not in models:
-            renames[old] = name
+        if isinstance(old, str) and old and old != name and old not in kept:
+            renames.setdefault(old, name)
     return renames
 
 
@@ -327,8 +343,9 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     is the complete list of profiles (missing ones are deleted). For each profile `api_key` absent or
     null keeps the stored key (of the same profile, or of `renamed_from`), "" removes it, a string sets it.
     A renamed default profile stays the default; masked MCP `env` values keep their stored values.
-    `roles` is the complete list of [[roles]] entries ([] removes every customization); a role's model profile
-    follows a rename. Their rules are checked by `validate` (config.parse_roles)."""
+    `roles` is the complete list of [[roles]] entries ([] removes every customization); a stored role's model
+    profile follows a rename. An `agents.default_model` or role model sent with the update that names one of its
+    profiles is taken as a new name (not renamed again: a swap). Their rules are checked by `validate`."""
     if not isinstance(update, dict):
         raise ValueError("The settings update must be an object")
     result = copy.deepcopy(raw)
@@ -398,14 +415,22 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
         if not models:
             raise ValueError("At least one model profile is required")
         result["models"] = models
-    renames = profile_renames(update)  # after every section: `agents` may come after `models`
+    # after every section: `agents` may come after `models`. A stored value carries an old name; a value sent with
+    # the update that names a profile of the update is already a new one (in a swap a new name is also an old one)
+    renames = profile_renames(update)
+    names = result.get("models") if isinstance(result.get("models"), dict) else {}
+
+    def follow(name: Any, sent: bool) -> Any:
+        return name if sent and name in names else renames.get(name, name)
+
     agents = result.get("agents") or {}
+    sent = update.get("agents") if isinstance(update.get("agents"), dict) else {}
     default = agents.get("default_model", "default") if isinstance(agents, dict) else None
     if default in renames:
-        result["agents"] = {**agents, "default_model": renames[default]}
+        result["agents"] = {**agents, "default_model": follow(default, sent.get("default_model") is not None)}
     for role in result.get("roles") if isinstance(result.get("roles"), list) else ():
         if isinstance(role, dict) and isinstance(role.get("model"), str) and role["model"] in renames:
-            role["model"] = renames[role["model"]]
+            role["model"] = follow(role["model"], "roles" in update)
     return result
 
 
@@ -596,11 +621,14 @@ async def list_models(profile: ModelProfile, timeout: float = 20.0) -> list[str]
 async def check_profile(profile: ModelProfile, *, live: bool = False, timeout: float = 30.0) -> dict[str, Any]:
     """Check an endpoint: list its models (free) and, with live=True, send one tiny request (costs a few
     tokens). Returns {"ok", "models", "models_error", "model_found", "error", "reply", "latency_ms",
-    "cost_usd"}; `ok` is the live result when live=True, else whether the model list was read."""
+    "cost_usd", "cost_source"}; `ok` is the live result when live=True, else whether the model list was read.
+    `cost_source` (live): "provider" when the response reported its cost, else the profile's price_source for the
+    response's model ("none" / "partial": those tokens counted as $0)."""
     from .llm.base import LLMError, cost_of
 
     result: dict[str, Any] = {"ok": False, "models": [], "models_error": None, "model_found": None,
-                              "error": None, "reply": None, "latency_ms": None, "cost_usd": None}
+                              "error": None, "reply": None, "latency_ms": None, "cost_usd": None,
+                              "cost_source": None}
     try:
         result["models"] = await list_models(profile, timeout=timeout)
         result["model_found"] = (profile.model in result["models"]) if result["models"] else None
@@ -621,6 +649,8 @@ async def check_profile(profile: ModelProfile, *, live: bool = False, timeout: f
         response = await llm.complete("Answer with one word.", [{"role": "user", "content": "Say OK."}], [])
         result["reply"] = (response.text or response.thinking or "").strip()[:200] or f"({response.stop_reason})"
         result["cost_usd"] = round(cost_of(probe, response.usage, response.model), 6)
+        result["cost_source"] = ("provider" if response.usage.cost_usd is not None
+                                 else probe.price_source(response.model))
         result["ok"] = True
     except LLMError as exc:
         result["error"] = f"{exc.kind}: {exc.message}"
@@ -634,6 +664,23 @@ async def check_profile(profile: ModelProfile, *, live: bool = False, timeout: f
         if isinstance(result[field], str):
             result[field] = scrub_keys(result[field], profile)
     return result
+
+
+def unpriced_line(config: Config) -> str | None:
+    """The CLI banners' note (English, ASCII) on the model profiles whose tokens count as $0 unless the provider
+    reports the cost (ModelProfile.missing_prices; the scripted provider has no bill); None when there are none."""
+    items = []
+    for name, profile in config.models.items():
+        missing = profile.missing_prices()
+        if not missing or (profile.provider or "").strip().lower() == "scripted":
+            continue
+        partial = f": no {', '.join(missing)}" if len(missing) < len(PRICE_FIELDS) else ""
+        items.append(f"{name} ({profile.model}{partial})")
+    if not items:
+        return None
+    return (f"Note: model profiles without prices: {', '.join(items)}. Their unpriced tokens count as $0 and the "
+            "budget does not see them, unless the provider reports the cost. Set input_price and output_price ($ per "
+            "1M tokens, 0 for a free model) in Settings > Models and endpoints or in dreamteam.toml.")
 
 
 def scrub_keys(text: str, profile: ModelProfile) -> str:
