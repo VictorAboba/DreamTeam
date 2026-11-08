@@ -186,6 +186,20 @@ TEXTS: dict[str, dict[str, str]] = {
                      "If it needs your answer, reply with `task_comment` (reply_to={post_id}).",
         "reply_suffix": ", reply to #{reply_to}",
         "n_trigger": "Trigger #{id} fired: {condition}. {note}",
+        # a fire of a trigger whose file_changed() files changed since its last fire (triggers.py): one fragment per
+        # file, each starting with a space; {by} is trigger_file_by or empty
+        "n_trigger_files": "Trigger #{id} fired: {condition}.{changes} {note}",
+        "trigger_file_settled": " File {path} was changed (changes: {count}{by}); the last change was {quiet} ago.",
+        "trigger_file_changing": " File {path} is still changing (changes: {count}{by} in {duration}).",
+        "trigger_file_by": ", by {names}",
+        # the fires of a member's repeating trigger held back by [agents] trigger_wake_seconds, in one notice
+        # ({changes}: the n_trigger_files fragments of all of them, or empty)
+        "n_trigger_held": "Trigger #{id} fired again since it last told you at {since} (fires: {count}, the last at "
+                          "{last}): {condition}.{changes} A repeating trigger wakes you at most once every {interval}. "
+                          "{note}",
+        # ... the same once the limit is off (trigger_wake_seconds = 0) while fires were held: no interval to name
+        "n_trigger_held_off": "Trigger #{id} fired again since it last told you at {since} (fires: {count}, the last "
+                              "at {last}): {condition}.{changes} {note}",
         "n_ready": "Ready unassigned tasks are waiting for someone: {tasks}. If you have no task in progress, claim "
                    "the one that suits you best (if the claim fails, take another). Otherwise, or if none of them is "
                    "work you can do, call `wait`.",
@@ -259,6 +273,16 @@ TEXTS: dict[str, dict[str, str]] = {
                                "branch of its git repository. Look at its files (`list_files`) before you continue: "
                                "files you knew may be missing or different.",
         "n_member_retired": "{name} left the swarm ({reason}). Their unfinished tasks went back to todo: {tasks}.",
+        # file locks (workspace.py): to a member refused a path, once no other member's lock covers it any more
+        "n_lock_free": "Free again: {paths} (you were refused it earlier). If you still need it, read it again first: "
+                       "it has probably changed. Before a long edit, lock it with `lock_file`: other members may want "
+                       "it too.",
+        # to the holder of a lock others were refused, once per lock, after [workspace] lock_wanted_minutes
+        "n_lock_wanted": "{path}, which you have held for {held}, is wanted by: {waiters}. If you are still editing "
+                         "it, finish that edit first and unlock it, then go on with the rest of your task. If you no "
+                         "longer need it, unlock it now (`lock_file` with unlock=true). No reply is needed: they are "
+                         "woken when it is free.",
+        "lock_waiter_task": "{name} (task {tasks})",   # one waiter of n_lock_wanted with its tasks in progress
         # background jobs (jobs.py): parts of the notices, built in the owner's language
         "job_exit": "exit code {code}",
         "job_gone": "all its processes exited",
@@ -379,6 +403,11 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_agent_error": "Agent {name} hit an error: {error}",
         "u_budget": "Budget exhausted: spent ${spent:.2f} of ${limit:.2f}. The swarm is paused; raise the limit to "
                     "continue.",
+        "u_cost_unknown": "DreamTeam cannot count the cost of model profile \"{profile}\" (model {model}): it has no "
+                          "{fields}, and the provider does not report the cost of a call, so those tokens count as "
+                          "$0. The spending shown is lower than the real one, and the session budget may never stop "
+                          "the swarm. Set the prices ($ per 1M tokens) in Settings → Models and endpoints (or in "
+                          "dreamteam.toml), or 0 for a free model.",
         "u_question": "{name} asked you a question (message #{id}), and the whole swarm is paused until you answer. "
                       "Your next message to {name} (or to all) is the answer: every member gets it with the question, "
                       "then the swarm goes on. To go on without an answer, resume the swarm (Resume on the board, "
@@ -502,6 +531,15 @@ TEXTS: dict[str, dict[str, str]] = {
                      "Если нужен твой ответ, ответь через `task_comment` (reply_to={post_id}).",
         "reply_suffix": ", ответ на #{reply_to}",
         "n_trigger": "Сработал триггер #{id}: {condition}. {note}",
+        "n_trigger_files": "Сработал триггер #{id}: {condition}.{changes} {note}",
+        "trigger_file_settled": " Файл {path} изменён (изменений: {count}{by}); последнее изменение — {quiet} назад.",
+        "trigger_file_changing": " Файл {path} всё ещё меняется (изменений за {duration}: {count}{by}).",
+        "trigger_file_by": "; кто менял: {names}",
+        "n_trigger_held": "Триггер #{id} снова срабатывал после прошлого уведомления в {since} (срабатываний: {count}, "
+                          "последнее в {last}): {condition}.{changes} Повторяющийся триггер будит не чаще раза в "
+                          "{interval}. {note}",
+        "n_trigger_held_off": "Триггер #{id} снова срабатывал после прошлого уведомления в {since} (срабатываний: "
+                              "{count}, последнее в {last}): {condition}.{changes} {note}",
         "n_ready": "Есть свободные задачи, готовые к работе: {tasks}. Если у тебя нет задачи в работе, возьми ту, что "
                    "подходит тебе лучше всего (если взять не получилось, возьми другую). Иначе, или если ни одна из "
                    "них тебе не по силам, вызови `wait`.",
@@ -565,6 +603,14 @@ TEXTS: dict[str, dict[str, str]] = {
                                "git-репозитория. Прежде чем продолжать, посмотри её файлы (`list_files`): знакомых "
                                "тебе файлов может не быть или они другие.",
         "n_member_retired": "{name} покинул(а) рой ({reason}). Незавершённые задачи вернулись в todo: {tasks}.",
+        "n_lock_free": "Снова свободно: {paths} (раньше тебе в этом отказали). Если ещё нужно, сначала перечитай: "
+                       "скорее всего, файл изменился. Перед долгой правкой заблокируй его через `lock_file`: он может "
+                       "понадобиться и другим.",
+        "n_lock_wanted": "{path}, который ты держишь уже {held}, ждут: {waiters}. Если ещё правишь, сначала закончи "
+                         "эту правку и сними блокировку, потом продолжай остальную работу по задаче. Если файл больше "
+                         "не нужен, сними блокировку сейчас (`lock_file` с unlock=true). Отвечать не нужно: их "
+                         "разбудят, когда файл освободится.",
+        "lock_waiter_task": "{name} (задача {tasks})",
         "job_exit": "код возврата {code}",
         "job_gone": "все его процессы завершились",
         "job_no_output": "(вывода нет)",
@@ -672,6 +718,11 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_agent_error": "У агента {name} ошибка: {error}",
         "u_budget": "Бюджет исчерпан: потрачено ${spent:.2f} из ${limit:.2f}. Рой на паузе; увеличьте лимит, чтобы "
                     "продолжить.",
+        "u_cost_unknown": "DreamTeam не может посчитать стоимость профиля модели «{profile}» (модель {model}): у него "
+                          "не указаны {fields}, а провайдер не сообщает стоимость запроса, поэтому эти токены "
+                          "считаются по $0. Показанные расходы ниже настоящих, и бюджет сессии может так и не "
+                          "остановить рой. Укажите цены ($ за 1M токенов) в «Настройки» → «Модели и эндпоинты» (или "
+                          "в dreamteam.toml) или 0, если модель бесплатная.",
         "u_question": "{name} задаёт вам вопрос (сообщение #{id}), и весь рой на паузе до вашего ответа. Ваше "
                       "следующее сообщение для {name} (или для всех) и будет ответом: его вместе с вопросом получат "
                       "все участники, затем рой продолжит работу. Чтобы продолжить без ответа, снимите рой с паузы "

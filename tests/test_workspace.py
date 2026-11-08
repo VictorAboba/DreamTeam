@@ -927,6 +927,314 @@ async def test_release_all(ws, fake_swarm):
     assert sorted(e["data"]["path"] for e in unlocked) == ["1.md", "2.md"]
 
 
+# --- waiting for a lock (docs/SPEC.md §7 "Lock waiters") ---------------------------------------------------
+CAROL = "Carol Diaz"
+WAIT_PROMISE = ("You will be notified when it is free; there is no need to message them. Meanwhile do other work, "
+                "or call `wait` if nothing else is left.")
+
+
+def waiters(swarm) -> list[tuple[str, str]]:
+    return [(r["agent"], r["path"]) for r in swarm.db.all("SELECT agent, path FROM lock_waiters ORDER BY since, rowid")]
+
+
+def kinds(swarm, name: str) -> list[str]:
+    return [k for k, _ in swarm.notifications_for(name)]
+
+
+def team(swarm) -> None:
+    for name in (ANNA, BORIS, CAROL):
+        swarm.add_member(name, language="en")
+
+
+async def test_lock_refusals_promise_a_wake_up_instead_of_a_message(ws, fake_swarm):
+    """A refused lock, write, edit or someone else's unlock names the holder and the time left, promises a
+    notification, says not to message the holder and names `wait` (`wait_for_events` to an external member)."""
+    team(fake_swarm)
+    fake_swarm.add_member("Ext Agent", kind="external", language="en")
+    ws.lock(ANNA, "plan.md")
+    await ws.write(ANNA, "plan.md", "v1\n")
+    refusals = []
+    for attempt in (lambda: ws.lock(BORIS, "plan.md"), lambda: ws.check_writable(BORIS, "plan.md"),
+                    lambda: ws.unlock(BORIS, "plan.md"), lambda: ws.lock("Ext Agent", "plan.md")):
+        with pytest.raises(ToolError) as err:
+            attempt()
+        refusals.append(str(err.value))
+    for awaited in (ws.write(BORIS, "plan.md", "mine"), ws.edit(BORIS, "plan.md", "v1", "v2")):
+        with pytest.raises(ToolError) as err:
+            await awaited
+        refusals.append(str(err.value))
+    for text in refusals:
+        assert f"locked by {ANNA} until" in text and "min left" in text
+        assert "Message them" not in text and "Ask them" not in text
+    assert all(text.endswith(WAIT_PROMISE) for i, text in enumerate(refusals) if i != 3)
+    assert refusals[3].endswith(WAIT_PROMISE.replace("`wait`", "`wait_for_events`"))
+    assert ", not by you: only they can unlock it. You will be notified" in refusals[2]
+    # the user is never recorded: it is told how to force the unlock; a name outside the swarm gets no promise
+    with pytest.raises(ToolError, match=r"not by you\. Pass force=true to unlock it anyway\.$"):
+        ws.unlock(USER, "plan.md")
+    with pytest.raises(ToolError, match=r"Try again once it is unlocked\.$"):
+        ws.lock("Nobody Here", "plan.md")
+    assert waiters(fake_swarm) == [(BORIS, "plan.md"), ("Ext Agent", "plan.md")]
+
+
+async def test_a_waiter_is_recorded_once_per_path(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "src")
+    for _ in range(2):
+        with pytest.raises(ToolError):
+            ws.lock(BORIS, "src/a.py")
+        with pytest.raises(ToolError):
+            await ws.write(BORIS, "src/a.py", "x")
+    with pytest.raises(ToolError):
+        ws.check_writable(BORIS, "src/b.py")
+    first = fake_swarm.db.scalar("SELECT since FROM lock_waiters WHERE path = 'src/a.py'")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "src/a.py")
+    assert waiters(fake_swarm) == [(BORIS, "src/a.py"), (BORIS, "src/b.py")]
+    assert fake_swarm.db.scalar("SELECT since FROM lock_waiters WHERE path = 'src/a.py'") == first
+    assert ws.waits_for_lock(BORIS) and not ws.waits_for_lock(ANNA)
+    assert ws.lock_waits(BORIS) == ["src/a.py", "src/b.py"]
+
+
+async def test_an_unlock_wakes_every_waiter_once(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "x.md")
+    for name in (BORIS, CAROL):
+        with pytest.raises(ToolError):
+            await ws.write(name, "x.md", name)
+    assert ws.settle_waiters() == 0 and not kinds(fake_swarm, BORIS)  # still locked
+    fake_swarm.signals.clear()
+    assert ws.unlock(ANNA, "x.md") == "Unlocked x.md."
+    for name in (BORIS, CAROL):
+        assert fake_swarm.notifications_for(name) == [("n_lock_free", {"paths": "x.md"})]
+    assert fake_swarm.signals == [BORIS, CAROL]  # waking, in the order they were refused
+    assert fake_swarm.has_pending(BORIS) and waiters(fake_swarm) == []
+    assert ws.settle_waiters() == 0 and kinds(fake_swarm, BORIS) == ["n_lock_free"]
+    text = fake_swarm.db.scalar("SELECT text FROM notifications WHERE recipient = ?", (BORIS,))
+    assert text.startswith("Free again: x.md (you were refused it earlier). If you still need it, read it again")
+    assert "`lock_file`" in text
+
+
+async def test_folder_locks_free_a_waiter_only_when_nothing_overlaps_it(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "docs/a.md")
+    ws.lock(CAROL, "docs/b.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "docs")          # a folder: both locks lie under it
+    ws.unlock(ANNA, "docs/a.md")
+    assert not kinds(fake_swarm, BORIS) and waiters(fake_swarm) == [(BORIS, "docs")]
+    ws.unlock(CAROL, "docs/b.md")
+    assert fake_swarm.notifications_for(BORIS) == [("n_lock_free", {"paths": "docs"})]
+    ws.lock(ANNA, "lib")
+    with pytest.raises(ToolError, match="lock on 'lib'"):
+        await ws.write(BORIS, "lib/util.py", "x")   # a file under a folder lock
+    ws.unlock(ANNA, "lib")
+    assert kinds(fake_swarm, BORIS) == ["n_lock_free", "n_lock_free"]
+    assert fake_swarm.notifications_for(BORIS)[-1][1] == {"paths": "lib/util.py"}
+
+
+async def test_release_all_wakes_the_waiters_and_drops_the_leavers_waits(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "a.md")
+    ws.lock(CAROL, "c.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "a.md")
+    with pytest.raises(ToolError):
+        ws.lock(ANNA, "c.md")
+    assert ws.release_all(ANNA) == 1     # Anna leaves: Boris is woken, her own wait for c.md is gone
+    assert kinds(fake_swarm, BORIS) == ["n_lock_free"] and waiters(fake_swarm) == []
+    assert ws.release_all(CAROL) == 1 and not kinds(fake_swarm, ANNA)
+
+
+async def test_a_waiter_that_left_is_dropped_silently(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "a.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "a.md")
+    fake_swarm.db.execute("UPDATE agents SET status = 'retired' WHERE name = ?", (BORIS,))
+    ws.unlock(ANNA, "a.md")
+    assert not kinds(fake_swarm, BORIS) and waiters(fake_swarm) == []
+
+
+async def test_taking_the_path_clears_the_wait_and_no_free_note_follows(ws, fake_swarm):
+    """The waiter's own retry expires the lock lazily and takes the path: expire_locks() never settles, so no "free"
+    note arrives for what it holds; a later settle has nothing to do."""
+    team(fake_swarm)
+    expire = "UPDATE file_locks SET expires_at = ?"
+    ws.lock(ANNA, "x.md")
+    with pytest.raises(ToolError):
+        await ws.write(BORIS, "x.md", "mine")
+    fake_swarm.db.execute(expire, (time.time() - 1,))
+    await ws.write(BORIS, "x.md", "mine")
+    ws.lock(ANNA, "docs/a.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "docs/a.md")
+    ws.check_writable(BORIS, "docs/b.md")        # free: its wait for docs/a.md stays
+    assert waiters(fake_swarm) == [(BORIS, "docs/a.md")]
+    fake_swarm.db.execute(expire, (time.time() - 1,))
+    ws.lock(BORIS, "docs")                       # a folder over what it waited for
+    assert waiters(fake_swarm) == [] and ws.settle_waiters() == 0 and not kinds(fake_swarm, BORIS)
+
+
+async def test_an_expiry_is_settled_by_settle_waiters_not_by_expire_locks(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "x.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "x.md")
+    fake_swarm.db.execute("UPDATE file_locks SET expires_at = ?", (time.time() - 1,))
+    assert ws.settle_waiters() == 1           # an expired row counts as free, deleted or not
+    assert ws.expire_locks() == 1 and kinds(fake_swarm, BORIS) == ["n_lock_free"]
+    ws.lock(ANNA, "y.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "y.md")
+    fake_swarm.db.execute("UPDATE file_locks SET expires_at = ?", (time.time() - 1,))
+    assert ws.expire_locks() == 1 and kinds(fake_swarm, BORIS) == ["n_lock_free"]
+    assert ws.settle_waiters() == 1 and kinds(fake_swarm, BORIS) == ["n_lock_free", "n_lock_free"]
+
+
+async def test_waits_survive_a_new_workspace_on_the_same_database(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "x.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "x.md")
+    again = Workspace(fake_swarm)
+    assert again.waits_for_lock(BORIS) and again.lock_waits(BORIS) == ["x.md"]
+    again.unlock(ANNA, "x.md")
+    assert kinds(fake_swarm, BORIS) == ["n_lock_free"]
+
+
+async def test_one_free_notice_names_at_most_ten_paths(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "src")
+    for i in range(12):
+        with pytest.raises(ToolError):
+            await ws.write(BORIS, f"src/f{i:02}.py", "x")
+    ws.unlock(ANNA, "src")
+    [(key, kw)] = fake_swarm.notifications_for(BORIS)
+    assert key == "n_lock_free" and kw["paths"] == ", ".join(f"src/f{i:02}.py" for i in range(10)) + " (+2)"
+    assert workspace_mod.shown_list(["a", "b"]) == "a, b" and workspace_mod.WAITERS_SHOWN == 10
+
+
+async def test_the_holder_is_told_once_per_lock_after_lock_wanted_minutes(ws, fake_swarm):
+    """The holder of a lock members wait for gets one waking n_lock_wanted once it has held the lock for [workspace]
+    lock_wanted_minutes (checked at a refusal and by settle_waiters, the scheduler tick): the lock, how long it is
+    held, the waiters with their tasks in progress. A refresh is the same lock; a new lock may be told again."""
+    from dreamteam.board import Board
+
+    team(fake_swarm)
+    fake_swarm.board = Board(fake_swarm)
+    task = fake_swarm.board.create(USER, "Parser", goal="g", assignee=BORIS)
+    fake_swarm.board.claim(BORIS, task.id)
+    assert fake_swarm.config.workspace.lock_wanted_minutes == 5
+    ws.lock(ANNA, "docs/AUDIT.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "docs/AUDIT.md")
+    with pytest.raises(ToolError):
+        ws.lock(CAROL, "docs")
+    assert ws.settle_waiters() == 0 and not kinds(fake_swarm, ANNA)     # held for less than 5 min
+    fake_swarm.db.execute("UPDATE file_locks SET acquired_at = ?", (time.time() - 6 * 60 - 5,))
+    fake_swarm.signals.clear()
+    ws.settle_waiters()
+    [(key, kw)] = fake_swarm.notifications_for(ANNA)
+    assert key == "n_lock_wanted" and fake_swarm.signals == [ANNA]
+    assert kw == {"path": "docs/AUDIT.md", "held": "6 min", "waiters": f"{BORIS} (task #{task.id} Parser), {CAROL}"}
+    text = fake_swarm.db.scalar("SELECT text FROM notifications WHERE recipient = ?", (ANNA,))
+    assert text.startswith(f"docs/AUDIT.md, which you have held for 6 min, is wanted by: {BORIS} (task #{task.id} "
+                           f"Parser), {CAROL}. If you are still editing it, finish that edit first and unlock it")
+    assert "No reply is needed" in text
+    ws.lock(ANNA, "docs/AUDIT.md")              # a refresh: the same lock, told already
+    ws.settle_waiters()
+    assert kinds(fake_swarm, ANNA) == ["n_lock_wanted"]
+    # a new lock is told again, here at the refusal itself (0: as soon as someone is refused)
+    fake_swarm.config.workspace.lock_wanted_minutes = 0
+    ws.lock(ANNA, "notes.md")
+    with pytest.raises(ToolError):
+        ws.check_writable(CAROL, "notes.md")
+    assert kinds(fake_swarm, ANNA) == ["n_lock_wanted", "n_lock_wanted"]
+    assert fake_swarm.notifications_for(ANNA)[-1][1]["waiters"] == CAROL
+    assert fake_swarm.notifications_for(ANNA)[-1][1]["held"] == "1 s"   # under a second: never "held for 0 s"
+    with pytest.raises(ToolError):
+        ws.check_writable(BORIS, "notes.md")    # once per lock
+    assert kinds(fake_swarm, ANNA) == ["n_lock_wanted", "n_lock_wanted"]
+    fake_swarm.add_member("Дарья Петрова", language="ru")
+    ws.lock("Дарья Петрова", "ru.md")
+    with pytest.raises(ToolError):
+        ws.lock(CAROL, "ru.md")
+    [(_, kw)] = fake_swarm.notifications_for("Дарья Петрова")
+    assert kw["held"] == "1 с"
+    assert "ru.md, который ты держишь уже 1 с, ждут:" in fake_swarm.db.scalar(
+        "SELECT text FROM notifications WHERE recipient = ?", ("Дарья Петрова",))
+
+
+async def test_a_holder_of_nested_locks_is_told_once(ws, fake_swarm):
+    """A folder and a file in it, both locked by the holder: one n_lock_wanted for a waiter, also at the next ticks
+    and for a nested lock taken after the notice."""
+    team(fake_swarm)
+    fake_swarm.config.workspace.lock_wanted_minutes = 0
+    ws.lock(ANNA, "docs")
+    ws.lock(ANNA, "docs/a.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "docs/a.md")
+    ws.settle_waiters()
+    ws.lock(ANNA, "docs/b.md")
+    ws.settle_waiters()
+    assert kinds(fake_swarm, ANNA) == ["n_lock_wanted"]
+    assert fake_swarm.db.scalar("SELECT COUNT(*) FROM file_locks WHERE wanted_at IS NULL") == 0
+
+
+async def test_lock_notices_are_quiet_once_the_goal_is_done(ws, fake_swarm):
+    """After complete_goal a freed waiter's n_lock_free is quiet (read at its next wake-up) and a holder is not told,
+    like a job's end; a reopened goal still gets the holder's notice (the lock stayed untold)."""
+    team(fake_swarm)
+    fake_swarm.config.workspace.lock_wanted_minutes = 0
+    fake_swarm.set_goal(USER, "G")
+    fake_swarm.complete_goal(ANNA, "done")
+    ws.lock(ANNA, "a.md")
+    ws.lock(ANNA, "b.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "a.md")
+    with pytest.raises(ToolError):
+        ws.lock(CAROL, "b.md")
+    ws.settle_waiters()
+    assert not kinds(fake_swarm, ANNA)
+    fake_swarm.signals.clear()
+    ws.unlock(ANNA, "a.md")
+    assert kinds(fake_swarm, BORIS) == ["n_lock_free"] and BORIS not in fake_swarm.signals
+    assert not fake_swarm.has_pending(BORIS) and not ws.waits_for_lock(BORIS)
+    fake_swarm.db.set("goal", {**fake_swarm.goal(), "status": "active"})
+    ws.settle_waiters()
+    assert kinds(fake_swarm, ANNA) == ["n_lock_wanted"]
+
+
+async def test_the_users_forced_unlock_wakes_the_waiters_and_names_what_is_locked(ws, fake_swarm):
+    team(fake_swarm)
+    ws.lock(ANNA, "docs")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "docs/AUDIT.md")
+    with pytest.raises(ToolError, match=r"^'docs/AUDIT.md' is not locked itself: it is under the lock on 'docs' "
+                                        rf"\({ANNA}\); unlock 'docs' instead\.$"):
+        ws.unlock(USER, "docs/AUDIT.md", force=True)
+    assert ws.unlock(USER, "docs", force=True) == f"Unlocked docs (it was locked by {ANNA})."
+    assert kinds(fake_swarm, BORIS) == ["n_lock_free"] and not kinds(fake_swarm, ANNA)  # no note to the holder
+    event = file_events(fake_swarm, "file.unlocked")[-1]
+    assert event["actor"] == USER and event["data"] == {"path": "docs", "owner": ANNA, "forced": True}
+    with pytest.raises(ToolError, match=r"^'docs' is not locked; no file is locked now\.$"):
+        ws.unlock(USER, "docs", force=True)
+    ws.lock(BORIS, "a.md")
+    with pytest.raises(ToolError, match=rf"^'b.md' is not locked\. Locked now: a\.md \({BORIS}\)\.$"):
+        ws.unlock(USER, "b.md", force=True)
+    assert ws.unlock(BORIS, "b.md") == "b.md is not locked."    # a member's own unlock of nothing is no error
+
+
+async def test_the_held_locks_note(ws, fake_swarm):
+    assert ws.held_locks_note(ANNA) == ""
+    ws.lock(ANNA, "docs/AUDIT.md", minutes=10)
+    ws.lock(BORIS, "other.md")
+    until = time.strftime("%H:%M", time.localtime(ws.locks()[0]["expires_at"]))
+    assert ws.held_locks_note(ANNA) == (f"You still hold locks on: docs/AUDIT.md (until {until}). Unlock those you "
+                                        "no longer need (`lock_file` with unlock=true).")
+
+
 # --- listing -----------------------------------------------------------------------------------------------
 
 async def test_list_tree_text(ws):

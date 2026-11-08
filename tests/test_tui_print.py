@@ -430,6 +430,32 @@ async def test_without_a_timeout_the_clarify_question_line_says_the_run_waits(la
     assert code == 0 and out.getvalue().strip() == "Picked the colour myself: blue.", err.getvalue()
 
 
+async def test_calls_that_count_as_zero_are_reported_on_stderr(tmp_path):
+    """A profile without prices whose provider reports no cost (an OpenAI-compatible endpoint, played by ScriptedLLM):
+    the hub's u_cost_unknown is one stderr line per run in `text` and `json` also without --verbose (the verbose feed
+    shows it as a notice line, once); `stream-json` carries the notification event instead."""
+    home = make_home(tmp_path)
+    raw = st.read_raw(home)
+    st.write_raw(home, {**raw, "models": {"default": {"provider": "openai", "model": "some-model-v1",
+                                                      "base_url": "http://127.0.0.1:9/v1", "api_key": "x"}}})
+    conn = await connect(home, web=False, llm_factory=lambda profile, agent: ScriptedLLM(finisher(), profile))
+    head = 'DreamTeam cannot count the cost of model profile "default" (model some-model-v1)'
+    try:
+        code, out, err = await run(conn, f"Write a {MARK}")
+        assert code == 0 and out.strip() == "The haiku is in out/haiku.txt.", err
+        assert err.count(head) == 1 and err.startswith(head), err
+        code, out, err = await run(conn, f"Another {MARK}", output_format="json")
+        assert code == 0 and json.loads(out)["status"] == "done" and err.count(head) == 1, err
+        code, out, err = await run(conn, f"Verbose {MARK}", verbose=True)
+        assert code == 0 and err.count(head) == 1, err
+        code, out, err = await run(conn, f"Stream a {MARK}", output_format="stream-json")
+        assert code == 0 and head not in err, err
+        notices = [json.loads(line) for line in out.splitlines() if '"u_cost_unknown"' in line]
+        assert [n["data"]["kind"] for n in notices] == ["u_cost_unknown"] and head in notices[0]["data"]["text"]
+    finally:
+        await conn.close()
+
+
 def test_texts_are_in_both_languages():
     def fields(text: str) -> list[str]:
         return sorted(name for _, name, _, _ in string.Formatter().parse(text) if name)

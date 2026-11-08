@@ -17,9 +17,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
+from . import prompts
 from .db import dumps, loads
-from .models import USER, Status, ToolError
-from .workspace import lexically_inside, network_anchor
+from .jobs import fmt_duration
+from .models import USER, AgentKind, AgentStatus, Status, ToolError
+from .tools.fmt import item_time
+from .workspace import lexically_inside, network_anchor, path_key, shown_list
 
 log = logging.getLogger(__name__)
 
@@ -28,6 +31,8 @@ MAX_CONDITION_NODES = 200
 MIN_EVERY_SECONDS = 10.0
 MAX_NOTE_CHARS = 4000
 MAX_ERROR_CHARS = 1000
+MAX_EDIT_EVENTS = 10_000             # file.changed events buffered between two evaluation passes
+MAX_EDITORS_SHOWN = 5                # editors a file_changed() notice names
 EVAL_ERROR_PREFIX = "evaluation error: "
 DIRTY_PREFIXES = ("task.", "message.", "file.", "goal.", "agent.")
 STATUS_NAMES = frozenset(Status.ALL)
@@ -48,8 +53,8 @@ GRAMMAR = (
     "  status(id), done(*ids), any_done(*ids), finished(*ids), failed(*ids), assignee(id),\n"
     "  count(status=None, tag=None, assignee=None, parent=None), all_done(tag=None, parent=None),\n"
     "  message(sender=None, contains=None), comment(task=None, sender=None, contains=None),\n"
-    "  file_exists(path), file_changed(path), after(\"2026-10-09 18:00\"), elapsed(seconds),\n"
-    "  every(seconds >= 10), agent_status(name), goal_done()\n"
+    "  file_exists(path), file_changed(path) [once the file has stopped changing], after(\"2026-10-09 18:00\"),\n"
+    "  elapsed(seconds), every(seconds >= 10), agent_status(name), goal_done()\n"
     "Example: done(1, 2) and status(3) in (failed, cancelled)"
 )
 
@@ -186,7 +191,48 @@ class _Marks:
 
     message_id: int | None = None                                   # max messages.id
     comment_id: int | None = None                                   # max comments.id
-    files: dict[str, tuple[int, int] | None] = field(default_factory=dict)  # path -> (mtime_ns, size)
+    files: dict[str, tuple[int, int] | None] = field(default_factory=dict)  # path -> (mtime_ns, size), None: no file
+
+
+@dataclass
+class _FileRun:
+    """The changes of one file_changed() path since the trigger's reference point (creation or last fire): the
+    file.changed events of write_file/edit_file, which name the editor, and the changes no event explains. A sure
+    pass (no write_file/edit_file of the path in flight, Workspace.write_mark) shows every write whose event came
+    since the previous sure pass, finished: its new signature is a command's or a job's change only when no event of
+    the path came in between. Times are the engine's clock."""
+
+    sig: tuple[int, int] | None       # signature seen by the last sure pass
+    cursor: int                       # MAX(events.id) when the run started: older file.changed events are not its own
+    first: float | None = None        # when the count first became > 0
+    last: float | None = None         # the latest change seen (the owner's included)
+    edits: int = 0                    # file.changed events of the path, every actor
+    own: int = 0                      # ... of the trigger's owner
+    unseen: int = 0                   # ... counted since the last sure pass: the next sure probe shows their writes
+    unexplained: int = 0              # sure passes that saw a new signature (file present) with no event since the
+                                      # previous one: a command's or a job's change
+    editors: dict[str, None] = field(default_factory=dict)   # the other actors, first seen first
+    done: bool = False                # every change explained by an event, every editor an AI agent out of its turn
+    adopt: bool = False               # `sig` was probed while the file was being written: the next sure probe is
+                                      # taken as the baseline, not counted (the write's event counts the change)
+    fresh: bool = False               # created while a pass was stat'ing: `sig` is newer than that pass's probe, which
+                                      # this run skips (until that pass ends; a fire in it adopts the next sure probe)
+
+    @property
+    def count(self) -> int:
+        """The changes reported: the others' edits plus the changes no event explains (commands, jobs)."""
+        return self.edits - self.own + self.unexplained
+
+    def stopped(self, now: float, settle: float) -> bool:
+        """The run has changes and they stopped: no change for `settle` seconds (0: at once), or the editors are
+        done."""
+        return self.count > 0 and (settle <= 0 or self.done or (self.last is not None and now - self.last >= settle))
+
+    def settled(self, now: float, settle: float, max_wait: float) -> bool:
+        """stopped(), or `max_wait` seconds (0: no cap) passed since the first change of a file that keeps changing."""
+        if self.stopped(now, settle):
+            return True
+        return self.count > 0 and max_wait > 0 and self.first is not None and now - self.first >= max_wait
 
 
 def _file_probe(root: Path, path: str) -> tuple[int, int, float] | None:
@@ -201,9 +247,27 @@ def _file_probe(root: Path, path: str) -> tuple[int, int, float] | None:
     return st.st_mtime_ns, st.st_size, st.st_mtime
 
 
-def _file_signature(root: Path, path: str) -> tuple[int, int] | None:
-    probe = _file_probe(root, path)
-    return None if probe is None else probe[:2]
+def _cached_probe(cache: dict[str, tuple[int, int, float] | None], root: Path, path: str
+                  ) -> tuple[int, int, float] | None:
+    """_file_probe() of `path` from a pass's cache, or a direct stat for a path that pass did not probe."""
+    return cache[path] if path in cache else _file_probe(root, path)
+
+
+def _within_interval(told: float | None, now: float, interval: float) -> bool:
+    """Told less than `interval` ago (a clock gone back since then does not count as within it)."""
+    return interval > 0 and told is not None and 0 <= now - told < interval
+
+
+def _path_key(root: Path, path: str) -> str | None:
+    """The key the file.changed events of `path` carry (workspace-relative as Workspace.rel gives it, in path_key
+    form), or None if the path is unsafe."""
+    target = safe_path(root, path)
+    if target is None:
+        return None
+    try:
+        return path_key(target.relative_to(root.resolve()).as_posix())
+    except (ValueError, OSError, RuntimeError):
+        return None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -212,7 +276,8 @@ def _file_signature(root: Path, path: str) -> tuple[int, int] | None:
 
 class _Env:
     def __init__(self, swarm: Any, owner: str, created_at: float, reference: float, now: float,
-                 marks: _Marks | None = None, fs: dict[str, tuple[int, int, float] | None] | None = None):
+                 marks: _Marks | None = None, fs: dict[str, tuple[int, int, float] | None] | None = None,
+                 runs: dict[str, _FileRun] | None = None, settle: float = 0.0, max_wait: float = 0.0):
         self.swarm = swarm
         self.db = swarm.db
         self.owner = owner
@@ -221,6 +286,9 @@ class _Env:
         self.now = now
         self.marks = marks              # what was already seen at the reference point
         self.fs = fs or {}              # file stats probed off the loop; empty for a direct (sync) call
+        self.runs = runs                # file_changed() runs (TriggerEngine._advance); None: any change counts at once
+        self.settle = settle            # [agents] file_settle_seconds, file_max_wait_seconds
+        self.max_wait = max_wait
 
     def _statuses(self, ids: tuple[int, ...]) -> dict[int, str]:
         marks = ",".join("?" for _ in ids)
@@ -301,21 +369,28 @@ class _Env:
     def _probe(self, path: str) -> tuple[int, int, float] | None:
         """The file's (mtime_ns, size, mtime) from the pass cache, or a direct stat when the engine is
         driven synchronously (tests); None if the path is unsafe or cannot be stat'd."""
-        if path in self.fs:
-            return self.fs[path]
-        return _file_probe(self.swarm.config.workspace_dir, path)
+        return _cached_probe(self.fs, self.swarm.config.workspace_dir, path)
 
     def fn_file_exists(self, path: str) -> bool:
         return self._probe(path) is not None
 
     def fn_file_changed(self, path: str) -> bool:
+        """Changed since the reference point and, with the engine's runs, that run of changes has settled and holds
+        changes other than the owner's own edits."""
         probe = self._probe(path)
         if probe is None:
             return False
         mtime_ns, size, mtime = probe
+        run = None if self.runs is None else self.runs.get(path)
         if self.marks is not None and path in self.marks.files:
-            return (mtime_ns, size) != self.marks.files[path]   # appeared or modified
-        return mtime > self.reference
+            # appeared or modified; a run followed since the reference point counted every change, also one that left
+            # the signature as it was (a coarse mtime, the same size)
+            changed = (mtime_ns, size) != self.marks.files[path] or (run is not None and run.count > 0)
+        else:
+            changed = mtime > self.reference
+        if not changed or self.runs is None:
+            return changed
+        return run is not None and run.settled(self.now, self.settle, self.max_wait)
 
     def fn_after(self, when: str) -> bool:
         return self.now >= parse_when(when)
@@ -341,6 +416,15 @@ class _Env:
 def _actor_key(name: Any) -> str:
     key = _norm(name)
     return USER if key in (USER, "пользователь") else key
+
+
+def _count_edit(run: _FileRun, actor: str | None, owner_key: str) -> None:
+    """One file.changed event of the run's path: the owner's own edit, or another editor's."""
+    run.edits += 1
+    if _actor_key(actor) == owner_key:
+        run.own += 1
+    else:
+        run.editors.setdefault(actor or "?", None)
 
 
 def _matches(author: str | None, text: str | None, sender: str | None, contains: str | None) -> bool:
@@ -702,13 +786,38 @@ def normalize_actions(actions: Any) -> list[dict[str, Any]]:
 # engine
 
 
-def _to_dict(row: Any) -> dict[str, Any]:
+def _to_dict(row: Any, interval: float = 0.0) -> dict[str, Any]:
+    """The public trigger dict; `interval` ([agents] trigger_wake_seconds) gives `wake_at`, when the fires held back
+    since the owner was last told (`held`, `told_at`) wake it."""
+    held, told = row["held"] or 0, row["told_at"]
+    wake_at = told + interval if held and row["active"] and interval > 0 and told is not None else None
     return {
         "id": row["id"], "owner": row["owner"], "condition": row["condition"], "note": row["note"] or "",
         "actions": loads(row["actions"], []), "once": bool(row["once"]), "active": bool(row["active"]),
         "created_at": row["created_at"], "last_fired": row["last_fired"],
         "fire_count": row["fire_count"] or 0, "last_error": row["last_error"],
+        "held": held, "told_at": told, "wake_at": wake_at,
     }
+
+
+def _held_files(row: Any) -> dict[str, dict[str, Any]]:
+    held = loads(row["held_files"], {})
+    return {p: v for p, v in held.items() if isinstance(v, dict)} if isinstance(held, dict) else {}
+
+
+def _merge_files(held: dict[str, dict[str, Any]], files: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """held_files with the file_changed() changes of one more fire (TriggerEngine._file_changes): the counts summed,
+    the editors joined, the first and the latest change, the state of the latest fire."""
+    merged = {path: dict(item) for path, item in held.items()}
+    for f in files:
+        item = merged.setdefault(f["path"], {"count": 0, "by": [], "first": None, "last": None})
+        item["count"] = int(item.get("count") or 0) + f["changes"]
+        item["by"] = list(dict.fromkeys([*(item.get("by") or []), *f["by"]]))
+        firsts = [t for t in (item.get("first"), f["first"]) if t is not None]
+        lasts = [t for t in (item.get("last"), f["last"]) if t is not None]
+        item["first"], item["last"] = min(firsts, default=None), max(lasts, default=None)
+        item["settled"] = f["settled"]
+    return merged
 
 
 class TriggerEngine:
@@ -723,6 +832,15 @@ class TriggerEngine:
         self._marks: dict[int, _Marks] = {}     # trigger id -> what it had seen at its reference point
         self._fires: dict[int, collections.deque[float]] = {}   # recent fire times of repeating triggers
         self._probes: dict[str, tuple[int, int, float] | None] = {}   # file stats for the current pass (off loop)
+        self._keys: dict[str, str | None] = {}  # path keys of the file_changed() paths for the current pass (off loop)
+        self._write_mark: tuple[int, frozenset[str]] | None = None   # Workspace.write_mark before the pass's probes
+        self._runs: dict[int, dict[str, _FileRun]] = {}   # trigger id -> its file_changed() runs (memory only)
+        # (event id, actor, path key) of the file.changed events since the last pass
+        self._edits: collections.deque[tuple[int, str | None, str]] = collections.deque(maxlen=MAX_EDIT_EVENTS)
+        # owners whose active triggers hold back fires ([agents] trigger_wake_seconds): render_wake asks no query for
+        # the others
+        self._held_owners: set[str] = {r["owner"] for r in swarm.db.all(
+            "SELECT DISTINCT owner FROM triggers WHERE active = 1 AND held > 0")}
         swarm.bus.listen(self._on_event)
 
     # --- conditions ---------------------------------------------------------------------------
@@ -792,7 +910,7 @@ class TriggerEngine:
         row = self.swarm.db.one("SELECT * FROM triggers WHERE id = ?", (trigger_id,))
         if row is None:
             raise ToolError(f"Trigger #{trigger_id} not found. Use trigger_list to see your triggers.")
-        return _to_dict(row)
+        return _to_dict(row, self._wake_interval())
 
     def delete(self, actor: str, trigger_id: int) -> None:
         trigger = self.get(trigger_id)
@@ -808,14 +926,20 @@ class TriggerEngine:
         rows = self.swarm.db.all(sql)
         if owner is not None:
             rows = [r for r in rows if _norm(r["owner"]) == _norm(owner)]
-        return [_to_dict(r) for r in rows]
+        interval = self._wake_interval()
+        return [_to_dict(r, interval) for r in rows]
 
     # --- evaluation ---------------------------------------------------------------------------
     def mark_dirty(self) -> None:
         self._dirty.set()
 
     def _on_event(self, event: dict[str, Any]) -> None:
-        if str(event.get("type", "")).startswith(DIRTY_PREFIXES):
+        kind = str(event.get("type", ""))
+        if kind == "file.changed" and event.get("id") is not None:
+            path = (event.get("data") or {}).get("path")
+            if isinstance(path, str):   # a write_file/edit_file edit: who changed which file (file_changed runs)
+                self._edits.append((event["id"], event.get("actor"), path_key(path)))
+        if kind.startswith(DIRTY_PREFIXES):
             self.mark_dirty()
 
     def evaluate_all(self) -> int:
@@ -827,53 +951,194 @@ class TriggerEngine:
         self._evaluating = True
         try:
             fired = 0
+            # the file.changed events since the last pass, for every trigger of this one
+            taken, self._edits = self._edits, collections.deque(maxlen=MAX_EDIT_EVENTS)
+            edits = list(taken)
             owners: dict[str, bool] = {}
             rows = self.swarm.db.all("SELECT * FROM triggers WHERE active = 1 ORDER BY id")
             for row in rows:
-                owner = row["owner"]
-                if owner not in owners:
-                    owners[owner] = owner == USER or bool(self.swarm.is_member(owner))
-                if owners[owner]:
-                    fired += self._evaluate_one(row)
-            if self._marks or self._fires:      # forget triggers deactivated or deleted elsewhere
+                if self._owner_alive(owners, row["owner"]):
+                    fired += self._evaluate_one(row, edits)
+            if self._marks or self._fires or self._runs:      # forget triggers deactivated or deleted elsewhere
                 active = {row["id"] for row in rows}
-                for stale in [k for k in {*self._marks, *self._fires} if k not in active]:
+                for stale in [k for k in {*self._marks, *self._fires, *self._runs} if k not in active]:
                     self._forget(stale)
+            self._release_due(owners)
             return fired
         finally:
             self._evaluating = False
 
-    def _watched_paths(self) -> set[str]:
-        """Workspace paths the active triggers probe, stat'd together off the loop before a pass."""
+    def _owner_alive(self, known: dict[str, bool], owner: str) -> bool:
+        """The owner is the user or a member (`known`: this pass's answers)."""
+        if owner not in known:
+            known[owner] = owner == USER or bool(self.swarm.is_member(owner))
+        return known[owner]
+
+    def _watched_paths(self) -> tuple[set[str], set[str]]:
+        """Workspace paths the active triggers probe (file_exists/file_changed) and those file_changed() watches,
+        resolved together off the loop before a pass."""
         paths: set[str] = set()
+        files: set[str] = set()
         for row in self.swarm.db.all("SELECT condition FROM triggers WHERE active = 1"):
             try:
-                paths.update(self.compile(row["condition"]).probes)
+                compiled = self.compile(row["condition"])
             except ToolError:
-                pass
-        return paths
+                continue
+            paths.update(compiled.probes)
+            files.update(compiled.files)
+        return paths, files
 
-    def _probe_files(self, paths: set[str]) -> dict[str, tuple[int, int, float] | None]:
+    def _probe_files(self, paths: set[str], files: set[str]
+                     ) -> tuple[dict[str, tuple[int, int, float] | None], dict[str, str | None]]:
         root = self.swarm.config.workspace_dir
-        return {path: _file_probe(root, path) for path in paths}
+        return {path: _file_probe(root, path) for path in paths}, {path: _path_key(root, path) for path in files}
 
     async def _evaluate_pass(self) -> int:
         """Stat the watched files off the event loop, then evaluate on it: no file resolve/stat blocks the
         loop, so a slow path cannot stall the swarm."""
-        paths = self._watched_paths()
-        self._probes = await asyncio.to_thread(self._probe_files, paths) if paths else {}
+        paths, files = self._watched_paths()
+        self._write_mark = self._take_write_mark()
         try:
+            self._probes, self._keys = await asyncio.to_thread(self._probe_files, paths, files) if paths else ({}, {})
             return self.evaluate_all()
         finally:
-            self._probes = {}
+            self._probes, self._keys, self._write_mark = {}, {}, None
+            for runs in self._runs.values():
+                for run in runs.values():
+                    run.fresh = False
 
-    def _evaluate_one(self, row: Any) -> int:
+    def _take_write_mark(self) -> tuple[int, frozenset[str]] | None:
+        mark = getattr(getattr(self.swarm, "workspace", None), "write_mark", None)
+        return mark() if callable(mark) else None
+
+    def _unsure(self, path: str) -> bool:
+        """A write_file/edit_file write of `path` was in flight when this pass started probing, or started since:
+        the probe may show the file before or in the middle of that write (Workspace.write_mark). Without a pass's
+        mark (trigger_create's direct stat, a direct evaluate_all, both on the loop): a write in flight now."""
+        mark = self._write_mark or self._take_write_mark()
+        if mark is None:
+            return False
+        key = self._key_of(path)
+        return key is not None and self.swarm.workspace.written_since(mark, key)
+
+    def _file_settings(self) -> tuple[float, float]:
+        """[agents] file_settle_seconds and file_max_wait_seconds, read at each pass (session overrides apply)."""
+        agents = self.swarm.config.agents
+        return max(0.0, float(agents.file_settle_seconds)), max(0.0, float(agents.file_max_wait_seconds))
+
+    def _wake_interval(self) -> float:
+        """[agents] trigger_wake_seconds, read at each use (session overrides apply)."""
+        return max(0.0, float(self.swarm.config.agents.trigger_wake_seconds))
+
+    # --- the wake limit of repeating triggers ([agents] trigger_wake_seconds) -------------------
+    @staticmethod
+    def _held_back(row: Any, now: float, interval: float) -> bool:
+        """The notice of this fire waits: a member's repeating trigger that told its owner less than `interval` ago
+        (a clock gone back since then does not hold it)."""
+        return not row["once"] and row["owner"] != USER and _within_interval(row["told_at"], now, interval)
+
+    def _hold(self, row: Any, now: float, files: list[dict[str, Any]]) -> None:
+        held = _merge_files(_held_files(row), files)
+        self.swarm.db.execute("UPDATE triggers SET held = COALESCE(held, 0) + 1, held_last = ?, held_files = ?"
+                              " WHERE id = ?", (now, dumps(held) if held else None, row["id"]))
+        self._held_owners.add(row["owner"])
+
+    def _told(self, trigger_id: int, now: float) -> None:
+        self.swarm.db.execute("UPDATE triggers SET told_at = ?, held = 0, held_last = NULL, held_files = NULL"
+                              " WHERE id = ?", (now, trigger_id))
+
+    def _notify_held(self, row: Any, now: float, *, count: int, last: float, files: dict[str, dict[str, Any]],
+                     note: str, wake: bool = True) -> None:
+        """The one notice of `count` fires, the latest at `last`, since the owner was last told."""
+        lang = self.swarm.language_of(row["owner"])
+        interval = self._wake_interval()
+        key = "n_trigger_held" if interval > 0 else "n_trigger_held_off"   # the limit switched off with fires held
+        self.swarm.notify(row["owner"], key, wake=wake, id=row["id"], condition=row["condition"], count=count,
+                          since=item_time(row["told_at"] or now, now), last=item_time(last, now),
+                          interval=fmt_duration(interval, lang), changes=self._held_changes_text(files, lang, now),
+                          note=note)
+
+    def _tell(self, row: Any, now: float, note: str, files: list[dict[str, Any]]) -> None:
+        """Wake the owner with this fire, merged with the fires held back since it was last told."""
+        trigger_id, owner = row["id"], row["owner"]
+        held = row["held"] or 0
+        if held:
+            self._notify_held(row, now, count=held + 1, last=now, files=_merge_files(_held_files(row), files),
+                              note=note)
+        else:
+            changes = self._changes_text(files, self.swarm.language_of(owner), now)
+            if changes:
+                self.swarm.notify(owner, "n_trigger_files", id=trigger_id, condition=row["condition"],
+                                  changes=changes, note=note)
+            else:
+                self.swarm.notify(owner, "n_trigger", id=trigger_id, condition=row["condition"], note=note)
+        self._told(trigger_id, now)
+
+    def _release(self, row: Any, now: float, *, wake: bool) -> None:
+        """The held fires of a trigger in one notice, without a new fire; their last action error is in its note."""
+        note = row["note"] or ""
+        error = row["last_error"]
+        if error and not error.startswith(EVAL_ERROR_PREFIX):
+            note = (note + "\n" if note else "") + "Trigger action errors: " + error
+        self._notify_held(row, now, count=row["held"], last=row["held_last"] or now, files=_held_files(row), note=note,
+                          wake=wake)
+        self._told(row["id"], now)
+
+    def _held_changes_text(self, held: dict[str, dict[str, Any]], lang: str, now: float) -> str:
+        """The n_trigger_files fragments of merged held_files: a file counts as settled when it has been quiet for
+        the settle window by now."""
+        settle, _ = self._file_settings()
+        files = [{"path": path, "changes": int(item.get("count") or 0), "by": list(item.get("by") or []),
+                  "first": item.get("first"), "last": item.get("last"),
+                  "settled": bool(item.get("settled")) or (item.get("last") is not None
+                                                           and now - item["last"] >= settle)}
+                 for path, item in held.items() if item.get("count")]
+        return self._changes_text(files, lang, now)
+
+    def _release_due(self, owners: dict[str, bool]) -> None:
+        """Wake the owners whose triggers held fires back for a whole interval (or the limit is off now)."""
+        if not self._held_owners:
+            return
+        now, interval = self.clock(), self._wake_interval()
+        waiting: set[str] = set()
+        for row in self.swarm.db.all("SELECT * FROM triggers WHERE active = 1 AND held > 0 ORDER BY id"):
+            owner = row["owner"]
+            if not self._owner_alive(owners, owner):
+                continue
+            if _within_interval(row["told_at"], now, interval):
+                waiting.add(owner)
+                continue
+            try:
+                self._release(row, now, wake=True)
+            except Exception:  # noqa: BLE001 - one owner's notice must not stop the others'
+                log.exception("trigger #%s: the held notice failed", row["id"])
+                waiting.add(owner)
+        self._held_owners = waiting
+
+    def release_held(self, owner: str) -> None:
+        """Tell `owner` now, quietly, about the fires its repeating triggers held back: it is reading its news anyway
+        (Swarm.render_wake: a wake-up, the news between two steps, wait_for_events), so they need no wake-up of their
+        own. Never raises."""
+        if owner not in self._held_owners:
+            return
+        try:
+            now = self.clock()
+            for row in self.swarm.db.all("SELECT * FROM triggers WHERE owner = ? AND active = 1 AND held > 0"
+                                         " ORDER BY id", (owner,)):
+                self._release(row, now, wake=False)
+            self._held_owners.discard(owner)
+        except Exception:  # noqa: BLE001 - the wake-up goes on without them; the interval's end tells it
+            log.exception("could not tell %s about the held trigger fires", owner)
+
+    def _evaluate_one(self, row: Any, edits: list[tuple[int, str | None, str]]) -> int:
         now = self.clock()
         reference = row["last_fired"] if row["last_fired"] is not None else row["created_at"]
         try:
             compiled = self.compile(row["condition"])
+            runs = self._advance(row, compiled, reference, now, edits) if compiled.files else None
+            settle, max_wait = self._file_settings()
             env = _Env(self.swarm, row["owner"], row["created_at"], reference, now, self._marks.get(row["id"]),
-                       self._probes)
+                       self._probes, runs, settle, max_wait)
             value = bool(compiled.evaluate(env))
         except Exception as e:  # any failure of a user condition is reported, never raised
             self._set_error(row["id"], f"{EVAL_ERROR_PREFIX}{_describe(e)}")
@@ -895,12 +1160,157 @@ class TriggerEngine:
         self.swarm.db.execute("UPDATE triggers SET last_error = ? WHERE id = ? AND last_error IS NOT ?",
                               (error, trigger_id, error))
 
+    def _probe(self, path: str) -> tuple[int, int, float] | None:
+        """The file's (mtime_ns, size, mtime), from the pass cache when one populated it, else a direct stat."""
+        return _cached_probe(self._probes, self.swarm.config.workspace_dir, path)
+
     def _signature(self, path: str) -> tuple[int, int] | None:
-        """file_changed() mark for `path`, from the pass cache when one populated it, else a direct stat."""
-        if path in self._probes:
-            probe = self._probes[path]
-            return None if probe is None else probe[:2]
-        return _file_signature(self.swarm.config.workspace_dir, path)
+        """file_changed() mark for `path`."""
+        probe = self._probe(path)
+        return None if probe is None else probe[:2]
+
+    def _key_of(self, path: str) -> str | None:
+        if path in self._keys:
+            return self._keys[path]
+        return _path_key(self.swarm.config.workspace_dir, path)
+
+    def _event_cursor(self) -> int:
+        return int(self.swarm.db.scalar("SELECT COALESCE(MAX(id), 0) FROM events") or 0)
+
+    def _advance(self, row: Any, compiled: CompiledCondition, reference: float, now: float,
+                 edits: list[tuple[int, str | None, str]]) -> dict[str, _FileRun]:
+        """The trigger's file_changed() runs brought up to this pass: the file.changed events since the last pass,
+        the signature the pass probed and whether the editors are done."""
+        runs = self._runs.get(row["id"])
+        if runs is None or runs.keys() != set(compiled.files):
+            runs = self._runs[row["id"]] = self._seed(row, compiled, reference, now)
+        owner = _actor_key(row["owner"])
+        for path, run in runs.items():
+            key = self._key_of(path)
+            for event_id, actor, event_key in edits:
+                if event_key == key and event_id > run.cursor:
+                    _count_edit(run, actor, owner)
+                    run.unseen += 1
+                    run.last = now
+            # a write in flight: the next sure pass probes it finished (its event counts it); a run created after this
+            # pass's stat: that stat is older than the run's baseline and says nothing about the changes since
+            unsure = self._unsure(path) or run.fresh
+            if not unsure:
+                sig = self._signature(path)
+                if run.adopt:            # the baseline was taken during a write (a fire, trigger_create, a reseed):
+                    run.adopt = False    # as the file is now, with the writes the run counted so far
+                elif sig != run.sig and sig is not None:
+                    run.last = now
+                    if not run.unseen:   # no write_file/edit_file event since the last sure pass: a command, a job
+                        run.unexplained += 1
+                run.sig, run.unseen = sig, 0
+            if run.first is None and run.count > 0:
+                run.first = now
+            # a wall clock set back: the times are at most now, so the quiet window and the cap still end
+            run.first = None if run.first is None else min(run.first, now)
+            run.last = None if run.last is None else min(run.last, now)
+            # the write in flight, and a command's change since the last sure probe, are not seen yet: the next sure
+            # pass decides
+            run.done = not unsure and self._editors_done(run)
+        return runs
+
+    def _seed(self, row: Any, compiled: CompiledCondition, reference: float, now: float) -> dict[str, _FileRun]:
+        """Runs of a trigger this engine has not followed (after a restart): the file.changed events since its
+        reference point from the journal, and an mtime after it as one change that no event may explain. Their
+        times are the journal's, at most now; a change seen only by the mtime starts its quiet window and its cap now.
+        A write in flight is no such change: its event counts it."""
+        cursor = self._event_cursor()
+        journal = [(r["actor"], min(r["ts"] or now, now), path_key(str(loads(r["data"], {}).get("path") or "")))
+                   for r in self.swarm.db.all("SELECT actor, ts, data FROM events WHERE type = 'file.changed'"
+                                              " AND ts > ? AND id <= ? ORDER BY id", (reference, cursor))]
+        owner = _actor_key(row["owner"])
+        runs: dict[str, _FileRun] = {}
+        for path in compiled.files:
+            probe = self._probe(path)
+            run = runs[path] = _FileRun(sig=None if probe is None else probe[:2], cursor=cursor,
+                                        adopt=self._unsure(path))
+            key = self._key_of(path)
+            times, others = [], []       # every change's time; those of the changes counted (not the owner's)
+            for actor, ts, event_key in journal:
+                if event_key == key:
+                    _count_edit(run, actor, owner)
+                    times.append(ts)
+                    if _actor_key(actor) != owner:
+                        others.append(ts)
+            if probe is not None and probe[2] > reference and not times and not run.adopt:
+                run.unexplained = 1      # a change no event explains: its quiet window and cap start now
+                times = others = [now]
+            if times:
+                run.last = max(times)
+                if run.count > 0:
+                    run.first = min(others)
+        return runs
+
+    def _editors_done(self, run: _FileRun) -> bool:
+        """Every change of the run is explained by a write_file/edit_file event, and every editor other than the
+        owner is an AI agent out of its turn (one without a runtime, e.g. retired, is out of it). An external
+        member or the user as an editor, or a change no event explains, leaves the quiet window to decide."""
+        if run.count <= 0 or run.unexplained:
+            return False
+        runtimes = getattr(self.swarm, "runtimes", None) or {}
+        for name in run.editors:
+            if self.swarm.kind_of(name) != AgentKind.LLM:
+                return False
+            runtime = runtimes.get(name)
+            if runtime is not None and runtime.state == AgentStatus.WORKING:
+                return False
+        return True
+
+    def pending(self, trigger_id: int) -> list[tuple[str, int, float | None]]:
+        """(path, changes, seconds since the latest change) of the trigger's file_changed() files changed since its
+        last fire (as far as the last pass saw)."""
+        now = self.clock()
+        return [(path, run.count, None if run.last is None else max(0.0, now - run.last))
+                for path, run in (self._runs.get(trigger_id) or {}).items() if run.count > 0]
+
+    def create_notes(self, trigger: dict) -> list[str]:
+        """How the trigger fires under the settings in force now, for the trigger_create result (English)."""
+        notes = []
+        if self.compile(trigger["condition"]).files:
+            settle, max_wait = self._file_settings()
+            if settle <= 0:
+                notes.append("file_changed() does not count your own write_file/edit_file edits")
+            else:
+                cap = f", at the latest {fmt_duration(max_wait)} after the first change" if max_wait > 0 else ""
+                notes.append(f"file_changed() becomes true once the file has stopped changing: after "
+                             f"{fmt_duration(settle)} without a change or once the agents who changed it have ended "
+                             f"their turns{cap}, and your own write_file/edit_file edits do not count")
+        interval = self._wake_interval()
+        if (not trigger["once"] and trigger["owner"] != USER and interval > 0
+                and any(a.get("type") == "wake" for a in trigger["actions"])):
+            notes.append(f"it wakes you at most once every {fmt_duration(interval)}, with the fires in between in one "
+                         "notice")
+        return notes
+
+    def _file_changes(self, trigger_id: int, now: float) -> list[dict[str, Any]]:
+        """The changes the trigger's file_changed() runs saw up to now: one item per file with changes; `settled`:
+        they stopped (a run fired by the cap, or absorbed by another part of the condition, is still changing)."""
+        settle, _ = self._file_settings()
+        return [{"path": path, "changes": run.count, "by": list(run.editors), "first": run.first, "last": run.last,
+                 "settled": run.stopped(now, settle)}
+                for path, run in (self._runs.get(trigger_id) or {}).items() if run.count > 0]
+
+    @staticmethod
+    def _changes_text(files: list[dict[str, Any]], lang: str, now: float) -> str:
+        """The fragments of n_trigger_files for `files` (_file_changes), in the owner's language."""
+        parts = []
+        for item in files:
+            names = shown_list(item["by"], MAX_EDITORS_SHOWN)
+            by = prompts.t(lang, "trigger_file_by", names=names) if item["by"] else ""
+            if item["settled"]:
+                quiet = fmt_duration(now - (item["last"] or now), lang)
+                parts.append(prompts.t(lang, "trigger_file_settled", path=item["path"], count=item["changes"], by=by,
+                                       quiet=quiet))
+            else:
+                duration = fmt_duration(now - (item["first"] or now), lang)
+                parts.append(prompts.t(lang, "trigger_file_changing", path=item["path"], count=item["changes"],
+                                       by=by, duration=duration))
+        return "".join(parts)
 
     def _capture_marks(self, compiled: CompiledCondition) -> _Marks | None:
         functions = compiled.functions
@@ -916,6 +1326,7 @@ class TriggerEngine:
     def _forget(self, trigger_id: int) -> None:
         self._marks.pop(trigger_id, None)
         self._fires.pop(trigger_id, None)
+        self._runs.pop(trigger_id, None)
 
     def _runaway(self, trigger_id: int, now: float) -> bool:
         """Record a fire of a repeating trigger; True if it now fired BURST_FIRES times within BURST_SECONDS."""
@@ -929,6 +1340,19 @@ class TriggerEngine:
             self._marks.pop(trigger_id, None)
         else:
             self._marks[trigger_id] = marks
+        if marks is not None and compiled.files:
+            # new runs from here: a run still unsettled at a fire is absorbed by it (its notice names it)
+            cursor = self._event_cursor()
+            # trigger_create while a pass waits for its stat thread: that pass's probe predates this baseline
+            fresh = self._write_mark is not None and not self._evaluating
+            # (a file being written now: its probe may predate the write, and so may a fire's in the pass that skipped
+            # the probe of a fresh run: the next sure pass gives the base)
+            old = self._runs.get(trigger_id) or {}
+            self._runs[trigger_id] = {path: _FileRun(sig=marks.files[path], cursor=cursor, fresh=fresh,
+                                                     adopt=self._unsure(path) or (path in old and old[path].fresh))
+                                      for path in compiled.files}
+        else:
+            self._runs.pop(trigger_id, None)
 
     def _rearm(self, row: Any, compiled: CompiledCondition, fired_at: float) -> None:
         """After a repeating trigger fired, message()/comment()/file_changed()/every() are measured
@@ -936,8 +1360,9 @@ class TriggerEngine:
         last_value = 1 would swallow the next message that arrives before the following pass and
         leave the trigger true (and silent) forever."""
         try:
+            settle, max_wait = self._file_settings()
             env = _Env(self.swarm, row["owner"], row["created_at"], fired_at, max(self.clock(), fired_at),
-                       self._marks.get(row["id"]), self._probes)
+                       self._marks.get(row["id"]), self._probes, self._runs.get(row["id"]), settle, max_wait)
             value = bool(compiled.evaluate(env))
         except Exception:  # reported by the next regular evaluation
             return
@@ -951,6 +1376,7 @@ class TriggerEngine:
         acts = any(a.get("type") != "wake" for a in actions)
         runaway = not row["once"] and acts and self._runaway(trigger_id, now)
         once = bool(row["once"]) or runaway
+        files = self._file_changes(trigger_id, now)   # before the actions: what they cause belongs to the next run
         self.swarm.db.execute(
             "UPDATE triggers SET last_value = 1, last_fired = ?, fire_count = fire_count + 1, active = ?,"
             " last_error = NULL WHERE id = ?",
@@ -966,8 +1392,12 @@ class TriggerEngine:
             note = row["note"] or ""
             if errors:
                 note = (note + "\n" if note else "") + "Trigger action errors: " + "; ".join(errors)
+            interval = self._wake_interval()
             try:
-                self.swarm.notify(owner, "n_trigger", id=trigger_id, condition=row["condition"], note=note)
+                if not runaway and self._held_back(row, now, interval):
+                    self._hold(row, now, files)   # told at the owner's next wake-up, or at the interval's end
+                else:
+                    self._tell(row, now, note, files)
             except Exception as e:
                 log.exception("trigger #%s: notification failed", trigger_id)
                 errors.append(f"wake: {_describe(e)}")
@@ -982,7 +1412,8 @@ class TriggerEngine:
                 self._rearm(row, compiled, now)
         trigger = self.get(trigger_id)
         log.info("trigger #%s fired (%s)", trigger_id, row["condition"])
-        self.swarm.bus.emit("trigger.fired", owner, trigger=trigger, errors=errors)
+        extra = {"files": [{k: f[k] for k in ("path", "changes", "by", "settled")} for f in files]} if files else {}
+        self.swarm.bus.emit("trigger.fired", owner, trigger=trigger, errors=errors, **extra)
 
     def _run_action(self, owner: str, action: dict[str, Any]) -> str | None:
         kind = action.get("type")

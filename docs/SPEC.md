@@ -143,12 +143,22 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 * `comments`: the per-task **discussion**: id, task_id, author, text, reply_to (comment id | null), ts.
 * `agents`: name, kind (`llm`|`external`), role (a catalog role by its canonical name in the member's language,
   §17.3), instructions (the hirer's own; a catalog role's instructions are only in the system prompt), model
-  (profile name), language, status (`idle`|`working`|`paused`|`error`|`retired`), hired_by, created_at,
-  last_active, cost_usd, tokens_in, tokens_out, notes, system_prompt (frozen at creation), context_tokens.
+  (profile name, set at hire; it follows a profile rename saved through the settings, §17.2 `update_settings`;
+  NULL for an external member), language, status (`idle`|`working`|`paused`|`error`|`retired`), hired_by,
+  created_at, last_active, cost_usd, tokens_in, tokens_out, notes, system_prompt (frozen at creation),
+  context_tokens.
 * `history`: agent, seq, msg (json neutral message, §6.1) — append-only per agent except compaction.
 * `messages` + `inbox(message_id, recipient, read_at)`.
 * `notifications`: id, ts, recipient, kind (prompt key), text (rendered), data (json), delivered_at.
-* `triggers`, `mcp_servers`, `file_locks`, `kv`, `events`.
+* `triggers` (§8): id, owner, condition, note, actions (json), once, active, created_at, last_value, last_fired,
+  fire_count, last_error, and the wake limit's told_at (when the trigger last told its owner), held (fires since then
+  whose notice waits), held_last (the latest of them), held_files (json `{path: {count, by, first, last, settled}}`:
+  their file_changed() changes); the last four are in `ADDED_COLUMNS` too, so an older file gets them at its next
+  open. `mcp_servers`, `kv`, `events`.
+* `file_locks`: path (primary key, workspace-relative), owner, acquired_at, expires_at, wanted_at (when its holder
+  was told that members wait for it, `n_lock_wanted`; NULL for a new lock, kept by a refresh; an older file gets the
+  column at its next open, `ADDED_COLUMNS`). `lock_waiters` (§7 "Lock waiters"): agent, path (what it was refused,
+  as it asked for it), since; primary key (agent, path).
 * `jobs` (background jobs, §7.1; index `jobs_owner(owner, status)`): id (AUTOINCREMENT: `j<id>`, unique for the
   session's life), owner, command, shell (display name), origin (`timeout`|`background`|`detached`), status
   (`running`|`ended`|`stopped`|`lost`), reason (stopped: `owner`|`user`|`lifetime`|`retired`|`session`; lost:
@@ -312,7 +322,8 @@ class Swarm:
         # whose first wake-up lists them), the report kept for `hire_agent` (skills.note_hire / hire_report)
     async def retire(self, by: str, name: str, reason: str = "") -> list[int]   # returns released task ids
         # before the first await: the ids of its running jobs, and jobs.forbid(name) (none of its commands may
-        # become a job while it leaves); then tasks and locks released, triggers deactivated, status retired,
+        # become a job while it leaves); then tasks and locks released (workspace.release_all: its own lock waits are
+        # dropped, the members waiting for its locks woken, §7 "Lock waiters"), triggers deactivated, status retired,
         # `agent.retired` {name, reason, released, jobs}, its pending question dropped (`_drop_question(by, "left")`,
         # §3.1), n_member_retired; then its runtime stops; last
         # jobs.stop_owner(name, "retired"): its jobs and its foreground commands (an external member's call in
@@ -325,6 +336,9 @@ class Swarm:
     def set_limits(self, actor: str, max_cost_usd: float | None = None, max_agents: int | None = None) -> dict
     def spent_usd(self) -> float
     def record_usage(self, agent: str, usage: Usage, profile: ModelProfile, model: str | None = None) -> float
+        # adds cost_of(...) to the agent; a call that counted tokens as $0 (uncounted_fields, §10) gives USER the quiet
+        # u_cost_unknown {profile, model, fields} once per start() for each (profile, provider, base_url, model,
+        # fields), plus a log warning (the set `_cost_warned` lives in memory and start() clears it)
     def budget_exceeded(self) -> bool
     paused: bool; pause_reason: str
     def pause(self, actor: str, reason: str, **details) -> bool
@@ -368,8 +382,14 @@ class Swarm:
         # off (False when it was not on): `swarm.wrap_up` {on: false} and a quiet `n_wrap_up_end` to every LLM member
         # (shown at its next wake-up); called by the user (swarm_control wrap_up=false), set_goal and reopen_goal
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient
-        # a member's profile (agents.model) that no longer exists in the settings (renamed or deleted) falls back
-        # to the default profile with a warning, instead of crashing that agent at every activation
+        # a member's profile (agents.model) that no longer exists in the settings (deleted, or renamed by a hand edit
+        # of dreamteam.toml) falls back to the default profile with a warning, instead of crashing that agent at every
+        # activation
+    def rename_profiles(self, renames: dict[str, str]) -> None
+        # {old: new} profile names (settings.profile_renames): agents.model of every member (retired ones too) and
+        # the runtimes' profile_name follow, in one statement (db.remap_sql: a swap or a chain of names stays
+        # correct); no client is reset here (the reconfigure that update_settings runs next rebuilds them);
+        # u_cost_unknown already sent for the old name is not repeated (under either name)
     def snapshot(self) -> dict                           # §14.1
     def workspace_info(self) -> dict                     # {"path", "default", "adopted", "exists"} (§14.1, §17.2)
 ```
@@ -384,7 +404,9 @@ config.swarm.clarify)` with its tags, §3.1). It has no `pending_question`, `ask
 their callers (Mailbox.send, send_message, the in-activation nudge, `_stop_reason`) look them up with getattr, so
 with FakeSwarm a message never answers or pauses anything.
 
-Scheduler (every 3 s): expires file locks, compares the skills mirror with its manifest (`skills.check()`, at most
+Scheduler (every 3 s): expires file locks, then settles the lock waiters (`workspace.settle_waiters()`, §7 "Lock
+waiters": a member refused a path that is free now is woken, a long holder told; also while paused, the
+notifications then wait for the resume), compares the skills mirror with its manifest (`skills.check()`, at most
 every `SKILLS_CHECK_SECONDS` = 60 s, §19), prunes old traces (every 6 h) and closes idle external trace
 sessions (§16); unless paused, `_wake_deferred` first (an agent a broadcast reached without a wake, §5, that no longer
 `waits_for_job` while the news is still unread is woken once: e.g. the busy window of its server ended), then in this
@@ -402,7 +424,9 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    `last_active` when that is later: an activation in between restarts it); the woken sets are shared with
    `_wake_stalled`, so a set is never woken about twice. Neither 2 nor 3 wakes an agent while the end of one of
    its running jobs will wake it (`JobManager.awaited`, what its `wait` result promised): it waits for that job
-   (a `detached` one, or a `background` one past its busy window), it has not stalled. Nor do they count a clarify
+   (a `detached` one, or a `background` one past its busy window), it has not stalled; nor while it waits for a
+   file it was refused (`Workspace.waits_for_lock`: a `lock_waiters` row, what the refusal promised; `n_lock_free`
+   wakes it, and every lock ends by unlock, expiry or retire). Nor do they count a clarify
    planning task whose holder waits for the user's answers (`asks_user`, §3.1);
 4. `hint_planner()` (planning hint; run 008-013: a planner researched for 40 minutes before creating any task while
    the team idled): an LLM member holding a task tagged `planning` in `in_progress` that has created no task (no
@@ -883,7 +907,9 @@ class AgentRuntime:
   `render_wake(name, incoming=True)` returns text, append it as a user message. Stops when: `wait` was
   called, no tool calls (a `nudge` once per in_progress task the agent holds, except a clarify planning task it
   waits for the user's answers about, `swarm.asks_user` looked up with getattr, §3.1; none while it is busy with a
-  job, §7.1 "Liveness": the job's end wakes it; after plain text even then, `stalled` records those tasks and
+  job, §7.1 "Liveness": the job's end wakes it, nor while it waits for a file it was refused,
+  `workspace.waits_for_lock`, §7 "Lock waiters": `n_lock_free` wakes it; after plain text even then, `stalled`
+  records those tasks and
   the scheduler wakes it once with `n_stalled`, also once the busy window ended), refusal, or
   step limit (then `notify(name, "n_step_limit")`). A reply cut off by max_tokens gets `cut_off` and
   the loop continues. At the end of an activation that is not stopping (any outcome), the new files its commands
@@ -947,6 +973,11 @@ had none); every later wake-up shows the one-line `skills_names` (the names with
 attached, nothing, except one `skills_none` line for a member that had seen an index (`_skills_shown` False then; a
 later attach shows the full index again).
 
+For a member (never the user), before the undelivered notifications are read, `triggers.release_held(name)` turns
+the fires its repeating triggers held back (§8 "Wake limit") into one quiet `n_trigger_held` per trigger, so they come
+with this render (a wake-up, the news between two steps, a `wait_for_events` result) and need no wake-up of their own.
+An in-memory set of the owners with held fires keeps this free of queries for the others.
+
 `stamps=True` (only `wait_for_events`, whose one result may hold hours of news; an agent's wake-up stays as above so
 its history does not grow): when the oldest undelivered notification or unread message, or `since` (the oldest
 progress line shown with it), is more than `fmt.STAMP_SPAN` (60 s) older than now, each notification and message
@@ -993,11 +1024,19 @@ class Workspace:
     def tree(self, path: str = ".", depth: int = 4) -> list[dict]   # for the web UI: [{"path","type","size","mtime"}]
     def read_raw(self, path: str, max_bytes: int = 2_000_000) -> tuple[str, bool]  # (text, truncated) for UI
     def lock(self, actor: str, path: str, minutes: float | None = None) -> str
-    def unlock(self, actor: str, path: str, force: bool = False) -> str   # force for USER
+    def unlock(self, actor: str, path: str, force: bool = False) -> str   # force for USER (file_unlock)
     def locks(self) -> list[dict]                # [{"path","owner","acquired_at","expires_at"}]
     def check_writable(self, actor: str, path: str) -> None
-    def release_all(self, actor: str) -> int
-    def expire_locks(self) -> int
+    def release_all(self, actor: str) -> int     # retire: also drops the actor's own lock waits, then settles
+    def expire_locks(self) -> int                # never settles (below)
+    def settle_waiters(self) -> int              # the waiters woken; never raises ("Lock waiters" below)
+    def waits_for_lock(self, name: str) -> bool  # a lock_waiters row of `name` (one indexed query)
+    def lock_waits(self, name: str) -> list[str]  # the paths `name` waits for, the oldest first
+    def awaited_locks(self, name: str) -> list[str]  # lock_waits whose release wakes it ([] once the goal is done)
+    def write_mark(self) -> tuple[int, frozenset[str]]   # write_file/edit_file writes: sequence, paths in flight
+    # (a write whose call is cancelled stays in flight until its thread ends, then emits its file.changed)
+    def written_since(self, mark, key: str) -> bool   # ... of path key `key` in flight at `mark` or since (§8)
+    def held_locks_note(self, actor: str) -> str  # the task_complete reminder ("" when it holds no lock)
     async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",
                          skipped: list[str] | None = None, hold: bool = False) -> str | None
         # commits everything except `.scratch/` and nested repositories as `actor`, one commit per call; commit hash
@@ -1029,6 +1068,41 @@ the event's top-level `actor`), then commit that path; a path under `.scratch/` 
 `init()` also writes repo-local settings (`_configure_repo`: core.autocrlf=false, commit.gpgsign=false and a
 default identity), so that git commands run from the shell behave like the autocommits (line endings, no
 signing); an agent's own commits carry its identity from the shell environment (`agent_git_env`, below).
+
+**Lock waiters.** A lock is advisory: only `write_file`, `edit_file` and `lock_file` check it (`shell` does not).
+A lock blocks another owner's lock on the same path, a folder above it or a path under it, and another owner's
+write or edit of a path it covers. These refusals, and a member's `lock_file` unlock=true of someone else's lock,
+are English ToolErrors that keep `'{rel}' is locked by X until HH:MM (N min left)[ (lock on '{path}')]` (the unlock:
+`…, not by you: only they can unlock it.`) and end with ``You will be notified when it is free; there is no need to
+message them. Meanwhile do other work, or call `wait` if nothing else is left.`` (`wait_for_events` for a member
+whose tools have no `wait`, an external one: `frozen.member_tool_names`). Only a member is recorded (`is_member`;
+the user's own unlock without force says `Pass force=true to unlock it anyway.`, a name outside the swarm `Try again
+once it is unlocked.`): one `lock_waiters` row per member and path (compared through `_norm`; a repeat keeps its
+first `since`). A successful own lock clears the actor's rows that it covers, a passing write or edit the row of
+that path, so no stale note follows. `settle_waiters()` (after `unlock`, after `release_all` that released
+something, and at every scheduler tick, §3): every row whose path no live lock of another owner overlaps any more
+is collected (an expired row counts as free, deleted or not; a row of a member that left is deleted silently); each
+such member gets ONE waking `n_lock_free` {paths} (at most `WAITERS_SHOWN` = 10 named, then ` (+N)`) and its rows
+are deleted; once the goal is done the notice is quiet (like a job's end, §7.1), so a finished session, also one
+reopened later, wakes nobody about a lock. Every waiter of a freed path is woken (no queue): the first to lock it
+wins, the others are refused and recorded again.
+`expire_locks()` never settles: it also runs lazily inside a waiter's own retry, which would
+otherwise get a "free" note for what it has just taken; the tick settles within 3 s (also an expiry found by
+`locks()` in a snapshot, or the rows left before a restart: the table persists). After the free rows,
+`settle_waiters` tells the holders (`_tell_holders`; also at each refusal, for the lock that refused): a live lock
+with `wanted_at` NULL that rows of other members overlap, held (`now - acquired_at`) for at least `[workspace]
+lock_wanted_minutes` (default 5; 0: at once), gets ONE waking `n_lock_wanted` {path, held (`jobs.fmt_duration` in
+the holder's language), waiters} to its owner, then `wanted_at = now`; `waiters` lists each waiting member in
+`since` order, with its in_progress tasks as `lock_waiter_task` ("Anna Smith (task #7 Parser)"). A holder of
+nested locks of its own (a folder and a file in it) gets one notice: its locks that overlap a told one are marked
+told with it (also one taken later). Nothing is told while the goal is done (the lock stays untold). A refresh keeps
+`wanted_at` (the same lock), a new lock starts untold. The user's `file_unlock` {path} (§12) calls `unlock(USER,
+path, force=True)`: `Unlocked docs (it was locked by Anna Smith).`, `file.unlocked` {path, owner, forced: true}, the
+waiters woken, the holder told nothing; a path that is not itself locked is a ToolError naming the folder lock that
+covers it (`'docs/a.md' is not locked itself: it is under the lock on 'docs' (Anna Smith); unlock 'docs'
+instead.`), or the locks there are (`Locked now: a.md (Boris King).`, up to 10), or `no file is locked now`. The
+user reaches it through the web Files tab's Unlock link (§18.4), `/unlock path` in the terminal UI (docs/TUI.md) and
+in the line console (`dreamteam console`), and an MCP user client.
 
 The whole-tree autocommit (after every `shell` call): `ensure_scratch()` (an agent may have deleted the marker),
 `git status --porcelain -z` (`porcelain_entries`), `git reset -q -- .scratch` when something under `.scratch/` is
@@ -1900,7 +1974,7 @@ chars / 200 AST nodes.
 | `all_done(tag=None, parent=None)` | ≥1 matching task and all done |
 | `message(sender=None, contains=None)` | a message to the owner arrived after creation/last fire |
 | `comment(task=None, sender=None, contains=None)` | a discussion post (not by the owner) after creation/last fire |
-| `file_exists(path)` / `file_changed(path)` | workspace file exists / mtime > creation/last fire; a path outside the workspace (a UNC or device path included, never resolved) is false |
+| `file_exists(path)` / `file_changed(path)` | workspace file exists / the file changed since creation/last fire and that run of changes has settled, not counting the owner's own edits (below); a path outside the workspace (a UNC or device path included, never resolved) is false |
 | `after("2026-10-09 18:00")` | local time reached (ISO) |
 | `elapsed(seconds)` | seconds since creation |
 | `every(seconds)` | ≥ seconds since last fire (min 10); makes the trigger periodic |
@@ -1917,9 +1991,15 @@ class TriggerEngine:
     def delete(self, actor: str, trigger_id: int) -> None    # owner or USER
     def list(self, owner: str | None = None, include_inactive: bool = False) -> list[dict]
     def mark_dirty(self) -> None
-    def evaluate_all(self) -> int                            # returns number fired
+    def evaluate_all(self) -> int                            # returns number fired; then the held notices due
     async def run(self) -> None                              # loop: wait dirty-or-tick, evaluate_all; the files
-                                                             # the active triggers watch are stat'd in a thread first
+                                                             # the active triggers watch are stat'd (and their
+                                                             # file_changed() paths resolved) in a thread first
+    def release_held(self, owner: str) -> None               # the held fires of owner's triggers, quietly; never
+                                                             # raises (Swarm.render_wake, §6.3)
+    def pending(self, trigger_id: int) -> list[tuple[str, int, float | None]]   # file_changed() changes not fired
+                                                             # yet: (path, changes, seconds since the latest)
+    def create_notes(self, trigger: dict) -> list[str]       # the trigger_create result's notes (§12)
 ```
 `create` resolves member names in the condition (`sender=` of message/comment, `assignee=` of count,
 `agent_status(name)`) with `swarm.resolve_member(allow_retired=True)` (a unique first name, `@Name`, any
@@ -1928,7 +2008,9 @@ canonical names; an unknown member is a ToolError at creation. Evaluation compar
 (case/whitespace-insensitive).
 Fires on false→true edge (and on every evaluation where it is true if it uses `every`); a trigger
 true at creation fires on the first evaluation. `once` → deactivated after firing. Actions
-(default `[{"type": "wake"}]`): `wake` → `notify(owner, "n_trigger", id, condition, note)`;
+(default `[{"type": "wake"}]`): `wake` → `notify(owner, "n_trigger", id, condition, note)`, or
+`n_trigger_files` {id, condition, changes, note} when file_changed() files changed since the last fire, or
+`n_trigger_held` while fires are held (both below);
 `message` {to, text} → `mail.send(owner, to, text, automatic=True)` (a user-owned trigger's message never answers
 a question pause, §3.1); `set_status` {task_id, status} →
 `board.update(owner, ...)`; `create_task` {title, goal?, description?, assignee?, tags?, priority?}.
@@ -1937,7 +2019,88 @@ errors are stored in `last_error`, not fired. After a fire, `message()`/`comment
 are measured from that fire. A repeating trigger with message/set_status/create_task actions that fires 20
 times within 10 s is deactivated and its owner is told why (flood guard). The engine listens to the bus: `task.*`, `message.*`,
 `file.*`, `goal.*`, `agent.*` mark it dirty. Events: `trigger.created`, `trigger.fired`, `trigger.deleted`.
-Trigger dict: {"id","owner","condition","note","actions","once","active","created_at","last_fired","fire_count","last_error"}.
+Trigger dict: {"id","owner","condition","note","actions","once","active","created_at","last_fired","fire_count",
+"last_error","held","told_at","wake_at"} (`wake_at` = told_at + `trigger_wake_seconds` while fires are held by an
+active trigger and the limit is on, else None).
+
+**file_changed(): one fire per settled run of changes.** `file_changed(path)` is true when the file changed since
+the reference point (its signature (mtime_ns, size) differs from the one at creation or the last fire, or its run
+counted a change, also one that left the signature as it was; after a restart its mtime is newer) *and* that run of
+changes has settled. Once and repeating triggers use the same rule; the edge, `once`, `every()` and and/or/not apply
+to its value as to any function. The engine keeps a run per trigger and path in memory:
+- Count = the `file.changed` events of the path from other actors (write_file/edit_file, with the editor's name) +
+  the changes no event explains (commands, jobs). The owner's own write_file/edit_file edits do not count, so own
+  edits alone do not fire it; its commands and jobs are unattributed and count. A pass takes
+  `Workspace.write_mark()` before it probes: for a path that a write_file/edit_file write was writing then, or
+  started writing since (`written_since`), the probe may show the file before the write or in the middle of it
+  (opened, truncated, then written), so the pass is unsure of the path: its probe is not used (the run's signature
+  does not move) and it does not settle the run by the editors' turns. A sure pass's probe shows every write whose
+  event came since the previous sure pass, finished (a path stays in flight until its write's event): a new
+  signature is explained when at least one event of the path came in between, and is one change no event explains
+  when none did. So two writes of commands between two sure passes count as one, and a command's change between
+  them together with an edit is not counted apart from it; together with only the owner's own edits it is not
+  counted at all, so it is not told (the probe cannot tell it from those writes, which do not count; the command
+  has to land after the last sure pass, at most one tick before the edit). A fire in an unsure pass takes the new
+  run's baseline from the next sure probe, without counting it (the edits the new run counted by then are in it; a
+  command's change before it is not counted); an edit of another actor that the new run has counted by then (that
+  write's event came after the fire) is told as any run's count. A trigger created while a write of its file is in
+  flight takes its baseline the same way; one created while a pass waits for its stat takes nothing from that pass's
+  probe, which is older than its baseline (if another part of its condition fires it in that pass, the new run takes
+  its baseline from the next sure probe, as above). The count of a run never goes down, and its cap counts from its
+  first counted change; the times of a run followed in memory are at most now (a wall clock set back does not hold
+  it).
+  Events and probed paths are compared by `workspace.path_key` of the workspace-relative path (case-insensitive on
+  Windows), the condition's path resolved like the probe.
+- Settled when the count is > 0 and: no change (anyone's, the owner's included) for `[agents] file_settle_seconds`
+  (60; 0: at the first pass that sees a change), or every change is explained by an event and every other editor is
+  an AI agent whose runtime is not WORKING (one without a runtime, e.g. retired, counts as done; an external member
+  or the user as an editor leaves it to the quiet window), or `file_max_wait_seconds` (300; 0: no cap) passed since
+  the first counted change. The end of the editors' turns emits `agent.status`, so the fire comes at the next pass;
+  while the swarm is paused no runtime is WORKING, so a pending run settles then. During an unsettled run
+  file_changed() is false, so `not file_changed(p)` stays true until it settles. While the file is missing
+  file_changed() is false and its run stays pending, past the quiet window and the cap alike (the file's return is
+  itself a change: the run is then told by the same rule, at once if the cap has passed); a deletion alone is not a
+  change.
+- When another part of the condition fires first (`file_changed('a') or message()`, `every()`), the unsettled run is
+  absorbed: the fire starts new runs, as everything is measured from the fire, and its notice lists the file as still
+  changing.
+- The notice: `n_trigger_files` {id, condition, changes, note}, `changes` = one fragment per file with changes
+  (`trigger_file_settled` {path, count, by, quiet}: "File docs/AUDIT.md was changed (changes: 7, by Anna Smith); the
+  last change was 2 min ago."; `trigger_file_changing` {path, count, by, duration} for a run fired by the cap or
+  absorbed: "File x is still changing (changes: 11, by Anna Smith in 5 min)."; `by` = `trigger_file_by` naming at
+  most 5 editors, then "(+N)"). Without changes the plain `n_trigger`. `trigger.fired` carries `files`
+  [{path, changes, by, settled}] then.
+- After a restart (or for a trigger another engine followed) the runs are seeded from the journal: the
+  `file.changed` events since the reference point (their times, at most now; the cap counts from the first event of
+  another actor); a newer mtime with no such event counts as one change no event explains, whose quiet window and
+  cap start now, so each restart postpones both for that change (a write in flight at that pass is no such change:
+  its event counts it, and the next sure probe is the baseline). The events of any actor, the owner's included, stand
+  for the file's changes: with one in the journal, a command's change next to it is not counted, also one the run
+  had counted in memory before the restart, so it is not told. A reseeded trigger still needs an mtime newer than its
+  reference: a counted edit older than that (a write stored before the fire, a clock set back) stays pending and is
+  told with the next change, and a command's change before a clock set back can count as a change after a trigger
+  created since. No schema change.
+
+**Wake limit.** A member's (an AI agent's or an external member's) repeating trigger wakes its owner at most once per
+`[agents] trigger_wake_seconds` (180; 0: at every fire), counted from the last time it told the owner anything
+(`told_at`). A fire within the interval runs in full (fire_count, last_fired, the reference point, the actions);
+only its notice is held: `held` + 1, `held_last`, and its file_changed() changes merged into
+`held_files` (counts summed, editors joined). The user's triggers, once triggers and the flood guard's notice are
+never held; `every()` triggers are limited like the others. The held fires reach the owner in ONE `n_trigger_held`
+{id, condition, count, since, last, interval, changes, note} ("Trigger #4 fired again since it last told you at
+18:40 (fires: 3, the last at 18:46): file_changed('docs/AUDIT.md'). File … A repeating trigger wakes you at most
+once every 3 min."), whichever comes first: the owner's next render_wake for any reason (§6.3: quiet, no wake of
+its own), a fire after the interval (that fire's notice, with count = held + 1), or the end of the interval
+(evaluate_all after each pass: waking; a clock gone back, told_at in the future, releases too). A release's note
+carries the last action error (`Trigger action errors: …`, not an evaluation error). Fires held when the limit was
+switched off (`trigger_wake_seconds` = 0) come as `n_trigger_held_off` (the same text without the interval
+sentence) at the next pass or fire. Notices are never told twice:
+whichever releases first sets `told_at` and clears `held`. The set of owners with held fires is rebuilt from the
+table when the engine starts; held fires survive a restart. A trigger made inactive (its owner left) keeps them
+untold (`wake_at` None). No new event type: every fire still emits `trigger.fired`, whose trigger dict carries
+`held` / `wake_at`; a release emits only its `notification`. The limit is per trigger and only for triggers:
+lock (`n_lock_free`) and job wake-ups are not limited, and a trigger's message action still wakes its recipients at
+every fire (the flood guard limits those).
 
 ## 9. Event types (bus)
 
@@ -1958,6 +2121,11 @@ as such. `skill.deps` {name, ecosystem: python | node, status: installing | read
 failed, files, env, key, installer?, reused: bool, seconds?, error?}, actor None: a skill's script dependencies,
 emitted by every session that has the skill when a build really starts and when it ends (§19 "Script
 dependencies").
+
+`trigger.fired` {trigger, errors, files?}, actor = the trigger's owner, at every fire (also one whose notice is held
+by the wake limit, §8): `trigger` is the trigger dict, with `held` and `wake_at`; `files` [{path, changes, by,
+settled}] only when file_changed() files changed since the last fire. The web feed and the TUI's verbose feed add
+"(wake-up held until 18:48)" / «(пробуждение отложено до 18:48)» to a fire with `held` > 0.
 
 `swarm.wrap_up` {on: bool}, actor = who switched it (the user, or the actor of the set_goal / reopen_goal that ended
 it).
@@ -2001,7 +2169,20 @@ def create_llm(profile: ModelProfile) -> LLMClient   # llm/__init__.py
 # clients may also expose `async aclose()` to release their HTTP pool (called when an agent stops)
 # stop_reason "other" covers pause_turn / stop_sequence and unknown values
 def cost_of(profile: ModelProfile, usage: Usage, model: str | None = None) -> float
+    # usage.cost_usd (the provider's cost) when set, else the tokens at profile.prices(model)
+def uncounted_fields(profile: ModelProfile, usage: Usage, model: str | None = None) -> tuple[str, ...]
+    # the price fields whose tokens cost_of counted as $0: profile.missing_prices(model); () when usage.cost_usd is
+    # set and for the scripted provider (tests and demos have no bill)
 ```
+* **Prices** (config.py `ModelProfile`, USD per 1M tokens): `input_price`, `output_price`, `cache_read_price`,
+  `cache_write_price`; None = not set, 0 = free. `prices(model)` takes the profile's price, else the built-in
+  `KNOWN_PRICES` entry of the response's model or the profile's model (`_table(model)`, exact ids), else 0 (the
+  cache prices: input × 0.1 / × 1.25). `PRICE_FIELDS = ("input_price", "output_price")`.
+  `missing_prices(model)` → the PRICE_FIELDS that are None while `_table(model)` has no entry (their tokens count
+  as $0); `price_source(model)` → `"none"` (both missing), `"partial"` (one), `"table"` (the built-in prices fill
+  what is not set), `"free"` (both set to 0), `"profile"` (both set); `has_prices` = no missing prices. A call
+  whose `uncounted_fields` is not empty is reported to the user once per start (`Swarm.record_usage`, §3:
+  `u_cost_unknown`); a provider that reports the cost (`usage.cost_usd`) never is.
 * **AnthropicLLM** (`anthropic.AsyncAnthropic`, SDK 1.x): converts neutral → Messages API (consecutive
   user-side items merged into one user message, tool_result blocks first; assistant uses `raw.content`
   verbatim when `raw.provider == "anthropic"`), top-level `cache_control={"type":"ephemeral"}`,
@@ -2186,6 +2367,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `edit_file` | path, old_text, new_text, replace_all? | LE |
 | `list_files` | path?, depth? | LEU |
 | `lock_file` | path, minutes?, unlock? | LE |
+| `file_unlock` | path (as it was locked: a member's lock removed by the user, the waiters woken, §7 "Lock waiters") | U |
 | `shell` | command, timeout?, background? (its environment: §7 after `scrubbed_env`; results and jobs: §7.1) | LE |
 | `jobs` | job_id?, tail? (without job_id: the running jobs of the swarm and the caller's ended in the last hour, everyone's for the user; with it: that job, §7.1) | LEU |
 | `job_stop` | job_id (only the job's owner or the user) | LEU |
@@ -2259,6 +2441,20 @@ check `ToolContext.has_tool`. `allow_empty` is validation only, not part of the 
 `user`/`external` audiences only (e.g. `set_goal`) are not in the LLM tools array, and external members and the user
 always see the live registry.
 
+`trigger_create` and `trigger_list` say what the frozen description cannot (§8), with the settings in force:
+- `trigger_create`: `Trigger #N created: CONDITION (NOTES)` then `; actions: …` when they are not just a wake.
+  NOTES, joined with "; ": `repeating`; for a condition with file_changed() `file_changed() becomes true once the file
+  has stopped changing: after 1 min without a change or once the agents who changed it have ended their turns, at
+  the latest 5 min after the first change, and your own write_file/edit_file edits do not count` (no cap: without
+  the "at the latest" part; `file_settle_seconds` 0: `file_changed() does not count your own write_file/edit_file
+  edits`); for a member's repeating trigger with a wake action while `trigger_wake_seconds` > 0 `it wakes you at most
+  once every 3 min, with the fires in between in one notice`. Without notes no parenthesis (`Trigger #1 created:
+  done(1).`).
+- `trigger_list`: each line `#N [state, repeating] owner=… when … — note actions=… (fired Nx, last …; 2 fires held,
+  wake-up at 18:48) pending: docs/AUDIT.md changed 3x, last 40 s ago error: …`: the held part while fires are held
+  (without the wake-up time for an inactive trigger), `pending` for the file_changed() changes not fired yet (as far as
+  the last pass saw).
+
 Results and checks of the review and role-catalog flows:
 - `task_claim` by the task's designated reviewer (independent review, §4.1) adds "You were its reviewer; since
   you execute it now, another member will review it."
@@ -2266,7 +2462,10 @@ Results and checks of the review and role-catalog flows:
   own reviewer); `... was sent to the user for review: nobody else in the team can review it. You will be told the
   verdict; meanwhile take the next task or call wait.`; or `... was sent to X for review: a member other than you
   checks it, and you will be told the verdict.` (picked by the board). Once the board accepted the call (a refused
-  one commits nothing) it commits the caller's held new files (`workspace.commit_held`, §7 "Held new files").
+  one commits nothing) it commits the caller's held new files (`workspace.commit_held`, §7 "Held new files"). A
+  member that still holds file locks gets ``You still hold locks on: docs/AUDIT.md (until 14:05). Unlock those you
+  no longer need (`lock_file` with unlock=true).`` appended (`held_locks_note`, at most 10 named); locks are not
+  tied to tasks, so none is released.
 - Dependencies (§4 `update`): `task_get` of an open task (not in review) the caller holds while it is blocked adds `You hold it while
   it is blocked: if its result can be produced without some of #3, #4, remove those with task_update (depends_on =
   the ones still needed) and say why in its discussion.`; `task_update` in which an assignee that did not create the
@@ -2335,7 +2534,10 @@ Results of the team, wait and job flows:
   line, `Global goal [active]: <title>` (no description, no summary); the rest is the same.
 - `wait` (description: the end of one of its background jobs wakes it too; "End every turn with it" stays): `OK,
   waiting. You will be woken up by new events.`, plus `, also when your background job j3 ends.` / `…jobs j3, j5 end.`
-  for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet).
+  for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet), and/or
+  `, also when docs/AUDIT.md, which you were refused, is free.` (`… are free` for several, at most 10 named;
+  `Workspace.awaited_locks`: none once the goal is done, when n_lock_free is quiet; §7 "Lock waiters"); both:
+  `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.`
 - `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
   min). Stop the ones nobody needs with job_stop; the rest stop with the session.` (a caller without `job_stop`: `with
   the shell command kill jN (as a command of its own)`).
@@ -2650,7 +2852,7 @@ dreamteam init [DIR] [--lang ru|en] [--provider anthropic|openai|openrouter|olla
 dreamteam run [DIR] [--goal G] [--host H] [--port P] [--no-console] [--open] [--network on|off]
     # one swarm, its board at / (web.serve); refuses when a hub already runs for DIR; --goal sets the goal
     # unless the stored one is active with the same title (compared with split_goal(G)[0], so a multi-line
-    # --goal does not reset the goal at every restart)
+    # --goal does not reset the goal at every restart); after the banner, settings.unpriced_line (§17.1) on stderr
 ```
 `console`, `mcp`, `status` and `sandbox` work with a project as well as with a home (§18.3).
 
@@ -2826,6 +3028,14 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   many LLM steps or minutes of holding the planning task without creating a task, once more at twice the value; 0
   turns that trigger off. Read at each use; session overrides apply. The
   template has both lines with Russian comments after `stagger_seconds`.
+- `[agents] file_settle_seconds = 60`, `file_max_wait_seconds = 300` and `trigger_wake_seconds = 180` (numbers ≥ 0;
+  §8): file_changed() is true once the file has had no change for `file_settle_seconds` or the agents who changed
+  it have ended their turns, at the latest `file_max_wait_seconds` after the first counted change (0: at every
+  change / no cap); a member's repeating trigger wakes it at most once per `trigger_wake_seconds`, the fires in between come in
+  one notice (0: at every fire). The worst delay of a file_changed() notice is about settle + interval, or max_wait +
+  interval for a file that keeps changing. Read at each pass and use; session overrides apply. The template has the
+  three lines with Russian comments after `planning_hint_minutes`; the settings page's «Агенты» section and the
+  session dialog's «Агенты» group have a field for each.
 - `[shell]` (`ShellSettings`, read at each use, so `reconfigure` and session overrides apply at once; §7, §7.1):
   `program = "auto"` (auto | bash | sh | powershell | pwsh | cmd), `timeout = 120` (seconds a call waits; a command
   still running then continues in the background), `max_timeout = 1800` (the largest `timeout`, and the lifetime of a
@@ -2843,6 +3053,12 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   `DREAMTEAM_MCP_LIBRARY_DIR` wins, as `DREAMTEAM_SKILLS_DIR` does for the skills library: the tests set it). The
   variable is one of shell's `_INTERNAL_ENV` (never in the members' commands, §7) and of `docker.SKILLS_ENV` (never
   passed into the sandbox by name).
+- `[workspace]` (`WorkspaceSettings`): `git = true` (the shared workspace under git with autocommits),
+  `lock_ttl_minutes = 30` (whole number ≥ 1: the time of a `lock_file` call without `minutes`; 0 would refuse every
+  such call), `lock_wanted_minutes = 5` (number ≥ 0: a lock members were refused is named to its holder once it has
+  held it this long, `n_lock_wanted`, §7 "Lock waiters"; 0: at the first refusal). The lock keys are read at each
+  use; session overrides apply. The template has them with Russian comments; the settings page's «Workspace»
+  section has a field for each.
 - `[skills]` (`SkillsSettings`, global only: not one of the session `OVERRIDE_SECTIONS`; §19): `library_dir =
   "~/.dreamteam/skills"` (the shared skills library; `Config.skills_library_dir`, where `DREAMTEAM_SKILLS_DIR` wins:
   the Docker sandbox and the tests set it), `claude = true` (offer Claude Code's skills), `max_mb = 10` and
@@ -2876,7 +3092,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   - every section with defaults filled in; no `swarm.goal` / `swarm.goal_description`;
   - in model profiles, `api_key` is null and comes with `api_key_set`, `api_key_hint` (`…abcd`) and
     `api_key_env_set` (true/false, or null when there is no env name); `api_key_env` is a variable name or
-    null (a key pasted there is never shown);
+    null (a key pasted there is never shown); `price_source` is `ModelProfile.price_source()` (§10). These computed
+    fields (`_PUBLIC_KEY_FIELDS`) are dropped by `apply_update` and `profile_from_view`;
   - values of `mcp.external.<server>.env` are masked as `SECRET_MASK + hint` (`••••…abcd`);
   - `roles`: the stored `[[roles]]` entries `[{name, description, instructions, model, hidden, skills}]`, normalized
     (a built-in role by its id, e.g. «Тестировщик» → `tester`); `[]` when there are none.
@@ -2894,7 +3111,11 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
     `renamed_from`), `""` removes it, and any other string sets it (whitespace stripped); a key pasted into
     `api_key_env` becomes the `api_key`;
   - renaming the default profile (`renamed_from`) moves `agents.default_model` along (`profile_renames(update)`
-    gives `{old: new}`).
+    gives `{old: new}` of every card whose `renamed_from` differs from its name, a swap or a chain in one save
+    included, applied in one step; an old name that a card not renamed from anything still has is left out). A
+    stored value carries an old name and follows; an `agents.default_model` or role `model` sent with the update
+    that names one of its profiles is a new name and is kept (the web UI sends the names after the save: in a swap
+    a new name is also an old one).
 - `profile_from_view(raw, data, name=None) -> ModelProfile` (an unsaved UI profile; a missing key falls back to
   the stored key of profile `name`, only when `data` has the provider and base_url that profile is saved with
   (a trailing `/` aside), else a ValueError. A key from the hub's environment (`api_key_env`, or with no key the
@@ -2910,11 +3131,19 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   first); `scrub_keys()` masks their values too.
 - `async list_models(profile, timeout=20)` (GET /models, free; ValueError with a readable message).
 - `async check_profile(profile, *, live=False, timeout=30)` → `{ok, models, models_error, model_found, error,
-  reply, latency_ms, cost_usd}`. `live=True` sends one tiny request (max_tokens <= 512; effort `low` only when
-  the profile uses effort). Errors and replies pass through `scrub_keys()`: an endpoint echoing a rejected key
-  never sends it to the browser.
+  reply, latency_ms, cost_usd, cost_source}`. `live=True` sends one tiny request (max_tokens <= 512; effort `low`
+  only when the profile uses effort); `cost_source` is then `"provider"` when the response reported its cost, else
+  the probe's `price_source(response model)` (`"none"` / `"partial"`: those tokens counted as $0), null without a
+  live request. Errors and replies pass through `scrub_keys()`: an endpoint echoing a rejected key never sends it
+  to the browser.
 - `PROVIDER_CHOICES`: presets for the UI (`anthropic`, `openai`, `openrouter`, `ollama`, `vllm`, `lmstudio`,
-  `custom`), each `{id, label, provider, base_url, api_key_env | api_key, model, models, ...}`.
+  `custom`), each `{id, label, provider, base_url, api_key_env | api_key, model, models, ...}`. The `openai` preset
+  sets `input_price = 1.25` and `output_price = 10.0` (as the init template), the local ones 0 / 0.
+- `unpriced_line(config) -> str | None`: the note the `serve` and `run` banners print (§18.3), English and ASCII:
+  `Note: model profiles without prices: remote (some-model-v1), half (kimi: no output_price). Their unpriced tokens
+  count as $0 and the budget does not see them, unless the provider reports the cost. Set input_price and
+  output_price ($ per 1M tokens, 0 for a free model) in Settings > Models and endpoints or in dreamteam.toml.`; the
+  profiles with `missing_prices()`, the scripted provider aside; None when there are none.
 
 ### 17.2 Sessions (sessions.py)
 `SessionManager(home, *, llm_factory=None, language="ru", provider="anthropic")` (`ensure_home` + the
@@ -2996,9 +3225,17 @@ settings; ValueError when they are invalid):
   session's lock, so a `set_workspace` that ran just before counts), else None.
 - `update_settings(update)`: `apply_update` + validation; every session must still produce a valid config,
   except damaged sessions and sessions whose overrides were already invalid (skipped); a session override that
-  pins a renamed profile follows the rename, one whose profile was deleted falls back to the default (an
-  `updated` event); then the file is written and every loaded swarm is reconfigured (a failure is logged per
-  session). Returns `{"settings": public view, "applied_to": [sids]}`. Edits of the settings file made by hand
+  pins a renamed profile follows the rename (also in a swap), one whose profile was deleted falls back to the
+  default (an `updated` event); then the file is written. A profile rename (`profile_renames(update)`) then reaches
+  the members hired on it, before the reconfigure: a loaded session through `Swarm.rename_profiles`, every other one
+  (`main` too) by `rename_member_profiles(db_path, renames)` on its `.dreamteam/swarm.db`, in a thread under the
+  session's lock (opened by its plain path after an exists() check, so a home on a UNC path or a mapped drive works;
+  a 2-s busy timeout, one statement; a missing file or one without an `agents` table is left alone; an error is
+  logged and never fails the save, and such a member falls back to the default profile, `make_llm`). A deleted
+  profile keeps `agents.model` as it is; a rename by a hand edit of the file has no `renamed_from` and is not
+  followed. Then
+  every loaded swarm is reconfigured (a failure is logged per session). Returns `{"settings": public view,
+  "applied_to": [sids]}`. Edits of the settings file made by hand
   while the server runs are picked up (mtime/size) before reads and updates; an invalid hand edit is ignored
   with a warning.
 - `default_session()`: the running session (the most recently active one when several run), else the only
@@ -3488,7 +3725,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   (`run` too; §14.2);
   `--goal` creates and starts a session (its first line becomes the title unless `--title`) and opens its board;
   the terminal console attaches to the running session when stdin is a real terminal (on Windows the NUL device
-  is not one). Settings errors and unusable homes are messages, not tracebacks.
+  is not one). Settings errors and unusable homes are messages, not tracebacks. Right after the `DreamTeam is
+  running.` banner (and after `run`'s, §15) stderr gets `settings.unpriced_line(config)` (§17.1) when a model
+  profile has no prices.
 - `console`: with a launcher hub it works against `{base}/s/{sid}` (`--session`, else the running one); `--url` is
   an address the user typed, so `DREAMTEAM_HUB_TOKEN` goes there whatever its host (§14.2); it
   refuses a URL where no hub answers and a stopped session, except a stopped session whose folder outside it
@@ -3654,7 +3893,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     the switch «Независимое ревью задач», `swarm.independent_review`, «Сначала уточнять цель», `swarm.clarify`, whose
     hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для команд агентов»,
     `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
-    `agents.planning_hint_steps` / `planning_hint_minutes` and their hints), «Консоль», «Workspace», «MCP»,
+    `agents.planning_hint_steps` / `planning_hint_minutes` and their hints, and the triggers' `file_settle_seconds`,
+    `file_max_wait_seconds`, `trigger_wake_seconds` with theirs, §8), «Консоль», «Workspace» (`workspace.git`,
+    `lock_ttl_minutes` ≥ 1 and `lock_wanted_minutes` ≥ 0 with its hint, §7 "Lock waiters"), «MCP»,
     «Скиллы», «Трейсы», «Сервер», with a section navigation.
     - Roles: a card per catalog role (from `role_presets` and `settings.roles`). A built-in role: its name in
       both languages (read-only), «встроенная» / «изменена» marks, «Сбросить» and «Скрыть» / «Показать»;
@@ -3670,7 +3911,19 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       max_tokens, context window, the max_tokens ceiling (after a cut-off reply, §6.2), effort, thinking (Anthropic) or the max-tokens parameter (OpenAI), and under
       «Дополнительно» thinking display, prefix-mismatch handling and fallbacks (Anthropic), prices and extra
       request parameters (JSON). Buttons «Проверить» (models list) and «Тестовый запрос» (live); key-like text
-      in the results is masked. Default profile (★, cannot be deleted), add from a preset, delete.
+      in the results is masked; the live result says how its cost was obtained (`cost_source`: «сообщил
+      провайдер», «по ценам профиля», «по встроенным ценам», «бесплатно», «неизвестна…» / «неполная…»). Default
+      profile (★, cannot be deleted), add from a preset, delete. Filling a card from a preset sets its four prices
+      to the preset's (empty when it has none), so the previous preset's prices never stay on the card.
+    - Prices (the hint: empty = the built-in prices of known Claude models, otherwise those tokens count as $0
+      unless the provider reports the cost; 0 = free): a profile whose `price_source` is `none` or `partial` (and
+      whose provider is not `scripted`) shows a warning outside «Дополнительно» (`.price-warn`): «Нет цен: вызовы этой
+      модели считаются по $0, и бюджет сессии их не видит, если только провайдер не сообщает стоимость сам
+      (проверьте «Тестовым запросом»).» or «Нет цены выхода: эти токены считаются по $0.», with «Указать цены»
+      (opens «Дополнительно», the cursor in the first missing price) and «Бесплатная модель (0 / 0)» (both prices
+      0). The server computes `price_source` for the saved model: while the card's model is the saved one, typing
+      the missing prices hides the warning at once (`missingPrices`); another model typed in shows none until the
+      settings are saved.
     - The external MCP servers are a JSON field; their `env` values come masked (`••••…abcd`) and are kept
       when sent back unchanged.
     - «Консоль» (`[shell]`, §17.1): the shell; the default wait for a command (`timeout`); «Наибольший тайм-аут
@@ -3758,9 +4011,12 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     and `GET /api/settings` (launcher routes, without `BASE`) and adds the groups «Фоновые процессы»
     (`shell.max_jobs_per_member`, `max_jobs`, `job_max_minutes`, `cpu_threads`) and «Агенты»
     (`agents.max_steps_per_turn`, `context_tokens`, `tool_output_chars`, `idle_nudge_seconds`,
-    `max_parallel_llm_calls`, `planning_hint_steps`, `planning_hint_minutes`) and «Сеть» (`swarm.network`, kind
-    `choice`: a select «как в общих настройках (…)» / «есть» / «нет», with the hint `networkHint` of the launcher's
-    `network_isolation`, §7.2) and «Уточнение цели» (`swarm.clarify`, field «Сначала уточнять цель», kind `bool`: a
+    `max_parallel_llm_calls`, `planning_hint_steps`, `planning_hint_minutes`, `file_settle_seconds`,
+    `file_max_wait_seconds`, `trigger_wake_seconds`: «Повторяющийся триггер будит не чаще, с» with the hint
+    «Срабатывания между пробуждениями приходят одним уведомлением; 0 — будить при каждом») and «Сеть»
+    (`swarm.network`, kind `choice`: a select «как в общих настройках (…)» / «есть» / «нет», with the hint
+    `networkHint` of the launcher's `network_isolation`, §7.2) and «Уточнение цели» (`swarm.clarify`, field
+    «Сначала уточнять цель», kind `bool`: a
     select «как в общих настройках (вкл|выкл)» / «вкл» / «выкл», parsed to null / true / false; its hint says that an
     agent's critical question then pauses the swarm until the user answers, that a new planning task starts with
     questions, and that a planning task already on the board stays as it is, §3.1) (`SESSION_FIELDS`, where a field's
@@ -3769,9 +4025,10 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     that an empty field takes the general value and that changes apply at once (steps from the agent's next
     wake-up, the rest from the next command or call), the context field that a model profile's own window wins
     (naming it when the session's profile has one). Save checks the values with config.py's minimums (whole
-    numbers; `idle_nudge_seconds` and `planning_hint_minutes` numbers; `cpu_threads` "auto" or a whole number ≥ 0; the first error is a toast
-    and gets the focus), then sends `PATCH /api/sessions/{sid}` `{"settings": ...}` with only the changed keys (an
-    emptied field is null) before `swarm_control`, so a stopped session takes them too; when the PATCH succeeds and
+    numbers; `idle_nudge_seconds`, `planning_hint_minutes` and the three trigger keys numbers; `cpu_threads` "auto"
+    or a whole number ≥ 0; the first error is a toast and gets the focus), then sends `PATCH /api/sessions/{sid}`
+    `{"settings": ...}` with only the changed keys (an emptied field is null) before `swarm_control`, so a stopped
+    session takes them too; when the PATCH succeeds and
     `swarm_control` fails, a toast says the session parameters were saved and the dialog stays open with them counted
     as saved. An emptied field counts as an unsaved edit when the dialog is closed (it removes an override). ⚙ is
     disabled while the two requests load, and a modal opened meanwhile is not replaced; if they fail, the dialog
@@ -3796,10 +4053,17 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     drawer lists them, each with «Остановить». The feed shows `job.started` / `job.ended` (FEED_TYPES `job.*`).
     The header's agents counter is `swarm.agent_count` (members who joined through MCP do not count) against
     max_agents.
+  - Tab «Триггеры»: a card per active trigger of the snapshot (condition, a repeat badge, owner, «срабатываний: N»
+    and, while its fires are held by the wake limit, «отложено: 2 до 18:48» / "held: 2 until 18:48" from `held` and
+    `wake_at`, §8; note, actions, last error; «Удалить» asks first).
   - Tab «Файлы»: above the tree, the session folder (`swarm.workspace`): its absolute path (click to copy) and
     the badge «своя папка» / «папка проекта» / «перенесена» / «папки нет»; the tab button's tooltip is the
     path. A missing folder is not listed (no `/api/files` call). When the path (or its existence) changes
-    after a `/cd`, the tab starts again from the root of the new folder. The viewer highlights the syntax of a file
+    after a `/cd`, the tab starts again from the root of the new folder. A locked entry (its path is the path of a
+    lock in the snapshot's `locks`) shows the lock icon («Заблокирован: {owner}» as its tooltip) and the link «Снять
+    блокировку» / "Unlock" (`.file-unlock`): after a `confirm()` («Снять блокировку, которую поставил(а) {owner}, с
+    {path}? Участников, которые ждут этот файл, разбудят.») it calls `act('file_unlock', {path})` (§7 "Lock
+    waiters"); cancelling sends nothing. The viewer highlights the syntax of a file
     (and the source of a `.md`) by its name (`highlight.js`, in-house, offline, loaded before markdown.js; also
     Markdown fences that name a language): Python, JS/TS, JSON, TOML, YAML, INI/.env, shell, Dockerfile, Makefile,
     PowerShell, batch, HTML/XML/SVG, CSS, SCSS/LESS, SQL, C/C++, C#, Java, Kotlin, Go, Rust, Ruby, PHP, Lua, R, Julia, LaTeX,

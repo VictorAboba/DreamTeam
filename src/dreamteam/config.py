@@ -59,6 +59,8 @@ KNOWN_PRICES: dict[str, tuple[float, float, float, float]] = {
     "claude-haiku-5-5": (0.10, 0.50, 0.01, 0.125),
     "claude-haiku-4-5": (1.0, 5.0, 0.1, 1.25),
 }
+# the prices without which a call's tokens count as $0 (the cache prices default to fractions of input_price)
+PRICE_FIELDS = ("input_price", "output_price")
 
 
 @dataclass
@@ -101,8 +103,12 @@ class ModelProfile:
             return os.environ.get(self.api_key_env) or None
         return None
 
+    def _table(self, model: str | None = None) -> tuple[float, float, float, float] | None:
+        """The built-in prices (KNOWN_PRICES) of the response's model, else of the profile's model."""
+        return KNOWN_PRICES.get(model or self.model) or KNOWN_PRICES.get(self.model)
+
     def prices(self, model: str | None = None) -> tuple[float, float, float, float]:
-        known = KNOWN_PRICES.get(model or self.model) or KNOWN_PRICES.get(self.model)
+        known = self._table(model)
         inp = self.input_price if self.input_price is not None else (known[0] if known else 0.0)
         out = self.output_price if self.output_price is not None else (known[1] if known else 0.0)
         cr = self.cache_read_price if self.cache_read_price is not None else (known[2] if known else inp * 0.1)
@@ -115,9 +121,27 @@ class ModelProfile:
         limit = max(int(self.max_tokens or 0), 1)
         return max(int(self.max_tokens_ceiling or 2 * limit), limit)
 
+    def missing_prices(self, model: str | None = None) -> tuple[str, ...]:
+        """The PRICE_FIELDS that are not set while the model has no built-in prices: their tokens count as $0.
+        A price set to 0 means free and is never missing."""
+        if self._table(model) is not None:
+            return ()
+        return tuple(name for name in PRICE_FIELDS if getattr(self, name) is None)
+
+    def price_source(self, model: str | None = None) -> str:
+        """Where a call's prices come from: "profile" (both set), "free" (both set to 0), "table" (the built-in
+        prices fill what is not set), "partial" (one is missing: missing_prices), "none" (both are)."""
+        missing = self.missing_prices(model)
+        if missing:
+            return "none" if len(missing) == len(PRICE_FIELDS) else "partial"
+        if all(getattr(self, name) is not None for name in PRICE_FIELDS):
+            return "free" if all(getattr(self, name) == 0 for name in PRICE_FIELDS) else "profile"
+        return "table"
+
     @property
     def has_prices(self) -> bool:
-        return self.input_price is not None or self.model in KNOWN_PRICES
+        """Whether every token of a call has a price (nothing in missing_prices)."""
+        return not self.missing_prices()
 
 
 @dataclass
@@ -168,6 +192,13 @@ class AgentSettings:
     # is told to create the independent tasks now (once more at twice the value); 0 turns that trigger off
     planning_hint_steps: int = 8
     planning_hint_minutes: float = 10.0
+    # file_changed() is true once the file has had no change this long, or the agents who changed it ended their
+    # turns, at the latest file_max_wait_seconds after the first change (0: at every change / no cap)
+    file_settle_seconds: float = 60.0
+    file_max_wait_seconds: float = 300.0
+    # a member's repeating trigger wakes it at most once this many seconds; the fires in between come in one notice
+    # (0: at every fire)
+    trigger_wake_seconds: float = 180.0
 
 
 @dataclass
@@ -198,6 +229,8 @@ class ShellSettings:
 class WorkspaceSettings:
     git: bool = True
     lock_ttl_minutes: int = 30
+    # the holder of a lock others were refused is told once, after it has held the lock this long (0: at once)
+    lock_wanted_minutes: float = 5.0
 
 
 @dataclass
@@ -249,7 +282,7 @@ _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSetti
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
                       "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
                       "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
-                      "install_timeout"})
+                      "install_timeout", "lock_ttl_minutes"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 
@@ -591,6 +624,9 @@ context_tokens = 120000       # при превышении история аг�
 stagger_seconds = 3.0         # задержка между стартами агентов
 planning_hint_steps = 8       # если взявший задачу планирования за столько шагов не создал ни одной задачи — подсказка создать их (0 — выкл.)
 planning_hint_minutes = 10    # то же через столько минут после того, как он взял задачу (0 — выкл.)
+file_settle_seconds = 60      # триггер file_changed срабатывает, когда файл столько секунд не меняется или менявшие его агенты закончили ход (0 — при каждом изменении)
+file_max_wait_seconds = 300   # но не позже, чем через столько секунд после первого изменения (0 — без предела)
+trigger_wake_seconds = 180    # повторяющийся триггер участника будит его не чаще раза в столько секунд; срабатывания между пробуждениями приходят одним уведомлением (0 — будить при каждом)
 
 [server]
 host = "127.0.0.1"
@@ -611,7 +647,8 @@ pass_env = []                 # переменные окружения с се�
 
 [workspace]
 git = true                    # общий workspace под git с автокоммитами
-lock_ttl_minutes = 30
+lock_ttl_minutes = 30         # на сколько минут блокируется файл, если агент не указал срок
+lock_wanted_minutes = 5       # напомнить держателю файла, который ждут, когда он держит его столько минут (0 — сразу)
 
 [mcp]
 require_approval = false      # true — новые MCP агентов ждут одобрения пользователя

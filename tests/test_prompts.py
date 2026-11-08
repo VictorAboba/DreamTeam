@@ -242,6 +242,61 @@ def test_agent_texts_name_only_baseline_tools():
             assert not code_idents(text) - allowed, (lang, key, code_idents(text) - allowed)
 
 
+def test_lock_texts():
+    """File locks (docs/SPEC.md §7 "Lock waiters"): the waiter's wake-up and the holder's notice name only
+    `lock_file`, say that no reply is needed, and never put a path in backticks."""
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        assert placeholders(texts["n_lock_free"]) == {"paths"}
+        assert placeholders(texts["n_lock_wanted"]) == {"path", "held", "waiters"}
+        assert placeholders(texts["lock_waiter_task"]) == {"name", "tasks"}
+        for key in ("n_lock_free", "n_lock_wanted"):
+            assert code_idents(texts[key]) == {"lock_file"} and "`{" not in texts[key], (lang, key)
+        assert ("No reply is needed" if lang == "en" else "Отвечать не нужно") in texts["n_lock_wanted"]
+    text = prompts.t("en", "n_lock_wanted", path="docs/AUDIT.md", held="6 min", waiters="Anna Smith (task #7 Parser)")
+    assert text.startswith("docs/AUDIT.md, which you have held for 6 min, is wanted by: Anna Smith (task #7 Parser).")
+
+
+def test_trigger_texts():
+    """Trigger notices (docs/SPEC.md §8): the file_changed() fragments go after "{condition}." and start with a space
+    (`by` with its own separator), the held notice says how often it may wake; none names a tool."""
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        assert placeholders(texts["n_trigger_files"]) == {"id", "condition", "changes", "note"}
+        assert placeholders(texts["trigger_file_settled"]) == {"path", "count", "by", "quiet"}
+        assert placeholders(texts["trigger_file_changing"]) == {"path", "count", "by", "duration"}
+        assert placeholders(texts["trigger_file_by"]) == {"names"}
+        assert placeholders(texts["n_trigger_held"]) == {"id", "condition", "count", "since", "last", "interval",
+                                                         "changes", "note"}
+        # the limit switched off with fires held: the same notice without the interval sentence
+        assert placeholders(texts["n_trigger_held_off"]) == placeholders(texts["n_trigger_held"]) - {"interval"}
+        limit = {"en": " A repeating trigger wakes you at most once every {interval}.",
+                 "ru": " Повторяющийся триггер будит не чаще раза в {interval}."}[lang]
+        assert texts["n_trigger_held_off"] == texts["n_trigger_held"].replace(limit, "")
+        keys = ("n_trigger_files", "trigger_file_settled", "trigger_file_changing", "trigger_file_by", "n_trigger_held",
+                "n_trigger_held_off")
+        for key in keys:
+            assert not code_idents(texts[key]) and "`" not in texts[key], (lang, key)
+        for key in ("n_trigger_files", "n_trigger_held", "n_trigger_held_off"):
+            assert "{condition}.{changes} " in texts[key] and texts[key].endswith(" {note}"), (lang, key)
+        assert texts["trigger_file_settled"].startswith(" ") and texts["trigger_file_changing"].startswith(" ")
+        assert texts["trigger_file_by"].startswith((", ", "; "))
+
+
+def test_cost_unknown_texts():
+    """The user's notice about calls counted as $0 (docs/SPEC.md §10): the profile, the model and the missing price
+    fields, where to set the prices and that 0 means free; it names no tool."""
+    for lang in LANGS:
+        text = prompts.TEXTS[lang]["u_cost_unknown"]
+        assert placeholders(text) == {"profile", "model", "fields"} and not code_idents(text) and "`" not in text
+        assert "$0" in text and "dreamteam.toml" in text and " 0" in text
+    text = prompts.t("en", "u_cost_unknown", profile="remote", model="some-model-v1", fields="output_price")
+    assert text.startswith('DreamTeam cannot count the cost of model profile "remote" (model some-model-v1): it has '
+                           "no output_price, and the provider does not report the cost of a call")
+    assert "Settings → Models and endpoints" in text
+    assert "«Настройки» → «Модели и эндпоинты»" in prompts.TEXTS["ru"]["u_cost_unknown"]
+
+
 def test_background_job_texts():
     for lang in LANGS:
         texts = prompts.TEXTS[lang]

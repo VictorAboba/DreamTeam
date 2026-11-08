@@ -32,7 +32,7 @@ Package layout: `src/dreamteam/tui/`.
 | `theme.py` | render | colours, symbols (unicode + ASCII fallback), `agent_style(name)` |
 | `render.py` | render | every renderable, the spinner line, the status line, `to_ansi()`, `to_plain()` |
 | `commands.py` | app | slash-command registry and handlers |
-| `input.py` | app | suggestions (slash commands, `@agents`, `#tasks`), input modes, history |
+| `input.py` | app | suggestions (slash commands, `@agents`, `#tasks`, locked paths after `/unlock`), input modes, history |
 | `dialogs.py` | app | session picker, MCP approval and skill proposal dialogs, confirm and choice dialogs, select-list widget |
 | `bash.py` | app | `ShellCommand`: the interruptible `!command` runner |
 | `app.py` | app | `TUI` application: layout, key bindings, event loop, view state |
@@ -244,6 +244,10 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
   - `text`: on success, the goal summary is printed to `out` (plain text); on failure, a one-line reason goes
     to `err`. With `verbose`, a compact progress feed goes to `err`: the plain-text rendering of the
     `render.event()` lines at verbosity "normal".
+  - `text` and `json`: a `notification` to the user of kind `u_cost_unknown` (a model profile's calls count as
+    $0: no prices, and the provider reports no cost; SPEC §10) writes its text to `err` once, also without
+    `verbose` (`on_cost_unknown`; the verbose feed already shows it as a notice line). `stream-json` carries the
+    event itself.
   - `json`: one object on `out` at the end:
     `{"type":"result","status":"done|budget|timeout|error|interrupted","session":id,"goal":{...},
     "summary":str,"tasks":[{id,title,status,assignee}],"cost_usd":float,"duration_s":float,"agents":[names],
@@ -311,10 +315,13 @@ class RenderContext:
 - Thinking (verbose only): `✻ Анна думает…` with the text dim italic, max 12 lines.
 - `wake` (verbose only): `⏰ Анна проснулась: <first line>`. Nudge and compaction lines appear only in
   verbose. Errors are always shown in red with `⚠`.
+- Triggers (verbose only; their errors at every verbosity): `⚡ сработал триггер #4: every(60) · Анна`; a fire whose
+  notice the wake limit holds (SPEC §8, trigger dict `held` > 0 with `wake_at`) adds `(пробуждение отложено до
+  18:48)` / "(wake-up held until 18:48)" (i18n `trigger_held`).
 - Notifications to the user: `🔔 text`. MCP pending → handled by the approval dialog (plus an info line). The
   review notices (`u_review_requested`, `u_review_fallback`, `u_review_handed_over`, `u_reviews_waiting`) are one
   warning line, like `u_budget`; so are the skill notices (`u_skill_proposed`, `u_skill_deps_failed`,
-  `u_role_skills_missing`, `u_role_skills_over_cap`).
+  `u_role_skills_missing`, `u_role_skills_over_cap`) and `u_cost_unknown` (a model profile's calls count as $0).
 - Skills (normal and verbose; quiet has the notices): `⏺ вы · подключил(а) скилл pdf · library` (обновил(а) for a
   replace, отключил(а)), `⏺ Анна · предлагает скилл x` (warn), `⏺ вы · сохранил(а) скилл x в библиотеку` / «не
   стал(а) сохранять … · <the reason>». Packages (`skill.deps`): `✓ скилл pdf: пакеты установлены
@@ -380,6 +387,12 @@ def skills_pending(ctx, sid, attached) -> RenderableType      # /skills pending:
 def skill_log(ctx, data: dict) -> RenderableType              # /skills log: the install log's path and its end
 def sessions_table(ctx, sessions: list[dict], current: str | None = None) -> RenderableType
 def cost_table(ctx, state: dict) -> RenderableType       # per agent tokens in/out, cost; total vs budget
+def models_table(ctx, settings: dict) -> RenderableType  # /model, /settings: ✓ default, profile, model, provider
+    # (≥ 80 columns), Цены / Prices from the public view's price_source ($in/$out of the profile, «встроенные» /
+    # built-in, «бесплатно» / free, in warn «нет цен» / no prices or «нет output_price»; "" for the scripted provider
+    # and for an older hub without price_source, never "no prices"), key state (never the key)
+def missing_prices(profile: dict) -> list[str]           # the price fields a public-view profile lacks (price_source
+                                                         # none / partial; [] otherwise): the /model NAME warning
 def status_report(ctx, info: dict) -> RenderableType     # version, home, web, session, goal, models, language, agents,
                                                          # jobs ({"running": N, "ids": ["j3", "j5"]}: «2 работают
                                                          # (j3, j5)»), tracing, clarify («Уточнение цели»: on/off),
@@ -394,6 +407,7 @@ def help_view(ctx, commands: list) -> RenderableType     # command table (name, 
 def shortcuts_view(ctx) -> RenderableType                # the "?" help: keys in 2 columns
 def info(ctx, text: str) -> RenderableType               # dim "  ⎿  text"
 def error(ctx, text: str) -> RenderableType              # red "⚠ text"
+def warning(ctx, text: str) -> RenderableType            # "⚠ text" in the warning colour (something to fix)
 def bash_result(ctx, command: str, code: int | None, output: str) -> RenderableType
 def tool_header(ctx, agent, tool) -> RenderableType      # `⏺ Анна Смирнова · tool` above a result printed apart
 class ToolPairs:                                         # the one stateful helper (see §3.1)
@@ -461,7 +475,11 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
   moves the selection, Tab completes, Enter runs the selected command. They come from:
   - `/` at the start — commands;
   - `@` — agents plus `all`;
-  - `#` — tasks: `#3 Title` and the translated status.
+  - `#` — tasks: `#3 Title` and the translated status;
+  - after `/unlock ` — the locked paths of the state (`locks`) that contain what is typed, with their owner (the
+    path typed in full first, then those that start with it); the suggestion replaces the whole argument. Enter
+    sends a typed path as it is (it never takes another path that contains it); Tab, or a suggestion picked with
+    Up/Down, completes it.
 - Submitting or clearing the input (Enter, Ctrl+C) also clears the suggestions: Enter on an empty box does
   nothing, and Up/Down browse the history.
 
@@ -518,10 +536,11 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/hire Роль [\| инструкции]` | `hire_agent`; the instructions are optional for a catalog role (sent as `""`) |
 | `/trace [Имя\|N]`, `/span N [ctx]` | traces list / trace N / span / its context |
 | `/files [путь]`, `/cat путь` | workspace listing / file with syntax highlighting |
+| `/unlock путь` | remove a member's lock on a file or folder (`file_unlock`, the path as it was locked; quotes around it are dropped): the members waiting for it are woken; the tool's answer is printed (`Unlocked docs (it was locked by Anna Smith).`, or why not: the path lies under a folder lock, which it names, or is not locked) |
 | `/cd [путь\|--default]` | the session folder (path; own / moved here / a project folder; missing) / move the session to another folder or adopt one, after a confirmation (§4.5); without a session: the folder of the next new session (as `--workspace`; `--default` clears it) |
 | `/cost` | spending per agent |
 | `/status` | setup and session status (with the session folder) |
-| `/model [профиль]` | list model profiles (✓ default); with an argument set the default profile in the settings (new sessions and new hires) |
+| `/model [профиль]` | list model profiles (✓ default; columns profile, model, provider, prices, key); with an argument set the default profile in the settings (new sessions and new hires), and for a profile whose tokens count as $0 (`price_source` none / partial) a warning line: «У профиля «{name}» не указаны {fields}: эти токены считаются по $0, и бюджет их не видит (если провайдер не сообщает стоимость сам). Цены — в /settings» / "Profile "{name}" has no {fields}: …" (i18n `model_no_prices`) |
 | `/pause` | pause / resume the swarm (toggle, `swarm_control`); during a question pause it resumes without the answer (the asker takes its own defaults) |
 | `/wrapup [off]` | wrap-up mode on (`on`/`вкл` or nothing) or off (`off`/`выкл`): the agents finish their tasks with what they have, start no new computations, and no new background jobs start (`swarm_control` wrap_up; the `swarm.wrap_up` event prints the change, a no-op prints the tool's answer) |
 | `/clarify [on\|off]` | clarify mode, `[swarm] clarify` (SPEC §3.1): questions before the plan, and an agent's critical question pauses the swarm (`on`/`вкл`, `off`/`выкл`; anything else: the usage line). In a session: that session's setting (`update_session` {"swarm": {"clarify": bool}}; «В этой сессии цель уточняется: …» / «…не уточняется: …»; the planning task already on the board stays as it is), without an argument its state («Уточнение цели в этой сессии: вкл (своя настройка сессии)», or «как в общих настройках»); `main` has no settings of its own: without an argument it shows the general setting as its state («Уточнение цели в этой сессии: вкл (как в общих настройках)»: main has no overrides), and `on` / `off` change nothing and send no PATCH («У сессии main нет своих настроек: уточнение цели задаётся в общих настройках»). Without a session: the window's new sessions (§4.5), without an argument their state (source «настройка этого окна» or «как в общих настройках»). Launcher only |
@@ -530,7 +549,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/reject имя [почему]`, `/reject N что исправить` | MCP rejection; return a task in review (the comment is required; after N it is free text taken as typed, without one pair of quotes around all of it) |
 | `/stop` | stop the session (agents stop; resumable) |
 | `/web` | open the session board in the browser (`webbrowser.open`) |
-| `/settings` | print the model profiles (key state, never the key) and open `/#settings` in the browser |
+| `/settings` | print the model profiles (prices and key state, never the key) and open `/#settings` in the browser |
 | `/verbose` | cycle verbosity (same as Shift+Tab) |
 | `/lang ru\|en` | UI language (persisted in `<home>/.dreamteam/tui.json`) |
 | `/clear` | clear the screen |
