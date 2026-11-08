@@ -34,8 +34,8 @@ src/dreamteam/
   events.py      EventBus                                            (exists)
   names.py       generate_name                                       (exists)
   prompts.py     system_prompt(), t(), PLANNING_TASK, DEFAULT_ROLE   (exists)
-  roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team (§17.3); imports nothing
-                 from the package
+  roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team, saved teams (§17.3); imports
+                 nothing from the package
   goal_text.py   split_goal, shorten_title: a goal typed as one text -> title + description (§3)
   board.py       Board          — tasks, goal field, discussion, independent review (§4)
   mailbox.py     Mailbox        — direct messages
@@ -2990,8 +2990,9 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
 ### 17.1 Settings (settings.py, config.py)
 - The **home** is `$DREAMTEAM_HOME`, else `~/DreamTeam` (`default_home()`); the CLI flags `--home` / DIR
   override both. Its settings file is `<home>/dreamteam.toml` (`settings_path(home)`) with the sections
-  `SECTIONS = swarm, agents, server, shell, workspace, mcp, skills, tracing, roles, models` (same format as a project's
-  `dreamteam.toml`; `roles` is an array of tables, `[[roles]]`, the role catalog of §17.3).
+  `SECTIONS = swarm, agents, server, shell, workspace, mcp, skills, tracing, teams, roles, models` (same format as a
+  project's `dreamteam.toml`; `teams` and `roles` are arrays of tables, `[[teams]]`, the saved teams, and `[[roles]]`,
+  the role catalog, both of §17.3).
 - `ensure_home(home, language="ru", provider="anthropic")` creates the directory, `sessions/` and the settings
   file from the template; `read_raw(home)`; `validate(home, raw) -> Config` (ValueError with a readable text);
   `dump_toml(data)` (a top-level non-empty list of tables is written as `[[name]]` blocks after every table,
@@ -3000,7 +3001,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   independent_review`): an agent's finished task is approved by another member, or by the user when nobody else
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
   true` with a comment, after the `starting_roles` comment (which names the starting team rule, §17.3), and a
-  commented `[[roles]]` example before the model profiles.
+  commented `[[roles]]` example before the model profiles, with a commented `[[teams]]` example before the role
+  catalog's.
 - `[swarm] network` ("on" | "off", default "on"; anything else is a ValueError naming `swarm.network`): "off"
   cuts the members' commands, their jobs and the stdio MCP servers off the network (§7.2). Read at each use;
   session overrides apply (a running session: from its next command). The template has the line after
@@ -3063,6 +3065,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   else None. The template has the block after `[mcp]` with Russian comments.
 - `[[roles]]` → `Config.roles: list[RoleSettings]` (`RoleSettings(name, description="", instructions="",
   model=None, hidden=False, skills=[])`), checked by `config.parse_roles(raw, profiles)` after the model profiles (§17.3).
+- `[[teams]]` → `Config.teams: list[TeamSettings]` (`TeamSettings(name, roles)`), checked by
+  `config.parse_teams(raw, entries)` after the roles (§17.3 "Saved teams").
 - `config.Config.from_dict` checks every field against its type (bool / int / float / str / list[str] /
   tables; integral floats become ints, bools are not numbers, no NaN/inf, counts and sizes >= 1, port <= 65535;
   None = the default) with messages like `[agents] max_steps_per_turn must be ...`; API keys are never echoed.
@@ -3080,13 +3084,19 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
     fields (`_PUBLIC_KEY_FIELDS`) are dropped by `apply_update` and `profile_from_view`;
   - values of `mcp.external.<server>.env` are masked as `SECRET_MASK + hint` (`••••…abcd`);
   - `roles`: the stored `[[roles]]` entries `[{name, description, instructions, model, hidden, skills}]`, normalized
-    (a built-in role by its id, e.g. «Тестировщик» → `tester`); `[]` when there are none.
+    (a built-in role by its id, e.g. «Тестировщик» → `tester`); `[]` when there are none;
+  - `teams`: the stored `[[teams]]` entries `[{name, roles}]`, normalized (§17.3 "Saved teams"); `[]` when there are
+    none.
 - `apply_update(raw, update)` (a dict of sections; ValueError for bad input):
   - `roles` is the complete list of entries: not a list → "Section roles must be a list of roles", an item that
     is not an object → "Role N must be an object"; names get their whitespace collapsed; fields that are null,
     `""`, `[]` (no skills) or `hidden: false` are not stored (an untouched field of a built-in role keeps the built-in value);
     `[]` removes every customization; a role's `model` follows a profile rename; the rules themselves are
     checked by `validate` (`[roles.N] ...`);
+  - `teams` is the complete list of entries: not a list → "Section teams must be a list of teams", an item that is
+    not an object → "Team N must be an object"; only null values are dropped, so the file keeps what was sent, and
+    `Config.teams` and the view normalize it at each load; `[]` removes the key; the rules themselves are checked by
+    `validate` (`[teams.N] ...`);
   - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays;
   - masked `mcp.external.*.env` values get their stored value back (same server first, then a renamed one);
     an unknown mask is a ValueError;
@@ -3163,10 +3173,10 @@ settings; ValueError when they are invalid):
   server derive it).
 - Effective config of a session = the global settings without `swarm.goal` / `goal_description`, deep-merged
   with its `overrides`. Overrides may only touch the sections swarm, agents, shell, workspace, mcp and tracing
-  (`OVERRIDE_SECTIONS`; not models, server or roles: the role catalog is global, and a session chooses its
-  starting team with `swarm.starting_roles` / `start_agents`); they are validated at create and update time
-  (`update` applies them to a loaded swarm at once via `reconfigure`). `config_view(sid)` is the public view of
-  the effective settings (the global ones when the overrides are invalid now).
+  (`OVERRIDE_SECTIONS`; not models, server, roles or teams: the role catalog and the saved teams are global, and a
+  session chooses its starting team with `swarm.starting_roles` / `start_agents`); they are validated at create and
+  update time (`update` applies them to a loaded swarm at once via `reconfigure`). `config_view(sid)` is the public
+  view of the effective settings (the global ones when the overrides are invalid now).
 - Partial update (`update(sid, settings=...)`, the settings dialog of the board, §18.4): `settings` is
   `{section: {key: value | None}}`; each key is set in the stored overrides, None (or "") removes it so the session
   inherits the global value again, and a section left empty disappears. The other overrides (those given at
@@ -3432,12 +3442,32 @@ of a home or a project, never a session override (§17.2).
     "developer", "developer", "tester"]` (names kept as typed, normalized); ValueError `'developer*0': the count
     must be a whole number from 1 to 50`, `'*2': the role name is empty`, `'<item>': a role name cannot be longer
     than 60 characters`, `The team is empty`, `A team has at most 200 agents`.
+- **Saved teams** (`[[teams]]`, `Config.teams`): `name` and `roles`, an ordered list with a name repeated per agent;
+  the size is its length, and trailing generalists stay. No model: an agent's profile comes from its role. No limit
+  on hiring: a team sets only who starts. `config.parse_teams(raw, entries)` checks shape only (messages
+  `[teams.N] ...`, a 400 on `PUT /api/settings`) and normalizes as `[[roles]]` does at each load (`PUT` itself stores
+  what was sent, §17.1); a name holding a control or invisible character (Unicode Cc, Cf) is refused, since it cannot
+  be typed and is printed, except the format characters of ordinary text: U+200C, U+200D (Persian and Indic words,
+  emoji sequences) and the tags U+E0020-E007F (subdivision flags). A name of those alone counts as empty. Names match
+  by `team_key`: casefolded, whitespace collapsed. Whether the
+  catalog has the roles is checked where a team is chosen, and the settings form
+  refuses a save that leaves a team on a role it just lost. A team may share a role's name. `team_choice(text, teams,
+  entries)` is the rule of `--team` and `/team`: a list or `*N` is roles (a saved team's name there that is no catalog
+  role is refused); a bare word is the saved team, else a catalog role; with teams saved any other bare word is
+  refused (`word*1` makes a new role), and with none it is a new role (`--team` says so on stderr, §18.3). A team's name
+  is looked up in the home in use: `--home`, else a `dreamteam.toml` in the current folder, else `$DREAMTEAM_HOME`,
+  else `~/DreamTeam`. A team is copied where it is chosen, into
+  `swarm.starting_roles` and `start_agents`: by `--team`, `/team` and `session_create(team_name=...)`, and by the
+  new-session dialog into its rows, which it sends as `starting_roles` even when the default equals them. POST
+  `/api/sessions`, `SessionManager` and `session.json` take no team name (`overrides.swarm.team_name` and
+  `overrides.teams` are refused), and nothing looks a team up after the copy.
 - **Views**: `presets_view()` → `[{id, name: {ru, en}, description: {ru, en}}]`; `catalog_view(entries)` →
   `[{key, builtin, customized, hidden, name: {ru, en}, description: {ru, en}, instructions, model, skills}]` (hidden roles
   included; an own role has the same text under both languages). Served by `GET /api/settings` (§18.1); the
   visible roles of one swarm by `GET /api/roles` (§14).
 - **Compatibility**: no `[[roles]]` → the 8 built-in roles; existing `starting_roles` keep working (built-in names
-  now bring their description); no database change.
+  now bring their description); no database change. An older version refuses a file with `[[teams]]` (`Unknown config
+  sections: teams`), but only once a team exists: with none the file has no such key. Session folders are untouched.
 
 ## 18. Launcher: web, MCP, CLI, UI
 
@@ -3464,8 +3494,8 @@ succeeded: either may have changed the library) and everything else to the launc
 | POST `/api/sessions/{sid}/skills/{name}/decide` | body `{"approve": bool, "comment"?, "replace"?}` → `{"text", "session"}` (`decide_skill`, via home) |
 | GET / POST `/api/skills`, GET / DELETE `/api/skills/{name}` | the library routes of §14 (`skill_routes` with `manager.global_config`, via `home`, no swarm: no `attached`, no `attach`, no `from=session`, no `deps-log`); `?workspace=<absolute>` names the folder whose `.claude/skills` is offered (a relative one 400); a change emits `sessions.changed` (session None, change `skills`) |
 | POST `/api/skill-envs/cleanup` | `EnvManager.cleanup(env_retention_days, every_unused=True)` now (a daemon thread: every env no session uses, whatever its age) → `{"removed", "kept"}`; emits change `skill-envs` |
-| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home", "network_isolation": netoff.shown(netoff.isolation()) (§7.2)}` (a hand edit of the file is picked up first) |
-| PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` text for a bad role (nothing saved) |
+| GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home", "network_isolation": netoff.shown(netoff.isolation()) (§7.2)}` (a hand edit of the file is picked up first); `settings.teams` holds the saved teams, `[{name, roles}]` (§17.3): a REST client starts one by posting its roles as `overrides.swarm.starting_roles` and `start_agents` |
+| PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization; `settings.teams`: the complete list of `[[teams]]` entries, `[]` removes the key, shape checked only: a team may name a role the catalog lacks) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` or `[teams.N] ...` text for a bad role or team (nothing saved) |
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result; 400 when the fallback would send the stored key to another provider or base_url than the saved one, or a key from the hub's environment to an endpoint that neither the provider's default, a preset nor a saved profile uses with that variable |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
 | `/mcp` | launcher MCP (§18.2) |
@@ -3502,7 +3532,7 @@ succeeded: either may have changed the library) and everything else to the launc
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
 `serve_stdio_launcher(manager)` (stdio, with hub_mcp's `_StdinLines`):
 - Session tools (`LAUNCHER_TOOLS`): `sessions_list`, `session_create(goal, title?, description?, language?,
-  start_agents?, max_agents?, team?, max_cost_usd?, model?, network?, clarify?, start?=true, workspace?,
+  start_agents?, max_agents?, team?, team_name?, max_cost_usd?, model?, network?, clarify?, start?=true, workspace?,
   skills?)` (unset values come from the global settings; the board URL is shown only when a web server runs;
   `goal`: one line, or several, split as in §17.2; `team`: role names in order, a name repeated per agent (§17.3) →
   `swarm.starting_roles` (normalized) and `start_agents = len(team)` unless `start_agents` is given, `[]` = no team;
@@ -3510,7 +3540,16 @@ succeeded: either may have changed the library) and everything else to the launc
   "team must be a list of role names, e.g. [...]", more than 200 → "A team has at most 200 agents.", a name over
   60 characters → "'<name>': a role name cannot be longer than 60 characters.", a name with `,` or `*` (the
   `--team` syntax) → "'<name>': a role name cannot contain ',' or '*'; give one item per agent and repeat a name
-  for several agents, e.g. [...]."; `clarify`: a boolean, `swarm.clarify` (§3.1; `false` overrides a global
+  for several agents, e.g. [...]."; `team_name`: a team saved in the settings (§17.3 "Saved teams"), looked up in
+  `manager.global_config()` and copied now: its roles become `swarm.starting_roles` and its size `start_agents`, and
+  `max_agents` is not raised, as with `team`; absent or `""` = none given; with `team` or `start_agents` → "team_name
+  sets the roles and their number: give it without team and start_agents.", not a string → "team_name must be the name
+  of a saved team.", an unknown name → "No saved team 'x'. Saved teams: a, b.", or with none saved "No saved team 'x'.
+  None are saved yet: Settings > Teams.", a team that cannot start → "The team 'X' uses roles that are not in the role
+  catalog: y, z. Fix it in Settings > Teams.", and a `team` item that names a saved team and no role
+  (`roles.saved_team_in`) → "'coding' is a saved team, not a role: pass it as team_name."; nothing is created on any of
+  these; `clarify`: a boolean, `swarm.clarify` (§3.1;
+  `false` overrides a global
   `true`), any other value → "clarify must be true or false." and nothing is created; `workspace`: an absolute
   folder, §17.2; `skills`: names or sources attached before the first start, §17.2 "Skills"),
   `session_start(session, skills?)` (the skills attached first, live when it runs), `session_stop(session)` and `session_cd(session, path)` (`set_workspace`; `path`
@@ -3541,6 +3580,8 @@ succeeded: either may have changed the library) and everything else to the launc
 - `dispatch_launcher_call(manager, name, args)` answers a tool name nobody knows (close matches + the list);
   `call_launcher_tool` turns SessionError / ToolError / unexpected failures into error results.
 - `INSTRUCTIONS` explain sessions (with `skill_library` and the `skills` of `session_create` / `session_start`,
+  with "`session_create(..., team_name=<name>)` starts with a team saved in the settings; an unknown name is answered
+  with the saved names.",
   and: "A session created with clarify=true first asks you about its goal; `sessions_list` shows a session that waits
   for your answer as "paused (waiting for your answer to X, question #N)"."), then the hub instructions (they hold
   the answer rule, §13).
@@ -3550,7 +3591,7 @@ succeeded: either may have changed the library) and everything else to the launc
 ```
 dreamteam [tui|chat] ["PROMPT"] [-c | -r [SID]] [-p [--output-format text|json|stream-json] [--timeout S]
           [--no-auto-reply]] [--verbose] [--home H] [--lang ru|en] [--model PROFILE] [--agents N]
-          [--team "ROLE[*N],..."] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
+          [--team "ROLE[*N],..." | NAME] [--max-agents N] [--budget USD] [--title T] [--workspace DIR]
           [--skill REF|PATH|URL ...] [--host H] [--port P] [--network on|off] [--clarify | --no-clarify]
 dreamteam serve [DIR | --home H] [--host H] [--port P] [--goal G [--title T] [--workspace DIR]
           [--skill REF|PATH|URL ...] [--network on|off] [--clarify | --no-clarify]] [--no-console] [--no-browser]
@@ -3573,11 +3614,26 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   prompt; no prompt → exit 2). `-r` without an id opens the session picker (`/sessions`). The flags `--model`,
   `--agents`, `--max-agents`, `--budget`, `--title` become the overrides of a session the TUI creates. The
   prompt is the goal: its first line becomes the title, the rest the description (split by the hub, §17.2).
-  `--team "architect, developer*2, tester"` (also with `-p`) is checked with `roles.parse_team` before anything
-  starts (`dreamteam: --team: <error>` on stderr, exit 2) and reaches the TUI as the raw text (`overrides["team"]`,
-  only when given), which turns it into `swarm.starting_roles` of the sessions it creates (`start_agents` = the
-  team's size unless `--agents` is given). With auto-replies on, `-p` also approves the tasks that wait for the
-  user's review (print mode `AUTO_REVIEW`, docs/TUI.md); with `--no-auto-reply` they wait.
+  `--team "architect, developer*2, tester"` or `--team NAME` (also with `-p`) is checked before anything starts
+  (`dreamteam: --team: <error>` on stderr, exit 2): `roles.parse_team`, then `roles.team_choice` (§17.3 "Saved teams")
+  over the home's settings (`_team_choice`). Exit 2 also for a bare word that is neither a saved team nor a role while
+  teams are saved (`no saved team or role 'codng' (there are: coding, Тексты). For a new role with no description write
+  'codng*1'`; the list is `roles.close_roles` plus all the saved names), a saved team's name that is no catalog role,
+  in a list or with `*N` (`'Тексты' is a saved team: choose it whole, with no other roles and no *N`), a team that
+  cannot start (`the team 'Тексты' uses roles that are not in the role catalog: y, z. Fix it in Settings > Teams`), a
+  team with `--agents` (`the team 'Тексты' sets the number of agents: --agents cannot go with it`), and a bare word
+  that is no built-in role when the settings cannot be read (`cannot read the settings to look up 'Тексты': <reason>`;
+  a list passes). The refusal of `--agents` adds `. For the role write 'tester*1' and keep --agents` when the word is
+  also a catalog role: `tester*1 --agents 2` is one tester and a generalist, what the word means with no such team. `-p`
+  with `-c` or `-r ID` continues a session and never reads the team, so it checks only the syntax. A note on stderr,
+  with no change in the exit code or stdout, for a bare word with no role or saved team in a home with no saved team
+  (`no role or saved team 'coding' in <home>: starting a new role with no description (write 'coding*1' to mean that)`:
+  the teams may be in another home). A saved
+  team reaches the TUI as its list of roles, copied now, anything else as the raw text (`overrides["team"]`, only when
+  given); the TUI turns it into `swarm.starting_roles` of the sessions it creates (`start_agents` = the team's size
+  unless `--agents` is given; `--max-agents` passes through, also below the size). With auto-replies on, `-p` also
+  approves the tasks that wait for the user's review (print mode `AUTO_REVIEW`, docs/TUI.md); with `--no-auto-reply`
+  they wait.
 - `--network on|off` (`tui`, `-p`, `serve` with `--goal`, exit 2 without it; `run`; `sandbox`): `[swarm] network`
   (§7.2) of the session that run creates (`overrides["network"]` → `swarm.network`, tui.commands.FLAT_OVERRIDES; serve:
   `create(..., overrides={"swarm": {"network": ...}})`), of `run`'s swarm for this run only (the settings file keeps
@@ -3795,17 +3851,33 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
     default; its hint is `networkHint(network_isolation of GET /api/settings)`: strict only for "docker" / "netns",
     the "env" and "container" texts say plainly that it is not isolation, "container" that a restart of the sandbox
     adds the firewall); «Запустить сразу» with «Создать и открыть» (or «Создать»). Only values that differ
-    from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). A stray
-    click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
+    from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). With teams
+    saved, the select `#ns-team` («Команда», first option «Роли ниже», right before the composer) fills the composer's
+    rows with a chosen team and sets the max to the larger of the typed value (else the saved `max_agents`) and the
+    team's size; a team with a role the catalog lacks is disabled, naming the first such role; a pick the settings no
+    longer support (another client saved while the dialog was open) changes nothing, puts the select back and says so;
+    the first option undoes a pick, bringing back the rows from before it and their max (a max typed since stays); any
+    edit of the rows resets the select and keeps those rows; the rows are what the session is created from, so no team
+    name is sent. A
+    stray click or Escape asks before discarding a typed goal. Independent review is not a field of the modal (the
     settings page has it; sessions can still override it through the API).
-  - Team composer (new-session modal and the settings' defaults): one row per group of the starting team (§17.3
+  - Team composer (new-session modal, settings' defaults, saved teams): one row per group of the starting team (§17.3
     `team_rows`; JS twins `teamRows` / `teamValue`): a role select over the visible catalog plus «Своя роль…» (a
-    name not in the catalog), −/+ count (1..50), the role's first sentence (full description as tooltip) and its
-    model profile, ✕; «Добавить роль»; the total. An empty team, an own role name with `,` or `*` (they separate
+    name not in the catalog), −/+ count (1..50; a row a saved team already holds above 50 keeps that count as its limit,
+    and a typed count above the limit shows as the limit), the role's first sentence (full description as tooltip) and
+    its model profile (for a role without one, muted, «модель: как у сессии»; none on a «Своя роль…» row, whose typed name may be a role with a profile), ✕; «Добавить роль»; the total. A re-render gives the focus back to the same control (keyboard
+    users). An empty team, an own role name with `,` or `*` (they separate
     team items) or more agents than the max is refused in the form; an untouched default is never written back.
-    The new-session modal sends `starting_roles` only when the saved list, at the new size, would give another
-    team (the saved list may hold more roles than its `start_agents`: they would fill a larger team).
-  - Settings tab: sections «Модели и эндпоинты», «Роли», «Новые сессии по умолчанию» (with the team composer and
+    The new-session modal sends `starting_roles` when a saved team is picked in `#ns-team`, and otherwise only when the
+    saved list, at the new size, would give another
+    team (the saved list may hold more roles than its `start_agents`: they would fill a larger team). A saved team's
+    composer (Settings → «Команда») is headed «Состав», without the hint, «Своя роль…» or its input: a team holds
+    catalog roles only. Its add button reads «Добавить строку», and ↑/↓ move a row, since the order is who is woken
+    first and who plans; the focus follows the row. A role the catalog lacks shows as a selected, disabled option in a
+    row marked in the error colour (`.team-gone`), with the hint «Этой роли больше нет в каталоге: выберите другую или
+    уберите строку.»; a hidden role shows as elsewhere: selected, marked «(скрыта)», and not offered to other rows.
+  - Settings tab: sections «Модели и эндпоинты», «Роли», «Команда», «Новые сессии по умолчанию» (with the team
+    composer and
     the switch «Независимое ревью задач», `swarm.independent_review`, «Сначала уточнять цель», `swarm.clarify`, whose
     hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для команд агентов»,
     `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
@@ -3821,6 +3893,20 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
       plus «Добавить» (Enter too; a name must be a skill name: lowercase letters, digits and `-`). Saved as
       `settings.roles` (only what differs from the built-in texts; `skills` when not empty); client checks (names,
       duplicates, a description for an own role, a known profile, skill names) are shown in the save bar.
+    - Teams («Команда», English "Teams"): a card per saved team (`settings.teams`), with an editable name, delete and
+      the saved team's composer; «Добавить команду». A card's composer id is generated (`tm<n>`), never the team's
+      name. Saved as `settings.teams` by `teamEntries`: `{name, roles}`, the rows expanded, trailing generalists kept.
+      Client checks, the first one found shown in the save bar: no name; a name over 60 characters (code points, as the
+      server; the name inputs of team and role cards have no `maxlength`, which counts UTF-16 units and cuts with no
+      message), with `,` or `*`, or starting with `-`; a name with a control or invisible character other than the
+      joiners of §17.3 (`TEAM_NAME_JOINERS`), or of those alone; a reserved name
+      (`TEAM_RESET_WORDS`, the twin of `roles.TEAM_RESET`); two teams of one
+      name; a team with no rows; a row whose role is missing from the edited catalog, unless it was already missing
+      from the saved settings, so a team broken by a hand edit blocks no other save. More than 200 agents is refused
+      by the server only. Rows are never changed automatically: a role renamed or deleted in the form leaves its rows
+      on the old name, shown as gone, and Save refuses, naming the team and the role and going to that row, until it
+      picks another role (the new name in the same save passes) or goes. Deleting a card leaves the focus on the delete
+      button of the card now in its place, else of the last card, else on «Добавить команду».
     - Model profiles: one card per profile. Fields: name, provider, base_url, key (mode «Переменная
       окружения» with its state on the server, or «Ключ»: a password input that is never filled from the
       server, «сохранён …abcd», a button to remove it), model (input + datalist filled by «Загрузить список»),

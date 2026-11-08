@@ -253,9 +253,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "role_instructions": "Доп. инструкции: {text}",
         "role_skills": "Скиллы роли (из библиотеки): {names}",
         "team_line": "Стартовая команда новых сессий: {team} — всего {n}",
-        "team_set": "Новые сессии из этого окна стартуют с командой: {team} — всего {n}",
+        "team_set": "Стартовая команда новых сессий из этого окна: {team} — всего {n}",
         "team_reset": "Стартовая команда новых сессий — из настроек.",
         "team_bad": "{error}. Пример: /team architect, developer*2, tester",
+        "team_picked": "Новые сессии из этого окна стартуют с командой «{name}»: {team} — всего {n}",
+        "team_saved": "Сохранённые команды: {teams}. Выбрать: /team {example}",
+        "team_unknown": "Нет команды или роли «{name}». Есть: {known}. Новая роль без описания: /team {name}*1",
+        "team_mixed": "«{name}» — сохранённая команда: её выбирают целиком, без других ролей и без *N: /team {name}",
+        "team_broken": "В команде «{name}» есть роли, которых нет в каталоге: {roles}. Исправьте её в настройках или "
+                       "выберите другую.",
         # ---- clarify mode (/clarify, --clarify)
         "clarify_session_on": "В этой сессии цель уточняется: важный вопрос агента ставит рой на паузу до вашего "
                               "ответа, новая задача планирования начнётся с вопросов (уже созданная не меняется)",
@@ -595,7 +601,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cmd_clear": "очистить экран",
         "cmd_exit": "выход",
         "cmdargs_new": "[цель]",
-        "cmdargs_team": "[роль*N, …]",
+        "cmdargs_team": "[команда | роль*N, …]",
         "cmdargs_resume": "[id]",
         "cmdargs_delete": "[id]",
         "cmdargs_goal": "[текст]",
@@ -867,6 +873,12 @@ TEXTS: dict[str, dict[str, str]] = {
         "team_set": "New sessions from this window start with: {team} ({n} in all)",
         "team_reset": "The starting team of new sessions comes from the settings.",
         "team_bad": "{error}. Example: /team architect, developer*2, tester",
+        "team_picked": "New sessions from this window start with the team “{name}”: {team} ({n} in all)",
+        "team_saved": "Saved teams: {teams}. To choose one: /team {example}",
+        "team_unknown": "No team or role “{name}”. There are: {known}. A new role with no description: /team {name}*1",
+        "team_mixed": "“{name}” is a saved team: choose it whole, with no other roles and no *N: /team {name}",
+        "team_broken": "The team “{name}” uses roles that are not in the catalog: {roles}. Fix it in the settings or "
+                       "choose another.",
         # ---- clarify mode (/clarify, --clarify)
         "clarify_session_on": "This session clarifies the goal: an agent's critical question pauses the swarm until "
                               "you answer, and a new planning task starts with questions (the one on the board stays "
@@ -1212,7 +1224,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "cmd_clear": "clear the screen",
         "cmd_exit": "quit",
         "cmdargs_new": "[goal]",
-        "cmdargs_team": "[role*N, …]",
+        "cmdargs_team": "[team | role*N, …]",
         "cmdargs_resume": "[id]",
         "cmdargs_delete": "[id]",
         "cmdargs_goal": "[text]",

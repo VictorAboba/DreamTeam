@@ -521,7 +521,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 |---|---|
 | `/help` | commands table + key hints |
 | `/new [цель]` | new session (asks for the goal when omitted: the next input is the goal); first line = title, the rest = description |
-| `/team [роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); without an argument shows it; the settings stay as they are |
+| `/team [команда \| роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); a bare word is a team saved in the settings first (`roles.team_choice`, SPEC §17.3 "Saved teams"), then a catalog role; with teams saved any other bare word is refused (`word*1` makes a new role), and so are a saved team's name that is no catalog role in a list or with `*N`, and a team with a role the catalog lacks; quotes around the argument, or around each item of a list, are dropped, as in other commands; the window copies the team when it is chosen, so a later edit of the team reaches the window only after `/team NAME` again; without an argument shows the team the window holds and lists the saved teams; the settings stay as they are |
 | `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" (warn) while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up" |
 | `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
@@ -715,9 +715,11 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   [--no-auto-reply]` runs print mode.
 - `-c/--continue` attaches to the most recently active session.
 - `-r/--resume [ID]` opens the picker, or attaches to ID.
-- Shared options: `--home`, `--lang ru|en`, `--model PROFILE`, `--agents N`, `--team "ROLE[*N],…"`,
+- Shared options: `--home`, `--lang ru|en`, `--model PROFILE`, `--agents N`, `--team "ROLE[*N],…" | NAME`,
   `--max-agents N`, `--budget USD`, `--title T`, `--workspace DIR`, `--host`, `--port`. `--team` is the starting
-  team of the session this run creates (`starting_roles`; `start_agents` = its size unless `--agents` is given).
+  team of the session this run creates (`starting_roles`; `start_agents` = its size unless `--agents` is given). It
+  also takes the name of a team saved in the settings, copied at launch (SPEC §18.3 has the rule, its refusals and the
+  note on stderr); `--agents` cannot go with a saved team. `-p` with `-c` or `-r ID` checks only its syntax.
 - `--skill REF|PATH|URL` (repeatable) is a skill of the session this run creates (with `-c` / `-r`: attached to the
   session resumed first, also when it runs); `/skills add` without a session adds to the same list.
 - `--workspace DIR` is the folder of the session this run creates (the TUI's first new session, or the

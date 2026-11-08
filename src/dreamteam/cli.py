@@ -18,6 +18,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
+from typing import Any
 
 from . import __version__, hubauth, netoff, roles
 from .config import CONFIG_FILE, PROVIDER_PRESETS, Config, render_template
@@ -1236,7 +1237,6 @@ def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
     `--workspace` folder's .claude/skills, or with `resuming` left to the hub, which knows the session's folder):
     None, with the reason printed, when one is unknown. Sources are checked by the hub."""
     from . import skills as skill_lib
-    from .settings import read_raw, validate
 
     out: list[str] = []
     refs: list[str] = []
@@ -1255,7 +1255,7 @@ def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
             refs.append(text)
     if refs:
         try:
-            config = validate(home, read_raw(home)) if (home / CONFIG_FILE).exists() else validate(home, {})
+            config = _home_config(home)
         except (OSError, ValueError):
             config = None   # the hub reports broken settings itself
         project = Path(workspace) if workspace else None
@@ -1270,6 +1270,49 @@ def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
     return out
 
 
+def _home_config(home: Path) -> Config:
+    """The home's settings as its hub reads them (a home not made yet: the defaults). OSError, ValueError."""
+    from .settings import read_raw, validate
+
+    return validate(home, read_raw(home)) if (home / CONFIG_FILE).exists() else validate(home, {})
+
+
+def _team_choice(text: str, home: Path, agents: int | None = None) -> tuple[str, Any]:
+    """`--team` (docs/SPEC.md §17.3 "Saved teams"): roles.team_choice over the home's settings, for a chosen team with
+    the checks that it can start and that `--agents` (`agents`) is not given. ValueError with what to tell the user. A
+    list and a built-in role's name need no settings; any other bare word does. Prints a note on stderr for a word that
+    names no role or team in this home: it starts a new role with no description."""
+    roles.parse_team(text)
+    word = roles.normalize(text)
+    try:
+        config = _home_config(home)
+    except (OSError, ValueError) as exc:
+        if "," in text or "*" in text or roles.preset_id(text):
+            return "roles", None
+        raise ValueError(f"cannot read the settings to look up '{word}': {exc}") from None
+    kind, value = roles.team_choice(text, config.teams, config.roles)
+    if kind == "unknown":
+        known = roles.close_roles(config.roles, value, "en") + [team.name for team in config.teams]
+        raise ValueError(f"no saved team or role '{value}' (there are: {', '.join(dict.fromkeys(known))}). "
+                         f"For a new role with no description write '{value}*1'")
+    if kind == "mixed":
+        raise ValueError(f"'{value}' is a saved team: choose it whole, with no other roles and no *N")
+    is_role = roles.find_role(config.roles, text, "en") is not None
+    if kind == "team":
+        missing = roles.missing_roles(value, config.roles)
+        if missing:
+            raise ValueError(f"the team '{value.name}' uses roles that are not in the role catalog: "
+                             f"{', '.join(missing)}. Fix it in Settings > Teams")
+        if agents is not None:
+            # the role with --agents is one of it and generalists beyond it, as ever: `word*1`, not `word*N`
+            tail = f". For the role write '{word}*1' and keep --agents" if is_role else ""
+            raise ValueError(f"the team '{value.name}' sets the number of agents: --agents cannot go with it{tail}")
+    elif not is_role and "," not in text and "*" not in text:  # a home with no saved team: the teams may be in another
+        print(f"dreamteam: --team: no role or saved team '{word}' in {home}: starting a new role with no description "
+              f"(write '{word}*1' to mean that)", file=sys.stderr)
+    return kind, value
+
+
 def cmd_tui(args) -> int:
     """The terminal UI in the style of Claude Code (docs/TUI.md), or with -p the non-interactive print mode."""
     home = _home_arg(args)
@@ -1281,11 +1324,16 @@ def cmd_tui(args) -> int:
         overrides["clarify"] = args.clarify
     if args.team is not None:
         try:  # checked here, before a session or the TUI starts (the TUI turns it into swarm.starting_roles)
-            roles.parse_team(args.team)
+            if args.print and (args.continue_last or args.resume):
+                roles.parse_team(args.team)   # print mode continues a session and never reads the team: syntax only
+                kind, value = "roles", None
+            else:
+                kind, value = _team_choice(args.team, home, args.agents)
         except ValueError as exc:
             print(f"dreamteam: --team: {exc}", file=sys.stderr)
             return 2
-        overrides["team"] = args.team
+        # a team is copied now: the session holds its roles and never looks the team up
+        overrides["team"] = list(value.roles) if kind == "team" else args.team
     session = args.resume or None
     prompt = args.prompt
     workspace = None
@@ -1411,7 +1459,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model", help="model profile of a new session's agents")
     s.add_argument("--agents", type=int, help="agents a new session starts with")
     s.add_argument("--team", help='starting team of a new session: roles in order, ROLE*N for several, e.g. '
-                                  '"architect,developer*2,tester"')
+                                  '"architect,developer*2,tester", or the name of a team saved in the settings')
     s.add_argument("--max-agents", type=int, help="agent limit of a new session")
     s.add_argument("--budget", type=float, help="money limit of a new session, USD")
     s.add_argument("--title", help="title of a new session")

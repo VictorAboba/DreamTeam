@@ -17,7 +17,7 @@ Working with the swarm:
 
 Setting up and running:
 
-- [Configuration](configuration.md): `dreamteam.toml`, models, roles and the starting team
+- [Configuration](configuration.md): `dreamteam.toml`, models, roles, teams and the starting team
 - [Docker sandbox and sessions without network](sandbox.md)
 - [Security](security.md) and the [security self-audit, November 2026](audits/2026-11-self-audit.md)
 

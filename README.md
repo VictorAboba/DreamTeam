@@ -73,8 +73,9 @@ dreamteam serve                             # web board only
 1. Open **Settings → Models and endpoints** on `http://127.0.0.1:8765`, pick a provider and model, give the key
    (an environment variable name or the key itself) and press **Check**.
 2. On **Sessions**, press **Start a new session** and describe the goal: the first line becomes the title, the rest the
-   description. You can also pick the starting team, e.g. `--team "architect, developer*2, tester"`. Tick **Clarify
-   the goal first** (in the terminal: `--clarify` or `/clarify on`) to be asked about the goal before the swarm plans.
+   description. You can also pick the starting team, e.g. `--team "architect, developer*2, tester"`, or a team saved
+   in the settings. Tick **Clarify the goal first** (in the terminal: `--clarify` or `/clarify on`) to be asked about
+   the goal before the swarm plans.
 3. Watch the swarm plan and work; write to any agent with `@Name`, review tasks it hands you with
    `/approve 3` or `/reject 3 what to fix`. All commands and keys: [Terminal UI and console](docs/en/terminal.md).
 

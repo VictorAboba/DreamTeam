@@ -197,7 +197,7 @@ def test_home_i18n_is_complete():
     used |= set(re.findall(r'\bfield\("([a-z0-9_]+)"', HOME_JS))                     # settings field labels
     used |= set(re.findall(r'\bhint: "([a-z0-9_]+)"', HOME_JS))
     sections = set(re.findall(r'\["\w+", "(s_\w+)"\]', HOME_JS))
-    assert len(sections) == 10 and {"s_roles", "s_skills"} <= sections
+    assert len(sections) == 11 and {"s_roles", "s_skills"} <= sections
     used |= sections | {s + "_hint" for s in sections}
     used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending")}  # sessionState() + pending goal
     used |= WORKSPACE_KINDS_KEYS  # workspaceLine(): t("ws_" + kind), t("ws_" + kind + "_hint")

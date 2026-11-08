@@ -35,6 +35,10 @@ name = "Designer"
 description = "You design interfaces: mockups, screen texts, user scenarios."
 model = ""               # model profile for this role ("" means the default)
 
+[[teams]]                # a named set of roles, chosen as a whole at launch
+name = "Design"
+roles = ["Designer", "Designer", "reviewer"]   # one name per agent, in order; the model comes from each role
+
 [agents]
 default_model = "default"
 max_steps_per_turn = 40
@@ -118,6 +122,17 @@ hire button on the board. **The starting team** is the roles of the agents a ses
 
 - in the new session dialog or in the settings ("Role ×N", rows in order);
 - with the flag `--team "architect, developer*2, tester"`;
-- with the `/team` command in the terminal.
+- with the `/team` command in the terminal;
+- by choosing a **team**, a named set of roles from "Settings" → "Teams" (`[[teams]]`): in the new session dialog,
+  with `--team NAME`, with `/team NAME`, or with `session_create(team_name=NAME)`. A team has no model: each agent's
+  profile comes from its role, so for another profile add another role (`dev_gpt`, `dev_claude`). A team sets only
+  who starts: agents can still hire other roles as they work, within the session's agent limit. `--team NAME`,
+  `/team NAME` and `team_name` keep `max_agents`, so a larger team starts in full and then cannot hire; the dialog
+  raises the limit only to the team's size, which leaves no free place either. The roles are copied when the team is
+  chosen: a session never changes afterwards, and a terminal window that chose the team with `--team` or `/team` keeps
+  its copy until `/team NAME` again. A name with no comma and no `*N` after `--team` or `/team` (it may hold spaces) is
+  the saved team first, then a role. Once teams are saved an unknown name is refused (`name*1` makes a new role); with
+  no team saved it is a new role, and `--team` says so on stderr. A team's name is looked up in the home in use:
+  `--home`, else a `dreamteam.toml` in the current folder, else `$DREAMTEAM_HOME`, else `~/DreamTeam`.
 
 Agents beyond the list become generalists.

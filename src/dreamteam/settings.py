@@ -32,8 +32,9 @@ from .config import (
 )
 
 HOME_ENV = "DREAMTEAM_HOME"
-# `roles` is a list of tables ([[roles]], the role catalog: docs/SPEC.md §17.3); the others are tables
-SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "roles", "models")
+# `teams` and `roles` are lists of tables ([[teams]], the saved teams; [[roles]], the role catalog: docs/SPEC.md §17.3);
+# the others are tables
+SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "teams", "roles", "models")
 _ROLE_FIELDS = ("name", "description", "instructions", "model", "hidden", "skills")
 # fields the public view computes for each model profile; never stored (an update or a check drops them)
 _PUBLIC_KEY_FIELDS = ("api_key_set", "api_key_hint", "api_key_env_set", "price_source")
@@ -263,12 +264,13 @@ def public_view(raw: dict[str, Any]) -> dict[str, Any]:
     """Settings for the UI: every section filled with defaults, API keys replaced by
     api_key_set / api_key_hint, api_key_env_set tells whether the named variable exists, price_source where a
     call's prices come from (ModelProfile.price_source: "none" / "partial" count tokens as $0). Values of
-    `env` tables of external MCP servers (usually tokens) are masked too. `roles`: the [[roles]] entries as
-    stored, normalized (a built-in role by its id)."""
+    `env` tables of external MCP servers (usually tokens) are masked too. `teams`: the [[teams]] entries as stored,
+    normalized, [] when there are none. `roles`: the [[roles]] entries as stored, normalized (a built-in role by its
+    id)."""
     cfg = validate(".", raw)
     view: dict[str, Any] = {}
     for name in SECTIONS:
-        if name in ("roles", "models"):
+        if name in ("teams", "roles", "models"):
             continue
         view[name] = dataclasses.asdict(getattr(cfg, name))
     view["swarm"].pop("goal", None)
@@ -276,6 +278,7 @@ def public_view(raw: dict[str, Any]) -> dict[str, Any]:
     for spec in (view["mcp"].get("external") or {}).values():
         if isinstance(spec, dict) and isinstance(spec.get("env"), dict):
             spec["env"] = {k: _mask(v) if v not in (None, "") else v for k, v in spec["env"].items()}
+    view["teams"] = [{"name": team.name, "roles": list(team.roles)} for team in cfg.teams]
     view["roles"] = [{k: getattr(role, k) for k in _ROLE_FIELDS} for role in cfg.roles]
     models: dict[str, Any] = {}
     for name, profile in cfg.models.items():
@@ -345,7 +348,8 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     A renamed default profile stays the default; masked MCP `env` values keep their stored values.
     `roles` is the complete list of [[roles]] entries ([] removes every customization); a stored role's model
     profile follows a rename. An `agents.default_model` or role model sent with the update that names one of its
-    profiles is taken as a new name (not renamed again: a swap). Their rules are checked by `validate`."""
+    profiles is taken as a new name (not renamed again: a swap). `teams` is the complete list of [[teams]] entries
+    ([] removes the key). Their rules are checked by `validate`."""
     if not isinstance(update, dict):
         raise ValueError("The settings update must be an object")
     result = copy.deepcopy(raw)
@@ -367,6 +371,19 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
                 result["roles"] = entries
             else:
                 result.pop("roles", None)
+            continue
+        if name == "teams":
+            if not isinstance(section, list):
+                raise ValueError("Section teams must be a list of teams")
+            teams = []
+            for i, item in enumerate(section, 1):
+                if not isinstance(item, dict):
+                    raise ValueError(f"Team {i} must be an object")
+                teams.append({k: v for k, v in copy.deepcopy(item).items() if v is not None})
+            if teams:
+                result["teams"] = teams
+            else:  # `teams = []` would land at the top of the file
+                result.pop("teams", None)
             continue
         if not isinstance(section, dict):
             raise ValueError(f"Section {name} must be an object")

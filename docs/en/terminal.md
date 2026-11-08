@@ -26,7 +26,7 @@
   it with the question, and the swarm goes on. `/pause` goes on without an answer.
 - **Commands** (`/` opens suggestions): `/new [goal]`, `/sessions` (`Del` in the list deletes a session),
   `/resume ID`, `/delete [ID]`, `/cd [path | --default]`, `/goal`, `/board`,
-  `/task N`, `/agents`, `/roles [role]`, `/jobs [jN | stop jN]`, `/team [role*N, …]`, `/to Name`,
+  `/task N`, `/agents`, `/roles [role]`, `/jobs [jN | stop jN]`, `/team [team | role*N, …]`, `/to Name`,
   `/hire Role [| instructions]`,
   `/trace [Name | N]`, `/span N [ctx]`, `/files [path]`, `/cat path`, `/unlock path`, `/cost`, `/status`,
   `/model [profile]`,

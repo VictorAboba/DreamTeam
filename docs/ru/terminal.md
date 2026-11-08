@@ -26,7 +26,7 @@
   продолжит работу. `/pause` продолжает без ответа.
 - **Команды** (`/` открывает подсказки): `/new [цель]`, `/sessions` (`Del` в списке удаляет сессию),
   `/resume ID`, `/delete [ID]`, `/cd [путь | --default]`, `/goal`, `/board`,
-  `/task N`, `/agents`, `/roles [роль]`, `/jobs [jN | stop jN]`, `/team [роль*N, …]`, `/to Имя`,
+  `/task N`, `/agents`, `/roles [роль]`, `/jobs [jN | stop jN]`, `/team [команда | роль*N, …]`, `/to Имя`,
   `/hire Роль [| инструкции]`,
   `/trace [Имя | N]`, `/span N [ctx]`, `/files [путь]`, `/cat путь`, `/unlock путь`, `/cost`, `/status`,
   `/model [профиль]`,

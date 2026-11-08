@@ -7,6 +7,7 @@ import math
 import os
 import re
 import tomllib
+import unicodedata
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, Iterable
@@ -180,6 +181,15 @@ class RoleSettings:
 
 
 @dataclass
+class TeamSettings:
+    """One [[teams]] entry (docs/SPEC.md §17.3 "Saved teams"): a named, ordered list of roles, a name repeated per
+    agent. No model: an agent's profile comes from its role."""
+
+    name: str = ""
+    roles: list[str] = field(default_factory=list)
+
+
+@dataclass
 class AgentSettings:
     default_model: str = "default"
     max_steps_per_turn: int = 40
@@ -276,7 +286,7 @@ class TracingSettings:
 _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSettings": "server",
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
                "TracingSettings": "tracing", "SkillsSettings": "skills", "ModelProfile": "models",
-               "RoleSettings": "roles"}
+               "RoleSettings": "roles", "TeamSettings": "teams"}
 # numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm; [skills] max_proposals = 0
 # turns proposals off)
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
@@ -437,6 +447,61 @@ def _role_skills(raw: list[str], where: str) -> list[str]:
     return names
 
 
+def _joins_text(char: str) -> bool:
+    """A format character that is a part of ordinary text: U+200C and U+200D (Persian and Indic words, emoji sequences)
+    and the tags of a subdivision flag. The form has the twin (TEAM_NAME_JOINERS in home.js)."""
+    return char in "‌‍" or "\U000e0020" <= char <= "\U000e007f"
+
+
+def parse_teams(raw: Any, entries: Iterable[RoleSettings]) -> list[TeamSettings]:
+    """The checked [[teams]] entries (docs/SPEC.md §17.3), normalized: a preset by its id, an own role as [[roles]]
+    spells it. `entries`: the checked [[roles]] entries. Whether the catalog has the roles is not checked: a file must
+    not stop the launcher over a team, which is harmless until it is chosen, and whoever chooses it refuses it then."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("[[teams]] must be a list of team tables (write each team as a [[teams]] table)")
+    if len(raw) > roles.MAX_TEAMS:
+        raise ValueError(f"At most {roles.MAX_TEAMS} teams")
+    spelled = {roles.role_key(entry.name): entry.name for entry in entries}
+    seen: dict[str, int] = {}
+    out: list[TeamSettings] = []
+    for i, item in enumerate(raw, 1):
+        where = f"teams.{i}"
+        entry = _fill(TeamSettings, item, where)
+        name = roles.normalize(entry.name)
+        if not name:
+            raise ValueError(f"[{where}] name is empty")
+        if len(name) > roles.NAME_LIMIT:
+            raise ValueError(f"[{where}] name must be at most {roles.NAME_LIMIT} characters")
+        if "," in name or "*" in name or name.startswith("-"):  # the syntax of --team and /team, and a flag
+            raise ValueError(f"[{where}] name cannot contain ',' or '*' or start with '-'")
+        if any(unicodedata.category(char) in ("Cc", "Cf") and not _joins_text(char) for char in name):
+            raise ValueError(f"[{where}] name has control or invisible characters")  # cannot be typed, and is printed
+        if all(_joins_text(char) for char in name):
+            raise ValueError(f"[{where}] name is empty")
+        if name.casefold() in roles.TEAM_RESET:
+            raise ValueError(f"[{where}] the name '{name}' is reserved: /team {name} goes back to the starting team of "
+                             "the settings")
+        key = roles.team_key(name)
+        if key in seen:
+            raise ValueError(f"[{where}] the team '{name}' is listed twice (also as team {seen[key]})")
+        seen[key] = i
+        if not entry.roles:
+            raise ValueError(f"[{where}] the team '{name}' has no roles")
+        if len(entry.roles) > roles.TEAM_MAX:
+            raise ValueError(f"[{where}] the team '{name}' has more than {roles.TEAM_MAX} agents")
+        members: list[str] = []
+        for role in entry.roles:
+            role = roles.normalize(role)
+            if not role or len(role) > roles.NAME_LIMIT or "," in role or "*" in role:
+                raise ValueError(f"[{where}] '{role[:80]}' is not a role name: write one name per agent, at most "
+                                 f"{roles.NAME_LIMIT} characters, without ',' or '*'")
+            members.append(spelled.get(roles.role_key(role)) or roles.preset_id(role) or role)
+        out.append(TeamSettings(name=name, roles=members))
+    return out
+
+
 @dataclass
 class Config:
     project_dir: Path
@@ -456,6 +521,8 @@ class Config:
     workspace_adopted: bool = False
     # [[roles]]: the role catalog's entries (docs/SPEC.md §17.3), checked and normalized by parse_roles
     roles: list[RoleSettings] = field(default_factory=list)
+    # [[teams]]: the saved teams (docs/SPEC.md §17.3), checked and normalized by parse_teams
+    teams: list[TeamSettings] = field(default_factory=list)
 
     @property
     def data_dir(self) -> Path:
@@ -516,6 +583,7 @@ class Config:
         mcp_raw = dict(mcp_raw)
         external = mcp_raw.pop("external", None) or {}
         roles_raw = raw.pop("roles", None)  # checked once the model profiles are known
+        teams_raw = raw.pop("teams", None)  # checked once the roles are known
         cfg = cls(
             project_dir=Path(project_dir).resolve(),
             swarm=_fill(SwarmSettings, raw.pop("swarm", None)),
@@ -534,6 +602,7 @@ class Config:
         if cfg.agents.default_model not in cfg.models:
             raise ValueError(f"agents.default_model = '{cfg.agents.default_model}' is not defined in [models]")
         cfg.roles = parse_roles(roles_raw, cfg.models)
+        cfg.teams = parse_teams(teams_raw, cfg.roles)
         for name in cfg.skills.install_env:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
                 raise ValueError(f"skills.install_env: {name[:60]!r} is not an environment variable name")
@@ -687,6 +756,15 @@ retention_days = 0            # 0 — хранить всегда
 # [mcp.external.fetch]
 # command = ["uvx", "mcp-server-fetch"]
 # description = "Загрузка веб-страниц"
+
+# Сохранённые команды: именованные наборы ролей; при запуске можно выбрать команду целиком. Имя роли повторяется для
+# нескольких агентов; модель каждому агенту задаёт его роль:
+# [[teams]]
+# name = "Разработка"
+# roles = ["architect", "developer", "developer", "tester"]
+# [[teams]]
+# name = "Тексты"
+# roles = ["researcher", "writer", "reviewer"]
 
 # Каталог ролей. Встроенные роли (generalist «Универсал», developer «Разработчик», tester «Тестировщик»,
 # reviewer «Ревьюер», analyst «Аналитик», architect «Архитектор», writer «Технический писатель»,

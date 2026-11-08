@@ -28,6 +28,7 @@ from .tools import REGISTRY
 from .workspace import format_size
 
 if TYPE_CHECKING:
+    from .config import Config
     from .sessions import SessionManager
     from .swarm import Swarm
 
@@ -49,6 +50,8 @@ one). `path="default"` moves it back.
 `skill_library` lists, shows, imports (a folder, a .zip or a Git URL) and deletes the shared skills library;
 `session_create(..., skills=[...])` and `session_start(session, skills=[...])` attach skills to a session by name or
 source.
+`session_create(..., team_name=<name>)` starts with a team saved in the settings; an unknown name is answered with the
+saved names.
 Every other tool works inside one session: pass `session="<id>"` (from sessions_list). Without it the call
 goes to the running session (the most recently active one when several run).
 
@@ -79,6 +82,10 @@ LAUNCHER_TOOLS: list[dict[str, Any]] = [
                                  "developer, tester, reviewer, analyst, architect, writer, researcher (or their names "
                                  "in either language); other names are new roles without a description. Sets "
                                  "start_agents unless it is given."},
+         "team_name": {"type": "string",
+                       "description": "A team saved in the settings instead of team and start_agents: its roles in "
+                                      "order; each agent's model comes from its role. An unknown name is answered with "
+                                      "the saved names."},
          "max_cost_usd": {"type": "number", "description": "Budget in USD"},
          "model": {"type": "string", "description": "Model profile name from the settings"},
          "network": {"type": "string", "enum": ["on", "off"],
@@ -376,6 +383,23 @@ def _team(value: Any) -> list[str]:
     return names
 
 
+def _saved_team(name: Any, config: "Config") -> list[str]:
+    """`team_name` of session_create: the roles of that saved team (docs/SPEC.md §17.3 "Saved teams"), checked now: the
+    session holds them as any other starting team and never looks the team up."""
+    if not isinstance(name, str):
+        raise ToolError("team_name must be the name of a saved team.")
+    team = roles.find_team(config.teams, name)
+    if team is None:
+        known = ", ".join(saved.name for saved in config.teams)
+        raise ToolError(f"No saved team '{roles.normalize(name)[:80]}'. "
+                        + (f"Saved teams: {known}." if known else "None are saved yet: Settings > Teams."))
+    missing = roles.missing_roles(team, config.roles)
+    if missing:
+        raise ToolError(f"The team '{team.name}' uses roles that are not in the role catalog: {', '.join(missing)}. "
+                        "Fix it in Settings > Teams.")
+    return list(team.roles)
+
+
 async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[str, Any]) -> tuple[str, bool]:
     args = dict(args or {})
     try:
@@ -393,6 +417,13 @@ async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[st
                 if args.get(key) not in (None, ""):
                     swarm_over[key] = _int_or_none(args[key])
             team = _team(args.get("team"))
+            config = manager.global_config()
+            if args.get("team_name") not in (None, ""):
+                if team or "start_agents" in swarm_over:
+                    raise ToolError("team_name sets the roles and their number: give it without team and start_agents.")
+                team = _saved_team(args["team_name"], config)
+            elif team and (saved := roles.saved_team_in(team, config.teams, config.roles)):
+                raise ToolError(f"'{saved}' is a saved team, not a role: pass it as team_name.")
             if team:  # the starting roles in order; the team's size unless start_agents is given
                 swarm_over["starting_roles"] = team
                 swarm_over.setdefault("start_agents", len(team))
