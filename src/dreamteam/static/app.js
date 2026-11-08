@@ -60,12 +60,15 @@ const I18N = {
     origin_workspace: "создан роем", origin_config: "из конфига", origin_library: "из библиотеки",
     scope_private: "личный", scope_task: "для задачи", scope_swarm: "для всего роя",
     reject_reason: "Причина отказа (необязательно)", trigger_delete_confirm: "Удалить триггер #{id}?",
-    periodic: "повторяющийся", retired_chat: "Агент покинул рой — написать ему нельзя",
+    periodic: "повторяющийся", trigger_held: "отложено: {n} до {time}", feed_trigger_held: " (пробуждение отложено до {time})",
+    retired_chat: "Агент покинул рой — написать ему нельзя",
     f_title: "заголовок", f_goal: "цель", f_description: "описание", f_status: "статус", f_assignee: "исполнитель",
     f_reviewer: "ревьюер", f_priority: "приоритет", f_tags: "теги", f_depends_on: "зависимости", f_result: "итог",
     f_parent_id: "родитель",
     op_create: "создал(а) файл", op_write: "перезаписал(а) файл", op_edit: "изменил(а) файл",
     locked_by: "Заблокирован: {owner}", select_file: "Выберите файл слева", workspace: "workspace",
+    unlock: "Снять блокировку",
+    unlock_confirm: "Снять блокировку, которую поставил(а) {owner}, с {path}? Участников, которые ждут этот файл, разбудят.",
     ws_folder: "Папка сессии", ws_default: "своя папка", ws_adopted: "папка проекта", ws_moved: "перенесена", ws_missing_badge: "папки нет",
     ws_default_hint: "Собственная папка workspace сессии; удаляется вместе с сессией.",
     ws_adopted_hint: "Существующая папка (ваш проект): агенты работают с её файлами и коммитят в текущую ветку её репозитория. При удалении сессии папка остаётся.",
@@ -96,6 +99,12 @@ const I18N = {
     sf_nudge: "Напоминание простаивающим, с", sf_parallel: "Параллельных вызовов LLM",
     sf_plan_steps: "Подсказка планирующему агенту после шагов", sf_plan_minutes: "Подсказка планирующему агенту после, мин",
     sf_plan_hint: "взявшему задачу планирования, если он ещё не создал ни одной задачи; 0 — выключено",
+    sf_file_settle: "Триггер file_changed ждёт тишины файла, с",
+    sf_file_settle_hint: "срабатывает, когда файл столько секунд не меняется или менявшие его агенты закончили ход; 0 — при каждом изменении",
+    sf_file_max_wait: "Триггер file_changed ждёт не дольше, с",
+    sf_file_max_wait_hint: "у файла, который всё ещё меняется, — через столько секунд после первого изменения; 0 — без предела",
+    sf_trigger_wake: "Повторяющийся триггер будит не чаще, с",
+    sf_trigger_wake_hint: "Срабатывания между пробуждениями приходят одним уведомлением; 0 — будить при каждом",
     sf_hint: "Пустое поле — значение из общих настроек (оно показано серым). Изменения действуют сразу: шаги — со следующего пробуждения агента, остальное — со следующей команды или вызова.",
     sf_context_hint: "окно контекста, заданное в профиле модели, важнее", sf_context_profile: "сейчас действует окно профиля «{profile}»: {n}",
     sf_general_only: "Остальные параметры (фоновые процессы, агенты) задаются в общих настройках.",
@@ -217,12 +226,15 @@ const I18N = {
     origin_workspace: "built by the swarm", origin_config: "from the config", origin_library: "from the library",
     scope_private: "private", scope_task: "task", scope_swarm: "whole swarm",
     reject_reason: "Reason (optional)", trigger_delete_confirm: "Delete trigger #{id}?",
-    periodic: "periodic", retired_chat: "This agent has left the swarm — you cannot message them",
+    periodic: "periodic", trigger_held: "held: {n} until {time}", feed_trigger_held: " (wake-up held until {time})",
+    retired_chat: "This agent has left the swarm — you cannot message them",
     f_title: "title", f_goal: "goal", f_description: "description", f_status: "status", f_assignee: "assignee",
     f_reviewer: "reviewer", f_priority: "priority", f_tags: "tags", f_depends_on: "dependencies", f_result: "result",
     f_parent_id: "parent",
     op_create: "created file", op_write: "rewrote file", op_edit: "edited file",
     locked_by: "Locked by {owner}", select_file: "Select a file on the left", workspace: "workspace",
+    unlock: "Unlock",
+    unlock_confirm: "Remove {owner}'s lock on {path}? The members waiting for this file are woken.",
     ws_folder: "Session folder", ws_default: "own folder", ws_adopted: "project folder", ws_moved: "moved", ws_missing_badge: "missing",
     ws_default_hint: "The session's own workspace folder; deleted with the session.",
     ws_adopted_hint: "An existing folder (your project): the agents work with its files and commit to the current branch of its repository. Deleting the session keeps the folder.",
@@ -252,6 +264,12 @@ const I18N = {
     sf_nudge: "Nudge idle agents after, s", sf_parallel: "Parallel LLM calls",
     sf_plan_steps: "Hint the planner after steps", sf_plan_minutes: "Hint the planner after, min",
     sf_plan_hint: "to the member holding the planning task while it has created no task; 0 = off",
+    sf_file_settle: "file_changed trigger waits for a quiet file, s",
+    sf_file_settle_hint: "fires once the file has not changed this long or the agents who changed it have ended their turns; 0 = at every change",
+    sf_file_max_wait: "file_changed trigger waits at most, s",
+    sf_file_max_wait_hint: "for a file that keeps changing: this long after its first change; 0 = no limit",
+    sf_trigger_wake: "Repeating trigger wakes at most every, s",
+    sf_trigger_wake_hint: "Fires in between arrive in one notice; 0 wakes at every fire",
     sf_hint: "An empty field takes the value of the general settings (shown in grey). Changes apply at once: the steps from the agent's next wake-up, the rest from the next command or call.",
     sf_context_hint: "a context window set in the model profile wins", sf_context_profile: "the profile “{profile}” sets {n} now",
     sf_general_only: "The other parameters (background jobs, agents) are set in the general settings.",
@@ -345,6 +363,10 @@ const $ = (sel, el = document) => el.querySelector(sel);
 const $$ = (sel, el = document) => Array.from(el.querySelectorAll(sel));
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+/** esc() for an attribute value read back exactly (dataset): the HTML parser turns a raw CR into LF. */
+function escAttr(value) {
+  return esc(value).replace(/\r/g, "&#13;").replace(/\n/g, "&#10;");
 }
 function t(key, vars) {
   let text = (I18N[S.lang] && I18N[S.lang][key]) || I18N.en[key] || key;
@@ -1641,6 +1663,10 @@ const SESSION_FIELDS = [
   { group: "agents", section: "agents", key: "max_parallel_llm_calls", label: "sf_parallel", kind: "int", min: 1 },
   { group: "agents", section: "agents", key: "planning_hint_steps", label: "sf_plan_steps", kind: "int", min: 0, hint: "sf_plan_hint" },
   { group: "agents", section: "agents", key: "planning_hint_minutes", label: "sf_plan_minutes", kind: "num", min: 0, hint: "sf_plan_hint" },
+  // triggers (docs/SPEC.md §8): file_changed() fires once per settled run of changes; a repeating trigger's wake limit
+  { group: "agents", section: "agents", key: "file_settle_seconds", label: "sf_file_settle", kind: "num", min: 0, hint: "sf_file_settle_hint" },
+  { group: "agents", section: "agents", key: "file_max_wait_seconds", label: "sf_file_max_wait", kind: "num", min: 0, hint: "sf_file_max_wait_hint" },
+  { group: "agents", section: "agents", key: "trigger_wake_seconds", label: "sf_trigger_wake", kind: "num", min: 0, hint: "sf_trigger_wake_hint" },
   // [swarm] network (docs/SPEC.md §7.2): "" inherits the general setting; the hint says what this machine gives
   { group: "network", section: "swarm", key: "network", label: "sf_network", kind: "choice", options: ["on", "off"] },
   // [swarm] clarify (docs/SPEC.md §3 "Clarify mode"): questions pause the swarm, a new planning task asks first
@@ -1810,11 +1836,18 @@ function deleteTrigger(id) {
   return act("trigger_delete", { trigger_id: id });
 }
 
+/** The fires of a repeating trigger whose notice waits for the wake limit ([agents] trigger_wake_seconds): `key` with
+ * their number and wake-up time after `sep`, or "" when none is held. */
+function heldText(trigger, key, sep = "") {
+  const n = Number(trigger && trigger.held) || 0;
+  return n > 0 && trigger.wake_at ? sep + t(key, { n, time: fmtTime(trigger.wake_at) }) : "";
+}
+
 function renderTriggers() {
   const items = S.state.triggers || [];
   setHtml($("#trigger-list"), items.length ? items.map((x) => `<div class="item">
     <div class="item-head"><b>#${Number(x.id)}</b><span class="cond">${esc(x.condition)}</span>${x.once ? "" : `<span class="badge" title="${esc(t("periodic"))}"><i class="ic ic-repeat"></i></span>`}
-      <span class="muted">${esc(t("owner"))}: ${esc(displayName(x.owner))} · ${esc(t("fired"))}: ${Number(x.fire_count) || 0}</span>
+      <span class="muted">${esc(t("owner"))}: ${esc(displayName(x.owner))} · ${esc(t("fired"))}: ${Number(x.fire_count) || 0}${esc(heldText(x, "trigger_held", " · "))}</span>
       <span class="spacer"></span><button class="btn small danger" data-trigger-del="${Number(x.id)}" type="button">${esc(t("delete"))}</button></div>
     ${x.note ? `<div class="desc">${md(x.note)}</div>` : ""}
     ${x.actions && JSON.stringify(x.actions) !== '[{"type":"wake"}]' ? `<div class="desc"><code>${esc(JSON.stringify(x.actions))}</code></div>` : ""}
@@ -2236,7 +2269,7 @@ function describeEvent(ev) {
     case "file.locked": return ru ? `${who} заблокировал(а) ${d.path}` : `${who} locked ${d.path}`;
     case "file.unlocked": return ru ? `${who} разблокировал(а) ${d.path}` : `${who} unlocked ${d.path}`;
     case "trigger.created": return ru ? `${who} поставил(а) триггер: ${short(d.trigger && d.trigger.condition)}` : `${who} set a trigger: ${short(d.trigger && d.trigger.condition)}`;
-    case "trigger.fired": return ru ? `${who}: сработал триггер #${d.trigger && d.trigger.id} — ${short(d.trigger && d.trigger.condition, 100)}` : `${who}: trigger #${d.trigger && d.trigger.id} fired — ${short(d.trigger && d.trigger.condition, 100)}`;
+    case "trigger.fired": return (ru ? `${who}: сработал триггер #${d.trigger && d.trigger.id} — ${short(d.trigger && d.trigger.condition, 100)}` : `${who}: trigger #${d.trigger && d.trigger.id} fired — ${short(d.trigger && d.trigger.condition, 100)}`) + heldText(d.trigger, "feed_trigger_held");
     case "trigger.deleted": return ru ? `${who} удалил(а) триггер: ${short(d.trigger && d.trigger.condition, 100)}` : `${who} deleted a trigger: ${short(d.trigger && d.trigger.condition, 100)}`;
     case "mcp.created": return ru ? `${who} создал(а) MCP «${d.server && d.server.name}»` : `${who} created MCP "${d.server && d.server.name}"`;
     case "mcp.status": return `MCP ${d.name}: ${tv("mcp_", d.status)}`;
@@ -2358,9 +2391,17 @@ function renderFileList() {
   setHtml($("#file-list"), entries.map((e) => {
     const name = e.path.split("/").pop();
     const dir = e.type === "dir";
-    const lock = locks.has(e.path) ? ` <span class="lock" title="${esc(t("locked_by", { owner: displayName(locks.get(e.path)) }))}"><i class="ic ic-lock"></i></span>` : "";
-    return `<div class="file-entry${e.path === S.openFile ? " active" : ""}" role="button" tabindex="0" data-${dir ? "dir" : "file"}="${esc(e.path)}"><span class="file-name">${dir ? '<i class="ic ic-folder"></i>' : '<i class="ic ic-file"></i>'}${esc(name)}${lock}</span><span class="size">${dir ? "" : esc(fmtSize(e.size))}</span></div>`;
+    const owner = locks.get(e.path);
+    const lock = locks.has(e.path) ? ` <span class="lock" title="${esc(t("locked_by", { owner: displayName(owner) }))}"><i class="ic ic-lock"></i></span>` : "";
+    // the user removes a member's lock (file_unlock): the members waiting for the file are woken
+    const unlock = locks.has(e.path) ? `<button type="button" class="link file-unlock" data-unlock="${escAttr(e.path)}" data-owner="${escAttr(owner)}">${esc(t("unlock"))}</button>` : "";
+    return `<div class="file-entry${e.path === S.openFile ? " active" : ""}" role="button" tabindex="0" data-${dir ? "dir" : "file"}="${escAttr(e.path)}"><span class="file-name">${dir ? '<i class="ic ic-folder"></i>' : '<i class="ic ic-file"></i>'}${esc(name)}${lock}</span>${unlock}<span class="size">${dir ? "" : esc(fmtSize(e.size))}</span></div>`;
   }).join("") || `<div class="empty">${esc(t("empty"))}</div>`);
+}
+/** Remove a member's lock on a file or folder of the Files tab, after a confirmation. */
+function unlockFile(path, owner) {
+  if (!confirm(t("unlock_confirm", { path, owner: displayName(owner) }))) return null;
+  return act("file_unlock", { path });
 }
 function isMarkdownPath(path) { return /\.(md|markdown)$/i.test(String(path || "")); }
 /** What the file viewer shows: a Markdown file formatted (unless the user switched to its source), any other as text. */
@@ -2527,7 +2568,7 @@ function applyTheme(theme) {
 }
 
 function onDocumentClick(e) {
-  const target = e.target.closest("[data-open-task],[data-close],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path,"
+  const target = e.target.closest("[data-open-task],[data-close],[data-unlock],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path,"
     + "[data-skill-show],[data-skill-save],[data-skill-nosave],[data-skill-update],[data-skill-detach],[data-skill-log],[data-skill-reinstall],"
     + "[data-skill-preview],[data-skill-attach],[data-skill-libshow],[data-skill-libdel],[data-copy],"
     + "#paused-banner[data-asker]");
@@ -2538,6 +2579,7 @@ function onDocumentClick(e) {
   const ds = target.dataset;
   if ("openTask" in ds) openTask(Number(ds.openTask));
   else if ("close" in ds) closeModal();
+  else if ("unlock" in ds) unlockFile(ds.unlock, ds.owner);
   else if ("dir" in ds) openDir(ds.dir);
   else if ("file" in ds) openFile(ds.file);
   else if ("reply" in ds) setReply(Number(ds.reply));
@@ -2644,7 +2686,7 @@ function init() {
 if (typeof module !== "undefined" && module.exports) {
   // pure helpers, exported for the Node-based UI tests (tests/test_ui.py); the browser ignores this
   module.exports = {
-    I18N, S, COLUMNS, ALL_STATUSES, TASK_FORM, esc, t, tv, linkify, highlightMentions, memberOptions, statusOptions,
+    I18N, S, COLUMNS, ALL_STATUSES, TASK_FORM, esc, escAttr, t, tv, linkify, highlightMentions, memberOptions, statusOptions,
     dropAction, makeScheduler, threadOrder, threadHtml, dirtyFields, taskChanges, mentionQuery, mentionCandidates,
     limitsArgs, describeEvent, changesText, activityHtml, messageHtml, cardHtml, boardHtml, boardColumns, rejectMcp,
     deleteTrigger, fillTaskForm, autoMarkRead, loadFeed, FEED_TYPES,
@@ -2666,6 +2708,7 @@ if (typeof module !== "undefined" && module.exports) {
     // Markdown (markdown.js) where agents', members' and the user's texts are shown
     md, decorate, MD_CACHE, mdFieldHtml, syncMdField, editMdField, taskResultHtml, renderTaskModal, updateTaskModal,
     renderMcp, renderTriggers, fileView, renderFileContent, toggleFileSource, openFile, isMarkdownPath, codeHtml,
+    renderFileList, unlockFile,
     // skills: the Skills tab, its packages rows, the attach dialog, the standalone library, the role chips
     SK, apiRaw, actError, loadSkillData, roleSkillsOf, skillChipsHtml, skillSourceState, depsReason, skillDepsHtml,
     skillPreviewHtml, skillCardHtml, skillLibraryHtml, renderSkills, attachRows, attachWarnings, attachRowHtml, renderAttachList,

@@ -7,6 +7,7 @@ import datetime
 import json
 import os
 import socket
+import sqlite3
 import sys
 import threading
 import tomllib
@@ -21,7 +22,7 @@ from dreamteam.config import Config, render_template
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER
 from dreamteam.sessions import (LEGACY_ID, TRASH_PREFIX, SessionError, SessionManager, pending_goal, read_stats,
-                                slugify)
+                                rename_member_profiles, slugify)
 
 
 def _raw(tmp_path: Path) -> dict[str, Any]:
@@ -791,12 +792,25 @@ async def test_profile_renames_and_deletions_follow_into_sessions(tmp_path):
     overrides = {"agents": {"default_model": "fast", "max_steps_per_turn": 5}}
     pinned = (await manager.create("Pinned", start=False, overrides=overrides))["id"]
     other = (await manager.create("Other", start=False, overrides={"agents": {"default_model": "fast"}}))["id"]
+    # members hired on the profile: in a running session, and in one that was stopped (its database not open)
+    live = (await manager.create("Live", start=True))["id"]
+    swarm = manager.swarms[live]
+    hired = await swarm.hire(USER, "Tester", model="fast")
+    stopped = (await manager.create("Stopped", start=True))["id"]
+    parked = await manager.swarms[stopped].hire(USER, "Tester", model="fast")
+    await manager.stop(stopped)
     events: list[dict] = []
     manager.listen(events.append)
     view = manager.settings_view()
     view["models"]["cheap"] = dict(view["models"].pop("fast"), renamed_from="fast")
     await manager.update_settings({"models": view["models"]})
     assert manager.meta(pinned)["overrides"]["agents"] == {"default_model": "cheap", "max_steps_per_turn": 5}
+    # the member keeps its profile under the new name instead of falling back to the default one
+    assert swarm.member(hired)["model"] == "cheap" and swarm.runtimes[hired].profile_name == "cheap"
+    assert swarm.runtimes[hired].llm.profile.name == "cheap"
+    assert sorted(m["model"] for m in swarm.members()) == ["cheap", "default"]  # the starter is untouched
+    assert stopped not in manager.swarms and (await manager.load(stopped)).member(parked)["model"] == "cheap"
+    assert not (manager.dir_of(other) / ".dreamteam" / "swarm.db").exists()  # a session never started: no file
     view = manager.settings_view()
     view["models"].pop("cheap")  # deleting a profile a session uses no longer blocks the save
     await manager.update_settings({"models": view["models"]})
@@ -806,6 +820,106 @@ async def test_profile_renames_and_deletions_follow_into_sessions(tmp_path):
     assert summary["model_profile"] == "default" and summary["config_error"] is None
     assert {(e["session"], e["change"]) for e in events} >= {(pinned, "updated"), (other, "updated"),
                                                              (None, "settings")}
+    # a deleted profile: agents.model keeps the name, the member's calls use the default profile (Swarm.make_llm)
+    assert swarm.member(hired)["model"] == "cheap" and swarm.runtimes[hired].llm.profile.name == "default"
+    await manager.shutdown()
+
+
+async def test_a_profile_rename_reaches_every_session_database_and_never_fails_the_save(tmp_path, caplog):
+    """A session that is not loaded is renamed in its database directly: the main session too; a damaged file is
+    logged and left alone, one without an agents table (an older version) is skipped, nothing creates a file."""
+    from dreamteam.db import Database
+
+    home = _home(tmp_path)
+    main = Database(home / ".dreamteam" / "swarm.db")
+    for name, model in (("Anna", "fast"), ("Boris", "default"), ("Vera", None)):
+        main.execute("INSERT INTO agents(name, kind, role, model, status) VALUES (?, ?, 'Tester', ?, 'idle')",
+                     (name, "llm" if model else "external", model))
+    main.close()
+    manager = _manager(home)
+    damaged, bare, fresh = [(await manager.create(t, start=False))["id"] for t in ("Damaged", "Bare", "Fresh")]
+    garbage = b"this is not a database " * 200
+    (manager.dir_of(damaged) / ".dreamteam").mkdir(parents=True, exist_ok=True)
+    (manager.dir_of(damaged) / ".dreamteam" / "swarm.db").write_bytes(garbage)
+    (manager.dir_of(bare) / ".dreamteam").mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(manager.dir_of(bare) / ".dreamteam" / "swarm.db")
+    conn.execute("CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT)")
+    conn.close()
+    view = manager.settings_view()
+    view["models"]["cheap"] = dict(view["models"].pop("fast"), renamed_from="fast")
+    await manager.update_settings({"models": view["models"]})
+    assert "cheap" in st.read_raw(home)["models"]
+    conn = sqlite3.connect(home / ".dreamteam" / "swarm.db")
+    try:
+        assert dict(conn.execute("SELECT name, model FROM agents")) == {"Anna": "cheap", "Boris": "default",
+                                                                        "Vera": None}
+    finally:
+        conn.close()
+    assert (manager.dir_of(damaged) / ".dreamteam" / "swarm.db").read_bytes() == garbage
+    assert "could not rename the model profiles of the members in" in caplog.text
+    conn = sqlite3.connect(manager.dir_of(bare) / ".dreamteam" / "swarm.db")
+    try:
+        assert [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")] == ["kv"]
+    finally:
+        conn.close()
+    assert not (manager.dir_of(fresh) / ".dreamteam" / "swarm.db").exists()
+    assert rename_member_profiles(manager.dir_of(fresh) / ".dreamteam" / "swarm.db", {"cheap": "x"}) == 0
+    assert not (manager.dir_of(fresh) / ".dreamteam" / "swarm.db").exists()
+    assert rename_member_profiles(home / ".dreamteam" / "swarm.db", {"cheap": "fast", "nope": "x"}) == 1
+
+
+async def test_a_swap_and_a_chain_of_profile_names_in_one_save_are_followed(tmp_path):
+    """fast <-> default in one save: the members keep their own profile (a loaded session and a stopped one), a
+    session's default profile and the global default follow; a chain A -> B, B -> C moves each set of members once.
+    A card that still has its name and was not renamed keeps it."""
+    swap = {"default": {"renamed_from": "fast"}, "fast": {"renamed_from": "default"}}
+    assert st.profile_renames({"models": swap}) == {"fast": "default", "default": "fast"}
+    chain = {"B": {"renamed_from": "A"}, "C": {"renamed_from": "B"}}
+    assert st.profile_renames({"models": chain}) == {"A": "B", "B": "C"}
+    assert st.profile_renames({"models": {"A": {}, "B": {"renamed_from": "A"}}}) == {}
+    manager = _manager(_home(tmp_path))
+    pinned = (await manager.create("Pinned", start=False, overrides={"agents": {"default_model": "fast"}}))["id"]
+    live = (await manager.create("Live", start=True))["id"]
+    swarm = manager.swarms[live]
+    on_fast = await swarm.hire(USER, "Tester", model="fast")
+    on_default = await swarm.hire(USER, "Tester", model="default")
+    stopped = (await manager.create("Stopped", start=True))["id"]
+    parked = await manager.swarms[stopped].hire(USER, "Tester", model="fast")
+    await manager.stop(stopped)
+    view = manager.settings_view()
+    fast, default = view["models"]["fast"], view["models"]["default"]
+    await manager.update_settings({"models": {"default": dict(fast, renamed_from="fast"),
+                                              "fast": dict(default, renamed_from="default")}})
+    assert swarm.member(on_fast)["model"] == "default" and swarm.member(on_default)["model"] == "fast"
+    assert swarm.runtimes[on_fast].llm.profile.model == fast["model"]
+    assert (await manager.load(stopped)).member(parked)["model"] == "default"
+    assert manager.meta(pinned)["overrides"]["agents"] == {"default_model": "default"}
+    assert st.read_raw(manager.home).get("agents", {}).get("default_model", "default") == "fast"
+    await manager.shutdown()
+
+
+def test_names_sent_with_a_swap_or_a_chain_are_not_renamed_twice(tmp_path):
+    """The web UI sends agents.default_model and a re-picked role model by the names after the save; in a swap or a
+    chain such a new name is also an old one and must stay on its card. A stored value (or an old name that is no
+    profile any more) still follows the rename."""
+    opus = {"provider": "anthropic", "model": "claude-opus-5-5"}
+    haiku = {"provider": "anthropic", "model": "claude-haiku-5-5"}
+    raw = {"agents": {"default_model": "default"}, "models": {"default": dict(opus), "fast": dict(haiku)},
+           "roles": [{"name": "tester", "model": "fast"}, {"name": "developer", "model": "default"}]}
+    swap = {"fast": dict(opus, renamed_from="default"), "default": dict(haiku, renamed_from="fast")}
+    # the star stays on the opus card (now "fast"); the tester still on the haiku card, the developer re-picked opus
+    roles = [{"name": "tester", "model": "default"}, {"name": "developer", "model": "fast"}]
+    new = st.apply_update(raw, {"agents": {"default_model": "fast"}, "models": swap, "roles": roles})
+    assert new["models"][new["agents"]["default_model"]]["model"] == "claude-opus-5-5"
+    assert [new["models"][r["model"]]["model"] for r in new["roles"]] == ["claude-haiku-5-5", "claude-opus-5-5"]
+    stored = st.apply_update(raw, {"models": swap})  # nothing sent: the stored names follow
+    assert stored["agents"]["default_model"] == "fast"
+    assert [r["model"] for r in stored["roles"]] == ["default", "fast"]
+    raw2 = {"agents": {"default_model": "A"}, "models": {"A": dict(opus), "B": dict(haiku)}}
+    chain = {"B": dict(opus, renamed_from="A"), "C": dict(haiku, renamed_from="B")}
+    assert st.apply_update(raw2, {"agents": {"default_model": "B"}, "models": chain})["agents"]["default_model"] == "B"
+    assert st.apply_update(raw2, {"agents": {"default_model": "A"}, "models": chain})["agents"]["default_model"] == "B"
+    assert st.apply_update(raw2, {"models": chain})["agents"]["default_model"] == "B"
 
 
 async def test_update_overrides_apply_to_the_loaded_swarm(tmp_path):

@@ -13,6 +13,7 @@ from .base import (
     Usage,
     cost_of,
     estimate_tokens,
+    uncounted_fields,
 )
 from .scripted import ScriptedLLM
 
@@ -31,6 +32,7 @@ __all__ = [
     "cost_of",
     "create_llm",
     "estimate_tokens",
+    "uncounted_fields",
 ]
 
 

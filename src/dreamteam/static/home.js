@@ -75,10 +75,16 @@ const I18N = {
     p_effort: "Effort", p_thinking: "Thinking", p_thinking_display: "Показ мыслей",
     p_fallbacks: "Серверный fallback при отказе (beta)", p_mismatch: "Thinking при изменённом префиксе", p_max_param: "Параметр лимита вывода",
     p_prices: "Цены, $ за 1M токенов", p_price_in: "Вход", p_price_out: "Выход", p_price_cr: "Чтение кэша", p_price_cw: "Запись кэша",
-    p_prices_hint: "Пусто — известные цены модели (или 0). OpenRouter сообщает стоимость сам.", p_extra: "Доп. параметры запроса (JSON)",
+    p_prices_hint: "Пусто — встроенные цены известных моделей Claude, для остальных такие токены считаются по $0 (если провайдер не сообщает стоимость сам). 0 — бесплатно.", p_extra: "Доп. параметры запроса (JSON)",
+    p_no_prices: "Нет цен: вызовы этой модели считаются по $0, и бюджет сессии их не видит, если только провайдер не сообщает стоимость сам (проверьте «Тестовым запросом»).",
+    p_some_prices: "Нет цены {fields}: эти токены считаются по $0.", p_price_of_in: "входа", p_price_of_out: "выхода",
+    p_enter_prices: "Указать цены", p_free_model: "Бесплатная модель (0 / 0)",
     p_check: "Проверить", p_live: "Тестовый запрос", p_checking: "Проверяю…", p_models_found: "Эндпоинт доступен, моделей: {n}.",
     p_model_ok: "Модель «{model}» есть в списке.", p_model_missing: "Модели «{model}» нет в списке эндпоинта.",
-    p_live_ok: "Ответ за {ms} мс: «{reply}» (стоимость ${cost}).", p_live_bad: "Запрос не прошёл: {error}",
+    p_live_ok: "Ответ за {ms} мс: «{reply}» (стоимость ${cost}: {how}).", p_live_bad: "Запрос не прошёл: {error}",
+    p_cost_provider: "сообщил провайдер", p_cost_profile: "по ценам профиля", p_cost_table: "по встроенным ценам",
+    p_cost_free: "бесплатно", p_cost_none: "неизвестна: провайдер её не сообщил, а цен у профиля нет",
+    p_cost_partial: "неполная: провайдер её не сообщил, а части цен у профиля нет",
     p_add: "Добавить профиль", p_add_from: "Пресет:", unsaved_check: "Проверка использует несохранённые значения формы.",
     default_marker: "основной", none_opt: "—",
     sw_name: "Имя роя", sw_lang: "Язык промптов агентов", sw_max: "Максимум агентов",
@@ -102,6 +108,12 @@ const I18N = {
     ag_plan_steps: "Подсказка планирующему агенту после шагов", ag_plan_minutes: "Подсказка планирующему агенту после, мин",
     ag_plan_hint: "Если взявший задачу планирования за столько шагов (или минут) не создал ни одной задачи, ему подсказывают создать независимые задачи сразу и отдать исследования другим; ещё раз — при удвоенном значении. 0 — выключено.",
     ag_plan_minutes_hint: "то же по времени с момента, когда он взял задачу; 0 — выключено",
+    ag_file_settle: "Триггер file_changed ждёт тишины файла, с",
+    ag_file_settle_hint: "срабатывает, когда файл столько секунд не меняется или менявшие его агенты закончили ход; 0 — при каждом изменении",
+    ag_file_max_wait: "Триггер file_changed ждёт не дольше, с",
+    ag_file_max_wait_hint: "у файла, который всё ещё меняется, — через столько секунд после первого изменения; 0 — без предела",
+    ag_trigger_wake: "Повторяющийся триггер будит не чаще, с",
+    ag_trigger_wake_hint: "Срабатывания между пробуждениями приходят одним уведомлением; 0 — будить при каждом",
     sh_program: "Оболочка", sh_timeout: "Ожидание команды по умолчанию, с", sh_max_timeout: "Наибольший тайм-аут команды, с",
     sh_max_timeout_hint: "столько же от запуска живёт команда, ушедшая в фон по тайм-ауту; само ожидание ИИ-агента ограничено следующим полем, по MCP — 600 с",
     sh_fg_max: "ИИ-агент ждёт команду не дольше, с", sh_fg_max_hint: "дальше она работает в фоне",
@@ -113,6 +125,8 @@ const I18N = {
     sh_cpu_hint: "для numpy, BLAS, OpenMP и т. п.: auto — ядра поровну между ИИ-агентами, число — столько потоков, 0 — не ограничивать; значение, заданное в самой команде, важнее",
     sh_pass_env: "Пробрасывать переменные", sh_pass_env_hint: "секреты из окружения скрыты от агентов, кроме перечисленных",
     ws_git: "Git с автокоммитами", ws_lock: "Время блокировки файла, мин",
+    ws_lock_wanted: "Напомнить держателю блокировки через, мин",
+    ws_lock_wanted_hint: "напомнит держателю, когда он держит файл, который ждут, столько минут; 0 — сразу",
     mcp_approval: "Подтверждать новые MCP-серверы агентов", mcp_library: "Папка библиотеки MCP", mcp_startup: "Таймаут запуска, с",
     mcp_call: "Таймаут вызова, с", mcp_external: "Внешние MCP-серверы (JSON)",
     mcp_env_hint: "значения env скрыты (••••…); оставьте как есть, чтобы сохранить, или впишите новое",
@@ -260,10 +274,16 @@ const I18N = {
     p_effort: "Effort", p_thinking: "Thinking", p_thinking_display: "Thinking display",
     p_fallbacks: "Server-side fallback on refusal (beta)", p_mismatch: "Thinking on a changed prefix", p_max_param: "Output limit parameter",
     p_prices: "Prices, $ per 1M tokens", p_price_in: "Input", p_price_out: "Output", p_price_cr: "Cache read", p_price_cw: "Cache write",
-    p_prices_hint: "Empty — the model's known prices (or 0). OpenRouter reports the cost itself.", p_extra: "Extra request parameters (JSON)",
+    p_prices_hint: "Empty — the built-in prices of known Claude models; for other models those tokens count as $0 (unless the provider reports the cost itself). 0 means free.", p_extra: "Extra request parameters (JSON)",
+    p_no_prices: "No prices: calls of this model count as $0 and the session budget does not see them, unless the provider reports the cost itself (check with “Test request”).",
+    p_some_prices: "No {fields} price: those tokens count as $0.", p_price_of_in: "input", p_price_of_out: "output",
+    p_enter_prices: "Enter prices", p_free_model: "Free model (0 / 0)",
     p_check: "Check", p_live: "Test request", p_checking: "Checking…", p_models_found: "The endpoint answers, {n} model(s).",
     p_model_ok: "Model “{model}” is in the list.", p_model_missing: "Model “{model}” is not in the endpoint's list.",
-    p_live_ok: "Answered in {ms} ms: “{reply}” (cost ${cost}).", p_live_bad: "The request failed: {error}",
+    p_live_ok: "Answered in {ms} ms: “{reply}” (cost ${cost}: {how}).", p_live_bad: "The request failed: {error}",
+    p_cost_provider: "reported by the provider", p_cost_profile: "by the profile's prices", p_cost_table: "by the built-in prices",
+    p_cost_free: "free", p_cost_none: "unknown: the provider did not report it, and the profile has no prices",
+    p_cost_partial: "incomplete: the provider did not report it, and the profile lacks some prices",
     p_add: "Add profile", p_add_from: "Preset:", unsaved_check: "The check uses the unsaved form values.",
     default_marker: "default", none_opt: "—",
     sw_name: "Swarm name", sw_lang: "Agents' prompt language", sw_max: "Max agents",
@@ -287,6 +307,12 @@ const I18N = {
     ag_plan_steps: "Hint the planner after steps", ag_plan_minutes: "Hint the planner after, min",
     ag_plan_hint: "When the member holding the planning task has created no task after this many steps (or minutes), it is told to create the independent tasks now and hand the research to the others; once more at twice the value. 0 = off.",
     ag_plan_minutes_hint: "the same by the time since it claimed the task; 0 = off",
+    ag_file_settle: "file_changed trigger waits for a quiet file, s",
+    ag_file_settle_hint: "fires once the file has not changed this long or the agents who changed it have ended their turns; 0 = at every change",
+    ag_file_max_wait: "file_changed trigger waits at most, s",
+    ag_file_max_wait_hint: "for a file that keeps changing: this long after its first change; 0 = no limit",
+    ag_trigger_wake: "Repeating trigger wakes at most every, s",
+    ag_trigger_wake_hint: "Fires in between arrive in one notice; 0 wakes at every fire",
     sh_program: "Shell", sh_timeout: "Default wait for a command, s", sh_max_timeout: "Largest command timeout, s",
     sh_max_timeout_hint: "a command that went to the background at its timeout lives this long from its start; an AI agent's wait itself is capped by the next field, 600 s over MCP",
     sh_fg_max: "An AI agent waits for a command at most, s", sh_fg_max_hint: "then it goes on in the background",
@@ -298,6 +324,8 @@ const I18N = {
     sh_cpu_hint: "for numpy, BLAS, OpenMP and the like: auto shares the cores equally between the AI agents, a number sets that many threads, 0 = no limit; a value set in the command itself wins",
     sh_pass_env: "Pass environment variables", sh_pass_env_hint: "secrets are hidden from agents except the listed ones",
     ws_git: "Git with auto-commits", ws_lock: "File lock time, min",
+    ws_lock_wanted: "Remind the lock holder after, min",
+    ws_lock_wanted_hint: "reminds the holder once it has held a file others wait for this long; 0 = at once",
     mcp_approval: "Require approval of new agent MCP servers", mcp_library: "MCP library folder", mcp_startup: "Startup timeout, s",
     mcp_call: "Call timeout, s", mcp_external: "External MCP servers (JSON)",
     mcp_env_hint: "env values are hidden (••••…); keep them to keep the saved value, or type a new one",
@@ -921,12 +949,22 @@ function roleHeadInner(card) {
   const other = preset ? `<span class="muted role-other">${esc(t("r_other_lang", { name: preset.name[otherLang] }))}</span>` : "";
   return `${name}${other}${badges}<span class="spacer"></span>${actions}`;
 }
+/** A role card's model profile by its name after the save: a stored name follows a profile renamed in this edit
+ * (an old name that a card not renamed still has stays, like settings.profile_renames); a profile name picked in
+ * this edit is already a current one (in a swap a new name is also an old one). */
+function roleModel(card) {
+  const model = card.model || null;
+  const profiles = H.profiles || [];
+  if (!model || (card.modelPicked && profiles.some((p) => p.name === model))) return model;
+  if (profiles.some((p) => p.name === model && (!p.original || p.original === p.name))) return model;
+  const renamed = profiles.find((p) => p.original === model);
+  return renamed ? renamed.name : model;
+}
 /** <option>s of a role's model profile: the session default, then the current profiles. A profile renamed in this
- * edit shows under its new name (the server follows the rename); an unknown one stays visible until fixed. */
-function roleModelOptions(model) {
+ * edit shows under its new name (roleModel); an unknown one stays visible until fixed. */
+function roleModelOptions(card) {
   const names = (H.profiles || []).map((p) => p.name);
-  const renamed = model ? (H.profiles || []).find((p) => p.original === model && p.name !== model) : null;
-  const shown = renamed ? renamed.name : model || "";
+  const shown = roleModel(card) || "";
   const opts = [`<option value=""${shown ? "" : " selected"}>${esc(t("r_model_default"))}</option>`]
     .concat(names.map((n) => `<option value="${esc(n)}"${n === shown ? " selected" : ""}>${esc(n)}</option>`));
   if (shown && !names.includes(shown)) opts.push(`<option value="${esc(shown)}" selected>${esc(shown)}</option>`);
@@ -941,7 +979,7 @@ function roleCard(card) {
     <div class="settings-grid">
       <label class="field full"><span>${esc(t("r_desc"))} <span class="hint">${esc(t("r_desc_hint"))}</span></span>
         <textarea rows="5" data-rc="description">${esc(desc)}</textarea>${preset ? `<span class="field-hint">${esc(t("r_desc_both"))}</span>` : ""}</label>
-      <label class="field"><span>${esc(t("r_model"))}</span><select data-rc="model">${roleModelOptions(card.model)}</select></label>
+      <label class="field"><span>${esc(t("r_model"))}</span><select data-rc="model">${roleModelOptions(card)}</select></label>
     </div>
     <details class="more"${card.moreOpen ? " open" : ""}><summary>${esc(t("f_more"))}${(card.skills || []).length ? ` · ${esc(t("r_skills"))}: ${esc(card.skills.join(", "))}` : ""}</summary>
       <label class="field"><span>${esc(t("r_instr"))} <span class="hint">${esc(t("r_instr_hint"))}</span></span>
@@ -1002,7 +1040,7 @@ function onRoleCardEvent(e) {
   if (field === "name") card.name = el.value;
   else if (field === "description") card.description = el.value;
   else if (field === "instructions") card.instructions = el.value;
-  else if (field === "model") card.model = el.value || null;
+  else if (field === "model") { card.model = el.value || null; card.modelPicked = true; }
   if (card.builtin) { const head = cardEl.querySelector(".role-head"); if (head) head.innerHTML = roleHeadInner(card); }
   renderTeam("defaults");
   markDirty();
@@ -1037,12 +1075,11 @@ function onRoleCardClick(e) {
  * an own role with its name and description. Throws the first client-side error (shown in the save bar). */
 function roleEntries(cards) {
   const profiles = new Set((H.profiles || []).map((p) => p.name));
-  const renamed = new Set((H.profiles || []).filter((p) => p.original && p.original !== p.name).map((p) => p.original));
   const seen = new Set();
   const out = [];
   for (const card of cards || []) {
     const instructions = String(card.instructions || "").trim();
-    const model = card.model || null;
+    const model = roleModel(card);   // by its name after the save (the server takes a sent current name as is)
     const entry = { name: card.builtin ? card.id : normRole(card.name) };
     if (!card.builtin) {
       const name = entry.name;
@@ -1054,7 +1091,7 @@ function roleEntries(cards) {
       entry.description = String(card.description || "").trim();
       if (!entry.description && !card.hidden) throw new Error(t("r_err_desc", { name }));
     } else if (changedDescription(card)) entry.description = changedDescription(card);
-    if (model && !profiles.has(model) && !renamed.has(model)) throw new Error(t("r_err_model", { name: roleCardName(card), model }));
+    if (model && !profiles.has(model)) throw new Error(t("r_err_model", { name: roleCardName(card), model }));
     if (instructions) entry.instructions = instructions;
     if (model) entry.model = model;
     if (card.hidden) entry.hidden = true;
@@ -1597,6 +1634,9 @@ function renderSettings(fromServer) {
       field("ag_parallel", "agents.max_parallel_llm_calls", "int", { min: 1 }),
       field("ag_plan_steps", "agents.planning_hint_steps", "int", { min: 0, hint: "ag_plan_hint" }),
       field("ag_plan_minutes", "agents.planning_hint_minutes", "float", { min: 0, step: 1, hint: "ag_plan_minutes_hint" }),
+      field("ag_file_settle", "agents.file_settle_seconds", "float", { min: 0, step: 10, hint: "ag_file_settle_hint" }),
+      field("ag_file_max_wait", "agents.file_max_wait_seconds", "float", { min: 0, step: 30, hint: "ag_file_max_wait_hint" }),
+      field("ag_trigger_wake", "agents.trigger_wake_seconds", "float", { min: 0, step: 30, hint: "ag_trigger_wake_hint" }),
     ]))}
     ${section("shell", grid([
       field("sh_program", "shell.program", "select", { options: ["auto", "bash", "sh", "powershell", "pwsh", "cmd"].map((x) => [x, x]) }),
@@ -1614,6 +1654,7 @@ function renderSettings(fromServer) {
     ${section("workspace", grid([
       field("ws_git", "workspace.git", "bool"),
       field("ws_lock", "workspace.lock_ttl_minutes", "int", { min: 1 }),
+      field("ws_lock_wanted", "workspace.lock_wanted_minutes", "float", { min: 0, step: 1, hint: "ws_lock_wanted_hint" }),
     ]))}
     ${section("mcp", grid([
       field("mcp_approval", "mcp.require_approval", "bool", { full: true }),
@@ -1728,6 +1769,10 @@ function onSettingsInput(e) {
       p.data[pf] = value === "" ? null : value;
     }
     if (pf === "provider") renderProfiles();
+    else if (pf === "model" || PRICE_FIELDS.includes(pf)) {   // only the warning: a re-render would lose the focus
+      const box = card.querySelector ? card.querySelector(".price-warn-box") : null;
+      if (box) box.innerHTML = priceWarnHtml(p);
+    }
     markDirty();
   }
 }
@@ -1737,7 +1782,49 @@ function makeProfile(name, data, original) {
   const p = { uid: "p" + (++H.uid), name, original, data: clone(data), newKey: null, cleared: false, keyMode: "env", check: null, models: [] };
   p.keyMode = data.api_key_set || (!data.api_key_env && data.provider !== "anthropic") ? "key" : "env";
   p.extraText = data.extra && Object.keys(data.extra).length ? JSON.stringify(data.extra, null, 2) : "";
+  p.priceModel = data.model;   // the model the server's price_source was computed for
   return p;
+}
+
+const PRICE_FIELDS = ["input_price", "output_price"];
+
+/** The price fields whose tokens count as $0 (ModelProfile.missing_prices): the server's price_source "none" /
+ * "partial" says the saved model has no built-in prices, so the empty ones of these fields are missing. For another
+ * model typed into the card it is not known before saving; the scripted provider has no bill. */
+function missingPrices(p) {
+  const d = p.data;
+  if (!["none", "partial"].includes(d.price_source) || d.model !== p.priceModel || d.provider === "scripted") return [];
+  return PRICE_FIELDS.filter((k) => d[k] === null || d[k] === undefined || d[k] === "");
+}
+
+/** The card's warning about missing prices (outside «More»), with «Enter prices» and «Free model (0 / 0)». */
+function priceWarnHtml(p) {
+  const missing = missingPrices(p);
+  if (!missing.length) return "";
+  const text = missing.length === PRICE_FIELDS.length ? t("p_no_prices")
+    : t("p_some_prices", { fields: missing.map((k) => t(k === "input_price" ? "p_price_of_in" : "p_price_of_out")).join(", ") });
+  return `<div class="price-warn"><i class="ic ic-alert"></i><span>${esc(text)}</span>
+    <button class="btn small" type="button" data-enter-prices>${esc(t("p_enter_prices"))}</button>
+    <button class="btn small" type="button" data-free-model>${esc(t("p_free_model"))}</button></div>`;
+}
+
+/** «Enter prices»: open the card's «More» and put the cursor into the first missing price. */
+function enterPrices(p, card) {
+  const more = card && card.querySelector ? card.querySelector("details.more") : null;
+  if (more) more.open = true;
+  p.moreOpen = true;
+  const first = missingPrices(p)[0] || "input_price";
+  const input = card && card.querySelector ? card.querySelector(`[data-pf="${first}"]`) : null;
+  if (input) input.focus();
+}
+
+/** «Free model (0 / 0)»: both prices 0 (free on purpose, unlike an empty field). */
+function freeModel(p, card) {
+  const more = card && card.querySelector ? card.querySelector("details.more") : null;
+  if (more) more.open = true;
+  p.moreOpen = true;
+  for (const k of PRICE_FIELDS) p.data[k] = 0;
+  renderProfiles(); markDirty();
 }
 
 function renderProfiles() {
@@ -1800,6 +1887,7 @@ function profileCard(p) {
       ${anthropic ? `<label class="field"><span>${esc(t("p_thinking"))}</span>${sel("thinking", [["adaptive", "adaptive"], ["off", "off"]], d.thinking)}</label>`
                   : `<label class="field"><span>${esc(t("p_max_param"))}</span>${sel("max_tokens_param", [["", "auto"], ["max_tokens", "max_tokens"], ["max_completion_tokens", "max_completion_tokens"]], d.max_tokens_param)}</label>`}
     </div>
+    <div class="price-warn-box">${priceWarnHtml(p)}</div>
     <details class="more"${p.moreOpen ? " open" : ""}><summary>${esc(t("f_more"))}</summary>
       <div class="settings-grid">
         ${anthropic ? `<label class="field"><span>${esc(t("p_thinking_display"))}</span>${sel("thinking_display", [["summarized", "summarized"], ["omitted", "omitted"]], d.thinking_display || "summarized")}</label>
@@ -1840,7 +1928,12 @@ function presetData(id) {
   if (!preset) return null;
   const data = { provider: preset.provider, base_url: preset.base_url || null, model: preset.model || "",
                  api_key_env: preset.api_key_env || null, effort: preset.effort || null };
-  for (const k of ["context_tokens", "max_tokens", "input_price", "output_price"]) if (preset[k] !== undefined) data[k] = preset[k];
+  for (const k of ["context_tokens", "max_tokens"]) if (preset[k] !== undefined) data[k] = preset[k];
+  // the prices always come from the preset (empty when it has none): a card switched to another preset must not keep
+  // the previous one's prices, which would count the new model's calls at them (or at $0) with no warning
+  for (const k of ["input_price", "output_price", "cache_read_price", "cache_write_price"]) {
+    data[k] = preset[k] !== undefined ? preset[k] : null;
+  }
   return { preset, data };
 }
 
@@ -1870,7 +1963,7 @@ function applyPreset(p, id) {
  * renamed card), "" removes it, a string sets it. The stored key never reaches the browser. */
 function profilePayload(p) {
   const d = clone(p.data);
-  delete d.api_key_set; delete d.api_key_hint; delete d.api_key_env_set; delete d.api_key;
+  delete d.api_key_set; delete d.api_key_hint; delete d.api_key_env_set; delete d.price_source; delete d.api_key;
   if (p.extraText && p.extraText.trim()) {
     try { d.extra = JSON.parse(p.extraText); } catch (e) { throw new Error(t("invalid_json", { field: t("p_extra") + " (" + p.name + ")" })); }
     if (!d.extra || typeof d.extra !== "object" || Array.isArray(d.extra)) throw new Error(t("invalid_json", { field: t("p_extra") + " (" + p.name + ")" }));
@@ -1892,6 +1985,12 @@ function redactKey(text, p) {
   return key && key.length >= 4 ? String(text).split(key).join("…" + key.slice(-4)) : String(text);
 }
 
+/** How a test request's cost was obtained (check_profile `cost_source`). */
+function costHow(source) {
+  return t({ provider: "p_cost_provider", profile: "p_cost_profile", table: "p_cost_table", free: "p_cost_free",
+             partial: "p_cost_partial" }[source] || "p_cost_none");
+}
+
 async function checkProfile(p, live, button) {
   let profile;
   try { profile = profilePayload(p); } catch (e) { toast(e.message, true); return; }
@@ -1911,7 +2010,7 @@ async function checkProfile(p, live, button) {
       lines.push(t("p_models_found", { n: r.models.length }));
       if (profile.model) lines.push(t(r.model_found ? "p_model_ok" : "p_model_missing", { model: profile.model }));
     } else if (r.models_error) lines.push("models: " + r.models_error);
-    if (live) lines.push(r.ok ? t("p_live_ok", { ms: r.latency_ms, reply: r.reply || "", cost: (Number(r.cost_usd) || 0).toFixed(5) }) : t("p_live_bad", { error: r.error || "?" }));
+    if (live) lines.push(r.ok ? t("p_live_ok", { ms: r.latency_ms, reply: r.reply || "", cost: (Number(r.cost_usd) || 0).toFixed(5), how: costHow(r.cost_source) }) : t("p_live_bad", { error: r.error || "?" }));
     p.check = { ok: !!r.ok, text: redactKey(lines.join("\n"), p) };
   } catch (e) {
     p.check = { ok: false, text: redactKey(e.message, p) };
@@ -1934,6 +2033,8 @@ function onSettingsClick(e) {
   else if ("delProfile" in btn.dataset) { if (p.uid !== H.defaultUid) H.profiles = H.profiles.filter((x) => x !== p); renderProfiles(); markDirty(); }
   else if ("keyMode" in btn.dataset) { p.keyMode = btn.dataset.keyMode; renderProfiles(); markDirty(); }
   else if ("clearKey" in btn.dataset) { p.cleared = true; p.newKey = ""; renderProfiles(); markDirty(); }
+  else if ("enterPrices" in btn.dataset) enterPrices(p, card);
+  else if ("freeModel" in btn.dataset) freeModel(p, card);
   else if ("loadModels" in btn.dataset) checkProfile(p, false, btn);
   else if ("check" in btn.dataset) checkProfile(p, btn.dataset.check === "1", btn);
 }
@@ -2106,6 +2207,7 @@ if (typeof module !== "undefined" && module.exports) {
     I18N, H, esc, t, ago, money, sessionState, sessionCard, filterSessions, renderSessions, sessionOverrides,
     workspaceKind, workspaceMissing, shortPath, workspaceLine,
     makeProfile, profileCard, profilePayload, collectSettings, presetData, uniqueName, redactKey, field, readInput,
+    missingPrices, priceWarnHtml, enterPrices, freeModel, costHow,
     renderSettings, checkProfile, onSettingsInput, onSettingsClick, leaveSettings, closeModal, openModal,
     deleteModal, newSessionModal, startSession, stopSession, setTab, loadSettingsPane, submitNewSession,
     // role catalog and starting team
