@@ -2109,8 +2109,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_traces, dir=None)
 
-    include_help = ("what to {0}: a comma list of settings (with the model profiles and roles), skills, mcp (the MCP "
-                    "library and [mcp.external]), sessions; repeatable (default: everything{1})")
+    include_help = ("what to {0}: a comma list of settings (with the model profiles, roles and teams), skills, mcp "
+                    "(the MCP library and [mcp.external]), sessions; repeatable (default: everything{1})")
     s = sub.add_parser("export", help="write the settings, skills, MCP servers and sessions (history and workspace "
                                       "files) of a home into a folder, to move them to another computer; API keys "
                                       "and MCP env values stay on this one",

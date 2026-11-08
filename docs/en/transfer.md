@@ -53,8 +53,8 @@ command to run on the other computer.
 Without `--include` everything is exported. `--include` takes a comma list and may repeat; an unknown word is a
 usage error (exit code 2).
 
-- `settings` — every section of `dreamteam.toml`, including the model profiles `[models.*]` and the role catalog
-  `[[roles]]`, but without `[mcp.external]` and without API keys.
+- `settings` — every section of `dreamteam.toml`, including the model profiles `[models.*]`, the role catalog
+  `[[roles]]` and the saved teams `[[teams]]`, but without `[mcp.external]` and without API keys.
 - `skills` — the skills library: each skill's files and a record of where it came from.
 - `mcp` — the MCP library (code, description and your approval) and the `[mcp.external]` servers: command, folder,
   description and the names of their `env` variables, without the values.
@@ -212,6 +212,8 @@ A category you named in `--include` that the export does not hold gives a warnin
   computer and a profile on `localhost` get a warning too.
 - Roles are matched by name: added or rewritten, the others stay. When a role's model profile does not exist here,
   the role uses the default profile.
+- Teams are matched by name: added or rewritten, the others stay. A team naming a role this computer does not have
+  stays, with a warning: fix it in Settings > Teams before choosing it.
 - When the export's `default_model` profile does not exist here, this computer's one stays.
 
 ### Skills

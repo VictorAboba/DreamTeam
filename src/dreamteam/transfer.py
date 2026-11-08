@@ -59,11 +59,11 @@ from urllib.parse import unquote, urlsplit
 from . import __version__, hubauth, hubgit
 from . import mcp_library
 from .config import (CONFIG_FILE, AgentSettings, MCPSettings, ModelProfile, RoleSettings, ServerSettings,
-                     ShellSettings, SkillsSettings, SwarmSettings, TracingSettings, WorkspaceSettings, env_var_name,
-                     key_env_names, make_profile)
+                     ShellSettings, SkillsSettings, SwarmSettings, TeamSettings, TracingSettings, WorkspaceSettings,
+                     env_var_name, key_env_names, make_profile)
 from .db import foreign_objects, known_columns, loads, max_tools_revision, sqlite_uri, unknown_columns
 from .mcp_forge import _split_command
-from .roles import role_key
+from .roles import missing_roles, role_key, team_key
 from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_FILE, SESSION_ID,
                        WORKSPACE_DIR, ImportedWorkspace, SessionError, SessionManager, _home_relative, _in_thread,
                        _to_end, new_uid, session_uid, slugify)
@@ -1120,8 +1120,9 @@ def render_export_report(report: ExportReport) -> str:
     sizes = report.sizes
     if "settings" in report.include and report.settings is not None:
         s = report.settings
+        teams = f", {_plural(len(s['teams']), 'team')}" if s.get("teams") else ""
         lines.append(f"  settings  dreamteam.toml: {_plural(len(s['sections']), 'section')}, "
-                     f"{_plural(len(s['models']), 'model profile')}, {_plural(len(s['roles']), 'role')}"
+                     f"{_plural(len(s['models']), 'model profile')}, {_plural(len(s['roles']), 'role')}{teams}"
                      " (API keys stay on this computer)")
     if "skills" in report.include:
         lines.append(f"  skills    {_plural(len(report.skills), 'skill')}, {format_size(sizes.get('skills', 0))}")
@@ -1366,10 +1367,12 @@ def _settings_part(raw: dict[str, Any], out: Path | None, report: ExportReport, 
     secrets.update(removed)
     models = scrubbed.get("models") if isinstance(scrubbed.get("models"), dict) else {}
     roles = scrubbed.get("roles") if isinstance(scrubbed.get("roles"), list) else []
+    teams = scrubbed.get("teams") if isinstance(scrubbed.get("teams"), list) else []
     report.settings = {
-        "sections": sorted(k for k, v in scrubbed.items() if isinstance(v, dict) or k == "roles"),
+        "sections": sorted(k for k, v in scrubbed.items() if isinstance(v, dict) or k in ("roles", "teams")),
         "models": sorted(models),
         "roles": [role_key(r.get("name")) for r in roles if isinstance(r, dict)],
+        "teams": [team_key(t.get("name")) for t in teams if isinstance(t, dict)],
         "omitted": omitted,
     }
     keys_told: set[str] = set()
@@ -2171,6 +2174,7 @@ _SECTION_FIELDS: dict[str, frozenset[str]] = {
         ("skills", SkillsSettings))}
 _PROFILE_FIELDS = frozenset(f.name for f in dataclasses.fields(ModelProfile)) - {"name"}
 _ROLE_FIELDS = frozenset(f.name for f in dataclasses.fields(RoleSettings))
+_TEAM_FIELDS = frozenset(f.name for f in dataclasses.fields(TeamSettings))
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9_-]+")
 _EMPTY_HEADER = re.compile(r"\s*([A-Za-z0-9_-]+)\s*:\s*")
 _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
@@ -2338,9 +2342,9 @@ class ImportResult:
 @dataclass
 class SettingsMerge:
     """Exported settings merged over this computer's (merge_settings). `update` is what
-    SessionManager.update_settings gets: only the sections that change, `models` and `roles` as complete lists
-    holding every profile and role of this computer too, so nothing that exists only here is deleted. `new_raw`:
-    the settings after it. `error`: why the result cannot be used here (nothing is applied then)."""
+    SessionManager.update_settings gets: only the sections that change, `models`, `roles` and `teams` as complete
+    lists holding every profile, role and team of this computer too, so nothing that exists only here is deleted.
+    `new_raw`: the settings after it. `error`: why the result cannot be used here (nothing is applied then)."""
     update: dict[str, Any] = field(default_factory=dict)
     new_raw: dict[str, Any] = field(default_factory=dict)
     sections: list[str] = field(default_factory=list)
@@ -2348,6 +2352,8 @@ class SettingsMerge:
     models_rewritten: list[str] = field(default_factory=list)
     roles_added: list[str] = field(default_factory=list)
     roles_rewritten: list[str] = field(default_factory=list)
+    teams_added: list[str] = field(default_factory=list)
+    teams_rewritten: list[str] = field(default_factory=list)
     keys_removed: list[str] = field(default_factory=list)   # profiles whose stored key goes: another endpoint now
     local_kept: list[str] = field(default_factory=list)     # machine-local keys whose value here stays
     dropped: list[str] = field(default_factory=list)        # what this version does not know, left out
@@ -2443,15 +2449,16 @@ def merge_settings(target: dict[str, Any], exported: dict[str, Any], *, home: st
     Model profiles: missing ones are added, existing ones rewritten from the export, the others stay; the key
     stored here stays only while the profile's endpoint (provider, base_url) is the same, else it is removed
     ("enter the key again"); a local-endpoint preset gets its placeholder key back. Roles (by roles.role_key):
-    added or rewritten, the others stay; a role model this computer does not have is dropped. `new_home`: the
-    target is the template of a home the import makes, so nothing in it was configured here: removing its key
+    added or rewritten, the others stay; a role model this computer does not have is dropped. Teams (by
+    roles.team_key): added or rewritten, the others stay; a team naming a role this computer lacks stays, with a
+    warning. `new_home`: the target is the template of a home the import makes, so nothing in it was configured here: removing its key
     variable or secret extras from a profile that now points elsewhere is not warned about."""
     environ = os.environ if environ is None else environ
     m = SettingsMerge()
     target = target if isinstance(target, dict) else {}
     exported = exported if isinstance(exported, dict) else {}
     for name, section in exported.items():
-        if name in ("models", "roles"):
+        if name in ("models", "roles", "teams"):
             continue
         if name not in _SECTION_FIELDS or not isinstance(section, dict):
             m.dropped.append(f"[{name}]")
@@ -2571,6 +2578,33 @@ def merge_settings(target: dict[str, Any], exported: dict[str, Any], *, home: st
                 m.roles_added.append(role["name"])
         if m.roles_added or m.roles_rewritten:
             m.update["roles"] = roles
+    exported_teams = exported.get("teams")
+    if isinstance(exported_teams, list):
+        teams = [copy.deepcopy(t) for t in target["teams"]] if isinstance(target.get("teams"), list) else []
+        index = {team_key(t.get("name")): i for i, t in enumerate(teams) if isinstance(t, dict)}
+        catalog = m.update.get("roles", target.get("roles"))
+        for number, item in enumerate(exported_teams, 1):
+            if not isinstance(item, dict) or not isinstance(item.get("name"), str) or not item["name"].strip():
+                m.dropped.append(f"teams.{number}")
+                continue
+            team = _known_part(item, _TEAM_FIELDS, f"teams.{item['name']}", m.dropped)
+            members = team.get("roles")
+            if isinstance(members, list) and all(isinstance(role, str) for role in members):  # else validate() says so
+                m.warnings.extend(f"team '{team['name']}' uses the role '{role}', which this computer does not have: "
+                                  "fix it in Settings > Teams before choosing it"
+                                  for role in missing_roles(team, catalog if isinstance(catalog, list) else ()))
+            key = team_key(team["name"])
+            if key in index:
+                if teams[index[key]] == team:
+                    continue
+                teams[index[key]] = team
+                m.teams_rewritten.append(team["name"])
+            else:
+                index[key] = len(teams)
+                teams.append(team)
+                m.teams_added.append(team["name"])
+        if m.teams_added or m.teams_rewritten:
+            m.update["teams"] = teams
     agents = m.update.get("agents")
     default = agents.get("default_model") if isinstance(agents, dict) else None
     if isinstance(default, str) and default not in profiles:
@@ -2958,6 +2992,7 @@ def _plan_settings(p: _Planner, raw: dict[str, Any]) -> dict[str, Any]:
     parts = []
     for label, names in (("profiles added", m.models_added), ("profiles rewritten", m.models_rewritten),
                          ("roles added", m.roles_added), ("roles rewritten", m.roles_rewritten),
+                         ("teams added", m.teams_added), ("teams rewritten", m.teams_rewritten),
                          ("sections", m.sections), ("kept as they are here", m.local_kept)):
         if names:
             parts.append(f"{label}: {', '.join(names)}")

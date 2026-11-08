@@ -5168,10 +5168,13 @@ stored key stays (no `api_key` in the update), and so do its secret `extra` entr
 export names none; otherwise `api_key = ""` removes the stored key (`enter the key for profile <name> again`), and
 secret extras or a key variable configured here are dropped with a warning. A local-endpoint preset without key
 gets its placeholder key back. Roles (by `roles.role_key`): added or rewritten, the others stay; a role model that
-is not a profile after the merge is dropped with a warning. An `agents.default_model` that is not a profile here
+is not a profile after the merge is dropped with a warning. Teams (by `roles.team_key`): added or rewritten, the
+others stay; a team naming a role the catalog lacks after the merge stays, with a warning (`team 'X' uses the role
+'Y', ...`): the load check is shape only, so nothing blocks the import, and the team is refused when chosen (§17.3
+"Saved teams"). An `agents.default_model` that is not a profile here
 keeps the target's value. Warnings: a profile without a key here, a base_url on localhost. The merged settings are
 validated (`validate`; an error refuses the item) and saved by one `SessionManager.update_settings(update)`, with
-`models` and `roles` as complete lists, so `apply_update` deletes nothing.
+`models`, `roles` and `teams` as complete lists, so `apply_update` deletes nothing.
 
 **Skills**: identity is the folder name; the exported folder must pass `check_skill_dir` with the target's limits
 and its SKILL.md must name it; a link of that name in the target library is refused. Same digest: unchanged;

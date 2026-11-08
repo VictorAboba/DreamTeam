@@ -134,7 +134,7 @@ def test_export_and_import_are_commands_and_their_folder_is_not_the_home(monkeyp
         cli.main(["export", "--help"])
     text = " ".join(capsys.readouterr().out.split())
     assert "dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] [--home HOME]" in text
-    assert "settings (with the model profiles and roles), skills, mcp" in text
+    assert "settings (with the model profiles, roles and teams), skills, mcp" in text
     with pytest.raises(SystemExit):
         cli.main(["--help"])
     text = " ".join(capsys.readouterr().out.split())
