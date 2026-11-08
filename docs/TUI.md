@@ -66,10 +66,13 @@ class HubClient:
         # {"clarify": bool}}; SPEC §17.2 "Partial update")
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
                              start: bool = True, workspace: str | None = None,
-                             skills: list[str] | None = None) -> dict
+                             skills: list[str] | None = None, copy_from: str | None = None) -> dict
         # POST /api/sessions -> ["session"]; `workspace` (an absolute folder, SPEC §17.2): the summary then has
         # "workspace_result" (the hub's "result": mode "created" | "adopted", git, ...); `skills`: references or
-        # sources attached before its first start (`--skill`, `/skills add` without a session; "via": "cli")
+        # sources attached before its first start (`--skill`, `/skills add` without a session; "via": "cli");
+        # `copy_from`: a folder or .zip on the hub's computer copied into the new session's folder first (SPEC
+        # §17.2 "Copying files into a new session"): the summary then has "copy_result" (the hub's "copy"). With
+        # `workspace` or `copy_from` the timeout is 900 s (MOVE_TIMEOUT), else 120 s
     async def start_session(self, sid: str, skills: list[str] | None = None) -> dict
         # POST /api/sessions/{sid}/start [{"skills", "via": "cli"}] -> ["session"]
     async def stop_session(self, sid: str) -> dict
@@ -154,10 +157,15 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
                     title: str | None = None, overrides: dict | None = None, output_format: str = "text",
                     verbose: bool = False, timeout: float | None = None, auto_reply: bool = True,
                     lang: str | None = None, out=sys.stdout, err=sys.stderr, on_session=None,
-                    workspace: str | None = None) -> int
+                    workspace: str | None = None, skills: list[str] | None = None,
+                    copy_from: str | None = None) -> int
     # on_session(sid): called with the session the run works in, once it is created or started
     # workspace: the absolute folder a new session works in (`--workspace`; with --verbose the folder is named on
     # err); a refused folder (e.g. a repository with uncommitted changes) ends the run as an error
+    # copy_from: a folder or .zip copied into the new session's folder first (`--copy-from`; err gets, also without
+    # --verbose but not with stream-json, «Скопировано в папку сессии: файлов N (size) из <source>» / "Copied N files
+    # (size) from <source> into the session folder", then «Не скопировано: ссылок N, папок по имени N, особых файлов
+    # N» / "Left out: ..." when something was left out); a refused source ends the run as an error
 ```
 
 - The prompt is used as follows:
@@ -442,11 +450,15 @@ def to_plain(renderable, width: int) -> str
 ```python
 async def run_tui(conn: Connection, *, lang: str | None = None, session: str | None = None,
                   continue_last: bool = False, initial_prompt: str | None = None, verbosity: str = "normal",
-                  input=None, output=None, printer=None, overrides=None, workspace: str | None = None) -> int
+                  input=None, output=None, printer=None, overrides=None, workspace: str | None = None,
+                  copy_from: str | None = None) -> int
     # `printer(renderable)` overrides how output is printed (tests capture to_plain()).
     # `input`/`output` are prompt_toolkit Input/Output (tests: create_pipe_input / DummyOutput).
     # `workspace`: the absolute folder of the first session created here (`--workspace`; the welcome says so,
     # «Новая сессия будет работать в папке …»; a refused creation keeps it for the next try).
+    # `copy_from`: the folder or .zip copied into the first session created here (`--copy-from`; also set by
+    # /copy-from, `TUI.copy_from_override`; the welcome says «Новая сессия получит копию файлов из …»; a refused
+    # creation keeps it too).
 ```
 
 ### 4.1 Screen (bottom area, re-rendered live; everything else printed above with `patch_stdout(raw=True)`)
@@ -538,6 +550,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/files [путь]`, `/cat путь` | workspace listing / file with syntax highlighting |
 | `/unlock путь` | remove a member's lock on a file or folder (`file_unlock`, the path as it was locked; quotes around it are dropped): the members waiting for it are woken; the tool's answer is printed (`Unlocked docs (it was locked by Anna Smith).`, or why not: the path lies under a folder lock, which it names, or is not locked) |
 | `/cd [путь\|--default]` | the session folder (path; own / moved here / a project folder; missing) / move the session to another folder or adopt one, after a confirmation (§4.5); without a session: the folder of the next new session (as `--workspace`; `--default` clears it) |
+| `/copy-from [путь\|--none]` | the folder or .zip whose copy the next new session gets (as `--copy-from`; SPEC §17.2 "Copying files into a new session"), with or without a current session; without an argument shows the choice, `--none` clears it (§4.5). Launcher only |
 | `/cost` | spending per agent |
 | `/status` | setup and session status (with the session folder) |
 | `/model [профиль]` | list model profiles (✓ default; columns profile, model, provider, prices, key); with an argument set the default profile in the settings (new sessions and new hires), and for a profile whose tokens count as $0 (`price_source` none / partial) a warning line: «У профиля «{name}» не указаны {fields}: эти токены считаются по $0, и бюджет их не видит (если провайдер не сообщает стоимость сам). Цены — в /settings» / "Profile "{name}" has no {fields}: …" (i18n `model_no_prices`) |
@@ -657,6 +670,20 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
     repository with uncommitted changes — «Commit or stash them first», a merge in progress, a folder that
     changed since the question) is printed as an error and nothing changes. The new summary replaces the
     session's (status line, `!`, `/status`).
+- A copy of files for the next session, `/copy-from` (launcher only; SPEC §17.2 "Copying files into a new
+  session"). It is always about the next session created here, with or without a current session, like `/cd PATH`
+  without one: `TUI.choose_copy_source` sets `copy_from_override`, which `--copy-from` sets at the start.
+  - `/copy-from` alone prints «Новая сессия получит копию файлов из <path>», or «Без копии файлов: /copy-from
+    <папка или .zip> скопирует их в следующую новую сессию» when none is chosen; `/copy-from --none` clears it
+    («Следующая новая сессия будет без копии файлов»).
+  - `/copy-from PATH`: resolved as for `/cd` (`resolve_folder`: `~` and a relative path against the TUI's current
+    directory when the hub is local, else only an absolute path, «Хаб не на этом компьютере: …»). On a local hub a
+    file that is not a .zip is refused at once («… — файл, но не архив .zip»); the hub checks the rest when the
+    session is created.
+  - `new_session` sends it as `copy_from` (`client.create_session`, timeout 900 s). After a successful create the
+    choice is cleared and «Скопировано в папку сессии: файлов N (size) из <source>» is printed, plus «Не
+    скопировано: ссылок N, папок по имени N, особых файлов N» when something was left out; a refused create keeps
+    the choice for the next try, as for `/cd`.
 - A session in a folder it adopted is checked again by the hub at every start (SPEC §17.2): when the user left
   uncommitted changes there meanwhile (or a detached HEAD, a merge halfway), the start is refused with the hub's
   409 text, printed as any start error; the user commits or stashes, and the next message starts it.
@@ -716,16 +743,22 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
 - `-c/--continue` attaches to the most recently active session.
 - `-r/--resume [ID]` opens the picker, or attaches to ID.
 - Shared options: `--home`, `--lang ru|en`, `--model PROFILE`, `--agents N`, `--team "ROLE[*N],…" | NAME`,
-  `--max-agents N`, `--budget USD`, `--title T`, `--workspace DIR`, `--host`, `--port`. `--team` is the starting
-  team of the session this run creates (`starting_roles`; `start_agents` = its size unless `--agents` is given). It
-  also takes the name of a team saved in the settings, copied at launch (SPEC §18.3 has the rule, its refusals and the
-  note on stderr); `--agents` cannot go with a saved team. `-p` with `-c` or `-r ID` checks only its syntax.
+  `--max-agents N`, `--budget USD`, `--title T`, `--workspace DIR`, `--copy-from DIR|ZIP`, `--host`, `--port`.
+  `--team` is the starting team of the session this run creates (`starting_roles`; `start_agents` = its size unless
+  `--agents` is given). It also takes the name of a team saved in the settings, copied at launch (SPEC §18.3 has the
+  rule, its refusals and the note on stderr); `--agents` cannot go with a saved team. `-p` with `-c` or `-r ID` checks
+  only its syntax.
 - `--skill REF|PATH|URL` (repeatable) is a skill of the session this run creates (with `-c` / `-r`: attached to the
   session resumed first, also when it runs); `/skills add` without a session adds to the same list.
 - `--workspace DIR` is the folder of the session this run creates (the TUI's first new session, or the
   session of `-p`): `~` and relative paths are resolved against the current directory; an empty or missing
   folder becomes its workspace, a folder with files (the user's project) is adopted (SPEC §17.2). With `-c` /
   `-r`, or for a file, it is refused (exit 2): an existing session moves with `/cd`.
+- `--copy-from DIR|ZIP` is a folder or .zip copied into the folder of the session this run creates before its first
+  start (the TUI's first new session, as `/copy-from`, or the session of `-p`; SPEC §17.2 "Copying files into a new
+  session"). `~` and relative paths are resolved against the current directory; a file that is not a .zip, and
+  `-c` / `-r`, are refused (exit 2). With `--workspace` the copy goes into that folder, which must be empty or
+  missing.
 - `--clarify` / `--no-clarify` (default: the settings) is `[swarm] clarify` of the sessions this window creates
   (`overrides["clarify"]`, window-wide like `/clarify` without a session, §4.5; with `-c` / `-r` too). With `-p`,
   `--clarify` needs `--no-auto-reply` (else exit 2: with automatic replies nobody answers the questions, and the

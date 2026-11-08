@@ -49,11 +49,11 @@ def _default_logging(home: Path) -> None:
 def main_tui(home: str | Path, *, lang: str | None = None, session: str | None = None,
              continue_last: bool = False, initial_prompt: str | None = None, overrides: dict | None = None,
              host: str | None = None, port: int | None = None, verbosity: str = "normal",
-             llm_factory: Callable | None = None, workspace: str | None = None) -> int:
+             llm_factory: Callable | None = None, workspace: str | None = None, copy_from: str | None = None) -> int:
     """Run the interactive TUI for `home`. `overrides` (model, agents, max_agents, budget, title) apply to
-    sessions created from it; `workspace` (an absolute folder) and `skills` (`--skill`) to the first one, or the
-    skills to the session `session` / `continue_last` resumes. Returns the exit code (130 on Ctrl+C outside the
-    UI)."""
+    sessions created from it; `workspace` (an absolute folder), `copy_from` (a folder or .zip copied into its
+    folder, `--copy-from`) and `skills` (`--skill`) to the first one, or the skills to the session `session` /
+    `continue_last` resumes. Returns the exit code (130 on Ctrl+C outside the UI)."""
     home = Path(home).expanduser()
     _default_logging(home)
 
@@ -62,7 +62,7 @@ def main_tui(home: str | Path, *, lang: str | None = None, session: str | None =
         try:
             return await run_tui(conn, lang=lang, session=session, continue_last=continue_last,
                                  initial_prompt=initial_prompt, verbosity=verbosity, overrides=overrides,
-                                 workspace=workspace)
+                                 workspace=workspace, copy_from=copy_from)
         finally:
             await conn.close()
 
@@ -77,10 +77,10 @@ def main_tui(home: str | Path, *, lang: str | None = None, session: str | None =
 
 def main_print(home: str | Path, prompt: str, **options: Any) -> int:
     """Run `dreamteam -p prompt` for `home`. Options: host, port (the in-process launcher), plus the
-    keyword arguments of run_print_mode (session, continue_last, title, overrides, workspace, output_format,
-    verbose, timeout, auto_reply, lang, out, err). Sessions of the home are not resumed by it, and when it runs the
-    launcher itself, the session it used is stopped at the end: a one-shot run is not resumed by the next
-    `dreamteam` (`dreamteam -c` still continues it)."""
+    keyword arguments of run_print_mode (session, continue_last, title, overrides, workspace, copy_from,
+    output_format, verbose, timeout, auto_reply, lang, out, err). Sessions of the home are not resumed by it, and
+    when it runs the launcher itself, the session it used is stopped at the end: a one-shot run is not resumed by
+    the next `dreamteam` (`dreamteam -c` still continues it)."""
     home = Path(home).expanduser()
     connect_options = {key: options.pop(key) for key in CONNECT_OPTIONS if key in options}
     _default_logging(home)

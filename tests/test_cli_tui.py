@@ -458,3 +458,283 @@ def test_print_mode_with_a_workspace_folder(monkeypatch, tmp_path, capsys):
     assert f"Session folder: {project}" in captured.err
     meta = json.loads(next((home / "sessions").glob("*/session.json")).read_text(encoding="utf-8"))
     assert meta["workspace"] == {"path": str(project), "adopted": False} and project.is_dir()
+
+
+# ---- --copy-from (docs/SPEC.md §17.2 "Copying files into a new session", §18.3) ---------------------------------
+def test_copy_from_option_reaches_the_session_creation(monkeypatch, tmp_path, capsys):
+    """`--copy-from DIR|ZIP` (tui, -p, serve --goal): copied into the session that run creates, as an absolute
+    path (relative to the current directory); refused with -c / -r, for a file that is not a .zip, and for serve
+    without --goal."""
+    home = str(tmp_path / "home")
+    seen: dict[str, Any] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_interactive", lambda: True)
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: seen.update(kw) or 0)
+    assert cli.main(["--home", home, "Сделай змейку", "--copy-from", "proj"]) == 0
+    assert seen["copy_from"] == str(tmp_path / "proj") and seen["initial_prompt"] == "Сделай змейку"
+    assert seen["workspace"] is None
+    seen.clear()
+    (tmp_path / "work.zip").write_bytes(b"PK\x05\x06" + b"\0" * 18)
+    assert cli.main(["tui", "--home", home, "--copy-from", "work.zip", "--workspace", "new"]) == 0
+    assert seen["copy_from"] == str(tmp_path / "work.zip") and seen["workspace"] == str(tmp_path / "new")
+    seen.clear()
+    assert cli.main(["--home", home, "--copy-from", "~/some-project"]) == 0
+    assert seen["copy_from"] == os.path.normpath(os.path.expanduser("~/some-project"))
+    seen.clear()
+    assert cli.main(["--home", home]) == 0 and seen["copy_from"] is None
+
+    monkeypatch.setattr(tui, "main_print", lambda home, prompt, **kw: seen.update(kw) or 0)
+    monkeypatch.setattr(cli, "_piped_stdin", lambda: "")
+    assert cli.main(["-p", "Почини тесты", "--home", home, "--copy-from", "repo"]) == 0
+    assert seen["copy_from"] == str(tmp_path / "repo")
+    seen.clear()
+    assert cli.main(["-p", "Почини тесты", "--home", home]) == 0 and seen["copy_from"] is None
+
+    monkeypatch.setattr(tui, "main_tui", lambda home, **kw: pytest.fail("must be refused"))
+    monkeypatch.setattr(tui, "main_print", lambda *a, **kw: pytest.fail("must be refused"))
+    capsys.readouterr()
+    for argv in (["-c", "--home", home, "--copy-from", "proj"], ["-r", "001-a", "--home", home, "--copy-from", "p"],
+                 ["-p", "x", "-c", "--home", home, "--copy-from", "proj"]):
+        assert cli.main(argv) == 2, argv
+        assert "--copy-from copies files into a new session; it cannot be used with -c / -r." in \
+            capsys.readouterr().err, argv
+    (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
+    assert cli.main(["--home", home, "--copy-from", "notes.txt"]) == 2
+    assert f"--copy-from {tmp_path / 'notes.txt'} is a file but not a .zip archive." in capsys.readouterr().err
+
+    calls: dict[str, Any] = {}
+
+    async def serve_home(home_dir, host, port, **kw):
+        calls.update(home=home_dir, **kw)
+        return 0
+
+    monkeypatch.setattr(cli, "_serve_home", serve_home)
+    monkeypatch.setattr(cli, "setup_logging", lambda *a, **kw: None)
+    assert cli.main(["serve", "--home", home, "--copy-from", "proj", "--no-browser"]) == 2
+    assert "--copy-from needs --goal: it fills the folder of the session that --goal creates." in \
+        capsys.readouterr().err and not calls
+    assert cli.main(["serve", "--home", home, "--goal", "G", "--copy-from", "notes.txt", "--no-browser"]) == 2
+    assert not calls
+    assert cli.main(["serve", "--home", home, "--goal", "Сделай змейку", "--copy-from", "proj", "--no-browser",
+                     "--no-console"]) == 0
+    assert calls["copy_from"] == str(tmp_path / "proj") and calls["goal"] == "Сделай змейку"
+    calls.clear()
+    assert cli.main(["serve", "--home", home, "--goal", "G", "--no-browser", "--no-console"]) == 0
+    assert calls["copy_from"] is None
+
+    parser = cli.build_parser()
+    subcommands = parser._subparsers._group_actions[0].choices
+    assert "--copy-from" in subcommands["tui"].format_help() and "--copy-from" in subcommands["serve"].format_help()
+    # neither a TUI nor a serve flag (as --workspace): the terminal decides
+    assert "--copy-from" not in cli.TUI_FLAGS | cli.SERVE_FLAGS
+
+
+async def test_print_mode_passes_copy_from_to_the_hub():
+    """`-p --copy-from`: the new session's body `copy_from`; --verbose says what was copied."""
+    from dreamteam.tui import printmode
+
+    calls: list[dict] = []
+
+    class Client:
+        mode = "launcher"
+
+        async def create_session(self, title, goal, **kw):
+            calls.append(kw)
+            return {"id": "001-a", "title": "A", "language": "en",
+                    "copy_result": {"source": "/work/p", "files": 3, "bytes": 2048}}
+
+    class Conn:
+        client = Client()
+
+    err = io.StringIO()
+    run = printmode._PrintRun(Conn(), "Goal", session=None, continue_last=False, title=None, overrides=None,
+                              output_format="text", verbose=True, timeout=None, auto_reply=True, lang="en",
+                              out=io.StringIO(), err=err, copy_from="/work/p")
+    await run.prepare()
+    assert calls[0]["copy_from"] == "/work/p"
+    assert "Copied 3 files (2.0 KB) from /work/p into the session folder" in err.getvalue()
+    run = printmode._PrintRun(Conn(), "Goal", session=None, continue_last=False, title=None, overrides=None,
+                              output_format="text", verbose=False, timeout=None, auto_reply=True, lang="ru",
+                              out=io.StringIO(), err=io.StringIO())
+    await run.prepare()
+    assert calls[1]["copy_from"] is None
+    assert printmode._text("ru", "copied", files=3, size="2.0 KB", source="/p") == \
+        "Скопировано в папку сессии: файлов 3 (2.0 KB) из /p"
+
+    # without --verbose too, with what was left out; stream-json keeps stderr for nothing of this
+    class Leaving(Client):
+        async def create_session(self, title, goal, **kw):
+            calls.append(kw)
+            return {"id": "001-a", "title": "A", "language": "en",
+                    "copy_result": {"source": "/work/p", "files": 3, "bytes": 2048, "links_count": 1,
+                                    "excluded_count": 2, "special_count": 0}}
+
+    class LeavingConn:
+        client = Leaving()
+
+    for output_format, shown in (("text", True), ("stream-json", False)):
+        err = io.StringIO()
+        run = printmode._PrintRun(LeavingConn(), "Goal", session=None, continue_last=False, title=None,
+                                  overrides=None, output_format=output_format, verbose=False, timeout=None,
+                                  auto_reply=True, lang="en", out=io.StringIO(), err=err, copy_from="/work/p")
+        await run.prepare()
+        expected = ("Copied 3 files (2.0 KB) from /work/p into the session folder\n"
+                    "Left out: 1 links, 2 folders by name, 0 special files\n")
+        assert err.getvalue() == (expected if shown else ""), output_format
+
+    seen: dict[str, Any] = {}
+
+    async def fake_run_print(conn, prompt, **kw):
+        seen.update(kw)
+        return 0
+
+    original = printmode.run_print
+    printmode.run_print = fake_run_print
+    try:
+        await tui.run_print_mode(Conn(), "Goal", copy_from="/work/p")
+    finally:
+        printmode.run_print = original
+    assert seen["copy_from"] == "/work/p"
+
+
+async def test_until_stopped_races_a_coroutine_against_the_stop():
+    stop = asyncio.Event()
+
+    async def quick() -> str:
+        return "made"
+
+    assert await cli._until_stopped(quick(), stop) == (False, "made")
+
+    async def broken() -> None:
+        raise RuntimeError("refused")
+
+    with pytest.raises(RuntimeError, match="refused"):
+        await cli._until_stopped(broken(), stop)
+
+    cancelled: list[bool] = []
+
+    async def slow() -> str:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        return "late"
+
+    asyncio.get_running_loop().call_later(0.05, stop.set)
+    assert await cli._until_stopped(slow(), stop) == (True, None) and cancelled == [True]
+
+    async def stubborn() -> str:   # the cancel came too late to undo the work
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            return "kept"
+        return "late"
+
+    stop = asyncio.Event()
+    asyncio.get_running_loop().call_later(0.05, stop.set)
+    assert await cli._until_stopped(stubborn(), stop) == (True, "kept")
+
+    cancelled.clear()   # the race itself cancelled: the coroutine does not go on alone
+    outer = asyncio.create_task(cli._until_stopped(slow(), asyncio.Event()))
+    await asyncio.sleep(0.05)
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+    assert cancelled == [True]
+
+
+def _serve_home_dir(tmp_path: Path) -> Path:
+    home = tmp_path / "home"
+    home.mkdir()
+    st.write_raw(home, {
+        "swarm": {"name": "Home", "language": "en", "start_agents": 0, "max_cost_usd": 1.0},
+        "workspace": {"git": False},
+        "mcp": {"library_dir": str(tmp_path / "library")},
+        "models": {"default": {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0}},
+    })
+    return home
+
+
+async def test_serve_home_goal_creates_then_starts_and_ctrl_c_undoes_only_the_create(monkeypatch, tmp_path, capsys):
+    """`serve --goal` (with --copy-from a copy may take long): a stop signal while the session is created cancels
+    the create (nothing is kept, 130), or names the session when the create was already done; the swarm's start
+    runs after the create and is never in that race."""
+    from dreamteam import launcher as launcher_module
+    from dreamteam.sessions import SessionManager
+
+    home = _serve_home_dir(tmp_path)
+    src = tmp_path / "project"
+    src.mkdir()
+    (src / "app.py").write_text("print('hi')\n", encoding="utf-8")
+    real_create = SessionManager.create
+    created: list[dict] = []
+    started: list[str] = []
+    stop = asyncio.Event()
+
+    async def no_server(manager, host, port, *, on_started=None, on_listening=None, **kw):
+        stop.set()   # (the web server is not what this is about: the hub stops at once)
+        await asyncio.Event().wait()
+
+    async def record_start(self, sid, **kw):
+        started.append(sid)
+
+    monkeypatch.setattr(launcher_module, "serve_launcher", no_server)
+    monkeypatch.setattr(SessionManager, "start", record_start)
+
+    async def recording_create(self, *args, **kw):
+        created.append(kw)
+        return await real_create(self, *args, **kw)
+
+    monkeypatch.setattr(SessionManager, "create", recording_create)
+    code = await cli._serve_home(home, "127.0.0.1", free_port(), console=False, open_browser=False, goal="Go",
+                                 stop=stop, copy_from=str(src))
+    err = capsys.readouterr().err
+    assert code == 0, err
+    assert created[0]["start"] is False and created[0]["copy_from"] == str(src)
+    sid = started[0]
+    assert sid in SessionManager(home).ids()
+    assert f"Session {sid}: Copied 1 files (" in err and f"from {src.resolve()} into the session's folder." in err
+
+    # a stop while the create still runs: it is cancelled, nothing is kept
+    began = asyncio.Event()
+
+    async def slow_create(self, *args, **kw):
+        began.set()
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(SessionManager, "create", slow_create)
+    started.clear()
+    stop = asyncio.Event()
+    task = asyncio.create_task(cli._serve_home(home, "127.0.0.1", free_port(), console=False, open_browser=False,
+                                               goal="Go", stop=stop))
+    await asyncio.wait_for(began.wait(), 10)
+    stop.set()
+    assert await asyncio.wait_for(task, 20) == 130
+    assert "Stopped before the session was created: nothing was kept." in capsys.readouterr().err
+    assert not started and SessionManager(home).ids() == [sid]
+
+    # the create was done when the stop came (it ignored the cancel): that session is named, and not started
+    made = asyncio.Event()
+
+    async def stubborn_create(self, *args, **kw):
+        summary = await real_create(self, *args, **kw)
+        made.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            pass
+        return summary
+
+    monkeypatch.setattr(SessionManager, "create", stubborn_create)
+    stop = asyncio.Event()
+    task = asyncio.create_task(cli._serve_home(home, "127.0.0.1", free_port(), console=False, open_browser=False,
+                                               goal="Again", stop=stop))
+    await asyncio.wait_for(made.wait(), 20)
+    stop.set()
+    assert await asyncio.wait_for(task, 20) == 130
+    ids = SessionManager(home).ids()
+    new = sorted(set(ids) - {sid})
+    assert len(new) == 1 and not started
+    assert f"Stopped: session {new[0]} was created but not started (dreamteam sessions lists it)." in \
+        capsys.readouterr().err

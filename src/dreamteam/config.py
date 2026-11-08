@@ -241,6 +241,9 @@ class WorkspaceSettings:
     lock_ttl_minutes: int = 30
     # the holder of a lock others were refused is told once, after it has held the lock this long (0: at once)
     lock_wanted_minutes: float = 5.0
+    # a copy into a new session (--copy-from, the upload): unpacked MB / files; global (copyfrom.py)
+    copy_max_mb: int = 1024
+    copy_max_files: int = 100000
 
 
 @dataclass
@@ -292,7 +295,7 @@ _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSetti
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
                       "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
                       "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
-                      "install_timeout", "lock_ttl_minutes"})
+                      "install_timeout", "lock_ttl_minutes", "copy_max_mb", "copy_max_files"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 
@@ -534,7 +537,8 @@ class Config:
 
     @property
     def library_dir(self) -> Path:
-        return Path(os.path.expanduser(self.mcp.library_dir))
+        """The shared MCP library; DREAMTEAM_MCP_LIBRARY_DIR wins (tests, a library kept elsewhere)."""
+        return Path(os.environ.get("DREAMTEAM_MCP_LIBRARY_DIR") or os.path.expanduser(self.mcp.library_dir))
 
     @property
     def skills_library_dir(self) -> Path:
@@ -717,6 +721,8 @@ pass_env = []                 # переменные окружения с се�
 git = true                    # общий workspace под git с автокоммитами
 lock_ttl_minutes = 30         # на сколько минут блокируется файл, если агент не указал срок
 lock_wanted_minutes = 5       # напомнить держателю файла, который ждут, когда он держит его столько минут (0 — сразу)
+copy_max_mb = 1024            # предел копии файлов в новую сессию (--copy-from, загрузка .zip), МБ
+copy_max_files = 100000       # файлов в такой копии (папки: .git, node_modules и т. п. не считаются)
 
 [mcp]
 require_approval = false      # true — новые MCP агентов ждут одобрения пользователя

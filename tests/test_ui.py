@@ -2016,6 +2016,289 @@ def test_home_card_shows_the_session_folder_and_delete_keeps_an_outside_one():
     assert out["calls"] == ["/api/sessions/proj?confirm=proj", "/api/sessions/own?confirm=own"]
 
 
+# the new-session dialog's form fields, as submitNewSession reads them (issue #39: files to work on)
+NS_FORM = r"""
+  const nsForm = (props) => {
+    for (const [id, value] of [["ns-title", ""], ["ns-goal", "Ship it"], ["ns-desc", ""], ["ns-lang", "en"],
+                               ["ns-max", "8"], ["ns-budget", "5"], ["ns-model", "default"], ["ns-steps", "40"]]) {
+      el(id, { value });
+    }
+    for (const id of ["ns-approval", "ns-offline", "ns-clarify", "ns-run"]) el(id, { checked: false });
+    el("ns-submit", { disabled: false }); el("ns-error");
+    el("ns-copy-from", { value: (props && props.path) || "", disabled: false });
+    el("ns-copy-zip", { files: (props && props.zip) ? [props.zip] : [], disabled: false });
+    el("modal"); el("modal-backdrop");
+  };
+  const seen = [];
+  const replies = {
+    upload: { status: 201, body: { upload: "t".repeat(24), filename: "w.zip", bytes: 10, expires_in: 3600 } },
+    create: { status: 201, body: { session: { id: "001-x", url: "/s/001-x/" }, copy: { files: 3, bytes: 2048 } } },
+  };
+  globalThis.fetch = async (url, opts) => {
+    const body = opts && opts.body;
+    seen.push({ url, method: opts && opts.method, type: opts && opts.headers && opts.headers["Content-Type"], body,
+                json: typeof body === "string" ? JSON.parse(body) : null });
+    if (globalThis.offline) throw new TypeError("Failed to fetch");
+    const create = url === "/api/sessions" && opts && opts.method === "POST";
+    const r = url.startsWith("/api/uploads") ? replies.upload : create ? replies.create
+            : { status: 200, body: { sessions: [] } };
+    return { ok: r.status < 400, status: r.status, statusText: r.statusText || "",
+             json: async () => { if (r.body === undefined) throw new SyntaxError("not JSON"); return r.body; } };
+  };
+  const toasts = [], toastEls = [];
+  document.createElement = () => ({ className: "", textContent: "", remove() {},
+                                    addEventListener(type, fn) { this.clicked = fn; } });
+  el("toasts", { appendChild: (box) => { toasts.push(box.textContent); toastEls.push(box); } });
+  const submit = async () => {   // (require caches home.js: the same module as the test body's `home`)
+    await loadHomeJs().submitNewSession({ preventDefault() {} });
+    await new Promise((r) => setImmediate(r));
+  };
+  const posts = () => seen.filter((c) => c.method === "POST").map((c) => c.url);
+"""
+
+
+@needs_node
+def test_home_new_session_files_block():
+    """«Файлы для работы» under «Дополнительно» (issue #39): a folder path or a .zip, the limit in the hint, the
+    sandbox hint shown only when the hub runs in the Docker sandbox; the two settings fields."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      el("modal"); el("modal-backdrop");
+      home.H.original = { swarm: { language: "en" }, agents: {}, mcp: {}, models: {}, workspace: { copy_max_mb: 50 } };
+      await home.newSessionModal();
+      await new Promise((r) => setImmediate(r));   // the dialog's own GET /api/skills settles first
+      out.html = elements.modal.innerHTML;
+      home.H.original = { swarm: {}, agents: {}, models: {}, mcp: {} };   // savedDefaults() before the settings load
+      out.defaultMb = home.copyMaxMb();
+      const hint = el("modal #ns-copy-sandbox", { hidden: true });
+      home.H.skills = { sandbox: true };
+      home.nsCopySandbox();
+      out.sandboxShown = hint.hidden === false;
+      home.H.skills = { sandbox: false };
+      home.nsCopySandbox();
+      out.sandboxHidden = hint.hidden === true;
+      home.H.skills = { sandbox: false, container: true };   // docker compose / docker run: no host library
+      home.nsCopySandbox();
+      out.containerShown = hint.hidden === false;
+      home.H.skills = null;
+      home.nsCopySandbox();
+      out.noSkills = hint.hidden === true;
+      home.H.lang = "ru";
+      await home.newSessionModal();
+      out.ru = elements.modal.innerHTML;
+      home.H.lang = "en";
+      // a chosen .zip or a typed folder path counts as typed text: closing the dialog asks first
+      answers.confirm = false;
+      el("modal #ns-goal", { value: "" }); el("modal #ns-desc", { value: "" });
+      el("modal #ns-copy-from", { value: "  " });
+      el("modal #ns-copy-zip", { files: [{ name: "w.zip", size: 1 }] });
+      out.closeZip = home.closeModal();
+      el("modal #ns-copy-zip", { files: [] });
+      out.closeBlank = home.closeModal();
+      el("modal #ns-copy-from", { value: "/data/p" });
+      out.closePath = home.closeModal();
+      el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
+      const v = { swarm: { name: "S", language: "en" }, agents: {}, shell: {}, server: {}, tracing: {},
+                  mcp: { external: {} }, models: {},
+                  workspace: { git: true, lock_ttl_minutes: 10, copy_max_mb: 1024, copy_max_files: 100000 } };
+      home.H.view = JSON.parse(JSON.stringify(v)); home.H.original = JSON.parse(JSON.stringify(v));
+      home.renderSettings(true);
+      out.settings = elements["settings-form"].innerHTML;
+    """)
+    html = out["html"]
+    assert 'id="ns-copy-from" spellcheck="false" autocomplete="off"' in html
+    assert 'placeholder="Full path on the computer the hub runs on, e.g. /home/me/project"' in html
+    assert '<input id="ns-copy-zip" type="file" accept=".zip,application/zip">' in html
+    assert "<summary>More</summary>" in html  # (the skills picker's own "more" comes earlier)
+    assert html.index("<summary>More</summary>") < html.index('id="ns-offline"') < html.index('id="ns-copy-from"')
+    assert html.index('id="ns-copy-from"') < html.index('id="ns-copy-zip"') < html.index('id="ns-error"')
+    assert "Files to work on" in html and "Copy from a folder" in html and "or upload a .zip" in html
+    assert "the originals are never changed" in html and "__pycache__ and links are left out; up to 50 MB." in html
+    assert '<span class="field-hint" id="ns-copy-sandbox" hidden>The hub runs in the Docker sandbox' in html
+    assert out["defaultMb"] == 1024
+    assert out["sandboxShown"] is True and out["sandboxHidden"] is True and out["noSkills"] is True
+    assert out["containerShown"] is True
+    ru = out["ru"]
+    assert "Файлы для работы" in ru and "Скопировать из папки" in ru and "или загрузить .zip" in ru
+    assert "оригиналы не меняются" in ru and "например C:\\work\\project" in ru
+    assert out["closeZip"] is False and out["closeBlank"] is True and out["closePath"] is False
+    settings = out["settings"]
+    assert 'data-path="workspace.copy_max_mb"' in settings and 'data-path="workspace.copy_max_files"' in settings
+    assert "Copy into a new session, MB" in settings and "the largest copy and uploaded .zip" in settings
+    assert "Files in such a copy" in settings
+    lock, copy_mb = (settings.index(f'data-path="workspace.{key}"') for key in ("lock_ttl_minutes", "copy_max_mb"))
+    assert lock < copy_mb
+
+
+@needs_node
+def test_home_submit_uploads_then_creates():
+    """A chosen .zip goes to POST /api/uploads as the raw body first; the create then carries only its token."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.original = { swarm: { language: "en", start_agents: 3, max_agents: 8, max_cost_usd: 5 },
+                          agents: { default_model: "default", max_steps_per_turn: 40 }, mcp: {}, models: {},
+                          workspace: {} };
+      home.H.teams.ns = home.teamRows([], 3); home.H.nsSkills = new Set();
+      const file = { name: "my work&1.zip", size: 10 };
+      nsForm({ zip: file });
+      await submit();
+      out.calls = seen.map((c) => [c.method, c.url.split("?")[0]]);
+      const up = seen.find((c) => c.url.startsWith("/api/uploads"));
+      out.upload = [up.url, up.type, up.body === file];
+      out.create = seen.find((c) => c.url === "/api/sessions" && c.method === "POST").json;
+      out.toasts = toasts.slice();
+      out.closed = elements.modal.innerHTML === "" && elements["modal-backdrop"].classList.contains("hidden");
+      // started right away: the browser goes to the board, no toast
+      toasts.length = 0; seen.length = 0;
+      nsForm({ zip: file }); elements["ns-run"].checked = true;
+      globalThis.location = { href: "" };
+      await submit();
+      out.started = [globalThis.location.href, toasts.length, posts()];
+      // started, but the copy left out links or special files: shown first, a click opens the board
+      const created = replies.create;
+      for (const [name, extra] of [["links", { links: ["cfg"], links_count: 1 }], ["special", { special_count: 1 }],
+                                   ["byName", { excluded: [".git"], excluded_count: 1 }]]) {
+        toasts.length = 0; toastEls.length = 0; seen.length = 0;
+        replies.create = { status: 201, body: { session: { id: "001-x", url: "/s/001-x/" },
+                                                copy: { files: 3, bytes: 2048, ...extra } } };
+        nsForm({ zip: file }); elements["ns-run"].checked = true;
+        globalThis.location = { href: "" };
+        await submit();
+        const last = toastEls[toastEls.length - 1];
+        out[name] = { href: globalThis.location.href, toasts: toasts.slice(),
+                      clickable: !!(last && last.clicked), cls: last ? last.className : "" };
+        if (last && last.clicked) { last.clicked(); out[name].afterClick = globalThis.location.href; }
+      }
+      replies.create = created;
+      // without data.copy (an older hub): no toast
+      toasts.length = 0; seen.length = 0;
+      replies.create = { status: 201, body: { session: { id: "002-y", url: "/s/002-y/" } } };
+      nsForm({ zip: file });
+      await submit();
+      out.noCopy = toasts.length;
+      // the upload helper itself: a guard refusal in plain text, a lost connection
+      replies.upload = { status: 403, statusText: "Forbidden" };
+      try { await home.uploadZip(file); } catch (e) { out.forbidden = [e.message, e.status]; }
+      globalThis.offline = true;
+      try { await home.uploadZip(file); } catch (e) { out.lost = e.message; }
+      globalThis.offline = false;
+      out.sizes = [0, 100, 2048, 1048575, 1.5 * 2 ** 20, -5, "x"].map(home.sizeText);
+      // what was left out gets a toast of its own
+      out.left = home.copyToasts({ files: 2, bytes: 10, links: ["a", "b", "c", "d"], links_count: 5,
+                                   excluded: ["node_modules"], excluded_count: 1, special_count: 2 });
+      out.nothingLeft = home.copyToasts({ files: 1, bytes: 1, links_count: 0, excluded_count: 0 });
+      out.noCopyToasts = [home.copyToasts(null), home.copyToasts("x")];
+      home.H.lang = "ru";
+      out.leftRu = home.copyToasts({ files: 1, bytes: 1, excluded: [".venv"], excluded_count: 1 })[1];
+    """, pre=NS_FORM)
+    assert out["calls"][:2] == [["POST", "/api/uploads"], ["POST", "/api/sessions"]]
+    assert out["upload"] == ["/api/uploads?filename=my%20work%261.zip", "application/zip", True]
+    create = out["create"]
+    assert create["copy_from_upload"] == "t" * 24 and "copy_from" not in create
+    assert create["goal"] == "Ship it" and create["start"] is False
+    assert out["toasts"] == ["Copied 3 files (2 KB)"] and out["closed"] is True
+    assert out["started"] == ["/s/001-x/", 0, ["/api/uploads?filename=my%20work%261.zip", "/api/sessions"]]
+    links = out["links"]
+    assert links["href"] == "" and links["clickable"] is True and "clickable" in links["cls"]
+    assert links["toasts"] == ["Copied 3 files (2 KB)",
+                               "Left out: 1 link(s) (cfg)\nThe session is running. Click to open its board."]
+    assert links["afterClick"] == "/s/001-x/"
+    assert out["special"]["href"] == "" and out["special"]["afterClick"] == "/s/001-x/"
+    assert out["special"]["toasts"][1].startswith("Left out: 1 special file(s)\n")
+    assert out["byName"]["href"] == "/s/001-x/" and out["byName"]["toasts"] == []   # .git and the like: expected
+    assert out["noCopy"] == 0
+    assert out["forbidden"] == ["403 Forbidden", 403] and out["lost"] == "No connection to the server"
+    assert out["sizes"] == ["0 KB", "1 KB", "2 KB", "1024 KB", "1.5 MB", "0 KB", "0 KB"]
+    assert out["left"] == ["Copied 2 files (1 KB)", "Left out: 5 link(s) (a, b, c, …); 1 folder(s) by name "
+                                                    "(node_modules); 2 special file(s)"]
+    assert out["nothingLeft"] == ["Copied 1 files (1 KB)"] and out["noCopyToasts"] == [[], []]
+    assert out["leftRu"] == "Не скопированы: папки по имени (1: .venv)"
+
+
+@needs_node
+def test_home_submit_copy_errors():
+    """The dialog's checks before any request, an upload refused by the hub (no create), a folder path sent as is."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      home.H.original = { swarm: { language: "en", start_agents: 3, max_agents: 8, max_cost_usd: 5 },
+                          agents: { default_model: "default", max_steps_per_turn: 40 }, mcp: {}, models: {},
+                          workspace: { copy_max_mb: 1 } };
+      home.H.teams.ns = home.teamRows([], 3); home.H.nsSkills = new Set();
+      const err = () => elements["ns-error"].textContent;
+      nsForm({ path: "/data/p", zip: { name: "w.zip", size: 10 } });
+      await submit();
+      out.both = [err(), seen.length, elements["ns-submit"].disabled];
+      nsForm({ zip: { name: "a.txt", size: 10 } });
+      await submit();
+      out.notZip = [err(), seen.length];
+      nsForm({ zip: { name: "W.ZIP", size: 2 * 2 ** 20 } });
+      await submit();
+      out.big = [err(), seen.length];
+      // the hub refuses the upload: its message, the form usable again, no create
+      replies.upload = { status: 413, body: { error: "X" } };
+      nsForm({ zip: { name: "w.zip", size: 10 } });
+      await submit();
+      out.refused = [err(), elements["ns-submit"].disabled, elements["ns-copy-from"].disabled,
+                     elements["ns-copy-zip"].disabled, posts()];
+      // a folder path: sent trimmed as copy_from, no upload
+      seen.length = 0;
+      nsForm({ path: "  /data/my project  " });
+      await submit();
+      out.path = [posts(), seen.find((c) => c.url === "/api/sessions" && c.method === "POST").json];
+      // a create the hub refuses (e.g. 409 "already has files"): the message, the fields enabled again
+      seen.length = 0;
+      replies.create = { status: 409, body: { error: "D:\\w already has files" } };
+      nsForm({ path: "/data/p" });
+      await submit();
+      out.conflict = [err(), elements["ns-submit"].disabled, elements["ns-copy-from"].disabled, posts()];
+    """, pre=NS_FORM)
+    assert out["both"] == ["Give a folder or a .zip, not both.", 0, False]
+    assert out["notZip"] == ["Choose a .zip file.", 0]
+    assert out["big"] == ["The archive is larger than 1 MB ([workspace] copy_max_mb).", 0]
+    assert out["refused"] == ["X", False, False, False, ["/api/uploads?filename=w.zip"]]
+    posted, body = out["path"]
+    assert posted == ["/api/sessions"] and body["copy_from"] == "/data/my project" and "copy_from_upload" not in body
+    assert out["conflict"] == ["D:\\w already has files", False, False, ["/api/sessions"]]
+
+
+@needs_node
+def test_home_card_shows_copied_from():
+    out = run_js(r"""
+      const E = process.env.EVIL;
+      const home = loadHomeJs();
+      home.H.lang = "en";
+      const card = (copied_from) => home.sessionCard({ id: "s", title: "T", status: "stopped", copied_from,
+                                                      tasks: { total: 0, done: 0 }, agents: { total: 0, working: 0 } });
+      out.copied = card({ source: "C:\\w\\p", files: 3, bytes: 2048, at: 1 });
+      out.upload = card({ source: "upload: work.zip", files: 1, bytes: 3 * 2 ** 20, at: 1 });
+      out.long = card({ source: "/home/someone/projects/a-very-long-folder-name/and-a-deeper-one/project", files: 1,
+                        bytes: 1, at: 1 });
+      out.evil = card({ source: E, files: E, bytes: E, at: E });
+      out.none = [card(undefined), card(null), card("C:\\w"), card({ files: 3 })];
+      const listed = [{ id: "a", title: "A", copied_from: { source: "/data/Snake" } }, { id: "b", title: "B" }];
+      out.search = home.filterSessions(listed, "all", "snake").map((s) => s.id);
+      home.H.lang = "ru";
+      out.ru = card({ source: "C:\\w\\p", files: 3, bytes: 2048, at: 1 });
+    """, env={"EVIL": EVIL})
+    copied = out["copied"]
+    assert '<div class="sc-folder sc-copied"' in copied and "<span>Copy of:</span>" in copied
+    assert '<code><bdi dir="ltr">C:\\w\\p</bdi></code>' in copied
+    assert 'title="C:\\w\\p\nFiles copied when the session was created (' in copied
+    assert "3 files, 2 KB. The originals were not changed." in copied
+    assert copied.index("sc-copied") < copied.index("sc-actions")
+    assert "upload: work.zip" in out["upload"] and "1 files, 3.0 MB" in out["upload"]
+    assert '<bdi dir="ltr">…/a-very-long-folder-name/and-a-deeper-one/project</bdi>' in out["long"]
+    assert 'title="/home/someone/projects/a-very-long-folder-name/and-a-deeper-one/project\n' in out["long"]
+    assert_escaped(out["evil"], at_least=2)  # the shown path and the tooltip
+    assert "0 files, 0 KB" in out["evil"]   # non-numeric counters are not injected
+    assert all("sc-copied" not in html for html in out["none"])
+    assert out["search"] == ["a"]
+    assert "Копия:" in out["ru"] and "Оригиналы не менялись" in out["ru"] and "2 КБ" in out["ru"]
+
+
 @needs_node
 def test_board_shows_the_session_folder_and_a_missing_one():
     out = run_js(r"""
@@ -3319,8 +3602,9 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             sid = session["id"]
             card_fields = {"id", "title", "status", "paused", "legacy", "dir", "created_at", "last_activity", "model",
                            "model_profile", "max_cost_usd", "spent_usd", "config_error", "goal", "tasks", "agents", "url",
-                           "workspace", "pause_reason", "question", "clarify"}
+                           "workspace", "pause_reason", "question", "clarify", "copied_from"}
             assert card_fields <= set(session) and session["url"] == f"/s/{sid}/"
+            assert session["copied_from"] is None   # the card's "copy of" line: only a session made with copy_from
             assert session["question"] is None and session["clarify"] is False   # the card's question badge
             folder_fields = {"path", "default", "adopted", "exists"}  # the folder line of the card / the Files tab
             assert set(session["workspace"]) == folder_fields and session["workspace"]["default"] is True

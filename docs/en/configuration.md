@@ -57,6 +57,8 @@ job_max_minutes = 480    # lifetime of a job started in the background on purpos
 git = true               # the shared workspace under git with automatic commits
 lock_ttl_minutes = 30    # how long a file stays locked when the agent gives no time (at least 1)
 lock_wanted_minutes = 5  # tell the holder of a lock others wait for once it has held it this many minutes (0 means at the first refusal)
+copy_max_mb = 1024       # the largest copy of files into a new session (--copy-from, an uploaded .zip), MB
+copy_max_files = 100000  # files in such a copy (of a folder: .git, node_modules and the like do not count)
 
 [models.default]         # Claude
 provider = "anthropic"
@@ -78,6 +80,7 @@ output_price = 0
 
 [mcp]
 require_approval = false
+library_dir = "~/.dreamteam/library"  # the shared MCP library (DREAMTEAM_MCP_LIBRARY_DIR wins)
 [mcp.external.fetch]     # external MCP servers for the swarm
 command = ["uvx", "mcp-server-fetch"]
 description = "Fetching web pages"
@@ -110,6 +113,13 @@ An agent keeps the model profile it was hired with. When that profile is renamed
 stays on it under the new name, in running and in stopped sessions. An agent whose profile was deleted (or renamed
 by hand in `dreamteam.toml`) uses the default profile.
 
+`copy_max_mb` and `copy_max_files` limit a [copy of files into a new session](projects.md#working-on-a-copy-of-files):
+the size and number of the files copied from a folder or unpacked from a .zip; `copy_max_mb` also caps the size of a
+.zip uploaded from the browser. In a folder, `.git`, `node_modules` and the like do not count; in a .zip, the
+archive's own size counts against `copy_max_mb`, and every entry (left-out ones and folders included) against a
+limit of twice `copy_max_files`. Both are at least 1. They are global settings: the copy is made before the session
+exists, so a value in a session's own settings has no effect.
+
 ## Roles and the starting team
 
 DreamTeam has a role catalog: generalist, developer, tester, reviewer, analyst, architect, technical writer and
@@ -136,3 +146,17 @@ hire button on the board. **The starting team** is the roles of the agents a ses
   `--home`, else a `dreamteam.toml` in the current folder, else `$DREAMTEAM_HOME`, else `~/DreamTeam`.
 
 Agents beyond the list become generalists.
+
+## Shared folders and this computer's settings
+
+Some folders are shared by all sessions and live outside the home, in `~/.dreamteam`: the skills library
+(`[skills] library_dir`, by default `~/.dreamteam/skills`), the skills' dependency environments (`[skills]
+envs_dir`, `~/.dreamteam/skill-envs`) and the MCP library (`[mcp] library_dir`, `~/.dreamteam/library`). The
+environment variables `DREAMTEAM_SKILLS_DIR`, `DREAMTEAM_SKILL_ENVS_DIR` and `DREAMTEAM_MCP_LIBRARY_DIR` win over
+these settings: the Docker sandbox sets its skills folders this way, and the tests set all three. The agents'
+console never gets these variables.
+
+An [import](transfer.md) (`dreamteam import`) never changes the settings that belong to the computer itself, in
+the global settings or in a session's settings: `server.host`, `server.port`, `shell.program`, `skills.library_dir`,
+`skills.envs_dir`, `skills.python` and `mcp.library_dir` keep the value they have here, and API keys and the `env`
+values of external MCP servers never go into an export at all.

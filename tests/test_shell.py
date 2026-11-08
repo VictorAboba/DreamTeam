@@ -51,6 +51,9 @@ def test_scrubbed_env(fake_swarm, monkeypatch):
     monkeypatch.setenv("DREAMTEAM_SKILL_ENVS_DIR", "/envs")
     fake_swarm.config.shell.pass_env = ["DREAMTEAM_SKILL_ENVS_DIR"]
     assert "DREAMTEAM_SKILL_ENVS_DIR" not in scrubbed_env(fake_swarm.config)
+    monkeypatch.setenv("DREAMTEAM_MCP_LIBRARY_DIR", "/mcp-library")   # nor the MCP library's folder
+    fake_swarm.config.shell.pass_env = ["DREAMTEAM_MCP_LIBRARY_DIR"]
+    assert "DREAMTEAM_MCP_LIBRARY_DIR" not in scrubbed_env(fake_swarm.config)
 
 
 def test_scrubbed_env_drops_more_secret_names_and_url_credentials(fake_swarm, monkeypatch):

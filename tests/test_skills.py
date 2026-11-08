@@ -4,10 +4,12 @@ repositories cloned through file:// URLs."""
 from __future__ import annotations
 
 import base64
+import dataclasses
 import io
 import json
 import os
 import shutil
+import struct
 import sys
 import zipfile
 from pathlib import Path
@@ -15,9 +17,9 @@ from pathlib import Path
 import pytest
 
 from conftest import make_skill
-from dreamteam import skills
+from dreamteam import copyfrom, skills
 from dreamteam.config import Config, render_template
-from dreamteam.skills import Library, Limits, SkillError
+from dreamteam.skills import Library, Limits, SkillError, ZipRules
 from dreamteam.workspace import init_repo, run_git
 
 needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
@@ -576,12 +578,16 @@ def test_library_from_config_uses_the_env_override(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------------------------- zip
-def zip_bytes(members: dict[str, bytes | str], *, mode: dict[str, int] | None = None) -> bytes:
+def zip_bytes(members: dict[str, bytes | str], *, mode: dict[str, int] | None = None,
+              system: int | None = None) -> bytes:
+    """A zip of `members`; `system`: the members' create_system (0 MS-DOS / Windows, 3 Unix; default: this OS's)."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in members.items():
             info = zipfile.ZipInfo(name)
             info.compress_type = zipfile.ZIP_DEFLATED
+            if system is not None:
+                info.create_system = system
             if mode and name in mode:
                 info.external_attr = mode[name] << 16
             zf.writestr(info, data)
@@ -648,6 +654,361 @@ def test_extract_zip_skips_and_exec_bit(tmp_path):
     assert sorted(p.name for p in (tmp_path / "out" / "s").iterdir()) == ["SKILL.md", "run.sh"]
     if os.name != "nt":
         assert os.stat(tmp_path / "out" / "s" / "run.sh").st_mode & 0o111
+
+
+def test_extract_zip_keeps_the_order_of_its_checks(tmp_path):
+    """The skills' zip keeps its order: the declared sizes of every member (__MACOSX too) before the names."""
+    big = b"\0" * (2 * 2 ** 20)
+    with pytest.raises(SkillError, match=r"max_archive_mb") as info:
+        skills.extract_zip(zip_bytes({"x/a|b.txt": "x", "big.bin": big}), tmp_path / "o1", Limits(max_archive_mb=1))
+    assert info.value.status == 413
+    with pytest.raises(SkillError, match=r"max_archive_mb") as info:
+        skills.extract_zip(zip_bytes({"s/SKILL.md": SKILL_TEXT.format(name="s"), "__MACOSX/s/._big": big}),
+                           tmp_path / "o2", Limits(max_archive_mb=1))
+    assert info.value.status == 413
+    with pytest.raises(SkillError, match="file names in a skill cannot contain"):
+        skills.extract_zip(zip_bytes({"x/a|b.txt": "x"}), tmp_path / "o3", LIMITS)
+
+
+WS_LIMITS = copyfrom.CopyLimits(max_mb=64, max_files=1000)
+
+
+def ws_rules(**changes) -> ZipRules:
+    """The rules of a zip copied into a new session, the same on every OS unless changed."""
+    return dataclasses.replace(copyfrom.zip_rules(WS_LIMITS), **{"portable": False, "fold_collisions": False,
+                                                                  **changes})
+
+
+def _tree(root: Path) -> dict[str, str]:
+    out = {}
+    for path in sorted(root.rglob("*")):
+        out[path.relative_to(root).as_posix()] = "dir" if path.is_dir() else path.read_text(encoding="utf-8")
+    return out
+
+
+def test_unpack_zip_workspace_rules(tmp_path):
+    data = zip_bytes({"mywork/": "", "mywork/a.txt": "A", "mywork/sub/": "", "mywork/.git/HEAD": "ref",
+                      "mywork/node_modules/x.js": "x", "mywork/Node_Modules/y.js": "y",
+                      "__MACOSX/mywork/._a.txt": "junk", "mywork/link": "a.txt"},
+                     mode={"mywork/link": 0o120777})
+    dest = tmp_path / "box" / "dest"
+    result = skills.unpack_zip(data, dest, ws_rules())
+    assert _tree(dest) == {"a.txt": "A", "sub": "dir"}
+    assert result.top == "mywork" and (result.files, result.bytes) == (1, 1)
+    assert result.excluded == ["mywork/.git", "mywork/node_modules", "mywork/Node_Modules"]
+    assert result.links == ["mywork/link"]
+    assert [s["path"] for s in result.skipped] == ["__MACOSX/mywork/._a.txt"]
+    assert sorted(p.name for p in (tmp_path / "box").iterdir()) == ["dest"]   # nothing outside dest
+
+
+def test_unpack_zip_unwraps_a_shutil_archive(tmp_path):
+    work = tmp_path / "src" / "mywork"
+    (work / "docs").mkdir(parents=True)
+    (work / "a.txt").write_text("A", encoding="utf-8")
+    (work / "docs" / "b.md").write_text("B", encoding="utf-8")
+    (work / "empty").mkdir()
+    archive = shutil.make_archive(str(tmp_path / "w"), "zip", root_dir=tmp_path / "src", base_dir="mywork")
+    with zipfile.ZipFile(archive) as zf:
+        assert "mywork/" in zf.namelist()
+    result = skills.unpack_zip(archive, tmp_path / "out", ws_rules())
+    assert _tree(tmp_path / "out") == {"a.txt": "A", "docs": "dir", "docs/b.md": "B", "empty": "dir"}
+    assert result.top == "mywork" and result.files == 2
+
+
+def test_unpack_zip_no_unwrap_with_two_tops(tmp_path):
+    result = skills.unpack_zip(zip_bytes({"a/x": "1", "b/y": "2"}), tmp_path / "o1", ws_rules())
+    assert _tree(tmp_path / "o1") == {"a": "dir", "a/x": "1", "b": "dir", "b/y": "2"} and result.top is None
+    result = skills.unpack_zip(zip_bytes({"only.txt": "1"}), tmp_path / "o2", ws_rules())
+    assert _tree(tmp_path / "o2") == {"only.txt": "1"} and result.top is None
+    result = skills.unpack_zip(zip_bytes({"mywork/": ""}), tmp_path / "o3", ws_rules())
+    assert _tree(tmp_path / "o3") == {"mywork": "dir"} and result.top is None
+    result = skills.unpack_zip(zip_bytes({"mywork/": "", "other.txt": "o"}), tmp_path / "o4", ws_rules())
+    assert _tree(tmp_path / "o4") == {"mywork": "dir", "other.txt": "o"} and result.top is None
+    result = skills.unpack_zip(zip_bytes({"mywork/": "", "mywork/a": "1", "other/": ""}), tmp_path / "o5",
+                               ws_rules())
+    assert _tree(tmp_path / "o5") == {"mywork": "dir", "mywork/a": "1", "other": "dir"} and result.top is None
+
+
+def test_unpack_zip_from_path_and_limits(tmp_path):
+    path = tmp_path / "w.zip"
+    path.write_bytes(zip_bytes({"a.txt": "A", "b.txt": "B"}))
+    result = skills.unpack_zip(path, tmp_path / "o1", ws_rules())
+    assert (result.files, result.bytes) == (2, 2)
+    rules = copyfrom.zip_rules(copyfrom.CopyLimits(max_mb=1, max_files=1))
+    with pytest.raises(SkillError, match=r"more than 1 files \(\[workspace\] copy_max_files\)") as info:
+        skills.unpack_zip(path, tmp_path / "o2", rules)
+    assert info.value.status == 413
+    # left-out members count neither against max_bytes nor against max_files
+    blob = zip_bytes({"a.txt": "A", "node_modules/blob": os.urandom(2 * 2 ** 20), ".git/x": "1"})
+    result = skills.unpack_zip(blob, tmp_path / "o3", rules)
+    assert _tree(tmp_path / "o3") == {"a.txt": "A"} and result.excluded == ["node_modules", ".git"]
+    with pytest.raises(SkillError, match=r"copy_max_mb") as info:
+        skills.unpack_zip(zip_bytes({"big.bin": os.urandom(2 * 2 ** 20)}), tmp_path / "o4", rules)
+    assert info.value.status == 413
+    with pytest.raises(SkillError, match="not a zip"):
+        skills.unpack_zip(tmp_path / "missing.zip", tmp_path / "o5", rules)
+
+
+def test_unpack_zip_ratio_off_for_the_workspace(tmp_path):
+    data = zip_bytes({"zeros.bin": b"\0" * (3 * 2 ** 20)})
+    assert skills.unpack_zip(data, tmp_path / "o1", ws_rules()).bytes == 3 * 2 ** 20
+    with pytest.raises(SkillError, match="zip bomb"):
+        skills.unpack_zip(data, tmp_path / "o2", ZipRules.for_skills(LIMITS))
+
+
+def _zip64_end(data: bytes, entries: int) -> bytes:
+    """`data` with a ZIP64 end record (and its locator) stating `entries`, the plain record holding the markers."""
+    pos = data.rfind(b"PK\x05\x06")
+    size, offset = struct.unpack_from("<II", data, pos + 12)
+    record = struct.pack("<4sQHHIIQQQQ", b"PK\x06\x06", 44, 45, 45, 0, 0, entries, entries, size, offset)
+    locator = struct.pack("<4sIQI", b"PK\x06\x07", 0, pos, 1)
+    end = struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 0xFFFF, 0xFFFF, size, offset, 0)
+    return data[:pos] + record + locator + end
+
+
+def test_unpack_zip_directory_precheck(tmp_path, monkeypatch):
+    normal = zip_bytes({"a.txt": "A", "b.txt": "B", "c.txt": "C"})
+    assert skills._zip_directory(io.BytesIO(normal))[0] == 3
+    lying = bytearray(normal)
+    pos = lying.rfind(b"PK\x05\x06")
+    lying[pos + 8:pos + 12] = struct.pack("<HH", 60000, 60000)   # entries on this disk, entries in total
+    huge_dir = bytearray(normal)
+    huge_dir[pos + 12:pos + 16] = struct.pack("<I", 5000 * 512 + 1)
+    zip64_ok = _zip64_end(normal, 3)
+    zip64_many = _zip64_end(normal, 70000)
+    assert skills._zip_directory(io.BytesIO(zip64_ok)) == (3, struct.unpack_from("<I", normal, pos + 12)[0])
+    # the ZIP64 zip zipfile reads too
+    assert skills.unpack_zip(zip64_ok, tmp_path / "ok", ZipRules.for_skills(LIMITS)).files == 3
+
+    def no_parsing(*args, **kwargs):
+        raise AssertionError("zipfile parsed the directory")
+
+    monkeypatch.setattr(skills.zipfile, "ZipFile", no_parsing)
+    for data in (lying, zip64_many):
+        with pytest.raises(SkillError, match="more than 5000 entries") as info:
+            skills.unpack_zip(bytes(data), tmp_path / "o", ZipRules.for_skills(LIMITS))
+        assert info.value.status == 413
+    # a large directory with few entries (long comments, extra fields) says so, not "more than 5000 entries"
+    with pytest.raises(SkillError, match=r"directory \(its list of entries\) is larger than 2\.4 MB") as info:
+        skills.unpack_zip(bytes(huge_dir), tmp_path / "o", ZipRules.for_skills(LIMITS))
+    assert info.value.status == 413 and "entries." not in str(info.value)
+    with pytest.raises(SkillError, match=r"copy_max_files; folders") as info:
+        skills.unpack_zip(bytes(lying), tmp_path / "o", copyfrom.zip_rules(copyfrom.CopyLimits(1, 10)))
+    with pytest.raises(AssertionError):   # a normal zip passes the pre-check
+        skills.unpack_zip(normal, tmp_path / "o", ZipRules.for_skills(LIMITS))
+
+
+def test_unpack_zip_precheck_trusts_no_understating_plain_record(tmp_path, monkeypatch):
+    """zipfile takes a ZIP64 record's counts whenever its locator precedes the plain end record, whatever that one
+    says: a plain record that understates both (no markers) must not hide a huge ZIP64 directory."""
+    normal = zip_bytes({"a.txt": "A", "b.txt": "B", "c.txt": "C"})
+    data = bytearray(_zip64_end(normal, 70000))
+    pos = data.rfind(b"PK\x05\x06")
+    struct.pack_into("<HHI", data, pos + 8, 3, 3, 300)   # the lie: 3 entries, 300 bytes of directory
+    assert skills._zip_directory(io.BytesIO(bytes(data)))[0] == 70000
+    # zipfile reads the record the locator names, or the one just before the locator (by version): both count
+    pos = normal.rfind(b"PK\x05\x06")
+    size, offset = struct.unpack_from("<II", normal, pos + 12)
+
+    def record(n: int) -> bytes:
+        return struct.pack("<4sQHHIIQQQQ", b"PK\x06\x06", 44, 45, 45, 0, 0, n, n, size, offset)
+
+    for named, before in ((70000, 3), (3, 70000)):
+        two = (normal[:pos] + record(named) + record(before) + struct.pack("<4sIQI", b"PK\x06\x07", 0, pos, 1)
+               + struct.pack("<4sHHHHIIH", b"PK\x05\x06", 0, 0, 3, 3, size, offset, 0))
+        assert skills._zip_directory(io.BytesIO(two))[0] == 70000, (named, before)
+
+    def no_parsing(*args, **kwargs):
+        raise AssertionError("zipfile parsed the directory")
+
+    many = zip_bytes({f"f{i}.txt": "x" for i in range(50)})
+    pos = many.rfind(b"PK\x05\x06")
+    # zipfile finds an end record followed by up to 64 KiB, whatever its comment length says
+    padded = many + b"\0" * (1 << 16)
+    # markers with no ZIP64 record: zipfile never uses the count and reads the plain directory size
+    markers = bytearray(many)
+    struct.pack_into("<HH", markers, pos + 8, 0xFFFF, 0xFFFF)
+    assert skills._zip_directory(io.BytesIO(padded)) == skills._zip_directory(io.BytesIO(many))
+    assert skills._zip_directory(io.BytesIO(bytes(markers)))[0] == 0xFFFF
+    few = ZipRules(max_bytes=2 ** 20, too_big="big", max_entries=10, too_many_entries="Too many entries.")
+
+    monkeypatch.setattr(skills.zipfile, "ZipFile", no_parsing)
+    with pytest.raises(SkillError, match="more than 5000 entries") as info:
+        skills.unpack_zip(bytes(data), tmp_path / "o", ZipRules.for_skills(LIMITS))
+    assert info.value.status == 413
+    for crafted in (padded, bytes(markers)):
+        with pytest.raises(SkillError, match="Too many entries") as info:
+            skills.unpack_zip(crafted, tmp_path / "o", few)
+        assert info.value.status == 413
+
+
+def test_unpack_zip_keeps_the_root_when_left_out_members_sit_beside_one_folder(tmp_path):
+    """A zip of a project's root that holds node_modules/ (or .git/, a link) and one folder is not a wrapper: the
+    folder stays, as a folder copy of the same tree keeps it."""
+    cases = {
+        "nm": ({"node_modules/x.js": "x", "app/a.txt": "A"}, {}, {"app": "dir", "app/a.txt": "A"}),
+        "git": ({".git/HEAD": "ref", "site/index.html": "I"}, {}, {"site": "dir", "site/index.html": "I"}),
+        "link": ({"l": "app", "app/a.txt": "A"}, {"l": 0o120777}, {"app": "dir", "app/a.txt": "A"}),
+    }
+    for name, (members, mode, tree) in cases.items():
+        result = skills.unpack_zip(zip_bytes(members, mode=mode), tmp_path / name, ws_rules())
+        assert result.top is None and _tree(tmp_path / name) == tree, name
+    # left out inside the one folder: still unwrapped
+    result = skills.unpack_zip(zip_bytes({"mywork/.git/HEAD": "ref", "mywork/a.txt": "A"}), tmp_path / "inner",
+                               ws_rules())
+    assert result.top == "mywork" and _tree(tmp_path / "inner") == {"a.txt": "A"}
+
+
+def _raw_name_zip(raw: bytes, data: str = "D", extra: dict | None = None, *, system: int | None = None) -> bytes:
+    """A zip with a member whose name is the bytes `raw`, stored without the UTF-8 flag (old Windows tools, macOS
+    Finder), next to `extra` members; `system` as for zip_bytes."""
+    return _raw_names_zip({raw: data}, extra, system=system)
+
+
+def _raw_names_zip(raws: dict[bytes, str], extra: dict | None = None, *, system: int | None = None) -> bytes:
+    """A zip whose members are named by the bytes of `raws` ({name bytes: data}), stored without the UTF-8 flag."""
+    holders = {}
+    for i, raw in enumerate(raws):   # 'Q' (then 'R', ...) for each non-ASCII byte and '\\': one per name
+        holders[raw] = bytes(b if b < 0x80 and b != 0x5C else 0x51 + i for b in raw)
+    data_zip = zip_bytes({holders[raw].decode("ascii"): data for raw, data in raws.items()} | (extra or {}),
+                         system=system)
+    for raw, placeholder in holders.items():
+        assert data_zip.count(placeholder) == 2   # the local header and the central directory
+        data_zip = data_zip.replace(placeholder, raw)
+    return data_zip
+
+
+def test_unpack_zip_reads_names_without_the_utf8_flag_again(tmp_path, monkeypatch):
+    import unicodedata
+
+    name = "Проект/Документ.txt"
+    names = lambda root: sorted(unicodedata.normalize("NFC", p.relative_to(root).as_posix())  # noqa: E731
+                                for p in root.rglob("*"))
+    extra = {"readme.txt": "R"}   # (two tops: nothing unwrapped)
+    # UTF-8 bytes without the flag (macOS Finder, many Linux tools): on every OS
+    skills.unpack_zip(_raw_name_zip(name.encode("utf-8"), extra=extra, system=3), tmp_path / "utf8", ws_rules())
+    assert names(tmp_path / "utf8") == ["readme.txt", "Проект", name]
+    # the OEM code page of a Russian Windows (its old "Compressed folder")
+    monkeypatch.setattr(skills, "_oem_codepage", lambda: "cp866")
+    skills.unpack_zip(_raw_name_zip(name.encode("cp866"), extra=extra, system=0), tmp_path / "oem", ws_rules())
+    assert names(tmp_path / "oem") == ["readme.txt", "Проект", name]
+    # made on Unix (create_system 3): UTF-8 first, on a Windows hub too
+    skills.unpack_zip(_raw_name_zip(name.encode("utf-8"), extra=extra, system=3), tmp_path / "utf8w", ws_rules())
+    assert names(tmp_path / "utf8w") == ["readme.txt", "Проект", name]
+    # a name with the flag stays as it is; the skills' rules keep zipfile's reading
+    skills.unpack_zip(zip_bytes({name: "D", **extra}), tmp_path / "flag", ws_rules())
+    assert names(tmp_path / "flag") == ["readme.txt", "Проект", name]
+    result = skills.unpack_zip(_raw_name_zip(b"caf\x82.txt"), tmp_path / "skill", ws_rules(redecode_names=False))
+    assert result.files == 1 and names(tmp_path / "skill") == [b"caf\x82.txt".decode("cp437")]
+    # decided once for the archive: 'раб' in cp866 is valid UTF-8 (U+0821), 'Проект' is not
+    pair = zip_bytes({"XXX.txt": "A", "YYYYYY.txt": "B"}, system=3)
+    for holder, real in (("XXX.txt", "раб.txt"), ("YYYYYY.txt", "Проект.txt")):
+        raw = real.encode("cp866")
+        assert len(raw) == len(holder) and pair.count(holder.encode()) == 2
+        pair = pair.replace(holder.encode(), raw)
+    "раб.txt".encode("cp866").decode("utf-8")   # (the trap: no error)
+    skills.unpack_zip(pair, tmp_path / "pair", ws_rules())
+    assert names(tmp_path / "pair") == ["Проект.txt", "раб.txt"]
+    # a hub not on Windows does not know the OEM code page: zipfile's cp437 reading stays
+    monkeypatch.setattr(skills, "_oem_codepage", lambda: None)
+    raw = name.encode("cp866")
+    skills.unpack_zip(_raw_name_zip(raw, extra=extra), tmp_path / "off", ws_rules())
+    assert names(tmp_path / "off") == sorted(["readme.txt", raw.decode("cp437").split("/")[0], raw.decode("cp437")])
+
+
+def test_unpack_zip_names_from_windows_tools_use_the_oem_code_page_first(tmp_path, monkeypatch):
+    """Every cp866 name here is also valid UTF-8 ('тип' is U+2A2F, 'фон' U+4BAD): members made on MS-DOS / Windows
+    (create_system 0) are read in the OEM code page of a Windows hub first."""
+    import unicodedata
+
+    names = lambda root: sorted(unicodedata.normalize("NFC", p.relative_to(root).as_posix())  # noqa: E731
+                                for p in root.rglob("*"))
+    raws = {"тип/a.txt".encode("cp866"): "A", "тип/фон.txt".encode("cp866"): "B"}
+    for raw in raws:
+        raw.decode("utf-8")   # (the trap: no error)
+    monkeypatch.setattr(skills, "_oem_codepage", lambda: "cp866")
+    result = skills.unpack_zip(_raw_names_zip(raws, {"readme.txt": "R"}, system=0), tmp_path / "dos", ws_rules())
+    assert result.files == 3 and names(tmp_path / "dos") == ["readme.txt", "тип", "тип/a.txt", "тип/фон.txt"]
+    result = skills.unpack_zip(_raw_names_zip(raws, system=0), tmp_path / "top", ws_rules())
+    assert result.top == "тип" and names(tmp_path / "top") == ["a.txt", "фон.txt"]
+
+
+def test_unpack_zip_a_name_read_again_tells_a_folder_by_itself(tmp_path, monkeypatch):
+    """cp932 'ソ' is 83 5C: zipfile's cp437 reading ends in '\\', which zipfile on Windows makes '/', a folder. The
+    name read again in the OEM code page is a file."""
+    monkeypatch.setattr(skills, "_oem_codepage", lambda: "cp932")
+    raws = {"メモ/ソ".encode("cp932"): "so", "メモ/表.txt".encode("cp932"): "table", "メモ/sub/".encode("cp932"): ""}
+    assert all(raw.endswith((b"\x5c", b".txt", b"/")) for raw in raws)
+    result = skills.unpack_zip(_raw_names_zip(raws, {"readme.txt": "R"}, system=0), tmp_path / "o", ws_rules())
+    assert result.files == 3
+    assert (tmp_path / "o" / "メモ" / "ソ").read_text(encoding="utf-8") == "so"
+    assert (tmp_path / "o" / "メモ" / "表.txt").read_text(encoding="utf-8") == "table"
+    assert (tmp_path / "o" / "メモ" / "sub").is_dir()
+
+
+def test_unpack_zip_names_the_file_system_folds_are_refused(tmp_path):
+    """A Linux hub writing onto a case-insensitive file system (a Docker Desktop bind mount) does not fold names
+    itself: the file system's refusal is a 400 that says why, and two folders are never merged."""
+    if not _case_insensitive(tmp_path):
+        pytest.skip("this file system tells letter case apart")
+    cases = ({"p/README": "upper", "p/readme": "lower"}, {"p/Docs/a.md": "a", "p/docs/b.md": "b"},
+             {"p/Docs/": "", "p/docs/": "", "p/x": "x"})
+    for i, members in enumerate(cases):
+        with pytest.raises(SkillError, match="cannot tell apart") as info:
+            skills.unpack_zip(zip_bytes(members), tmp_path / f"o{i}", ws_rules())
+        assert info.value.status == 400 and "letter case" in str(info.value)
+
+
+def test_unpack_zip_refusals_show_names_without_control_characters(tmp_path):
+    for member in ("x\x1b]52;c;SGVsbG8=\x07.txt", "/\x1b[2Jabs", "a/../\x1b[2J"):
+        with pytest.raises(SkillError) as info:
+            skills.unpack_zip(zip_bytes({member: "x"}), tmp_path / "o", ws_rules(portable=True))
+        text = str(info.value)
+        assert "\x1b" not in text and "\x07" not in text and "?" in text, text
+
+
+def _case_insensitive(folder: Path) -> bool:
+    (folder / "CaseProbe").write_text("x", encoding="utf-8")
+    try:
+        return (folder / "caseprobe").exists()
+    finally:
+        (folder / "CaseProbe").unlink()
+
+
+def test_unpack_zip_case_collisions(tmp_path):
+    data = zip_bytes({"README": "upper", "readme": "lower"})
+    with pytest.raises(SkillError, match="letter case"):
+        skills.unpack_zip(data, tmp_path / "o1", ws_rules(fold_collisions=True))
+    if _case_insensitive(tmp_path):
+        pytest.skip("this file system ignores letter case")
+    result = skills.unpack_zip(data, tmp_path / "o2", ws_rules())
+    assert result.files == 2 and _tree(tmp_path / "o2") == {"README": "upper", "readme": "lower"}
+
+
+@pytest.mark.parametrize("bad", ["../x/SKILL.md", "/abs/SKILL.md", "C:/x/SKILL.md", "a/../../x", "a\\..\\..\\x",
+                                 "//host/share/x"])
+@pytest.mark.parametrize("rules", ["skills", "workspace"])
+def test_unpack_zip_refuses_escapes_with_both_rule_sets(tmp_path, bad, rules):
+    chosen = ZipRules.for_skills(LIMITS) if rules == "skills" else copyfrom.zip_rules(WS_LIMITS)
+    with pytest.raises(SkillError):
+        skills.unpack_zip(zip_bytes({"ok.txt": "1", bad: "x"}), tmp_path / "box" / "out", chosen)
+    assert not (tmp_path / "x").exists() and not (tmp_path / "box" / "x").exists()
+
+
+def test_unpack_zip_check_stops_it(tmp_path):
+    calls = []
+
+    class Stop(Exception):
+        pass
+
+    def check():
+        calls.append(1)
+        if len(calls) > 2:
+            raise Stop()
+
+    with pytest.raises(Stop):
+        skills.unpack_zip(zip_bytes({"a": "1", "b": "2", "c": "3"}), tmp_path / "out", ws_rules(), check=check)
+    assert sorted(p.name for p in (tmp_path / "out").iterdir()) == ["a"]
 
 
 def test_import_zip_layouts_and_caps(tmp_path):

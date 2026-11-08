@@ -52,6 +52,23 @@ const I18N = {
     net_hint_container: "Песочница запущена без файрвола, поэтому здесь это не строгая изоляция: только прокси и офлайн-настройки pip, uv, npm и git. Перезапустите dreamteam sandbox: если есть сессия без интернета, контейнер запустится с файрволом.",
     net_hint_unknown: "Команды агентов, их фоновые процессы и MCP-серверы без интернета, LLM работает: строго — в Docker (dreamteam sandbox) и на Linux, на Windows и macOS — только прокси и офлайн-настройки.",
     goal_required: "Укажите цель сессии.", creating: "Создаю сессию…",
+    f_files: "Файлы для работы", f_copy_from: "Скопировать из папки",
+    f_copy_from_ph: "Полный путь на компьютере, где работает хаб, например C:\\work\\project",
+    f_copy_zip: "или загрузить .zip",
+    f_copy_hint: "Файлы копируются в папку новой сессии до её первого запуска: агенты работают с копией, " +
+      "оригиналы не меняются. .git, node_modules, .venv, venv, __pycache__ и ссылки не копируются; до {mb} МБ.",
+    f_copy_sandbox: "Хаб работает в песочнице Docker и видит только свою домашнюю " +
+      "папку: папку со своего компьютера загрузите как .zip.",
+    f_copy_both: "Укажите папку или .zip, а не то и другое.", f_copy_zip_only: "Выберите файл .zip.",
+    f_copy_zip_big: "Архив больше {mb} МБ ([workspace] copy_max_mb).",
+    uploading: "Загрузка архива ({mb} МБ)…", copying: "Копирование файлов…",
+    copied_toast: "Скопировано файлов: {files} ({size})",
+    copied_left_out: "Не скопированы: {what}", copied_links: "ссылки ({n}: {names})",
+    copied_excluded: "папки по имени ({n}: {names})", copied_special: "особые файлы ({n})",
+    copied_open: "Сессия запущена. Нажмите, чтобы открыть её доску.",
+    sc_copied: "Копия:",
+    sc_copied_hint: "Файлы скопированы при создании сессии ({when}), файлов: {files}, {size}. Оригиналы не менялись.",
+    u_kb: "КБ", u_mb: "МБ",
     // settings
     s_models: "Модели и эндпоинты", s_models_hint: "Профили подключения к LLM. Агенты используют профиль по умолчанию; при найме агента можно указать другой профиль (например, дешёвый «fast»).",
     s_roles: "Роли",
@@ -146,6 +163,9 @@ const I18N = {
     ws_git: "Git с автокоммитами", ws_lock: "Время блокировки файла, мин",
     ws_lock_wanted: "Напомнить держателю блокировки через, мин",
     ws_lock_wanted_hint: "напомнит держателю, когда он держит файл, который ждут, столько минут; 0 — сразу",
+    ws_copy_mb: "Копия в новую сессию, МБ",
+    ws_copy_mb_hint: "--copy-from и «Файлы для работы»: предел копии и загружаемого .zip",
+    ws_copy_files: "Файлов в такой копии",
     mcp_approval: "Подтверждать новые MCP-серверы агентов", mcp_library: "Папка библиотеки MCP", mcp_startup: "Таймаут запуска, с",
     mcp_call: "Таймаут вызова, с", mcp_external: "Внешние MCP-серверы (JSON)",
     mcp_env_hint: "значения env скрыты (••••…); оставьте как есть, чтобы сохранить, или впишите новое",
@@ -271,6 +291,25 @@ const I18N = {
     net_hint_container: "The sandbox was started without its firewall, so this is not strict isolation here: only proxies and offline settings of pip, uv, npm and git. Restart dreamteam sandbox: with a session without network, the container starts with the firewall.",
     net_hint_unknown: "The agents' commands, their background jobs and MCP servers get no internet, the LLM keeps it: strictly in Docker (dreamteam sandbox) and on Linux; on Windows and macOS only proxies and offline settings.",
     goal_required: "Enter the session goal.", creating: "Creating the session…",
+    f_files: "Files to work on", f_copy_from: "Copy from a folder",
+    f_copy_from_ph: "Full path on the computer the hub runs on, e.g. /home/me/project",
+    f_copy_zip: "or upload a .zip",
+    f_copy_hint: "The files are copied into the new session's folder before its first start: the agents work on " +
+      "the copy, the originals are never changed. .git, node_modules, .venv, venv, __pycache__ and links are left " +
+      "out; up to {mb} MB.",
+    f_copy_sandbox: "The hub runs in the Docker sandbox and sees only its home " +
+      "folder: upload a folder from your computer as a .zip.",
+    f_copy_both: "Give a folder or a .zip, not both.", f_copy_zip_only: "Choose a .zip file.",
+    f_copy_zip_big: "The archive is larger than {mb} MB ([workspace] copy_max_mb).",
+    uploading: "Uploading the archive ({mb} MB)…", copying: "Copying the files…",
+    copied_toast: "Copied {files} files ({size})",
+    copied_left_out: "Left out: {what}", copied_links: "{n} link(s) ({names})",
+    copied_excluded: "{n} folder(s) by name ({names})", copied_special: "{n} special file(s)",
+    copied_open: "The session is running. Click to open its board.",
+    sc_copied: "Copy of:",
+    sc_copied_hint: "Files copied when the session was created ({when}): {files} files, {size}. " +
+      "The originals were not changed.",
+    u_kb: "KB", u_mb: "MB",
     s_models: "Models and endpoints", s_models_hint: "LLM connection profiles. Agents use the default profile; a hired agent can use another one (e.g. a cheap “fast”).",
     s_roles: "Roles",
     s_roles_hint: "The role catalog: starting teams are built from it and agents hire new members by it. A role description goes into an agent's system prompt when the agent is created; agents already working are not affected.",
@@ -365,6 +404,9 @@ const I18N = {
     ws_git: "Git with auto-commits", ws_lock: "File lock time, min",
     ws_lock_wanted: "Remind the lock holder after, min",
     ws_lock_wanted_hint: "reminds the holder once it has held a file others wait for this long; 0 = at once",
+    ws_copy_mb: "Copy into a new session, MB",
+    ws_copy_mb_hint: "--copy-from and “Files to work on”: the largest copy and uploaded .zip",
+    ws_copy_files: "Files in such a copy",
     mcp_approval: "Require approval of new agent MCP servers", mcp_library: "MCP library folder", mcp_startup: "Startup timeout, s",
     mcp_call: "Call timeout, s", mcp_external: "External MCP servers (JSON)",
     mcp_env_hint: "env values are hidden (••••…); keep them to keep the saved value, or type a new one",
@@ -492,12 +534,14 @@ async function apiRaw(method, path, body) {
   }
 }
 
-function toast(text, isErr = false) {
+/** A toast; with `onClick` it is clickable (and stays longer), the click removing it first. */
+function toast(text, isErr = false, onClick = null) {
   const box = document.createElement("div");
-  box.className = "toast" + (isErr ? " err" : "");
+  box.className = "toast" + (isErr ? " err" : "") + (onClick ? " clickable" : "");
   box.textContent = text;
+  if (onClick) box.addEventListener("click", () => { box.remove(); onClick(); });
   $("#toasts").appendChild(box);
-  setTimeout(() => box.remove(), isErr ? 9000 : 4500);
+  setTimeout(() => box.remove(), isErr || onClick ? 9000 : 4500);
 }
 
 function ago(ts) {
@@ -614,8 +658,8 @@ function filterSessions(all, filter, search) {
     if (filter === "running" && s.status !== "running") return false;
     if (filter === "stopped" && s.status === "running") return false;
     if (!q) return true;
-    return [s.title, s.id, s.goal && s.goal.title, s.goal && s.goal.description, s.workspace && s.workspace.path]
-      .join(" ").toLowerCase().includes(q);
+    return [s.title, s.id, s.goal && s.goal.title, s.goal && s.goal.description, s.workspace && s.workspace.path,
+            s.copied_from && s.copied_from.source].join(" ").toLowerCase().includes(q);
   });
 }
 
@@ -645,6 +689,16 @@ function workspaceLine(ws) {
   const badge = `<span class="badge ${missing ? "err" : kind === "default" ? "plain" : ""}">${esc(label)}</span>`;
   return `<div class="sc-folder" title="${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}"><i class="ic ic-folder"></i><code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</div>
     ${missing ? `<div class="sc-warn"><i class="ic ic-alert"></i>${esc(t("ws_missing"))}</div>` : ""}`;
+}
+
+/** The card line of a session whose files were copied in when it was created (summary "copied_from": the folder or
+ * .zip path, or "upload: <name>"); the tooltip says how much and that the originals were not changed. */
+function copiedLine(c) {
+  if (!c || typeof c !== "object" || !c.source) return "";
+  const tip = t("sc_copied_hint", { files: Number(c.files) || 0, size: sizeText(c.bytes),
+                                    when: ago(Number(c.at) || 0) });
+  return `<div class="sc-folder sc-copied" title="${esc(c.source)}\n${esc(tip)}"><span>${esc(t("sc_copied"))}</span>`
+    + `<code><bdi dir="ltr">${esc(shortPath(c.source))}</bdi></code></div>`;
 }
 
 /** What a session without network gets here (the launcher's network_isolation: "docker" | "netns" | "env" | "container"; unknown:
@@ -689,6 +743,7 @@ function sessionCard(s) {
       ${skills.count}
     </div>
     ${workspaceLine(s.workspace)}
+    ${copiedLine(s.copied_from)}
     ${skills.warn}
     ${error ? `<div class="sc-error">${esc(error)}</div>` : ""}
     <div class="sc-actions">
@@ -1352,6 +1407,15 @@ async function newSessionModal() {
           <label class="field"><span>${esc(t("f_steps"))}</span><input id="ns-steps" type="number" min="1" max="500" value="${esc((v.agents || {}).max_steps_per_turn ?? 40)}"></label>
           <label class="check full"><input type="checkbox" id="ns-approval"${(v.mcp || {}).require_approval ? " checked" : ""}> ${esc(t("f_approval"))}</label>
           <label class="check full"><input type="checkbox" id="ns-offline"${sw.network === "off" ? " checked" : ""}> <span>${esc(t("f_network"))} <span class="hint">${esc(networkHint(H.isolation))}</span></span></label>
+          <div class="field full ns-files"><span><i class="ic ic-folder"></i>${esc(t("f_files"))}</span>
+            <label class="field full"><span>${esc(t("f_copy_from"))}</span>
+              <input id="ns-copy-from" spellcheck="false" autocomplete="off"
+                placeholder="${esc(t("f_copy_from_ph"))}"></label>
+            <label class="field full"><span>${esc(t("f_copy_zip"))}</span>
+              <input id="ns-copy-zip" type="file" accept=".zip,application/zip"></label>
+            <span class="field-hint">${esc(t("f_copy_hint", { mb: copyMaxMb() }))}</span>
+            <span class="field-hint" id="ns-copy-sandbox" hidden>${esc(t("f_copy_sandbox"))}</span>
+          </div>
         </div>
       </details>
       <div class="err-text" id="ns-error"></div>
@@ -1371,6 +1435,66 @@ async function newSessionModal() {
   loadSkills();
   $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = t(e.target.checked ? "create_open" : "create"); });
   $("#ns-form").addEventListener("submit", submitNewSession);
+  nsCopySandbox();
+}
+
+/** [workspace] copy_max_mb of the saved settings: the largest copy and uploaded .zip (1024 when not loaded). */
+function copyMaxMb() { return Number((savedDefaults().workspace || {}).copy_max_mb) || 1024; }
+
+/** The "upload it as a .zip" hint of the new-session dialog: shown when the hub runs in a Docker container (the
+ * sandbox, docker compose, docker run), which sees only its home (GET /api/skills "container"). */
+function nsCopySandbox() {
+  const el = $("#modal #ns-copy-sandbox");
+  if (el) el.hidden = !(H.skills && (H.skills.container || H.skills.sandbox));
+}
+
+/** The toasts of a copy made for a new session (POST /api/sessions "copy"): what was copied and, when something
+ * was, what was left out (links, folders by name, special files). */
+function copyToasts(copy) {
+  if (!copy || typeof copy !== "object") return [];
+  const out = [t("copied_toast", { files: Number(copy.files) || 0, size: sizeText(copy.bytes) })];
+  const names = (list, n) => {
+    const shown = (Array.isArray(list) ? list : []).slice(0, 3).map(String);
+    return shown.join(", ") + (n > shown.length ? ", …" : "");
+  };
+  const left = [];
+  const links = Number(copy.links_count) || 0, excluded = Number(copy.excluded_count) || 0;
+  const special = Number(copy.special_count) || 0;
+  if (links) left.push(t("copied_links", { n: links, names: names(copy.links, links) }));
+  if (excluded) left.push(t("copied_excluded", { n: excluded, names: names(copy.excluded, excluded) }));
+  if (special) left.push(t("copied_special", { n: special }));
+  if (left.length) out.push(t("copied_left_out", { what: left.join("; ") }));
+  return out;
+}
+
+/** Disables (or enables again) the dialog's folder field and .zip input while the session is created. */
+function nsFilesDisabled(on) {
+  for (const sel of ["#ns-copy-from", "#ns-copy-zip"]) { const el = $(sel); if (el) el.disabled = on; }
+}
+
+/** "3 KB" / "1.5 MB": a copy's size for the toast and the session card's tooltip. */
+function sizeText(n) {
+  const bytes = Math.max(0, Number(n) || 0);
+  if (bytes < 2 ** 20) return `${bytes ? Math.max(1, Math.round(bytes / 1024)) : 0} ${t("u_kb")}`;
+  return `${(bytes / 2 ** 20).toFixed(1)} ${t("u_mb")}`;
+}
+
+/** POST /api/uploads: the zip as the raw body (not base64 JSON), for copy_from_upload of a new session. Same-origin
+ * fetch sends the hub's cookie, as api() does. */
+async function uploadZip(file) {
+  let resp;
+  try {
+    resp = await fetch(`/api/uploads?filename=${encodeURIComponent(file.name)}`,
+                       { method: "POST", headers: { "Content-Type": "application/zip" }, body: file });
+  } catch (e) { throw new Error(t("conn_lost")); }
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  if (!resp.ok || !data || !data.upload) {
+    const err = new Error((data && data.error) || `${resp.status} ${resp.statusText}`);
+    err.status = resp.status;
+    throw err;
+  }
+  return data;
 }
 
 /** The select of a saved team in the new-session form (nothing without saved teams): a team one of whose roles is gone
@@ -1477,15 +1601,34 @@ async function submitNewSession(e) {
   const run = $("#ns-run").checked;
   const btn = $("#ns-submit");
   if (btn.disabled) return;
-  btn.disabled = true; $("#ns-error").textContent = t("creating");
+  // files to work on (docs/SPEC.md §17.2): a folder on the hub's computer, or a .zip uploaded first
+  const copyFrom = String($("#ns-copy-from").value || "").trim();
+  const zip = Array.from($("#ns-copy-zip").files || [])[0] || null;
+  const maxMb = copyMaxMb();
+  if (copyFrom && zip) { $("#ns-error").textContent = t("f_copy_both"); return; }
+  if (zip && !/\.zip$/i.test(String(zip.name || ""))) { $("#ns-error").textContent = t("f_copy_zip_only"); return; }
+  if (zip && zip.size > maxMb * 2 ** 20) { $("#ns-error").textContent = t("f_copy_zip_big", { mb: maxMb }); return; }
+  btn.disabled = true; nsFilesDisabled(true);
+  $("#ns-error").textContent = zip ? t("uploading", { mb: (zip.size / 2 ** 20).toFixed(1) })
+                                   : copyFrom ? t("copying") : t("creating");
   try {
     const body = { title: $("#ns-title").value.trim(), goal, description: $("#ns-desc").value.trim(), overrides, start: run };
     if (H.nsSkills.size) body.skills = [...H.nsSkills];   // references: "x" from the library, "claude-user:x"…
+    // a new upload on every submit: a create that failed may already have used the token
+    if (zip) { body.copy_from_upload = (await uploadZip(zip)).upload; $("#ns-error").textContent = t("copying"); }
+    else if (copyFrom) body.copy_from = copyFrom;
     const data = await api("POST", "/api/sessions", body);
-    if (run) { location.href = data.session.url; return; }
+    const copy = (data && data.copy) || {};
+    const lines = copyToasts(data && data.copy);
+    // started: the board opens at once, unless the copy left out links or special files (the folders left out
+    // by name are expected): that is shown here first, and a click on it opens the board
+    if (run && !(Number(copy.links_count) || Number(copy.special_count))) { location.href = data.session.url; return; }
+    const open = () => { location.href = data.session.url; };
+    lines.forEach((line, i) => (run && i === lines.length - 1 ? toast(`${line}\n${t("copied_open")}`, false, open)
+                                                                : toast(line)));
     closeModal(true); loadSessions();
   } catch (err) {
-    btn.disabled = false; $("#ns-error").textContent = err.message;
+    btn.disabled = false; nsFilesDisabled(false); $("#ns-error").textContent = err.message;
   }
 }
 
@@ -1503,7 +1646,7 @@ async function loadSkills() {
     const roles = $("#roles");
     const typing = document.activeElement && roles && roles.contains && roles.contains(document.activeElement);
     if (H.view && roles && !typing) renderRoles();
-    if ($("#modal #ns-skills-list")) renderNsSkills();
+    if ($("#modal #ns-skills-list")) { renderNsSkills(); nsCopySandbox(); }
   } catch (e) {
     if (seq !== H.skillSeq) return;
     const box = $("#skill-library");
@@ -1843,7 +1986,9 @@ function openModal(html) {
 }
 /** Closes the modal; a new-session form with typed text asks first (a stray click must not lose a long goal). */
 function closeModal(force = false) {
-  const typed = ["#ns-goal", "#ns-desc"].some((sel) => { const el = $("#modal " + sel); return el && el.value.trim(); });
+  const typed = ["#ns-goal", "#ns-desc", "#ns-copy-from"].some((sel) => {
+    const el = $("#modal " + sel); return el && el.value.trim();
+  }) || !!(($("#modal #ns-copy-zip") || {}).files || []).length;   // a chosen .zip counts as typed too
   if (!force && typed && !confirm(t("discard_new"))) return false;
   $("#modal-backdrop").classList.add("hidden");
   $("#modal").innerHTML = "";
@@ -1932,6 +2077,8 @@ function renderSettings(fromServer) {
       field("ws_git", "workspace.git", "bool"),
       field("ws_lock", "workspace.lock_ttl_minutes", "int", { min: 1 }),
       field("ws_lock_wanted", "workspace.lock_wanted_minutes", "float", { min: 0, step: 1, hint: "ws_lock_wanted_hint" }),
+      field("ws_copy_mb", "workspace.copy_max_mb", "int", { min: 1, hint: "ws_copy_mb_hint" }),
+      field("ws_copy_files", "workspace.copy_max_files", "int", { min: 1 }),
     ]))}
     ${section("mcp", grid([
       field("mcp_approval", "mcp.require_approval", "bool", { full: true }),
@@ -2510,6 +2657,8 @@ if (typeof module !== "undefined" && module.exports) {
     roleSkillsHtml, addRoleSkill, nsSkillsHtml, teamSkills, nsRoleSkillsHtml, renderNsSkills, onNsSkillChange,
     sessionSkillsHtml, pendingSkillsModal, renderPendingSkills, decidePendingSkill, onPendingClick, confirmDelete,
     networkHint,
+    // files to work on: the new-session dialog's copy block, the zip upload, the card's "copy of" line
+    uploadZip, copiedLine, sizeText, nsCopySandbox, copyMaxMb, copyToasts,
   };
 } else if (typeof document !== "undefined") {
   init();

@@ -22,23 +22,30 @@ import copy
 import errno
 import json
 import logging
+import math
 import os
 import re
 import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unicodedata
+import uuid
 from dataclasses import dataclass, field
-from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Callable
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from typing import TYPE_CHECKING, Any, Callable, Collection
 
 from . import netoff
 from . import skills as skill_lib
 from .config import Config
-from .db import loads, remap_sql
+from .copyfrom import (COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError, CopyLimits, Source,
+                       Uploads, check_target, copy_into, done_with, hub_in_container, left_over, printable_line,
+                       resolve_source, staging_name)
+from .db import Database, loads, remap_sql, sqlite_uri
 from .goal_text import shorten_title, split_goal
 from .models import USER, Status, ToolError
 from .settings import (
@@ -46,8 +53,9 @@ from .settings import (
 )
 from .skills import Library, Limits, SkillError, SkillInfo, Staged
 from .swarm_skills import attach_files, decide_files, read_session_skills, skills_dir, source_spec, stopped_public
+from .treecopy import is_within
 from .workspace import (SCRATCH_DIR, SKILLS_MIRROR, commit_paths, init_repo, is_link, isolated_git, looks_like_git_dir,
-                        repo_state, rmtree, tracked)
+                        pid_alive, repo_state, rmtree, tracked)
 
 if TYPE_CHECKING:
     from .swarm import Swarm
@@ -63,6 +71,18 @@ TITLE_LIMIT = 200
 TRASH_PREFIX = ".deleted-"  # a session directory being deleted (never a valid session id)
 WORKSPACE_DIR = "workspace"  # a session's own (default) workspace folder inside its directory
 MOVE_JOURNAL = "workspace-move.json"  # in the session's .dreamteam/ while its workspace moves (kept if it failed)
+IMPORTING_PREFIX = ".importing-"  # a session being imported, staged before it is renamed in (never a valid session id)
+REPLACED_PREFIX = ".replaced-"  # the last copy of a session an import rewrote: .replaced-<id>-<time>/
+SWAP_JOURNAL = "swap.json"  # in a .replaced-* backup while an import swaps the session (kept if the process died)
+# what an import rewrite moves from the old copy's workspace into the new one: environments an export never carries
+KEEP_ON_IMPORT = (".venv", "venv", "node_modules")
+_STAMP = re.compile(r"\d{8}-\d{6}(?:-\d+)?")
+RENAME_TRIES = 10  # a rename refused while a file inside is held open for a moment (Windows) is tried again
+RENAME_PAUSE = 0.2
+# A session's identity across homes and computers (session.json "uid", see session_uid): the sequence id is not one,
+# two homes both make 017-session. Fixed forever: it derives the uid of sessions made before "uid" was written.
+UID_NAMESPACE = uuid.UUID("545ad73f-3f1d-471d-a6b5-de9395f527da")
+_UID = re.compile(r"[0-9a-f]{32}")
 LEGACY_WORKSPACE_TEXT = (
     "The main session lives in the home directory itself, and `dreamteam run` can still open that directory as a "
     "single-swarm project, which would not know about another folder: its workspace cannot be moved. Create a new "
@@ -115,6 +135,21 @@ def _number(value: Any) -> float:
         return 0.0
 
 
+def _copied_from(value: Any) -> dict[str, Any] | None:
+    """session.json "copied_from" as a summary shows it: exactly {source, files, bytes, at}, the source one
+    printable line of at most SOURCE_SHOWN_MAX characters, the numbers >= 0; None when there is none. The file may
+    come from an import or a hand edit, so nothing else of it is passed on."""
+    if not isinstance(value, dict) or not isinstance(value.get("source"), str):
+        return None
+
+    def count(v: Any) -> float:
+        n = _number(v)
+        return n if math.isfinite(n) and n > 0 else 0.0
+
+    return {"source": printable_line(value["source"], SOURCE_SHOWN_MAX), "files": int(count(value.get("files"))),
+            "bytes": int(count(value.get("bytes"))), "at": count(value.get("at"))}
+
+
 # workspace.rmtree: the extended-length form on Windows, since a renamed-away session (.deleted-<id>-<ns>) is longer
 # than the original and its deepest files (git objects, read-only there) may pass the 260-character limit
 _rmtree = rmtree
@@ -129,10 +164,38 @@ def _same_path(a: Path, b: Path) -> bool:
     return _path_key(a) == _path_key(b)
 
 
+def _fold_key(path: Path) -> str:
+    return unicodedata.normalize("NFC", os.path.normpath(str(path))).casefold()
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    """The resolved folders `a` and `b` are one folder, or one holds the other, ignoring letter case and Unicode
+    form (a folder not created yet has no file identity to compare: on the safe side, for a reservation only)."""
+    p, q = _fold_key(a), _fold_key(b)
+    return p == q or p.startswith(q.rstrip(os.sep) + os.sep) or q.startswith(p.rstrip(os.sep) + os.sep)
+
+
 def _within(path: Path, parent: Path) -> bool:
     """`path` is `parent` or inside it (both resolved; case-insensitive where the file system is)."""
     p, q = _path_key(path), _path_key(parent)
     return p == q or p.startswith(q if q.endswith(os.sep) else q + os.sep)
+
+
+def _some_entries(folder: Path, shown: int = 5) -> str:
+    """A few entries of a folder that is not empty, as ' (it holds .git, notes.txt; hidden files count)': .git and
+    the hidden ones first (a fresh `git init`, .DS_Store: the user may see no files there); '' when it cannot be
+    read."""
+    try:
+        with os.scandir(folder) as it:
+            names = [entry.name for entry in it]
+    except OSError:
+        return ""
+    if not names:
+        return ""
+    names.sort(key=lambda n: (n != ".git", not n.startswith("."), n.casefold()))
+    text = ", ".join(printable_line(n, 80) or "?" for n in names[:shown]) + (", ..." if len(names) > shown else "")
+    hidden = "; hidden files count" if any(n.startswith(".") for n in names[:shown]) else ""
+    return f" (it holds {text}{hidden})"
 
 
 def _remove(path: Path) -> None:
@@ -354,13 +417,16 @@ def _repo_refusal(folder: Path, state: dict[str, Any], *, starting: str | None =
     return None
 
 
-async def _in_thread(fn: Callable[..., Any], *args: Any) -> Any:
+async def _in_thread(fn: Callable[..., Any], *args: Any, on_cancel: Callable[[], None] | None = None) -> Any:
     """Blocking file work in a thread that a cancellation cannot abandon halfway (a move whose undo would run
-    while it still moves files): the caller waits for it to end before the CancelledError goes on."""
+    while it still moves files): the caller waits for it to end before the CancelledError goes on. `on_cancel()`
+    is called at the first cancellation, before the wait (it tells the work to stop early: a copy)."""
     work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(work)
     except asyncio.CancelledError:
+        if on_cancel is not None:
+            on_cancel()
         while not work.done():
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.wait({work})
@@ -369,15 +435,154 @@ async def _in_thread(fn: Callable[..., Any], *args: Any) -> Any:
         raise
 
 
+async def _to_end(fn: Callable[..., Any], *args: Any) -> Any:
+    """Blocking file work in a thread, run to its end and its result returned whatever happens meanwhile: a
+    cancellation (Ctrl+C) waits for it and stays pending for the caller, who sees it in
+    `asyncio.current_task().cancelling()` (an import finishes the session it is swapping in, then stops)."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    while True:
+        try:
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            if work.done():
+                return work.result()
+
+
+# ---- import ----------------------------------------------------------------------------------------------
+@dataclass
+class ImportedWorkspace:
+    """Where a session an import brings in works on this computer. `own`: its own `workspace/` folder (the staged
+    copy's). `in_home`: `folder`, a folder of the home that the staged `workspace/` becomes. `outside`: `path`, a
+    folder outside the home, kept as it is stored (its files are never copied)."""
+    kind: str = "own"
+    folder: Path | None = None
+    path: str | None = None
+    adopted: bool = False
+
+
+def _rename_retry(src: Path, dst: Path, done: list[tuple[Path, Path]] | None = None) -> None:
+    """Rename a file or folder within one volume. A refusal while a file inside is held open for a moment (Windows:
+    a scanner, an indexer) is tried again, as `delete` does. Something at `dst` is never replaced (FileExistsError,
+    nothing renamed). `done` gets (src, dst) once renamed."""
+    if os.path.lexists(dst):
+        raise FileExistsError(errno.EEXIST, "a file or folder of that name is already there", str(dst))
+    for attempt in range(RENAME_TRIES):
+        try:
+            os.rename(src, dst)
+            break
+        except (FileNotFoundError, FileExistsError):
+            raise
+        except OSError as exc:
+            if _cross_device(exc) or attempt == RENAME_TRIES - 1:
+                raise
+            time.sleep(RENAME_PAUSE)
+    if done is not None:
+        done.append((src, dst))
+
+
+def _undo_renames(done: list[tuple[Path, Path]], created: list[Path]) -> list[str]:
+    """Put back what `_rename_retry` renamed (in reverse order) and remove the folders made for it; returns what
+    could not be put back (empty: everything is as it was)."""
+    problems = []
+    for src, dst in reversed(done):
+        try:
+            _rename_retry(dst, src)
+        except OSError as exc:
+            problems.append(f"{dst} (belongs in {src}): {exc.strerror or exc}")
+    for folder in reversed(created):
+        with contextlib.suppress(OSError):
+            folder.rmdir()
+    return problems
+
+
+def _in_use(exc: BaseException) -> bool:
+    return isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32, 33)
+
+
+_pid_alive = pid_alive
+
+
+def _journal_path(path: Path, home: Path) -> str:
+    """A path of a swap journal: relative to the home (posix) when it lies inside it, so that the journal still
+    holds where the home was moved or mounted under another drive letter; absolute otherwise."""
+    try:
+        return Path(path).relative_to(home).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _journal_resolve(text: Any, home: Path) -> Path:
+    """A path of a swap journal (_journal_path) for the home as it is now. ValueError for a relative path that
+    leaves the home."""
+    path = Path(str(text))
+    if path.is_absolute():
+        return path   # (a journal of an older version, or a folder outside the home)
+    if not path.parts or ".." in path.parts or path.drive or path.root:
+        raise ValueError(f"not a path inside the home: {text}")
+    return home / path
+
+
+def _write_swap_journal(path: Path, sid: str, planned: list[tuple[Path, Path]], done: list[tuple[Path, Path]],
+                        created: list[Path], home: Path) -> None:
+    """The journal of a session swap (`_swap_replaced`), written atomically: the planned renames, those done, the
+    folders made for them (paths inside `home` relative to it) and the process that does it."""
+    def rel(p: Path) -> str:
+        return _journal_path(p, home)
+
+    data = {"sid": sid, "pid": os.getpid(), "planned": [[rel(a), rel(b)] for a, b in planned],
+            "done": [[rel(a), rel(b)] for a, b in done], "created": [rel(p) for p in created]}
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_bytes(json.dumps(data, ensure_ascii=False).encode("utf-8", "replace"))
+    os.replace(tmp, path)
+
+
+def _backup_uid(backup: Path) -> str | None:
+    """The uid of the session copy a `.replaced-*` backup keeps (None when its session.json cannot be read)."""
+    try:
+        meta = json.loads((backup / "session" / SESSION_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return session_uid(meta) if isinstance(meta, dict) else None
+
+
+def _rebase_job_logs(db: Database, staged_jobs: Path, final_jobs: Path) -> None:
+    """Point the absolute job-log paths of an imported database (the data-dir fallback of the computer it came
+    from) at the same file of the copy's own jobs folder `final_jobs`, when the copy has it; clear the others."""
+    for row in db.all("SELECT id, log FROM jobs WHERE log IS NOT NULL AND log != ''"):
+        value = str(row["log"])
+        for flavour in (PurePosixPath, PureWindowsPath):
+            path = flavour(value)
+            if path.is_absolute():
+                break
+        else:
+            continue   # relative to the workspace: found again there
+        name = path.name
+        found = path.parent.name == "jobs" and name and not is_link(staged_jobs / name) \
+            and (staged_jobs / name).is_file()
+        db.execute("UPDATE jobs SET log = ? WHERE id = ?", (str(final_jobs / name) if found else None, row["id"]))
+
+
+def _make_parents(folder: Path, created: list[Path]) -> None:
+    missing = []
+    parent = folder.parent
+    while not os.path.lexists(parent):
+        missing.append(parent)
+        parent = parent.parent
+    for path in reversed(missing):
+        path.mkdir()
+        created.append(path)
+
+
 def _home_relative(workspace: Any) -> str | None:
     """The "in_home" entry of a stored workspace: the folder relative to the home (posix) when it lies inside the
     home, so that it is found again where the home is mounted elsewhere (the Docker sandbox) or was moved."""
     relative = workspace.get("in_home") if isinstance(workspace, dict) else None
-    if not isinstance(relative, str) or not relative.strip():
-        return None
-    parts = PurePosixPath(relative.replace("\\", "/")).parts
-    if not parts or parts[0] == "/" or ".." in parts or ":" in parts[0]:
-        return None  # only a plain relative path inside the home
+    if not isinstance(relative, str) or not relative.strip() or any(ord(c) < 32 for c in relative):
+        return None   # (a NUL or another control character is in no folder name)
+    text = relative.replace("\\", "/")
+    parts = PurePosixPath(text).parts
+    if not parts or text.startswith("/") or PurePosixPath(text).is_absolute() or ".." in parts or ":" in parts[0]:
+        return None  # only a plain relative path inside the home ('//x' is a root of its own for PurePosixPath)
     return "/".join(parts)
 
 
@@ -417,7 +622,7 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
         if not db_path.exists():
             return stats
         try:
-            conn = sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True, timeout=2.0)
+            conn = sqlite3.connect(sqlite_uri(db_path, "mode=ro"), uri=True, timeout=2.0)
         except sqlite3.Error:
             return stats
     try:
@@ -501,6 +706,34 @@ def pending_goal(meta: dict[str, Any]) -> dict[str, str] | None:
     return {"title": title, "description": description} if title else None
 
 
+def new_uid() -> str:
+    """A fresh session uid: 32 lowercase hex characters."""
+    return uuid.uuid4().hex
+
+
+def session_uid(meta: dict[str, Any]) -> str | None:
+    """The session's identity across homes and computers: session.json "uid" when it holds 32 hex characters
+    (lowercased), else a uid derived from "created_at" (uuid5 of its float value), so a session made before "uid"
+    existed, or a folder copied by hand, has the same identity in every home it is in. Nothing is written. None
+    without a usable "created_at" (missing, not a finite number) and for the legacy main session, whose created_at
+    may come from the file system and is not stable: such a session is never matched with another."""
+    if not isinstance(meta, dict) or meta.get("legacy"):
+        return None
+    stored = meta.get("uid")
+    if isinstance(stored, str) and _UID.fullmatch(stored.lower()):
+        return stored.lower()
+    created = meta.get("created_at")
+    if isinstance(created, bool) or not isinstance(created, (int, float)):
+        return None
+    try:
+        value = float(created)
+    except OverflowError:  # an int too large for a float
+        return None
+    if not math.isfinite(value):
+        return None
+    return uuid.uuid5(UID_NAMESPACE, "created_at:" + repr(value)).hex
+
+
 class SessionManager:
     def __init__(self, home: str | Path, *, llm_factory: Callable | None = None,
                  language: str = "ru", provider: str = "anthropic"):
@@ -519,7 +752,13 @@ class SessionManager:
         # one workspace change at a time in the whole home (taken inside a session's lock, from the final check of
         # the new folder until session.json names it): two sessions never take the same folder
         self._claims = asyncio.Lock()
+        # the folders new sessions are being created in with `workspace` (resolved): a second create, or a workspace
+        # change, into the same folder (inside it, containing it) is refused at once instead of copying everything
+        # first and failing at the claim
+        self._creating_in: set[Path] = set()
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
+        # zips the sessions page uploads for a new session's copy (POST /api/uploads, copy_from_upload)
+        self.uploads = Uploads(self.home / ".dreamteam" / UPLOADS_DIR)
 
     # ---- change notifications ------------------------------------------------------------------
     def listen(self, listener: Callable[[dict[str, Any]], None]) -> None:
@@ -892,7 +1131,7 @@ class SessionManager:
         if not db.exists():
             return []
         try:
-            conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True, timeout=5.0)
+            conn = sqlite3.connect(sqlite_uri(db, "mode=ro"), uri=True, timeout=5.0)
         except sqlite3.Error:
             return []
         try:
@@ -917,12 +1156,91 @@ class SessionManager:
                 continue  # a damaged session: its own summary shows the error
         return found
 
+    def _target_refusal(self, target: Path, sid: str | None) -> str | None:
+        """Why the folder `target` (resolved) can never be the workspace of session `sid` (None: a session about to
+        be created; an id that does not exist yet is fine): a drive root, the user's home or a folder containing it,
+        the DreamTeam home or a folder containing it, DreamTeam's own data folder, the sessions folder (except the
+        session's own default folder), a git database, the MCP and skills libraries and the skill environments.
+        None when it can be."""
+        try:
+            home = self.home.resolve()
+            sessions = self.sessions_dir.resolve()
+            user_home = Path.home().resolve()
+            default_real = self.default_workspace(sid).resolve() if sid is not None else None
+            session_dir = self.dir_of(sid).resolve() if sid is not None else None
+        except (OSError, ValueError, RuntimeError) as exc:
+            return f"Cannot use the folder {target}: {exc}"
+        # compared as text and by file identity: a file system that ignores case where normcase does not (macOS)
+        def within(path: Path, parent: Path) -> bool:
+            return _within(path, parent) or is_within(path, parent)
+
+        def same(a: Path, b: Path) -> bool:
+            return _same_path(a, b) or (is_within(a, b) and is_within(b, a))
+
+        is_default = default_real is not None and same(target, default_real)
+        if target.parent == target:
+            return f"{target} is the root of a drive or of the file system; choose a folder inside it."
+        if same(target, user_home):
+            return f"{target} is your home folder itself; choose a folder inside it, e.g. {target / 'my-project'}."
+        if within(user_home, target):
+            return f"{target} contains your home folder {user_home}; choose a folder inside it."
+        if same(target, home) or within(home, target):
+            return f"{target} is the DreamTeam home or contains it; choose a folder outside {home}."
+        if within(target, home / ".dreamteam"):
+            return f"{target} is inside DreamTeam's own data folder {home / '.dreamteam'}."
+        if within(target, sessions) and not is_default:
+            return (f"{target} is inside the DreamTeam sessions folder {sessions}; choose a folder outside it (or "
+                    "--default for the session's own folder).")
+        if session_dir is not None and within(target, session_dir / ".dreamteam"):
+            return f"{target} is inside the session's data folder."
+        if any(part.casefold() == ".git" for part in target.parts) or looks_like_git_dir(target):
+            return (f"{target} is a git repository's own database (a .git folder or a bare repository), not a folder "
+                    "of files: choose the folder of its work tree.")
+        libraries = [self.config.library_dir]
+        if sid is not None and os.path.lexists(self.dir_of(sid) / SESSION_FILE):
+            with contextlib.suppress(ValueError, SessionError):
+                libraries.append(self._config_from(self.raw, sid).library_dir)
+        for library in libraries:
+            try:
+                library = library.resolve()
+            except (OSError, ValueError, RuntimeError):
+                continue
+            if _within(target, library) or _within(library, target):
+                return (f"{target} is DreamTeam's shared MCP library {library}, or inside it or contains it (every "
+                        "session imports its servers from there); choose another folder.")
+        try:  # the skills library: agents would write into the skills every session attaches from
+            skills_library = self.config.skills_library_dir.resolve()
+        except (OSError, ValueError, RuntimeError):
+            skills_library = None
+        if skills_library is not None and (_within(target, skills_library) or _within(skills_library, target)):
+            return (f"{target} is DreamTeam's shared skills library {skills_library}, or inside it or contains it "
+                    "(sessions attach their skills from there); choose another folder.")
+        try:  # the skills' environments: agents' files and autocommit's `git add -A` would reach every session's
+            envs = self.config.skill_envs_dir.resolve()
+        except (OSError, ValueError, RuntimeError):
+            envs = None
+        if envs is not None and (_within(target, envs) or _within(envs, target)):
+            return (f"{target} is DreamTeam's skill environments folder {envs}, or inside it or contains it (every "
+                    "session runs its skills' packages from there); choose another folder.")
+        return None
+
+    def _check_reserved(self, target: Path) -> None:
+        """409 when a session is being created right now (create with `workspace`) in the resolved folder `target`,
+        inside it or in a folder containing it: two sessions cannot share files, and the second would learn it only
+        after a copy of its own."""
+        for folder in tuple(self._creating_in):
+            if _overlaps(target, folder):
+                how = "" if _fold_key(target) == _fold_key(folder) else f" ({target} is inside it or contains it)"
+                raise SessionError(f"Another session is being created in {folder} right now{how}; when it is done, "
+                                   "that folder is taken.", 409)
+
     def _plan(self, sid: str | None, path: Any, *, git_on: bool, mcp: list[str] | None = None,
-              network_off: bool = False) -> _Plan:
+              network_off: bool = False, copying: bool = False) -> _Plan:
         """Check a new workspace folder for a session (sid None: a session about to be created) and decide what
         to do; SessionError (400 bad target, 409 conflict) before anything changes. `network_off`: the session's
         setting, for its git checks here and later (_Plan.network_off; the first check runs while the session's
-        members may still run commands). Blocking (git): run it in a thread."""
+        members may still run commands). `copying`: files are copied into the new session (create's copy_from),
+        so a folder with files is refused (409). Blocking (git): run it in a thread."""
         meta = self.meta(sid) if sid is not None else {}
         if sid is not None:
             old, old_stored, old_adopted = self._workspace_entry(sid, meta)
@@ -945,60 +1263,15 @@ class SessionManager:
                                    "relative paths against their own current directory).")
         try:
             target = target.resolve()  # symlinks and junctions: the checks below see the real folder
-            home = self.home.resolve()
-            sessions = self.sessions_dir.resolve()
-            user_home = Path.home().resolve()
             old_real = old.resolve() if old is not None else None
             default_real = default.resolve() if default is not None else None
             session_dir = self.dir_of(sid).resolve() if sid is not None else None
         except (OSError, ValueError, RuntimeError) as exc:
             raise SessionError(f"Cannot use the folder {path}: {exc}") from None
         is_default = default_real is not None and _same_path(target, default_real)
-        if target.parent == target:
-            raise SessionError(f"{target} is the root of a drive or of the file system; choose a folder inside it.")
-        if _same_path(target, user_home):
-            raise SessionError(f"{target} is your home folder itself; choose a folder inside it, e.g. "
-                               f"{target / 'my-project'}.")
-        if _within(user_home, target):
-            raise SessionError(f"{target} contains your home folder {user_home}; choose a folder inside it.")
-        if _same_path(target, home) or _within(home, target):
-            raise SessionError(f"{target} is the DreamTeam home or contains it; choose a folder outside {home}.")
-        if _within(target, home / ".dreamteam"):
-            raise SessionError(f"{target} is inside DreamTeam's own data folder {home / '.dreamteam'}.")
-        if _within(target, sessions) and not is_default:
-            raise SessionError(f"{target} is inside the DreamTeam sessions folder {sessions}; choose a folder "
-                               "outside it (or --default for the session's own folder).")
-        if session_dir is not None and _within(target, session_dir / ".dreamteam"):
-            raise SessionError(f"{target} is inside the session's data folder.")
-        if any(part.casefold() == ".git" for part in target.parts) or looks_like_git_dir(target):
-            raise SessionError(f"{target} is a git repository's own database (a .git folder or a bare repository), "
-                               "not a folder of files: choose the folder of its work tree.")
-        libraries = [self.config.library_dir]
-        if sid is not None:
-            with contextlib.suppress(ValueError):
-                libraries.append(self._config_from(self.raw, sid).library_dir)
-        for library in libraries:
-            try:
-                library = library.resolve()
-            except (OSError, ValueError, RuntimeError):
-                continue
-            if _within(target, library) or _within(library, target):
-                raise SessionError(f"{target} is DreamTeam's shared MCP library {library}, or inside it or contains "
-                                   "it (every session imports its servers from there); choose another folder.")
-        try:  # the skills library: agents would write into the skills every session attaches from
-            skills_library = self.config.skills_library_dir.resolve()
-        except (OSError, ValueError, RuntimeError):
-            skills_library = None
-        if skills_library is not None and (_within(target, skills_library) or _within(skills_library, target)):
-            raise SessionError(f"{target} is DreamTeam's shared skills library {skills_library}, or inside it or "
-                               "contains it (sessions attach their skills from there); choose another folder.")
-        try:  # the skills' environments: agents' files and autocommit's `git add -A` would reach every session's
-            envs = self.config.skill_envs_dir.resolve()
-        except (OSError, ValueError, RuntimeError):
-            envs = None
-        if envs is not None and (_within(target, envs) or _within(envs, target)):
-            raise SessionError(f"{target} is DreamTeam's skill environments folder {envs}, or inside it or contains "
-                               "it (every session runs its skills' packages from there); choose another folder.")
+        refusal = self._target_refusal(target, sid)
+        if refusal is not None:
+            raise SessionError(refusal)
         if old_real is not None and _same_path(target, old_real):
             git = "existing" if (target / ".git").exists() else ("disabled" if not git_on else "none")
             return _Plan(target=target, old=old_real, mode="unchanged", default=is_default,
@@ -1053,6 +1326,10 @@ class SessionManager:
             return plan
         # A folder with files (adopted as it is), or an empty one after the user's own folder: the user's files stay
         # where they are; only the session's MCP servers come along.
+        if copying and not empty:
+            raise SessionError(f"{target} already has files{_some_entries(target)}: a copy goes into a new or empty "
+                               f"folder. Choose an empty folder, or leave out the copy to work with the files in "
+                               f"{target} itself.", 409)
         plan.mode = "moved" if empty else "adopted"
         plan.adopted = not empty and not is_default
         plan.mcp = carried
@@ -1201,7 +1478,7 @@ class SessionManager:
         model = cfg.models.get(profile)
         attached = self._attached_skills(sid)
         return {
-            "id": sid, "title": meta.get("title") or sid, "legacy": meta.get("legacy", False),
+            "id": sid, "uid": session_uid(meta), "title": meta.get("title") or sid, "legacy": meta.get("legacy", False),
             "dir": str(self.dir_of(sid)), "created_at": meta.get("created_at"),
             "status": "running" if sid in self.running else "stopped",
             "loaded": swarm is not None, "autostart": bool(meta.get("autostart")),
@@ -1212,6 +1489,7 @@ class SessionManager:
             "max_agents": int(_number(limits.get("max_agents", cfg.swarm.max_agents))),
             "overrides": meta.get("overrides") or {}, "config_error": config_error,
             "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta),
+            "copied_from": _copied_from(meta.get("copied_from")),   # files copied in at create (copyfrom.py)
             "skills": [s.name for s in attached],
             "skills_pending": [s.name for s in attached if s.library == "pending"],
             **stats,
@@ -1224,10 +1502,11 @@ class SessionManager:
                 items.append(self.summary(sid))
             except SessionError as exc:
                 if exc.status != 404:  # 404: deleted meanwhile
-                    items.append({"id": sid, "title": sid, "status": "stopped", "error": str(exc)})
+                    items.append({"id": sid, "uid": None, "title": sid, "status": "stopped", "error": str(exc)})
             except Exception as exc:  # one broken session must not break the sessions page
                 log.exception("cannot summarize session %s", sid)
-                items.append({"id": sid, "title": sid, "status": "stopped", "error": f"{type(exc).__name__}: {exc}"})
+                items.append({"id": sid, "uid": None, "title": sid, "status": "stopped",
+                              "error": f"{type(exc).__name__}: {exc}"})
         items.sort(key=lambda s: (s.get("status") != "running",
                                   -_number(s.get("last_activity") or s.get("created_at"))))
         return items
@@ -1465,7 +1744,8 @@ class SessionManager:
     async def create(self, title: str, goal: str = "", description: str = "", *,
                      overrides: dict[str, Any] | None = None, start: bool = True, actor: str = USER,
                      workspace: str | os.PathLike | None = None, skills: list[str] | None = None,
-                     via: str = "home", auto_reply: bool = False) -> dict[str, Any]:
+                     via: str = "home", auto_reply: bool = False, copy_from: str | os.PathLike | None = None,
+                     copy_from_upload: str | None = None) -> dict[str, Any]:
         """Create a session (and start it with the goal unless start=False). Returns its summary.
         `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
         an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
@@ -1474,33 +1754,127 @@ class SessionManager:
         the `workspace` folder) or sources (absolute folder or .zip paths, Git URLs: imported into the library, `by`
         the user, `via` the surface); all of them are resolved and staged before anything is created.
         `auto_reply`: a `dreamteam -p` client with automatic replies asks (models.AUTO_REPLY_HEADER): see
-        _start_locked."""
+        _start_locked.
+        `copy_from`: an absolute folder or .zip path on this computer, copied into the folder the session works in
+        before anything else is created (docs/SPEC.md §17.2 "Copying files into a new session"); `copy_from_upload`:
+        the token of a zip uploaded with POST /api/uploads instead, claimed before anything else: a create that
+        names it uses it up, whether it succeeds or not. Not both. With `workspace`, that folder must be
+        empty or missing. The summary then has "copy_result" (copyfrom.copy_into's result)."""
         # the goal split as set_goal splits it: its first line also names the session (cut at a word)
         goal_title, goal_description = split_goal(_text(goal), _text(description))
         title = (_one_line(title) or shorten_title(goal_title, 60) or "Session")[:TITLE_LIMIT].strip()
         self._refresh_settings()
-        overrides = self._validated_overrides(overrides)
-        if workspace is not None:  # checked before anything is created
-            new = validate(self.sessions_dir / "new", self._merged(self.raw, overrides))
-            await asyncio.to_thread(self._plan, None, workspace, git_on=new.workspace.git,
-                                    network_off=netoff.is_off(new))
+        copying = copy_from is not None or copy_from_upload is not None
+        source: Source | None = None
         prepared: list[_SkillItem] = []
-        if skills:
-            if isinstance(skills, list) and len(skills) > self.config.skills.max_attached:
-                raise SessionError(f"At most {self.config.skills.max_attached} skills can be attached to a session "
-                                   "([skills] max_attached).")
-            prepared = await asyncio.to_thread(self._prepare_skills, self.config, skills,
-                                               Path(workspace) if workspace is not None else None)
+        staging: Path | None = None
+        copied: dict[str, Any] | None = None
+        claimed: Path | None = None
+        reserved: Path | None = None
         try:
+            if copy_from_upload is not None:
+                # claimed first: a create that names an upload uses it up, whatever refuses the create later (the
+                # sessions page uploads again for its next try)
+                try:
+                    claimed = self.uploads.claim_path(copy_from_upload)   # known before the claim runs
+                    source = await _in_thread(self.uploads.claim, copy_from_upload, claimed)
+                except CopyError as exc:
+                    if copy_from is None:   # (with both, "not both" is the answer)
+                        raise SessionError(str(exc), exc.status) from None
+            if copy_from is not None and copy_from_upload is not None:
+                raise SessionError("Give copy_from or copy_from_upload, not both.")
+            overrides = self._validated_overrides(overrides)
+            if copy_from is not None:   # the source is refused early, before any work
+                text = os.fspath(copy_from) if isinstance(copy_from, os.PathLike) else copy_from
+                try:
+                    source = await asyncio.to_thread(resolve_source, text, home=self.home, config=self.config,
+                                                     sandbox=hub_in_container(self.config))
+                except CopyError as exc:
+                    raise SessionError(str(exc), exc.status) from None
+            if workspace is not None:  # checked before anything is created
+                new = validate(self.sessions_dir / "new", self._merged(self.raw, overrides))
+                plan = await asyncio.to_thread(self._plan, None, workspace, git_on=new.workspace.git,
+                                               network_off=netoff.is_off(new), copying=copying)
+                if source is not None and copy_from is not None:
+                    try:
+                        check_target(source, plan.target)
+                    except CopyError as exc:
+                        raise SessionError(str(exc), exc.status) from None
+                self._check_reserved(plan.target)   # (checked and added with no await between)
+                self._creating_in.add(plan.target)
+                reserved = plan.target
+            if skills:
+                if isinstance(skills, list) and len(skills) > self.config.skills.max_attached:
+                    raise SessionError(f"At most {self.config.skills.max_attached} skills can be attached to a "
+                                       "session ([skills] max_attached).")
+                prepared = await asyncio.to_thread(self._prepare_skills, self.config, skills,
+                                                   Path(workspace) if workspace is not None else None)
+            if copying:
+                try:
+                    if source is None:   # (resolved or claimed above)
+                        raise SessionError("Nothing to copy.", 500)
+                    self.sessions_dir.mkdir(parents=True, exist_ok=True)
+                    await asyncio.to_thread(self.clean_copy_leftovers)
+                    staging = self.sessions_dir / staging_name()
+                    cancel = threading.Event()
+
+                    def check() -> None:
+                        if cancel.is_set():
+                            raise CopyCancelled()
+
+                    copied = await _in_thread(copy_into, source, staging, CopyLimits.from_config(self.config), check,
+                                              on_cancel=cancel.set)
+                except CopyError as exc:
+                    raise SessionError(str(exc), exc.status) from None
             summary = await self._create(title, goal_title, goal_description, overrides, start, actor, workspace,
-                                         prepared, via, auto_reply=auto_reply)
+                                         prepared, via, auto_reply=auto_reply,
+                                         copied=(staging, copied) if staging is not None and copied is not None
+                                         else None)
         finally:
+            if reserved is not None:
+                self._creating_in.discard(reserved)
             _discard(prepared)   # (whatever a failure left staged)
+            if claimed is not None and copy_from_upload is not None:
+                # used once, whatever happened (nothing when the claim never renamed it); synchronous: no await
+                # after a success, so a cancellation cannot turn a created session into an error
+                self.uploads.release(copy_from_upload, claimed)
+            if staging is not None:
+                try:
+                    if os.path.lexists(staging):   # not moved in: a failure before or in _create
+                        await _in_thread(_rmtree, staging)
+                finally:
+                    done_with(staging)   # (what a failed removal left, the next clean removes)
         return summary
+
+    def clean_copy_leftovers(self) -> None:
+        """Remove what copies into new sessions left behind: expired uploads and the claims and staging folders of
+        processes that no longer run (the launcher calls it at its start and hourly, create before a copy). Best
+        effort; blocking."""
+        self.uploads.clean()
+        self._clean_copies()
+
+    def _clean_copies(self) -> None:
+        """Remove the `.copying-<pid>-<run>-<hex>` staging folders left over (copyfrom.left_over: by processes that
+        no longer run, killed while they copied files into a new session, or in the Docker sandbox an earlier
+        container's hub with the same pid; or this run's whose removal failed); those concurrent creates of this run
+        use and those of other live processes are never touched. Best effort."""
+        try:
+            entries = list(self.sessions_dir.iterdir())
+        except OSError:
+            return
+        for entry in entries:
+            m = COPYING_NAME.match(entry.name)
+            if m is None or not left_over(int(m.group(1)), m.group(2), entry.name):
+                continue
+            try:
+                _remove(entry)
+            except OSError as exc:
+                log.warning("could not remove the stale copy %s: %s", entry, exc)
 
     async def _create(self, title: str, goal_title: str, goal_description: str, overrides: dict[str, Any],
                       start: bool, actor: str, workspace: str | os.PathLike | None, prepared: list[_SkillItem],
-                      via: str, *, auto_reply: bool = False) -> dict[str, Any]:
+                      via: str, *, auto_reply: bool = False,
+                      copied: tuple[Path, dict[str, Any]] | None = None) -> dict[str, Any]:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         for _attempt in range(100):  # another process (a second launcher, the CLI) may take the same id
             sid = self._new_id(title)
@@ -1512,11 +1886,25 @@ class SessionManager:
                 continue
         else:
             raise SessionError("Could not choose a session id.", 500)
-        (path / WORKSPACE_DIR).mkdir(exist_ok=True)
-        meta: dict[str, Any] = {"title": title, "created_at": time.time(), "overrides": overrides,
+        if copied is not None:
+            # the staged copy moves in (one volume: sessions/); _in_thread: the rename always ends before this goes on
+            try:
+                await _in_thread(_rename_retry, copied[0], path / WORKSPACE_DIR)
+            except BaseException as exc:
+                await asyncio.to_thread(_rmtree, path)   # nothing half-created stays behind (the copy too, if moved)
+                if isinstance(exc, OSError):
+                    raise SessionError(f"Could not move the copied files into {path / WORKSPACE_DIR}: {exc}",
+                                       500) from None
+                raise
+        else:
+            (path / WORKSPACE_DIR).mkdir(exist_ok=True)
+        meta: dict[str, Any] = {"title": title, "uid": new_uid(), "created_at": time.time(), "overrides": overrides,
                                 "autostart": False}
         if goal_title:  # set at the first start, when the members exist
             meta["pending_goal"] = {"title": goal_title, "description": goal_description, "actor": actor}
+        if copied is not None:   # for the user (the session card, the TUI); the agents are never told the source
+            r = copied[1]
+            meta["copied_from"] = {"source": r["source"], "files": r["files"], "bytes": r["bytes"], "at": time.time()}
         self._write_meta(sid, meta)
         if prepared:  # before the folder: a failure leaves nothing in it; the members find them at the first start
             try:
@@ -1527,7 +1915,9 @@ class SessionManager:
         result = None
         if workspace is not None:
             try:
-                result = await self._set_workspace(sid, workspace, creating=True)
+                # with a copy, the folder must still be new or empty: the copied files move there
+                result = await self._set_workspace(sid, workspace, creating=True,
+                                                   expect="moved" if copied is not None else None)
             except BaseException:
                 await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
                 raise
@@ -1543,6 +1933,8 @@ class SessionManager:
         summary = self.summary(sid)
         if result is not None:
             summary["workspace_result"] = result
+        if copied is not None:
+            summary["copy_result"] = copied[1]
         return summary
 
     def _load_locked(self, sid: str) -> "Swarm":
@@ -1829,6 +2221,8 @@ class SessionManager:
                                             network_off=network_off)
             if first.mode == "unchanged":
                 return {**first.result(), "restarted": False, "start_error": None}
+            if not creating:   # (a create checked its own folder against the others before it copied)
+                self._check_reserved(first.target)
             self._check_expected(sid, first, expect)
             was_loaded, was_running = sid in self.swarms, sid in self.running
             try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now
@@ -2011,6 +2405,407 @@ class SessionManager:
                 _rmtree(path)
                 if path.exists():
                     log.warning("could not remove %s completely; it is retried at the next delete", path)
+
+    # ---- import (transfer.apply_import) ---------------------------------------------------------------
+    def staging_path(self, sid: str) -> Path:
+        """A new (not yet created) folder in sessions/ to stage an imported session in before it is renamed in."""
+        return self.sessions_dir / f"{IMPORTING_PREFIX}{sid}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+    def clean_staging(self) -> list[str]:
+        """Remove the staged copies (`.importing-*`) an interrupted import left in sessions/; returns those that
+        could not be removed completely. Called at the start of an import, when no other one runs on this home."""
+        left = []
+        if not self.sessions_dir.is_dir():
+            return left
+        for path in sorted(self.sessions_dir.iterdir()):
+            if not path.name.startswith(IMPORTING_PREFIX):
+                continue
+            parts = path.name.rsplit("-", 2)   # .importing-<id>-<pid>-<token>: another live import's copy stays
+            if len(parts) == 3 and parts[1].isdigit() and int(parts[1]) != os.getpid() and _pid_alive(int(parts[1])):
+                continue
+            try:
+                _remove(path)
+            except OSError:
+                left.append(str(path))
+        return left
+
+    def backups(self, sid: str) -> list[Path]:
+        """The copies of session `sid` imports replaced (`.replaced-<id>-<time>/`), oldest first."""
+        prefix = f"{REPLACED_PREFIX}{sid}-"
+        if not self.sessions_dir.is_dir():
+            return []
+        return sorted(p for p in self.sessions_dir.iterdir()
+                      if p.name.startswith(prefix) and _STAMP.fullmatch(p.name[len(prefix):]) and p.is_dir())
+
+    @classmethod
+    def import_overrides(cls, overrides: Any, models: Collection[str]) -> tuple[dict[str, Any], str | None]:
+        """The overrides an imported session is written with (the import plan compares the same): cleaned as
+        update() cleans them, an `agents.default_model` naming a profile not in `models` dropped (as update_settings
+        does; its name is returned, else None). Raises SessionError for overrides that are not sections."""
+        overrides = cls.clean_overrides(overrides or {})
+        agents = overrides.get("agents")
+        dropped = agents.get("default_model") if isinstance(agents, dict) else None
+        if isinstance(dropped, str) and dropped not in models:
+            del agents["default_model"]
+            if not agents:
+                del overrides["agents"]
+            return overrides, dropped
+        return overrides, None
+
+    def _import_meta(self, sid: str, meta: dict[str, Any], workspace: ImportedWorkspace) -> tuple[dict, str | None]:
+        """The session.json an imported session gets as `sid`: its overrides checked against this home's settings
+        (an `agents.default_model` naming a profile this home does not have is dropped, as update_settings does; the
+        name is returned), never started by itself (autostart false), its workspace entry built for this home."""
+        self._refresh_settings()
+        data = {k: copy.deepcopy(v) for k, v in meta.items() if k not in ("id", "legacy", "workspace_notice")}
+        if not isinstance(data.get("uid"), str) or not _UID.fullmatch(data["uid"]):
+            raise SessionError(f"Session {sid} has no valid uid to be imported with.")
+        overrides, dropped = self.import_overrides(data.get("overrides"), self.config.models)
+        try:
+            self._config_from(self.raw, sid, overrides)
+        except ValueError as exc:
+            raise SessionError(f"Session {sid} has settings this home cannot use: {exc}") from None
+        data["overrides"] = overrides
+        data["autostart"] = False
+        data.pop("workspace", None)
+        if workspace.kind == "in_home":
+            if workspace.folder is None:
+                raise SessionError(f"Session {sid}: no folder in the home for its workspace.", 500)
+            data["workspace"] = self._workspace_meta(Path(os.path.abspath(workspace.folder)), workspace.adopted)
+        elif workspace.kind == "outside":
+            if not isinstance(workspace.path, str) or not workspace.path.strip():
+                raise SessionError(f"Session {sid}: no folder for its workspace.", 500)
+            data["workspace"] = {"path": workspace.path, "adopted": workspace.adopted}
+        elif workspace.kind != "own":
+            raise SessionError(f"Unknown workspace kind '{workspace.kind}'.", 500)
+        return data, dropped
+
+    @staticmethod
+    def _finish_staged(staged: Path, data: dict[str, Any], final: Path) -> None:
+        """Open the staged copy's database once (columns added by this version, WAL mode again; the absolute job
+        log paths of the other computer point at the copy's own `.dreamteam/jobs/` in `final`, the folder it is
+        renamed to, or are cleared), then write its session.json: last, so a staged copy without one never looks
+        like a finished session."""
+        db = staged / ".dreamteam" / "swarm.db"
+        if db.is_file():
+            database = Database(db)
+            try:
+                _rebase_job_logs(database, staged / ".dreamteam" / "jobs", final / ".dreamteam" / "jobs")
+            finally:
+                database.close()
+        path = staged / SESSION_FILE
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_bytes(json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8", "replace"))
+            os.replace(tmp, path)
+        finally:
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+
+    def _import_error(self, sid: str, exc: BaseException, problems: list[str], what: str) -> SessionError:
+        if isinstance(exc, SessionError) and not problems:
+            return exc
+        reason = exc.strerror if isinstance(exc, OSError) and exc.strerror else (str(exc) or type(exc).__name__)
+        if isinstance(exc, OSError) and exc.filename:
+            reason += f": {exc.filename}"
+        if problems:
+            return SessionError(f"Could not {what} session {sid} ({reason}), and some folders could not be put back: "
+                                f"{'; '.join(problems[:10])}. Move them back by hand.", 500)
+        if _in_use(exc):
+            return SessionError(f"Could not {what} session {sid}: its files are in use ({reason}). Close the programs "
+                                "that use them and try again. Nothing was changed.", 409)
+        return SessionError(f"Could not {what} session {sid} ({reason}). Nothing was changed.", 500)
+
+    def _place_workspace(self, staged: Path, workspace: ImportedWorkspace, done: list, created: list[Path]) -> None:
+        """Move the staged `workspace/` to its folder in the home (in_home; the folder must not exist)."""
+        if workspace.kind != "in_home" or workspace.folder is None:
+            return
+        folder = Path(workspace.folder)
+        if os.path.lexists(folder):
+            raise SessionError(f"{folder} appeared meanwhile; check it and import again.", 409)
+        _make_parents(folder, created)
+        source = staged / WORKSPACE_DIR
+        if os.path.lexists(source):
+            _rename_retry(source, folder, done)
+        else:
+            folder.mkdir()
+            created.append(folder)
+
+    async def import_add(self, staged: Path, meta: dict[str, Any], workspace: ImportedWorkspace, *, sid: str,
+                         before_swap: Callable[[str], None] | None = None) -> dict[str, Any]:
+        """Add the session staged in `staged` (a folder in sessions/: its .dreamteam/ and workspace/, see
+        staging_path) under the id `sid`, or a new id (`_new_id` of its title) when `sid` is taken here. `meta`:
+        its session.json (with its uid); `workspace`: where it works here. `before_swap(id)` runs right before it
+        is renamed in (it may raise to refuse). The session never starts by itself. Returns {"id", "dropped_model"
+        (an agents.default_model override this home does not have, removed, or None)}. Raises SessionError with
+        nothing left behind but `staged` (the caller removes it)."""
+        if not isinstance(sid, str) or not SESSION_ID.match(sid) or sid == LEGACY_ID:
+            raise SessionError(f"'{sid}' is not a valid session id.")
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        chosen = sid
+        for _attempt in range(100):   # another process may take the id meanwhile
+            if os.path.lexists(self.dir_of(chosen)):
+                chosen = self._new_id(str(meta.get("title") or ""))
+                continue
+            async with self._lock(chosen):
+                if os.path.lexists(self.dir_of(chosen)):
+                    continue
+                data, dropped = self._import_meta(chosen, meta, workspace)
+                await _in_thread(self._finish_staged, staged, data, self.dir_of(chosen))
+                if before_swap is not None:
+                    before_swap(chosen)
+                if await _to_end(self._swap_added, staged, chosen, workspace):
+                    self._changed(chosen, "created")
+                    return {"id": chosen, "dropped_model": dropped}
+        raise SessionError("Could not choose a session id.", 500)
+
+    def _swap_added(self, staged: Path, sid: str, workspace: ImportedWorkspace) -> bool:
+        """Rename the staged copy in (False: the id was taken meanwhile, nothing changed)."""
+        if os.path.lexists(self.dir_of(sid)):
+            return False
+        done: list[tuple[Path, Path]] = []
+        created: list[Path] = []
+        try:
+            self._place_workspace(staged, workspace, done, created)
+            _rename_retry(staged, self.dir_of(sid), done)
+        except BaseException as exc:
+            problems = _undo_renames(done, created)
+            raise self._import_error(sid, exc, problems, "import") from None
+        return True
+
+    async def import_rewrite(self, sid: str, staged: Path, meta: dict[str, Any], workspace: ImportedWorkspace, *,
+                             expect: dict[str, Any] | None = None,
+                             before_swap: Callable[[str], None] | None = None) -> dict[str, Any]:
+        """Replace the session `sid` with the copy staged in `staged` (see import_add), under the session's lock.
+        `expect`: its session.json as the import plan read it; a session changed since then is refused (409). The
+        old folder and its workspace folder inside the home go into the backup `sessions/.replaced-<id>-<time>/`
+        (`session/`, `workspace/`), then the staged copy is renamed in; a failure puts everything back (renames are
+        tried again while a file is held open for a moment; files in use: 409). Afterwards the old copy's
+        environments (KEEP_ON_IMPORT folders) move into the new workspace, and older backups of this session are
+        removed: only the last one is kept. A running session is refused; a loaded one is unloaded first. Returns
+        {"id", "backup", "kept": [moved environments], "removed_backups", "warnings", "dropped_model"}."""
+        self._check(sid)
+        if sid == LEGACY_ID:
+            raise SessionError("The main session cannot be replaced by an import.", 409)
+        async with self._lock(sid):
+            self._check(sid)
+            current = self.meta(sid)
+            if expect is not None and {k: v for k, v in current.items() if k not in ("id", "legacy")} != \
+                    {k: v for k, v in expect.items() if k not in ("id", "legacy")}:
+                raise SessionError(f"Session {sid} changed after the import was planned: run the import again.", 409)
+            self._check_journal(sid, current)   # files of an unfinished workspace move: a person puts them together
+            if sid in self.running:
+                raise SessionError(f"Session {sid} is running here: stop it first, then import again.", 409)
+            if sid in self.swarms:
+                await self._unload(sid)
+            data, dropped = self._import_meta(sid, meta, workspace)
+            await _in_thread(self._finish_staged, staged, data, self.dir_of(sid))
+            old_folder, old_stored, _adopted = self._workspace_entry(sid, current)
+            relative = _home_relative(current.get("workspace"))
+            old_in_home = old_folder if relative is not None else None
+            if before_swap is not None:
+                before_swap(sid)
+            backup = await _to_end(self._swap_replaced, sid, staged, workspace, old_in_home)
+            old_workspace = (backup / WORKSPACE_DIR if old_in_home is not None
+                             else backup / "session" / WORKSPACE_DIR if old_stored is None else None)
+            new_workspace = (Path(workspace.folder) if workspace.kind == "in_home" and workspace.folder is not None
+                             else self.default_workspace(sid) if workspace.kind == "own" else None)
+            kept, warnings = await _to_end(self._carry_environments, old_workspace, new_workspace)
+            removed, left = await _to_end(self._drop_old_backups, sid, backup)
+            warnings += [f"the older backup {path} could not be removed completely: delete it by hand"
+                         for path in left]
+        self._changed(sid, "updated")
+        return {"id": sid, "backup": str(backup), "kept": kept, "removed_backups": removed, "warnings": warnings,
+                "dropped_model": dropped}
+
+    async def import_settings(self, sid: str, meta: dict[str, Any], *,
+                              expect: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Write the session.json an import brings for session `sid` whose history and files are the same here
+        (only its title, its settings or its pending goal differ): no folder is swapped and no backup is made. The
+        session keeps its workspace entry; the checks are those of import_rewrite. Returns {"id",
+        "dropped_model"}."""
+        self._check(sid)
+        if sid == LEGACY_ID:
+            raise SessionError("The main session cannot be replaced by an import.", 409)
+        async with self._lock(sid):
+            self._check(sid)
+            current = self.meta(sid)
+            if expect is not None and {k: v for k, v in current.items() if k not in ("id", "legacy")} != \
+                    {k: v for k, v in expect.items() if k not in ("id", "legacy")}:
+                raise SessionError(f"Session {sid} changed after the import was planned: run the import again.", 409)
+            self._check_journal(sid, current)
+            if sid in self.running:
+                raise SessionError(f"Session {sid} is running here: stop it first, then import again.", 409)
+            if sid in self.swarms:
+                await self._unload(sid)   # a loaded swarm keeps the settings it was loaded with
+            data, dropped = self._import_meta(sid, meta, ImportedWorkspace("own"))
+            if "workspace" in current:
+                data["workspace"] = copy.deepcopy(current["workspace"])
+            self._write_meta(sid, data)
+        self._changed(sid, "updated")
+        return {"id": sid, "dropped_model": dropped}
+
+    def _swap_replaced(self, sid: str, staged: Path, workspace: ImportedWorkspace, old_in_home: Path | None) -> Path:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = self.sessions_dir / f"{REPLACED_PREFIX}{sid}-{stamp}"
+        number = 1
+        while os.path.lexists(backup):
+            number += 1
+            backup = self.sessions_dir / f"{REPLACED_PREFIX}{sid}-{stamp}-{number}"
+        done: list[tuple[Path, Path]] = []
+        created: list[Path] = []
+        planned: list[tuple[Path, Path]] = [(self.dir_of(sid), backup / "session")]
+        if old_in_home is not None and os.path.lexists(old_in_home) and not is_link(old_in_home):
+            planned.append((old_in_home, backup / WORKSPACE_DIR))
+        if workspace.kind == "in_home" and workspace.folder is not None and os.path.lexists(staged / WORKSPACE_DIR):
+            planned.append((staged / WORKSPACE_DIR, Path(workspace.folder)))
+        planned.append((staged, self.dir_of(sid)))
+        journal = backup / SWAP_JOURNAL
+        try:
+            backup.mkdir()
+            created.append(backup)
+            # the journal names every rename in order: a process that dies halfway (power loss) is undone by the
+            # next import (recover_swaps); it goes once the swap is complete
+            _write_swap_journal(journal, sid, planned, done, created, self.home)
+            _rename_retry(self.dir_of(sid), backup / "session", done)
+            _write_swap_journal(journal, sid, planned, done, created, self.home)
+            if old_in_home is not None and os.path.lexists(old_in_home) and not is_link(old_in_home):
+                _rename_retry(old_in_home, backup / WORKSPACE_DIR, done)
+                _write_swap_journal(journal, sid, planned, done, created, self.home)
+            self._place_workspace(staged, workspace, done, created)
+            _write_swap_journal(journal, sid, planned, done, created, self.home)
+            _rename_retry(staged, self.dir_of(sid), done)
+        except BaseException as exc:
+            problems = _undo_renames(done, [])
+            if not problems:
+                with contextlib.suppress(OSError):
+                    journal.unlink()
+            for folder in reversed(created):
+                with contextlib.suppress(OSError):
+                    folder.rmdir()
+            raise self._import_error(sid, exc, problems, "replace") from None
+        with contextlib.suppress(OSError):
+            journal.unlink()
+        return backup
+
+    def recover_swaps(self) -> list[str]:
+        """Finish or undo the session swaps of an import that stopped halfway (the process died between the renames
+        of `_swap_replaced`: the session folder may be in its backup). A swap whose renames all happened is kept
+        (only its journal goes); otherwise every rename it made is put back, newest first. Swaps of a live process
+        are left alone. Returns what was done, and what could not be put back, as messages. Called at the start
+        of an import, when no other one runs on this home."""
+        messages: list[str] = []
+        if not self.sessions_dir.is_dir():
+            return messages
+        for backup in sorted(self.sessions_dir.iterdir()):
+            journal = backup / SWAP_JOURNAL
+            if not backup.name.startswith(REPLACED_PREFIX) or not journal.is_file():
+                continue
+            try:
+                info = json.loads(journal.read_text(encoding="utf-8"))
+                sid = str(info["sid"])
+                planned = [(_journal_resolve(a, self.home), _journal_resolve(b, self.home)) for a, b in info["planned"]]
+                done = [(_journal_resolve(a, self.home), _journal_resolve(b, self.home)) for a, b in info["done"]]
+                created = [_journal_resolve(p, self.home) for p in info.get("created") or []]
+                pid = int(info.get("pid") or 0)
+            except (OSError, ValueError, KeyError, TypeError, RecursionError):
+                messages.append(f"{journal} cannot be read: check {backup} by hand (it may hold a session's files)")
+                continue
+            if pid and pid != os.getpid() and _pid_alive(pid):
+                messages.append(f"the import of session {sid} by process {pid} has not finished ({backup}): it is "
+                                "left as it is while that process runs")
+                continue   # an import of another process is swapping it right now
+            if len(done) < len(planned):   # a rename may have happened just before the process died
+                src, dst = planned[len(done)]
+                if os.path.lexists(dst) and not os.path.lexists(src):
+                    done.append((src, dst))
+            if len(done) >= len(planned):
+                if planned and not os.path.lexists(planned[-1][1]):   # the session folder is not where it should be
+                    messages.append(f"the import of session {sid} that stopped halfway cannot be checked: "
+                                    f"{planned[-1][1]} does not exist (was the home moved?); the session's files may "
+                                    f"be in {backup}. Move them back by hand.")
+                    continue
+                with contextlib.suppress(OSError):
+                    journal.unlink()
+                messages.append(f"the import of session {sid} that stopped halfway had finished; its previous copy is "
+                                f"in {backup}")
+                continue
+            problems = []
+            for src, dst in reversed(done):
+                if not os.path.lexists(dst):
+                    if not os.path.lexists(src):   # neither is there: the journal names other places
+                        problems.append(f"{dst} (belongs in {src}): neither is there (was the home moved?); the "
+                                        f"files may be in {backup}")
+                    continue
+                if os.path.lexists(src):   # taken meanwhile: the copy stays where it is, and the journal too
+                    problems.append(f"{dst} (belongs in {src}, which exists now)")
+                    continue
+                try:
+                    _rename_retry(dst, src)
+                except OSError as exc:
+                    problems.append(f"{dst} (belongs in {src}): {exc.strerror or exc}")
+            if problems:
+                messages.append(f"the import of session {sid} that stopped halfway could not be undone completely: "
+                                f"{'; '.join(problems)}. Move them back by hand.")
+                continue
+            with contextlib.suppress(OSError):
+                journal.unlink()
+            for folder in reversed(created):
+                with contextlib.suppress(OSError):
+                    folder.rmdir()
+            messages.append(f"the import of session {sid} that stopped halfway was undone: the session is as it was "
+                            "before it")
+        return messages
+
+    def interrupted_swaps(self) -> list[str]:
+        """The backups that hold the journal of a session swap that stopped halfway (see recover_swaps)."""
+        if not self.sessions_dir.is_dir():
+            return []
+        return [str(p) for p in sorted(self.sessions_dir.iterdir())
+                if p.name.startswith(REPLACED_PREFIX) and (p / SWAP_JOURNAL).is_file()]
+
+    @staticmethod
+    def _carry_environments(old: Path | None, new: Path | None) -> tuple[list[str], list[str]]:
+        """Move the KEEP_ON_IMPORT folders of the old workspace `old` to the same place in `new` where that place is
+        free (an export never carries them; the path stays the same, so they keep working). Returns (the moved
+        relative paths, warnings)."""
+        moved: list[str] = []
+        warnings: list[str] = []
+        if old is None or new is None or is_link(old) or not old.is_dir() or not new.is_dir():
+            return moved, warnings
+        for top, dirs, _files in os.walk(old):
+            keep = sorted(d for d in dirs if d in KEEP_ON_IMPORT)
+            dirs[:] = [d for d in dirs if d not in KEEP_ON_IMPORT and d != ".git" and not is_link(Path(top, d))]
+            for name in keep:
+                src = Path(top, name)
+                rel = src.relative_to(old)
+                dst = new / rel
+                if is_link(src) or not dst.parent.is_dir() or os.path.lexists(dst):
+                    continue
+                try:
+                    _rename_retry(src, dst)
+                    moved.append(rel.as_posix())
+                except OSError as exc:
+                    warnings.append(f"{rel.as_posix()} stays in the backup {src} ({exc.strerror or exc}): move it by "
+                                    "hand or create it again")
+        return moved, warnings
+
+    def _drop_old_backups(self, sid: str, keep: Path) -> tuple[list[str], list[str]]:
+        """Remove the older backups of session `sid`: those of the same session (its uid; a deleted session that had
+        the same id keeps its backup) whose swap finished (no swap journal)."""
+        removed, left = [], []
+        uid = _backup_uid(keep)
+        for path in self.backups(sid):
+            if _same_path(path, keep) or (path / SWAP_JOURNAL).exists():
+                continue
+            if uid is not None and _backup_uid(path) not in (uid, None):
+                continue
+            try:
+                _remove(path)
+                removed.append(str(path))
+            except OSError:
+                left.append(str(path))
+        return removed, left
 
     def finished(self, sid: str) -> bool:
         """The session's work is over: its goal is achieved and no task is open (todo, in_progress, waiting or

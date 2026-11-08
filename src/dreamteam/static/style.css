@@ -114,7 +114,7 @@ code { font-family: var(--mono); font-size: .92em; }
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
 .spacer { margin-left: auto; }
-.err-text { color: var(--err); white-space: pre-wrap; }
+.err-text { color: var(--err); white-space: pre-wrap; overflow-wrap: anywhere; } /* a long path in the message */
 /* small caps of the interface: column heads, panel and section titles, stat labels */
 .goal-label, .column-head, .sidebar-head h2, .section-title, .stat-row > span {
   font-family: var(--mono); font-size: 11px; font-weight: 600; letter-spacing: .08em; text-transform: uppercase;

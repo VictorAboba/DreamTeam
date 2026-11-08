@@ -20,6 +20,9 @@ Local models (Ollama, vLLM) are reachable from the container at `http://host.doc
 Only the home folder is mounted into the container, so sessions that `/cd` moved to a folder outside it don't start
 in the sandbox: `dreamteam sandbox` lists them at startup. Before the start, return such sessions to the home folder
 (`/cd --default` or `/cd` to a folder inside it: such folders are found in the container too).
+Files from your computer reach a new session through the .zip upload of the "New session" dialog ("More" → "Files
+to work on"): a folder path from the host is not there in the container (see
+[Working on a copy of files](projects.md#working-on-a-copy-of-files)).
 
 Git in the image trusts no repository that belongs to another user (git's `safe.directory` check is on). The agents'
 commands, their background processes and the MCP servers of a session trust that session's folder, the folders inside

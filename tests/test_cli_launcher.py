@@ -581,16 +581,18 @@ def test_serve_clarify_needs_a_goal(tmp_path, monkeypatch, capsys):
         assert cli.main(["serve", "--home", str(home), "--goal", "G", *flags, "--no-browser", "--no-console"]) == 0
         assert calls["goal"] == "G" and calls["clarify"] is value, flags
 
+    stops: list[asyncio.Event] = []
+
     async def no_server(manager, host, port, **kw):   # the web server is not what this is about
-        await asyncio.Event().wait()
+        stops[-1].set()   # stops right after --goal created and started its session (a stop during the create
+        await asyncio.Event().wait()   # would cancel it)
 
     monkeypatch.setattr(launcher_module, "serve_launcher", no_server)
 
     async def serve(**kw) -> int:
-        stop = asyncio.Event()
-        stop.set()   # stops right after --goal created and started its session
+        stops.append(asyncio.Event())
         return await real_serve_home(home, "127.0.0.1", free_port(), console=False, open_browser=False, goal="G",
-                                     stop=stop, **kw)
+                                     stop=stops[-1], **kw)
 
     for kw in ({"clarify": False}, {"clarify": True}, {}):
         assert asyncio.run(serve(**kw)) == 0, kw
@@ -654,3 +656,209 @@ async def test_run_keeps_a_multi_line_goal_across_restarts(tmp_path, monkeypatch
     assert await run(goal) == first  # kept: same updated_at
     changed = await run("Tetris\nPython")
     assert changed["title"] == "Tetris" and changed["updated_at"] >= first["updated_at"]
+
+
+# ---- the computer name in hub.json (#38) ----------------------------------------------------------------------------
+@pytest.fixture
+def this_pc(monkeypatch):
+    """This process runs on the computer "this-pc" (outside a container); the warnings start unprinted."""
+    from dreamteam import netoff
+
+    monkeypatch.setattr(netoff, "in_container", lambda: False)
+    monkeypatch.delenv(netoff.IMAGE_ENV, raising=False)
+    monkeypatch.setattr(cli.platform, "node", lambda: "this-pc")
+    monkeypatch.setattr(cli, "_machine_warned", set())
+    return "this-pc"
+
+
+def _hub_config(home: Path):
+    return type("HubConfig", (), {"project_dir": home})()  # _write_hub_file reads only project_dir
+
+
+def _old_hub_file(home: Path, **info) -> None:
+    path = cli.hub_file(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = {"base_url": "http://127.0.0.1:1", "mcp_url": "http://127.0.0.1:1/mcp", "pid": 4_000_000,
+            "project": str(home), **info}
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+def _two_computers_warning(home: Path, name: str) -> str:
+    return (f"warning: {home} was last served by the computer {name}. Do not run one DreamTeam folder on two "
+            "computers at the same time; move sessions with dreamteam export / dreamteam import.")
+
+
+def test_hub_file_records_the_computer(tmp_path, this_pc, capsys):
+    home = tmp_path / "home"
+    cli._write_hub_file(home, "http://127.0.0.1:1", _hub_config(home))
+    info = json.loads(cli.hub_file(home).read_text(encoding="utf-8"))
+    assert info["machine"] == "this-pc" and info["pid"] == os.getpid() and info["project"] == str(home)
+    assert capsys.readouterr().err == ""  # no file before: nothing to warn about
+
+
+def test_hub_file_records_the_real_computer_name(tmp_path, monkeypatch):
+    import platform
+
+    from dreamteam import netoff
+
+    monkeypatch.setattr(netoff, "in_container", lambda: False)
+    monkeypatch.delenv(netoff.IMAGE_ENV, raising=False)
+    home = tmp_path / "home"
+    cli._write_hub_file(home, "http://127.0.0.1:1", _hub_config(home))
+    assert json.loads(cli.hub_file(home).read_text(encoding="utf-8"))["machine"] == (platform.node() or None)
+
+
+def test_hub_file_of_another_computer_warns_once(tmp_path, this_pc, capsys):
+    home = tmp_path / "home"
+    _old_hub_file(home, machine="laptop")
+    cli._write_hub_file(home, "http://127.0.0.1:2", _hub_config(home))
+    err = capsys.readouterr().err
+    assert err.strip() == _two_computers_warning(home, "laptop")
+    assert json.loads(cli.hub_file(home).read_text(encoding="utf-8"))["machine"] == "this-pc"  # written anyway
+
+    _old_hub_file(home, machine="laptop")  # once per process: a retried start (another port) prints nothing more
+    cli._write_hub_file(home, "http://127.0.0.1:3", _hub_config(home))
+    assert capsys.readouterr().err == ""
+
+    other = tmp_path / "other"  # another home of the same process has its own warning
+    _old_hub_file(other, machine="desktop")
+    cli._write_hub_file(other, "http://127.0.0.1:4", _hub_config(other))
+    assert capsys.readouterr().err.strip() == _two_computers_warning(other, "desktop")
+
+
+@pytest.mark.parametrize("info", [{"machine": "this-pc"}, {}, {"machine": None}, {"machine": ""}, {"machine": 7}],
+                         ids=["same", "older-file", "container", "empty", "not-a-name"])
+def test_hub_file_of_this_computer_gives_no_warning(tmp_path, this_pc, capsys, info):
+    home = tmp_path / "home"
+    _old_hub_file(home, **info)
+    cli._write_hub_file(home, "http://127.0.0.1:2", _hub_config(home))
+    assert capsys.readouterr().err == ""
+    assert json.loads(cli.hub_file(home).read_text(encoding="utf-8"))["machine"] == "this-pc"
+
+
+def test_unreadable_hub_file_gives_no_warning(tmp_path, this_pc, capsys):
+    home = tmp_path / "home"
+    cli.hub_file(home).parent.mkdir(parents=True)
+    cli.hub_file(home).write_text("{not json", encoding="utf-8")
+    cli._write_hub_file(home, "http://127.0.0.1:2", _hub_config(home))
+    assert capsys.readouterr().err == ""
+    assert json.loads(cli.hub_file(home).read_text(encoding="utf-8"))["machine"] == "this-pc"
+
+
+def test_container_hub_writes_no_computer_name_and_never_warns(tmp_path, this_pc, monkeypatch, capsys):
+    """A hub in the sandbox image serves a folder of the host: its own name (the container's) is no computer."""
+    from dreamteam import netoff
+
+    home = tmp_path / "home"
+    _old_hub_file(home, machine="laptop")
+    monkeypatch.setenv(netoff.IMAGE_ENV, "1")
+    cli._write_hub_file(home, "http://127.0.0.1:2", _hub_config(home))
+    assert capsys.readouterr().err == ""
+    assert json.loads(cli.hub_file(home).read_text(encoding="utf-8"))["machine"] is None
+
+    monkeypatch.delenv(netoff.IMAGE_ENV)
+    monkeypatch.setattr(netoff, "in_container", lambda: True)
+    _old_hub_file(home, machine="laptop")
+    cli._write_hub_file(home, "http://127.0.0.1:3", _hub_config(home))
+    assert capsys.readouterr().err == ""
+    assert json.loads(cli.hub_file(home).read_text(encoding="utf-8"))["machine"] is None
+
+    monkeypatch.setattr(netoff, "in_container", lambda: False)  # the host after the sandbox: the file has no name
+    cli._write_hub_file(home, "http://127.0.0.1:4", _hub_config(home))
+    assert capsys.readouterr().err == ""
+
+
+def test_other_computer_changes_no_hub_decision(tmp_path, this_pc):
+    """The name only warns: running_hub() and _session_holders() decide by pid, project and identity as before."""
+    home = tmp_path / "home"
+    for project in (str(home.resolve()), "/swarm"):  # this home's path (a stale file), a sandbox's view
+        _old_hub_file(home, project=project)
+        before = (cli.running_hub(home), cli._session_holders(home))
+        _old_hub_file(home, project=project, machine="laptop")
+        after = (cli.running_hub(home), cli._session_holders(home))
+        assert after[0] == before[0] and len(after[1]) == len(before[1])   # only the wording names the computer
+    assert before[0] is None and len(before[1]) == 1  # (the sandbox's file counts as a holder, with or without it)
+    assert after[1] == [f"the hub of the computer laptop ({cli.hub_file(home)}): stop DreamTeam there, or delete "
+                        "that file if it no longer runs"]
+    _old_hub_file(home, project="/swarm", machine="THIS-PC.lan")   # this computer under another network name
+    assert cli._other_machine(json.loads(cli.hub_file(home).read_text(encoding="utf-8"))) is None
+
+
+def test_hub_file_of_another_computer_is_not_removed(tmp_path, this_pc):
+    """Another computer's hub may have this process's pid: its file stays; this process's own file goes."""
+    home = tmp_path / "home"
+    _old_hub_file(home, pid=os.getpid(), machine="laptop")
+    cli._remove_hub_file(home)
+    assert cli.hub_file(home).exists()
+    cli._write_hub_file(home, "http://127.0.0.1:2", _hub_config(home))
+    cli._remove_hub_file(home)
+    assert not cli.hub_file(home).exists()
+
+
+def test_a_hub_removes_its_file_after_the_computer_name_changed(tmp_path, this_pc, monkeypatch):
+    """macOS takes the computer name from the network: a hub that started as this-pc still removes its own file."""
+    home = tmp_path / "home"
+    cli._write_hub_file(home, "http://127.0.0.1:2", _hub_config(home))
+    monkeypatch.setattr(cli.platform, "node", lambda: "dhcp-10-0-0-5.corp")
+    cli._remove_hub_file(home)
+    assert not cli.hub_file(home).exists()
+    cli._write_hub_file(home, "http://127.0.0.1:3", _hub_config(home))
+    _old_hub_file(home, pid=os.getpid(), machine="laptop")   # replaced by another computer's hub meanwhile
+    cli._remove_hub_file(home)
+    assert cli.hub_file(home).exists()
+
+
+async def test_hubs_warn_before_they_write_hub_json(tmp_path, this_pc, monkeypatch, capsys):
+    """`dreamteam serve` and the stdio launcher with its web UI write hub.json through _write_hub_file, which warns
+    first when the file it replaces names another computer (no port is bound: the servers are replaced)."""
+    from dreamteam import launcher as launcher_module
+    from dreamteam import launcher_mcp
+
+    async def fake_launcher(manager, host, port, log_level="warning", *, on_started=None, resume=None,
+                            on_listening=None):
+        if on_listening is not None:
+            on_listening()
+        if on_started is not None:
+            on_started()
+        await asyncio.Event().wait()
+
+    async def no_stdio(manager):  # (stdin is not an MCP client here)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(launcher_module, "serve_launcher", fake_launcher)
+    monkeypatch.setattr(launcher_mcp, "serve_stdio_launcher", no_stdio)
+    monkeypatch.setattr(cli, "_port_free", lambda host, port: True)
+    home = make_home(tmp_path, 1)
+    seen: list[dict] = []
+    real_write = cli._write_hub_file
+
+    def write(project_dir, base, config):
+        real_write(project_dir, base, config)
+        seen.append(json.loads(cli.hub_file(project_dir).read_text(encoding="utf-8")))
+
+    monkeypatch.setattr(cli, "_write_hub_file", write)
+    _old_hub_file(home, machine="laptop")
+    stop = asyncio.Event()
+    task = asyncio.create_task(cli._serve_home(home, "127.0.0.1", 1, console=False, open_browser=False, stop=stop))
+    for _ in range(200):
+        if seen:
+            break
+        await asyncio.sleep(0.02)
+    stop.set()
+    assert await task == 0
+    assert seen and seen[0]["machine"] == "this-pc"
+    assert _two_computers_warning(home, "laptop") in capsys.readouterr().err
+
+    monkeypatch.setattr(cli, "_machine_warned", set())
+    _old_hub_file(home, machine="desktop")
+    stop = asyncio.Event()
+    task = asyncio.create_task(cli._mcp_launcher_in_process(home, Config.load(home), True, stop=stop))
+    for _ in range(200):
+        if len(seen) > 1:
+            break
+        await asyncio.sleep(0.02)
+    stop.set()
+    await task
+    assert len(seen) == 2 and seen[1]["machine"] == "this-pc"
+    assert _two_computers_warning(home, "desktop") in capsys.readouterr().err
+    assert not cli.hub_file(home).exists()  # removed at the end, as before

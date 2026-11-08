@@ -551,6 +551,10 @@ async def _cd(c: CommandContext) -> None:
     await c.app.change_folder(c.args)
 
 
+async def _copy_from(c: CommandContext) -> None:
+    c.app.choose_copy_source(c.args)
+
+
 async def _cost(c: CommandContext) -> None:
     c.print(render.cost_table(c.ctx, await c.state()))
 
@@ -740,6 +744,7 @@ COMMANDS: tuple[Command, ...] = (
     Command("cat", _files, args=True, required=True, session=True),
     Command("unlock", _unlock, args=True, required=True, session=True),
     Command("cd", _cd, args=True, launcher=True),   # without a session: the folder of the next new one
+    Command("copy-from", _copy_from, args=True, launcher=True),   # always the files of the next new session
     Command("cost", _cost, session=True),
     Command("status", _status),
     Command("model", _model, args=True, launcher=True),
