@@ -435,3 +435,36 @@ async def test_single_swarm_hub(tmp_path):
         await asyncio.gather(server, return_exceptions=True)
         await swarm.stop()
         swarm.close()
+
+
+async def test_create_session_with_copy_from(conn: Connection, tmp_path, monkeypatch):
+    """`create_session(..., copy_from=)`: the body's `copy_from`, the long timeout of a folder move (a copy may take
+    long), and the hub's `copy` answer as the summary's "copy_result"."""
+    from dreamteam.tui import client as client_module
+
+    client = conn.client
+    src = tmp_path / "project"
+    (src / "__pycache__").mkdir(parents=True)
+    (src / "__pycache__" / "a.pyc").write_bytes(b"\0")
+    (src / "a.py").write_text("print('a')\n", encoding="utf-8")
+    summary = await client.create_session("Copy", "Work on the copy", start=False, copy_from=str(src))
+    assert summary["copy_result"]["files"] == 1 and summary["copy_result"]["excluded_count"] == 1
+    assert summary["copied_from"]["source"] == str(src.resolve()) and summary["status"] == "stopped"
+    assert (conn.manager.default_workspace(summary["id"]) / "a.py").is_file()
+    plain = await client.create_session("Plain", "No copy", start=False)
+    assert "copy_result" not in plain and plain["copied_from"] is None
+    with pytest.raises(HubError) as exc:
+        await client.create_session("Bad", "x", start=False, copy_from=str(tmp_path / "missing"))
+    assert exc.value.status == 400 and "Nothing to copy" in exc.value.message
+
+    calls: list[tuple] = []
+
+    async def fake_call(method, path, *, body=None, timeout=None, **kw):
+        calls.append((method, path, body, timeout))
+        return {"session": {"id": "001-x"}, "copy": {"files": 2}}
+
+    monkeypatch.setattr(client, "_call", fake_call)
+    assert (await client.create_session("T", "G", copy_from="/x"))["copy_result"] == {"files": 2}
+    assert calls[-1][2]["copy_from"] == "/x" and calls[-1][3] == client_module.MOVE_TIMEOUT
+    await client.create_session("T", "G")
+    assert "copy_from" not in calls[-1][2] and calls[-1][3] == client_module.SESSION_TIMEOUT

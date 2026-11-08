@@ -19,6 +19,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from pathlib import Path
+from typing import Any
 
 from . import __version__, hubauth, netoff, roles
 from .config import CONFIG_FILE, PROVIDER_PRESETS, Config, render_template
@@ -799,16 +800,40 @@ def _print_sessions(home: Path, base: str | None) -> int:
     return 0
 
 
+async def _until_stopped(coro: Any, stop: asyncio.Event) -> tuple[bool, Any]:
+    """Run `coro` until it ends or `stop` is set, whichever comes first: (False, its result; its exception goes
+    on), or (True, the result it still returned despite the cancel, else None) after a stop cancelled it and it
+    ended."""
+    task = asyncio.ensure_future(coro)
+    stopper = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait({task, stopper}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:   # this call was cancelled itself: `coro` must not go on alone
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+    finally:
+        stopper.cancel()
+    if task.done():
+        return False, task.result()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    return True, (task.result() if not task.cancelled() and task.exception() is None else None)
+
+
 async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_browser: bool,
                       goal: str | None = None, title: str | None = None, start: str | None = None,
                       stop: asyncio.Event | None = None, workspace: str | None = None,
                       skills: list[str] | None = None, network: str | None = None,
-                      clarify: bool | None = None) -> int:
+                      clarify: bool | None = None, copy_from: str | None = None) -> int:
     """Run the launcher (sessions page, settings, every session's board, MCP) until a stop signal, the
     console's /quit or a server failure. `goal` creates and starts a new session (working in the absolute
-    folder `workspace` when given, docs/SPEC.md §17.2; with the skills `skills`, §19; [swarm] network `network`,
-    §7.2; [swarm] clarify `clarify` when not None, §3); `start` starts an existing one. hub.json exists exactly
-    while the server listens; all sessions stop at the end."""
+    folder `workspace` when given, docs/SPEC.md §17.2; filled with a copy of the folder or .zip `copy_from`,
+    §17.2 "Copying files into a new session"; with the skills `skills`, §19; [swarm] network `network`, §7.2;
+    [swarm] clarify `clarify` when not None, §3); a stop signal while it is created (a long copy) undoes the
+    create, and 130 is returned; its start is not interrupted. `start` starts an existing one. hub.json exists
+    exactly while the server listens; all sessions stop at the end."""
+    from .copyfrom import copy_text
     from .launcher import serve_launcher
     from .launcher_mcp import workspace_text
     from .sessions import SessionManager
@@ -835,11 +860,26 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                 swarm_over = {**({"network": network} if network else {}),
                               **({"clarify": clarify} if clarify is not None else {})}
                 overrides = {"swarm": swarm_over} if swarm_over else None
-                created = await manager.create(title or "", goal, overrides=overrides, workspace=workspace,
-                                               skills=skills, via="cli")
+                before = set(manager.ids())
+                # only the create races Ctrl+C (a copy may take long; a cancelled create leaves nothing), never the
+                # start of the swarm, which runs below as create(start=True) would run it
+                stopped, created = await _until_stopped(
+                    manager.create(title or "", goal, overrides=overrides, workspace=workspace, skills=skills,
+                                   via="cli", start=False, copy_from=copy_from), stop)
+                if stopped:
+                    new = sorted(set(manager.ids()) - before)
+                    if not new:
+                        print("Stopped before the session was created: nothing was kept.", file=sys.stderr)
+                    else:
+                        print(f"Stopped: session {new[0]} was created but not started (dreamteam sessions lists it).",
+                              file=sys.stderr)
+                    return 130
                 focus = created["id"]
+                if created.get("copy_result"):
+                    print(f"Session {focus}: {copy_text(created['copy_result'])}", file=sys.stderr)
                 if created.get("workspace_result"):
                     print(f"Session {focus}: {workspace_text(created['workspace_result'])}", file=sys.stderr)
+                await manager.start(focus)
         except Exception as exc:  # unknown session, invalid settings, a refused folder, the swarm failed to start
             print(f"Could not start the session: {exc}", file=sys.stderr)
             return 1
@@ -916,6 +956,15 @@ def cmd_serve(args) -> int:
         workspace = _workspace_arg(args.workspace)
         if workspace is None:
             return 2
+    copy_from = None
+    if args.copy_from:
+        if not args.goal:
+            print("--copy-from needs --goal: it fills the folder of the session that --goal creates.",
+                  file=sys.stderr)
+            return 2
+        copy_from = _copy_from_arg(args.copy_from)
+        if copy_from is None:
+            return 2
     if args.network and not args.goal:
         print("--network needs --goal: it is the network of the session that --goal creates (an existing session "
               "changes it in its settings).", file=sys.stderr)
@@ -948,7 +997,7 @@ def cmd_serve(args) -> int:
     try:
         return asyncio.run(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
                                        goal=args.goal, title=args.title, workspace=workspace, skills=skills,
-                                       network=args.network, clarify=args.clarify))
+                                       network=args.network, clarify=args.clarify, copy_from=copy_from))
     except KeyboardInterrupt:
         return 0
 
@@ -1715,6 +1764,17 @@ def _workspace_arg(text: str) -> str | None:
     return path
 
 
+def _copy_from_arg(text: str) -> str | None:
+    """`--copy-from DIR|ZIP` as the absolute path the hub needs (`~` and relative paths resolved against the
+    current directory); None, with the reason printed, for a file that is not a .zip. The hub checks the rest
+    (docs/SPEC.md §17.2 "Copying files into a new session")."""
+    path = os.path.normpath(os.path.abspath(os.path.expanduser(text)))
+    if os.path.isfile(path) and not path.lower().endswith(".zip"):
+        print(f"dreamteam: --copy-from {path} is a file but not a .zip archive.", file=sys.stderr)
+        return None
+    return path
+
+
 def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
                  resuming: bool = False) -> list[str] | None:
     """`--skill REF|PATH|URL` (repeatable) as the hub needs it: a path (it has a `/` or `\\`, starts with `.` or `~`,
@@ -1724,7 +1784,6 @@ def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
     `--workspace` folder's .claude/skills, or with `resuming` left to the hub, which knows the session's folder):
     None, with the reason printed, when one is unknown. Sources are checked by the hub."""
     from . import skills as skill_lib
-    from .settings import read_raw, validate
 
     out: list[str] = []
     refs: list[str] = []
@@ -1743,7 +1802,7 @@ def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
             refs.append(text)
     if refs:
         try:
-            config = validate(home, read_raw(home)) if (home / CONFIG_FILE).exists() else validate(home, {})
+            config = _home_config(home)
         except (OSError, ValueError):
             config = None   # the hub reports broken settings itself
         project = Path(workspace) if workspace else None
@@ -1758,6 +1817,49 @@ def _skill_items(items: list[str] | None, home: Path, workspace: str | None, *,
     return out
 
 
+def _home_config(home: Path) -> Config:
+    """The home's settings as its hub reads them (a home not made yet: the defaults). OSError, ValueError."""
+    from .settings import read_raw, validate
+
+    return validate(home, read_raw(home)) if (home / CONFIG_FILE).exists() else validate(home, {})
+
+
+def _team_choice(text: str, home: Path, agents: int | None = None) -> tuple[str, Any]:
+    """`--team` (docs/SPEC.md §17.3 "Saved teams"): roles.team_choice over the home's settings, for a chosen team with
+    the checks that it can start and that `--agents` (`agents`) is not given. ValueError with what to tell the user. A
+    list and a built-in role's name need no settings; any other bare word does. Prints a note on stderr for a word that
+    names no role or team in this home: it starts a new role with no description."""
+    roles.parse_team(text)
+    word = roles.normalize(text)
+    try:
+        config = _home_config(home)
+    except (OSError, ValueError) as exc:
+        if "," in text or "*" in text or roles.preset_id(text):
+            return "roles", None
+        raise ValueError(f"cannot read the settings to look up '{word}': {exc}") from None
+    kind, value = roles.team_choice(text, config.teams, config.roles)
+    if kind == "unknown":
+        known = roles.close_roles(config.roles, value, "en") + [team.name for team in config.teams]
+        raise ValueError(f"no saved team or role '{value}' (there are: {', '.join(dict.fromkeys(known))}). "
+                         f"For a new role with no description write '{value}*1'")
+    if kind == "mixed":
+        raise ValueError(f"'{value}' is a saved team: choose it whole, with no other roles and no *N")
+    is_role = roles.find_role(config.roles, text, "en") is not None
+    if kind == "team":
+        missing = roles.missing_roles(value, config.roles)
+        if missing:
+            raise ValueError(f"the team '{value.name}' uses roles that are not in the role catalog: "
+                             f"{', '.join(missing)}. Fix it in Settings > Teams")
+        if agents is not None:
+            # the role with --agents is one of it and generalists beyond it, as ever: `word*1`, not `word*N`
+            tail = f". For the role write '{word}*1' and keep --agents" if is_role else ""
+            raise ValueError(f"the team '{value.name}' sets the number of agents: --agents cannot go with it{tail}")
+    elif not is_role and "," not in text and "*" not in text:  # a home with no saved team: the teams may be in another
+        print(f"dreamteam: --team: no role or saved team '{word}' in {home}: starting a new role with no description "
+              f"(write '{word}*1' to mean that)", file=sys.stderr)
+    return kind, value
+
+
 def cmd_tui(args) -> int:
     """The terminal UI in the style of Claude Code (docs/TUI.md), or with -p the non-interactive print mode."""
     home = _home_arg(args)
@@ -1769,11 +1871,16 @@ def cmd_tui(args) -> int:
         overrides["clarify"] = args.clarify
     if args.team is not None:
         try:  # checked here, before a session or the TUI starts (the TUI turns it into swarm.starting_roles)
-            roles.parse_team(args.team)
+            if args.print and (args.continue_last or args.resume):
+                roles.parse_team(args.team)   # print mode continues a session and never reads the team: syntax only
+                kind, value = "roles", None
+            else:
+                kind, value = _team_choice(args.team, home, args.agents)
         except ValueError as exc:
             print(f"dreamteam: --team: {exc}", file=sys.stderr)
             return 2
-        overrides["team"] = args.team
+        # a team is copied now: the session holds its roles and never looks the team up
+        overrides["team"] = list(value.roles) if kind == "team" else args.team
     session = args.resume or None
     prompt = args.prompt
     workspace = None
@@ -1784,6 +1891,15 @@ def cmd_tui(args) -> int:
             return 2
         workspace = _workspace_arg(args.workspace)
         if workspace is None:
+            return 2
+    copy_from = None
+    if args.copy_from:
+        if args.continue_last or args.resume is not None:
+            print("dreamteam: --copy-from copies files into a new session; it cannot be used with -c / -r.",
+                  file=sys.stderr)
+            return 2
+        copy_from = _copy_from_arg(args.copy_from)
+        if copy_from is None:
             return 2
     if args.skill:  # a new session's skills, or (-c / -r) attached to the resumed one
         skills = _skill_items(args.skill, home, workspace, resuming=args.continue_last or args.resume is not None)
@@ -1811,7 +1927,7 @@ def cmd_tui(args) -> int:
         options = {"session": session, "continue_last": args.continue_last, "overrides": overrides,
                    "output_format": args.output_format, "verbose": args.verbose, "timeout": args.timeout,
                    "auto_reply": not args.no_auto_reply, "host": args.host, "port": args.port,
-                   "workspace": workspace}
+                   "workspace": workspace, "copy_from": copy_from}
         if args.lang:
             options["lang"] = args.lang
         return main_print(home, prompt, **options)
@@ -1826,7 +1942,8 @@ def cmd_tui(args) -> int:
     try:   # (session "": the one picked is the session resumed, which gets the --skill ones)
         return main_tui(home, lang=args.lang, session=args.resume, continue_last=args.continue_last,
                         initial_prompt=prompt, overrides=overrides, host=args.host, port=args.port,
-                        verbosity="verbose" if args.verbose else "normal", workspace=workspace)
+                        verbosity="verbose" if args.verbose else "normal", workspace=workspace,
+                        copy_from=copy_from)
     except Exception as exc:  # e.g. prompt_toolkit's NoConsoleScreenBufferError in mintty without winpty
         if type(exc).__name__ != "NoConsoleScreenBufferError":
             raise
@@ -1920,7 +2037,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model", help="model profile of a new session's agents")
     s.add_argument("--agents", type=int, help="agents a new session starts with")
     s.add_argument("--team", help='starting team of a new session: roles in order, ROLE*N for several, e.g. '
-                                  '"architect,developer*2,tester"')
+                                  '"architect,developer*2,tester", or the name of a team saved in the settings')
     s.add_argument("--max-agents", type=int, help="agent limit of a new session")
     s.add_argument("--budget", type=float, help="money limit of a new session, USD")
     s.add_argument("--title", help="title of a new session")
@@ -1929,6 +2046,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "becomes its workspace; a folder with files (your project) is adopted: the agents work "
                         "with its files and commit to its current git branch (refused while the repository has "
                         "uncommitted changes). An existing session moves with /cd")
+    s.add_argument("--copy-from", metavar="DIR|ZIP",
+                   help="copy this folder or .zip into the new session's folder before its first start: the agents "
+                        "work on the copy, the originals are never changed (.git, node_modules, .venv, venv, "
+                        "__pycache__ and links are left out; [workspace] copy_max_mb / copy_max_files). With "
+                        "--workspace the copy goes into that folder, which must be empty or missing")
     s.add_argument("--skill", action="append", metavar="REF|PATH|URL",
                    help="a skill for the new session (repeatable; with -c / -r attached to that session): a name "
                         "from the skills library or ~/.claude/skills (claude-user:NAME / claude-project:NAME picks "
@@ -1950,6 +2072,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--workspace", metavar="DIR",
                    help="with --goal: the folder that session works in (an empty or missing folder becomes its "
                         "workspace, a folder with files is adopted, as for `dreamteam --workspace`)")
+    s.add_argument("--copy-from", metavar="DIR|ZIP",
+                   help="with --goal: copy this folder or .zip into that session's folder first, as for "
+                        "`dreamteam --copy-from`")
     s.add_argument("--skill", action="append", metavar="REF|PATH|URL",
                    help="with --goal: a skill for that session (repeatable), as for `dreamteam --skill`")
     s.add_argument("--network", choices=netoff.NETWORK_MODES, help="with --goal: that session's network; "
@@ -1984,8 +2109,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_traces, dir=None)
 
-    include_help = ("what to {0}: a comma list of settings (with the model profiles and roles), skills, mcp (the MCP "
-                    "library and [mcp.external]), sessions; repeatable (default: everything{1})")
+    include_help = ("what to {0}: a comma list of settings (with the model profiles, roles and teams), skills, mcp "
+                    "(the MCP library and [mcp.external]), sessions; repeatable (default: everything{1})")
     s = sub.add_parser("export", help="write the settings, skills, MCP servers and sessions (history and workspace "
                                       "files) of a home into a folder, to move them to another computer; API keys "
                                       "and MCP env values stay on this one",

@@ -25,6 +25,7 @@ import re
 import secrets
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -33,7 +34,7 @@ import zipfile
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, BinaryIO, Callable
 from urllib.parse import urlsplit
 
 from .workspace import _TRANSLIT, _WIN_BAD_CHARS, _WIN_RESERVED, NO_EXPAND, git_env, is_link, long_path, rmtree
@@ -292,16 +293,25 @@ def _quoted(key: str, text: str) -> str:
 
 
 # ---- validating a folder ---------------------------------------------------------------------------------------
-def _portable(part: str, rel: str) -> None:
-    """A path part every OS can store (the Windows rules on every OS, so that a skill copies to Windows too)."""
+def printable_name(text: str) -> str:
+    """A file name from a zip or a folder as shown in a message: every character that is not printable (control
+    characters, escape sequences, lone surrogates) becomes '?', so a name cannot drive the terminal it is printed
+    to."""
+    return "".join(ch if ch.isprintable() else "?" for ch in str(text))
+
+
+def _portable(part: str, rel: str, names_in: str = "a skill") -> None:
+    """A path part every OS can store (the Windows rules on every OS, so that a skill copies to Windows too).
+    `names_in`: what the first message says the names are in."""
     if _WIN_BAD_CHARS.search(part) or "\\" in part or "\x7f" in part:
-        raise SkillError(f"'{rel}': file names in a skill cannot contain < > : \" | ? * \\ or control characters "
-                         "(Windows cannot store them).")
+        raise SkillError(f"'{printable_name(rel)}': file names in {names_in} cannot contain < > : \" | ? * \\ or "
+                         "control characters (Windows cannot store them).")
     if part != part.rstrip(". "):
-        raise SkillError(f"'{rel}': '{part}' ends with a dot or a space, which Windows drops from file names.")
+        raise SkillError(f"'{printable_name(rel)}': '{printable_name(part)}' ends with a dot or a space, which "
+                         "Windows drops from file names.")
     if _WIN_RESERVED.fullmatch(part):
-        raise SkillError(f"'{rel}': '{part}' is a reserved device name on Windows (CON, PRN, AUX, NUL, COM1-9, "
-                         "LPT1-9).")
+        raise SkillError(f"'{printable_name(rel)}': '{part}' is a reserved device name on Windows (CON, PRN, AUX, "
+                         "NUL, COM1-9, LPT1-9).")
 
 
 def _fold(rel: str) -> str:
@@ -966,12 +976,20 @@ def resolve_ref(config: "Config", ref: str, *, workspace: Path | None = None) ->
 def _zip_parts(raw: str) -> list[str]:
     name = raw.replace("\\", "/")
     if not name or name.startswith("/") or re.match(r"[A-Za-z]:", name):
-        raise SkillError(f"The zip holds an absolute path ('{raw[:80]}'), which is not allowed.")
+        raise SkillError(f"The zip holds an absolute path ('{printable_name(raw[:80])}'), which is not allowed.")
     parts = name.rstrip("/").split("/")
     if any(p in ("", ".", "..") for p in parts):
-        raise SkillError(f"The zip holds the path '{raw[:80]}' (with '..', '.' or an empty part), which is not "
-                         "allowed.")
+        raise SkillError(f"The zip holds the path '{printable_name(raw[:80])}' (with '..', '.' or an empty part), "
+                         "which is not allowed.")
     return parts
+
+
+def folded_names_text(where: str, name: str) -> str:
+    """The refusal of a copy or unpack whose names the file system written to cannot tell apart (it ignores letter
+    case or Unicode form where the source does not): `where` ("The zip", a folder) holds them, `name` is the one
+    that met another (relative, '/')."""
+    return (f"{where} holds names that the folder they are written to cannot tell apart (they differ only in "
+            f"letter case or Unicode form): '{printable_name(name)}'.")
 
 
 def extract_zip(data: bytes, dest: Path, limits: Limits) -> list[dict]:
@@ -979,75 +997,337 @@ def extract_zip(data: bytes, dest: Path, limits: Limits) -> list[dict]:
     letters, duplicates, case or Unicode collisions, links or encrypted members; sizes streamed against
     `max_archive_mb`, the compression ratio bounded). Returns the members skipped (`__MACOSX/`, `.DS_Store`,
     `.dreamteam.json`)."""
+    return unpack_zip(data, dest, ZipRules.for_skills(limits)).skipped
+
+
+@dataclass(frozen=True)
+class ZipRules:
+    """What unpack_zip allows and how its refusals read (the defaults: a skill's zip, see for_skills)."""
+
+    max_bytes: int                       # the unpacked bytes (declared and streamed)
+    too_big: str                         # the 413 sentence when they are more
+    max_entries: int = ZIP_MAX_ENTRIES   # members of any kind (folders and left-out ones too)
+    too_many_entries: str = f"The zip has more than {ZIP_MAX_ENTRIES} entries."
+    max_files: int | None = None         # files written (None: no count limit)
+    too_many_files: str = ""
+    skip_files: frozenset[str] = frozenset({".DS_Store", META_FILE})   # last part, exact: skipped
+    exclude_names: frozenset[str] = frozenset()   # casefolded: a member with such a path part is left out
+    # paths with '/' (exact, relative to what is unpacked: after unwrap): a member at or below one is left out
+    exclude_paths: frozenset[str] = frozenset()
+    links: str = "refuse"                # "skip": a link member is left out and listed
+    portable: bool = True                # the Windows name rules (_portable) on every OS
+    fold_collisions: bool = True         # names that differ only in case / Unicode form collide (False: exact)
+    names_in: str = "a skill"            # _portable's message: "file names in {names_in} cannot contain ..."
+    folders: bool = False                # create the zip's folder entries (empty folders kept)
+    unwrap: bool = False                 # every member under one top folder: unpack that folder's contents
+    # names stored without the UTF-8 flag (zipfile reads them as cp437) are read again, all in one encoding: as
+    # UTF-8 (macOS, Linux tools), else on a Windows hub in its OEM code page (its old "Compressed folder")
+    redecode_names: bool = False
+    max_ratio: int | None = ZIP_MAX_RATIO   # per-member compression ratio bound (None: none; max_bytes still caps)
+    # the declared sizes of all members are checked before planning (False: after it, of the planned files only,
+    # so left-out members do not count)
+    declared_first: bool = True
+
+    @classmethod
+    def for_skills(cls, limits: Limits) -> "ZipRules":
+        text = f"The zip unpacks to more than {limits.max_archive_mb} MB ([skills] max_archive_mb)."
+        return cls(max_bytes=limits.archive_bytes, too_big=text)
+
+
+@dataclass
+class ZipResult:
+    """What unpack_zip wrote and left out. Left-out paths are as written in the zip (not unwrapped)."""
+
+    files: int = 0
+    bytes: int = 0
+    skipped: list[dict] = field(default_factory=list)   # {"path", "error": "skipped"}: __MACOSX, skip_files
+    excluded: list[str] = field(default_factory=list)   # distinct paths up to the excluded part ("web/node_modules")
+    links: list[str] = field(default_factory=list)      # links left out (links="skip")
+    top: str | None = None                              # the folder unwrap took the contents of
+
+
+_EOCD = b"PK\x05\x06"
+_EOCD64_LOCATOR = b"PK\x06\x07"
+_EOCD64 = b"PK\x06\x06"
+_EOCD_SIZE = 22
+_DIRECTORY_BYTES_PER_ENTRY = 512   # the largest directory unpack_zip reads: max_entries times this
+_DOS_SYSTEMS = frozenset({0, 6, 10, 14})   # ZipInfo.create_system: MS-DOS (FAT), OS/2 HPFS, Windows NTFS, VFAT
+
+
+def _zip_directory(f: BinaryIO) -> tuple[int, int] | None:
+    """(entries, central directory bytes) as the zip's end records state them, read from the tail of the file
+    without parsing the directory itself. The plain end record is searched for in the window zipfile searches
+    (the last 64 KiB + 22 bytes, whatever its comment length says). zipfile takes a ZIP64 record's values whenever
+    its locator precedes the plain record, whatever that one says, from the offset the locator names or from just
+    before the locator (by version): both places count, with the largest of them and of the plain record's values
+    that are not a 0xFFFF / 0xFFFFFFFF marker. With no ZIP64 record zipfile reads the plain values as they are,
+    markers included, so they count as stated. None when no plain record is found (zipfile refuses that file)."""
     try:
-        archive = zipfile.ZipFile(io.BytesIO(data))
-    except (zipfile.BadZipFile, ValueError):
-        raise SkillError("The file is not a zip archive.") from None
-    with archive:
-        infos = archive.infolist()
-        if len(infos) > ZIP_MAX_ENTRIES:
-            raise SkillError(f"The zip has more than {ZIP_MAX_ENTRIES} entries.", 413)
-        if sum(i.file_size for i in infos) > limits.archive_bytes:
-            raise SkillError(f"The zip unpacks to more than {limits.max_archive_mb} MB ([skills] max_archive_mb).",
-                             413)
-        skipped: list[dict] = []
-        seen: dict[str, tuple[str, bool]] = {}   # folded path -> (as written, is a folder)
-        planned: list[tuple[zipfile.ZipInfo, list[str]]] = []
-        for info in infos:
-            parts = _zip_parts(info.filename)
-            rel = "/".join(parts)
-            if (info.external_attr >> 16) & 0o170000 == 0o120000:
-                raise SkillError(f"The zip holds a link ('{rel}'), which is not allowed.")
-            if info.is_dir():
-                continue
-            if any(p == "__MACOSX" for p in parts) or parts[-1] in (".DS_Store", META_FILE):
-                skipped.append({"path": rel, "error": "skipped"})
-                continue
-            if info.flag_bits & 0x1:
-                raise SkillError("Encrypted zip entries are not supported.")
-            for i, part in enumerate(parts):
-                _portable(part, rel)
-                sub = "/".join(parts[:i + 1])
-                is_folder = i < len(parts) - 1
-                key = _fold(sub)
-                if key in seen:
-                    written, was_folder = seen[key]
-                    if not (is_folder and was_folder and written == sub):
-                        why = ("differ only in letter case or Unicode form" if written != sub else
-                               "are a file and a folder of the same name" if is_folder != was_folder else
-                               "are the same file twice")
-                        raise SkillError(f"The zip holds '{written}' and '{sub}', which {why}.")
-                else:
-                    seen[key] = (sub, is_folder)
-            planned.append((info, parts))
-        total = 0
-        os.makedirs(long_path(dest), exist_ok=True)
-        for info, parts in planned:
-            target = Path(dest, *parts)
-            os.makedirs(long_path(target.parent), exist_ok=True)
-            written = 0
+        end = f.seek(0, io.SEEK_END)
+        start = max(0, end - (1 << 16) - _EOCD_SIZE)
+        f.seek(start)
+        tail = f.read(end - start)
+        pos = tail.rfind(_EOCD)
+        while pos >= 0 and len(tail) - pos < _EOCD_SIZE:
+            pos = tail.rfind(_EOCD, 0, pos)
+        if pos < 0:
+            return None
+        entries, size = struct.unpack_from("<HI", tail, pos + 10)
+        found_entries = [entries] if entries != 0xFFFF else []
+        found_size = [size] if size != 0xFFFFFFFF else []
+        zip64 = False
+        at = start + pos - 20
+        if at >= 0:
+            f.seek(at)
+            locator = f.read(20)
+            if len(locator) == 20 and locator[:4] == _EOCD64_LOCATOR:
+                (offset,) = struct.unpack_from("<Q", locator, 8)
+                for where in {offset, at - 56}:
+                    if where < 0:
+                        continue
+                    f.seek(where)
+                    record = f.read(56)
+                    if len(record) >= 48 and record[:4] == _EOCD64:
+                        entries64, size64 = struct.unpack_from("<QQ", record, 32)
+                        found_entries.append(entries64)
+                        found_size.append(size64)
+                        zip64 = True
+        if not zip64:
+            return entries, size
+        return max(found_entries, default=0), max(found_size, default=0)
+    except (OSError, ValueError, struct.error):
+        return None
+
+
+def unpack_zip(source: bytes | str | os.PathLike, dest: Path, rules: ZipRules, *,
+               check: Callable[[], None] | None = None) -> ZipResult:
+    """Unpack a zip (its bytes, or the path of a zip file, streamed from the file) into the fresh folder `dest`
+    with every member checked as `rules` say: no absolute paths, '..', drive letters, duplicates or collisions,
+    encrypted members; links refused or left out; sizes streamed against `max_bytes`. A directory pre-check reads
+    the entry count and the directory size from the end record before zipfile parses the directory. `check()` is
+    called before each member is written and after each chunk; what it raises stops the unpack (the partial files
+    stay: the caller removes `dest`). SkillError with `.status` for a refusal."""
+    with contextlib.ExitStack() as stack:
+        if isinstance(source, (bytes, bytearray, memoryview)):
+            f: BinaryIO = io.BytesIO(source)
+        else:
             try:
-                # the declared sizes cannot be trusted: the bytes are counted as they come
-                with archive.open(info) as src, open(long_path(target), "xb") as out:
-                    for chunk in iter(lambda: src.read(COPY_CHUNK), b""):
-                        written += len(chunk)
-                        total += len(chunk)
-                        if total > limits.archive_bytes:
-                            raise SkillError(f"The zip unpacks to more than {limits.max_archive_mb} MB ([skills] "
-                                             "max_archive_mb).", 413)
-                        # (small files of one repeated byte compress far better: only large members count)
-                        if written > 1 << 20 and written > ZIP_MAX_RATIO * max(info.compress_size, 1):
-                            raise SkillError(f"'{'/'.join(parts)}' in the zip looks like a zip bomb (compressed "
-                                             f"more than {ZIP_MAX_RATIO} times).", 413)
-                        out.write(chunk)
-            except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as exc:
-                raise SkillError(f"The zip is damaged or uses an unsupported format ('{'/'.join(parts)}': "
-                                 f"{exc}).") from None
+                f = stack.enter_context(open(source, "rb"))
+            except (OSError, ValueError):
+                raise SkillError("The file is not a zip archive.") from None
+        found = _zip_directory(f)
+        if found is not None and found[0] > rules.max_entries:
+            raise SkillError(rules.too_many_entries, 413)
+        # zipfile reads and parses the whole directory, however few entries the end record states
+        if found is not None and found[1] > rules.max_entries * _DIRECTORY_BYTES_PER_ENTRY:
+            limit = rules.max_entries * _DIRECTORY_BYTES_PER_ENTRY / 2 ** 20
+            raise SkillError(f"The zip's directory (its list of entries) is larger than {limit:.1f} MB: its names, "
+                             "comments or extra fields are too long.", 413)
+        try:
+            archive = zipfile.ZipFile(f)
+        except (zipfile.BadZipFile, ValueError, OSError):
+            raise SkillError("The file is not a zip archive.") from None
+        stack.enter_context(archive)
+        return _unpack(archive, dest, rules, check)
+
+
+def _oem_codepage() -> str | None:
+    """The OEM code page of Windows ("cp866" on a Russian one), which its old "Compressed folder" writes zip names
+    in; None elsewhere or when it cannot be read."""
+    if not _WINDOWS:
+        return None
+    try:
+        import ctypes
+        return f"cp{ctypes.windll.kernel32.GetOEMCP()}"   # type: ignore[attr-defined]
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _raw_name(info: zipfile.ZipInfo) -> bytes | None:
+    """The stored bytes of a non-ASCII name without the UTF-8 flag (zipfile read them as cp437), else None."""
+    if info.flag_bits & 0x800 or info.filename.isascii():
+        return None
+    try:
+        return info.orig_filename.encode("cp437")
+    except UnicodeEncodeError:
+        return None
+
+
+def _names_encoding(infos: list[zipfile.ZipInfo]) -> str | None:
+    """What the names without the UTF-8 flag are read again in, decided once for the whole archive (short names in
+    one code page can happen to be valid UTF-8): the first of these that decodes every such name. Members all made
+    on MS-DOS / Windows (create_system 0, 6, 10, 14: Explorer's old "Compressed folder", 7-Zip and WinRAR without
+    the flag): the OEM code page of Windows, then UTF-8; others (Unix, macOS tools write UTF-8 without the flag):
+    UTF-8, then the OEM code page. None, zipfile's cp437 reading kept, when neither does: on other OSes the OEM
+    code page is not known."""
+    unflagged = [(info, raw) for info in infos if (raw := _raw_name(info)) is not None]
+    if not unflagged:
+        return None
+    raws = [raw for _info, raw in unflagged]
+    order = ["utf-8", _oem_codepage()]
+    if all(info.create_system in _DOS_SYSTEMS for info, _raw in unflagged):
+        order.reverse()
+    for encoding in order:
+        if encoding is None:
+            continue
+        try:
+            for raw in raws:
+                raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+        return encoding
+    return None
+
+
+def _member_name(info: zipfile.ZipInfo, encoding: str | None) -> str:
+    """The member's name: a name without the UTF-8 flag read again in `encoding` (see _names_encoding)."""
+    raw = _raw_name(info)
+    if encoding is None or raw is None:
+        return info.filename
+    return raw.decode(encoding).split("\x00", 1)[0]   # as zipfile cuts a name
+
+
+def _unpack(archive: zipfile.ZipFile, dest: Path, rules: ZipRules, check: Callable[[], None] | None) -> ZipResult:
+    infos = archive.infolist()
+    if len(infos) > rules.max_entries:
+        raise SkillError(rules.too_many_entries, 413)
+    if rules.declared_first and sum(i.file_size for i in infos) > rules.max_bytes:
+        raise SkillError(rules.too_big, 413)
+    result = ZipResult()
+    excluded: set[str] = set()
+    left_tops: set[str] = set()   # the top parts of excluded and link members: what unwrap must not drop
+    seen: dict[str, tuple[str, bool]] = {}   # collision key -> (as written, is a folder)
+    planned: list[tuple[zipfile.ZipInfo, list[str], bool]] = []   # (member, parts, is a folder)
+    encoding = _names_encoding(infos) if rules.redecode_names else None
+    for info in infos:
+        name = _member_name(info, encoding)
+        parts = _zip_parts(name)
+        rel = "/".join(parts)
+        if (info.external_attr >> 16) & 0o170000 == 0o120000:
+            if rules.links == "skip":
+                result.links.append(printable_name(rel))
+                left_tops.add(parts[0])
+                continue
+            raise SkillError(f"The zip holds a link ('{printable_name(rel)}'), which is not allowed.")
+        # a name read again tells a folder by its own last character: zipfile's cp437 reading (with '\\' made '/'
+        # on Windows) can end in a '\\' that is the second byte of a double-byte character (cp932 'ソ' is 83 5C)
+        is_dir = name.endswith(("/", "\\")) if name != info.filename else info.is_dir()
+        if is_dir and not rules.folders:
+            continue
+        if any(p == "__MACOSX" for p in parts) or parts[-1] in rules.skip_files:
+            result.skipped.append({"path": printable_name(rel), "error": "skipped"})
+            continue
+        if rules.exclude_names:
+            hit = next((i for i, p in enumerate(parts) if p.casefold() in rules.exclude_names), None)
+            if hit is not None:
+                path = printable_name("/".join(parts[:hit + 1]))
+                if path not in excluded:
+                    excluded.add(path)
+                    result.excluded.append(path)
+                left_tops.add(parts[0])
+                continue
+        if info.flag_bits & 0x1:
+            raise SkillError("Encrypted zip entries are not supported.")
+        for i, part in enumerate(parts):
+            if rules.portable:
+                _portable(part, rel, rules.names_in)
+            sub = "/".join(parts[:i + 1])
+            is_folder = is_dir or i < len(parts) - 1
+            key = _fold(sub) if rules.fold_collisions else sub
+            if key in seen:
+                written, was_folder = seen[key]
+                if not (is_folder and was_folder and written == sub):
+                    why = ("differ only in letter case or Unicode form" if written != sub else
+                           "are a file and a folder of the same name" if is_folder != was_folder else
+                           "are the same file twice")
+                    raise SkillError(f"The zip holds '{printable_name(written)}' and '{printable_name(sub)}', "
+                                     f"which {why}.")
+            else:
+                seen[key] = (sub, is_folder)
+        planned.append((info, parts, is_dir))
+    if rules.unwrap:
+        tops = [p for p in planned if p[2] and len(p[1]) == 1]   # "mywork/": zip -r, Finder, make_archive
+        rest = [p for p in planned if not (p[2] and len(p[1]) == 1)]
+        names = {p[1][0] for p in rest}
+        # a left-out member beside the folder (node_modules/, .git/, a link) shows that the zip's root is the
+        # project's root: nothing is unwrapped
+        if rest and len(names) == 1 and all(len(p[1]) >= 2 for p in rest) \
+                and all(p[1][0] in names for p in tops) and not left_tops - names:
+            result.top = printable_name(rest[0][1][0])
+            planned = [(info, parts[1:], is_dir) for info, parts, is_dir in rest]
+    if rules.exclude_paths:
+        kept = []
+        for info, parts, is_dir in planned:
+            hit = next((i for i in range(len(parts)) if "/".join(parts[:i + 1]) in rules.exclude_paths), None)
+            if hit is None:
+                kept.append((info, parts, is_dir))
+                continue
+            path = printable_name("/".join(([result.top] if result.top else []) + parts[:hit + 1]))
+            if path not in excluded:
+                excluded.add(path)
+                result.excluded.append(path)
+        planned = kept
+    files = [p for p in planned if not p[2]]
+    if not rules.declared_first and sum(p[0].file_size for p in files) > rules.max_bytes:
+        raise SkillError(rules.too_big, 413)
+    if rules.max_files is not None and len(files) > rules.max_files:
+        raise SkillError(rules.too_many_files, 413)
+    total = 0
+    os.makedirs(long_path(dest), exist_ok=True)
+    made: set[str] = set()   # the folders written, as spelled in the zip
+
+    def make_folders(folder: list[str]) -> None:
+        # one by one: a spelling the file system folds onto one written before (a case-insensitive home of a Linux
+        # hub, a Docker Desktop bind mount) is refused, not merged into it
+        for i in range(len(folder)):
+            sub = "/".join(folder[:i + 1])
+            if sub in made:
+                continue
+            try:
+                os.mkdir(long_path(Path(dest, *folder[:i + 1])))
+            except FileExistsError:
+                raise SkillError(folded_names_text("The zip", sub)) from None
             except OSError as exc:
-                raise SkillError(f"Cannot extract '{'/'.join(parts)}': {exc.strerror or exc}", 500) from None
-            if (info.external_attr >> 16) & 0o111 and not _WINDOWS:
-                os.chmod(target, 0o755)
-        return skipped
+                raise SkillError(f"Cannot extract '{printable_name(sub)}': {exc.strerror or exc}", 500) from None
+            made.add(sub)
+
+    for info, parts, is_dir in planned:
+        if check is not None:
+            check()
+        target = Path(dest, *parts)
+        shown = printable_name("/".join(parts))
+        if is_dir:
+            make_folders(parts)
+            continue
+        make_folders(parts[:-1])
+        written = 0
+        try:
+            # the declared sizes cannot be trusted: the bytes are counted as they come
+            with archive.open(info) as src, open(long_path(target), "xb") as out:
+                for chunk in iter(lambda: src.read(COPY_CHUNK), b""):
+                    written += len(chunk)
+                    total += len(chunk)
+                    if total > rules.max_bytes:
+                        raise SkillError(rules.too_big, 413)
+                    # (small files of one repeated byte compress far better: only large members count)
+                    if rules.max_ratio is not None and written > 1 << 20 \
+                            and written > rules.max_ratio * max(info.compress_size, 1):
+                        raise SkillError(f"'{shown}' in the zip looks like a zip bomb (compressed more than "
+                                         f"{rules.max_ratio} times).", 413)
+                    if check is not None:
+                        check()
+                    out.write(chunk)
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, RuntimeError) as exc:
+            raise SkillError(f"The zip is damaged or uses an unsupported format ('{shown}': {exc}).") from None
+        except FileExistsError:   # (the same name twice is refused above: the file system folded two names)
+            raise SkillError(folded_names_text("The zip", "/".join(parts))) from None
+        except OSError as exc:
+            raise SkillError(f"Cannot extract '{shown}': {exc.strerror or exc}", 500) from None
+        if (info.external_attr >> 16) & 0o111 and not _WINDOWS:
+            os.chmod(target, 0o755)
+        result.files += 1
+        result.bytes += written
+    return result
 
 
 # ---- Git ------------------------------------------------------------------------------------------------------

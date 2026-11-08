@@ -35,6 +35,10 @@ name = "Designer"
 description = "You design interfaces: mockups, screen texts, user scenarios."
 model = ""               # model profile for this role ("" means the default)
 
+[[teams]]                # a named set of roles, chosen as a whole at launch
+name = "Design"
+roles = ["Designer", "Designer", "reviewer"]   # one name per agent, in order; the model comes from each role
+
 [agents]
 default_model = "default"
 max_steps_per_turn = 40
@@ -53,6 +57,8 @@ job_max_minutes = 480    # lifetime of a job started in the background on purpos
 git = true               # the shared workspace under git with automatic commits
 lock_ttl_minutes = 30    # how long a file stays locked when the agent gives no time (at least 1)
 lock_wanted_minutes = 5  # tell the holder of a lock others wait for once it has held it this many minutes (0 means at the first refusal)
+copy_max_mb = 1024       # the largest copy of files into a new session (--copy-from, an uploaded .zip), MB
+copy_max_files = 100000  # files in such a copy (of a folder: .git, node_modules and the like do not count)
 
 [models.default]         # Claude
 provider = "anthropic"
@@ -107,6 +113,13 @@ An agent keeps the model profile it was hired with. When that profile is renamed
 stays on it under the new name, in running and in stopped sessions. An agent whose profile was deleted (or renamed
 by hand in `dreamteam.toml`) uses the default profile.
 
+`copy_max_mb` and `copy_max_files` limit a [copy of files into a new session](projects.md#working-on-a-copy-of-files):
+the size and number of the files copied from a folder or unpacked from a .zip; `copy_max_mb` also caps the size of a
+.zip uploaded from the browser. In a folder, `.git`, `node_modules` and the like do not count; in a .zip, the
+archive's own size counts against `copy_max_mb`, and every entry (left-out ones and folders included) against a
+limit of twice `copy_max_files`. Both are at least 1. They are global settings: the copy is made before the session
+exists, so a value in a session's own settings has no effect.
+
 ## Roles and the starting team
 
 DreamTeam has a role catalog: generalist, developer, tester, reviewer, analyst, architect, technical writer and
@@ -119,7 +132,18 @@ hire button on the board. **The starting team** is the roles of the agents a ses
 
 - in the new session dialog or in the settings ("Role ×N", rows in order);
 - with the flag `--team "architect, developer*2, tester"`;
-- with the `/team` command in the terminal.
+- with the `/team` command in the terminal;
+- by choosing a **team**, a named set of roles from "Settings" → "Teams" (`[[teams]]`): in the new session dialog,
+  with `--team NAME`, with `/team NAME`, or with `session_create(team_name=NAME)`. A team has no model: each agent's
+  profile comes from its role, so for another profile add another role (`dev_gpt`, `dev_claude`). A team sets only
+  who starts: agents can still hire other roles as they work, within the session's agent limit. `--team NAME`,
+  `/team NAME` and `team_name` keep `max_agents`, so a larger team starts in full and then cannot hire; the dialog
+  raises the limit only to the team's size, which leaves no free place either. The roles are copied when the team is
+  chosen: a session never changes afterwards, and a terminal window that chose the team with `--team` or `/team` keeps
+  its copy until `/team NAME` again. A name with no comma and no `*N` after `--team` or `/team` (it may hold spaces) is
+  the saved team first, then a role. Once teams are saved an unknown name is refused (`name*1` makes a new role); with
+  no team saved it is a new role, and `--team` says so on stderr. A team's name is looked up in the home in use:
+  `--home`, else a `dreamteam.toml` in the current folder, else `$DREAMTEAM_HOME`, else `~/DreamTeam`.
 
 Agents beyond the list become generalists.
 

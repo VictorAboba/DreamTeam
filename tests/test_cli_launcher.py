@@ -581,16 +581,18 @@ def test_serve_clarify_needs_a_goal(tmp_path, monkeypatch, capsys):
         assert cli.main(["serve", "--home", str(home), "--goal", "G", *flags, "--no-browser", "--no-console"]) == 0
         assert calls["goal"] == "G" and calls["clarify"] is value, flags
 
+    stops: list[asyncio.Event] = []
+
     async def no_server(manager, host, port, **kw):   # the web server is not what this is about
-        await asyncio.Event().wait()
+        stops[-1].set()   # stops right after --goal created and started its session (a stop during the create
+        await asyncio.Event().wait()   # would cancel it)
 
     monkeypatch.setattr(launcher_module, "serve_launcher", no_server)
 
     async def serve(**kw) -> int:
-        stop = asyncio.Event()
-        stop.set()   # stops right after --goal created and started its session
+        stops.append(asyncio.Event())
         return await real_serve_home(home, "127.0.0.1", free_port(), console=False, open_browser=False, goal="G",
-                                     stop=stop, **kw)
+                                     stop=stops[-1], **kw)
 
     for kw in ({"clarify": False}, {"clarify": True}, {}):
         assert asyncio.run(serve(**kw)) == 0, kw

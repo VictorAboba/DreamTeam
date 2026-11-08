@@ -10,7 +10,7 @@ import os
 import time
 import urllib.parse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 import uvicorn
 from starlette.applications import Starlette
@@ -22,6 +22,7 @@ from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__, hubauth, netoff, roles
 from . import skills as skill_lib
+from .copyfrom import hub_in_container
 from .db import loads
 from .hub_mcp import LIBRARY_TOOLS, LOOPBACK_HOSTS, MCPHttpEndpoint
 from .httpjson import JSONResponse, json_text
@@ -104,7 +105,9 @@ def env_public_origin() -> tuple[str, int] | None:
 
 class GuardMiddleware:
     """DNS-rebinding guard (Host check), cross-site guard (Origin check, also for WebSockets), the hub token and
-    JSON-only POSTs (blocks cross-site form posts).
+    JSON-only POSTs (blocks cross-site form posts), except `raw_posts`: an exact path mapped to the one other
+    content type a POST there may have (e.g. the launcher's zip upload, application/zip, which no cross-site page
+    can send without a preflight the hub never answers).
 
     Loopback bind: Host must be localhost / 127.0.0.1 / [::1]. Any other bind (0.0.0.0 in Docker, a LAN
     address): Host may also be the bind address, or an IP literal (a rebinding attack always arrives with the
@@ -125,8 +128,11 @@ class GuardMiddleware:
     """
 
     def __init__(self, app, loopback: bool | None = None, *, host: str = "127.0.0.1",
-                 extra_hosts: frozenset[str] | set[str] = frozenset(), token: str | None | object = hubauth.FROM_ENV):
+                 extra_hosts: frozenset[str] | set[str] = frozenset(), token: str | None | object = hubauth.FROM_ENV,
+                 raw_posts: Mapping[str, str] | None = None):
         self.app = app
+        # exact path -> the only other content type a POST there may have (no prefix: "/api/uploads/" is not it)
+        self.raw_posts = {path: kind.lower() for path, kind in (raw_posts or {}).items()}
         self.loopback = (host in LOOPBACK_HOSTS) if loopback is None else loopback
         bind = _split_hostport(host if not (":" in host and not host.startswith("[")) else f"[{host}]")
         self.bind_host = bind[0] if bind else ""
@@ -244,8 +250,11 @@ class GuardMiddleware:
             if credential == "query":
                 await self._token_cookie(scope, receive, send)
                 return
-            if (scope["type"] == "http" and scope.get("method") == "POST" and scope.get("path", "").startswith("/api/")
-                    and not headers.get("content-type", "").lower().startswith("application/json")):
+            path = scope.get("path", "")
+            content_type = headers.get("content-type", "").lower()
+            if (scope["type"] == "http" and scope.get("method") == "POST" and path.startswith("/api/")
+                    and not content_type.startswith("application/json")
+                    and self.raw_posts.get(path) != content_type.split(";")[0].strip()):
                 await PlainTextResponse("Content-Type must be application/json", status_code=415)(scope, receive, send)
                 return
         await self.app(scope, receive, send)
@@ -308,6 +317,7 @@ def skill_routes(config_of: Callable[[], "Config"], workspace_of: Callable[[Requ
                     "library_dir": str(lib.root), "library": lib.list(),
                     "claude": skill_lib.claude_skills(config, workspace), "host": skill_lib.host_skills(config),
                     "sandbox": config.skills_host_library_dir is not None, "limits": limits_view(config),
+                    "container": hub_in_container(config),   # a copy into a session: only a .zip upload helps
                     "install": skill_lib.install_info(config)}
                 if swarm is not None:   # "Update" compares with the skill's own source only, never by name elsewhere
                     digests = {s.name: swarm.skills.source_digest(s) for s in current}

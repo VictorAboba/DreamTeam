@@ -23,8 +23,9 @@ restarts (`dreamteam mcp --home <home>` for a home outside the default one).
 Through `/mcp` you get the session tools: `sessions_list`, `session_create(title, goal, ..., workspace)`,
 `session_start`, `session_stop` and `session_cd(session, path)` (move to another folder, `path="default"` moves it
 back to its own folder), and also `skill_library` (the skill library); `session_create` and `session_start` accept
-`skills=[...]`, and `session_create(..., clarify=true)` turns on [clarify mode](features.md) (`false` turns it off
-over the global setting). The other tools work inside a session, which the `session="<id>"` parameter sets; by
+`skills=[...]`, `session_create(..., team_name=...)` starts with a team saved in the settings, and
+`session_create(..., clarify=true)` turns on [clarify mode](features.md) (`false` turns it off over the global
+setting). The other tools work inside a session, which the `session="<id>"` parameter sets; by
 default the running session is chosen. To connect to one session directly, use `http://127.0.0.1:8765/s/<id>/mcp`.
 
 By default, Claude Code acts as the user of the swarm: it sets the goal, looks at the board, writes to the agents,

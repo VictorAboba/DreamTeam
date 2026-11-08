@@ -23,8 +23,9 @@ claude mcp add dreamteam -- dreamteam mcp
 Через `/mcp` доступны инструменты сессий: `sessions_list`, `session_create(title, goal, ..., workspace)`,
 `session_start`, `session_stop` и `session_cd(session, path)` (перенос в другую папку, `path="default"` — в
 собственную), а также `skill_library` (библиотека скиллов); `session_create` и `session_start` принимают
-`skills=[...]`, а `session_create(..., clarify=true)` включает [уточнение цели](features.md) (`false` выключает его
-поверх общей настройки). Остальные инструменты работают внутри сессии, её задаёт параметр `session="<id>"`; по
+`skills=[...]`, `session_create(..., team_name=...)` запускает сессию с командой, сохранённой в настройках, а
+`session_create(..., clarify=true)` включает [уточнение цели](features.md) (`false` выключает его поверх общей
+настройки). Остальные инструменты работают внутри сессии, её задаёт параметр `session="<id>"`; по
 умолчанию выбирается работающая сессия. Подключиться к одной сессии напрямую можно по адресу
 `http://127.0.0.1:8765/s/<id>/mcp`.
 

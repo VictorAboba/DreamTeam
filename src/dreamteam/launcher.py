@@ -19,12 +19,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from starlette.applications import Starlette
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, RedirectResponse
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__, netoff, procs, roles
+from .copyfrom import UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
 from .models import AUTO_REPLY_HEADER
@@ -333,6 +334,18 @@ async def _clean_envs_daily(manager: "SessionManager") -> None:
         await asyncio.sleep(ENV_CLEANUP_EVERY)
 
 
+async def _sweep_copies_hourly(manager: "SessionManager") -> None:
+    """The launcher's removal of what copies into new sessions left (expired uploads, the claims and staging
+    folders of processes that no longer run): at the start, then every UPLOAD_TTL seconds. In a daemon thread: the
+    hub's exit does not wait for a long removal (a large copy a killed hub left); the next sweep finishes it."""
+    while True:
+        try:
+            await procs.daemon_call(manager.clean_copy_leftovers)
+        except Exception:  # noqa: BLE001 - the next hour tries again
+            log.exception("cannot remove the leftovers of copies into new sessions")
+        await asyncio.sleep(UPLOAD_TTL)
+
+
 def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> GuardMiddleware:
     extra_hosts = env_allowed_hosts()
     endpoint = LauncherMCPEndpoint(manager, host, extra_hosts=extra_hosts)
@@ -344,28 +357,54 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     async def hub_info(request: Request):
         return JSONResponse({"pid": os.getpid(), "project": str(manager.home), "home": str(manager.home),
                              "name": "DreamTeam", "version": __version__, "mode": "launcher",
-                             "sandbox": manager.config.skills_host_library_dir is not None})
+                             "sandbox": manager.config.skills_host_library_dir is not None,
+                             "container": hub_in_container(manager.config)})
 
     async def sessions(request: Request):
         if request.method == "GET":
             return JSONResponse({"sessions": manager.list()})
         body = await _json_body(request)
-        problem = _body_error(body, strings=("title", "goal", "description", "workspace", "via"),
+        problem = _body_error(body, strings=("title", "goal", "description", "workspace", "via", "copy_from",
+                                             "copy_from_upload"),
                               objects=("overrides",), flags=("start",), lists=("skills",))
         if problem:
             return JSONResponse({"error": problem}, status_code=400)
         try:
+            # copy_from: a folder or .zip on this computer; copy_from_upload: a token of POST /api/uploads
             summary = await manager.create(body.get("title") or "", body.get("goal") or "",
                                            body.get("description") or "", overrides=body.get("overrides") or {},
                                            start=body.get("start") is not False,
                                            workspace=body.get("workspace") or None, skills=body.get("skills") or None,
-                                           via=_via(body.get("via")), auto_reply=_auto_reply(request))
+                                           via=_via(body.get("via")), auto_reply=_auto_reply(request),
+                                           copy_from=body.get("copy_from") or None,
+                                           copy_from_upload=body.get("copy_from_upload") or None)
         except (SessionError, ValueError) as exc:
             return _error(exc)
         except Exception as exc:  # e.g. the swarm failed to start: show it in the UI
             return _failure("session create", exc)
         result = summary.pop("workspace_result", None)
-        return JSONResponse({"session": summary, **({"result": result} if result else {})}, status_code=201)
+        copy = summary.pop("copy_result", None)
+        return JSONResponse({"session": summary, **({"result": result} if result else {}),
+                             **({"copy": copy} if copy else {})}, status_code=201)
+
+    async def upload(request: Request):
+        """POST /api/uploads?filename=<name>: a zip as the raw body (Content-Type: application/zip, at most
+        [workspace] copy_max_mb) kept for an hour; a new session takes it with {"copy_from_upload": token}."""
+        content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if content_type != "application/zip":   # (the guard says so too; this holds wherever the route is mounted)
+            return JSONResponse({"error": "Send the zip as application/zip."}, status_code=415)
+        config = manager.global_config()   # a hand edit of copy_max_mb is picked up
+        try:
+            data = await manager.uploads.receive(request.stream(), filename=request.query_params.get("filename"),
+                                                 length=request.headers.get("content-length"),
+                                                 limits=CopyLimits.from_config(config))
+        except CopyError as exc:
+            return _error(exc)
+        except ClientDisconnect:   # (receive removed the partial file already)
+            return _error(CopyError("The upload was interrupted.", 400))
+        except Exception as exc:  # e.g. the disk is full
+            return _failure("upload", exc)
+        return JSONResponse(data, status_code=201)
 
     async def session_item(request: Request):
         sid = request.path_params["sid"]
@@ -545,6 +584,7 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     @contextlib.asynccontextmanager
     async def lifespan(app):
         cleaner = asyncio.create_task(_clean_envs_daily(manager), name="skill-envs-cleanup")
+        sweeper = asyncio.create_task(_sweep_copies_hourly(manager), name="copy-leftovers-cleanup")
         try:
             async with endpoint.manager.run():
                 try:
@@ -554,14 +594,16 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                     if router is not None:
                         await router.aclose()
         finally:
-            cleaner.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await cleaner
+            for task in (cleaner, sweeper):
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
 
     routes = [
         Route("/", home),
         Route("/api/hub", hub_info),
         Route("/api/sessions", sessions, methods=["GET", "POST"]),
+        Route(UPLOAD_PATH, upload, methods=["POST"]),
         Route("/api/sessions/{sid}", session_item, methods=["GET", "PATCH", "DELETE"]),
         Route("/api/sessions/{sid}/workspace", session_workspace, methods=["POST"]),
         Route("/api/sessions/{sid}/skills", session_skills),
@@ -583,7 +625,7 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
 
     # The router forwards "lifespan" (and every non-session path) to `inner`, whose lifespan runs the
     # launcher MCP manager and closes the session apps at shutdown.
-    app = GuardMiddleware(router, host=host, extra_hosts=extra_hosts)
+    app = GuardMiddleware(router, host=host, extra_hosts=extra_hosts, raw_posts={UPLOAD_PATH: "application/zip"})
     app.session_router = router  # type: ignore[attr-defined]
     app.manager = manager  # type: ignore[attr-defined]
     return app

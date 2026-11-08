@@ -190,21 +190,27 @@ class HubClient:
 
     async def create_session(self, title: str, goal: str, description: str = "", overrides: dict | None = None,
                              start: bool = True, workspace: str | None = None,
-                             skills: list[str] | None = None) -> dict:
+                             skills: list[str] | None = None, copy_from: str | None = None) -> dict:
         """POST /api/sessions -> the new session's summary. `workspace`: an absolute folder the session works in
         (docs/SPEC.md §17.2); the summary then has "workspace_result" (the hub's "result"). `skills`: references or
-        sources attached before its first start (§19)."""
+        sources attached before its first start (§19). `copy_from`: an absolute folder or .zip path on the hub's
+        computer copied into the new session's folder first (§17.2 "Copying files into a new session"); the summary
+        then has "copy_result" (the hub's "copy")."""
         body = {"title": title, "goal": goal, "description": description, "overrides": overrides or {},
                 "start": start}
         if workspace:
             body["workspace"] = workspace
+        if copy_from:
+            body["copy_from"] = copy_from
         if skills:
             body["skills"], body["via"] = list(skills), "cli"   # (the library records the terminal as the surface)
         data = await self._call("POST", "/api/sessions", body=body,
-                                timeout=MOVE_TIMEOUT if workspace else SESSION_TIMEOUT)
+                                timeout=MOVE_TIMEOUT if workspace or copy_from else SESSION_TIMEOUT)
         summary = data["session"]
         if isinstance(data.get("result"), dict):
             summary = {**summary, "workspace_result": data["result"]}
+        if isinstance(data.get("copy"), dict):
+            summary = {**summary, "copy_result": data["copy"]}
         return summary
 
     async def _session_action(self, sid: str, action: str, body: dict | None = None) -> dict:

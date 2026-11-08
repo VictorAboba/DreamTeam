@@ -39,7 +39,7 @@ const I18N = {
     team_total: "Всего агентов: {n}", team_add: "Добавить роль", team_remove: "Убрать", team_custom: "Своя роль…",
     team_custom_ph: "Название роли",
     team_custom_hint: "Этой роли нет в каталоге: агент получит только её название. Описание можно задать в Настройках → Роли.",
-    team_model: "модель: {model}", team_hidden: "(скрыта)", team_empty: "Добавьте в стартовую команду хотя бы одну роль.",
+    team_model: "модель: {model}", team_model_session: "модель: как у сессии", team_hidden: "(скрыта)", team_empty: "Добавьте в стартовую команду хотя бы одну роль.",
     team_over_max: "В стартовой команде {n} агентов — больше максимума ({max}).",
     f_more: "Дополнительно", f_steps: "Шагов за пробуждение", f_approval: "Подтверждать MCP-серверы агентов", f_start_now: "Запустить сразу",
     f_network: "Без интернета для агентов", sw_network: "Интернет для команд агентов", net_on: "есть", net_off: "нет",
@@ -52,10 +52,46 @@ const I18N = {
     net_hint_container: "Песочница запущена без файрвола, поэтому здесь это не строгая изоляция: только прокси и офлайн-настройки pip, uv, npm и git. Перезапустите dreamteam sandbox: если есть сессия без интернета, контейнер запустится с файрволом.",
     net_hint_unknown: "Команды агентов, их фоновые процессы и MCP-серверы без интернета, LLM работает: строго — в Docker (dreamteam sandbox) и на Linux, на Windows и macOS — только прокси и офлайн-настройки.",
     goal_required: "Укажите цель сессии.", creating: "Создаю сессию…",
+    f_files: "Файлы для работы", f_copy_from: "Скопировать из папки",
+    f_copy_from_ph: "Полный путь на компьютере, где работает хаб, например C:\\work\\project",
+    f_copy_zip: "или загрузить .zip",
+    f_copy_hint: "Файлы копируются в папку новой сессии до её первого запуска: агенты работают с копией, " +
+      "оригиналы не меняются. .git, node_modules, .venv, venv, __pycache__ и ссылки не копируются; до {mb} МБ.",
+    f_copy_sandbox: "Хаб работает в песочнице Docker и видит только свою домашнюю " +
+      "папку: папку со своего компьютера загрузите как .zip.",
+    f_copy_both: "Укажите папку или .zip, а не то и другое.", f_copy_zip_only: "Выберите файл .zip.",
+    f_copy_zip_big: "Архив больше {mb} МБ ([workspace] copy_max_mb).",
+    uploading: "Загрузка архива ({mb} МБ)…", copying: "Копирование файлов…",
+    copied_toast: "Скопировано файлов: {files} ({size})",
+    copied_left_out: "Не скопированы: {what}", copied_links: "ссылки ({n}: {names})",
+    copied_excluded: "папки по имени ({n}: {names})", copied_special: "особые файлы ({n})",
+    copied_open: "Сессия запущена. Нажмите, чтобы открыть её доску.",
+    sc_copied: "Копия:",
+    sc_copied_hint: "Файлы скопированы при создании сессии ({when}), файлов: {files}, {size}. Оригиналы не менялись.",
+    u_kb: "КБ", u_mb: "МБ",
     // settings
     s_models: "Модели и эндпоинты", s_models_hint: "Профили подключения к LLM. Агенты используют профиль по умолчанию; при найме агента можно указать другой профиль (например, дешёвый «fast»).",
     s_roles: "Роли",
     s_roles_hint: "Каталог ролей: из него собирается стартовая команда, и по нему агенты нанимают новых участников. Описание роли попадает в системный промпт агента при его создании; уже работающих агентов изменения не касаются.",
+    s_teams: "Команда",
+    s_teams_hint: "Именованные наборы ролей: при запуске сессии можно выбрать команду целиком. Модель каждого агента "
+      + "задаёт его роль, а роль без своего профиля работает на модели сессии; для другого профиля заведите другую "
+      + "роль в разделе «Роли» (например, dev_gpt и dev_claude). Порядок важен: первым будится агент из первой строки. "
+      + "Команда задаёт только стартовый состав: по ходу работы агенты могут нанять и другие роли, в пределах лимита "
+      + "агентов сессии. Изменения касаются только сессий и окон терминала, которые выберут команду после этого.",
+    tm_add: "Добавить команду", tm_name: "Название команды", tm_name_ph: "Например: Разработка",
+    tm_delete: "Удалить команду", tm_empty: "Команд пока нет.", tm_roles: "Состав", tm_add_row: "Добавить строку",
+    tm_up: "Выше", tm_down: "Ниже",
+    tm_role_gone: "Этой роли больше нет в каталоге: выберите другую или уберите строку.",
+    tm_err_name: "Укажите название команды.",
+    tm_err_name_bad: "Название команды «{name}»: не длиннее 60 символов, без «,» и «*», не с «-» в начале.",
+    tm_err_name_ctrl: "В названии команды «{name}» есть управляющие или невидимые символы.",
+    tm_err_reserved: "Название «{name}» занято: /team {name} возвращает стартовую команду из настроек.",
+    tm_err_dup: "Две команды с названием «{name}».", tm_err_empty: "Добавьте в команду «{name}» хотя бы одну роль.",
+    tm_err_gone: "В команде «{team}» есть роль «{role}», которой нет в каталоге: выберите другую или уберите строку.",
+    f_team_pick: "Команда", f_team_pick_hint: "заполнит состав ниже; его можно изменить",
+    f_team_pick_own: "Роли ниже", f_team_pick_broken: "нет роли «{role}»",
+    f_team_pick_stale: "Команда «{name}» изменилась в настройках: откройте это окно заново.",
     s_swarm: "Новые сессии по умолчанию", s_swarm_hint: "Значения для новых сессий; при создании сессии их можно изменить.",
     s_agents: "Агенты", s_agents_hint: "Поведение ReAct-цикла агентов.",
     s_shell: "Консоль", s_shell_hint: "Команды, которые агенты выполняют в workspace.",
@@ -127,6 +163,9 @@ const I18N = {
     ws_git: "Git с автокоммитами", ws_lock: "Время блокировки файла, мин",
     ws_lock_wanted: "Напомнить держателю блокировки через, мин",
     ws_lock_wanted_hint: "напомнит держателю, когда он держит файл, который ждут, столько минут; 0 — сразу",
+    ws_copy_mb: "Копия в новую сессию, МБ",
+    ws_copy_mb_hint: "--copy-from и «Файлы для работы»: предел копии и загружаемого .zip",
+    ws_copy_files: "Файлов в такой копии",
     mcp_approval: "Подтверждать новые MCP-серверы агентов", mcp_library: "Папка библиотеки MCP", mcp_startup: "Таймаут запуска, с",
     mcp_call: "Таймаут вызова, с", mcp_external: "Внешние MCP-серверы (JSON)",
     mcp_env_hint: "значения env скрыты (••••…); оставьте как есть, чтобы сохранить, или впишите новое",
@@ -239,7 +278,7 @@ const I18N = {
     team_total: "Agents in all: {n}", team_add: "Add a role", team_remove: "Remove", team_custom: "Other role…",
     team_custom_ph: "Role name",
     team_custom_hint: "This role is not in the catalog: the agent gets only its name. Describe it in Settings → Roles.",
-    team_model: "model: {model}", team_hidden: "(hidden)", team_empty: "Add at least one role to the starting team.",
+    team_model: "model: {model}", team_model_session: "model: the session's", team_hidden: "(hidden)", team_empty: "Add at least one role to the starting team.",
     team_over_max: "The starting team has {n} agents, more than the maximum ({max}).",
     f_more: "More", f_steps: "Steps per wake-up", f_approval: "Require approval of agents' MCP servers", f_start_now: "Start right away",
     f_network: "No internet for the agents", sw_network: "Internet for the agents' commands", net_on: "on", net_off: "off",
@@ -252,9 +291,48 @@ const I18N = {
     net_hint_container: "The sandbox was started without its firewall, so this is not strict isolation here: only proxies and offline settings of pip, uv, npm and git. Restart dreamteam sandbox: with a session without network, the container starts with the firewall.",
     net_hint_unknown: "The agents' commands, their background jobs and MCP servers get no internet, the LLM keeps it: strictly in Docker (dreamteam sandbox) and on Linux; on Windows and macOS only proxies and offline settings.",
     goal_required: "Enter the session goal.", creating: "Creating the session…",
+    f_files: "Files to work on", f_copy_from: "Copy from a folder",
+    f_copy_from_ph: "Full path on the computer the hub runs on, e.g. /home/me/project",
+    f_copy_zip: "or upload a .zip",
+    f_copy_hint: "The files are copied into the new session's folder before its first start: the agents work on " +
+      "the copy, the originals are never changed. .git, node_modules, .venv, venv, __pycache__ and links are left " +
+      "out; up to {mb} MB.",
+    f_copy_sandbox: "The hub runs in the Docker sandbox and sees only its home " +
+      "folder: upload a folder from your computer as a .zip.",
+    f_copy_both: "Give a folder or a .zip, not both.", f_copy_zip_only: "Choose a .zip file.",
+    f_copy_zip_big: "The archive is larger than {mb} MB ([workspace] copy_max_mb).",
+    uploading: "Uploading the archive ({mb} MB)…", copying: "Copying the files…",
+    copied_toast: "Copied {files} files ({size})",
+    copied_left_out: "Left out: {what}", copied_links: "{n} link(s) ({names})",
+    copied_excluded: "{n} folder(s) by name ({names})", copied_special: "{n} special file(s)",
+    copied_open: "The session is running. Click to open its board.",
+    sc_copied: "Copy of:",
+    sc_copied_hint: "Files copied when the session was created ({when}): {files} files, {size}. " +
+      "The originals were not changed.",
+    u_kb: "KB", u_mb: "MB",
     s_models: "Models and endpoints", s_models_hint: "LLM connection profiles. Agents use the default profile; a hired agent can use another one (e.g. a cheap “fast”).",
     s_roles: "Roles",
     s_roles_hint: "The role catalog: starting teams are built from it and agents hire new members by it. A role description goes into an agent's system prompt when the agent is created; agents already working are not affected.",
+    s_teams: "Teams",
+    s_teams_hint: "Named sets of roles: a whole team can be chosen when a session starts. Each agent's model comes "
+      + "from its role, and a role with no profile of its own uses the session's model; for another profile, add "
+      + "another role under Roles (e.g. dev_gpt and dev_claude). Order matters: the agent of the first row is woken "
+      + "first. A team sets only who starts: agents can still hire other roles as they work, within the session's "
+      + "agent limit. Changes reach only sessions and terminal windows that choose the team afterwards.",
+    tm_add: "Add a team", tm_name: "Team name", tm_name_ph: "e.g. Development",
+    tm_delete: "Delete team", tm_empty: "No teams yet.", tm_roles: "Roles", tm_add_row: "Add a row",
+    tm_up: "Move up", tm_down: "Move down",
+    tm_role_gone: "This role is no longer in the catalog: choose another or remove the row.",
+    tm_err_name: "Enter the team name.",
+    tm_err_name_bad: "Team name “{name}”: at most 60 characters, no “,” or “*”, not starting with “-”.",
+    tm_err_name_ctrl: "The team name “{name}” has control or invisible characters.",
+    tm_err_reserved: "The name “{name}” is taken: /team {name} goes back to the starting team of the settings.",
+    tm_err_dup: "Two teams are named “{name}”.", tm_err_empty: "Add at least one role to the team “{name}”.",
+    tm_err_gone: "The team “{team}” uses the role “{role}”, which is not in the catalog: choose another or "
+      + "remove the row.",
+    f_team_pick: "Team", f_team_pick_hint: "fills in the roles below; you can still change them",
+    f_team_pick_own: "The roles below", f_team_pick_broken: "no role “{role}”",
+    f_team_pick_stale: "The team “{name}” has changed in the settings: open this dialog again.",
     s_swarm: "Defaults for new sessions", s_swarm_hint: "Values for new sessions; you can change them when creating a session.",
     s_agents: "Agents", s_agents_hint: "Behaviour of the agents' ReAct loop.",
     s_shell: "Console", s_shell_hint: "Commands agents run in the workspace.",
@@ -326,6 +404,9 @@ const I18N = {
     ws_git: "Git with auto-commits", ws_lock: "File lock time, min",
     ws_lock_wanted: "Remind the lock holder after, min",
     ws_lock_wanted_hint: "reminds the holder once it has held a file others wait for this long; 0 = at once",
+    ws_copy_mb: "Copy into a new session, MB",
+    ws_copy_mb_hint: "--copy-from and “Files to work on”: the largest copy and uploaded .zip",
+    ws_copy_files: "Files in such a copy",
     mcp_approval: "Require approval of new agent MCP servers", mcp_library: "MCP library folder", mcp_startup: "Startup timeout, s",
     mcp_call: "Call timeout, s", mcp_external: "External MCP servers (JSON)",
     mcp_env_hint: "env values are hidden (••••…); keep them to keep the saved value, or type a new one",
@@ -406,6 +487,7 @@ const H = {
   view: null, original: null, providers: [], path: "", profiles: [], defaultUid: null,
   dirty: false, ws: null, wsRetry: 0, reloadTimer: null, uid: 0, busy: new Set(), settingsError: null,
   rolePresets: [], roleCards: [], teams: {},   // the role catalog (Settings → Roles) and the team composers
+  teamCards: [],   // Settings → Teams: [{uid, name}], the rows of each in teams[uid]
   // skills: GET /api/skills (null until loaded), the cards shown open (key → GET /api/skills/{name}), the refs ticked
   // in the new-session modal
   skills: null, skillShown: {}, nsSkills: new Set(),
@@ -452,12 +534,14 @@ async function apiRaw(method, path, body) {
   }
 }
 
-function toast(text, isErr = false) {
+/** A toast; with `onClick` it is clickable (and stays longer), the click removing it first. */
+function toast(text, isErr = false, onClick = null) {
   const box = document.createElement("div");
-  box.className = "toast" + (isErr ? " err" : "");
+  box.className = "toast" + (isErr ? " err" : "") + (onClick ? " clickable" : "");
   box.textContent = text;
+  if (onClick) box.addEventListener("click", () => { box.remove(); onClick(); });
   $("#toasts").appendChild(box);
-  setTimeout(() => box.remove(), isErr ? 9000 : 4500);
+  setTimeout(() => box.remove(), isErr || onClick ? 9000 : 4500);
 }
 
 function ago(ts) {
@@ -574,8 +658,8 @@ function filterSessions(all, filter, search) {
     if (filter === "running" && s.status !== "running") return false;
     if (filter === "stopped" && s.status === "running") return false;
     if (!q) return true;
-    return [s.title, s.id, s.goal && s.goal.title, s.goal && s.goal.description, s.workspace && s.workspace.path]
-      .join(" ").toLowerCase().includes(q);
+    return [s.title, s.id, s.goal && s.goal.title, s.goal && s.goal.description, s.workspace && s.workspace.path,
+            s.copied_from && s.copied_from.source].join(" ").toLowerCase().includes(q);
   });
 }
 
@@ -605,6 +689,16 @@ function workspaceLine(ws) {
   const badge = `<span class="badge ${missing ? "err" : kind === "default" ? "plain" : ""}">${esc(label)}</span>`;
   return `<div class="sc-folder" title="${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}"><i class="ic ic-folder"></i><code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</div>
     ${missing ? `<div class="sc-warn"><i class="ic ic-alert"></i>${esc(t("ws_missing"))}</div>` : ""}`;
+}
+
+/** The card line of a session whose files were copied in when it was created (summary "copied_from": the folder or
+ * .zip path, or "upload: <name>"); the tooltip says how much and that the originals were not changed. */
+function copiedLine(c) {
+  if (!c || typeof c !== "object" || !c.source) return "";
+  const tip = t("sc_copied_hint", { files: Number(c.files) || 0, size: sizeText(c.bytes),
+                                    when: ago(Number(c.at) || 0) });
+  return `<div class="sc-folder sc-copied" title="${esc(c.source)}\n${esc(tip)}"><span>${esc(t("sc_copied"))}</span>`
+    + `<code><bdi dir="ltr">${esc(shortPath(c.source))}</bdi></code></div>`;
 }
 
 /** What a session without network gets here (the launcher's network_isolation: "docker" | "netns" | "env" | "container"; unknown:
@@ -649,6 +743,7 @@ function sessionCard(s) {
       ${skills.count}
     </div>
     ${workspaceLine(s.workspace)}
+    ${copiedLine(s.copied_from)}
     ${skills.warn}
     ${error ? `<div class="sc-error">${esc(error)}</div>` : ""}
     <div class="sc-actions">
@@ -728,9 +823,16 @@ const DEFAULT_ROLE_ID = "generalist";
 const CUSTOM_ROLE = "__custom__";   // the composer's "Other role…" option
 const ROLE_NAME_MAX = 60;           // roles.NAME_LIMIT
 const TEAM_ROW_MAX = 50;            // agents in one row of the composer
+// roles.TEAM_RESET: /team WORD goes back to the starting team of the settings, so no saved team has these names
+const TEAM_RESET_WORDS = ["-", "default", "reset", "сброс"];
+// config._joins_text: format characters that are a part of ordinary text (Persian and Indic words, emoji sequences)
+const TEAM_NAME_JOINERS = /[‌‍\u{e0020}-\u{e007f}]/gu;
 
-/** A role name with its whitespace collapsed (roles.normalize). */
-function normRole(name) { return String(name ?? "").split(/\s+/).filter(Boolean).join(" "); }
+/** A role name with its whitespace collapsed (roles.normalize): the whitespace of Python's str.split, not of \s, which
+ * differs on U+FEFF, U+0085 and U+001C-1F. */
+function normRole(name) {
+  return String(name ?? "").split(/[\t-\r\x1c-\x20\x85\xa0\u{1680}\u{2000}-\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}]+/u).filter(Boolean).join(" ");
+}
 function presetOf(id) { return (H.rolePresets || []).find((p) => p.id === id) || null; }
 /** The id of the built-in role named `name` (its id or its name in either language, any case), else null. */
 function presetIdOf(name) {
@@ -809,34 +911,73 @@ function teamCatalog(id) {
 }
 function findCatalogRole(catalog, role) { const key = roleMatchKey(role); return key ? catalog.find((r) => r.key === key) || null : null; }
 function teamTotal(rows) { return (rows || []).reduce((n, r) => n + (Number(r.count) || 0), 0); }
+/** The most a row can hold: the limit, or more if it came with more (a saved team's 30 + 30 are one row of 60). Kept
+ * once seen: lowering the row can be undone, and the digit just typed does not lower the limit of the next one. */
+function rowCap(row) {
+  if (Number(row.count) > TEAM_ROW_MAX) row.cap = Math.max(row.cap || 0, Number(row.count));
+  return row.cap || TEAM_ROW_MAX;
+}
 
 function teamComposer(id) { return `<div class="team full" id="team-${id}">${teamInner(id)}</div>`; }
+/** A composer of Settings → Teams (its id is the card's generated uid, never the team's name). */
+function isSavedTeam(id) { return String(id).startsWith("tm"); }
 function teamInner(id) {
   const rows = H.teams[id] || [];
   const catalog = teamCatalog(id);
+  const saved = isSavedTeam(id);
   const attrs = (kind, i) => `data-team="${kind}" data-composer="${id}" data-row="${i}"`;
   const rowHtml = rows.map((row, i) => {
     const role = row.custom ? null : findCatalogRole(catalog, row.role);
     const options = catalog.filter((r) => !r.hidden || (role && r.key === role.key)).map((r) =>
       `<option value="${esc(r.value)}"${role && r.key === role.key ? " selected" : ""}>${esc(r.name)}${r.hidden ? " " + esc(t("team_hidden")) : ""}</option>`);
-    options.push(`<option value="${CUSTOM_ROLE}"${role ? "" : " selected"}>${esc(t("team_custom"))}</option>`);
+    // a saved team holds catalog roles only: no «Своя роль…», and a role the catalog lost shows until it is replaced
+    if (!saved) {
+      options.push(`<option value="${CUSTOM_ROLE}"${role ? "" : " selected"}>${esc(t("team_custom"))}</option>`);
+    } else if (!role) {
+      options.push(`<option value="${esc(row.role)}" selected disabled>${esc(row.role)}</option>`);
+    }
     const desc = role ? `<div class="team-desc" title="${esc(role.description)}">${esc(roleSummary(role.description))}</div>`
-      : `<div class="team-desc hint">${esc(t("team_custom_hint"))}</div>`;
-    return `<div class="team-row">
+      : `<div class="team-desc hint">${esc(t(saved ? "tm_role_gone" : "team_custom_hint"))}</div>`;
+    // the order of a saved team's rows is who is woken first and who plans (the other composers fill a session's team)
+    const move = (kind, label, mark, end) => `<button class="btn small" type="button" ${attrs(kind, i)}${end ? " disabled" : ""}
+      title="${esc(t(label))}" aria-label="${esc(t(label))}">${mark}</button>`;
+    // no badge on a row with no catalog role: a gone one has no model, and the name typed in «Своя роль…» may be a role
+    // with a profile of its own
+    return `<div class="team-row${saved && !role ? " team-gone" : ""}">
+      ${saved ? `<span class="team-move">${move("up", "tm_up", "↑", i === 0)}${move("down", "tm_down", "↓", i === rows.length - 1)}</span>` : ""}
       <select ${attrs("role", i)}>${options.join("")}</select>
-      ${role ? "" : `<input type="text" ${attrs("custom", i)} maxlength="${ROLE_NAME_MAX}" value="${esc(row.role)}" placeholder="${esc(t("team_custom_ph"))}">`}
-      <span class="team-count"><button class="btn small" type="button" ${attrs("dec", i)}>−</button><input type="number" min="1" max="${TEAM_ROW_MAX}" ${attrs("count", i)} value="${Number(row.count) || 1}"><button class="btn small" type="button" ${attrs("inc", i)}>+</button></span>
-      ${role && role.model ? `<span class="team-model">${esc(t("team_model", { model: role.model }))}</span>` : ""}
+      ${role || saved ? "" : `<input type="text" ${attrs("custom", i)} maxlength="${ROLE_NAME_MAX}"
+        value="${esc(row.role)}" placeholder="${esc(t("team_custom_ph"))}">`}
+      <span class="team-count"><button class="btn small" type="button" ${attrs("dec", i)}>−</button><input type="number" min="1" max="${rowCap(row)}" ${attrs("count", i)} value="${Number(row.count) || 1}"><button class="btn small" type="button" ${attrs("inc", i)}>+</button></span>
+      ${role && role.model ? `<span class="team-model">${esc(t("team_model", { model: role.model }))}</span>`
+        : role ? `<span class="team-model session">${esc(t("team_model_session"))}</span>` : ""}
       <button class="icon-btn small" type="button" ${attrs("del", i)} title="${esc(t("team_remove"))}" aria-label="${esc(t("team_remove"))}"><i class="ic ic-close"></i></button>
       ${desc}
     </div>`;
   }).join("");
-  return `<div class="team-head"><span>${esc(t("f_team"))}</span><span class="team-total" id="team-total-${id}">${esc(t("team_total", { n: teamTotal(rows) }))}</span></div>
+  const total = esc(t("team_total", { n: teamTotal(rows) }));
+  return `<div class="team-head"><span>${esc(t(saved ? "tm_roles" : "f_team"))}</span><span class="team-total"
+      id="team-total-${id}">${total}</span></div>
     ${rowHtml}
-    <div><button class="btn small" type="button" data-team="add" data-composer="${id}"><i class="ic ic-plus"></i>${esc(t("team_add"))}</button></div>
-    <p class="field-hint">${esc(t("f_team_hint"))}</p>`;
+    <div><button class="btn small" type="button" data-team="add" data-composer="${id}"><i class="ic ic-plus"></i>${esc(t(saved ? "tm_add_row" : "team_add"))}</button></div>
+    ${saved ? "" : `<p class="field-hint">${esc(t("f_team_hint"))}</p>`}`;
 }
-function renderTeam(id) { const box = $("#team-" + id); if (box) box.innerHTML = teamInner(id); }
+function renderTeam(id) {
+  const box = $("#team-" + id);
+  if (!box) return;
+  // the focused control is replaced: a keyboard user stays on it (its row gone: on the composer's add button)
+  const focused = document.activeElement;
+  const active = focused && box.contains && box.contains(focused) ? focused.dataset : null;
+  box.innerHTML = teamInner(id);
+  if (!active || !active.team) return;
+  const row = active.row === undefined ? "" : `[data-row="${active.row}"]`;
+  (box.querySelector(`[data-team="${active.team}"]${row}`) || box.querySelector('[data-team="add"]'))?.focus();
+}
+/** Every composer of the settings page: they show the edited catalog, so a change of a role reaches them all. */
+function renderSettingsTeams() {
+  renderTeam("defaults");
+  for (const card of H.teamCards) renderTeam(card.uid);
+}
 
 /** The error of a composer's rows (shown in the form's error line), or null. */
 function teamError(rows, max) {
@@ -860,7 +1001,7 @@ function onTeamEvent(e) {
   const kind = el.dataset.team;
   const i = Number(el.dataset.row);
   const row = rows[i];
-  const clamp = (n) => Math.max(1, Math.min(TEAM_ROW_MAX, Math.floor(n)));
+  const clamp = (n) => Math.max(1, Math.min(rowCap(row), Math.floor(n)));
   if (e.type === "click") {
     if (kind === "add") {
       const used = new Set(rows.filter((r) => !r.custom).map((r) => roleMatchKey(r.role)));
@@ -869,6 +1010,7 @@ function onTeamEvent(e) {
     } else if (!row) return true;
     else if (kind === "inc" || kind === "dec") row.count = clamp((Number(row.count) || 1) + (kind === "inc" ? 1 : -1));
     else if (kind === "del") rows.splice(i, 1);
+    else if (kind === "up" || kind === "down") return moveTeamRow(id, i, kind);
     else return true;
     renderTeam(id);
   } else if (kind === "role" && e.type === "change" && row) {
@@ -881,6 +1023,7 @@ function onTeamEvent(e) {
     const n = Number(el.value);
     if (!Number.isFinite(n) || String(el.value).trim() === "") return true;   // being typed
     row.count = clamp(n);
+    if (row.count !== n) el.value = row.count;   // the field shows what is kept
   } else return true;
   const total = $("#team-total-" + id);
   if (total) total.textContent = t("team_total", { n: teamTotal(rows) });
@@ -888,10 +1031,28 @@ function onTeamEvent(e) {
   if (id === "ns") renderNsRoleSkills();   // the skills the team's roles bring
   return true;
 }
-/** The settings composer writes its value back, except when it equals the canonical value of the saved team:
- * then the original raw values stay (an untouched default never churns the file: [] stays []). */
+/** A row of a saved team one place up or down. The focus follows the row, on the same button, or on the other one when
+ * this one has just been disabled at the end of the list. */
+function moveTeamRow(id, i, kind) {
+  const rows = H.teams[id];
+  const j = i + (kind === "up" ? -1 : 1);
+  if (!rows[j]) return true;
+  [rows[i], rows[j]] = [rows[j], rows[i]];
+  renderTeam(id);
+  const atEnd = j === (kind === "up" ? 0 : rows.length - 1);
+  const stay = atEnd ? (kind === "up" ? "down" : "up") : kind;
+  $(`#team-${id} [data-team="${stay}"][data-row="${j}"]`)?.focus();
+  teamChanged(id);
+  return true;
+}
+/** An edit of the new-session composer: its rows are no longer the picked team's, so the select goes back to its first
+ * option, and these rows are what that option brings back after a later pick. A saved team's composer is read at save.
+ * The settings composer writes its value back, except when it equals the canonical value of the saved team: then the
+ * original raw values stay (an untouched default never churns the file: [] stays []). */
 function teamChanged(id) {
-  if (id !== "defaults" || !H.view) return;
+  if (id === "ns") { const pick = $("#ns-team"); if (pick) pick.value = ""; H.nsBeforePick = null; return; }
+  if (!H.view) return;
+  if (id !== "defaults") { markDirty(); return; }
   const o = (H.original && H.original.swarm) || {};
   const value = teamValue(H.teams.defaults);
   const same = JSON.stringify(value) === JSON.stringify(teamValue(teamRows(o.starting_roles, o.start_agents)));
@@ -944,7 +1105,7 @@ function roleHeadInner(card) {
        <button class="btn small" type="button" data-rc-hide>${esc(t(card.hidden ? "r_show" : "r_hide"))}</button>`
     : `<button class="icon-btn small" type="button" data-rc-del title="${esc(t("r_delete"))}" aria-label="${esc(t("r_delete"))}"><i class="ic ic-trash"></i></button>`;
   const name = preset ? `<span class="role-name">${esc(roleCardName(card))}</span>`
-    : `<input class="role-name" type="text" data-rc="name" maxlength="${ROLE_NAME_MAX}" value="${esc(card.name)}" placeholder="${esc(t("r_name_ph"))}" title="${esc(t("r_name"))}">`;
+    : `<input class="role-name" type="text" data-rc="name" value="${esc(card.name)}" placeholder="${esc(t("r_name_ph"))}" title="${esc(t("r_name"))}">`;
   const otherLang = H.lang === "ru" ? "en" : "ru";   // the name of a built-in role in the other language
   const other = preset ? `<span class="muted role-other">${esc(t("r_other_lang", { name: preset.name[otherLang] }))}</span>` : "";
   return `${name}${other}${badges}<span class="spacer"></span>${actions}`;
@@ -1042,7 +1203,7 @@ function onRoleCardEvent(e) {
   else if (field === "instructions") card.instructions = el.value;
   else if (field === "model") { card.model = el.value || null; card.modelPicked = true; }
   if (card.builtin) { const head = cardEl.querySelector(".role-head"); if (head) head.innerHTML = roleHeadInner(card); }
-  renderTeam("defaults");
+  renderSettingsTeams();
   markDirty();
   return true;
 }
@@ -1053,7 +1214,7 @@ function onRoleCardClick(e) {
   if ("roleAdd" in ds) {
     const card = { uid: "r" + (++H.uid), builtin: false, name: "", description: "", instructions: "", model: null, hidden: false };
     H.roleCards.push(card);
-    renderRoles(); renderTeam("defaults"); markDirty();
+    renderRoles(); renderSettingsTeams(); markDirty();
     $(`.role-card[data-role-uid="${card.uid}"] .role-name`)?.focus();
     return true;
   }
@@ -1068,8 +1229,110 @@ function onRoleCardClick(e) {
   else if ("rcSkillAdd" in ds) { if (!addRoleSkill(card, cardEl)) return true; }
   else if ("rcDel" in ds) H.roleCards = H.roleCards.filter((c) => c !== card);
   else return true;
-  renderRoles(); renderTeam("defaults"); markDirty();
+  renderRoles(); renderSettingsTeams(); markDirty();
   return true;
+}
+
+// ---- settings: saved teams (Settings → Teams) ---------------------------------------------------------
+function teamCardHtml(card) {
+  const name = esc(t("tm_name")), remove = esc(t("tm_delete"));
+  return `<div class="role-card team-card" data-tc-uid="${card.uid}">
+    <div class="role-head"><input class="role-name" type="text" data-tc="name"
+        value="${esc(card.name)}" placeholder="${esc(t("tm_name_ph"))}" title="${name}" aria-label="${name}">
+      <button class="icon-btn small" type="button" data-tc-del title="${remove}"
+        aria-label="${remove}"><i class="ic ic-trash"></i></button></div>
+    ${teamComposer(card.uid)}
+  </div>`;
+}
+function renderTeamCards() {
+  const box = $("#teams");
+  const cards = H.teamCards.map(teamCardHtml).join("");
+  if (box) box.innerHTML = cards || `<p class="muted">${esc(t("tm_empty"))}</p>`;
+}
+/** The cards of the saved teams, each one's rows in H.teams[uid] (the rows of the cards before them are dropped). */
+function makeTeamCards(teams) {
+  for (const key of Object.keys(H.teams)) if (isSavedTeam(key)) delete H.teams[key];
+  H.teamCards = (teams || []).map((team) => {
+    const uid = "tm" + (++H.uid);
+    H.teams[uid] = teamRows(team.roles, (team.roles || []).length);
+    return { uid, name: team.name };
+  });
+}
+/** Typing a team's name (true when the event was one; the card is not re-rendered while typed in). */
+function onTeamCardEvent(e) {
+  const el = e.target;
+  if (!el || !el.dataset || el.dataset.tc !== "name") return false;
+  const cardEl = el.closest ? el.closest("[data-tc-uid]") : null;
+  const card = cardEl && H.teamCards.find((c) => c.uid === cardEl.dataset.tcUid);
+  if (card) { card.name = el.value; markDirty(); }
+  return true;
+}
+/** Team card buttons: add, delete (true when the click was one of them). */
+function onTeamCardClick(e) {
+  const btn = e.target && e.target.closest ? e.target.closest("button") : null;
+  const ds = (btn && btn.dataset) || {};
+  if ("tcAdd" in ds) {
+    const card = { uid: "tm" + (++H.uid), name: "" };
+    H.teams[card.uid] = [];
+    H.teamCards.push(card);
+    renderTeamCards(); markDirty();
+    $(`.team-card[data-tc-uid="${card.uid}"] .role-name`)?.focus();
+    return true;
+  }
+  if (!("tcDel" in ds)) return false;
+  const cardEl = btn.closest("[data-tc-uid]");
+  const uid = cardEl && cardEl.dataset.tcUid;
+  const at = H.teamCards.findIndex((c) => c.uid === uid);
+  H.teamCards = H.teamCards.filter((c) => c.uid !== uid);
+  delete H.teams[uid];
+  renderTeamCards(); markDirty();
+  // the button is gone: the focus goes to the card now in its place, else the last card, else the add button
+  const next = H.teamCards[Math.min(at, H.teamCards.length - 1)];
+  $(next ? `.team-card[data-tc-uid="${next.uid}"] [data-tc-del]` : "[data-tc-add]")?.focus();
+  return true;
+}
+/** The row Save refused (Error.goneRow of teamEntries), on a page where the teams come after the role cards. */
+function showGoneRow({ uid, row }) {
+  const select = $(`#team-${uid} [data-team="role"][data-row="${row}"]`);
+  select?.scrollIntoView({ block: "center" });
+  select?.focus();
+}
+/** The [[teams]] entries of the cards (PUT /api/settings "teams"), rows expanded and trailing generalists kept: a saved
+ * team's size is its list. Throws the first client-side error (shown in the save bar). A role the saved settings
+ * already lacked does not block the save. */
+function teamEntries() {
+  const catalog = teamCatalog("settings");
+  const saved = savedDefaults();
+  const savedCatalog = catalogOf(saved.roles);
+  const goneBefore = new Set((saved.teams || []).flatMap((team) => team.roles || [])
+    .filter((role) => !findCatalogRole(savedCatalog, role)).map((role) => roleMatchKey(role)));
+  const seen = new Set();
+  return H.teamCards.map((card) => {
+    const name = normRole(card.name);
+    // roles.team_key: casefold, which folds ß, ſ and ς as this does; ẞ and dotless ı are the two letters it would miss
+    const key = name.replace(/ẞ/g, "ss").split("ı").map((part) => part.toUpperCase().toLowerCase()).join("ı");
+    if (!name) throw new Error(t("tm_err_name"));
+    if ([...name].length > ROLE_NAME_MAX || /[,*]/.test(name) || name.startsWith("-")) {   // code points, as the server
+      throw new Error(t("tm_err_name_bad", { name }));
+    }
+    const shown = name.replace(TEAM_NAME_JOINERS, "");
+    if (/[\p{Cc}\p{Cf}]/u.test(shown)) throw new Error(t("tm_err_name_ctrl", { name }));
+    if (!shown) throw new Error(t("tm_err_name"));
+    if (TEAM_RESET_WORDS.includes(key)) throw new Error(t("tm_err_reserved", { name }));
+    if (seen.has(key)) throw new Error(t("tm_err_dup", { name }));
+    seen.add(key);
+    const rows = H.teams[card.uid] || [];
+    if (!rows.length) throw new Error(t("tm_err_empty", { name }));
+    const roles = [];
+    for (const [at, row] of rows.entries()) {
+      if (!findCatalogRole(catalog, row.role) && !goneBefore.has(roleMatchKey(row.role))) {
+        throw Object.assign(new Error(t("tm_err_gone", { team: name, role: normRole(row.role) })),
+                            { goneRow: { uid: card.uid, row: at } });
+      }
+      for (let i = 0; i < Math.max(0, Math.floor(Number(row.count) || 0)); i++) roles.push(roleKeyOf(row.role));
+    }
+    return { name, roles };
+  });
 }
 /** The [[roles]] entries of the cards (PUT /api/settings "roles"): a built-in role only with what changed (by id),
  * an own role with its name and description. Throws the first client-side error (shown in the save bar). */
@@ -1084,7 +1347,7 @@ function roleEntries(cards) {
     if (!card.builtin) {
       const name = entry.name;
       if (!name) throw new Error(t("r_err_name"));
-      if (name.length > ROLE_NAME_MAX || /[,*]/.test(name)) throw new Error(t("r_err_name_bad", { name }));
+      if ([...name].length > ROLE_NAME_MAX || /[,*]/.test(name)) throw new Error(t("r_err_name_bad", { name }));
       if (presetIdOf(name)) throw new Error(t("r_err_builtin", { name }));
       if (seen.has(name.toLowerCase())) throw new Error(t("r_err_dup", { name }));
       seen.add(name.toLowerCase());
@@ -1111,6 +1374,8 @@ async function newSessionModal() {
   const sw = v.swarm || {};
   H.teams.ns = teamRows(sw.starting_roles, sw.start_agents ?? 3);
   H.nsSkills = new Set();
+  H.nsMaxTyped = null;
+  H.nsBeforePick = null;
   const profiles = Object.entries(v.models || {});
   const def = (v.agents || {}).default_model || "default";
   const modelOpts = profiles.map(([name, p]) =>
@@ -1129,6 +1394,7 @@ async function newSessionModal() {
           <option value="en"${sw.language === "en" ? " selected" : ""}>English</option></select></label>
         <label class="field"><span>${esc(t("f_max_agents"))}</span><input id="ns-max" type="number" min="1" max="200" value="${esc(sw.max_agents ?? 8)}"></label>
         <label class="field"><span>${esc(t("f_budget"))}</span><input id="ns-budget" type="number" min="0" step="0.5" value="${esc(sw.max_cost_usd ?? 5)}"></label>
+        ${nsTeamPick(v)}
         ${teamComposer("ns")}
         <div class="field full ns-skills"><span><i class="ic ic-skill"></i>${esc(t("f_skills"))} <span class="hint">${esc(t("f_skills_hint"))}</span></span>
           <div id="ns-skills-list">${H.skills ? nsSkillsHtml(H.skills, H.nsSkills) : `<span class="muted">${esc(t("loading"))}</span>`}</div>
@@ -1141,6 +1407,15 @@ async function newSessionModal() {
           <label class="field"><span>${esc(t("f_steps"))}</span><input id="ns-steps" type="number" min="1" max="500" value="${esc((v.agents || {}).max_steps_per_turn ?? 40)}"></label>
           <label class="check full"><input type="checkbox" id="ns-approval"${(v.mcp || {}).require_approval ? " checked" : ""}> ${esc(t("f_approval"))}</label>
           <label class="check full"><input type="checkbox" id="ns-offline"${sw.network === "off" ? " checked" : ""}> <span>${esc(t("f_network"))} <span class="hint">${esc(networkHint(H.isolation))}</span></span></label>
+          <div class="field full ns-files"><span><i class="ic ic-folder"></i>${esc(t("f_files"))}</span>
+            <label class="field full"><span>${esc(t("f_copy_from"))}</span>
+              <input id="ns-copy-from" spellcheck="false" autocomplete="off"
+                placeholder="${esc(t("f_copy_from_ph"))}"></label>
+            <label class="field full"><span>${esc(t("f_copy_zip"))}</span>
+              <input id="ns-copy-zip" type="file" accept=".zip,application/zip"></label>
+            <span class="field-hint">${esc(t("f_copy_hint", { mb: copyMaxMb() }))}</span>
+            <span class="field-hint" id="ns-copy-sandbox" hidden>${esc(t("f_copy_sandbox"))}</span>
+          </div>
         </div>
       </details>
       <div class="err-text" id="ns-error"></div>
@@ -1155,24 +1430,144 @@ async function newSessionModal() {
   $("#ns-skills-list").addEventListener("change", onNsSkillChange);
   mountNsSkillForm();
   renderNsRoleSkills();
+  $("#ns-team")?.addEventListener("change", onNsTeamPick);
+  $("#ns-max").addEventListener("input", onNsMaxInput);
   loadSkills();
   $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = t(e.target.checked ? "create_open" : "create"); });
   $("#ns-form").addEventListener("submit", submitNewSession);
+  nsCopySandbox();
+}
+
+/** [workspace] copy_max_mb of the saved settings: the largest copy and uploaded .zip (1024 when not loaded). */
+function copyMaxMb() { return Number((savedDefaults().workspace || {}).copy_max_mb) || 1024; }
+
+/** The "upload it as a .zip" hint of the new-session dialog: shown when the hub runs in a Docker container (the
+ * sandbox, docker compose, docker run), which sees only its home (GET /api/skills "container"). */
+function nsCopySandbox() {
+  const el = $("#modal #ns-copy-sandbox");
+  if (el) el.hidden = !(H.skills && (H.skills.container || H.skills.sandbox));
+}
+
+/** The toasts of a copy made for a new session (POST /api/sessions "copy"): what was copied and, when something
+ * was, what was left out (links, folders by name, special files). */
+function copyToasts(copy) {
+  if (!copy || typeof copy !== "object") return [];
+  const out = [t("copied_toast", { files: Number(copy.files) || 0, size: sizeText(copy.bytes) })];
+  const names = (list, n) => {
+    const shown = (Array.isArray(list) ? list : []).slice(0, 3).map(String);
+    return shown.join(", ") + (n > shown.length ? ", …" : "");
+  };
+  const left = [];
+  const links = Number(copy.links_count) || 0, excluded = Number(copy.excluded_count) || 0;
+  const special = Number(copy.special_count) || 0;
+  if (links) left.push(t("copied_links", { n: links, names: names(copy.links, links) }));
+  if (excluded) left.push(t("copied_excluded", { n: excluded, names: names(copy.excluded, excluded) }));
+  if (special) left.push(t("copied_special", { n: special }));
+  if (left.length) out.push(t("copied_left_out", { what: left.join("; ") }));
+  return out;
+}
+
+/** Disables (or enables again) the dialog's folder field and .zip input while the session is created. */
+function nsFilesDisabled(on) {
+  for (const sel of ["#ns-copy-from", "#ns-copy-zip"]) { const el = $(sel); if (el) el.disabled = on; }
+}
+
+/** "3 KB" / "1.5 MB": a copy's size for the toast and the session card's tooltip. */
+function sizeText(n) {
+  const bytes = Math.max(0, Number(n) || 0);
+  if (bytes < 2 ** 20) return `${bytes ? Math.max(1, Math.round(bytes / 1024)) : 0} ${t("u_kb")}`;
+  return `${(bytes / 2 ** 20).toFixed(1)} ${t("u_mb")}`;
+}
+
+/** POST /api/uploads: the zip as the raw body (not base64 JSON), for copy_from_upload of a new session. Same-origin
+ * fetch sends the hub's cookie, as api() does. */
+async function uploadZip(file) {
+  let resp;
+  try {
+    resp = await fetch(`/api/uploads?filename=${encodeURIComponent(file.name)}`,
+                       { method: "POST", headers: { "Content-Type": "application/zip" }, body: file });
+  } catch (e) { throw new Error(t("conn_lost")); }
+  let data = null;
+  try { data = await resp.json(); } catch (e) { data = null; }
+  if (!resp.ok || !data || !data.upload) {
+    const err = new Error((data && data.error) || `${resp.status} ${resp.statusText}`);
+    err.status = resp.status;
+    throw err;
+  }
+  return data;
+}
+
+/** The select of a saved team in the new-session form (nothing without saved teams): a team one of whose roles is gone
+ * cannot be chosen. */
+function nsTeamPick(v) {
+  const teams = v.teams || [];
+  if (!teams.length) return "";
+  const catalog = catalogOf(v.roles);
+  const options = teams.map((team) => {
+    const roles = team.roles || [];
+    const gone = roles.find((role) => !findCatalogRole(catalog, role));
+    const note = gone ? t("f_team_pick_broken", { role: gone }) : roles.length;
+    return `<option value="${esc(team.name)}"${gone ? " disabled" : ""}>${esc(team.name)} (${esc(note)})</option>`;
+  }).join("");
+  const hint = `<span class="hint">${esc(t("f_team_pick_hint"))}</span>`;
+  return `<label class="field full"><span>${esc(t("f_team_pick"))} ${hint}</span>
+    <select id="ns-team"><option value="">${esc(t("f_team_pick_own"))}</option>${options}</select></label>`;
+}
+/** The max as the user typed it, kept apart from the field: a pick writes there too, and a later pick starts over from
+ * what was typed (no input event fires for that write). Empty: nothing typed. */
+function onNsMaxInput() {
+  const typed = String($("#ns-max").value).trim();
+  H.nsMaxTyped = typed !== "" && Number.isFinite(Number(typed)) ? Number(typed) : null;
+}
+/** A team picked: its roles fill the composer, which is what the session is created from, and the max becomes the typed
+ * one, else the saved one, or the team's size if that is larger. The first option undoes a pick: it brings back the rows
+ * and the max from before it (a row edit has already put the select there, and keeps the rows it made). A team the
+ * settings no longer hold as listed here (another client saved while the dialog was open) is not applied: the select
+ * goes back and says so, so that it never names a team the rows are not. */
+function onNsTeamPick() {
+  const name = $("#ns-team").value;
+  if (!name) {
+    const before = H.nsBeforePick;
+    if (!before) return;
+    H.nsBeforePick = null;
+    $("#ns-error").textContent = "";
+    H.teams.ns = before.rows;
+    renderTeam("ns");
+    renderNsRoleSkills();
+    $("#ns-max").value = H.nsMaxTyped ?? before.max;
+    return;
+  }
+  const saved = savedDefaults();
+  const team = (saved.teams || []).find((x) => x.name === name);
+  const catalog = catalogOf(saved.roles);
+  if (!team || (team.roles || []).some((role) => !findCatalogRole(catalog, role))) {
+    $("#ns-team").value = "";
+    $("#ns-error").textContent = t("f_team_pick_stale", { name });
+    return;
+  }
+  $("#ns-error").textContent = "";
+  H.nsBeforePick = H.nsBeforePick || { rows: clone(H.teams.ns), max: $("#ns-max").value };
+  H.teams.ns = teamRows(team.roles, team.roles.length);
+  renderTeam("ns");
+  renderNsRoleSkills();
+  $("#ns-max").value = Math.max(H.nsMaxTyped ?? Number((saved.swarm || {}).max_agents ?? 8), team.roles.length);
 }
 
 /** Session overrides (sessions.create) for the values of the new-session form, relative to the saved
  * defaults `v`. Empty number fields keep the default; the team (composer rows) always gives start_agents, and
- * starting_roles when they differ from the saved team. */
+ * starting_roles when they differ from the saved team or a saved team was picked (form.pinned). */
 function sessionOverrides(v, form) {
   const num = (x) => { const s = String(x ?? "").trim(); if (s === "") return null; const n = Number(s); return Number.isFinite(n) ? n : null; };
   const sw = v.swarm || {};
   const swarm = { language: form.lang };
   if (form.team) {
     // starting_roles is sent only when the saved list, at the new size, would give another team (the saved list
-    // may hold more roles than its start_agents: those would fill a larger team)
+    // may hold more roles than its start_agents: those would fill a larger team). A picked team always sends them: it
+    // is copied now, and must not follow a default that merely equals it today
     const team = teamValue(form.team), effective = teamValue(teamRows(sw.starting_roles, team.start_agents));
     swarm.start_agents = team.start_agents;
-    if (JSON.stringify(team.starting_roles) !== JSON.stringify(effective.starting_roles)) swarm.starting_roles = team.starting_roles;
+    const differs = JSON.stringify(team.starting_roles) !== JSON.stringify(effective.starting_roles);
+    if (form.pinned || differs) swarm.starting_roles = team.starting_roles;
   }
   for (const [key, value] of [["max_agents", num(form.max)], ["max_cost_usd", num(form.budget)]]) {
     if (value !== null) swarm[key] = value;
@@ -1201,19 +1596,39 @@ async function submitNewSession(e) {
     lang: $("#ns-lang").value, max: $("#ns-max").value, budget: $("#ns-budget").value, team: H.teams.ns,
     model: $("#ns-model").value, steps: $("#ns-steps").value, approval: $("#ns-approval").checked,
     offline: $("#ns-offline").checked, clarify: $("#ns-clarify").checked,
+    pinned: !!$("#ns-team")?.value,   // (any edit of the rows resets the select)
   });
   const run = $("#ns-run").checked;
   const btn = $("#ns-submit");
   if (btn.disabled) return;
-  btn.disabled = true; $("#ns-error").textContent = t("creating");
+  // files to work on (docs/SPEC.md §17.2): a folder on the hub's computer, or a .zip uploaded first
+  const copyFrom = String($("#ns-copy-from").value || "").trim();
+  const zip = Array.from($("#ns-copy-zip").files || [])[0] || null;
+  const maxMb = copyMaxMb();
+  if (copyFrom && zip) { $("#ns-error").textContent = t("f_copy_both"); return; }
+  if (zip && !/\.zip$/i.test(String(zip.name || ""))) { $("#ns-error").textContent = t("f_copy_zip_only"); return; }
+  if (zip && zip.size > maxMb * 2 ** 20) { $("#ns-error").textContent = t("f_copy_zip_big", { mb: maxMb }); return; }
+  btn.disabled = true; nsFilesDisabled(true);
+  $("#ns-error").textContent = zip ? t("uploading", { mb: (zip.size / 2 ** 20).toFixed(1) })
+                                   : copyFrom ? t("copying") : t("creating");
   try {
     const body = { title: $("#ns-title").value.trim(), goal, description: $("#ns-desc").value.trim(), overrides, start: run };
     if (H.nsSkills.size) body.skills = [...H.nsSkills];   // references: "x" from the library, "claude-user:x"…
+    // a new upload on every submit: a create that failed may already have used the token
+    if (zip) { body.copy_from_upload = (await uploadZip(zip)).upload; $("#ns-error").textContent = t("copying"); }
+    else if (copyFrom) body.copy_from = copyFrom;
     const data = await api("POST", "/api/sessions", body);
-    if (run) { location.href = data.session.url; return; }
+    const copy = (data && data.copy) || {};
+    const lines = copyToasts(data && data.copy);
+    // started: the board opens at once, unless the copy left out links or special files (the folders left out
+    // by name are expected): that is shown here first, and a click on it opens the board
+    if (run && !(Number(copy.links_count) || Number(copy.special_count))) { location.href = data.session.url; return; }
+    const open = () => { location.href = data.session.url; };
+    lines.forEach((line, i) => (run && i === lines.length - 1 ? toast(`${line}\n${t("copied_open")}`, false, open)
+                                                                : toast(line)));
     closeModal(true); loadSessions();
   } catch (err) {
-    btn.disabled = false; $("#ns-error").textContent = err.message;
+    btn.disabled = false; nsFilesDisabled(false); $("#ns-error").textContent = err.message;
   }
 }
 
@@ -1231,7 +1646,7 @@ async function loadSkills() {
     const roles = $("#roles");
     const typing = document.activeElement && roles && roles.contains && roles.contains(document.activeElement);
     if (H.view && roles && !typing) renderRoles();
-    if ($("#modal #ns-skills-list")) renderNsSkills();
+    if ($("#modal #ns-skills-list")) { renderNsSkills(); nsCopySandbox(); }
   } catch (e) {
     if (seq !== H.skillSeq) return;
     const box = $("#skill-library");
@@ -1571,7 +1986,9 @@ function openModal(html) {
 }
 /** Closes the modal; a new-session form with typed text asks first (a stray click must not lose a long goal). */
 function closeModal(force = false) {
-  const typed = ["#ns-goal", "#ns-desc"].some((sel) => { const el = $("#modal " + sel); return el && el.value.trim(); });
+  const typed = ["#ns-goal", "#ns-desc", "#ns-copy-from"].some((sel) => {
+    const el = $("#modal " + sel); return el && el.value.trim();
+  }) || !!(($("#modal #ns-copy-zip") || {}).files || []).length;   // a chosen .zip counts as typed too
   if (!force && typed && !confirm(t("discard_new"))) return false;
   $("#modal-backdrop").classList.add("hidden");
   $("#modal").innerHTML = "";
@@ -1590,8 +2007,9 @@ async function loadSettings() {
 }
 
 const SECTIONS = [
-  ["models", "s_models"], ["roles", "s_roles"], ["swarm", "s_swarm"], ["agents", "s_agents"], ["shell", "s_shell"],
-  ["workspace", "s_workspace"], ["mcp", "s_mcp"], ["skills", "s_skills"], ["tracing", "s_tracing"], ["server", "s_server"],
+  ["models", "s_models"], ["roles", "s_roles"], ["teams", "s_teams"], ["swarm", "s_swarm"], ["agents", "s_agents"],
+  ["shell", "s_shell"], ["workspace", "s_workspace"], ["mcp", "s_mcp"], ["skills", "s_skills"],
+  ["tracing", "s_tracing"], ["server", "s_server"],
 ];
 
 function renderSettings(fromServer) {
@@ -1601,6 +2019,7 @@ function renderSettings(fromServer) {
     const def = H.profiles.find((p) => p.name === H.view.agents.default_model) || H.profiles[0];
     H.defaultUid = def ? def.uid : null;
     H.roleCards = makeRoleCards(H.view.roles);
+    makeTeamCards(H.view.teams);
     H.teams.defaults = teamRows((H.view.swarm || {}).starting_roles, (H.view.swarm || {}).start_agents);
     H.dirty = false;
   }
@@ -1614,6 +2033,9 @@ function renderSettings(fromServer) {
       <p class="field-hint">${esc(t("p_key_note"))} <code>${esc(H.path)}</code></p>`)}
     ${section("roles", `<div class="roles" id="roles"></div>
       <div class="add-role"><button class="btn" type="button" data-role-add><i class="ic ic-plus"></i>${esc(t("r_add"))}</button></div>`)}
+    ${section("teams", `<div class="roles" id="teams"></div>
+      <div class="add-role"><button class="btn" type="button"
+        data-tc-add><i class="ic ic-plus"></i>${esc(t("tm_add"))}</button></div>`)}
     ${section("swarm", grid([
       field("sw_name", "swarm.name", "str"),
       field("sw_lang", "swarm.language", "select", { options: [["ru", "Русский"], ["en", "English"]] }),
@@ -1655,6 +2077,8 @@ function renderSettings(fromServer) {
       field("ws_git", "workspace.git", "bool"),
       field("ws_lock", "workspace.lock_ttl_minutes", "int", { min: 1 }),
       field("ws_lock_wanted", "workspace.lock_wanted_minutes", "float", { min: 0, step: 1, hint: "ws_lock_wanted_hint" }),
+      field("ws_copy_mb", "workspace.copy_max_mb", "int", { min: 1, hint: "ws_copy_mb_hint" }),
+      field("ws_copy_files", "workspace.copy_max_files", "int", { min: 1 }),
     ]))}
     ${section("mcp", grid([
       field("mcp_approval", "mcp.require_approval", "bool", { full: true }),
@@ -1693,6 +2117,7 @@ function renderSettings(fromServer) {
     ]))}`;
   renderProfiles();
   renderRoles();
+  renderTeamCards();
   $("#add-profile").addEventListener("click", addProfile);
   updateSaveBar();
 }
@@ -1753,7 +2178,7 @@ function readInput(el) {
 
 function onSettingsInput(e) {
   const el = e.target;
-  if (onTeamEvent(e) || onRoleCardEvent(e)) return;
+  if (onTeamEvent(e) || onTeamCardEvent(e) || onRoleCardEvent(e)) return;
   if (el.dataset.path) { setPath(el.dataset.path, readInput(el)); markDirty(); return; }
   const card = el.closest(".profile-card");
   if (card && el.dataset.pf) {
@@ -2022,7 +2447,7 @@ async function checkProfile(p, live, button) {
 function onSettingsClick(e) {
   const nav = e.target.closest("[data-nav]");
   if (nav) { e.preventDefault(); $("#s-" + nav.dataset.nav)?.scrollIntoView({ behavior: "smooth", block: "start" }); return; }
-  if (onTeamEvent(e) || onRoleCardClick(e)) return;
+  if (onTeamEvent(e) || onTeamCardClick(e) || onRoleCardClick(e)) return;
   const card = e.target.closest(".profile-card");
   if (!card) return;
   const p = H.profiles.find((x) => x.uid === card.dataset.uid);
@@ -2083,6 +2508,7 @@ function collectSettings() {
   const def = H.profiles.find((p) => p.uid === H.defaultUid) || H.profiles[0];
   v.agents = Object.assign({}, v.agents, { default_model: def ? def.name : undefined });
   if ((H.rolePresets || []).length) v.roles = roleEntries(H.roleCards);   // (an older server: left as loaded)
+  if (Array.isArray(v.teams)) v.teams = teamEntries();
   const saved = (H.original && H.original.swarm) || {};
   if (H.teams.defaults && JSON.stringify(teamValue(H.teams.defaults)) !== JSON.stringify(teamValue(teamRows(saved.starting_roles, saved.start_agents)))) {
     const err = teamError(H.teams.defaults, (v.swarm || {}).max_agents);
@@ -2092,8 +2518,17 @@ function collectSettings() {
 }
 
 async function saveSettings() {
+  // a tap may leave the focus in an edited input (iOS): its change event must run now, not when a refusal moves the focus
+  // to a row, where it would overwrite the message and replace that row
+  $("#settings-save").focus();
   let payload;
-  try { payload = collectSettings(); } catch (e) { updateSaveBar(e.message, true); return; }
+  try {
+    payload = collectSettings();
+  } catch (e) {
+    updateSaveBar(e.message, true);
+    if (e.goneRow) showGoneRow(e.goneRow);
+    return;
+  }
   const btn = $("#settings-save");
   btn.disabled = true; updateSaveBar(t("saving"));
   try {
@@ -2212,6 +2647,8 @@ if (typeof module !== "undefined" && module.exports) {
     deleteModal, newSessionModal, startSession, stopSession, setTab, loadSettingsPane, submitNewSession,
     // role catalog and starting team
     normRole, presetIdOf, roleKeyOf, roleSummary, teamRows, teamValue, catalogOf, teamComposer, teamError, onTeamEvent,
+    teamEntries, teamCardHtml, renderTeamCards, onTeamCardEvent, onTeamCardClick, nsTeamPick, onNsTeamPick,
+    onNsMaxInput, TEAM_RESET_WORDS, saveSettings, renderTeam,
     makeRoleCards, roleCard, roleEntries, onRoleCardEvent, onRoleCardClick, CUSTOM_ROLE,
     // skills: the Skills tab, role skills, the new-session picker, the session cards' proposals, the delete choice
     SK, api, apiRaw, loadSkills, renderSkillsPane, libraryCard, sourceRow, skillShowHtml, skillSources, skillResolves,
@@ -2220,6 +2657,8 @@ if (typeof module !== "undefined" && module.exports) {
     roleSkillsHtml, addRoleSkill, nsSkillsHtml, teamSkills, nsRoleSkillsHtml, renderNsSkills, onNsSkillChange,
     sessionSkillsHtml, pendingSkillsModal, renderPendingSkills, decidePendingSkill, onPendingClick, confirmDelete,
     networkHint,
+    // files to work on: the new-session dialog's copy block, the zip upload, the card's "copy of" line
+    uploadZip, copiedLine, sizeText, nsCopySandbox, copyMaxMb, copyToasts,
   };
 } else if (typeof document !== "undefined") {
   init();

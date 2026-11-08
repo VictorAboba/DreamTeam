@@ -1306,15 +1306,18 @@ async def test_settings_merge_keeps_machine_local_keys_and_drops_what_this_versi
     exported["future"] = {"x": 1}
     exported["models"]["default"]["future_field"] = "y"
     exported["roles"].append({"name": "Scout", "description": "Looks ahead", "model": "missing"})
+    exported["teams"] = [{"name": "Recon", "roles": ["Scout", "Nobody"]}]
     path.write_text(st.dump_toml(exported), encoding="utf-8")
     raw_b = _raw_b()
     raw_b["shell"] = {"program": "pwsh"}
+    raw_b["teams"] = [{"name": "Only here", "roles": ["Librarian"]}]
     home_b = _home_named(tmp_path, "b", raw_b)
     manager, plan, result = await _import(home_b, dest)
     item = _item(plan.items, "settings", "dreamteam.toml")
     assert item.action == "rewrite"
     assert "kept as they are here: server.host, server.port, shell.program, skills.python" in item.reason
     assert "profiles added: pasted, lm" in item.reason and "roles added: Archivist, Scout" in item.reason
+    assert "teams added: Recon" in item.reason
     assert "settings this DreamTeam does not know are left out: swarm.future_key, [future], " \
            "models.default.future_field" in item.warnings
     assert result.ok, render_import_result(result)
@@ -1324,12 +1327,55 @@ async def test_settings_merge_keeps_machine_local_keys_and_drops_what_this_versi
     assert raw["models"]["lm"]["api_key"] == "lm-studio"   # the placeholder of the LM Studio preset comes back
     assert "api_key" not in raw["models"]["fast"] and raw["models"]["default"]["api_key"] == B_KEY
     assert {r["name"]: r for r in raw["roles"]}["Scout"] == {"name": "Scout", "description": "Looks ahead"}
+    assert raw["teams"] == [{"name": "Only here", "roles": ["Librarian"]}, {"name": "Recon", "roles": ["Scout", "Nobody"]}]
     warnings = "\n".join(item.warnings)
+    assert "team 'Recon' uses the role 'Nobody', which this computer does not have: fix it in Settings > Teams before " \
+           "choosing it" in warnings
+    assert "'Scout', which this computer" not in warnings   # the same import adds that role
     assert "model profile 'fast' points at another endpoint now, so the API key stored here was removed: enter the " \
            "key for profile fast again" in warnings
     assert "role 'Scout' uses the model profile 'missing'" in warnings
     assert "model profile 'lm' uses http://localhost:1234/v1: that server must run on this computer" in warnings
     await manager.shutdown()
+
+
+def test_export_carries_the_teams(tmp_path):
+    raw = _raw()
+    raw["teams"] = [{"name": "Recon", "roles": ["Archivist", "Archivist"]}]
+    home = _home_named(tmp_path, "home", raw)
+    dest = tmp_path / "out"
+    report = export_home(home, dest, include=["settings"])
+    assert report.ok, report.errors
+    settings = tomllib.loads((dest / "settings" / "dreamteam.toml").read_text(encoding="utf-8"))
+    assert settings["teams"] == raw["teams"]
+    manifest = _manifest(dest)
+    assert manifest["settings"]["teams"] == ["recon"] and "teams" in manifest["settings"]["sections"]
+    assert ", 1 team (API keys stay" in render_export_report(report)
+
+
+def test_merge_settings_matches_teams_by_name_and_keeps_the_others():
+    target = {"roles": [{"name": "Librarian", "description": "Here"}],
+              "teams": [{"name": "Only here", "roles": ["Librarian"]}, {"name": "Build", "roles": ["developer"]}]}
+    exported = {"teams": [{"name": "BUILD", "roles": ["architect", "developer"], "future": 1},
+                          {"name": "Texts", "roles": ["writer", "Missing", "Missing"]},
+                          {"name": ""}, "not a table"]}
+    m = merge_settings(target, exported)
+    assert m.error is None
+    assert m.update["teams"] == [{"name": "Only here", "roles": ["Librarian"]},
+                                 {"name": "BUILD", "roles": ["architect", "developer"]},
+                                 {"name": "Texts", "roles": ["writer", "Missing", "Missing"]}]
+    assert m.teams_added == ["Texts"] and m.teams_rewritten == ["BUILD"]
+    assert {"teams.BUILD.future", "teams.3", "teams.4"} <= set(m.dropped)
+    assert [w for w in m.warnings if w.startswith("team ")] == [
+        "team 'Texts' uses the role 'Missing', which this computer does not have: fix it in Settings > Teams before "
+        "choosing it"]
+    again = merge_settings(m.new_raw, {"teams": m.update["teams"]})
+    assert "teams" not in again.update and not again.teams_added and not again.teams_rewritten
+
+
+@pytest.mark.parametrize("roles", ["architect", [1]])
+def test_merge_settings_a_malformed_team_is_an_error_not_a_crash(roles):
+    assert merge_settings({}, {"teams": [{"name": "Bad", "roles": roles}]}).error
 
 
 def test_merge_settings_and_merge_external():
