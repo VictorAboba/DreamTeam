@@ -61,6 +61,8 @@ Commands:
 | `dreamteam serve [HOME]` | home page, settings, the boards of all sessions and MCP (`--host`, `--port`, `--goal` and `--title` (with `--workspace DIR`, `--clarify`), `--no-browser`, `--no-console`); without a terminal, `dreamteam` runs this one |
 | `dreamteam sessions` / `dreamteam status` | list of sessions and whether the server is running |
 | `dreamteam sessions rm ID [ID …]` | delete sessions with their board, messages, workspace files and traces (asks for confirmation; `--yes` skips the question); a folder outside the session (your project or a folder after `/cd`) stays where it is |
+| `dreamteam export FOLDER` | write the settings, skills, MCP servers and sessions into a folder for another computer or a backup (`--include settings,skills,mcp,sessions`, `--session ID`, `--dry-run`); API keys and `env` values stay here, see [Moving to another computer](transfer.md) |
+| `dreamteam import FOLDER` | add what is new from such a folder and rewrite what changed; nothing the export does not carry is deleted (shows the plan and asks for confirmation; `--yes` or `-y` skips the question, `--dry-run` shows the plan only, `--include`, `--session ID`); refused while DreamTeam runs this home |
 | `dreamteam console [--session ID]` | console chat with a running session (`/help` lists the commands) |
 | `dreamteam traces [Agent] [--session ID] [--id N] [--span N --context] [--status failed] [--json]` | agent traces in the terminal (with or without the server) |
 | `dreamteam mcp` | DreamTeam as an MCP server over stdio (a proxy to the running server or its own process) |

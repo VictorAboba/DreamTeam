@@ -49,6 +49,11 @@ templates, reference). Agents see the names and descriptions of the attached ski
   sandbox has its own library in `<home>/.dreamteam/skills-library`. `~/.claude/skills` is not mounted: first add such
   a skill to the library on the host. Folder paths in the sandbox are container paths, so a zip is more convenient for
   uploading. There is no Node in the image.
+- **Moving to another computer.** The skills library is part of an export (`dreamteam export`, the `skills`
+  category): each skill with its files and a record of where it came from. An import adds the new skills and
+  rewrites the changed ones, and leaves the other skills of the library alone. Skills attached to a session travel
+  with the session. Dependency environments do not travel: they are built again on the other computer. See
+  [Moving to another computer and backups](transfer.md).
 
 ```toml
 [skills]

@@ -96,4 +96,14 @@ On the home page, each session shows its folder with the label "own folder", "pr
 warning if the folder is missing; on the session board, the path is shown on the "Files" tab. You can't change the
 folder from the web interface, only with the `/cd` command, through MCP or REST.
 
+A session that worked in a folder outside the home on another computer arrives after an [import](transfer.md)
+without the files of that folder: only the path travels. When a folder with files exists at that path here, the
+session works in it as in your project, and the same checks as above apply when it starts. An empty folder there
+is used as the session had it on the other computer (as your project only when it was one there). When there is
+no such folder, the session does not start: put the project at that path, or run `/cd` in the session. The import
+refuses the session when that path is a file here, overlaps the export folder or another session's folder, or is
+a folder `/cd` would refuse (the home, your user folder, a library, the root of a drive and the like). When the session
+already works in a folder of its own outside the home here (after `/cd`), a later import does not change that
+folder: the session stays in it, and the files of the export go to the session's own folder.
+
 The `main` session of an old project (`dreamteam run`) can't be moved.

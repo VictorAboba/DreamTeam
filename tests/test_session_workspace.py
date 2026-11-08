@@ -1019,7 +1019,8 @@ async def test_a_create_that_fails_in_its_folder_says_what_is_left_there(tmp_pat
 
 # ---- git rules of an adopted folder ----------------------------------------------------------------------------
 @needs_git
-async def test_git_internals_a_halfway_merge_and_the_mcp_library_are_refused(tmp_path):
+async def test_git_internals_a_halfway_merge_and_the_mcp_library_are_refused(tmp_path, monkeypatch):
+    monkeypatch.delenv("DREAMTEAM_MCP_LIBRARY_DIR")  # the library is the one the settings name ([mcp] library_dir)
     project = _user_repo(tmp_path / "project")
     git(tmp_path, "init", "-q", "--bare", "bare.git")
     library = tmp_path / "library"

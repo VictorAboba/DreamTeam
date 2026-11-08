@@ -192,6 +192,37 @@ def is_link(entry: os.DirEntry | Path | str) -> bool:
         return False
 
 
+def pid_alive(pid: Any, *, other_users: bool = True) -> bool:
+    """A process with this id runs: on Windows asked without signalling it, on POSIX by signal 0, where a process of
+    another user (EPERM) runs too unless `other_users` is False (a marker this user's DreamTeam wrote whose pid
+    belongs to another user's process now is stale). False for no pid or one that is not a number."""
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        import ctypes
+
+        if pid > 0xFFFFFFFF:
+            return False
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        code = ctypes.c_ulong()
+        ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return other_users
+    except (OSError, OverflowError):
+        return False
+    return True
+
+
 def _write_inside(p: Path, rel: str, data: bytes, root: Path) -> None:
     """Write `data` to `p` as one checked step, whatever changed since the path was resolved: refused when its
     folder now resolves outside the workspace or the file became a link. The file is opened without truncating it

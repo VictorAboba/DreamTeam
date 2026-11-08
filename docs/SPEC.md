@@ -79,6 +79,10 @@ src/dreamteam/
   tools/trace_tools.py  the `agent_traces` tool (§16.2)
   settings.py    global settings of a home: read/write/validate, public view, updates, endpoint checks (§17.1)
   sessions.py    SessionManager — the sessions of a home (§17.2)
+  transfer.py    `dreamteam export` / `dreamteam import` of a home: the export folder, the secret check, the import
+                 plan and its application (§20)
+  treecopy.py    copy or measure a folder tree byte for byte, with a digest that is the same on every OS (§20)
+  mcp_library.py the shared MCP library on disk, usable without a Swarm: list, read, add atomically, remove (§20)
   launcher.py    launcher web app: sessions page, settings, /s/{sid}/ routing (§18.1)
   launcher_mcp.py  the launcher as one MCP server (§18.2)
   static/        index.html app.js traces.js style.css traces.css (board), home.html home.js home.css (launcher),
@@ -93,13 +97,20 @@ tests/  conftest.py (FakeSwarm fixture) + test_*.py
 A **home** (launcher, §17–18; `~/DreamTeam` by default) on disk:
 ```
 <home>/dreamteam.toml               global settings (§17.1); dreamteam.toml.bak = the previous version
-<home>/sessions/<id>/session.json   {"title", "created_at", "overrides", "autostart", "pending_goal"?,
-                                     "workspace"?: {"path", "adopted", "in_home"?}, "workspace_notice"?} (§17.2)
+<home>/sessions/<id>/session.json   {"title", "uid", "created_at", "overrides", "autostart", "pending_goal"?,
+                                     "workspace"?: {"path", "adopted", "in_home"?}, "workspace_notice"?,
+                                     "origin_uid"?} (§17.2; "uid": the session's identity across homes, 32
+                                     lowercase hex; a session.json without it gets one derived from
+                                     "created_at" on read, `sessions.session_uid`; "origin_uid": §20.4)
 <home>/sessions/<id>/workspace/     the session's shared files (unless "workspace" names another folder)
 <home>/sessions/<id>/.dreamteam/workspace-move.json  only while a workspace move runs, or after one whose
                                     undo failed (§17.2 "Workspace folder")
 <home>/sessions/<id>/.dreamteam/    the session's swarm.db and logs/ (a project directory as below)
 <home>/sessions/.deleted-<id>-<ns>/ a session being deleted (renamed away first, then removed)
+<home>/sessions/.importing-<id>-<pid>-<hex8>/  a session an import stages before renaming it in (§20.4)
+<home>/sessions/.replaced-<id>-<YYYYMMDD-HHMMSS>[-N]/  the last copy of a session an import rewrote: session/
+                                    (the old session folder), workspace/ (its in_home folder, if any), swap.json
+                                    only while the swap runs or after it died halfway (§20.4)
 <home>/.dreamteam/hub.json          the running launcher (same format as below; "project" = the home)
 <home>/.dreamteam/logs/dreamteam.log
 <home>/.dreamteam/swarm.db          only in a home that was a single-swarm project before: session `main`
@@ -115,9 +126,10 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
                                 jobs (§7.1)
 <project>/.dreamteam/swarm.db   sqlite
 <project>/.dreamteam/jobs/      job logs when `.scratch` is not a plain folder of the workspace (§7.1)
-<project>/.dreamteam/hub.json   {"base_url": "...", "mcp_url": "...", "pid": 123, "project": "<abs path>"}
+<project>/.dreamteam/hub.json   {"base_url": "...", "mcp_url": "...", "pid": 123, "project": "<abs path>",
+                                "machine": "<platform.node()>" | null}
                                 written once the server listens; other commands trust it only if GET /api/hub
-                                confirms the same pid and project
+                                confirms the same pid and project; "machine" is null in a container (§18.3)
 <project>/.dreamteam/logs/      dreamteam.log, mcp-<name>.log
 ```
 
@@ -3037,6 +3049,10 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   in any case or a whole number, also written as a string; anything else is a ValueError `[shell] cpu_threads must
   be "auto" or a whole number ...`), `pass_env = []`. `timeout`, `max_timeout`, `foreground_max` and `job_log_mb`
   are at least 1. The template lists every key with a Russian comment.
+- `[mcp] library_dir = "~/.dreamteam/library"` (the shared MCP library, §11; `Config.library_dir`, where
+  `DREAMTEAM_MCP_LIBRARY_DIR` wins, as `DREAMTEAM_SKILLS_DIR` does for the skills library: the tests set it). The
+  variable is one of shell's `_INTERNAL_ENV` (never in the members' commands, §7) and of `docker.SKILLS_ENV` (never
+  passed into the sandbox by name).
 - `[workspace]` (`WorkspaceSettings`): `git = true` (the shared workspace under git with autocommits),
   `lock_ttl_minutes = 30` (whole number ≥ 1: the time of a `lock_file` call without `minutes`; 0 would refuse every
   such call), `lock_wanted_minutes = 5` (number ≥ 0: a lock members were refused is named to its holder once it has
@@ -3145,8 +3161,12 @@ settings; ValueError when they are invalid):
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
-  `async set_workspace(sid, path, *, expect=None)`; module functions `read_stats(db_path, conn=None)`,
-  `slugify(title)` and `external_workspaces(home)`.
+  `async set_workspace(sid, path, *, expect=None)`; for an import (§20.4) `staging_path(sid)`, `clean_staging()`,
+  `backups(sid)`, `import_overrides(overrides, models)`, `async import_add(staged, meta, workspace, *, sid,
+  before_swap=None)`, `async import_rewrite(sid, staged, meta, workspace, *, expect=None, before_swap=None)`,
+  `async import_settings(sid, meta, *, expect=None)`, `recover_swaps()` and `interrupted_swaps()`; module functions
+  `read_stats(db_path, conn=None)`, `slugify(title)`, `external_workspaces(home)`, `new_uid()` and
+  `session_uid(meta)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
 - `SessionError(message, status=400, **extra)` (a ValueError) carries an HTTP status and `extra` (put into the
@@ -3161,6 +3181,13 @@ settings; ValueError when they are invalid):
   `sessions/main/` is ignored. Titles are one line, at most 200 chars (default: the goal's first line,
   shortened to 60 characters at a word by `goal_text.shorten_title`, else "Session"; an empty `title` lets the
   server derive it).
+- **Identity.** The sequence id is not an identity across homes (two homes both make `017-session`). `create`
+  writes `"uid": new_uid()` (uuid4, 32 lowercase hex) into session.json; `_write_meta` keeps unknown keys, so
+  `update`, `set_workspace` and `start` keep it. `session_uid(meta)` is the stored uid when it is 32 hex characters
+  (lowercased), else `uuid5(UID_NAMESPACE, "created_at:" + repr(float(created_at))).hex`, derived on read and never
+  written (so a session made before uids existed, or a folder copied by hand, has the same identity in every home
+  it is in); None without a finite numeric `created_at` and for the legacy `main` session (never matched).
+  `summary(sid)` carries `uid` (None for a damaged session). `UID_NAMESPACE` is fixed forever.
 - Effective config of a session = the global settings without `swarm.goal` / `goal_description`, deep-merged
   with its `overrides`. Overrides may only touch the sections swarm, agents, shell, workspace, mcp and tracing
   (`OVERRIDE_SECTIONS`; not models, server or roles: the role catalog is global, and a session chooses its
@@ -3561,13 +3588,16 @@ dreamteam console [DIR | --home H | --url URL] [--session SID] [--lang ru|en]
 dreamteam mcp [DIR | --home H] [--no-web]
 dreamteam status [DIR | --home H]
 dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on|off]
+dreamteam export FOLDER [--include CATEGORIES]... [--session ID]... [--dry-run] [--home H] [--quiet]
+dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-run] [--yes] [--home H] [--quiet]
 ```
 - Default command (`_default_command`): `dreamteam` alone runs `tui` when stdin and stdout are terminals,
   else `serve`. Options only: `tui` when one of them is a TUI option (`-p -c -r --output-format --model
   --budget --agents --team --max-agents --verbose --timeout --no-auto-reply --lang`), `serve` when one is
   serve-only (`--no-console --no-browser --goal`) or there is no terminal, else `tui`. A first word that is not a command
-  is the TUI prompt (`dreamteam "Сделай змейку"`), except a near-miss of a command name (difflib, 0.75), which
-  argparse reports.
+  is the TUI prompt (`dreamteam "Сделай змейку"`), except a mistyped command name, which argparse reports
+  (`_mistyped`: one word of at least 3 letters one edit from a command — a letter inserted, deleted or replaced, or
+  two neighbours swapped; a word of 3 letters only with two swapped, `rnu`).
 - `tui` (docs/TUI.md): `tui.main_tui` (interactive; refuses without a terminal, exit 2) or with `-p`
   `tui.main_print` (text piped into stdin — a pipe or a file, never a terminal or NUL — is appended to the
   prompt; no prompt → exit 2). `-r` without an id opens the session picker (`/sessions`). The flags `--model`,
@@ -3632,8 +3662,62 @@ dreamteam sandbox [DIR | --home H] [--build] [--port P] [--goal G] [--network on
   (`&skills=` on the hub's DELETE, `delete(sid, skills=, via="cli")` without one). The words
   of `sessions` are `[DIR]` or `rm SID...`, in any order with the options.
 - `hub.json` lives in `<home>/.dreamteam/hub.json`, written once the port listens (before the resume) and
-  removed at exit (only by the process that wrote it). `running_hub(dir)` trusts it only when `GET /api/hub`
-  confirms the pid and the directory.
+  removed at exit (only by the process that wrote it, and never a file of another computer whose hub has the same
+  pid). `running_hub(dir)` trusts it only when `GET /api/hub` confirms the pid and the directory. It records
+  `"machine": cli.this_machine()` (`platform.node()`; None inside a container, `netoff.in_container()` or
+  `DREAMTEAM_IMAGE=1`, whose name is the container's). Before a hub (`serve`, `run`, `mcp` with its web UI) or the
+  TUI's launcher writes its own file,
+  `_warn_other_machine` reads the one it replaces; when it names another computer (compared without the domain
+  part and case: `mbp.lan` = `MBP.local`) it prints once per home and process to stderr (and the log):
+  `warning: <home> was last served by the computer <name>. Do not run one DreamTeam folder on two computers at the
+  same time; move sessions with dreamteam export / dreamteam import.` It never refuses and never changes
+  `running_hub`'s answer. `_session_holders` names a `hub.json` of another computer as `the hub of the computer
+  <name> (<path>): stop DreamTeam there, or delete that file if it no longer runs`.
+- `export FOLDER` / `import FOLDER` (§20): the positional is `folder`, never the home (`_home_arg` with `dir`
+  None: `--home`, else the current directory when it has `dreamteam.toml`, else the default home). Both are commands for
+  `_default_command`, so `dreamteam export E:/dt` never becomes a TUI prompt (on 0.1.0 it was `['tui', 'export',
+  'E:/dt']`, which exits 2 with `unrecognized arguments`). `--include` values go through `transfer.parse_include`
+  before anything else (an unknown word: its message on stderr, exit 2).
+  - `export`: refuses a folder that is not a home (`cli.is_home`: SessionManager would create one; exit 1). The
+    sessions a hub runs come from its `GET /api/sessions` (status `running`) through `running_hub`; without an
+    answering hub, `_session_holders(home, clean=False)` only notes other processes (an export never removes
+    launcher markers). Either way the sessions are exported as they are on disk (a snapshot, warned). Then
+    `transfer.export_home(...)` and `render_export_report`. Exit 0 when `report.ok`, 1 when something asked for
+    was left out or the export failed (`TransferError`, `SecretFound`), 2 for a `TransferError` with `usage`
+    (an unknown `--session`), 130 for Ctrl+C (the partial export is removed).
+  - `import`: the target is a home, or a missing or empty folder (`_import_target`: it becomes a home only after
+    the user says yes; until then it is planned against an empty home in a temporary folder); anything else is
+    refused (exit 1). A mistyped `--session` is a usage error (exit 2, `check_session_names`) whatever runs the
+    home. `_import_blockers`: a hub that answers (`running_hub`; one that asks for a token no client here sends
+    counts too), else `_session_holders(home, clean=not dry_run)`. With a blocker everything but `--dry-run` is
+    refused (`Nothing imported: another DreamTeam process may be running the sessions of <home> (...). Stop it,
+    then import again (--dry-run shows the plan meanwhile).`, exit 1); a dry run warns and prints the plan. The
+    plan (`render_import_plan`) is printed; `--dry-run`, or a plan without changes, exits with
+    `plan.exit_code`. Otherwise `[y/N]` (`Import? [y/N] `; `y`, `yes`, `д`, `да`) when `_stdin_is_terminal()`,
+    else `--yes` is required (`Nothing imported: pass --yes to import without a confirmation.`, exit 1); another
+    answer prints `Nothing imported.` (exit 0); Ctrl+C there exits 130. The blockers are checked again after the
+    answer. The import runs in this process (`SessionManager(home)`, `asyncio.run`) with its own launcher marker
+    (`write_launcher_marker`, removed at the end) and a `before_swap` hook that checks the blockers again right
+    before each session is renamed in (a process that started meanwhile fails that session). It prints
+    `render_import_result` and exits with `result.exit_code` (130 when Ctrl+C stopped it; a second Ctrl+C breaks
+    off and says that what was imported stays).
+  - Progress (both): `export_home`, `plan_import` and `apply_import` take `progress=`, called with a frozen
+    `transfer.Progress` (op export | plan | import; stage sizing, settings, skills, mcp, session, database, files,
+    swap, secrets, git, cleaning, replacing, done; item, index/count; done/total bytes and files, totals from a
+    stat-only pre-pass for an export and from the manifest for an import, unknown when that pre-pass fails;
+    `done_*` never above a total). An export's done comes once it is in place (after a replaced export is removed):
+    a KeyboardInterrupt from that event changes nothing; one from any earlier event removes the export. Bytes come
+    from
+    `treecopy.copy_tree(progress=)` per chunk and file, the sqlite backup in steps (immutable reads only: a live
+    database is copied in one step), the import's checked database copy and the secret scan. A KeyboardInterrupt
+    the callback raises is a Ctrl+C (in the import's staging thread it is carried out as `_Interrupted`). Each stage
+    start is also logged to `dreamteam.transfer` at INFO. The CLI renderer `_ProgressLine` writes to stderr: in a
+    terminal one line, `'\r'` plus text padded to the width less one (no ANSI escapes), byte updates at most 8 a
+    second, cut and padded in terminal cells, cleared before the plan, the question, warnings (the stderr log
+    handler's filter clears it) and the result, and closed for good at the end (a staging thread still running
+    after a Ctrl+C draws nothing); else one plain line per stage of each item (`export: session 003-snake (2/5):
+    files`). Characters that are not printable show as `?`; stdout is flushed before each write (one log of both
+    streams keeps the plan first); a failing or missing stderr only hides it. `--quiet` (`-q`) turns it off.
 - `serve`: refuses when a hub already runs for the home (opening that one in the browser unless
   `--no-browser`, whether this process has a hub token or not; a hub that asks for a token no client here may send
   ends it with `TokenRequired`'s text) or when the port is busy, and, right after the check
@@ -4518,3 +4602,320 @@ digest, cannot call its API; a token for every hub is out of scope.
 **Not in v1**: Claude Code plugin skills; automatic updates of library skills from their Git source (the recorded
 `commit` makes a later check possible); per-role visibility; mounting the MCP library or `~/.claude/skills` into the
 sandbox; rendered Markdown on the home page; refs given as commit SHAs (`--branch` takes branches and tags only).
+
+## 20. Export and import (transfer.py, treecopy.py, mcp_library.py)
+
+A home moves to another computer (or into a backup) as one folder: `transfer.export_home` writes it, and
+`plan_import` / `apply_import` bring it into another home, adding what is new and rewriting what changed; nothing
+the export does not carry is ever deleted. Stage 1 is the CLI only (§18.3: `dreamteam export`, `dreamteam
+import`): no launcher route, no MCP tool, no UI. User docs: docs/en/transfer.md.
+
+```python
+# transfer.py
+CATEGORIES = ("settings", "skills", "mcp", "sessions")
+FORMAT, FORMAT_VERSION, MANIFEST = "dreamteam-export", 1, "dreamteam-export.json"
+def parse_include(values) -> tuple[str, ...]          # comma lists, repeatable; every category for None / empty;
+                                                      # an unknown word: TransferError(usage=True)
+def export_home(home, dest, *, include=None, sessions=None, running=None, dry_run=False, git=None) -> ExportReport
+def read_manifest(folder) -> dict
+def check_session_names(folder, sessions) -> None   # --session values the export holds (id or uid), else usage
+def plan_import(manager, folder, *, include=None, sessions=None) -> ImportPlan          # changes nothing
+async def apply_import(manager, plan, *, before_swap=None) -> ImportResult
+def render_export_report(report) -> str; def render_import_plan(plan) -> str; def render_import_result(r) -> str
+class TransferError(ValueError)      # (message, *, usage=False): usage → the CLI exits 2, else 1
+class SecretFound(TransferError)     # .places: where a secret was found, never the value
+```
+
+### 20.1 Categories
+
+- `settings`: every section of `dreamteam.toml` (`read_raw`), `[models.*]` and `[[roles]]` included, without
+  `[mcp.external]` and without keys (`scrub_settings`, §20.3).
+- `skills`: the skills library (`Config.skills_library_dir`).
+- `mcp`: the MCP library (`Config.library_dir`, approvals included) and `[mcp.external]` without env values.
+- `sessions`: whole sessions (database, `.dreamteam/{mcp,attached-skills,jobs}`, workspace files).
+
+`include` defaults to every category; `sessions` (ids or uids) picks sessions and adds the `sessions` category, the
+others still follow `include`. On import, `include` is intersected with the manifest's `include`; a category named
+in `include` that the export does not hold goes to `plan.missing` with a warning (the plan is not ok: exit 1).
+
+### 20.2 The export folder
+
+```
+dreamteam-export.json                 the manifest, written last (<name>.tmp + os.replace): a folder without it is an
+                                      incomplete export, which import refuses
+settings/dreamteam.toml               dump_toml(scrub_settings(raw)) after a two-line comment
+skills/<name>/                        skills.copy_skill of each valid library skill, plus .dreamteam.json {name,
+                                      description, origin, source (URL credentials stripped), by, via, added_at,
+                                      updated_at, digest}; never the stat manifest (mtimes of this computer)
+mcp/library/<name>/                   server.py + meta.json (mcp_library.write_entry_folder); an entry whose
+                                      `project` is the folder of a session of this home has `project_session: <uid>`
+                                      instead
+mcp/external.json                     {name: {command, cwd, description, env_keys}} (scrub_external)
+sessions/<id>/session.json            session.json without "id"/"legacy", with "uid" written, overrides through
+                                      scrub_overrides
+sessions/<id>/.dreamteam/swarm.db     the sqlite backup of the database (_copy_db), finished by _finish_db
+sessions/<id>/.dreamteam/{mcp,attached-skills,jobs}/   treecopy.copy_tree, no excludes
+sessions/<id>/workspace/              copy_tree of the session's own folder or its in_home folder with the export
+                                      excludes (§20.5); a folder outside the home is not copied (its path is in
+                                      session.json and the manifest)
+```
+
+- **Destination** (`_check_dest`): missing, empty (OS metadata such as `.DS_Store`, `Thumbs.db`, `desktop.ini`
+  ignored), or a previous export (only `LAYOUT` names, with the manifest): then the new export is built in the
+  sibling `.<name>.export-<hex8>` and swapped in through `.<name>.old-<hex8>` (`_put_in_place`; when the swap can be
+  neither done nor undone both folders are kept and named, `_Kept`); stale siblings of an interrupted export older
+  than `STALE_SECONDS` (1 h) are removed first. Refused: a drive or file-system root, a mount point, a link, a file,
+  any other non-empty folder, a folder inside the home's `sessions/` or `.dreamteam/`, the skills or MCP library
+  (when exported), the workspace of any session of the home (exported or not), and a folder that contains the home
+  or any of these. A new folder is created with mode 0700 on POSIX (`_mkdir_private`; on Windows it inherits its
+  access rules); an empty one is chmod 0700 and must belong to the current user on POSIX.
+- **Sessions** (`_pick_sessions`): every session but the legacy `main` (left out; refused only when named), by id
+  or uid (an unknown or ambiguous one: usage error). Left out (refused) per session: a damaged session.json, no
+  uid (`session_uid` None), `.dreamteam/workspace-move.json`. Two picked sessions with one uid are warned. The
+  workspace kind is `own`, `in_home` (`_home_relative(meta["workspace"])`) or `outside`. A session the caller lists
+  in `running` (the CLI asks the hub) is exported as a snapshot with a warning (`running_at_export`). A failure of
+  one session (`_Refused`: its database changed twice while read, is damaged or cannot be read; or an error of the
+  destination's file system: names differing only in case, a file of 4 GiB or more on FAT32, a name or path it
+  cannot hold, `_write_refusal`) removes that session from the export and the others go on; a full disk stops the
+  export.
+- **Database copy** (`_copy_db`, `_read_db`): never writes next to the source. A database with both `-wal` and
+  `-shm` is read through them (`?mode=ro`: WAL content included); one with a `-wal` only is read from a private
+  copy of both; one without either as `immutable=1`, read again once when its file changed meanwhile, then
+  refused. `_finish_db` on the copy: `journal_mode=DELETE`; command credentials stripped (§20.3); `VACUUM` (no free
+  page keeps deleted text); `PRAGMA quick_check` must be "ok"; then its figures (events, last event, MCP servers,
+  `max_tools_revision`).
+- **Order** (`_export_parts`): settings, skills, mcp, sessions; then `scan_for_secrets` over the whole folder; then
+  the manifest; then the swap. Any exception (TransferError, OSError, KeyboardInterrupt) discards what was written
+  (`_discard`: the temp folder, or the contents of the user's empty folder; retried `DISCARD_TRIES` times), naming
+  what could not be removed. `dry_run` measures the same parts without writing (no secret check).
+- **Manifest**: `{format, format_version, dreamteam_version, created_at, source: {machine: platform.node(), os:
+  sys.platform, home, python}, schema: {db_columns: sorted(db.known_columns()), toolset_revision}, include,
+  settings: {sections, models, roles, omitted} | null, skills: [{name, digest, origin, files, size,
+  changed_outside}] | null, mcp: {library: [{name, digest, approved, changed_outside, project_session}], external:
+  [{name, env_keys, credentials_removed}]} | null, sessions: [{id, uid, title, created_at, last_event: {id, ts,
+  type}, events, max_tools_rev, db_sha256, db_bytes, attached_skills, mcp_servers, running_at_export, workspace:
+  {kind, in_home, path, adopted, files, bytes, tree_digest, compare_digest, carried?}, modes}] | null, left_out:
+  [{what, reason, refused}], warnings, not_copied: [{session, path}]}`. `modes` holds the permission bits worth
+  restoring (`treecopy.mode_record`) by path inside the session; `carried: false` marks a workspace folder that was
+  missing at export (the import keeps the files the target has).
+- `ExportReport.ok`: nothing asked for was refused (the legacy `main` session left out by rule does not count).
+
+### 20.3 What never travels, and the secret check
+
+Never exported: `models.*.api_key`; a key typed into `api_key_env` (`_pasted_key`: not a variable name, or a name
+no variable has that looks like a key); secret-looking entries of `models.*.extra` at any depth (`_scrub_extra`:
+names matching shell's `_SECRET_RE` or `SECRET_NAMES` such as `authorization`, `x-api-key`, `cookie`; values like
+`Bearer <8+ chars>`), each with a warning; every `[mcp.external.*].env` value, global and in session overrides
+(`env_keys`: the sorted names only); credentials in MCP commands (below); `dreamteam.toml.bak`, `hub.json`,
+launcher markers, logs, `tui_history` and everything else of `<home>/.dreamteam/`; a session's `.dreamteam/`
+except `swarm.db` and `SESSION_DATA_PARTS`; `sessions/.deleted-*`, `.importing-*`, `.replaced-*`; skill
+environments; hub tokens; the files of workspace folders outside the home; the legacy `main` session and `dreamteam
+run` projects.
+
+`strip_command_credentials(command) -> (command, removed)`: URL user information (`shell.strip_url_credentials`),
+credential query parameters (`?api_key=`, `?token=`, `?sig=`, ...), the value of a credential flag (`--token X`,
+`--api-key=X`, `-token=X`, `--password X`, `--client-secret X`, `--auth X`; not `--no-...`), credential headers
+(`Authorization: Bearer X`, also as `--header`/`-H` with two arguments or as a JSON object), `NAME=value`
+assignments whose name the shell treats as secret, and lone `Bearer X` / `Basic X` / `Token X` arguments become
+empty; a command written as one string is split as mcp_forge splits it. It applies to `mcp/external.json`, to
+session overrides and, in each exported database, to `mcp_servers.command` of origin `config` (start() registers
+them again from the target's settings). Every removed value, and the command credentials of every `mcp.created`
+event of the journal, is also removed from every text value of the copied database (`_strip_db_credentials`:
+journal, histories); each affected server is warned (`re-enter the credentials of ... on the other computer`).
+
+`known_secrets(raw, overrides, environ) -> Secrets` (value → label; values shorter than `MIN_SECRET` = 8 and the
+`PLACEHOLDER_KEYS` of `settings.PROVIDER_CHOICES`, e.g. `lm-studio`, are not kept): the stored key of every profile
+(also one typed into `api_key_env`); the value of every variable a profile names; every environment variable
+`shell._is_secret` accepts with `_KNOWN_SECRETS`, `key_env_names()` and the profiles' variables; the header values
+of `ANTHROPIC_CUSTOM_HEADERS` / `OPENAI_CUSTOM_HEADERS`; the values of the `[shell] pass_env` and `[skills]
+install_env` variables; the env values and command credentials of the `[mcp.external]` servers of the global
+settings and of every session's overrides (also sessions not exported); `hubauth.env_token()` and the tokens in
+`hubauth.tokens_dir()`; plus everything the export itself removed.
+
+`scan_for_secrets(root, secrets, *, git=None) -> [place]`: each value is searched for as it is, JSON-escaped (with
+and without ASCII escapes) and escaped twice, each as UTF-8 and UTF-16LE (`_Matcher`, chunked with an overlap).
+Every file below `root` is searched as bytes (links skipped, `long_path`); a SQLite file is also read row by row
+(`_scan_db`: every value of every table and the schema text; a long value lies on overflow pages), a hit named
+`<file> (table.column:rowid, ...)` (at most three rows per value and column). Every git repository database below
+it (`looks_like_git_dir`) is read whole with `git cat-file --batch-all-objects --batch --unordered` (blobs, trees,
+commits, tags; packed or loose, reachable or not), run with `hubgit.fixed_args()`, `-c safe.directory=*`,
+`core.longpaths` on Windows, `GIT_CONFIG_NOSYSTEM=1` and `GIT_CONFIG_GLOBAL` set to the null device; a hit is named
+`<repo> (git object <id12>)`. No git on PATH or a git that cannot start or exits non-zero is a TransferError
+(the history could not be checked); on Windows a repository path longer than `GIT_PATH_MAX` (250) only picks the
+"its path in the export is too long" text of that error (git that succeeds on it is fine). Places are
+`<path>: <label>`, sorted. Any place found raises `SecretFound` (exit 1, nothing left at the destination):
+"Nothing exported: the export would contain a secret of this computer ... in: - <place> ... Remove it there, or
+leave that part out (--include, --session), then export again."
+
+### 20.4 Import
+
+**Manifest** (`read_manifest`): refused (`Nothing imported: ...`) when the folder is missing, has no manifest, has a
+link among the `LAYOUT` names or `mcp/library`, the manifest cannot be read (files an import reads whole are capped
+at `SMALL_FILE_MAX` = 64 MiB) or is not `format: dreamteam-export`, or `format_version` is not a positive int; a
+`format_version` above `FORMAT_VERSION` says `Update DreamTeam here first.`
+
+**Plan** (`plan_import`): pure. The export folder must not lie inside the target's `sessions/`, `.dreamteam/` or
+the workspace of an own or in_home session (`_check_source`). Items are `ImportItem(category, name, action, reason,
+target, warnings, status, error, backup)` with `action` add | rewrite | unchanged | skip | refuse; `ImportPlan`
+has `changes` (something is added or rewritten), `blocked` (something is skipped or refused), `ok` (not blocked
+and nothing missing), `exit_code` (0 when ok, else 1), `id_map` (exported id → id here) and `warnings` (the
+export's `left_out`; an earlier import's interrupted swap; another source OS: agents keep its shell in their
+frozen instructions and its paths in their histories).
+
+**Settings** (`merge_settings(target, exported, *, home, environ) -> SettingsMerge`): sections are deep-merged,
+exported values winning; keys this version does not know, sections not in `_SECTION_FIELDS` and invalid profile
+names are dropped and listed; `swarm.goal` / `goal_description` are not taken; the machine-local keys
+`LOCAL_KEYS` = `server.host`, `server.port`, `shell.program`, `skills.library_dir`, `skills.envs_dir`,
+`skills.python`, `mcp.library_dir` keep the target's value (listed as `kept as they are here` when they differ).
+Profiles: missing ones are added, the others rewritten from the export (an exported `api_key` is never taken);
+profiles only here stay. When the profile's endpoint (`settings._endpoint`: provider, base_url) is the same, the
+stored key stays (no `api_key` in the update), and so do its secret `extra` entries and its `api_key_env` when the
+export names none; otherwise `api_key = ""` removes the stored key (`enter the key for profile <name> again`), and
+secret extras or a key variable configured here are dropped with a warning. A local-endpoint preset without key
+gets its placeholder key back. Roles (by `roles.role_key`): added or rewritten, the others stay; a role model that
+is not a profile after the merge is dropped with a warning. An `agents.default_model` that is not a profile here
+keeps the target's value. Warnings: a profile without a key here, a base_url on localhost. The merged settings are
+validated (`validate`; an error refuses the item) and saved by one `SessionManager.update_settings(update)`, with
+`models` and `roles` as complete lists, so `apply_update` deletes nothing.
+
+**Skills**: identity is the folder name; the exported folder must pass `check_skill_dir` with the target's limits
+and its SKILL.md must name it; a link of that name in the target library is refused. Same digest: unchanged;
+otherwise rewrite, or add. Applied by `Library.add(src, origin, source, replace=True, by=<exported by>,
+via="import")`.
+
+**MCP library**: identity is the name; `mcp_library.read_folder` and `check_requirements` must pass. `project`:
+when the entry's `project_session` uid maps to a session here (`uid_targets`, after the sessions are applied),
+`str((sessions_dir / sid).resolve())`; otherwise the target entry's own `project` stays, else none
+(`_project_updates`; `project_session` is never written). `approved_digest` travels as exported (an approval the
+target records for the same digest is kept). Unchanged iff the code and the resulting meta.json are the same; a
+link in the library is replaced (the link only). Warnings: requirements without `uv` on PATH; an approved entry
+while `[mcp] require_approval` is on here. Applied by `mcp_library.add_entry(root, src, name=, replace=True,
+meta_updates=, meta_drop=)`.
+
+**`[mcp.external]`** (`merge_external(target, exported, *, keep_others=True, where="Settings")`): identity is the
+table name; command, cwd, description and the other keys come from the export. The target's env values for a
+server (also keys only here), and its command with the credentials stored here, stay when `_same_program` holds:
+the same command credentials aside (a string command is split, so `"npx -y X"` equals `["npx", "-y", "X"]`) and the
+same cwd; otherwise they are dropped (`... the env values stored here for it were dropped: enter ... again`).
+Exported names without a value here: `enter <KEY> for <server> in <where>`; a command the export emptied of
+credentials: `re-enter the credentials of <server> ...`. Servers only here stay. Warnings: `command[0]` not on PATH,
+an absolute cwd that does not exist, a session override with env values only whose global server's command
+changes. All servers are saved by one `update_settings({"mcp": ...})`.
+
+**Sessions** (`_plan_sessions`, `_plan_session`). Identity is `session_uid` (§17.2), never the id.
+- A uid held by more than one exported session (a folder copied by hand there) is refused unless named by id with
+  `sessions`; a named copy is matched by its id only (the target session of that id when its uid or `origin_uid` is
+  that uid), else added: with a fresh uid and `origin_uid` = the shared one when a target session holds that uid or
+  this import already adds or keeps it, otherwise with the shared uid (no `origin_uid`). A uid held by more than one
+  target session is refused unless named by an id among them (when the exported id is not one of them, it is
+  refused whatever is named: delete or move the unwanted copy here). An exported session whose `origin_uid` is the
+  uid of the target session with its id comes back to that copy. Two exported sessions that would rewrite one target are
+  refused.
+- Refused per session (the others go on): an invalid id, an unreadable session.json or one whose uid does not
+  match the manifest, a link among its folders, `workspace-move.json` in the export or here, a database that
+  `_check_export_db` rejects (no `db_sha256` in the manifest, a different sha256, `-wal`/`-shm`/`-journal` files
+  next to it, `db.unknown_columns`, `db.foreign_objects`, `db.max_tools_revision` > `TOOLSET_REVISION`), overrides
+  that `import_overrides` or `validate` refuse, a placement that fails (below). A session running here is
+  `skip`.
+- No target: **add** under the exported id when it is free and not reserved by this import, else `_free_id(title)`
+  (`as <id>: <id> is taken here`).
+- A target: **unchanged** when the last events `(id, ts, type)` are equal, the files match (`compare_digest` of the
+  exported workspace equals that of the target's folder; always true when the target works outside the home or the
+  export carries no files) and `_settings_differ` finds nothing (title, overrides as the import writes them,
+  `pending_goal`); when only those differ: **rewrite** of session.json alone (`settings_only`,
+  `import_settings`, no backup). When the export carries no workspace files and the target's folder has some:
+  refused. Otherwise **rewrite**, whatever the history says, with the reason: `its files differ`, `the export has
+  newer work in it` (the export holds the target's last event), `this computer has newer work in it` (the target
+  holds the export's last event) or `both computers worked on it since they last had the same copy`.
+- Overrides (`_session_overrides`, then `SessionManager.import_overrides`): sections outside `OVERRIDE_SECTIONS`
+  and unknown keys dropped; `LOCAL_KEYS` removed from the export and the replaced copy's values put back; its
+  `[mcp.external]` merged with the replaced copy's by `merge_external(keep_others=False)`; a server overridden with
+  another command or folder than the target's global server of that name gets the inherited env values blanked;
+  an `agents.default_model` that is not a profile here is dropped (warned).
+- Placement (`_placement` → `ImportedWorkspace(kind, folder, path, adopted)`): a rewrite of a target that works
+  outside the home keeps that path (the export's workspace files go to the session's own folder, warned); `own`
+  stays own; `in_home` goes to `<home>/<in_home>`, the target's own in_home folder on a rewrite, else the first
+  free of `<in_home>-<id>`, `<in_home>-<id>-2` ... (warned), refused when it would leave the home, lie in
+  `sessions/` or `.dreamteam/`, overlap the export folder or another session's folder, or fail
+  `SessionManager._target_refusal`; `outside` keeps the path: a relative or missing folder is warned (`put the
+  project at that path, or run /cd`), a file or a folder overlapping another session or the export folder is
+  refused, an existing non-empty folder is adopted (the user's project), an empty one is used as is.
+- Warnings: names the target's file system cannot hold (`_portability_warnings`: Windows-invalid names on win32,
+  case-only clashes on win32 and darwin; copying them fails the session), agents whose model profile is missing
+  here (they use the default profile).
+
+**Apply** (`apply_import`): first `recover_swaps()` (finish or undo the swaps of an import that died halfway) and
+`clean_staging()` (stale `.importing-*` of processes that are gone); when a swap was put back, the planned sessions
+are `not done` (`import again`). Then the items in `APPLY_ORDER` = settings, skills, sessions, mcp (library entries
+before `[mcp.external]`, so a library entry's `project` can name an imported session). refuse → `refused`, skip →
+`skipped`, unchanged → `unchanged`; one item that fails is `failed` with its error and the others go on. A
+cancellation or KeyboardInterrupt lets the item in progress finish or undo (`_to_end`), marks the rest `not done`
+and sets `interrupted` (exit 130). When the settings or `[mcp.external]` were saved, `dreamteam.toml.bak` is
+rewritten with the settings from before the import. `ImportResult.exit_code`: 130 interrupted, 0 when every item
+is added, rewritten or unchanged and nothing is missing, else 1.
+
+A session is staged in `staging_path(id)` = `sessions/.importing-<id>-<pid>-<hex8>` (`_stage_session`: the
+database copied with its sha256 checked against the manifest, the data parts and `workspace/` by `copy_tree(...,
+modes="import")` with the recorded `modes`; a link or an unreadable file fails it). `_import_meta` writes the uid
+(it must be 32 hex), `autostart: false` (imported sessions never start by themselves), the overrides checked
+against this home, and the workspace entry rebuilt for this home (`_workspace_meta` for in_home, `{path, adopted}`
+for outside). `_finish_staged` opens the database once with `db.Database` (`ADDED_COLUMNS`, WAL again), points
+absolute job-log paths at the copy's own `.dreamteam/jobs/` (or clears them), and writes session.json last.
+`before_swap(id)` (the CLI's holder check) runs right before the rename; an exception fails that session with
+nothing changed.
+- `import_add`: under the id's lock; when the id is taken meanwhile, `_new_id(title)`; `_swap_added` places the
+  in_home folder and renames the staged copy in, undoing both on failure. Emits `created`.
+- `import_rewrite(sid, ...)`: under `_lock(sid)`; refused (409) when session.json changed since the plan
+  (`expect`), when a workspace move is unfinished, or when the session runs; a loaded swarm is unloaded.
+  `_swap_replaced` creates `sessions/.replaced-<id>-<YYYYMMDD-HHMMSS>[-N]/` with the journal `swap.json` {sid, pid,
+  planned, done, created}, rewritten after every step, and renames: the session folder → `session/`, its in_home
+  folder → `workspace/`, the staged `workspace/` → its in_home folder, the staged copy → the session folder. Renames
+  are retried (`RENAME_TRIES` = 10 × `RENAME_PAUSE` 0.2 s) and never replace anything; a failure undoes every done
+  rename (`Could not replace session ... its files are in use ... Nothing was changed.`, 409) and removes the
+  journal. Then `_carry_environments` moves `KEEP_ON_IMPORT` = `.venv`, `venv`, `node_modules` (at any depth, not
+  inside `.git`) from the backup's workspace to the same free place of the new one, and `_drop_old_backups` removes
+  the older backups of the same session (same uid, no journal): only the last one is kept. Returns {id, backup,
+  kept, removed_backups, warnings, dropped_model}; emits `updated`.
+- `import_settings(sid, meta, *, expect)`: the same checks, session.json rewritten in place (its workspace entry
+  kept), no backup.
+- `recover_swaps()`: for each backup with a journal whose process is gone: all renames done (also the one just
+  before the process died, seen on disk) → the journal goes; otherwise the done renames are undone newest first
+  (a place taken meanwhile is reported, the journal stays). `interrupted_swaps()` lists such backups for the plan.
+
+### 20.5 Tree copy (treecopy.py)
+
+`copy_tree(src, dst, *, exclude_names=EXPORT_EXCLUDE_NAMES, exclude_paths=EXPORT_EXCLUDE_PATHS, modes="keep",
+apply_modes=None) -> TreeResult` and `scan_tree(src, *, exclude_names, exclude_paths, hash=True) -> TreeResult`
+(the walk without copying). Links (symlinks, junctions) are never followed and are listed; FIFOs, sockets and
+devices are listed as special; unreadable files are listed in `errors`; Windows paths use `workspace.long_path`.
+`dst` must be missing or an empty folder and not inside `src`. `EXPORT_EXCLUDE_NAMES` = `node_modules`, `.venv`,
+`venv`, `__pycache__` (at any depth); `EXPORT_EXCLUDE_PATHS` = `.scratch/_skills`, `.unavailable-workspace`
+(relative paths); `.git` and `.scratch/<member>` are kept. `TreeResult`: files, bytes, digest, links, excluded,
+special, errors, entries `(path, size, sha256)`, modes. `tree_digest(entries)`: sha256 over the sorted lines
+`<NFC path with '/'>\0<size>\0<sha256>\n`, the same on every OS (empty folders do not count). `compare_digest`
+leaves out `volatile` files (below a `.git`: index, `*.lock`, logs, FETCH_HEAD, ORIG_HEAD, COMMIT_EDITMSG and the
+like, never objects or refs; anywhere the `-wal`/`-shm`/`-journal` file next to its database). `modes`: "keep";
+"export" copies the bits where the destination can hold them and records `mode_record` bits (POSIX: executable,
+read-only or owner-restricted files; Windows: read-only); "import" ignores the medium's bits and sets the recorded
+ones (`valid_mode`), never writable by group or others. `is_within(path, parent)` compares as text and by file
+identity. Feature #39 (`--copy-from`) reuses this module.
+
+### 20.6 MCP library on disk (mcp_library.py)
+
+The library is `Config.library_dir` (§17.1), one folder per server in mcp_forge's format (`server.py` of at most
+`mcp_forge.MAX_CODE_BYTES`, `meta.json` of at most `MAX_META_BYTES`). `read_folder(folder, name=None)`,
+`read_entry(root, name) -> LibraryEntry | None`, `scan(root) -> Scan(entries, skipped)`, `list_entries(root)`,
+`check_requirements(requirements)`, `write_entry_folder(folder, code, meta)`, `add_entry(root, src, *, name=None,
+replace=False, meta_updates=None, meta_drop=()) -> "added" | "rewritten" | "unchanged"` (staged in a temp folder
+of the root and renamed in, the old entry renamed away first; another entry without `replace`: `LibraryError` 409
+`exists=[name]`; an approval recorded for the same digest is kept), `remove_entry(root, name)` (renamed away, then
+deleted; a link is removed itself). `LibraryEntry`: name, path, meta, code, requirements, `digest`
+(`snapshot_digest` of the files), `stored_digest`, `approved_digest`, tools; `approved` = approved_digest ==
+digest; `changed_outside` = stored_digest != digest (content-based: it holds on another computer). Links are
+never followed. mcp_forge keeps its own library code in stage 1.
+
+### 20.7 Not in stage 1
+
+Export and import through a running hub (launcher routes), in the TUI, console or web UI; an MCP tool for either;
+`--update` of an existing export; a path map for folders outside the home; the legacy `main` session and
+`dreamteam run` projects; a command that lists or restores `.replaced-*` backups.

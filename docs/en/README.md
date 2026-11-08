@@ -19,6 +19,7 @@ Setting up and running:
 
 - [Configuration](configuration.md): `dreamteam.toml`, models, roles and the starting team
 - [Docker sandbox and sessions without network](sandbox.md)
+- [Moving to another computer and backups](transfer.md): `dreamteam export` and `dreamteam import`
 - [Security](security.md) and the [security self-audit, November 2026](audits/2026-11-self-audit.md)
 
 How it works inside:
