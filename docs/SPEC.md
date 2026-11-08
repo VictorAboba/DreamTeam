@@ -4149,7 +4149,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       stays in the paused state, its badge reads «Ждёт вашего ответа» / "Waiting for your answer" with the tooltip
       «{name} ждёт вашего ответа на вопрос #{id}» from the summary's `question`) and, for a running session in the
       user's wrap-up mode (summary `wrap_up`, read
-      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity,
+      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity (the time of
+      the session's last event, its tooltip «Активность: … · Создана: …»; without an event, the creation time and
+      «Создана: …»),
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
       and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved with /cd); a folder
       outside the session that does not exist gets the badge «папки нет» and a warning that the session cannot
