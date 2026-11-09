@@ -1,7 +1,7 @@
 <h1>
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark.svg">
-    <img alt="DreamTeam" src="docs/assets/logo-light.svg" height="64">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/logo-dark-animated.svg">
+    <img alt="DreamTeam" src="docs/assets/logo-light-animated.svg" height="64">
   </picture>
 </h1>
 
