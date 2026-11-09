@@ -23,11 +23,13 @@ Security problems: please don't open a public issue — see [SECURITY.md](SECURI
 
 ## Development setup
 
-You need Python 3.11+, [uv](https://docs.astral.sh/uv/) and git.
+You need Python 3.11+, [uv](https://docs.astral.sh/uv/) and git. New work goes into the `dev` branch, while
+`master` holds only releases, so start from `dev`:
 
 ```bash
 git clone https://github.com/VictorAboba/DreamTeam.git
 cd DreamTeam
+git switch dev
 uv sync
 uv run pytest -q
 ```
@@ -95,14 +97,16 @@ dreamteam
 ## Pull requests
 
 1. Open an issue first for anything bigger than a small fix, so we can agree on the approach.
-2. One pull request, one issue: write `Fixes #N` in the description, and leave unrelated changes for another pull
+2. Branch from `dev` and open the pull request against `dev`. `master` changes only when a new version is
+   released, so a pull request against `master` gets its base switched to `dev`.
+3. One pull request, one issue: write `Fixes #N` in the description, and leave unrelated changes for another pull
    request. Add tests for new behaviour and fixed bugs.
-3. Write code like the code around it, and reuse existing helpers instead of copying them. If you have to
+4. Write code like the code around it, and reuse existing helpers instead of copying them. If you have to
    duplicate something (because of a circular import, say), explain why in the pull request.
-4. Run `uv run pytest -q` and `uvx ruff check src tests` before pushing; CI runs both on Linux, Windows and
+5. Run `uv run pytest -q` and `uvx ruff check src tests` before pushing; CI runs both on Linux, Windows and
    macOS. On your first pull request, CI waits until a maintainer approves the run (GitHub's protection for new
    contributors): that's expected, there's nothing to fix and no need to reopen the pull request.
-5. Update the docs when behaviour visible to users changes: the guide pages in [docs/en](docs/en/README.md) and
+6. Update the docs when behaviour visible to users changes: the guide pages in [docs/en](docs/en/README.md) and
    [docs/ru](docs/ru/README.md) (the same files in both languages — change both, or say in the PR which one needs
    a translation), the README if the short overview changes ([README.md](README.md) and [README.ru.md](README.ru.md)
    mirror each other) and, for module contracts, [docs/SPEC.md](docs/SPEC.md). For a change to the web board or
