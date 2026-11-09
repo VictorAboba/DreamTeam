@@ -16,7 +16,9 @@ plan it on a shared task board, claim tasks, review each other's work, talk in t
 messages, share a git workspace, set themselves triggers and write their own tools as MCP servers.
 The swarm itself is an MCP server, so Claude Code can watch it, steer it, or join it as a member.
 
-<!-- demo: a short GIF of the kanban board while agents move tasks goes here -->
+![The web board: four agents plan a CSV-to-JSON CLI, claim the tasks, discuss them, send one back in review and reach the goal](docs/assets/demo.gif)
+
+<sub>Recorded with [scripts/demo_gif.py](scripts/demo_gif.py): the board is real, the agents follow a script instead of a model.</sub>
 
 ```bash
 uv tool install git+https://github.com/VictorAboba/DreamTeam.git
