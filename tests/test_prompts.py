@@ -134,12 +134,13 @@ def test_clarify_planning_task_keeps_the_steps_and_asks_first():
     """The clarify card ([swarm] clarify) asks the user first: its head replaces the first line of the classic
     description and the nine steps follow verbatim, so every snippet of the classic card still holds; the head
     overrides the system prompt's "continue with the work that doesn't depend on the answer" and names only tools
-    every revision has (no pause_swarm: the card never relies on it)."""
+    every revision a session this version opens has (from frozen.OLDEST_OPEN_REVISION on; no pause_swarm: the card
+    never relies on it)."""
     from dreamteam.tools import frozen
     from dreamteam.tui.printmode import AUTO_REPLY
 
     shared: set[str] | None = None
-    for rev in frozen.revisions():
+    for rev in (r for r in frozen.revisions() if r >= frozen.OLDEST_OPEN_REVISION):
         for lang in LANGS:
             names = set(frozen.names(frozen.snapshot(rev, lang)))
             shared = names if shared is None else shared & names
@@ -220,16 +221,17 @@ def test_texts_reference_only_real_tools():
 
 
 def test_agent_texts_name_only_baseline_tools():
-    """Notifications and wake-up texts reach agents of every tool set revision (tools/frozen.py: an agent keeps
-    its tools until a compaction), so they may name only the tools and parameters that every shipped revision
-    has, plus statuses. A text that points at a newer tool is either tailored by its caller with
-    ToolContext.has_tool (listed in TAILORED) or would send old agents to a tool they lack. The system prompts
-    are exempt: only new members, who get the current revision, receive them."""
+    """Notifications and wake-up texts reach agents of every tool set revision a session this version opens
+    (tools/frozen.py: an agent keeps its tools until a compaction; sessions with a member below
+    frozen.OLDEST_OPEN_REVISION are not opened), so they may name only the tools and parameters that every shipped
+    revision from OLDEST_OPEN_REVISION on has, plus statuses. A text that points at a newer tool is either tailored
+    by its caller with ToolContext.has_tool (listed in TAILORED) or would send old agents to a tool they lack. The
+    system prompts are exempt: only new members, who get the current revision, receive them."""
     from dreamteam.tools import frozen
 
     tailored: set[str] = set()
     shared: set[str] | None = None
-    for rev in frozen.revisions():
+    for rev in (r for r in frozen.revisions() if r >= frozen.OLDEST_OPEN_REVISION):
         for lang in LANGS:
             tools = frozen.snapshot(rev, lang)
             names = set(frozen.names(tools)) | {p for t in tools for p in t["parameters"].get("properties", {})}

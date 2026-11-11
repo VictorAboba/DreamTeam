@@ -53,7 +53,7 @@ def make_config(tmp_path: Path, **overrides: Any) -> Config:
 
 
 class FakeRuntime:
-    """An LLM agent's context without a ReAct loop (the registry's schema: revision 4)."""
+    """An LLM agent's context without a ReAct loop (the registry's schema: the current revision)."""
 
     def note_sent_to_user(self) -> None:
         pass

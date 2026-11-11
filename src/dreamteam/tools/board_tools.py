@@ -116,13 +116,19 @@ async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
        "Optional: description, assignee (member name or 'me'; they are notified), reviewer, depends_on (task ids "
        "that must be done first), parent_id (for subtasks), priority (0 low, 1 normal, 2 high, 3 critical), tags. "
        "Check the board first so you do not duplicate a task. Write the description for a member who has none "
-       "of your context (inputs, file paths, interfaces). Leave assignee empty to let free members claim it.",
+       "of your context (inputs, file paths, interfaces). Leave assignee empty to let free members claim it. "
+       "A deliverable too big for one member whose detailed split is unclear: pass crew (how many members may "
+       "work on it at once, its owner included) and directions (its areas; the members who take them write the "
+       "details).",
     ru="Создать задачу на доске. Всегда указывай goal (цель): зачем нужна задача и что считается успехом. "
        "Необязательно: description, assignee (имя участника или 'me'; он получит уведомление), reviewer, "
        "depends_on (номера задач, которые должны быть выполнены раньше), parent_id (для подзадач), "
        "priority (0 низкий, 1 обычный, 2 высокий, 3 критичный), tags. Сначала проверь доску, чтобы не "
        "создать дубликат. Пиши description для участника без твоего контекста (входные данные, пути к файлам, "
-       "интерфейсы). Оставь assignee пустым, чтобы задачу взял свободный участник.",
+       "интерфейсы). Оставь assignee пустым, чтобы задачу взял свободный участник. Если результат слишком "
+       "велик для одного участника и его подробное деление заранее неясно, передай crew (сколько участников "
+       "могут работать над задачей одновременно, включая её владельца) и directions (её направления; "
+       "подробности напишут те, кто их возьмёт).",
     properties={
         "title": {"type": "string", "description": "Short imperative title (max 200 characters)"},
         "goal": {"type": "string", "description": "Why the task exists / success criterion"},
@@ -133,6 +139,12 @@ async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
         "parent_id": {"type": "integer", "description": "Parent task id (makes this a subtask)"},
         "priority": _PRIORITY,
         "tags": _TAGS,
+        # toolset revision 5 (tools/frozen.py): crew tasks (docs/SPEC.md §4.2)
+        "crew": {"type": "integer", "description": "Crew task: how many members may work on it at once, its owner "
+                                                   "included (2..8); 0 = an ordinary task"},
+        "directions": {"type": "array", "items": {"type": "string"},
+                       "description": "With crew: its areas, one title per item; each becomes a draft subtask whose "
+                                      "taker writes its card"},
     },
     required=["title", "goal"],
 )
@@ -188,12 +200,18 @@ async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
     en="Change a task (fields of tasks you created or are assigned to): title, goal, description, priority, tags, "
        "depends_on, parent_id (0 = none), reviewer, assignee ('me', a name, '' to unassign), status. Status: "
        "in_progress, waiting (blocked: explain in comment), todo (releases the task), failed, cancelled; "
-       "finish with task_complete, not with done/review. comment is posted to the task discussion.",
+       "finish with task_complete, not with done/review. comment is posted to the task discussion. A task you "
+       "work on that turns out too big for one member: pass crew and directions; you then own it and the first "
+       "direction is your own part; each direction is handed in on its own, and when all of them are finished you "
+       "write the task's result and complete it (crew 0 makes it an ordinary task again).",
     ru="Изменить задачу (поля задач, которые ты создал или которые на тебе): title, goal, description, priority, "
        "tags, depends_on, parent_id (0 — без родителя), reviewer, assignee ('me', имя, '' — снять исполнителя), "
        "status. Статусы: in_progress, waiting (заблокирована: объясни в comment), todo (отпустить задачу), "
        "failed, cancelled; завершай через task_complete, а не через done/review. comment публикуется в "
-       "обсуждении задачи.",
+       "обсуждении задачи. Если задача, над которой ты работаешь, оказалась слишком велика для одного "
+       "участника, передай crew и directions: ты станешь её владельцем, а первое направление — твоя часть; "
+       "каждое направление сдаётся отдельно, а когда все они завершены, ты пишешь итог задачи и завершаешь её "
+       "(crew 0 снова делает её обычной задачей).",
     properties={
         "task_id": _TASK_ID,
         "title": {"type": "string"},
@@ -207,6 +225,12 @@ async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
         "depends_on": _DEPENDS,
         "parent_id": {"type": "integer", "description": "Parent task id; 0 = no parent"},
         "comment": {"type": "string", "description": "Why you change it (posted to the discussion)"},
+        # toolset revision 5 (tools/frozen.py): crew tasks (docs/SPEC.md §4.2)
+        "crew": {"type": "integer", "description": "Creator or assignee: 2..8 makes it a crew task (members at once, "
+                                                   "its owner included); 0 makes it an ordinary task again"},
+        "directions": {"type": "array", "items": {"type": "string"},
+                       "description": "Directions to add to a crew task (titles); the first is your own part while "
+                                      "you have none"},
     },
     required=["task_id"],
 )

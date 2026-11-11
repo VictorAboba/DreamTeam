@@ -106,13 +106,11 @@ class AgentRuntime:
         self._resume = self._ended_mid_activation()
 
     def _load_tools(self) -> None:
-        """The agent's tool set, stored at its first runtime start (it never changes until a compaction).
-        An agent that has a history but no record ran before tool sets were frozen: it keeps the baseline."""
+        """The agent's tool set, stored at its first runtime start (it never changes until a compaction)."""
         db = self.swarm.db
         rec = frozen.read(db, self.name)
         if rec is None:
-            has_history = db.scalar("SELECT 1 FROM history WHERE agent = ? LIMIT 1", (self.name,))
-            rec = frozen.initial_record(self.language, bool(has_history))
+            rec = frozen.current_record(self.language)
             frozen.write(db, self.name, rec)
         self._set_tools(rec)
 
