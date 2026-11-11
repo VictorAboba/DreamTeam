@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable
 
 from . import prompts, roles
@@ -106,6 +106,42 @@ def _norm_tags(tags: Any) -> list[str]:
             seen.add(tag.lower())
             out.append(tag)
     return out
+
+
+def _check_crew(value: Any) -> int:
+    """`crew`: 0 (an ordinary task) or 2..CREW_MAX (docs/SPEC.md §4.2 "Marking")."""
+    crew = _as_int(value, "crew")
+    if crew != 0 and not 2 <= crew <= CREW_MAX:
+        raise ToolError(f"Invalid crew {crew!r}: use 2..{CREW_MAX} (how many members may work on it at once, its "
+                        "owner included), or 0 to make it an ordinary task again.")
+    return crew
+
+
+def _check_directions(value: Any) -> list[str]:
+    """`directions`: a list of 1..MAX_DIRECTIONS distinct titles, each checked like a task title. Titles are not
+    compared with the directions a crew task has already (their takers may have renamed them)."""
+    if (not isinstance(value, (list, tuple)) or not 1 <= len(value) <= MAX_DIRECTIONS
+            or not all(isinstance(item, str) for item in value)):
+        raise ToolError(f"directions must be a list of 1..{MAX_DIRECTIONS} direction titles, "
+                        "e.g. [\"parser\", \"cli\"].")
+    titles: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        title = _check_title(item)
+        if title.casefold() in seen:
+            raise ToolError(f"Direction \"{title}\" is listed twice.")
+        seen.add(title.casefold())
+        titles.append(title)
+    return titles
+
+
+def _has_planning(tags: Iterable[str]) -> bool:
+    return any(str(tag).strip().lower() == "planning" for tag in tags)
+
+
+_NO_CREW_PLANNING = "planning stays with one member"
+_DIRECTIONS_NEED_CREW = ("directions are for crew tasks: pass crew (how many members may work on it at once, its "
+                         "owner included).")
 
 
 def _check_post(text: Any) -> str:
@@ -291,6 +327,31 @@ def similar_tasks(title: str, goal: str, candidates: Iterable[Task], limit: int 
 def _post_dict(row: Any) -> dict[str, Any]:
     return {"id": row["id"], "task_id": row["task_id"], "author": row["author"], "text": row["text"],
             "reply_to": row["reply_to"], "ts": row["ts"]}
+
+
+@dataclass
+class _Batch:
+    """What one mutation collects inside its transaction besides its primary row: side rows to write (the row as
+    loaded, the values to set), the ids of the rows it inserted, the notes for the result of the actor's call
+    (rendered in the actor's language, each starting with a space), callbacks to run after the commit, and further
+    parents whose finish state it may change."""
+    writes: list[tuple[Task, dict[str, Any]]] = field(default_factory=list)
+    inserts: list[int] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    after: list[Callable[[], None]] = field(default_factory=list)
+    parents: set[int] = field(default_factory=set)
+
+
+@dataclass
+class _Mutation:
+    """The outcome of Board._mutate: the primary row before and after, its changes ({field: [old, new]}), the
+    batch, and (finish state, subtasks per status) of the touched parents before and after the writes."""
+    old: Task
+    task: Task
+    changes: dict[str, list[Any]]
+    batch: _Batch
+    before: dict[int, tuple[str | None, dict[str, int]]]
+    after: dict[int, tuple[str | None, dict[str, int]]]
 
 
 class Board:
@@ -562,33 +623,51 @@ class Board:
 
     def create(self, actor: str, title: str, *, goal: str = "", description: str = "",
                assignee: str | None = None, reviewer: str | None = None, parent_id: int | None = None,
-               depends_on: list[int] | None = None, priority: int = 1, tags: list[str] | None = None) -> Task:
+               depends_on: list[int] | None = None, priority: int = 1, tags: list[str] | None = None,
+               crew: Any = 0, directions: Any = None, notes: list[str] | None = None) -> Task:
+        """A new todo task. With `crew` 2..8 a crew task, and its `directions` are inserted as its subtasks in the
+        same transaction (docs/SPEC.md §4.2 "Marking"; the first is the actor's own part when it names itself as
+        the assignee). `notes`: extended with the sentences for the result of the actor's call."""
         title = _check_title(title)
         priority = _check_priority(priority)
         tags = _norm_tags(tags)
+        crew = 0 if crew is None else _check_crew(crew)
+        titles = None if directions is None else _check_directions(directions)
+        if titles is not None and crew < 2:
+            raise ToolError(_DIRECTIONS_NEED_CREW)
+        if crew >= 2 and _has_planning(tags):
+            raise ToolError(f"The task is tagged planning, and {_NO_CREW_PLANNING}: it cannot be a crew task.")
         assignee = self._resolve_opt(assignee)
         reviewer = self._resolve_opt(reviewer)
         if self.independent_review and reviewer is not None and reviewer != USER and reviewer == assignee:
             raise _reviewer_is_assignee(reviewer, "the task")
+        batch = _Batch()
         with self.db.transaction():
             deps = self._check_deps(depends_on or [])
             parent = self._check_parent(parent_id)
-            now = time.time()
-            task_id = self.db.insert(
-                "INSERT INTO tasks(title, goal, description, status, assignee, reviewer, created_by, parent_id,"
-                " depends_on, priority, tags, result, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)",
-                (title, str(goal or "").strip(), str(description or ""), Status.TODO, assignee, reviewer, actor,
-                 parent, dumps(deps), priority, dumps(tags), now, now),
-            )
+            if parent is not None:
+                self._check_subtask_parent(actor, parent)
+                self._check_crew_structure(None, crew, parent)
+            task_id = self._insert_task(title, actor, goal=str(goal or "").strip(), description=str(description or ""),
+                                        assignee=assignee, reviewer=reviewer, parent_id=parent, depends_on=deps,
+                                        priority=priority, tags=tags, crew=crew)
+            if titles:
+                self._insert_directions(actor, self._load(task_id), titles, batch)
         task = self.get(task_id)
         log.info("task #%s created by %s", task.id, actor)
         self.swarm.bus.emit("task.created", actor, task=task.to_dict())
-        self._notify_member(assignee, actor, "n_assigned", id=task.id, title=task.title, by=actor)
+        for sub_id in sorted(batch.inserts):
+            self.swarm.bus.emit("task.created", actor, task=self.get(sub_id).to_dict())
+        if task.crew >= 2:
+            self._notify_crew_owner(assignee, actor, task)
+        else:
+            self._notify_member(assignee, actor, "n_assigned", id=task.id, title=task.title, by=actor)
+        if notes is not None:
+            notes.extend(batch.notes)
         return task
 
-    def claim(self, actor: str, task_id: int) -> Task:
-        def plan(old: Task) -> dict[str, Any]:
+    def claim(self, actor: str, task_id: int, notes: list[str] | None = None) -> Task:
+        def plan(old: Task, batch: _Batch) -> dict[str, Any]:
             if old.assignee == actor and old.status in (Status.IN_PROGRESS, Status.WAITING):
                 return {}
             if old.assignee and old.assignee != actor and old.status in Status.OPEN:
@@ -603,25 +682,48 @@ class Board:
                 values["reviewer"] = None  # the designated reviewer executes it now: someone else will review it
             return values
 
-        _, task, _ = self._mutate(actor, task_id, plan)
-        return task
+        mutation = self._mutate(actor, task_id, plan)
+        if notes is not None:
+            notes.extend(mutation.batch.notes)
+        return mutation.task
 
     def update(self, actor: str, task_id: int, *, title: Any = None, goal: Any = None, description: Any = None,
                status: Any = None, assignee: Any = UNSET, reviewer: Any = UNSET, parent_id: Any = UNSET,
-               priority: Any = None, tags: Any = None, depends_on: Any = None) -> Task:
-        def plan(old: Task) -> dict[str, Any]:
+               priority: Any = None, tags: Any = None, depends_on: Any = None, crew: Any = None,
+               directions: Any = None, notes: list[str] | None = None) -> Task:
+        """Every check sees the task as it was before the call, except that `directions` see the `crew` set in it,
+        and `crew` 2..8 and `directions` a review or terminal `status` set in it; the errors come in the order of
+        the plan: the fields (title, tags, parent_id and the crew structure, crew, directions), then assignment and
+        status, then the review fields (docs/SPEC.md §4.2 "Order"). The directions are inserted last, in the same
+        transaction. `notes`: extended with the sentences for the result of the actor's call."""
+        def plan(old: Task, batch: _Batch) -> dict[str, Any]:
+            try:
+                new_status = old.status if status is None else normalize_status(status)
+            except ToolError:
+                new_status = old.status  # the assignment phase raises it, in its turn
             values = self._plan_fields(actor, old, title=title, goal=goal, description=description,
                                        reviewer=reviewer, parent_id=parent_id, priority=priority, tags=tags,
                                        depends_on=depends_on)
+            crew_after = old.crew
+            if crew is not None:
+                crew_after = self._plan_crew(actor, old, crew, new_status, values.get("parent_id", old.parent_id))
+                if crew_after != old.crew:
+                    values["crew"] = crew_after
+            titles = None
+            if directions is not None:
+                titles = self._plan_directions(actor, old, directions, crew_after, new_status)
             values.update(self._plan_assignment(actor, old, assignee, status,
                                                 values.get("depends_on", old.depends_on)))
             if self.independent_review:
                 self._plan_review_fields(actor, old, values)
+            if titles:
+                self._insert_directions(actor, replace(old, **values), titles, batch)
             return values
 
-        old, task, changes = self._mutate(actor, task_id, plan)
+        mutation = self._mutate(actor, task_id, plan)
+        old, task, changes = mutation.old, mutation.task, mutation.changes
         if changes:
-            self._notify_assignment(actor, old, task, changes)
+            self._notify_assignment(actor, old, task, changes, mutation.batch.notes)
             if task.status == Status.REVIEW and ("reviewer" in changes or old.status != Status.REVIEW):
                 # the task already waits for review: the new reviewer must learn about it now
                 self._request_review(actor, task, auto=False)
@@ -633,14 +735,16 @@ class Board:
             self._on_status_change(actor, old.status, task)
             if "depends_on" in changes:
                 self._deps_changed(actor, old, task)
+        if notes is not None:
+            notes.extend(mutation.batch.notes)
         return task
 
-    def complete(self, actor: str, task_id: int, result: str) -> Task:
+    def complete(self, actor: str, task_id: int, result: str, notes: list[str] | None = None) -> Task:
         text = str(result if result is not None else "").strip()
         if not text:
             raise ToolError("Result must not be empty: say what was done, where it is and what is left.")
 
-        def plan(old: Task) -> dict[str, Any]:
+        def plan(old: Task, batch: _Batch) -> dict[str, Any]:
             if actor != USER and actor != old.assignee:
                 raise ToolError(f"Only the assignee of task #{old.id} ({old.assignee or 'nobody'}) can complete "
                                 "it. Claim it first with task_claim.")
@@ -656,20 +760,24 @@ class Board:
             reviewer = old.reviewer if self._valid_reviewer(old, old.reviewer) else self.pick_reviewer(old)
             return {"result": text, "status": Status.REVIEW, "reviewer": reviewer}
 
-        old, task, changes = self._mutate(actor, task_id, plan)
+        mutation = self._mutate(actor, task_id, plan)
+        old, task = mutation.old, mutation.task
         if task.status == Status.REVIEW:
-            self._request_review(actor, task, auto="reviewer" in changes)
+            self._request_review(actor, task, auto="reviewer" in mutation.changes)
         else:
             self._on_status_change(actor, old.status, task)
+        if notes is not None:
+            notes.extend(mutation.batch.notes)
         return task
 
-    def review(self, actor: str, task_id: int, approve: bool, comment: str = "") -> Task:
+    def review(self, actor: str, task_id: int, approve: bool, comment: str = "",
+               notes: list[str] | None = None) -> Task:
         approved = _as_bool(approve)
         comment = str(comment or "").strip()
         if comment:
             _check_post(comment)  # before the review is committed: the comment becomes a post afterwards
 
-        def plan(old: Task) -> dict[str, Any]:
+        def plan(old: Task, batch: _Batch) -> dict[str, Any]:
             if old.status != Status.REVIEW:
                 raise ToolError(f"Task #{old.id} has status '{old.status}', it is not waiting for review.")
             if actor != USER and actor == old.assignee and self.independent_review:
@@ -685,7 +793,8 @@ class Board:
             # rejected work goes back to its assignee; without one it must be claimable again
             return {"status": Status.IN_PROGRESS if old.assignee else Status.TODO}
 
-        old, task, _ = self._mutate(actor, task_id, plan)
+        mutation = self._mutate(actor, task_id, plan)
+        old, task = mutation.old, mutation.task
         # every verdict wakes the assignee: task_complete told it that it will be told the verdict, so an
         # executor that ended its turn with `wait` is waiting for exactly this (a rejection must be fixed now)
         if approved:
@@ -701,6 +810,8 @@ class Board:
             # the assignee already got the comment inside the review notification
             self._post(actor, task, comment, None, skip={task.assignee})
         self._review_dropped(actor, old, task)
+        if notes is not None:
+            notes.extend(mutation.batch.notes)
         return task
 
     def post(self, actor: str, task_id: int, text: str, reply_to: int | None = None) -> dict:
@@ -760,12 +871,13 @@ class Board:
         """The reviewer of a task in review did not review it (ignored the reminder, or its runtime is in error):
         give the review to the next pick, or USER when nobody else qualifies (SPEC §4 "Independent review").
         Scheduler-driven: the task.updated event has no actor. None when the task is no longer in review."""
-        def plan(old: Task) -> dict[str, Any]:
+        def plan(old: Task, batch: _Batch) -> dict[str, Any]:
             if old.status != Status.REVIEW or not old.reviewer:
                 return {}
             return {"reviewer": self.pick_reviewer(old, exclude={*exclude, old.reviewer})}
 
-        old, task, changes = self._mutate(None, task_id, plan)
+        mutation = self._mutate(None, task_id, plan)
+        old, task, changes = mutation.old, mutation.task, mutation.changes
         if not changes:
             return None
         # the review comes from its executor, or from the reviewer that let it lapse when the executor has left
@@ -802,8 +914,94 @@ class Board:
                 value = self._plan_deps(actor, old, value)
             if value != getattr(old, field_name):
                 self._require_owner(actor, old, field_name)
+                if field_name == "tags" and old.crew >= 2 and _has_planning(value):
+                    raise ToolError(f"#{old.id} is a crew task, and {_NO_CREW_PLANNING}: it cannot be tagged "
+                                    "planning.")
+                if field_name == "parent_id" and value is not None:
+                    self._check_subtask_parent(actor, value)
+                    self._check_crew_structure(old.id, old.crew, value, moved=True)
                 values[field_name] = value
         return values
+
+    def _plan_crew(self, actor: str, old: Task, value: Any, status: str, parent_id: int | None) -> int:
+        """The `crew` of an update (docs/SPEC.md §4.2 "Marking"): the creator, the assignee or USER; 2..8 not on a
+        task in review or terminal (`status`: the one after the call), never nesting crews (`parent_id`: the one
+        after the call), not with the tag planning; 0 not while a direction is open or failed. The same value is no
+        change and no error."""
+        crew = _check_crew(value)
+        if crew == old.crew:
+            return crew
+        if actor != USER and actor not in (old.created_by, old.assignee):
+            raise ToolError(f"Only the creator ({old.created_by}) or the assignee ({old.assignee or 'nobody'}) of "
+                            f"task #{old.id} can change its crew. Suggest it in its discussion.")
+        if crew >= 2:
+            if status == Status.REVIEW or status in Status.TERMINAL:
+                raise ToolError(f"#{old.id} is {status}: it cannot become a crew task now.")
+            self._check_crew_structure(old.id, crew, parent_id)
+            if _has_planning(old.tags):
+                raise ToolError(f"#{old.id} is tagged planning, and {_NO_CREW_PLANNING}: it cannot be a crew task.")
+            return crew
+        subs = self.subtasks_of(old.id)
+        if any(s.status in Status.OPEN for s in subs):
+            raise ToolError(f"#{old.id} has open directions: {self._open_list(subs, actor)}: finish or cancel them "
+                            "first (task_update status=cancelled); their holders are told.")
+        failed = [s for s in subs if s.status == Status.FAILED]
+        if failed:
+            raise ToolError(f"Crew task #{old.id} has failed directions: {self._direction_names(failed, 'en')}. "
+                            f"Reopen each to be done again (task_update status=todo) or cancel it if #{old.id} does "
+                            "without it (status=cancelled) first.")
+        return crew
+
+    def _plan_directions(self, actor: str, old: Task, value: Any, crew: int, status: str) -> list[str]:
+        """The checked titles of `directions` in an update: they need a crew task (`crew`: the one after the call),
+        come from the creator, the assignee or USER, and are refused while the task is in review or terminal
+        (`status`: the one after the call)."""
+        titles = _check_directions(value)
+        if crew < 2:
+            raise ToolError(_DIRECTIONS_NEED_CREW)
+        self._require_owner(actor, old, "directions")
+        if status == Status.REVIEW or status in Status.TERMINAL:
+            raise ToolError(f"#{old.id} is {status}: it takes no new subtasks.")
+        return titles
+
+    def _insert_directions(self, actor: str, task: Task, titles: list[str], batch: _Batch) -> None:
+        """Insert the directions of crew task `task` (as it is after the call) as todo subtasks created by `actor`,
+        with its priority and tags. The owner's own part: when `actor` is its assignee (a member) and none of its
+        directions is the actor's (assigned to it, in any status but cancelled), the first one is the actor's,
+        in_progress (todo while the crew task is blocked), with a note for the result."""
+        own = False
+        if actor != USER and task.assignee == actor:
+            own = self.db.one("SELECT 1 FROM tasks WHERE parent_id = ? AND assignee = ? AND status != ? LIMIT 1",
+                              (task.id, actor, Status.CANCELLED)) is None
+        blockers = self._blockers_of(task.depends_on) if own else []
+        for i, title in enumerate(titles):
+            mine = own and i == 0
+            status = (Status.TODO if blockers else Status.IN_PROGRESS) if mine else Status.TODO
+            sub_id = self._insert_task(title, actor, status=status, assignee=actor if mine else None,
+                                       parent_id=task.id, priority=task.priority, tags=task.tags)
+            batch.inserts.append(sub_id)
+            if not mine:
+                continue
+            lang = self.swarm.language_of(actor)
+            if blockers:
+                batch.notes.append(prompts.t(lang, "note_own_part_blocked", sub=sub_id, title=title, id=task.id,
+                                             blockers=", ".join(f"#{d}" for d in blockers)))
+            else:
+                batch.notes.append(prompts.t(lang, "note_own_part", sub=sub_id, title=title, id=task.id))
+
+    def _insert_task(self, title: str, created_by: str, *, goal: str = "", description: str = "",
+                     status: str = Status.TODO, assignee: str | None = None, reviewer: str | None = None,
+                     parent_id: int | None = None, depends_on: Iterable[int] = (), priority: int = 1,
+                     tags: Iterable[str] = (), crew: int = 0) -> int:
+        """One INSERT of a task row with checked values (inside the caller's transaction); its id."""
+        now = time.time()
+        return self.db.insert(
+            "INSERT INTO tasks(title, goal, description, status, assignee, reviewer, created_by, parent_id,"
+            " depends_on, priority, tags, result, created_at, updated_at, crew)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            (title, goal, description, status, assignee, reviewer, created_by, parent_id, dumps(list(depends_on)),
+             priority, dumps(list(tags)), now, now, crew),
+        )
 
     @staticmethod
     def _plan_deps(actor: str, old: Task, deps: list[int]) -> list[int]:
@@ -827,8 +1025,11 @@ class Board:
         if assignee is not UNSET:
             target = self._resolve_opt(assignee)
             if target != old.assignee:
+                # the parent's creator and assignee may unassign its open subtasks (not one in review, R2)
+                unassign = (target is None and old.status in Status.OPEN and old.status != Status.REVIEW
+                            and self._controls_parent(actor, old))
                 if (actor != USER and old.assignee is not None
-                        and actor not in (old.assignee, old.created_by)):
+                        and actor not in (old.assignee, old.created_by) and not unassign):
                     raise ToolError(f"Task #{old.id} is assigned to {old.assignee}; only they or the creator "
                                     f"({old.created_by}) can reassign it. Ask them in the task discussion.")
                 values["assignee"] = new_assignee = target
@@ -845,6 +1046,14 @@ class Board:
         values["status"] = new_status
         if release:
             values["assignee"] = None
+        if old.status in Status.TERMINAL and new_status in Status.OPEN and assignee is UNSET:
+            # reopened: a failed subtask is to be done again by whoever takes it; an assignee that left is cleared,
+            # so the task is ready (docs/SPEC.md §4 `update`)
+            gone = new_assignee not in (None, USER) and not self.swarm.is_member(new_assignee)
+            if gone or (old.status == Status.FAILED and old.parent_id is not None and new_status == Status.TODO):
+                values["assignee"] = None
+                if new_status in _WORKING:
+                    values["status"] = Status.TODO
         return values
 
     def _plan_review_fields(self, actor: str, old: Task, values: dict[str, Any]) -> None:
@@ -885,12 +1094,20 @@ class Board:
             return
         holder = actor in {old.assignee, new_assignee} - {None}
         if old.status in Status.TERMINAL:
-            if new == Status.TODO and actor == old.created_by:
-                return
-            raise ToolError(f"Task #{old.id} is {old.status}; only its creator ({old.created_by}) or the user "
-                            "can reopen it (status todo).")
+            # a failed subtask: its parent's creator and assignee may reopen it or cancel it (the parent does
+            # without it); no subtask is reopened while its parent is in review or terminal
+            parent_moves = (old.status == Status.FAILED and new in (Status.TODO, Status.CANCELLED)
+                            and self._controls_parent(actor, old))
+            if not (new == Status.TODO and actor == old.created_by) and not parent_moves:
+                raise ToolError(f"Task #{old.id} is {old.status}; only its creator ({old.created_by}) or the user "
+                                "can reopen it (status todo).")
+            parent = self._parent_row(old)
+            if parent is not None and (parent["status"] == Status.REVIEW or parent["status"] in Status.TERMINAL):
+                raise ToolError(f"#{parent['id']} is {parent['status']}: it takes no new subtasks; reopen "
+                                f"#{parent['id']} first.")
+            return
         if new == Status.CANCELLED:
-            if holder or actor == old.created_by:
+            if holder or actor == old.created_by or self._controls_parent(actor, old):
                 return
             raise ToolError(f"Only the creator ({old.created_by}) or the assignee "
                             f"({old.assignee or 'nobody'}) can cancel task #{old.id}.")
@@ -999,6 +1216,64 @@ class Board:
                     stack.append(child)
         return False
 
+    def _parent_row(self, task: Task) -> Any:
+        """The row (id, crew, status, created_by, assignee, parent_id) of the task's parent, or None."""
+        rows = self._ancestors(task.parent_id)
+        return rows[0] if rows else None
+
+    def _controls_parent(self, actor: str | None, task: Task) -> bool:
+        """`actor` (a member) created the parent of `task` or is its assignee: it may cancel or unassign the open
+        subtask, and reopen or cancel a failed one (docs/SPEC.md §4.2 "Who controls subtasks")."""
+        parent = self._parent_row(task)
+        return actor not in (None, USER) and parent is not None and actor in (parent["created_by"], parent["assignee"])
+
+    def _check_subtask_parent(self, actor: str, parent_id: int) -> None:
+        """A member puts a task under a parent only when it created that parent or is its assignee, and never under
+        a parent in review or terminal (docs/SPEC.md §4.2 "Who controls subtasks"; USER may do anything)."""
+        if actor == USER:
+            return
+        rows = self._ancestors(parent_id)
+        if not rows:
+            return
+        parent = rows[0]
+        if actor not in (parent["created_by"], parent["assignee"]):
+            raise ToolError(f"Only the creator ({parent['created_by']}) or the assignee "
+                            f"({parent['assignee'] or 'nobody'}) of task #{parent_id} can add subtasks to it. "
+                            "Suggest it in its discussion.")
+        if parent["status"] == Status.REVIEW or parent["status"] in Status.TERMINAL:
+            raise ToolError(f"#{parent_id} is {parent['status']}: it takes no new subtasks.")
+
+    def _check_crew_structure(self, task_id: int | None, crew: int, parent_id: int | None,
+                              moved: bool = False) -> None:
+        """Crews are one level deep (docs/SPEC.md §4.2 "Marking"): no crew task (`crew` >= 2) below a crew task,
+        no crew task above one, and a move (`moved`: `parent_id` is the new parent) puts neither a crew task nor a
+        task with a crew task below it anywhere below a crew task. `task_id` None: a task being created."""
+        rows = self._ancestors(parent_id)
+        above = next((r for r in rows if (r["crew"] or 0) >= 2), None)
+        me = f"#{task_id}" if task_id is not None else "The new task"
+        if crew >= 2 and above is not None:
+            if moved:
+                raise ToolError(f"{me} is a crew task, and crews are one level deep: it cannot go below crew task "
+                                f"#{above['id']}.")
+            if above["id"] == parent_id:
+                n = above["id"]
+                ask = above["assignee"] or f"its creator {above['created_by']}"
+                hint = (f"ask its owner ({ask}) in #{n}'s discussion to add directions (task_create parent_id=#{n}, "
+                        "or task_update directions).")
+                if task_id is None:
+                    raise ToolError(f"#{n} is a crew task, and crews are one level deep: a task under it is one of "
+                                    f"its directions and cannot be a crew task itself. Pass no crew, or {hint}")
+                raise ToolError(f"#{task_id} is a direction of crew task #{n}, and crews are one level deep: {hint}")
+            raise ToolError(f"{me} is below crew task #{above['id']}, and crews are one level deep: it cannot be a "
+                            "crew task itself.")
+        below = (crew >= 2 and not moved) or (moved and above is not None)
+        if task_id is not None and below and self._has_crew_below(task_id):
+            if moved:
+                raise ToolError(f"#{task_id} has a crew task below it, and crews are one level deep: it cannot go "
+                                f"below crew task #{above['id']}.")
+            raise ToolError(f"#{task_id} has a crew task below it, and crews are one level deep: it cannot be a "
+                            "crew task itself.")
+
     def _raise_if_blocked(self, task_id: int, deps: list[int], assignee: bool = False) -> None:
         """`assignee`: the actor is the task's assignee, who may remove dependencies it can do without."""
         blocked = self._blockers_of(deps)
@@ -1065,19 +1340,45 @@ class Board:
         self.db.execute(sql, [*params, task_id])
 
     def _mutate(self, actor: str | None, task_id: Any,
-                plan: Callable[[Task], dict[str, Any]]) -> tuple[Task, Task, dict[str, list[Any]]]:
-        """Atomic read-modify-write; emits one `task.updated` if anything changed."""
+                plan: Callable[[Task, _Batch], dict[str, Any]]) -> _Mutation:
+        """Atomic read-modify-write of a task and the rows that go with it, in one transaction: `plan(old, batch)`
+        returns the values of the primary row and collects side rows, inserted rows and notes in the batch (it
+        writes through internal helpers only: the transaction is not re-entrant); then the primary row, the side
+        rows and the rows the change brings with it (_cascade) are written. The finish info of the parents it
+        touches (the old and the new parent, and the batch's) is read before and after the writes. After the
+        commit: one `task.updated` for the primary row if it changed, one per side row that changed, one
+        `task.created` per inserted row (id order), then the batch's callbacks."""
+        batch = _Batch()
+        side: list[tuple[int, dict[str, list[Any]]]] = []
         with self.db.transaction():
             old = self._load(task_id)
-            values = plan(old)
+            values = plan(old, batch)
             changes = {f: [getattr(old, f), v] for f, v in values.items() if getattr(old, f) != v}
+            parents = sorted({old.parent_id, values.get("parent_id", old.parent_id), *batch.parents} - {None})
+            before = self._finish_info(parents)
             if changes:
                 self._write(old.id, {f: c[1] for f, c in changes.items()})
+            for row, row_values in batch.writes:
+                row_changes = {f: [getattr(row, f), v] for f, v in row_values.items() if getattr(row, f) != v}
+                if row_changes:
+                    self._write(row.id, {f: c[1] for f, c in row_changes.items()})
+                    side.append((row.id, row_changes))
+            self._cascade(actor, old, changes, batch)
+            after = self._finish_info(parents)
         task = self.get(old.id)
         if changes:
             log.info("task #%s updated by %s: %s", task.id, actor, ", ".join(changes))
             self.swarm.bus.emit("task.updated", actor, task=task.to_dict(), changes=changes)
-        return old, task, changes
+        for row_id, row_changes in side:
+            self.swarm.bus.emit("task.updated", actor, task=self.get(row_id).to_dict(), changes=row_changes)
+        for row_id in sorted(batch.inserts):
+            self.swarm.bus.emit("task.created", actor, task=self.get(row_id).to_dict())
+        for callback in batch.after:
+            callback()
+        return _Mutation(old, task, changes, batch, before, after)
+
+    def _cascade(self, actor: str | None, old: Task, changes: dict[str, list[Any]], batch: _Batch) -> None:
+        """The rows a change of the primary row brings with it, written in the same transaction (none yet)."""
 
     def _statuses(self, ids: Iterable[int]) -> dict[int, str]:
         ids = list(ids)
@@ -1404,14 +1705,55 @@ class Board:
         self._notify_member(old.reviewer, actor, "n_review_cancelled", wake=False, id=task.id, title=task.title,
                             by=actor)
 
-    def _notify_assignment(self, actor: str, old: Task, task: Task, changes: dict[str, list[Any]]) -> None:
+    def _notify_assignment(self, actor: str, old: Task, task: Task, changes: dict[str, list[Any]],
+                           notes: list[str]) -> None:
+        """Who holds the task now, and a change of its crew (docs/SPEC.md §4.2 "The owner", "Marking"). Every
+        notice that makes or tells a member the holder of a crew task (an assignment, the creator's reopening,
+        `crew` set by someone else, or both in one call) is one n_crew_owner, never also n_assigned. The actor that
+        becomes the holder of a crew task reads the owner sentence in `notes`."""
+        reopened = old.status in Status.TERMINAL and task.status in Status.OPEN
+        told: str | None = None  # the member told that it holds the task
+        removed: str | None = None
         if "assignee" in changes:
-            removed, added = changes["assignee"]
-            self._notify_member(added, actor, "n_assigned", id=task.id, title=task.title, by=actor)
-            self._notify_member(removed, actor, "n_unassigned", id=task.id, title=task.title, by=actor)
-        elif old.status in Status.TERMINAL and task.status in Status.OPEN:
+            removed, told = changes["assignee"]
+            if reopened and old.status == Status.FAILED and old.parent_id is not None:
+                removed = None  # a failed subtask reopened to be done again: its old assignee gets nothing
+        elif reopened:
             # reopened (creator: to todo; the user: to any open status): back on its assignee's plate
-            self._notify_member(task.assignee, actor, "n_assigned", id=task.id, title=task.title, by=actor)
+            told = task.assignee
+        old_crew, new_crew = changes.get("crew", [old.crew, task.crew])
+        made_crew = old_crew < 2 <= new_crew
+        quiet_crew_to: str | None = None
+        if "crew" in changes:
+            if old.assignee is not None and actor == old.assignee and actor != old.created_by:
+                quiet_crew_to = old.created_by
+                notes.append(prompts.t(self.swarm.language_of(actor), "note_crew_say_why", id=task.id))
+            elif actor in (old.created_by, USER) and task.assignee not in (None, actor) and told is None:
+                if made_crew:
+                    told = task.assignee
+                else:
+                    quiet_crew_to = task.assignee
+        if task.crew >= 2:
+            self._notify_crew_owner(told, actor, task)
+        else:
+            self._notify_member(told, actor, "n_assigned", id=task.id, title=task.title, by=actor)
+        self._notify_member(removed, actor, "n_unassigned", id=task.id, title=task.title, by=actor)
+        self._notify_member(quiet_crew_to, actor, "n_crew_changed", wake=False, id=task.id, title=task.title,
+                            by=actor, crew=task.crew)
+        # the actor became the holder: self-assigned, its reopening of one it holds, or crew set on the task it holds
+        became = (told == actor or (made_crew and actor == old.assignee)) and task.assignee == actor
+        if task.crew >= 2 and became and actor != USER:
+            instructions, directions = self._owner_sentence(task, actor, self.swarm.language_of(actor))
+            notes.append(instructions + directions)
+
+    def _notify_crew_owner(self, name: str | None, actor: str, task: Task) -> None:
+        """n_crew_owner to the member made or told the holder of crew task `task`, with the owner sentence in its
+        language (_owner_sentence)."""
+        if not name or name == actor or name == USER or not self.swarm.is_member(name):
+            return
+        instructions, directions = self._owner_sentence(task, name, self.swarm.language_of(name))
+        self._notify_member(name, actor, "n_crew_owner", id=task.id, title=task.title, crew=task.crew,
+                            instructions=instructions, directions=directions)
 
     def _on_status_change(self, actor: str, old_status: str, task: Task) -> None:
         if task.status == old_status:

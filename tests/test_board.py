@@ -1265,7 +1265,9 @@ def test_similar_open_tasks_best_first(swarm, board):
     board.update(BOB, closed.id, status="cancelled")
     new = board.create(CARL, "Fix crash in parser on empty input", goal="The parser must not crash on empty input")
     assert [t.id for t in board.similar_open(new)] == [parser.id, near.id]   # open ones only, not itself
-    # its parent and the tasks it depends on share its words by design
+    # its parent and the tasks it depends on share its words by design (CARL may add subtasks to the parent it
+    # holds; the parent is skipped as the parent, it is not CARL's own task)
+    board.update(ANNA, parser.id, assignee=CARL)
     sub = board.create(CARL, "Parser: empty input crash test", parent_id=parser.id, depends_on=[near.id])
     assert not {parser.id, near.id} & {t.id for t in board.similar_open(sub)}
     many = [board.create(ANNA, f"Parser crash on empty input, case {i}") for i in range(5)]
