@@ -486,25 +486,46 @@ class Board:
         return tasks
 
     def pick_reviewer(self, task: Task, exclude: Iterable[str] = ()) -> str:
-        """The reviewer the board chooses for `task` (SPEC §4 "Independent review"): an active LLM member other than
-        its assignee and `exclude`; members who did not create the task first, then the reviewer role, then idle
-        ones, then the fewest open tasks + pending reviews, then by name. USER when nobody qualifies. External
-        members are never picked (they may be offline), only designated."""
+        """The reviewer the board chooses for `task` (docs/SPEC.md §4.1 "Reviewer selection"): an active LLM member
+        other than its assignee and `exclude`, the first by (cannot act now, [is a contributor], is the task's
+        creator, role rank, reviews pending, reviews so far, open tasks held, status rank idle 0 / working 1, name).
+        "Is a contributor" is part of the key only for the check of the whole of a crew task (`_whole_by_pick`).
+        Reviews so far: tasks with this reviewer in review, done or failed updated since the newest active LLM member
+        joined. USER when nobody qualifies. External members are never picked (they may be offline), only
+        designated."""
         banned = {task.assignee, *exclude} - {None}
-        pool = [m for m in self.swarm.members() if m["kind"] == AgentKind.LLM and m["name"] not in banned]
+        llm = [m for m in self.swarm.members() if m["kind"] == AgentKind.LLM]
+        pool = [m for m in llm if m["name"] not in banned]
         if not pool:
             return USER
-        load: dict[str, int] = {}
-        for row in self.db.all(f"SELECT assignee, reviewer, status FROM tasks WHERE status IN ({_qmarks(len(_OPEN))})",
-                               _OPEN):
-            if row["assignee"]:
-                load[row["assignee"]] = load.get(row["assignee"], 0) + 1
-            if row["status"] == Status.REVIEW and row["reviewer"]:
-                load[row["reviewer"]] = load.get(row["reviewer"], 0) + 1
+        since = max(m.get("created_at") or 0 for m in llm)
+        pending: dict[str, int] = {}
+        so_far: dict[str, int] = {}
+        for row in self.db.all("SELECT reviewer, SUM(status = ?) AS pending, SUM(updated_at >= ?) AS so_far"
+                               " FROM tasks WHERE reviewer IS NOT NULL AND status IN (?, ?, ?) GROUP BY reviewer",
+                               (Status.REVIEW, since, Status.REVIEW, Status.DONE, Status.FAILED)):
+            pending[row["reviewer"]] = row["pending"] or 0
+            so_far[row["reviewer"]] = row["so_far"] or 0
+        held = {row["assignee"]: row["n"] for row in self.db.all(
+            "SELECT assignee, COUNT(*) AS n FROM tasks WHERE assignee IS NOT NULL"
+            f" AND status IN ({_qmarks(len(_OPEN))}) GROUP BY assignee", _OPEN)}
+        contributors = self.contributors_of(task) if self._whole_by_pick(task) else set()
         rank = {AgentStatus.IDLE: 0, AgentStatus.WORKING: 1}
-        best = min(pool, key=lambda m: (m["name"] == task.created_by, self._role_rank(m), rank.get(m["status"], 2),
-                                        load.get(m["name"], 0), m["name"]))
-        return best["name"]
+
+        def key(m: dict) -> tuple:
+            name = m["name"]
+            return (m["status"] not in rank, name in contributors, name == task.created_by, self._role_rank(m),
+                    pending.get(name, 0), so_far.get(name, 0), held.get(name, 0), rank.get(m["status"], 2), name)
+
+        return min(pool, key=key)["name"]
+
+    def _whole_by_pick(self, task: Task) -> bool:
+        """A review of `task` picked by the board is the check of the whole of a crew task: crew >= 2, [swarm]
+        crew_review on, and at least one done direction (docs/SPEC.md §4.2 "Finishing")."""
+        if task.crew < 2 or not self.crew_review:
+            return False
+        return self.db.one("SELECT 1 FROM tasks WHERE parent_id = ? AND status = ? LIMIT 1",
+                           (task.id, Status.DONE)) is not None
 
     @staticmethod
     def _role_rank(member: dict) -> int:
@@ -690,9 +711,15 @@ class Board:
         unassigned (their ids are returned). With independent review, its tasks waiting in review stay there
         without an assignee (done work: the review goes on, they are not returned), and the reviews it was to
         do go to the next pick, or USER. Without it, open tasks it was to review lose their reviewer, and one
-        waiting in review goes back to its assignee, who is told to complete it again."""
+        waiting in review goes back to its assignee, who is told to complete it again. Each row is written right
+        after its pick, so every re-pick counts the ones before it (the reviews spread over the team)."""
         independent = self.independent_review
         updates: list[tuple[Task, dict[str, Any]]] = []
+
+        def write(old: Task, values: dict[str, Any]) -> None:
+            self._write(old.id, values)
+            updates.append((old, values))
+
         with self.db.transaction():
             olds = self._query(["assignee = ?", f"status IN ({_qmarks(len(_OPEN))})"], [name, *_OPEN])
             for old in olds:
@@ -700,12 +727,12 @@ class Board:
                     values: dict[str, Any] = {"assignee": None}
                     if old.reviewer == name:  # only a row written while the switch was off
                         values["reviewer"] = self.pick_reviewer(old, exclude={name})
-                    updates.append((old, values))
+                    write(old, values)
                     continue
                 values = {"assignee": None, "status": Status.TODO}
                 if old.reviewer == name:
                     values["reviewer"] = None
-                updates.append((old, values))
+                write(old, values)
             reviewed = self._query(["reviewer = ?", "(assignee IS NULL OR assignee != ?)",
                                     f"status IN ({_qmarks(len(_OPEN))})"], [name, name, *_OPEN])
             for old in reviewed:
@@ -715,9 +742,7 @@ class Board:
                         values["reviewer"] = self.pick_reviewer(old, exclude={name})
                     else:
                         values["status"] = Status.IN_PROGRESS if old.assignee else Status.TODO
-                updates.append((old, values))
-            for old, values in updates:
-                self._write(old.id, values)
+                write(old, values)
         for old, values in updates:
             changes = {f: [getattr(old, f), v] for f, v in values.items() if getattr(old, f) != v}
             task = self.get(old.id)

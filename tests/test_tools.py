@@ -570,8 +570,9 @@ async def test_claim_complete_and_review_flow(swarm):
     assert await ok(swarm, b, "task_review", {"task_id": 1, "approve": True}) == f"Task #1 is now done (assignee: {a})."
     assert "n_unblocked" not in notifications(swarm, ext)
     await ok(swarm, ext, "task_claim", {"task_id": 2})
-    # no reviewer: the board picks an agent that neither created (the user did) nor did it; both are idle and free
-    picked = min(a, b)
+    # no reviewer: the board picks an agent that neither created (the user did) nor did it; both are idle and free,
+    # and b has already given a review (#1), so a takes this one
+    picked = a
     assert await ok(swarm, ext, "task_complete", {"task_id": 2, "result": "ok"}) == \
         f"Task #2 was sent to {picked} for review: a member other than you checks it, and you will be told the verdict."
     # the user may complete and review anything
