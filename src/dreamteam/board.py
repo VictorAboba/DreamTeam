@@ -667,25 +667,40 @@ class Board:
         return task
 
     def claim(self, actor: str, task_id: int, notes: list[str] | None = None) -> Task:
+        """The actor takes a todo task. A direction of a crew task has the checks of "Taking a direction"
+        (docs/SPEC.md §4.2). `notes`: extended with the sentences for the result of the actor's call: the direction's
+        card, the crew task's reviewer cleared, and for a parent the owner sentence (a crew task) or the owner form
+        of the plain ending (an ordinary parent whose subtasks are all finished)."""
         def plan(old: Task, batch: _Batch) -> dict[str, Any]:
             if old.assignee == actor and old.status in (Status.IN_PROGRESS, Status.WAITING):
                 return {}
             if old.assignee and old.assignee != actor and old.status in Status.OPEN:
+                hint = self._crew_holder_hint(old, actor) if old.crew >= 2 else ""
                 raise ToolError(f"Task #{old.id} is already assigned to {old.assignee} (status {old.status}). "
                                 "Pick another ready task (or call wait if there is none); post in its discussion only if "
-                                "you have something the assignee needs.")
+                                f"you have something the assignee needs.{hint}")
             if old.status != Status.TODO:
                 raise ToolError(f"Task #{old.id} has status '{old.status}'; only 'todo' tasks can be claimed.")
             self._raise_if_blocked(old.id, old.depends_on, assignee=old.assignee == actor)
+            if actor != USER and old.parent_id is not None:
+                parent = self._load(old.parent_id)
+                if parent.crew >= 2:
+                    self._check_direction_take(batch, actor, actor, old, parent)
             values: dict[str, Any] = {"assignee": actor, "status": Status.IN_PROGRESS}
             if old.reviewer == actor and self.independent_review:
                 values["reviewer"] = None  # the designated reviewer executes it now: someone else will review it
             return values
 
         mutation = self._mutate(actor, task_id, plan)
+        task = mutation.task
+        if mutation.changes and actor != USER:
+            # the actor holds a parent now: what it does with it (for a crew task the owner sentence)
+            instructions, directions = self._owner_sentence(task, actor, self.swarm.language_of(actor))
+            if instructions:
+                mutation.batch.notes.append(instructions + directions)
         if notes is not None:
             notes.extend(mutation.batch.notes)
-        return mutation.task
+        return task
 
     def update(self, actor: str, task_id: int, *, title: Any = None, goal: Any = None, description: Any = None,
                status: Any = None, assignee: Any = UNSET, reviewer: Any = UNSET, parent_id: Any = UNSET,
@@ -704,6 +719,10 @@ class Board:
             values = self._plan_fields(actor, old, title=title, goal=goal, description=description,
                                        reviewer=reviewer, parent_id=parent_id, priority=priority, tags=tags,
                                        depends_on=depends_on)
+            moved = values.get("parent_id") is not None
+            # a move under a crew task takes a direction for the task's assignee, checked with the move (the
+            # assignee a call also passes is checked with the assignment instead)
+            move_checked = moved and assignee is UNSET and self._take_by_move(actor, old, values["parent_id"], batch)
             crew_after = old.crew
             if crew is not None:
                 crew_after = self._plan_crew(actor, old, crew, new_status, values.get("parent_id", old.parent_id))
@@ -714,6 +733,7 @@ class Board:
                 titles = self._plan_directions(actor, old, directions, crew_after, new_status)
             values.update(self._plan_assignment(actor, old, assignee, status,
                                                 values.get("depends_on", old.depends_on)))
+            self._plan_take(actor, old, values, batch, moved=moved and not move_checked)
             if self.independent_review:
                 self._plan_review_fields(actor, old, values)
             if titles:
@@ -1121,6 +1141,113 @@ class Board:
         if new == Status.IN_PROGRESS:
             # the removal hint only for the current assignee: one becoming it in this call cannot drop deps yet
             self._raise_if_blocked(old.id, deps, assignee=actor == old.assignee)
+
+    # --- taking a direction (docs/SPEC.md §4.2 "Taking a direction") ----------------------------------------------
+
+    def _take_by_move(self, actor: str, old: Task, parent_id: int, batch: _Batch) -> bool:
+        """A parent_id change that puts an in_progress or waiting task under a crew task takes a direction for the
+        task's assignee (checked with the move, so a refused move leaves the task where it was). Exempt: USER as the
+        actor or the assignee. True when the checks ran."""
+        if actor == USER or old.assignee in (None, USER) or old.status not in _WORKING:
+            return False
+        parent = self._load(parent_id)
+        if parent.crew < 2:
+            return False
+        self._check_direction_take(batch, actor, old.assignee, replace(old, parent_id=parent_id), parent)
+        return True
+
+    def _plan_take(self, actor: str, old: Task, values: dict[str, Any], batch: _Batch, moved: bool) -> None:
+        """An update that makes a member the assignee of a direction in in_progress or waiting takes it: an assignee
+        change that leaves it in_progress or waiting, the assignee setting in_progress (or waiting) from todo, and a
+        move under a crew task not checked with the move (`moved`). Not a resume from waiting, nor the holder
+        withdrawing its work from review, nor an assignment that stays todo; USER as the actor or the assignee is
+        exempt."""
+        taker = values.get("assignee", old.assignee)
+        status = values.get("status", old.status)
+        if actor == USER or taker in (None, USER) or status not in _WORKING:
+            return
+        if taker == old.assignee and old.status != Status.TODO and not moved:
+            return  # it holds the direction already: a resume, or its work withdrawn from review
+        parent_id = values.get("parent_id", old.parent_id)
+        if parent_id is None:
+            return
+        parent = self._load(parent_id)
+        if parent.crew >= 2:
+            self._check_direction_take(batch, actor, taker, replace(old, **values), parent)
+
+    def _check_direction_take(self, batch: _Batch, actor: str, taker: str, direction: Task, parent: Task) -> None:
+        """`taker` takes `direction` (as it is after the call) of crew task `parent` (loaded in this transaction):
+        the crew task is todo, in_progress or waiting and not blocked; a free place unless the taker is in its
+        working set already (the owner always takes); the taker works on no other direction of it (one in review
+        does not count). Side effects into the batch: the crew task's reviewer cleared when it is the taker
+        (independent review on), the card note and the reviewer note when the actor is the taker, and the quiet
+        n_direction_taken to the owner unless it is the actor or the taker."""
+        n, m = parent.id, direction.id
+        if parent.status not in _TAKEABLE:
+            raise ToolError(f"Direction #{m} belongs to #{n}, which is {parent.status}: it takes no directions now. "
+                            "Pick another task or call wait.")
+        blockers = self._blockers_of(parent.depends_on)
+        if blockers:
+            listed = ", ".join(f"#{d}" for d in blockers)
+            raise ToolError(f"Direction #{m} belongs to #{n}, which is blocked by {listed}: take #{m} when #{n} is no "
+                            "longer blocked. Pick another task or call wait.")
+        working = self._working_without(parent, m)
+        if taker not in working and len(working) + 1 > parent.crew:
+            raise ToolError(f"Crew task #{n} already has {len(working)} of {parent.crew} members working "
+                            f"({', '.join(working)}): #{m} is free again when one of them hands its direction in. "
+                            "Pick another task or call wait.")
+        other = self.db.one(f"SELECT id FROM tasks WHERE parent_id = ? AND assignee = ? AND id != ? AND status IN "
+                            f"({_qmarks(len(_WORKING))}) ORDER BY id LIMIT 1", (n, taker, m, *_WORKING))
+        if other is not None:
+            raise ToolError(f"You already work on #{other['id']}, a direction of #{n}: hand it in first "
+                            "(task_complete).")
+        lang = self.swarm.language_of(actor)
+        if actor == taker:
+            if parent.assignee is None:
+                owner = prompts.t(lang, "direction_owner_none")
+            elif parent.assignee == taker:
+                owner = prompts.t(lang, "direction_owner_you", id=n)
+            else:
+                owner = prompts.t(lang, "direction_owner_named", name=parent.assignee)
+            batch.notes.append(prompts.t(lang, "note_direction_card", sub=m, id=n, owner=owner))
+        if self.independent_review and parent.reviewer == taker:
+            # it works on a part of the crew task now: it does not check the crew task as a whole
+            batch.writes.append((parent, {"reviewer": None}))
+            if actor == taker:
+                batch.notes.append(prompts.t(lang, "note_reviewer_cleared", id=n))
+        owner_name = parent.assignee
+        if owner_name not in (None, actor, taker):
+            def tell_owner() -> None:
+                title = self._load(m).title
+                self._notify_member(owner_name, actor, "n_direction_taken", wake=False, id=m, title=title, by=taker,
+                                    parent=n)
+
+            batch.after.append(tell_owner)
+
+    def _working_without(self, parent: Task, direction_id: int) -> list[str]:
+        """The working set of open crew task `parent` without `direction_id`: its assignee, then the assignees of its
+        other directions in in_progress or waiting (id ascending), each once, never USER."""
+        working = [parent.assignee] if parent.assignee not in (None, USER) else []
+        for row in self.db.all(f"SELECT assignee FROM tasks WHERE parent_id = ? AND id != ? AND assignee IS NOT NULL"
+                               f" AND status IN ({_qmarks(len(_WORKING))}) ORDER BY id",
+                               (parent.id, direction_id, *_WORKING)):
+            if row["assignee"] != USER and row["assignee"] not in working:
+                working.append(row["assignee"])
+        return working
+
+    def _crew_holder_hint(self, task: Task, actor: str) -> str:
+        """The end of the holder error of a claim of crew task `task` someone else holds: the direction the actor
+        works on already, or its free directions (none while its working set is full), English like every board
+        error."""
+        mine = self.db.one(f"SELECT id FROM tasks WHERE parent_id = ? AND assignee = ? AND status IN "
+                           f"({_qmarks(len(_WORKING))}) ORDER BY id LIMIT 1", (task.id, actor, *_WORKING))
+        if mine is not None:
+            return f" It is a crew task, and you work on #{mine['id']} of it already."
+        free = self.free_directions(task)
+        if len(self.crew_working(task)) >= task.crew:
+            free = []  # no free place for the actor
+        names = self._direction_names(free, "en") if free else "none is free now"
+        return f" It is a crew task: take one of its free directions instead: {names}."
 
     @staticmethod
     def _require_owner(actor: str, task: Task, field_name: str) -> None:

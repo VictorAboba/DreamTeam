@@ -4,6 +4,7 @@ the texts the board renders for agents."""
 from __future__ import annotations
 
 import re
+import threading
 
 import pytest
 
@@ -1244,3 +1245,423 @@ def test_a_failing_plan_writes_nothing(swarm, board):
     with pytest.raises(ToolError):
         board._mutate(ANNA, task.id, plan)
     assert table(board) == before
+
+
+# --- Taking a direction: claims ------------------------------------------------------------------------------------
+
+def card(board: Board, sub: int, task_id: int, owner_key: str, lang: str = "en", **kw) -> str:
+    owner = prompts.t(lang, owner_key, **kw)
+    return prompts.t(lang, "note_direction_card", sub=sub, id=task_id, owner=owner)
+
+
+def full_text(task_id: int, sub: int, names: list[str], crew: int) -> str:
+    return (f"Crew task #{task_id} already has {len(names)} of {crew} members working ({', '.join(names)}): #{sub} is "
+            "free again when one of them hands its direction in. Pick another task or call wait.")
+
+
+def refused(call) -> str:
+    with pytest.raises(ToolError) as exc:
+        call()
+    return str(exc.value)
+
+
+def test_a_claim_takes_a_direction_with_its_card(swarm, board):
+    task, subs = crew_task(board)
+    notes: list[str] = []
+    taken = board.claim(BOB, subs[0].id, notes=notes)
+    assert (taken.status, taken.assignee) == (Status.IN_PROGRESS, BOB)
+    assert notes == [card(board, subs[0].id, task.id, "direction_owner_named", name=ANNA)]
+    assert notes[0].startswith(f" #{subs[0].id} is a direction of crew task #{task.id} (owner {ANNA}): first write "
+                               "its card with task_update")
+    assert notes_of(swarm, ANNA, "n_direction_taken") == [
+        {"id": subs[0].id, "title": "parser", "by": BOB, "parent": task.id}]
+    assert quiet(swarm, ANNA, "n_direction_taken") == [True]
+    assert board.get(task.id).crew_working == [ANNA, BOB]
+    assert [e["data"]["task"]["id"] for e in events(swarm, "task.updated")][-1] == subs[0].id  # no parent event
+
+
+def test_the_card_names_the_owner_in_the_takers_language(swarm, board):
+    task, subs = crew_task(board, owner=None)
+    notes: list[str] = []
+    board.claim(BOB, subs[0].id, notes=notes)
+    assert notes == [card(board, subs[0].id, task.id, "direction_owner_none")]
+    assert swarm.notified == []  # no owner to tell
+    notes.clear()
+    board.claim(EVA, subs[1].id, notes=notes)
+    assert notes == [card(board, subs[1].id, task.id, "direction_owner_none", "ru")]
+    owned, osubs = crew_task(board)
+    notes.clear()
+    board.claim(ANNA, osubs[0].id, notes=notes)
+    assert notes == [card(board, osubs[0].id, owned.id, "direction_owner_you", id=owned.id)]
+    assert f"(you own #{owned.id})" in notes[0]
+    assert notes_of(swarm, ANNA, "n_direction_taken") == []  # the owner took it itself
+
+
+@pytest.mark.parametrize("status", [Status.REVIEW, Status.DONE, Status.FAILED, Status.CANCELLED])
+def test_no_direction_is_taken_while_the_crew_task_is_closed_or_in_review(board, status):
+    task, subs = crew_task(board)
+    set_raw(board, task.id, status=status)
+    text = refused(lambda: board.claim(BOB, subs[0].id))
+    assert text == (f"Direction #{subs[0].id} belongs to #{task.id}, which is {status}: it takes no directions now. "
+                    "Pick another task or call wait.")
+    assert board.get(subs[0].id).assignee is None
+
+
+def test_no_direction_is_taken_while_the_crew_task_is_blocked(board):
+    dep = board.create(ANNA, "dep")
+    other = board.create(ANNA, "other")
+    task, subs = crew_task(board, depends_on=[dep.id, other.id])
+    text = refused(lambda: board.claim(BOB, subs[0].id))
+    assert text == (f"Direction #{subs[0].id} belongs to #{task.id}, which is blocked by #{dep.id}, #{other.id}: take "
+                    f"#{subs[0].id} when #{task.id} is no longer blocked. Pick another task or call wait.")
+    finish_raw(board, dep.id, Status.DONE, "ok")
+    finish_raw(board, other.id, Status.DONE, "ok")
+    assert board.claim(BOB, subs[0].id).assignee == BOB
+
+
+def test_a_full_crew_task_refuses_a_member_outside_it(board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    text = refused(lambda: board.claim(CARL, subs[1].id))
+    assert text == full_text(task.id, subs[1].id, [ANNA, BOB], 2)
+    assert board.get(subs[1].id).assignee is None
+
+
+def test_a_member_works_on_one_direction_of_a_crew_task_at_a_time(board):
+    task, subs = crew_task(board)
+    for status in (Status.IN_PROGRESS, Status.WAITING):
+        work(board, subs[0].id, BOB, status)
+        text = refused(lambda: board.claim(BOB, subs[1].id))
+        assert text == (f"You already work on #{subs[0].id}, a direction of #{task.id}: hand it in first "
+                        "(task_complete).")
+    work(board, subs[0].id, BOB, Status.REVIEW)  # handed in: it does not count
+    assert board.claim(BOB, subs[1].id).assignee == BOB
+
+
+def test_the_checks_come_after_the_ordinary_claim_checks_and_in_order(board):
+    dep = board.create(ANNA, "dep")
+    task, subs = crew_task(board, crew=2, depends_on=[dep.id])
+    work(board, subs[0].id, BOB)  # full as well
+    assert "which is blocked by" in refused(lambda: board.claim(CARL, subs[1].id))  # the status before the place
+    finish_raw(board, dep.id, Status.DONE, "ok")
+    work(board, subs[1].id, DINA)
+    assert refused(lambda: board.claim(CARL, subs[2].id)).startswith(f"Crew task #{task.id} already has 3 of 2")
+    blocked = board.create(ANNA, "blocked", parent_id=task.id, depends_on=[board.create(ANNA, "d2").id])
+    gone = board.create(ANNA, "gone", parent_id=task.id)
+    finish_raw(board, gone.id, Status.CANCELLED)
+    set_raw(board, task.id, status=Status.REVIEW)
+    set_raw(board, subs[2].id, assignee=CARL)
+    # the ordinary claim's errors come first: the holder, the status, the blockers
+    assert "already assigned to" in refused(lambda: board.claim(BOB, subs[2].id))
+    assert "only 'todo' tasks" in refused(lambda: board.claim(BOB, gone.id))
+    assert "blocked by unfinished dependencies" in refused(lambda: board.claim(BOB, blocked.id))
+
+
+def test_the_owner_always_takes(board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    assert board.claim(ANNA, subs[1].id).assignee == ANNA
+    assert board.get(task.id).crew_working == [ANNA, BOB]
+
+
+def test_a_crew_below_its_working_set_stops_only_members_outside_it(board):
+    task, subs = crew_task(board, titles=("a", "b", "c", "d"))
+    work(board, subs[0].id, BOB)
+    work(board, subs[1].id, CARL)
+    set_raw(board, task.id, crew=2)
+    assert refused(lambda: board.claim(DINA, subs[2].id)) == full_text(task.id, subs[2].id, [ANNA, BOB, CARL], 2)
+    assert board.claim(ANNA, subs[2].id).assignee == ANNA  # the owner's own direction
+
+
+def test_a_direction_in_review_frees_its_place(board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB, Status.REVIEW)
+    assert board.claim(CARL, subs[1].id).assignee == CARL
+
+
+def test_user_takes_no_place_and_is_exempt(board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, USER)
+    assert board.claim(BOB, subs[1].id).assignee == BOB
+    notes: list[str] = []
+    assert board.claim(USER, subs[2].id, notes=notes).assignee == USER  # over the crew: USER is exempt
+    assert notes == []
+    extra = board.create(USER, "extra", parent_id=task.id)
+    dep = board.create(ANNA, "dep")
+    set_raw(board, task.id, depends_on=f"[{dep.id}]")
+    assert board.claim(USER, extra.id).assignee == USER  # a blocked crew task too
+
+
+def test_a_held_direction_is_returned_as_is(swarm, board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    set_raw(board, task.id, status=Status.REVIEW)
+    swarm.notified.clear()
+    notes: list[str] = []
+    assert board.claim(BOB, subs[0].id, notes=notes).assignee == BOB
+    assert notes == [] and swarm.notified == []
+
+
+def test_the_own_part_of_a_blocked_crew_task_is_claimed_once_it_is_unblocked(board):
+    dep = board.create(ANNA, "dep")
+    task = board.create(ANNA, "auth", crew=2, directions=["a"], assignee=ANNA, depends_on=[dep.id])
+    own = board.subtasks_of(task.id)[0]
+    assert "which is blocked by" in refused(lambda: board.claim(ANNA, own.id))
+    assert "which is blocked by" in refused(lambda: board.update(ANNA, own.id, status=Status.IN_PROGRESS))
+    finish_raw(board, dep.id, Status.DONE, "ok")
+    notes: list[str] = []
+    assert board.claim(ANNA, own.id, notes=notes).status == Status.IN_PROGRESS
+    assert notes == [card(board, own.id, task.id, "direction_owner_you", id=task.id)]
+
+
+def test_directions_claimed_at_once_never_pass_the_crew(board):
+    task, subs = crew_task(board, crew=2, owner=None, titles=("a", "b", "c", "d", "e"))
+    actors = [ANNA, BOB, CARL, DINA, EVA]
+    barrier = threading.Barrier(len(actors))
+    wins: list[str] = []
+    errors: list[str] = []
+
+    def worker(name: str, sid: int) -> None:
+        barrier.wait()
+        try:
+            board.claim(name, sid)
+            wins.append(name)
+        except ToolError as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=worker, args=(a, s.id)) for a, s in zip(actors, subs)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(wins) == 2 and sorted(board.get(task.id).crew_working) == sorted(wins)
+    assert len(errors) == 3 and all(e.startswith(f"Crew task #{task.id} already has 2 of 2") for e in errors)
+
+
+# --- Taking a direction: the crew task's reviewer ------------------------------------------------------------------
+
+@pytest.mark.parametrize("independent", [True, False])
+def test_the_crew_tasks_reviewer_that_takes_a_direction_stops_being_its_reviewer(swarm, board, independent):
+    swarm.config.swarm.independent_review = independent
+    task, subs = crew_task(board, reviewer=BOB)
+    notes: list[str] = []
+    board.claim(BOB, subs[0].id, notes=notes)
+    cleared = prompts.t("en", "note_reviewer_cleared", id=task.id)
+    if independent:
+        assert board.get(task.id).reviewer is None
+        assert notes == [card(board, subs[0].id, task.id, "direction_owner_named", name=ANNA), cleared]
+        updated = [(e["data"]["task"]["id"], e["data"]["changes"]) for e in events(swarm, "task.updated")]
+        assert updated[-2:] == [(subs[0].id, {"assignee": [None, BOB], "status": [Status.TODO, Status.IN_PROGRESS]}),
+                                (task.id, {"reviewer": [BOB, None]})]
+    else:
+        assert board.get(task.id).reviewer == BOB
+        assert notes == [card(board, subs[0].id, task.id, "direction_owner_named", name=ANNA)]
+
+
+def test_a_reviewer_handed_a_direction_by_an_update_is_cleared_without_a_note_to_the_actor(swarm, board):
+    task, subs = crew_task(board, reviewer=CARL)
+    work(board, subs[0].id, BOB)
+    notes: list[str] = []
+    board.update(BOB, subs[0].id, assignee=CARL, status=Status.IN_PROGRESS, notes=notes)
+    assert board.get(task.id).reviewer is None
+    assert notes == []  # the card and the reviewer note are for the taker's own call
+    assert notes_of(swarm, ANNA, "n_direction_taken")[-1] == {"id": subs[0].id, "title": "parser", "by": CARL,
+                                                              "parent": task.id}
+
+
+# --- Taking a direction: updates -----------------------------------------------------------------------------------
+
+def test_self_assigning_a_direction_in_progress_takes_it(swarm, board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    text = refused(lambda: board.update(CARL, subs[1].id, assignee=CARL, status=Status.IN_PROGRESS))
+    assert text == full_text(task.id, subs[1].id, [ANNA, BOB], 2)
+    set_raw(board, task.id, crew=3)
+    notes: list[str] = []
+    board.update(CARL, subs[1].id, assignee=CARL, status=Status.IN_PROGRESS, notes=notes)
+    assert notes == [card(board, subs[1].id, task.id, "direction_owner_named", name=ANNA)]
+    assert notes_of(swarm, ANNA, "n_direction_taken")[-1]["by"] == CARL
+
+
+@pytest.mark.parametrize("status", [Status.IN_PROGRESS, Status.WAITING])
+def test_an_assignee_change_that_keeps_the_direction_working_takes_it(swarm, board, status):
+    task, subs = crew_task(board)
+    work(board, subs[0].id, BOB, status)
+    work(board, subs[1].id, DINA)
+    set_raw(board, task.id, crew=2)
+    text = refused(lambda: board.update(BOB, subs[0].id, assignee=CARL, status=status))
+    assert text == full_text(task.id, subs[0].id, [ANNA, DINA], 2)  # the place BOB leaves is not counted
+    set_raw(board, task.id, crew=3)
+    work(board, subs[2].id, CARL)
+    text = refused(lambda: board.update(BOB, subs[0].id, assignee=CARL, status=status))
+    assert text == f"You already work on #{subs[2].id}, a direction of #{task.id}: hand it in first (task_complete)."
+    set_raw(board, subs[2].id, status=Status.TODO, assignee=None)
+    moved = board.update(BOB, subs[0].id, assignee=CARL, status=status)
+    assert (moved.assignee, moved.status) == (CARL, status)
+    assert notes_of(swarm, ANNA, "n_direction_taken")[-1]["by"] == CARL
+
+
+def test_a_new_assignee_setting_in_progress_from_todo_takes_it(swarm, board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    assigned = board.update(ANNA, subs[1].id, assignee=CARL)  # stays todo: no place taken, no check
+    assert (assigned.status, assigned.assignee) == (Status.TODO, CARL)
+    assert board.get(task.id).crew_working == [ANNA, BOB]
+    assert refused(lambda: board.update(CARL, subs[1].id, status=Status.IN_PROGRESS)) == full_text(
+        task.id, subs[1].id, [ANNA, BOB], 2)
+    assert refused(lambda: board.update(CARL, subs[1].id, status=Status.WAITING)) == full_text(
+        task.id, subs[1].id, [ANNA, BOB], 2)
+    set_raw(board, subs[0].id, status=Status.REVIEW)
+    notes: list[str] = []
+    assert board.update(CARL, subs[1].id, status=Status.IN_PROGRESS, notes=notes).status == Status.IN_PROGRESS
+    assert notes == [card(board, subs[1].id, task.id, "direction_owner_named", name=ANNA)]
+
+
+def test_resuming_from_waiting_takes_nothing(swarm, board):
+    task, subs = crew_task(board)
+    work(board, subs[0].id, BOB, Status.WAITING)
+    work(board, subs[1].id, CARL)
+    set_raw(board, task.id, crew=2)
+    swarm.notified.clear()
+    notes: list[str] = []
+    assert board.update(BOB, subs[0].id, status=Status.IN_PROGRESS, notes=notes).status == Status.IN_PROGRESS
+    assert notes == [] and keys_for(swarm, ANNA) == []
+
+
+def test_withdrawing_from_review_into_a_full_crew_task_is_allowed(swarm, board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB, Status.REVIEW)
+    set_raw(board, subs[0].id, reviewer=DINA)
+    work(board, subs[1].id, CARL)
+    swarm.notified.clear()
+    notes: list[str] = []
+    assert board.update(BOB, subs[0].id, status=Status.IN_PROGRESS, notes=notes).status == Status.IN_PROGRESS
+    assert notes == [] and "n_direction_taken" not in keys_for(swarm, ANNA)
+    assert board.get(task.id).crew_working == [ANNA, BOB, CARL]  # over the crew, like a lowered crew
+
+
+def test_user_assigning_a_direction_in_progress_is_exempt(board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    taken = board.update(USER, subs[1].id, assignee=CARL, status=Status.IN_PROGRESS)
+    assert (taken.assignee, taken.status) == (CARL, Status.IN_PROGRESS)
+    assert board.get(task.id).crew_working == [ANNA, BOB, CARL]
+
+
+# --- Taking a direction: moves -------------------------------------------------------------------------------------
+
+def test_a_move_under_a_full_crew_task_is_refused_and_writes_nothing(swarm, board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, CARL)
+    loose = board.create(ANNA, "loose", assignee=BOB)
+    board.claim(BOB, loose.id)
+    before = table(board)
+    for kw in ({}, {"assignee": BOB}, {"assignee": BOB, "title": "renamed"}):
+        text = refused(lambda kw=kw: board.update(ANNA, loose.id, parent_id=task.id, **kw))
+        assert text == full_text(task.id, loose.id, [ANNA, CARL], 2)
+    assert table(board) == before
+
+
+def test_a_move_takes_a_direction_for_the_tasks_assignee(swarm, board):
+    task, subs = crew_task(board)
+    loose = board.create(ANNA, "loose", assignee=BOB)
+    board.claim(BOB, loose.id)
+    work(board, subs[0].id, BOB, Status.WAITING)
+    text = refused(lambda: board.update(ANNA, loose.id, parent_id=task.id))
+    assert text == f"You already work on #{subs[0].id}, a direction of #{task.id}: hand it in first (task_complete)."
+    set_raw(board, subs[0].id, status=Status.TODO, assignee=None)
+    notes: list[str] = []
+    moved = board.update(ANNA, loose.id, parent_id=task.id, notes=notes)
+    assert moved.parent_id == task.id and notes == []  # the actor is the owner, not the taker
+    assert board.get(task.id).crew_working == [ANNA, BOB]
+
+
+def test_the_owner_moving_its_own_task_while_on_another_direction_is_refused(board):
+    task, subs = crew_task(board)
+    mine = board.create(ANNA, "mine")
+    board.claim(ANNA, mine.id)
+    work(board, subs[0].id, ANNA)
+    text = refused(lambda: board.update(ANNA, mine.id, parent_id=task.id))
+    assert text == f"You already work on #{subs[0].id}, a direction of #{task.id}: hand it in first (task_complete)."
+    assert board.get(mine.id).parent_id is None
+    set_raw(board, subs[0].id, status=Status.TODO, assignee=None)
+    notes: list[str] = []
+    assert board.update(ANNA, mine.id, parent_id=task.id, notes=notes).parent_id == task.id
+    assert notes == [card(board, mine.id, task.id, "direction_owner_you", id=task.id)]
+
+
+def test_moving_a_todo_task_or_one_under_an_ordinary_parent_takes_nothing(board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    todo = board.create(ANNA, "todo", assignee=CARL)
+    assert board.update(ANNA, todo.id, parent_id=task.id).parent_id == task.id
+    plain = board.create(ANNA, "plain")
+    working = board.create(ANNA, "working", assignee=CARL)
+    board.claim(CARL, working.id)
+    assert board.update(ANNA, working.id, parent_id=plain.id).parent_id == plain.id
+
+
+# --- The owner: claims and the holder error ------------------------------------------------------------------------
+
+HOLDER = ("Task #{id} is already assigned to {who} (status in_progress). Pick another ready task (or call wait if "
+          "there is none); post in its discussion only if you have something the assignee needs.")
+
+
+def test_claiming_a_crew_task_someone_holds_names_its_free_directions(board):
+    task, subs = crew_task(board)
+    work(board, subs[2].id, CARL, Status.REVIEW)
+    text = refused(lambda: board.claim(BOB, task.id))
+    assert text == HOLDER.format(id=task.id, who=ANNA) + (
+        f" It is a crew task: take one of its free directions instead: #{subs[0].id} \"parser\", #{subs[1].id} "
+        "\"cli\".")
+    work(board, subs[0].id, BOB, Status.WAITING)
+    assert refused(lambda: board.claim(BOB, task.id)).endswith(
+        f" It is a crew task, and you work on #{subs[0].id} of it already.")
+    set_raw(board, task.id, crew=2)
+    assert refused(lambda: board.claim(DINA, task.id)).endswith(
+        " It is a crew task: take one of its free directions instead: none is free now.")
+    plain = board.create(ANNA, "plain", assignee=ANNA)
+    board.claim(ANNA, plain.id)
+    assert refused(lambda: board.claim(BOB, plain.id)) == HOLDER.format(id=plain.id, who=ANNA)
+
+
+def test_claiming_a_crew_task_gives_the_owner_sentence(swarm, board):
+    task, subs = crew_task(board, owner=None)
+    work(board, subs[0].id, BOB)
+    notes: list[str] = []
+    board.claim(CARL, task.id, notes=notes)
+    assert notes == [owner_note(board, task.id, CARL)]
+    assert notes[0].startswith(prompts.t("en", "crew_owner_take", id=task.id, crew=3))
+    assert board.get(task.id).crew_working == [CARL, BOB]  # the owner needs no free place
+    full, fsubs = crew_task(board, crew=2, owner=None)
+    work(board, fsubs[0].id, BOB)
+    work(board, fsubs[1].id, DINA)
+    assert board.claim(CARL, full.id).assignee == CARL
+
+
+def test_claiming_a_crew_task_whose_directions_are_finished_gives_the_draft(board):
+    task, subs = crew_task(board, owner=None, titles=("a", "b"))
+    finish_raw(board, subs[0].id, Status.DONE, "the alpha result", assignee=BOB)
+    finish_raw(board, subs[1].id, Status.CANCELLED)
+    notes: list[str] = []
+    board.claim(CARL, task.id, notes=notes)
+    assert notes == [owner_note(board, task.id, CARL)]
+    assert notes[0].startswith(" All its directions are finished: ") and "the alpha result" in notes[0]
+
+
+@pytest.mark.parametrize("lang, name", [("en", CARL), ("ru", EVA)])
+def test_claiming_an_ordinary_parent_whose_subtasks_are_finished(board, lang, name):
+    parent = board.create(ANNA, "parent")
+    finish_raw(board, board.create(ANNA, "s1", parent_id=parent.id).id, Status.DONE, "ok")
+    finish_raw(board, board.create(ANNA, "s2", parent_id=parent.id).id, Status.CANCELLED)
+    notes: list[str] = []
+    board.claim(name, parent.id, notes=notes)
+    expected = " " + prompts.t(lang, "owner_prefix_plain") + prompts.t(lang, "ending_plain", id=parent.id)
+    assert notes == [expected]
+    if lang == "en":
+        assert notes[0] == " All its subtasks are finished: assemble their results and complete it."
+    open_parent = board.create(ANNA, "open parent")
+    board.create(ANNA, "s3", parent_id=open_parent.id)
+    notes.clear()
+    board.claim(name, open_parent.id, notes=notes)
+    assert notes == []  # no finish state: nothing to add
