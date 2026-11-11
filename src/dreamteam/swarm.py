@@ -13,11 +13,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from . import hubauth, netoff, procs, prompts, roles
+from . import __version__, hubauth, netoff, procs, prompts, roles
 from .agent import AgentRuntime
 from .board import Board
 from .config import Config, ModelProfile
-from .db import Database, dumps, loads, remap_sql, utf8_safe
+from .db import Database, dumps, loads, made_by_earlier_version, remap_sql, utf8_safe
 from .events import EventBus
 from .goal_text import split_goal
 from .jobs import JobManager, fmt_duration, short_command
@@ -59,6 +59,14 @@ _DROPPED = ("SELECT 1 FROM events WHERE type IN ('swarm.resumed', 'swarm.paused'
             "AND json_extract(data, '$.question.message_id') = ? "
             "AND json_extract(data, '$.question.outcome') = 'dropped' LIMIT 1")
 _monotonic = time.monotonic      # the lease's clock; tests patch swarm._monotonic, never time.monotonic itself
+# the refusal of a swarm whose database was made by an earlier version (db.made_by_earlier_version); {dir} is the
+# project (or session) folder, {version} this version
+PROJECT_EARLIER_VERSION_TEXT = ("The swarm in {dir} was made by an earlier version of DreamTeam and cannot be "
+                                "opened by this one ({version}). Open it with the version that made it.")
+
+
+class EarlierVersionError(ValueError):
+    """The swarm's database was made by an earlier DreamTeam: it is not opened and nothing is written to it."""
 
 
 def _digest(text: str) -> str:
@@ -98,6 +106,10 @@ class Swarm:
             if project_dir is None:
                 raise ValueError("project_dir or config is required")
             config = Config.load(project_dir)
+        # before the logs folder and Database(...), whose schema would be written into the old file
+        if made_by_earlier_version(config.data_dir / "swarm.db"):
+            raise EarlierVersionError(PROJECT_EARLIER_VERSION_TEXT.format(dir=config.project_dir,
+                                                                          version=__version__))
         self.config = config
         self.project_dir = config.project_dir
         (config.data_dir / "logs").mkdir(parents=True, exist_ok=True)

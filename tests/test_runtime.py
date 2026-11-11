@@ -27,6 +27,7 @@ from dreamteam.llm.base import LLMError, LLMResponse, ToolCall, Usage
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status, ToolError
 from dreamteam.swarm import Swarm
+from dreamteam.tools import frozen
 
 Policy = Callable[[Swarm, str, str, list[dict], list[dict]], Any]
 
@@ -974,8 +975,11 @@ async def test_restart_wakes_agents_with_open_tasks_exactly_once(tmp_path):
 
 
 def write_history(swarm: Swarm, name: str, msgs: list[dict]) -> None:
+    """The agent's history as if it had run, with the tool-set record its runtime would have written (a history
+    without a record is a session of an earlier version, which is not reopened)."""
     for seq, msg in enumerate(msgs):
         swarm.db.execute("INSERT INTO history(agent, seq, msg) VALUES (?, ?, ?)", (name, seq, json.dumps(msg)))
+    frozen.write(swarm.db, name, frozen.current_record("en"))
 
 
 @pytest.mark.parametrize("paused", [False, True])

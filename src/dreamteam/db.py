@@ -199,9 +199,42 @@ Source = str | os.PathLike | sqlite3.Connection | Database
 
 
 @contextlib.contextmanager
+def reading_file(path: str | os.PathLike, timeout: float = 30.0) -> Iterator[tuple[sqlite3.Connection, bool]]:
+    """A connection that reads the database file `path` without writing anything next to it, and whether it reads
+    it immutable: a database with both its -wal and -shm files is read through them (?mode=ro: the WAL content is
+    included); one with a -wal file only (a crash, a copy that skipped the -shm) is read from a private copy of
+    both, since a read-only open would create the -shm next to it; one closed cleanly has neither and is read as
+    immutable (a plain ?mode=ro open of a WAL database would leave a -wal and a -shm next to it)."""
+    import shutil
+    import tempfile
+
+    from .workspace import long_path  # the workspace module imports more of the package
+
+    path = Path(path)
+    wal = os.path.lexists(path.with_name(path.name + "-wal"))
+    shm = os.path.lexists(path.with_name(path.name + "-shm"))
+    if wal and not shm:
+        with tempfile.TemporaryDirectory(prefix="dreamteam-db-") as folder:
+            copy = Path(folder) / path.name
+            shutil.copyfile(long_path(path), copy)
+            shutil.copyfile(long_path(path.with_name(path.name + "-wal")), copy.with_name(copy.name + "-wal"))
+            conn = sqlite3.connect(sqlite_uri(copy, "mode=ro"), uri=True, timeout=timeout)
+            try:
+                yield conn, False
+            finally:
+                conn.close()
+        return
+    conn = sqlite3.connect(sqlite_uri(path, "mode=ro" if wal else "immutable=1"), uri=True, timeout=timeout)
+    try:
+        yield conn, not wal
+    finally:
+        conn.close()
+
+
+@contextlib.contextmanager
 def _reading(source: Source) -> Iterator[sqlite3.Connection]:
-    """A connection to `source`: a Database's or a given connection (under the Database's lock), or a file opened
-    read-only (never created, nothing written to it) and closed afterwards."""
+    """A connection to `source`: a Database's or a given connection (under the Database's lock), or a file read
+    through reading_file (never created, nothing written to it or next to it) and closed afterwards."""
     if isinstance(source, Database):
         with source._lock:
             yield source.conn
@@ -212,11 +245,8 @@ def _reading(source: Source) -> Iterator[sqlite3.Connection]:
     path = Path(source)
     if not path.is_file():
         raise FileNotFoundError(f"no database file at {path}")
-    conn = sqlite3.connect(sqlite_uri(path, "mode=ro"), uri=True, timeout=5.0)
-    try:
+    with reading_file(path, timeout=5.0) as (conn, _immutable):
         yield conn
-    finally:
-        conn.close()
 
 
 def _columns(conn: sqlite3.Connection) -> set[str]:
@@ -307,6 +337,39 @@ def max_tools_revision(source: Source) -> int | None:
             if isinstance(rev, int) and not isinstance(rev, bool) and (best is None or rev > best):
                 best = rev
     return best
+
+
+def made_by_earlier_version(source: Source) -> bool:
+    """Whether the session database `source` (see columns_of) was made by an earlier DreamTeam, which this version
+    does not open: a kv `tools:<member>` record whose "rev" is an integer below frozen.OLDEST_OPEN_REVISION (valid
+    or not, retired members included), or `history` rows of an agent with no usable record (missing, not JSON or
+    not frozen.valid: an agent of the baseline revision). False without a database file (it is not created) and
+    for a database with neither (no LLM member ever ran). Read only; sqlite3.Error and OSError reach the caller."""
+    from .tools.frozen import KV_PREFIX, OLDEST_OPEN_REVISION, valid  # the tools package imports this module
+
+    if not isinstance(source, (Database, sqlite3.Connection)) and not Path(source).is_file():
+        return False
+    with _reading(source) as conn:
+        tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('kv', 'history')")}
+        usable: set[str] = set()
+        if "kv" in tables:
+            rows = conn.execute("SELECT key, value FROM kv WHERE substr(key, 1, ?) = ?", (len(KV_PREFIX), KV_PREFIX))
+            for key, value in rows:
+                try:
+                    rec = json.loads(value) if isinstance(value, (str, bytes)) else None
+                except ValueError:
+                    rec = None
+                rev = rec.get("rev") if isinstance(rec, dict) else None
+                if isinstance(rev, int) and not isinstance(rev, bool) and rev < OLDEST_OPEN_REVISION:
+                    return True
+                if valid(rec):
+                    usable.add(str(key)[len(KV_PREFIX):])
+        if "history" in tables:
+            for (agent,) in conn.execute("SELECT DISTINCT agent FROM history"):
+                if agent not in usable:
+                    return True
+    return False
 
 
 def remap_sql(table: str, column: str, mapping: dict[str, str]) -> tuple[str, list[str]]:

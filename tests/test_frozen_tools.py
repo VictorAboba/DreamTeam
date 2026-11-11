@@ -9,13 +9,14 @@ import asyncio
 import copy
 import hashlib
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
-from dreamteam import cli, prompts
+from dreamteam import __version__, cli, prompts
 from dreamteam import swarm as swarm_module
 from dreamteam import tools as tools_module
 from dreamteam.agent import AgentRuntime
@@ -677,6 +678,9 @@ async def test_provider_requests_are_byte_identical_across_restarts(tmp_path):
 
 
 async def test_view_only_access_writes_no_tool_record(tmp_path, capsys):
+    """A member with a history and no tool-set record ran under an earlier version (the baseline revision): the
+    project is not opened again, neither to view it nor by `dreamteam status`, and nothing is written into its data
+    folder (no logs folder, no -wal or -shm next to the database)."""
     project = tmp_path / "swarm"
     assert cli.main(["init", str(project), "--lang", "en", "--name", "View only"]) == 0
     text = (project / "dreamteam.toml").read_text(encoding="utf-8")
@@ -687,29 +691,29 @@ async def test_view_only_access_writes_no_tool_record(tmp_path, capsys):
     await swarm.start(run_agents=False)  # members, but no runtime
     agent = swarm.members()[0]["name"]
     seed_history(swarm, agent, pairs=1, size=10)
-    span = swarm.tracer.begin(agent, "x").llm_start(1, tools_rev=1)
+    assert tool_rows(swarm) == 0
     await swarm.stop()
     swarm.close()
-    view = Swarm(project)
-    try:
-        for tool in ("swarm_status", "agents", "board"):
-            text, is_error = await call_tool(ToolContext(view, USER), tool, {})
-            assert not is_error, text
-        assert dumps(view.tracer.span_context(span.id)["tools"]) == dumps(frozen.snapshot(1, "en"))
-        # a member with a history and no record: the set its first start would freeze (the current revision)
-        current = frozen.names(frozen.current_record("en")["tools"])
-        assert frozen.member_tool_names(view, view.member(agent)) == frozenset(current)
-        assert tool_rows(view) == 0
-    finally:
-        view.close()
+    data = Config.load(project).data_dir
+    shutil.rmtree(data / "logs")
+
+    def snapshot() -> dict[str, tuple[int, int]]:
+        return {p.relative_to(data).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in sorted(data.rglob("*"))}
+
+    before = snapshot()
+    assert "swarm.db" in before and "swarm.db-wal" not in before and "swarm.db-shm" not in before
+    message = swarm_module.PROJECT_EARLIER_VERSION_TEXT.format(dir=Config.load(project).project_dir,
+                                                               version=__version__)
+    with pytest.raises(swarm_module.EarlierVersionError) as refused:
+        Swarm(project)
+    assert str(refused.value) == message and isinstance(refused.value, ValueError)
+    assert snapshot() == before
     capsys.readouterr()
-    assert await asyncio.to_thread(cli.main, ["status", str(project)]) == 0  # it runs its own event loop
-    assert "View only" in capsys.readouterr().out
-    view = Swarm(project)
-    try:
-        assert tool_rows(view) == 0
-    finally:
-        view.close()
+    assert await asyncio.to_thread(cli.main, ["status", str(project)]) == 1  # (status runs its own event loop)
+    out = capsys.readouterr()
+    assert out.err.strip() == message and "View only" not in out.out
+    assert snapshot() == before and not (data / "logs").exists()
 
 
 async def test_has_tool_and_member_tool_names(tmp_path, later_revision):

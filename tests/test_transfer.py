@@ -27,6 +27,7 @@ from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.mcp_forge import snapshot_digest
 from dreamteam.sessions import MOVE_JOURNAL, SessionManager, session_uid
 from dreamteam.skills import Library
+from dreamteam.tools import frozen
 from dreamteam.tools.frozen import TOOLSET_REVISION
 from dreamteam.transfer import (MANIFEST, SecretFound, Secrets, TransferError, apply_import, export_home,
                                 known_secrets, merge_external, merge_settings, parse_include, plan_import,
@@ -95,6 +96,7 @@ def _fill_db(home: Path, sid: str, text: str = "hello") -> None:
         db.execute("INSERT INTO events(ts, type, actor, data) VALUES (?, 'session.started', 'user', '{}')", (1.0,))
         db.execute("INSERT INTO events(ts, type, actor, data) VALUES (?, 'message', 'alice', '{}')", (2.0,))
         db.execute("INSERT INTO history(agent, seq, msg) VALUES ('alice', 1, ?)", (json.dumps({"text": text}),))
+        frozen.write(db, "alice", frozen.current_record("en"))  # an agent of this version (no earlier one)
     finally:
         db.close()
 
@@ -306,6 +308,7 @@ async def test_rows_still_in_the_wal_of_an_open_database_are_exported(tmp_path):
     try:
         db.execute("PRAGMA wal_autocheckpoint=0")
         db.execute("INSERT INTO history(agent, seq, msg) VALUES ('bob', 1, 'still in the wal')")
+        frozen.write(db, "bob", frozen.current_record("en"))
         assert (home / "sessions" / sid / ".dreamteam" / "swarm.db-wal").stat().st_size > 0
         report = export_home(home, tmp_path / "out", include=["sessions"], running={sid})
     finally:
@@ -1269,7 +1272,8 @@ async def test_a_session_of_a_newer_dreamteam_is_refused_and_the_others_are_impo
     dest = tmp_path / "usb"
     export_home(home_a, dest, include=["sessions"])
     for sid, sql in ((column, "ALTER TABLE agents ADD COLUMN future TEXT"),
-                     (tools, "INSERT INTO kv(key, value) VALUES ('tools:alice', '{\"rev\": 99, \"tools\": []}')"),
+                     (tools, "INSERT OR REPLACE INTO kv(key, value) VALUES ('tools:alice', "
+                             "'{\"rev\": 99, \"tools\": []}')"),
                      (changed, "INSERT INTO kv(key, value) VALUES ('x', 'y')")):
         conn = sqlite3.connect(dest / "sessions" / sid / ".dreamteam" / "swarm.db")
         conn.execute(sql)

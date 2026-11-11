@@ -705,10 +705,14 @@ def cmd_status(args) -> int:
             print(json.loads(resp.read().decode("utf-8"))["result"])
         print(f"Hub: {base}")
         return 0
-    from .swarm import Swarm
+    from .swarm import EarlierVersionError, Swarm
     from .tools import ToolContext, call_tool
 
-    swarm = Swarm(project)
+    try:
+        swarm = Swarm(project)
+    except EarlierVersionError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     text, _ = asyncio.run(call_tool(ToolContext(swarm, USER), "swarm_status", {}))
     print(text)
     print("Hub: not running")
