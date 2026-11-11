@@ -181,7 +181,7 @@ async def test_clarify_kickoff_wakes_only_the_planner(tmp_path, monkeypatch):
         kickoff = {n: [d for k, d in notes(swarm, n) if k == "n_kickoff"] for n in names}
         assert len(kickoff[planner]) == 1 and "_quiet" not in kickoff[planner][0]
         assert all(len(kickoff[n]) == 1 and kickoff[n][0]["_quiet"] is True for n in others)
-        assert swarm._nudged[1] == {planner}
+        assert swarm._nudged[(1, None)] == {planner}
         await run_until(lambda: bool(swarm.mail.conversation(planner, USER))
                         and swarm.member(planner)["status"] == AgentStatus.IDLE)
         await asyncio.sleep(0.5)  # ten scheduler passes: nobody else is woken or offered the card

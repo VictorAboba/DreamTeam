@@ -1166,6 +1166,54 @@ async def test_the_holder_is_told_once_per_lock_after_lock_wanted_minutes(ws, fa
         "SELECT text FROM notifications WHERE recipient = ?", ("Дарья Петрова",))
 
 
+async def test_lock_waiters_name_their_waiting_tasks_and_directions(ws, fake_swarm):
+    """A waiter's tasks in n_lock_wanted (docs/SPEC.md §7 "Lock waiters"): its in_progress and waiting tasks; a
+    crew task with open directions is left out (it waits for them), a direction is named with its crew task, and
+    a subtask of an ordinary task is named as a task."""
+    from dreamteam.board import Board
+    from helpers.crew import make_crew_raw, set_raw
+
+    team(fake_swarm)
+    fake_swarm.add_member("Дарья Петрова", language="ru")
+    board = fake_swarm.board = Board(fake_swarm)
+    crew, (parser, cli) = make_crew_raw(board, USER, 3, ["parser", "cli"], title="Tool", goal="g")
+    set_raw(board, crew.id, status="in_progress", assignee=BORIS)
+    set_raw(board, parser.id, status="in_progress", assignee=BORIS)
+    set_raw(board, cli.id, status="todo", assignee=BORIS)                  # todo: not named
+    paused = board.create(USER, "Docs", goal="g")
+    set_raw(board, paused.id, status="waiting", assignee=BORIS)
+    plain = board.create(USER, "Report", goal="g")
+    part = board.create(USER, "Intro", goal="g", parent_id=plain.id)
+    set_raw(board, part.id, status="in_progress", assignee=CAROL)
+    ws.lock(ANNA, "src")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "src")
+    with pytest.raises(ToolError):
+        ws.lock(CAROL, "src/a.py")
+    fake_swarm.db.execute("UPDATE file_locks SET acquired_at = ?", (time.time() - 6 * 60,))
+    ws.settle_waiters()
+    [(key, kw)] = fake_swarm.notifications_for(ANNA)
+    assert key == "n_lock_wanted"
+    assert kw["waiters"] == (f"{BORIS} (task #{parser.id} parser (direction of #{crew.id}), #{paused.id} Docs)"
+                             f", {CAROL} (task #{part.id} Intro)")
+    # a crew task whose directions are all finished is named again; in Russian the direction reads so too
+    set_raw(board, parser.id, status="done", assignee=BORIS)
+    set_raw(board, cli.id, status="cancelled", assignee=BORIS)
+    set_raw(board, paused.id, status="todo", assignee=None)
+    fake_swarm.config.workspace.lock_wanted_minutes = 0                   # told at the refusal itself
+    ws.lock("Дарья Петрова", "ru.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "ru.md")
+    [(_, kw)] = fake_swarm.notifications_for("Дарья Петрова")
+    assert kw["waiters"] == f"{BORIS} (задача #{crew.id} Tool)"
+    set_raw(board, cli.id, status="in_progress", assignee=BORIS)
+    ws.lock("Дарья Петрова", "ru2.md")
+    with pytest.raises(ToolError):
+        ws.lock(BORIS, "ru2.md")
+    assert fake_swarm.notifications_for("Дарья Петрова")[-1][1]["waiters"] == (
+        f"{BORIS} (задача #{cli.id} cli (направление #{crew.id}))")
+
+
 async def test_a_holder_of_nested_locks_is_told_once(ws, fake_swarm):
     """A folder and a file in it, both locked by the holder: one n_lock_wanted for a waiter, also at the next ticks
     and for a nested lock taken after the notice."""

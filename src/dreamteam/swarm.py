@@ -15,7 +15,7 @@ from typing import Any, Callable
 
 from . import __version__, hubauth, netoff, procs, prompts, roles
 from .agent import AgentRuntime
-from .board import Board
+from .board import MARK_FREE_DIRECTIONS, Board
 from .config import Config, ModelProfile
 from .db import Database, dumps, loads, made_by_earlier_version, remap_sql, utf8_safe
 from .events import EventBus
@@ -63,6 +63,9 @@ _monotonic = time.monotonic      # the lease's clock; tests patch swarm._monoton
 # project (or session) folder, {version} this version
 PROJECT_EARLIER_VERSION_TEXT = ("The swarm in {dir} was made by an earlier version of DreamTeam and cannot be "
                                 "opened by this one ({version}). Open it with the version that made it.")
+# the liveness key of a member (docs/SPEC.md §3 items 2-3): (its stalled in_progress task ids, its marks as
+# (task id, kind), Board.stall_marks); the two parts are compared apart, never sorted together
+StallKey = tuple[frozenset[int], frozenset[tuple[int, str]]]
 
 
 class EarlierVersionError(ValueError):
@@ -140,12 +143,15 @@ class Swarm:
         self._timers: set[asyncio.TimerHandle] = set()
         self._started = False
         self._run_agents = True
-        self._nudged: dict[int, set[str]] = {}
+        # (ready task id, its finish state) -> members offered it (docs/SPEC.md §4.2 "Offers"): a parent whose
+        # subtasks have all finished gets a fresh key, so it is offered again to everyone
+        self._nudged: dict[tuple[int, str | None], set[str]] = {}
         self._last_nudge: dict[str, float] = {}
         # agent -> (nudged at, its open task ids then, task ids offered)
         self._considering: dict[str, tuple[float, frozenset[int], frozenset[int]]] = {}
         self._all_done_key: tuple | None = None
-        self._stall_woken: dict[str, frozenset[int]] = {}  # agent -> stalled task ids it was woken about
+        # agent -> the liveness key it was woken about: (stalled task ids, liveness marks), see _stall_key
+        self._stall_woken: dict[str, StallKey] = {}
         # planning task id -> {holder, since (first seen holding it), steps (its runtime's llm_steps then), hints sent,
         # hinted (its llm_steps at the last hint)}: hint_planner
         self._planning_watch: dict[int, dict[str, Any]] = {}
@@ -154,8 +160,9 @@ class Swarm:
         # streams, and the _monotonic() deadline of the grace after its last sign
         self._auto_reply_streams = 0
         self._auto_reply_until = 0.0
-        # agent idle (not busy, nothing pending) holding in-progress tasks -> (their ids, idle with them since)
-        self._idle_holding: dict[str, tuple[frozenset[int], float]] = {}
+        # agent idle (not busy, nothing pending) holding in-progress tasks or with liveness marks -> (that liveness
+        # key, idle with it since)
+        self._idle_holding: dict[str, tuple[StallKey, float]] = {}
         # reviewer -> (ids of the reviews it was reminded about, or that waited while it was in error; since when)
         self._review_reminded: dict[str, tuple[frozenset[int], float]] = {}
         self._review_lapsed: dict[int, set[str]] = {}  # task in review -> reviewers it was taken from (hand-over)
@@ -714,7 +721,7 @@ class Swarm:
                 if not quiet:
                     # the kickoff is everybody's offer of the planning task: no "ready task" nudge about it
                     # before (stagger) or after the kickoff
-                    self._nudged.setdefault(planning.id, set()).add(m["name"])
+                    self._nudged.setdefault((planning.id, None), set()).add(m["name"])
                 self.notify_later(0 if quiet else i * stagger, m["name"], "n_kickoff", wake=not quiet, by=actor,
                                   title=goal["title"], description=goal.get("description", ""), team=team,
                                   task_id=planning.id, task_title=planning.title)
@@ -1287,7 +1294,12 @@ class Swarm:
     def _nudge_idle(self) -> None:
         ready = self.board.ready_unassigned()
         ready_ids = {t.id for t in ready}
-        self._nudged = {k: v for k, v in self._nudged.items() if k in ready_ids}
+        # a ready task is offered to each member once while it stays ready with the same finish state (docs/SPEC.md
+        # §4.2 "Offers"): a key no longer among the ready ones is dropped
+        states = self.board.finish_states(ready_ids) if ready else {}
+        offer_key = {t.id: (t.id, states.get(t.id)) for t in ready}
+        live = set(offer_key.values())
+        self._nudged = {k: v for k, v in self._nudged.items() if k in live}
         goal = self.goal()
         if not ready or not goal or goal.get("status") != "active":
             return
@@ -1309,21 +1321,22 @@ class Swarm:
                 continue
             if independent and self.board.reviews_of(name):
                 continue  # its reviews come first: it is reminded of them (_remind_reviewers), not offered more work
-            fresh = [t for t in ready if name not in self._nudged.get(t.id, set())][:6]
+            fresh = [t for t in ready if name not in self._nudged.get(offer_key[t.id], set())][:6]
             if not fresh:
                 continue
             owned = frozenset(t.id for t in self.board.open_tasks_of(name))
             self.notify(name, "n_ready", tasks="; ".join(f"#{t.id} {t.title}" for t in fresh))
             for t in fresh:
-                self._nudged.setdefault(t.id, set()).add(name)
+                self._nudged.setdefault(offer_key[t.id], set()).add(name)
             self._last_nudge[name] = now
             self._considering[name] = (now, owned, frozenset(t.id for t in fresh))
             break
 
     def _wake_stalled(self) -> None:
         """An agent that stopped with plain text holding in-progress tasks even after the in-activation nudge
-        is idle with nothing pending, so no event would ever wake it: wake it once per such set of tasks (not while
-        the end of one of its jobs, or a file it was refused becoming free, will wake it)."""
+        is idle with nothing pending, so no event would ever wake it: wake it once per liveness key, those of its
+        stalled tasks it still holds and its marks (_stall_key; not while the end of one of its jobs, or a file it
+        was refused becoming free, will wake it)."""
         now = time.time()
         for m in self._idle_llm_members():
             name = m["name"]
@@ -1334,42 +1347,89 @@ class Swarm:
             if self.jobs.awaited(name) or self.workspace.waits_for_lock(name):
                 continue  # the end of its job (or n_lock_free) will wake it: it waits, it has not stalled
             runtime.stalled = frozenset()
-            # a clarify planner that waits for the user's answers has not stalled (asks_user)
-            still = [t for t in self.board.open_tasks_of(name)
-                     if t.status == Status.IN_PROGRESS and t.id in stalled and not self.asks_user(name, t)]
-            if not still or self._stall_woken.get(name) == stalled:
+            still = self._stall_ids(name, stalled)
+            if not still:
                 continue
-            self._stall_woken[name] = stalled
-            self.notify(name, "n_stalled", tasks=", ".join(f"#{t.id}" for t in still), marks="")
+            key = self._stall_key(name, still)
+            if self._stall_woken.get(name) == key:
+                continue
+            self._wake_about(name, key)
 
     def _wake_idle_holders(self) -> None:
         """An agent that sleeps (idle, not busy, nothing pending) while it holds in-progress tasks, e.g. after
         `wait` with nothing that will wake it, would sleep until some unrelated event: after
-        agents.idle_nudge_seconds it is woken once per such set of tasks (n_stalled, shared with _wake_stalled, so
-        a set is never woken about twice). The clock starts when it was last seen going idle with that set. A
-        member whose running job's end will wake it (JobManager.awaited, what `wait` promised it) is waiting for
-        that job, and one refused a file waits for it to be free (Workspace.waits_for_lock, what the refusal
-        promised): no clock runs for it meanwhile."""
+        agents.idle_nudge_seconds it is woken once per liveness key (its in-progress task ids and its marks,
+        _stall_key; shared with _wake_stalled, so a key is never woken about twice), also with no such task when
+        it has marks (a `waiting` parent whose subtasks have all finished). The clock starts when it was last seen
+        going idle with that key. A member whose running job's end will wake it (JobManager.awaited, what `wait`
+        promised it) is waiting for that job, and one refused a file waits for it to be free
+        (Workspace.waits_for_lock, what the refusal promised): no clock runs for it meanwhile."""
         now, wait = time.time(), self.config.agents.idle_nudge_seconds
-        holding: dict[str, tuple[frozenset[int], float]] = {}
+        holding: dict[str, tuple[StallKey, float]] = {}
         for m in self._idle_llm_members():
             name = m["name"]
-            held = frozenset(t.id for t in self.board.open_tasks_of(name)
-                             if t.status == Status.IN_PROGRESS and not self.asks_user(name, t))
-            if not held or self.jobs.awaited(name) or self.workspace.waits_for_lock(name):
+            if self.jobs.awaited(name) or self.workspace.waits_for_lock(name):
                 continue
-            key, since = self._idle_holding.get(name, (None, now))
-            if key != held:
+            key = self._stall_key(name, self._stall_ids(name))
+            if not key[0] and not key[1]:
+                continue
+            seen, since = self._idle_holding.get(name, (None, now))
+            if seen != key:
                 since = now
             # an activation between two ticks (woken and idle again) restarts the clock: last_active is when it
             # last went idle
             since = max(since, float(m.get("last_active") or 0))
-            holding[name] = (held, since)
-            if now - since < wait or self._stall_woken.get(name) == held:
+            holding[name] = (key, since)
+            if now - since < wait or self._stall_woken.get(name) == key:
                 continue
-            self._stall_woken[name] = held
-            self.notify(name, "n_stalled", tasks=", ".join(f"#{i}" for i in sorted(held)), marks="")
+            self._wake_about(name, key)
         self._idle_holding = holding
+
+    def _stall_ids(self, name: str, among: frozenset[int] | None = None) -> frozenset[int]:
+        """The in_progress task ids of `name` that count as stalled (`among` them, when given): not a clarify
+        planning task whose holder waits for the user's answers (asks_user), nor a crew task with open directions
+        (it waits for them; a free one is the "free directions" mark). A `waiting` task counts only through its
+        marks."""
+        return frozenset(t.id for t in self.board.open_tasks_of(name)
+                         if t.status == Status.IN_PROGRESS and (among is None or t.id in among)
+                         and not self.asks_user(name, t) and not self.board.has_open_directions(t))
+
+    def _stall_key(self, name: str, ids: frozenset[int]) -> StallKey:
+        """The liveness key both scheduler items compare and record (docs/SPEC.md §3 items 2-3): the stalled ids
+        and the member's marks read from the board now (Board.stall_marks)."""
+        return frozenset(ids), self.board.stall_marks(name)
+
+    def _wake_about(self, name: str, key: StallKey) -> None:
+        """Wake `name` about its liveness key: n_stalled naming the ids that carry no mark followed by one sentence
+        per mark, or the mark sentences alone (n_marks_stalled). The key is recorded only once the text is built,
+        so a failed render leaves it to the next pass (logged; the other scheduler items still run)."""
+        ids, marks = key
+        marked = {tid for tid, _ in marks}
+        unmarked = sorted(i for i in ids if i not in marked)
+        try:
+            text = self.board.mark_text(name, marks) if marks else ""
+        except Exception:
+            log.exception("could not render the liveness marks of %s", name)
+            return
+        if not unmarked and not text:
+            return  # the marks no longer apply (changed since they were read): the next pass reads them again
+        self._stall_woken[name] = key
+        if unmarked:
+            self.notify(name, "n_stalled", tasks=", ".join(f"#{i}" for i in unmarked), marks=text)
+        else:
+            self.notify(name, "n_marks_stalled", text=text.lstrip())
+
+    def crew_nudge(self, name: str, tasks: list[Any]) -> tuple[set[int], str]:
+        """The in-activation nudge's crew part (docs/SPEC.md §6.2) for `name`'s in_progress `tasks`: the ids of the
+        crew tasks with open directions (left out of the nudge: they wait for their directions), and the "free
+        directions" sentences of those with a free direction its owner, working on none of them, could take ("" when
+        there is none)."""
+        crew = {t.id for t in tasks if self.board.has_open_directions(t)}
+        if not crew:
+            return set(), ""
+        free = [(tid, kind) for tid, kind in self.board.stall_marks(name)
+                if tid in crew and kind == MARK_FREE_DIRECTIONS]
+        return crew, self.board.mark_text(name, free) if free else ""
 
     def hint_planner(self, name: str | None = None) -> None:
         """An LLM member holding a `planning` task in progress that has created no task `agents.planning_hint_steps`
@@ -1494,18 +1554,35 @@ class Swarm:
             self._user_reviews_key = None
             return
         llm = [m for m in self.members() if m["kind"] == AgentKind.LLM]
-        actionable = [t for t in self.board.list(status=Status.TODO)  # claimable or assigned, not blocked
-                      if not t.blocked_by and t.assignee != USER]
         # a member busy with a job (its command went on in the background) is at work like a WORKING one
         if (any(m["status"] == AgentStatus.WORKING or self.has_pending(m["name"]) or self.jobs.busy(m["name"])
                 for m in llm)
-                or actionable or self.board.list(status=Status.IN_PROGRESS)
-                or any(t.reviewer != USER for t in reviews)):
+                or any(t.reviewer != USER for t in reviews) or self.board.list(status=Status.IN_PROGRESS)
+                or self._has_actionable_todo()):
             return
         key = frozenset(t.id for t in waiting)
         if key != self._user_reviews_key:
             self._user_reviews_key = key
             self.notify(USER, "u_reviews_waiting", tasks=", ".join(f"#{t.id}" for t in waiting))
+
+    def _has_actionable_todo(self) -> bool:
+        """A `todo` task someone can go on with: one ready_unassigned returns (a direction only while its crew task
+        takes directions), or one a member holds that no blocker stops, nor a blocker of its crew task (the owner's
+        own part of a blocked crew task waits like its other directions)."""
+        if self.board.ready_unassigned():
+            return True
+        held = [t for t in self.board.list(status=Status.TODO)
+                if t.assignee is not None and t.assignee != USER and not t.blocked_by]
+        blocked_crews: dict[int, bool] = {}
+        for t in held:
+            if t.parent_id is None:
+                return True
+            if t.parent_id not in blocked_crews:
+                parent = self.board.get(t.parent_id)
+                blocked_crews[t.parent_id] = parent.crew >= 2 and bool(parent.blocked_by)
+            if not blocked_crews[t.parent_id]:
+                return True
+        return False
 
     def _check_all_done(self) -> None:
         goal = self.goal()

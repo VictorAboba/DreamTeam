@@ -1479,15 +1479,23 @@ class Workspace:
                     mark(other["path"])
 
     def _waiter_text(self, name: str, lang: str) -> str:
-        """"Anna Smith (task #7 Parser)": a waiter with its tasks in progress, if any."""
+        """"Anna Smith (task #7 Parser)": a waiter with its in_progress and waiting tasks, if any; a crew task with
+        open directions is left out (it waits for them), a direction is named with its crew task ("#15 pkce
+        (direction of #7)", docs/SPEC.md §4.2)."""
         board = getattr(self.swarm, "board", None)
         try:
-            tasks = [t for t in board.open_tasks_of(name) if t.status == Status.IN_PROGRESS] if board else []
+            tasks = [t for t in board.open_tasks_of(name)
+                     if t.status in (Status.IN_PROGRESS, Status.WAITING)] if board else []
+            tasks = [t for t in tasks if not board.has_open_directions(t)]
+            crews = {p.id for p in map(board.get, {t.parent_id for t in tasks if t.parent_id is not None})
+                     if p.crew >= 2}
         except Exception:  # noqa: BLE001 - the name alone is enough
             tasks = []
         if not tasks:
             return name
-        return prompts.t(lang, "lock_waiter_task", name=name, tasks=", ".join(f"#{t.id} {t.title}" for t in tasks))
+        names = [prompts.t(lang, "lock_waiter_direction", id=t.id, title=t.title, parent=t.parent_id)
+                 if t.parent_id in crews else f"#{t.id} {t.title}" for t in tasks]
+        return prompts.t(lang, "lock_waiter_task", name=name, tasks=", ".join(names))
 
     # --- git --------------------------------------------------------------------------------
     async def autocommit(self, actor: str, message: str = "", *, kind: str = "", detail: str = "",

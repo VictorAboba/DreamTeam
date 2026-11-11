@@ -3392,7 +3392,8 @@ async def test_api_provides_every_field_the_ui_reads(tmp_path):
         assert sw["workspace"] == {"path": str(swarm.workspace.root), "default": True, "adopted": False, "exists": True}
         assert {"title", "description", "status", "summary"} <= set(sw["goal"])
         task_keys = {"id", "title", "goal", "description", "status", "assignee", "reviewer", "created_by", "parent_id",
-                     "depends_on", "priority", "tags", "result", "created_at", "updated_at", "blocked_by", "comments"}
+                     "depends_on", "priority", "tags", "result", "created_at", "updated_at", "blocked_by", "comments",
+                     "crew", "crew_working"}
         assert all(task_keys <= set(t) for t in state["tasks"])
         second = next(t for t in state["tasks"] if t["id"] == 2)
         assert second["blocked_by"] == [1] and second["comments"] == 2 and second["goal"] == "It works"

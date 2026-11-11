@@ -490,19 +490,27 @@ class AgentRuntime:
                 asks = getattr(swarm, "asks_user", None)
                 in_progress = [t for t in swarm.board.open_tasks_of(self.name) if t.status == Status.IN_PROGRESS
                                and not (asks is not None and asks(self.name, t))]
+                # a crew task with open directions waits for them: it is left out, and a free direction its owner
+                # could take is told in the "free directions" sentence (Swarm.crew_nudge; getattr: test doubles)
+                crew_nudge = getattr(swarm, "crew_nudge", None)
+                crew_ids, free = crew_nudge(self.name, in_progress) if crew_nudge is not None else (set(), "")
+                in_progress = [t for t in in_progress if t.id not in crew_ids]
+                free_ids = crew_ids if free else set()
                 # a command of the agent went on as a job it waits for (JobManager.busy), or it was refused a file
                 # and waits for it (Workspace.waits_for_lock): no nudge now; the job's end or n_lock_free wakes the
                 # agent, and the stall below is still recorded for once that wait is over
                 jobs = getattr(swarm, "jobs", None)
                 ws = getattr(swarm, "workspace", None)
-                busy = in_progress and ((jobs is not None and jobs.busy(self.name))
-                                        or (ws is not None and getattr(ws, "waits_for_lock", None) is not None
-                                            and ws.waits_for_lock(self.name)))
+                busy = (in_progress or free_ids) and ((jobs is not None and jobs.busy(self.name))
+                                                      or (ws is not None and getattr(ws, "waits_for_lock", None)
+                                                          is not None and ws.waits_for_lock(self.name)))
                 # one nudge per task: an agent that finished #2 with a nudge and then stopped with text again
                 # after claiming #3 would otherwise go idle holding #3, and nothing would ever wake it
-                if not busy and any(t.id not in nudged for t in in_progress):
+                if not busy and (any(t.id not in nudged for t in in_progress) or free_ids - nudged):
                     nudged.update(t.id for t in in_progress)
-                    nudge = prompts.t(self.language, "nudge", tasks=", ".join(f"#{t.id}" for t in in_progress))
+                    nudged.update(free_ids)
+                    nudge = (prompts.t(self.language, "nudge", tasks=", ".join(f"#{t.id}" for t in in_progress))
+                             + free if in_progress else free.lstrip())
                     self._append({"role": "user", "content": nudge})
                     self._activity("nudge", nudge)
                     trace.record("input", "nudge", output=nudge)
