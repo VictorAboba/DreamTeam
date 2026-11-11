@@ -158,6 +158,10 @@ class SwarmSettings:
     # a finished task of an agent goes to review by another member (or the user when nobody else can);
     # false: a task without an explicit reviewer is done at once (docs/SPEC.md §4 "Independent review")
     independent_review: bool = True
+    # the review of a crew task its owner completed with a direction done is the check of the whole, by a reviewer
+    # picked preferably outside the crew; false: an ordinary review, unless the task has a reviewer of its own
+    # (docs/SPEC.md §4.2 "Finishing"); read at each review request
+    crew_review: bool = True
     # "off": the members' commands, their jobs and the stdio MCP servers have no internet (benchmarks); DreamTeam
     # itself keeps it (docs/SPEC.md §7.2, netoff.py)
     network: str = "on"
@@ -686,6 +690,7 @@ max_cost_usd = 5.0            # бюджет роя в долларах; при 
 goal = {toml_string(goal)}          # глобальная задача (можно задать позже в веб-интерфейсе)
 starting_roles = []           # стартовая команда по порядку, например ["architect", "developer", "developer", "tester"]; недостающим до start_agents — «Универсал»
 independent_review = true     # задачу агента принимает другой агент (или вы, если больше некому); false — без ревьюера задача сразу готова
+crew_review = true            # завершённую групповую задачу проверяет целиком, по возможности, агент вне её направлений; false — обычное ревью (назначенный ей ревьюер всё равно проверяет её целиком)
 network = "on"                # "off" — у команд агентов, их фоновых процессов и MCP-серверов нет интернета (LLM работает); строго только в Docker и Linux
 clarify = false               # true — сначала уточнить цель: планировщик задаёт вам вопросы до плана, остальные ждут; важный вопрос агента ставит рой на паузу до ответа
 

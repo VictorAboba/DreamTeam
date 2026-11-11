@@ -4,6 +4,8 @@ level (wake-up text, reminders, hand-over, the user's notice, the scheduler) aga
 
 from __future__ import annotations
 
+import tomllib
+
 import pytest
 
 from dreamteam import prompts
@@ -376,6 +378,20 @@ def test_config_flag(make_fake_swarm, tmp_path):
     with pytest.raises(ValueError, match=r"\[swarm\] independent_review"):
         Config.from_dict(tmp_path / "bad", {"swarm": {"independent_review": "yes"}})
     assert "\nindependent_review = true" in render_template("X", "ru", "anthropic")
+
+
+def test_crew_review_setting(tmp_path):
+    """`[swarm] crew_review` (default true) is a bool; the template has its line right after independent_review."""
+    assert SwarmSettings().crew_review is True
+    assert Config.from_dict(tmp_path, {"swarm": {"crew_review": False}}).swarm.crew_review is False
+    with pytest.raises(ValueError, match=r"\[swarm\] crew_review must be true or false"):
+        Config.from_dict(tmp_path / "bad", {"swarm": {"crew_review": "yes"}})
+    template = render_template("X", "ru", "anthropic")
+    lines = template.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("crew_review = "))
+    assert lines[at - 1].startswith("independent_review = ") and lines[at + 1].startswith("network = ")
+    assert lines[at].startswith("crew_review = true            # завершённую групповую задачу проверяет целиком")
+    assert tomllib.loads(template)["swarm"]["crew_review"] is True
 
 
 def test_pick_prefers_the_reviewer_role(swarm, board):

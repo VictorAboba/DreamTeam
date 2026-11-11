@@ -11,6 +11,7 @@ import pytest
 from dreamteam import db as dbmod
 from dreamteam import tracing
 from dreamteam.db import (ADDED_COLUMNS, Database, columns_of, known_columns, max_tools_revision, unknown_columns)
+from dreamteam.models import CREW_MAX, Task
 from dreamteam.tools import frozen
 from dreamteam.tracing import Tracer
 
@@ -57,25 +58,68 @@ def test_known_columns_are_what_a_fresh_database_and_tracer_create(tmp_path):
 
 def test_an_older_database_is_a_strict_subset_and_gets_upgraded(tmp_path):
     path = tmp_path / "old.db"
-    _older(path, {("mcp_servers", "digest"), ("mcp_servers", "approved_digest"), ("messages", "to_all")})
+    _older(path, {("mcp_servers", "digest"), ("mcp_servers", "approved_digest"), ("messages", "to_all"),
+                  ("tasks", "crew")})
+    conn = sqlite3.connect(str(path))
+    try:  # a task an older version made
+        conn.execute("INSERT INTO tasks(title, status, created_at, updated_at) VALUES ('old', 'todo', 1, 1)")
+        conn.commit()
+    finally:
+        conn.close()
     old = columns_of(path)
     assert old < known_columns()
     assert known_columns() - old >= {"mcp_servers.digest", "mcp_servers.approved_digest", "messages.to_all",
-                                     "traces.id", "spans.input"}
+                                     "tasks.crew", "traces.id", "spans.input"}
     assert unknown_columns(path) == []
-    _fresh(path).close()  # opening it adds the columns and tables
+    database = _fresh(path)  # opening it adds the columns and tables
+    try:
+        row = database.one("SELECT * FROM tasks WHERE title = 'old'")
+        assert row["crew"] == 0  # the column's default: an ordinary task
+        task = Task.from_row(row)
+        assert task.crew == 0 and task.crew_working == []
+    finally:
+        database.close()
     assert columns_of(path) == known_columns()
+
+
+def test_tasks_crew_is_stored_and_read_into_the_task(tmp_path):
+    """`tasks.crew` (0 = an ordinary task, 2..CREW_MAX = a crew task) is read into `Task.crew`; `crew_working` is
+    filled by the board, never stored; both are in `to_dict()`, and `short()` names a crew task's working set."""
+    assert CREW_MAX == 8
+    database = _fresh(tmp_path / "swarm.db")
+    try:
+        database.execute("INSERT INTO tasks(title, status, assignee, created_at, updated_at, crew)"
+                         " VALUES ('big', 'in_progress', 'Anna', 1, 2, 3)")
+        database.execute("INSERT INTO tasks(title, status, created_at, updated_at) VALUES ('plain', 'todo', 1, 1)")
+        big, plain = (Task.from_row(database.one("SELECT * FROM tasks WHERE title = ?", (title,)))
+                      for title in ("big", "plain"))
+        legacy = Task.from_row(database.one("SELECT id, title, goal, description, status, assignee, reviewer,"
+                                            " created_by, parent_id, depends_on, priority, tags, result, created_at,"
+                                            " updated_at FROM tasks WHERE title = 'big'"))
+    finally:
+        database.close()
+    assert big.crew == 3 and plain.crew == 0 and legacy.crew == 0  # a row without the column: an ordinary task
+    assert big.crew_working == []
+    assert big.to_dict()["crew"] == 3 and big.to_dict()["crew_working"] == []
+    assert big.short() == f"#{big.id} [in_progress] big @Anna crew 0/3"
+    big.crew_working = ["Anna", "Bob"]
+    big.status, big.reviewer = "review", "Carl"
+    assert big.short() == f"#{big.id} [review] big @Anna review:Carl crew 2/3"
+    assert "crew" not in plain.short()
+    plain.crew = 1  # below 2: not a crew task
+    assert "crew" not in plain.short()
+    assert "tasks.crew" in known_columns() and "tasks.crew_working" not in known_columns()
 
 
 def test_a_database_of_a_newer_version_shows_its_unknown_columns(tmp_path):
     path = tmp_path / "new.db"
     database = _fresh(path)
-    database.execute("ALTER TABLE tasks ADD COLUMN crew TEXT")
+    database.execute("ALTER TABLE tasks ADD COLUMN squad TEXT")
     database.execute("CREATE TABLE \"odd \"\"name\" (a TEXT, \"b c\" INTEGER)")
-    assert unknown_columns(database) == ['odd "name.a', 'odd "name.b c', "tasks.crew"]
+    assert unknown_columns(database) == ['odd "name.a', 'odd "name.b c', "tasks.squad"]
     database.close()
-    assert unknown_columns(path) == ['odd "name.a', 'odd "name.b c', "tasks.crew"]
-    assert columns_of(path) - known_columns() == {"tasks.crew", 'odd "name.a', 'odd "name.b c'}
+    assert unknown_columns(path) == ['odd "name.a', 'odd "name.b c', "tasks.squad"]
+    assert columns_of(path) - known_columns() == {"tasks.squad", 'odd "name.a', 'odd "name.b c'}
 
 
 def test_columns_of_reads_a_file_without_changing_it(tmp_path):

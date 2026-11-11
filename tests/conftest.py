@@ -44,11 +44,16 @@ class FakeSwarm:
 
     # --- members -------------------------------------------------------------------------
     def add_member(self, name: str, kind: str = AgentKind.LLM, role: str = "Generalist",
-                   language: str | None = None, status: str = AgentStatus.IDLE) -> str:
+                   language: str | None = None, status: str = AgentStatus.IDLE,
+                   created_at: float | None = None) -> str:
+        """`created_at` (default now) sets when the member joined: the reviewer key counts the reviews given since
+        the newest active LLM member joined."""
+        now = time.time()
         self.db.execute(
             "INSERT INTO agents(name, kind, role, model, language, status, hired_by, created_at, last_active)"
             " VALUES (?, ?, ?, 'default', ?, ?, ?, ?, ?)",
-            (name, kind, role, language or self.language, status, USER, time.time(), time.time()),
+            (name, kind, role, language or self.language, status, USER,
+             now if created_at is None else created_at, now),
         )
         return name
 
