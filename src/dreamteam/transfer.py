@@ -1753,6 +1753,14 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
             entry["db_sha256"] = _sha256(copied)
         else:
             entry["db_bytes"] = sum(p.stat().st_size for p in (db, db.with_name(DB_FILE + "-wal")) if p.is_file())
+        try:  # docs/SPEC.md §17.2: exported like any other, but the same version will refuse it at import
+            earlier = made_by_earlier_version(copied if target is not None else db)
+        except (sqlite3.Error, OSError):
+            earlier = False
+        if earlier:
+            report.warnings.append(f"session {sid} was made by an earlier version of DreamTeam: this version and the "
+                                   "same one on the other computer refuse it; only the version that made it imports "
+                                   "and opens it (keep this folder)")
     size += entry["db_bytes"]
     modes: dict[str, int] = {}
     if target is not None:

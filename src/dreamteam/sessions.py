@@ -91,7 +91,8 @@ LEGACY_WORKSPACE_TEXT = (
 # exported, never opened (docs/SPEC.md §17.2 "Sessions of an earlier version")
 EARLIER_VERSION_TEXT = (
     "Session {sid} was made by an earlier version of DreamTeam and cannot be opened by this one ({version}). Open it "
-    "with the version that made it, or delete it.")
+    "with the version that made it (export it here, then import it into a home of that version: once this one saved "
+    "its settings, that version may not read this home), or delete it.")
 MAIN_EARLIER_VERSION_TEXT = (
     "Session main (the swarm in {home}) was made by an earlier version of DreamTeam and cannot be opened by this one "
     "({version}). Open it with the version that made it, or remove {home}/.dreamteam/swarm.db (with its -wal and "
@@ -1772,8 +1773,11 @@ class SessionManager:
             if entry is not None and ("error" in entry or lib.digest_of(name) != attached[name].digest):
                 clashes.append(name)
         if clashes:
-            raise SessionError(f"The library already has other skills named {', '.join(clashes)}: decide them in the "
-                               f"session's Skills tab first, or delete session {sid} with its proposals discarded.",
+            # a session of an earlier version has no Skills tab here (never opened): its export keeps the proposals
+            first = ("export the session first (the export keeps its proposals)" if self.earlier_version(sid) else
+                     "decide them in the session's Skills tab first")
+            raise SessionError(f"The library already has other skills named {', '.join(clashes)}: {first}, or "
+                               f"delete session {sid} with its proposals discarded.",
                                409, exists=clashes, pending_skills=pending)
         try:
             for name in pending:

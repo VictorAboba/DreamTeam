@@ -440,6 +440,9 @@ def test_it_is_exported_and_dreamteam_import_refuses_it_before_writing(tmp_path,
     monkeypatch.setenv("DREAMTEAM_MCP_LIBRARY_DIR", str(tmp_path / "libs" / "mcp"))
     made = asyncio.run(make_old(tmp_path, "record"))
     assert cli.main(["export", str(tmp_path / "usb"), "--home", str(made.home)]) == 0
+    # the export says that the same version will refuse it on the other computer
+    assert (f"session {made.sid} was made by an earlier version of DreamTeam: this version and the same one on the "
+            "other computer refuse it") in capsys.readouterr().out
     assert untouched(made)
     assert (tmp_path / "usb" / "sessions" / made.sid / ".dreamteam" / "swarm.db").is_file()
     other = tmp_path / "other"
