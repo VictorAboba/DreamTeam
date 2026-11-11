@@ -302,6 +302,91 @@ async def test_a_claim_of_an_ordinary_parent_with_all_subtasks_finished_gives_th
     assert text.endswith("\nAll its subtasks are finished: assemble their results and complete it.")
 
 
+# --- finishing: the owner told in the result of its own call ------------------------------------------------------
+
+def finished_text(sw: Swarm, crew_id: int, counts: str, total: int) -> str:
+    """n_subtasks_done of a crew task whose directions are all finished, in the holder form with the draft, as the
+    board renders it now."""
+    task = sw.board.get(crew_id)
+    ending = prompts.t("en", "ending_crew_finished", id=crew_id) + sw.board._crew_draft(task, "en")
+    return prompts.t("en", "n_subtasks_done", id=crew_id, title=task.title, total=total, counts=counts, ending=ending)
+
+
+async def test_the_owner_completing_the_last_direction_reads_the_finished_ending_in_its_result(swarm):
+    a, b, *_ = members(swarm)
+    swarm.config.swarm.independent_review = False   # no review: the completion finishes the direction at once
+    await ok(swarm, a, "task_create", {"title": "Auth", "goal": "log in", "assignee": "me", "crew": 2,
+                                       "directions": ["parser", "cli"]})
+    await ok(swarm, b, "task_claim", {"task_id": 3})
+    await ok(swarm, b, "task_update", {"task_id": 3, "goal": "a cli"})
+    assert await ok(swarm, b, "task_complete", {"task_id": 3, "result": "cli in src/cli.py"}) == "Task #3 is done."
+    await ok(swarm, a, "task_update", {"task_id": 2, "goal": "a parser"})
+    text = await ok(swarm, a, "task_complete", {"task_id": 2, "result": "parser in src/parser.py"})
+    expected = finished_text(swarm, 1, "2 done", 2)
+    assert text == f"Task #2 is done.\n{expected}"
+    assert "Draft for #1's result" in text and "parser in src/parser.py" in text and "cli in src/cli.py" in text
+    assert told(swarm, a, "n_subtasks_done") == []      # the actor reads it in its result, no notification
+
+
+async def test_the_owner_approving_the_last_direction_reads_the_finished_ending_in_its_result(swarm):
+    a, b, c, *_ = members(swarm)
+    board = swarm.board
+    await ok(swarm, a, "task_create", {"title": "Auth", "goal": "log in", "assignee": "me", "crew": 2,
+                                       "directions": ["parser", "cli"]})
+    finish_raw(board, 2, Status.DONE, "parser in src/parser.py")
+    await ok(swarm, b, "task_claim", {"task_id": 3})
+    await ok(swarm, b, "task_update", {"task_id": 3, "goal": "a cli"})
+    board.update(USER, 3, reviewer=a)                    # the owner reviews the direction
+    text = await ok(swarm, b, "task_complete", {"task_id": 3, "result": "cli"})
+    assert text == f"Task #3 was sent to {a} for review."
+    text = await ok(swarm, a, "task_review", {"task_id": 3, "approve": True})
+    assert text == f"Task #3 is now done (assignee: {b}).\n{finished_text(swarm, 1, '2 done', 2)}"
+    assert told(swarm, a, "n_subtasks_done") == []
+    # a reviewer that is not the owner reads nothing about the crew task: the owner is told
+    await ok(swarm, a, "task_update", {"task_id": 1, "directions": ["docs"]})
+    board.update(USER, 4, assignee=b, status=Status.IN_PROGRESS, goal="docs")
+    board.update(USER, 4, reviewer=c)
+    await ok(swarm, b, "task_complete", {"task_id": 4, "result": "docs"})
+    text = await ok(swarm, c, "task_review", {"task_id": 4, "approve": True})
+    assert text == f"Task #4 is now done (assignee: {b})."
+    assert told(swarm, a, "n_subtasks_done") == [finished_text(swarm, 1, "3 done", 3)]
+
+
+async def test_the_owner_cancelling_the_last_open_direction_reads_the_finished_ending_in_its_result(swarm):
+    a, b, *_ = members(swarm)
+    board = swarm.board
+    await ok(swarm, a, "task_create", {"title": "Auth", "goal": "log in", "assignee": "me", "crew": 3,
+                                       "directions": ["parser", "cli", "docs"]})
+    finish_raw(board, 2, Status.DONE, "parser in src/parser.py")
+    finish_raw(board, 3, Status.DONE, "cli in src/cli.py", assignee=b)
+    text = await ok(swarm, a, "task_update", {"task_id": 4, "status": "cancelled"})
+    expected = finished_text(swarm, 1, "2 done, 1 cancelled", 3)
+    assert text.startswith("Updated task #4: status todo → cancelled.") and text.endswith("\n" + expected)
+    assert '- #4 [cancelled] "docs"\n' not in expected and expected.endswith('- #4 [cancelled] "docs"')
+    assert told(swarm, a, "n_subtasks_done") == [] and told(swarm, a, "n_task_closed") == []
+
+
+async def test_a_returned_crew_task_tells_its_owner_to_fix_it_or_add_directions(swarm):
+    a, b, c, *_ = members(swarm)
+    board = swarm.board
+    await ok(swarm, a, "task_create", {"title": "Auth", "goal": "log in", "assignee": "me", "reviewer": c, "crew": 2,
+                                       "directions": ["parser", "cli"]})
+    finish_raw(board, 2, Status.DONE, "parser")
+    finish_raw(board, 3, Status.DONE, "cli", assignee=b)
+    await ok(swarm, a, "task_claim", {"task_id": 1})
+    assert await ok(swarm, a, "task_complete", {"task_id": 1, "result": "auth works"}) == (
+        f"Task #1 was sent to {c} for review.")
+    assert told(swarm, c, "n_crew_review_requested") == [
+        prompts.t("en", "n_crew_review_requested", by=a, id=1, title="Auth", n=2)]
+    text = await ok(swarm, c, "task_review", {"task_id": 1, "approve": False, "comment": "the cli does not parse"})
+    assert text == f"Task #1 is now in_progress (assignee: {a})."
+    rejected = told(swarm, a, "n_review_rejected")
+    assert rejected == [prompts.t("en", "n_review_rejected", id=1, title="Auth", by=c,
+                                  comment="the cli does not parse",
+                                  ending=prompts.t("en", "review_rejected_crew", id=1))]
+    assert "Draft for" not in rejected[0]
+
+
 # --- task_get -------------------------------------------------------------------------------------------------
 
 async def test_task_get_lists_the_subtasks_and_the_crew(swarm):
