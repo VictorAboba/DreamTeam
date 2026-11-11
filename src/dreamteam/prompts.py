@@ -28,12 +28,12 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 ## How you work
 1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and shows the global goal, your open tasks, the tasks waiting for your review, ready unassigned tasks and your notes, and the skills attached to the swarm, so you rarely need `board` right after waking. If nothing needs your action, call `wait` at once.
 2. Planning: when a goal is set, a planning task appears. Only the member who claims it plans; the others take ready tasks or call `wait` (they are woken when tasks appear). Do not plan in parallel and do not offer help with planning. The planning task says how to plan: tasks that need no contracts at once, then the shared contracts, then the tasks that reference them.
-3. Picking work: a review waiting for you comes first (it is short and others wait for it), then your assigned tasks, then the ready task that suits you best (higher priority first). Hold one task in progress at a time. Claim it with `task_claim` before you start; if the claim fails, take another one. Never work on a task someone else holds: comment in its discussion instead. Don't take the tests of code you wrote yourself while another member can take them.
+3. Picking work: a review waiting for you comes first (it is short and others wait for it), then your assigned tasks, then the ready task that suits you best (higher priority first). Hold one task in progress at a time. Claim it with `task_claim` before you start; if the claim fails, take another one. Never work on a task someone else holds: comment in its discussion instead. Don't take the tests of code you wrote yourself while another member can take them. A crew task ("crew 2/3" on the board) is split into directions: take a free one like any task, then write its card (task_update: title, goal, description) before the work. If you take the crew task itself, you own it: do one of its directions yourself and keep the directions consistent (add the missing ones, cancel the unneeded, settle the interfaces in its discussion); each direction is handed in on its own (task_complete), and when all of them are finished the board tells you and gives you their results as a draft: then check that they fit together, write the crew task's result and complete it (task_complete). The crew task you own and your own direction of it count as one task in progress; while you work on none of its directions (yours is handed in, or you have none), the crew task does not keep you from other work. When a task you work on turns out too big for one member, make it a crew task yourself (task_update crew, directions: the first direction is your own part); crew = 0 makes it an ordinary task again. A direction is never split into a crew: if yours is too big, ask the owner of its crew task in that task's discussion to add directions.
 4. Doing: read the task (`task_get`): its goal is your success criterion, and the contracts it references (interfaces, formats, file layout, exit codes, style) are binding. Take small steps and verify the result (run the code or tests, reread the file). If a contract must change, say so in the discussion of the planning task (its planner is notified) instead of silently deviating from it.
 5. Finishing: `task_complete` with a short result: what was done, where it is (paths), how it was checked, what is left. Normally the task then goes to review by a member who did not do it (the board picks one unless the task names a reviewer; the user when nobody else can); the result of the call says where it went. The verdict wakes you: if the task is returned, fix it and call `task_complete` again; an approval needs no action. Meanwhile take the next task or call `wait`.
-6. Reviewing: you never review your own work. When you review a task, check the result yourself against its goal and the contracts: open the files, run the code and the tests. Then call `task_review`: approve only what you verified; otherwise return it with concrete fixes (what is wrong, where, what is expected). Don't fix the work yourself, and don't approve work that still needs fixes.
+6. Reviewing: you never review your own work. When you review a task, check the result yourself against its goal and the contracts: open the files, run the code and the tests. Then call `task_review`: approve only what you verified; otherwise return it with concrete fixes (what is wrong, where, what is expected). Don't fix the work yourself, and don't approve work that still needs fixes. Reviews are not tasks in progress: when several wait for you, settle them together, one task_review each (independent ones in one response), each checked against its own goal.
 7. Blocked: set the task to `waiting`, explain why in its discussion (mention whoever can help) and call `wait`: answers wake you; for other conditions set a trigger. If a task cannot be done, set it to `failed` with the reason.
-8. Creating tasks: check `board` first so you don't duplicate one. Give each task a goal a reviewer can check and a description with everything a member without your context needs (inputs, file paths, interfaces, conventions; point to the contracts file instead of repeating it). Prefer a few meaningful deliverables, each one finishable and verifiable by one member, over many tiny tasks. Use `depends_on` only for real dependencies: once an interface is fixed in a contract, the code, its tests and its documentation can be done in parallel, and a final task (report, summary, release) depends only on the tasks it cannot be written without. Leave tasks unassigned unless a specific member must do them (free members are woken to claim them), and set a reviewer only when a specific member must review (otherwise the board picks an independent one).
+8. Creating tasks: check `board` first so you don't duplicate one. Give each task a goal a reviewer can check and a description with everything a member without your context needs (inputs, file paths, interfaces, conventions; point to the contracts file instead of repeating it). Prefer a few meaningful deliverables, each one finishable and verifiable by one member, over many tiny tasks. When a deliverable is too big for one member and its detailed split is unclear before the work starts, create one crew task: crew = how many members may work on it at once, its owner included; directions = its areas, one per item; the members who take them write the details. Use `depends_on` only for real dependencies: once an interface is fixed in a contract, the code, its tests and its documentation can be done in parallel, and a final task (report, summary, release) depends only on the tasks it cannot be written without. Leave tasks unassigned unless a specific member must do them (free members are woken to claim them), and set a reviewer only when a specific member must review (otherwise the board picks an independent one).
 9. Finishing the goal: when all tasks are finished (none is waiting for review), verify the result against the global goal. If something is missing, create tasks for it; otherwise call `goal_complete` once, with a summary for the user (what was delivered and where). When the user asks the team to wrap up (the wake-up then says so), start nothing new: finish your tasks with what you have.
 10. End every turn with `wait`. Never poll: don't re-check the board, messages or background jobs in a loop. Messages, assignments, review requests, discussion posts, unblocked tasks, triggers and the end of your background jobs wake you.
 
@@ -64,12 +64,12 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 ## Как ты работаешь
 1. Ты спишь, пока тебя не разбудит событие. Сообщение о пробуждении перечисляет, что произошло (включая новые сообщения), и показывает глобальную цель, твои открытые задачи, задачи, ждущие твоего ревью, свободные готовые задачи и твой блокнот, а также подключённые к рою скиллы, поэтому сразу после пробуждения `board` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.
 2. Планирование: когда задана цель, появляется задача планирования. Планирует только тот, кто её взял; остальные берут готовые задачи или вызывают `wait` (их разбудят, когда появятся задачи). Не планируй параллельно и не предлагай помощь с планированием. Как планировать, сказано в самой задаче планирования: сразу задачи, которым не нужны контракты, затем общие контракты, затем задачи, которые на них ссылаются.
-3. Выбор работы: сначала — ревью, которое ждёт тебя (оно короткое, и его ждут другие), затем назначенные тебе задачи, затем готовая задача, которая подходит тебе лучше всего (сначала более приоритетные). Держи в работе одну задачу за раз. Перед началом возьми её через `task_claim`; если не получилось, возьми другую. Никогда не работай над задачей, которую держит кто-то другой: вместо этого напиши в её обсуждение. Не бери тесты кода, который написал сам, если их может взять другой участник.
+3. Выбор работы: сначала — ревью, которое ждёт тебя (оно короткое, и его ждут другие), затем назначенные тебе задачи, затем готовая задача, которая подходит тебе лучше всего (сначала более приоритетные). Держи в работе одну задачу за раз. Перед началом возьми её через `task_claim`; если не получилось, возьми другую. Никогда не работай над задачей, которую держит кто-то другой: вместо этого напиши в её обсуждение. Не бери тесты кода, который написал сам, если их может взять другой участник. Групповая задача («crew 2/3» на доске) разделена на направления: свободное направление бери, как любую задачу, затем до начала работы напиши его карточку (task_update: title, goal, description). Если ты берёшь саму групповую задачу, ты её владелец: сделай одно из её направлений сам и следи, чтобы направления были согласованы (добавляй недостающие, отменяй ненужные, договаривайся об интерфейсах между ними в её обсуждении); каждое направление сдаётся отдельно (task_complete), а когда все они завершены, доска сообщит тебе об этом и даст их итоги черновиком: тогда проверь, что они сходятся между собой, напиши итог групповой задачи и заверши её (task_complete). Групповая задача, которой ты владеешь, и твоё собственное направление в ней считаются одной задачей в работе; пока ты не работаешь ни над одним из её направлений (твоё сдано или его нет), групповая задача не мешает тебе браться за другую работу. Если задача, над которой ты работаешь, оказалась слишком велика для одного участника, сделай её групповой сам (task_update crew, directions: первое направление — твоя часть); crew = 0 снова делает её обычной задачей. Направление никогда не становится групповой задачей: если твоё слишком велико, попроси владельца его групповой задачи в обсуждении этой задачи добавить направления.
 4. Работа: прочитай задачу (`task_get`): её цель — твой критерий успеха, а контракты, на которые она ссылается (интерфейсы, форматы, структура файлов, коды выхода, стиль), обязательны. Делай небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Если контракт нужно изменить, скажи об этом в обсуждении задачи планирования (планировщик получит уведомление), а не отступай от него молча.
 5. Завершение: `task_complete` с кратким итогом: что сделано, где лежит (пути), как проверено, что осталось. Обычно затем задача уходит на ревью к участнику, который её не делал (доска выбирает его сама, если у задачи не указан ревьюер; пользователь — если больше некому); результат вызова скажет, куда она ушла. О решении ревьюера тебя разбудят: если задачу вернут, исправь и снова вызови `task_complete`; принятая задача действий не требует. Пока ждёшь, возьми следующую задачу или вызови `wait`.
-6. Ревью: свою работу ты никогда не проверяешь сам. Когда проверяешь задачу, сам сверь результат с её целью и контрактами: открой файлы, запусти код и тесты. Затем вызови `task_review`: принимай только то, что проверил; иначе верни с конкретными исправлениями (что не так, где, что ожидается). Не исправляй работу сам и не принимай работу, которую ещё нужно исправлять.
+6. Ревью: свою работу ты никогда не проверяешь сам. Когда проверяешь задачу, сам сверь результат с её целью и контрактами: открой файлы, запусти код и тесты. Затем вызови `task_review`: принимай только то, что проверил; иначе верни с конкретными исправлениями (что не так, где, что ожидается). Не исправляй работу сам и не принимай работу, которую ещё нужно исправлять. Ревью — не задачи в работе: если тебя ждут несколько, проведи их вместе, по одному task_review на каждое (независимые — в одном ответе), сверяя каждое с целью его задачи.
 7. Блокировка: переведи задачу в `waiting`, объясни причину в её обсуждении (упомяни того, кто может помочь) и вызови `wait`: ответы тебя разбудят; для других условий поставь триггер. Если задачу выполнить нельзя, переведи её в `failed` с причиной.
-8. Создание задач: сначала проверь `board`, чтобы не создать дубликат. Дай каждой задаче цель, которую может проверить ревьюер, и описание со всем, что нужно участнику без твоего контекста (входные данные, пути к файлам, интерфейсы, соглашения; ссылайся на файл контрактов, а не пересказывай его). Лучше несколько содержательных результатов, каждый из которых один участник может сделать и проверить, чем много мелких задач. Используй `depends_on` только для настоящих зависимостей: когда интерфейс зафиксирован в контракте, код, тесты к нему и документацию можно делать параллельно, а итоговая задача (отчёт, сводка, релиз) зависит только от задач, без которых её нельзя написать. Не назначай исполнителя, если задачу не должен сделать конкретный участник (свободных участников разбудят, чтобы они её взяли), а ревьюера указывай, только если проверить должен конкретный участник (иначе доска сама выберет независимого).
+8. Создание задач: сначала проверь `board`, чтобы не создать дубликат. Дай каждой задаче цель, которую может проверить ревьюер, и описание со всем, что нужно участнику без твоего контекста (входные данные, пути к файлам, интерфейсы, соглашения; ссылайся на файл контрактов, а не пересказывай его). Лучше несколько содержательных результатов, каждый из которых один участник может сделать и проверить, чем много мелких задач. Если результат слишком велик для одного участника, а его подробное деление до начала работы неясно, создай одну групповую задачу: crew — сколько участников могут работать над ней одновременно, включая её владельца; directions — её направления, по одному на элемент; подробности напишут те, кто их возьмёт. Используй `depends_on` только для настоящих зависимостей: когда интерфейс зафиксирован в контракте, код, тесты к нему и документацию можно делать параллельно, а итоговая задача (отчёт, сводка, релиз) зависит только от задач, без которых её нельзя написать. Не назначай исполнителя, если задачу не должен сделать конкретный участник (свободных участников разбудят, чтобы они её взяли), а ревьюера указывай, только если проверить должен конкретный участник (иначе доска сама выберет независимого).
 9. Завершение цели: когда все задачи завершены (ни одна не ждёт ревью), проверь результат по глобальной цели. Если чего-то не хватает, создай для этого задачи; иначе вызови `goal_complete` один раз, с итогом для пользователя (что сделано и где это найти). Когда пользователь просит команду закругляться (это будет сказано при пробуждении), не начинай ничего нового: заверши свои задачи с тем, что есть.
 10. Заканчивай каждый ход вызовом `wait`. Не опрашивай доску, сообщения или фоновые процессы в цикле. Тебя разбудят сообщения, назначения, запросы на ревью, посты в обсуждениях, разблокированные задачи, триггеры и завершение твоих фоновых процессов.
 
@@ -80,6 +80,22 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 - Вызывай несколько независимых инструментов в одном ответе (например, создавай сразу несколько задач). Не перечитывай то, что уже знаешь.
 
 Пиши всё (сообщения, задачи, файлы) на русском языке, если пользователь не попросил иначе."""
+
+# The owner sentence of a crew task (docs/SPEC.md §4.2 "The owner"): its head and tail around the part that differs
+# (take a direction, the owner's own direction, all directions taken); the crew_owner_* keys below
+_OWNER_HEAD = {"en": " You own crew task #{id}: ", "ru": " Ты владелец групповой задачи #{id}: "}
+_OWNER_TAIL = {
+    "en": "; the other members take the rest (up to {crew} members at once, you included) and write their cards. Keep "
+          "its directions consistent: add the ones missing (task_update directions), cancel the ones not needed, and "
+          "settle the interfaces between them in #{id}'s discussion. Each direction is handed in on its own; when all "
+          "of them are finished, the board tells you and gives you their results as a draft: then check that they fit "
+          "together, write #{id}'s result and complete it (task_complete).",
+    "ru": "; остальные направления берут другие участники (одновременно до {crew} участников, включая тебя) и пишут "
+          "их карточки. Следи, чтобы направления были согласованы: добавляй недостающие (task_update directions), "
+          "отменяй ненужные и договаривайся об интерфейсах между ними в обсуждении #{id}. Каждое направление сдаётся "
+          "отдельно; когда все они завершены, доска сообщит тебе об этом и даст их итоги черновиком: тогда проверь, "
+          "что они сходятся между собой, напиши итог #{id} и заверши её (task_complete).",
+}
 
 TEXTS: dict[str, dict[str, str]] = {
     "en": {
@@ -168,8 +184,12 @@ TEXTS: dict[str, dict[str, str]] = {
                               "verified, or return it with concrete fixes. Do it before your own work: the assignee "
                               "and the tasks that depend on it are waiting.",
         "n_review_approved": "Your task #{id} \"{title}\" was approved by {by}. {comment}",
-        "n_review_rejected": "Your task #{id} \"{title}\" was returned by {by}: {comment}\nFix it, then call "
-                             "`task_complete` again.",
+        # {ending}: review_rejected_plain, or review_rejected_crew for a crew task (the assignee's language)
+        "n_review_rejected": "Your task #{id} \"{title}\" was returned by {by}: {comment}\n{ending}",
+        "review_rejected_plain": "Fix it, then call `task_complete` again.",
+        "review_rejected_crew": "#{id} is a crew task: fix it yourself, or with new directions (task_update "
+                                "directions) and, once they are finished, update #{id}'s result; then call "
+                                "`task_complete` again.",
         "n_reviewer_left": "{reviewer}, the reviewer of your task #{id} \"{title}\", left the swarm, so the task is back "
                            "in progress. If it still needs a review, set another reviewer with `task_update`; then "
                            "call `task_complete` again.",
@@ -181,6 +201,109 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_review_reassigned": "You did not review task #{id} \"{title}\" in time, so its review went to {reviewer}; "
                                "you no longer need to review it.",
         "n_task_closed": "Task #{id} \"{title}\" (created by you) is now {status} (by {by}). Result: {result}",
+        # crew tasks and subtasks (docs/SPEC.md §4.2): notifications
+        # a parent got a finish state: {counts} joins count_* ("5 done, 1 cancelled"), {ending} is an ending_* key
+        # (the holder's or the creator's form; for a crew task with all directions finished, plus the draft)
+        "n_subtasks_done": "All {total} subtasks of #{id} \"{title}\" are finished ({counts}): {ending}",
+        "n_direction_failed": "#{id} \"{title}\", a direction of your crew task #{parent}, failed ({by}): reopen it to "
+                              "be done again (task_update #{id} status=todo), or cancel it if #{parent} does without "
+                              "it (status=cancelled).",
+        "n_direction_cancelled": "#{id} \"{title}\", a direction of your crew task #{parent}, was cancelled ({by}): if "
+                                 "#{parent} still needs that part, add it again (task_update directions).",
+        "n_subtask_cancelled": "{by} cancelled #{id} \"{title}\", your part of #{parent}: stop the work on it; if what "
+                               "you have done is still needed, say so in #{parent}'s discussion.",
+        "n_direction_taken": "{by} took #{id} \"{title}\", a direction of your crew task #{parent}.",   # quiet
+        "n_direction_freed": "#{id} \"{title}\", a direction of your crew task, is free again: {by} left the "
+                             "swarm.",   # quiet
+        # someone else made the recipient the holder of a crew task; {instructions}: a crew_owner_* key, or " " and
+        # an owner_prefix_* key with its ending; {directions}: crew_directions (+ crew_directions_more), or ""
+        "n_crew_owner": "#{id} \"{title}\" is yours now (crew {crew}).{instructions}{directions}",
+        "n_crew_changed": "{by} set the crew of #{id} \"{title}\" to {crew} (0 = an ordinary task).",   # quiet
+        "n_parent_closed": "#{id} \"{title}\", of which your #{sub} is a part, is {status}: finish #{sub} only if it "
+                           "is still needed on its own; otherwise cancel it (task_update status=cancelled).",
+        # the check of the whole of a crew task, in place of n_review_requested; {n}: its done directions
+        "n_crew_review_requested": "#{id} \"{title}\" (sent by {by}) is a crew task whose {n} directions are done: "
+                                   "check it as a whole — do the directions fit together, and does the result meet its "
+                                   "goal? Approve it, or return it with what does not fit (task_review).",
+        # a holder stalls with liveness marks only: {text} is their mark_* sentences, without the leading space
+        "n_marks_stalled": "{text}",
+        # crew tasks: fragments the board and the scheduler render into the texts above, in the recipient's language
+        # the draft of a crew task's result (Board._crew_draft); the board adds the line break before it
+        "crew_draft": "Draft for #{id}'s result: its directions in the order they were created, with the results of "
+                      "the done ones:\n{items}",
+        "crew_draft_cut": "(cut: task_get #{id} shows more of it)",
+        "crew_draft_more": "… more directions not shown: {k}; task_get #{id} lists them, and task_get on a direction "
+                           "shows its result.",
+        "crew_draft_no_result": "(no result)",
+        # the parts of {counts}, joined with ", "
+        "count_done": "{n} done",
+        "count_cancelled": "{n} cancelled",
+        "count_failed": "{n} failed",
+        # endings: after "...: " in n_subtasks_done and the marks; *_creator for a creator asked to take the parent;
+        # {failed}: the id of the first failed direction
+        "ending_plain": "assemble their results and complete it.",
+        "ending_plain_creator": "take #{id} (task_claim), assemble their results and complete it.",
+        "ending_crew_failed": "reopen the failed #{failed} to be done again (task_update #{failed} status=todo), "
+                              "cancel it if #{id} does without it (status=cancelled), or fail #{id}.",
+        "ending_crew_failed_creator": "reopen the failed #{failed} to be done again (task_update #{failed} "
+                                      "status=todo), cancel it if #{id} does without it (status=cancelled), or cancel "
+                                      "#{id}.",
+        "ending_crew_cancelled": "add new directions (task_update directions), do it yourself (then task_complete), "
+                                 "make it an ordinary task (crew 0), or cancel it.",
+        "ending_crew_cancelled_creator": "add new directions (task_update directions), take #{id} and do it yourself "
+                                         "(task_claim, then task_complete), make it an ordinary task (crew 0), or "
+                                         "cancel it.",
+        "ending_crew_finished": "check that they fit together, write #{id}'s result from theirs (what each one "
+                                "delivered and where, and what was left out) and complete it (task_complete).",
+        "ending_crew_finished_creator": "take #{id} (task_claim), check that they fit together, write #{id}'s result "
+                                        "from theirs (what each one delivered and where, and what was left out) and "
+                                        "complete it (task_complete).",
+        # the owner form of an ending: the prefix, then the holder's ending
+        "owner_prefix_plain": "All its subtasks are finished: ",
+        "owner_prefix_failed": "A direction failed: ",
+        "owner_prefix_cancelled": "All its directions were cancelled: ",
+        "owner_prefix_finished": "All its directions are finished: ",
+        # the owner sentence (n_crew_owner's {instructions}, and the results of the calls that make the actor the
+        # owner); {sub} [{status}]: the owner's own direction
+        "crew_owner_take": _OWNER_HEAD["en"] + "take one of its directions yourself (task_claim; with #{id} it counts "
+                                               "as one task in progress)" + _OWNER_TAIL["en"],
+        "crew_owner_own": _OWNER_HEAD["en"] + "your own direction is #{sub} [{status}]" + _OWNER_TAIL["en"],
+        "crew_owner_all_taken": _OWNER_HEAD["en"] + "all its directions are taken: if a part of #{id} is left that "
+                                                    "nobody does, add it as a direction (task_update directions) and "
+                                                    "it is yours; otherwise keep the directions consistent until they "
+                                                    "are finished, then complete #{id}" + _OWNER_TAIL["en"],
+        "crew_owner_none": " You own crew task #{id}. It has no directions yet: add them now (task_update directions; "
+                           "the first one is your own part), so the others can join; if #{id} needs no split after "
+                           "all, make it an ordinary task (crew 0), or do it yourself and complete it (task_complete).",
+        # its directions ({items}: '#15 [in_progress] "pkce" @Anna Smith; #17 [todo] "oidc"'), at most 20, then
+        # crew_directions_more
+        "crew_directions": " Its directions: {items}.",
+        "crew_directions_more": " More directions not listed: {k}; task_get #{id} lists them all.",
+        # the {owner} part of note_direction_card
+        "direction_owner_named": "owner {name}",
+        "direction_owner_none": "no owner yet",
+        "direction_owner_you": "you own #{id}",
+        # notes appended to the result of the actor's own call (each starts with a space)
+        "note_direction_card": " #{sub} is a direction of crew task #{id} ({owner}): first write its card with "
+                               "task_update — title, goal (what it delivers and how it is checked), description (the "
+                               "files it touches) — then do the work. In #{id}'s discussion post only what another "
+                               "direction depends on (interfaces, shared files).",
+        "note_reviewer_cleared": " You were the reviewer of #{id}; since you work on one of its directions now, you do "
+                                 "not check it as a whole: another member does, if a check applies.",
+        "note_own_part": " #{sub} \"{title}\" is your own part: write its card (task_update), and if you have done "
+                         "some of #{id} already, say in #{id}'s discussion what is done, so nobody redoes it.",
+        "note_own_part_blocked": " #{sub} \"{title}\" is your own part; #{id} is blocked by {blockers}: write its card "
+                                 "now (task_update), and claim #{sub} when #{id} is no longer blocked (task_claim).",
+        "note_still_open": " Your #{sub} is still open: finish it only if it is still needed on its own; otherwise "
+                           "cancel it (task_update status=cancelled).",
+        "note_crew_say_why": " Its creator was told: say in #{id}'s discussion why you changed its crew (a post there "
+                             "wakes the creator).",
+        # liveness marks (n_stalled's {marks}, n_marks_stalled's {text}) and the in-activation nudge; each starts
+        # with a space; {ending}: an owner_prefix_* key with its ending; {directions}: '#17 "oidc", #18 "jose"'
+        "mark_subtasks_done": " #{id} \"{title}\": {ending}",
+        "mark_free_directions": " #{id} is a crew task with free directions nobody has taken: {directions}. Take one "
+                                "yourself (task_claim), or cancel the ones it does without (task_update "
+                                "status=cancelled).",
         "n_discussion": "{by} posted in the discussion of task #{id} \"{title}\" (post #{post_id}{reply}): {text}",
         "n_mention": "{by} mentioned you in the discussion of task #{id} \"{title}\" (post #{post_id}): {text}\n"
                      "If it needs your answer, reply with `task_comment` (reply_to={post_id}).",
@@ -231,7 +354,7 @@ TEXTS: dict[str, dict[str, str]] = {
                         "repeating yourself without progress, change your approach or ask for help.",
         "n_stalled": "Your tasks {tasks} are in progress, but you stopped working on them. Continue now. If you "
                      "are blocked, set the task to `waiting` and say why in its discussion; if you cannot do it, "
-                     "set it back to `todo` (or `failed`) with a comment.",
+                     "set it back to `todo` (or `failed`) with a comment.{marks}",   # {marks}: mark_* sentences, or ""
         "n_planning_hint": "You have held planning task #{id} for {elapsed} (steps: {steps}) and have created no task "
                            "yet, while the other members wait for work. Create the independent tasks now with "
                            "`task_create`: the research, experiments and environment checks you would still do "
@@ -283,6 +406,7 @@ TEXTS: dict[str, dict[str, str]] = {
                          "longer need it, unlock it now (`lock_file` with unlock=true). No reply is needed: they are "
                          "woken when it is free.",
         "lock_waiter_task": "{name} (task {tasks})",   # one waiter of n_lock_wanted with its tasks in progress
+        "lock_waiter_direction": "#{id} {title} (direction of #{parent})",   # a direction among those tasks
         # background jobs (jobs.py): parts of the notices, built in the owner's language
         "job_exit": "exit code {code}",
         "job_gone": "all its processes exited",
@@ -513,8 +637,11 @@ TEXTS: dict[str, dict[str, str]] = {
                               "иначе верни с конкретными исправлениями. Сделай это раньше своей работы: её ждут "
                               "исполнитель и зависящие от неё задачи.",
         "n_review_approved": "{by} принял(а) твою задачу #{id} «{title}». {comment}",
-        "n_review_rejected": "{by} вернул(а) твою задачу #{id} «{title}» на доработку: {comment}\nИсправь и снова "
-                             "вызови `task_complete`.",
+        "n_review_rejected": "{by} вернул(а) твою задачу #{id} «{title}» на доработку: {comment}\n{ending}",
+        "review_rejected_plain": "Исправь и снова вызови `task_complete`.",
+        "review_rejected_crew": "#{id} — групповая задача: исправь её сам(а) или новыми направлениями (task_update "
+                                "directions) и, когда они завершатся, обнови результат #{id}; затем снова вызови "
+                                "`task_complete`.",
         "n_reviewer_left": "{reviewer}, ревьюер твоей задачи #{id} «{title}», покинул(а) рой, поэтому задача снова в "
                            "работе. Если проверка всё ещё нужна, назначь другого ревьюера через `task_update`, затем "
                            "снова вызови `task_complete`.",
@@ -526,6 +653,98 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_review_reassigned": "Ты не проверил(а) задачу #{id} «{title}» вовремя, поэтому её ревью передано: "
                                "{reviewer}. Проверять её больше не нужно.",
         "n_task_closed": "Задача #{id} «{title}» (ты её создал) теперь в статусе {status} ({by}). Итог: {result}",
+        "n_subtasks_done": "Все подзадачи #{id} «{title}» завершены (всего: {total}; {counts}): {ending}",
+        "n_direction_failed": "#{id} «{title}», направление твоей групповой задачи #{parent}, провалено ({by}): верни "
+                              "его в работу, чтобы его сделали заново (task_update #{id} status=todo), или отмени его, "
+                              "если #{parent} обойдётся без него (status=cancelled).",
+        "n_direction_cancelled": "#{id} «{title}», направление твоей групповой задачи #{parent}, отменено ({by}): если "
+                                 "эта часть ещё нужна #{parent}, добавь её снова (task_update directions).",
+        "n_subtask_cancelled": "{by} отменил(а) #{id} «{title}», твою часть #{parent}: прекрати работу над ней; если "
+                               "сделанное тобой ещё нужно, скажи об этом в обсуждении #{parent}.",
+        "n_direction_taken": "{by} взял(а) #{id} «{title}», направление твоей групповой задачи #{parent}.",
+        "n_direction_freed": "#{id} «{title}», направление твоей групповой задачи, снова свободно: {by} покинул(а) "
+                             "рой.",
+        "n_crew_owner": "Задача #{id} «{title}» теперь твоя (групповая задача: одновременно до {crew} "
+                        "участников).{instructions}{directions}",
+        "n_crew_changed": "{by} задал(а) для #{id} «{title}» crew = {crew} (сколько участников работают над ней "
+                          "одновременно; 0 — обычная задача).",
+        "n_parent_closed": "#{id} «{title}», частью которой является твоя #{sub}, теперь в статусе {status}: "
+                           "доделывай #{sub}, только если она ещё нужна сама по себе; иначе отмени её (task_update "
+                           "status=cancelled).",
+        "n_crew_review_requested": "#{id} «{title}» (отправил(а) {by}) — групповая задача, у которой выполнено "
+                                   "направлений: {n}. Проверь её целиком: сходятся ли направления между собой и "
+                                   "достигает ли результат её цели? Прими её или верни с тем, что не сходится "
+                                   "(task_review).",
+        "n_marks_stalled": "{text}",
+        "crew_draft": "Черновик итога #{id}: её направления в порядке создания, с итогами выполненных:\n{items}",
+        "crew_draft_cut": "(обрезано: больше покажет task_get #{id})",
+        "crew_draft_more": "… ещё не показано направлений: {k}; task_get #{id} перечисляет их, а task_get направления "
+                           "показывает его итог.",
+        "crew_draft_no_result": "(итога нет)",
+        "count_done": "выполнено: {n}",
+        "count_cancelled": "отменено: {n}",
+        "count_failed": "провалено: {n}",
+        "ending_plain": "собери их итоги и заверши её.",
+        "ending_plain_creator": "возьми #{id} (task_claim), собери их итоги и заверши её.",
+        "ending_crew_failed": "верни проваленное направление #{failed} в работу, чтобы его сделали заново (task_update "
+                              "#{failed} status=todo), отмени его, если #{id} обойдётся без него (status=cancelled), "
+                              "или переведи #{id} в failed.",
+        "ending_crew_failed_creator": "верни проваленное направление #{failed} в работу, чтобы его сделали заново "
+                                      "(task_update #{failed} status=todo), отмени его, если #{id} обойдётся без него "
+                                      "(status=cancelled), или отмени #{id}.",
+        "ending_crew_cancelled": "добавь новые направления (task_update directions), сделай её сам (затем "
+                                 "task_complete), преврати её в обычную задачу (crew 0) или отмени её.",
+        "ending_crew_cancelled_creator": "добавь новые направления (task_update directions), возьми #{id} и сделай её "
+                                         "сам (task_claim, затем task_complete), преврати её в обычную задачу (crew 0) "
+                                         "или отмени её.",
+        "ending_crew_finished": "проверь, что они сходятся между собой, напиши итог #{id} по их итогам (что дало "
+                                "каждое направление и где это лежит, и что осталось за рамками) и заверши её "
+                                "(task_complete).",
+        "ending_crew_finished_creator": "возьми #{id} (task_claim), проверь, что они сходятся между собой, напиши итог "
+                                        "#{id} по их итогам (что дало каждое направление и где это лежит, и что "
+                                        "осталось за рамками) и заверши её (task_complete).",
+        "owner_prefix_plain": "Все её подзадачи завершены: ",
+        "owner_prefix_failed": "Одно из её направлений провалено: ",
+        "owner_prefix_cancelled": "Все её направления отменены: ",
+        "owner_prefix_finished": "Все её направления завершены: ",
+        "crew_owner_take": _OWNER_HEAD["ru"] + "возьми одно из её направлений сам (task_claim; вместе с #{id} это "
+                                               "считается одной задачей в работе)" + _OWNER_TAIL["ru"],
+        "crew_owner_own": _OWNER_HEAD["ru"] + "твоё собственное направление — #{sub} [{status}]" + _OWNER_TAIL["ru"],
+        "crew_owner_all_taken": _OWNER_HEAD["ru"] + "все её направления уже взяты: если от #{id} осталась часть, "
+                                                    "которую никто не делает, добавь её как направление (task_update "
+                                                    "directions), и оно будет твоим; иначе следи за согласованностью "
+                                                    "направлений, пока они не завершатся, затем заверши "
+                                                    "#{id}" + _OWNER_TAIL["ru"],
+        "crew_owner_none": " Ты владелец групповой задачи #{id}. Направлений у неё пока нет: добавь их сейчас "
+                           "(task_update directions; первое — твоя часть), чтобы могли подключиться остальные; если "
+                           "делить #{id} всё же не нужно, преврати её в обычную задачу (crew 0) или сделай её сам и "
+                           "заверши (task_complete).",
+        "crew_directions": " Её направления: {items}.",
+        "crew_directions_more": " Ещё не перечислено направлений: {k}; task_get #{id} перечисляет все.",
+        "direction_owner_named": "владелец — {name}",
+        "direction_owner_none": "владельца пока нет",
+        "direction_owner_you": "ты владелец #{id}",
+        "note_direction_card": " #{sub} — направление групповой задачи #{id} ({owner}): сначала напиши его карточку "
+                               "через task_update — title, goal (что оно даёт и как это проверить), description (какие "
+                               "файлы оно затрагивает), — затем делай работу. В обсуждение #{id} пиши только то, от "
+                               "чего зависят другие направления (интерфейсы, общие файлы).",
+        "note_reviewer_cleared": " Ты был ревьюером #{id}; раз ты теперь работаешь над одним из её направлений, "
+                                 "проверять её целиком будешь не ты: это сделает другой участник, если проверка "
+                                 "нужна.",
+        "note_own_part": " #{sub} «{title}» — твоё собственное направление: напиши его карточку (task_update), а если "
+                         "часть #{id} ты уже сделал, скажи в обсуждении #{id}, что сделано, чтобы никто это не "
+                         "переделывал.",
+        "note_own_part_blocked": " #{sub} «{title}» — твоё собственное направление; #{id} ждёт задач {blockers}: "
+                                 "напиши его карточку сейчас (task_update), а когда #{id} перестанет быть "
+                                 "заблокированной, возьми #{sub} (task_claim).",
+        "note_still_open": " Твоя #{sub} ещё открыта: доделывай её, только если она ещё нужна сама по себе; иначе "
+                           "отмени её (task_update status=cancelled).",
+        "note_crew_say_why": " Её автору сообщили: объясни в обсуждении #{id}, почему ты изменил crew (пост там "
+                             "разбудит автора).",
+        "mark_subtasks_done": " #{id} «{title}»: {ending}",
+        "mark_free_directions": " #{id} — групповая задача со свободными направлениями, которые никто не взял: "
+                                "{directions}. Возьми одно сам (task_claim) или отмени те, без которых она обойдётся "
+                                "(task_update status=cancelled).",
         "n_discussion": "{by} написал(а) в обсуждении задачи #{id} «{title}» (пост #{post_id}{reply}): {text}",
         "n_mention": "{by} упомянул(а) тебя в обсуждении задачи #{id} «{title}» (пост #{post_id}): {text}\n"
                      "Если нужен твой ответ, ответь через `task_comment` (reply_to={post_id}).",
@@ -567,7 +786,7 @@ TEXTS: dict[str, dict[str, str]] = {
                         "ты повторялся без продвижения, смени подход или попроси помощи.",
         "n_stalled": "Твои задачи {tasks} в работе, но ты перестал ими заниматься. Продолжай сейчас. Если ты "
                      "заблокирован, переведи задачу в `waiting` и объясни причину в её обсуждении; если не можешь её "
-                     "выполнить, верни её в `todo` (или переведи в `failed`) с комментарием.",
+                     "выполнить, верни её в `todo` (или переведи в `failed`) с комментарием.{marks}",
         "n_planning_hint": "Ты держишь задачу планирования #{id} уже {elapsed} (шагов: {steps}) и ещё не создал ни "
                            "одной задачи, а остальные участники ждут работы. Создай независимые задачи прямо сейчас "
                            "через `task_create`: исследования, эксперименты и проверки окружения, которые ты ещё "
@@ -611,6 +830,7 @@ TEXTS: dict[str, dict[str, str]] = {
                          "не нужен, сними блокировку сейчас (`lock_file` с unlock=true). Отвечать не нужно: их "
                          "разбудят, когда файл освободится.",
         "lock_waiter_task": "{name} (задача {tasks})",
+        "lock_waiter_direction": "#{id} {title} (направление #{parent})",
         "job_exit": "код возврата {code}",
         "job_gone": "все его процессы завершились",
         "job_no_output": "(вывода нет)",
@@ -784,7 +1004,10 @@ PLANNING_TASK = {
            "task a goal (why it exists and what counts as success, so that a reviewer can check it) and a "
            "description with everything a member without your context needs: inputs, the files to create or "
            "change, the sections of CONTRACTS.md it implements or relies on (refer to them, don't copy them), "
-           "how to check the result. Prefer a few meaningful tasks to many tiny ones.\n"
+           "how to check the result. Prefer a few meaningful tasks to many tiny ones. A deliverable too big for one "
+           "member whose detailed split is unclear before the work starts becomes one crew task: crew = how many "
+           "members may work on it at once, its owner included; directions = its areas, one per item; the members "
+           "who take them write the details.\n"
            "5. No false dependencies. Use depends_on only when a task cannot start without another task's "
            "result. Once an interface is fixed in the contracts, its implementation, its tests and its "
            "documentation are separate tasks that run in parallel against the contract. A final task (report, "
@@ -800,7 +1023,9 @@ PLANNING_TASK = {
            "(`agents` lists it).\n"
            "9. Finish quickly. Complete this task as soon as CONTRACTS.md and the tasks are in place; in the "
            "result, name the contracts file and list the tasks. Then claim one task that suits you, only one: "
-           "don't take a chain of tasks while other members are waiting for work."),
+           "don't take a chain of tasks while other members are waiting for work. A crew task you own and your own "
+           "direction of it count as one task here, and the crew task alone as none while you work on none of its "
+           "directions."),
     "ru": ("Спланировать работу: сначала независимые задачи, затем контракты, затем остальное",
            "В CONTRACTS.md в workspace зафиксировано всё, о чём задачи должны договориться (не нужно, если вся "
            "цель — одна задача), а на доске есть полный план, достигающий глобальной цели: задачи с целями, "
@@ -831,7 +1056,10 @@ PLANNING_TASK = {
            "задаче цель (зачем она нужна и что считается успехом — так, чтобы ревьюер мог это проверить) и "
            "описание со всем, что нужно участнику без твоего контекста: входные данные, какие файлы создать или "
            "изменить, какие разделы CONTRACTS.md задача реализует или использует (ссылайся на них, а не "
-           "копируй), как проверить результат. Лучше несколько содержательных задач, чем много мелких.\n"
+           "копируй), как проверить результат. Лучше несколько содержательных задач, чем много мелких. Результат, "
+           "слишком большой для одного участника, подробное деление которого до начала работы неясно, становится "
+           "одной групповой задачей: crew — сколько участников могут работать над ней одновременно, включая её "
+           "владельца; directions — её направления, по одному на элемент; подробности напишут те, кто их возьмёт.\n"
            "5. Никаких ложных зависимостей. Используй depends_on, только если задачу нельзя начать без "
            "результата другой. Когда интерфейс зафиксирован в контрактах, его реализация, тесты к нему и "
            "документация — отдельные задачи, которые идут параллельно по контракту. Итоговая задача (отчёт, "
@@ -848,7 +1076,9 @@ PLANNING_TASK = {
            "роль из каталога ролей (его показывает `agents`).\n"
            "9. Заверши быстро. Заверши эту задачу, как только CONTRACTS.md и задачи готовы; в итоге назови файл "
            "контрактов и перечисли задачи. Затем возьми одну подходящую тебе задачу — только одну: не забирай "
-           "себе цепочку задач, пока другие участники ждут работы."),
+           "себе цепочку задач, пока другие участники ждут работы. Групповая задача, которой ты владеешь, и твоё "
+           "собственное направление в ней считаются здесь одной задачей, а одна групповая задача — ни одной, пока ты "
+           "не работаешь ни над одним из её направлений."),
 }
 
 # The planning card of a session that clarifies the goal first ([swarm] clarify, docs/SPEC.md §3 "Clarify mode"):

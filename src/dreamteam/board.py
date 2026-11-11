@@ -522,11 +522,16 @@ class Board:
             return {"status": Status.IN_PROGRESS if old.assignee else Status.TODO}
 
         old, task, _ = self._mutate(actor, task_id, plan)
-        key = "n_review_approved" if approved else "n_review_rejected"
         # every verdict wakes the assignee: task_complete told it that it will be told the verdict, so an
         # executor that ended its turn with `wait` is waiting for exactly this (a rejection must be fixed now)
-        self._notify_member(task.assignee, actor, key, id=task.id, title=task.title, by=actor,
-                            comment=_clip(comment))
+        if approved:
+            self._notify_member(task.assignee, actor, "n_review_approved", id=task.id, title=task.title, by=actor,
+                                comment=_clip(comment))
+        else:
+            # what a returned task asks of its assignee, in the assignee's language
+            ending = prompts.t(self.swarm.language_of(task.assignee), "review_rejected_plain")
+            self._notify_member(task.assignee, actor, "n_review_rejected", id=task.id, title=task.title, by=actor,
+                                comment=_clip(comment), ending=ending)
         self._on_status_change(actor, old.status, task)
         if comment:
             # the assignee already got the comment inside the review notification

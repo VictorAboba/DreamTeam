@@ -814,8 +814,9 @@ def test_review_reject_posts_comment(swarm, board):
     clear(swarm)
     upd = board.review(CARL, t.id, False, "  Tests are missing  ")
     assert upd.status == Status.IN_PROGRESS
+    plain = prompts.t("en", "review_rejected_plain")   # an ordinary task: fix it, then complete it again
     assert swarm.notifications_for(BOB) == [("n_review_rejected", {"id": t.id, "title": "t", "by": CARL,
-                                                                     "comment": "Tests are missing"})]
+                                                                     "comment": "Tests are missing", "ending": plain})]
     assert quiet_flags(swarm, BOB)[-1] == ("n_review_rejected", False)   # a rejection wakes the assignee
     posts = board.discussion(t.id)
     assert [(p["author"], p["text"]) for p in posts] == [(CARL, "Tests are missing")]
@@ -823,6 +824,24 @@ def test_review_reject_posts_comment(swarm, board):
     assert keys_for(swarm, ANNA) == ["n_discussion"]
     types = [e["type"] for e in swarm.bus.recent(limit=50) if e["type"].startswith("task.")]
     assert types[-2:] == ["task.updated", "task.comment"]
+
+
+def test_review_reject_ending_is_in_the_assignees_language(swarm, board):
+    """The `ending` of n_review_rejected is rendered by the board in the assignee's language, like the text."""
+    swarm.db.execute("UPDATE agents SET language = 'ru' WHERE name = ?", (BOB,))
+    t = _in_review(board)
+    clear(swarm)
+    board.review(CARL, t.id, False, "нет тестов")
+    (key, kw), = swarm.notifications_for(BOB)
+    assert key == "n_review_rejected" and kw["ending"] == "Исправь и снова вызови `task_complete`."
+    text = swarm.db.one("SELECT text FROM notifications WHERE recipient = ? ORDER BY id DESC", (BOB,))["text"]
+    assert text.endswith("на доработку: нет тестов\nИсправь и снова вызови `task_complete`.")
+    # an approval carries no ending
+    u = _in_review(board)
+    clear(swarm)
+    board.review(CARL, u.id, True)
+    assert swarm.notifications_for(BOB) == [("n_review_approved", {"id": u.id, "title": "t", "by": CARL,
+                                                                     "comment": ""})]
     assert board.complete(BOB, t.id, "fixed").status == Status.REVIEW
 
 
@@ -1068,6 +1087,7 @@ def test_review_comment_truncated_in_notification(swarm, board):
     board.review(CARL, t.id, False, "z" * 5000)
     (key, kw), = swarm.notifications_for(BOB)
     assert key == "n_review_rejected" and len(kw["comment"]) == NOTIFY_TEXT_LIMIT and kw["comment"].endswith("…")
+    assert kw["ending"] == prompts.t("en", "review_rejected_plain")
     assert board.discussion(t.id)[0]["text"] == "z" * 5000
 
 

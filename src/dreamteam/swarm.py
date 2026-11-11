@@ -1328,7 +1328,7 @@ class Swarm:
             if not still or self._stall_woken.get(name) == stalled:
                 continue
             self._stall_woken[name] = stalled
-            self.notify(name, "n_stalled", tasks=", ".join(f"#{t.id}" for t in still))
+            self.notify(name, "n_stalled", tasks=", ".join(f"#{t.id}" for t in still), marks="")
 
     def _wake_idle_holders(self) -> None:
         """An agent that sleeps (idle, not busy, nothing pending) while it holds in-progress tasks, e.g. after
@@ -1356,7 +1356,7 @@ class Swarm:
             if now - since < wait or self._stall_woken.get(name) == held:
                 continue
             self._stall_woken[name] = held
-            self.notify(name, "n_stalled", tasks=", ".join(f"#{i}" for i in sorted(held)))
+            self.notify(name, "n_stalled", tasks=", ".join(f"#{i}" for i in sorted(held)), marks="")
         self._idle_holding = holding
 
     def hint_planner(self, name: str | None = None) -> None:

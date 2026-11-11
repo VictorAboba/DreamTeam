@@ -426,6 +426,202 @@ def test_skill_deps_texts():
         assert not any("`{" in texts[k] for k in deps_keys), lang
 
 
+# ------------------------------------------------------------------------------- crew tasks
+# every text of crew tasks and subtasks (docs/SPEC.md §4.2) with its placeholders: the board, the scheduler and the
+# workspace render them by these names, in both languages
+CREW_KEYS = {
+    "n_subtasks_done": {"id", "title", "total", "counts", "ending"},
+    "n_direction_failed": {"by", "id", "title", "parent"},
+    "n_direction_cancelled": {"by", "id", "title", "parent"},
+    "n_subtask_cancelled": {"by", "id", "title", "parent"},
+    "n_direction_taken": {"by", "id", "title", "parent"},
+    "n_direction_freed": {"id", "title", "by"},
+    "n_crew_owner": {"id", "title", "crew", "directions", "instructions"},
+    "n_crew_changed": {"by", "id", "title", "crew"},
+    "n_parent_closed": {"id", "title", "status", "sub"},
+    "n_crew_review_requested": {"by", "id", "title", "n"},
+    "n_marks_stalled": {"text"},
+    "crew_draft": {"id", "items"}, "crew_draft_cut": {"id"}, "crew_draft_more": {"k", "id"},
+    "crew_draft_no_result": set(),
+    "count_done": {"n"}, "count_cancelled": {"n"}, "count_failed": {"n"},
+    "ending_plain": set(), "ending_plain_creator": {"id"},
+    "ending_crew_failed": {"failed", "id"}, "ending_crew_failed_creator": {"failed", "id"},
+    "ending_crew_cancelled": set(), "ending_crew_cancelled_creator": {"id"},
+    "ending_crew_finished": {"id"}, "ending_crew_finished_creator": {"id"},
+    "owner_prefix_plain": set(), "owner_prefix_failed": set(), "owner_prefix_cancelled": set(),
+    "owner_prefix_finished": set(),
+    "review_rejected_plain": set(), "review_rejected_crew": {"id"},
+    "crew_owner_take": {"id", "crew"}, "crew_owner_own": {"id", "crew", "sub", "status"},
+    "crew_owner_all_taken": {"id", "crew"}, "crew_owner_none": {"id"},
+    "crew_directions": {"items"}, "crew_directions_more": {"k", "id"},
+    "direction_owner_named": {"name"}, "direction_owner_none": set(), "direction_owner_you": {"id"},
+    "note_direction_card": {"sub", "id", "owner"}, "note_reviewer_cleared": {"id"},
+    "note_own_part": {"sub", "title", "id"}, "note_own_part_blocked": {"sub", "title", "id", "blockers"},
+    "note_still_open": {"sub"}, "note_crew_say_why": {"id"},
+    "mark_subtasks_done": {"id", "title", "ending"}, "mark_free_directions": {"id", "directions"},
+    "lock_waiter_direction": {"id", "title", "parent"},
+}
+# changed keys of existing texts
+CHANGED_KEYS = {"n_review_rejected": {"by", "id", "title", "comment", "ending"}, "n_stalled": {"tasks", "marks"}}
+
+
+def test_crew_texts_have_their_placeholders():
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        for key, fields in {**CREW_KEYS, **CHANGED_KEYS}.items():
+            assert placeholders(texts[key]) == fields, (lang, key)
+        # fragments appended as they are start with a space; the ones after "...: " do not
+        for key in CREW_KEYS:
+            spaced = key.startswith(("crew_owner_", "crew_directions", "note_", "mark_"))
+            assert texts[key].startswith(" ") == spaced, (lang, key)
+        for key in ("n_stalled", "n_review_rejected"):
+            assert texts[key].endswith(("{marks}", "\n{ending}")), (lang, key)
+        assert texts["n_marks_stalled"] == "{text}"
+        for key in ("owner_prefix_plain", "owner_prefix_failed", "owner_prefix_cancelled", "owner_prefix_finished"):
+            assert texts[key].endswith(": "), (lang, key)
+    # the old n_stalled text is kept, with the marks after it; without marks it reads as before
+    assert prompts.t("en", "n_stalled", tasks="#3", marks="").endswith("with a comment.")
+
+
+def test_crew_texts_say_crew_task_and_direction_in_russian():
+    """Russian texts call a crew task «групповая задача» and a direction «направление», never «команда» (a team of
+    roles is a «команда»); the tools they name in parentheses are real tools and parameters."""
+    ru = prompts.TEXTS["ru"]
+    for key in CREW_KEYS:
+        assert "команд" not in ru[key].lower(), key
+    for key in ("n_direction_failed", "n_direction_cancelled", "n_direction_taken", "n_direction_freed",
+                "n_crew_review_requested", "crew_owner_take", "mark_free_directions", "note_direction_card"):
+        assert "групповой задачи" in ru[key] or "групповая задача" in ru[key], key
+        assert "направлен" in ru[key], key
+    for text in (prompts.SYSTEM_RU, prompts.planning_task("ru")[2]):
+        lines = {int(m.group(1)): m.group(2) for m in re.finditer(r"^(\d+)\. (.*)$", text, re.M)}
+        for number in (3, 6, 8) if text is prompts.SYSTEM_RU else (4, 9):
+            assert "команд" not in lines[number].lower(), number
+            assert "групповую задачу" in lines[number] or "групповой задач" in lines[number] \
+                or "групповая задача" in lines[number].lower() or number == 6, number
+    known = set(REGISTRY) | {p for spec in REGISTRY.values() for p in spec.parameters.get("properties", {})}
+    for lang in LANGS:
+        for key in [*CREW_KEYS, *CHANGED_KEYS]:
+            words = set(re.findall(r"\b[a-z]+(?:_[a-z]+)+\b", prompts.TEXTS[lang][key]))
+            assert words <= known, (lang, key, words - known)
+
+
+def test_crew_texts_render_the_spec_wording():
+    """The English texts docs/SPEC.md §4.2 fixes word for word, rendered."""
+    t = prompts.t
+    assert t("en", "n_subtasks_done", id=7, title="auth", total=6,
+             counts=", ".join([t("en", "count_done", n=5), t("en", "count_cancelled", n=1)]),
+             ending=t("en", "ending_plain")) == \
+        'All 6 subtasks of #7 "auth" are finished (5 done, 1 cancelled): assemble their results and complete it.'
+    assert t("en", "n_crew_review_requested", by="Anna Smith", id=7, title="auth", n=3) == (
+        '#7 "auth" (sent by Anna Smith) is a crew task whose 3 directions are done: check it as a whole — do the '
+        "directions fit together, and does the result meet its goal? Approve it, or return it with what does not fit "
+        "(task_review).")
+    assert t("en", "crew_owner_take", id=7, crew=3) == (
+        " You own crew task #7: take one of its directions yourself (task_claim; with #7 it counts as one task in "
+        "progress); the other members take the rest (up to 3 members at once, you included) and write their cards. "
+        "Keep its directions consistent: add the ones missing (task_update directions), cancel the ones not needed, "
+        "and settle the interfaces between them in #7's discussion. Each direction is handed in on its own; when all "
+        "of them are finished, the board tells you and gives you their results as a draft: then check that they fit "
+        "together, write #7's result and complete it (task_complete).")
+    take, own = t("en", "crew_owner_take", id=7, crew=3), t("en", "crew_owner_own", id=7, crew=3, sub=15,
+                                                            status="in_progress")
+    assert own == take.replace("take one of its directions yourself (task_claim; with #7 it counts as one task in "
+                               "progress)", "your own direction is #15 [in_progress]")
+    assert t("en", "crew_owner_all_taken", id=7, crew=3).startswith(
+        " You own crew task #7: all its directions are taken: if a part of #7 is left that nobody does, add it as a "
+        "direction (task_update directions) and it is yours; otherwise keep the directions consistent until they are "
+        "finished, then complete #7; the other members")
+    assert t("en", "crew_owner_none", id=7).endswith(
+        " It has no directions yet: add them now (task_update directions; the first one is your own part), so the "
+        "others can join; if #7 needs no split after all, make it an ordinary task (crew 0), or do it yourself and "
+        "complete it (task_complete).")
+    owner_form = t("en", "owner_prefix_plain") + t("en", "ending_plain")
+    assert t("en", "mark_subtasks_done", id=7, title="auth", ending=owner_form) == \
+        ' #7 "auth": All its subtasks are finished: assemble their results and complete it.'
+    assert t("en", "mark_free_directions", id=7, directions='#17 "oidc"') == (
+        ' #7 is a crew task with free directions nobody has taken: #17 "oidc". Take one yourself (task_claim), or '
+        "cancel the ones it does without (task_update status=cancelled).")
+    assert t("en", "crew_draft", id=7, items="- #15") == ("Draft for #7's result: its directions in the order they "
+                                                          "were created, with the results of the done ones:\n- #15")
+    assert t("en", "crew_draft_more", k=2, id=7) == \
+        "… more directions not shown: 2; task_get #7 lists them, and task_get on a direction shows its result."
+    assert t("ru", "crew_draft_more", k=2, id=7).startswith("… ещё не показано направлений: 2; ")
+    assert t("en", "review_rejected_crew", id=7) == (
+        "#7 is a crew task: fix it yourself, or with new directions (task_update directions) and, once they are "
+        "finished, update #7's result; then call `task_complete` again.")
+    assert t("ru", "review_rejected_crew", id=7) == (
+        "#7 — групповая задача: исправь её сам(а) или новыми направлениями (task_update directions) и, когда они "
+        "завершатся, обнови результат #7; затем снова вызови `task_complete`.")
+    assert t("en", "review_rejected_plain") == "Fix it, then call `task_complete` again."
+    assert t("ru", "review_rejected_plain") == "Исправь и снова вызови `task_complete`."
+    assert t("en", "ending_crew_failed", failed=16, id=7) == (
+        "reopen the failed #16 to be done again (task_update #16 status=todo), cancel it if #7 does without it "
+        "(status=cancelled), or fail #7.")
+    assert t("en", "ending_crew_failed_creator", failed=16, id=7).endswith(", or cancel #7.")
+    assert t("en", "ending_crew_finished_creator", id=7) == \
+        "take #7 (task_claim), " + t("en", "ending_crew_finished", id=7)
+    assert t("en", "lock_waiter_direction", id=15, title="pkce", parent=7) == "#15 pkce (direction of #7)"
+    assert t("en", "n_direction_freed", id=15, title="pkce", by="Anna Smith") == \
+        '#15 "pkce", a direction of your crew task, is free again: Anna Smith left the swarm.'
+
+
+def test_russian_subtasks_done_needs_no_plural_forms():
+    """`n_subtasks_done` and its counts put the number after a colon in Russian, so one subtask and six read right."""
+    t = prompts.t
+    one = t("ru", "n_subtasks_done", id=7, title="парсер", total=1, counts=t("ru", "count_done", n=1),
+            ending=t("ru", "ending_plain"))
+    assert one == "Все подзадачи #7 «парсер» завершены (всего: 1; выполнено: 1): собери их итоги и заверши её."
+    six = t("ru", "n_subtasks_done", id=7, title="парсер", total=6,
+            counts=", ".join([t("ru", "count_done", n=5), t("ru", "count_cancelled", n=1)]),
+            ending=t("ru", "ending_crew_finished", id=7))
+    assert six.startswith("Все подзадачи #7 «парсер» завершены (всего: 6; выполнено: 5, отменено: 1): проверь")
+    for key in ("count_done", "count_cancelled", "count_failed", "crew_draft_more", "crew_directions_more",
+                "n_crew_review_requested"):
+        text = prompts.TEXTS["ru"][key]
+        number = "{n}" if "{n}" in text else "{k}"
+        assert f": {number}" in text, key
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_system_prompt_teaches_crew_tasks(lang):
+    """Rules 3, 6 and 8 of the system prompt (docs/SPEC.md §4.1 "Several reviews at once", §4.2 "System prompt");
+    the planning card says the same in step 4 and counts a crew task with its own direction as one task in step 9."""
+    lines = {int(m.group(1)): m.group(2) for m in re.finditer(r"^(\d+)\. (.*)$", SYSTEMS[lang], re.M)}
+    snippets = {
+        "en": {3: ('A crew task ("crew 2/3" on the board) is split into directions', "you own it",
+                   "count as one task in progress", "(task_update crew, directions: the first direction is your own "
+                   "part); crew = 0 makes it an ordinary task again", "A direction is never split into a crew"),
+               6: ("Reviews are not tasks in progress: when several wait for you, settle them together, one "
+                   "task_review each (independent ones in one response), each checked against its own goal.",),
+               8: ("When a deliverable is too big for one member and its detailed split is unclear before the work "
+                   "starts, create one crew task: crew = how many members may work on it at once, its owner "
+                   "included; directions = its areas, one per item; the members who take them write the details.",)},
+        "ru": {3: ("Групповая задача («crew 2/3» на доске) разделена на направления", "ты её владелец",
+                   "считаются одной задачей в работе", "(task_update crew, directions: первое направление — твоя "
+                   "часть); crew = 0 снова делает её обычной задачей", "Направление никогда не становится групповой "
+                   "задачей"),
+               6: ("Ревью — не задачи в работе", "по одному task_review на каждое"),
+               8: ("создай одну групповую задачу: crew — сколько участников могут работать над ней одновременно, "
+                   "включая её владельца; directions — её направления",)},
+    }[lang]
+    for number, parts in snippets.items():
+        for part in parts:
+            assert part in lines[number], (lang, number, part)
+    # the rules end where they ended before: the crew text is added, nothing is moved
+    assert lines[3].index("`task_claim`") < lines[3].index("crew 2/3")
+    steps = {int(m.group(1)): m.group(2)
+             for m in re.finditer(r"^(\d+)\. (.*)$", prompts.PLANNING_TASK[lang][2], re.M)}
+    assert sorted(steps) == list(range(1, 10))
+    step4, step9 = {"en": ("becomes one crew task: crew = how many members may work on it at once",
+                           "A crew task you own and your own direction of it count as one task here"),
+                    "ru": ("становится одной групповой задачей: crew — сколько участников могут работать над ней",
+                           "Групповая задача, которой ты владеешь, и твоё собственное направление в ней считаются "
+                           "здесь одной задачей")}[lang]
+    assert step4 in steps[4] and step9 in steps[9]
+    assert step4 in prompts.planning_task(lang, True)[2] and step9 in prompts.planning_task(lang, True)[2]
+
+
 # ------------------------------------------------------------------------- rendering & callers
 def test_system_prompt_renders_all_fields():
     for lang in LANGS:
@@ -538,7 +734,9 @@ def test_texts_steer_agents_to_the_right_tools(lang):
         "n_goal_reopened": {"goal_complete"},
         "n_review_requested": {"task_review", "task_get"},
         "n_review_reminder": {"task_review"},  # an idle reviewer is reminded with the tool that settles it
-        "n_review_rejected": {"task_complete"},
+        # a returned task: its ending (the plain one, or a crew task's) says to complete it again
+        "review_rejected_plain": {"task_complete"},
+        "review_rejected_crew": {"task_complete"},
         "n_assigned": {"task_claim"},
         "n_unblocked": {"task_claim"},
         "n_unblocked_removed": {"task_claim"},
@@ -546,6 +744,27 @@ def test_texts_steer_agents_to_the_right_tools(lang):
     }
     for key, tools in expected.items():
         assert tools <= code_idents(texts[key]), (key, code_idents(texts[key]))
+    assert texts["n_review_rejected"].endswith("\n{ending}")
+    # the crew texts name their tools in parentheses, without backticks (docs/SPEC.md §4.2): the tool that settles
+    # each one is there
+    plain = {
+        "ending_plain_creator": {"task_claim"},
+        "ending_crew_failed": {"task_update"}, "ending_crew_failed_creator": {"task_update"},
+        "ending_crew_cancelled": {"task_update", "task_complete"},
+        "ending_crew_cancelled_creator": {"task_update", "task_claim", "task_complete"},
+        "ending_crew_finished": {"task_complete"}, "ending_crew_finished_creator": {"task_claim", "task_complete"},
+        "n_crew_review_requested": {"task_review"},
+        "n_direction_failed": {"task_update"}, "n_direction_cancelled": {"task_update"},
+        "n_parent_closed": {"task_update"}, "note_still_open": {"task_update"},
+        "crew_owner_take": {"task_claim", "task_update", "task_complete"},
+        "crew_owner_own": {"task_update", "task_complete"}, "crew_owner_all_taken": {"task_update", "task_complete"},
+        "crew_owner_none": {"task_update", "task_complete"},
+        "note_direction_card": {"task_update"}, "note_own_part": {"task_update"},
+        "note_own_part_blocked": {"task_update", "task_claim"}, "mark_free_directions": {"task_claim", "task_update"},
+    }
+    for key, words in plain.items():
+        for word in words:
+            assert word in texts[key], (key, word)
     # a new member must not greet the hirer: a greeting is a message that wakes someone for nothing
     assert "send_message" not in code_idents(texts["n_hired"])
     # git hygiene: temporary files go to the member's own scratch folder, commits are made for the agents
