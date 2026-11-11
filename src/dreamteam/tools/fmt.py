@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 from typing import Any
 
-from ..models import PRIORITIES, Task
+from ..models import PRIORITIES, Status, Task
 
 
 def trim(text: str | None, limit: int) -> str:
@@ -67,13 +67,55 @@ def goal_line(goal: dict[str, Any] | None) -> str:
     return line
 
 
-def task_line(task: Task, with_goal: bool = True) -> str:
-    line = task.short()
+def task_line(task: Task, with_goal: bool = True, indent: str = "") -> str:
+    """The task's short line; `indent` goes before it (a subtask under its parent: "  ↳ "), and the goal line is
+    indented by as much more."""
+    line = indent + task.short()
     if task.comments:
         line += f" 💬{task.comments}"
     if with_goal and task.goal:
-        line += f"\n    goal: {trim(task.goal, 160)}"
+        line += f"\n{' ' * len(indent)}    goal: {trim(task.goal, 160)}"
     return line
+
+
+# the free directions named in a crew task's card (docs/SPEC.md §4.2 "Texts for agents"); its Subtasks: lines list all
+CREW_FREE_LISTED = 20
+
+
+def subtask_line(task: Task) -> str:
+    """One subtask in its parent's card: #15 [done] "title" @Anna Smith — <the result's first line>."""
+    line = f'#{task.id} [{task.status}] "{trim(task.title, 80)}"'
+    if task.assignee:
+        line += f" @{task.assignee}"
+    first = next((part for part in (task.result or "").splitlines() if part.strip()), "")
+    if first:
+        line += f" — {trim(first, 120)}"
+    return line
+
+
+def crew_line(task: Task, subtasks: list[Task]) -> str:
+    """The crew of a crew task: `Crew task: up to 3 members at once, the owner included; 2 working now (owner X #16;
+    Anna Smith #15). Free directions: #17 "oidc".` (`subtasks`: its directions; `task.crew_working` filled)."""
+    held: dict[str, list[int]] = {}
+    for sub in subtasks:
+        if sub.assignee and sub.status in (Status.IN_PROGRESS, Status.WAITING):
+            held.setdefault(sub.assignee, []).append(sub.id)
+
+    def who(name: str) -> str:
+        label = f"owner {name}" if name == task.assignee else name
+        ids = held.get(name, [])
+        return label + (" " + ", ".join(f"#{i}" for i in ids) if ids else "")
+
+    working = list(task.crew_working)
+    line = f"Crew task: up to {task.crew} members at once, the owner included; {len(working)} working now"
+    if working:
+        line += f" ({'; '.join(who(name) for name in working)})"
+    takeable = task.status in (Status.TODO, Status.IN_PROGRESS, Status.WAITING) and not task.blocked_by
+    free = [s for s in subtasks if takeable and s.status == Status.TODO and s.assignee is None]
+    names = [f'#{s.id} "{trim(s.title, 80)}"' for s in free[:CREW_FREE_LISTED]]
+    if len(free) > CREW_FREE_LISTED:
+        names.append("…")
+    return line + ". Free directions: " + (", ".join(names) or "none") + "."
 
 
 def task_detail(task: Task) -> str:

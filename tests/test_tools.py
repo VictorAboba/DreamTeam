@@ -449,7 +449,8 @@ async def test_task_get_shows_structure_and_latest_posts(swarm):
         await ok(swarm, b, "task_comment", {"task_id": 1, "text": f"post {i}"})
     text = await ok(swarm, a, "task_get", {"task_id": 1})
     assert "Task #1: Epic" in text and "Goal: everything" in text and "Description:\nLong text" in text
-    assert "Subtasks: #2 [todo] Part" in text and "Required by (open): #3 [todo]" in text
+    assert '\nSubtasks:\n#2 [todo] "Part"\n' in text and "Required by (open): #3 [todo]" in text
+    assert "Crew task:" not in text  # an ordinary parent
     assert "Discussion: 7 post(s)" in text and "post 6" in text and "post 1" not in text
     assert "Parent: #1" in await ok(swarm, a, "task_get", {"task_id": 2})
     assert "Task #9 not found" in await err(swarm, a, "task_get", {"task_id": 9})
