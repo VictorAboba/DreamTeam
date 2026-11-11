@@ -518,9 +518,30 @@ async def _serve_swarm(project: Path, config: Config, host: str, port: int, goal
     return code
 
 
+def _earlier_project(config: Config) -> str | None:
+    """The message for a single-swarm project whose database was made by an earlier version (docs/SPEC.md §17.2),
+    else None. Read only; a database that cannot be read is left to Swarm, which fails the usual way."""
+    import sqlite3
+
+    from .db import made_by_earlier_version
+
+    try:
+        if not made_by_earlier_version(config.data_dir / "swarm.db"):
+            return None
+    except (sqlite3.Error, OSError):
+        return None
+    from .swarm import PROJECT_EARLIER_VERSION_TEXT
+
+    return PROJECT_EARLIER_VERSION_TEXT.format(dir=config.project_dir, version=__version__)
+
+
 def cmd_run(args) -> int:
     project = Path(args.dir).resolve()
     config = Config.load(project)
+    refusal = _earlier_project(config)  # before anything is written (a log file included)
+    if refusal:
+        print(refusal, file=sys.stderr)
+        return 1
     if args.network:  # for this run only: the settings file keeps its [swarm] network
         config = dataclasses.replace(config, swarm=dataclasses.replace(config.swarm, network=args.network))
     if args.clarify is not None:  # the same for [swarm] clarify (--clarify / --no-clarify)
@@ -573,6 +594,11 @@ def cmd_console(args) -> int:
             return 1
         except (OSError, ValueError) as exc:  # the hub went away, or not a DreamTeam answer
             print(f"Cannot list the sessions at {base}: {exc}", file=sys.stderr)
+            return 1
+        if session.get("earlier_version"):  # never opened by this version (docs/SPEC.md §17.2)
+            from .sessions import earlier_version_text
+
+            print(earlier_version_text(str(session["id"]), ident.get("home"), ident.get("version")), file=sys.stderr)
             return 1
         folder = session.get("workspace") if isinstance(session.get("workspace"), dict) else {}
         lost = folder.get("default") is False and folder.get("exists") is False
@@ -655,6 +681,10 @@ def cmd_mcp(args) -> int:
         raise  # main() prints it
     except (ValueError, OSError) as exc:
         print(f"Cannot load {project / CONFIG_FILE}: {exc}", file=sys.stderr)
+        return 1
+    refusal = None if home_mode else _earlier_project(config)  # (stdout is the MCP channel)
+    if refusal:
+        print(refusal, file=sys.stderr)
         return 1
     setup_logging(project, quiet_stderr=True)
     base = running_hub(project)
@@ -762,7 +792,8 @@ def _hub_json(base: str, path: str, timeout: float = 15.0, *, user_url: str | No
 
 
 def _pick_session(base: str, sid: str | None, *, user_url: str | None = None) -> dict:
-    """The session a command works with: `sid`, else the running one (most recently active)."""
+    """The session a command works with: `sid`, else the running one (most recently active), else the only one
+    this version opens."""
     sessions = _hub_json(base, "/api/sessions", user_url=user_url).get("sessions", [])
     if sid:
         for item in sessions:
@@ -772,8 +803,9 @@ def _pick_session(base: str, sid: str | None, *, user_url: str | None = None) ->
     running = [x for x in sessions if x.get("status") == "running"]
     if running:
         return running[0]
-    if len(sessions) == 1:
-        return sessions[0]
+    openable = [x for x in sessions if not x.get("earlier_version")]
+    if len(openable) == 1:
+        return openable[0]
     raise LookupError("No running session. Create or start one on the sessions page, or pass --session ID."
                       + (f" Sessions: {', '.join(x['id'] for x in sessions)}." if sessions else ""))
 
@@ -1094,6 +1126,12 @@ def _delete_sessions(args, ids: list[str]) -> int:
               f"Sessions: {', '.join(by_id) or 'none'}.", file=sys.stderr)
         return 1
     legacy = [sid for sid in ids if by_id[sid].get("legacy")]
+    earlier = [sid for sid in legacy if by_id[sid].get("earlier_version")]
+    if earlier:  # its own message names the file to remove by hand (docs/SPEC.md §17.2)
+        from .sessions import earlier_version_text
+
+        print("Nothing deleted: " + earlier_version_text(earlier[0], home), file=sys.stderr)
+        return 1
     if legacy:
         print(f"Nothing deleted: {', '.join(legacy)} is the project's own session; its files are "
               f"{home / '.dreamteam'}, delete that folder by hand if you mean it.", file=sys.stderr)
@@ -1641,25 +1679,26 @@ async def _mcp_launcher_in_process(home: Path, config: Config, web: bool, stop: 
                 log.info("launcher stopped")
 
 
-def _session_db(home: Path, sid: str | None) -> Path | None:
-    """The database of a session (or of a single-swarm project) for reading traces without a hub."""
+def _session_db(home: Path, sid: str | None) -> tuple[Path | None, str | None]:
+    """The database of a session (or of a single-swarm project) for reading traces without a hub, and the session
+    it belongs to (None for a project)."""
     if not is_home(home):
         path = home / ".dreamteam" / "swarm.db"
-        return path if path.exists() else None
+        return (path if path.exists() else None), None
     from .sessions import SessionManager
 
     manager = SessionManager(home)
-    if not sid:  # no hub, nothing runs: the most recently active session (list() order), not the oldest id
-        items = [s for s in manager.list() if not s.get("error")]
+    if not sid:  # no hub, nothing runs: the most recently active session this version opens (list() order)
+        items = [s for s in manager.list() if not s.get("error") and not s.get("earlier_version")]
         sid = next((s["id"] for s in items if s.get("last_activity")), None) or next((s["id"] for s in items), None)
         if sid:
             print(f"Session {sid}", file=sys.stderr)
     if not sid or not manager.exists(sid):
-        return None
+        return None, sid
     try:
-        return manager.config_for(sid).data_dir / "swarm.db"
+        return manager.config_for(sid).data_dir / "swarm.db", sid
     except ValueError:  # its settings are invalid now: the database is still where it always is
-        return manager.dir_of(sid) / ".dreamteam" / "swarm.db"
+        return manager.dir_of(sid) / ".dreamteam" / "swarm.db", sid
 
 
 def cmd_traces(args) -> int:
@@ -1671,8 +1710,16 @@ def cmd_traces(args) -> int:
     limit = max(1, min(args.limit, 500))
     if base:
         try:
-            if (hub_identity(base) or {}).get("mode") == "launcher":
-                base = f"{base}/s/{_pick_session(base, args.session)['id']}"
+            ident = hub_identity(base) or {}
+            if ident.get("mode") == "launcher":
+                session = _pick_session(base, args.session)
+                if session.get("earlier_version"):  # never opened by this version (docs/SPEC.md §17.2)
+                    from .sessions import earlier_version_text
+
+                    print(earlier_version_text(str(session["id"]), ident.get("home"), ident.get("version")),
+                          file=sys.stderr)
+                    return 1
+                base = f"{base}/s/{session['id']}"
             if args.span and args.context:
                 data = _hub_json(base, f"/api/spans/{args.span}/context")
             elif args.span:
@@ -1693,9 +1740,11 @@ def cmd_traces(args) -> int:
             print(f"Cannot read traces from {base}: {exc}", file=sys.stderr)
             return 1
     else:
-        from .db import Database
+        import sqlite3
 
-        db_path = _session_db(home, args.session)
+        from .db import Database, made_by_earlier_version
+
+        db_path, sid = _session_db(home, args.session)
         if db_path is None:
             print(f"Unknown session '{args.session}'." if args.session else "No session to read traces from.",
                   file=sys.stderr)
@@ -1706,6 +1755,20 @@ def cmd_traces(args) -> int:
                 return 1
             print("[]" if args.json else "No traces.")
             return 0
+        try:
+            earlier = made_by_earlier_version(db_path)
+        except (sqlite3.Error, OSError):  # Database() below says what is wrong with it
+            earlier = False
+        if earlier:  # its database is not opened (docs/SPEC.md §17.2)
+            if sid is None:
+                from .swarm import PROJECT_EARLIER_VERSION_TEXT
+
+                print(PROJECT_EARLIER_VERSION_TEXT.format(dir=home, version=__version__), file=sys.stderr)
+            else:
+                from .sessions import earlier_version_text
+
+                print(earlier_version_text(sid, home), file=sys.stderr)
+            return 1
         db = Database(db_path)
         try:
             tracer = tracing.Tracer(db)

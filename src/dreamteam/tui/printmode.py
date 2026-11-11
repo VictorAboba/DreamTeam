@@ -347,7 +347,14 @@ class _PrintRun:
             summary = next((s for s in sessions if s.get("id") == self.session), None)
             if summary is None:
                 raise _Finished("error", _text(self.text_lang, "unknown_session", sid=self.session))
+            if summary.get("earlier_version"):  # never opened by this version (docs/SPEC.md §17.2): nothing created
+                from ..sessions import earlier_version_text   # (here only: the client needs no session code otherwise)
+
+                hub = await client.hub_info()
+                raise _Finished("error", earlier_version_text(str(summary["id"]), hub.get("home"), hub.get("version")))
         else:
+            # -c: the most recent session this version opens (one made by an earlier version is never picked)
+            sessions = [s for s in sessions if not s.get("earlier_version")]
             if not sessions:
                 raise _Finished("error", _text(self.text_lang, "no_sessions"))
             summary = max(sessions, key=lambda s: s.get("last_activity") or s.get("created_at") or 0)

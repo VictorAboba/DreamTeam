@@ -39,13 +39,13 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable, Collection
 
-from . import netoff
+from . import __version__, netoff
 from . import skills as skill_lib
 from .config import Config
 from .copyfrom import (COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError, CopyLimits, Source,
                        Uploads, check_target, copy_into, done_with, hub_in_container, left_over, printable_line,
                        resolve_source, staging_name)
-from .db import Database, loads, remap_sql, sqlite_uri
+from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
 from .goal_text import shorten_title, split_goal
 from .models import USER, Status, ToolError
 from .settings import (
@@ -87,6 +87,15 @@ LEGACY_WORKSPACE_TEXT = (
     "The main session lives in the home directory itself, and `dreamteam run` can still open that directory as a "
     "single-swarm project, which would not know about another folder: its workspace cannot be moved. Create a new "
     "session in the other folder instead.")
+# a session whose database was made by an earlier DreamTeam (db.made_by_earlier_version): listed, deleted and
+# exported, never opened (docs/SPEC.md §17.2 "Sessions of an earlier version")
+EARLIER_VERSION_TEXT = (
+    "Session {sid} was made by an earlier version of DreamTeam and cannot be opened by this one ({version}). Open it "
+    "with the version that made it, or delete it.")
+MAIN_EARLIER_VERSION_TEXT = (
+    "Session main (the swarm in {home}) was made by an earlier version of DreamTeam and cannot be opened by this one "
+    "({version}). Open it with the version that made it, or remove {home}/.dreamteam/swarm.db (with its -wal and "
+    "-shm files) by hand.")
 
 _TRANSLIT = dict(zip(
     "абвгдеёжзийклмнопрстуфхцчшщъыьэюяіїєґ",
@@ -108,6 +117,15 @@ class SessionError(ValueError):
 def _session_error(exc: SkillError | ToolError) -> SessionError:
     """A skills error (SkillError, or a swarm_skills ToolError with its status) as a SessionError."""
     return SessionError(str(exc), getattr(exc, "status", 400), **(getattr(exc, "extra", None) or {}))
+
+
+def earlier_version_text(sid: str, home: str | os.PathLike | None, version: str | None = None) -> str:
+    """The message of a session made by an earlier version (the legacy `main` names the file to remove by hand).
+    `home` and `version` may come from a hub's /api/hub; `version` defaults to this one."""
+    version = version or __version__
+    if sid == LEGACY_ID:
+        return MAIN_EARLIER_VERSION_TEXT.format(home=os.fspath(home) if home else "the home", version=version)
+    return EARLIER_VERSION_TEXT.format(sid=sid, version=version)
 
 
 def slugify(title: str, limit: int = 40) -> str:
@@ -610,21 +628,30 @@ def external_workspaces(home: str | Path) -> list[tuple[str, str]]:
 
 
 def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
-    """Board/agent/budget figures of a session database (read-only; zeros when it does not exist)."""
+    """Board/agent/budget figures of a session database (read-only; zeros when it does not exist), and whether an
+    earlier version made it (`earlier_version`). A file of its own is read through db.reading_file, which writes
+    nothing next to it (a plain read-only open of a WAL database would leave a -wal and a -shm in every stopped
+    session at each listing)."""
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
-        "jobs": {"running": 0}, "question": None,
+        "jobs": {"running": 0}, "question": None, "earlier_version": False,
     }
-    own = conn is None
-    if own:
-        if not db_path.exists():
-            return stats
-        try:
-            conn = sqlite3.connect(sqlite_uri(db_path, "mode=ro"), uri=True, timeout=2.0)
-        except sqlite3.Error:
-            return stats
+    with contextlib.ExitStack() as stack:
+        if conn is None:
+            if not db_path.exists():
+                return stats
+            try:
+                conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
+            except (sqlite3.Error, OSError):
+                return stats
+        _read_stats(conn, db_path, stats)
+    return stats
+
+
+def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any]) -> None:
+    """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default."""
     try:
         def kv(key: str) -> Any:
             row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
@@ -667,10 +694,10 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
             log.debug("cannot count the jobs of %s: %s", db_path, exc)
     except sqlite3.Error as exc:  # a database of an older version or locked: show what we have
         log.debug("cannot read stats of %s: %s", db_path, exc)
-    finally:
-        if own:
-            conn.close()
-    return stats
+    try:  # its own try: the tables it reads may be all that is left of a damaged file
+        stats["earlier_version"] = made_by_earlier_version(conn)
+    except sqlite3.Error as exc:
+        log.debug("cannot tell whether an earlier version made %s: %s", db_path, exc)
 
 
 def rename_member_profiles(db_path: Path, renames: dict[str, str]) -> int:
@@ -875,7 +902,10 @@ class SessionManager:
                     async with self._lock(sid):
                         swarm = self.swarms.get(sid)
                         if swarm is None:
-                            await asyncio.to_thread(rename_member_profiles, self._data_dir(sid) / "swarm.db", renames)
+                            # a session made by an earlier version keeps its database as it is (§17.2)
+                            if not await asyncio.to_thread(self.earlier_version, sid):
+                                await asyncio.to_thread(rename_member_profiles, self._data_dir(sid) / "swarm.db",
+                                                        renames)
                             continue
                 rename = getattr(swarm, "rename_profiles", None)
                 try:
@@ -1513,12 +1543,33 @@ class SessionManager:
 
     def default_session(self) -> str | None:
         """The session MCP calls without `session` go to: the only running one, else the most recently
-        active running one, else the only session."""
+        active running one, else the only session this version opens (one made by an earlier version is never
+        it)."""
         running = [s for s in self.list() if s.get("status") == "running"]
         if running:
             return running[0]["id"]
-        ids = self.ids()
+        ids = [sid for sid in self.ids() if not self.earlier_version(sid)]
         return ids[0] if len(ids) == 1 else None
+
+    def earlier_version(self, sid: str) -> bool:
+        """The session is not loaded and its database was made by an earlier version of DreamTeam (§17.2): this one
+        does not open it. False for a loaded session (it passed the check) and when its database cannot be read."""
+        if sid in self.swarms:
+            return False
+        try:
+            return made_by_earlier_version(self._data_dir(sid) / "swarm.db")
+        except (sqlite3.Error, OSError) as exc:
+            log.debug("cannot tell whether an earlier version made session %s: %s", sid, exc)
+            return False
+
+    def earlier_version_text(self, sid: str) -> str:
+        """The message of a session made by an earlier version (module earlier_version_text)."""
+        return earlier_version_text(sid, self.home)
+
+    def _refuse_earlier(self, sid: str) -> None:
+        """409 with the message when the session was made by an earlier version: it is not opened or changed."""
+        if self.earlier_version(sid):
+            raise SessionError(self.earlier_version_text(sid), 409, earlier_version=True)
 
     # ---- skills (docs/SPEC.md §19) -------------------------------------------------------------
     def _data_dir(self, sid: str) -> Path:
@@ -1644,8 +1695,10 @@ class SessionManager:
     async def session_skills(self, sid: str, show: str | None = None) -> dict[str, Any]:
         """`{"attached": [...], "running": bool}` of a session, stopped or running: the snapshot items (docs/SPEC.md
         §14.1) of a loaded swarm, else the same keys from its files (`deps` empty); `show`: also `files_list`,
-        `skill_md` and `deps` of that session copy, and `install` (the switches its preview line is worded by)."""
+        `skill_md` and `deps` of that session copy, and `install` (the switches its preview line is worded by).
+        Refused (409) for a session made by an earlier version."""
         self._check(sid)
+        self._refuse_earlier(sid)
         swarm = self.swarms.get(sid)
         if getattr(swarm, "skills", None) is not None:
             attached = swarm.skills.public()   # on the loop: its deps read live state
@@ -1677,8 +1730,10 @@ class SessionManager:
                            via: str = "home") -> str:
         """The user's library decision on a member's proposal (skill_approve), also on a stopped session: there it is
         made on its files (`via` "stopped-session"; the owner is told at the next start). The result text;
-        SessionError with the status (404 unknown, 409 not pending or a library clash)."""
+        SessionError with the status (404 unknown, 409 not pending, a library clash or a session made by an earlier
+        version)."""
         self._check(sid)
+        self._refuse_earlier(sid)
         async with self._lock(sid):
             self._check(sid)
             try:
@@ -1949,10 +2004,12 @@ class SessionManager:
             raise
         except ValueError as exc:
             raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
-        from .swarm import Swarm
+        from .swarm import EarlierVersionError, Swarm
 
         try:
             swarm = Swarm(config=cfg, llm_factory=self.llm_factory)
+        except EarlierVersionError:  # refused before anything was written (§17.2)
+            raise SessionError(self.earlier_version_text(sid), 409, earlier_version=True) from None
         except Exception as exc:  # e.g. a locked or corrupt database
             log.exception("session %s cannot be opened", sid)
             raise SessionError(f"Session {sid} cannot be opened: {type(exc).__name__}: {exc}", 500) from None
@@ -2055,8 +2112,10 @@ class SessionManager:
 
     async def stop(self, sid: str, *, remember: bool = False) -> None:
         """Stop the session's agents and unload it. remember=True keeps it marked for resume() (used at
-        server shutdown); an explicit stop clears the mark."""
+        server shutdown); an explicit stop clears the mark. A session made by an earlier version is refused (409):
+        it is never running, and its mark stays."""
         self._check(sid)
+        self._refuse_earlier(sid)
         async with self._lock(sid):
             try:
                 await self._unload(sid)
@@ -2116,8 +2175,9 @@ class SessionManager:
         """Rename a session, replace its overrides (`overrides`) or change some of them (`settings`: {section: {key:
         value or None}}, see _patched_overrides; the settings dialog of the session page). Applied to the loaded
         swarm at once, like the global settings; the language and the start settings matter only at the first start.
-        Nothing is written when a value is invalid."""
+        Nothing is written when a value is invalid, nor for a session made by an earlier version (409)."""
         self._check(sid)
+        self._refuse_earlier(sid)
         if overrides is not None and settings is not None:
             raise SessionError("Pass either \"overrides\" (all of them) or \"settings\" (the keys to change), not both.")
         meta = self.meta(sid)
@@ -2180,8 +2240,10 @@ class SessionManager:
         everything moved so far). Workspace changes of the sessions of a home run one at a time. Returns {"mode":
         "moved"|"adopted"|"unchanged", "from", "to", "git": "moved"|"existing"|"initialized"|"disabled"|"none",
         "mcp_moved": [names], "old_kept": folder|None, "old_missing": bool, "old_changed": None|{"paths",
-        "commit", "error"}, "restarted": bool, "start_error": text|None}."""
+        "commit", "error"}, "restarted": bool, "start_error": text|None}. A session made by an earlier version is
+        refused (409) with its message."""
         self._check(sid)
+        self._refuse_earlier(sid)
         if sid == LEGACY_ID:
             raise SessionError(LEGACY_WORKSPACE_TEXT, 409)
         if expect not in (None, "moved", "adopted"):
@@ -2350,6 +2412,8 @@ class SessionManager:
         delete) or "discard"."""
         self._check(sid)
         if sid == LEGACY_ID:
+            if self.earlier_version(sid):  # its own message names the file to remove by hand
+                raise SessionError(self.earlier_version_text(sid), 409, earlier_version=True)
             raise SessionError("The main session lives in the home directory itself and cannot be deleted "
                                "from the UI; delete its .dreamteam folder by hand.", 409)
         if skills not in (None, "save", "discard"):
@@ -2821,11 +2885,15 @@ class SessionManager:
 
     async def resume(self) -> list[str]:
         """Start the sessions that were running when the server last stopped, except finished ones (finished()):
-        they stay stopped until started by hand."""
+        they stay stopped until started by hand; and except sessions made by an earlier version, which keep their
+        mark (one warning each)."""
         started = []
         for sid in self.ids():
             try:
                 if self.meta(sid).get("autostart"):
+                    if self.earlier_version(sid):
+                        log.warning("session %s was made by an earlier version of DreamTeam: not resumed", sid)
+                        continue
                     if self.finished(sid):
                         log.info("session %s is finished (goal achieved, no open task): not resumed", sid)
                         continue
