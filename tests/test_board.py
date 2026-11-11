@@ -144,8 +144,9 @@ def test_create_retired_assignee_rejected(swarm, board):
 def test_create_with_deps_and_parent(swarm, board):
     a = board.create(ANNA, "a")
     b = board.create(ANNA, "b")
-    child = board.create(ANNA, "c", depends_on=[a.id, "#2", a.id], parent_id=b.id, priority=0)
-    assert child.depends_on == [a.id, b.id] and child.parent_id == b.id
+    p = board.create(ANNA, "p")
+    child = board.create(ANNA, "c", depends_on=[a.id, "#2", a.id], parent_id=p.id, priority=0)
+    assert child.depends_on == [a.id, b.id] and child.parent_id == p.id
     assert child.blocked_by == [a.id, b.id]
     assert board.blockers(child) == [a.id, b.id]
 

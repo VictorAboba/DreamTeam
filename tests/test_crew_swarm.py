@@ -515,6 +515,57 @@ async def test_a_held_direction_its_holder_cannot_take_keeps_no_reminder_back(tm
         await shutdown(swarm)
 
 
+async def test_an_owner_that_can_take_a_free_direction_of_its_full_crew_task_keeps_the_reminder_back(tmp_path):
+    """The owner's claim takes no place: a free direction of its full crew task is work for it, so the user is not
+    told that only their reviews keep the swarm going while the owner has a "free directions" mark."""
+    swarm = await live_team(tmp_path, ANNA, BOB, CARL)
+    try:
+        board = swarm.board
+        impl = board.create(USER, "impl", goal="g")
+        swarm.set_goal(USER, "Ship it")
+        crew, (d1, d2) = make_crew_raw(board, USER, 2, ["d1", "d2"], title="Tool", goal="g")
+        set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        set_raw(board, d1.id, status=Status.WAITING, assignee=BOB)     # the crew task is full
+        finish_raw(board, impl.id, Status.REVIEW, "done", assignee=CARL, reviewer=USER)
+        deliver(swarm)
+        assert board.stall_marks(ANNA) == frozenset({(crew.id, FREE)})
+        assert swarm._has_task_in_progress() is True
+        swarm._remind_user_reviews()
+        assert "u_reviews_waiting" not in kinds_for(swarm, USER)
+    finally:
+        await shutdown(swarm)
+
+
+@pytest.mark.parametrize("status", [Status.CANCELLED, Status.FAILED])
+async def test_an_owner_whose_directions_wait_for_a_closed_one_is_woken(tmp_path, status):
+    """A crew task whose only open direction waits for a cancelled or failed one is no longer left out of its
+    owner's stalled ids: n_stalled wakes the owner once for that key."""
+    swarm = await live_team(tmp_path, ANNA, BOB)
+    try:
+        board = swarm.board
+        crew, (p, q, r) = make_crew_raw(board, USER, 3, ["p", "q", "r"], title="Tool", goal="g")
+        board.update(USER, r.id, depends_on=[q.id])
+        set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        set_raw(board, q.id, status=Status.IN_PROGRESS, assignee=BOB)
+        finish_raw(board, p.id, Status.DONE, "ok", assignee=BOB)
+        assert swarm._stall_ids(ANNA) == frozenset()                       # r waits for q, which is open
+        assert swarm.crew_nudge(ANNA, [board.get(crew.id)])[0] == {crew.id}
+        finish_raw(board, q.id, status, assignee=BOB)
+        assert swarm._stall_ids(ANNA) == frozenset({crew.id})
+        assert swarm.crew_nudge(ANNA, [board.get(crew.id)]) == (set(), "")
+        swarm._wake_idle_holders()
+        idle_for_a_while(swarm)
+        assert wakes(swarm, ANNA) == ["n_stalled"]
+        assert texts_for(swarm, ANNA, "n_stalled") == [prompts.t("en", "n_stalled", tasks=f"#{crew.id}", marks="")]
+        deliver(swarm)
+        stall(swarm, ANNA, crew.id)
+        swarm._wake_stalled()
+        idle_for_a_while(swarm)
+        assert wakes(swarm, ANNA) == ["n_stalled"]                         # once per key
+    finally:
+        await shutdown(swarm)
+
+
 # ================================================================== liveness of crew owners and assignees (§4.2)
 
 async def test_an_owner_holding_its_crew_task_todo_is_woken_when_its_directions_finished(tmp_path):

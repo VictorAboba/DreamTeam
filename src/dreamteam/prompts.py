@@ -298,6 +298,12 @@ TEXTS: dict[str, dict[str, str]] = {
                            "cancel it (task_update status=cancelled).",
         "note_crew_say_why": " Its creator was told: say in #{id}'s discussion why you changed its crew (a post there "
                              "wakes the creator).",
+        # a direction left todo without an assignee under a terminal crew task is cancelled in its place
+        "note_direction_closed": " #{parent} is {status}, so #{id} is cancelled instead of going back to the board: "
+                                 "nobody takes a direction of a closed crew task.",
+        # a task became failed or cancelled while open tasks depend on it; {deps}: "#5, #7"
+        "note_dependents_blocked": " {deps} depend on #{id}, which is {status} now: they stay blocked until that "
+                                   "dependency is removed (task_update depends_on) or they are cancelled.",
         # liveness marks (n_stalled's {marks}, n_marks_stalled's {text}) and the in-activation nudge; each starts
         # with a space; {ending}: an owner_prefix_* key with its ending; {directions}: '#17 "oidc", #18 "jose"'
         "mark_subtasks_done": " #{id} \"{title}\": {ending}",
@@ -745,6 +751,11 @@ TEXTS: dict[str, dict[str, str]] = {
                            "отмени её (task_update status=cancelled).",
         "note_crew_say_why": " Её автору сообщили: объясни в обсуждении #{id}, почему ты изменил crew (пост там "
                              "разбудит автора).",
+        "note_direction_closed": " #{parent} в статусе {status}, поэтому #{id} отменена, а не возвращена на доску: "
+                                 "направления закрытой групповой задачи никто не берёт.",
+        "note_dependents_blocked": " {deps} зависят от #{id}, которая теперь в статусе {status}: они останутся "
+                                   "заблокированными, пока эту зависимость не уберут (task_update depends_on) или их "
+                                   "не отменят.",
         "mark_subtasks_done": " #{id} «{title}»: {ending}",
         "mark_free_directions": " #{id} — групповая задача со свободными направлениями, которые никто не взял: "
                                 "{directions}. Возьми одно сам (task_claim) или отмени те, без которых она обойдётся "

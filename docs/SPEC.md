@@ -433,12 +433,15 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    (a `detached` one, or a `background` one past its busy window), it has not stalled; nor while it waits for a
    file it was refused (`Workspace.waits_for_lock`: a `lock_waiters` row, what the refusal promised; `n_lock_free`
    wakes it, and every lock ends by unlock, expiry or retire). Nor do they count a clarify
-   planning task whose holder waits for the user's answers (`asks_user`, §3.1), nor a crew task with open
-   directions (§4.2) among their ids: while each of them has an assignee it waits for them, so its owner has
-   nothing to continue there (its own direction counts on its own; the in-activation nudge of §6.2 skips such a
-   crew task too), and a free one is the "free directions" mark below. Both items also count
-   three marks, compared apart from the task ids (§4.2 "Finishing", Liveness): a task `todo`, `in_progress` or
-   `waiting` that has at least one subtask, all of them terminal (its holder has to complete it, or, for a crew task
+   planning task whose holder waits for the user's answers (`asks_user`, §3.1), nor a crew task with a direction
+   that can still move (§4.2; `Board.has_live_directions`: one `in_progress`, `waiting` or in review, or a `todo`
+   one none of whose blockers is `failed` or `cancelled`) among their ids: while each of them has an assignee it
+   waits for them, so its owner has nothing to continue there (its own direction counts on its own; the
+   in-activation nudge of §6.2 skips such a crew task too), and a free one is the "free directions" mark below. A
+   crew task whose open directions all wait for a failed or cancelled task is among the ids: nothing else would
+   move it, and its completion refusal names the blockers (§4.2 "Finishing"). Both items also count
+   three marks, compared apart from the task ids (§4.2 "Finishing", Liveness): a task `todo` (not blocked),
+   `in_progress` or `waiting` that has at least one subtask, all of them terminal (its holder has to complete it, or, for a crew task
    with a failed direction or only cancelled ones, decide what to do), a `todo` direction assigned to the member
    that its claim would take now, and a crew task with a free direction that its owner, working on none of its
    directions, could take (§4.2 "Offers"). Items 2 and 3 compute the same key, so a set is
@@ -654,6 +657,14 @@ class Board:
 Rules (USER may do anything; "member" = agent of any kind):
 * `create`: title non-empty (<= 200 chars). `assignee`/`reviewer` resolved via `swarm.resolve_member`
   (USER allowed). `depends_on` ids must exist, no self/cycles. `parent_id` must exist. priority 0..3.
+  No dependency the hierarchy contradicts (checked by `create`, and by `update` when it changes `depends_on` or
+  `parent_id`, or sets `crew` ≥ 2): a task never depends on its parent or an ancestor of it (`Task #M is a part of
+  #P: it cannot wait for #P to be done (a parent finishes after its subtasks). Remove #P from its depends_on.`; a
+  parent completes only after its subtasks, §4.2 "Finishing", so neither would finish), a crew task never on its
+  own directions (`#M is a direction of crew task #N: #N already waits for its directions (it cannot be completed
+  while one is open), so it does not depend on them. Remove #M from its depends_on.`: a blocked crew task gives
+  none of them out, §4.2 "Taking a direction"), and a task is not moved under a crew task that depends on it. An
+  ordinary parent may depend on its own subtask.
   Status `todo`. Emits `task.created`. If assignee given and != actor: notify assignee `n_assigned`.
 * `claim`: status must be `todo` (if already assigned to actor and in_progress/waiting: return as is).
   assignee must be None or actor (else ToolError naming the holder). No blockers (ToolError lists them). A direction
@@ -841,7 +852,9 @@ notifications explain it.
     "#3, #5"} once per set of such tasks. A parent with an open subtask, `in_progress` or `todo` (a crew task waiting
     for its directions, an ordinary parent whose last subtasks wait for the user's review), counts neither way: its
     holder cannot complete it before they finish (§4.2 "Finishing"), and its open subtasks count on their own
-    (`Board.open_parents(ids)`, one grouped query). A `todo` task is actionable only when it has no open subtask
+    (`Board.open_parents(ids)`, one grouped query); except an `in_progress` crew task a member holds that has a free
+    direction (`Board.free_directions`): its owner's claim takes no place, so even a full crew task has work for its
+    owner (the "free directions" mark). A `todo` task is actionable only when it has no open subtask
     and `ready_unassigned` returns it (a direction only while its crew task takes directions, §4.2 "Offers"), or a
     member (not USER) holds it and no blocker stops it; a held direction of a crew task only when its holder's
     claim would take it now (`Board.directions_to_take`, the "direction to take" mark of §4.2 Liveness)
@@ -1020,7 +1033,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   In place of `take one of its directions
   yourself (task_claim; …)`, an owner that already has one of its directions (assigned to it, in any status but
   `cancelled`) reads `your own direction is #15 [in_progress]` (its first open one, else its first one), and one
-  that has none and finds none free reads `all
+  that has none and finds none free (`todo`, no assignee, no blocker of its own) reads `all
   its directions are taken: if a part of #N is left that nobody does, add it as a direction (task_update directions)
   and it is yours; otherwise keep the directions consistent until they are finished, then complete #N`; both keep
   the rest of the sentence from `; the other members take the rest` on. The owner form of a crew ending other than
@@ -1096,7 +1109,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   review too): its discussion is the crew's channel, and a post there wakes them (the economy rules of the system
   prompt apply). Taking a direction posts nothing: the board shows it.
 - **Finishing.** An agent cannot complete a task with open subtasks (any parent): `Task #N has open subtasks: #17
-  [in_progress, Anna Smith], #19 [review]. Complete it when they are finished; as its creator or assignee you may
+  [in_progress, Anna Smith], #19 [review], #20 [todo, blocked by #16]. Complete it when they are finished; as its creator or assignee you may
   cancel the ones no longer needed (task_update status=cancelled), and move the ones that are not parts of #N out of
   it (task_update parent_id=0).` (e.g. a planner that filed the plan's tasks under the planning card, which tells it
   to create them without `parent_id`); nor a crew task with a `failed` direction:
@@ -1262,7 +1275,8 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     subtask, all of them terminal (what `n_subtasks_done` was sent about; a task without subtasks, a crew task with
     no directions yet included, gets no mark; `todo` too, because an owner often holds its crew task `todo` for its
     whole life: `task_create` with `assignee` leaves it so, and the owner texts tell it to take a direction, never
-    to claim #N);
+    to claim #N; but not a `todo` task that is blocked: it is not to be completed yet, and `n_unblocked` wakes its
+    holder when its dependencies are done);
   - `(M, "direction to take")` for each `todo` direction M assigned to the member that its claim would take now
     (`Board.directions_to_take(name)`: M not blocked, #N `todo`, `in_progress` or `waiting` and not blocked, a
     place for the member or the member in the working set already, and no other direction of #N it works on): a
@@ -1272,7 +1286,8 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   - `(N, "free directions")` for each crew task the member owns that has a free direction (`todo`, no assignee, no
     blocker of its own, #N `todo`, `in_progress` or `waiting` and not blocked: the owner's claim needs no free
     place) while the owner holds none of its directions in `in_progress` or `waiting`, nor one to take (the
-    "direction to take" mark names that one instead; it is never among the ids while it has open directions).
+    "direction to take" mark names that one instead; it is never among the ids while it has a direction that can
+    still move, §3 items 2-3).
   A holder woken about ({N}, {}) before N's subtasks finished differs from ({N}, {(N, "subtasks done")}) and is
   woken once more, so a holder that missed `n_subtasks_done`, or the owner of a crew task open again with all its
   directions finished (returned, or taken by a new owner), is told; one
@@ -1335,6 +1350,17 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   no notification: the result of its call adds the same sentence as ` Your #{sub} is still open: finish it only if
   it is still needed on its own; otherwise cancel it (task_update status=cancelled).` (USER's call too: the REST
   result carries the board's notes).
+  The same rule holds after the closing: an open direction that a later change would leave `todo` without an
+  assignee while its crew task is terminal (its holder releases it or leaves, `release_all`; the parent's creator or
+  assignee unassigns it; its review is returned after its executor left) is cancelled in the same mutation instead,
+  since nobody may take it and it would keep the goal open: one `task.updated`, no `n_direction_freed`,
+  `n_task_closed` or `n_subtask_cancelled`, not among the ids `release_all` returns; the result of the actor's call
+  adds `note_direction_closed` {id, parent, status} ` #{parent} is {status}, so #{id} is cancelled instead of going
+  back to the board: nobody takes a direction of a closed crew task.` A reopening by USER is not such a change.
+  Any task that becomes `failed` or `cancelled` while open tasks list it in `depends_on` (they stay blocked: only a
+  done dependency clears) adds `note_dependents_blocked` {deps, id, status} to the result of the actor's call:
+  ` #5, #7 depend on #{id}, which is {status} now: they stay blocked until that dependency is removed (task_update
+  depends_on) or they are cancelled.`
 - **Offers.** A free direction is a ready unassigned task: `ready_unassigned` (§4) returns a subtask of a crew task
   only while that crew task is `todo`, `in_progress` or `waiting`, not blocked, and has a free place. So `_nudge_idle`
   (`n_ready`), the wake-up's `ready` list and wrap-up mode treat directions like any ready task: `_nudge_idle`

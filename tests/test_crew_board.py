@@ -1378,16 +1378,19 @@ def test_the_mutation_reads_the_finish_state_of_its_parents_before_and_after(boa
     task, subs = crew_task(board, titles=("a", "b"))
     finish_raw(board, subs[0].id, Status.DONE, "ok")
     other = board.create(ANNA, "other")
+    part = board.create(ANNA, "part", parent_id=other.id)
 
     def plan(old, batch):
-        batch.parents.add(other.id)
+        # a side row under another parent: that parent's finish state is read too (derived from the side rows)
+        batch.writes.append((board.get(part.id), {"status": Status.DONE}))
         return {"status": Status.CANCELLED}
 
     mutation = board._mutate(ANNA, subs[1].id, plan)
     assert mutation.before[task.id][0] is None
     assert mutation.after[task.id] == ("finished", {Status.DONE: 1, Status.CANCELLED: 1})
-    assert mutation.before[other.id] == (None, {}) and mutation.changes == {"status": [Status.TODO,
-                                                                                         Status.CANCELLED]}
+    assert mutation.before[other.id] == (None, {Status.TODO: 1})
+    assert mutation.after[other.id] == ("finished", {Status.DONE: 1})
+    assert mutation.changes == {"status": [Status.TODO, Status.CANCELLED]}
 
 
 def test_the_mutation_writes_side_rows_and_emits_them_after_the_primary_row(swarm, board):
@@ -1882,3 +1885,152 @@ def test_claiming_an_ordinary_parent_whose_subtasks_are_finished(board, lang, na
     notes.clear()
     board.claim(name, open_parent.id, notes=notes)
     assert notes == []  # no finish state: nothing to add
+
+
+# --- dependencies the hierarchy contradicts, directions left under a closed crew task (review round 2) ----------
+
+def test_a_crew_task_never_depends_on_its_own_directions(board):
+    task, (parser, cli, docs) = crew_task(board)
+    with pytest.raises(ToolError, match=rf"#{cli.id}, #{docs.id} are directions of crew task #{task.id}: "
+                                        rf"#{task.id} already waits for its directions"):
+        board.update(ANNA, task.id, depends_on=[cli.id, docs.id])
+    assert board.get(task.id).depends_on == []
+    # an ordinary parent may wait for its own subtask (it finishes after it anyway) ...
+    parent = board.create(ANNA, "parent")
+    part = board.create(ANNA, "part", parent_id=parent.id)
+    assert board.update(ANNA, parent.id, depends_on=[part.id]).depends_on == [part.id]
+    # ... but it does not become a crew task while it does
+    with pytest.raises(ToolError, match=rf"#{part.id} is a direction of crew task #{parent.id}"):
+        board.update(ANNA, parent.id, crew=2)
+    assert board.get(parent.id).crew == 0
+    # a task a crew task depends on does not become one of its directions
+    schema = board.create(ANNA, "schema")
+    board.update(ANNA, task.id, depends_on=[schema.id])
+    with pytest.raises(ToolError, match=rf"Crew task #{task.id} depends on #{schema.id}"):
+        board.update(ANNA, schema.id, parent_id=task.id)
+    assert board.get(schema.id).parent_id is None
+
+
+def test_a_task_never_depends_on_its_parent_or_an_ancestor(board):
+    top = board.create(ANNA, "top")
+    parent = board.create(ANNA, "parent", parent_id=top.id)
+    with pytest.raises(ToolError, match=rf"The new task is a part of #{parent.id}: it cannot wait for"):
+        board.create(ANNA, "part", parent_id=parent.id, depends_on=[parent.id])
+    with pytest.raises(ToolError, match=rf"The new task is a part of #{top.id}"):
+        board.create(ANNA, "part", parent_id=parent.id, depends_on=[top.id])
+    part = board.create(ANNA, "part", parent_id=parent.id)
+    with pytest.raises(ToolError, match=rf"Task #{part.id} is a part of #{parent.id}"):
+        board.update(ANNA, part.id, depends_on=[parent.id])
+    loose = board.create(ANNA, "loose", depends_on=[top.id])
+    with pytest.raises(ToolError, match=rf"Task #{loose.id} is a part of #{top.id}"):
+        board.update(ANNA, loose.id, parent_id=parent.id)
+    assert board.get(loose.id).parent_id is None and board.get(part.id).depends_on == []
+    # a direction on its crew task: the same
+    task, subs = crew_task(board)
+    with pytest.raises(ToolError, match=rf"Task #{subs[2].id} is a part of #{task.id}"):
+        board.update(ANNA, subs[2].id, depends_on=[task.id])
+
+
+def test_directions_without_crew_under_a_crew_task_get_the_crew_structure_error(board):
+    task, _ = crew_task(board)
+    with pytest.raises(ToolError, match="crews are one level deep.*add the directions yourself"):
+        board.create(ANNA, "sub", parent_id=task.id, directions=["x", "y"])
+    with pytest.raises(ToolError, match=rf"Only the creator .* of task #{task.id} can add subtasks"):
+        board.create(BOB, "sub", parent_id=task.id, directions=["x", "y"])
+    plain = board.create(ANNA, "plain")
+    for kw in ({}, {"parent_id": plain.id}):
+        with pytest.raises(ToolError, match="directions are for crew tasks: pass crew"):
+            board.create(ANNA, "sub", directions=["x", "y"], **kw)
+
+
+def closed_crew_with_bobs_direction(board, status: str = Status.IN_PROGRESS) -> tuple[Task, Task]:
+    """Anna's crew task, cancelled by her while Bob holds its direction q (`status`): (crew task, q)."""
+    task, (_, q) = crew_task(board, titles=("p", "q"))
+    work(board, q.id, BOB, status)
+    board.update(ANNA, task.id, status=Status.CANCELLED)
+    return board.get(task.id), board.get(q.id)
+
+
+def test_a_direction_freed_under_a_closed_crew_task_by_a_leave_is_cancelled(swarm, board):
+    task, q = closed_crew_with_bobs_direction(board)
+    assert q.status == Status.IN_PROGRESS and keys_for(swarm, BOB) == ["n_parent_closed"]
+    anna = keys_for(swarm, ANNA)
+    assert board.release_all(BOB, BOB) == []                 # not released: cancelled
+    assert board.get(q.id).status == Status.CANCELLED and board.get(q.id).assignee is None
+    assert keys_for(swarm, ANNA) == anna                     # no n_direction_freed, no n_task_closed
+    assert board.ready_unassigned() == [] and board.counts()[Status.TODO] == 0
+    # an open task of a leaving member that is no such direction still goes back to todo
+    other = board.create(ANNA, "other", assignee=CARL)
+    assert board.release_all(CARL, CARL) == [other.id] and board.get(other.id).status == Status.TODO
+
+
+@pytest.mark.parametrize("how", ["release", "unassign"])
+def test_a_direction_freed_under_a_closed_crew_task_by_an_update_is_cancelled(swarm, board, how):
+    task, q = closed_crew_with_bobs_direction(board)
+    before = {ANNA: len(keys_for(swarm, ANNA)), BOB: len(keys_for(swarm, BOB))}
+    notes: list[str] = []
+    if how == "release":
+        board.update(BOB, q.id, status=Status.TODO, notes=notes)
+    else:
+        board.update(ANNA, q.id, assignee="", notes=notes)
+    assert board.get(q.id).status == Status.CANCELLED
+    assert prompts.t("en", "note_direction_closed", id=q.id, parent=task.id, status=Status.CANCELLED) in notes
+    assert "n_task_closed" not in keys_for(swarm, ANNA)[before[ANNA]:]
+    assert "n_subtask_cancelled" not in keys_for(swarm, BOB)[before[BOB]:]
+
+
+def test_a_direction_returned_from_review_after_its_executor_left_is_cancelled(swarm, board):
+    task, q = closed_crew_with_bobs_direction(board, Status.REVIEW)
+    set_raw(board, q.id, reviewer=CARL, result="r")
+    board.release_all(BOB, BOB)
+    assert board.get(q.id).status == Status.REVIEW and board.get(q.id).assignee is None
+    board.review(CARL, q.id, False, "not good")
+    assert board.get(q.id).status == Status.CANCELLED
+
+
+@pytest.mark.parametrize("status", [Status.CANCELLED, Status.FAILED])
+def test_closing_a_task_others_depend_on_names_them_in_the_result(board, status):
+    task, (parser, cli, docs) = crew_task(board)
+    board.update(ANNA, cli.id, depends_on=[parser.id])
+    board.update(ANNA, docs.id, depends_on=[parser.id])
+    work(board, parser.id, BOB)
+    notes: list[str] = []
+    board.update(BOB, parser.id, status=status, notes=notes)
+    assert prompts.t("en", "note_dependents_blocked", deps=f"#{cli.id}, #{docs.id}", id=parser.id,
+                     status=status) in notes
+    notes.clear()
+    board.update(ANNA, cli.id, status=Status.CANCELLED, notes=notes)   # nothing depends on cli
+    assert not any("depend on" in n for n in notes)
+
+
+@pytest.mark.parametrize("status", [Status.CANCELLED, Status.FAILED])
+def test_a_crew_task_whose_open_directions_wait_for_a_closed_task_has_no_live_direction(board, status):
+    task, (p, q, r) = crew_task(board, titles=("p", "q", "r"))
+    board.update(ANNA, r.id, depends_on=[q.id])
+    finish_raw(board, p.id, Status.DONE, "ok")
+    assert board.has_live_directions(task)                   # r waits for q, which is still open
+    finish_raw(board, q.id, status)
+    assert board.has_open_directions(task) and not board.has_live_directions(task)
+    assert board.stall_marks(ANNA) == frozenset() and board.free_directions(task) == []
+    # the completion refusal names the blocker
+    with pytest.raises(ToolError, match=rf"#{r.id} \[todo, blocked by #{q.id}\]"):
+        board.complete(ANNA, task.id, "all done")
+    set_raw(board, r.id, assignee=BOB, status=Status.IN_PROGRESS)
+    assert board.has_live_directions(task)
+
+
+def test_a_blocked_todo_parent_whose_subtasks_finished_gets_no_mark(board):
+    dep = board.create(ANNA, "experiments")
+    parent = board.create(ANNA, "report", assignee=BOB, depends_on=[dep.id])
+    finish_raw(board, board.create(ANNA, "part", parent_id=parent.id).id, Status.DONE, "ok")
+    assert board.stall_marks(BOB) == frozenset()
+    finish_raw(board, dep.id, Status.DONE, "ok")
+    assert board.stall_marks(BOB) == frozenset({(parent.id, MARK_SUBTASKS_DONE)})
+
+
+def test_the_owner_sentence_skips_a_direction_blocked_by_its_own_dependency(board):
+    task, (a, b) = crew_task(board, crew=2, titles=("a", "b"))
+    work(board, a.id, BOB)
+    board.update(ANNA, b.id, depends_on=[a.id])
+    instructions, _ = board._owner_sentence(board.get(task.id), ANNA, "en")
+    assert instructions == prompts.t("en", "crew_owner_all_taken", id=task.id, crew=2)

@@ -1388,12 +1388,13 @@ class Swarm:
 
     def _stall_ids(self, name: str, among: frozenset[int] | None = None) -> frozenset[int]:
         """The in_progress task ids of `name` that count as stalled (`among` them, when given): not a clarify
-        planning task whose holder waits for the user's answers (asks_user), nor a crew task with open directions
-        (it waits for them; a free one is the "free directions" mark). A `waiting` task counts only through its
-        marks."""
+        planning task whose holder waits for the user's answers (asks_user), nor a crew task with a direction that can
+        still move (Board.has_live_directions: it waits for them; a free one is the "free directions" mark). A crew
+        task whose open directions all wait for a failed or cancelled task counts. A `waiting` task counts only through
+        its marks."""
         return frozenset(t.id for t in self.board.open_tasks_of(name)
                          if t.status == Status.IN_PROGRESS and (among is None or t.id in among)
-                         and not self.asks_user(name, t) and not self.board.has_open_directions(t))
+                         and not self.asks_user(name, t) and not self.board.has_live_directions(t))
 
     def _stall_key(self, name: str, ids: frozenset[int]) -> StallKey:
         """The liveness key both scheduler items compare and record (docs/SPEC.md §3 items 2-3): the stalled ids
@@ -1422,10 +1423,10 @@ class Swarm:
 
     def crew_nudge(self, name: str, tasks: list[Any]) -> tuple[set[int], str]:
         """The in-activation nudge's crew part (docs/SPEC.md §6.2) for `name`'s in_progress `tasks`: the ids of the
-        crew tasks with open directions (left out of the nudge: they wait for their directions), and the "free
-        directions" sentences of those with a free direction its owner, working on none of them, could take ("" when
-        there is none)."""
-        crew = {t.id for t in tasks if self.board.has_open_directions(t)}
+        crew tasks with a direction that can still move (Board.has_live_directions; left out of the nudge: they wait
+        for their directions), and the "free directions" sentences of those with a free direction its owner, working
+        on none of them, could take ("" when there is none)."""
+        crew = {t.id for t in tasks if self.board.has_live_directions(t)}
         if not crew:
             return set(), ""
         free = [(tid, kind) for tid, kind in self.board.stall_marks(name)
@@ -1568,10 +1569,12 @@ class Swarm:
 
     def _has_task_in_progress(self) -> bool:
         """An `in_progress` task its holder can go on with: one without open subtasks (a parent with an open subtask
-        waits for it, and cannot be completed before it finishes; the open subtasks count on their own)."""
+        waits for it, and cannot be completed before it finishes; the open subtasks count on their own), or a crew
+        task a member holds with a free direction (its owner's claim takes no place, so a full crew task counts)."""
         tasks = self.board.list(status=Status.IN_PROGRESS)
         waits = self.board.open_parents(t.id for t in tasks)
-        return any(t.id not in waits for t in tasks)
+        return any(t.id not in waits or (t.crew >= 2 and t.assignee not in (None, USER)
+                                         and bool(self.board.free_directions(t))) for t in tasks)
 
     def _has_actionable_todo(self) -> bool:
         """A `todo` task someone can go on with, never a parent with an open subtask (it waits for them): one
