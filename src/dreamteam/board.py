@@ -10,7 +10,9 @@ from typing import Any, Callable, Iterable
 
 from . import prompts, roles
 from .db import Database, dumps, loads
+from .models import CREW_MAX as CREW_MAX
 from .models import USER, AgentKind, AgentStatus, Status, Task, ToolError
+from .tools.fmt import trim
 
 log = logging.getLogger(__name__)
 
@@ -19,11 +21,21 @@ UNSET: Any = object()  # sentinel for "not passed" on nullable fields
 MAX_TITLE = 200
 MAX_POST = 20000
 NOTIFY_TEXT_LIMIT = 1500
+# crew tasks (docs/SPEC.md §4.2)
+MAX_DIRECTIONS = 20        # directions passed in one call
+CREW_DRAFT_CHARS = 8000    # the largest budget of the draft of a crew task's result ("Finishing")
+CREW_DRAFT_MIN = 300       # a cut result keeps at least this many characters, else only its task_get pointer
+OWNER_LIST_MAX = 20        # directions listed in the owner sentence, then crew_directions_more
+MARK_SUBTASKS_DONE = "subtasks done"      # liveness marks (stall_marks)
+MARK_FREE_DIRECTIONS = "free directions"
 
 _USER_ALIASES = ("user", "пользователь")
 _JSON_FIELDS = ("depends_on", "tags")
 _OPEN = tuple(s for s in Status.ALL if s in Status.OPEN)
+_WORKING = (Status.IN_PROGRESS, Status.WAITING)            # a direction in these takes a place in the working set
+_TAKEABLE = (Status.TODO, Status.IN_PROGRESS, Status.WAITING)  # a crew task whose directions can be taken
 _CHUNK = 500
+_INDENT = "    "           # the results in the draft of a crew task's result
 
 
 # --- value helpers -----------------------------------------------------------------------------
@@ -114,6 +126,15 @@ def _reviewer_is_assignee(reviewer: str, task: str) -> ToolError:
 
 def _clip(text: str, limit: int = NOTIFY_TEXT_LIMIT) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _quote(title: str, lang: str) -> str:
+    """A title in the quotes of the recipient's language: "title" / «title»."""
+    return f"«{title}»" if lang == "ru" else f"\"{title}\""
+
+
+def _indented(text: str) -> str:
+    return "\n".join(_INDENT + line for line in text.split("\n"))
 
 
 def _unique(items: Iterable[Any]) -> list[Any]:
@@ -323,18 +344,140 @@ class Board:
                              [t for t in self.list() if t.id not in skip and t.created_by != task.created_by])
 
     def ready_unassigned(self) -> list[Task]:
-        return [t for t in self.list(status=Status.TODO) if t.assignee is None and not t.blocked_by]
+        """Todo tasks without an assignee or blockers; a direction only while its crew task is todo, in_progress or
+        waiting, not blocked, and has a free place (docs/SPEC.md §4.2 "Offers")."""
+        ready = [t for t in self.list(status=Status.TODO) if t.assignee is None and not t.blocked_by]
+        parents = {p.id: p for p in self._load_many(t.parent_id for t in ready if t.parent_id is not None)}
+        return [t for t in ready if t.parent_id not in parents or self._takes_directions(parents[t.parent_id])]
 
     def open_tasks_of(self, name: str) -> list[Task]:
         tasks = self._query(["assignee = ?", f"status IN ({_qmarks(len(_OPEN))})"], [name, *_OPEN])
         self._fill(tasks)
         return tasks
 
+    # --- reads: subtasks and crew tasks (docs/SPEC.md §4.2) -----------------------------------------------------
+
+    def subtasks_of(self, task_id: int, open_only: bool = False) -> list[Task]:
+        """The subtasks of a task (parent_id == task_id) in the order they were created (id ascending), filled."""
+        sql = "SELECT * FROM tasks WHERE parent_id = ?"
+        params: list[Any] = [_as_int(task_id, "task_id")]
+        if open_only:
+            sql += f" AND status IN ({_qmarks(len(_OPEN))})"
+            params += _OPEN
+        tasks = [Task.from_row(r) for r in self.db.all(sql + " ORDER BY id ASC", params)]
+        self._fill(tasks)
+        return tasks
+
+    def crew_working(self, task: Task) -> list[str]:
+        """The working set of a crew task: its assignee while it is open, then the assignees of its in_progress or
+        waiting subtasks (id ascending), each once, never USER. Read from the database now (inside a transaction:
+        the state the transaction sees)."""
+        return self._working_sets([task]).get(task.id, [])
+
+    def contributors_of(self, task: Task) -> set[str]:
+        """The assignees of its subtasks, in any status."""
+        rows = self.db.all("SELECT DISTINCT assignee FROM tasks WHERE parent_id = ? AND assignee IS NOT NULL",
+                           (task.id,))
+        return {r["assignee"] for r in rows}
+
+    def finish_states(self, ids: Iterable[int]) -> dict[int, str | None]:
+        """The finish state of each parent: None while it has no subtask or an open one, else "failed" for a crew
+        task with a failed direction, else "finished" (one grouped query per chunk of ids)."""
+        return {tid: state for tid, (state, _) in self._finish_info(ids).items()}
+
+    def _finish_info(self, ids: Iterable[int]) -> dict[int, tuple[str | None, dict[str, int]]]:
+        """(finish state, subtasks per status) of each id; ids of missing tasks get (None, {})."""
+        wanted = _unique(ids)
+        crews: dict[int, int] = {}
+        counts: dict[int, dict[str, int]] = {}
+        for i in range(0, len(wanted), _CHUNK):
+            chunk = wanted[i:i + _CHUNK]
+            rows = self.db.all("SELECT p.id AS id, p.crew AS crew, s.status AS status, COUNT(s.id) AS n FROM tasks p"
+                               f" LEFT JOIN tasks s ON s.parent_id = p.id WHERE p.id IN ({_qmarks(len(chunk))})"
+                               " GROUP BY p.id, s.status", chunk)
+            for row in rows:
+                crews[row["id"]] = row["crew"] or 0
+                if row["status"] is not None:
+                    counts.setdefault(row["id"], {})[row["status"]] = row["n"]
+        out: dict[int, tuple[str | None, dict[str, int]]] = {}
+        for tid in wanted:
+            per_status = counts.get(tid, {})
+            state: str | None = None
+            if per_status and not any(s in Status.OPEN for s in per_status):
+                state = "failed" if crews.get(tid, 0) >= 2 and per_status.get(Status.FAILED) else "finished"
+            out[tid] = (state, per_status)
+        return out
+
+    def free_directions(self, task: Task) -> list[Task]:
+        """The directions of a crew task anyone may take now: todo, without an assignee, while the crew task is
+        todo, in_progress or waiting and not blocked (no free place needed: the owner's claim takes none)."""
+        if task.crew < 2 or task.status not in _TAKEABLE or self._blockers_of(task.depends_on):
+            return []
+        return [s for s in self.subtasks_of(task.id, open_only=True) if s.status == Status.TODO and s.assignee is None]
+
+    def has_open_directions(self, task: Task) -> bool:
+        """A crew task with an open direction: it waits for them (liveness leaves it out of the stalled ids)."""
+        if task.crew < 2:
+            return False
+        return self.db.one(f"SELECT 1 FROM tasks WHERE parent_id = ? AND status IN ({_qmarks(len(_OPEN))}) LIMIT 1",
+                           (task.id, *_OPEN)) is not None
+
+    def stall_marks(self, name: str) -> frozenset[tuple[int, str]]:
+        """The liveness marks of `name` (docs/SPEC.md §4.2 "Finishing", Liveness): (N, "subtasks done") for each of
+        its tasks in in_progress or waiting with at least one subtask, all of them terminal; (N, "free directions")
+        for each crew task it holds that has a free direction while it holds none of its directions in in_progress
+        or waiting."""
+        held = self._query(["assignee = ?", f"status IN ({_qmarks(len(_TAKEABLE))})"], [name, *_TAKEABLE])
+        states = self.finish_states(t.id for t in held if t.status in _WORKING)
+        marks = {(tid, MARK_SUBTASKS_DONE) for tid, state in states.items() if state is not None}
+        for task in held:
+            if task.crew < 2 or (task.id, MARK_SUBTASKS_DONE) in marks:
+                continue
+            subs = self.subtasks_of(task.id, open_only=True)
+            if any(s.assignee == name and s.status in _WORKING for s in subs):
+                continue
+            if self.free_directions(task):
+                marks.add((task.id, MARK_FREE_DIRECTIONS))
+        return frozenset(marks)
+
+    def mark_text(self, name: str, marks: Iterable[tuple[int, str]]) -> str:
+        """One sentence per mark, in `name`'s language, sorted by (id, kind), each starting with a space: the
+        owner form of the ending that applies now for "subtasks done" (the drafts of several crew tasks share one
+        budget, each built with draft_budget() // their number), the free directions for "free directions". A mark
+        that no longer applies gives no sentence."""
+        lang = self.swarm.language_of(name)
+        marks = sorted(set(marks))
+        tasks = {t.id: t for t in self._load_many(tid for tid, _ in marks)}
+        info = self._finish_info(tid for tid, kind in marks if kind == MARK_SUBTASKS_DONE)
+        drafts = sum(1 for tid, (state, counts) in info.items()
+                     if tid in tasks and tasks[tid].crew >= 2 and state == "finished" and counts.get(Status.DONE))
+        share = self.draft_budget() // drafts if drafts else None
+        parts: list[str] = []
+        for tid, kind in marks:
+            task = tasks.get(tid)
+            if task is None:
+                continue
+            if kind == MARK_SUBTASKS_DONE and info[tid][0] is not None:
+                ending = self._ending(task, info[tid][0], "owner", lang, budget=share)
+                parts.append(prompts.t(lang, "mark_subtasks_done", id=task.id, title=task.title, ending=ending))
+            elif kind == MARK_FREE_DIRECTIONS:
+                free = self.free_directions(task)
+                if free:
+                    parts.append(prompts.t(lang, "mark_free_directions", id=task.id,
+                                           directions=self._direction_names(free, lang)))
+        return "".join(parts)
+
     @property
     def independent_review(self) -> bool:
         """[swarm] independent_review (default true): an agent never approves work it executed (SPEC §4). Read on
         every call, so reconfiguration and session overrides apply at once."""
         return bool(getattr(getattr(self.swarm.config, "swarm", None), "independent_review", True))
+
+    @property
+    def crew_review(self) -> bool:
+        """[swarm] crew_review (default true): the review of a crew task with a done direction is its check of the
+        whole (docs/SPEC.md §4.2 "Finishing"). Read on every call, like independent_review."""
+        return bool(getattr(getattr(self.swarm.config, "swarm", None), "crew_review", True))
 
     def reviews_of(self, name: str) -> list[Task]:
         """Tasks waiting for `name`'s review (status review, reviewer == name): priority desc, id asc, filled."""
@@ -796,14 +939,40 @@ class Board:
         if self.db.one("SELECT id FROM tasks WHERE id = ?", (parent,)) is None:
             raise ToolError(f"Parent task #{parent} not found.")
         # walk up from the new parent: reaching task_id would make the hierarchy a loop
-        seen: set[int] = set()
-        node: int | None = parent
-        while task_id is not None and node is not None and node not in seen:
-            if node == task_id:
-                raise ToolError(f"Task #{parent} is a subtask of #{task_id}; it cannot become its parent.")
-            seen.add(node)
-            node = self.db.scalar("SELECT parent_id FROM tasks WHERE id = ?", (node,))
+        if task_id is not None and any(row["id"] == task_id for row in self._ancestors(parent)):
+            raise ToolError(f"Task #{parent} is a subtask of #{task_id}; it cannot become its parent.")
         return parent
+
+    def _ancestors(self, parent_id: int | None) -> list[Any]:
+        """The rows (id, crew, status, created_by, assignee, parent_id) from `parent_id` up to the top, nearest
+        first; the walk stops at a missing row or a loop."""
+        rows: list[Any] = []
+        seen: set[int] = set()
+        node = parent_id
+        while node is not None and node not in seen:
+            row = self.db.one("SELECT id, crew, status, created_by, assignee, parent_id FROM tasks WHERE id = ?",
+                              (node,))
+            if row is None:
+                break
+            seen.add(node)
+            rows.append(row)
+            node = row["parent_id"]
+        return rows
+
+    def _has_crew_below(self, task_id: int) -> bool:
+        """A crew task among the descendants of `task_id` (one query, walked in memory)."""
+        children: dict[int, list[tuple[int, int]]] = {}
+        for row in self.db.all("SELECT id, parent_id, crew FROM tasks WHERE parent_id IS NOT NULL"):
+            children.setdefault(row["parent_id"], []).append((row["id"], row["crew"] or 0))
+        stack, seen = [task_id], {task_id}
+        while stack:
+            for child, crew in children.get(stack.pop(), []):
+                if crew >= 2:
+                    return True
+                if child not in seen:
+                    seen.add(child)
+                    stack.append(child)
+        return False
 
     def _raise_if_blocked(self, task_id: int, deps: list[int], assignee: bool = False) -> None:
         """`assignee`: the actor is the task's assignee, who may remove dependencies it can do without."""
@@ -829,6 +998,40 @@ class Board:
         sql = "SELECT * FROM tasks" + (" WHERE " + " AND ".join(where) if where else "")
         rows = self.db.all(sql + " ORDER BY priority DESC, id ASC", params)
         return [Task.from_row(r) for r in rows]
+
+    def _load_many(self, ids: Iterable[int]) -> list[Task]:
+        """The tasks with these ids that exist, id ascending, filled."""
+        wanted = sorted(set(ids) - {None})
+        tasks: list[Task] = []
+        for i in range(0, len(wanted), _CHUNK):
+            chunk = wanted[i:i + _CHUNK]
+            tasks += [Task.from_row(r) for r in self.db.all(
+                f"SELECT * FROM tasks WHERE id IN ({_qmarks(len(chunk))}) ORDER BY id ASC", chunk)]
+        self._fill(tasks)
+        return tasks
+
+    def _working_sets(self, tasks: list[Task]) -> dict[int, list[str]]:
+        """The working set of each of `tasks` (crew_working), with one query per chunk."""
+        out = {t.id: [t.assignee] if t.status in Status.OPEN and t.assignee not in (None, USER) else [] for t in tasks}
+        ids = list(out)
+        for i in range(0, len(ids), _CHUNK):
+            chunk = ids[i:i + _CHUNK]
+            for row in self.db.all(f"SELECT parent_id, assignee FROM tasks WHERE parent_id IN ({_qmarks(len(chunk))})"
+                                   f" AND status IN ({_qmarks(len(_WORKING))}) AND assignee IS NOT NULL ORDER BY id",
+                                   [*chunk, *_WORKING]):
+                working = out[row["parent_id"]]
+                if row["assignee"] != USER and row["assignee"] not in working:
+                    working.append(row["assignee"])
+        return out
+
+    @staticmethod
+    def _takes_directions(parent: Task) -> bool:
+        """`parent` (filled) is no crew task, or a crew task whose free directions may be offered now: todo,
+        in_progress or waiting, not blocked, with a free place."""
+        if parent.crew < 2:
+            return True
+        return (parent.status in _TAKEABLE and not parent.blocked_by
+                and len(parent.crew_working) < parent.crew)
 
     def _write(self, task_id: int, values: dict[str, Any]) -> None:
         cols = {**values, "updated_at": time.time()}
@@ -875,16 +1078,25 @@ class Board:
             for row in self.db.all(f"SELECT task_id, COUNT(*) AS n FROM comments WHERE task_id IN "
                                    f"({_qmarks(len(chunk))}) GROUP BY task_id", chunk):
                 counts[row["task_id"]] = row["n"]
+        working = self._working_sets([t for t in tasks if t.crew >= 2])
         for task in tasks:
             task.blocked_by = [d for d in task.depends_on if d in statuses and statuses[d] != Status.DONE]
             task.comments = counts.get(task.id, 0)
+            task.crew_working = working.get(task.id, [])
 
     # --- discussion ----------------------------------------------------------------------------------
 
     def _participants(self, task: Task) -> list[str]:
+        """Its creator, assignee, reviewer and posters; for a crew task also the assignees of its open directions
+        (in review too): its discussion is the crew's channel."""
         posters = [r["author"] for r in self.db.all(
             "SELECT author FROM comments WHERE task_id = ? GROUP BY author ORDER BY MIN(id)", (task.id,))]
-        return _unique([task.created_by, task.assignee, task.reviewer, *posters])
+        crew: list[str] = []
+        if task.crew >= 2:
+            crew = [r["assignee"] for r in self.db.all(
+                f"SELECT assignee FROM tasks WHERE parent_id = ? AND assignee IS NOT NULL AND status IN "
+                f"({_qmarks(len(_OPEN))}) ORDER BY id", (task.id, *_OPEN))]
+        return _unique([task.created_by, task.assignee, task.reviewer, *posters, *crew])
 
     def _post(self, actor: str, task: Task, text: Any, reply_to: Any, skip: set[str | None] | None = None,
               notify: bool = True) -> dict:
@@ -933,6 +1145,205 @@ class Board:
                 reply = prompts.t(self.swarm.language_of(name), "reply_suffix", reply_to=post["reply_to"])
             self.swarm.notify(name, "n_discussion", by=actor, id=task.id, title=task.title,
                               post_id=post["id"], reply=reply, text=text)
+
+    # --- crew tasks: texts for agents (docs/SPEC.md §4.2), in the recipient's language ---------------------------
+
+    def draft_budget(self) -> int:
+        """B, the budget of the draft of a crew task's result: min(CREW_DRAFT_CHARS, agents.tool_output_chars // 2),
+        the setting read at each call."""
+        chars = getattr(getattr(self.swarm.config, "agents", None), "tool_output_chars", 2 * CREW_DRAFT_CHARS)
+        return min(CREW_DRAFT_CHARS, int(chars) // 2)
+
+    def _crew_draft(self, task: Task, lang: str, budget: int | None = None) -> str:
+        """The draft of #N's result ("Finishing"): a line break, the crew_draft header and one item per direction in
+        creation order (a done one followed by its indented result), at most `budget` characters in all (default
+        draft_budget()). Pass 1 takes the directions while the header, their lines, the least pieces of the done
+        ones and, when not all fit, crew_draft_more fit; pass 2 shares what is left among the done results, the
+        shortest first. "" when not even crew_draft_more fits."""
+        from .shell import truncate_middle
+
+        limit = max(0, self.draft_budget() if budget is None else budget)
+        subs = self.subtasks_of(task.id)
+        if not subs:
+            return ""
+        head = "\n" + prompts.t(lang, "crew_draft", id=task.id, items="")
+        more_all = prompts.t(lang, "crew_draft_more", k=len(subs), id=task.id)
+        lines = [self._draft_line(s, lang) for s in subs]
+        results = {i: (s.result or "") for i, s in enumerate(subs) if s.status == Status.DONE}
+        cuts = {i: _INDENT + prompts.t(lang, "crew_draft_cut", id=subs[i].id) for i in results}
+        no_result = _INDENT + prompts.t(lang, "crew_draft_no_result")
+        whole = {i: _indented(r) if r else no_result for i, r in results.items()}
+        least = {i: whole[i] if not results[i] or len(whole[i]) <= len(cuts[i]) else cuts[i] for i in results}
+
+        def size(lengths: list[int]) -> int:  # the elements joined by line breaks, after the header
+            return len(head) + sum(lengths) + max(0, len(lengths) - 1)
+
+        def item(i: int) -> list[int]:
+            return [len(lines[i])] + ([len(least[i])] if i in results else [])
+
+        # pass 1: which items
+        taken: list[int] = []
+        count = 0
+        if size([n for i in range(len(subs)) for n in item(i)]) <= limit:
+            count = len(subs)
+        else:
+            while count < len(subs) and size([*taken, *item(count), len(more_all)]) <= limit:
+                taken += item(count)
+                count += 1
+        if count == 0:
+            if size([len(more_all)]) <= limit:
+                return head + more_all
+            return "\n" + more_all if 1 + len(more_all) <= limit else ""
+        more = prompts.t(lang, "crew_draft_more", k=len(subs) - count, id=task.id) if count < len(subs) else ""
+        # pass 2: the results of the items, the shortest first
+        shown = range(count)
+        fixed = [len(lines[i]) for i in shown] + [0 for i in shown if i in results] + ([len(more)] if more else [])
+        left = limit - size(fixed)
+        served = sorted((i for i in shown if i in results and results[i]), key=lambda i: (len(results[i]), i))
+        pieces = {i: no_result for i in shown if i in results and not results[i]}
+        left -= sum(len(p) for p in pieces.values())
+        reserve = sum(len(least[i]) for i in served)
+        for pos, i in enumerate(served):
+            reserve -= len(least[i])
+            # each share leaves the least pieces of the ones still to serve (pass 1 kept room for all of them)
+            share = min(NOTIFY_TEXT_LIMIT, left // (len(served) - pos), left - reserve)
+            piece = self._draft_piece(whole[i], cuts[i], share, truncate_middle)
+            if len(piece) > share:
+                piece = least[i]
+            pieces[i] = piece
+            left -= len(piece)
+        elements: list[str] = []
+        for i in shown:
+            elements.append(lines[i])
+            if i in pieces:
+                elements.append(pieces[i])
+        if more:
+            elements.append(more)
+        return "\n" + prompts.t(lang, "crew_draft", id=task.id, items="\n".join(elements))
+
+    @staticmethod
+    def _draft_piece(whole: str, cut: str, share: int, truncate_middle: Callable[[str, int], str]) -> str:
+        """A done direction's indented result within `share` characters: whole, or cut in the middle with its
+        task_get pointer after it, or the pointer alone when the cut would keep fewer than CREW_DRAFT_MIN."""
+        if len(whole) <= share:
+            return whole
+        marker = len(f"\n... [{len(whole)} characters skipped] ...\n")
+        keep = share - (1 + len(cut)) - marker
+        if keep < CREW_DRAFT_MIN:
+            return cut
+        return truncate_middle(whole, keep) + "\n" + cut
+
+    @staticmethod
+    def _draft_line(sub: Task, lang: str) -> str:
+        line = f"- #{sub.id} [{sub.status}] {_quote(trim(sub.title, 80), lang)}"
+        return line + (f" @{sub.assignee}" if sub.assignee else "")
+
+    @staticmethod
+    def _counts_text(counts: dict[str, int], lang: str) -> str:
+        """The finished subtasks per status: "5 done, 1 cancelled" (n_subtasks_done's {counts})."""
+        parts = []
+        if counts.get(Status.DONE):
+            parts.append(prompts.t(lang, "count_done", n=counts[Status.DONE]))
+        if counts.get(Status.CANCELLED):
+            parts.append(prompts.t(lang, "count_cancelled", n=counts[Status.CANCELLED]))
+        if counts.get(Status.FAILED):
+            parts.append(prompts.t(lang, "count_failed", n=counts[Status.FAILED]))
+        return ", ".join(parts)
+
+    def _ending(self, task: Task, state: str | None, form: str, lang: str, budget: int | None = None) -> str:
+        """What a parent in finish state `state` asks of its holder ("Finishing"): the plain ending, or for a crew
+        task the first crew ending that applies (a direction failed, all were cancelled, all are finished). `form`:
+        "holder", "creator" (asked to take it first) or "owner" (a prefix that says what happened, then the
+        holder's ending). The all finished ending of the holder and owner forms is followed by the draft of the
+        result (`budget`: its characters, default draft_budget()). "" for state None."""
+        if form not in ("holder", "creator", "owner"):
+            raise ValueError(f"unknown ending form {form!r}")
+        if state is None:
+            return ""
+        creator = form == "creator"
+        if task.crew < 2:
+            text = prompts.t(lang, "ending_plain_creator" if creator else "ending_plain", id=task.id)
+            return prompts.t(lang, "owner_prefix_plain") + text if form == "owner" else text
+        subs = self.subtasks_of(task.id)
+        failed = next((s.id for s in subs if s.status == Status.FAILED), None)
+        if state == "failed" and failed is not None:
+            text = prompts.t(lang, "ending_crew_failed_creator" if creator else "ending_crew_failed", id=task.id,
+                             failed=failed)
+            prefix = prompts.t(lang, "owner_prefix_failed")
+        elif not any(s.status == Status.DONE for s in subs):
+            text = prompts.t(lang, "ending_crew_cancelled_creator" if creator else "ending_crew_cancelled",
+                             id=task.id)
+            prefix = prompts.t(lang, "owner_prefix_cancelled")
+        else:
+            text = prompts.t(lang, "ending_crew_finished_creator" if creator else "ending_crew_finished", id=task.id)
+            prefix = prompts.t(lang, "owner_prefix_finished")
+            if not creator:
+                text += self._crew_draft(task, lang, budget)
+        return prefix + text if form == "owner" else text
+
+    def _owner_sentence(self, task: Task, holder: str | None, lang: str,
+                        budget: int | None = None) -> tuple[str, str]:
+        """(instructions, directions) told to the holder of crew task `task` ("The owner"; n_crew_owner's
+        placeholders, and the results of the calls that make the actor the holder). instructions: the owner form of
+        the crew ending when all its directions are finished (a finish state), else the owner sentence (its own
+        direction, take one, all taken, or no directions yet). directions: the directions but the cancelled ones,
+        id ascending, at most OWNER_LIST_MAX, then crew_directions_more; "" with none, and "" with the all finished
+        ending, whose draft lists them. For a task that is no crew task: the owner form of the plain ending when
+        all its subtasks are finished, else ("", "")."""
+        state = self.finish_states([task.id])[task.id]
+        if task.crew < 2:
+            return (" " + self._ending(task, state, "owner", lang, budget) if state else ""), ""
+        subs = self.subtasks_of(task.id)
+        listed = [s for s in subs if s.status != Status.CANCELLED]
+        if state is not None:
+            instructions = " " + self._ending(task, state, "owner", lang, budget)
+            if state == "finished" and any(s.status == Status.DONE for s in subs):
+                return instructions, ""
+            return instructions, self._directions_text(task, listed, lang)
+        if not subs:
+            return prompts.t(lang, "crew_owner_none", id=task.id), ""
+        own = [s for s in listed if holder is not None and s.assignee == holder]
+        if own:
+            mine = next((s for s in own if s.status in Status.OPEN), own[0])
+            instructions = prompts.t(lang, "crew_owner_own", id=task.id, sub=mine.id, status=mine.status,
+                                     crew=task.crew)
+        elif any(s.status == Status.TODO and s.assignee is None for s in subs):
+            instructions = prompts.t(lang, "crew_owner_take", id=task.id, crew=task.crew)
+        else:
+            instructions = prompts.t(lang, "crew_owner_all_taken", id=task.id, crew=task.crew)
+        return instructions, self._directions_text(task, listed, lang)
+
+    def _directions_text(self, task: Task, listed: list[Task], lang: str) -> str:
+        """crew_directions with '#15 [in_progress] "pkce" @Anna Smith; #17 [todo] "oidc"' (at most OWNER_LIST_MAX,
+        then crew_directions_more), or "" with none."""
+        if not listed:
+            return ""
+        items = "; ".join(self._draft_line(s, lang)[2:] for s in listed[:OWNER_LIST_MAX])
+        text = prompts.t(lang, "crew_directions", items=items)
+        if len(listed) > OWNER_LIST_MAX:
+            text += prompts.t(lang, "crew_directions_more", k=len(listed) - OWNER_LIST_MAX, id=task.id)
+        return text
+
+    @staticmethod
+    def _direction_names(subs: list[Task], lang: str) -> str:
+        """'#17 "oidc", #18 "jose"' (at most OWNER_LIST_MAX, then "…")."""
+        names = [f"#{s.id} {_quote(trim(s.title, 80), lang)}" for s in subs[:OWNER_LIST_MAX]]
+        return ", ".join(names + (["…"] if len(subs) > OWNER_LIST_MAX else []))
+
+    @staticmethod
+    def _open_list(subs: list[Task], viewer: str | None, lang: str = "en") -> str:
+        """The open ones of `subs` for the board's errors: '#15 [in_progress, you], #16 [in_progress, Anna Smith],
+        #17 [review]' (the holder named unless the subtask is in review, `viewer` as "you"). The board's errors are
+        English, so `lang` changes nothing yet."""
+        parts = []
+        for sub in subs:
+            if sub.status not in Status.OPEN:
+                continue
+            who = ""
+            if sub.assignee and sub.status != Status.REVIEW:
+                who = ", you" if sub.assignee == viewer else f", {sub.assignee}"
+            parts.append(f"#{sub.id} [{sub.status}{who}]")
+        return ", ".join(parts)
 
     # --- notifications -------------------------------------------------------------------------------
 
