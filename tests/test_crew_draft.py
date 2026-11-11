@@ -173,6 +173,15 @@ def test_shortest_results_are_served_first(board):
     assert long_piece.count("L") >= CREW_DRAFT_MIN  # the long one got the rest, cut
 
 
+def test_the_room_a_short_result_leaves_goes_to_the_long_one(board):
+    """Served shortest first: the long result gets what the short one did not use, not half of the room."""
+    task, subs = crew_with_results(board, ["s" * 100, "l" * 3000])
+    draft = board._crew_draft(task, "en", budget=1000)
+    assert len(draft) <= 1000
+    assert "    " + "s" * 100 + "\n" in draft  # the short one whole
+    assert draft.count("l") > 600  # the long one keeps most of the rest (half the room would be about 340)
+
+
 def test_a_short_result_shown_whole_however_small_the_budget_lets_items_in(board):
     task, subs = crew_with_results(board, ["ok"])
     full = board._crew_draft(task, "en", budget=CREW_DRAFT_CHARS)

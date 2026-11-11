@@ -11,6 +11,8 @@ import dataclasses
 import sqlite3
 import time
 
+import pytest
+
 from dreamteam import prompts
 from dreamteam import settings as st
 from dreamteam.db import Database
@@ -420,6 +422,148 @@ async def test_a_held_todo_of_an_ordinary_parent_keeps_the_reminder_back(tmp_pat
         await shutdown(swarm)
 
 
+async def test_a_held_top_level_todo_keeps_the_reminder_back(tmp_path):
+    swarm = await live_team(tmp_path, BOB)
+    try:
+        board = swarm.board
+        impl = board.create(USER, "impl", goal="g")
+        swarm.set_goal(USER, "Ship it")
+        board.claim(BOB, impl.id)
+        board.complete(BOB, impl.id, "done")
+        board.create(USER, "tests", goal="g", depends_on=[impl.id])
+        side = board.create(USER, "side", goal="g", assignee=BOB)
+        deliver(swarm)
+        swarm._remind_user_reviews()
+        assert "u_reviews_waiting" not in kinds_for(swarm, USER)      # Bob holds work it can go on with
+        board.update(USER, side.id, status="cancelled")
+        deliver(swarm)
+        swarm._remind_user_reviews()
+        swarm._remind_user_reviews()
+        assert kinds_for(swarm, USER).count("u_reviews_waiting") == 1
+    finally:
+        await shutdown(swarm)
+
+
+@pytest.mark.parametrize("status", [Status.TODO, Status.IN_PROGRESS])
+async def test_user_is_told_when_a_crew_task_waits_only_for_their_review_of_a_direction(tmp_path, status):
+    """The owner holds the crew task (todo, as task_create with assignee leaves it, or claimed): it waits for its
+    directions, so neither way does it keep the reminder back while the last one waits for the user's review."""
+    swarm = await live_team(tmp_path, ANNA, BOB)
+    try:
+        board = swarm.board
+        crew, (parser, cli) = make_crew_raw(board, ANNA, 2, ["parser", "cli"], title="Tool", goal="g")
+        swarm.set_goal(USER, "Ship it")
+        set_raw(board, crew.id, status=status, assignee=ANNA)
+        finish_raw(board, parser.id, Status.DONE, "parsed", assignee=ANNA)
+        finish_raw(board, cli.id, Status.REVIEW, "cli done", assignee=BOB, reviewer=USER)
+        deliver(swarm)
+        for _ in range(3):
+            swarm._wake_stalled()
+            idle_for_a_while(swarm)
+            swarm._remind_user_reviews()
+        assert texts_for(swarm, USER, "u_reviews_waiting") == [prompts.t("en", "u_reviews_waiting",
+                                                                         tasks=f"#{cli.id}")]
+    finally:
+        await shutdown(swarm)
+
+
+@pytest.mark.parametrize("held", [True, False])
+async def test_user_is_told_when_an_ordinary_parent_waits_for_their_review_of_its_subtasks(tmp_path, held):
+    """An agent cannot complete a parent with an open subtask: an epic whose subtasks wait for the user's review is
+    no work that keeps the swarm going, held in progress or released to todo."""
+    swarm = await live_team(tmp_path, BOB)
+    try:
+        board = swarm.board
+        epic = board.create(USER, "epic", goal="g")
+        swarm.set_goal(USER, "Ship it")
+        board.claim(BOB, epic.id)
+        parts = [board.create(BOB, f"part {i}", goal="g", parent_id=epic.id) for i in (1, 2)]
+        for part in parts:
+            board.claim(BOB, part.id)
+            assert board.complete(BOB, part.id, "done").reviewer == USER   # a one-agent team: the user reviews
+        assert "has open subtasks" in str(pytest.raises(Exception, board.complete, BOB, epic.id, "all").value)
+        if not held:
+            board.update(BOB, epic.id, status="todo")
+        deliver(swarm)
+        swarm._remind_user_reviews()
+        swarm._remind_user_reviews()
+        assert texts_for(swarm, USER, "u_reviews_waiting") == [
+            prompts.t("en", "u_reviews_waiting", tasks=", ".join(f"#{p.id}" for p in parts))]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_held_direction_its_holder_cannot_take_keeps_no_reminder_back(tmp_path):
+    """A direction assigned while its crew task is full waits like the full crew task's free ones."""
+    swarm = await live_team(tmp_path, ANNA, BOB, CARL)
+    try:
+        board = swarm.board
+        impl = board.create(USER, "impl", goal="g")
+        swarm.set_goal(USER, "Ship it")
+        crew, (parser, cli) = make_crew_raw(board, ANNA, 2, ["parser", "cli"], title="Tool", goal="g")
+        set_raw(board, crew.id, status=Status.WAITING, assignee=ANNA)
+        set_raw(board, parser.id, status=Status.WAITING, assignee=BOB)
+        set_raw(board, cli.id, assignee=CARL)                           # todo, assigned: the crew task is full
+        finish_raw(board, impl.id, Status.REVIEW, "done", assignee=BOB, reviewer=USER)
+        deliver(swarm)
+        assert swarm._has_actionable_todo() is False
+        swarm._remind_user_reviews()
+        assert kinds_for(swarm, USER).count("u_reviews_waiting") == 1
+        set_raw(board, parser.id, status=Status.REVIEW, reviewer=USER)  # handed in: Carl can take cli now
+        assert swarm._has_actionable_todo() is True
+    finally:
+        await shutdown(swarm)
+
+
+# ================================================================== liveness of crew owners and assignees (§4.2)
+
+async def test_an_owner_holding_its_crew_task_todo_is_woken_when_its_directions_finished(tmp_path):
+    """task_create with assignee=me leaves the crew task todo: the owner that answered n_subtasks_done with plain
+    text is woken once by the "subtasks done" mark after the idle clock."""
+    swarm = await live_team(tmp_path, ANNA, BOB)
+    try:
+        board = swarm.board
+        swarm.set_goal(USER, "Ship it")
+        crew = board.create(ANNA, "Tool", goal="g", crew=2, directions=["parser", "cli"], assignee=ANNA)
+        for sub in board.subtasks_of(crew.id):
+            finish_raw(board, sub.id, Status.DONE, "ok", assignee=BOB)
+        assert board.get(crew.id).status == Status.TODO
+        deliver(swarm)
+        swarm._wake_idle_holders()
+        idle_for_a_while(swarm)
+        assert wakes(swarm, ANNA) == ["n_marks_stalled"]
+        [text] = texts_for(swarm, ANNA, "n_marks_stalled")
+        assert text.startswith(f'#{crew.id} "Tool": ' + prompts.t("en", "owner_prefix_finished"))
+        deliver(swarm)
+        idle_for_a_while(swarm)
+        assert wakes(swarm, ANNA) == ["n_marks_stalled"]                # once per key
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_member_refused_a_direction_of_a_full_crew_task_is_woken_once_a_place_frees(tmp_path):
+    swarm = await live_team(tmp_path, ANNA, BOB, CARL)
+    try:
+        board = swarm.board
+        swarm.set_goal(USER, "Ship it")
+        crew, (parser, cli) = make_crew_raw(board, ANNA, 2, ["parser", "cli"], title="Tool", goal="g")
+        set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        set_raw(board, parser.id, status=Status.IN_PROGRESS, assignee=BOB)
+        board.update(ANNA, cli.id, assignee=CARL)
+        deliver(swarm)
+        swarm._wake_idle_holders()
+        idle_for_a_while(swarm)
+        assert wakes(swarm, CARL) == []                                 # full: nothing it can do yet
+        set_raw(board, parser.id, status=Status.REVIEW, reviewer=ANNA)  # Bob handed it in
+        swarm._wake_idle_holders()
+        assert wakes(swarm, CARL) == []                                 # the idle clock first
+        idle_for_a_while(swarm)
+        assert texts_for(swarm, CARL, "n_marks_stalled") == [
+            prompts.t("en", "mark_direction_to_take", sub=cli.id, title="cli", id=crew.id).lstrip()]
+    finally:
+        await shutdown(swarm)
+
+
 # ================================================================== the in-activation nudge (§6.2)
 
 async def test_the_owner_is_nudged_about_free_directions_only(tmp_path):
@@ -452,6 +596,9 @@ async def test_the_owner_is_nudged_about_free_directions_only(tmp_path):
 
         calls = await activation("status?")
         assert len(calls) == 1 and runtime.stalled == frozenset()      # all directions taken: no nudge
+        # a crew task the owner parked in `waiting`, with a free direction: never in the nudge
+        parked, _ = make_crew_raw(board, USER, 3, ["later"], title="Parked", goal="g")
+        set_raw(board, parked.id, status=Status.WAITING, assignee=anna)
         set_raw(board, cli.id, status=Status.TODO, assignee=None)
         sentence = board.mark_text(anna, {(crew.id, FREE)})
         assert sentence.startswith(f" #{crew.id} is a crew task with free directions")

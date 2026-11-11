@@ -1360,7 +1360,8 @@ class Swarm:
         `wait` with nothing that will wake it, would sleep until some unrelated event: after
         agents.idle_nudge_seconds it is woken once per liveness key (its in-progress task ids and its marks,
         _stall_key; shared with _wake_stalled, so a key is never woken about twice), also with no such task when
-        it has marks (a `waiting` parent whose subtasks have all finished). The clock starts when it was last seen
+        it has marks (a `waiting` or `todo` parent whose subtasks have all finished, a direction it can take now).
+        The clock starts when it was last seen
         going idle with that key. A member whose running job's end will wake it (JobManager.awaited, what `wait`
         promised it) is waiting for that job, and one refused a file waits for it to be free
         (Workspace.waits_for_lock, what the refusal promised): no clock runs for it meanwhile."""
@@ -1557,7 +1558,7 @@ class Swarm:
         # a member busy with a job (its command went on in the background) is at work like a WORKING one
         if (any(m["status"] == AgentStatus.WORKING or self.has_pending(m["name"]) or self.jobs.busy(m["name"])
                 for m in llm)
-                or any(t.reviewer != USER for t in reviews) or self.board.list(status=Status.IN_PROGRESS)
+                or any(t.reviewer != USER for t in reviews) or self._has_task_in_progress()
                 or self._has_actionable_todo()):
             return
         key = frozenset(t.id for t in waiting)
@@ -1565,22 +1566,39 @@ class Swarm:
             self._user_reviews_key = key
             self.notify(USER, "u_reviews_waiting", tasks=", ".join(f"#{t.id}" for t in waiting))
 
+    def _has_task_in_progress(self) -> bool:
+        """An `in_progress` task its holder can go on with: one without open subtasks (a parent with an open subtask
+        waits for it, and cannot be completed before it finishes; the open subtasks count on their own)."""
+        tasks = self.board.list(status=Status.IN_PROGRESS)
+        waits = self.board.open_parents(t.id for t in tasks)
+        return any(t.id not in waits for t in tasks)
+
     def _has_actionable_todo(self) -> bool:
-        """A `todo` task someone can go on with: one ready_unassigned returns (a direction only while its crew task
-        takes directions), or one a member holds that no blocker stops, nor a blocker of its crew task (the owner's
-        own part of a blocked crew task waits like its other directions)."""
-        if self.board.ready_unassigned():
+        """A `todo` task someone can go on with, never a parent with an open subtask (it waits for them): one
+        ready_unassigned returns (a direction only while its crew task takes directions), or one a member holds that
+        no blocker stops; a held direction of a crew task only when its holder's claim would take it now
+        (Board.directions_to_take: not while the crew task is blocked, full, in review or terminal)."""
+        ready = self.board.ready_unassigned()
+        waits = self.board.open_parents(t.id for t in ready)
+        if any(t.id not in waits for t in ready):
             return True
         held = [t for t in self.board.list(status=Status.TODO)
                 if t.assignee is not None and t.assignee != USER and not t.blocked_by]
-        blocked_crews: dict[int, bool] = {}
+        waits = self.board.open_parents(t.id for t in held)
+        crews: dict[int, bool] = {}
+        takeable: dict[str, set[int]] = {}
         for t in held:
+            if t.id in waits:
+                continue
             if t.parent_id is None:
                 return True
-            if t.parent_id not in blocked_crews:
-                parent = self.board.get(t.parent_id)
-                blocked_crews[t.parent_id] = parent.crew >= 2 and bool(parent.blocked_by)
-            if not blocked_crews[t.parent_id]:
+            if t.parent_id not in crews:
+                crews[t.parent_id] = self.board.get(t.parent_id).crew >= 2
+            if not crews[t.parent_id]:
+                return True
+            if t.assignee not in takeable:
+                takeable[t.assignee] = {d.id for d in self.board.directions_to_take(t.assignee)}
+            if t.id in takeable[t.assignee]:
                 return True
         return False
 

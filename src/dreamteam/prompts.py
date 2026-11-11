@@ -304,6 +304,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "mark_free_directions": " #{id} is a crew task with free directions nobody has taken: {directions}. Take one "
                                 "yourself (task_claim), or cancel the ones it does without (task_update "
                                 "status=cancelled).",
+        # {sub} "{title}": a todo direction assigned to the member that its claim would take now
+        "mark_direction_to_take": " #{sub} \"{title}\", your direction of crew task #{id}, can be taken now: claim it "
+                                  "(task_claim) and do it, or unassign yourself if you will not (task_update "
+                                  "assignee='').",
         "n_discussion": "{by} posted in the discussion of task #{id} \"{title}\" (post #{post_id}{reply}): {text}",
         "n_mention": "{by} mentioned you in the discussion of task #{id} \"{title}\" (post #{post_id}): {text}\n"
                      "If it needs your answer, reply with `task_comment` (reply_to={post_id}).",
@@ -745,6 +749,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "mark_free_directions": " #{id} — групповая задача со свободными направлениями, которые никто не взял: "
                                 "{directions}. Возьми одно сам (task_claim) или отмени те, без которых она обойдётся "
                                 "(task_update status=cancelled).",
+        "mark_direction_to_take": " #{sub} «{title}», твоё направление групповой задачи #{id}, теперь можно взять: "
+                                  "возьми его (task_claim) и сделай или сними себя с него, если делать не будешь "
+                                  "(task_update assignee='').",
         "n_discussion": "{by} написал(а) в обсуждении задачи #{id} «{title}» (пост #{post_id}{reply}): {text}",
         "n_mention": "{by} упомянул(а) тебя в обсуждении задачи #{id} «{title}» (пост #{post_id}): {text}\n"
                      "Если нужен твой ответ, ответь через `task_comment` (reply_to={post_id}).",
@@ -1000,7 +1007,7 @@ PLANNING_TASK = {
            "whoever needs to change it says so in the discussion of this task. A small goal that is one "
            "deliverable for one member needs no contracts file: create that one task.\n"
            "4. Then the rest of the tasks. Tasks are deliverables, not steps: each one finishable and verifiable "
-           "by one member. Give every "
+           "by one member. Create them without parent_id: they are not parts of this task. Give every "
            "task a goal (why it exists and what counts as success, so that a reviewer can check it) and a "
            "description with everything a member without your context needs: inputs, the files to create or "
            "change, the sections of CONTRACTS.md it implements or relies on (refer to them, don't copy them), "
@@ -1052,7 +1059,7 @@ PLANNING_TASK = {
            "нужно их изменить, тот пишет об этом в обсуждении этой задачи. Небольшой цели, которая сводится к "
            "одному результату для одного участника, файл контрактов не нужен: создай эту одну задачу.\n"
            "4. Затем остальные задачи. Задачи — это результаты, а не шаги: каждую один участник может сделать и "
-           "проверить. Дай каждой "
+           "проверить. Создавай их без parent_id: они не части этой задачи. Дай каждой "
            "задаче цель (зачем она нужна и что считается успехом — так, чтобы ревьюер мог это проверить) и "
            "описание со всем, что нужно участнику без твоего контекста: входные данные, какие файлы создать или "
            "изменить, какие разделы CONTRACTS.md задача реализует или использует (ссылайся на них, а не "

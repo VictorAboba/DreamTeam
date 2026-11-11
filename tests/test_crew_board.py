@@ -9,7 +9,8 @@ import threading
 import pytest
 
 from dreamteam import prompts
-from dreamteam.board import CREW_MAX, MARK_FREE_DIRECTIONS, MARK_SUBTASKS_DONE, OWNER_LIST_MAX, Board
+from dreamteam.board import (CREW_MAX, MARK_DIRECTION_TO_TAKE, MARK_FREE_DIRECTIONS, MARK_SUBTASKS_DONE,
+                             OWNER_LIST_MAX, Board)
 from dreamteam.db import loads
 from dreamteam.models import USER, AgentKind, AgentStatus, Status, Task, ToolError
 from dreamteam.swarm import QUIET_KEY
@@ -300,8 +301,8 @@ def test_the_owner_gets_the_free_directions_mark_while_it_works_on_none(board):
     task, subs = crew_task(board)
     work(board, subs[0].id, BOB)
     assert board.stall_marks(ANNA) == frozenset({(task.id, MARK_FREE_DIRECTIONS)})
-    work(board, subs[1].id, ANNA, Status.TODO)  # its own part, not started: still works on none
-    assert board.stall_marks(ANNA) == frozenset({(task.id, MARK_FREE_DIRECTIONS)})
+    work(board, subs[1].id, ANNA, Status.TODO)  # its own part, not started: that one is named, not the free ones
+    assert board.stall_marks(ANNA) == frozenset({(subs[1].id, MARK_DIRECTION_TO_TAKE)})
     work(board, subs[1].id, ANNA)
     assert board.stall_marks(ANNA) == frozenset()
 
@@ -321,6 +322,104 @@ def test_an_owner_of_a_todo_crew_task_gets_the_free_directions_mark(board):
     task, subs = crew_task(board)
     set_raw(board, task.id, status=Status.TODO)  # assigned by its creator, not claimed yet
     assert board.stall_marks(ANNA) == frozenset({(task.id, MARK_FREE_DIRECTIONS)})
+
+
+def test_an_owner_holding_its_crew_task_todo_gets_the_subtasks_done_mark(board):
+    """task_create with assignee leaves the crew task todo for its whole life (the owner takes a direction, never #N):
+    the owner that missed n_subtasks_done is still told (both ways of naming the owner)."""
+    named = board.create(DINA, "big", crew=2, directions=["x", "y"], assignee=ANNA)
+    own = board.create(ANNA, "mine", crew=3, directions=["p", "q", "r"], assignee=ANNA)
+    for task in (named, own):
+        assert board.get(task.id).status == Status.TODO
+        for sub in board.subtasks_of(task.id):
+            finish_raw(board, sub.id, Status.DONE, "ok", assignee=BOB)
+    assert board.stall_marks(ANNA) == frozenset({(named.id, MARK_SUBTASKS_DONE), (own.id, MARK_SUBTASKS_DONE)})
+    plain = board.create(DINA, "plain", assignee=CARL)  # an ordinary parent held todo too
+    finish_raw(board, board.create(DINA, "sub", parent_id=plain.id).id, Status.DONE, "ok")
+    assert board.stall_marks(CARL) == frozenset({(plain.id, MARK_SUBTASKS_DONE)})
+
+
+def test_a_direction_assigned_while_the_crew_task_was_full_is_pointed_at_once_a_place_frees(board):
+    task, subs = crew_task(board, crew=2)
+    work(board, subs[0].id, BOB)
+    board.update(ANNA, subs[1].id, assignee=CARL)  # stays todo: takes no place
+    assert refused(lambda: board.claim(CARL, subs[1].id)) == full_text(task.id, subs[1].id, [ANNA, BOB], 2)
+    assert board.stall_marks(CARL) == frozenset() and board.directions_to_take(CARL) == []
+    work(board, subs[0].id, BOB, Status.REVIEW)  # handed in: the place is free
+    assert board.stall_marks(CARL) == frozenset({(subs[1].id, MARK_DIRECTION_TO_TAKE)})
+    assert board.mark_text(CARL, board.stall_marks(CARL)) == prompts.t(
+        "en", "mark_direction_to_take", sub=subs[1].id, title="cli", id=task.id)
+    board.claim(CARL, subs[1].id)
+    assert board.stall_marks(CARL) == frozenset()
+
+
+def test_a_direction_assigned_while_the_crew_task_was_blocked_is_pointed_at_once_it_is_not(swarm, board):
+    dep = board.create(ANNA, "dep")
+    task, subs = crew_task(board, depends_on=[dep.id])
+    board.update(ANNA, subs[1].id, assignee=CARL)
+    assert "no longer blocked" in refused(lambda: board.claim(CARL, subs[1].id))
+    assert board.stall_marks(CARL) == frozenset()
+    finish_raw(board, dep.id, Status.DONE, "ok")
+    assert board.stall_marks(CARL) == frozenset({(subs[1].id, MARK_DIRECTION_TO_TAKE)})
+    # in its language; and nothing for a direction it could not take (it works on another one of #N)
+    board.update(ANNA, subs[2].id, assignee=EVA)
+    assert board.mark_text(EVA, board.stall_marks(EVA)) == prompts.t(
+        "ru", "mark_direction_to_take", sub=subs[2].id, title="docs", id=task.id)
+    work(board, subs[0].id, EVA)
+    assert board.stall_marks(EVA) == frozenset()
+
+
+def test_the_owners_own_part_left_todo_after_the_unblock_is_pointed_at(board):
+    schema = board.create(DINA, "schema")
+    task = board.create(ANNA, "tool", crew=3, directions=["parser", "cli", "docs"], assignee=ANNA,
+                        depends_on=[schema.id])
+    parser, cli, docs = board.subtasks_of(task.id)
+    assert (parser.status, parser.assignee) == (Status.TODO, ANNA)
+    assert board.stall_marks(ANNA) == frozenset()  # blocked: it waits like the other directions
+    finish_raw(board, schema.id, Status.DONE, "ok")
+    # its own part is named, not the free directions it could take in its place
+    assert board.stall_marks(ANNA) == frozenset({(parser.id, MARK_DIRECTION_TO_TAKE)})
+    board.claim(ANNA, task.id)
+    work(board, cli.id, BOB)
+    finish_raw(board, cli.id, Status.DONE, "ok")
+    finish_raw(board, docs.id, Status.DONE, "ok", assignee=CARL)
+    assert board.stall_marks(ANNA) == frozenset({(parser.id, MARK_DIRECTION_TO_TAKE)})
+
+
+def test_a_direction_blocked_by_its_own_dependency_is_not_free(board):
+    task, (parser, cli, docs) = crew_task(board)
+    board.update(ANNA, docs.id, depends_on=[cli.id])
+    work(board, cli.id, BOB)
+    finish_raw(board, parser.id, Status.DONE, "ok", assignee=CARL)
+    assert ready_ids(board).isdisjoint({docs.id}) and board.free_directions(task) == []
+    assert board.stall_marks(ANNA) == frozenset()  # it waits for cli: no claim it would refuse
+    finish_raw(board, cli.id, Status.DONE, "ok")
+    assert [s.id for s in board.free_directions(board.get(task.id))] == [docs.id]
+    assert board.stall_marks(ANNA) == frozenset({(task.id, MARK_FREE_DIRECTIONS)})
+
+
+@pytest.mark.parametrize("lang,member", [("en", ANNA), ("ru", EVA)])
+def test_a_mark_after_a_draft_starts_on_a_line_of_its_own(board, lang, member):
+    finished, subs = crew_task(board, titles=("a", "b"), owner=member)
+    for sub in subs:
+        finish_raw(board, sub.id, Status.DONE, "built it\nall of it", assignee=BOB)
+    free, _ = crew_task(board, titles=("s1",), owner=member)
+    plain = board.create(ANNA, "Plain")
+    set_raw(board, plain.id, assignee=member, status=Status.IN_PROGRESS)
+    finish_raw(board, board.create(ANNA, "sub", parent_id=plain.id).id, Status.DONE, "ok")
+    marks = board.stall_marks(member)
+    assert marks == {(finished.id, MARK_SUBTASKS_DONE), (free.id, MARK_FREE_DIRECTIONS),
+                     (plain.id, MARK_SUBTASKS_DONE)}
+    draft = prompts.t(lang, "mark_subtasks_done", id=finished.id, title=finished.title,
+                      ending=board._ending(board.get(finished.id), "finished", "owner", lang,
+                                           budget=board.draft_budget()))
+    assert "\n" in draft and draft.endswith("    all of it")  # the draft ends with the last result's line
+    free_text = prompts.t(lang, "mark_free_directions", id=free.id,
+                          directions=board._direction_names(board.free_directions(free), lang))
+    plain_text = prompts.t(lang, "mark_subtasks_done", id=plain.id, title="Plain",
+                           ending=prompts.t(lang, "owner_prefix_plain") + prompts.t(lang, "ending_plain"))
+    # the sentence after the draft starts on a line of its own; the one after it follows as before
+    assert board.mark_text(member, marks) == draft + "\n" + free_text.lstrip() + plain_text
 
 
 def test_mark_text_in_the_members_language(swarm, board):
@@ -357,15 +456,44 @@ def test_two_drafts_in_one_wake_share_the_budget(swarm, board):
         marks.add((task.id, MARK_SUBTASKS_DONE))
     assert board.stall_marks(ANNA) == marks
     text = board.mark_text(ANNA, marks)
-    expected = ""
+    sentences = []
     for tid in sorted(tid for tid, _ in marks):
         task = board.get(tid)
         draft = board._crew_draft(task, "en", budget=500)
         assert 0 < len(draft) <= 500 and draft != board._crew_draft(task, "en")  # B // 2, not B
         ending = prompts.t("en", "owner_prefix_finished") + prompts.t("en", "ending_crew_finished", id=tid) + draft
-        expected += prompts.t("en", "mark_subtasks_done", id=tid, title=task.title, ending=ending)
-    assert text == expected
+        sentences.append(prompts.t("en", "mark_subtasks_done", id=tid, title=task.title, ending=ending))
+    assert text == sentences[0] + "\n" + sentences[1].lstrip()  # the second after the first draft, on its own line
     assert text.count("\nDraft for #") == 2
+
+
+@pytest.mark.parametrize("other", ["plain", "failed"])
+def test_only_the_crew_drafts_share_the_budget(swarm, board, other):
+    """A wake with one crew draft and marks that make none (a plain parent, a crew task with a failed direction)
+    builds that draft with the whole budget."""
+    swarm.config.agents.tool_output_chars = 2000  # B = 1000
+    task, subs = crew_task(board, titles=("a", "b"))
+    for sub in subs:
+        finish_raw(board, sub.id, Status.DONE, "r" * 3000, assignee=BOB)
+    if other == "plain":
+        extra = board.create(ANNA, "plain")
+        set_raw(board, extra.id, assignee=ANNA, status=Status.IN_PROGRESS)
+        finish_raw(board, board.create(ANNA, "sub", parent_id=extra.id).id, Status.DONE, "ok")
+        extra_ending = prompts.t("en", "owner_prefix_plain") + prompts.t("en", "ending_plain")
+    else:
+        extra, (f1, f2) = crew_task(board, titles=("f1", "f2"))
+        finish_raw(board, f1.id, Status.FAILED, assignee=CARL)
+        finish_raw(board, f2.id, Status.DONE, "ok", assignee=BOB)
+        extra_ending = board._ending(board.get(extra.id), "failed", "owner", "en")
+    marks = board.stall_marks(ANNA)
+    assert marks == {(task.id, MARK_SUBTASKS_DONE), (extra.id, MARK_SUBTASKS_DONE)}
+    draft = board._crew_draft(board.get(task.id), "en")
+    assert draft != board._crew_draft(board.get(task.id), "en", budget=500)  # a share would cut more
+    ending = prompts.t("en", "owner_prefix_finished") + prompts.t("en", "ending_crew_finished", id=task.id) + draft
+    expected = prompts.t("en", "mark_subtasks_done", id=task.id, title=task.title, ending=ending)
+    expected += "\n" + prompts.t("en", "mark_subtasks_done", id=extra.id, title=extra.title,
+                                 ending=extra_ending).lstrip()
+    assert board.mark_text(ANNA, marks) == expected
 
 
 # --- endings -------------------------------------------------------------------------------------------------------
@@ -464,6 +592,15 @@ def test_the_owner_sentence_own_direction_with_its_status(board):
     instructions, _ = board._owner_sentence(task, ANNA, "en")
     assert instructions == prompts.t("en", "crew_owner_own", id=task.id, sub=subs[1].id, status="waiting", crew=3)
     assert f"your own direction is #{subs[1].id} [waiting]" in instructions
+
+
+def test_the_owner_sentence_names_its_open_direction_over_a_done_one(board):
+    task, subs = crew_task(board)
+    finish_raw(board, subs[0].id, Status.DONE, "ok", assignee=ANNA)  # its own part, handed in
+    work(board, subs[2].id, ANNA)  # then it took a free one
+    instructions, _ = board._owner_sentence(board.get(task.id), ANNA, "en")
+    assert instructions == prompts.t("en", "crew_owner_own", id=task.id, sub=subs[2].id, status="in_progress",
+                                     crew=3)
 
 
 def test_a_cancelled_own_direction_is_not_its_own(board):
@@ -873,6 +1010,18 @@ def test_crew_zero_with_open_directions_lists_them(board):
     assert board.get(task.id).status == Status.IN_PROGRESS
 
 
+@pytest.mark.parametrize("open_status", [Status.TODO, Status.REVIEW])
+def test_crew_zero_is_refused_with_only_free_or_reviewed_directions_open(board, open_status):
+    task, subs = crew_task(board, titles=("a", "b"))
+    finish_raw(board, subs[0].id, Status.DONE, "ok", assignee=BOB)
+    if open_status == Status.REVIEW:
+        work(board, subs[1].id, CARL, Status.REVIEW)
+    text = refused(lambda: board.update(ANNA, task.id, crew=0))
+    assert text == (f"#{task.id} has open directions: #{subs[1].id} [{open_status}]: finish or cancel them first "
+                    "(task_update status=cancelled); their holders are told.")
+    assert board.get(task.id).crew == 3
+
+
 def test_crew_zero_with_a_failed_direction(board):
     task, subs = crew_task(board, titles=("a", "oidc"))
     finish_raw(board, subs[0].id, Status.DONE, "ok")
@@ -940,13 +1089,38 @@ def test_crew_on_a_direction_names_who_to_ask(board):
                               f"owner ({BOB}) in #{n}'s discussion to add directions (task_create parent_id=#{n}, or "
                               "task_update directions).")
     free, free_subs = crew_task(board, owner=None)
+    board.claim(CARL, free_subs[0].id)  # its holder may change its crew: it is told to ask the creator
     with pytest.raises(ToolError, match=f"ask its owner \\(its creator {ANNA}\\)"):
-        board.update(ANNA, free_subs[0].id, crew=2)
+        board.update(CARL, free_subs[0].id, crew=2)
     with pytest.raises(ToolError) as err:
         board.create(ANNA, "nested", crew=2, parent_id=task.id)
     assert str(err.value).startswith(f"#{n} is a crew task, and crews are one level deep: a task under it is one "
                                      f"of its directions and cannot be a crew task itself. Pass no crew, or ask its "
                                      f"owner ({BOB})")
+
+
+def test_the_crew_structure_error_never_tells_the_actor_to_ask_itself(board):
+    task, subs = crew_task(board, owner=BOB)
+    n = task.id
+    yourself = (f"add the directions yourself (task_create parent_id=#{n} without crew, or task_update #{n} "
+                "directions).")
+    assert refused(lambda: board.create(BOB, "nested", crew=2, parent_id=n)).endswith("Pass no crew, or " + yourself)
+    free, free_subs = crew_task(board, owner=None)  # its creator ANNA is the one to ask
+    assert refused(lambda: board.update(ANNA, free_subs[0].id, crew=2)) == (
+        f"#{free_subs[0].id} is a direction of crew task #{free.id}, and crews are one level deep: add the directions "
+        f"yourself (task_create parent_id=#{free.id} without crew, or task_update #{free.id} directions).")
+
+
+def test_directions_on_a_direction_get_the_crew_structure_error(board):
+    """`directions` without crew on a direction: the advice to pass crew would only be refused next."""
+    task, subs = crew_task(board, owner=BOB)
+    board.claim(CARL, subs[0].id)
+    text = refused(lambda: board.update(CARL, subs[0].id, directions=["x"]))
+    assert text == (f"#{subs[0].id} is a direction of crew task #{task.id}, and crews are one level deep: ask its "
+                    f"owner ({BOB}) in #{task.id}'s discussion to add directions (task_create parent_id=#{task.id}, or "
+                    "task_update directions).")
+    plain = board.create(CARL, "plain")
+    assert refused(lambda: board.update(CARL, plain.id, directions=["x"])).startswith("directions are for crew tasks")
 
 
 def test_crews_are_one_level_deep_both_ways(board):
@@ -1302,9 +1476,24 @@ def test_no_direction_is_taken_while_the_crew_task_is_closed_or_in_review(board,
     task, subs = crew_task(board)
     set_raw(board, task.id, status=status)
     text = refused(lambda: board.claim(BOB, subs[0].id))
+    way = ("Pick another task or call wait." if status == Status.REVIEW else
+           f"If #{subs[0].id} is still needed on its own, move it out of #{task.id} first (task_update parent_id=0); "
+           "otherwise pick another task or call wait.")
     assert text == (f"Direction #{subs[0].id} belongs to #{task.id}, which is {status}: it takes no directions now. "
-                    "Pick another task or call wait.")
+                    + way)
     assert board.get(subs[0].id).assignee is None
+
+
+def test_the_holder_of_a_todo_direction_of_a_closed_crew_task_moves_it_out_to_take_it(swarm, board):
+    """n_parent_closed asks the holder of a todo direction to finish it only if still needed: the refusal of its claim
+    names the way (the move out of the closed crew task), which works."""
+    task, subs = crew_task(board)
+    work(board, subs[0].id, BOB, Status.TODO)
+    board.update(ANNA, task.id, status="cancelled")
+    assert "n_parent_closed" in keys_for(swarm, BOB)
+    assert "task_update parent_id=0" in refused(lambda: board.claim(BOB, subs[0].id))
+    board.update(BOB, subs[0].id, parent_id=None)  # the tool's parent_id=0
+    assert board.claim(BOB, subs[0].id).status == Status.IN_PROGRESS
 
 
 def test_no_direction_is_taken_while_the_crew_task_is_blocked(board):
@@ -1390,6 +1579,31 @@ def test_user_takes_no_place_and_is_exempt(board):
     dep = board.create(ANNA, "dep")
     set_raw(board, task.id, depends_on=f"[{dep.id}]")
     assert board.claim(USER, extra.id).assignee == USER  # a blocked crew task too
+
+
+def test_a_crew_task_the_user_owns_has_all_its_places_for_members(board):
+    task, subs = crew_task(board, crew=2, titles=("a", "b", "c", "d"), owner=USER)
+    assert board.claim(BOB, subs[0].id).assignee == BOB
+    assert board.claim(CARL, subs[1].id).assignee == CARL  # the user takes no place
+    assert refused(lambda: board.claim(DINA, subs[2].id)) == full_text(task.id, subs[2].id, [BOB, CARL], 2)
+    # a member moving a task the user works on under the full crew task: the user is exempt as the taker
+    theirs = board.create(ANNA, "theirs")
+    work(board, theirs.id, USER)
+    assert board.update(ANNA, theirs.id, parent_id=task.id).parent_id == task.id
+
+
+def test_a_move_that_also_releases_the_task_takes_nothing(board):
+    task, subs = crew_task(board)
+    work(board, subs[0].id, ANNA)  # the owner works on its own part
+    mine = board.create(ANNA, "mine")
+    work(board, mine.id, ANNA)
+    moved = board.update(ANNA, mine.id, parent_id=task.id, status="todo")
+    assert (moved.parent_id, moved.status, moved.assignee) == (task.id, Status.TODO, None)
+    # the same move keeping the task in progress takes a second direction: refused
+    other = board.create(ANNA, "other")
+    work(board, other.id, ANNA)
+    assert refused(lambda: board.update(ANNA, other.id, parent_id=task.id)).startswith("You already work on")
+
 
 
 def test_a_held_direction_is_returned_as_is(swarm, board):
@@ -1494,7 +1708,9 @@ def test_an_assignee_change_that_keeps_the_direction_working_takes_it(swarm, boa
     set_raw(board, task.id, crew=3)
     work(board, subs[2].id, CARL)
     text = refused(lambda: board.update(BOB, subs[0].id, assignee=CARL, status=status))
-    assert text == f"You already work on #{subs[2].id}, a direction of #{task.id}: hand it in first (task_complete)."
+    # the taker is not the actor: named, and the actor told what it can do
+    assert text == (f"{CARL} already works on #{subs[2].id}, a direction of #{task.id}: they hand it in first "
+                    "(task_complete), or pick another member.")
     set_raw(board, subs[2].id, status=Status.TODO, assignee=None)
     moved = board.update(BOB, subs[0].id, assignee=CARL, status=status)
     assert (moved.assignee, moved.status) == (CARL, status)
@@ -1568,7 +1784,8 @@ def test_a_move_takes_a_direction_for_the_tasks_assignee(swarm, board):
     board.claim(BOB, loose.id)
     work(board, subs[0].id, BOB, Status.WAITING)
     text = refused(lambda: board.update(ANNA, loose.id, parent_id=task.id))
-    assert text == f"You already work on #{subs[0].id}, a direction of #{task.id}: hand it in first (task_complete)."
+    assert text == (f"{BOB} already works on #{subs[0].id}, a direction of #{task.id}: they hand it in first "
+                    "(task_complete), or pick another member.")
     set_raw(board, subs[0].id, status=Status.TODO, assignee=None)
     notes: list[str] = []
     moved = board.update(ANNA, loose.id, parent_id=task.id, notes=notes)

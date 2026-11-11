@@ -199,9 +199,9 @@ async def task_create(ctx: ToolContext, args: dict[str, Any]) -> str:
         depends_on=args.get("depends_on") or None,
         priority=1 if args.get("priority") is None else args["priority"],
         tags=args.get("tags") or None,
-        # 0 and [] reach the board as they are: [] gets its directions error
+        # 0 and [] reach the board as they are: [] gets its directions error, unless no crew task is meant
         crew=0 if args.get("crew") is None else args["crew"],
-        directions=args.get("directions"),
+        directions=_directions_arg(args, 0),
         notes=notes,
     )
     text = f"Created task {task_line(task, with_goal=False)}"
@@ -215,6 +215,21 @@ async def task_create(ctx: ToolContext, args: dict[str, Any]) -> str:
     if similar:
         text += "\n" + prompts.t(ctx.lang, "similar_tasks", tasks=", ".join(_similar_item(t) for t in similar))
     return text
+
+
+def _directions_arg(args: dict[str, Any], crew_before: int) -> Any:
+    """`directions` as the board gets it: [] is no value when the call is about no crew task (`crew` below 2 or
+    absent, and `crew_before`, the task's crew before the call, below 2), as empty tags and depends_on are, so a
+    model that sends every optional field empty can still create or change an ordinary task; otherwise [] reaches
+    the board, which refuses it (docs/SPEC.md §4.2 "Marking", Values)."""
+    directions = args.get("directions")
+    if directions != [] or crew_before >= 2:
+        return directions
+    try:
+        crew = int(args.get("crew") or 0)
+    except (TypeError, ValueError):
+        return directions  # the board's crew error comes first
+    return None if crew < 2 else directions
 
 
 def _similar_item(task: Task) -> str:
@@ -290,10 +305,14 @@ async def task_update(ctx: ToolContext, args: dict[str, Any]) -> str:
     board_ = ctx.swarm.board
     task_id = args["task_id"]
     changes: dict[str, Any] = {}
-    # crew 0 and directions [] are values too (0 makes an ordinary task again; [] gets the board's error)
-    for key in ("title", "goal", "description", "status", "priority", "tags", "depends_on", "crew", "directions"):
+    old = board_.get(task_id)
+    # crew 0 and directions [] are values too (0 makes an ordinary task again; [] gets the board's error unless no
+    # crew task is meant)
+    for key in ("title", "goal", "description", "status", "priority", "tags", "depends_on", "crew"):
         if args.get(key) is not None:
             changes[key] = args[key]
+    if _directions_arg(args, old.crew) is not None:
+        changes["directions"] = args["directions"]
     for key in ("assignee", "reviewer"):
         if args.get(key) is not None:
             changes[key] = _member_arg(ctx, args[key])
@@ -306,7 +325,6 @@ async def task_update(ctx: ToolContext, args: dict[str, Any]) -> str:
         raise ToolError("Nothing to change: pass at least one field (or a comment).")
     if len(comment) > MAX_POST:
         raise ToolError(f"comment is too long ({len(comment)} chars, max {MAX_POST}).")
-    old = board_.get(task_id)
     adding = "directions" in changes
     had = {t.id for t in board_.subtasks_of(old.id)} if adding else set()
     notes: list[str] = []

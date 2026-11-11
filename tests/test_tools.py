@@ -454,6 +454,15 @@ async def test_task_get_shows_structure_and_latest_posts(swarm):
     assert "Discussion: 7 post(s)" in text and "post 6" in text and "post 1" not in text
     assert "Parent: #1" in await ok(swarm, a, "task_get", {"task_id": 2})
     assert "Task #9 not found" in await err(swarm, a, "task_get", {"task_id": 9})
+    # closed dependents are not "required by (open)"
+    gone = swarm.board.create(USER, "Gone", goal="g", depends_on=[1])
+    swarm.board.update(USER, gone.id, status="cancelled")
+    done = swarm.board.create(USER, "Done", goal="g", depends_on=[1])
+    swarm.board.update(USER, done.id, status="done")
+    text = await ok(swarm, a, "task_get", {"task_id": 1})
+    assert "Required by (open): #3 [todo]\n" in text + "\n"
+    assert f"#{gone.id} [" not in text.split("Required by (open):", 1)[1].split("\n", 1)[0]
+    assert f"#{done.id} [" not in text.split("Required by (open):", 1)[1].split("\n", 1)[0]
 
 
 async def test_task_create_options(swarm):

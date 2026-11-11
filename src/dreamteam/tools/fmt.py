@@ -111,7 +111,7 @@ def crew_line(task: Task, subtasks: list[Task]) -> str:
     if working:
         line += f" ({'; '.join(who(name) for name in working)})"
     takeable = task.status in (Status.TODO, Status.IN_PROGRESS, Status.WAITING) and not task.blocked_by
-    free = [s for s in subtasks if takeable and s.status == Status.TODO and s.assignee is None]
+    free = [s for s in subtasks if takeable and s.status == Status.TODO and s.assignee is None and not s.blocked_by]
     names = [f'#{s.id} "{trim(s.title, 80)}"' for s in free[:CREW_FREE_LISTED]]
     if len(free) > CREW_FREE_LISTED:
         names.append("…")

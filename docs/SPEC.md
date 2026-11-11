@@ -289,7 +289,8 @@ class Swarm:
         # planner's tasks meanwhile; `hint_planner` reminds a planner that has created none); 2 independent work at once (work that needs no contracts:
         # literature and theory, the environment and tools, data, exploratory experiments, becomes tasks before
         # CONTRACTS.md, so the members waiting for the plan start now; only the planner creates the plan's tasks);
-        # 3 then the contracts; 4 then the rest of the tasks; 5 no false dependencies (a final task: report,
+        # 3 then the contracts; 4 then the rest of the tasks (created without parent_id: they are not parts of
+        # the card, which an open subtask would keep from completing, §4.2 "Finishing"); 5 no false dependencies (a final task: report,
         # summary, documentation, release, depends only on the tasks it cannot be written without; exploratory and
         # optional tasks do not block it); 6 tests by someone else; 7 reviews; 8 team; 9 finish quickly. n_kickoff
         # tells the others that the first tasks come before the plan is complete. A clarify card wakes only the first
@@ -436,10 +437,11 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    directions (§4.2) among their ids: while each of them has an assignee it waits for them, so its owner has
    nothing to continue there (its own direction counts on its own; the in-activation nudge of §6.2 skips such a
    crew task too), and a free one is the "free directions" mark below. Both items also count
-   two marks, compared apart from the task ids (§4.2 "Finishing", Liveness): a task `in_progress` or `waiting` that
-   has at least one subtask, all of them terminal (its holder has to complete it, or, for a crew task with a failed
-   direction or only cancelled ones, decide what to do), and a crew task with a free direction that its owner,
-   working on none of its directions, could take (§4.2 "Offers"). Items 2 and 3 compute the same key, so a set is
+   three marks, compared apart from the task ids (§4.2 "Finishing", Liveness): a task `todo`, `in_progress` or
+   `waiting` that has at least one subtask, all of them terminal (its holder has to complete it, or, for a crew task
+   with a failed direction or only cancelled ones, decide what to do), a `todo` direction assigned to the member
+   that its claim would take now, and a crew task with a free direction that its owner, working on none of its
+   directions, could take (§4.2 "Offers"). Items 2 and 3 compute the same key, so a set is
    woken about once; item 3's idle clock is keyed by the same pair, so a mark that appears on an unchanged set of
    ids waits the full `idle_nudge_seconds` again;
 4. `hint_planner()` (planning hint; run 008-013: a planner researched for 40 minutes before creating any task while
@@ -834,13 +836,19 @@ notifications explain it.
     reviewer gets the quiet `n_review_reassigned`.
   - `_remind_user_reviews` (both modes): the goal is active, at least one task waits for USER's review, no LLM
     member is working, busy with a job (§7.1) or has pending events, no `todo` task is actionable, no task is
-    `in_progress` and no review waits for anyone but USER → USER gets `u_reviews_waiting` {tasks:
-    "#3, #5"} once per set of such tasks. A `todo` task is actionable only when `ready_unassigned` returns it (a
-    direction only while its crew task takes directions, §4.2 "Offers"), or a member (not USER) holds it and no
-    blocker stops it nor its crew task (`Swarm._has_actionable_todo`; it stops at the first one and runs after the
-    cheaper conditions). Blocked `todo` tasks (the tests of an implementation that waits for the user), the
-    directions of a crew task that is blocked or full, and an owner's own part waiting for its blocked crew task
-    do not suppress it. The user never answering only leaves the session idle (no cost).
+    `in_progress` but a parent with an open subtask (`Swarm._has_task_in_progress`) and no review waits for anyone
+    but USER → USER gets `u_reviews_waiting` {tasks:
+    "#3, #5"} once per set of such tasks. A parent with an open subtask, `in_progress` or `todo` (a crew task waiting
+    for its directions, an ordinary parent whose last subtasks wait for the user's review), counts neither way: its
+    holder cannot complete it before they finish (§4.2 "Finishing"), and its open subtasks count on their own
+    (`Board.open_parents(ids)`, one grouped query). A `todo` task is actionable only when it has no open subtask
+    and `ready_unassigned` returns it (a direction only while its crew task takes directions, §4.2 "Offers"), or a
+    member (not USER) holds it and no blocker stops it; a held direction of a crew task only when its holder's
+    claim would take it now (`Board.directions_to_take`, the "direction to take" mark of §4.2 Liveness)
+    (`Swarm._has_actionable_todo`; it stops at the first one and runs after the cheaper conditions). Blocked `todo`
+    tasks (the tests of an implementation that waits for the user), the directions of a crew task that is blocked,
+    full, in review or terminal, and an owner's own part waiting for its blocked crew task do not suppress it. The
+    user never answering only leaves the session idle (no cost).
   - Goal completion: `review` is an open status, so `n_all_done` waits for every review, and `goal_complete`
     (§12) is refused while any task is in review (switch on).
   - The planning task is reviewed like any task; in a one-agent team that asks the user to approve the plan, which
@@ -902,7 +910,10 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   2..`CREW_MAX` raises `Invalid crew {v!r}: use 2..8 (how many members may work on it at once, its owner
   included), or 0 to make it an ordinary task again`. Each direction title is checked like a task title (stripped;
   `Task title must not be empty.` / `Task title is too long ...`); a `directions` value that is not a list of 1..20
-  strings raises `directions must be a list of 1..20 direction titles, e.g. ["parser", "cli"]`, and a title listed
+  strings raises `directions must be a list of 1..20 direction titles, e.g. ["parser", "cli"]` (the tools
+  `task_create` and `task_update` leave out `directions` [] when the call is about no crew task: no `crew` ≥ 2 in
+  it and, for an update, the task no crew task, as they leave out empty `tags` and `depends_on`; so a model that
+  sends every optional field empty still creates and changes ordinary tasks), and a title listed
   twice in the call (compared stripped and case-insensitively) `Direction "<t>" is listed twice`. Titles are not
   compared with the crew task's existing directions (their takers may have renamed them), and there is no cap on
   the number of directions over several calls: `crew` caps how many work at once.
@@ -932,7 +943,11 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   Brown)`, or `ask its owner (its creator Anna Smith)` while it has none; `task_create` with `crew` and
   `parent_id` = a crew task: `#N is a crew task, and crews are one level deep: a task under it is one of its
   directions and cannot be a crew task itself. Pass no crew, or ask its owner (X | its creator X) …` with the same
-  hint; deeper: `#M is below crew task #N, and crews are one level deep: it cannot be a crew task itself.` (`The new
+  hint; the actor it would name (#N's assignee, or its creator while it has none) reads `add the directions
+  yourself (task_create parent_id=#N without crew, or task_update #N directions).` in place of `ask its owner …`;
+  `directions` without `crew` ≥ 2 on a task that cannot be a crew task (a direction, a task below one, a task with
+  a crew task below it) gets that crew-structure error in place of `directions are for crew tasks: pass crew …`;
+  deeper: `#M is below crew task #N, and crews are one level deep: it cannot be a crew task itself.` (`The new
   task is below …` in `task_create`), `#M has a crew task below it, and crews are one level deep: it cannot be a
   crew task itself.`, and for a move `#M is a crew task, and crews are one level deep: it cannot go below crew task
   #N.` / `#M has a crew task below it, and crews are one level deep: it cannot go below crew task #N.`; the `crew`
@@ -1026,16 +1041,20 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   of an ordinary claim (an already-held direction returns as is; the holder, status and
   blocker errors come first), three more checks, in this order:
   - the crew task is `todo`, `in_progress` or `waiting` and not blocked (a direction can be taken before the crew
-    task has an owner; `Direction #M belongs to #N, which is {status}: it takes no directions now. Pick another
-    task or call wait.` / `Direction #M belongs to #N, which is blocked by #3: take #M when #N is no longer blocked.
-    Pick another task or call wait.`);
+    task has an owner; `Direction #M belongs to #N, which is review: it takes no directions now. Pick another
+    task or call wait.`, for a terminal #N `Direction #M belongs to #N, which is {status}: it takes no directions
+    now. If #M is still needed on its own, move it out of #N first (task_update parent_id=0); otherwise pick another
+    task or call wait.` (the way out for the holder of a `todo` direction told `n_parent_closed`) / `Direction #M
+    belongs to #N, which is blocked by #3: take #M when #N is no longer blocked. Pick another task or call wait.`);
   - a free place, unless the actor is in the working set already (the owner): the working set, with the actor added,
     is at most `crew` (`Crew task #N already has 3 of 3 members working (X, A, B): #M is free again when one of them
     hands its direction in. Pick another task or call wait.`); the working set here leaves out #M itself, so an
     update that hands an `in_progress` direction to another member does not count the place its old holder gives
     up, and the error does not name it;
   - the actor holds no other direction of it in `in_progress` or `waiting` (`You already work on #15, a direction of
-    #N: hand it in first (task_complete).`; one in review does not count).
+    #N: hand it in first (task_complete).`; one in review does not count; when an `update` takes the direction
+    for another member, the taker is named: `Bob Brown already works on #15, a direction of #N: they hand it in
+    first (task_complete), or pick another member.`).
   The result adds ` #M is a direction of crew task #N (owner X | no owner yet | you own #N): first write its card
   with task_update — title, goal (what it delivers and how it is checked), description (the files it touches) — then
   do the work. In #N's discussion post only what another direction depends on (interfaces, shared files).` (only
@@ -1056,14 +1075,16 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `waiting`: an assignee change with `in_progress` (or `waiting`) in the same call, an assignee change that keeps
   `in_progress` or `waiting`, and a new assignee setting `in_progress` (or `waiting`: it enters the working set
   too) from `todo`. Such an update gets the same three checks, with
-  the same texts, for the member who takes the direction, and the same side effects (`n_direction_taken` to the
+  the same texts (the third one naming the taker when it is not the actor), for the member who takes the direction,
+  and the same side effects (`n_direction_taken` to the
   owner unless it is the actor or the taker, the card instruction in the result, the reviewer cleared). So does a
   `parent_id` change that puts an `in_progress` or `waiting` task under a crew task: it takes a direction for that
   task's assignee, with the same three checks and texts and the same side effects, so a move never gives a member
   a second direction, a place over `crew`, or the check of the whole of a crew task it works on. A move without
   `assignee` in the call is checked with the fields, for the task's assignee before the call (a refused move writes
-  nothing, and its error comes before the `crew` and `directions` errors; a call that also releases the task, status
-  `todo`, is still checked); a move whose call also passes `assignee` is checked with the assignment, for the
+  nothing, and its error comes before the `crew` and `directions` errors; a call that also sets a status that is
+  neither `in_progress` nor `waiting`, e.g. releases the task with status `todo` or cancels it, takes nothing and is
+  not checked); a move whose call also passes `assignee` is checked with the assignment, for the
   assignee after the call. Exempt: the
   owner's own part created by "Marking" (its later claim or `in_progress` is checked), an assignee resuming its
   own direction from `waiting` or from `in_progress` after a return, its holder withdrawing it from review
@@ -1076,7 +1097,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   prompt apply). Taking a direction posts nothing: the board shows it.
 - **Finishing.** An agent cannot complete a task with open subtasks (any parent): `Task #N has open subtasks: #17
   [in_progress, Anna Smith], #19 [review]. Complete it when they are finished; as its creator or assignee you may
-  cancel the ones no longer needed (task_update status=cancelled).`; nor a crew task with a `failed` direction:
+  cancel the ones no longer needed (task_update status=cancelled), and move the ones that are not parts of #N out of
+  it (task_update parent_id=0).` (e.g. a planner that filed the plan's tasks under the planning card, which tells it
+  to create them without `parent_id`); nor a crew task with a `failed` direction:
   `Crew task #N has failed directions: #16 "oidc". Reopen each to be done again (task_update status=todo) or cancel
   it if #N does without it (status=cancelled), then complete #N.` A parent never finishes by itself: its holder
   (for a crew task, its owner) checks how the subtasks fit together, writes its result and completes it.
@@ -1235,18 +1258,27 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   key, the pair (task ids, marks): the ids as before (in_progress, without the exempt ones; item 2 only those of
   its stalled set still held), and the marks, a frozenset of `(id, kind)` read from the board now by one helper
   both items call, so the two never sort or compare ids with tuples and never differ for the same state:
-  - `(N, "subtasks done")` for each task `in_progress` or `waiting` of the member that has at least one subtask,
-    all of them terminal (what `n_subtasks_done` was sent about; a task without subtasks, a crew task with no
-    directions yet included, gets no mark);
-  - `(N, "free directions")` for each crew task the member owns that has a free direction (`todo`, no assignee,
-    #N `todo`, `in_progress` or `waiting` and not blocked: the owner's claim needs no free place) while the owner
-    holds none of its directions in `in_progress` or `waiting` (it is never among the ids while it has open
-    directions).
+  - `(N, "subtasks done")` for each task `todo`, `in_progress` or `waiting` of the member that has at least one
+    subtask, all of them terminal (what `n_subtasks_done` was sent about; a task without subtasks, a crew task with
+    no directions yet included, gets no mark; `todo` too, because an owner often holds its crew task `todo` for its
+    whole life: `task_create` with `assignee` leaves it so, and the owner texts tell it to take a direction, never
+    to claim #N);
+  - `(M, "direction to take")` for each `todo` direction M assigned to the member that its claim would take now
+    (`Board.directions_to_take(name)`: M not blocked, #N `todo`, `in_progress` or `waiting` and not blocked, a
+    place for the member or the member in the working set already, and no other direction of #N it works on): a
+    direction assigned while #N was full or blocked (its claim was refused with "#M is free again when one of them
+    hands its direction in" / "take #M when #N is no longer blocked"), or the owner's own part created `todo` under
+    a blocked crew task, is pointed at once it can be taken, since nothing else offers an assigned task;
+  - `(N, "free directions")` for each crew task the member owns that has a free direction (`todo`, no assignee, no
+    blocker of its own, #N `todo`, `in_progress` or `waiting` and not blocked: the owner's claim needs no free
+    place) while the owner holds none of its directions in `in_progress` or `waiting`, nor one to take (the
+    "direction to take" mark names that one instead; it is never among the ids while it has open directions).
   A holder woken about ({N}, {}) before N's subtasks finished differs from ({N}, {(N, "subtasks done")}) and is
   woken once more, so a holder that missed `n_subtasks_done`, or the owner of a crew task open again with all its
   directions finished (returned, or taken by a new owner), is told; one
   that keeps stalling afterwards gives both items the same pair and is not woken again. Item 3 wakes also when the
-  ids are empty and the marks are not (a `waiting` parent). The wake is `n_stalled` naming the ids that carry no
+  ids are empty and the marks are not (a `waiting` or `todo` parent, a direction to take). The wake is `n_stalled`
+  naming the ids that carry no
   mark (when there are any), followed by one sentence per mark, in the member's language: for "subtasks done"
   ` #N "title": ` and the owner form of the ending `n_subtasks_done` would give it now (`All its subtasks are
   finished: assemble their results and complete it.` or a crew ending above, the all finished one with the draft
@@ -1255,9 +1287,13 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   they share one budget B, each built with B ÷ their number); for
   "free directions" ` #N is a crew task with free directions nobody has taken: #17 "oidc". Take one yourself
   (task_claim), or cancel the ones it does without (task_update status=cancelled).` (at most 20 named, then `…`;
-  the in-activation nudge of §6.2 adds the same sentence for such a crew task). The sentences
-  (`Board.mark_text(name, marks)`, sorted by id and kind, each starting with a space) end `n_stalled` as its
-  `{marks}` (the last placeholder of both texts, "" without marks).
+  the in-activation nudge of §6.2 adds the same sentence for such a crew task); for "direction to take" ` #M "title",
+  your direction of crew task #N, can be taken now: claim it (task_claim) and do it, or unassign yourself if you
+  will not (task_update assignee='').` (`mark_direction_to_take` {sub, title, id}, ru « #M «title», твоё
+  направление групповой задачи #N, теперь можно взять: …»; the title cut like `fmt.trim(title, 80)`). The sentences
+  (`Board.mark_text(name, marks)`, sorted by id and kind, each starting with a space; a sentence after one that
+  spans lines, a draft, starts on a line of its own, its leading space removed, so it never reads as a part of the
+  draft's last result) end `n_stalled` as its `{marks}` (the last placeholder of both texts, "" without marks).
   With no unmarked ids the wake is those sentences alone (`n_marks_stalled` {text}: their leading space removed).
   A mark that no longer applies when the text is built gives no sentence; when nothing is left to send, nothing is
   sent and the key is not recorded, so the next pass reads the marks again. `_stall_woken` is set only
@@ -3967,7 +4003,10 @@ settings; ValueError when they are invalid):
   covers a session and a single-swarm project (§15) alike: `_load_locked` turns it into `SessionError(…, 409)`
   before its 500 wrap, with `EARLIER_VERSION_TEXT` (en; the hub's errors are English): `Session {sid} was made by
   an earlier version of DreamTeam and cannot be opened by this one ({version}). Open it with the version that made
-  it, or delete it.` (`version` = `dreamteam.__version__`); a project gets `The swarm in {dir} was made by an
+  it (export it here, then import it into a home of that version: once this one saved its settings, that version
+  may not read this home), or delete it.` (`version` = `dreamteam.__version__`; 0.1.x checks the keys of `[swarm]`
+  strictly, and this version writes `crew_review` into the home's dreamteam.toml at its first settings save, so
+  the old version reopening the home itself usually fails, while export and import work); a project gets `The swarm in {dir} was made by an
   earlier version of DreamTeam and cannot be opened by this one ({version}). Open it with the version that made
   it.`, and the legacy `main` (`MAIN_EARLIER_VERSION_TEXT`), which has no delete, `Session main (the swarm in
   {home}) was made by an earlier version of DreamTeam and cannot be opened by this one ({version}). Open it with the
@@ -3975,7 +4014,9 @@ settings; ValueError when they are invalid):
   in place of {home} when a caller has none; `sessions.earlier_version_text(sid, home, version=None)` renders
   both, and a CLI attached to a hub passes the hub's home and version from `/api/hub`). The web page
   and the TUI show the twin from the summary flag: «Сессия {sid} создана более ранней версией DreamTeam, и эта
-  версия ({version}) не может её открыть. Откройте её в той версии, которой она создана, или удалите.», for `main`
+  версия ({version}) не может её открыть. Откройте её в той версии, которой она создана (экспортируйте её здесь и
+  импортируйте в домашнюю папку той версии: после того как эта версия сохранила настройки, та может не прочитать
+  эту папку), или удалите.», for `main`
   «Сессия main (рой в {home}) создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть.
   Откройте её в той версии, которой она создана, или удалите вручную {home}/.dreamteam/swarm.db (вместе с файлами
   -wal и -shm).» The CLI's texts (the project message, `traces`, `console`, `-r`, `-p`) and the import reason
@@ -5917,7 +5958,10 @@ sessions/<id>/workspace/              copy_tree of the session's own folder or i
   refused. `_finish_db` on the copy: `journal_mode=DELETE`; command credentials stripped (§20.3); `VACUUM` (no free
   page keeps deleted text); `PRAGMA quick_check` must be "ok"; then its figures (events, last event, MCP servers,
   `max_tools_revision`). The session is never opened, so one made by an earlier version (§17.2) is exported like
-  any other (an import by this version refuses it, §20.4).
+  any other (an import by this version refuses it, §20.4), with a warning in the report (`session {sid} was made by
+  an earlier version of DreamTeam: this version and the same one on the other computer refuse it; only the version
+  that made it imports and opens it (keep this folder)`; `db.made_by_earlier_version` of the copy, of the database
+  itself in a dry run), since the report's closing advice is to use the same version there.
 - **Order** (`_export_parts`): settings, skills, mcp, sessions; then `scan_for_secrets` over the whole folder; then
   the manifest; then the swap. Any exception (TransferError, OSError, KeyboardInterrupt) discards what was written
   (`_discard`: the temp folder, or the contents of the user's empty folder; retried `DISCARD_TRIES` times), naming

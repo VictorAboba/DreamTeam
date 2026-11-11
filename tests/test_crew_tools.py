@@ -176,6 +176,19 @@ async def test_empty_directions_reach_the_board(swarm):
     assert swarm.board.subtasks_of(1) == []
 
 
+async def test_empty_directions_on_an_ordinary_call_are_no_value(swarm):
+    """A model that sends every optional field empty still creates and changes ordinary tasks: [] with no crew of 2
+    or more, on a task that is no crew task, is left out like empty tags and depends_on."""
+    a, *_ = members(swarm)
+    await ok(swarm, a, "task_create", {"title": "T", "goal": "g", "crew": 0, "directions": [], "tags": []})
+    await ok(swarm, a, "task_create", {"title": "U", "goal": "g", "directions": []})
+    task = next(t for t in swarm.board.list() if t.title == "U")
+    assert task.crew == 0 and swarm.board.subtasks_of(task.id) == []
+    await ok(swarm, a, "task_claim", {"task_id": task.id})
+    await ok(swarm, a, "task_update", {"task_id": task.id, "status": "waiting", "crew": 0, "directions": []})
+    assert swarm.board.get(task.id).status == Status.WAITING
+
+
 async def test_a_comma_string_of_directions_is_split(swarm):
     a, *_ = members(swarm)
     text = await ok(swarm, a, "task_create", {"title": "T", "goal": "g", "crew": "2", "directions": "parser, cli"})
@@ -408,6 +421,10 @@ async def test_task_get_lists_the_subtasks_and_the_crew(swarm):
         'Free directions: #5 "oidc".',
     ]
     assert "second line" not in text
+    # a working member's finished direction is not one it works on now
+    set_raw(board, 4, assignee=c)
+    text = await ok(swarm, b, "task_get", {"task_id": 1})
+    assert f"2 working now (owner {a} #2; {c} #3)." in text
 
 
 async def test_the_crew_line_without_workers_or_free_directions(swarm):

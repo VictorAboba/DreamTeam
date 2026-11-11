@@ -83,7 +83,8 @@ def test_an_agent_cannot_complete_a_task_with_open_subtasks(swarm, board):
     text = refused(lambda: board.complete(ANNA, parent.id, "all"))
     assert text == (f"Task #{parent.id} has open subtasks: #{a.id} [in_progress, {BOB}], #{b.id} [review], "
                     f"#{mine.id} [waiting, you]. Complete it when they are finished; as its creator or assignee you "
-                    "may cancel the ones no longer needed (task_update status=cancelled).")
+                    f"may cancel the ones no longer needed (task_update status=cancelled), and move the ones that are "
+                    f"not parts of #{parent.id} out of it (task_update parent_id=0).")
     assert board.get(parent.id).status == Status.IN_PROGRESS
 
 
@@ -105,8 +106,9 @@ def test_open_subtasks_are_named_before_a_failed_direction(board):
     assert refused(lambda: board.complete(ANNA, task.id, "all")).startswith(f"Task #{task.id} has open subtasks")
 
 
-def test_a_direction_needs_its_goal_before_it_is_handed_in(board):
-    task, subs = crew_task(board)
+@pytest.mark.parametrize("crew", [2, 8])
+def test_a_direction_needs_its_goal_before_it_is_handed_in(board, crew):
+    task, subs = crew_task(board, crew=crew)
     board.claim(BOB, subs[0].id)
     text = refused(lambda: board.complete(BOB, subs[0].id, "parsed"))
     assert text == (f"Write the goal of #{subs[0].id} first (task_update goal=...): its reviewer checks the work "

@@ -459,6 +459,7 @@ CREW_KEYS = {
     "note_own_part": {"sub", "title", "id"}, "note_own_part_blocked": {"sub", "title", "id", "blockers"},
     "note_still_open": {"sub"}, "note_crew_say_why": {"id"},
     "mark_subtasks_done": {"id", "title", "ending"}, "mark_free_directions": {"id", "directions"},
+    "mark_direction_to_take": {"sub", "title", "id"},
     "lock_waiter_direction": {"id", "title", "parent"},
 }
 # changed keys of existing texts
@@ -490,7 +491,8 @@ def test_crew_texts_say_crew_task_and_direction_in_russian():
     for key in CREW_KEYS:
         assert "команд" not in ru[key].lower(), key
     for key in ("n_direction_failed", "n_direction_cancelled", "n_direction_taken", "n_direction_freed",
-                "n_crew_review_requested", "crew_owner_take", "mark_free_directions", "note_direction_card"):
+                "n_crew_review_requested", "crew_owner_take", "mark_free_directions", "note_direction_card",
+                "mark_direction_to_take"):
         assert "групповой задачи" in ru[key] or "групповая задача" in ru[key], key
         assert "направлен" in ru[key], key
     for text in (prompts.SYSTEM_RU, prompts.planning_task("ru")[2]):
@@ -620,6 +622,10 @@ def test_system_prompt_teaches_crew_tasks(lang):
                            "здесь одной задачей")}[lang]
     assert step4 in steps[4] and step9 in steps[9]
     assert step4 in prompts.planning_task(lang, True)[2] and step9 in prompts.planning_task(lang, True)[2]
+    # the plan's tasks are no subtasks of the card: a parent cannot be completed while a subtask is open
+    no_parent = {"en": "Create them without parent_id: they are not parts of this task.",
+                 "ru": "Создавай их без parent_id: они не части этой задачи."}[lang]
+    assert no_parent in steps[4] and no_parent in prompts.planning_task(lang, True)[2]
 
 
 # ------------------------------------------------------------------------- rendering & callers
@@ -761,6 +767,7 @@ def test_texts_steer_agents_to_the_right_tools(lang):
         "crew_owner_none": {"task_update", "task_complete"},
         "note_direction_card": {"task_update"}, "note_own_part": {"task_update"},
         "note_own_part_blocked": {"task_update", "task_claim"}, "mark_free_directions": {"task_claim", "task_update"},
+        "mark_direction_to_take": {"task_claim", "task_update"},
     }
     for key, words in plain.items():
         for word in words:
