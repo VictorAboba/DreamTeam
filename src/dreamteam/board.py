@@ -333,13 +333,15 @@ def _post_dict(row: Any) -> dict[str, Any]:
 class _Batch:
     """What one mutation collects inside its transaction besides its primary row: side rows to write (the row as
     loaded, the values to set), the ids of the rows it inserted, the notes for the result of the actor's call
-    (rendered in the actor's language, each starting with a space), callbacks to run after the commit, and further
-    parents whose finish state it may change."""
+    (rendered in the actor's language, each starting with a space), callbacks to run after the commit, further
+    parents whose finish state it may change, and the open subtasks a primary row that became terminal keeps
+    (the cascade's, for n_parent_closed)."""
     writes: list[tuple[Task, dict[str, Any]]] = field(default_factory=list)
     inserts: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     after: list[Callable[[], None]] = field(default_factory=list)
     parents: set[int] = field(default_factory=set)
+    still_open: list[Task] = field(default_factory=list)
 
 
 @dataclass
@@ -752,7 +754,7 @@ class Board:
                 self._notify_member(task.assignee, actor, "n_review_approved", id=task.id,
                                     title=task.title, by=actor, comment="")
             self._review_dropped(actor, old, task)
-            self._on_status_change(actor, old.status, task)
+            self._after_status(actor, mutation)
             if "depends_on" in changes:
                 self._deps_changed(actor, old, task)
         if notes is not None:
@@ -760,6 +762,10 @@ class Board:
         return task
 
     def complete(self, actor: str, task_id: int, result: str, notes: list[str] | None = None) -> Task:
+        """The assignee hands its work in (to review, or done). An agent cannot complete a task with open subtasks,
+        a crew task with a failed direction, or a direction with an empty goal (docs/SPEC.md §4.2 "Finishing").
+        `notes`: extended with the sentences for the result of the actor's call (a parent it holds whose subtasks
+        are all finished now)."""
         text = str(result if result is not None else "").strip()
         if not text:
             raise ToolError("Result must not be empty: say what was done, where it is and what is left.")
@@ -773,6 +779,8 @@ class Board:
                                 "Wait for task_review.")
             if old.status in Status.TERMINAL:
                 raise ToolError(f"Task #{old.id} is already {old.status}.")
+            if actor != USER:
+                self._check_finishable(actor, old)
             if actor == USER or not self.independent_review:
                 to_review = old.reviewer is not None and old.reviewer != actor
                 return {"result": text, "status": Status.REVIEW if to_review else Status.DONE}
@@ -781,11 +789,10 @@ class Board:
             return {"result": text, "status": Status.REVIEW, "reviewer": reviewer}
 
         mutation = self._mutate(actor, task_id, plan)
-        old, task = mutation.old, mutation.task
+        task = mutation.task
         if task.status == Status.REVIEW:
             self._request_review(actor, task, auto="reviewer" in mutation.changes)
-        else:
-            self._on_status_change(actor, old.status, task)
+        self._after_status(actor, mutation)
         if notes is not None:
             notes.extend(mutation.batch.notes)
         return task
@@ -825,7 +832,7 @@ class Board:
             ending = prompts.t(self.swarm.language_of(task.assignee), "review_rejected_plain")
             self._notify_member(task.assignee, actor, "n_review_rejected", id=task.id, title=task.title, by=actor,
                                 comment=_clip(comment), ending=ending)
-        self._on_status_change(actor, old.status, task)
+        self._after_status(actor, mutation)
         if comment:
             # the assignee already got the comment inside the review notification
             self._post(actor, task, comment, None, skip={task.assignee})
@@ -1141,6 +1148,25 @@ class Board:
         if new == Status.IN_PROGRESS:
             # the removal hint only for the current assignee: one becoming it in this call cannot drop deps yet
             self._raise_if_blocked(old.id, deps, assignee=actor == old.assignee)
+
+    def _check_finishable(self, actor: str, old: Task) -> None:
+        """What an agent's completion needs (docs/SPEC.md §4.2 "Finishing"), in this order: no open subtask (any
+        parent), no failed direction of a crew task, and a direction of a crew task has a goal."""
+        subs = self.subtasks_of(old.id)
+        if any(s.status in Status.OPEN for s in subs):
+            raise ToolError(f"Task #{old.id} has open subtasks: {self._open_list(subs, actor)}. Complete it when "
+                            "they are finished; as its creator or assignee you may cancel the ones no longer needed "
+                            "(task_update status=cancelled).")
+        failed = [s for s in subs if s.status == Status.FAILED]
+        if old.crew >= 2 and failed:
+            raise ToolError(f"Crew task #{old.id} has failed directions: {self._direction_names(failed, 'en')}. "
+                            f"Reopen each to be done again (task_update status=todo) or cancel it if #{old.id} does "
+                            f"without it (status=cancelled), then complete #{old.id}.")
+        if not old.goal:
+            parent = self._parent_row(old)
+            if parent is not None and (parent["crew"] or 0) >= 2:
+                raise ToolError(f"Write the goal of #{old.id} first (task_update goal=...): its reviewer checks the "
+                                "work against it.")
 
     # --- taking a direction (docs/SPEC.md §4.2 "Taking a direction") ----------------------------------------------
 
@@ -1470,11 +1496,11 @@ class Board:
                 plan: Callable[[Task, _Batch], dict[str, Any]]) -> _Mutation:
         """Atomic read-modify-write of a task and the rows that go with it, in one transaction: `plan(old, batch)`
         returns the values of the primary row and collects side rows, inserted rows and notes in the batch (it
-        writes through internal helpers only: the transaction is not re-entrant); then the primary row, the side
-        rows and the rows the change brings with it (_cascade) are written. The finish info of the parents it
-        touches (the old and the new parent, and the batch's) is read before and after the writes. After the
-        commit: one `task.updated` for the primary row if it changed, one per side row that changed, one
-        `task.created` per inserted row (id order), then the batch's callbacks."""
+        writes through internal helpers only: the transaction is not re-entrant); then the primary row, the rows
+        the change brings with it (_cascade, added to the side rows) and the side rows are written. The finish info
+        of the parents it touches (the old and the new parent, and the batch's) is read before and after the
+        writes. After the commit: one `task.updated` for the primary row if it changed, one per side row that
+        changed, one `task.created` per inserted row (id order), then the batch's callbacks."""
         batch = _Batch()
         side: list[tuple[int, dict[str, list[Any]]]] = []
         with self.db.transaction():
@@ -1485,12 +1511,12 @@ class Board:
             before = self._finish_info(parents)
             if changes:
                 self._write(old.id, {f: c[1] for f, c in changes.items()})
+            self._cascade(actor, old, changes, batch)
             for row, row_values in batch.writes:
                 row_changes = {f: [getattr(row, f), v] for f, v in row_values.items() if getattr(row, f) != v}
                 if row_changes:
                     self._write(row.id, {f: c[1] for f, c in row_changes.items()})
                     side.append((row.id, row_changes))
-            self._cascade(actor, old, changes, batch)
             after = self._finish_info(parents)
         task = self.get(old.id)
         if changes:
@@ -1505,7 +1531,18 @@ class Board:
         return _Mutation(old, task, changes, batch, before, after)
 
     def _cascade(self, actor: str | None, old: Task, changes: dict[str, list[Any]], batch: _Batch) -> None:
-        """The rows a change of the primary row brings with it, written in the same transaction (none yet)."""
+        """The rows a change of the primary row brings with it (docs/SPEC.md §4.2 "Leaving and closing"): when a
+        task with open subtasks becomes terminal, its todo subtasks without an assignee are cancelled (side rows,
+        one task.updated each and no notification), and its other open subtasks are kept in batch.still_open for
+        n_parent_closed."""
+        status = changes.get("status")
+        if status is None or status[0] in Status.TERMINAL or status[1] not in Status.TERMINAL:
+            return
+        for sub in self.subtasks_of(old.id, open_only=True):
+            if sub.status == Status.TODO and sub.assignee is None:
+                batch.writes.append((sub, {"status": Status.CANCELLED}))
+            else:
+                batch.still_open.append(sub)
 
     def _statuses(self, ids: Iterable[int]) -> dict[int, str]:
         ids = list(ids)
@@ -1882,19 +1919,108 @@ class Board:
         self._notify_member(name, actor, "n_crew_owner", id=task.id, title=task.title, crew=task.crew,
                             instructions=instructions, directions=directions)
 
-    def _on_status_change(self, actor: str, old_status: str, task: Task) -> None:
-        if task.status == old_status:
-            return
-        if task.status == Status.DONE:
+    def _after_status(self, actor: str, mutation: _Mutation) -> None:
+        """The side effects of a change of a task's status or parent, after the commit (docs/SPEC.md §4 side
+        effects; §4.2 "Finishing", "Leaving and closing", "Who controls subtasks"), sent in this order:
+        n_unblocked for a task done; n_parent_closed to the holders of the open subtasks a task that became
+        terminal keeps (the actor's own one: note_still_open); n_subtask_cancelled to the assignee of an open
+        subtask someone else cancelled; n_direction_failed / n_direction_cancelled to the owner of an open crew task
+        not in review while another of its directions is open; n_subtasks_done for each parent (the old and the new
+        one) that is open, not in review, and got another finish state that is not None, to its holder, else to its
+        creator when that is an active member (the actor reads it in its notes); n_task_closed to the task's
+        creator. The recipients are decided first, so a member gets one notice for the change: the first of
+        n_subtasks_done, n_subtask_cancelled, n_direction_failed / n_direction_cancelled, n_parent_closed,
+        n_task_closed. The subtasks the cascade cancelled get only their task.updated."""
+        old, task, batch = mutation.old, mutation.task, mutation.batch
+        closed = task.status if task.status != old.status and task.status in Status.TERMINAL else None
+        actor_lang = self.swarm.language_of(actor)
+        finishes = self._finish_recipients(actor, mutation)
+        taken = {name for name, *_ in finishes}  # the members whose notice about this change is decided
+        cancelled_to = None
+        parent_id = task.parent_id if task.parent_id is not None else old.parent_id
+        if (closed == Status.CANCELLED and old.status in Status.OPEN and parent_id is not None
+                and old.assignee not in (None, actor) and old.assignee not in taken):
+            cancelled_to = old.assignee
+            taken.add(cancelled_to)
+        direction_to = self._direction_owner(actor, old, task, closed, mutation)
+        if direction_to in taken:
+            direction_to = None
+        elif direction_to is not None:
+            taken.add(direction_to)
+        parent_closed: list[tuple[str, int]] = []
+        for sub in batch.still_open:
+            if sub.assignee == actor:
+                batch.notes.append(prompts.t(actor_lang, "note_still_open", sub=sub.id))
+            elif sub.assignee is not None and sub.assignee not in taken:
+                parent_closed.append((sub.assignee, sub.id))
+        taken.update(name for name, _ in parent_closed)
+        if task.status != old.status and task.status == Status.DONE:
             self._notify_unblocked(actor, task.id)
-        if task.status in Status.TERMINAL:
+        for name, sub_id in parent_closed:
+            self._notify_member(name, actor, "n_parent_closed", id=task.id, title=task.title, status=task.status,
+                                sub=sub_id)
+        self._notify_member(cancelled_to, actor, "n_subtask_cancelled", id=task.id, title=task.title, by=actor,
+                            parent=parent_id)
+        if direction_to is not None:
+            self._notify_member(direction_to, actor, "n_direction_failed" if closed == Status.FAILED
+                                else "n_direction_cancelled", id=task.id, title=task.title, by=actor, parent=parent_id)
+        for name, parent, form, state, counts in finishes:
+            lang = actor_lang if name == actor else self.swarm.language_of(name)
+            total, listed = sum(counts.values()), self._counts_text(counts, lang)
+            ending = self._ending(parent, state, form, lang)
+            if name == actor:
+                batch.notes.append(" " + prompts.t(lang, "n_subtasks_done", id=parent.id, title=parent.title,
+                                                   total=total, counts=listed, ending=ending))
+            else:
+                self._notify_member(name, actor, "n_subtasks_done", id=parent.id, title=parent.title, total=total,
+                                    counts=listed, ending=ending)
+        creator = task.created_by
+        if closed is not None and creator not in taken:
             # The creator (usually the planner) must act when a task failed or was cancelled, or when it
             # waits on something; a task done is news for its next wake-up, not one more full-history LLM
             # call per finished task (n_all_done wakes someone when everything is finished).
-            creator = task.created_by
             wake = task.status != Status.DONE or any(t.status == Status.WAITING for t in self.open_tasks_of(creator))
             self._notify_member(creator, actor, "n_task_closed", wake=wake, id=task.id, title=task.title,
                                 status=task.status, by=actor, result=_clip(task.result or "-"))
+
+    def _finish_recipients(self, actor: str, mutation: _Mutation) -> list[tuple[str, Task, str, str, dict[str, int]]]:
+        """(recipient, parent, ending form, finish state, subtasks per status) for each parent the mutation gave
+        another finish state that is not None while the parent is open and not in review (a parent in review is
+        judged by its reviewer as it stands; a terminal one was closed on purpose): its holder ("holder" form),
+        else its creator ("creator" form) when that is an active member or the actor. USER is told nothing."""
+        changed = {pid: info for pid, info in mutation.after.items()
+                   if info[0] is not None and info[0] != mutation.before.get(pid, (None, {}))[0]}
+        out: list[tuple[str, Task, str, str, dict[str, int]]] = []
+        for parent in self._load_many(changed):
+            if parent.status not in Status.OPEN or parent.status == Status.REVIEW:
+                continue
+            name, form = (parent.assignee, "holder") if parent.assignee else (parent.created_by, "creator")
+            if name == USER or (name != actor and not self.swarm.is_member(name)):
+                continue
+            state, counts = changed[parent.id]
+            out.append((name, parent, form, state, counts))
+        return out
+
+    def _direction_owner(self, actor: str, old: Task, task: Task, closed: str | None,
+                         mutation: _Mutation) -> str | None:
+        """The owner to tell that direction `task` failed or was cancelled while another direction of its crew task
+        is open (n_direction_failed / n_direction_cancelled): the crew task open and not in review, its owner a
+        member that is not the actor, not the direction's creator (n_task_closed tells it), and for a cancel not
+        the direction's assignee (n_subtask_cancelled tells it). None otherwise."""
+        if closed not in (Status.FAILED, Status.CANCELLED) or task.parent_id is None:
+            return None
+        _, counts = mutation.after.get(task.parent_id, (None, {}))
+        if not any(counts.get(s) for s in Status.OPEN):
+            return None  # the last one: n_subtasks_done says it
+        parent = self._load(task.parent_id)
+        if parent.crew < 2 or parent.status not in Status.OPEN or parent.status == Status.REVIEW:
+            return None
+        owner = parent.assignee
+        if owner in (None, USER, actor, task.created_by):
+            return None
+        if closed == Status.CANCELLED and owner == old.assignee:
+            return None
+        return owner
 
     def _deps_changed(self, actor: str, old: Task, task: Task) -> None:
         """depends_on changed: an assignee that removed dependencies its creator planned leaves a record in the
