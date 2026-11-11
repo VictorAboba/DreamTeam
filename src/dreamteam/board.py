@@ -585,10 +585,23 @@ class Board:
     def _whole_by_pick(self, task: Task) -> bool:
         """A review of `task` picked by the board is the check of the whole of a crew task: crew >= 2, [swarm]
         crew_review on, and at least one done direction (docs/SPEC.md §4.2 "Finishing")."""
-        if task.crew < 2 or not self.crew_review:
+        return self._whole(task, own=False)
+
+    def _whole(self, task: Task, own: bool) -> bool:
+        """A review request of `task` is the check of the whole of a crew task (docs/SPEC.md §4.2 "Finishing"):
+        crew >= 2, at least one done direction, and [swarm] crew_review on or `own`, a reviewer of the task's own
+        (the valid reviewer kept at a completion, or one an update passes in its `reviewer` field). A hand-over,
+        a re-pick in release_all, and the board's re-pick when the user makes the reviewer the assignee are not
+        the task's own reviewer."""
+        if task.crew < 2 or not (self.crew_review or own):
             return False
-        return self.db.one("SELECT 1 FROM tasks WHERE parent_id = ? AND status = ? LIMIT 1",
-                           (task.id, Status.DONE)) is not None
+        return self._done_directions(task.id) > 0
+
+    def _done_directions(self, task_id: int) -> int:
+        """How many subtasks of `task_id` are done (`n` of n_crew_review_requested)."""
+        row = self.db.one("SELECT COUNT(*) AS n FROM tasks WHERE parent_id = ? AND status = ?",
+                          (task_id, Status.DONE))
+        return row["n"] if row else 0
 
     @staticmethod
     def _role_rank(member: dict) -> int:
@@ -747,8 +760,9 @@ class Board:
         if changes:
             self._notify_assignment(actor, old, task, changes, mutation.batch.notes)
             if task.status == Status.REVIEW and ("reviewer" in changes or old.status != Status.REVIEW):
-                # the task already waits for review: the new reviewer must learn about it now
-                self._request_review(actor, task, auto=False)
+                # the task already waits for review: the new reviewer must learn about it now (a reviewer the call
+                # passes is the task's own; the board's re-pick at the user's reassignment is not)
+                self._request_review(actor, task, auto=False, own=reviewer is not UNSET)
             if old.status == Status.REVIEW and task.status == Status.DONE:
                 # the user set done: an approval, which wakes the assignee like any verdict
                 self._notify_member(task.assignee, actor, "n_review_approved", id=task.id,
@@ -791,7 +805,9 @@ class Board:
         mutation = self._mutate(actor, task_id, plan)
         task = mutation.task
         if task.status == Status.REVIEW:
-            self._request_review(actor, task, auto="reviewer" in mutation.changes)
+            # a reviewer kept from before the completion is the task's own; one the board picked just now is not
+            picked = "reviewer" in mutation.changes
+            self._request_review(actor, task, auto=picked, own=not picked)
         self._after_status(actor, mutation)
         if notes is not None:
             notes.extend(mutation.batch.notes)
@@ -828,8 +844,10 @@ class Board:
             self._notify_member(task.assignee, actor, "n_review_approved", id=task.id, title=task.title, by=actor,
                                 comment=_clip(comment))
         else:
-            # what a returned task asks of its assignee, in the assignee's language
-            ending = prompts.t(self.swarm.language_of(task.assignee), "review_rejected_plain")
+            # what a returned task asks of its assignee, in the assignee's language (for a crew task: fix it itself
+            # or with new directions; no draft, the owner wrote the result itself)
+            ending = prompts.t(self.swarm.language_of(task.assignee),
+                               "review_rejected_crew" if task.crew >= 2 else "review_rejected_plain", id=task.id)
             self._notify_member(task.assignee, actor, "n_review_rejected", id=task.id, title=task.title, by=actor,
                                 comment=_clip(comment), ending=ending)
         self._after_status(actor, mutation)
@@ -892,7 +910,22 @@ class Board:
             elif not independent and old.status == Status.REVIEW and old.assignee and old.assignee != name:
                 self._notify_member(old.assignee, actor, "n_reviewer_left", id=task.id, title=task.title,
                                     reviewer=name)
+        self._directions_freed(name, actor, updates)
         return [t.id for t in olds if not (independent and t.status == Status.REVIEW)]
+
+    def _directions_freed(self, name: str, actor: str, updates: list[tuple[Task, dict[str, Any]]]) -> None:
+        """release_all: each direction of `name` that went back to todo is free again; the crew task's assignee
+        after the release, if it has one, gets the quiet n_direction_freed (nobody does when the owner itself
+        left: the next owner reads the directions in the owner sentence). A direction in review stays there."""
+        freed = [old for old, values in updates
+                 if old.assignee == name and old.parent_id is not None and values.get("status") == Status.TODO]
+        parents = {p.id: p for p in self._load_many({old.parent_id for old in freed})}
+        for old in freed:
+            parent = parents.get(old.parent_id)
+            if parent is None or parent.crew < 2:
+                continue
+            self._notify_member(parent.assignee, actor, "n_direction_freed", wake=False, id=old.id,
+                                title=old.title, by=name)
 
     def hand_over_review(self, task_id: int, exclude: Iterable[str]) -> Task | None:
         """The reviewer of a task in review did not review it (ignored the reminder, or its runtime is in error):
@@ -1844,11 +1877,14 @@ class Board:
             return
         self.swarm.notify(name, key, **kw)
 
-    def _request_review(self, by: str, task: Task, auto: bool, handed_over_from: str | None = None) -> None:
+    def _request_review(self, by: str, task: Task, auto: bool, handed_over_from: str | None = None,
+                        own: bool = False) -> None:
         """`task` waits for its reviewer: tell them. `auto`: the board chose the reviewer just now (USER chosen
         by the board means that nobody else qualifies). `handed_over_from`: the reviewer the board took the review
         from (it let the review lapse, or it left while the executor had left too): the user, when the board chose
-        it, is told that no agent took the review over rather than who finished the task."""
+        it, is told that no agent took the review over rather than who finished the task. `own`: the reviewer is
+        the task's own (_whole); a member reviewer of the check of the whole of a crew task gets
+        n_crew_review_requested in place of n_review_requested."""
         if task.reviewer == USER:
             if auto and handed_over_from:
                 self.swarm.notify(USER, "u_review_handed_over", id=task.id, title=task.title,
@@ -1856,6 +1892,10 @@ class Board:
             elif by != USER:
                 self.swarm.notify(USER, "u_review_fallback" if auto else "u_review_requested",
                                   by=by, id=task.id, title=task.title)
+            return
+        if self._whole(task, own):
+            self._notify_member(task.reviewer, by, "n_crew_review_requested", id=task.id, title=task.title, by=by,
+                                n=self._done_directions(task.id))
             return
         self._notify_member(task.reviewer, by, "n_review_requested", id=task.id, title=task.title, by=by)
 

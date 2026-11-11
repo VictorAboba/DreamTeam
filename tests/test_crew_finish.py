@@ -1,6 +1,6 @@
-"""Finishing a parent and a crew task, and closing one (docs/SPEC.md §4 side effects, §4.2 "Finishing", "Leaving
-and closing", "Who controls subtasks"): what an agent's completion needs, who is told when the subtasks finish, and
-the cascade when a parent is closed."""
+"""Finishing a parent and a crew task, and closing one (docs/SPEC.md §4 side effects, §4.2 "Finishing", "Reviews",
+"Leaving and closing", "Who controls subtasks"): what an agent's completion needs, who is told when the subtasks
+finish, the check of the whole and a returned crew task, a member leaving, and the cascade when a parent is closed."""
 
 from __future__ import annotations
 
@@ -8,7 +8,9 @@ import pytest
 
 from dreamteam import prompts
 from dreamteam.board import Board
+from dreamteam.db import loads
 from dreamteam.models import USER, AgentKind, AgentStatus, Status, Task, ToolError
+from dreamteam.swarm import QUIET_KEY
 from helpers.crew import finish_raw, keys_for, make_crew_raw, notes_of, set_raw
 
 ANNA, BOB, CARL, DINA, EVA = "Anna Smith", "Bob Brown", "Carl Clark", "Dina Evans", "Eva Orlova"
@@ -530,3 +532,294 @@ def test_a_task_without_open_subtasks_closes_as_before(swarm, board):
     board.complete(BOB, task.id, "ok")
     assert keys_for(swarm, ANNA) == ["n_task_closed"]
     assert notes_of(swarm, ANNA, "n_task_closed")[0]["status"] == Status.DONE
+
+
+# --- the check of the whole ----------------------------------------------------------------------------------------
+
+def quiet(swarm, name: str, kind: str) -> list[bool]:
+    """For each stored `kind` notification of `name`, oldest first: was it sent with wake=False."""
+    rows = swarm.db.all("SELECT data FROM notifications WHERE recipient = ? AND kind = ? ORDER BY id", (name, kind))
+    return [bool(loads(r["data"], {}).get(QUIET_KEY)) for r in rows]
+
+
+def in_review(board: Board, done: tuple[str, ...] = (BOB,), reviewer: str = CARL, **kw) -> tuple[Task, list[Task]]:
+    """A crew task held by ANNA waiting for `reviewer`, with one done direction per name in `done`."""
+    task, subs = crew_task(board, titles=tuple(f"part{i}" for i in range(len(done))), **kw)
+    for sub, name in zip(subs, done):
+        finish_raw(board, sub.id, Status.DONE, f"{sub.title} done", assignee=name)
+    return set_raw(board, task.id, status=Status.REVIEW, reviewer=reviewer, result="whole"), subs
+
+
+def review_keys(swarm) -> list[tuple[str, str]]:
+    return [(r, k) for r, k, _ in swarm.notified if k in ("n_review_requested", "n_crew_review_requested")]
+
+
+@pytest.mark.parametrize("done", [True, False])
+@pytest.mark.parametrize("own", [True, False])
+@pytest.mark.parametrize("independent", [True, False])
+@pytest.mark.parametrize("crew_review", [True, False])
+def test_the_owners_completion_follows_the_matrix(swarm, board, crew_review, independent, own, done):
+    swarm.config.swarm.crew_review = crew_review
+    swarm.config.swarm.independent_review = independent
+    task, subs = crew_task(board, titles=("parser", "cli"), creator=DINA)
+    for sub, name in zip(subs, (BOB, CARL)):
+        if done:
+            finish_raw(board, sub.id, Status.DONE, f"{sub.title} done", assignee=name)
+        else:
+            finish_raw(board, sub.id, Status.CANCELLED)
+    if own:
+        set_raw(board, task.id, reviewer=DINA)
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "the whole")
+    after = board.get(task.id)
+    if not own and not independent:
+        assert (after.status, after.reviewer, review_keys(swarm)) == (Status.DONE, None, [])
+        return
+    whole = done and (own or crew_review)
+    # the task's own reviewer; else the pick: with the contributor key someone outside the crew (DINA created it and
+    # comes after EVA), without it the first by name (BOB, a contributor)
+    expected = DINA if own else EVA if whole else BOB
+    assert (after.status, after.reviewer) == (Status.REVIEW, expected)
+    key = "n_crew_review_requested" if whole else "n_review_requested"
+    assert review_keys(swarm) == [(expected, key)]
+    kw = {"id": task.id, "title": task.title, "by": ANNA}
+    assert notes_of(swarm, expected, key) == [{**kw, "n": 2} if whole else kw]
+
+
+def test_the_check_of_the_whole_goes_to_a_contributor_before_the_user(swarm, board):
+    task, subs = crew_task(board, crew=4, titles=("a", "b", "c", "d"))
+    for sub, name in zip(subs, (BOB, CARL, DINA, EVA)):
+        finish_raw(board, sub.id, Status.DONE, "ok", assignee=name)
+    board.complete(ANNA, task.id, "the whole")
+    reviewer = board.get(task.id).reviewer
+    assert reviewer in board.contributors_of(board.get(task.id)) and reviewer not in (ANNA, USER)
+    assert keys_for(swarm, reviewer) == ["n_crew_review_requested"]
+
+
+def test_a_crew_task_without_a_done_direction_is_reviewed_as_any_task(swarm, board):
+    task, subs = crew_task(board, titles=("parser",))
+    finish_raw(board, subs[0].id, Status.CANCELLED)
+    board.complete(ANNA, task.id, "done it myself")
+    assert review_keys(swarm) == [(board.get(task.id).reviewer, "n_review_requested")]
+
+
+@pytest.mark.parametrize("crew_review, key", [(True, "n_crew_review_requested"), (False, "n_review_requested")])
+def test_a_hand_over_is_the_check_of_the_whole_only_through_crew_review(swarm, board, crew_review, key):
+    swarm.config.swarm.crew_review = crew_review
+    task, _ = in_review(board)
+    swarm.notified.clear()
+    board.hand_over_review(task.id, exclude=())
+    reviewer = board.get(task.id).reviewer
+    assert reviewer not in (CARL, ANNA, USER)
+    expected = {"id": task.id, "title": task.title, "by": ANNA}
+    assert notes_of(swarm, reviewer, key) == [{**expected, "n": 1} if crew_review else expected]
+    assert keys_for(swarm, CARL) == ["n_review_reassigned"]
+
+
+def test_a_re_pick_when_the_reviewer_leaves_asks_for_the_check_of_the_whole(swarm, board):
+    task, _ = in_review(board)
+    swarm.notified.clear()
+    board.release_all(CARL, USER)
+    reviewer = board.get(task.id).reviewer
+    assert reviewer not in (CARL, ANNA, USER)
+    assert notes_of(swarm, reviewer, "n_crew_review_requested") == [
+        {"id": task.id, "title": task.title, "by": ANNA, "n": 1}]
+
+
+@pytest.mark.parametrize("actor", [USER, ANNA])
+def test_a_reviewer_passed_by_an_update_is_the_tasks_own(swarm, board, actor):
+    swarm.config.swarm.crew_review = False
+    task, _ = in_review(board, done=(BOB, CARL), reviewer=DINA)
+    swarm.notified.clear()
+    board.update(actor, task.id, reviewer=EVA)
+    assert notes_of(swarm, EVA, "n_crew_review_requested") == [
+        {"id": task.id, "title": task.title, "by": actor, "n": 2}]
+    assert keys_for(swarm, DINA) == ["n_review_cancelled"]
+
+
+@pytest.mark.parametrize("crew_review, key", [(False, "n_review_requested"), (True, "n_crew_review_requested")])
+def test_the_users_reassignment_re_picks_without_the_tasks_own_reviewer(swarm, board, crew_review, key):
+    swarm.config.swarm.crew_review = crew_review
+    task, _ = in_review(board)
+    swarm.notified.clear()
+    board.update(USER, task.id, assignee=CARL)
+    after = board.get(task.id)
+    assert after.assignee == CARL and after.reviewer not in (CARL, ANNA, USER)
+    assert review_keys(swarm) == [(after.reviewer, key)]
+
+
+# --- a returned crew task ------------------------------------------------------------------------------------------
+
+def test_a_returned_crew_task_goes_back_to_its_owner_with_the_crew_ending(swarm, board):
+    task, _ = in_review(board)
+    swarm.notified.clear()
+    board.review(CARL, task.id, False, "the parts do not fit")
+    after = board.get(task.id)
+    assert (after.status, after.assignee, after.reviewer) == (Status.IN_PROGRESS, ANNA, CARL)
+    (kw,) = notes_of(swarm, ANNA, "n_review_rejected")
+    assert kw["ending"] == prompts.t("en", "review_rejected_crew", id=task.id)
+    assert kw["ending"].startswith(f"#{task.id} is a crew task: fix it yourself, or with new directions")
+    assert "Draft" not in kw["ending"] and "part0 done" not in kw["ending"]  # the owner wrote the result itself
+    assert quiet(swarm, ANNA, "n_review_rejected") == [False]
+
+
+def test_the_crew_ending_in_russian(swarm, board):
+    task, _ = in_review(board, owner=EVA)
+    board.review(CARL, task.id, False, "не сходится")
+    row = swarm.db.one("SELECT text FROM notifications WHERE recipient = ? AND kind = ?", (EVA, "n_review_rejected"))
+    assert row["text"].endswith(f"\n#{task.id} — групповая задача: исправь её сам(а) или новыми направлениями "
+                                f"(task_update directions) и, когда они завершатся, обнови результат #{task.id}; "
+                                "затем снова вызови `task_complete`.")
+
+
+def test_a_returned_ordinary_task_keeps_the_plain_ending(swarm, board):
+    task = board.create(DINA, "plain")
+    board.claim(ANNA, task.id)
+    board.complete(ANNA, task.id, "ok")
+    board.review(board.get(task.id).reviewer, task.id, False, "redo")
+    assert notes_of(swarm, ANNA, "n_review_rejected")[0]["ending"] == "Fix it, then call `task_complete` again."
+
+
+def test_a_returned_crew_task_without_an_owner_is_ready_and_its_next_owner_reads_the_draft(swarm, board):
+    task, subs = in_review(board, done=(BOB, CARL), reviewer=DINA)
+    set_raw(board, task.id, assignee=None)  # its owner left while it waited
+    board.review(DINA, task.id, False, "the parts do not fit")
+    after = board.get(task.id)
+    assert (after.status, after.assignee) == (Status.TODO, None)
+    assert task.id in [t.id for t in board.ready_unassigned()]
+    notes: list[str] = []
+    board.claim(EVA, task.id, notes=notes)
+    assert notes == [" " + board._ending(board.get(task.id), "finished", "owner", "ru")]
+    assert notes[0].startswith(" " + prompts.t("ru", "owner_prefix_finished"))
+    assert "part0 done" in notes[0] and "part1 done" in notes[0]
+
+
+def test_a_returned_crew_task_completed_again_after_new_directions(swarm, board):
+    task, subs = crew_task(board, titles=("parser", "cli"), creator=DINA)
+    finish_raw(board, subs[0].id, Status.DONE, "parser done", assignee=BOB)
+    finish_raw(board, subs[1].id, Status.DONE, "cli done", assignee=CARL)
+    board.complete(ANNA, task.id, "whole v1")
+    whole_reviewer = board.get(task.id).reviewer
+    board.review(whole_reviewer, task.id, False, "no tests")
+    board.update(ANNA, task.id, directions=["tests"])
+    new = board.subtasks_of(task.id)[-1]
+    assert (new.title, new.assignee, new.status) == ("tests", ANNA, Status.IN_PROGRESS)  # its own part
+    board.update(ANNA, new.id, goal="the tests pass")
+    board.complete(ANNA, new.id, "tests done")
+    swarm.notified.clear()
+    board.review(board.get(new.id).reviewer, new.id, True)
+    # the owner is told again, with the draft of all its directions, the earlier ones first
+    (kw,) = notes_of(swarm, ANNA, "n_subtasks_done")
+    assert (kw["total"], kw["counts"]) == (3, "3 done")
+    ending = kw["ending"]
+    places = [ending.index(f"#{s.id} [done]") for s in (*subs, new)]
+    assert places == sorted(places)
+    assert all(text in ending for text in ("parser done", "cli done", "tests done"))
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "whole v2")
+    after = board.get(task.id)
+    assert (after.status, after.reviewer) == (Status.REVIEW, whole_reviewer)  # kept from the first check
+    assert notes_of(swarm, whole_reviewer, "n_crew_review_requested") == [
+        {"id": task.id, "title": task.title, "by": ANNA, "n": 3}]
+
+
+# --- n_crew_owner with all directions finished ---------------------------------------------------------------------
+
+def test_n_crew_owner_carries_the_draft_when_all_directions_are_finished(swarm, board):
+    task, subs = crew_task(board, titles=("parser", "cli"), owner=None, creator=DINA)
+    finish_raw(board, subs[0].id, Status.DONE, "parser done", assignee=BOB)
+    finish_raw(board, subs[1].id, Status.CANCELLED)
+    swarm.notified.clear()
+    board.update(DINA, task.id, assignee=BOB)
+    assert keys_for(swarm, BOB) == ["n_crew_owner"]  # never also n_assigned
+    (kw,) = notes_of(swarm, BOB, "n_crew_owner")
+    assert kw["directions"] == ""  # the draft lists them
+    assert kw["instructions"] == " " + board._ending(board.get(task.id), "finished", "owner", "en")
+    assert kw["instructions"].startswith(" All its directions are finished: check that they fit together")
+    assert f"\nDraft for #{task.id}'s result" in kw["instructions"] and "parser done" in kw["instructions"]
+
+
+def test_n_crew_owner_after_the_creators_reopening_carries_the_draft_of_all_directions(swarm, board):
+    task, subs = crew_task(board, titles=("parser", "cli", "tests"), creator=DINA)
+    for sub, name in zip(subs, (BOB, CARL, ANNA)):
+        finish_raw(board, sub.id, Status.DONE, f"{sub.title} done", assignee=name)
+    finish_raw(board, task.id, Status.DONE, "whole", assignee=ANNA)
+    swarm.notified.clear()
+    board.update(DINA, task.id, status="todo")
+    after = board.get(task.id)
+    assert (after.status, after.assignee) == (Status.TODO, ANNA)
+    assert keys_for(swarm, ANNA) == ["n_crew_owner"]
+    (kw,) = notes_of(swarm, ANNA, "n_crew_owner")
+    assert kw["directions"] == ""
+    places = [kw["instructions"].index(f"#{s.id} [done] \"{s.title}\"") for s in subs]
+    assert places == sorted(places)
+    assert all(f"{s.title} done" in kw["instructions"] for s in subs)
+
+
+# --- leaving: the owner, a direction's holder ----------------------------------------------------------------------
+
+def test_an_owner_releasing_its_crew_task_keeps_its_own_direction(swarm, board):
+    task, subs = crew_task(board)
+    work(board, subs[0].id, ANNA)
+    work(board, subs[1].id, BOB)
+    swarm.notified.clear()
+    board.update(ANNA, task.id, status="todo")
+    after = board.get(task.id)
+    assert (after.status, after.assignee) == (Status.TODO, None)
+    assert task.id in [t.id for t in board.ready_unassigned()]  # its next claim makes a new owner
+    own = board.get(subs[0].id)
+    assert (own.status, own.assignee) == (Status.IN_PROGRESS, ANNA)
+    assert set(board.crew_working(after)) == {ANNA, BOB}  # as its direction's assignee it keeps its place
+    assert not [k for _, k, _ in swarm.notified if k == "n_direction_freed"]
+
+
+def test_an_owner_leaving_leaves_its_directions_going(swarm, board):
+    task, subs = crew_task(board)
+    work(board, subs[0].id, ANNA)
+    work(board, subs[1].id, BOB)
+    swarm.notified.clear()
+    released = board.release_all(ANNA, USER)
+    assert sorted(released) == sorted([task.id, subs[0].id])
+    assert [(t.status, t.assignee) for t in (board.get(task.id), board.get(subs[0].id))] == [
+        (Status.TODO, None), (Status.TODO, None)]
+    assert (board.get(subs[1].id).status, board.get(subs[1].id).assignee) == (Status.IN_PROGRESS, BOB)
+    ready = [t.id for t in board.ready_unassigned()]
+    assert {task.id, subs[0].id, subs[2].id} <= set(ready)
+    # nobody is told: the next owner reads the directions in the owner sentence
+    assert not [k for _, k, _ in swarm.notified if k == "n_direction_freed"]
+
+
+@pytest.mark.parametrize("independent", [True, False])
+def test_a_direction_holder_leaving_frees_only_the_directions_back_in_todo(swarm, board, independent):
+    swarm.config.swarm.independent_review = independent
+    task, subs = crew_task(board, crew=4, titles=("parser", "cli", "docs"))
+    work(board, subs[0].id, BOB)
+    work(board, subs[1].id, BOB, Status.REVIEW, reviewer=CARL, result="cli done", goal="cli")
+    work(board, subs[2].id, BOB, Status.TODO)  # assigned, not taken yet
+    swarm.notified.clear()
+    board.release_all(BOB, USER)
+    freed = [subs[0], subs[2]] if independent else [subs[0], subs[1], subs[2]]
+    assert sorted(notes_of(swarm, ANNA, "n_direction_freed"), key=lambda kw: kw["id"]) == [
+        {"id": s.id, "title": s.title, "by": BOB} for s in freed]
+    assert set(quiet(swarm, ANNA, "n_direction_freed")) == {True}
+    if independent:  # handed in: it stays in review without an assignee, and is not free
+        cli = board.get(subs[1].id)
+        assert (cli.status, cli.assignee) == (Status.REVIEW, None)
+
+
+def test_a_crew_task_held_by_the_user_hears_nothing_of_a_freed_direction(swarm, board):
+    task, subs = crew_task(board, owner=USER)
+    work(board, subs[0].id, BOB)
+    swarm.notified.clear()
+    board.release_all(BOB, ANNA)
+    assert not [k for _, k, _ in swarm.notified if k == "n_direction_freed"]  # USER is never told
+
+
+def test_a_subtask_of_an_ordinary_parent_freed_tells_nobody(swarm, board):
+    parent = board.create(ANNA, "parent", assignee=ANNA)
+    sub = board.create(ANNA, "sub", parent_id=parent.id)
+    work(board, sub.id, BOB)
+    swarm.notified.clear()
+    board.release_all(BOB, USER)
+    assert board.get(sub.id).assignee is None
+    assert "n_direction_freed" not in keys_for(swarm, ANNA)
