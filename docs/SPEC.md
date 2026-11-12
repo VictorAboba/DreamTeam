@@ -5333,12 +5333,21 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     `button` (it holds the toggle and the rows, which are buttons of their own); a card without one stays a
     `button`. The board's keydown (Enter / Space) and dragstart handlers ignore events from the
     toggle and the stack: Enter on the toggle toggles, Enter on a row opens that row, and rows are not draggable (a
-    subtask's status changes in its modal). Setting a terminal status on a parent with open subtasks, by dropping
-    its card on «done» or «closed» or by saving its modal with the status done, failed or cancelled, first asks
-    («У задачи #N открыты подзадачи: #17, #19. Закрыть всё равно?» / "Task #N has open subtasks: #17, #19. Close
-    anyway?"; for a crew task «У групповой задачи #N открыты направления: …» / "Crew task #N has open directions:
-    …"; naming what happens to them, §4.2 "Leaving and closing"; one i18n key used by `moveTask` and `saveTask`).
-    Cancelling the question leaves the task, and the modal's other unsaved edits, unchanged. Expanded parents are
+    subtask's status changes in its modal). Setting a terminal status on an open parent with open subtasks, by
+    dropping its card on «done» or «closed», by saving its modal with the status done, failed or cancelled, or by
+    approving it in review (a drop of its review card on «done» and the modal's «Принять»: the approval makes it
+    done), first asks («У задачи #N открыты подзадачи: #17, #19. Закрыть всё равно?» / "Task #N has open subtasks:
+    #17, #19. Close anyway?"; for a crew task «У групповой задачи #N открыты направления: …» / "Crew task #N has open
+    directions: …"). The list is the open direct subtasks in id order, and between it and «Закрыть всё равно?» the
+    question names what happens to them (§4.2 "Leaving and closing"), one sentence per kind that occurs: «Без
+    исполнителя, отменятся вместе с ней: #17. » / "Unassigned, cancelled with it: #17. " (`todo` without an
+    assignee), «Останутся открытыми, их исполнители получат уведомление: #19. » / "Stay open, their holders are
+    told: #19. ", «Останутся открытыми ваши: #20. » / "Stay open, yours: #20. " (assigned to the user, who is told
+    nothing) and «Останутся открытыми: #21. » / "Stay open: #21. " (open with no assignee: nobody is told). One text
+    per kind of parent (an i18n key for an ordinary task and one for a crew task, with the fate sentences), the
+    same for `moveTask`, `saveTask` and `reviewTask` (app.js `closeQuestion`); a parent that is already terminal is
+    not asked (the cascade acts only on open -> terminal), nor is a return of a review. Cancelling the question
+    leaves the task, and the modal's other unsaved edits and the review comment, unchanged. Expanded parents are
     kept in memory across renders (`S.expanded`, a set of ids), and the keyboard focus on a card, a toggle or a row
     stays on it across live re-renders of the board. A crew task's card adds a chip with the users icon
     and `2/3` (working / `crew`; its tooltip «Групповая задача: работают 2 из 3» / "Crew task: 2 of 3 working";

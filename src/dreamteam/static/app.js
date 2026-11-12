@@ -54,6 +54,11 @@ const I18N = {
     required: "Заполните обязательные поля", required_task: "Заполните заголовок и цель задачи",
     invalid_limits: "Бюджет должен быть ≥ 0, а максимум агентов — целым числом ≥ 1",
     discard_changes: "Закрыть без сохранения? Введённый текст пропадёт.",
+    close_open_subtasks: "У задачи #{id} открыты подзадачи: {ids}. {fate}Закрыть всё равно?",
+    close_open_directions: "У групповой задачи #{id} открыты направления: {ids}. {fate}Закрыть всё равно?",
+    close_fate_cancel: "Без исполнителя, отменятся вместе с ней: {ids}. ",
+    close_fate_told: "Останутся открытыми, их исполнители получат уведомление: {ids}. ",
+    close_fate_yours: "Останутся открытыми ваши: {ids}. ", close_fate_open: "Останутся открытыми: {ids}. ",
     edit: "Изменить", md_source: "Исходный текст", md_formatted: "Форматированный вид",
     truncated: "(обрезано)", system: "система", theme: "Тема: светлая / тёмная", language: "Язык интерфейса",
     collapse_team: "Свернуть панель команды", expand_team: "Развернуть панель команды",
@@ -224,6 +229,11 @@ const I18N = {
     required: "Fill in the required fields", required_task: "Fill in the title and the task goal",
     invalid_limits: "The budget must be ≥ 0 and max agents a whole number ≥ 1",
     discard_changes: "Close without saving? Your text will be lost.",
+    close_open_subtasks: "Task #{id} has open subtasks: {ids}. {fate}Close anyway?",
+    close_open_directions: "Crew task #{id} has open directions: {ids}. {fate}Close anyway?",
+    close_fate_cancel: "Unassigned, cancelled with it: {ids}. ",
+    close_fate_told: "Stay open, their holders are told: {ids}. ",
+    close_fate_yours: "Stay open, yours: {ids}. ", close_fate_open: "Stay open: {ids}. ",
     edit: "Edit", md_source: "Source", md_formatted: "Formatted",
     truncated: "(truncated)", system: "system", theme: "Theme: light / dark", language: "Interface language",
     collapse_team: "Collapse the team panel", expand_team: "Expand the team panel",
@@ -824,6 +834,27 @@ function dropAction(task, col) {
   if (task.status === "review" && col !== "closed") return { open: true };
   return { status: col === "closed" ? "cancelled" : col };
 }
+/** The question before a terminal status is set on an open parent with open subtasks (docs/SPEC.md §18.4
+ * "Subtasks" and §4.2 "Leaving and closing"): its open direct subtasks and what happens to them — todo ones without
+ * an assignee are cancelled with it; the others stay open and their holders are told (the user's own are named
+ * apart; an open one with no assignee tells nobody). null when there is nothing to ask. One text for moveTask,
+ * saveTask and the modal's «Принять» (an approval makes the task done). */
+function closeQuestion(task, status) {
+  if (!task || !TERMINAL_STATUSES.has(status) || !OPEN_STATUSES.has(task.status)) return null;
+  const open = ((S.state && S.state.tasks) || []).filter((x) => x && x.parent_id === task.id && OPEN_STATUSES.has(x.status))
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  if (!open.length) return null;
+  const ids = (list) => list.map((x) => "#" + Number(x.id)).join(", ");
+  const cancelled = open.filter((x) => x.status === "todo" && !x.assignee);
+  const rest = open.filter((x) => !cancelled.includes(x));
+  const told = rest.filter((x) => x.assignee && x.assignee !== "user");
+  const yours = rest.filter((x) => x.assignee === "user");
+  const left = rest.filter((x) => !x.assignee);   // nobody to tell
+  const part = (key, list) => (list.length ? t(key, { ids: ids(list) }) : "");
+  const fate = part("close_fate_cancel", cancelled) + part("close_fate_told", told) + part("close_fate_yours", yours)
+    + part("close_fate_open", left);
+  return t(Number(task.crew) >= 2 ? "close_open_directions" : "close_open_subtasks", { id: Number(task.id), ids: ids(open), fate });
+}
 
 /** The board's cards and their stacks (docs/SPEC.md §18.4 "Subtasks"); the one place of this rule — the TUI's
  * board (§4.2 "Surfaces": a subtask is its own line only where the web shows it as its own card) twins it, and
@@ -1091,6 +1122,9 @@ function moveTask(id, col) {
   const action = dropAction(task, col);
   if (!action) return;
   if (action.error) { toast(t(action.error), "err"); return; }
+  // a terminal status on a parent with open subtasks asks first (a review card dropped on «done» is approved: done)
+  const question = action.open ? null : closeQuestion(task, action.review ? "done" : action.status);
+  if (question && !confirm(question)) return;
   if (action.review) { act("task_review", { task_id: id, approve: true }, true); return; }
   if (action.open) { openTask(id).then(() => { $("#review-comment")?.focus(); toast(t("review_reason")); }); return; }
   act("task_update", { task_id: id, status: action.status }, true);
@@ -1664,6 +1698,12 @@ async function reviewTask(approve) {
   const comment = ($("#review-comment")?.value || "").trim();
   // a return without a reason gives the agent nothing to act on
   if (!approve && !comment) { toast(t("review_reason"), "err"); $("#review-comment")?.focus(); return; }
+  if (approve) {
+    // the approval makes the task done: a parent with open subtasks asks first, and a cancel keeps the comment
+    const current = ((S.state && S.state.tasks) || []).find((x) => x && x.id === taskId) || S.taskBase;
+    const question = closeQuestion(current, "done");
+    if (question && !confirm(question)) return;
+  }
   const res = await act("task_review", { task_id: taskId, approve, comment });
   if (res.ok && S.openTaskId === taskId) {
     const box = $("#review-comment");
@@ -1677,6 +1717,9 @@ async function saveTask() {
   if (!task) return;
   const changes = taskChanges(task, readTaskForm());
   if (!changes) { closeModal(true); return; }
+  // a terminal status on a parent with open subtasks asks first; a cancel leaves the form and its other edits as typed
+  const question = changes.status ? closeQuestion(task, changes.status) : null;
+  if (question && !confirm(question)) return;
   const btn = $("#save-task");
   btn.disabled = true;
   const res = await act("task_update", { task_id: task.id, ...changes }, true);
@@ -2964,6 +3007,8 @@ if (typeof module !== "undefined" && module.exports) {
     OPEN_STATUSES, TERMINAL_STATUSES, EMPTY_CARD, STACK_DOTS,
     // crew tasks in the task forms: the crew number and the directions fields, the modal's subtasks, the feed's values
     crewValue, crewOn, parseDirections, syncCrewField, taskSubtasksHtml, newTaskModal, saveTask, fmtValue, CREW_MAX,
+    // the question before a parent with open subtasks is closed (moveTask, saveTask, reviewTask)
+    closeQuestion,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

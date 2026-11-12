@@ -983,6 +983,130 @@ def test_crew_line_styles():
     assert ".crew-line {" in css and ".modal-stack {" in css
 
 
+# ----------------------------------------------------- closing a parent with open subtasks asks first (§18.4, §4.2)
+# parent #2 (in_progress): #3 todo unassigned (cancelled with it), #4 Ann's (told), #5 the user's own, #6 done (not
+# open), #8 waiting with nobody on it (nobody told); #10 is a grandchild (one level only); crew task #7 with #11, #12
+CLOSE_TASKS = [stack_task(1, title="Plain"), stack_task(2, "in_progress", title="Parent", assignee="Ann Lee"),
+               stack_task(3, "todo", 2), stack_task(4, "in_progress", 2, assignee="Ann Lee"),
+               stack_task(5, "waiting", 2, assignee="user"), stack_task(6, "done", 2),
+               stack_task(7, "in_progress", title="Crew", crew=3, assignee="Bob Stone"),
+               stack_task(8, "waiting", 2), stack_task(10, "todo", 4),
+               stack_task(11, "todo", 7), stack_task(12, "in_progress", 7, assignee="Bob Stone"),
+               stack_task(20, "in_progress", title="Finished children"), stack_task(21, "done", 20),
+               stack_task(22, "cancelled", 20)]
+
+
+@needs_node
+def test_close_anyway_question():
+    out = run_js(f"""
+      app.S.state = {{ agents: [], tasks: {json.dumps(CLOSE_TASKS)} }};
+      const task = (id) => app.S.state.tasks.find((x) => x.id === id);
+      const ask = () => [app.closeQuestion(task(2), "done"), app.closeQuestion(task(7), "cancelled")];
+      app.S.lang = "en"; out.en = ask();
+      app.S.lang = "ru"; out.ru = ask();
+      app.S.lang = "en";
+      out.failed = app.closeQuestion(task(2), "failed");
+      out.review = app.closeQuestion(Object.assign({{}}, task(2), {{ status: "review" }}), "done");
+      out.none = [app.closeQuestion(task(2), "todo"), app.closeQuestion(task(2), "in_progress"),
+                  app.closeQuestion(Object.assign({{}}, task(2), {{ status: "done" }}), "cancelled"),
+                  app.closeQuestion(task(20), "done"), app.closeQuestion(task(1), "failed"),
+                  app.closeQuestion(undefined, "done")];
+      app.S.state = null;
+      out.noState = app.closeQuestion({{ id: 2, status: "in_progress" }}, "done");
+    """)
+    en_task = ("Task #2 has open subtasks: #3, #4, #5, #8. Unassigned, cancelled with it: #3. Stay open, their holders"
+               " are told: #4. Stay open, yours: #5. Stay open: #8. Close anyway?")
+    assert out["en"] == [en_task, "Crew task #7 has open directions: #11, #12. Unassigned, cancelled with it: #11."
+                                  " Stay open, their holders are told: #12. Close anyway?"]
+    assert out["ru"] == [
+        "У задачи #2 открыты подзадачи: #3, #4, #5, #8. Без исполнителя, отменятся вместе с ней: #3. Останутся"
+        " открытыми, их исполнители получат уведомление: #4. Останутся открытыми ваши: #5. Останутся открытыми: #8."
+        " Закрыть всё равно?",
+        "У групповой задачи #7 открыты направления: #11, #12. Без исполнителя, отменятся вместе с ней: #11. Останутся"
+        " открытыми, их исполнители получат уведомление: #12. Закрыть всё равно?"]
+    assert out["failed"] == en_task and out["review"] == en_task  # one text for every terminal status
+    assert out["none"] == [None] * 6
+    assert out["noState"] is None
+
+
+@needs_node
+def test_move_save_and_approve_ask_before_closing_a_parent():
+    out = run_js(f"""
+      app.S.lang = "en";
+      const tasks = {json.dumps(CLOSE_TASKS)};
+      app.S.state = {{ agents: [{{ name: "Ann Lee", role: "Dev", status: "idle" }}], tasks }};
+      const asked = [];
+      globalThis.confirm = (q) => {{ asked.push(q); return answers.confirm; }};
+      const settle = () => new Promise((r) => setImmediate(r));
+      const acts = () => calls.filter((c) => c.url.includes("/api/act/")).map((c) => [c.url.split("/").pop(), c.body]);
+      el("toasts", {{ children: [], appendChild: () => {{}} }});
+      document.createElement = () => ({{ className: "", textContent: "", remove() {{}}, addEventListener() {{}} }});
+      // the board: a drop on «done» or «closed» asks, a cancel sends nothing
+      answers.confirm = false;
+      app.moveTask(2, "done"); app.moveTask(2, "closed"); await settle();
+      out.moveCancelled = [acts(), asked.length];
+      tasks[1].status = "review";
+      app.moveTask(2, "done"); await settle();
+      out.reviewDropCancelled = [acts(), asked.length];
+      tasks[1].status = "in_progress";
+      app.moveTask(2, "todo"); app.moveTask(20, "done"); await settle();   // not terminal; no open subtasks
+      out.noQuestion = [acts(), asked.length];
+      calls.length = 0; answers.confirm = true;
+      app.moveTask(2, "closed"); await settle();
+      out.moveConfirmed = [acts(), asked.length];
+      // the modal: saving done asks; a cancel keeps the form, its other edits, the base and the modal
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      const parent = tasks[1];
+      for (const [id, valueOf] of Object.entries(app.TASK_FORM)) el(id, {{ value: valueOf(parent) }});
+      el("save-task", {{ disabled: false }});
+      el("modal", {{ innerHTML: "the task form" }}); el("modal-backdrop", {{ classList: classList() }});
+      app.S.taskBase = parent; app.S.openTaskId = 2;
+      elements["f-title"].value = "Edited title"; elements["f-status"].value = "done";
+      await app.saveTask(); await settle();
+      out.saveCancelled = [acts(), asked.length, elements["f-title"].value, elements["f-status"].value,
+                           app.S.taskBase === parent, app.S.openTaskId, elements.modal.innerHTML,
+                           elements["modal-backdrop"].classList.contains("hidden"), elements["save-task"].disabled];
+      answers.confirm = true; app.S.openTaskId = 0;     // the modal moved on: no reload of the task after the save
+      await app.saveTask(); await settle();
+      out.saveConfirmed = [acts(), asked.length];
+      // a status that is not terminal, or no status change, never asks
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      elements["f-status"].value = "waiting"; await app.saveTask(); await settle();
+      elements["f-status"].value = "in_progress"; await app.saveTask(); await settle();
+      out.saveOther = [acts(), asked.length];
+      // «Принять» on a parent in review asks; a cancel keeps the comment; «Вернуть» never asks
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      tasks[1].status = "review"; app.S.openTaskId = 2; app.S.taskBase = null;
+      el("review-comment", {{ value: "Looks good", focus: () => {{}} }});
+      await app.reviewTask(true); await settle();
+      out.approveCancelled = [acts(), asked.length, elements["review-comment"].value];
+      answers.confirm = true;
+      await app.reviewTask(true); await settle();
+      out.approveConfirmed = [acts(), asked.length];
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      elements["review-comment"].value = "Fix the parser";
+      await app.reviewTask(false); await settle();
+      out.reject = [acts(), asked.length];
+      // a parent in review with no open subtasks is approved without a question
+      calls.length = 0; tasks.find((x) => x.id === 20).status = "review"; app.S.openTaskId = 20;
+      await app.reviewTask(true); await settle();
+      out.approvePlain = [acts(), asked.length];
+    """)
+    assert out["moveCancelled"] == [[], 2]
+    assert out["reviewDropCancelled"] == [[], 3]  # a review card dropped on «done» is approved, so it asks too
+    assert out["noQuestion"] == [[["task_update", {"task_id": 2, "status": "todo"}],
+                                  ["task_update", {"task_id": 20, "status": "done"}]], 3]
+    assert out["moveConfirmed"] == [[["task_update", {"task_id": 2, "status": "cancelled"}]], 4]
+    assert out["saveCancelled"] == [[], 1, "Edited title", "done", True, 2, "the task form", False, False]
+    assert out["saveConfirmed"] == [[["task_update", {"task_id": 2, "title": "Edited title", "status": "done"}]], 2]
+    assert out["saveOther"] == [[["task_update", {"task_id": 2, "title": "Edited title", "status": "waiting"}],
+                                 ["task_update", {"task_id": 2, "title": "Edited title"}]], 0]
+    assert out["approveCancelled"] == [[], 1, "Looks good"]
+    assert out["approveConfirmed"] == [[["task_review", {"task_id": 2, "approve": True, "comment": "Looks good"}]], 2]
+    assert out["reject"] == [[["task_review", {"task_id": 2, "approve": False, "comment": "Fix the parser"}]], 0]
+    assert out["approvePlain"] == [[["task_review", {"task_id": 20, "approve": True, "comment": ""}]], 0]
+
+
 @needs_node
 def test_goal_and_hire_dialogs():
     out = run_js(r"""
