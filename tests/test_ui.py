@@ -532,7 +532,12 @@ def test_board_stacks_subtasks_under_their_parent():
       out.loops = app.boardCards([{{ id: 5, status: "todo", parent_id: 21 }}, {{ id: 20, status: "todo", parent_id: 21 }},
                                   {{ id: 21, status: "todo", parent_id: 20 }}, {{ id: 30, status: "todo", parent_id: 30 }}])
         .map((c) => [c.task.id, c.rows.map((r) => [r.task.id, r.level])]);
+      // two tasks of one id, the second (the one byId holds) leading into the loop #3 <-> #4: the walk ends
+      out.dup = app.boardCards([{{ id: 1, parent_id: 1, status: "done" }}, {{ id: 1, parent_id: 4, status: "cancelled" }},
+                                {{ id: 4, parent_id: 3, status: "weird" }}, {{ id: 3, parent_id: 4, status: "weird" }}])
+        .map((c) => [c.task.id, c.rows.map((r) => [r.task.id, r.level])]);
     """)
+    assert out["dup"] == [[1, []], [3, [[4, 0]]]]
     assert [(c[0], [tuple(r) for r in c[1]]) for c in out["cards"]] == list(EXPECTED_CARDS.items())
     assert {c[0]: c[2] for c in out["cards"]}[2] == [3, 4, 5]
     ids = [c[0] for c in out["cards"]] + [r[0] for c in out["cards"] for r in c[1]]

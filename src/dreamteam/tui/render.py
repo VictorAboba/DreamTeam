@@ -1327,8 +1327,11 @@ def board_cards(tasks: Any) -> list[Card]:
             seen.add(placed_key(y))
             y = parent(y)
         root = y if y is not None else x
+        # around the loop back to y, by key: with two tasks of one id, y may be the one by_id does not hold
+        walked = {placed_key(root)}
         z = parent(root)
-        while z is not None and z is not y:
+        while z is not None and placed_key(z) not in walked:
+            walked.add(placed_key(z))
             if _int(z.get("id")) < _int(root.get("id")):
                 root = z
             z = parent(z)

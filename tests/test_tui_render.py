@@ -985,6 +985,23 @@ def test_board_cards_match_the_web():
     assert render.board_cards(None) == [] and render.board_cards({"id": 1}) == []
 
 
+def test_board_cards_two_tasks_of_one_id_under_a_loop_end():
+    # by_id holds the second #1, whose parents lead into the loop #3 <-> #4: the walk around the loop compares
+    # keys, so it ends (it used to spin forever, waiting to meet the first #1 again)
+    import threading
+    dup = [{"id": 1, "parent_id": 1, "status": "done"}, {"id": 1, "parent_id": 4, "status": "cancelled"},
+           {"id": 4, "parent_id": 3, "status": "weird"}, {"id": 3, "parent_id": 4, "status": "weird"}]
+    result: list = []
+    worker = threading.Thread(target=lambda: result.append(render.board_cards(dup)), daemon=True)
+    worker.start()
+    worker.join(5)
+    assert not worker.is_alive() and result
+    shown = {c.task["id"] for c in result[0]} | {t["id"] for c in result[0] for t, _ in c.rows}
+    assert shown == {1, 3, 4}
+    board = plain(render.board(ctx(), dup))
+    assert "#3 " in board and "#1 " in board  # #4 is a dot in #3's line
+
+
 def test_board_cards_odd_ids():
     odd = [{"id": [1]}, {"id": True, "parent_id": 1}, {"parent_id": {}}, {"id": 1, "status": "todo"},
            {"id": 2, "parent_id": True}, {"id": 3, "parent_id": 1, "status": ["x"]}]

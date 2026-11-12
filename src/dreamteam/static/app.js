@@ -917,7 +917,12 @@ function boardCards(tasks) {
     let y = x;
     while (y && !seen.has(y.id)) { seen.add(y.id); y = byId.get(y.parent_id); }
     let root = y || x;
-    for (let z = byId.get(root.parent_id); z && z !== y; z = byId.get(z.parent_id)) if (Number(z.id) < Number(root.id)) root = z;
+    // around the loop back to y, by id: with two tasks of one id, y may be the one byId does not hold
+    const walked = new Set([root.id]);
+    for (let z = byId.get(root.parent_id); z && !walked.has(z.id); z = byId.get(z.parent_id)) {
+      walked.add(z.id);
+      if (Number(z.id) < Number(root.id)) root = z;
+    }
     build(root);
   }
   return cards.sort((a, b) => Number(a.task.id) - Number(b.task.id));
