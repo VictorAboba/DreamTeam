@@ -42,6 +42,12 @@
   `/model [profile]`,
   `/pause`, `/wrapup [off]`, `/clarify [on|off]`, `/budget N`, `/max N`, `/approve name|N`, `/reject name|N`, `/stop`,
   `/web`, `/settings`, `/verbose`, `/lang ru|en`, `/clear`, `/exit`.
+- **Sessions of an earlier version.** This version does not open a session in which agents of an earlier version
+  already worked (almost every session of 0.1.x). `/sessions` and the list of `dreamteam -r` show it with the status
+  "earlier version". Enter on it, `/resume ID` and `dreamteam -r ID` print why it does not open and attach nothing;
+  `Del` deletes it as usual. The `main` session of an old project is never deleted: when it is one of them, `Del`
+  and `/delete` print its own message, which names the file to delete by hand. See
+  [Updating to 0.2.0](getting-started.md#updating-to-020).
 - **Review.** A task the swarm handed to you for review shows as `◑ #3 … waits for your review`. `/approve 3`
   accepts it, `/reject 3 what to fix` returns it to the assignee. On the web board the task card has buttons for this,
   and dragging a task from "Review" to "Done" also accepts it. When a subtask waits for your review, its parent's
@@ -77,7 +83,9 @@
   the decision off: `/approve name` then approves only the code that dialog showed.
 
 If a server for the home folder is already running (`dreamteam serve`), the UI connects to it. Otherwise the server
-starts in the same process, and the sessions stop on exit; `dreamteam -c` continues the last one.
+starts in the same process, and the sessions stop on exit; `dreamteam -c` continues the last one. When the last one
+was made by an earlier version, `-c` says so under the welcome box and opens nothing: start a new session. A prompt
+given with `-c` then stays in the input line unsent, as does one given with `-r ID` of a session that did not open.
 In Git Bash (mintty), run `winpty dreamteam` or use Windows Terminal / PowerShell.
 
 Non-interactive mode for scripts:
@@ -99,6 +107,8 @@ and a question that pauses the swarm one more (`stream-json` shows the events in
 `--verbose`, for the notice that a model profile's calls count as $0 (no prices, and the provider does not report
 the cost): one line on stderr.
 `--clarify` / `--no-clarify` do not work with `-c` / `-r`: change an existing session with `/clarify`.
+`-c` whose most recent session was made by an earlier version, and `-r ID` of such a session, exit with code 1 and
+its message, and create nothing; so does a run whose session an import replaced with one of an earlier version.
 Background jobs still running at the end (for example, a dev server) are listed in the `jobs` field of the
 `--output-format json` result. A server started in the same process stops them together with the session. If the
 server was started separately, the jobs run until the session stops, and the text mode reports them on stderr.
@@ -131,4 +141,6 @@ attaching by name, path or URL, the decision on a member's proposal, packages an
 The console's `/board` lists subtasks indented under their parent, `/show N` of a task with subtasks lists them (for a
 crew task, also who works on it and its free directions), and `/task` creates an ordinary task.
 The console connects to a running session: `dreamteam console` (or `dreamteam console --session 003-snake`).
+`--session` of a session made by an earlier version prints its message (exit code 1); without `--session` the
+console picks only among the sessions this version opens.
 It is a simple line-based client for terminals where the [terminal UI](#terminal-ui) does not work.

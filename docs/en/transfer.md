@@ -13,6 +13,11 @@ The same two commands make a backup: export the home to an external disk, and im
   `unrecognized arguments`, and `dreamteam export` without a folder opens the terminal interface with the goal
   "export". Keep the same version on both computers: an older one refuses what a newer one wrote (a new export
   format, new columns in a session's database, a new tool set of the agents).
+- **Sessions of an earlier version.** Since 0.2.0 the reverse holds too: 0.2.0 does not open the sessions in which
+  agents of an earlier version already worked (almost every session of 0.1.x). It exports them, with a warning, and
+  its import refuses them; there is no conversion. Before updating to 0.2.0, finish the sessions you still need or
+  export them, and keep the folder. To open one again, import it into a separate home with DreamTeam 0.1.1 (0.1.0
+  has no import): see [Updating to 0.2.0](getting-started.md#updating-to-020).
 - **Export** works while DreamTeam runs: the home is only read. A session that runs at that moment is exported as
   it is on disk right now, and the report warns about it.
 - **Import** is refused while another DreamTeam process serves the target home: `dreamteam serve`, the terminal
@@ -46,7 +51,9 @@ complete. Any other folder with files in it is refused. You cannot export to the
 that category is exported. On Linux and macOS the export folder is created readable by you only (mode 0700).
 
 At the end the report lists what was written per category, what was left out and why, the warnings, and the
-command to run on the other computer.
+command to run on the other computer. A session made by an earlier version is exported like any other, with the
+warning `session 003-snake was made by an earlier version of DreamTeam: this version and the same one on the other
+computer refuse it; only the version that made it imports and opens it (keep this folder)`.
 
 ### Categories
 
@@ -96,7 +103,9 @@ put the project at the same path or run `/cd` in the session (see
   jobs do travel with the session), the terminal interface's input history, the skills' dependency environments
   (`~/.dreamteam/skill-envs`), hub tokens (`DREAMTEAM_HUB_TOKEN` and `~/.dreamteam/hub-tokens`).
 - The internal folders `sessions/.deleted-*`, `.importing-*` and `.replaced-*`.
-- The `main` session of an old project: it cannot be moved yet (the report says so). A `dreamteam run` project is
+- The `main` session of an old project: it cannot be moved yet (the report says so). So when it was made by an
+  earlier version, no export keeps it either: finish its work before updating to 0.2.0; afterwards it can only be
+  removed by hand (`<home>/.dreamteam/swarm.db` with its `-wal` and `-shm` files). A `dreamteam run` project is
   not a home, and the export refuses it (`is not a DreamTeam home`).
 - A session whose workspace move did not finish (`.dreamteam/workspace-move.json`): the report says how to fix it.
 
@@ -265,8 +274,10 @@ so a folder you once copied by hand is recognized on both computers too.
   exported session has the id of one of them, `--session ID` rewrites that one. Otherwise `--session` does not
   help: delete or move the copy you do not want here, then import again.
 - **Only that session is refused** (the others are imported) when its database was made by a newer DreamTeam
-  (unknown tables and columns, a newer tool set), when the database changed after the export (its checksum does not
-  match), when a move of its workspace did not finish on either computer, when its folder would overlap another
+  (unknown tables and columns, a newer tool set) or by an earlier one that this version does not open (`import it
+  with the version that made it`: for a session of 0.1.x, DreamTeam 0.1.1, see
+  [Before you start](#before-you-start)), when the database changed after the export (its checksum does not match),
+  when a move of its workspace did not finish on either computer, when its folder would overlap another
   session's folder or the export folder, when the folder outside the home it works in cannot be used here (see
   below), or when the export carries none of its files while its folder here has some.
 - File names this computer's file system cannot hold (characters Windows refuses; names that differ only in case,
@@ -332,7 +343,8 @@ An export is a backup too: run `dreamteam export D:\backups\dreamteam` from time
 same folder replaces the previous one. To restore, run `dreamteam import D:\backups\dreamteam` into the home, or
 with `--home NEW_FOLDER` into a new one. API keys and `env` values are not in the backup: keep them separately.
 Neither are the files of a session that works in a folder outside the home (your project after `/cd` or
-`--workspace`): the backup holds only its path, so back up that project yourself.
+`--workspace`): the backup holds only its path, so back up that project yourself. An export made before updating to
+0.2.0 keeps the sessions of 0.1.x, which 0.2.0 does not open; `--include sessions` exports the sessions alone.
 
 ## Exit codes
 

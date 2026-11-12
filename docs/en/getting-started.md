@@ -14,7 +14,8 @@ uv tool install git+https://github.com/VictorAboba/DreamTeam.git
 - uv puts the `dreamteam` command into its folder for commands (`uv tool dir --bin`, usually `~/.local/bin`). If
   `dreamteam` is not found after the install, add this folder to PATH with `uv tool update-shell` and open the
   terminal again.
-- To update to the latest version: `uv tool upgrade dreamteam`. To remove: `uv tool uninstall dreamteam`.
+- To update to the latest version: `uv tool upgrade dreamteam` (from 0.1.x, read
+  [Updating to 0.2.0](#updating-to-020) first). To remove: `uv tool uninstall dreamteam`.
 
 To change the code, clone the repository and install it from the repository folder with `--editable`. Code changes
 then take effect at once.
@@ -26,6 +27,35 @@ uv tool install --editable .
 After you change the dependencies in `pyproject.toml` or move the repository folder, reinstall:
 `uv tool install --editable . --force`. Without an install, run DreamTeam from the repository folder through uv:
 `uv sync`, then `uv run dreamteam …`. The tests run the same way, see [CONTRIBUTING.md](../../CONTRIBUTING.md).
+
+### Updating to 0.2.0
+
+0.2.0 brings [crew tasks](features.md) and a new tool set for the agents. It does not open the sessions in which
+agents of an earlier version already worked (almost every session of 0.1.x), and there is no conversion.
+
+- **Before updating**, finish the sessions you still need, or export them and keep the folder:
+  `dreamteam export FOLDER --include sessions` (one session: add `--session ID`; see
+  [Moving to another computer](transfer.md)).
+- **After updating**, such sessions stay in the list, marked as made by an earlier version: in `dreamteam sessions`,
+  on the home page ("Earlier version") and in the terminal interface's `/sessions` ("earlier version"). The session's
+  card on the home page says why it does not open, and so does Enter in the terminal interface's list. Such a
+  session can be deleted and exported, but not opened, started or resumed, and the import of 0.2.0 refuses it.
+  When the most recent session is one of them, `dreamteam -c` says so and opens nothing: start a new session.
+- **A session in which no agent has run yet** (for example, one that was never started) opens as usual.
+- **To open such a session again**, import its export into a separate home with DreamTeam 0.1.1 (0.1.0 has no
+  import; 0.1.1 opens the sessions of 0.1.0 too). With uv this runs beside 0.2.0, for example:
+
+  ```bash
+  uvx --from "git+https://github.com/VictorAboba/DreamTeam.git@v0.1.1" dreamteam import FOLDER --home OLD_HOME
+  uvx --from "git+https://github.com/VictorAboba/DreamTeam.git@v0.1.1" dreamteam --home OLD_HOME
+  ```
+
+  Export only the sessions (`--include sessions`) and set up the models in the new home's settings, as after a
+  fresh install: once 0.2.0 has saved its settings, 0.1.x may not read them. For the same reason, do not go back to
+  0.1.x in the home 0.2.0 used.
+- **The `main` session of an old project** cannot be exported or deleted from the interface: finish its work before
+  updating. Afterwards it can only be removed by hand: delete `<home>/.dreamteam/swarm.db` together with its `-wal`
+  and `-shm` files (its message names the path).
 
 ## Quick start
 
@@ -56,11 +86,11 @@ Commands:
 
 | command | what it does |
 |---|---|
-| `dreamteam ["goal"]` / `dreamteam tui` | terminal interface; `-c` continues the last session, `-r [ID]` picks or opens a session; for a new session: `--model`, `--agents`, `--team "architect, developer*2"` or `--team NAME` (a saved team), `--max-agents`, `--budget`, `--title`, `--workspace DIR`, `--copy-from DIR\|ZIP` (the session works on a [copy of these files](projects.md#working-on-a-copy-of-files)), `--clarify` / `--no-clarify` (clarify mode for the sessions this window creates) |
-| `dreamteam -p "goal"` | no interface: run the goal and print the result (`--output-format text/json/stream-json`, `--verbose`, `--timeout`, `-c`/`-r ID` for the next instruction to an existing session, `--workspace DIR` for the folder of a new session, `--copy-from DIR\|ZIP` for a copy of files in it, `--clarify` only with `--no-auto-reply`); text from stdin is added to the request |
+| `dreamteam ["goal"]` / `dreamteam tui` | terminal interface; `-c` continues the last session, `-r [ID]` picks or opens a session; for a new session: `--model`, `--agents`, `--team "architect, developer*2"` or `--team NAME` (a saved team), `--max-agents`, `--budget`, `--title`, `--workspace DIR`, `--copy-from DIR\|ZIP` (the session works on a [copy of these files](projects.md#working-on-a-copy-of-files)), `--clarify` / `--no-clarify` (clarify mode for the sessions this window creates); a session made by an earlier version is not opened: `-c` whose most recent session is one says so and creates nothing, `-r ID` of one shows why ([Updating to 0.2.0](#updating-to-020)) |
+| `dreamteam -p "goal"` | no interface: run the goal and print the result (`--output-format text/json/stream-json`, `--verbose`, `--timeout`, `-c`/`-r ID` for the next instruction to an existing session (one made by an earlier version: exit code 1 with its message), `--workspace DIR` for the folder of a new session, `--copy-from DIR\|ZIP` for a copy of files in it, `--clarify` only with `--no-auto-reply`); text from stdin is added to the request |
 | `dreamteam serve [HOME]` | home page, settings, the boards of all sessions and MCP (`--host`, `--port`, `--goal` and `--title` (with `--workspace DIR`, `--copy-from DIR\|ZIP`, `--clarify`), `--no-browser`, `--no-console`); without a terminal, `dreamteam` runs this one |
-| `dreamteam sessions` / `dreamteam status` | list of sessions and whether the server is running |
-| `dreamteam sessions rm ID [ID …]` | delete sessions with their board, messages, workspace files and traces (asks for confirmation; `--yes` skips the question); a folder outside the session (your project or a folder after `/cd`) stays where it is |
+| `dreamteam sessions` / `dreamteam status` | list of sessions and whether the server is running; sessions made by an earlier version are marked |
+| `dreamteam sessions rm ID [ID …]` | delete sessions with their board, messages, workspace files and traces (asks for confirmation; `--yes` skips the question); a folder outside the session (your project or a folder after `/cd`) stays where it is; sessions made by an earlier version are deleted too, but not the `main` session of an old project: its message names the file to delete by hand |
 | `dreamteam export FOLDER` | write the settings, skills, MCP servers and sessions into a folder for another computer or a backup (`--include settings,skills,mcp,sessions`, `--session ID`, `--dry-run`); API keys and `env` values stay here, see [Moving to another computer](transfer.md) |
 | `dreamteam import FOLDER` | add what is new from such a folder and rewrite what changed; nothing the export does not carry is deleted (shows the plan and asks for confirmation; `--yes` or `-y` skips the question, `--dry-run` shows the plan only, `--include`, `--session ID`); refused while DreamTeam runs this home |
 | `dreamteam console [--session ID]` | console chat with a running session (`/help` lists the commands) |

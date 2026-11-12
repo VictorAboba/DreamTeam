@@ -4135,8 +4135,17 @@ settings; ValueError when they are invalid):
   web card, the TUI and the `-r` picker show its own message, which names the file to remove by hand. Docs:
   README.md / README.ru.md (updating), docs/TUI.md and docs/en|ru/transfer.md, and the release note of the
   version, say to finish or export the sessions before updating, that this version lists them but does not open
-  them, and that there is no conversion. Since sessions stop opening, the release that brings crew tasks is
-  0.2.0, not a patch: the version in pyproject.toml, src/dreamteam/__init__.py and uv.lock.
+  them, and that there is no conversion. The README's short "Updating to 0.2.0" / «Обновление до 0.2.0» (under
+  Install) links to the full section of that name in docs/en|ru/getting-started.md (also linked from the docs
+  index, features.md's "Sessions" row, terminal.md and transfer.md); they say "sessions in which agents already
+  worked (almost every session of 0.1.x)", never every session of 0.1.x, since one in which no LLM member ran opens
+  as usual. To open one again the docs name DreamTeam 0.1.1, not "that version" as the hub's message does: 0.1.0 has
+  no `dreamteam import`, and 0.1.1 (tool set revision 4 like 0.1.0) opens the sessions of both; the export takes
+  only the sessions (`--include sessions`) and goes into a separate home of 0.1.1, for example through
+  `uvx --from "git+…@v0.1.1" dreamteam import FOLDER --home OLD_HOME`. The legacy `main` is never said to be
+  exported: finish it before updating, or remove its database by hand afterwards. Since sessions stop opening, the
+  release that brings crew tasks is 0.2.0, not a patch: the version in pyproject.toml, src/dreamteam/__init__.py and
+  uv.lock.
   Tests: a session with a revision-4 record, one with a history and no record, and one with a history and a record
   that is not `frozen.valid` are each listed with `earlier_version`, refused with the message and writing nothing
   through `load`, `start`, `stop`, `resume()`, PATCH, `set_workspace`, the skills routes, `/mcp`, `-c`, `-r`,

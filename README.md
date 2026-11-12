@@ -73,6 +73,18 @@ This puts the `dreamteam` command on your PATH (run `uv tool update-shell` if it
 clone the repository and run `uv tool install --editable .` instead — see [CONTRIBUTING.md](CONTRIBUTING.md)
 and [Install and quick start](docs/en/getting-started.md).
 
+### Updating to 0.2.0
+
+```bash
+uv tool upgrade dreamteam
+```
+
+Before you update, finish or export the sessions in which agents already worked (almost every session of 0.1.x):
+0.2.0 lists them, marked "earlier version", but does not open them, and there is no conversion. A session in which
+no agent has run yet opens as usual. To open such a session again, import its export into a separate home with
+DreamTeam 0.1.1. The `main` session of an old project cannot be exported: finish its work first. Details:
+[Updating to 0.2.0](docs/en/getting-started.md#updating-to-020).
+
 ## Quick start
 
 ```bash
@@ -140,7 +152,8 @@ dreamteam import E:/dreamteam      # on the other computer: shows the plan, asks
 API keys and MCP `env` values stay on the first computer, and the export is checked for that computer's secrets
 before it is finished. Import adds what is new and rewrites what changed; nothing the export does not carry is
 deleted, and a session rewritten in full keeps its previous copy. Imported sessions never start by themselves.
-Both computers need DreamTeam 0.1.1 or newer. Details: [Moving to another computer and backups](docs/en/transfer.md).
+Both computers need DreamTeam 0.1.1 or newer. A session in which agents of 0.1.x worked is exported by 0.2.0 too,
+but only DreamTeam 0.1.1 imports and opens it. Details: [Moving to another computer and backups](docs/en/transfer.md).
 
 ## Configuration
 
