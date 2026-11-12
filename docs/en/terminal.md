@@ -14,7 +14,17 @@
 - **Feed.** Agents' tool calls look like `⏺ Anna Smirnova · task_claim(task_id=3)` with the result under them after
   `⎿`. Messages to you are shown in full as markdown, tasks as a to-do list `☐ ◐ ◑ ☒`, the goal in a frame.
   `Shift+Tab` switches the verbosity: quiet, normal (the default) or verbose, with the agents' thoughts and tool
-  results. `Ctrl+O` toggles verbose mode.
+  results. `Ctrl+O` toggles verbose mode. In verbose mode a change of a task's crew is labelled "crew", and the
+  history of `/task N` reads 0 as an ordinary task (`crew: ordinary task → 3`).
+- **Subtasks and crew tasks.** `/board` shows a task's subtasks in the task's own line: one `●` per direct subtask
+  in its status colour (at most 12, then `+N`), how many of them are done, `crew 2/3` for a crew task (members
+  working / `crew`) and `waits for your review` when one of its subtasks waits for yours, for example
+  `◐ #2 Parser — Anna · ●●● 1/3 · crew 2/3`. A subtask has a line of its own only where the web board shows it as a
+  card of its own: an open subtask of a task that is done, failed or cancelled, or one whose parent is not on the
+  board. Column headers count the lines. `/task N` of a crew task shows `Crew task: up to 3 members, 2 working now`,
+  and `/task N` of any task lists its direct subtasks indented, under "Directions (k)" for a crew task, otherwise
+  "Subtasks (k)". [Crew tasks](features.md) are made in the web board's task forms, over MCP or by the agents; the
+  terminal has no command for that.
 - **The spinner** `✻ Huddling… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc to pause)` is shown while the agents work.
   `Esc` pauses the swarm, `/pause` resumes it.
 - **Clarify mode and questions.** `/clarify on` (or `--clarify` at the start) makes the planner ask you about the goal
@@ -34,7 +44,8 @@
   `/web`, `/settings`, `/verbose`, `/lang ru|en`, `/clear`, `/exit`.
 - **Review.** A task the swarm handed to you for review shows as `◑ #3 … waits for your review`. `/approve 3`
   accepts it, `/reject 3 what to fix` returns it to the assignee. On the web board the task card has buttons for this,
-  and dragging a task from "Review" to "Done" also accepts it.
+  and dragging a task from "Review" to "Done" also accepts it. When a subtask waits for your review, its parent's
+  `/board` line carries the same mark; accept or return the subtask by its own number (`/approve 5`).
 - **Agents' background jobs.** While they run, the status line shows `jobs N`, and the agent in `/agents` shows
   `⚙N`. `/jobs` lists them (and the ones that finished in the last hour), `/jobs j3` shows a job's output,
   `/jobs stop j3` stops it together with everything it started. `Esc` and `/pause` do not stop them.
@@ -117,5 +128,7 @@ for confirmation `y/N`, `--yes` skips the question),
 `/skills` (the attached skills) and `/skills lib | add X [--pick a,b] [--replace] | update X | rm X | show X |
 approve X [replace] | reject X [reason] | reinstall X | log X | clean-envs` ([skills](skills.md): the library,
 attaching by name, path or URL, the decision on a member's proposal, packages and their log).
+The console's `/board` lists subtasks indented under their parent, `/show N` of a task with subtasks lists them (for a
+crew task, also who works on it and its free directions), and `/task` creates an ordinary task.
 The console connects to a running session: `dreamteam console` (or `dreamteam console --session 003-snake`).
 It is a simple line-based client for terminals where the [terminal UI](#terminal-ui) does not work.

@@ -1510,6 +1510,10 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   no task count). A change of `crew` in the task history and the feed (web `changesText`, TUI history
   and change lines) is labelled by `f_crew` (ru «групповая задача (участников)», en "crew"; the value 0 reads
   «обычная задача» / "ordinary task"), in app.js and tui/i18n.py.
+- **Docs** (en and ru alike): README.md / README.ru.md (a "Crew tasks" bullet), docs/en|ru/features.md (a row of
+  its own, and subtasks in the "Task board", terminal and live board rows), agent-tools.md (`crew`, `directions`,
+  `task_get`, `board`), configuration.md (the `crew_review` line of the `[swarm]` block and a "Reviews" / «Ревью»
+  section on both review switches) and terminal.md (the TUI's lines and `/task N`, the review mark, the console).
 - **Tests** (besides new ones for each rule above: the owner told when all directions are finished, also in the
   result of its own call, at the claim of an ownerless crew task and at a `task_update` that makes the actor its
   holder (self-assignment, the creator's reopening of a crew task it holds), each time with the draft of #N's

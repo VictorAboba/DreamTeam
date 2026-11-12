@@ -30,6 +30,11 @@ dreamteam "Build a snake game in Python with tests"
 - **No orchestrator.** Setting a goal puts a planning task on the board; whoever is free takes it, the others
   pick up tasks as they appear. Claiming is atomic, dependencies block, and every task is accepted by a
   *different* member (independent review) — or by you, if nobody else is left.
+- **Crew tasks.** A deliverable too big for one member becomes a crew task. Whoever makes it a crew task names
+  only its directions, and the members who take them write their cards. Its owner does one of them itself, keeps
+  them consistent and writes the result from a draft the board assembles from theirs. By default another member,
+  where possible one who worked on none of its directions, then checks it as a whole
+  ([more](docs/en/features.md)).
 - **It asks before it builds.** In clarify mode the planner asks you about the goal's open points in one message
   before it creates any task, while the other agents wait without spending tokens; an agent whose question decides
   how the whole team goes on can pause the swarm until you answer, and your answer reaches every member.
@@ -52,7 +57,7 @@ dreamteam "Build a snake game in Python with tests"
 | | |
 |---|---|
 | **Terminal UI** | `dreamteam` opens a Claude Code–style terminal UI: a feed of agents' actions (`⏺ Anna Smirnova · task_claim(task_id=3)`), slash commands, `@mentions`, `esc` to pause. `dreamteam -p "goal"` runs headless for scripts and CI with `text`, `json` or `stream-json` output. |
-| **Web board** | `http://127.0.0.1:8765` — sessions page, settings, and per session a live kanban with drag-and-drop, task threads, chat with any agent, its live activity, files, MCP servers, triggers, background jobs and traces. Light/dark, English/Russian. |
+| **Web board** | `http://127.0.0.1:8765` — sessions page, settings, and per session a live kanban with drag-and-drop, subtasks in their parent's stack, task threads, chat with any agent, its live activity, files, MCP servers, triggers, background jobs and traces. Light/dark, English/Russian. |
 | **MCP** | `/mcp` over HTTP or `dreamteam mcp` over stdio: session management plus every board, message and trace tool. |
 | **REST + WebSocket** | Everything the board does, for your own tooling. |
 

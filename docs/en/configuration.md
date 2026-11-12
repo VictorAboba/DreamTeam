@@ -27,6 +27,7 @@ max_agents = 8           # max AI agents (they hire new ones themselves; members
 max_cost_usd = 5.0       # budget; when it runs out, the swarm pauses
 starting_roles = []      # the starting team in order: ["architect", "developer", "developer", "tester"]
 independent_review = true # another member accepts an agent's task (or you, if there is no one else)
+crew_review = true       # a crew task its owner completed is checked as a whole, where possible by a member outside its directions; false: no second review (the directions were reviewed): done once the owner completes it, even with a reviewer named
 network = "on"           # "off": the agents' commands and MCP servers have no internet (see "Session without internet")
 clarify = false          # true: the planner asks you about the goal first; a critical question pauses the swarm
 
@@ -119,6 +120,21 @@ the size and number of the files copied from a folder or unpacked from a .zip; `
 archive's own size counts against `copy_max_mb`, and every entry (left-out ones and folders included) against a
 limit of twice `copy_max_files`. Both are at least 1. They are global settings: the copy is made before the session
 exists, so a value in a session's own settings has no effect.
+
+## Reviews
+
+The board reads `independent_review` and `crew_review` each time it uses them, so a change applies at once, to
+running sessions too, unless a session overrides it in its own settings. With `independent_review` on, an agent's
+finished task is accepted by another member, or by you when nobody else can; off, a task without a reviewer is done
+at once.
+`crew_review` decides whether the owner's completion of a [crew task](features.md) with at least one direction done
+goes to the check of the whole: a reviewer, where possible one who worked on none of its directions, checks whether
+the directions fit together and whether the result meets the task's goal. Whether there is a review at all still
+follows `independent_review` (off: only when the task has a reviewer of its own). With `crew_review` off there is no
+second review, since each direction was reviewed already: the crew task is done once its owner completes it, even
+with a reviewer named. A change leaves a crew task already in review alone: its reviewer settles it as usual. On the
+"Settings" tab both are switches under "Defaults for new sessions": "Independent review of tasks" and "Check a crew
+task as a whole"; neither is in the new-session dialog or in a session's ⚙ dialog.
 
 ## Roles and the starting team
 
