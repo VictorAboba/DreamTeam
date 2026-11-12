@@ -1154,8 +1154,10 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   changed gets `n_subtasks_done` in place of `n_task_closed`, not as well. In general a member gets one notice per
   change of a task, the first that applies of `n_subtasks_done`, `n_subtask_cancelled`, `n_direction_failed` /
   `n_direction_cancelled`, `n_parent_closed` and `n_task_closed` (so an owner whose own part is cancelled as the
-  last open direction gets only `n_subtasks_done`, and the creator of a closed parent who holds one of its open
-  subtasks only `n_parent_closed`); the recipients are decided before any is sent, and `n_unblocked` goes out
+  last open direction gets only `n_subtasks_done`, an owner that created a direction that failed or was cancelled
+  while another is open only `n_direction_failed` / `n_direction_cancelled`, with their options, and the creator of
+  a closed parent who holds one of its open subtasks only `n_parent_closed`); the recipients are decided before any
+  is sent, and `n_unblocked` goes out
   first.
   The `ending` follows the colon after the counts, which already say how many failed or were cancelled; the plain
   one is `assemble their results and complete it.` (creator form: `take #N (task_claim), assemble their results and
@@ -1271,13 +1273,13 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   завершатся, обнови результат #N; затем снова вызови `task_complete`.»).
   A direction that fails while another one is still open, and its crew task is open and not in review, tells the
   crew task's owner at once (unless the owner is
-  the actor, or the direction's creator, which gets `n_task_closed`; for the last one `n_subtasks_done` above
-  says it): `n_direction_failed` {by, id, title, parent} (wakes): `#{id} "{title}", a direction of your crew task
-  #{parent}, failed ({by}): reopen it to be done again (task_update #{id} status=todo), or cancel it if #{parent}
-  does without it (status=cancelled).` A direction cancelled, by anyone, while another one is still open tells the
-  owner the same way, under the same condition, if it has one (unless the owner is the actor, the direction's
-  creator, which gets
-  `n_task_closed`, or its assignee, which gets `n_subtask_cancelled`):
+  the actor; for the last one `n_subtasks_done` above says it; an owner that created the direction gets it in
+  place of `n_task_closed`, never both): `n_direction_failed` {by, id, title, parent} (wakes): `#{id} "{title}", a
+  direction of your crew task #{parent}, failed ({by}): reopen it to be done again (task_update #{id} status=todo),
+  or cancel it if #{parent} does without it (status=cancelled).` A direction cancelled, by anyone, while another one
+  is still open tells the owner the same way, under the same condition, if it has one (unless the owner is the
+  actor, or its assignee, which gets `n_subtask_cancelled`; an owner that created it gets this in place of
+  `n_task_closed`):
   `n_direction_cancelled` {by, id, title, parent} (wakes): `#{id} "{title}", a direction of your crew task
   #{parent}, was cancelled ({by}): if #{parent} still needs that part, add it again (task_update directions).`
   Liveness (§3 items 2 and 3): `_wake_stalled` and `_wake_idle_holders` compare and record (`_stall_woken`) one
@@ -1431,8 +1433,8 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   | when | to | key {placeholders} | wakes |
   |---|---|---|---|
   | a parent open and not in review gets another finish state that is not None ("Finishing") | its assignee (a crew task's owner), else its creator when an active member | `n_subtasks_done` {id, title, total, counts, ending} (in place of `n_task_closed` to the creator of the subtask that changed; to the holder of a crew task with all directions finished, `ending` is the all finished one followed by the draft of #N's result) | yes |
-  | a direction fails while another one is open and its crew task is open and not in review | the owner, unless it is the actor or the direction's creator (`n_task_closed`) | `n_direction_failed` {by, id, title, parent} | yes |
-  | a direction is cancelled while another one is open and its crew task is open and not in review | the owner, unless it is the actor, the direction's creator (`n_task_closed`) or its assignee (`n_subtask_cancelled`) | `n_direction_cancelled` {by, id, title, parent} | yes |
+  | a direction fails while another one is open and its crew task is open and not in review | the owner, unless it is the actor | `n_direction_failed` {by, id, title, parent} (in place of `n_task_closed` when the owner also created the direction) | yes |
+  | a direction is cancelled while another one is open and its crew task is open and not in review | the owner, unless it is the actor or its assignee (`n_subtask_cancelled`) | `n_direction_cancelled` {by, id, title, parent} (in place of `n_task_closed` when the owner also created the direction) | yes |
   | an open subtask is cancelled by someone other than its assignee | its assignee (for one in review, its executor) | `n_subtask_cancelled` {by, id, title, parent} (in place of `n_task_closed` when it also created it) | yes |
   | a direction is taken (a claim, an `update`, a `parent_id` move) | the owner, unless it is the actor or the taker | `n_direction_taken` {by, id, title, parent} | no |
   | a direction's holder left the swarm | the crew task's assignee after the release | `n_direction_freed` {id, title, by} | no |
@@ -1498,7 +1500,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   returned crew task completed again after new directions; the working-set limit for claims, updates and
   `parent_id` moves (an `in_progress` task moved under a crew task by its owner while the owner works on another
   direction is refused); exactly one notification to the owner as the creator of a direction cancelled by its
-  holder while another is open (`n_task_closed`), to an owner that did not create a direction the crew task's
+  holder while another is open (`n_direction_cancelled`), to an owner that did not create a direction the crew task's
   creator cancels (`n_direction_cancelled`), and to the owner as creator and assignee of its own part cancelled by
   the crew task's creator (`n_subtask_cancelled`); the sequential re-pick of `release_all`, the liveness marks, the
   web stack; and those of §17.2 "Sessions of an earlier version"). Tests that change: tests/test_review.py

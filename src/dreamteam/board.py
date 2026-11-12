@@ -2335,8 +2335,8 @@ class Board:
                          mutation: _Mutation) -> str | None:
         """The owner to tell that direction `task` failed or was cancelled while another direction of its crew task
         is open (n_direction_failed / n_direction_cancelled): the crew task open and not in review, its owner a
-        member that is not the actor, not the direction's creator (n_task_closed tells it), and for a cancel not
-        the direction's assignee (n_subtask_cancelled tells it). None otherwise."""
+        member that is not the actor, and for a cancel not the direction's assignee (n_subtask_cancelled tells it).
+        An owner that created the direction gets this notice in place of n_task_closed. None otherwise."""
         if closed not in (Status.FAILED, Status.CANCELLED) or task.parent_id is None:
             return None
         _, counts = mutation.after.get(task.parent_id, (None, {}))
@@ -2346,7 +2346,7 @@ class Board:
         if parent.crew < 2 or parent.status not in Status.OPEN or parent.status == Status.REVIEW:
             return None
         owner = parent.assignee
-        if owner in (None, USER, actor, task.created_by):
+        if owner in (None, USER, actor):
             return None
         if closed == Status.CANCELLED and owner == old.assignee:
             return None

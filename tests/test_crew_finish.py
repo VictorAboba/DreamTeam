@@ -371,13 +371,15 @@ def test_a_failed_direction_tells_the_owner_while_another_is_open(swarm, board):
     assert keys_for(swarm, DINA) == ["n_task_closed"]  # the direction's creator
 
 
-def test_an_owner_that_created_the_failed_direction_gets_only_n_task_closed(swarm, board):
+def test_an_owner_that_created_the_failed_direction_gets_only_the_crew_notice(swarm, board):
     task, subs = crew_task(board)
     work(board, subs[0].id, BOB)
     work(board, subs[1].id, CARL, goal="cli")
     swarm.notified.clear()
     board.update(CARL, subs[1].id, status="failed")
-    assert keys_for(swarm, ANNA) == ["n_task_closed"]
+    assert keys_for(swarm, ANNA) == ["n_direction_failed"]  # with its options, never also n_task_closed
+    assert notes_of(swarm, ANNA, "n_direction_failed") == [
+        {"by": CARL, "id": subs[1].id, "title": "cli", "parent": task.id}]
 
 
 def test_exactly_one_notice_for_the_owner_that_created_a_direction_its_holder_cancels(swarm, board):
@@ -386,7 +388,7 @@ def test_exactly_one_notice_for_the_owner_that_created_a_direction_its_holder_ca
     work(board, subs[1].id, CARL)
     swarm.notified.clear()
     board.update(BOB, subs[0].id, status="cancelled")
-    assert keys_for(swarm, ANNA) == ["n_task_closed"]
+    assert keys_for(swarm, ANNA) == ["n_direction_cancelled"]
     assert keys_for(swarm, BOB) == []
 
 
