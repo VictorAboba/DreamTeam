@@ -714,11 +714,13 @@ Rules (USER may do anything; "member" = agent of any kind):
 * `complete`: actor must be the assignee (or USER); status must be open and not `review`; an agent cannot complete
   a task whose subtasks are open, nor a crew task with a `failed` direction, nor a direction of a crew task with an
   empty goal (§4.2 "Finishing"). result non-empty. With independent review on, an agent's completion always goes
-  to `review` (reviewer chosen below). Otherwise (switch off, or USER completes): if reviewer set and reviewer !=
-  actor → status `review`, else `done`. A task entering review notifies its reviewer: `n_review_requested` {by,
-  id, title}, or USER `u_review_requested` / `u_review_fallback` (below). The review of a crew task with a `done`
-  direction is its check of the whole while `[swarm] crew_review` is on, and by a valid reviewer of its own in any
-  mode (§4.2 "Finishing").
+  to `review` (reviewer chosen below), except an agent's completion of a crew task while `[swarm] crew_review` is
+  off: `review` only with a valid reviewer of its own, else `done` (§4.2 "Finishing"). Otherwise (switch off, or
+  USER completes): if reviewer set and reviewer != actor → status `review`, else `done`. A task entering review
+  notifies its reviewer: `n_review_requested` {by, id, title}, or USER `u_review_requested` / `u_review_fallback`
+  (below). The review of a crew task with a `done` direction is its check of the whole while `[swarm]
+  crew_review` is on; with it off, a crew task is reviewed only by a reviewer of its own, as any task (§4.2
+  "Finishing").
 * `review`: actor is reviewer (or USER), status `review`. approve → `done`, the assignee gets
   `n_review_approved`, which wakes it (`task_complete` told it that it will be told the verdict, so an
   executor that ended its turn with `wait` waits for exactly this); reject → `in_progress` (or `todo` when the task has no assignee), the
@@ -799,7 +801,7 @@ notifications explain it.
   | `update` reviewer | a reviewer equal to the (new) assignee, not USER → R1; in review: clearing it → R3, another valid reviewer is notified and the old one quietly cancelled | no R1 / R3; the notifications as on |
   | `update` assignee | in review: an agent → R2; USER may (reassigning to the reviewer re-picks the reviewer, excluding the new and the old assignee); not in review: a new assignee equal to the reviewer clears the reviewer | unchanged |
   | `update(USER, status=done)` in review | done; `n_review_approved` (comment "") to the assignee, quiet `n_review_cancelled` to the reviewer | same |
-  | `complete` by an agent | always `review`: reviewer = the task's own if valid (for a crew task with a `done` direction, the check of the whole in any mode), else `pick_reviewer(task)` (for a crew task with a `done` direction and `[swarm] crew_review` on, the check of the whole: the pick with the contributor key, §4.2 "Finishing") | `review` only with a reviewer other than the actor, else `done` (the check of the whole when that reviewer is a crew task's own and a direction is `done`) |
+  | `complete` by an agent | always `review`: reviewer = the task's own if valid, else `pick_reviewer(task)` (for a crew task with a `done` direction and `[swarm] crew_review` on, the check of the whole, by its own reviewer or the pick with the contributor key, §4.2 "Finishing"); a crew task while `crew_review` is off: `review` only with a valid reviewer of its own (an ordinary review), else `done`, no pick | `review` only with a reviewer other than the actor, else `done` (the check of the whole when the task is a crew task with a `done` direction and `crew_review` is on) |
   | `complete` by USER | as with the switch off | — |
   | `review` by an agent | the task's assignee → R4 (checked before "only the reviewer", also for a row written while the switch was off with reviewer == assignee) | no R4 |
   | `release_all(name)` | name's tasks in review: assignee NULL, they stay in review and are not in the returned ids (a reviewer equal to name, a legacy row, is re-picked); name's other open tasks: `todo`, unassigned (returned). Reviews name was to do: re-picked with `exclude={name}` one at a time, each pick counting the ones re-picked before it in the same call (so they spread over the team), the new reviewer is notified (by = the executor, else the actor); open tasks not in review just lose the reviewer. No `n_reviewer_left` | as in the method comment above |
@@ -896,9 +898,10 @@ assignee is its **owner**: the member that executes the crew task does one of it
 directions consistent (the ones missing, the ones not needed, the interfaces between them). Each direction is
 handed in and reviewed by the ordinary rules (§4.1); when all of them are finished, the board tells the owner and
 gives it their results as a draft ("Finishing"): the owner checks how they fit together, writes the crew task's
-result and completes it; that completion is reviewed by the
-ordinary rules, and with `[swarm] crew_review` on (the default), or by a reviewer of its own, it is the check of
-the whole, preferably by a member outside the crew ("Finishing"). Every subtask of a crew task is one of its
+result and completes it; with `[swarm] crew_review` on (the default) that completion is reviewed by the ordinary
+rules as the check of the whole, preferably by a member outside the crew ("Finishing"); with it off there is no
+second review (each direction was reviewed already): the completion is `done` at once, unless the crew task has a
+reviewer of its own, who reviews it as any task. Every subtask of a crew task is one of its
 directions, whoever created it. `crew` is how many members may work on the crew task at once, the owner included:
 its **working set** is its assignee (while it is open, and not USER) plus the members assigned to its directions
 in `in_progress` or `waiting`, each member once (the owner's own direction takes no second place); a direction in
@@ -1089,7 +1092,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   unless it took the direction itself, gets the quiet `n_direction_taken` {by, id, title, parent}. A direction's
   `goal` must be non-empty when it is completed: `complete` of a direction with an empty goal raises `Write the goal
   of #M first (task_update goal=...): its reviewer checks the work against it.` The reviewer of the crew task
-  (designated, or kept from an earlier check of the whole) that takes one of its directions stops being its
+  (designated, or kept from an earlier review of it) that takes one of its directions stops being its
   reviewer in the same mutation (§4.1 claim row, a write of the crew task's row with its own `task.updated`), and
   the result, when the actor is the taker, says ` You were the reviewer of #N; since you
   work on one of its directions now, you do not check it as a whole: another member does, if a check applies.`
@@ -1238,30 +1241,38 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     past that, the
     card is cut in the middle like any tool result, and no member tool reads that part of the result. The draft
     shows the directions as they are when the text is built.
-  The owner completes the crew task (`task_complete`, its `result` the one it wrote). The **check of the whole** is
-  a review of a crew task with at least one `done` direction while `[swarm] crew_review` is on (the default; read at
-  each review request), or by a valid reviewer of its own (designated, or kept from an earlier check of the whole)
-  in any mode: the owner's completion goes to `review` by the ordinary rules (§4.1: with independent review on,
-  always: to the crew task's own valid reviewer if it has one, else to `pick_reviewer`, with the contributor key
-  while `crew_review` is on, "Reviews"; with it off, only to a valid reviewer of its own), and every review request
-  of it (the completion, a hand-over, a re-pick in `release_all`, a reviewer changed by `update`) is
-  `n_crew_review_requested` (wakes) in place of `n_review_requested`. Nothing stores whether a review is such a
-  check, so "a reviewer of its
-  own" is decided at each request (`Board._whole(task, own)`): at a completion, the reviewer kept rather than picked
-  by that completion (a valid one kept with independent review on, any reviewer with it off, and the reviewer of
-  USER's completion), and in review, a reviewer an `update` passes in its `reviewer` field; the board's re-pick when
-  USER makes the reviewer the assignee, a hand-over and a re-pick in `release_all` are the check of the whole only
-  through `crew_review`. So with `crew_review` off, a reviewer the board picked for an ordinary review and kept
-  after a return is the task's own at the owner's next completion, and gets `n_crew_review_requested`. The
-  request reads `n_crew_review_requested` {by, id, title, n}, `n` the number of its done
-  directions, `by` as for any review request (§4.1): `#{id} "{title}" (sent by {by}) is a crew task whose {n}
-  directions are done: check it as a whole — do the directions fit together, and does the result meet its goal?
-  Approve it, or return it with what does not fit (task_review).`; USER gets `u_review_requested`,
-  `u_review_fallback` or `u_review_handed_over` as for any task (§4.1), with the same `by`. With `crew_review` off
-  and no valid reviewer of its own, and for a crew task none of whose directions is done (it has none, or all were
-  cancelled and the owner did the work itself), the completion is reviewed as any task's (`n_review_requested`, the
-  pick without the contributor key). USER completes a crew task as any task (§4.1 `complete` by USER: to review
-  only with a reviewer of its own), open or failed directions notwithstanding.
+  The owner completes the crew task (`task_complete`, its `result` the one it wrote). What follows depends on
+  `[swarm] crew_review` (read at each completion and each review request; session overrides apply):
+  - **On** (the default): the owner's completion goes to `review` by the ordinary rules (§4.1: with independent
+    review on, always: to the crew task's own valid reviewer if it has one, else to `pick_reviewer`; with it off,
+    only to a reviewer other than the actor). The **check of the whole** is a review of a crew task with at least
+    one `done` direction while `crew_review` is on: the pick uses the contributor key ("Reviews"), and every review
+    request of it (the completion, a hand-over, a re-pick in `release_all`, a reviewer changed by `update`, the
+    board's re-pick when USER makes the reviewer the assignee) is `n_crew_review_requested` (wakes) in place of
+    `n_review_requested` (`Board._whole(task)`). The request reads `n_crew_review_requested` {by, id, title, n},
+    `n` the number of its done directions, `by` as for any review request (§4.1): `#{id} "{title}" (sent by {by})
+    is a crew task whose {n} directions are done: check it as a whole — do the directions fit together, and does
+    the result meet its goal? Approve it, or return it with what does not fit (task_review).`; USER gets
+    `u_review_requested`, `u_review_fallback` or `u_review_handed_over` as for any task (§4.1), with the same `by`.
+    A crew task none of whose directions is done (it has none, or all were cancelled and the owner did the work
+    itself) is reviewed as any task (`n_review_requested`, the pick without the contributor key).
+  - **Off**: no second review, since each direction was reviewed already. An agent's completion of a crew task
+    (its owner's, its `result` the one the owner wrote) makes it `done` at once, whatever `independent_review`
+    says, unless the crew task has a reviewer of its own: the reviewer it holds at the completion (named in
+    `task_create` or `task_update` `reviewer`, or set by USER; with independent review on, a valid one; with it off,
+    any reviewer other than the actor, §4.1), which reviews it as an ordinary review (`n_review_requested`, or USER's
+    `u_review_requested`). The board picks no reviewer at the completion. The same holds for a crew task none of
+    whose directions is done. A return from that review goes back to the owner as below; the reviewer stays the
+    task's own, so the owner's next completion goes to it again, as an ordinary review.
+  - A toggle of `crew_review` while a crew task is in review changes nothing for that review: it stays in review
+    with its reviewer, whose verdict (or the user's) settles it as usual; only a later completion follows the new
+    setting. Nothing stores whether a review is a check of the whole, so a request made while it waits (a
+    hand-over or a re-pick in `release_all`, which keep a review going, §4.1 "Liveness", or a reviewer changed by
+    `update`) follows the setting at that request: `n_crew_review_requested` and the contributor key only while
+    `crew_review` is on. A reviewer the crew task holds at a later completion is its own however it got there (one
+    the board picked for an earlier review and kept after a return included).
+  USER completes a crew task as any task (§4.1 `complete` by USER: to review only with a reviewer of its own), open
+  or failed directions notwithstanding.
   A crew task returned from review goes back to its owner (`in_progress`; `todo` without one, and its next owner
   reads the owner form of the crew ending that applies; the reviewer's comment is in #N's discussion), which fixes
   it itself or with new directions and completes it again; the new directions are reviewed one by one, and when
@@ -1339,7 +1350,8 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   though for the directions it added it is their creator and comes after the others, like any creator); with
   independent review off, a direction without a reviewer of its own is done when it is handed in. Reviews spread
   evenly (§4.1 "Reviewer selection"), so the directions of one crew task usually go to different members. The check
-  of the whole: for a crew task the key of `pick_reviewer` gains `is a contributor` right after `cannot act now`
+  of the whole (`crew_review` on, "Finishing"; with it off the board picks no reviewer for a crew task's
+  completion): for a crew task the key of `pick_reviewer` gains `is a contributor` right after `cannot act now`
   (`Board.contributors_of(task)`: the assignees of its subtasks, finished ones included; the owner is the crew
   task's assignee and never reviews it), so a member outside the crew checks it when there is one; otherwise a
   contributor does, before USER: "independent" means "not the owner" here, and such a contributor checks how all
@@ -1495,7 +1507,10 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   #N again (`n_ready`), and the same for an ordinary parent without an assignee and for an owner that released the
   crew task while its directions ran; a failed direction moved out of its crew task telling the owner; the owner's
   completion with `crew_review` on and off and independent review on and off, with and without a reviewer of its
-  own (that reviewer gets `n_crew_review_requested` with `crew_review` off too), and with no `done` direction; a
+  own (with `crew_review` off: `done` at once without one, whatever independent review says, and with one an
+  ordinary review, `n_review_requested`, a return and the next completion going to it again), and with no `done`
+  direction; a toggle of `crew_review` while a crew task is in review (the review goes on and its verdict settles
+  it); a
   failed direction refusing the completion and `crew` 0 and, reopened or cancelled, no longer refusing them; a
   returned crew task completed again after new directions; the working-set limit for claims, updates and
   `parent_id` moves (an `in_progress` task moved under a crew task by its owner while the owner works on another
@@ -3803,12 +3818,15 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   catalog's.
 - `[swarm] crew_review` (bool, default true; a non-bool is a ValueError, "true or false"): the review of a crew task
   its owner completed with at least one direction done is the check of the whole (§4.2 "Finishing"): its reviewer
-  is picked preferably outside the crew and asked to check how the directions fit together; false: it is reviewed
-  as any task, unless it has a reviewer of its own, who still checks it as a whole. Whether it is reviewed at all
-  follows `independent_review` (off: only by a reviewer of its own). Read at each review request; session overrides
-  apply. The template has the line `crew_review = true  # завершённую групповую задачу проверяет целиком, по
-  возможности, агент вне её направлений; false — обычное ревью (назначенный ей ревьюер всё равно проверяет её
-  целиком)` after `independent_review` (one line in the file, its `#` in the column of the lines around it).
+  is picked preferably outside the crew and asked to check how the directions fit together; whether it is reviewed
+  at all follows `independent_review` (off: only by a reviewer of its own). false: no second review, since each
+  direction was reviewed already: the owner's completion makes the crew task `done` at once, whatever
+  `independent_review` says, unless it has a reviewer of its own, who reviews it as any task; the board picks no
+  reviewer for it. A toggle leaves a crew task already in review alone. Read at each completion and review request;
+  session overrides apply. The template has the line `crew_review = true  # завершённую групповую задачу проверяет
+  целиком, по возможности, агент вне её направлений; false — без второго ревью (направления уже проверены): готова,
+  как только владелец её завершит; назначенный ей ревьюер проверит её как обычную задачу` after
+  `independent_review` (one line in the file, its `#` in the column of the lines around it).
 - `[swarm] network` ("on" | "off", default "on"; anything else is a ValueError naming `swarm.network`): "off"
   cuts the members' commands, their jobs and the stdio MCP servers off the network (§7.2). Read at each use;
   session overrides apply (a running session: from its next command). The template has the line after
@@ -5151,11 +5169,13 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     composer and
     the switches «Независимое ревью задач», `swarm.independent_review`, «Проверять групповую задачу целиком» (en
     "Check a crew task as a whole"), `swarm.crew_review`, whose hint reads «Завершённую владельцем групповую задачу
-    проверяет, по возможности, агент вне её направлений: сочетаются ли они. Выключено — обычное ревью (назначенный
-    задаче ревьюер всё равно проверяет её целиком). Будет ли ревью вообще, решает независимое ревью» (en "A crew
-    task its owner completed is checked, preferably by a member outside its directions, for how they fit together.
-    Off: the ordinary review (a reviewer the task names still checks it as a whole). Whether there is a review at
-    all follows independent review"), and «Сначала уточнять цель»,
+    проверяет, по возможности, агент вне её направлений: сочетаются ли они; будет ли ревью вообще, решает
+    независимое ревью. Выключено — без второго ревью, ведь каждое направление уже проверено: задача готова, как только
+    владелец её завершит; назначенный ей ревьюер проверит её как обычную задачу» (en "A crew task its owner completed
+    is checked, preferably by a member outside its directions, for how they fit together; whether there is a review
+    at all follows independent review. Off: no second review, since each direction was reviewed already: the task
+    is done once its owner completes it; a reviewer the task names reviews it as any task"), and «Сначала уточнять
+    цель»,
     `swarm.clarify`, whose hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для
     команд агентов», `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
     `agents.planning_hint_steps` / `planning_hint_minutes` and their hints, and the triggers' `file_settle_seconds`,

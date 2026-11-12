@@ -139,19 +139,19 @@ def test_the_check_of_the_whole_prefers_a_member_outside_the_crew(swarm, board):
     task = set_raw(board, task.id, assignee=ANNA, status=Status.IN_PROGRESS)
     finish_raw(board, subs[0].id, Status.DONE, "parsed", assignee=BOB)
     board.create(USER, "held", assignee=CARL)                       # without the contributor step: BOB
-    assert board._whole_by_pick(task)
+    assert board._whole(task)
     assert board.pick_reviewer(task) == CARL                        # outside the crew first
     set_status(swarm, CARL, AgentStatus.PAUSED)
     assert board.pick_reviewer(task) == BOB                         # cannot act now comes before it
     set_status(swarm, CARL, AgentStatus.IDLE)
     swarm.config.swarm.crew_review = False
-    assert not board._whole_by_pick(task) and board.pick_reviewer(task) == BOB    # the ordinary pick
+    assert not board._whole(task) and board.pick_reviewer(task) == BOB    # the ordinary pick
     swarm.config.swarm.crew_review = True
     set_raw(board, subs[0].id, status=Status.CANCELLED)
-    assert not board._whole_by_pick(task) and board.pick_reviewer(task) == BOB    # no done direction
+    assert not board._whole(task) and board.pick_reviewer(task) == BOB    # no done direction
     set_raw(board, subs[0].id, status=Status.DONE)
     set_raw(board, task.id, crew=0)
-    assert not board._whole_by_pick(board.get(task.id))                           # an ordinary parent
+    assert not board._whole(board.get(task.id))                           # an ordinary parent
 
 
 def test_the_check_of_the_whole_goes_to_a_contributor_before_the_user(swarm, board):

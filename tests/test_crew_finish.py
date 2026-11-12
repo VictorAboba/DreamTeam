@@ -576,10 +576,12 @@ def test_the_owners_completion_follows_the_matrix(swarm, board, crew_review, ind
     swarm.notified.clear()
     board.complete(ANNA, task.id, "the whole")
     after = board.get(task.id)
-    if not own and not independent:
-        assert (after.status, after.reviewer, review_keys(swarm)) == (Status.DONE, None, [])
+    if not own and not (independent and crew_review):
+        # no reviewer of its own: with independent review off as for any task; with crew_review off whatever
+        # independent review says (each direction was reviewed already), and the board picks nobody
+        assert (after.status, after.reviewer, after.result, review_keys(swarm)) == (Status.DONE, None, "the whole", [])
         return
-    whole = done and (own or crew_review)
+    whole = done and crew_review  # with crew_review off, a reviewer of its own reviews it as any task
     # the task's own reviewer; else the pick: with the contributor key someone outside the crew (DINA created it and
     # comes after EVA), without it the first by name (BOB, a contributor)
     expected = DINA if own else EVA if whole else BOB
@@ -630,14 +632,20 @@ def test_a_re_pick_when_the_reviewer_leaves_asks_for_the_check_of_the_whole(swar
         {"id": task.id, "title": task.title, "by": ANNA, "n": 1}]
 
 
+@pytest.mark.parametrize("crew_review", [True, False])
 @pytest.mark.parametrize("actor", [USER, ANNA])
-def test_a_reviewer_passed_by_an_update_is_the_tasks_own(swarm, board, actor):
-    swarm.config.swarm.crew_review = False
+def test_a_reviewer_passed_by_an_update_in_review_follows_crew_review(swarm, board, actor, crew_review):
+    swarm.config.swarm.crew_review = crew_review
     task, _ = in_review(board, done=(BOB, CARL), reviewer=DINA)
     swarm.notified.clear()
     board.update(actor, task.id, reviewer=EVA)
-    assert notes_of(swarm, EVA, "n_crew_review_requested") == [
-        {"id": task.id, "title": task.title, "by": actor, "n": 2}]
+    expected = {"id": task.id, "title": task.title, "by": actor}
+    if crew_review:
+        assert review_keys(swarm) == [(EVA, "n_crew_review_requested")]
+        assert notes_of(swarm, EVA, "n_crew_review_requested") == [{**expected, "n": 2}]
+    else:  # an ordinary review
+        assert review_keys(swarm) == [(EVA, "n_review_requested")]
+        assert notes_of(swarm, EVA, "n_review_requested") == [expected]
     assert keys_for(swarm, DINA) == ["n_review_cancelled"]
 
 
@@ -650,6 +658,132 @@ def test_the_users_reassignment_re_picks_without_the_tasks_own_reviewer(swarm, b
     after = board.get(task.id)
     assert after.assignee == CARL and after.reviewer not in (CARL, ANNA, USER)
     assert review_keys(swarm) == [(after.reviewer, key)]
+
+
+# --- crew_review off: no second review ----------------------------------------------------------------------------
+
+def no_pick(*args, **kw):
+    raise AssertionError("the board picks no reviewer for a crew task while crew_review is off")
+
+
+@pytest.mark.parametrize("done", [True, False])
+def test_with_crew_review_off_the_owners_completion_is_done_at_once_whatever_independent_review_says(
+        swarm, board, monkeypatch, done):
+    swarm.config.swarm.crew_review = False
+    assert board.independent_review
+    monkeypatch.setattr(board, "pick_reviewer", no_pick)
+    task, subs = crew_task(board, titles=("parser", "cli"), creator=DINA)
+    for sub, name in zip(subs, (BOB, CARL)):
+        if done:
+            finish_raw(board, sub.id, Status.DONE, f"{sub.title} done", assignee=name)
+        else:  # all cancelled: the owner did the work itself
+            finish_raw(board, sub.id, Status.CANCELLED)
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "the whole")
+    after = board.get(task.id)
+    assert (after.status, after.reviewer, after.result) == (Status.DONE, None, "the whole")
+    assert review_keys(swarm) == []
+    assert [kw["status"] for kw in notes_of(swarm, DINA, "n_task_closed")] == [Status.DONE]
+    assert events(swarm, "task.updated")[-1]["data"]["changes"]["status"] == [Status.IN_PROGRESS, Status.DONE]
+
+
+@pytest.mark.parametrize("independent", [True, False])
+@pytest.mark.parametrize("named_by", ["create", "update", "user"])
+def test_with_crew_review_off_a_named_reviewer_reviews_the_crew_task_as_any_task(swarm, board, monkeypatch,
+                                                                                    named_by, independent):
+    """The reviewer named in task_create or task_update, or set by USER, reviews the owner's completion as an
+    ordinary review; a return goes back to the owner, and its next completion goes to the same reviewer."""
+    swarm.config.swarm.crew_review = False
+    swarm.config.swarm.independent_review = independent
+    monkeypatch.setattr(board, "pick_reviewer", no_pick)
+    if named_by == "create":
+        task = board.create(DINA, "Auth", crew=2, directions=["parser", "cli"], reviewer=EVA)
+    else:
+        task = board.create(DINA, "Auth", crew=2, directions=["parser", "cli"])
+        board.update(USER if named_by == "user" else DINA, task.id, reviewer=EVA)
+    for sub, name in zip(board.subtasks_of(task.id), (BOB, CARL)):
+        finish_raw(board, sub.id, Status.DONE, f"{sub.title} done", assignee=name)
+    set_raw(board, task.id, assignee=ANNA, status=Status.IN_PROGRESS)
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "whole v1")
+    after = board.get(task.id)
+    assert (after.status, after.reviewer) == (Status.REVIEW, EVA)
+    assert review_keys(swarm) == [(EVA, "n_review_requested")]
+    assert notes_of(swarm, EVA, "n_review_requested") == [{"id": task.id, "title": "Auth", "by": ANNA}]
+    board.review(EVA, task.id, False, "the cli does not parse")
+    after = board.get(task.id)
+    assert (after.status, after.assignee, after.reviewer) == (Status.IN_PROGRESS, ANNA, EVA)
+    (kw,) = notes_of(swarm, ANNA, "n_review_rejected")
+    assert kw["ending"] == prompts.t("en", "review_rejected_crew", id=task.id)
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "whole v2")
+    after = board.get(task.id)
+    assert (after.status, after.reviewer, after.result) == (Status.REVIEW, EVA, "whole v2")
+    assert review_keys(swarm) == [(EVA, "n_review_requested")]
+    board.review(EVA, task.id, True)
+    assert board.get(task.id).status == Status.DONE
+
+
+def test_with_crew_review_off_the_user_as_the_named_reviewer_is_asked(swarm, board, monkeypatch):
+    swarm.config.swarm.crew_review = False
+    monkeypatch.setattr(board, "pick_reviewer", no_pick)
+    task, subs = crew_task(board, titles=("parser",), creator=DINA, reviewer=USER)
+    finish_raw(board, subs[0].id, Status.DONE, "parser done", assignee=BOB)
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "the whole")
+    assert (board.get(task.id).status, board.get(task.id).reviewer) == (Status.REVIEW, USER)
+    assert notes_of(swarm, USER, "u_review_requested") == [{"by": ANNA, "id": task.id, "title": task.title}]
+    assert review_keys(swarm) == []
+
+
+def test_with_crew_review_off_a_reviewer_cleared_by_taking_a_direction_leaves_no_review(swarm, board, monkeypatch):
+    swarm.config.swarm.crew_review = False
+    monkeypatch.setattr(board, "pick_reviewer", no_pick)
+    task, subs = crew_task(board, titles=("parser", "cli"), creator=DINA, reviewer=BOB)
+    board.claim(BOB, subs[0].id)  # its reviewer works on a direction now: it is no longer the crew task's
+    assert board.get(task.id).reviewer is None
+    finish_raw(board, subs[0].id, Status.DONE, "parser done")
+    finish_raw(board, subs[1].id, Status.DONE, "cli done", assignee=CARL)
+    board.complete(ANNA, task.id, "the whole")
+    assert (board.get(task.id).status, board.get(task.id).reviewer) == (Status.DONE, None)
+
+
+@pytest.mark.parametrize("approve", [True, False])
+def test_a_toggle_of_crew_review_off_mid_review_changes_nothing_for_that_review(swarm, board, approve):
+    task, subs = crew_task(board, titles=("parser", "cli"), creator=DINA)
+    for sub, name in zip(subs, (BOB, CARL)):
+        finish_raw(board, sub.id, Status.DONE, f"{sub.title} done", assignee=name)
+    board.complete(ANNA, task.id, "whole v1")  # crew_review on: the check of the whole, outside the crew
+    assert keys_for(swarm, EVA) == ["n_crew_review_requested"]
+    swarm.config.swarm.crew_review = False
+    after = board.get(task.id)
+    assert (after.status, after.reviewer, after.result) == (Status.REVIEW, EVA, "whole v1")
+    assert [t.id for t in board.reviews_of(EVA)] == [task.id]
+    board.review(EVA, task.id, approve, "" if approve else "the parts do not fit")
+    after = board.get(task.id)
+    if approve:
+        assert after.status == Status.DONE
+        return
+    assert (after.status, after.assignee, after.reviewer) == (Status.IN_PROGRESS, ANNA, EVA)
+    # the next completion follows the setting now: the reviewer it holds is its own, and reviews it as any task
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "whole v2")
+    assert (board.get(task.id).status, board.get(task.id).reviewer) == (Status.REVIEW, EVA)
+    assert review_keys(swarm) == [(EVA, "n_review_requested")]
+
+
+def test_a_toggle_of_crew_review_on_mid_review_changes_nothing_for_that_review(swarm, board):
+    swarm.config.swarm.crew_review = False
+    task, subs = crew_task(board, titles=("parser", "cli"), creator=DINA, reviewer=DINA)
+    for sub, name in zip(subs, (BOB, CARL)):
+        finish_raw(board, sub.id, Status.DONE, f"{sub.title} done", assignee=name)
+    board.complete(ANNA, task.id, "whole")  # an ordinary review by its own reviewer
+    assert keys_for(swarm, DINA)[-1] == "n_review_requested"
+    swarm.config.swarm.crew_review = True
+    after = board.get(task.id)
+    assert (after.status, after.reviewer) == (Status.REVIEW, DINA)
+    board.review(DINA, task.id, True)
+    assert board.get(task.id).status == Status.DONE
 
 
 # --- a returned crew task ------------------------------------------------------------------------------------------

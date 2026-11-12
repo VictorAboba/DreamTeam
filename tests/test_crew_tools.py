@@ -400,6 +400,28 @@ async def test_a_returned_crew_task_tells_its_owner_to_fix_it_or_add_directions(
     assert "Draft for" not in rejected[0]
 
 
+async def test_with_crew_review_off_task_complete_says_done_or_names_the_tasks_own_reviewer(swarm):
+    a, b, c, *_ = members(swarm)
+    board = swarm.board
+    swarm.config.swarm.crew_review = False
+    assert board.independent_review
+    await ok(swarm, a, "task_create", {"title": "Auth", "goal": "log in", "assignee": "me", "crew": 2,
+                                       "directions": ["parser", "cli"]})
+    finish_raw(board, 2, Status.DONE, "parser")
+    finish_raw(board, 3, Status.DONE, "cli", assignee=b)
+    await ok(swarm, a, "task_claim", {"task_id": 1})
+    assert await ok(swarm, a, "task_complete", {"task_id": 1, "result": "auth works"}) == "Task #1 is done."
+    await ok(swarm, a, "task_create", {"title": "Docs", "goal": "documented", "assignee": "me", "reviewer": c,
+                                       "crew": 2, "directions": ["guide", "api"]})
+    finish_raw(board, 5, Status.DONE, "guide")
+    finish_raw(board, 6, Status.DONE, "api", assignee=b)
+    await ok(swarm, a, "task_claim", {"task_id": 4})
+    assert await ok(swarm, a, "task_complete", {"task_id": 4, "result": "docs written"}) == (
+        f"Task #4 was sent to {c} for review.")
+    assert told(swarm, c, "n_review_requested") == [prompts.t("en", "n_review_requested", by=a, id=4, title="Docs")]
+    assert told(swarm, c, "n_crew_review_requested") == []
+
+
 # --- task_get -------------------------------------------------------------------------------------------------
 
 async def test_task_get_lists_the_subtasks_and_the_crew(swarm):
