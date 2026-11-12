@@ -495,6 +495,33 @@ def test_closing_a_crew_task_cancels_its_free_directions_and_tells_the_others(sw
     assert notes_of(swarm, DINA, "n_task_closed")[0]["id"] == task.id
 
 
+@pytest.mark.parametrize("actor, status", [(USER, Status.CANCELLED), (ANNA, Status.FAILED)])
+@pytest.mark.parametrize("held", [False, True])
+def test_a_crew_task_the_cascade_cancels_takes_its_open_directions_along(swarm, board, actor, status, held):
+    """A plain parent closes with a crew subtask nobody took: its free directions go too (nobody may take a direction
+    of a terminal crew task), and the holders of the others are told the crew task is cancelled."""
+    epic = board.create(ANNA, "epic", assignee=ANNA)
+    set_raw(board, epic.id, status=Status.IN_PROGRESS)
+    crew = board.create(ANNA, "auth", parent_id=epic.id, crew=2, directions=["docs", "ui"])
+    docs, ui = board.subtasks_of(crew.id)
+    if held:
+        work(board, ui.id, CARL, Status.TODO)  # assigned, not taken yet
+    swarm.notified.clear()
+    before = len(events(swarm, "task.updated"))
+    board.update(actor, epic.id, status=status)
+    assert board.get(crew.id).status == Status.CANCELLED
+    assert board.get(docs.id).status == Status.CANCELLED
+    cascaded = [epic.id, crew.id, docs.id] + ([] if held else [ui.id])
+    assert updated_ids(swarm)[before:] == cascaded   # the primary row, the crew task, then its directions
+    if held:
+        assert board.get(ui.id).status == Status.TODO
+        assert notes_of(swarm, CARL, "n_parent_closed") == [
+            {"id": crew.id, "title": "auth", "status": Status.CANCELLED, "sub": ui.id}]
+        board.update(CARL, ui.id, assignee="")   # its holder lets it go: cancelled, not freed
+        assert board.get(ui.id).status == Status.CANCELLED
+    assert [t.id for t in board.list() if t.status in Status.OPEN] == []
+
+
 def test_the_user_setting_done_closes_an_ordinary_parent_too(swarm, board):
     parent = board.create(ANNA, "parent", assignee=CARL)
     open_sub = board.create(ANNA, "open", parent_id=parent.id)
@@ -572,7 +599,7 @@ def test_the_owners_completion_follows_the_matrix(swarm, board, crew_review, ind
         else:
             finish_raw(board, sub.id, Status.CANCELLED)
     if own:
-        set_raw(board, task.id, reviewer=DINA)
+        set_raw(board, task.id, reviewer=DINA, reviewer_named=1)
     swarm.notified.clear()
     board.complete(ANNA, task.id, "the whole")
     after = board.get(task.id)
@@ -765,11 +792,63 @@ def test_a_toggle_of_crew_review_off_mid_review_changes_nothing_for_that_review(
         assert after.status == Status.DONE
         return
     assert (after.status, after.assignee, after.reviewer) == (Status.IN_PROGRESS, ANNA, EVA)
-    # the next completion follows the setting now: the reviewer it holds is its own, and reviews it as any task
+    # the next completion follows the setting now: EVA was the board's pick, not named, so no second review
     swarm.notified.clear()
     board.complete(ANNA, task.id, "whole v2")
-    assert (board.get(task.id).status, board.get(task.id).reviewer) == (Status.REVIEW, EVA)
-    assert review_keys(swarm) == [(EVA, "n_review_requested")]
+    assert (board.get(task.id).status, board.get(task.id).result) == (Status.DONE, "whole v2")
+    assert review_keys(swarm) == []
+
+
+@pytest.mark.parametrize("renamed", [False, True])
+def test_with_crew_review_off_a_pick_kept_from_a_review_before_the_crew_is_not_the_crew_tasks_own(
+        swarm, board, monkeypatch, renamed):
+    """A plain task the board's pick returned ("split it") becomes a crew task: that pick is not named, so the owner's
+    completion is done; passing the same reviewer in task_update names it, and then it reviews as any task."""
+    swarm.config.swarm.crew_review = False
+    task = board.create(BOB, "Auth")
+    board.claim(ANNA, task.id)
+    board.complete(ANNA, task.id, "all of it")
+    picked = board.get(task.id).reviewer
+    assert picked not in (None, ANNA, USER) and not board.get(task.id).reviewer_named
+    board.review(picked, task.id, False, "too big: split it")
+    assert (board.get(task.id).status, board.get(task.id).reviewer) == (Status.IN_PROGRESS, picked)
+    board.update(ANNA, task.id, crew=2, directions=["parser"])
+    (sub,) = board.subtasks_of(task.id)
+    assert sub.assignee == ANNA  # the owner's own part
+    finish_raw(board, sub.id, Status.DONE, "parser done")
+    if renamed:
+        board.update(BOB, task.id, reviewer=picked)
+        assert board.get(task.id).reviewer_named
+    monkeypatch.setattr(board, "pick_reviewer", no_pick)
+    swarm.notified.clear()
+    board.complete(ANNA, task.id, "the whole")
+    after = board.get(task.id)
+    if renamed:
+        assert (after.status, after.reviewer) == (Status.REVIEW, picked)
+        assert review_keys(swarm) == [(picked, "n_review_requested")]
+    else:
+        assert (after.status, after.result) == (Status.DONE, "the whole")
+        assert review_keys(swarm) == []
+
+
+def test_with_crew_review_off_and_independent_review_off_a_reviewer_not_named_reviews_nothing(swarm, board):
+    swarm.config.swarm.crew_review = False
+    swarm.config.swarm.independent_review = False
+    task, subs = crew_task(board, titles=("parser",), creator=DINA)
+    finish_raw(board, subs[0].id, Status.DONE, "parser done", assignee=BOB)
+    set_raw(board, task.id, reviewer=EVA)   # e.g. a hand-over's pick, kept after a return
+    board.complete(ANNA, task.id, "the whole")
+    assert (board.get(task.id).status, review_keys(swarm)) == (Status.DONE, [])
+
+
+def test_the_board_clears_a_named_reviewer_mark_when_it_re_picks(swarm, board):
+    """A named reviewer the board replaces (a hand-over) is the board's pick from then on."""
+    task, _ = crew_task(board, titles=("parser",), creator=DINA, reviewer=CARL)
+    assert board.get(task.id).reviewer_named
+    set_raw(board, task.id, status=Status.REVIEW, result="whole")
+    board.hand_over_review(task.id, exclude=())
+    after = board.get(task.id)
+    assert after.reviewer not in (CARL, None) and not after.reviewer_named
 
 
 def test_a_toggle_of_crew_review_on_mid_review_changes_nothing_for_that_review(swarm, board):

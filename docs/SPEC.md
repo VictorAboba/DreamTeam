@@ -435,10 +435,16 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    file it was refused (`Workspace.waits_for_lock`: a `lock_waiters` row, what the refusal promised; `n_lock_free`
    wakes it, and every lock ends by unlock, expiry or retire). Nor do they count a clarify
    planning task whose holder waits for the user's answers (`asks_user`, §3.1), nor a crew task with a direction
-   that can still move (§4.2; `Board.has_live_directions`: one `in_progress`, `waiting` or in review, or a `todo`
-   one none of whose blockers is stuck while the crew task itself is not blocked by a stuck task; stuck: `failed`
-   or `cancelled`, or `todo` while blocked by a stuck task in turn (a direction also while its crew task is), or
-   while its blockers lead back to it or to the crew task) among their ids: while each of them has an assignee it
+   that can still move (§4.2; `Board.has_live_directions`: one in review; one `in_progress` or `waiting` that does
+   not wait for a held-back direction, through its `depends_on` that are not done or its open subtasks,
+   transitively (held back: a `todo` direction whose assignee, a member, may not take it now, since it works on
+   another direction of the crew task or the working set is full without it; it moves only when a working
+   direction is handed in, so a crew task whose working directions all wait for one never moves); or a `todo`
+   one, not held back, none of whose blockers is stuck while the crew task itself is not blocked by a stuck task;
+   stuck: `failed` or `cancelled`, or `todo` while blocked by a stuck task in turn (a direction also while its
+   crew task is), or while its blockers lead back to it or to the crew task, or a working direction that waits
+   for a held-back one; the check is iterative, so a chain of any length is fine) among their ids: while each of
+   them has an assignee it
    waits for them, so its owner has nothing to continue there (its own direction counts on its own; the
    in-activation nudge of §6.2 skips such a crew task too), and a free one is the "free directions" mark below. A
    crew task whose open directions all wait, directly or through other todo tasks, for a failed or cancelled task,
@@ -671,9 +677,9 @@ Rules (USER may do anything; "member" = agent of any kind):
   while one is open), so it does not depend on them. Remove #M from its depends_on.`: a blocked crew task gives
   none of them out, §4.2 "Taking a direction"), and a task is not moved under a crew task that depends on it. An
   ordinary parent may depend on its own subtask. These are the direct forms of one rule, checked after them on the
-  same calls (`Board._check_wait_cycle`): no change closes a cycle of waits, where a task waits for each entry of its
-  depends_on, a parent for each of its open subtasks, and an open direction of a crew task for each entry of the crew
-  task's depends_on (`Dependency cycle: #a -> #b -> ... -> #a (#b is a part of #a; #c is a direction of #n, which
+  same calls (`Board._check_wait_cycle`): no change closes a cycle of waits, where an open task waits for each entry of
+  its depends_on, an open parent for each of its open subtasks, and an open direction of a crew task for each entry of
+  the crew task's depends_on (a finished task waits for nothing; the task changed counts as open) (`Dependency cycle: #a -> #b -> ... -> #a (#b is a part of #a; #c is a direction of #n, which
   depends on #d): none of them would ever finish. Remove one of these dependencies.`; `the new task` names a task
   being created; the parenthesis names the waits that are no depends_on entry). So a moved task's subtree never
   waits for its new ancestors, and a crew task never waits, through other tasks, for its own directions.
@@ -1258,19 +1264,24 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     itself) is reviewed as any task (`n_review_requested`, the pick without the contributor key).
   - **Off**: no second review, since each direction was reviewed already. An agent's completion of a crew task
     (its owner's, its `result` the one the owner wrote) makes it `done` at once, whatever `independent_review`
-    says, unless the crew task has a reviewer of its own: the reviewer it holds at the completion (named in
-    `task_create` or `task_update` `reviewer`, or set by USER; with independent review on, a valid one; with it off,
-    any reviewer other than the actor, §4.1), which reviews it as an ordinary review (`n_review_requested`, or USER's
-    `u_review_requested`). The board picks no reviewer at the completion. The same holds for a crew task none of
-    whose directions is done. A return from that review goes back to the owner as below; the reviewer stays the
-    task's own, so the owner's next completion goes to it again, as an ordinary review.
+    says, unless the crew task has a reviewer of its own: the reviewer it holds at the completion when that one was
+    named (in `task_create` or `task_update` `reviewer`, or set by USER; with independent review on, a valid one;
+    with it off, any reviewer other than the actor, §4.1), which reviews it as an ordinary review
+    (`n_review_requested`, or USER's `u_review_requested`). The board picks no reviewer at the completion, and a
+    reviewer it picked for an earlier review and kept after a return (one picked before the task became a crew
+    task, or for a check of the whole before the toggle) is not the task's own: the completion is `done`. The row
+    records it (`tasks.reviewer_named`, `Task.reviewer_named`): set when `task_create` or `task_update` passes the
+    reviewer (from an agent or USER, the same name passed again included), cleared whenever the board writes the
+    reviewer itself (a pick, a re-pick, or clearing it). The same holds for a crew task none of whose directions is
+    done. A return from that review goes back to the owner as below; the named reviewer stays the task's own, so
+    the owner's next completion goes to it again, as an ordinary review.
   - A toggle of `crew_review` while a crew task is in review changes nothing for that review: it stays in review
     with its reviewer, whose verdict (or the user's) settles it as usual; only a later completion follows the new
     setting. Nothing stores whether a review is a check of the whole, so a request made while it waits (a
     hand-over or a re-pick in `release_all`, which keep a review going, §4.1 "Liveness", or a reviewer changed by
     `update`) follows the setting at that request: `n_crew_review_requested` and the contributor key only while
-    `crew_review` is on. A reviewer the crew task holds at a later completion is its own however it got there (one
-    the board picked for an earlier review and kept after a return included).
+    `crew_review` is on. A later completion with `crew_review` off goes to the reviewer the crew task holds only when
+    that one was named (above).
   USER completes a crew task as any task (§4.1 `complete` by USER: to review only with a reviewer of its own), open
   or failed directions notwithstanding.
   A crew task returned from review goes back to its owner (`in_progress`; `todo` without one, and its next owner
@@ -1369,7 +1380,10 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   of USER's completion, `failed`, `cancelled`), its `todo` subtasks
   without an assignee are cancelled in the same mutation (one `task.updated` each, after the parent's, and no other
   notice: their creators get no `n_task_closed`, the parent's closing is the news; one level only: their own
-  subtasks are left as they are) and the assignees of its other
+  subtasks are left as they are, except that a crew task cancelled this way takes its open directions along by the
+  same rule, its `todo` directions without an assignee cancelled after it and the holders of the others told with
+  `n_parent_closed` naming the crew task, since nobody may take a direction of a terminal crew task) and the
+  assignees of its other
   open subtasks get `n_parent_closed` {id, title, status, sub} (wakes): `#{id} "{title}", of which your #{sub} is a
   part, is {status}: finish #{sub} only if it is still needed on its own; otherwise cancel it (task_update
   status=cancelled).` A move from one terminal status to another cancels nothing (`n_task_closed` still goes out).
@@ -1430,9 +1444,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `n_crew_owner`: the owner sentence above; `n_crew_review_requested`, the crew endings of `n_subtasks_done` and
   `n_review_rejected`, the draft of #N's result (`crew_draft`, `crew_draft_cut`, `crew_draft_more`,
   `crew_draft_no_result`), `n_direction_failed`, `n_direction_cancelled`, `n_marks_stalled`: "Finishing". `Task` gains
-  `crew: int` (stored) and `crew_working:
-  list[str]` (filled by `Board`, not stored); both are in `to_dict()`, so in the state API and the events (an
-  export copies the column `tasks.crew`). The web and the TUI compute a crew task's chip from the tasks they have
+  `crew: int` and `reviewer_named: bool` (stored, "Finishing") and `crew_working:
+  list[str]` (filled by `Board`, not stored); all are in `to_dict()`, so in the state API and the events (an
+  export copies the columns `tasks.crew` and `tasks.reviewer_named`). The web and the TUI compute a crew task's chip from the tasks they have
   (its assignee and its subtasks), so a direction's `task.updated` is enough and the board emits no event for the
   parent.
   `n_crew_changed`: `{by} set the crew of #{id} "{title}" to {crew}

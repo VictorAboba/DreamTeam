@@ -337,13 +337,16 @@ class _Batch:
     (rendered in the actor's language, each starting with a space), callbacks to run after the commit, the open
     subtasks a primary row that became terminal keeps (the cascade's, for n_parent_closed), and whether the primary
     row is a direction of a terminal crew task cancelled in place of going back to todo without an assignee
-    (_close_dangling: no notice about it)."""
+    (_close_dangling: no notice about it), and whether the primary row's reviewer after the call was named by the
+    actor (an update passing reviewer; None: not passed, the reviewer the plan writes, if any, is not named)."""
     writes: list[tuple[Task, dict[str, Any]]] = field(default_factory=list)
     inserts: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     after: list[Callable[[], None]] = field(default_factory=list)
-    still_open: list[Task] = field(default_factory=list)
+    # (an open subtask, its closed parent: None for the primary row, else a crew task the cascade cancelled)
+    still_open: list[tuple[Task, Task | None]] = field(default_factory=list)
     dangling: bool = False
+    reviewer_named: bool | None = None
 
 
 @dataclass
@@ -527,46 +530,122 @@ class Board:
                            (task.id, *_OPEN)) is not None
 
     def has_live_directions(self, task: Task) -> bool:
-        """A crew task with an open direction that can still move: one in in_progress, waiting or review, or a todo
-        one while the crew task is not stuck and none of the direction's blockers is (_stuck: failed or cancelled, or
-        todo and stuck in turn, or waiting for the crew task itself). It waits for them (liveness leaves it out of the
-        stalled ids); a todo direction that waits for a stuck task moves only when someone changes it."""
+        """A crew task with an open direction that can still move: one in review; one in in_progress or waiting that
+        does not wait for a held-back direction (_held_back: todo, and nobody may take it now under the crew limit or
+        the one direction per member), through its depends_on or its open subtasks (_wait_for_held); or a todo one
+        that is not held back while the crew task is not stuck and none of the direction's blockers is (_stuck:
+        failed or cancelled, or todo and stuck in turn, or waiting for the crew task itself or for a working direction
+        that waits for a held-back one). It waits for them (liveness leaves it out of the stalled ids); a direction
+        that waits for a stuck task moves only when someone changes the board, and its owner is woken for that."""
         if task.crew < 2:
             return False
         subs = self.subtasks_of(task.id, open_only=True)
-        if any(s.status != Status.TODO for s in subs):
-            return True
-        own = self._blockers_of(task.depends_on)
-        if not subs or (not own and not any(s.blocked_by for s in subs)):
+        if not subs or any(s.status == Status.REVIEW for s in subs):
             return bool(subs)
+        held = self._held_back(task, subs)
+        working = [s.id for s in subs if s.status in _WORKING]
+        todo = [s for s in subs if s.status == Status.TODO and s.id not in held]
+        own = self._blockers_of(task.depends_on)
+        if not held and (working or (not own and not any(s.blocked_by for s in todo))):
+            return bool(working or todo)
         rows = {r["id"]: r for r in self.db.all("SELECT id, status, depends_on, parent_id, crew FROM tasks")}
-        memo: dict[int, bool] = {task.id: True}  # a chain that leads back to the crew task never moves
-        if any(self._stuck(rows, d, memo, set()) for d in own):
+        dead = self._wait_for_held(rows, working, held) if held else set()
+        if len(dead) < len(working):
+            return True
+        memo: dict[int, bool] = dict.fromkeys(dead, True)
+        memo[task.id] = True  # a chain that leads back to the crew task never moves
+        if any(self._stuck(rows, d, memo) for d in own):
             return False
-        return any(not any(self._stuck(rows, d, memo, set()) for d in s.blocked_by) for s in subs)
+        return any(not any(self._stuck(rows, d, memo) for d in s.blocked_by) for s in todo)
 
-    def _stuck(self, rows: dict[int, Any], tid: int, memo: dict[int, bool], path: set[int]) -> bool:
+    @staticmethod
+    def _held_back(task: Task, subs: list[Task]) -> set[int]:
+        """The ids of the todo directions among `subs` (the open directions of crew task `task`) that nobody may take
+        now: assigned to a member that works on another of its directions, or that is outside a full working set
+        (_may_take's limits; USER takes any). They move only when a working direction is handed in."""
+        working = [task.assignee] if task.assignee not in (None, USER) else []
+        busy: set[str] = set()
+        for s in subs:
+            if s.status in _WORKING and s.assignee not in (None, USER):
+                busy.add(s.assignee)
+                if s.assignee not in working:
+                    working.append(s.assignee)
+        full = len(working) >= task.crew
+        return {s.id for s in subs if s.status == Status.TODO and s.assignee not in (None, USER)
+                and (s.assignee in busy or (full and s.assignee not in working))}
+
+    @staticmethod
+    def _wait_for_held(rows: dict[int, Any], working: list[int], held: set[int]) -> set[int]:
+        """The ids among `working` (directions in in_progress or waiting) that wait for a direction in `held`: it is
+        reached through depends_on that are not done and open subtasks, transitively. `rows`: id -> (id, status,
+        depends_on, parent_id, crew) of every task."""
+        children: dict[int, list[int]] = {}
+        for row in rows.values():
+            if row["parent_id"] is not None and row["status"] in Status.OPEN:
+                children.setdefault(row["parent_id"], []).append(row["id"])
+        dead: set[int] = set()
+        for start in working:
+            seen, stack = {start}, [start]
+            while stack:
+                row = rows.get(stack.pop())
+                if row is None:
+                    continue
+                nxt = [d for d in loads(row["depends_on"], []) if d in rows and rows[d]["status"] != Status.DONE]
+                nxt += children.get(row["id"], [])
+                if held.intersection(nxt):
+                    dead.add(start)
+                    break
+                stack.extend(n for n in nxt if n not in seen)
+                seen.update(nxt)
+        return dead
+
+    def _stuck(self, rows: dict[int, Any], tid: int, memo: dict[int, bool]) -> bool:
         """Task `tid` never finishes unless someone changes the board (has_live_directions): failed or cancelled; or
         todo while one of its blockers is stuck, or (a direction) while its crew task is blocked by a stuck task, or
-        while its blockers lead back to it. `rows`: id -> (id, status, depends_on, parent_id, crew) of every task."""
-        if tid in memo:
-            return memo[tid]
-        row = rows.get(tid)
-        if row is None or row["status"] in (Status.FAILED, Status.CANCELLED):
-            return row is not None
-        if row["status"] != Status.TODO:
-            return False
-        if tid in path:
-            return True  # todo tasks that wait for each other
-        path.add(tid)
-        waits = [d for d in loads(row["depends_on"], []) if d in rows and rows[d]["status"] != Status.DONE]
-        parent = rows.get(row["parent_id"]) if row["parent_id"] is not None else None
-        if parent is not None and (parent["crew"] or 0) >= 2:  # a blocked crew task gives no direction out
-            waits += [d for d in loads(parent["depends_on"], []) if d in rows and rows[d]["status"] != Status.DONE]
-        stuck = any(self._stuck(rows, d, memo, path) for d in waits)
-        path.discard(tid)
-        memo[tid] = stuck
-        return stuck
+        while its blockers lead back to it; `memo` holds the answers known (the crew task itself, the working
+        directions that wait for a held-back one). Iterative, so a chain of any length is fine. `rows`: id -> (id,
+        status, depends_on, parent_id, crew) of every task."""
+        def leaf(t: int) -> bool | None:  # the answer without looking further, or None for a todo task
+            if t in memo:
+                return memo[t]
+            row = rows.get(t)
+            if row is None or row["status"] in (Status.FAILED, Status.CANCELLED):
+                return row is not None
+            return None if row["status"] == Status.TODO else False
+
+        def waits(t: int) -> list[int]:
+            row = rows[t]
+            out = [d for d in loads(row["depends_on"], []) if d in rows and rows[d]["status"] != Status.DONE]
+            parent = rows.get(row["parent_id"]) if row["parent_id"] is not None else None
+            if parent is not None and (parent["crew"] or 0) >= 2:  # a blocked crew task gives no direction out
+                out += [d for d in loads(parent["depends_on"], []) if d in rows and rows[d]["status"] != Status.DONE]
+            return out
+
+        first = leaf(tid)
+        if first is not None:
+            return first
+        frames: list[list[Any]] = [[tid, iter(waits(tid)), False]]   # [task, its waits left, stuck so far]
+        path = {tid}
+        while frames:
+            frame = frames[-1]
+            nxt = None if frame[2] else next(frame[1], None)
+            if nxt is None:  # answered: it is stuck, or none of its waits is
+                frames.pop()
+                path.discard(frame[0])
+                memo[frame[0]] = frame[2]
+                if frames:
+                    frames[-1][2] = frames[-1][2] or frame[2]
+                continue
+            if nxt in path:
+                frame[2] = True  # todo tasks that wait for each other
+                continue
+            answer = leaf(nxt)
+            if answer is None:
+                frames.append([nxt, iter(waits(nxt)), False])
+                path.add(nxt)
+            elif answer:
+                frame[2] = True
+        return memo[tid]
 
     def stall_marks(self, name: str) -> frozenset[tuple[int, str]]:
         """The liveness marks of `name` (docs/SPEC.md §4.2 "Finishing", Liveness): (N, "subtasks done") for each of
@@ -766,7 +845,7 @@ class Board:
                 self._check_wait_cycle(None, deps, parent, crew)
             task_id = self._insert_task(title, actor, goal=str(goal or "").strip(), description=str(description or ""),
                                         assignee=assignee, reviewer=reviewer, parent_id=parent, depends_on=deps,
-                                        priority=priority, tags=tags, crew=crew)
+                                        priority=priority, tags=tags, crew=crew, reviewer_named=reviewer is not None)
             if titles:
                 self._insert_directions(actor, self._load(task_id), titles, batch)
         task = self.get(task_id)
@@ -861,6 +940,11 @@ class Board:
                 self._plan_review_fields(actor, old, values)
             if titles:
                 self._insert_directions(actor, replace(old, **values), titles, batch)
+            if reviewer is not UNSET and (actor in (USER, old.created_by) or actor == old.assignee):
+                # named (the same one passed again too: only by those who may change it), unless the board re-picked
+                # it (_plan_review_fields)
+                named = self._resolve_opt(reviewer)
+                batch.reviewer_named = named is not None and values.get("reviewer", old.reviewer) == named
             return values
 
         mutation = self._mutate(actor, task_id, plan)
@@ -885,8 +969,9 @@ class Board:
     def complete(self, actor: str, task_id: int, result: str, notes: list[str] | None = None) -> Task:
         """The assignee hands its work in (to review, or done). An agent cannot complete a task with open subtasks,
         a crew task with a failed direction, or a direction with an empty goal (docs/SPEC.md §4.2 "Finishing"). With
-        [swarm] crew_review off, an agent's completion of a crew task goes to review only with a valid reviewer of
-        its own, else it is done, independent review notwithstanding.
+        [swarm] crew_review off, an agent's completion of a crew task goes to review only with a valid reviewer that
+        was named (not one the board picked for an earlier review), else it is done, independent review
+        notwithstanding.
         `notes`: extended with the sentences for the result of the actor's call (a parent it holds whose subtasks
         are all finished now)."""
         text = str(result if result is not None else "").strip()
@@ -906,11 +991,13 @@ class Board:
                 self._check_finishable(actor, old)
             if actor == USER or not self.independent_review:
                 to_review = old.reviewer is not None and old.reviewer != actor
+                if actor != USER and old.crew >= 2 and not self.crew_review:
+                    to_review = to_review and old.reviewer_named  # no second review, as below
                 return {"result": text, "status": Status.REVIEW if to_review else Status.DONE}
             if old.crew >= 2 and not self.crew_review:
-                # each direction was reviewed already: the board picks nobody, only a reviewer of the crew task's
-                # own reviews the owner's result, as any task (docs/SPEC.md §4.2 "Finishing")
-                own = self._valid_reviewer(old, old.reviewer)
+                # each direction was reviewed already: the board picks nobody, only a reviewer named on the crew
+                # task reviews the owner's result, as any task (docs/SPEC.md §4.2 "Finishing")
+                own = old.reviewer_named and self._valid_reviewer(old, old.reviewer)
                 return {"result": text, "status": Status.REVIEW if own else Status.DONE}
             # an agent's work always goes to review, never by its executor (old.assignee == actor here)
             reviewer = old.reviewer if self._valid_reviewer(old, old.reviewer) else self.pick_reviewer(old)
@@ -1196,15 +1283,15 @@ class Board:
     def _insert_task(self, title: str, created_by: str, *, goal: str = "", description: str = "",
                      status: str = Status.TODO, assignee: str | None = None, reviewer: str | None = None,
                      parent_id: int | None = None, depends_on: Iterable[int] = (), priority: int = 1,
-                     tags: Iterable[str] = (), crew: int = 0) -> int:
+                     tags: Iterable[str] = (), crew: int = 0, reviewer_named: bool = False) -> int:
         """One INSERT of a task row with checked values (inside the caller's transaction); its id."""
         now = time.time()
         return self.db.insert(
             "INSERT INTO tasks(title, goal, description, status, assignee, reviewer, created_by, parent_id,"
-            " depends_on, priority, tags, result, created_at, updated_at, crew)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
+            " depends_on, priority, tags, result, created_at, updated_at, crew, reviewer_named)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
             (title, goal, description, status, assignee, reviewer, created_by, parent_id, dumps(list(depends_on)),
-             priority, dumps(list(tags)), now, now, crew),
+             priority, dumps(list(tags)), now, now, crew, int(reviewer_named)),
         )
 
     @staticmethod
@@ -1533,8 +1620,8 @@ class Board:
 
     def _check_wait_cycle(self, task_id: int | None, deps: list[int], parent_id: int | None, crew: int) -> None:
         """No change closes a cycle of waits (docs/SPEC.md §4 `create`), for a task as it is after the call (`task_id`
-        None: a new one, open). A task waits for each entry of its depends_on; a parent for each of its open
-        subtasks; an open direction of a crew task for each entry of the crew task's depends_on (a blocked crew task
+        None: a new one, open). An open task waits for each entry of its depends_on; an open parent for each of its
+        open subtasks (a finished task waits for nothing); an open direction of a crew task for each entry of the crew task's depends_on (a blocked crew task
         gives none of them out). The waits the change adds: the task's own, its new parent's for it, and those of its
         open directions when it is a crew task."""
         me = task_id if task_id is not None else 0  # task ids start at 1
@@ -1556,9 +1643,13 @@ class Board:
 
         for tid in [*(i for i in rows if i != me), me]:
             task = info(tid)
+            if tid != me and task["status"] not in Status.OPEN:
+                continue  # a finished task waits for nothing
             graph.setdefault(tid, []).extend(task["depends_on"])
             parent = task["parent_id"]
             if parent is None or parent not in rows or task["status"] not in Status.OPEN:
+                continue
+            if parent != me and rows[parent]["status"] not in Status.OPEN:
                 continue
             graph.setdefault(parent, []).append(tid)
             hops.setdefault((parent, tid), parent)
@@ -1760,8 +1851,12 @@ class Board:
         return (parent.status in _TAKEABLE and not parent.blocked_by
                 and len(parent.crew_working) < parent.crew)
 
-    def _write(self, task_id: int, values: dict[str, Any]) -> None:
+    def _write(self, task_id: int, values: dict[str, Any], named: bool | None = None) -> None:
+        """`named`: whether the reviewer was named (_Batch.reviewer_named); a reviewer written without it is one
+        the board set (a pick, or none)."""
         cols = {**values, "updated_at": time.time()}
+        if named is not None or "reviewer" in values:
+            cols["reviewer_named"] = int(bool(named))
         sql = "UPDATE tasks SET " + ", ".join(f"{c} = ?" for c in cols) + " WHERE id = ?"
         params = [dumps(v) if c in _JSON_FIELDS else v for c, v in cols.items()]
         self.db.execute(sql, [*params, task_id])
@@ -1787,8 +1882,9 @@ class Board:
                               *(p for row, row_values in batch.writes
                                 for p in (row.parent_id, row_values.get("parent_id", row.parent_id)))} - {None})
             before = self._finish_info(parents)
-            if changes:
-                self._write(old.id, {f: c[1] for f, c in changes.items()})
+            named = batch.reviewer_named
+            if changes or (named is not None and named != old.reviewer_named):
+                self._write(old.id, {f: c[1] for f, c in changes.items()}, named)
             self._cascade(actor, old, changes, batch)
             for row, row_values in batch.writes:
                 row_changes = {f: [getattr(row, f), v] for f, v in row_values.items() if getattr(row, f) != v}
@@ -1812,15 +1908,24 @@ class Board:
         """The rows a change of the primary row brings with it (docs/SPEC.md §4.2 "Leaving and closing"): when a
         task with open subtasks becomes terminal, its todo subtasks without an assignee are cancelled (side rows,
         one task.updated each and no notification), and its other open subtasks are kept in batch.still_open for
-        n_parent_closed."""
+        n_parent_closed. One level only, except that a crew task cancelled this way takes its open directions along
+        by the same rule (_close_dangling's: nobody may take them, and they would keep the goal open)."""
         status = changes.get("status")
         if status is None or status[0] in Status.TERMINAL or status[1] not in Status.TERMINAL:
             return
         for sub in self.subtasks_of(old.id, open_only=True):
-            if sub.status == Status.TODO and sub.assignee is None:
-                batch.writes.append((sub, {"status": Status.CANCELLED}))
-            else:
-                batch.still_open.append(sub)
+            if sub.status != Status.TODO or sub.assignee is not None:
+                batch.still_open.append((sub, None))
+                continue
+            batch.writes.append((sub, {"status": Status.CANCELLED}))
+            if sub.crew < 2:
+                continue
+            closed = replace(sub, status=Status.CANCELLED)
+            for direction in self.subtasks_of(sub.id, open_only=True):
+                if direction.status == Status.TODO and direction.assignee is None:
+                    batch.writes.append((direction, {"status": Status.CANCELLED}))
+                else:
+                    batch.still_open.append((direction, closed))
 
     def _close_dangling(self, actor: str | None, old: Task, values: dict[str, Any], batch: _Batch) -> None:
         """The cascade's rule after the closing (docs/SPEC.md §4.2 "Leaving and closing"): an open direction that this
@@ -2272,17 +2377,17 @@ class Board:
             direction_to = None
         elif direction_to is not None:
             taken.add(direction_to)
-        parent_closed: list[tuple[str, int]] = []
-        for sub in batch.still_open:
+        parent_closed: list[tuple[str, int, Task]] = []
+        for sub, closed_parent in batch.still_open:
             if sub.assignee == actor:
                 batch.notes.append(prompts.t(actor_lang, "note_still_open", sub=sub.id))
             elif sub.assignee is not None and sub.assignee not in taken:
-                parent_closed.append((sub.assignee, sub.id))
-        taken.update(name for name, _ in parent_closed)
+                parent_closed.append((sub.assignee, sub.id, closed_parent or task))
+        taken.update(name for name, *_ in parent_closed)
         if task.status != old.status and task.status == Status.DONE:
             self._notify_unblocked(actor, task.id)
-        for name, sub_id in parent_closed:
-            self._notify_member(name, actor, "n_parent_closed", id=task.id, title=task.title, status=task.status,
+        for name, sub_id, parent in parent_closed:
+            self._notify_member(name, actor, "n_parent_closed", id=parent.id, title=parent.title, status=parent.status,
                                 sub=sub_id)
         self._notify_member(cancelled_to, actor, "n_subtask_cancelled", id=task.id, title=task.title, by=actor,
                             parent=parent_id)

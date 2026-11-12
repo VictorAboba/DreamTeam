@@ -2153,3 +2153,57 @@ def test_the_owner_sentence_skips_a_direction_blocked_by_its_own_dependency(boar
     board.update(ANNA, b.id, depends_on=[a.id])
     instructions, _ = board._owner_sentence(board.get(task.id), ANNA, "en")
     assert instructions == prompts.t("en", "crew_owner_all_taken", id=task.id, crew=2)
+
+
+# --- review round 4: the crew limit in liveness, chains of any length ----------------------------------------------
+
+@pytest.mark.parametrize("through", ["subtask", "depends_on"])
+def test_a_working_direction_that_waits_for_a_direction_held_back_by_the_crew_limit_is_not_live(board, through):
+    """cli is worked on and waits (through a subtask, or its own depends_on) for tests, assigned to Carl, who may not
+    take it while the crew is full: neither moves until the owner changes something, so the owner is not left
+    unwoken."""
+    task, (tests, cli) = crew_task(board, crew=2, titles=("tests", "cli"))
+    work(board, cli.id, BOB)                                  # the working set: Anna and Bob, full
+    work(board, tests.id, CARL, Status.TODO)
+    assert board.directions_to_take(CARL) == []
+    assert board.has_live_directions(task)                    # cli does not wait for tests yet
+    if through == "subtask":
+        board.create(BOB, "fixture", parent_id=cli.id, depends_on=[tests.id])
+    else:
+        board.update(ANNA, cli.id, depends_on=[tests.id])
+    assert not board.has_live_directions(task)
+    set_raw(board, cli.id, status=Status.WAITING)             # still in the working set
+    assert not board.has_live_directions(task)
+    board.update(ANNA, tests.id, assignee=ANNA)               # the owner takes it over: it can move again
+    assert board.has_live_directions(task)
+
+
+def test_a_direction_held_back_by_one_direction_per_member_stops_its_crew_too(board):
+    task, (tests, cli) = crew_task(board, crew=3, titles=("tests", "cli"))
+    work(board, cli.id, BOB)
+    work(board, tests.id, BOB, Status.TODO)                   # Bob works on cli: he may not take tests too
+    board.create(BOB, "fixture", parent_id=cli.id, depends_on=[tests.id])
+    assert not board.has_live_directions(task)
+    work(board, tests.id, CARL, Status.TODO)                  # the crew has a place for Carl
+    assert board.has_live_directions(task)
+
+
+def test_a_chain_of_any_length_is_checked_without_recursion(board):
+    task, (d1, d2) = crew_task(board, crew=2, titles=("d1", "d2"))
+    with board.db.transaction():
+        prev = board._insert_task("root", ANNA, status=Status.CANCELLED)
+        for i in range(1500):
+            prev = board._insert_task(f"link {i}", ANNA, depends_on=[prev])
+    set_raw(board, d1.id, depends_on=f"[{prev}]")
+    set_raw(board, d2.id, depends_on=f"[{prev}]")
+    assert not board.has_live_directions(board.get(task.id))
+
+
+def test_a_finished_task_waits_for_nothing_in_the_cycle_check(board):
+    """Z is done although it depended on P, reopened since: a subtask of P may depend on Z, nothing waits."""
+    p = board.create(ANNA, "P")
+    z = board.create(ANNA, "Z", depends_on=[p.id])
+    finish_raw(board, z.id, Status.DONE, "ok")
+    s = board.create(ANNA, "S", parent_id=p.id)
+    board.update(ANNA, s.id, depends_on=[z.id])
+    assert board.get(s.id).depends_on == [z.id] and board.get(s.id).blocked_by == []
