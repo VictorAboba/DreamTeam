@@ -337,8 +337,7 @@ class _Batch:
     (rendered in the actor's language, each starting with a space), callbacks to run after the commit, the open
     subtasks a primary row that became terminal keeps (the cascade's, for n_parent_closed), and whether the primary
     row is a direction of a terminal crew task cancelled in place of going back to todo without an assignee
-    (_close_dangling: no notice about it), and whether the primary row's reviewer after the call was named by the
-    actor (an update passing reviewer; None: not passed, the reviewer the plan writes, if any, is not named)."""
+    (_close_dangling: no notice about it)."""
     writes: list[tuple[Task, dict[str, Any]]] = field(default_factory=list)
     inserts: list[int] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
@@ -346,7 +345,6 @@ class _Batch:
     # (an open subtask, its closed parent: None for the primary row, else a crew task the cascade cancelled)
     still_open: list[tuple[Task, Task | None]] = field(default_factory=list)
     dangling: bool = False
-    reviewer_named: bool | None = None
 
 
 @dataclass
@@ -717,8 +715,8 @@ class Board:
     @property
     def crew_review(self) -> bool:
         """[swarm] crew_review (default true): the review of a crew task with a done direction is its check of the
-        whole; off, the owner's completion is done at once unless the crew task has a reviewer of its own, who
-        reviews it as any task (docs/SPEC.md §4.2 "Finishing"). Read on every call, like independent_review."""
+        whole; off, an agent owner's completion is done at once, with no second review whatever reviewer the crew
+        task holds (docs/SPEC.md §4.2 "Finishing"). Read on every call, like independent_review."""
         return bool(getattr(getattr(self.swarm.config, "swarm", None), "crew_review", True))
 
     def reviews_of(self, name: str) -> list[Task]:
@@ -764,7 +762,8 @@ class Board:
     def _whole(self, task: Task) -> bool:
         """A review of `task` (its pick, and each request of it) is the check of the whole of a crew task: crew >= 2,
         [swarm] crew_review on, and at least one done direction (docs/SPEC.md §4.2 "Finishing"). With crew_review
-        off a crew task is reviewed only by a reviewer of its own, as any task."""
+        off a review of a crew task (one already running at the toggle, or one USER's completion starts) is an
+        ordinary review."""
         if task.crew < 2 or not self.crew_review:
             return False
         return self._done_directions(task.id) > 0
@@ -845,7 +844,7 @@ class Board:
                 self._check_wait_cycle(None, deps, parent, crew)
             task_id = self._insert_task(title, actor, goal=str(goal or "").strip(), description=str(description or ""),
                                         assignee=assignee, reviewer=reviewer, parent_id=parent, depends_on=deps,
-                                        priority=priority, tags=tags, crew=crew, reviewer_named=reviewer is not None)
+                                        priority=priority, tags=tags, crew=crew)
             if titles:
                 self._insert_directions(actor, self._load(task_id), titles, batch)
         task = self.get(task_id)
@@ -940,11 +939,6 @@ class Board:
                 self._plan_review_fields(actor, old, values)
             if titles:
                 self._insert_directions(actor, replace(old, **values), titles, batch)
-            if reviewer is not UNSET and (actor in (USER, old.created_by) or actor == old.assignee):
-                # named (the same one passed again too: only by those who may change it), unless the board re-picked
-                # it (_plan_review_fields)
-                named = self._resolve_opt(reviewer)
-                batch.reviewer_named = named is not None and values.get("reviewer", old.reviewer) == named
             return values
 
         mutation = self._mutate(actor, task_id, plan)
@@ -969,9 +963,8 @@ class Board:
     def complete(self, actor: str, task_id: int, result: str, notes: list[str] | None = None) -> Task:
         """The assignee hands its work in (to review, or done). An agent cannot complete a task with open subtasks,
         a crew task with a failed direction, or a direction with an empty goal (docs/SPEC.md §4.2 "Finishing"). With
-        [swarm] crew_review off, an agent's completion of a crew task goes to review only with a valid reviewer that
-        was named (not one the board picked for an earlier review), else it is done, independent review
-        notwithstanding.
+        [swarm] crew_review off, an agent's completion of a crew task is done: no second review, whatever
+        independent_review says and whatever reviewer the task holds.
         `notes`: extended with the sentences for the result of the actor's call (a parent it holds whose subtasks
         are all finished now)."""
         text = str(result if result is not None else "").strip()
@@ -989,16 +982,13 @@ class Board:
                 raise ToolError(f"Task #{old.id} is already {old.status}.")
             if actor != USER:
                 self._check_finishable(actor, old)
+                if old.crew >= 2 and not self.crew_review:
+                    # each direction was reviewed already: no second review, whatever reviewer the crew task holds
+                    # (docs/SPEC.md §4.2 "Finishing")
+                    return {"result": text, "status": Status.DONE}
             if actor == USER or not self.independent_review:
                 to_review = old.reviewer is not None and old.reviewer != actor
-                if actor != USER and old.crew >= 2 and not self.crew_review:
-                    to_review = to_review and old.reviewer_named  # no second review, as below
                 return {"result": text, "status": Status.REVIEW if to_review else Status.DONE}
-            if old.crew >= 2 and not self.crew_review:
-                # each direction was reviewed already: the board picks nobody, only a reviewer named on the crew
-                # task reviews the owner's result, as any task (docs/SPEC.md §4.2 "Finishing")
-                own = old.reviewer_named and self._valid_reviewer(old, old.reviewer)
-                return {"result": text, "status": Status.REVIEW if own else Status.DONE}
             # an agent's work always goes to review, never by its executor (old.assignee == actor here)
             reviewer = old.reviewer if self._valid_reviewer(old, old.reviewer) else self.pick_reviewer(old)
             return {"result": text, "status": Status.REVIEW, "reviewer": reviewer}
@@ -1283,15 +1273,15 @@ class Board:
     def _insert_task(self, title: str, created_by: str, *, goal: str = "", description: str = "",
                      status: str = Status.TODO, assignee: str | None = None, reviewer: str | None = None,
                      parent_id: int | None = None, depends_on: Iterable[int] = (), priority: int = 1,
-                     tags: Iterable[str] = (), crew: int = 0, reviewer_named: bool = False) -> int:
+                     tags: Iterable[str] = (), crew: int = 0) -> int:
         """One INSERT of a task row with checked values (inside the caller's transaction); its id."""
         now = time.time()
         return self.db.insert(
             "INSERT INTO tasks(title, goal, description, status, assignee, reviewer, created_by, parent_id,"
-            " depends_on, priority, tags, result, created_at, updated_at, crew, reviewer_named)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)",
+            " depends_on, priority, tags, result, created_at, updated_at, crew)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)",
             (title, goal, description, status, assignee, reviewer, created_by, parent_id, dumps(list(depends_on)),
-             priority, dumps(list(tags)), now, now, crew, int(reviewer_named)),
+             priority, dumps(list(tags)), now, now, crew),
         )
 
     @staticmethod
@@ -1851,12 +1841,8 @@ class Board:
         return (parent.status in _TAKEABLE and not parent.blocked_by
                 and len(parent.crew_working) < parent.crew)
 
-    def _write(self, task_id: int, values: dict[str, Any], named: bool | None = None) -> None:
-        """`named`: whether the reviewer was named (_Batch.reviewer_named); a reviewer written without it is one
-        the board set (a pick, or none)."""
+    def _write(self, task_id: int, values: dict[str, Any]) -> None:
         cols = {**values, "updated_at": time.time()}
-        if named is not None or "reviewer" in values:
-            cols["reviewer_named"] = int(bool(named))
         sql = "UPDATE tasks SET " + ", ".join(f"{c} = ?" for c in cols) + " WHERE id = ?"
         params = [dumps(v) if c in _JSON_FIELDS else v for c, v in cols.items()]
         self.db.execute(sql, [*params, task_id])
@@ -1882,9 +1868,8 @@ class Board:
                               *(p for row, row_values in batch.writes
                                 for p in (row.parent_id, row_values.get("parent_id", row.parent_id)))} - {None})
             before = self._finish_info(parents)
-            named = batch.reviewer_named
-            if changes or (named is not None and named != old.reviewer_named):
-                self._write(old.id, {f: c[1] for f, c in changes.items()}, named)
+            if changes:
+                self._write(old.id, {f: c[1] for f, c in changes.items()})
             self._cascade(actor, old, changes, batch)
             for row, row_values in batch.writes:
                 row_changes = {f: [getattr(row, f), v] for f, v in row_values.items() if getattr(row, f) != v}

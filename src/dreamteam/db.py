@@ -22,7 +22,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, goal TEXT DEFAULT '', description TEXT DEFAULT '',
     status TEXT NOT NULL, assignee TEXT, reviewer TEXT, created_by TEXT, parent_id INTEGER,
     depends_on TEXT DEFAULT '[]', priority INTEGER DEFAULT 1, tags TEXT DEFAULT '[]', result TEXT,
-    created_at REAL, updated_at REAL, crew INTEGER DEFAULT 0, reviewer_named INTEGER DEFAULT 0);
+    created_at REAL, updated_at REAL, crew INTEGER DEFAULT 0);
 CREATE TABLE IF NOT EXISTS comments (
     id INTEGER PRIMARY KEY AUTOINCREMENT, task_id INTEGER, author TEXT, text TEXT, reply_to INTEGER, ts REAL);
 CREATE INDEX IF NOT EXISTS comments_task ON comments(task_id, id);
@@ -68,7 +68,7 @@ ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"), ("mcp_servers", "d
                  ("mcp_servers", "approved_digest", "TEXT"), ("file_locks", "wanted_at", "REAL"),
                  ("triggers", "told_at", "REAL"), ("triggers", "held", "INTEGER DEFAULT 0"),
                  ("triggers", "held_last", "REAL"), ("triggers", "held_files", "TEXT"),
-                 ("tasks", "crew", "INTEGER DEFAULT 0"), ("tasks", "reviewer_named", "INTEGER DEFAULT 0"))
+                 ("tasks", "crew", "INTEGER DEFAULT 0"))
 
 
 class Database:

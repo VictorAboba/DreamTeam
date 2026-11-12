@@ -69,9 +69,6 @@ class Task:
     created_at: float
     updated_at: float
     crew: int = 0  # stored (tasks.crew): 0 = an ordinary task, 2..CREW_MAX = a crew task (docs/SPEC.md §4.2)
-    # stored (tasks.reviewer_named): the reviewer was named (task_create, task_update reviewer, or USER), not picked
-    # by the board; with [swarm] crew_review off only such a reviewer reviews a crew task (docs/SPEC.md §4.2)
-    reviewer_named: bool = False
     blocked_by: list[int] = field(default_factory=list)
     comments: int = 0
     # the working set of a crew task (Board.crew_working: its assignee while open, then the assignees of its
@@ -97,7 +94,6 @@ class Task:
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             crew=(row["crew"] or 0) if "crew" in row.keys() else 0,
-            reviewer_named=bool(row["reviewer_named"]) if "reviewer_named" in row.keys() else False,
         )
 
     def to_dict(self) -> dict[str, Any]:
