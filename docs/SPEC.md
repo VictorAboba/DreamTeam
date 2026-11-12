@@ -87,6 +87,10 @@ src/dreamteam/
   mcp_library.py the shared MCP library on disk, usable without a Swarm: list, read, add atomically, remove (§20)
   launcher.py    launcher web app: sessions page, settings, /s/{sid}/ routing (§18.1)
   launcher_mcp.py  the launcher as one MCP server (§18.2)
+  api_v1.py      the external HTTP API under /api/v1 (§21; draft, not implemented)
+  autoreply.py   the hub's automatic answers for a session created with answers "auto" (§21.5; draft)
+  eventtext.py   one plain line per event for people, outside the tui package (§21.6; draft)
+  result.py      the result object of a run, shared by `dreamteam -p` and the API (§21.7; draft)
   static/        index.html app.js traces.js style.css traces.css (board), home.html home.js home.css (launcher),
                  markdown.js and icons.css (both); no build step
   console.py     terminal chat client (talks to the REST API)
@@ -4759,6 +4763,7 @@ succeeded: either may have changed the library) and everything else to the launc
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result; 400 when the fallback would send the stored key to another provider or base_url than the saved one, or a key from the hub's environment to an endpoint that neither the provider's default, a preset nor a saved profile uses with that variable |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
 | `/mcp` | launcher MCP (§18.2) |
+| `/api/v1/...` | the external HTTP API v1 (§21; draft, not implemented) |
 | GET `/s/{sid}` | 307 redirect to `/s/{sid}/` (query kept) |
 | GET `/s/{sid}/` | the session's `index.html` (board UI) |
 | `/s/{sid}/api/*`, `/s/{sid}/ws`, `/s/{sid}/mcp` | the session app; `manager.load(sid)` loads a stopped session for viewing |
@@ -6491,3 +6496,307 @@ never followed. mcp_forge keeps its own library code in stage 1.
 Export and import through a running hub (launcher routes), in the TUI, console or web UI; an MCP tool for either;
 `--update` of an existing export; a path map for folders outside the home; the legacy `main` session and
 `dreamteam run` projects; a command that lists or restores `.replaced-*` backups.
+
+## 21. External HTTP API v1 (api_v1.py, autoreply.py, eventtext.py) — DRAFT, issue #55, not implemented
+
+A stable HTTP interface for programs that use the swarm as a service: a site uploads a document, starts a session
+with a goal, shows its timeline, answers the agents if asked and gets the result as JSON and files. It is the
+HTTP form of `dreamteam -p` (docs/TUI.md §2), not a mirror of the board: everything is said in terms of a
+session, its goal, events, requests to the user, the result and files, so that a session in another mode (a feed
+instead of a task board) can answer the same routes. The internal routes (§14, §18.1) stay as they are and may
+change; `/api/v1` changes only as 21.1 says.
+
+### 21.1 Where, who, format
+
+- Served by the launcher only (`dreamteam serve`, `dreamteam sandbox`, the TUI's launcher), under `/api/v1/`, next to
+  the routes of §18.1. `dreamteam run` (one swarm) has none.
+- **The API token.** v1 has a token of its own, separate from the hub token (§14.2), and asks for it on every bind,
+  loopback included: `DREAMTEAM_API_TOKEN` (or its SHA-256 in `DREAMTEAM_API_TOKEN_SHA256`, as `DIGEST_ENV`), taken
+  out of the environment and kept from the agents like the hub token (`take_env_token`, `shell._INTERNAL_ENV`).
+  Without one, every `/api/v1` route answers 403 `api_disabled`. The client sends `Authorization: Bearer <token>`
+  (never a cookie or `?token=`). The guard (§14) takes the API token only for paths under `/api/v1/`: it opens no
+  internal route, `/mcp` or board, so a leaked API token cannot change the settings, read the keys' profiles or
+  start a session on a folder of the hub's computer. The hub token (where there is one) also works for v1, as the
+  hub's owner.
+- **Scope.** With the API token, v1 sees only the sessions created through v1 (`"via": "api"`, 21.4): listing,
+  reading, files, messages and DELETE of any other session are 404 `not_found`. With the hub token, all sessions.
+- **The rest of the hub.** A site on the same computer that calls a loopback hub without a hub token exposes the
+  internal routes to its own bugs (a server-side request forgery reaches `127.0.0.1`), so the docs say: run the hub
+  that serves a site with a hub token too, or in `dreamteam sandbox`, which the docs recommend anyway (the agents
+  run commands, and an uploaded document may carry instructions to them). For another computer the hub listens on a
+  non-loopback address, which needs the hub token (§14.2), and the name the client uses goes into
+  `DREAMTEAM_ALLOWED_HOSTS`. No CORS: a page of another origin is refused as today, so a site calls the API from its
+  server, never from its visitors' browsers.
+- JSON bodies (`Content-Type: application/json`) and answers (`httpjson.JSONResponse`), except uploads (raw body)
+  and file downloads (raw bytes). Times are Unix seconds (float), money is USD (float).
+- **Errors** are `{"error": text, "code": code}` for every answer under `/api/v1/`, the guard's included: the guard
+  gives that shape to `/api/v1/` paths (`token_required` 401 with its `WWW-Authenticate`, `forbidden_host` and
+  `forbidden_origin` 403, `unsupported_media_type` 415), and v1's own catch-all route answers unknown paths
+  (`not_found` 404) and methods (`method_not_allowed` 405). Other codes: `api_disabled` 403, `bad_request`,
+  `unknown_field`, `unknown_team`, `unknown_model`, `unknown_role`, `unknown_skill`, `bad_name` (400),
+  `not_found` (session, file, request, upload), `file_conflict`, `not_running`, `budget_exhausted`, `conflict` (409),
+  `too_large` (413), `too_many_uploads`, `too_many_sessions` (429), `internal` (500). The text is English; programs
+  check `code`.
+- **Compatibility**: within v1, fields, codes, states and event types are only added, never renamed, removed or given
+  another meaning; a client ignores what it does not know. A request field the server does not know is 400
+  `unknown_field` (a typo never passes silently). The `text` of events (21.6) is for people and may be reworded.
+  Anything else is `/api/v2`, and v1 then stays for at least one minor release. `GET /api/v1/options` names the
+  DreamTeam version.
+
+### 21.2 Routes
+
+| method path | answer |
+|---|---|
+| GET `/api/v1/options` | `{"api": 1, "version", "languages": ["ru","en"], "language": the default, "teams": [{name, roles}], "roles": [{key, name, description}], "models": [{name, provider, model}], "default_model", "limits": {"upload_max_mb", "upload_max_files", "uploads_pending", "max_running", "archive_max_mb"}}`: what a client may choose. Never a key, base_url or env name. |
+| POST `/api/v1/uploads?filename=<name>[&unpack=true]` | the file as the raw body, `Content-Type: application/octet-stream` or `application/zip` → 201 `{"upload": token, "filename", "bytes", "unpack", "expires_in": 3600}` (21.3) |
+| POST `/api/v1/sessions` | 21.4 → 202 `{"session": summary}` (201 → 200 with the existing one for a repeated `client_ref`) |
+| GET `/api/v1/sessions?state=&limit=` | `{"sessions": [summary]}`, newest first (limit ≤ 200, default 50); `state` filters |
+| GET `/api/v1/sessions/{id}` | `{"session": summary}` |
+| PATCH `/api/v1/sessions/{id}` | `{max_cost_usd?, max_agents?, wrap_up?: bool}` → `{"session"}`: what `swarm_control` does; a stopped session gets them in its own database (the `limits` and `wrap_up` keys the swarm reads at its start, §3), not in its overrides, which the database outranks |
+| POST `/api/v1/sessions/{id}/continue` | `{"text"}` → `{"session"}`: what `dreamteam -p -r <id> "<text>"` does with its prompt (start if stopped, a new instruction to the coordinator, a completed goal reopened with the text as the comment, a pending question answered by it), and it also lifts a budget pause when the budget now covers what was spent (409 `budget_exhausted` otherwise: raise it with PATCH first) |
+| POST `/api/v1/sessions/{id}/stop` | `{"session"}` |
+| DELETE `/api/v1/sessions/{id}?confirm={id}` | `{"ok": true}`; the session folder goes with it (§18.1 DELETE, skills `discard`) |
+| GET `/api/v1/sessions/{id}/events?after=&wait=&limit=&detail=&lang=` | `{"events": [event], "last": id, "more": bool, "state", "final": bool}` (21.6) |
+| GET `/api/v1/sessions/{id}/events/stream?after=&detail=&lang=` | Server-Sent Events (21.6) |
+| GET `/api/v1/sessions/{id}/requests` | `{"requests": [request]}`: what waits for the user now, oldest first (21.5) |
+| POST `/api/v1/sessions/{id}/requests/{rid}` | the answer (21.5) → `{"ok": true, "session"}` |
+| GET `/api/v1/sessions/{id}/messages?after=&limit=` | `{"messages": [{id, ts, from, to, text, reply_to}], "last"}`: the user's conversation with the members, oldest first |
+| POST `/api/v1/sessions/{id}/messages` | `{"to": ["all"] or [names], "text", "reply_to"?}` → 201 `{"message"}` (as `send_message` of the user); 409 `not_running` for a stopped session (use `continue`) |
+| GET `/api/v1/sessions/{id}/result` | the result (21.7), also while it runs (`"final": false`) |
+| GET `/api/v1/sessions/{id}/files?path=` | `{"path", "entries": [{name, path, type: file\|dir, size, modified}]}` of a folder of the session's workspace (21.8) |
+| GET `/api/v1/sessions/{id}/files/{path}` | the file's bytes (21.8) |
+| GET `/api/v1/sessions/{id}/archive?path=` | a zip of the workspace or of one folder in it (21.8) |
+
+`{id}` is the session's `uid` (§17.2: 32 hex, never reused), not its folder name: folder numbers come back after a
+delete (`_new_id` takes the highest number + 1), so a stored id could reach another job. The summary also has
+`name`, the folder name the board shows (`/s/<name>/`). `continue` starts a stopped session; `messages` POST and the
+answers of `question`, `review` and `mcp` requests need it running.
+
+### 21.3 Uploads
+
+- Required changes in `copyfrom.Uploads` (§17.2 "Copying files into a new session"), which today takes zips only:
+  any file is stored (`<token>.bin` + its `<token>.json`; cleanup knows the new suffix), and `create` copies several
+  sources into one staging folder. v1's uploads have their own cap, `[api] uploads_pending` (default 32 waiting at
+  once, 429 `too_many_uploads`), apart from the sessions page's 8 (`UPLOAD_MAX_PENDING`).
+- The guard's `raw_posts` maps `/api/v1/uploads` to two types, `application/octet-stream` and `application/zip`
+  (neither is CORS-safelisted: a cross-site page cannot send one without a preflight the hub never answers);
+  anything else is 415.
+- `filename` becomes the file's name in the session folder, so it is refused (400 `bad_name`), never cleaned up:
+  empty, `.` or `..`, a separator (`/`, `\`), a NUL or another control character, `:`, over `NAME_MAX` (200)
+  characters, a name Windows cannot hold on every OS (reserved device names such as `CON` or `aux.txt`, a trailing
+  dot or space: the portable rule of skills, §19), and, case-folded, the names the copy leaves out
+  (`COPY_EXCLUDE_NAMES`: `.git`, `node_modules`, ...) and the session's own: `.scratch`, `.gitignore`,
+  `.dreamteam`. (A file named `.git` would be taken for a linked worktree's gitfile, and the autocommits would go to
+  the repository it names.)
+- `unpack=true` takes a zip and puts its files there under the zip rules of `copy_from` (a zip of one folder gives
+  that folder's files; `.git`, links and the excluded names are left out); without it a zip is one file like any
+  other. The limits are `[workspace] copy_max_mb` / `copy_max_files` (413 `too_large`, also for the sum of a
+  session's uploads). A token lives an hour and is used by one successful create.
+
+### 21.4 Creating a session
+
+```json
+{"goal": "text, required: first line the title, the rest the description (as §17.2)",
+ "title": "", "description": "",
+ "language": "ru | en",
+ "team": "name of a saved team | [\"role\", ...]",
+ "model": "profile name",
+ "start_agents": 3, "max_agents": 8, "max_cost_usd": 5.0,
+ "network": "on | off",
+ "files": ["upload token", "..."],
+ "skills": ["library skill name", "..."],
+ "answers": "auto | manual",
+ "clarify": false,
+ "stop_when_done": true,
+ "client_ref": "the caller's own id of this job, ≤ 128 printable characters"}
+```
+
+- Unset values come from the settings, as for the board. `team`: a string is a saved team (§17.3; 400
+  `unknown_team` with the saved names), a list is the starting roles in order, as `session_create` of the launcher
+  MCP (§18.2: it sets `start_agents` unless that is given), except that a name the catalog does not resolve is 400
+  `unknown_role` (the board invents a role; a program's typo should fail). `model`: 400 `unknown_model` with the
+  profile names. No provider, key or endpoint is ever taken: those are the settings of the computer DreamTeam runs
+  on.
+- `files`: up to 20 tokens of 21.3; their files land in the session folder before the first start, as
+  `copy_from_upload` does. Not in v1: `workspace`, `copy_from` (paths on the hub's computer) and skills from a path,
+  Git URL or Claude Code (`skills` names the library only: 400 `unknown_skill`).
+- `answers`: who answers what the agents ask the user. `auto` (default): the hub itself, as `dreamteam -p` with
+  auto-replies (21.5). `manual`: the client, through `requests`. `clarify: true` (the planner asks first, §3.1) only
+  with `manual` (400 otherwise, as `--clarify` needs `--no-auto-reply`).
+- `stop_when_done` (default true): when the goal is completed, or the budget pauses the session, the session is
+  stopped (its background jobs too), as `dreamteam -p` does with its own launcher; `continue` starts it again.
+  false: it stays running like a board session.
+- `client_ref`: a create that repeats the `client_ref` of a session v1 still has answers 200 with that session and
+  creates nothing (a retry after a timeout never makes a second job); the same `client_ref` with another body is
+  409 `conflict`.
+- Order, so that a refused create costs nothing: the whole body is checked first (fields, team, model, roles,
+  skills, every upload token known, unused and of this caller, name clashes between the uploads, the limits, `[api]
+  max_running`); any 4xx leaves every token usable. Then the session folder is made, the uploads are claimed and
+  copied, and the answer is 202 with state `starting`; the start runs in the background. A start that fails leaves
+  the session stopped with `api.start_error` (state `failed`, the text in the summary's `error`).
+- The session's `session.json` (§17.2) gets `"via": "api"` and `"api": {"answers", "stop_when_done", "client_ref",
+  "base_commit", "started_at", "finished_at", "start_error"}`: `base_commit` is the workspace's HEAD when the session
+  first started (after the uploads were committed); `started_at` the first start, `finished_at` when it last reached
+  a final state (21.7). The sessions page shows such a session like any other, marked "API".
+- `[api] max_running` (default 3, 0 = no limit): running sessions that were created through v1; one more start
+  (create or `continue`) is 429 `too_many_sessions`.
+
+### 21.5 Requests to the user, automatic answers (autoreply.py)
+
+A **request** is something only the user can give, in board-neutral words. Its id names the exact thing asked, so
+a retried answer never lands on a newer one:
+
+```json
+{"id": "q12", "kind": "question", "ts", "from": "Anna Smith", "text", "pauses_swarm": true}
+{"id": "m15", "kind": "message",  "ts", "from": "Anna Smith", "text"}
+{"id": "r7-1794463609", "kind": "review",   "ts", "from": "Anna Smith", "task": {"id", "title", "summary"}}
+{"id": "s-web", "kind": "mcp",  "ts", "from": "Anna Smith", "server": {"name", "description", "command"}}
+```
+
+- `question`: the question that holds a question pause (§3.1, `pauses_swarm: true`), or, while the snapshot's
+  `clarify_wait` (§14.1) names a planner that waits for the user's answers, that planner's last message to the user
+  (`pauses_swarm: false`). Answer `{"text"}`: a message to the asker with `reply_to` (which ends the
+  pause). These block the work, and so does every `review` and `mcp` request: the state is then `waiting` (21.7).
+- `message`: a member's last message to the user that no message of the user to that member followed (the
+  query `swarm._LAST_TO` answers; a message the user sends on the board closes it too). Answer `{"text"}`. It does not block:
+  reports to the user land here too, and the state stays `running`.
+- `review`: a task in review whose reviewer is the user; the id carries the second it entered review (its
+  `updated_at` then, as `-p` keys its approvals), so a new submission is a new id.
+  Answer `{"approve": bool, "comment"?}` → `task_review`.
+- `mcp`: an agent-built MCP server that waits for the user's approval (`[mcp] require_approval`, §11). Answer
+  `{"approve": bool}` → `mcp_approve`. Never answered automatically. Skill proposals are not requests: they do not
+  block the work, and the board decides them.
+- An answered or vanished request is 404 `not_found`; an answer of another kind's shape is 400.
+- **`answers: "auto"`**: `autoreply.SessionAutoReply` does for that session what the `-p` client does (docs/TUI.md
+  §2): every message of a member to the user gets `AUTO_REPLY` (at most `AUTO_REPLY_MAX` per start), a task waiting
+  for the user's review is approved with `AUTO_REVIEW` once per round, and a question pause is answered. It runs as
+  a task that reads the session's journal by id from where it stopped, woken by the bus (never inside a bus
+  listener, which would re-enter `emit`), and is started by `_start_locked` when the `api` meta says `auto`, on
+  every start path (the board, the TUI, `-r`, a resume after a hub restart, the launcher MCP). There too,
+  `Swarm.hold_auto_reply()` (new) takes the auto-reply lease for the whole run before `swarm.start()` / `set_goal`:
+  no planning question first, `pause_swarm` ignored (§3.1). Past `AUTO_REPLY_MAX`, messages are no longer answered:
+  they stay requests of kind `message`, and the session notifies the user once (a `notification`). `mcp` requests
+  stay requests in this mode too. The texts and the limit move from printmode.py to autoreply.py; `-p` keeps its
+  client-side replies.
+
+### 21.6 Events
+
+An event is a journal row (§9) with its id, plus a line for people:
+
+```json
+{"id": 41, "type": "task.updated", "ts": 1794463609.8, "actor": "Anna Smith", "data": {...},
+ "text": "◐ #3 Parse the document — Anna Smith"}
+```
+
+- `data` is §9's and may gain fields.
+- `text`: one line from `eventtext.event_text(event, lang)` (new, outside the `tui` package, standard library only):
+  the meaning of the TUI's feed line (`render.event`) without its terminal parts: no wrapping, panels or colours,
+  no clock (`ts` has the time). A tool call and its result are one line: the call event carries it and the result
+  event has `text` null. Null also for an event the feed leaves out. The TUI may later take its words from it. The
+  wording is for people and may change (21.1).
+- `detail=timeline` (default) selects by type, so the database does the filtering: `task.*`, `message.sent`,
+  `notification`, `goal.*`, `agent.hired`, `agent.retired`, `swarm.*`, `session.*`, `job.started`, `job.ended`,
+  `mcp.*`, `skill.*`, `file.changed`. `detail=all`: every journaled event (`agent.activity`, `agent.usage`,
+  `agent.status`, `trigger.*`, the locks too). The live-only `trace.*` and `job.silent` (§9) have no id and are never
+  sent.
+- New journaled events (§9): `session.started` {} and `session.stopped` {reason: `done` | `budget` | `user` |
+  `failed` | `shutdown`}, emitted into the session's journal by the manager around a start and a stop (a stop by
+  `stop_when_done` included), so that a client sees the end as an event.
+- **Polling.** `after` = the last id the client has (0: from the oldest event: the query runs `ORDER BY id ASC`,
+  unlike `EventBus.recent(since=0)`, which gives the newest), `limit` ≤ 500 (default 200). `last` is the highest id
+  the query examined, not only the last one returned, and `more` says whether events newer than `last` exist, so a
+  page whose rows the filter dropped still moves on. `wait` 0–60 seconds (default 0): with nothing newer, the answer
+  waits up to that long for a new event or a change of state. `state` and `final` (21.7) are read before the
+  events: when `final` is true and `more` false, nothing will follow.
+- **Stream.** `text/event-stream`; each event `id: <id>`, `event: <type>`, `data: <the event JSON>`; `after` or the
+  `Last-Event-ID` header resumes. It reads the journal by id; the bus only wakes it, and it follows the session
+  across its swarm objects (a stop or start replaces the swarm and its bus, §17.2), so nothing is lost when a bus
+  queue overflows or the swarm changes. A `: ping` comment every 15 s. When the state becomes final, one `event:
+  result` with the result (21.7), then the stream ends. A hub shutdown ends it without a result (the session comes
+  back with the hub when it has `autostart`); a client reconnects with `Last-Event-ID`.
+
+### 21.7 State, summary, result
+
+`state`, the first that holds:
+
+| state | when |
+|---|---|
+| `starting` | a create or `continue` is starting it |
+| `failed` | its last start failed (`api.start_error`) |
+| `created` | never started (`start` was not reached yet) |
+| `done` | the goal is completed (running with `stop_when_done: false`, or stopped) |
+| `budget` | the budget paused it (running), or that pause stopped it |
+| `waiting` | running, and a `question`, `review` or `mcp` request waits (21.5) |
+| `paused` | running, paused by the user |
+| `running` | running |
+| `stopped` | stopped otherwise (by the user, a DELETE in progress, a hub shutdown) |
+
+`final` is true when the session is stopped and will not come back by itself: not running, not `starting`, and no
+`autostart` mark (a hub shutdown keeps the mark, and the session is resumed with the hub). With `stop_when_done`
+the end of a job is `done` or `budget` with `final: true`.
+
+Summary: `{"id": uid, "name", "title", "state", "final", "error", "goal": {title, description, status, summary} |
+null, "language", "model", "cost_usd", "max_cost_usd", "max_agents", "created_at", "started_at", "finished_at",
+"agents": n, "tasks": {status: n}, "requests": n, "answers", "stop_when_done", "client_ref", "via", "board_url"}`.
+`board_url` is absolute when the hub knows its public address (`DREAMTEAM_PUBLIC_URL`, or a loopback bind), else
+null; opening it takes the hub token, not the API token.
+
+Result: `result.build_result(*, summary, goal, tasks, agents, jobs, cost_usd, started_at, finished_at, error)`, a
+builder moved out of printmode.py with explicit inputs (`-p` passes its own clock and its `status`, which keeps its
+own words: done, budget, timeout, error, interrupted). v1 gives the `-p` fields (`type`, `session`, `goal`,
+`summary`, `tasks`, `cost_usd`, `duration_s`, `agents`, `jobs`; `duration_s` from `api.started_at` to
+`finished_at` or now) with `status` = the v1 state, plus `final`, `error`, `board_url` and `"changed_files": [{"path",
+"change": "added" | "modified" | "deleted"}]`:
+
+- the working tree against `base_commit`, untracked files included (files still held back from the autocommit, §7
+  "Held new files", count), ignored ones and `.scratch` not: an output the agents put into `.gitignore` is not
+  listed;
+- computed with DreamTeam's guarded git (`hubgit`, §7: the repository's hooks, filters and `core.fsmonitor`
+  disarmed) under the workspace's git lock while the session runs, and cached per HEAD and working-tree state;
+- null, with `changed_files_error`, when git is off, the workspace has no `base_commit`, or the commit is gone.
+
+### 21.8 Files
+
+- Paths are relative to the session's workspace, with `/`. An absolute path, `..`, a NUL, a backslash, and, on
+  Windows, a component with a trailing dot or space or a `~` short-name form are 400 `bad_name`.
+- Nothing is followed when a file is opened, not only when it is checked: the path is walked one component at a time
+  from the workspace's folder with no-follow opens (`O_NOFOLLOW` and directory descriptors on POSIX, as treecopy.py
+  does; on Windows every component's attributes are checked for a reparse point and the final handle's path is
+  compared), so a link, or a folder swapped for one meanwhile, ends the request instead of reading outside the
+  workspace (in the sandbox the hub reads with more rights than the agents, `/proc` included).
+- `.git` (case-folded, at any depth: nested repositories and gitfiles too) is never listed, served or archived;
+  `.scratch` (the members' own) only with `?scratch=true`.
+- `files/{path}`: the bytes, streamed, `Content-Type: application/octet-stream` whatever the name (the agents wrote
+  them, so a site that passes them to its visitors must not have them rendered), `Content-Disposition: attachment;
+  filename*=UTF-8''<name>`, `X-Content-Type-Options: nosniff`, `Content-Length`. A folder is 400 (list it instead).
+- `archive?path=`: a zip streamed as it is built, of the workspace or of that folder, with the same rules (links
+  left out, never followed). Over `[api] archive_max_mb` (default 1024) by a measure taken first: 413 `too_large`. An
+  error once the answer has started (a file vanished or turned into a link) aborts the connection, so the client gets
+  a zip without its central directory, never a valid one that lacks files; it is logged.
+
+### 21.9 Settings, modules, tests
+
+- `[api]` (`ApiSettings`): `max_running = 3`, `uploads_pending = 32`, `archive_max_mb = 1024`. The file gets the
+  section only when a value differs from its default, since an older version refuses unknown sections (as with
+  `[[teams]]`, §17.3); export carries it (§20).
+- `api_v1.py`: `api_routes(manager) -> [Route]`, mounted by `create_launcher_app` before `SessionRouter`; it uses
+  the manager and the session swarms (`manager.load(sid)`), never the internal routes over HTTP.
+- `autoreply.py`: `SessionAutoReply`, `AUTO_REPLY`, `AUTO_REVIEW`, `AUTO_REPLY_MAX` (moved from printmode.py, which
+  imports them). `eventtext.py`: `event_text`. `result.py`: `build_result`. `hubauth.py`: the API token.
+- Tests (ScriptedLLM, no network): the API token (absent: `api_disabled`; it opens no internal route; scope to
+  `via: "api"` sessions), the JSON error shape of the guard's answers; uploads (a file, an unpacked zip, every
+  refused name, `.git` among them, a name clash, the limits, tokens kept after a 4xx); create (unknown field, team,
+  model, role, skill; `client_ref` twice; a failed start); auto answers (a question, a review per round, a question
+  pause, past `AUTO_REPLY_MAX`, after a hub restart) and manual requests with their answers; polling (`after=0`
+  from the oldest, a page the filter emptied, `wait` woken by a state change) and the stream (resume by
+  `Last-Event-ID`, across a stop and a start, its `result`); `stop_when_done`; PATCH of a stopped session followed by
+  its start; `continue` after a budget stop; files and archive (path escapes, a link swapped in, `.git` at depth,
+  `.scratch`); `changed_files` with a hook in `.git/config` that must not run; `max_running`; uid ids after a
+  delete.
+
+### 21.10 Not in v1
+
+WebSocket; multipart uploads; `workspace` and `copy_from` paths; skills from paths or URLs; changing the settings
+(providers, keys, roles, teams) through v1; CORS; several users with their own quotas (every client with the API
+token acts as the one user of the hub); a callback URL called when a session ends; an OpenAPI document (it could
+come with the implementation).
