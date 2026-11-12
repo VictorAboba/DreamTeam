@@ -685,6 +685,45 @@ def test_question_pause_rendering():
         assert fields(i18n.TEXTS["ru"][key]) == fields(i18n.TEXTS["en"][key]) == names_, key
 
 
+def test_a_session_of_an_earlier_version_is_marked_and_its_message_is_the_twin():
+    """docs/SPEC.md §17.2: the picker, /sessions, the welcome box and /status show «прежняя версия» / "earlier
+    version" (warn), whatever else the summary says; the TUI's messages are the twins of the hub's texts and of the
+    home page's."""
+    from dreamteam import sessions
+    from dreamteam.tui.dialogs import session_status
+
+    old = {"id": "x", "status": "stopped", "earlier_version": True}
+    for extra in ({}, {"config_error": "bad"}, {"goal": {"title": "G", "status": "done"}},
+                  {"status": "running", "paused": True}):
+        assert session_status("en", {**old, **extra}) == "earlier version"
+        assert session_status("ru", {**old, **extra}) == "прежняя версия"
+        assert render._session_status(ctx(), {**old, **extra}) == ("прежняя версия", theme.WARN)
+    assert session_status("en", {**old, "earlier_version": False}) == "stopped"
+    assert "earlier version" in plain(render.sessions_table(ctx(lang="en"), [{**SESSIONS[0], **old}]))
+    assert "прежняя версия" in plain(render.sessions_table(ctx(), [{**SESSIONS[0], **old}]))
+
+    assert i18n.t("en", "earlier_session", sid="s1", version="0.2.0") == \
+        sessions.EARLIER_VERSION_TEXT.format(sid="s1", version="0.2.0")
+    assert i18n.t("en", "earlier_main", home="/h", version="0.2.0") == \
+        sessions.MAIN_EARLIER_VERSION_TEXT.format(home="/h", version="0.2.0")
+    assert i18n.t("en", "earlier_home") == "the home" and \
+        sessions.earlier_version_text("main", None, "0.2.0") == i18n.t("en", "earlier_main", home="the home",
+                                                                        version="0.2.0")
+    assert i18n.t("ru", "earlier_session", sid="s1", version="0.2.0") == (
+        "Сессия s1 создана более ранней версией DreamTeam, и эта версия (0.2.0) не может её открыть. Откройте её в "
+        "той версии, которой она создана (экспортируйте её здесь и импортируйте в домашнюю папку той версии: после "
+        "того как эта версия сохранила настройки, та может не прочитать эту папку), или удалите.")
+    assert i18n.t("ru", "earlier_main", home="/h", version="0.2.0") == (
+        "Сессия main (рой в /h) создана более ранней версией DreamTeam, и эта версия (0.2.0) не может её открыть. "
+        "Откройте её в той версии, которой она создана, или удалите вручную /h/.dreamteam/swarm.db (вместе с файлами "
+        "-wal и -shm).")
+    # the home page says the same words (home.js I18N)
+    home_js = (Path(render.__file__).parents[1] / "static" / "home.js").read_text(encoding="utf-8")
+    for lang in ("ru", "en"):
+        for key in ("earlier_session", "earlier_main"):
+            assert json.dumps(i18n.TEXTS[lang][key], ensure_ascii=False) in home_js, (lang, key)
+
+
 def test_background_job_lines():
     c = ctx()
     assert plain(render.event(c, ev("job.started", ANNA, job=job()))) == \

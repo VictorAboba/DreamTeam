@@ -115,14 +115,17 @@ class HubClient:
     async def trace_stats(self, sid, agent: str | None = None) -> dict
     def ws_url(self, sid) -> str                                   # ws(s)://host/{base}/ws
     def stream(self, sid) -> AsyncIterator[dict]
-        # Yields bus events (dicts as sent by the server, trace.* included), forever. It reconnects with
-        # backoff (0.5 s .. 10 s). On every (re)connect and loss it yields pseudo events
+        # Yields bus events (dicts as sent by the server, trace.* included) until the caller stops it. It
+        # reconnects with backoff (0.5 s .. 10 s). On every (re)connect and loss it yields pseudo events
         # {"type": "_connection", "data": {"state": "connected" | "lost"}}. When the hub answers the handshake
         # with an HTTP error instead (403: e.g. the session was deleted), {"state": "rejected", "status": N}
         # follows the "lost" (once per streak): consumers check over REST whether the session still exists, or
         # (also for a single swarm) whether the hub takes none of the tokens tried (HubError 401: its text is shown).
         # It stops when the iterator is closed (aclose) or the client is closed. Server close codes 1012
-        # (session restarted) / 1001 mean "reconnect now".
+        # (session restarted) / 1001 mean "reconnect now". A close 1011 with the reason `made by an earlier
+        # version` (EARLIER_REASON = launcher.EARLIER_VERSION_REASON: the hub accepts the socket of a session made
+        # by an earlier version, SPEC §17.2, then closes it) yields {"state": "earlier"} and ends the iterator:
+        # no reconnect opens that session.
 
 @dataclass
 class Connection:
@@ -177,11 +180,16 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     becomes its goal (`set_goal`). A session paused by the user (not by the budget) is resumed: the prompt
     is a new instruction to work on. A session paused for a member's question (the state's `swarm.question`,
     SPEC §3.1) is not resumed: the prompt goes to the asker instead, which makes it the answer.
+  - A session made by an earlier version (summary `earlier_version`, SPEC §17.2) is never opened and nothing is
+    created: `-r ID` of one exits 1 with its message (English, `sessions.earlier_version_text` with the hub's home
+    and version); `-c` whose most recent session is one exits 1 with `continue_earlier`.
 - It follows the session's WebSocket stream until it ends:
   - `goal.completed` → exit code 0;
   - `swarm.paused` with reason "budget" → 2;
   - timeout → 3;
   - an unrecoverable error (hub gone and not reconnecting for 60 s, or the session deleted) → 1;
+  - the stream's state `earlier` (the hub closed it 1011 «made by an earlier version»: an import replaced the
+    session) → 1 with the English message of `-r ID` above;
   - Ctrl+C → 130. The session is left as it is (running, if the hub is external).
 - When `dreamteam -p` runs the launcher in its own process (`main_print`, `conn.owned`), the session it used
   is stopped explicitly at the end, whatever the outcome: a one-shot run is not resumed by the next
@@ -556,8 +564,8 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/help` | commands table + key hints |
 | `/new [цель]` | new session (asks for the goal when omitted: the next input is the goal); first line = title, the rest = description |
 | `/team [команда \| роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); a bare word is a team saved in the settings first (`roles.team_choice`, SPEC §17.3 "Saved teams"), then a catalog role; with teams saved any other bare word is refused (`word*1` makes a new role), and so are a saved team's name that is no catalog role in a list or with `*N`, and a team with a role the catalog lacks; quotes around the argument, or around each item of a list, are dropped, as in other commands; the window copies the team when it is chosen, so a later edit of the team reaches the window only after `/team NAME` again; without an argument shows the team the window holds and lists the saved teams; the settings stay as they are |
-| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" (warn) while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up" |
-| `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it |
+| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" (warn) while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up"; a session made by an earlier version (SPEC §17.2) reads «прежняя версия» / "earlier version" (warn, before any other status): Enter and `/resume ID` print its message (`earlier_session`, or the legacy `main`'s `earlier_main`) and attach nothing, the picker closing; Del deletes it as usual |
+| `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it; the legacy `main`: `delete_legacy`, and when it was made by an earlier version its message instead, which names the file to remove by hand |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
 | `/board` | the board (`board`): one line per card, a parent's subtasks as dots in its line |
 | `/task N` | task with discussion (`task_detail` with the snapshot's tasks: a crew task's line «Групповая задача: до N участников, сейчас работают M» and the direct subtasks indented under «Направления (k)» / «Подзадачи (k)», between the description and the result) |
@@ -623,6 +631,20 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
     Answers for a session the user has left meanwhile (a slow state refresh) are not applied.
   - The event baseline is taken before the history; a message printed as history is not printed again
     when its `message.sent` is replayed (by message id).
+- Sessions made by an earlier version (summary `earlier_version`, SPEC §17.2) are never opened. Their message is
+  printed in the UI language (`earlier_session`, the twin of `sessions.EARLIER_VERSION_TEXT`; the legacy `main`:
+  `earlier_main`, which names `{home}/.dreamteam/swarm.db` to remove by hand); `{version}` is the hub's, `{home}` the
+  summary's `dir`, else the hub's home, else its project, the TUI's own home only for the launcher it runs itself,
+  else `earlier_home` («<домашняя папка>» / "the home"). `-r ID` of one: the message under the welcome box (no
+  session line in the box), no start request, nothing attached; a prompt given with it stays in the input line.
+  A refused session ends `--skill`'s resume attempt (no later resumed session gets the skills), and the skills go to
+  a session `/new` creates, as after `-c` with no sessions. A start answered 409 with `earlier_version` (a list gone
+  stale, or a message typed into a stopped session an import replaced) prints the message instead of the hub's
+  text: the typed message is not sent, and the session is left. A stream closed 1011 «made by an earlier version»
+  (the state `earlier`) prints it, leaves the session and stops reconnecting; the hub accepts the socket before
+  closing it, so «Связь с хабом восстановлена» / "Reconnected to the hub" can print just before.
+- Before updating to 0.2.0, finish or export the sessions in which agents already worked: 0.2.0 lists them but does
+  not open them, and there is no conversion.
 - Deleting a session (`/delete`, Del in the picker): the main session of a project home (`legacy`) is refused
   at once, as the hub would. Otherwise a `ConfirmDialog` («Удалить сессию «X»?», what is deleted, that a
   workspace folder outside the session stays, and that a running session's agents are stopped; «Нет»
@@ -762,8 +784,11 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   prompt.
 - `dreamteam -p "текст" [--output-format text|json|stream-json] [--verbose] [--timeout S]
   [--no-auto-reply]` runs print mode.
-- `-c/--continue` attaches to the most recently active session.
-- `-r/--resume [ID]` opens the picker, or attaches to ID.
+- `-c/--continue` attaches to the most recently active session. When that one was made by an earlier version
+  (SPEC §17.2) it never passes over it for an older one: `continue_earlier` under the welcome box, nothing attached,
+  a prompt given with it kept in the input line (`-p -c`: exit 1, §2).
+- `-r/--resume [ID]` opens the picker, or attaches to ID. `-r ID` of a session made by an earlier version: its
+  message under the welcome box, nothing attached (§4.5; `-p -r ID`: exit 1 with the English message, §2).
 - Shared options: `--home`, `--lang ru|en`, `--model PROFILE`, `--agents N`, `--team "ROLE[*N],…" | NAME`,
   `--max-agents N`, `--budget USD`, `--title T`, `--workspace DIR`, `--copy-from DIR|ZIP`, `--host`, `--port`.
   `--team` is the starting team of the session this run creates (`starting_roles`; `start_agents` = its size unless
@@ -771,7 +796,8 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   rule, its refusals and the note on stderr); `--agents` cannot go with a saved team. `-p` with `-c` or `-r ID` checks
   only its syntax.
 - `--skill REF|PATH|URL` (repeatable) is a skill of the session this run creates (with `-c` / `-r`: attached to the
-  session resumed first, also when it runs); `/skills add` without a session adds to the same list.
+  session resumed first, also when it runs; a session refused as one of an earlier version ends that attempt, and
+  the skills go to a session `/new` creates, §4.5); `/skills add` without a session adds to the same list.
 - `--workspace DIR` is the folder of the session this run creates (the TUI's first new session, or the
   session of `-p`): `~` and relative paths are resolved against the current directory; an empty or missing
   folder becomes its workspace, a folder with files (the user's project) is adopted (SPEC §17.2). With `-c` /

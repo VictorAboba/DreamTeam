@@ -955,6 +955,9 @@ class TUI:
                     return
                 focus = None if deleted else sid
         summary = next((s for s in sessions if s.get("id") == choice), None)
+        if summary is not None and summary.get("earlier_version"):   # the picker closes, the message is printed
+            self._refuse_earlier(summary)
+            return
         if summary is not None:
             await self.attach(summary)
 
@@ -969,8 +972,8 @@ class TUI:
             if summary is None:
                 self.error(self.t("unknown_session", id=sid))
                 return False
-        if summary.get("legacy"):
-            self.error(self.t("delete_legacy"))
+        if summary.get("legacy"):   # (one of an earlier version: its message names the file to remove by hand)
+            self.error(self._earlier_text(summary) if summary.get("earlier_version") else self.t("delete_legacy"))
             return False
         title = " ".join(str(summary.get("title") or sid).split())
         workspace = summary.get("workspace") if isinstance(summary.get("workspace"), dict) else {}
@@ -1056,7 +1059,34 @@ class TUI:
         if summary is None:
             self.error(self.t("unknown_session", id=sid))
             return
+        if summary.get("earlier_version"):
+            self._refuse_earlier(summary)
+            return
         await self.attach(summary)
+
+    def _earlier_text(self, summary: dict) -> str:
+        """The message of a session made by an earlier version (docs/SPEC.md §17.2), in the UI language: the legacy
+        `main` names the file to remove by hand, in the summary's folder, else the hub's home or project (this TUI's
+        home only for the launcher it runs itself). {version} is the hub's."""
+        version = self.hub.get("version") or __version__
+        if summary.get("legacy") or summary.get("id") == "main":   # (sessions.LEGACY_ID)
+            home = (summary.get("dir") or self.hub.get("home") or self.hub.get("project")
+                    or (str(self.home) if self.conn.owned else self.t("earlier_home")))
+            return self.t("earlier_main", home=home, version=version)
+        return self.t("earlier_session", sid=summary.get("id"), version=version)
+
+    def _refuse_earlier(self, summary: dict) -> None:
+        """A session made by an earlier version is never opened: its message, nothing attached. It ends --skill's
+        resume attempt (no later resumed session gets them); a session /new creates still does."""
+        self.error(self._earlier_text(summary))
+        self._resume_skills = False
+
+    async def _leave(self) -> None:
+        """Stop following the current session (it went away under this view)."""
+        await self._detach()
+        self._reset_session()
+        self._update_suggestions()
+        self.invalidate()
 
     async def stop_session(self) -> None:
         summary = await self.client.stop_session(self.sid)
@@ -1234,6 +1264,12 @@ class TUI:
                 summary = await (self.client.start_session(sid, skills=skills) if skills else
                                  self.client.start_session(sid))
             except HubError as exc:
+                if exc.status == 409 and isinstance(exc.data, dict) and exc.data.get("earlier_version"):
+                    # a list gone stale (an import replaced the session): as for one listed so, nothing attached;
+                    # the skills of this attempt stay for a session /new creates
+                    self.skills_override = skills or self.skills_override
+                    self._refuse_earlier(summary)
+                    return
                 stopped = await self._folder_gone(sid, exc)
                 if stopped is None:
                     raise
@@ -1353,6 +1389,13 @@ class TUI:
             try:
                 self.session = await self.client.start_session(self.sid)
             except HubError as exc:
+                if exc.status == 409 and isinstance(exc.data, dict) and exc.data.get("earlier_version"):
+                    # an import replaced the stopped session with one made by an earlier version: its message (the
+                    # caller prints it, as any failed hub call), the session left, the typed message never sent
+                    text = self._earlier_text(self.session or {"id": self.sid})
+                    self._resume_skills = False
+                    await self._leave()
+                    raise HubError(exc.status, text, exc.data) from None
                 stopped = await self._folder_gone(self.sid, exc)
                 if stopped is None:
                     raise
@@ -1943,6 +1986,13 @@ class TUI:
                 self._moving_conn = state      # (change_folder handles a loss not made good by then)
                 return
             self._moving_conn = None
+        if state == "earlier":
+            # the hub closed the stream 1011 «made by an earlier version»: an import replaced the session; the stream
+            # ended (no reconnect opens it). The hub accepts the socket first, so «connection restored» may precede.
+            if self.attached:
+                self._refuse_earlier(self.session or {"id": self.sid})
+                await self._leave()
+            return
         if state == "rejected":
             # the hub refused the stream: if the session is gone (deleted in the web UI), stop following it; a hub
             # that takes no token this computer may send says so over REST too (also a single swarm's: sid None,
@@ -2054,6 +2104,7 @@ class TUI:
             sessions: list[dict] = []
             target: dict | None = None
             earlier: dict | None = None  # -c: the most recent session, made by an earlier version
+            refused: dict | None = None  # -r ID: a session made by an earlier version (its message, nothing attached)
             if self.client.mode == "launcher":
                 if not self._lang_fixed:
                     with contextlib.suppress(HubError):
@@ -2066,6 +2117,8 @@ class TUI:
                 if self.session_arg:
                     target = next((s for s in sessions if s.get("id") == self.session_arg), None)
                     missing = None if target else self.session_arg
+                    if target is not None and target.get("earlier_version"):   # never opened (SPEC §17.2)
+                        refused, target = target, None
                 elif self.continue_last and sessions:
                     target = max(sessions, key=lambda s: _float(s.get("last_activity") or s.get("created_at")))
                     if target.get("earlier_version"):  # never opened, nor passed over for an older one (SPEC §17.2)
@@ -2077,6 +2130,9 @@ class TUI:
             elif earlier is not None:
                 self.error(self.t("continue_earlier", id=earlier.get("id"),
                                   version=self.hub.get("version") or __version__))
+                self._resume_skills = False   # the skills go to a session /new creates, as with no sessions
+            elif refused is not None:
+                self._refuse_earlier(refused)
             elif self.continue_last and not sessions and self.client.mode == "launcher":
                 self.info(self.t("no_sessions_continue"))
             if self.client.mode != "launcher":

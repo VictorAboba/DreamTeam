@@ -222,6 +222,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_wrap_up": "завершается",
         "sess_done": "цель достигнута",
         "sess_error": "ошибка конфигурации",
+        "sess_earlier": "прежняя версия",
+        # a session made by an earlier version (docs/SPEC.md §17.2): the twins of sessions.EARLIER_VERSION_TEXT and
+        # MAIN_EARLIER_VERSION_TEXT (and of home.js); earlier_home stands for {home} when nothing names the folder
+        "earlier_session": "Сессия {sid} создана более ранней версией DreamTeam, и эта версия ({version}) не может её "
+                           "открыть. Откройте её в той версии, которой она создана (экспортируйте её здесь и "
+                           "импортируйте в домашнюю папку той версии: после того как эта версия сохранила настройки, "
+                           "та может не прочитать эту папку), или удалите.",
+        "earlier_main": "Сессия main (рой в {home}) создана более ранней версией DreamTeam, и эта версия ({version}) "
+                        "не может её открыть. Откройте её в той версии, которой она создана, или удалите вручную "
+                        "{home}/.dreamteam/swarm.db (вместе с файлами -wal и -shm).",
+        "earlier_home": "<домашняя папка>",
         "spent_of": "Потрачено {spent} из {budget} ({pct}%)",
         "spent_unlimited": "Потрачено {spent} (без лимита)",
         "mt_title": "Профили моделей",
@@ -855,6 +866,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_wrap_up": "wrapping up",
         "sess_done": "goal achieved",
         "sess_error": "config error",
+        "sess_earlier": "earlier version",
+        "earlier_session": "Session {sid} was made by an earlier version of DreamTeam and cannot be opened by this one "
+                           "({version}). Open it with the version that made it (export it here, then import it into a "
+                           "home of that version: once this one saved its settings, that version may not read this "
+                           "home), or delete it.",
+        "earlier_main": "Session main (the swarm in {home}) was made by an earlier version of DreamTeam and cannot be "
+                        "opened by this one ({version}). Open it with the version that made it, or remove "
+                        "{home}/.dreamteam/swarm.db (with its -wal and -shm files) by hand.",
+        "earlier_home": "the home",
         "spent_of": "Spent {spent} of {budget} ({pct}%)",
         "spent_unlimited": "Spent {spent} (no limit)",
         "mt_title": "Model profiles",

@@ -461,6 +461,16 @@ class _PrintRun:
                         continue
                 if ev.get("type") == "_connection":
                     state = (ev.get("data") or {}).get("state")
+                    if state == "earlier":   # the hub closed the stream: an import replaced the session with one
+                        # made by an earlier version (docs/SPEC.md §17.2), which this version never opens
+                        from ..sessions import earlier_version_text   # (as for -r ID of one)
+
+                        try:
+                            hub = await self.client.hub_info()
+                        except HubError:
+                            hub = {}
+                        raise _Finished("error", earlier_version_text(str(self.sid), hub.get("home"),
+                                                                      hub.get("version")))
                     if state == "connected":
                         lost_since = None
                         await self.bounded(self.catch_up())

@@ -4108,7 +4108,13 @@ settings; ValueError when they are invalid):
   эту папку), или удалите.», for `main`
   «Сессия main (рой в {home}) создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть.
   Откройте её в той версии, которой она создана, или удалите вручную {home}/.dreamteam/swarm.db (вместе с файлами
-  -wal и -shm).» The CLI's texts (the project message, `traces`, `console`, `-r`, `-p`) and the import reason
+  -wal и -shm).» In the TUI, `{version}` is the hub's, else this one's, and the legacy `main`'s `{home}` is the
+  summary's `dir`, else the hub's home, else its project; the TUI's own home only for a launcher it runs itself,
+  else a neutral word («<домашняя папка>» / "the home"). A TUI attached to a session that becomes one of an earlier
+  version (an import replaced it: the close 1011 with the reason `made by an earlier version`, or a start answered
+  409 with `earlier_version`, e.g. for a message typed into it while stopped) prints the message in the user's
+  language, leaves the session and stops reconnecting (the typed message is not sent); print mode exits 1 with
+  the English text. The CLI's texts (the project message, `traces`, `console`, `-r`, `-p`) and the import reason
   (§20.4) are English, like the hub's errors, except where the TUI shows the twin; `-c` and `-p -c` whose most
   recent session is such a one say a shorter message of their own in the user's language (§18.3). Such a session is listed and
   marked (summary `earlier_version`), and only listing (its summary),
@@ -4858,7 +4864,10 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   (`resolve_ref`; `claude-project:x` against the `--workspace` folder; not checked when resuming, the hub resolves it
   against the session's folder): `dreamteam: --skill X: <error>` on stderr, exit 2. The TUI attaches them to the session it creates, or
   with `-c` / `-r` to the resumed one (`POST .../start {"skills", "via": "cli"}`, live when it runs; `-r` without an
-  id: the session picked; one attempt, so a failed one never attaches them to another session later); `-p` the
+  id: the session picked; one attempt, so a failed one never attaches them to another session later; a session
+  refused as one of an earlier version — `-r ID`, the picker, `-c`, or a start the hub answers 409 with
+  `earlier_version` — ends the resume attempt: no later resumed session gets them; a session the TUI then creates
+  does, as after `-c` with no sessions); `-p` the
   same; `serve` passes them to `create(..., skills=, via="cli")`. `--skill` is not a TUI-only flag (`serve` takes it too).
 - The directory: `--home`, else DIR, else the current directory when it has `dreamteam.toml`, else the default
   home (`serve` never takes the current directory: `--home`, DIR or the default home). It is a launcher **home**
@@ -5005,7 +5014,8 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   session (`console` and `traces` without `--session`) still skips sessions made by an earlier version; `-r ID` of
   one prints its message (the TUI says it under the welcome box and creates nothing; `-p` exits 1); the `-r`
   picker and `/sessions` show them with the status «прежняя версия» / "earlier version", Enter shows the message
-  instead of attaching, Del deletes as usual; `console --session ID` refuses one with the message (exit 1, before
+  instead of attaching (the picker closes and the message is printed; `/resume ID` the same; the legacy `main`'s Del
+  and `/delete` show its message too), Del deletes as usual; `console --session ID` refuses one with the message (exit 1, before
   its stopped check; without `--session` it picks, like `traces`, only among the sessions this version opens);
   `sessions rm` deletes them as any session (the legacy `main` stays undeletable there too, and its message names
   the file to remove by hand).

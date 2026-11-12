@@ -514,6 +514,186 @@ async def test_a_tui_prompt_for_a_session_that_does_not_open_creates_nothing(tmp
             assert not h.tui.attached and h.tui.sid is None
             assert len(await conn.client.sessions()) == 2
             assert untouched(made)
+            if how == "resume":   # its own message, not "no such session"
+                assert made.text in " ".join(h.text.split()) and "No session" not in h.text   # (wrapped at 200)
+        finally:
+            await h.close()
+    await conn.close()
+
+
+def wait_policy(system, messages, tools):
+    return call("wait")
+
+
+@pytest.mark.parametrize("lang", ["en", "ru"])
+async def test_the_tui_resume_id_says_its_message(tmp_path, lang):
+    """`dreamteam -r ID` of a session made by an earlier version: its message in the UI language under the welcome
+    box (no session line in it), no start, nothing attached, nothing written."""
+    from test_tui_app import Harness
+
+    from dreamteam.tui import i18n
+
+    made = await make_old(tmp_path, "record")
+    await made.manager.shutdown()
+    conn = await connect(made.home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(wait_policy, profile))
+    twin = i18n.t(lang, "earlier_session", sid=made.sid, version=__version__)
+    with contextlib.ExitStack() as stack:
+        h = Harness(conn, stack, width=400, session=made.sid, lang=lang)
+        try:
+            await h.see(twin)
+            await h.until(lambda: h.tui.ready.is_set(), what="the start")
+            await asyncio.sleep(0.2)
+            text = h.text
+            assert text.index(i18n.t(lang, "welcome")) < text.index(twin) and text.count(twin) == 1
+            assert i18n.t(lang, "unknown_session", id=made.sid) not in text
+            assert i18n.t(lang, "session_starting", title="Old") not in text
+            assert f"{i18n.t(lang, 'w_session')}: Old" not in text
+            assert not h.tui.attached and h.tui.sid is None
+            assert untouched(made)
+        finally:
+            await h.close()
+    await conn.close()
+
+
+async def test_the_tui_shows_mains_own_message_and_never_deletes_it(tmp_path):
+    """The legacy `main` made by an earlier version: `-r main`, Enter and Del in the picker, and `/delete main` show its
+    own message, which names the file to remove by hand; nothing is written or deleted."""
+    from test_tui_app import DELETE_KEY, Harness
+
+    from dreamteam.tui.dialogs import SessionPicker
+
+    home = make_home(tmp_path)
+    write_earlier(home / ".dreamteam" / "swarm.db", "record")
+    data = home / ".dreamteam"
+
+    def swarm_files() -> dict:   # (the launcher's own files live in this folder too)
+        return {name: value for name, value in snapshot(data).items() if name.startswith("swarm.db")}
+
+    before = swarm_files()
+    conn = await connect(home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(wait_policy, profile))
+    summary = next(s for s in await conn.client.sessions() if s["id"] == LEGACY_ID)
+    assert summary["earlier_version"] is True and summary["legacy"] is True
+    twin = MAIN_EARLIER_VERSION_TEXT.format(home=summary["dir"], version=__version__)
+    assert f"remove {summary['dir']}/.dreamteam/swarm.db" in twin
+    with contextlib.ExitStack() as stack:
+        h = Harness(conn, stack, width=1000, session=LEGACY_ID)   # (a long path: not wrapped)
+        try:
+            await h.see(twin)
+            assert not h.tui.attached
+            await h.run(f"/delete {LEGACY_ID}", twin)
+            assert h.text.count(twin) == 2
+            h.type("/sessions\r")
+            await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker")
+            assert h.tui.dialog.select.selected.value == LEGACY_ID
+            assert "earlier version" in h.tui.dialog.select.selected.hint
+            h.type(DELETE_KEY)   # no confirmation: its message, and the picker again
+            await h.until(lambda: h.text.count(twin) == 3, what="the message on Del")
+            await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker again")
+            h.type("\r")
+            await h.until(lambda: h.text.count(twin) == 4 and h.tui.dialog is None, what="the message on Enter")
+            assert not h.tui.attached
+        finally:
+            await h.close()
+    assert swarm_files() == before and list(before) == ["swarm.db"]
+    assert LEGACY_ID in [s["id"] for s in await conn.client.sessions()]
+    await conn.close()
+
+
+async def test_the_tui_picker_marks_it_shows_its_message_and_deletes_it(tmp_path):
+    """`dreamteam -r --skill X` and the picker: the status "earlier version"; Enter prints the message and attaches
+    nothing (the resume attempt of --skill ends: a session /new creates gets X); `/resume ID` the same; Del deletes it as
+    any session."""
+    from conftest import make_skill
+    from test_tui_app import DELETE_KEY, DOWN, Harness
+
+    from dreamteam.tui.dialogs import ConfirmDialog, SessionPicker
+
+    made, older = await make_old_latest(tmp_path)
+    pdf = make_skill(tmp_path / "src" / "pdf", "pdf")
+    conn = await connect(made.home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(wait_policy, profile))
+
+    async def select(h: Harness, sid: str) -> None:
+        await h.until(lambda: isinstance(h.tui.dialog, SessionPicker), what="the picker")
+        for _ in range(len(h.tui.dialog.select.options)):
+            if h.tui.dialog.select.selected.value == sid:
+                return
+            index = h.tui.dialog.select.index
+            h.type(DOWN)
+            await h.until(lambda: h.tui.dialog.select.index != index)
+        raise AssertionError(f"{sid} is not in the picker")
+
+    with contextlib.ExitStack() as stack:
+        h = Harness(conn, stack, width=400, session="", initial_prompt="/sessions", overrides={"skills": [str(pdf)]})
+        try:
+            await select(h, made.sid)
+            assert "earlier version" in h.tui.dialog.select.selected.hint
+            assert "earlier version" not in next(o.hint for o in h.tui.dialog.select.options if o.value == older)
+            h.type("\r")
+            await h.see(made.text)
+            await h.until(lambda: h.tui.dialog is None, what="the picker closed")
+            assert not h.tui.attached and untouched(made)
+            assert h.tui._resume_skills is False and h.tui.skills_override == [str(pdf)]
+            await h.run(f"/resume {made.sid}", made.text)
+            assert h.text.count(made.text) == 2 and not h.tui.attached and untouched(made)
+            h.type("/sessions\r")
+            await select(h, made.sid)
+            h.type(DELETE_KEY)
+            await h.until(lambda: isinstance(h.tui.dialog, ConfirmDialog), what="the confirmation")
+            h.type("1")   # "Yes"
+            await h.see(f'Session "Old" ({made.sid}) deleted', 20)
+            h.type("\x1b")
+            await h.until(lambda: h.tui.dialog is None, what="the picker closed")
+            assert made.sid not in [s["id"] for s in await conn.client.sessions()] and not made.folder.exists()
+        finally:
+            await h.close()
+    await conn.close()
+
+
+@pytest.mark.parametrize("how", ["resume", "continue", "stale", "no_sessions"])
+async def test_a_refused_session_leaves_the_skill_option_to_a_new_session(tmp_path, monkeypatch, how):
+    """`--skill X` with `-r ID` of a session made by an earlier version, `-c` whose most recent session is one, or a
+    start the hub answers 409 `earlier_version` (a list gone stale): the resume attempt ends (no later resumed
+    session gets X), and the session /new creates gets X, as after `-c` with no sessions (docs/SPEC.md §18.3
+    `--skill`)."""
+    from conftest import make_skill
+    from test_tui_app import Harness
+
+    from dreamteam.tui.client import HubError
+
+    older = None
+    if how == "no_sessions":
+        home, made = make_home(tmp_path), None
+    else:
+        made, older = await make_old_latest(tmp_path)
+        home = made.home
+    pdf = make_skill(tmp_path / "src" / "pdf", "pdf")
+    conn = await connect(home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(wait_policy, profile))
+    if how == "stale":   # the list says `older` opens; an import replaced it meanwhile
+        async def refused(sid, **kwargs):
+            raise HubError(409, made.text, {"error": made.text, "earlier_version": True})
+
+        monkeypatch.setattr(conn.client, "start_session", refused)
+    kwargs: dict[str, Any] = {"resume": {"session": made.sid if made else None}, "continue": {"continue_last": True},
+                              "stale": {"session": older}, "no_sessions": {"continue_last": True}}[how]
+    with contextlib.ExitStack() as stack:
+        h = Harness(conn, stack, width=400, overrides={"skills": [str(pdf)]}, **kwargs)
+        try:
+            await h.until(lambda: h.tui.ready.is_set(), what="the start")
+            await asyncio.sleep(0.2)
+            assert not h.tui.attached and h.tui.skills_override == [str(pdf)]
+            assert h.tui._resume_skills is (how == "no_sessions")
+            if how == "stale":   # the message of the session asked for, in place of the hub's text
+                assert f"Session {older} was made by an earlier version" in " ".join(h.text.split())
+            h.type("/new Write a haiku\r")
+            await h.until(lambda: h.tui.attached and h.tui.sid, 30, "the new session")
+            summary = next(s for s in await conn.client.sessions() if s["id"] == h.tui.sid)
+            assert summary["skills"] == ["pdf"] and h.tui.skills_override == []
+            if made is not None:
+                assert untouched(made)
         finally:
             await h.close()
     await conn.close()

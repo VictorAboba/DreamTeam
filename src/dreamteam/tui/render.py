@@ -1716,6 +1716,8 @@ def job_output(ctx: RenderContext, text: Any) -> RenderableType:
 
 def _session_status(ctx: RenderContext, s: dict) -> tuple[str, str]:
     goal = _d(s.get("goal"))
+    if s.get("earlier_version"):   # made by an earlier version: never opened (docs/SPEC.md §17.2)
+        return ctx.t("sess_earlier"), theme.WARN
     if s.get("config_error") or s.get("error"):
         return ctx.t("sess_error"), theme.ERROR
     if goal.get("status") == "done":

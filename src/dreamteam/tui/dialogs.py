@@ -436,6 +436,8 @@ class SessionPicker(Dialog):
 def session_status(lang: str, s: dict) -> str:
     """Status label of a session summary (as the sessions table shows it)."""
     goal = s.get("goal") if isinstance(s.get("goal"), dict) else {}
+    if s.get("earlier_version"):   # made by an earlier version: never opened (docs/SPEC.md §17.2)
+        return t(lang, "sess_earlier")
     if s.get("config_error") or s.get("error"):
         return t(lang, "sess_error")
     if goal.get("status") == "done":
