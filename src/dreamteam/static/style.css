@@ -311,6 +311,9 @@ code { font-family: var(--mono); font-size: .92em; }
 .stack-row .ic-eye { color: var(--c-review); flex: none; }
 .stack-row .crew-chip { flex: none; }
 .stack-toggle:focus-visible, .stack-row:focus-visible { outline: 2px solid var(--accent-fill); outline-offset: 1px; }
+/* the task modal: a crew task's line and the parent's subtasks as stack rows (under a section title, no rule above) */
+.crew-line { display: flex; align-items: center; gap: 6px; margin: 8px 0 4px; color: var(--muted); font-size: 12.5px; }
+.modal-stack { margin-top: 4px; padding-top: 0; border-top: 0; }
 .empty { color: var(--faint); font-size: 12.5px; text-align: center; padding: 14px 0; }
 
 /* avatars: the member's colour (the TUI palette, agentColor) tints a rounded square */

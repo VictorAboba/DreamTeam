@@ -20,6 +20,9 @@ const I18N = {
     goal_hint: "Зачем нужна задача и что считается успехом", description: "Описание", status: "Статус",
     assignee: "Исполнитель", reviewer: "Ревьюер", priority: "Приоритет", tags: "Теги (через запятую)",
     depends_on: "Зависит от задач (номера через запятую)", parent: "Родительская задача", none: "— нет —",
+    crew_members: "Групповая задача: участников", crew_members_hint: "пусто или 0 — обычная задача; 2–8",
+    directions: "Направления", directions_hint: "по одному в строке", directions_add_hint: "новые, по одному в строке",
+    subtasks: "Подзадачи", crew_line: "Групповая задача: до {n} участников, сейчас работают {m}",
     user: "пользователь (вы)", save: "Сохранить", cancel: "Отмена", create: "Создать", close: "Закрыть",
     result: "Итог", discussion: "Обсуждение", history: "История", write_post: "Написать в обсуждение… (@Имя — упомянуть, Ctrl+Enter — отправить)",
     post: "Опубликовать", reply: "Ответить", replying_to: "Ответ для", reply_to_post: "Перейти к посту, на который это ответ",
@@ -65,7 +68,7 @@ const I18N = {
     retired_chat: "Агент покинул рой — написать ему нельзя",
     f_title: "заголовок", f_goal: "цель", f_description: "описание", f_status: "статус", f_assignee: "исполнитель",
     f_reviewer: "ревьюер", f_priority: "приоритет", f_tags: "теги", f_depends_on: "зависимости", f_result: "итог",
-    f_parent_id: "родитель",
+    f_parent_id: "родитель", f_crew: "групповая задача (участников)", crew_ordinary: "обычная задача",
     op_create: "создал(а) файл", op_write: "перезаписал(а) файл", op_edit: "изменил(а) файл",
     locked_by: "Заблокирован: {owner}", select_file: "Выберите файл слева", workspace: "workspace",
     unlock: "Снять блокировку",
@@ -187,6 +190,9 @@ const I18N = {
     goal_hint: "Why the task exists and what counts as success", description: "Description", status: "Status",
     assignee: "Assignee", reviewer: "Reviewer", priority: "Priority", tags: "Tags (comma-separated)",
     depends_on: "Depends on tasks (ids, comma-separated)", parent: "Parent task", none: "— none —",
+    crew_members: "Crew task: members", crew_members_hint: "empty or 0: an ordinary task; 2–8",
+    directions: "Directions", directions_hint: "one per line", directions_add_hint: "new ones, one per line",
+    subtasks: "Subtasks", crew_line: "Crew task: up to {n} members, {m} working now",
     user: "user (you)", save: "Save", cancel: "Cancel", create: "Create", close: "Close",
     result: "Result", discussion: "Discussion", history: "History", write_post: "Write to the discussion… (@Name to mention, Ctrl+Enter to post)",
     post: "Post", reply: "Reply", replying_to: "Replying to", reply_to_post: "Go to the post this replies to",
@@ -232,7 +238,7 @@ const I18N = {
     retired_chat: "This agent has left the swarm — you cannot message them",
     f_title: "title", f_goal: "goal", f_description: "description", f_status: "status", f_assignee: "assignee",
     f_reviewer: "reviewer", f_priority: "priority", f_tags: "tags", f_depends_on: "dependencies", f_result: "result",
-    f_parent_id: "parent",
+    f_parent_id: "parent", f_crew: "crew", crew_ordinary: "ordinary task",
     op_create: "created file", op_write: "rewrote file", op_edit: "edited file",
     locked_by: "Locked by {owner}", select_file: "Select a file on the left", workspace: "workspace",
     unlock: "Unlock",
@@ -340,6 +346,8 @@ const ALL_STATUSES = ["todo", "in_progress", "waiting", "review", "done", "faile
 const OPEN_STATUSES = new Set(["todo", "in_progress", "waiting", "review"]);
 const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
 const STACK_DOTS = 12;   // a parent card's toggle shows a dot for at most this many direct subtasks, then +N
+// the largest `crew` of a crew task (models.CREW_MAX): only the crew field's placeholder names it, the board checks it
+const CREW_MAX = 8;
 // a card with no stack (cardHtml(task) of one argument, a task that is a card with nothing under it)
 const EMPTY_CARD = Object.freeze({ rows: Object.freeze([]), direct: Object.freeze([]), forced: false, matches: new Set() });
 const ACTIVITY_PROSE = new Set(["text", "thinking", "compacted"]);   // activity kinds the LLM wrote: shown as Markdown
@@ -553,6 +561,23 @@ function priorityOptions(selected) {
 }
 function parseIds(text) { return String(text || "").split(/[,\s]+/).map((x) => x.replace("#", "")).filter(Boolean).map(Number).filter((n) => Number.isInteger(n)); }
 function parseTags(text) { return String(text || "").split(",").map((x) => x.trim()).filter(Boolean); }
+/** The crew number of a form field: null when empty, a number for digits only, else the trimmed text, sent as typed
+ * (the tool or the board refuses it with its own text; nothing is turned into 0, an ordinary task, silently). The
+ * board checks 0 or 2..CREW_MAX. */
+function crewValue(text) { const v = String(text ?? "").trim(); return v === "" ? null : /^\d+$/.test(v) ? Number(v) : v; }
+/** A crew number that makes a crew task (or a typo the board will refuse): not empty and not 0. */
+function crewOn(v) { return v !== null && v !== undefined && v !== 0; }
+/** Directions of the textarea: one per line, trimmed, blank lines dropped (sent as a JSON array: a plain string would
+ * be split on commas by the tools' coercion). */
+function parseDirections(text) { return norm(text).split("\n").map((x) => x.trim()).filter(Boolean); }
+/** Shows the directions field while the crew number is on; hiding it also empties the textarea, so hidden text is
+ * neither sent nor an unsaved edit. `prefix`: "n" (the create form) or "f" (the task modal). */
+function syncCrewField(prefix) {
+  const on = crewOn(crewValue($(`#${prefix}-crew`)?.value));
+  $(`#${prefix}-dirs-field`)?.classList.toggle("hidden", !on);
+  const box = $(`#${prefix}-dirs`);
+  if (!on && box) box.value = "";
+}
 
 /**
  * A timer that runs `fn` at most once per window and is never starved: a pending run is only moved
@@ -626,6 +651,8 @@ function renderAll() {
   if (S.tab === "files") renderFileList();
   if (S.chatWith) renderDrawerHead();
   if (modalOpen() && $("#sk-attach-list")) renderAttachList();   // (what is attached changed meanwhile)
+  // the open task's subtasks and crew line come from the snapshot (a subtask's change carries no event of the parent)
+  if (S.openTaskId && S.taskBase) setHtml($("#task-subtasks"), taskSubtasksHtml(S.taskBase));
 }
 
 /* ---------------------------------------------------------------- header */
@@ -1328,6 +1355,8 @@ const TASK_FORM = {
   "f-reviewer": (task) => task.reviewer || "",
   "f-tags": (task) => (task.tags || []).join(", "),
   "f-deps": (task) => (task.depends_on || []).join(", "),
+  "f-crew": (task) => (Number(task.crew) ? String(task.crew) : ""),
+  "f-dirs": () => "",   // the directions to add: the field starts empty, typed lines are an edit
 };
 /** Form fields whose current value differs from what the form showed for `base` (= unsaved edits). */
 function dirtyFields(base, values) {
@@ -1358,6 +1387,12 @@ function taskChanges(task, values) {
   if (tags.join(",") !== (task.tags || []).join(",")) changes.tags = tags;
   const deps = parseIds(values["f-deps"]);
   if (deps.join(",") !== (task.depends_on || []).join(",")) changes.depends_on = deps;
+  // the crew number: empty = 0 = an ordinary task again; text that is no whole number is sent as typed (refused)
+  const before = Number(task.crew) || 0;
+  const typed = "f-crew" in values ? (crewValue(values["f-crew"]) ?? 0) : before;
+  if (typed !== before) changes.crew = typed;
+  const dirs = parseDirections(values["f-dirs"]);
+  if (crewOn(typed) && dirs.length) changes.directions = dirs;   // never for a task that is (becoming) ordinary
   if (values["f-status"] && values["f-status"] !== task.status) changes.status = values["f-status"];
   return Object.keys(changes).length ? changes : null;
 }
@@ -1371,6 +1406,7 @@ function fillTaskForm(task, old, force) {
     else if (id === "f-assignee" || id === "f-reviewer") el.innerHTML = memberOptions(valueOf(task), true, id === "f-reviewer" ? reviewerNone() : undefined);
     if (el.value !== valueOf(task)) el.value = valueOf(task);
   }
+  syncCrewField("f");
 }
 
 function taskHeadHtml(task) {
@@ -1383,6 +1419,22 @@ function taskMetaHtml(task) {
   if (task.parent_id) parts.push(`${esc(t("parent"))}: <button type="button" class="link" data-open-task="${Number(task.parent_id)}">#${Number(task.parent_id)}</button>`);
   if ((task.blocked_by || []).length) parts.push(`<span class="blocked"><i class="ic ic-blocked"></i>${esc(t("blocked_by"))}</span> ${task.blocked_by.map((b) => `<button type="button" class="link" data-open-task="${Number(b)}">#${Number(b)}</button>`).join(", ")}`);
   return parts.join(" · ");
+}
+/** The task modal's crew line («Групповая задача: до N участников, сейчас работают M») and its direct subtasks (all of
+ * them in id order, also those shown as their own cards) as stack rows, under «Направления» for a crew task, else
+ * «Подзадачи»; "" with neither. Both read the snapshot: a crew task's working set changes with its directions, and
+ * no event carries the parent. */
+function taskSubtasksHtml(task) {
+  const tasks = (S.state && S.state.tasks) || [];
+  const id = Number(task.id);
+  const live = tasks.find((x) => Number(x.id) === id) || task;
+  const n = Number(live.crew) || 0;
+  const crew = Number.isInteger(n) && n >= 2;
+  const line = crew ? `<div class="crew-line"><i class="ic ic-users" aria-hidden="true"></i>${esc(t("crew_line", { n, m: (Array.isArray(live.crew_working) ? live.crew_working : []).length }))}</div>` : "";
+  const subs = tasks.filter((x) => Number(x.parent_id) === id && Number(x.id) !== id).sort((a, b) => a.id - b.id);
+  const rows = subs.length ? `<div class="section-title">${esc(t(crew ? "directions" : "subtasks"))}</div>`
+    + `<div class="stack modal-stack">${subs.map((sub) => stackRowHtml({ task: sub, level: 0 }, false)).join("")}</div>` : "";
+  return line + rows;
 }
 function taskResultHtml(task) {
   return task.result ? `<div class="section-title">${esc(t("result"))}</div><div class="result-box">${md(task.result)}</div>` : "";
@@ -1460,8 +1512,11 @@ function renderTaskModal(data) {
       <label class="field"><span>${esc(t("reviewer"))}</span><select id="f-reviewer"></select></label>
       <label class="field"><span>${esc(t("tags"))}</span><input id="f-tags"></label>
       <label class="field"><span>${esc(t("depends_on"))}</span><input id="f-deps"></label>
+      <label class="field"><span><i class="ic ic-users" aria-hidden="true"></i>${esc(t("crew_members"))} <span class="hint">${esc(t("crew_members_hint"))}</span></span><input id="f-crew" inputmode="numeric" autocomplete="off" placeholder="2–${CREW_MAX}"></label>
+      <label class="field full hidden" id="f-dirs-field"><span>${esc(t("directions"))} <span class="hint">${esc(t("directions_add_hint"))}</span></span><textarea id="f-dirs" rows="3"></textarea></label>
     </div>
     <div class="task-meta muted" id="task-meta">${taskMetaHtml(task)}</div>
+    <div id="task-subtasks">${taskSubtasksHtml(task)}</div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("close"))}</button><button class="btn primary" id="save-task" type="button">${esc(t("save"))}</button></div>
     <div id="task-result">${taskResultHtml(task)}</div>
     <div id="task-review">${taskReviewHtml(task)}</div>
@@ -1478,6 +1533,7 @@ function renderTaskModal(data) {
   S.taskBase = task;
   S.lastPostId = posts.reduce((m, p) => Math.max(m, p.id), 0);
   $("#save-task").addEventListener("click", saveTask);
+  $("#f-crew").addEventListener("input", () => syncCrewField("f"));
   $("#post-btn").addEventListener("click", postComment);
   const box = $("#post-text");
   attachMentions(box, $("#mention-menu"));
@@ -1496,6 +1552,7 @@ function updateTaskModal(data, force = false) {
   syncMdField("f-desc", task.description, force);
   $("#task-head").innerHTML = taskHeadHtml(task);
   setHtml($("#task-meta"), taskMetaHtml(task));
+  setHtml($("#task-subtasks"), taskSubtasksHtml(task));
   setHtml($("#task-result"), taskResultHtml(task));
   if ((old.status === "review") !== (task.status === "review")) { $("#task-review").innerHTML = taskReviewHtml(task); wireReview(); }
   $("#discussion-title").textContent = discussionTitle(task, posts);
@@ -1719,8 +1776,11 @@ function newTaskModal() {
       <label class="field"><span>${esc(t("tags"))}</span><input id="n-tags"></label>
       <label class="field"><span>${esc(t("depends_on"))}</span><input id="n-deps"></label>
       <label class="field"><span>${esc(t("parent"))}</span><input id="n-parent" inputmode="numeric"></label>
+      <label class="field"><span><i class="ic ic-users" aria-hidden="true"></i>${esc(t("crew_members"))} <span class="hint">${esc(t("crew_members_hint"))}</span></span><input id="n-crew" inputmode="numeric" autocomplete="off" placeholder="2–${CREW_MAX}"></label>
+      <label class="field full hidden" id="n-dirs-field"><span>${esc(t("directions"))} <span class="hint">${esc(t("directions_hint"))}</span></span><textarea id="n-dirs" rows="3"></textarea></label>
     </div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="create-task" type="button">${esc(t("create"))}</button></div>`);
+  $("#n-crew").addEventListener("input", () => syncCrewField("n"));
   $("#create-task").addEventListener("click", async () => {
     const title = $("#n-title").value.trim();
     const goal = $("#n-goal").value.trim();
@@ -1731,6 +1791,12 @@ function newTaskModal() {
     const tags = parseTags($("#n-tags").value); if (tags.length) args.tags = tags;
     const deps = parseIds($("#n-deps").value); if (deps.length) args.depends_on = deps;
     const parent = parseIds($("#n-parent").value)[0]; if (parent) args.parent_id = parent;
+    // empty or 0: an ordinary task, no `crew`; directions only with a crew number
+    const crew = crewValue($("#n-crew").value);
+    if (crewOn(crew)) {
+      args.crew = crew;
+      const dirs = parseDirections($("#n-dirs").value); if (dirs.length) args.directions = dirs;
+    }
     const res = await act("task_create", args);
     if (res.ok) closeModal(true);
   });
@@ -2412,6 +2478,7 @@ function tickJobs() {
 
 /* ---------------------------------------------------------------- feed */
 function fmtValue(field, value) {
+  if (field === "crew" && (value === 0 || value === "0")) return t("crew_ordinary");
   if (value === null || value === undefined || value === "") return "—";
   if (field === "status") return tv("s_", value);
   if (field === "priority") return tv("p", value);
@@ -2895,6 +2962,8 @@ if (typeof module !== "undefined" && module.exports) {
     boardCards, visibleCards, crewChipHtml, stackToggleHtml, stackRowHtml, dotHtml, statusKey, toggleStack, renderBoard,
     boardFocusKey, onBoardClick, onBoardKeydown, onBoardPointerdown, onBoardDragstart, onSearchInput, taskMatches,
     OPEN_STATUSES, TERMINAL_STATUSES, EMPTY_CARD, STACK_DOTS,
+    // crew tasks in the task forms: the crew number and the directions fields, the modal's subtasks, the feed's values
+    crewValue, crewOn, parseDirections, syncCrewField, taskSubtasksHtml, newTaskModal, saveTask, fmtValue, CREW_MAX,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

@@ -89,7 +89,7 @@ def test_i18n_covers_every_value_the_backend_emits():
     ops = set(re.findall(r'"(\w+)"', " ".join(re.findall(r"_store_and_commit\(actor.*", workspace_src))))
     assert {"create", "write", "edit"} <= ops
     task_fields = {"title", "goal", "description", "status", "assignee", "reviewer", "priority", "tags",
-                   "depends_on", "result", "parent_id"}
+                   "depends_on", "result", "parent_id", "crew"}
     # (a member's question passes its details after the reason: .pause(asker, "question", asker=…))
     pause_reasons = {r for f in SRC.rglob("*.py")
                      for r in re.findall(r"\.pause\(\w+, \"([^\"]+)\"[,)]", f.read_text(encoding="utf-8"))}
@@ -128,7 +128,11 @@ def test_ids_used_by_app_js_exist():
     assert not missing, missing
     # the task modal live-update needs these sections
     assert {"task-head", "task-meta", "task-result", "task-review", "thread", "task-history", "post-text",
-            "mention-menu", "f-goal"} <= template_ids
+            "mention-menu", "f-goal", "task-subtasks"} <= template_ids
+    # the crew fields of the create form and of the task modal (§18.4 "Subtasks")
+    crew_ids = {"n-crew", "n-dirs", "n-dirs-field", "f-crew", "f-dirs", "f-dirs-field"}
+    assert crew_ids <= template_ids
+    assert {"n-crew", "n-dirs", "task-subtasks"} <= used
 
 
 def test_jobs_tab_feed_and_settings_fields():
@@ -788,6 +792,195 @@ def test_stack_styles_and_icon():
     reduced = css[css.index("@media (prefers-reduced-motion: reduce)"):]
     assert ".stack-toggle .sdot.in_progress::after { animation: none;" in reduced.split("\n}\n")[0]
     assert ".ic-chevron {" in (STATIC / "icons.css").read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------------- crew tasks in the task forms (§18.4)
+@needs_node
+def test_crew_changes_in_the_feed():
+    out = run_js(r"""
+      const ev = (changes) => ({ type: "task.updated", actor: "Ann Lee", data: { task: { id: 3 }, changes } });
+      app.S.lang = "ru";
+      out.ru = [app.describeEvent(ev({ crew: [0, 3] })), app.describeEvent(ev({ crew: [3, 0] }))];
+      app.S.lang = "en";
+      out.en = app.describeEvent(ev({ crew: [0, 3] }));
+      out.none = app.changesText({ crew: [null, 2] });
+      out.other = [app.fmtValue("priority", 0), app.fmtValue("crew", "0"), app.fmtValue("crew", 5)];
+    """)
+    assert out["ru"][0].endswith("#3: групповая задача (участников): обычная задача → 3"), out["ru"]
+    assert out["ru"][1].endswith("#3: групповая задача (участников): 3 → обычная задача"), out["ru"]
+    assert out["en"] == "Ann Lee updated #3: crew: ordinary task → 3"
+    assert out["none"] == "crew: — → 2"
+    assert out["other"] == ["low", "ordinary task", "5"]
+
+
+CREATE_FORM = r"""
+  const handlers = {};
+  const on = (id, props) => el(id, Object.assign({ addEventListener: (type, fn) => { handlers[id + ":" + type] = fn; } }, props || {}));
+  el("modal"); el("modal-backdrop", { classList: classList(["hidden"]) });
+  for (const id of ["n-title", "n-goal", "n-desc", "n-assignee", "n-reviewer", "n-tags", "n-deps", "n-parent", "n-dirs"]) el(id);
+  el("n-priority", { value: "1" }); el("n-dirs-field", { classList: classList(["hidden"]) });
+  on("n-crew"); on("create-task");
+  const create = async (crew, dirs) => {
+    app.newTaskModal();
+    Object.assign(elements["n-title"], { value: "T" }); Object.assign(elements["n-goal"], { value: "G" });
+    elements["n-crew"].value = crew; elements["n-dirs"].value = dirs;
+    calls.length = 0;
+    await handlers["create-task:click"]();
+    return calls.filter((c) => c.url.endsWith("/api/act/task_create")).map((c) => c.body);
+  };
+"""
+
+
+@needs_node
+def test_create_form_sends_crew_and_directions():
+    dirs = "oauth2, flow\n\n  pkce \r\nоidc"
+    out = run_js(f"""
+      app.S.lang = "ru";
+      app.S.state = {{ agents: [] }};
+      out.crew = await create("3", {json.dumps(dirs, ensure_ascii=False)});
+      out.empty = await create("", "typed but no crew");
+      out.zero = await create("0", "typed");
+      out.text = await create(" 2e ", "");
+      out.closed = elements.modal.innerHTML;   // a create that went through closes the modal
+      app.newTaskModal();
+      out.html = elements.modal.innerHTML;
+      out.listens = typeof handlers["n-crew:input"];
+      // the directions field shows while the number is on; hiding it empties it
+      elements["n-crew"].value = "2"; app.syncCrewField("n");
+      out.shown = !elements["n-dirs-field"].classList.contains("hidden");
+      elements["n-dirs"].value = "kept while shown"; app.syncCrewField("n");
+      out.kept = elements["n-dirs"].value;
+      elements["n-crew"].value = "0"; app.syncCrewField("n");
+      out.hidden = [elements["n-dirs-field"].classList.contains("hidden"), elements["n-dirs"].value];
+      elements["n-crew"].value = ""; elements["n-dirs"].value = "x"; app.syncCrewField("n");
+      out.hiddenEmpty = [elements["n-dirs-field"].classList.contains("hidden"), elements["n-dirs"].value];
+      out.values = ["", " ", "0", "3", " 12 ", "-1", "2.5", "x"].map(app.crewValue);
+      out.on = [null, 0, 3, "x"].map(app.crewOn);
+      out.max = app.CREW_MAX;
+    """, pre=CREATE_FORM)
+    [crew] = out["crew"]
+    assert crew["crew"] == 3 and crew["directions"] == ["oauth2, flow", "pkce", "оidc"]
+    assert crew["title"] == "T" and crew["goal"] == "G"
+    for case in ("empty", "zero"):
+        [body] = out[case]
+        assert "crew" not in body and "directions" not in body, (case, body)
+    [text] = out["text"]
+    assert text["crew"] == "2e" and "directions" not in text  # sent as typed: the tool refuses it
+    assert out["closed"] == ""
+    html = out["html"]
+    field = re.search(r'<label class="field"><span>(.*?)</span><input id="n-crew"[^>]*>', html).group(0)
+    assert 'inputmode="numeric"' in field and 'placeholder="2–8"' in field
+    assert "Групповая задача: участников" in field and '<span class="hint">пусто или 0 — обычная задача; 2–8</span>' in field
+    assert re.search(r'<label class="field full hidden" id="n-dirs-field"><span>Направления <span class="hint">по одному в строке</span>', html)
+    assert '<textarea id="n-dirs"' in html
+    assert out["listens"] == "function"
+    assert out["shown"] is True and out["kept"] == "kept while shown"
+    assert out["hidden"] == [True, ""] and out["hiddenEmpty"] == [True, ""]
+    assert out["values"] == [None, None, 0, 3, 12, "-1", "2.5", "x"]
+    assert out["on"] == [False, False, True, True]
+    from dreamteam.models import CREW_MAX
+    assert out["max"] == CREW_MAX
+
+
+@needs_node
+def test_edit_form_crew_fields():
+    out = run_js(r"""
+      app.S.lang = "en";
+      app.S.state = { agents: [] };
+      const ordinary = { id: 4, title: "T", goal: "G", description: "", status: "todo", priority: 1, assignee: null,
+                         reviewer: null, tags: [], depends_on: [], crew: 0, crew_working: [] };
+      const crewTask = Object.assign({}, ordinary, { crew: 3 });
+      const form = (task, extra) => Object.assign(Object.fromEntries(Object.entries(app.TASK_FORM).map(([id, f]) => [id, f(task)])), extra);
+      const ch = (task, extra) => app.taskChanges(task, form(task, extra));
+      out.cases = [
+        ch(crewTask, {}), ch(ordinary, {}),
+        ch(crewTask, { "f-crew": "" }), ch(ordinary, { "f-crew": "" }), ch(ordinary, { "f-crew": "0" }),
+        ch(crewTask, { "f-crew": "4" }), ch(crewTask, { "f-crew": "x" }), ch(crewTask, { "f-crew": " 03 " }),
+        ch(crewTask, { "f-dirs": "a\n\n b \r\n" }), ch(ordinary, { "f-crew": "2", "f-dirs": "a" }),
+        ch(crewTask, { "f-crew": "", "f-dirs": "a" }), ch(ordinary, { "f-crew": "", "f-dirs": "x" }),
+      ];
+      // a form of the time before crew tasks (no f-crew value) changes no crew
+      out.noField = app.taskChanges(crewTask, { "f-title": "T", "f-goal": "G", "f-desc": "", "f-priority": "1" });
+      out.dirty = app.dirtyFields(crewTask, form(crewTask, { "f-dirs": "x" }));
+      out.clean = app.dirtyFields(crewTask, form(crewTask, {}));
+      out.form = [app.TASK_FORM["f-crew"]({ crew: 0 }), app.TASK_FORM["f-crew"]({ crew: 3 }), app.TASK_FORM["f-crew"]({}),
+                  app.TASK_FORM["f-dirs"]({ crew: 3 })];
+      // the modal: the fields after the dependencies, the directions shown for a crew task, the subtasks block
+      const handlers = {};
+      for (const id of Object.keys(app.TASK_FORM)) el(id, { focus: () => {} });
+      el("f-crew", { addEventListener: (type, fn) => { handlers["f-crew:" + type] = fn; } });
+      el("f-dirs-field", { classList: classList(["hidden"]) });
+      el("modal"); el("modal-backdrop", { classList: classList(["hidden"]) });
+      el("f-desc-view"); el("task-form"); el("task-head"); el("task-meta"); el("task-result"); el("task-review"); el("task-subtasks");
+      el("discussion-title"); el("thread"); el("task-history"); el("save-task"); el("post-btn"); el("post-text"); el("mention-menu");
+      app.renderTaskModal({ task: Object.assign({ created_at: 0, updated_at: 0 }, crewTask), discussion: [], events: [] });
+      out.html = elements.modal.innerHTML;
+      out.crewValue = elements["f-crew"].value;
+      out.dirsShown = !elements["f-dirs-field"].classList.contains("hidden");
+      out.listens = typeof handlers["f-crew:input"];
+      // the user clears the number: the field hides and empties, so nothing is left unsaved there
+      elements["f-dirs"].value = "typed"; elements["f-crew"].value = ""; handlers["f-crew:input"]();
+      out.cleared = [elements["f-dirs-field"].classList.contains("hidden"), elements["f-dirs"].value];
+    """)
+    cases = out["cases"]
+    assert cases[0] is None and cases[1] is None
+    assert cases[2] == {"crew": 0} and cases[3] is None and cases[4] is None
+    assert cases[5] == {"crew": 4} and cases[6] == {"crew": "x"} and cases[7] is None
+    assert cases[8] == {"directions": ["a", "b"]}
+    assert cases[9] == {"crew": 2, "directions": ["a"]}
+    assert cases[10] == {"crew": 0} and cases[11] is None  # typed directions never go with an ordinary task
+    assert out["noField"] is None
+    assert out["dirty"] == {"f-dirs": "x"} and out["clean"] == {}
+    assert out["form"] == ["", "3", "", ""]
+    html = out["html"]
+    assert html.index('id="f-deps"') < html.index('id="f-crew"') < html.index('id="f-dirs"') < html.index('id="task-meta"')
+    assert html.index('id="task-meta"') < html.index('id="task-subtasks"') < html.index('id="task-result"')
+    assert '<span class="hint">new ones, one per line</span>' in html and 'placeholder="2–8"' in html
+    assert out["crewValue"] == "3" and out["dirsShown"] is True and out["listens"] == "function"
+    assert out["cleared"] == [True, ""]
+
+
+@needs_node
+def test_task_modal_lists_subtasks_and_the_crew_line():
+    tasks = [stack_task(10, "in_progress", title="Crew", crew=3, crew_working=["Ann Lee"], assignee="Ann Lee"),
+             stack_task(12, "review", 10, title="Second <b>", assignee="Bob Stone"),
+             stack_task(11, "todo", 10, title="First"),
+             stack_task(13, "todo", 11, title="Grandchild"),
+             stack_task(20, "done", title="Ordinary parent"), stack_task(21, "in_progress", 20, title="Open under done"),
+             stack_task(30, title="Alone")]
+    out = run_js(f"""
+      app.S.lang = "en";
+      app.S.state = {{ agents: [], tasks: {json.dumps(tasks)} }};
+      const stale = Object.assign({{}}, app.S.state.tasks[0], {{ crew_working: [] }});
+      out.crew = app.taskSubtasksHtml(stale);
+      out.ordinary = app.taskSubtasksHtml({{ id: 20 }});
+      out.alone = app.taskSubtasksHtml({{ id: 30 }});
+      out.unknown = app.taskSubtasksHtml({{ id: 99, crew: 0 }});
+      app.S.lang = "ru";
+      out.ru = app.taskSubtasksHtml({{ id: 10 }});
+      app.S.state = null;
+      app.S.lang = "en";
+      out.noState = app.taskSubtasksHtml({{ id: 10, crew: 3, crew_working: ["A", "B"] }});
+      out.noStateOrdinary = app.taskSubtasksHtml({{ id: 10 }});
+    """)
+    crew = out["crew"]
+    assert '<div class="crew-line"><i class="ic ic-users" aria-hidden="true"></i>Crew task: up to 3 members, 1 working now</div>' in crew
+    assert '<div class="section-title">Directions</div><div class="stack modal-stack">' in crew
+    # the direct subtasks only, in id order; the one in review has the eye; titles escaped
+    assert re.findall(r'data-open-task="(\d+)"', crew) == ["11", "12"]
+    assert crew.count("ic-eye") == 1 and "<b>" not in crew and "Second &lt;b&gt;" in crew
+    ordinary = out["ordinary"]
+    assert "crew-line" not in ordinary and '<div class="section-title">Subtasks</div>' in ordinary
+    assert re.findall(r'data-open-task="(\d+)"', ordinary) == ["21"]  # also one shown as its own card
+    assert out["alone"] == "" and out["unknown"] == ""
+    assert "Групповая задача: до 3 участников, сейчас работают 1" in out["ru"] and ">Направления</div>" in out["ru"]
+    assert "Crew task: up to 3 members, 2 working now" in out["noState"] and "data-open-task" not in out["noState"]
+    assert out["noStateOrdinary"] == ""
+
+
+def test_crew_line_styles():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert ".crew-line {" in css and ".modal-stack {" in css
 
 
 @needs_node

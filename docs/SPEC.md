@@ -5351,7 +5351,17 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     task: up to N members, M working now"; the create form gets «Групповая задача: участников» / "Crew task:
     members" (a number: empty or 0 = обычная задача / an ordinary task, 2–8) and «Направления» / "Directions" (a
     textarea, one per line, shown when the number is set), and the edit form the same, where the textarea adds new
-    directions.
+    directions. The number is a text field (`inputmode="numeric"`, placeholder «2–8») with the hint «пусто или 0 —
+    обычная задача; 2–8» / "empty or 0: an ordinary task; 2–8" in its label; the page checks no range: the board's
+    refusal of 1 or 9 is the toast, and text that is not a whole number is sent as typed and refused (never read as
+    0). Empty or 0 sends no `crew` in a create and `crew: 0` in an edit of a crew task (an ordinary task again).
+    Directions are the trimmed non-blank lines, sent as a list and only while the number is on (not empty, not 0);
+    hiding the textarea empties it, so hidden text is neither sent nor an unsaved edit. The directions textarea's
+    hint: «по одному в строке» / "one per line" in the create form, «новые, по одному в строке» / "new ones, one per
+    line" in the edit form. The modal's rows are the task's direct subtasks, all of them (also one shown as its own
+    card), in id order, under «Направления» / "Directions" for a crew task and «Подзадачи» / "Subtasks" otherwise; a
+    row opens that subtask (asking first about unsaved edits, as every link to a task does). The crew line and the
+    rows read the board's snapshot, so they follow the subtasks live.
   - Hire dialog: the role input offers the visible catalog (`GET api/roles`) and shows the matched role's
     description and model profile (matched as the hire resolves it: any of its `names`, hidden roles included),
     or that a typed name is a new role to describe in the instructions; the
