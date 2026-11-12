@@ -34,6 +34,7 @@ from dreamteam.config import _MIN_ONE, Config, ShellSettings, WorkspaceSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status
 from dreamteam.swarm import Swarm
+from helpers.stacks import EXPECTED_CARDS, STACK_TASKS
 
 STATIC = Path(dreamteam.__file__).parent / "static"
 APP_JS = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -491,6 +492,302 @@ def test_review_on_the_board():
         ["/api/act/task_review", {"task_id": 4, "approve": False, "comment": "Add tests for the parser"}],
         ["/api/act/task_review", {"task_id": 4, "approve": True}],
     ]
+
+
+# ------------------------------------------------------------------------- subtasks in their parent's stack (§18.4)
+def stack_task(tid: int, status: str = "todo", parent_id: int | None = None, **extra: Any) -> dict[str, Any]:
+    task = {"id": tid, "title": f"Task {tid}", "goal": "", "description": "", "status": status, "assignee": None,
+            "reviewer": None, "parent_id": parent_id, "priority": 1, "tags": [], "depends_on": [], "blocked_by": [],
+            "comments": 0, "crew": 0, "crew_working": [], "updated_at": float(tid)}
+    task.update(extra)
+    return task
+
+
+# a parent #2 with a done, an in_progress (a review one under it) and a todo subtask, and a plain #1
+BOARD_STACK = [stack_task(1, title="Plain one"), stack_task(2, title="Parent"),
+               stack_task(3, "done", 2, title="Done child"), stack_task(4, "in_progress", 2, title="Busy child", assignee="Ann Lee"),
+               stack_task(5, "todo", 2, title="Later child"), stack_task(6, "review", 4, title="Needle grandchild", reviewer="Bob Stone")]
+BOARD_STUB = r"""
+  app.S.lang = "en"; app.S.tab = "board";
+  const asked = [];
+  el("board", { _html: undefined, style: { setProperty: (k, v) => { elements.board.cols = v; } },
+                querySelector: (sel) => { asked.push(sel); return null; } });
+"""
+
+
+@needs_node
+def test_board_stacks_subtasks_under_their_parent():
+    out = run_js(f"""
+      const cards = app.boardCards({json.dumps(STACK_TASKS)});
+      out.cards = cards.map((c) => [c.task.id, c.rows.map((r) => [r.task.id, r.level]), c.direct.map((x) => x.id)]);
+      // the input order does not matter, and nothing breaks on what is not a task
+      out.shuffled = app.boardCards({json.dumps(list(reversed(STACK_TASKS)))}.concat([null, 7])).map((c) => c.task.id);
+      // a self-parent and a task hanging under a loop with a lower id than the loop: the card starts at the loop
+      out.loops = app.boardCards([{{ id: 5, status: "todo", parent_id: 21 }}, {{ id: 20, status: "todo", parent_id: 21 }},
+                                  {{ id: 21, status: "todo", parent_id: 20 }}, {{ id: 30, status: "todo", parent_id: 30 }}])
+        .map((c) => [c.task.id, c.rows.map((r) => [r.task.id, r.level])]);
+    """)
+    assert [(c[0], [tuple(r) for r in c[1]]) for c in out["cards"]] == list(EXPECTED_CARDS.items())
+    assert {c[0]: c[2] for c in out["cards"]}[2] == [3, 4, 5]
+    ids = [c[0] for c in out["cards"]] + [r[0] for c in out["cards"] for r in c[1]]
+    assert sorted(ids) == sorted(t["id"] for t in STACK_TASKS)  # every task once
+    assert out["shuffled"] == list(EXPECTED_CARDS)
+    assert out["loops"] == [[20, [[21, 0], [5, 1]]], [30, []]]
+
+
+@needs_node
+def test_stack_toggle_dots_more_and_done_total():
+    statuses = ["done", "in_progress", "todo", "waiting", "review", "failed", "cancelled"]
+    tasks = [stack_task(2, title="Parent")] + [stack_task(10 + i, statuses[i % 7] if i != 13 else "bogus", 2)
+                                                for i in range(14)]
+    tasks[-2]["status"] = "done"  # three done: #10, #17, #22
+    out = run_js(f"""
+      app.S.lang = "en";
+      const card = app.boardCards({json.dumps(tasks)}).find((c) => c.task.id === 2);
+      out.toggle = app.stackToggleHtml(card, false);
+      out.card = app.cardHtml(card.task, card);
+      out.plain = app.cardHtml({json.dumps(stack_task(1))});
+      out.plainCard = app.cardHtml({json.dumps(stack_task(1))}, {{ task: {{ id: 1 }}, rows: [], direct: [], forced: false, matches: new Set() }});
+      out.last = app.dotHtml("bogus");
+    """)
+    toggle = out["toggle"]
+    assert toggle.count('class="sdot ') == 12
+    assert '<span class="stack-more" aria-hidden="true">+2</span>' in toggle
+    assert '<span class="stack-count">3/14</span>' in toggle
+    assert 'aria-expanded="false"' in toggle and 'data-stack-toggle="2"' in toggle
+    assert 'title="Subtasks: 3 of 14 done" aria-label="Subtasks: 3 of 14 done"' in toggle
+    assert toggle.index('<span class="sdot done" style="--dc:var(--c-done)" aria-hidden="true"></span>') < toggle.index("sdot in_progress")
+    assert '<span class="sdot in_progress" style="--dc:var(--c-in_progress)"' in toggle
+    assert '<i class="ic ic-chevron" aria-hidden="true"></i></button>' in toggle
+    assert out["last"] == '<span class="sdot todo" style="--dc:var(--c-todo)" aria-hidden="true"></span>'
+    card = out["card"]
+    assert 'class="card p1 has-stack"' in card and 'role="group" aria-label="#2 Parent"' in card
+    assert 'role="button"' not in card and toggle in card and 'class="stack"' not in card
+    for plain in (out["plain"], out["plainCard"]):
+        assert 'class="card p1"' in plain and 'role="button"' in plain and "stack-toggle" not in plain
+    assert out["plain"] == out["plainCard"]
+
+
+@needs_node
+def test_crew_chip_and_its_tooltip():
+    tasks = [stack_task(2, title="Parent"),
+             stack_task(3, "in_progress", 2, title="Crew child", crew=3, crew_working=["Ann Lee", "Bob Stone"]),
+             stack_task(9, title="Crew one", crew=3, crew_working=["Ann Lee", "Bob Stone"])]
+    out = run_js(f"""
+      app.S.lang = "en";
+      out.en = app.crewChipHtml({{ crew: 3, crew_working: ["Ann", "Bob"] }});
+      app.S.lang = "ru";
+      out.ru = app.crewChipHtml({{ crew: 3, crew_working: ["Ann", "Bob"] }});
+      app.S.lang = "en";
+      out.none = [app.crewChipHtml({{ crew: 0 }}), app.crewChipHtml({{}}), app.crewChipHtml(null), app.crewChipHtml({{ crew: 1 }})];
+      const cards = app.boardCards({json.dumps(tasks)});
+      out.crewCard = app.cardHtml(cards[1].task, cards[1]);
+      app.S.expanded.add(2);
+      out.parent = app.cardHtml(cards[0].task, cards[0]);
+    """)
+    chip = '<span class="chip plain crew-chip" title="Crew task: 2 of 3 working"><i class="ic ic-users" aria-hidden="true"></i>2/3</span>'
+    assert out["en"] == chip
+    assert 'title="Групповая задача: работают 2 из 3"' in out["ru"]
+    assert out["none"] == ["", "", "", ""]
+    assert chip in out["crewCard"]
+    meta, stack = out["parent"].split('<div class="stack">')
+    assert "crew-chip" not in meta and chip in stack
+
+
+@needs_node
+def test_parent_card_carries_the_review_badge_of_a_subtask():
+    def board(reviewer: str, level: int) -> list[dict[str, Any]]:
+        tasks = [stack_task(2, title="Parent"), stack_task(3, "in_progress", 2)]
+        tasks.append(stack_task(4, "review", 2 if level == 0 else 3, reviewer=reviewer, assignee="Ann Lee"))
+        return tasks
+
+    out = run_js(f"""
+      app.S.lang = "en";
+      const parent = (tasks) => {{ const c = app.boardCards(tasks)[0]; return app.cardHtml(c.task, c); }};
+      out.direct = parent({json.dumps(board("user", 0))});
+      out.deeper = parent({json.dumps(board("user", 1))});
+      out.agent = parent({json.dumps(board("Bob Stone", 0))});
+    """)
+    badge = '<span class="badge warn"><i class="ic ic-eye"></i>waits for your review</span>'
+    assert out["direct"].count(badge) == 1 and out["deeper"].count(badge) == 1
+    assert "badge warn" not in out["agent"] and "ic-eye" not in out["agent"].split('<button type="button" class="stack-toggle"')[0]
+
+
+@needs_node
+def test_stack_rows_and_expanded_across_renders():
+    out = run_js(BOARD_STUB + f"""
+      app.S.state = {{ tasks: {json.dumps(BOARD_STACK)} }};
+      app.renderBoard();
+      out.first = elements.board.innerHTML;
+      app.onBoardClick({{ target: {{ closest: (sel) => (sel === "[data-stack-toggle]" ? {{ dataset: {{ stackToggle: "2" }} }} : null) }} }});
+      out.expanded = Array.from(app.S.expanded);
+      out.open = elements.board.innerHTML;
+      app.S.state = JSON.parse(JSON.stringify(app.S.state));   // a refresh: a new snapshot, same tasks
+      app.renderBoard();
+      out.again = elements.board.innerHTML;
+      out.cols = elements.board.cols;
+      // the focus on the toggle comes back after a re-render that changed the board
+      const toggle = {{ dataset: {{ stackToggle: "2" }} }};
+      globalThis.document.activeElement = {{ closest: (sel) => (sel === "[data-stack-toggle]" ? toggle : null) }};
+      elements.board.contains = () => true;
+      out.key = app.boardFocusKey();
+      const focused = [];
+      elements.board.querySelector = (sel) => {{ asked.push(sel); return {{ focus: (o) => focused.push(o) }}; }};
+      app.toggleStack(2);
+      out.closed = elements.board.innerHTML;
+      out.expandedAfter = Array.from(app.S.expanded);
+      out.asked = asked.slice(); out.focused = focused;
+      // a row and a card give their own keys
+      globalThis.document.activeElement = {{ closest: (sel) => (sel === ".card" ? {{ dataset: {{ id: "2" }} }}
+        : sel === "[data-open-task]" ? {{ dataset: {{ openTask: "6" }} }} : null) }};
+      out.rowKey = app.boardFocusKey();
+      globalThis.document.activeElement = {{ closest: (sel) => (sel === ".card" ? {{ dataset: {{ id: "1" }} }} : null) }};
+      out.cardKey = app.boardFocusKey();
+      elements.board.contains = () => false;
+      out.outside = app.boardFocusKey();
+    """)
+    assert 'class="stack"' not in out["first"] and 'aria-expanded="false"' in out["first"]
+    assert out["expanded"] == [2]
+    html = out["open"]
+    assert 'class="stack"' in html and 'aria-expanded="true"' in html and 'class="card p1 has-stack expanded"' in html
+    assert 'data-open-task="3"' in html and 'style="--lvl:1" data-open-task="6"' in html
+    assert 'style="--lvl:0" data-open-task="4"' in html
+    row6 = html.split('data-open-task="6"')[1].split("</button>")[0]
+    assert '<i class="ic ic-eye" aria-hidden="true"></i>' in row6
+    assert 'aria-label="#3 Done child · Done"' in html
+    assert 'aria-label="#4 Busy child · In progress · Ann Lee"' in html
+    assert '<span class="avatar xs" style="--c:' in html
+    assert html.index('data-open-task="4"') < html.index('data-open-task="6"') < html.index('data-open-task="5"')
+    assert out["again"] == html  # kept open across renders
+    assert out["key"] == '[data-stack-toggle="2"]'
+    assert 'class="stack"' not in out["closed"] and out["expandedAfter"] == []
+    assert '[data-stack-toggle="2"]' in out["asked"] and out["focused"] == [{"preventScroll": True}]
+    assert out["rowKey"] == '.card[data-id="2"] [data-open-task="6"]' and out["cardKey"] == '.card[data-id="1"]'
+    assert out["outside"] is None
+
+
+@needs_node
+def test_board_filter_shows_parents_of_matching_rows():
+    tasks = BOARD_STACK + [stack_task(7, title="Unrelated")]
+    out = run_js(BOARD_STUB + f"""
+      app.S.state = {{ tasks: {json.dumps(tasks)} }};
+      app.renderBoard();
+      out.plain = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: " needle " }} }});
+      out.found = elements.board.innerHTML;
+      out.expanded = Array.from(app.S.expanded);
+      app.toggleStack(2);   // closing the stack the search opened
+      out.closed = elements.board.innerHTML;
+      out.sets = [Array.from(app.S.expanded), Array.from(app.S.unforced)];
+      app.renderBoard();
+      out.stillClosed = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: "needle" }} }});   // the same search: stays closed
+      out.same = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: "needl" }} }});    // another search opens it again
+      out.reopened = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: "needle" }} }});
+      app.toggleStack(2); app.toggleStack(2);                   // closed, then opened by the user
+      out.userOpen = [Array.from(app.S.expanded), Array.from(app.S.unforced)];
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.cleared = elements.board.innerHTML;
+    """)
+    def count(html: str, col: str) -> str:
+        return re.search(rf'data-col="{col}">\s*<div class="column-head">.*?<span class="count">(\d+)</span>', html, re.S).group(1)
+
+    assert count(out["plain"], "todo") == "3" and count(out["plain"], "in_progress") == "0"  # cards, not tasks
+    assert count(out["plain"], "done") == "0" and count(out["plain"], "review") == "0"
+    found = out["found"]
+    assert 'data-id="2"' in found and 'data-id="1"' not in found and 'data-id="7"' not in found
+    assert 'class="stack"' in found and out["expanded"] == []
+    assert 'class="stack-row match" style="--lvl:1" data-open-task="6"' in found
+    assert found.count("stack-row match") == 1 and 'class="stack-row" style="--lvl:0" data-open-task="4"' in found
+    assert count(found, "todo") == "1"
+    assert 'class="stack"' not in out["closed"] and 'aria-expanded="false"' in out["closed"]
+    assert out["sets"] == [[], [2]]
+    assert 'class="stack"' not in out["stillClosed"] and 'class="stack"' not in out["same"]
+    assert 'class="stack"' in out["reopened"]
+    assert out["userOpen"] == [[2], []]
+    assert 'class="stack"' in out["cleared"] and 'data-id="7"' in out["cleared"] and "stack-row match" not in out["cleared"]
+
+
+@needs_node
+def test_board_keys_and_drags_ignore_the_stack():
+    pre = r"""
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
+        const task = { id: 2, title: "P", goal: "", description: "", status: "todo", priority: 1, assignee: null, reviewer: null,
+                       tags: [], depends_on: [], crew: 0, crew_working: [], created_at: 0, updated_at: 0 };
+        const data = { task, discussion: [], events: [] };
+        return { ok: true, json: async () => data, text: async () => JSON.stringify(data) };
+      };
+    """
+    out = run_js(r"""
+      el("modal"); el("modal-backdrop");
+      for (const id of Object.keys(app.TASK_FORM)) el(id, { focus: () => {} });
+      el("f-desc-view"); el("task-form"); el("task-head"); el("task-meta"); el("task-result"); el("task-review");
+      el("discussion-title"); el("thread"); el("task-history"); el("save-task"); el("post-btn"); el("post-text"); el("mention-menu");
+      app.S.state = { tasks: [] };
+      const card = { dataset: { id: "2" }, classList: { add: () => {} } };
+      const target = (inStack) => ({ closest: (sel) => (sel === ".stack-toggle, .stack" ? (inStack ? {} : null) : sel === ".card" ? card : null) });
+      let prevented = 0;
+      const key = (inStack, k = "Enter") => ({ key: k, target: target(inStack), preventDefault: () => { prevented++; } });
+      app.onBoardKeydown(key(true)); app.onBoardKeydown(key(true, " "));
+      out.stack = [calls.length, prevented];
+      app.onBoardKeydown(key(false));
+      await new Promise((r) => setImmediate(r));
+      out.card = [calls.map((c) => c.url), prevented];
+      const data = [];
+      const drag = (inStack) => ({ target: target(inStack), preventDefault: () => { prevented++; },
+                                   dataTransfer: { setData: (k, v) => data.push([k, v]) } });
+      prevented = 0;
+      app.onBoardPointerdown(drag(true)); app.onBoardDragstart(drag(false));
+      out.rowDrag = [prevented, app.S.dragging, data.length];
+      app.onBoardPointerdown(drag(false)); app.onBoardDragstart(drag(false));
+      out.cardDrag = [prevented, app.S.dragging && app.S.dragging.id, data];
+    """, pre=pre)
+    assert out["stack"] == [0, 0]
+    assert out["card"] == [["/api/tasks/2"], 1]
+    assert out["rowDrag"] == [1, None, 0]
+    assert out["cardDrag"] == [1, 2, [["application/x-dreamteam-task", "2"], ["text/plain", "#2"]]]
+
+
+@needs_node
+def test_stack_markup_escapes_task_data():
+    tasks = [stack_task(2, title='<i>x</i>"onclick="x', assignee='"><i>', status='x" onmouseover="y',
+                        crew='3" onclick="x', crew_working=["<i>"]),
+             stack_task(3, 'x" onmouseover="y', 2, title='<i>row</i>"onclick="x', assignee='"><i>',
+                        crew='3" onclick="x', crew_working=["<i>"])]
+    out = run_js(f"""
+      app.S.lang = "en";
+      const cards = app.boardCards({json.dumps(tasks)});
+      const c = cards[0];
+      app.S.expanded.add(2);
+      out.card = app.cardHtml(c.task, c);
+      // hostile ids and levels reach no attribute raw
+      out.row = app.stackRowHtml({{ task: {{ id: "7 onmouseover=x", title: "t", status: "todo" }}, level: "1;}}" }}, true);
+      out.toggle = app.stackToggleHtml({{ task: {{ id: "7 onmouseover=x" }}, rows: [], direct: [{{ status: '"><i>' }}] }}, true);
+    """)
+    for html in (out["card"], out["row"], out["toggle"]):
+        assert "<i>" not in html and "onclick=" not in html.replace("&quot;onclick=&quot;", "")
+        assert "onmouseover=" not in html.replace("&quot; onmouseover=&quot;", "")
+        assert all(re.fullmatch(r"\d+", m) for m in re.findall(r"--lvl:([^\"]*)\"", html))
+        assert all(re.fullmatch(r"\d+|NaN", m) for m in re.findall(r'data-(?:open-task|stack-toggle|id)="([^"]*)"', html))
+    assert "sdot todo" in out["card"] and "sdot x" not in out["card"]
+    assert "crew-chip" not in out["card"] and 'class="stack"' in out["card"]
+    assert 'style="--lvl:0"' in out["row"] and 'data-open-task="NaN"' in out["row"]  # "1;}" is no number
+    assert 'data-stack-toggle="NaN"' in out["toggle"] and "sdot todo" in out["toggle"]
+
+
+def test_stack_styles_and_icon():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    for rule in (".stack-toggle {", ".stack-row {", ".stack {", ".card.has-stack:not(.expanded) {", ".avatar.xs {",
+                 '.stack-toggle[aria-expanded="true"] .ic-chevron', ".stack-row.match {"):
+        assert rule in css, rule
+    keyframes = re.search(r"@keyframes subpulse \{(.*?)\}\s*\}", css, re.S).group(1)
+    assert "transform" in keyframes and "box-shadow" not in keyframes
+    reduced = css[css.index("@media (prefers-reduced-motion: reduce)"):]
+    assert ".stack-toggle .sdot.in_progress::after { animation: none;" in reduced.split("\n}\n")[0]
+    assert ".ic-chevron {" in (STATIC / "icons.css").read_text(encoding="utf-8")
 
 
 @needs_node

@@ -1527,7 +1527,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   holder while another is open (`n_direction_cancelled`), to an owner that did not create a direction the crew task's
   creator cancels (`n_direction_cancelled`), and to the owner as creator and assignee of its own part cancelled by
   the crew task's creator (`n_subtask_cancelled`); the sequential re-pick of `release_all`, the liveness marks, the
-  web stack; and those of §17.2 "Sessions of an earlier version"). Tests that change: tests/test_review.py
+  web stack — which tasks are cards and which are rows of whose stack is one fixture, tests/helpers/stacks.py, that
+  pins the web's rule (app.js `boardCards`) and the TUI board's lines alike; and those of §17.2 "Sessions of an
+  earlier version"). Tests that change: tests/test_review.py
   `test_pick_order_idle_then_load_then_name` (the new key: `cannot act now` first, pending reviews apart from open
   tasks) and `test_pick_prefers_the_reviewer_role`; tests/test_tools.py (the `Subtasks:` line of `task_get`);
   tests/test_board.py (a subtask created by a member that is neither the parent's creator nor its assignee, now
@@ -5312,15 +5314,24 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     review on, the empty reviewer option reads
     «— (выберет доска)».
   - Subtasks (§4.2): a subtask is not a card of its own; it is in its parent's **stack**. Exception: an open subtask
-    whose parent is terminal (or missing from the snapshot) is a card, so open work never hides in «done»; it leaves
-    its ancestors' stacks together with its own subtree. The stack holds all other descendants (depth-first by id,
-    indented by level, each task once even when `parent_id` loops). A parent card shows two thin strips under it
-    (the stack), and in its meta row a toggle button (`.stack-toggle`, `aria-expanded`) with one dot per direct
-    subtask in id order (`--c-<status>`, so a free direction is grey; up to 12, then `+N`), `done/total` in mono and
-    a chevron; the dot of an `in_progress` subtask pulses (a ring, off under `prefers-reduced-motion`). The toggle
-    expands the stack inside the card (`.stack`): a row per subtask (dot, `#id`, title, the assignee's avatar, the
-    eye icon while in review, the group chip for a crew task); a row opens that subtask's modal, the rest of the card
-    opens the parent as before. The board's keydown (Enter / Space) and dragstart handlers ignore events from the
+    whose parent is terminal is a card, so open work never hides in «done»; it leaves its ancestors' stacks
+    together with its own subtree. A subtask whose parent is missing from the snapshot is a card whatever its
+    status, and tasks under a `parent_id` loop that no card reaches are the stack of a card made of the loop's
+    lowest id (app.js `boardCards`, the one place of this rule). The stack holds all other descendants (depth-first
+    by id, indented by level, each task once even when `parent_id` loops). A parent card shows two thin strips under
+    it (the stack) while the stack is collapsed, and in its meta row a toggle button (`.stack-toggle`,
+    `aria-expanded`) with one dot per direct subtask in id order (`--c-<status>`, so a free direction is grey; up to
+    12, then `+N`), `done/total` in mono and a chevron; the dots and `done/total` count the direct subtasks in the
+    card's stack (one shown as its own card is no dot; `done` counts the status done, failed and cancelled ones are
+    in the total, in their colours), and a card with an empty stack has neither the strips nor the toggle. The
+    toggle's tooltip and accessible name: «Подзадачи: готово {done} из {total}» / "Subtasks: {done} of {total}
+    done". The dot of an `in_progress` subtask on the toggle pulses (a ring of transform and opacity; off under
+    `prefers-reduced-motion`); the rows' dots are still. The toggle expands the stack inside the card (`.stack`): a
+    row per subtask (dot, `#id`, title, the assignee's avatar, the eye icon while in review, the group chip for a
+    crew task; its tooltip and accessible name «#id title · status · assignee»); a row opens that subtask's modal,
+    the rest of the card opens the parent as before. A card with a stack is a `group` named «#id title», not a
+    `button` (it holds the toggle and the rows, which are buttons of their own); a card without one stays a
+    `button`. The board's keydown (Enter / Space) and dragstart handlers ignore events from the
     toggle and the stack: Enter on the toggle toggles, Enter on a row opens that row, and rows are not draggable (a
     subtask's status changes in its modal). Setting a terminal status on a parent with open subtasks, by dropping
     its card on «done» or «closed» or by saving its modal with the status done, failed or cancelled, first asks
@@ -5328,11 +5339,14 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     anyway?"; for a crew task «У групповой задачи #N открыты направления: …» / "Crew task #N has open directions:
     …"; naming what happens to them, §4.2 "Leaving and closing"; one i18n key used by `moveTask` and `saveTask`).
     Cancelling the question leaves the task, and the modal's other unsaved edits, unchanged. Expanded parents are
-    kept in memory across renders (`S.expanded`, a set of ids). A crew task's card adds a chip with the users icon
+    kept in memory across renders (`S.expanded`, a set of ids), and the keyboard focus on a card, a toggle or a row
+    stays on it across live re-renders of the board. A crew task's card adds a chip with the users icon
     and `2/3` (working / `crew`; its tooltip «Групповая задача: работают 2 из 3» / "Crew task: 2 of 3 working";
-    the stack rows show the same chip). A subtask waiting for the user's review puts the
-    badge «ждёт вашего ревью» on its parent's card. A filter shows a parent when it or one of its descendants
-    matches, expands that stack and marks the rows that match. Column counts count cards. The task modal of a parent
+    the stack rows show the same chip). A subtask waiting for the user's review, at any level of a card's stack,
+    puts the badge «ждёт вашего ревью» on that card. A filter shows a parent when it or one of its descendants
+    matches, expands that stack and marks the rows that match (an accent line, `.stack-row.match`); the stack is
+    open while the filter holds without changing `S.expanded`, and the toggle closes it until the search text
+    changes. Column counts count cards. The task modal of a parent
     lists its subtasks as rows and, for a crew task, «Групповая задача: до N участников, сейчас работают M» / "Crew
     task: up to N members, M working now"; the create form gets «Групповая задача: участников» / "Crew task:
     members" (a number: empty or 0 = обычная задача / an ordinary task, 2–8) and «Направления» / "Directions" (a
