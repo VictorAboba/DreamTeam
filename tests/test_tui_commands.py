@@ -372,6 +372,15 @@ async def test_task_lists_the_subtasks_from_the_snapshot():
     await execute(app, "/task abc")
     assert "Usage: /task N" in app.text and len(asked) == 1
 
+    async def failing_state():  # the snapshot fails after the task came: the task prints without its subtasks
+        raise HubError(500, "GET /api/state: 500")
+
+    app.refresh_state = failing_state
+    await execute(app, "/task 3")
+    out = app.out[-1]
+    assert len(asked) == 2 and "Calculator" in out and "Directions" not in out and "Crew task:" not in out
+    assert "/api/state" not in app.text
+
 
 def test_unknown_event_types_do_not_break_rendering():
     # the app prints render.event() for every bus event: odd payloads must render or be skipped

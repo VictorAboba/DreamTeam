@@ -1501,7 +1501,8 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   are their own lines on the board; under «Направления (k)» / "Directions (k)" for a crew task, else «Подзадачи (k)» /
   "Subtasks (k)": the count is the TUI's, as its «Обсуждение (k)», the web modal's title has none; after the crew
   line «Групповая задача: до N участников, сейчас работают M» / "Crew task: up to N members, M working now"; between
-  the description and the result); the board list shows a subtask as its own line only where the web shows it as its own card (a
+  the description and the result; a snapshot that fails, a hub error, leaves out the crew line and the subtasks,
+  and the task still prints); the board list shows a subtask as its own line only where the web shows it as its own card (a
   subtask that is its own line carries no note of its parent; an id or parent_id that is not an integer or a string
   is no key: such a task is a card of its own, never a parent), and its column headers count the lines they show (as
   the web's columns count cards; a done or closed column cut to its last 15 lines counts the lines its `… +N` stands
