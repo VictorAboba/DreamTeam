@@ -2033,12 +2033,17 @@ class TUI:
     # ---- lifecycle ---------------------------------------------------------------------------------
     async def _startup(self) -> None:
         async with self._input_lock:  # what the user types meanwhile waits for the attach
-            await self._open()
+            wanted = await self._open()
         if self.initial_prompt and self.initial_prompt.strip():
+            if wanted and not self.attached:   # meant for a session that did not open: never a new one (SPEC §18)
+                self.buffer.text = self.initial_prompt   # left to send on purpose
+                return
             await self.handle_input(self.initial_prompt)
 
-    async def _open(self) -> None:
+    async def _open(self) -> bool:
+        """Open the hub and the session asked for; whether one was asked for (-r ID, or -c with sessions)."""
         missing = None
+        wanted = False
         try:
             self.hub = await self.client.hub_info()
             home = str(self.hub.get("home") or self.hub.get("project") or "")
@@ -2054,6 +2059,7 @@ class TUI:
                         if lang in LANGS:
                             self.ctx.lang = lang
                 sessions = await self.client.sessions()
+                wanted = bool(self.session_arg) or (self.continue_last and bool(sessions))
                 if self.session_arg:
                     target = next((s for s in sessions if s.get("id") == self.session_arg), None)
                     missing = None if target else self.session_arg
@@ -2088,6 +2094,7 @@ class TUI:
         finally:
             self.ready.set()
             self.invalidate()
+        return wanted
 
     def _pre_run(self) -> None:
         self.ctx.width = self.width

@@ -496,6 +496,29 @@ async def test_the_tui_continue_says_the_most_recent_session_is_of_an_earlier_ve
     await conn.close()
 
 
+@pytest.mark.parametrize("how", ["continue", "resume", "unknown"])
+async def test_a_tui_prompt_for_a_session_that_does_not_open_creates_nothing(tmp_path, how):
+    """`dreamteam -c "go on"` after an upgrade: the text was meant for the old session, never a new swarm's goal."""
+    from test_tui_app import Harness
+
+    made, older = await make_old_latest(tmp_path)
+    conn = await connect(made.home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(finisher, profile))
+    kwargs: dict[str, Any] = {"continue": {"continue_last": True}, "resume": {"session": made.sid},
+                              "unknown": {"session": "999-nope"}}[how]
+    with contextlib.ExitStack() as stack:
+        h = Harness(conn, stack, width=200, initial_prompt="go on please", **kwargs)
+        try:
+            await h.until(lambda: h.tui.ready.is_set() and h.tui.buffer.text == "go on please", what="the prompt kept")
+            await asyncio.sleep(0.3)
+            assert not h.tui.attached and h.tui.sid is None
+            assert len(await conn.client.sessions()) == 2
+            assert untouched(made)
+        finally:
+            await h.close()
+    await conn.close()
+
+
 # ---- import, a session that ran, and what still opens -----------------------------------------------------------
 def test_it_is_exported_and_dreamteam_import_refuses_it_before_writing(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(tmp_path / "libs" / "skills"))
