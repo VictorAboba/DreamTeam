@@ -204,11 +204,13 @@ def test_home_i18n_is_complete():
     sections = set(re.findall(r'\["\w+", "(s_\w+)"\]', HOME_JS))
     assert len(sections) == 11 and {"s_roles", "s_skills"} <= sections
     used |= sections | {s + "_hint" for s in sections}
-    used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending")}  # sessionState() + pending goal
+    # sessionState() + pending goal
+    used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending", "earlier")}
     used |= WORKSPACE_KINDS_KEYS  # workspaceLine(): t("ws_" + kind), t("ws_" + kind + "_hint")
     assert {"new_session", "delete_text", "p_key_saved", "p_key_env_drop", "p_model_required", "discard_new",
             "started", "stopped", "p_model_ok", "create_open", "f_team", "team_over_max", "r_err_model", "sw_review",
-            "sw_review_hint", "f_goal_hint", "f_model_hint"} <= used
+            "sw_review_hint", "f_goal_hint", "f_model_hint", "sw_crew_review", "sw_crew_review_hint", "earlier_session",
+            "earlier_main"} <= used
     # the starting team is a composer now: the old number field and the comma list are gone
     assert not {"f_start_agents", "f_roles", "f_roles_ph", "f_roles_hint", "sw_start", "sw_roles"} & keys
     missing = sorted(k for k in used if k not in keys)
@@ -2007,6 +2009,11 @@ def test_home_cards_and_dialogs_escape_session_data():
       out.card = home.sessionCard(s);
       out.legacy = home.sessionCard({ id: "main", title: "Old", status: "stopped", legacy: true });
       out.broken = home.sessionCard({ id: "x", title: "x", status: "stopped", error: E });
+      home.H.hub = { version: E, home: E };
+      out.earlier = home.sessionCard({ id: E, title: E, status: "stopped", legacy: false, dir: E, earlier_version: true });
+      out.earlierMain = home.sessionCard({ id: "main", title: "Old", status: "stopped", legacy: true, dir: E,
+                                           earlier_version: true });
+      home.H.hub = null;
       el("modal"); el("modal-backdrop");
       home.H.sessions = [s];
       home.deleteModal(E);
@@ -2034,6 +2041,8 @@ def test_home_cards_and_dialogs_escape_session_data():
     assert "<b>0</b> agents" in card and "1 of 0 tasks" in card  # non-numeric counters are not injected
     assert "data-delete" not in out["legacy"] and "project · main" in out["legacy"]
     assert_escaped(out["broken"])
+    assert_escaped(out["earlier"], at_least=4)       # title (text and tooltip), id, the message's sid and version
+    assert_escaped(out["earlierMain"], at_least=3)   # the message's home (twice) and version
     assert_escaped(out["del"])
     assert_escaped(out["ns"], at_least=3)
     settings = out["settings"]
@@ -2265,11 +2274,15 @@ def test_home_clarify_checkbox_overrides():
       out.ru = elements.modal.innerHTML;
       home.H.lang = "en";
       el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
-      const v = { swarm: { name: "S", language: "en", clarify: true }, agents: {}, shell: {}, workspace: {}, server: {},
-                  tracing: {}, mcp: { external: {} }, models: {} };
+      const v = { swarm: { name: "S", language: "en", clarify: true, crew_review: true }, agents: {}, shell: {},
+                  workspace: {}, server: {}, tracing: {}, mcp: { external: {} }, models: {} };
       home.H.view = JSON.parse(JSON.stringify(v)); home.H.original = JSON.parse(JSON.stringify(v));
       home.renderSettings(true);
       out.settings = elements["settings-form"].innerHTML;
+      out.ns_crew = /crew/.test(out.ns_false + out.ns_true + out.ru);
+      home.H.lang = "ru";
+      home.renderSettings(true);
+      out.settings_ru = elements["settings-form"].innerHTML;
     """)
     assert out["on"] is True and out["off"] is False and out["equal"] == [False, False, False, False]
     html = out["ns_false"]
@@ -2287,7 +2300,18 @@ def test_home_clarify_checkbox_overrides():
     field = '<input type="checkbox" data-path="swarm.clarify" data-type="bool" checked> <span>Clarify the goal first'
     assert field in settings
     assert "No effect in dreamteam -p with automatic replies" in settings
-    assert settings.index('data-path="swarm.independent_review"') < settings.index('data-path="swarm.clarify"')
+    # «Проверять групповую задачу целиком» (docs/SPEC.md §18.4 Settings tab): between independent review and clarify,
+    # with its hint ending in a period like its neighbours; not a field of the new-session modal
+    crew = ('<input type="checkbox" data-path="swarm.crew_review" data-type="bool" checked> '
+            '<span>Check a crew task as a whole')
+    assert crew in settings
+    assert "whether there is a review at all follows independent review" in settings
+    assert "the task is done once its owner completes it, even with a reviewer named.</span>" in settings
+    assert (settings.index('data-path="swarm.independent_review"') < settings.index('data-path="swarm.crew_review"')
+            < settings.index('data-path="swarm.clarify"'))
+    assert out["ns_crew"] is False
+    assert "Проверять групповую задачу целиком" in out["settings_ru"]
+    assert "задача готова, как только владелец её завершит, даже с назначенным ревьюером.</span>" in out["settings_ru"]
 
 
 @needs_node
@@ -2321,7 +2345,131 @@ def test_home_card_shows_a_question():
     assert 'title="Anna Smith ждёт вашего ответа на вопрос #12">Ждёт вашего ответа</span>' in out["ru"]
 
 
-TEAM_CASES = [([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 2), (["Разработчик"], 1),
+@needs_node
+def test_home_card_of_an_earlier_version_session():
+    """A session made by an earlier version (docs/SPEC.md §17.2, §18.4 home card): the «Прежняя версия» badge in place
+    of its status and the message in the page's language; no link, Open, Start/Stop or proposals button; delete only
+    (none for the legacy main, whose message names the file); listed under stopped."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.hub = { version: "0.2.0", home: "C:/h" };
+      const old = { id: "003-old", title: "Old", status: "stopped", earlier_version: true, skills: ["x"],
+                    skills_pending: ["x"], workspace: { path: "D:/gone", default: false, adopted: true, exists: false } };
+      const main = { id: "main", title: "Main", legacy: true, dir: "C:/h", status: "stopped", earlier_version: true };
+      for (const lang of ["en", "ru"]) {
+        home.H.lang = lang;
+        out[lang] = { old: home.sessionCard(old), main: home.sessionCard(main) };
+      }
+      home.H.lang = "en";
+      out.plain = home.sessionCard({ id: "004-new", title: "New", status: "stopped" });
+      out.state = home.sessionState(Object.assign({}, old, { goal: { title: "G", status: "done" } }));
+      out.filters = ["stopped", "running", "all"].map((f) => home.filterSessions([old], f, "").length);
+      home.H.hub = null;
+      out.unknown = home.sessionCard(old);
+      out.mainNoDir = home.earlierText({ id: "main", legacy: true });
+    """)
+    from dreamteam.sessions import EARLIER_VERSION_TEXT, MAIN_EARLIER_VERSION_TEXT
+    old, main = out["en"]["old"], out["en"]["main"]
+    assert old.startswith('<article class="session-card earlier" data-sid="003-old">')
+    assert '<span class="dot earlier"></span>' in old and out["state"] == "earlier"
+    assert '<span class="badge warn">Earlier version</span>' in old and "Stopped" not in old
+    assert ('<div class="sc-warn sc-earlier"><i class="ic ic-alert" aria-hidden="true"></i><span>'
+            + EARLIER_VERSION_TEXT.format(sid="003-old", version="0.2.0") + "</span></div>") in old
+    assert '<span class="sc-title" title="Old">Old</span>' in old
+    for absent in ('href="/s/', "data-start", "data-stop", "data-skills-pending", "cannot start"):
+        assert absent not in old, absent
+    # the folder line stays with its badge; the skills count stays
+    assert "D:/gone" in old and '<span class="badge err">missing</span>' in old and "skills: 1" in old
+    assert 'data-delete="003-old"' in old
+    assert "data-delete" not in main and "project · main" in main
+    assert MAIN_EARLIER_VERSION_TEXT.format(home="C:/h", version="0.2.0") in main
+    ru = out["ru"]
+    assert ("Сессия 003-old создана более ранней версией DreamTeam, и эта версия (0.2.0) не может её открыть."
+            in ru["old"]) and '<span class="badge warn">Прежняя версия</span>' in ru["old"]
+    assert "удалите вручную C:/h/.dreamteam/swarm.db" in ru["main"]
+    assert "(?)" in out["unknown"] and "(0.2.0)" not in out["unknown"]
+    assert out["mainNoDir"] == MAIN_EARLIER_VERSION_TEXT.format(home="?", version="?")
+    # a plain stopped card is as before
+    assert '<a class="sc-title" href="/s/004-new/" title="New">New</a>' in out["plain"]
+    assert '<a class="btn primary small" href="/s/004-new/">Open</a>' in out["plain"] and "sc-earlier" not in out["plain"]
+    assert out["filters"] == [1, 0, 1]
+
+
+@needs_node
+def test_home_earlier_twins_match_the_server():
+    """The en twins are the server's texts word for word; the ru twins are docs/SPEC.md §17.2's."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      out.en = [home.I18N.en.earlier_session, home.I18N.en.earlier_main];
+      out.ru = [home.I18N.ru.earlier_session, home.I18N.ru.earlier_main];
+    """)
+    from dreamteam.sessions import EARLIER_VERSION_TEXT, MAIN_EARLIER_VERSION_TEXT
+    assert out["en"] == [EARLIER_VERSION_TEXT, MAIN_EARLIER_VERSION_TEXT]
+    spec = " ".join((Path(__file__).parent.parent / "docs" / "SPEC.md").read_text(encoding="utf-8").split())
+    start = spec.index("The web page and the TUI show the twin from the summary flag")
+    ru_session = re.search(r"«(Сессия \{sid\} создана.*?)»", spec[start:]).group(1)
+    ru_main = re.search(r"«(Сессия main \(рой в \{home\}\).*?)»", spec[start:]).group(1)
+    assert out["ru"] == [ru_session, ru_main]
+
+
+@needs_node
+def test_home_loads_the_hub_version_once_for_earlier_sessions():
+    """{version} of the earlier-version message comes from GET /api/hub: one request shared by overlapping list
+    loads, none while no listed session is such a one, and "?" (no unhandled rejection) when it fails."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      el("sessions"); el("sessions-empty");
+      const tick = () => new Promise((r) => setImmediate(r));
+      let list = [];
+      let hubAnswer = null;   // null: the request waits for releaseHub
+      let releaseHub = null;
+      const fetched = [];
+      globalThis.fetch = (url) => {
+        fetched.push(url);
+        const ok = (data) => ({ ok: true, status: 200, json: async () => data });
+        if (url === "/api/sessions") return new Promise((r) => setImmediate(() => r(ok({ sessions: list }))));
+        if (url === "/api/hub") {
+          if (hubAnswer === "fail") return Promise.resolve({ ok: false, status: 500, statusText: "Error", json: async () => ({ error: "boom" }) });
+          return new Promise((r) => { releaseHub = () => r(ok({ version: "9.9", home: "C:/h" })); });
+        }
+        throw new Error("unexpected " + url);
+      };
+      const reset = () => { home.H.hub = null; home.H.hubLoad = null; home.H.sessions = null; fetched.length = 0;
+                            elements.sessions.innerHTML = ""; elements.sessions._html = null; };
+      home.H.lang = "en";
+      // no earlier session: the hub is never asked
+      list = [{ id: "001-a", title: "A", status: "stopped" }];
+      await home.loadSessions();
+      out.plainFetched = fetched.slice();
+      // an earlier session: two overlapping loads and a third share one request
+      reset();
+      list = [{ id: "002-old", title: "Old", status: "stopped", earlier_version: true }];
+      const first = home.loadSessions();
+      for (let i = 0; i < 5 && !releaseHub; i++) await tick();
+      const second = home.loadSessions();
+      for (let i = 0; i < 5; i++) await tick();
+      out.beforeHub = elements.sessions.innerHTML;
+      releaseHub();
+      await first; await second;
+      await home.loadSessions();
+      out.fetched = fetched.slice();
+      out.html = elements.sessions.innerHTML;
+      // a failed request: "?" and no unhandled rejection
+      reset();
+      hubAnswer = "fail";
+      await home.loadSessions();
+      await home.loadSessions();
+      out.failFetched = fetched.slice();
+      out.failHtml = elements.sessions.innerHTML;
+    """)
+    assert out["plainFetched"] == ["/api/sessions"]
+    assert out["fetched"].count("/api/hub") == 1 and out["fetched"].count("/api/sessions") == 3
+    assert out["beforeHub"] == ""   # the list waits for the version rather than showing "?" first
+    assert "(9.9)" in out["html"] and "Session 002-old was made by an earlier version" in out["html"]
+    assert out["failFetched"].count("/api/hub") == 1 and "(?)" in out["failHtml"]
+
+
+TEAM_CASES =[([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 2), (["Разработчик"], 1),
               (["Tester", " tester ", "QA  lead", "generalist"], 5), (["generalist", "Developer"], 2), ([], 0)]
 
 
@@ -4227,7 +4375,10 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             assert all(set(p["name"]) == set(p["description"]) == {"ru", "en"} for p in data["role_presets"])
             catalog_fields = {"key", "builtin", "customized", "hidden", "name", "description", "instructions", "model"}
             assert all(catalog_fields <= set(r) for r in data["role_catalog"]) and view["roles"] == []
-            assert {"starting_roles", "start_agents", "independent_review"} <= set(view["swarm"])
+            assert {"starting_roles", "start_agents", "independent_review", "crew_review"} <= set(view["swarm"])
+            # the version and home the message of a session made by an earlier version names (home.js earlierText)
+            hub = c.get("/api/hub").json()
+            assert hub["version"] == dreamteam.__version__ and hub["home"]
 
             # a session created with the form's overrides
             overrides = {"swarm": {"language": "en", "start_agents": 1, "max_agents": 3, "max_cost_usd": 1.5},
@@ -4239,8 +4390,9 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             sid = session["id"]
             card_fields = {"id", "title", "status", "paused", "legacy", "dir", "created_at", "last_activity", "model",
                            "model_profile", "max_cost_usd", "spent_usd", "config_error", "goal", "tasks", "agents", "url",
-                           "workspace", "pause_reason", "question", "clarify", "copied_from"}
+                           "workspace", "pause_reason", "question", "clarify", "copied_from", "earlier_version"}
             assert card_fields <= set(session) and session["url"] == f"/s/{sid}/"
+            assert session["earlier_version"] is False
             assert session["copied_from"] is None   # the card's "copy of" line: only a session made with copy_from
             assert session["question"] is None and session["clarify"] is False   # the card's question badge
             folder_fields = {"path", "default", "adopted", "exists"}  # the folder line of the card / the Files tab

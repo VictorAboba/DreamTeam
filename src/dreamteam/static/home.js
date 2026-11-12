@@ -11,11 +11,16 @@ const I18N = {
     empty_hint: "Опишите цель — рой сам спланирует задачи, распределит их между агентами и начнёт работу. Перед стартом проверьте модель в настройках.",
     no_match: "Ничего не найдено.", loading: "Загрузка…",
     st_running: "Работает", st_paused: "На паузе", st_stopped: "Остановлена", st_done: "Цель достигнута", st_pending: "ждёт запуска",
+    st_earlier: "Прежняя версия",
     st_wrap_up: "Завершается", st_wrap_up_hint: "Режим завершения: агенты завершают задачи с тем, что есть, без новых вычислений",
     st_question: "Ждёт вашего ответа", question_tip: "{name} ждёт вашего ответа на вопрос #{id}",
     no_goal: "Цель не задана", tasks_done: "{done} из {total} задач", agents_n: "агентов", working_n: "работают",
     spent: "Потрачено", model: "Модель", last_activity: "Активность", created: "Создана",
     open: "Открыть", start: "Запустить", stop: "Остановить", delete: "Удалить", legacy: "проект",
+    // a session made by an earlier version (docs/SPEC.md §17.2): the twins of sessions.EARLIER_VERSION_TEXT and
+    // MAIN_EARLIER_VERSION_TEXT
+    earlier_session: "Сессия {sid} создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть. Откройте её в той версии, которой она создана (экспортируйте её здесь и импортируйте в домашнюю папку той версии: после того как эта версия сохранила настройки, та может не прочитать эту папку), или удалите.",
+    earlier_main: "Сессия main (рой в {home}) создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть. Откройте её в той версии, которой она создана, или удалите вручную {home}/.dreamteam/swarm.db (вместе с файлами -wal и -shm).",
     started: "Сессия «{title}» запущена", stopped: "Сессия «{title}» остановлена", deleted: "Сессия удалена",
     delete_title: "Удалить сессию?",
     delete_text: "Сессия «{title}» будет удалена вместе с доской задач, перепиской, файлами workspace, MCP-серверами сессии и трейсами. Это действие необратимо.",
@@ -127,6 +132,8 @@ const I18N = {
     sw_budget: "Бюджет сессии, $", sw_budget_hint: "0 — без лимита",
     sw_review: "Независимое ревью задач",
     sw_review_hint: "Задачу агента принимает другой агент, а если больше некому — вы. Выключите для дешёвых прогонов: тогда задача без ревьюера сразу готова.",
+    sw_crew_review: "Проверять групповую задачу целиком",
+    sw_crew_review_hint: "Завершённую владельцем групповую задачу проверяет, по возможности, агент вне её направлений: сочетаются ли они; будет ли ревью вообще, решает независимое ревью. Выключено — без второго ревью, ведь каждое направление уже проверено: задача готова, как только владелец её завершит, даже с назначенным ревьюером.",
     sw_clarify: "Сначала уточнять цель",
     sw_clarify_hint: "По умолчанию для новых сессий: планировщик сначала задаёт вам вопросы, а важный вопрос агента ставит рой на паузу до вашего ответа. В dreamteam -p с автоответами не действует: там всё как раньше.",
     r_builtin: "встроенная", r_custom: "своя", r_customized: "изменена", r_hidden: "скрыта", r_name: "Название",
@@ -250,11 +257,14 @@ const I18N = {
     empty_hint: "Describe a goal: the swarm plans the tasks, shares them out between agents and gets to work. Check the model in Settings first.",
     no_match: "Nothing found.", loading: "Loading…",
     st_running: "Running", st_paused: "Paused", st_stopped: "Stopped", st_done: "Goal reached", st_pending: "waiting to start",
+    st_earlier: "Earlier version",
     st_wrap_up: "Wrapping up", st_wrap_up_hint: "Wrap-up mode: the agents finish their tasks with what they have, no new computations",
     st_question: "Waiting for your answer", question_tip: "{name} waits for your answer to question #{id}",
     no_goal: "No goal yet", tasks_done: "{done} of {total} tasks", agents_n: "agents", working_n: "working",
     spent: "Spent", model: "Model", last_activity: "Activity", created: "Created",
     open: "Open", start: "Start", stop: "Stop", delete: "Delete", legacy: "project",
+    earlier_session: "Session {sid} was made by an earlier version of DreamTeam and cannot be opened by this one ({version}). Open it with the version that made it (export it here, then import it into a home of that version: once this one saved its settings, that version may not read this home), or delete it.",
+    earlier_main: "Session main (the swarm in {home}) was made by an earlier version of DreamTeam and cannot be opened by this one ({version}). Open it with the version that made it, or remove {home}/.dreamteam/swarm.db (with its -wal and -shm files) by hand.",
     started: "Session “{title}” started", stopped: "Session “{title}” stopped", deleted: "Session deleted",
     delete_title: "Delete the session?",
     delete_text: "Session “{title}” will be deleted with its task board, messages, workspace files, session MCP servers and traces. This cannot be undone.",
@@ -368,6 +378,8 @@ const I18N = {
     sw_budget: "Session budget, $", sw_budget_hint: "0 — no limit",
     sw_review: "Independent review of tasks",
     sw_review_hint: "An agent's task is approved by another agent, or by you when there is nobody else. Turn it off for cheap runs: a task without a reviewer is then done at once.",
+    sw_crew_review: "Check a crew task as a whole",
+    sw_crew_review_hint: "A crew task its owner completed is checked, preferably by a member outside its directions, for how they fit together; whether there is a review at all follows independent review. Off: no second review, since each direction was reviewed already: the task is done once its owner completes it, even with a reviewer named.",
     sw_clarify: "Clarify the goal first",
     sw_clarify_hint: "The default of new sessions: the planner asks you first, and an agent's critical question pauses the swarm until you answer. No effect in dreamteam -p with automatic replies: it works as before.",
     r_builtin: "built-in", r_custom: "your own", r_customized: "changed", r_hidden: "hidden", r_name: "Name",
@@ -491,6 +503,9 @@ const H = {
   // skills: GET /api/skills (null until loaded), the cards shown open (key → GET /api/skills/{name}), the refs ticked
   // in the new-session modal
   skills: null, skillShown: {}, nsSkills: new Set(),
+  // GET /api/hub ({version, home}: the message of a session made by an earlier version), asked once, only when such a
+  // session is listed; hubLoad is that one request
+  hub: null, hubLoad: null,
 };
 // skills.js: a global of the page (loaded before this script), a module in the Node tests
 const SK = typeof Skills !== "undefined" ? Skills : require("./skills.js");
@@ -619,7 +634,12 @@ async function loadSessions() {
   try {
     const data = await api("GET", "/api/sessions");
     if (seq !== H.listSeq) return;
-    H.sessions = data.sessions || [];
+    const sessions = data.sessions || [];
+    if (sessions.some((s) => s.earlier_version) && !H.hub) {   // the version their message names
+      await loadHub();
+      if (seq !== H.listSeq) return;
+    }
+    H.sessions = sessions;
     renderSessions();
   } catch (e) {
     if (seq === H.listSeq && H.sessions === null) {
@@ -633,8 +653,14 @@ function scheduleSessions() {
   clearTimeout(H.reloadTimer);
   H.reloadTimer = setTimeout(loadSessions, 250);
 }
+/** The hub's version and home (GET /api/hub) into H.hub, once: overlapping list loads share the one request, and a
+ * failure leaves {} (the message then reads "?"). Never rejects. */
+function loadHub() {
+  return H.hubLoad || (H.hubLoad = api("GET", "/api/hub").then((d) => { H.hub = d || {}; }, () => { H.hub = {}; }));
+}
 
 function sessionState(s) {
+  if (s.earlier_version) return "earlier";   // made by an earlier version: never opened (docs/SPEC.md §17.2)
   if (s.goal && s.goal.status === "done") return "done";
   if (s.status === "running") return s.paused ? "paused" : "running";
   return "stopped";
@@ -681,14 +707,16 @@ function shortPath(path, max = 52) {
   return "…" + (cut > 0 && cut < tail.length - 1 ? tail.slice(cut) : tail);
 }
 
-function workspaceLine(ws) {
+/** The card's folder line; `quiet` (a session that cannot start anyway: made by an earlier version) keeps the
+ * «папки нет» badge but drops the warning that the session will not start until it is moved. */
+function workspaceLine(ws, quiet = false) {
   const kind = workspaceKind(ws);
   if (!kind) return "";
   const missing = workspaceMissing(ws);
   const label = missing ? t("ws_missing_badge") : t("ws_" + kind);
   const badge = `<span class="badge ${missing ? "err" : kind === "default" ? "plain" : ""}">${esc(label)}</span>`;
   return `<div class="sc-folder" title="${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}"><i class="ic ic-folder"></i><code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</div>
-    ${missing ? `<div class="sc-warn"><i class="ic ic-alert"></i>${esc(t("ws_missing"))}</div>` : ""}`;
+    ${missing && !quiet ? `<div class="sc-warn"><i class="ic ic-alert"></i>${esc(t("ws_missing"))}</div>` : ""}`;
 }
 
 /** The card line of a session whose files were copied in when it was created (summary "copied_from": the folder or
@@ -716,13 +744,24 @@ function cardTime(s) {
     : { text: ago(s.created_at), title: created };
 }
 
+/** The message of a session made by an earlier version (docs/SPEC.md §17.2), in the page's language: {version} from
+ * the hub's /api/hub ("?" until known or when it failed), {home} of the legacy main from its summary's dir (the home). */
+function earlierText(s) {
+  const version = (H.hub && H.hub.version) || "?";
+  return s.legacy || s.id === "main"
+    ? t("earlier_main", { home: s.dir || (H.hub && H.hub.home) || "?", version })
+    : t("earlier_session", { sid: s.id, version });
+}
+
 function sessionCard(s) {
   const state = sessionState(s);
+  const earlier = state === "earlier";   // listed and deleted only: no link, no Open, Start or Stop, no proposals
   const time = cardTime(s);
   const tasks = s.tasks || { total: 0, done: 0 };
   const agents = s.agents || { total: 0, working: 0 };
   const pct = tasks.total ? Math.round(100 * tasks.done / tasks.total) : 0;
-  const badgeCls = { running: "", paused: "warn", done: "done", stopped: "plain" }[state];   // working: the accent, as everywhere
+  // working: the accent, as everywhere
+  const badgeCls = { running: "", paused: "warn", done: "done", stopped: "plain", earlier: "warn" }[state];
   const goal = s.goal && s.goal.title
     ? `<div class="sc-goal" title="${esc(s.goal.description || s.goal.title)}"><i class="ic ic-goal"></i>${esc(s.goal.title)}${s.goal.status === "pending" ? ` <span class="muted">(${esc(t("st_pending"))})</span>` : ""}</div>`
     : `<div class="sc-goal none">${esc(t("no_goal"))}</div>`;
@@ -738,7 +777,8 @@ function sessionCard(s) {
   return `<article class="session-card ${state}" data-sid="${esc(s.id)}">
     <div class="sc-head">
       <span class="dot ${state === "done" ? "" : state}"></span>
-      <a class="sc-title" href="/s/${encodeURIComponent(s.id)}/" title="${esc(s.title)}">${esc(s.title)}</a>
+      ${earlier ? `<span class="sc-title" title="${esc(s.title)}">${esc(s.title)}</span>`
+                : `<a class="sc-title" href="/s/${encodeURIComponent(s.id)}/" title="${esc(s.title)}">${esc(s.title)}</a>`}
       <span class="badge ${badgeCls}"${badgeTip}>${esc(asks ? t("st_question") : t("st_" + state))}</span>
       ${state === "running" && s.wrap_up ? `<span class="badge warn" title="${esc(t("st_wrap_up_hint"))}">${esc(t("st_wrap_up"))}</span>` : ""}
       ${s.network === "off" ? `<span class="badge warn" title="${esc(networkHint(H.isolation))}">${esc(t("net_badge"))}</span>` : ""}
@@ -752,14 +792,15 @@ function sessionCard(s) {
       <span title="${esc(time.title)}"><i class="ic ic-clock"></i>${esc(time.text)}</span>
       ${skills.count}
     </div>
-    ${workspaceLine(s.workspace)}
+    ${workspaceLine(s.workspace, earlier)}
     ${copiedLine(s.copied_from)}
-    ${skills.warn}
+    ${earlier ? "" : skills.warn}
     ${error ? `<div class="sc-error">${esc(error)}</div>` : ""}
+    ${earlier ? `<div class="sc-warn sc-earlier"><i class="ic ic-alert" aria-hidden="true"></i><span>${esc(earlierText(s))}</span></div>` : ""}
     <div class="sc-actions">
-      <a class="btn primary small" href="/s/${encodeURIComponent(s.id)}/">${esc(t("open"))}</a>
+      ${earlier ? "" : `<a class="btn primary small" href="/s/${encodeURIComponent(s.id)}/">${esc(t("open"))}</a>
       ${running ? `<button class="btn small" type="button" data-stop="${esc(s.id)}"${busy}><i class="ic ic-stop"></i>${esc(t("stop"))}</button>`
-                : `<button class="btn small" type="button" data-start="${esc(s.id)}"${busy}><i class="ic ic-play"></i>${esc(t("start"))}</button>`}
+                : `<button class="btn small" type="button" data-start="${esc(s.id)}"${busy}><i class="ic ic-play"></i>${esc(t("start"))}</button>`}`}
       <span class="spacer"></span>
       <span class="sc-id" title="${esc(s.dir || "")}">${esc(s.legacy ? t("legacy") + " · " + s.id : s.id)}</span>
       ${s.legacy ? "" : `<button class="icon-btn small" type="button" data-delete="${esc(s.id)}" title="${esc(t("delete"))}"><i class="ic ic-trash"></i></button>`}
@@ -2053,6 +2094,7 @@ function renderSettings(fromServer) {
       field("sw_budget", "swarm.max_cost_usd", "float", { min: 0, step: 0.5, hint: "sw_budget_hint" }),
       teamComposer("defaults"),
       field("sw_review", "swarm.independent_review", "bool", { full: true, hint: "sw_review_hint" }),
+      field("sw_crew_review", "swarm.crew_review", "bool", { full: true, hint: "sw_crew_review_hint" }),
       field("sw_clarify", "swarm.clarify", "bool", { full: true, hint: "sw_clarify_hint" }),
       field("sw_network", "swarm.network", "select", { full: true, options: [["on", t("net_on")], ["off", t("net_off")]],
                                                        hintText: networkHint(H.isolation) }),
@@ -2650,7 +2692,7 @@ if (typeof module !== "undefined" && module.exports) {
   // pure helpers, exported for the Node-based UI tests (tests/test_ui.py); the browser runs init() instead
   module.exports = {
     I18N, H, esc, t, ago, money, sessionState, sessionCard, filterSessions, renderSessions, sessionOverrides,
-    workspaceKind, workspaceMissing, shortPath, workspaceLine,
+    workspaceKind, workspaceMissing, shortPath, workspaceLine, loadSessions, loadHub, earlierText,
     makeProfile, profileCard, profilePayload, collectSettings, presetData, uniqueName, redactKey, field, readInput,
     missingPrices, priceWarnHtml, enterPrices, freeModel, costHow,
     renderSettings, checkProfile, onSettingsInput, onSettingsClick, leaveSettings, closeModal, openModal,

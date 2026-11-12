@@ -4091,7 +4091,8 @@ settings; ValueError when they are invalid):
   version that made it, or remove {home}/.dreamteam/swarm.db (with its -wal and -shm files) by hand.` (`the home`
   in place of {home} when a caller has none; `sessions.earlier_version_text(sid, home, version=None)` renders
   both, and a CLI attached to a hub passes the hub's home and version from `/api/hub`). The web page
-  and the TUI show the twin from the summary flag: «Сессия {sid} создана более ранней версией DreamTeam, и эта
+  and the TUI show the twin from the summary flag (the home page's card takes `{version}` and `{home}` as §18.4 says
+  for that card; home.js `earlierText`, whose en twins are these texts word for word): «Сессия {sid} создана более ранней версией DreamTeam, и эта
   версия ({version}) не может её открыть. Откройте её в той версии, которой она создана (экспортируйте её здесь и
   импортируйте в домашнюю папку той версии: после того как эта версия сохранила настройки, та может не прочитать
   эту папку), или удалите.», for `main`
@@ -5091,7 +5092,13 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       copy's source. A session made by an earlier version (summary `earlier_version`, §17.2) gets the badge
       «Прежняя версия» / "Earlier version" in place of its status and the message of §17.2 in its twin (ru / en);
       its title is no link, and it has no «Открыть» or «Запустить», only delete (none for the legacy `main`: its
-      message names the file to remove).
+      message names the file to remove). Such a card has the state `earlier` (`sessionState`): the top stripe and the
+      dot of a stopped one, the badge in the warning colour, the message as a warning line under the error line; the
+      folder line keeps its path and «папки нет» badge but not the warning that the session cannot start, and there
+      is no proposals button (its dialog's request would be refused; the delete dialog still names the proposals).
+      The filters list it under «Остановлены», never «Работают». The message's `{version}` is the hub's
+      (`GET /api/hub`, asked once and only when a listed session is such a one; «?» until it answers or when it
+      fails), and the `{home}` of `main` is its summary's `dir` (the home), else the hub's `home`.
     - Card buttons: «Открыть», «Запустить» / «Остановить» (disabled while the request runs), delete (not for
       the legacy `main`) with a confirmation dialog naming the session; for a folder outside the session the
       dialog says the folder stays, and the toast names it (`workspace_kept` of the DELETE answer). The web UI
@@ -5182,10 +5189,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     "Check a crew task as a whole"), `swarm.crew_review`, whose hint reads «Завершённую владельцем групповую задачу
     проверяет, по возможности, агент вне её направлений: сочетаются ли они; будет ли ревью вообще, решает
     независимое ревью. Выключено — без второго ревью, ведь каждое направление уже проверено: задача готова, как только
-    владелец её завершит, даже с назначенным ревьюером» (en "A crew task its owner completed is checked, preferably
+    владелец её завершит, даже с назначенным ревьюером.» (en "A crew task its owner completed is checked, preferably
     by a member outside its directions, for how they fit together; whether there is a review at all follows
     independent review. Off: no second review, since each direction was reviewed already: the task is done once its
-    owner completes it, even with a reviewer named"), and «Сначала уточнять
+    owner completes it, even with a reviewer named."; only here: neither the new-session modal nor the board's ⚙
+    dialog has it), and «Сначала уточнять
     цель»,
     `swarm.clarify`, whose hint says it does not apply to `dreamteam -p` with automatic replies, and «Интернет для
     команд агентов», `swarm.network`, a select with the same honest hint), «Агенты» (with the planning hint's
