@@ -4987,7 +4987,7 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   version of DreamTeam and cannot be opened by this one ({version}): start a new session`, ru «Последняя сессия,
   {id}, создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть: начните новую
   сессию», and attaches nothing; a prompt given with `-c`, or with `-r ID` of a session that did not open, is
-  never sent: it is left in the input line, to send on purpose; `{version}` is the hub's); a default picked without the user asking for the last
+  never sent (nor when the hub or its session list failed): it is left in the input line, to send on purpose; `{version}` is the hub's); a default picked without the user asking for the last
   session (`console` and `traces` without `--session`) still skips sessions made by an earlier version; `-r ID` of
   one prints its message (the TUI says it under the welcome box and creates nothing; `-p` exits 1); the `-r`
   picker and `/sessions` show them with the status «прежняя версия» / "earlier version", Enter shows the message

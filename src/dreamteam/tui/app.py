@@ -2041,11 +2041,14 @@ class TUI:
             await self.handle_input(self.initial_prompt)
 
     async def _open(self) -> bool:
-        """Open the hub and the session asked for; whether one was asked for (-r ID, or -c with sessions)."""
+        """Open the hub and the session asked for; whether one was asked for (-r ID, or -c with sessions, or either
+        when the hub or its session list failed)."""
         missing = None
-        wanted = False
+        # asked for until the session list says otherwise: a list that fails keeps the prompt as well
+        wanted = bool(self.session_arg) or self.continue_last
         try:
             self.hub = await self.client.hub_info()
+            wanted = wanted and self.client.mode == "launcher"
             home = str(self.hub.get("home") or self.hub.get("project") or "")
             self.local = bool(self.conn.owned) or _same_path(home, str(self.home))
             sessions: list[dict] = []

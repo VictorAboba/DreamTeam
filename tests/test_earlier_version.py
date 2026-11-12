@@ -519,6 +519,38 @@ async def test_a_tui_prompt_for_a_session_that_does_not_open_creates_nothing(tmp
     await conn.close()
 
 
+@pytest.mark.parametrize("how", ["continue", "resume"])
+async def test_a_tui_prompt_for_a_session_is_kept_when_the_session_list_fails(tmp_path, monkeypatch, how):
+    """`dreamteam -r ID "go on"` while GET /sessions fails: the text was meant for that session, never a new goal."""
+    from test_tui_app import Harness
+
+    from dreamteam.tui.client import HubError
+
+    made, older = await make_old_latest(tmp_path)
+    conn = await connect(made.home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(finisher, profile))
+    sessions, calls = conn.client.sessions, []
+
+    async def failing(*args: Any, **kwargs: Any) -> Any:
+        calls.append(1)
+        if len(calls) == 1:
+            raise HubError(500, "one session folder is broken")
+        return await sessions(*args, **kwargs)
+
+    monkeypatch.setattr(conn.client, "sessions", failing)
+    kwargs: dict[str, Any] = {"continue": {"continue_last": True}, "resume": {"session": older}}[how]
+    with contextlib.ExitStack() as stack:
+        h = Harness(conn, stack, width=200, initial_prompt="go on please", **kwargs)
+        try:
+            await h.until(lambda: h.tui.ready.is_set() and h.tui.buffer.text == "go on please", what="the prompt kept")
+            await asyncio.sleep(0.3)
+            assert not h.tui.attached and h.tui.sid is None
+            assert len(await conn.client.sessions()) == 2
+        finally:
+            await h.close()
+    await conn.close()
+
+
 # ---- import, a session that ran, and what still opens -----------------------------------------------------------
 def test_it_is_exported_and_dreamteam_import_refuses_it_before_writing(tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(tmp_path / "libs" / "skills"))
