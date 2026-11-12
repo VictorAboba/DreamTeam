@@ -417,7 +417,7 @@ async def test_with_crew_review_off_task_complete_says_done_even_with_a_named_re
     finish_raw(board, 6, Status.DONE, "api", assignee=b)
     await ok(swarm, a, "task_claim", {"task_id": 4})
     assert await ok(swarm, a, "task_complete", {"task_id": 4, "result": "docs written"}) == "Task #4 is done."
-    assert board.get(4).reviewer == c
+    assert board.get(4).reviewer is None   # cleared: c gave no review
     assert told(swarm, c, "n_review_requested") == [] and told(swarm, c, "n_crew_review_requested") == []
 
 

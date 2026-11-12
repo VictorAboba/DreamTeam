@@ -605,9 +605,9 @@ def test_the_owners_completion_follows_the_matrix(swarm, board, crew_review, ind
     after = board.get(task.id)
     if not crew_review or (not own and not independent):
         # crew_review off: no second review whatever independent review says and whatever reviewer the task holds
-        # (each direction was reviewed already), and the board picks nobody; without a reviewer and with
+        # (each direction was reviewed already; cleared), and the board picks nobody; without a reviewer and with
         # independent review off, as for any task
-        expected = (Status.DONE, DINA if own else None, "the whole", [])
+        expected = (Status.DONE, DINA if own and crew_review else None, "the whole", [])
         assert (after.status, after.reviewer, after.result, review_keys(swarm)) == expected
         return
     whole = done
@@ -723,7 +723,7 @@ def test_with_crew_review_off_the_owners_completion_is_done_at_once_whatever_ind
 def test_with_crew_review_off_a_named_reviewer_reviews_nothing(swarm, board, monkeypatch, named_by, reviewer,
                                                                independent):
     """A reviewer named in task_create, or set by task_update (by the creator, the owner or USER), is no exception:
-    the owner's completion is done at once, nobody is asked, and the reviewer field stays as it was."""
+    the owner's completion is done at once, nobody is asked, and the reviewer field is cleared (no review given)."""
     swarm.config.swarm.crew_review = False
     swarm.config.swarm.independent_review = independent
     monkeypatch.setattr(board, "pick_reviewer", no_pick)
@@ -740,12 +740,12 @@ def test_with_crew_review_off_a_named_reviewer_reviews_nothing(swarm, board, mon
     swarm.notified.clear()
     board.complete(ANNA, task.id, "the whole")
     after = board.get(task.id)
-    assert (after.status, after.reviewer, after.result) == (Status.DONE, reviewer, "the whole")
+    assert (after.status, after.reviewer, after.result) == (Status.DONE, None, "the whole")
     assert review_keys(swarm) == []
     assert "u_review_requested" not in keys_for(swarm, USER) and keys_for(swarm, EVA) == []
     assert [kw["status"] for kw in notes_of(swarm, DINA, "n_task_closed")] == [Status.DONE]
     assert events(swarm, "task.updated")[-1]["data"]["changes"] == {
-        "status": [Status.IN_PROGRESS, Status.DONE], "result": [None, "the whole"]}
+        "status": [Status.IN_PROGRESS, Status.DONE], "result": [None, "the whole"], "reviewer": [reviewer, None]}
 
 
 def test_with_crew_review_off_a_reviewer_cleared_by_taking_a_direction_leaves_no_review(swarm, board, monkeypatch):
@@ -798,7 +798,7 @@ def test_with_crew_review_off_a_reviewer_kept_from_a_check_of_the_whole_reviews_
     swarm.notified.clear()
     board.complete(ANNA, task.id, "whole v2")
     after = board.get(task.id)
-    assert (after.status, after.reviewer, after.result) == (Status.DONE, EVA, "whole v2")
+    assert (after.status, after.reviewer, after.result) == (Status.DONE, None, "whole v2")
     assert review_keys(swarm) == [] and keys_for(swarm, EVA) == []
 
 
@@ -825,7 +825,7 @@ def test_with_crew_review_off_a_pick_kept_from_a_review_before_the_crew_reviews_
     swarm.notified.clear()
     board.complete(ANNA, task.id, "the whole")
     after = board.get(task.id)
-    assert (after.status, after.reviewer, after.result) == (Status.DONE, picked, "the whole")
+    assert (after.status, after.reviewer, after.result) == (Status.DONE, None, "the whole")
     assert review_keys(swarm) == []
 
 

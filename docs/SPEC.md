@@ -1267,7 +1267,8 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     (its owner's, its `result` the one the owner wrote) makes it `done` at once, always: whatever
     `independent_review` says and whatever reviewer the crew task holds (named in `task_create` or `task_update`
     `reviewer`, set by USER, or picked by the board for an earlier review and kept after a return). The board picks
-    no reviewer and nobody is asked for a review; the reviewer field stays as it was. The same holds for a crew
+    no reviewer and nobody is asked for a review; the reviewer field is cleared, so the reviewer spread (§4.1,
+    reviews so far) counts no review its holder never gave. The same holds for a crew
     task none of whose directions is done. Whoever wants a crew task reviewed turns `crew_review` on.
   - A toggle of `crew_review` while a crew task is in review changes nothing for that review: it stays in review
     with its reviewer, whose verdict (or the user's) settles it as usual; only a later completion follows the new

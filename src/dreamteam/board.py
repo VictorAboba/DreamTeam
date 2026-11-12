@@ -971,7 +971,7 @@ class Board:
         """The assignee hands its work in (to review, or done). An agent cannot complete a task with open subtasks,
         a crew task with a failed direction, or a direction with an empty goal (docs/SPEC.md §4.2 "Finishing"). With
         [swarm] crew_review off, an agent's completion of a crew task is done: no second review, whatever
-        independent_review says and whatever reviewer the task holds.
+        independent_review says and whatever reviewer the task holds (cleared).
         `notes`: extended with the sentences for the result of the actor's call (a parent it holds whose subtasks
         are all finished now)."""
         text = str(result if result is not None else "").strip()
@@ -990,9 +990,9 @@ class Board:
             if actor != USER:
                 self._check_finishable(actor, old)
                 if old.crew >= 2 and not self.crew_review:
-                    # each direction was reviewed already: no second review, whatever reviewer the crew task holds
-                    # (docs/SPEC.md §4.2 "Finishing")
-                    return {"result": text, "status": Status.DONE}
+                    # each direction was reviewed already: no second review, whatever reviewer the crew task holds,
+                    # which is cleared, so no review given is counted for it (docs/SPEC.md §4.2 "Finishing")
+                    return {"result": text, "status": Status.DONE, "reviewer": None}
             if actor == USER or not self.independent_review:
                 to_review = old.reviewer is not None and old.reviewer != actor
                 return {"result": text, "status": Status.REVIEW if to_review else Status.DONE}
