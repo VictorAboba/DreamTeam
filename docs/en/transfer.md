@@ -52,7 +52,7 @@ complete. Any other folder with files in it is refused. You cannot export to the
 that category is exported. On Linux and macOS the export folder is created readable by you only (mode 0700).
 
 At the end the report lists what was written per category, what was left out and why, the warnings, and the
-command to run on the other computer. A session made by an earlier version is exported like any other, with the
+command to run on the other computer. A session of an earlier version is exported like any other, with the
 warning `session 003-snake was made by an earlier version of DreamTeam: this version and the same one on the other
 computer refuse it; only the version that made it imports and opens it (keep this folder)`.
 

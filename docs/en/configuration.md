@@ -27,7 +27,7 @@ max_agents = 8           # max AI agents (they hire new ones themselves; members
 max_cost_usd = 5.0       # budget; when it runs out, the swarm pauses
 starting_roles = []      # the starting team in order: ["architect", "developer", "developer", "tester"]
 independent_review = true # another member accepts an agent's task (or you, if there is no one else)
-crew_review = true       # a crew task its owner completed is checked as a whole, where possible by a member outside its directions; false: no second review (the directions were reviewed): done once the owner completes it, even with a reviewer named
+crew_review = true       # a crew task its owner completed is checked as a whole (see "Reviews"); false: done once the owner completes it
 network = "on"           # "off": the agents' commands and MCP servers have no internet (see "Session without internet")
 clarify = false          # true: the planner asks you about the goal first; a critical question pauses the swarm
 
@@ -127,8 +127,8 @@ The board reads `independent_review` and `crew_review` each time it uses them, s
 running sessions too, unless a session overrides it in its own settings. With `independent_review` on, an agent's
 finished task is accepted by another member, or by you when nobody else can; off, a task without a reviewer is done
 at once.
-`crew_review` decides whether the owner's completion of a [crew task](features.md) with at least one direction done
-goes to the check of the whole: a reviewer, where possible one who worked on none of its directions, checks whether
+`crew_review` decides whether a [crew task](features.md) its owner completed, with at least one direction done, is
+checked as a whole: a reviewer, where possible one who worked on none of its directions, checks whether
 the directions fit together and whether the result meets the task's goal. Whether there is a review at all still
 follows `independent_review` (off: only when the task has a reviewer of its own). With `crew_review` off there is no
 second review, since each direction was reviewed already: the crew task is done once its owner completes it, even

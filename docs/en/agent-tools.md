@@ -7,10 +7,10 @@ themselves as MCP servers.
 
 * Board: `board`, `task_get`, `task_create`, `task_claim`, `task_update`, `task_complete`, `task_review`,
   `task_comment`, `task_discussion` ([crew tasks](features.md): `task_create` and `task_update` take `crew`, how many
-  members may work on the task at once, its owner included, 2..8, or 0 to make it an ordinary task again (in
-  `task_update` its creator or assignee sets it), and `directions`, the titles of its directions: each direction
-  becomes a draft subtask whose taker writes its card. `task_update` adds directions; when the task's owner names
-  them while none of its directions is its own, the first is its own part. `task_get` of a task with subtasks lists
+  members may work on the task at once, its owner included (2 to 8, or 0 to make it an ordinary task again; in
+  `task_update` the task's creator or assignee sets it), and `directions`, the titles of its directions: each one
+  becomes a draft subtask whose taker writes its card. `task_update` adds directions; when the owner names them and
+  has no direction of its own yet, the first one becomes its own. `task_get` of a task with subtasks lists
   them with the first line of their results and, for a crew task, who works on it and its free directions; `board`
   lists a subtask indented under its parent).
 * Communication: `send_message` (in [clarify mode](features.md), `[swarm] clarify`, `pause_swarm=true` on a critical

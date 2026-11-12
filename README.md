@@ -32,8 +32,8 @@ dreamteam "Build a snake game in Python with tests"
   *different* member (independent review) — or by you, if nobody else is left.
 - **Crew tasks.** A deliverable too big for one member becomes a crew task. Whoever makes it a crew task names
   only its directions, and the members who take them write their cards. Its owner does one of them itself, keeps
-  them consistent and writes the result from a draft the board assembles from theirs. By default another member,
-  where possible one who worked on none of its directions, then checks it as a whole
+  them consistent and writes the result from a draft the board assembles from the directions' results. By default
+  another member, where possible one who worked on none of its directions, then checks it as a whole
   ([more](docs/en/features.md)).
 - **It asks before it builds.** In clarify mode the planner asks you about the goal's open points in one message
   before it creates any task, while the other agents wait without spending tokens; an agent whose question decides
