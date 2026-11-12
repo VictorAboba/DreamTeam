@@ -470,6 +470,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "session_deleting": "Удаляю сессию…",
         "session_deleted": "Сессия «{title}» ({id}) удалена",
         "no_sessions_continue": "Нет сессий, которые можно продолжить",
+        "continue_earlier": "Последняя сессия, {id}, создана более ранней версией DreamTeam, и эта версия ({version}) "
+                            "не может её открыть: начните новую сессию",
         "confirm_new_title": "Цель этой сессии уже достигнута",
         "confirm_new_text": "Начать новую сессию с этой целью? «Нет» — отправить как сообщение.",
         "mcp_tools": "Инструменты",
@@ -1099,6 +1101,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "session_deleting": "Deleting the session…",
         "session_deleted": "Session \"{title}\" ({id}) deleted",
         "no_sessions_continue": "There is no session to continue",
+        "continue_earlier": "The most recent session, {id}, was made by an earlier version of DreamTeam and cannot be "
+                            "opened by this one ({version}): start a new session",
         "confirm_new_title": "This session's goal is already achieved",
         "confirm_new_text": "Start a new session with this goal? \"No\" sends it as a message.",
         "mcp_tools": "Tools",

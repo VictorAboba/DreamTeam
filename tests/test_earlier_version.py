@@ -9,11 +9,13 @@ folder as they were (no -wal or -shm next to its database, no logs folder)."""
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import html
 import io
 import json
 import logging
 import sqlite3
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -423,7 +425,7 @@ async def test_print_mode_never_opens_it(tmp_path, kind):
         code, out, err = await _print(conn, "A haiku", session=made.sid)
         assert code == 1 and out == "" and err.strip() == made.text
         code, out, err = await _print(conn, "A haiku", continue_last=True)
-        assert code == 1 and err.strip() == "There is no session to continue."
+        assert code == 1 and out == "" and err.strip() == continue_text(made.sid)
         assert untouched(made) and len(await conn.client.sessions()) == 1
         fresh = (await conn.client.create_session("Fresh", "", start=False))["id"]
         code, out, err = await _print(conn, "Write a haiku", continue_last=True, output_format="json")
@@ -432,6 +434,66 @@ async def test_print_mode_never_opens_it(tmp_path, kind):
         assert untouched(made)
     finally:
         await conn.close()
+
+
+def continue_text(sid: str, lang: str = "en") -> str:
+    if lang == "ru":
+        return (f"Последняя сессия, {sid}, создана более ранней версией DreamTeam, и эта версия ({__version__}) не может "
+                "её открыть. Начните новую сессию: запустите без -c.")
+    return (f"The most recent session, {sid}, was made by an earlier version of DreamTeam and cannot be opened by this "
+            f"one ({__version__}). Start a new session: run without -c.")
+
+
+async def make_old_latest(tmp_path: Path) -> tuple[SimpleNamespace, str]:
+    """An openable session, then a session of an earlier version that was active after it (the most recent one)."""
+    made = await make_old(tmp_path, "record")
+    older = (await made.manager.create("Older", "", start=False))["id"]
+    db = Database(made.folder / ".dreamteam" / "swarm.db")
+    try:
+        db.execute("INSERT INTO events(ts, type, actor, data) VALUES (?, 'session.started', 'user', '{}')",
+                   (time.time() + 3600,))
+    finally:
+        db.close()
+    made.before = snapshot(made.folder)
+    await made.manager.shutdown()
+    return made, older
+
+
+@pytest.mark.parametrize("lang", ["en", "ru"])
+async def test_continue_says_the_most_recent_session_is_of_an_earlier_version(tmp_path, lang):
+    """-p -c never passes over the most recent session for an older one the user did not ask for."""
+    made, older = await make_old_latest(tmp_path)
+    conn = await connect(made.home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(finisher, profile))
+    try:
+        out, err = io.StringIO(), io.StringIO()
+        code = await run_print(conn, "A haiku", out=out, err=err, timeout=30, lang=lang, continue_last=True)
+        assert code == 1 and out.getvalue() == "" and err.getvalue().strip() == continue_text(made.sid, lang)
+        assert untouched(made)
+        summary = next(s for s in await conn.client.sessions() if s["id"] == older)
+        assert summary["status"] != "running"   # not continued in its place
+    finally:
+        await conn.close()
+
+
+async def test_the_tui_continue_says_the_most_recent_session_is_of_an_earlier_version(tmp_path):
+    from test_tui_app import Harness
+
+    made, older = await make_old_latest(tmp_path)
+    conn = await connect(made.home, web=False, resume=False,
+                         llm_factory=lambda profile, agent: ScriptedLLM(finisher, profile))
+    with contextlib.ExitStack() as stack:
+        h = Harness(conn, stack, width=200, continue_last=True)
+        try:
+            await h.see(f"The most recent session, {made.sid}, was made by an earlier version of DreamTeam and cannot "
+                        f"be opened by this one ({__version__}): start a new session")
+            assert not h.tui.attached and h.tui.sid is None
+            assert untouched(made)
+            summary = next(s for s in await conn.client.sessions() if s["id"] == older)
+            assert summary["status"] != "running"
+        finally:
+            await h.close()
+    await conn.close()
 
 
 # ---- import, a session that ran, and what still opens -----------------------------------------------------------

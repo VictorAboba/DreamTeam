@@ -2045,6 +2045,7 @@ class TUI:
             self.local = bool(self.conn.owned) or _same_path(home, str(self.home))
             sessions: list[dict] = []
             target: dict | None = None
+            earlier: dict | None = None  # -c: the most recent session, made by an earlier version
             if self.client.mode == "launcher":
                 if not self._lang_fixed:
                     with contextlib.suppress(HubError):
@@ -2058,10 +2059,15 @@ class TUI:
                     missing = None if target else self.session_arg
                 elif self.continue_last and sessions:
                     target = max(sessions, key=lambda s: _float(s.get("last_activity") or s.get("created_at")))
+                    if target.get("earlier_version"):  # never opened, nor passed over for an older one (SPEC §17.2)
+                        earlier, target = target, None
             self.print(render.welcome(self.ctx, version=__version__, home=str(self.home),
                                       web_url=self.web_url(session=False), session=target))
             if missing:
                 self.error(self.t("unknown_session", id=missing))
+            elif earlier is not None:
+                self.error(self.t("continue_earlier", id=earlier.get("id"),
+                                  version=self.hub.get("version") or __version__))
             elif self.continue_last and not sessions and self.client.mode == "launcher":
                 self.info(self.t("no_sessions_continue"))
             if self.client.mode != "launcher":

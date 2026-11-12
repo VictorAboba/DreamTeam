@@ -4070,7 +4070,8 @@ settings; ValueError when they are invalid):
   «Сессия main (рой в {home}) создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть.
   Откройте её в той версии, которой она создана, или удалите вручную {home}/.dreamteam/swarm.db (вместе с файлами
   -wal и -shm).» The CLI's texts (the project message, `traces`, `console`, `-r`, `-p`) and the import reason
-  (§20.4) are English, like the hub's errors, except where the TUI shows the twin. Such a session is listed and
+  (§20.4) are English, like the hub's errors, except where the TUI shows the twin; `-c` and `-p -c` whose most
+  recent session is such a one say a shorter message of their own in the user's language (§18.3). Such a session is listed and
   marked (summary `earlier_version`), and only listing (its summary),
   `delete` and export (§20.2: it reads a copy of the database and never opens the session) act on it; every other
   operation is refused with that message and writes nothing: `load` (viewing, the board, the session REST and
@@ -4950,7 +4951,17 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   stderr, exit 1, and its database is not opened: `db.made_by_earlier_version` runs right after `_session_db`
   returns an existing path, before `Database(...)`, so one check covers the home and the project).
 - Sessions made by an earlier version (§17.2 "Sessions of an earlier version"): `sessions` and `status` list them
-  marked (`session_line`, as in §18.2); `-c` and `-p -c` pick among the sessions this version opens; `-r ID` of
+  marked (`session_line`, as in §18.2); `-c` and `-p -c` continue the most recent session, and when that one was
+  made by an earlier version they never pass over it for an older session the user did not ask for: they say so
+  and that a new session is needed, and create nothing (`-p` exits 1 with the print mode's `continue_earlier` on
+  stderr, en `The most recent session, {sid}, was made by an earlier version of DreamTeam and cannot be opened by
+  this one ({version}). Start a new session: run without -c.`, ru «Последняя сессия, {sid}, создана более ранней
+  версией DreamTeam, и эта версия ({version}) не может её открыть. Начните новую сессию: запустите без -c.»; the
+  TUI says its `continue_earlier` under the welcome box, en `The most recent session, {id}, was made by an earlier
+  version of DreamTeam and cannot be opened by this one ({version}): start a new session`, ru «Последняя сессия,
+  {id}, создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть: начните новую
+  сессию», and attaches nothing; `{version}` is the hub's); a default picked without the user asking for the last
+  session (`console` and `traces` without `--session`) still skips sessions made by an earlier version; `-r ID` of
   one prints its message (the TUI says it under the welcome box and creates nothing; `-p` exits 1); the `-r`
   picker and `/sessions` show them with the status «прежняя версия» / "earlier version", Enter shows the message
   instead of attaching, Del deletes as usual; `console --session ID` refuses one with the message (exit 1, before
