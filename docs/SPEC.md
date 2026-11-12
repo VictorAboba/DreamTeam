@@ -1493,11 +1493,17 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   results and `n_crew_owner`.
 - **Surfaces.** The web board shows subtasks in their parent's stack (§18.4 "Subtasks"). The TUI (docs/TUI.md,
   updated with the code) does the same in text: a parent's line ends with one `●` per direct subtask in its status
-  colour, `done/total`, `crew 2/3` for a crew task (ru «групповая 2/3») and the TUI's review-for-you mark when one of
-  its subtasks waits for the user's review; `/task N` lists the subtasks indented; the board list shows a subtask as
-  its own line only where the web shows it as its own card, and its column headers count the lines they show (as
-  the web's columns count cards). The session card on the home page (`read_stats`) and the TUI's status line count
-  tasks, directions included. A change of `crew` in the task history and the feed (web `changesText`, TUI history
+  colour (the TUI's status colours, ASCII `o`; at most 12 dots, then `+N`, as the web's toggle), `done/total`,
+  `crew 2/3` for a crew task (ru «групповая 2/3»; for any task whose `crew` is an integer ≥ 2, with or without
+  subtasks) and the TUI's review-for-you mark when one of its subtasks (any level of the stack) waits for the user's
+  review (once per line); these parts end the line's first row, each after ` · `, in this order; `/task N` lists the
+  subtasks indented; the board list shows a subtask as its own line only where the web shows it as its own card (a
+  subtask that is its own line carries no note of its parent; an id or parent_id that is not an integer or a string
+  is no key: such a task is a card of its own, never a parent), and its column headers count the lines they show (as
+  the web's columns count cards; a done or closed column cut to its last 15 lines counts the lines its `… +N` stands
+  for too). The session card on the home page and the TUI's `/sessions` table (`read_stats`), and the board summary
+  the TUI prints on attach (`render.board_summary`), count tasks, directions included (the TUI's status line shows
+  no task count). A change of `crew` in the task history and the feed (web `changesText`, TUI history
   and change lines) is labelled by `f_crew` (ru «групповая задача (участников)», en "crew"; the value 0 reads
   «обычная задача» / "ordinary task"), in app.js and tui/i18n.py.
 - **Tests** (besides new ones for each rule above: the owner told when all directions are finished, also in the

@@ -187,6 +187,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "td_history": "История",
         "td_created": "создал(а) задачу",
         "task_review_you": "ждёт вашего ревью",
+        "task_crew": "групповая {m}/{n}",
         "td_review_hint": "Принять: /approve {id} [комментарий] · вернуть: /reject {id} что исправить",
         "review_reason_required": "Напишите, что исправить: /reject {id} что исправить",
         # ---- tables
@@ -814,6 +815,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "td_history": "History",
         "td_created": "created the task",
         "task_review_you": "waits for your review",
+        "task_crew": "crew {m}/{n}",
         "td_review_hint": "Approve: /approve {id} [comment] · return: /reject {id} what to fix",
         "review_reason_required": "Say what to fix: /reject {id} what to fix",
         # ---- tables

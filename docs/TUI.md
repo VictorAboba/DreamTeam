@@ -317,7 +317,14 @@ class RenderContext:
     such a task adds the hint «Принять: /approve 3 [комментарий] · вернуть: /reject 3 что исправить»;
   - done: `☒ #3 Title — Анна` + `⎿ result (first line)` (verbose: more);
   - failed or cancelled: `✗ #3 …` (red or dim);
-  - discussion post: `💬 #3 Анна: text`.
+  - discussion post: `💬 #3 Анна: text`;
+  - board line of a parent: `☐ #2 Парсер — Анна · ●●● 1/3 · групповая 2/3 · ждёт вашего ревью`: one `●` per direct
+    subtask (ASCII `o`), each in its status colour (todo default, in progress accent, waiting dim, review warn, done
+    ok, failed error, cancelled dim; an unknown status as todo), at most 12, then `+N`; `done/total` of the direct
+    subtasks; the crew chip `групповая m/n` / "crew m/n" (m = members working, n = `crew`) when `crew` is an integer
+    ≥ 2, with or without subtasks; the review-for-you mark when any subtask of the stack (any level) waits for the
+    user's review, once per line (not again when the task itself waits for it). The tail ends the first line (after
+    the comments and the verbose tags, before the verbose goal) and wraps; the head does not move.
 - Goal: `goal.set` renders as a rounded panel titled «Цель» / "Goal". `goal.completed` renders as a green
   rounded panel «✓ Цель достигнута» with the summary as markdown.
 - Thinking (verbose only): `✻ Анна думает…` with the text dim italic, max 12 lines.
@@ -347,7 +354,7 @@ class RenderContext:
 - Wrap-up mode (`swarm.wrap_up`) renders as a warning line `⚠ вы: режим завершения — агенты завершают задачи с тем,
   что есть, без новых вычислений и фоновых процессов` / a dim `· вы: режим завершения выключен`.
 - Quiet shows only messages to/from the user, the goal, errors, approvals and pause/budget/wrap-up lines.
-- Unicode symbols have ASCII fallbacks (`*`, `|_`, `[ ]`, `[~]`, `[x]`, `x`, `>`), used when the terminal
+- Unicode symbols have ASCII fallbacks (`*`, `|_`, `[ ]`, `[~]`, `[x]`, `x`, `>`, `o`), used when the terminal
   encoding cannot encode them.
 
 ### 3.2 Functions
@@ -362,7 +369,15 @@ def event(ctx, ev: dict) -> RenderableType | None        # every bus event type 
 def user_echo(ctx, text: str, to: str | None) -> RenderableType
 def agent_message(ctx, msg: dict) -> RenderableType      # msg from /api/messages or message.sent data.message
 def goal_panel(ctx, goal: dict | None) -> RenderableType
-def board(ctx, tasks: list[dict]) -> RenderableType      # grouped by column, todo symbols, assignee, deps, 💬n
+def board(ctx, tasks: list[dict]) -> RenderableType      # grouped by column, todo symbols, assignee, deps, 💬n;
+    # one line per card as the web's board (board_cards): a subtask is its own line only as an open subtask of a
+    # terminal parent or under a parent missing from the snapshot, other subtasks are dots in their card's line;
+    # a column header counts its lines (a done or closed column cut to its last 15 counts the `… +N` ones too)
+def board_cards(tasks: list[dict]) -> list[Card]         # the twin of app.js boardCards (tests/helpers/stacks.py):
+    # Card(task, rows=((task, level), ...) depth-first by id, direct=the level-0 rows), in task-id order; an id or
+    # parent_id that is not an int (a bool is none) or a str is no key: such a task is a card, never a parent
+def board_summary(ctx, tasks: list[dict] | dict) -> RenderableType   # `Задачи: ☐ 3 · ◐ 2 · ☒ 5`: counts every
+    # task, directions included (a task list or the snapshot counts {status: n})
 def task_detail(ctx, data: dict) -> RenderableType       # /api/tasks/{id}: header, goal, description, result, discussion
 def agents_table(ctx, agents: list[dict]) -> RenderableType   # a member with running background jobs: `⚙N` after
                                                               # its tasks (narrow: after its status)
@@ -537,7 +552,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" (warn) while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up" |
 | `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
-| `/board` | the board (`board`) |
+| `/board` | the board (`board`): one line per card, a parent's subtasks as dots in its line |
 | `/task N` | task with discussion |
 | `/agents` | team table |
 | `/roles [роль]` | the role catalog (`roles_table`) / one role in full (`role_detail`) |
@@ -592,9 +607,9 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   catch-up replays its journal (the starting team joining, the goal panel, the first tasks and messages),
   so nothing that happened before the stream connected is lost and the goal is printed once.
 - After attaching to an existing session:
-  - print the goal panel, a one-line board summary (`Задачи: ☐ 3 · ◐ 2 · ☒ 5`) and the last 6 messages between the
-    user and agents (the newest messages of everyone merged with the user's inbox, so an old question to the
-    user is not lost behind agent-to-agent traffic);
+  - print the goal panel, a one-line board summary (`Задачи: ☐ 3 · ◐ 2 · ☒ 5`; every task, directions included)
+    and the last 6 messages between the user and agents (the newest messages of everyone merged with the user's
+    inbox, so an old question to the user is not lost behind agent-to-agent traffic);
   - then follow `client.stream(sid)`; every event goes through `render.event` at the current verbosity.
   - Attaching is transactional: the start, the event baseline, the state and the history are fetched first;
     only then is the current session left. A failed `/resume` or picker choice keeps the current session.

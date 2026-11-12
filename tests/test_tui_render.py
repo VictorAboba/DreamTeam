@@ -16,6 +16,7 @@ from rich.cells import cell_len
 
 from dreamteam.tui import i18n, render, theme
 from dreamteam.tui.render import RenderContext, to_ansi, to_plain
+from helpers.stacks import EXPECTED_CARDS, STACK_TASKS
 
 ANNA, BORIS = "Анна Смирнова", "Борис Петров"
 NOW = 1_760_000_000.0
@@ -242,7 +243,8 @@ def all_renderables(c: RenderContext) -> list:
                          task(3, status="todo", depends_on=[2], blocked_by=[2], priority=3),
                          task(4, status="review", assignee=BORIS, reviewer=ANNA),
                          task(5, status="cancelled"), task(6, status="failed")]),
-        render.board(c, []), render.board_summary(c, [task(1), task(2, status="done")]),
+        render.board(c, []), render.board(c, STACK_TASKS), render.board(c, crew_board()),
+        render.board_summary(c, [task(1), task(2, status="done")]),
         render.board_summary(c, {"todo": 1, "in_progress": 2}),
         render.task_detail(c, task_data()), render.task_detail(c, {"error": "not found"}),
         render.agents_table(c, AGENTS), render.agents_table(c, []),
@@ -277,6 +279,18 @@ def task_data() -> dict:
             "events": [ev("task.created", ANNA, task=task(2)),
                        ev("task.updated", BORIS, task=task(2), changes={"status": ["todo", "in_progress"]}),
                        ev("task.comment", ANNA, task_id=2, post={"text": "Как дела?"})]}
+
+
+def crew_board(title: str = "Парсер выражений", subtasks: int = 14, done: int = 3) -> list[dict]:
+    """A crew parent #1 (crew 3, two at work) with `subtasks` direct subtasks: `done` done, one in review for the
+    user, the rest todo."""
+    parent = task(1, title, "todo", assignee=ANNA, crew=3, crew_working=[ANNA, BORIS])
+    subs = []
+    for i in range(subtasks):
+        status = "done" if i < done else "review" if i == done else "todo"
+        subs.append(task(i + 2, f"Направление {i + 2}", status, parent_id=1, assignee=BORIS,
+                         reviewer="user" if status == "review" else None))
+    return [parent] + subs
 
 
 def status_info() -> dict:
@@ -849,6 +863,7 @@ def test_ascii_mode_with_ascii_data_is_pure_ascii():
     trace, span, context, sessions, agents, detail = ascii_only([TRACE, SPAN, CONTEXT, SESSIONS, AGENTS,
                                                                  task_data()])
     renderables = [render.event(c, e) for e in events] + [
+        render.board(c, STACK_TASKS), render.board(c, ascii_only(crew_board())),
         render.welcome(c, version="1", home="/h", web_url="http://x", session=sessions[0]), render.tips(c, True),
         render.trace_detail(c, trace), render.span_detail(c, span), render.context_view(c, context),
         render.sessions_table(c, sessions, "001-calc"), render.agents_table(c, agents),
@@ -908,6 +923,154 @@ def test_board_and_summary():
     many = [task(i, f"T{i}", "done") for i in range(1, 31)]
     assert "#1 " not in plain(render.board(ctx(), many)) and "#30 " in plain(render.board(ctx(), many))
     assert "#1 " in plain(render.board(ctx("verbose"), many))
+
+
+def _cards(tasks) -> dict:
+    return {c.task["id"]: [(t["id"], level) for t, level in c.rows] for c in render.board_cards(tasks)}
+
+
+def test_board_cards_match_the_web():
+    cards = render.board_cards(STACK_TASKS)
+    assert _cards(STACK_TASKS) == EXPECTED_CARDS
+    assert [c.task["id"] for c in cards] == sorted(EXPECTED_CARDS)
+    assert [t["id"] for t in next(c for c in cards if c.task["id"] == 2).direct] == [3, 4, 5]
+    assert _cards(list(reversed(STACK_TASKS)) + [None, 7, "x"]) == EXPECTED_CARDS  # shuffled, non-dicts dropped
+    loop = [{"id": 5, "parent_id": 21}, {"id": 20, "parent_id": 21}, {"id": 21, "parent_id": 20},
+            {"id": 30, "parent_id": 30}]  # as tests/test_ui.py: a loop with no root, a task its own parent
+    assert [(c.task["id"], [(t["id"], lv) for t, lv in c.rows]) for c in render.board_cards(loop)] == \
+        [(20, [(21, 0), (5, 1)]), (30, [])]
+    assert render.board_cards(None) == [] and render.board_cards({"id": 1}) == []
+
+
+def test_board_cards_odd_ids():
+    odd = [{"id": [1]}, {"id": True, "parent_id": 1}, {"parent_id": {}}, {"id": 1, "status": "todo"},
+           {"id": 2, "parent_id": True}, {"id": 3, "parent_id": 1, "status": ["x"]}]
+    cards = render.board_cards(odd)
+    one = next(c for c in cards if c.task.get("id") == 1 and not isinstance(c.task.get("id"), bool))
+    assert one.task is odd[3]
+    assert [row for row, _ in one.rows] == [odd[1], odd[5]]  # True is no key, its parent_id 1 is
+    assert any(c.task is odd[4] for c in cards)  # parent_id True: no parent, a card of its own
+    seen = [c.task for c in cards] + [row for c in cards for row, _ in c.rows]
+    assert len(seen) == len(odd) and all(any(x is item for x in seen) for item in odd)  # each dict once
+    out = plain(render.board(ctx(), odd))
+    assert "#1 " in out
+
+
+def test_board_lines_follow_the_cards():
+    out = plain(render.board(ctx(), STACK_TASKS))
+    lines = out.split("\n")
+    heads = {int(m.group(1)) for line in lines if (m := re.match(r"  \S+ #(\d+) ", line))}
+    assert heads == {1, 2, 7, 8, 10, 12}
+    assert "К работе (3)" in lines and "В работе (1)" in lines and "Готово (2)" in lines
+    line = {n: next(x for x in lines if x.startswith(f"  ") and f" #{n} " in x) for n in heads}
+    assert line[2].endswith("Task 2 · ●●● 1/3")
+    assert line[7].endswith("Task 7 · ● 1/1")
+    assert line[10].endswith("Task 10 · ● 0/1")
+    for n in (1, 8, 12):
+        assert "●" not in line[n] and line[n].endswith(f"Task {n}")
+    assert plain(render.board(ctx(lang="en"), STACK_TASKS)).split("\n")[0] == "To do (3)"
+
+
+def style_at(text, i: int) -> str:
+    """The style of the last span of `text` covering offset `i`, "" when none does."""
+    style = ""
+    for span in text.spans:
+        if span.start <= i < span.end:
+            style = str(span.style)
+    return style
+
+
+def test_stack_dots_take_the_status_colours():
+    c = ctx()
+    card = next(x for x in render.board_cards(STACK_TASKS) if x.task["id"] == 2)
+    tail = render._stack_tail(c, card)
+    assert tail.plain == "●●● 1/3"
+    assert [style_at(tail, i) for i in range(3)] == [theme.OK, theme.ACCENT, ""]
+    statuses = ["failed", "cancelled", "waiting", "review", "odd", "in_progress", "done"]
+    tasks = [task(1)] + [task(i + 2, status=s, parent_id=1) for i, s in enumerate(statuses)]
+    card = render.board_cards(tasks)[0]
+    tail = render._stack_tail(c, card)
+    expected = [render._task_symbol(c, s)[1] for s in statuses]
+    assert expected[:4] == [theme.ERROR, "dim", "dim", theme.WARN] and expected[4] == render._task_symbol(c, "todo")[1]
+    assert [style_at(tail, i) for i in range(len(statuses))] == expected
+
+
+def test_stack_dots_cap():
+    tasks = [task(1)] + [task(i, status="done" if i < 5 else "todo", parent_id=1) for i in range(2, 16)]
+    out = plain(render.board(ctx(), tasks))
+    assert "●" * 12 + " +2 3/14" in out and "●" * 13 not in out
+
+
+def test_crew_chip_on_the_board_line():
+    tasks = crew_board(subtasks=3, done=1)
+    tasks[2]["reviewer"] = BORIS  # no review-for-you mark here
+    en = plain(render.board(ctx(lang="en"), tasks))
+    assert "#1 Парсер выражений — Анна · ●●● 1/3 · crew 2/3" in en
+    ru = plain(render.board(ctx(), tasks))
+    assert "· ●●● 1/3 · групповая 2/3" in ru
+    alone = plain(render.board(ctx(lang="en"), [task(1, "Alone", crew=3, crew_working=[])]))
+    assert "#1 Alone · crew 0/3" in alone and "●" not in alone
+    for crew in (0, 1, True, 2.5, "3", None):
+        out = plain(render.board(ctx(lang="en"), [task(1, "Plain", crew=crew, crew_working=[ANNA])]))
+        assert "crew" not in out, crew
+    assert "crew" not in plain(render.board(ctx(lang="en"), [task(1, "Plain")]))
+
+
+def test_review_for_you_mark_from_a_subtask():
+    mark = "ждёт вашего ревью"
+    direct = [task(1, "Родитель"), task(2, "Под", "review", parent_id=1, reviewer="user")]
+    assert plain(render.board(ctx(), direct)).count(mark) == 1
+    deep = [task(1, "Родитель"), task(2, "Под", "in_progress", parent_id=1),
+            task(3, "Глубже", "review", parent_id=2, reviewer="user")]
+    assert plain(render.board(ctx(), deep)).count(mark) == 1
+    own = [task(1, "Родитель", "review", reviewer="user"), task(2, "Под", "review", parent_id=1, reviewer="user")]
+    assert plain(render.board(ctx(), own)).count(mark) == 1
+    other = [task(1, "Родитель"), task(2, "Под", "review", parent_id=1, reviewer=BORIS)]
+    assert mark not in plain(render.board(ctx(), other))
+
+
+def test_board_header_counts_cut_lines():
+    tasks = [task(i, f"T{i}", "done") for i in range(1, 21)]
+    tasks += [task(i, f"S{i}", "done", parent_id=i - 20) for i in range(21, 31)]  # subtasks of #1..#10
+    out = plain(render.board(ctx(), tasks))
+    assert "Готово (20)" in out and "… +5" in out
+    assert "#21 " not in out and "#20 " in out and "#5 " not in out
+
+
+def test_board_summary_counts_directions():
+    assert plain(render.board_summary(ctx(), STACK_TASKS)) == "Задачи: ☐ 6 · ◐ 2 · ☒ 4"
+    row = {**SESSIONS[0], "tasks": {"done": 4, "total": 12}}
+    assert "4/12" in plain(render.sessions_table(ctx(), [row]))
+
+
+def test_board_at_80_columns():
+    title = ("Parser of arithmetic expressions " * 4).strip()[:120]
+    for c in (ctx(width=80), ctx(lang="en", width=80), ctx(lang="en", width=80, unicode=False)):
+        out = plain(render.board(c, crew_board(title)), 80)
+        assert_fits(out, 80)
+        first = out.split("\n")[1]  # the parent's first line, right under the header
+        assert re.match(rf"  (\S+|\[.\]) #1 {title.split()[0]} ", first), first
+        flat = " ".join(out.split())
+        dot = "o" if not c.unicode else "●"
+        assert dot * 12 + " +2 3/14" in flat
+        assert c.t("task_crew", m=2, n=3) in flat and c.t("task_review_you") in flat
+        assert sum(1 for line in out.split("\n") if re.match(r"\s+(\S+|\[.\]) #\d+ ", line)) == 1
+
+
+def test_board_large_and_deep():
+    chain = [task(1, "Root")] + [task(i, f"T{i}", parent_id=i - 1) for i in range(2, 301)]
+    wide = [task(1, "Root")] + [task(i, f"T{i}", parent_id=1) for i in range(2, 301)]
+    started = time.perf_counter()
+    deep = plain(render.board(ctx(width=80), chain), 80)
+    broad = plain(render.board(ctx(width=80), wide), 80)
+    assert time.perf_counter() - started < 10
+    assert deep.split("\n")[0] == "К работе (1)" and "#1 Root · ● 0/1" in deep
+    assert broad.split("\n")[0] == "К работе (1)" and "#1 Root · " + "●" * 12 + " +287 0/299" in broad
+
+
+def test_board_title_markup_prints_literally():
+    out = plain(render.board(ctx(), [task(1, "[bold red]x[/]")]))
+    assert "#1 [bold red]x[/]" in out
 
 
 def test_task_detail():

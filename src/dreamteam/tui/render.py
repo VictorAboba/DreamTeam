@@ -1238,6 +1238,102 @@ class ToolPairs:
 # ---- board ----------------------------------------------------------------------------------------
 BOARD_COLUMNS = (("todo", ("todo",)), ("in_progress", ("in_progress",)), ("waiting", ("waiting",)),
                  ("review", ("review",)), ("done", ("done",)), ("closed", ("failed", "cancelled")))
+OPEN_STATUSES = frozenset({"todo", "in_progress", "waiting", "review"})
+TERMINAL_STATUSES = frozenset({"done", "failed", "cancelled"})
+STACK_DOTS = 12  # a parent's line shows a dot for at most this many direct subtasks, then +N (app.js STACK_DOTS)
+
+
+def _key(value: Any) -> int | str | None:
+    """A task id or parent_id as a key: an int (not a bool) or a str; anything else is no key (docs/SPEC.md §4.2
+    "Surfaces": such a task is a card of its own, never a parent)."""
+    if isinstance(value, str) or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    return None
+
+
+@dataclass(frozen=True, eq=False)
+class Card:
+    """A line of the board: `task`, the `rows` of its stack ((task, level), depth-first by id; level 0 = a direct
+    subtask) and `direct` (the level-0 rows)."""
+    task: dict
+    rows: tuple[tuple[dict, int], ...] = ()
+    direct: tuple[dict, ...] = ()
+
+
+def board_cards(tasks: Any) -> list[Card]:
+    """The board's cards and their stacks: the twin of app.js `boardCards` (docs/SPEC.md §18.4 "Subtasks", §4.2
+    "Surfaces"); both are pinned by tests/helpers/stacks.py. A task is a card when it has no parent, its parent is
+    missing from the snapshot, or it is open while its parent is terminal; every other task is a row of the stack
+    of the card above it, each task once even when parent_id loops (a loop with no root makes a card of its lowest
+    id). No recursion. -> cards in task-id order."""
+    items = sorted((x for x in _list(tasks) if isinstance(x, dict)), key=lambda x: _int(x.get("id")))
+    by_id: dict[int | str, dict] = {}
+    for x in items:
+        k = _key(x.get("id"))
+        if k is not None:
+            by_id[k] = x  # the last wins, as in a JS Map
+
+    def placed_key(x: dict) -> tuple:  # the id, or the object itself for a task without a usable id
+        k = _key(x.get("id"))
+        return ("k", k) if k is not None else ("o", id(x))
+
+    def parent(x: dict) -> dict | None:
+        p = _key(x.get("parent_id"))
+        return by_id.get(p) if p is not None else None
+
+    kids: dict[int | str, list[dict]] = {}  # parent id -> its children in id order (parents in the snapshot only)
+    for x in items:
+        if parent(x) is not None:
+            kids.setdefault(_key(x.get("parent_id")), []).append(x)
+
+    def status(x: dict) -> str:  # a status of another type (even an unhashable one) is no status
+        value = x.get("status")
+        return value if isinstance(value, str) else ""
+
+    def is_card(x: dict) -> bool:
+        p = parent(x)
+        return p is None or (status(x) in OPEN_STATUSES and status(p) in TERMINAL_STATUSES)
+
+    def children(x: dict) -> list[dict]:
+        k = _key(x.get("id"))
+        return kids.get(k, []) if k is not None else []
+
+    placed: set[tuple] = set()
+    cards: list[Card] = []
+
+    def build(root: dict) -> None:
+        placed.add(placed_key(root))
+        rows: list[tuple[dict, int]] = []
+        todo = [(c, 0) for c in reversed(children(root))]  # an explicit stack: no recursion depth
+        while todo:
+            x, level = todo.pop()
+            if placed_key(x) in placed or is_card(x):
+                continue
+            placed.add(placed_key(x))
+            rows.append((x, level))
+            todo += [(c, level + 1) for c in reversed(children(x))]
+        cards.append(Card(root, tuple(rows), tuple(x for x, level in rows if level == 0)))
+
+    for x in items:
+        if is_card(x):
+            build(x)
+    for x in items:
+        if placed_key(x) in placed:
+            continue
+        # no card reaches x: its parents lead into a parent_id loop; the card starts at the loop's lowest id
+        seen: set[tuple] = set()
+        y: dict | None = x
+        while y is not None and placed_key(y) not in seen:
+            seen.add(placed_key(y))
+            y = parent(y)
+        root = y if y is not None else x
+        z = parent(root)
+        while z is not None and z is not y:
+            if _int(z.get("id")) < _int(root.get("id")):
+                root = z
+            z = parent(z)
+        build(root)
+    return sorted(cards, key=lambda c: _int(c.task.get("id")))
 
 
 def board_summary(ctx: RenderContext, tasks: list[dict] | dict) -> RenderableType:
@@ -1262,15 +1358,16 @@ def board_summary(ctx: RenderContext, tasks: list[dict] | dict) -> RenderableTyp
 
 
 def board(ctx: RenderContext, tasks: list[dict]) -> RenderableType:
-    tasks = [_d(task) for task in _list(tasks) if isinstance(task, dict)]
-    if not tasks:
+    """One line per card of the web's board (board_cards): a parent's subtasks are dots in its line, a subtask has
+    its own line only as a card (open under a terminal parent, or its parent missing); headers count the lines."""
+    cards = board_cards(tasks)
+    if not cards:
         return _out(ctx, info(ctx, ctx.t("board_empty")))
+    known = tuple(s for _, group in BOARD_COLUMNS for s in group)  # a tuple: a status of any type is compared
     rows: list[RenderableType] = []
     for column, statuses in BOARD_COLUMNS:
-        items = [task for task in tasks if task.get("status") in statuses]
-        if column == "todo":  # unknown statuses go with todo
-            known = {s for _, group in BOARD_COLUMNS for s in group}
-            items += [task for task in tasks if task.get("status") not in known]
+        items = [card for card in cards if card.task.get("status") in statuses
+                 or (column == "todo" and card.task.get("status") not in known)]  # unknown statuses go with todo
         if not items:
             continue
         if rows:
@@ -1280,12 +1377,31 @@ def board(ctx: RenderContext, tasks: list[dict]) -> RenderableType:
         shown = items[-limit:] if limit else items
         if len(shown) < len(items):
             rows.append(Text(f"  {ctx.sym['ellipsis']} +{len(items) - len(shown)}", style="dim"))
-        for task in shown:
-            rows.append(_board_row(ctx, task))
+        for card in shown:
+            rows.append(_board_row(ctx, card.task, card))
     return _out(ctx, Group(*rows))
 
 
-def _board_row(ctx: RenderContext, task: dict) -> Table:
+def _crew_size(task: dict) -> int:
+    """`crew` of a crew task (an integer >= 2), else 0."""
+    crew = task.get("crew")
+    return crew if isinstance(crew, int) and not isinstance(crew, bool) and crew >= 2 else 0
+
+
+def _stack_tail(ctx: RenderContext, card: Card) -> Text:
+    """`●●● 1/3`: one dot per direct subtask in its status colour (at most STACK_DOTS, then `+N`), done/total."""
+    out = Text()
+    for sub in card.direct[:STACK_DOTS]:
+        out.append(ctx.sym["sub"], style=_task_symbol(ctx, sub.get("status"))[1])
+    total = len(card.direct)
+    if total > STACK_DOTS:
+        out.append(f" +{total - STACK_DOTS}", style="dim")
+    done = sum(1 for sub in card.direct if sub.get("status") == "done")
+    out.append(f" {done}/{total}", style="dim")
+    return out
+
+
+def _board_row(ctx: RenderContext, task: dict, card: Card | None = None) -> Table:
     s = ctx.sym
     body = _task_head(ctx, task)
     status = task.get("status")
@@ -1308,8 +1424,20 @@ def _board_row(ctx: RenderContext, task: dict) -> Table:
         tags = [clean(tag) for tag in _list(task.get("tags")) if tag]
         if tags:
             body.append(f" {s['dot']} " + " ".join("#" + tag for tag in tags), style="dim")
-        if task.get("goal"):
-            body.append("\n" + ctx.short(task.get("goal"), 300), style="dim")
+    # the tail of the first line (docs/SPEC.md §4.2 "Surfaces"): the stack, the crew chip, the review mark
+    if card is not None and card.rows:
+        body.append(f" {s['dot']} ", style="dim")
+        body.append_text(_stack_tail(ctx, card))
+    crew = _crew_size(task)
+    if crew:
+        body.append(f" {s['dot']} {ctx.t('task_crew', m=len(_list(task.get('crew_working'))), n=crew)}", style="dim")
+    own_mark = status == "review" and bool(task.get("reviewer")) and task.get("reviewer") == ctx.me
+    if card is not None and not own_mark and any(
+            row.get("status") == "review" and row.get("reviewer") and row.get("reviewer") == ctx.me
+            for row, _level in card.rows):
+        body.append(f" {s['dot']} {ctx.t('task_review_you')}", style=f"bold {theme.WARN}")
+    if ctx.verbose and task.get("goal"):
+        body.append("\n" + ctx.short(task.get("goal"), 300), style="dim")
     return Padding(_task_line(ctx, task, body), (0, 0, 0, 2))
 
 
