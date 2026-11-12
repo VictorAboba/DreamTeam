@@ -247,6 +247,7 @@ def all_renderables(c: RenderContext) -> list:
         render.board_summary(c, [task(1), task(2, status="done")]),
         render.board_summary(c, {"todo": 1, "in_progress": 2}),
         render.task_detail(c, task_data()), render.task_detail(c, {"error": "not found"}),
+        render.task_detail(c, crew_detail(), crew_snapshot()),
         render.agents_table(c, AGENTS), render.agents_table(c, []),
         render.agents_table(c, [{**AGENTS[0], "jobs": 2}, {**AGENTS[1], "open_tasks": [], "jobs": 1}]),
         render.jobs_table(c, JOBS), render.jobs_table(c, []), render.jobs_table(c, [{"id": None}, {}]),
@@ -370,6 +371,8 @@ def test_every_text_key_used_by_render_exists():
               ("tr_", ("running", "done", "error", "step_limit", "refusal", "paused", "stopped", "interrupted")),
               ("mcp_", ("active", "pending", "failed", "rejected", "available", "removed")),
               ("op_", ("create", "write", "edit")), ("p", ("0", "1", "2", "3")),
+              ("f_", ("title", "goal", "description", "status", "assignee", "reviewer", "priority", "tags",
+                      "depends_on", "result", "parent_id", "crew")),
               ("verbosity_", render.VERBOSITY), ("k_", render.ACTIVITY_KINDS)]
     for prefix, values in labels:
         for value in values:
@@ -867,7 +870,8 @@ def test_ascii_mode_with_ascii_data_is_pure_ascii():
         render.welcome(c, version="1", home="/h", web_url="http://x", session=sessions[0]), render.tips(c, True),
         render.trace_detail(c, trace), render.span_detail(c, span), render.context_view(c, context),
         render.sessions_table(c, sessions, "001-calc"), render.agents_table(c, agents),
-        render.task_detail(c, detail), render.cost_table(c, {"agents": agents, "swarm": {}}),
+        render.task_detail(c, detail), render.task_detail(c, ascii_only(crew_detail()), ascii_only(crew_snapshot())),
+        render.cost_table(c, {"agents": agents, "swarm": {}}),
         render.help_view(c, [("/help", "", "help")]), render.shortcuts_view(c), render.goal_panel(c, None),
         render.event(c, ev("message.sent", "Ann", message=message("Ann", ["user"], "# T\n- a\n\n> q\n\n---\n"))),
         render.files_view(c, dir_data() | {"entries": [{"path": "a/b.py", "type": "file", "size": 1}]}),
@@ -1094,6 +1098,78 @@ def test_task_detail():
     out = plain(render.task_detail(ctx(lang="en"), review))
     assert "Approve: /approve 2 [comment] · return: /reject 2 what to fix" in out
     assert out.index("Status") < out.index("/approve 2") < out.index("Task goal")
+
+
+def crew_detail(**kw) -> dict:
+    """/api/tasks/4 of a done crew task #4 (crew 3), with a description, a result and a post."""
+    fields = {"description": "Разбить на части", "result": "Сделано", "crew": 3, "crew_working": [ANNA, BORIS],
+              "assignee": ANNA, **kw}
+    return {"task": task(4, "Калькулятор", "done", **fields),
+            "discussion": [{"id": 1, "task_id": 4, "author": ANNA, "text": "Начинаю", "reply_to": None, "ts": NOW}]}
+
+
+def crew_snapshot(**kw) -> list[dict]:
+    """The snapshot's tasks: #4 (done crew task), its directions #6 and #5 (given in that order), #7 a subtask of
+    #6, #8 open under the done #4 (its own card on the board), #9 unrelated."""
+    return [crew_detail(**kw)["task"],
+            task(6, "Ввод", "in_progress", parent_id=4, assignee=ANNA),
+            task(5, "Вычисления", "todo", parent_id=4),
+            task(7, "Скобки", "todo", parent_id=6),
+            task(8, "Тесты", "todo", parent_id=4),
+            task(9, "Другое", "todo")]
+
+
+def test_task_detail_lists_subtasks():
+    out = plain(render.task_detail(ctx(lang="en"), crew_detail(), crew_snapshot()))
+    lines = out.split("\n")
+    order = ["Crew task: up to 3 members, 2 working now", "Directions (3)", "  ☐ #5 Вычисления",
+             "  ◐ #6 Ввод — Анна", "  ☐ #8 Тесты"]
+    at = [next(i for i, line in enumerate(lines) if line.startswith(text)) for text in order]
+    assert at == sorted(at) and at[2:] == [at[1] + 1, at[1] + 2, at[1] + 3]
+    assert "#7" not in out and "#9" not in out           # direct subtasks only
+    assert out.index("Description") < out.index("Crew task:") < out.index("Result") < out.index("Discussion (1)")
+    ru = plain(render.task_detail(ctx(), crew_detail(), crew_snapshot()))
+    assert "Групповая задача: до 3 участников, сейчас работают 2" in ru and "Направления (3)" in ru
+    # an ordinary parent: «Подзадачи (k)», no crew line
+    ordinary = plain(render.task_detail(ctx(), {"task": task(6, "Ввод", "in_progress")}, crew_snapshot()))
+    assert "Подзадачи (1)" in ordinary and "  ☐ #7 Скобки" in ordinary and "Групповая задача" not in ordinary
+    # a crew task with no directions: the crew line, no section
+    alone = plain(render.task_detail(ctx(lang="en"), crew_detail(), [crew_detail()["task"]]))
+    assert "Crew task: up to 3 members, 2 working now" in alone and "Directions" not in alone
+    # the crew line follows the snapshot's copy of the task
+    live = plain(render.task_detail(ctx(lang="en"), crew_detail(crew_working=[]),
+                                    crew_snapshot(crew_working=[ANNA])))
+    assert "Crew task: up to 3 members, 1 working now" in live
+    # no snapshot, or no subtasks: nothing added
+    for tasks in (None, [], [task(9, "Другое")]):
+        out = plain(render.task_detail(ctx(), task_data(), tasks))
+        assert "Подзадачи" not in out and "Направления" not in out and "Групповая задача" not in out
+    assert plain(render.task_detail(ctx(), task_data(), None)) == plain(render.task_detail(ctx(), task_data()))
+    # a subtask's row: the review mark for the user, a crew subtask's chip, a title printed literally
+    rows = plain(render.task_detail(ctx(), {"task": task(1, "Родитель")}, [
+        task(1, "Родитель"), task(2, "Проверка", "review", parent_id=1, assignee=BORIS, reviewer="user"),
+        task(3, "Группа", "todo", parent_id=1, crew=2, crew_working=[ANNA]),
+        task(4, "[bold red]x[/]", "todo", parent_id=1)]))
+    assert "Подзадачи (3)" in rows
+    assert "#2 Проверка — Борис · ждёт вашего ревью" in rows and rows.count("ждёт вашего ревью") == 1
+    assert "#3 Группа · групповая 1/2" in rows and "#4 [bold red]x[/]" in rows
+
+
+def test_crew_change_lines():
+    def history(lang: str, *changes: dict) -> str:
+        data = {"task": task(4), "discussion": [],
+                "events": [ev("task.updated", ANNA, task=task(4), changes=c) for c in changes]}
+        return plain(render.task_detail(ctx("verbose", lang), data), 160)
+
+    en = history("en", {"crew": [0, 3]}, {"crew": [3, 0]}, {"crew": [None, 3]})
+    assert "crew: ordinary task → 3" in en and "crew: 3 → ordinary task" in en and "crew: — → 3" in en
+    ru = history("ru", {"crew": [0, 3]}, {"crew": ["0", 2]})
+    assert "групповая задача (участников): обычная задача → 3" in ru
+    assert "групповая задача (участников): обычная задача → 2" in ru
+    assert "ordinary task" not in history("en", {"crew": [False, True]})   # a bool is not «ordinary»
+    change = ev("task.updated", ANNA, task=task(4), changes={"crew": [0, 3]})
+    assert "изменена: групповая задача (участников)" in plain(render.event(ctx("verbose"), change))
+    assert render.event(ctx(), change) is None
 
 
 def test_review_notices_for_the_user_are_one_warning_line():

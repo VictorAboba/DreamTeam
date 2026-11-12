@@ -230,7 +230,9 @@ async def _board(c: CommandContext) -> None:
 
 async def _task(c: CommandContext) -> None:
     task_id = _int_arg(c.args)
-    c.print(render.task_detail(c.ctx, await c.client.task(c.sid, task_id)))
+    data = await c.client.task(c.sid, task_id)   # an unknown task errors before the snapshot is fetched
+    state = await c.state()                      # the crew line and the subtasks come from the snapshot (§4.2)
+    c.print(render.task_detail(c.ctx, data, state.get("tasks") or []))
 
 
 async def _agents(c: CommandContext) -> None:

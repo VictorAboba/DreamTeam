@@ -325,6 +325,9 @@ class RenderContext:
     ≥ 2, with or without subtasks; the review-for-you mark when any subtask of the stack (any level) waits for the
     user's review, once per line (not again when the task itself waits for it). The tail ends the first line (after
     the comments and the verbose tags, before the verbose goal) and wraps; the head does not move.
+  - a change of `crew` reads «групповая задача (участников)» / "crew", with 0 as «обычная задача» / "ordinary task"
+    (the verbose change line `✎ #4 … · изменена: групповая задача (участников)` and the `/task` history
+    `групповая задача (участников): обычная задача → 3`), as the web's `fmtValue`.
 - Goal: `goal.set` renders as a rounded panel titled «Цель» / "Goal". `goal.completed` renders as a green
   rounded panel «✓ Цель достигнута» with the summary as markdown.
 - Thinking (verbose only): `✻ Анна думает…` with the text dim italic, max 12 lines.
@@ -378,7 +381,11 @@ def board_cards(tasks: list[dict]) -> list[Card]         # the twin of app.js bo
     # parent_id that is not an int (a bool is none) or a str is no key: such a task is a card, never a parent
 def board_summary(ctx, tasks: list[dict] | dict) -> RenderableType   # `Задачи: ☐ 3 · ◐ 2 · ☒ 5`: counts every
     # task, directions included (a task list or the snapshot counts {status: n})
-def task_detail(ctx, data: dict) -> RenderableType       # /api/tasks/{id}: header, goal, description, result, discussion
+def task_detail(ctx, data: dict, tasks: list[dict] | None = None) -> RenderableType   # /api/tasks/{id}: header,
+    # goal, description, result, discussion (verbose: history); with the snapshot's `tasks`, between the description
+    # and the result: the crew line «Групповая задача: до N участников, сейчас работают M» (from the snapshot's copy
+    # of the task) and its direct subtasks (all, in id order) as board lines under «Направления (k)» / «Подзадачи (k)»,
+    # as the web modal's taskSubtasksHtml
 def agents_table(ctx, agents: list[dict]) -> RenderableType   # a member with running background jobs: `⚙N` after
                                                               # its tasks (narrow: after its status)
 def jobs_table(ctx, jobs: list[dict]) -> RenderableType       # /jobs: the state's "jobs" (running, then ended in the
@@ -553,7 +560,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
 | `/board` | the board (`board`): one line per card, a parent's subtasks as dots in its line |
-| `/task N` | task with discussion |
+| `/task N` | task with discussion (`task_detail` with the snapshot's tasks: a crew task's line «Групповая задача: до N участников, сейчас работают M» and the direct subtasks indented under «Направления (k)» / «Подзадачи (k)», between the description and the result) |
 | `/agents` | team table |
 | `/roles [роль]` | the role catalog (`roles_table`) / one role in full (`role_detail`) |
 | `/skills`, `/skills lib`, `/skills add X [--pick a,b] [--replace]`, `/skills update X`, `/skills rm X`, `/skills show X` | the session's skills (`skills_table` from the state; without a session: the next new session's) / the library, the host's and Claude Code's skills / attach a reference (`pdf`, `claude-user:pdf`) or import a folder, .zip (a relative path or `~` resolved here when the hub is on this computer) or Git URL and attach it (`skill_attach`); without a session it is kept for the next new session, as `--skill` / again from its own source (`<from>:X` with replace; refused for a member's proposal) / `skill_detach` / the session's copy of an attached skill, else the library's (`claude-user:x`: that one) |

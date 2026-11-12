@@ -1441,8 +1441,10 @@ def _board_row(ctx: RenderContext, task: dict, card: Card | None = None) -> Tabl
     return Padding(_task_line(ctx, task, body), (0, 0, 0, 2))
 
 
-def task_detail(ctx: RenderContext, data: dict) -> RenderableType:
-    """/api/tasks/{id}: header, goal, description, result, discussion (and history in verbose)."""
+def task_detail(ctx: RenderContext, data: dict, tasks: list[dict] | None = None) -> RenderableType:
+    """/api/tasks/{id}: header, goal, description, result, discussion (and history in verbose); with the snapshot's
+    `tasks`, also the crew line and the direct subtasks between the description and the result, as the web modal
+    (docs/SPEC.md §4.2 "Surfaces")."""
     data = _d(data)
     task = _d(data.get("task"))
     if not task:
@@ -1482,6 +1484,8 @@ def task_detail(ctx: RenderContext, data: dict) -> RenderableType:
     for key, field in (("td_goal", "goal"), ("td_description", "description")):
         if task.get(field):
             rows += [Text(""), Text(ctx.t(key), style="bold"), Padding(_markdown(ctx, task.get(field)), (0, 0, 0, 2))]
+    if tasks is not None:
+        rows += _task_subtasks(ctx, task, tasks)
     if task.get("result"):
         color = theme.ERROR if status == "failed" else theme.OK
         rows += [Text(""), Text(ctx.t("td_result"), style=f"bold {color}"),
@@ -1507,6 +1511,27 @@ def task_detail(ctx: RenderContext, data: dict) -> RenderableType:
     return _out(ctx, Group(*rows))
 
 
+def _task_subtasks(ctx: RenderContext, task: dict, tasks: Any) -> list[RenderableType]:
+    """/task N's crew line («Групповая задача: до N участников, сейчас работают M») and the task's direct subtasks
+    (all of them in id order, also those that are their own lines on the board) as board lines, under «Направления
+    (k)» for a crew task, else «Подзадачи (k)»; nothing with neither. Both read the snapshot, as app.js
+    `taskSubtasksHtml`: a crew task's working set changes with its directions, and no event carries the parent."""
+    items = [x for x in _list(tasks) if isinstance(x, dict)]
+    key = _key(task.get("id"))
+    live = next((x for x in items if key is not None and _key(x.get("id")) == key), task)
+    crew = _crew_size(live)
+    rows: list[RenderableType] = []
+    if crew:
+        rows += [Text(""), Text(ctx.t("td_crew_line", n=crew, m=len(_list(live.get("crew_working")))))]
+    subs = sorted((x for x in items if key is not None and _key(x.get("parent_id")) == key
+                   and _key(x.get("id")) != key), key=lambda x: _int(x.get("id")))
+    if subs:
+        head = ctx.t("td_directions") if crew else ctx.t("td_subtasks")
+        rows += [Text(""), Text(f"{head} ({len(subs)})", style="bold")]
+        rows += [_board_row(ctx, sub) for sub in subs]
+    return rows
+
+
 def _history_line(ctx: RenderContext, ev: dict) -> Text:
     d = _d(ev.get("data"))
     line = Text(f"{_clock(ev.get('ts'), True)} ", style="dim")
@@ -1529,6 +1554,8 @@ def _history_line(ctx: RenderContext, ev: dict) -> Text:
 
 
 def _value_text(ctx: RenderContext, field: str, value: Any) -> str:
+    if field == "crew" and value in (0, "0") and not isinstance(value, bool):  # as app.js fmtValue
+        return ctx.t("crew_ordinary")
     if value in (None, "", []):
         return "—"
     if field == "status":

@@ -1496,8 +1496,12 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   colour (the TUI's status colours, ASCII `o`; at most 12 dots, then `+N`, as the web's toggle), `done/total`,
   `crew 2/3` for a crew task (ru «групповая 2/3»; for any task whose `crew` is an integer ≥ 2, with or without
   subtasks) and the TUI's review-for-you mark when one of its subtasks (any level of the stack) waits for the user's
-  review (once per line); these parts end the line's first row, each after ` · `, in this order; `/task N` lists the
-  subtasks indented; the board list shows a subtask as its own line only where the web shows it as its own card (a
+  review (once per line); these parts end the line's first row, each after ` · `, in this order; `/task N` lists its
+  direct subtasks indented, read from the snapshot as the web modal does (all of them, in id order, also those that
+  are their own lines on the board; under «Направления (k)» / "Directions (k)" for a crew task, else «Подзадачи (k)» /
+  "Subtasks (k)": the count is the TUI's, as its «Обсуждение (k)», the web modal's title has none; after the crew
+  line «Групповая задача: до N участников, сейчас работают M» / "Crew task: up to N members, M working now"; between
+  the description and the result); the board list shows a subtask as its own line only where the web shows it as its own card (a
   subtask that is its own line carries no note of its parent; an id or parent_id that is not an integer or a string
   is no key: such a task is a card of its own, never a parent), and its column headers count the lines they show (as
   the web's columns count cards; a done or closed column cut to its last 15 lines counts the lines its `… +N` stands
