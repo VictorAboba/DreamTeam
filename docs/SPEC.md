@@ -1505,9 +1505,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   subtask that is its own line carries no note of its parent; an id or parent_id that is not an integer or a string
   is no key: such a task is a card of its own, never a parent), and its column headers count the lines they show (as
   the web's columns count cards; a done or closed column cut to its last 15 lines counts the lines its `… +N` stands
-  for too). The session card on the home page and the TUI's `/sessions` table (`read_stats`), and the board summary
-  the TUI prints on attach (`render.board_summary`), count tasks, directions included (the TUI's status line shows
-  no task count). A change of `crew` in the task history and the feed (web `changesText`, TUI history
+  for too). The session card on the home page (`read_stats`) and the board summary the TUI prints on attach
+  (`render.board_summary`) count tasks, directions included (the TUI's `/sessions` picker, a plain `id · status ·
+  goal` hint per session, and its status line show no task count). A change of `crew` in the task history and the feed (web `changesText`, TUI history
   and change lines) is labelled by `f_crew` (ru «групповая задача (участников)», en "crew"; the value 0 reads
   «обычная задача» / "ordinary task"), in app.js and tui/i18n.py.
 - **Docs** (en and ru alike): README.md / README.ru.md (a "Crew tasks" bullet), docs/en|ru/features.md (a row of
