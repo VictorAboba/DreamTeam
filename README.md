@@ -80,9 +80,10 @@ uv tool upgrade dreamteam
 ```
 
 Before you update, finish or export the sessions in which agents already worked (almost every session of 0.1.x):
-0.2.0 lists them, marked "earlier version", but does not open them, and there is no conversion. A session in which
-no agent has run yet opens as usual. To open such a session again, import its export into a separate home with
-DreamTeam 0.1.1. The `main` session of an old project cannot be exported: finish its work first. Details:
+0.2.0 lists them, marked "earlier version", but does not open them, and there is no conversion. 0.1.0 has no
+`dreamteam export`: there, finish them, or update and then export them with 0.2.0, which exports them with a
+warning. A session in which no agent has run yet opens as usual. To open a session of an earlier version again,
+import its export into a separate home with DreamTeam 0.1.1. The `main` session of an old project cannot be exported: finish its work first. Details:
 [Updating to 0.2.0](docs/en/getting-started.md#updating-to-020).
 
 ## Quick start

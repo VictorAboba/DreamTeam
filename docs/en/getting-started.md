@@ -35,22 +35,24 @@ agents of an earlier version already worked (almost every session of 0.1.x), and
 
 - **Before updating**, finish the sessions you still need, or export them and keep the folder:
   `dreamteam export FOLDER --include sessions` (one session: add `--session ID`; see
-  [Moving to another computer](transfer.md)).
+  [Moving to another computer](transfer.md)). 0.1.0 has no `dreamteam export`: there, finish the sessions, or
+  update and then export them with 0.2.0, which exports them with a warning.
 - **After updating**, such sessions stay in the list, marked as made by an earlier version: in `dreamteam sessions`,
   on the home page ("Earlier version") and in the terminal interface's `/sessions` ("earlier version"). The session's
   card on the home page says why it does not open, and so does Enter in the terminal interface's list. Such a
   session can be deleted and exported, but not opened, started or resumed, and the import of 0.2.0 refuses it.
   When the most recent session is one of them, `dreamteam -c` says so and opens nothing: start a new session.
 - **A session in which no agent has run yet** (for example, one that was never started) opens as usual.
-- **To open such a session again**, import its export into a separate home with DreamTeam 0.1.1 (0.1.0 has no
-  import; 0.1.1 opens the sessions of 0.1.0 too). With uv this runs beside 0.2.0, for example:
+- **To open a session of an earlier version again**, import its export into a separate home with DreamTeam 0.1.1
+  (0.1.0 has neither export nor import; 0.1.1 opens the sessions of 0.1.0 too). uvx runs 0.1.1 without replacing
+  the installed 0.2.0, for example:
 
   ```bash
-  uvx --from "git+https://github.com/VictorAboba/DreamTeam.git@v0.1.1" dreamteam import FOLDER --home OLD_HOME
-  uvx --from "git+https://github.com/VictorAboba/DreamTeam.git@v0.1.1" dreamteam --home OLD_HOME
+  uvx --from "git+https://github.com/VictorAboba/DreamTeam.git@v0.1.1" dreamteam import FOLDER --home NEW_HOME
+  uvx --from "git+https://github.com/VictorAboba/DreamTeam.git@v0.1.1" dreamteam --home NEW_HOME
   ```
 
-  Export only the sessions (`--include sessions`) and set up the models in the new home's settings, as after a
+  `NEW_HOME` is a new, empty folder, not the home 0.2.0 uses. Export only the sessions (`--include sessions`) and set up the models in the new home's settings, as after a
   fresh install: once 0.2.0 has saved its settings, 0.1.x may not read them. For the same reason, do not go back to
   0.1.x in the home 0.2.0 used.
 - **The `main` session of an old project** cannot be exported or deleted from the interface: finish its work before

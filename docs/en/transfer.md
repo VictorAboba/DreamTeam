@@ -16,8 +16,9 @@ The same two commands make a backup: export the home to an external disk, and im
 - **Sessions of an earlier version.** Since 0.2.0 the reverse holds too: 0.2.0 does not open the sessions in which
   agents of an earlier version already worked (almost every session of 0.1.x). It exports them, with a warning, and
   its import refuses them; there is no conversion. Before updating to 0.2.0, finish the sessions you still need or
-  export them, and keep the folder. To open one again, import it into a separate home with DreamTeam 0.1.1 (0.1.0
-  has no import): see [Updating to 0.2.0](getting-started.md#updating-to-020).
+  export them, and keep the folder. On 0.1.0, which has no export, finish them, or update and then export them with
+  0.2.0. To open one again, import it into a separate home with DreamTeam 0.1.1 (0.1.0 has neither export nor
+  import): see [Updating to 0.2.0](getting-started.md#updating-to-020).
 - **Export** works while DreamTeam runs: the home is only read. A session that runs at that moment is exported as
   it is on disk right now, and the report warns about it.
 - **Import** is refused while another DreamTeam process serves the target home: `dreamteam serve`, the terminal

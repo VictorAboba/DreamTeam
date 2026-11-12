@@ -4135,14 +4135,15 @@ settings; ValueError when they are invalid):
   web card, the TUI and the `-r` picker show its own message, which names the file to remove by hand. Docs:
   README.md / README.ru.md (updating), docs/TUI.md and docs/en|ru/transfer.md, and the release note of the
   version, say to finish or export the sessions before updating, that this version lists them but does not open
-  them, and that there is no conversion. The README's short "Updating to 0.2.0" / «Обновление до 0.2.0» (under
+  them, and that there is no conversion; 0.1.0 has no `dreamteam export` either, so they name the route of updating
+  and then exporting with this version (which exports them with a warning, §20.2). The README's short "Updating to 0.2.0" / «Обновление до 0.2.0» (under
   Install) links to the full section of that name in docs/en|ru/getting-started.md (also linked from the docs
   index, features.md's "Sessions" row, terminal.md and transfer.md); they say "sessions in which agents already
   worked (almost every session of 0.1.x)", never every session of 0.1.x, since one in which no LLM member ran opens
   as usual. To open one again the docs name DreamTeam 0.1.1, not "that version" as the hub's message does: 0.1.0 has
-  no `dreamteam import`, and 0.1.1 (tool set revision 4 like 0.1.0) opens the sessions of both; the export takes
+  neither `dreamteam export` nor `dreamteam import`, and 0.1.1 (tool set revision 4 like 0.1.0) opens the sessions of both; the export takes
   only the sessions (`--include sessions`) and goes into a separate home of 0.1.1, for example through
-  `uvx --from "git+…@v0.1.1" dreamteam import FOLDER --home OLD_HOME`. The legacy `main` is never said to be
+  `uvx --from "git+…@v0.1.1" dreamteam import FOLDER --home NEW_HOME` (a new, empty folder, never the home this version uses). The legacy `main` is never said to be
   exported: finish it before updating, or remove its database by hand afterwards. Since sessions stop opening, the
   release that brings crew tasks is 0.2.0, not a patch: the version in pyproject.toml, src/dreamteam/__init__.py and
   uv.lock.
