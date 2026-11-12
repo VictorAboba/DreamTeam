@@ -443,7 +443,7 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    one, not held back, none of whose blockers is stuck while the crew task itself is not blocked by a stuck task;
    stuck: `failed` or `cancelled`, or `todo` while blocked by a stuck task in turn (a direction also while its
    crew task is), or while its blockers lead back to it or to the crew task, or a working direction that waits
-   for a held-back one; the check is iterative, so a chain of any length is fine) among their ids: while each of
+   for a held-back one, or a held-back one once every working direction waits for one; the check is iterative, so a chain of any length is fine) among their ids: while each of
    them has an assignee it
    waits for them, so its owner has nothing to continue there (its own direction counts on its own; the
    in-activation nudge of §6.2 skips such a crew task too), and a free one is the "free directions" mark below. A
@@ -677,7 +677,8 @@ Rules (USER may do anything; "member" = agent of any kind):
   while one is open), so it does not depend on them. Remove #M from its depends_on.`: a blocked crew task gives
   none of them out, §4.2 "Taking a direction"), and a task is not moved under a crew task that depends on it. An
   ordinary parent may depend on its own subtask. These are the direct forms of one rule, checked after them on the
-  same calls (`Board._check_wait_cycle`): no change closes a cycle of waits, where an open task waits for each entry of
+  same calls, and on an `update` that reopens a terminal task, whose waits come back with it, once its status is
+  checked (`Board._check_wait_cycle`): no change closes a cycle of waits, where an open task waits for each entry of
   its depends_on, an open parent for each of its open subtasks, and an open direction of a crew task for each entry of
   the crew task's depends_on (a finished task waits for nothing; the task changed counts as open) (`Dependency cycle: #a -> #b -> ... -> #a (#b is a part of #a; #c is a direction of #n, which
   depends on #d): none of them would ever finish. Remove one of these dependencies.`; `the new task` names a task

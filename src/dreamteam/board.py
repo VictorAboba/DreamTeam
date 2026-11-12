@@ -533,7 +533,7 @@ class Board:
         the one direction per member), through its depends_on or its open subtasks (_wait_for_held); or a todo one
         that is not held back while the crew task is not stuck and none of the direction's blockers is (_stuck:
         failed or cancelled, or todo and stuck in turn, or waiting for the crew task itself or for a working direction
-        that waits for a held-back one). It waits for them (liveness leaves it out of the stalled ids); a direction
+        that waits for a held-back one, or for a held-back one once every working direction waits for one). It waits for them (liveness leaves it out of the stalled ids); a direction
         that waits for a stuck task moves only when someone changes the board, and its owner is woken for that."""
         if task.crew < 2:
             return False
@@ -550,7 +550,9 @@ class Board:
         dead = self._wait_for_held(rows, working, held) if held else set()
         if len(dead) < len(working):
             return True
-        memo: dict[int, bool] = dict.fromkeys(dead, True)
+        # every working direction waits for a held-back one: no direction is handed in, so the held-back ones never
+        # move either, and a todo direction blocked by one of them is stuck
+        memo: dict[int, bool] = dict.fromkeys(dead | held, True)
         memo[task.id] = True  # a chain that leads back to the crew task never moves
         if any(self._stuck(rows, d, memo) for d in own):
             return False
@@ -601,7 +603,7 @@ class Board:
         """Task `tid` never finishes unless someone changes the board (has_live_directions): failed or cancelled; or
         todo while one of its blockers is stuck, or (a direction) while its crew task is blocked by a stuck task, or
         while its blockers lead back to it; `memo` holds the answers known (the crew task itself, the working
-        directions that wait for a held-back one). Iterative, so a chain of any length is fine. `rows`: id -> (id,
+        directions that wait for a held-back one, and the held-back ones). Iterative, so a chain of any length is fine. `rows`: id -> (id,
         status, depends_on, parent_id, crew) of every task."""
         def leaf(t: int) -> bool | None:  # the answer without looking further, or None for a todo task
             if t in memo:
@@ -924,16 +926,21 @@ class Board:
                 crew_after = self._plan_crew(actor, old, crew, new_status, values.get("parent_id", old.parent_id))
                 if crew_after != old.crew:
                     values["crew"] = crew_after
+            # a reopening brings the task's waits back: checked once its status is planned
+            reopen = old.status not in Status.OPEN and new_status in Status.OPEN
+            tree = (values.get("depends_on", old.depends_on), values.get("parent_id", old.parent_id), crew_after)
             if "depends_on" in values or moved or (crew_after >= 2 > old.crew):
-                tree = (values.get("depends_on", old.depends_on), values.get("parent_id", old.parent_id), crew_after)
                 self._check_tree_deps(old.id, *tree, moved=moved)
-                self._check_wait_cycle(old.id, *tree)
+                if not reopen:
+                    self._check_wait_cycle(old.id, *tree)
             titles = None
             if directions is not None:
                 titles = self._plan_directions(actor, old, directions, crew_after, new_status,
                                                values.get("parent_id", old.parent_id))
             values.update(self._plan_assignment(actor, old, assignee, status,
                                                 values.get("depends_on", old.depends_on)))
+            if reopen and values.get("status", old.status) in Status.OPEN:
+                self._check_wait_cycle(old.id, *tree, reopen_to=values["status"])
             self._plan_take(actor, old, values, batch, moved=moved and not move_checked)
             if self.independent_review:
                 self._plan_review_fields(actor, old, values)
@@ -1608,16 +1615,18 @@ class Board:
             raise ToolError(f"Crew task #{parent.id} depends on #{task_id}: as its direction #{task_id} would block it "
                             f"for good. Remove #{task_id} from the depends_on of #{parent.id} first.")
 
-    def _check_wait_cycle(self, task_id: int | None, deps: list[int], parent_id: int | None, crew: int) -> None:
+    def _check_wait_cycle(self, task_id: int | None, deps: list[int], parent_id: int | None, crew: int,
+                          reopen_to: str | None = None) -> None:
         """No change closes a cycle of waits (docs/SPEC.md §4 `create`), for a task as it is after the call (`task_id`
         None: a new one, open). An open task waits for each entry of its depends_on; an open parent for each of its
         open subtasks (a finished task waits for nothing); an open direction of a crew task for each entry of the crew task's depends_on (a blocked crew task
         gives none of them out). The waits the change adds: the task's own, its new parent's for it, and those of its
-        open directions when it is a crew task."""
+        open directions when it is a crew task; a terminal task reopened (`reopen_to`: its open status after the call)
+        also its own for its open subtasks."""
         me = task_id if task_id is not None else 0  # task ids start at 1
         rows = {r["id"]: r for r in self.db.all("SELECT id, status, depends_on, parent_id, crew FROM tasks")}
-        node = {"status": Status.TODO if task_id is None else rows[task_id]["status"], "depends_on": deps,
-                "parent_id": parent_id, "crew": crew}
+        status = reopen_to or (Status.TODO if task_id is None else rows[task_id]["status"])
+        node = {"status": status, "depends_on": deps, "parent_id": parent_id, "crew": crew}
         graph: dict[int, list[int]] = {}
         hops: dict[tuple[int, int], int] = {}  # a wait that is no depends_on entry -> the parent it comes from
 
@@ -1653,9 +1662,12 @@ class Board:
             added.append((parent_id, me))
             if (rows[parent_id]["crew"] or 0) >= 2:
                 added += [(me, d) for d in loads(rows[parent_id]["depends_on"], [])]
+        subs = [sub for sub, row in rows.items() if sub != me and row["parent_id"] == me
+                and row["status"] in Status.OPEN]
         if crew >= 2:
-            added += [(sub, d) for sub, row in rows.items() if sub != me and row["parent_id"] == me
-                      and row["status"] in Status.OPEN for d in deps]
+            added += [(sub, d) for sub in subs for d in deps]
+        if reopen_to is not None:
+            added += [(me, sub) for sub in subs]
         for start, end in added:
             path = _find_path(graph, end, start)
             if path:

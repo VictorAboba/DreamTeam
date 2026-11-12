@@ -2207,3 +2207,58 @@ def test_a_finished_task_waits_for_nothing_in_the_cycle_check(board):
     s = board.create(ANNA, "S", parent_id=p.id)
     board.update(ANNA, s.id, depends_on=[z.id])
     assert board.get(s.id).depends_on == [z.id] and board.get(s.id).blocked_by == []
+
+
+# --- review round 5: held-back directions once every working one waits, reopenings and their waits -----------------
+
+def test_a_todo_direction_blocked_by_a_held_back_one_is_stuck_too(board):
+    """cli (Bob's) waits for tests, held back from Carl by the full crew; docs waits for tests as well: nothing moves
+    until the owner changes something, so the crew task is not live."""
+    task, (tests, cli, docs) = crew_task(board, crew=2, titles=("tests", "cli", "docs"))
+    work(board, cli.id, BOB)
+    work(board, tests.id, CARL, Status.TODO)
+    board.update(ANNA, cli.id, depends_on=[tests.id])
+    assert board.has_live_directions(board.get(task.id))      # docs is free: Anna may take it
+    board.update(ANNA, docs.id, depends_on=[tests.id])
+    assert not board.has_live_directions(board.get(task.id))
+    board.update(ANNA, tests.id, assignee=ANNA)               # the owner takes it over: it can move again
+    assert board.has_live_directions(board.get(task.id))
+
+
+@pytest.mark.parametrize("actor", [USER, ANNA])
+def test_a_reopening_that_closes_a_cycle_of_waits_is_refused(board, actor):
+    """Z is done although it depended on P, and S, a part of P, depends on Z: reopened, Z would wait for P again."""
+    p = board.create(ANNA, "P")
+    z = board.create(ANNA, "Z", depends_on=[p.id])
+    finish_raw(board, z.id, Status.DONE, "ok")
+    s = board.create(ANNA, "S", parent_id=p.id)
+    board.update(ANNA, s.id, depends_on=[z.id])
+    with pytest.raises(ToolError, match=rf"Dependency cycle: #{z.id} -> #{p.id} -> #{s.id} -> #{z.id} "
+                                        rf"\(#{s.id} is a part of #{p.id}\)"):
+        board.update(actor, z.id, status=Status.TODO)
+    assert board.get(z.id).status == Status.DONE
+    board.update(ANNA, s.id, depends_on=[])
+    assert board.update(actor, z.id, status=Status.TODO).status == Status.TODO
+
+
+def test_a_reopened_failed_subtask_whose_dependency_waits_for_its_parent_is_refused(board):
+    p = board.create(ANNA, "P")
+    x = board.create(ANNA, "X", depends_on=[p.id])
+    s = board.create(ANNA, "S", parent_id=p.id)
+    finish_raw(board, s.id, Status.FAILED, "no")
+    board.update(ANNA, s.id, depends_on=[x.id])               # a failed task waits for nothing
+    with pytest.raises(ToolError, match=rf"Dependency cycle: #{s.id} -> #{x.id} -> #{p.id} -> #{s.id}"):
+        board.update(ANNA, s.id, status=Status.TODO)
+    assert board.get(s.id).status == Status.FAILED
+
+
+def test_a_reopened_parent_waits_for_its_open_subtasks_again(board):
+    p = board.create(ANNA, "P")
+    s = board.create(ANNA, "S", parent_id=p.id)
+    x = board.create(ANNA, "X", depends_on=[p.id])
+    set_raw(board, s.id, depends_on=f"[{x.id}]")
+    finish_raw(board, p.id, Status.DONE, "ok")                # done by USER, its open subtask kept
+    with pytest.raises(ToolError, match=rf"Dependency cycle: #{p.id} -> #{s.id} -> #{x.id} -> #{p.id} "
+                                        rf"\(#{s.id} is a part of #{p.id}\)"):
+        board.update(USER, p.id, status=Status.TODO)
+    assert board.get(p.id).status == Status.DONE
