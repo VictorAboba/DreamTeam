@@ -4660,7 +4660,8 @@ succeeded: either may have changed the library) and everything else to the launc
   `{"error": <message>, "earlier_version": true}`; checked before the stopped answer, the database read in a
   thread; the answer to a `SessionError` of a load carries the error's extra fields too), the HTML
   page with it for the board, a WebSocket accepted and then closed 1011 with the reason `made by an earlier
-  version` (a close reason holds at most 123 bytes; the page shows the full message), and the same 409 from
+  version` (a close reason holds at most 123 bytes; the page shows the full message; an open board keeps that
+  message and stops reconnecting, §18.4 "Topbar"), and the same 409 from
   `POST .../start`, `POST .../stop`, `PATCH`, `.../workspace` and the `.../skills` routes, while `GET
   /api/sessions`, `GET` and
   `DELETE /api/sessions/{sid}` work (the summary carries `earlier_version`). After shutdown began, no new session
@@ -5287,6 +5288,13 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     extra blank lines stay); task links `#12` and @mentions work in the plain text (not in code, math or links). Toasts, the feed, one-line previews and tooltips stay plain. Rendered HTML is cached by text.
   - Topbar: «← Все сессии» link to `/` and the session title; a stopped banner with «Запустить сессию»
     (POST `/api/sessions/{sid}/start`, then reload). Actions on a stopped session show the stopped message.
+    A board page left open on a session made by an earlier version (§17.2; an import replaced it, a cached page)
+    meets the answers of §18.1: an action's 409 with `earlier_version` shows its own text, not the stopped message
+    (`actError`); that 409 of a refresh, or the close 1011 with the reason `made by an earlier version`, puts the
+    launcher's message (English, like the hub's errors; the close starts a refresh whose 409 brings it) in the
+    connection banner, where it stays, and the board stops reconnecting and polling (`showEarlier`). The socket is
+    accepted before that close, so the refresh's 409 may come before the close or after it; either order ends the
+    same. Any other close reconnects as before.
     A folder outside the session that does not exist (snapshot `swarm.workspace`) adds a banner naming the
     path and the fix (`/cd FOLDER` or `/cd --default`).
   - Wrap-up (§3): a toggle button «Завершать» / «Wrap up» (`ic-check`, label hidden on phones) right after «Пауза»

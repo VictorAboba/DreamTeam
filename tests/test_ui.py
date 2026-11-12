@@ -1871,6 +1871,117 @@ def test_board_base_detection_and_readable_api_errors():
 
 
 @needs_node
+def test_board_keeps_the_earlier_version_message():
+    from dreamteam.sessions import earlier_version_text
+
+    text = earlier_version_text("s", "C:/h", "0.2.0")
+    out = run_js(r"""
+      const answer = (body) => async () => ({ ok: false, status: 409, text: async () => JSON.stringify(body) });
+      app.S.state = { swarm: { session: { id: "s", status: "stopped" } }, agents: [] };
+      globalThis.fetch = answer({ error: process.env.EARLIER, earlier_version: true });
+      out.earlier = await app.act("x", {});
+      for (const lang of ["ru", "en"]) {
+        app.S.lang = lang;
+        globalThis.fetch = answer({ ok: false, result: "The session is stopped.", error: "The session is stopped." });
+        out["stopped_" + lang] = await app.act("x", {});
+        out["want_" + lang] = app.t("session_stopped");
+      }
+      out.data = [app.responseData('{"a": 1}'), app.responseData("[1]"), app.responseData("<p>"), app.responseData("1")];
+    """, env={"EARLIER": text})
+    assert out["earlier"] == {"ok": False, "result": text}   # not «Сессия остановлена»
+    for lang in ("ru", "en"):   # a plain 409 of a stopped session still says it in the UI language
+        assert out[f"stopped_{lang}"] == {"ok": False, "result": out[f"want_{lang}"]}
+    assert out["data"] == [{"a": 1}, [1], None, None]
+
+
+EARLIER_WS = r"""
+  const sockets = [];
+  globalThis.WebSocket = class { constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); } close() {} };
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+  el("conn"); el("conn-banner", { classList: classList(["hidden"]) });
+  const held = [];
+  const gate = { held: false };
+  const release = () => held.splice(0).forEach((r) => r());
+  // EARLIER set: the 409 of a session made by an earlier version; else a plain failure
+  const body = process.env.EARLIER ? { error: process.env.EARLIER, earlier_version: true } : { error: "down" };
+  globalThis.fetch = async (url) => {
+    calls.push({ url });
+    if (gate.held) await new Promise((r) => held.push(r));
+    return { ok: false, status: process.env.EARLIER ? 409 : 502, text: async () => JSON.stringify(body) };
+  };
+  const ticks = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+  const look = () => ({
+    earlier: app.S.earlier, banner: elements["conn-banner"].textContent,
+    hidden: elements["conn-banner"].classList.contains("hidden"), live: elements.conn.classList.contains("on"),
+  });
+  const reconnects = () => timers.filter((x) => x.fn === app.connect).map((x) => x.ms);
+  const states = () => calls.filter((c) => c.url === "/s/a/api/state").length;
+"""
+
+
+@needs_node
+def test_board_stops_reconnecting_after_close_1011():
+    from dreamteam import launcher
+    from dreamteam.sessions import earlier_version_text
+
+    text = earlier_version_text("a", "C:/h", "0.2.0")
+    pre = 'globalThis.location = { pathname: "/s/a/", protocol: "http:", host: "h" };'
+    env = {"EARLIER": text}
+    # the launcher accepts the socket and then closes it: onopen (and its refresh) first, its 409 before the close
+    out = run_js(EARLIER_WS + r"""
+      out.reason = app.EARLIER_REASON;
+      app.connect();
+      const ws = sockets[0];
+      ws.readyState = 1; ws.onopen();
+      await ticks();
+      out.open = look();
+      ws.readyState = 3;
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      await ticks();
+      app.connect();   // returns at once
+      out.closed = look();
+      out.sockets = sockets.length; out.reconnects = reconnects(); out.states = states();
+    """, pre=pre, env=env)
+    assert out["reason"] == launcher.EARLIER_VERSION_REASON
+    want = {"earlier": True, "banner": text, "hidden": False, "live": False}
+    assert out["open"] == want and out["closed"] == want
+    assert out["sockets"] == 1 and out["reconnects"] == [] and out["states"] == 1
+    # the close before the refresh answers: the message arrives with the 409, still no reconnect
+    out = run_js(EARLIER_WS + r"""
+      gate.held = true;
+      app.connect();
+      const ws = sockets[0];
+      ws.readyState = 1; ws.onopen();
+      ws.readyState = 3;
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      out.closing = look();
+      out.held = held.length;
+      gate.held = false; release();
+      await ticks();
+      out.closed = look();
+      out.sockets = sockets.length; out.reconnects = reconnects(); out.states = states();
+    """, pre=pre, env=env)
+    closing = out["closing"]
+    assert closing["earlier"] is True and closing["hidden"] is True and closing["live"] is False
+    assert closing["banner"] != text and out["held"] == 4   # onopen's state and inbox, the close's state and inbox
+    assert out["closed"] == want
+    assert out["sockets"] == 1 and out["reconnects"] == [] and out["states"] <= 2
+    # any other close (a dropped link, the 1011 of a session that cannot be loaded) reconnects as before
+    for code, reason in ((1006, ""), (1011, "")):
+        out = run_js(EARLIER_WS + f"""
+          app.connect();
+          const ws = sockets[0];
+          ws.readyState = 1; ws.onopen(); await ticks();
+          ws.readyState = 3; ws.onclose({{ code: {code}, reason: {json.dumps(reason)} }});
+          out.reconnects = reconnects(); out.earlier = app.S.earlier;
+        """, pre=pre)
+        assert out == {"reconnects": [1000], "earlier": False}, code
+
+
+@needs_node
 def test_traces_html_escapes_every_agent_controlled_string():
     out = run_js(r"""
       const E = process.env.EVIL;

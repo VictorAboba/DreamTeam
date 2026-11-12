@@ -375,6 +375,7 @@ const S = {
   state: null, lang: "ru", tab: "board", chatWith: null, dtab: "chat", fileDir: ".", fileEntries: [], openFile: null,
   search: "", feed: [], feedMaxId: 0, activityMaxId: 0, seenEvents: new Set(), userInbox: [], replyTo: null,
   openTaskId: null, taskBase: null, lastPostId: 0, ws: null, wsRetry: 0, wsEverOpen: false, dragging: null,
+  earlier: false, earlierText: "",   // made by an earlier version: the launcher's message (showEarlier)
   boardDirty: false, appliedSeq: 0, modalInitial: null, markingRead: new Set(), drafts: {},
   jobOpen: new Set(), jobOutputs: {}, jobLoading: new Set(),   // Jobs tab: ids whose output is shown, its text
   fileText: "", fileSource: false,   // Files tab: the open file's text; a Markdown file shown as its source
@@ -490,23 +491,36 @@ function toast(text, kind = "", onClick = null) {
 }
 // The board of one session lives under /s/{sid}/ on the launcher; a standalone swarm app serves it at /.
 const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/s\/[a-z0-9][a-z0-9-]{0,63}(?=\/|$)/) || [""])[0];
-/** Readable text of a failed response: the JSON `error` / `result` field when there is one. */
-function responseError(status, body) {
+/** The JSON object of a response body, or null. */
+function responseData(body) {
   let data = null;
   try { data = JSON.parse(body); } catch (e) { /* not JSON */ }
-  const text = data && typeof data === "object" && (data.error || data.result);
+  return data && typeof data === "object" ? data : null;
+}
+/** Readable text of a failed response: the JSON `error` / `result` field when there is one. */
+function responseError(status, body) {
+  const data = responseData(body);
+  const text = data && (data.error || data.result);
   return typeof text === "string" && text ? text : `${status} ${String(body || "").slice(0, 300)}`.trim();
+}
+/** The error of a failed response; `earlierVersion` marks the 409 of a session made by an earlier version (docs/SPEC.md
+ * §18.1), whose text is the launcher's message. */
+function responseFailure(status, body) {
+  const data = responseData(body);
+  const err = new Error(responseError(status, body));
+  err.earlierVersion = !!(data && data.earlier_version);
+  return err;
 }
 function errText(e) { return (e && e.message) || String(e); }
 async function api(path, options) {
   const resp = await fetch(path.startsWith("/api/") ? BASE + path : path, options);
-  if (!resp.ok) throw new Error(responseError(resp.status, await resp.text()));
+  if (!resp.ok) throw responseFailure(resp.status, await resp.text());
   return resp.json();
 }
 /** A launcher route (/api/sessions/{sid}, /api/settings): it is not under the session's BASE. */
 async function launcherApi(path, options) {
   const resp = await fetch(path, options);
-  if (!resp.ok) throw new Error(responseError(resp.status, await resp.text()));
+  if (!resp.ok) throw responseFailure(resp.status, await resp.text());
   return resp.json();
 }
 /** The id of the launcher session this board belongs to; "" for a standalone swarm app. */
@@ -528,8 +542,10 @@ async function act(tool, args, quiet = false) {
   }
 }
 /** The text of an action that failed: a stopped session answers every action with 409 (English text from the
- * launcher), said in the UI language. */
+ * launcher), said in the UI language. A session made by an earlier version keeps the launcher's own message (it is
+ * checked before the stopped answer there too). */
 function actError(e) {
+  if (e && e.earlierVersion) return errText(e);
   const stopped = S.state && S.state.swarm && S.state.swarm.session && S.state.swarm.session.status === "stopped";
   return stopped ? t("session_stopped") : errText(e);
 }
@@ -622,6 +638,7 @@ async function refresh() {
     renderAll();
     autoMarkRead();
   } catch (e) {
+    if (e && e.earlierVersion) showEarlier(errText(e));
     console.error(e);
   }
 }
@@ -2792,17 +2809,34 @@ function resync() {
 
 let connTimer = null;
 function setConnected(on, quiet = false) {
+  on = on && !S.earlier;
   const dot = $("#conn");
   dot.classList.toggle("on", on);
   dot.title = t(on ? "live" : "disconnected");
   clearTimeout(connTimer);
   const banner = $("#conn-banner");
+  if (S.earlierText) {   // a session made by an earlier version: its message stays (showEarlier)
+    banner.textContent = S.earlierText;
+    banner.classList.remove("hidden");
+    return;
+  }
   banner.textContent = t("disconnected");
   if (on || quiet) banner.classList.toggle("hidden", on || banner.classList.contains("hidden"));
   else connTimer = setTimeout(() => banner.classList.remove("hidden"), 3000);
 }
+// the close reason of the WebSocket of a session made by an earlier version (launcher.EARLIER_VERSION_REASON)
+const EARLIER_REASON = "made by an earlier version";
+/** The session was made by an earlier version (a 409 with `earlier_version`, or the close 1011 with EARLIER_REASON;
+ * docs/SPEC.md §18.1): the connection banner shows the launcher's message (English, like the hub's errors) and keeps
+ * it; the board no longer reconnects or polls. Idempotent: the 409 of the refresh may come before the close or after. */
+function showEarlier(text) {
+  S.earlier = true;
+  if (text) S.earlierText = text;
+  setConnected(false);
+}
 
 function connect() {
+  if (S.earlier) return;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}${BASE}/ws`);
   S.ws = ws;
@@ -2813,8 +2847,12 @@ function connect() {
     S.wsEverOpen = true;
   };
   ws.onmessage = (msg) => { try { handleEvent(JSON.parse(msg.data)); } catch (e) { console.error(e); } };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     if (S.ws !== ws) return;
+    if (ev && ev.code === 1011 && ev.reason === EARLIER_REASON) {   // accepted, then closed: no reconnect
+      if (!S.earlier) { showEarlier(""); refresh(); }   // the refresh's 409 brings the message
+      return;
+    }
     setConnected(false);
     const delay = Math.min(10000, 1000 * 2 ** Math.min(S.wsRetry++, 4));
     setTimeout(connect, delay);
@@ -2966,7 +3004,7 @@ function init() {
   document.addEventListener("visibilitychange", () => { if (!document.hidden) autoMarkRead(); });
   refresh();
   connect();
-  setInterval(() => { if (!S.ws || S.ws.readyState !== 1) refresh(); }, 10000);
+  setInterval(() => { if (!S.earlier && (!S.ws || S.ws.readyState !== 1)) refresh(); }, 10000);
   setInterval(tickJobs, JOB_REFRESH);
 }
 
@@ -3009,6 +3047,8 @@ if (typeof module !== "undefined" && module.exports) {
     crewValue, crewOn, parseDirections, syncCrewField, taskSubtasksHtml, newTaskModal, saveTask, fmtValue, CREW_MAX,
     // the question before a parent with open subtasks is closed (moveTask, saveTask, reviewTask)
     closeQuestion,
+    // a session made by an earlier version: its 409 and the close 1011 (docs/SPEC.md §18.1)
+    showEarlier, EARLIER_REASON, responseData, refresh,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);
