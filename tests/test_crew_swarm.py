@@ -536,6 +536,62 @@ async def test_an_owner_that_can_take_a_free_direction_of_its_full_crew_task_kee
         await shutdown(swarm)
 
 
+async def test_an_owner_whose_own_direction_waits_in_a_full_crew_task_keeps_no_reminder_back(tmp_path):
+    """Everyone in the crew, the owner included, waits on a direction: nobody can take the free one, so the user
+    is told that only their reviews keep the swarm going."""
+    swarm = await live_team(tmp_path, ANNA, BOB, CARL)
+    try:
+        board = swarm.board
+        impl = board.create(USER, "impl", goal="g")
+        swarm.set_goal(USER, "Ship it")
+        crew, (d1, d2, d3) = make_crew_raw(board, USER, 2, ["d1", "d2", "d3"], title="Tool", goal="g")
+        set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        set_raw(board, d1.id, status=Status.WAITING, assignee=ANNA)
+        set_raw(board, d2.id, status=Status.WAITING, assignee=BOB)
+        finish_raw(board, impl.id, Status.REVIEW, "done", assignee=CARL, reviewer=USER)
+        deliver(swarm)
+        assert [t.id for t in board.free_directions(board.get(crew.id))] == [d3.id]
+        assert board.stall_marks(ANNA) == frozenset() and board.ready_unassigned() == []
+        assert swarm._has_task_in_progress() is False and swarm._has_actionable_todo() is False
+        swarm._remind_user_reviews()
+        assert kinds_for(swarm, USER).count("u_reviews_waiting") == 1
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_direction_is_not_offered_to_a_member_that_works_on_another_of_its_crew_task(tmp_path):
+    swarm = await live_team(tmp_path, ANNA, BOB, CARL)
+    try:
+        board = swarm.board
+        crew, (parser, cli, docs) = make_crew_raw(board, USER, 3, ["parser", "cli", "docs"], title="Tool", goal="g")
+        swarm.set_goal(USER, "Ship it")
+        set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        set_raw(board, parser.id, status=Status.IN_PROGRESS, assignee=ANNA)   # the owner's own part
+        set_raw(board, cli.id, status=Status.WAITING, assignee=BOB)
+        offer_rounds(swarm, 4)
+        assert [offered(swarm, n, docs) for n in (ANNA, BOB, CARL)] == [0, 0, 1]
+        assert f"#{docs.id} docs" not in swarm.render_wake(ANNA) and f"#{docs.id} docs" in swarm.render_wake(CARL)
+    finally:
+        await shutdown(swarm)
+
+
+async def test_an_owner_whose_directions_wait_behind_a_chain_to_a_closed_task_is_woken(tmp_path):
+    swarm = await live_team(tmp_path, ANNA, BOB)
+    try:
+        board = swarm.board
+        crew, (d1, d2) = make_crew_raw(board, USER, 2, ["d1", "d2"], title="Tool", goal="g")
+        failed = board.create(USER, "F", goal="g", assignee=BOB)
+        board.update(USER, d1.id, depends_on=[failed.id])
+        board.update(USER, d2.id, depends_on=[d1.id])
+        set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        assert swarm._stall_ids(ANNA) == frozenset()
+        finish_raw(board, failed.id, Status.FAILED, assignee=BOB)
+        assert swarm._stall_ids(ANNA) == frozenset({crew.id})
+        assert swarm.crew_nudge(ANNA, [board.get(crew.id)]) == (set(), "")
+    finally:
+        await shutdown(swarm)
+
+
 @pytest.mark.parametrize("status", [Status.CANCELLED, Status.FAILED])
 async def test_an_owner_whose_directions_wait_for_a_closed_one_is_woken(tmp_path, status):
     """A crew task whose only open direction waits for a cancelled or failed one is no longer left out of its

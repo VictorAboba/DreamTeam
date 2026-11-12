@@ -2019,6 +2019,125 @@ def test_a_crew_task_whose_open_directions_wait_for_a_closed_task_has_no_live_di
     assert board.has_live_directions(task)
 
 
+# --- review round 3: stuck chains, cycles through the hierarchy, the cascade of a leave -----------------------------
+
+def test_a_direction_behind_a_chain_to_a_closed_task_is_not_live(board):
+    """d2 waits for d1, which waits for a failed task: neither moves, so the owner is no longer left unwoken."""
+    task, (d1, d2, d3) = crew_task(board, titles=("d1", "d2", "d3"))
+    failed = board.create(ANNA, "F")
+    board.update(ANNA, d1.id, depends_on=[failed.id])
+    board.update(ANNA, d2.id, depends_on=[d1.id])
+    finish_raw(board, d3.id, Status.DONE, "ok")
+    assert board.has_live_directions(task)                   # F is still open: d1 and d2 wait for it
+    finish_raw(board, failed.id, Status.FAILED)
+    assert not board.has_live_directions(task)
+    assert board.free_directions(task) == [] and board.stall_marks(ANNA) == frozenset()
+
+
+def test_a_crew_task_blocked_by_a_closed_task_has_no_live_todo_direction(board):
+    task, (d1, d2) = crew_task(board, titles=("d1", "d2"))
+    blocker = board.create(ANNA, "B")
+    middle = board.create(ANNA, "M", depends_on=[blocker.id])
+    board.update(ANNA, task.id, depends_on=[middle.id])
+    assert board.has_live_directions(board.get(task.id))     # blocked by tasks that can still move: it waits
+    finish_raw(board, blocker.id, Status.CANCELLED)          # M can never move now, so neither can the directions
+    task = board.get(task.id)
+    assert task.blocked_by == [middle.id] and not board.has_live_directions(task)
+    assert board.free_directions(task) == []
+    set_raw(board, d1.id, assignee=BOB, status=Status.IN_PROGRESS)
+    assert board.has_live_directions(task)                   # one is worked on: it waits for it
+
+
+def test_cycles_of_waits_through_the_hierarchy_are_refused(board):
+    # (a) a subtask of a crew task waits for a task that waits for the crew task
+    task, (parser, docs) = crew_task(board, crew=2, titles=("parser", "docs"))
+    y = board.create(CARL, "Y", depends_on=[task.id], assignee=BOB)
+    with pytest.raises(ToolError, match=rf"^Dependency cycle: the new task -> #{y.id} -> #{task.id} -> the new task "
+                                        rf"\(the new task is a part of #{task.id}\): none of them would ever finish"):
+        board.create(ANNA, "extra", parent_id=task.id, depends_on=[y.id])
+    # (b) a crew task waits for a task that waits for one of its directions (a blocked crew task gives none out)
+    z = board.create(BOB, "Z", depends_on=[parser.id])
+    with pytest.raises(ToolError, match=rf"^Dependency cycle: #{parser.id} -> #{z.id} -> #{parser.id} "
+                                        rf"\(#{parser.id} is a direction of #{task.id}, which depends on #{z.id}\)"):
+        board.update(ANNA, task.id, depends_on=[z.id])
+    assert board.get(task.id).depends_on == []
+    # (c) across two crews: a direction of one waits for a direction of the other, whose crew task waits for it
+    other, (o_docs,) = crew_task(board, crew=2, titles=("docs",))
+    board.update(ANNA, other.id, depends_on=[docs.id])
+    with pytest.raises(ToolError, match="Dependency cycle: "):
+        board.update(ANNA, docs.id, depends_on=[o_docs.id])
+    assert board.get(docs.id).depends_on == []
+    # the plain form: a part of P waits for a task that waits for P
+    p = board.create(ANNA, "P")
+    q = board.create(ANNA, "Q", depends_on=[p.id])
+    with pytest.raises(ToolError, match=rf"^Dependency cycle: the new task -> #{q.id} -> #{p.id} -> the new task "
+                                        rf"\(the new task is a part of #{p.id}\)"):
+        board.create(ANNA, "S", parent_id=p.id, depends_on=[q.id])
+    # what waits without a cycle is accepted
+    board.create(ANNA, "S2", parent_id=p.id)
+    assert board.update(BOB, z.id, depends_on=[docs.id]).depends_on == [docs.id]
+
+
+def test_a_moved_subtree_never_waits_for_its_new_ancestor(board):
+    q = board.create(ANNA, "Q")
+    p = board.create(ANNA, "P")
+    t = board.create(ANNA, "T", parent_id=p.id, depends_on=[q.id])
+    with pytest.raises(ToolError, match=rf"^Dependency cycle: #{q.id} -> #{p.id} -> #{t.id} -> #{q.id} \(#{p.id} is a "
+                                        rf"part of #{q.id}; #{t.id} is a part of #{p.id}\)"):
+        board.update(ANNA, p.id, parent_id=q.id)
+    assert board.get(p.id).parent_id is None
+    # a crew task that waits for the moved task through another task
+    task, _ = crew_task(board, titles=("a", "b"))
+    loose = board.create(ANNA, "loose")
+    x = board.create(ANNA, "X", depends_on=[loose.id])
+    board.update(ANNA, task.id, depends_on=[x.id])
+    with pytest.raises(ToolError, match="Dependency cycle: "):
+        board.update(ANNA, loose.id, parent_id=task.id)
+    assert board.get(loose.id).parent_id is None
+    # a new task under Q that waits for a task waiting for Q
+    w = board.create(ANNA, "W", depends_on=[q.id])
+    with pytest.raises(ToolError, match=rf"^Dependency cycle: the new task -> #{w.id} -> #{q.id} -> the new task"):
+        board.create(ANNA, "N", parent_id=q.id, depends_on=[w.id])
+
+
+def test_a_leave_cancels_the_todo_subtasks_of_a_direction_it_cancels(swarm, board):
+    task, q = closed_crew_with_bobs_direction(board)
+    own = board.create(BOB, "own part", parent_id=q.id, assignee=BOB)
+    set_raw(board, own.id, status=Status.IN_PROGRESS)
+    free = board.create(BOB, "free part", parent_id=q.id)
+    held = board.create(BOB, "Carl's part", parent_id=q.id, assignee=CARL)
+    set_raw(board, held.id, status=Status.IN_PROGRESS)
+    swarm.notified.clear()
+    assert board.release_all(BOB, USER) == []
+    assert [board.get(i).status for i in (q.id, own.id, free.id, held.id)] == [
+        Status.CANCELLED, Status.CANCELLED, Status.CANCELLED, Status.IN_PROGRESS]
+    assert board.ready_unassigned() == []
+    assert notes_of(swarm, CARL, "n_parent_closed") == [
+        {"id": q.id, "title": q.title, "status": Status.CANCELLED, "sub": held.id}]
+    assert keys_for(swarm, BOB) == [] and keys_for(swarm, ANNA) == []
+
+
+def test_a_single_dependent_is_named_in_the_singular(board):
+    a, b = board.create(ANNA, "a", assignee=BOB), board.create(ANNA, "b")
+    board.update(ANNA, b.id, depends_on=[a.id])
+    notes: list[str] = []
+    board.update(BOB, a.id, status=Status.CANCELLED, notes=notes)
+    assert prompts.t("en", "note_dependent_blocked", deps=f"#{b.id}", id=a.id, status=Status.CANCELLED) in notes
+    assert prompts.t("en", "note_dependent_blocked", deps="#4", id=3, status="failed") == (
+        " #4 depends on #3, which is failed now: it stays blocked until that dependency is removed (task_update "
+        "depends_on) or it is cancelled.")
+
+
+def test_the_dependents_of_directions_the_cascade_cancels_are_named(board):
+    task, (parser, docs) = crew_task(board, crew=2, titles=("parser", "docs"))
+    user = board.create(CARL, "uses the docs", depends_on=[docs.id], assignee=CARL)
+    notes: list[str] = []
+    board.update(ANNA, task.id, status=Status.CANCELLED, notes=notes)
+    assert board.get(docs.id).status == Status.CANCELLED
+    assert prompts.t("en", "note_dependent_blocked", deps=f"#{user.id}", id=docs.id,
+                     status=Status.CANCELLED) in notes
+
+
 def test_a_blocked_todo_parent_whose_subtasks_finished_gets_no_mark(board):
     dep = board.create(ANNA, "experiments")
     parent = board.create(ANNA, "report", assignee=BOB, depends_on=[dep.id])

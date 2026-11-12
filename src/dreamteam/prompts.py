@@ -304,6 +304,8 @@ TEXTS: dict[str, dict[str, str]] = {
         # a task became failed or cancelled while open tasks depend on it; {deps}: "#5, #7"
         "note_dependents_blocked": " {deps} depend on #{id}, which is {status} now: they stay blocked until that "
                                    "dependency is removed (task_update depends_on) or they are cancelled.",
+        "note_dependent_blocked": " {deps} depends on #{id}, which is {status} now: it stays blocked until that "
+                                  "dependency is removed (task_update depends_on) or it is cancelled.",
         # liveness marks (n_stalled's {marks}, n_marks_stalled's {text}) and the in-activation nudge; each starts
         # with a space; {ending}: an owner_prefix_* key with its ending; {directions}: '#17 "oidc", #18 "jose"'
         "mark_subtasks_done": " #{id} \"{title}\": {ending}",
@@ -756,6 +758,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "note_dependents_blocked": " {deps} зависят от #{id}, которая теперь в статусе {status}: они останутся "
                                    "заблокированными, пока эту зависимость не уберут (task_update depends_on) или их "
                                    "не отменят.",
+        "note_dependent_blocked": " {deps} зависит от #{id}, которая теперь в статусе {status}: она останется "
+                                  "заблокированной, пока эту зависимость не уберут (task_update depends_on) или её не "
+                                  "отменят.",
         "mark_subtasks_done": " #{id} «{title}»: {ending}",
         "mark_free_directions": " #{id} — групповая задача со свободными направлениями, которые никто не взял: "
                                 "{directions}. Возьми одно сам (task_claim) или отмени те, без которых она обойдётся "

@@ -418,7 +418,8 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
 1. `_nudge_idle`: offers ready unassigned tasks to idle LLM agents (`n_ready`), never more agents considering
    offers than there are ready tasks, and the kickoff counts as everyone's offer of the planning task; with
    independent review on, a member with reviews waiting for it is not offered more work (it is reminded of them
-   instead); the free directions of crew tasks are ready tasks like any other (§4.2); a ready task is offered to
+   instead); the free directions of crew tasks are ready tasks like any other (§4.2), except that a member is never
+   offered the directions of a crew task it works on a direction of (`Board.busy_crews`); a ready task is offered to
    each member once while it stays ready with the same finish state (`_nudged` is keyed by the pair (task id,
    finish state), §4.2 "Offers"), so a parent without an assignee whose subtasks have all just finished is offered
    again to every idle member, those that took its subtasks included;
@@ -435,11 +436,14 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    wakes it, and every lock ends by unlock, expiry or retire). Nor do they count a clarify
    planning task whose holder waits for the user's answers (`asks_user`, §3.1), nor a crew task with a direction
    that can still move (§4.2; `Board.has_live_directions`: one `in_progress`, `waiting` or in review, or a `todo`
-   one none of whose blockers is `failed` or `cancelled`) among their ids: while each of them has an assignee it
+   one none of whose blockers is stuck while the crew task itself is not blocked by a stuck task; stuck: `failed`
+   or `cancelled`, or `todo` while blocked by a stuck task in turn (a direction also while its crew task is), or
+   while its blockers lead back to it or to the crew task) among their ids: while each of them has an assignee it
    waits for them, so its owner has nothing to continue there (its own direction counts on its own; the
    in-activation nudge of §6.2 skips such a crew task too), and a free one is the "free directions" mark below. A
-   crew task whose open directions all wait for a failed or cancelled task is among the ids: nothing else would
-   move it, and its completion refusal names the blockers (§4.2 "Finishing"). Both items also count
+   crew task whose open directions all wait, directly or through other todo tasks, for a failed or cancelled task,
+   or that is blocked by such a chain itself, is among the ids: nothing else would move it, and its completion
+   refusal names the blockers (§4.2 "Finishing"). Both items also count
    three marks, compared apart from the task ids (§4.2 "Finishing", Liveness): a task `todo` (not blocked),
    `in_progress` or `waiting` that has at least one subtask, all of them terminal (its holder has to complete it, or, for a crew task
    with a failed direction or only cancelled ones, decide what to do), a `todo` direction assigned to the member
@@ -642,6 +646,8 @@ class Board:
     def crew_working(self, task: Task) -> list[str]    # working set: its assignee while open, then the assignees of
                                                        # its in_progress/waiting subtasks (id asc), unique; never USER
     def contributors_of(self, task: Task) -> set[str]  # the assignees of its subtasks, any status
+    def busy_crews(self, name: str) -> set[int]        # crew tasks with a direction name works on (in_progress or
+                                                       # waiting): their directions are not offered to it
 
     # independent review (below)
     independent_review: bool                           # property: [swarm] independent_review, read on every call
@@ -664,7 +670,13 @@ Rules (USER may do anything; "member" = agent of any kind):
   own directions (`#M is a direction of crew task #N: #N already waits for its directions (it cannot be completed
   while one is open), so it does not depend on them. Remove #M from its depends_on.`: a blocked crew task gives
   none of them out, §4.2 "Taking a direction"), and a task is not moved under a crew task that depends on it. An
-  ordinary parent may depend on its own subtask.
+  ordinary parent may depend on its own subtask. These are the direct forms of one rule, checked after them on the
+  same calls (`Board._check_wait_cycle`): no change closes a cycle of waits, where a task waits for each entry of its
+  depends_on, a parent for each of its open subtasks, and an open direction of a crew task for each entry of the crew
+  task's depends_on (`Dependency cycle: #a -> #b -> ... -> #a (#b is a part of #a; #c is a direction of #n, which
+  depends on #d): none of them would ever finish. Remove one of these dependencies.`; `the new task` names a task
+  being created; the parenthesis names the waits that are no depends_on entry). So a moved task's subtree never
+  waits for its new ancestors, and a crew task never waits, through other tasks, for its own directions.
   Status `todo`. Emits `task.created`. If assignee given and != actor: notify assignee `n_assigned`.
 * `claim`: status must be `todo` (if already assigned to actor and in_progress/waiting: return as is).
   assignee must be None or actor (else ToolError naming the holder). No blockers (ToolError lists them). A direction
@@ -852,9 +864,10 @@ notifications explain it.
     "#3, #5"} once per set of such tasks. A parent with an open subtask, `in_progress` or `todo` (a crew task waiting
     for its directions, an ordinary parent whose last subtasks wait for the user's review), counts neither way: its
     holder cannot complete it before they finish (§4.2 "Finishing"), and its open subtasks count on their own
-    (`Board.open_parents(ids)`, one grouped query); except an `in_progress` crew task a member holds that has a free
-    direction (`Board.free_directions`): its owner's claim takes no place, so even a full crew task has work for its
-    owner (the "free directions" mark). A `todo` task is actionable only when it has no open subtask
+    (`Board.open_parents(ids)`, one grouped query); except an `in_progress` crew task whose holder, a member, has its
+    "free directions" mark (`Board.stall_marks`: a free direction while the owner works on none of its directions):
+    its owner's claim takes no place, so even a full crew task has work for its owner; an owner whose own direction is
+    `in_progress` or `waiting` cannot take a second one, so then it does not count. A `todo` task is actionable only when it has no open subtask
     and `ready_unassigned` returns it (a direction only while its crew task takes directions, §4.2 "Offers"), or a
     member (not USER) holds it and no blocker stops it; a held direction of a crew task only when its holder's
     claim would take it now (`Board.directions_to_take`, the "direction to take" mark of §4.2 Liveness)
@@ -1357,14 +1370,23 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `n_task_closed` or `n_subtask_cancelled`, not among the ids `release_all` returns; the result of the actor's call
   adds `note_direction_closed` {id, parent, status} ` #{parent} is {status}, so #{id} is cancelled instead of going
   back to the board: nobody takes a direction of a closed crew task.` A reopening by USER is not such a change.
+  Such a direction has the cascade above too, `release_all` included: its `todo` subtasks without an assignee
+  (the leaver's own ones it just returned included, which are then not among the returned ids either) are
+  cancelled, one `task.updated` each after the direction's, and the holders of its other open subtasks but the
+  leaver get `n_parent_closed`.
   Any task that becomes `failed` or `cancelled` while open tasks list it in `depends_on` (they stay blocked: only a
-  done dependency clears) adds `note_dependents_blocked` {deps, id, status} to the result of the actor's call:
-  ` #5, #7 depend on #{id}, which is {status} now: they stay blocked until that dependency is removed (task_update
-  depends_on) or they are cancelled.`
+  done dependency clears), the subtasks the cascade cancels with it included, adds `note_dependents_blocked` {deps,
+  id, status} to the result of the actor's call: ` #5, #7 depend on #{id}, which is {status} now: they stay blocked
+  until that dependency is removed (task_update depends_on) or they are cancelled.`, for a single one
+  `note_dependent_blocked` {deps, id, status}: ` #5 depends on #{id}, which is {status} now: it stays blocked until
+  that dependency is removed (task_update depends_on) or it is cancelled.` (`release_all` has no result to add them
+  to).
 - **Offers.** A free direction is a ready unassigned task: `ready_unassigned` (§4) returns a subtask of a crew task
   only while that crew task is `todo`, `in_progress` or `waiting`, not blocked, and has a free place. So `_nudge_idle`
   (`n_ready`), the wake-up's `ready` list and wrap-up mode treat directions like any ready task: `_nudge_idle`
-  offers it to each member once while it stays ready. Its fallback is the owner: an idle owner working on none
+  offers it to each member once while it stays ready. Neither `n_ready` nor the wake-up's `ready` list names to a
+  member the directions of a crew task in which it works on a direction (`in_progress` or `waiting`;
+  `Board.busy_crews(name)`): its claim would be refused. Its fallback is the owner: an idle owner working on none
   of the directions is woken once about a free one ("free directions" mark, "Finishing", Liveness).
   A parent without an assignee is ready the whole time its subtasks are worked on, so most members were offered it
   already when they finish. `_nudged` is therefore keyed by the pair (task id, finish state), the finish states of

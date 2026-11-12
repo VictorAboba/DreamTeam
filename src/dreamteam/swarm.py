@@ -623,7 +623,8 @@ class Swarm:
             if jobs:
                 now = time.time()
                 lines.append(prompts.t(lang, "my_jobs", jobs="; ".join(self._my_job(j, lang, now) for j in jobs)))
-            ready = self.board.ready_unassigned()[:8]
+            busy = self.board.busy_crews(name)
+            ready = [t for t in self.board.ready_unassigned() if t.parent_id not in busy][:8]
             if ready:
                 lines.append(prompts.t(lang, "ready", tasks="; ".join(f"#{t.id} {t.title}" for t in ready)))
             member = self.member(name) or {}
@@ -1321,7 +1322,10 @@ class Swarm:
                 continue
             if independent and self.board.reviews_of(name):
                 continue  # its reviews come first: it is reminded of them (_remind_reviewers), not offered more work
-            fresh = [t for t in ready if name not in self._nudged.get(offer_key[t.id], set())][:6]
+            # never a direction of a crew task it works on already: its claim would be refused
+            busy = self.board.busy_crews(name)
+            fresh = [t for t in ready if name not in self._nudged.get(offer_key[t.id], set())
+                     and t.parent_id not in busy][:6]
             if not fresh:
                 continue
             owned = frozenset(t.id for t in self.board.open_tasks_of(name))
@@ -1570,11 +1574,20 @@ class Swarm:
     def _has_task_in_progress(self) -> bool:
         """An `in_progress` task its holder can go on with: one without open subtasks (a parent with an open subtask
         waits for it, and cannot be completed before it finishes; the open subtasks count on their own), or a crew
-        task a member holds with a free direction (its owner's claim takes no place, so a full crew task counts)."""
+        task whose holder, a member, has its "free directions" mark (Board.stall_marks: it works on none of its
+        directions and may take a free one; its owner's claim takes no place, so a full crew task counts)."""
         tasks = self.board.list(status=Status.IN_PROGRESS)
         waits = self.board.open_parents(t.id for t in tasks)
-        return any(t.id not in waits or (t.crew >= 2 and t.assignee not in (None, USER)
-                                         and bool(self.board.free_directions(t))) for t in tasks)
+        marks: dict[str, frozenset] = {}
+        for t in tasks:
+            if t.id not in waits:
+                return True
+            if t.crew >= 2 and t.assignee not in (None, USER):
+                if t.assignee not in marks:
+                    marks[t.assignee] = self.board.stall_marks(t.assignee)
+                if (t.id, MARK_FREE_DIRECTIONS) in marks[t.assignee]:
+                    return True
+        return False
 
     def _has_actionable_todo(self) -> bool:
         """A `todo` task someone can go on with, never a parent with an open subtask (it waits for them): one
