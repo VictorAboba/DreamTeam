@@ -596,14 +596,14 @@ function crewOn(v) { return v !== null && v !== undefined && v !== 0; }
 /** Directions of the textarea: one per line, trimmed, blank lines dropped (sent as a JSON array: a plain string would
  * be split on commas by the tools' coercion). */
 function parseDirections(text) { return norm(text).split("\n").map((x) => x.trim()).filter(Boolean); }
-/** Shows the directions field while the crew number is on; hiding it also empties the textarea, so hidden text is
- * neither sent nor an unsaved edit. `prefix`: "n" (the create form) or "f" (the task modal). */
+/** Shows the directions field while the crew number is on. Hiding it keeps the typed text (a number retyped through
+ * an empty field loses nothing), but hidden text is neither sent (taskChanges, the create handler) nor an unsaved
+ * edit (readTaskForm, modalHasUnsaved: dirsHidden). `prefix`: "n" (the create form) or "f" (the task modal). */
 function syncCrewField(prefix) {
   const on = crewOn(crewValue($(`#${prefix}-crew`)?.value));
   $(`#${prefix}-dirs-field`)?.classList.toggle("hidden", !on);
-  const box = $(`#${prefix}-dirs`);
-  if (!on && box) box.value = "";
 }
+function dirsHidden(prefix) { return !!$(`#${prefix}-dirs-field`)?.classList.contains("hidden"); }
 
 /**
  * A timer that runs `fn` at most once per window and is never starved: a pending run is only moved
@@ -679,7 +679,7 @@ function renderAll() {
   if (S.chatWith) renderDrawerHead();
   if (modalOpen() && $("#sk-attach-list")) renderAttachList();   // (what is attached changed meanwhile)
   // the open task's subtasks and crew line come from the snapshot (a subtask's change carries no event of the parent)
-  if (S.openTaskId && S.taskBase) setHtml($("#task-subtasks"), taskSubtasksHtml(S.taskBase));
+  if (S.openTaskId && S.taskBase) renderTaskSubtasks(S.taskBase);
 }
 
 /* ---------------------------------------------------------------- header */
@@ -1029,18 +1029,20 @@ function boardColumns(tasks) {
 function cardHtml(task, card) {
   card = card && typeof card === "object" && Array.isArray(card.rows) ? card : EMPTY_CARD;
   const hasStack = card.rows.length > 0;
-  const open = hasStack && (S.expanded.has(Number(task.id)) || !!card.forced);
+  // a stack the user closed under this search stays closed, also one the user had opened before (S.unforced wins)
+  const open = hasStack && !S.unforced.has(Number(task.id)) && (S.expanded.has(Number(task.id)) || !!card.forced);
   const matches = card.matches instanceof Set ? card.matches : EMPTY_CARD.matches;
   const blocked = (task.blocked_by || []).length && task.status === "todo"
     ? `<span class="blocked"><i class="ic ic-blocked"></i>${esc(t("blocked_by"))} ${task.blocked_by.map((b) => "#" + Number(b)).join(", ")}</span>` : "";
   const assignee = task.assignee ? `<span class="chip">${avatar(task.assignee, "sm")}${esc(displayName(task.assignee))}</span>` : "";
   const tags = (task.tags || []).map((g) => `<span class="tag">${esc(g)}</span>`).join("");
   const comments = task.comments ? `<span class="chip plain"><i class="ic ic-chat"></i>${Number(task.comments)}</span>` : "";
-  // the user's review: of the card's own task or of a subtask anywhere in its stack
+  // the user's review: of the card's own task or of a subtask anywhere in its stack; the card's own review by another
+  // member keeps the chip naming its reviewer next to that badge
   const userReview = (task.status === "review" && task.reviewer === "user")
     || card.rows.some((r) => r.task.status === "review" && r.task.reviewer === "user");
-  const review = userReview ? `<span class="badge warn"><i class="ic ic-eye"></i>${esc(t("review_you"))}</span>`
-    : task.status === "review" && task.reviewer ? `<span class="chip plain"><i class="ic ic-eye"></i>${esc(displayName(task.reviewer))}</span>` : "";
+  const review = (userReview ? `<span class="badge warn"><i class="ic ic-eye"></i>${esc(t("review_you"))}</span>` : "")
+    + (task.status === "review" && task.reviewer && task.reviewer !== "user" ? `<span class="chip plain"><i class="ic ic-eye"></i>${esc(displayName(task.reviewer))}</span>` : "");
   const failed = task.status === "failed" ? `<span class="badge err">${esc(t("s_failed"))}</span>` : task.status === "cancelled" ? `<span class="badge st-cancelled">${esc(t("s_cancelled"))}</span>` : "";
   const prio = Math.max(0, Math.min(3, Number(task.priority) || 0));
   const role = hasStack ? `role="group" aria-label="${esc(`#${Number(task.id)} ${task.title ?? ""}`)}"` : 'role="button"';
@@ -1052,15 +1054,15 @@ function cardHtml(task, card) {
   </div>`;
 }
 
-/** Opens or closes a parent's stack as it is shown: a stack a search opened is closed for as long as that search
- * holds (S.unforced), without touching the parents the user opened (S.expanded). */
+/** Opens or closes a parent's stack as it is shown: a stack a search opened (one of its rows matches) is closed for
+ * as long as that search holds (S.unforced), without touching the parents the user opened (S.expanded). */
 function toggleStack(id) {
   id = Number(id);
   const card = visibleCards(boardCards((S.state && S.state.tasks) || [])).find((c) => Number(c.task.id) === id);
-  const forced = !!(card && card.forced);
-  if (S.expanded.has(id) || forced) {
-    S.expanded.delete(id);
-    if (forced) S.unforced.add(id);
+  const searched = !!(card && card.matches && card.matches.size);
+  if (!S.unforced.has(id) && (S.expanded.has(id) || !!(card && card.forced))) {
+    if (searched) S.unforced.add(id);
+    else S.expanded.delete(id);
   } else {
     S.expanded.add(id);
     S.unforced.delete(id);
@@ -1381,7 +1383,8 @@ function modalHasUnsaved() {
   // an emptied field is no edit, except where emptying it means something (data-empty-edit: a session setting
   // cleared to take the global value again)
   return $$("#modal input, #modal textarea").some((el) => el.id && S.modalInitial && S.modalInitial.has(el.id)
-    && el.value !== S.modalInitial.get(el.id) && (el.value.trim() !== "" || el.hasAttribute("data-empty-edit")));
+    && el.value !== S.modalInitial.get(el.id) && (el.value.trim() !== "" || el.hasAttribute("data-empty-edit"))
+    && !(el.id === "n-dirs" && dirsHidden("n")));
 }
 function closeModal(force = false) {
   if (!force && modalHasUnsaved() && !confirm(t("discard_changes"))) return false;
@@ -1419,7 +1422,10 @@ function dirtyFields(base, values) {
 }
 function readTaskForm() {
   const values = {};
-  for (const id of Object.keys(TASK_FORM)) { const el = $("#" + id); if (el) values[id] = el.value; }
+  for (const id of Object.keys(TASK_FORM)) {
+    const el = $("#" + id);
+    if (el && !(id === "f-dirs" && dirsHidden("f"))) values[id] = el.value;   // hidden directions: no edit
+  }
   return values;
 }
 /** task_update arguments for the edits in `values` relative to `task`, or null when nothing changed. */
@@ -1486,6 +1492,17 @@ function taskSubtasksHtml(task) {
   const rows = subs.length ? `<div class="section-title">${esc(t(crew ? "directions" : "subtasks"))}</div>`
     + `<div class="stack modal-stack">${subs.map((sub) => stackRowHtml({ task: sub, level: 0 }, false)).join("")}</div>` : "";
   return line + rows;
+}
+/** The modal's crew line and subtask rows after a change; a row that had the keyboard focus gets it back. */
+function renderTaskSubtasks(task) {
+  const box = $("#task-subtasks");
+  if (!box) return;
+  const active = globalThis.document && document.activeElement;
+  const row = active && typeof box.contains === "function" && box.contains(active) && active.dataset ? active.dataset.openTask : null;
+  const html = taskSubtasksHtml(task);
+  if (box._html === html) return;
+  setHtml(box, html);
+  if (row) $(`[data-open-task="${Number(row)}"]`, box)?.focus?.({ preventScroll: true });
 }
 function taskResultHtml(task) {
   return task.result ? `<div class="section-title">${esc(t("result"))}</div><div class="result-box">${md(task.result)}</div>` : "";
@@ -1603,7 +1620,7 @@ function updateTaskModal(data, force = false) {
   syncMdField("f-desc", task.description, force);
   $("#task-head").innerHTML = taskHeadHtml(task);
   setHtml($("#task-meta"), taskMetaHtml(task));
-  setHtml($("#task-subtasks"), taskSubtasksHtml(task));
+  renderTaskSubtasks(task);
   setHtml($("#task-result"), taskResultHtml(task));
   if ((old.status === "review") !== (task.status === "review")) { $("#task-review").innerHTML = taskReviewHtml(task); wireReview(); }
   $("#discussion-title").textContent = discussionTitle(task, posts);
@@ -2529,9 +2546,10 @@ function openJobLog(path) {
   S.fileDir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".";
   setTab("files");
 }
-/** Every JOB_REFRESH ms while the Jobs tab is shown: the open outputs of running jobs and the running times. */
+/** Every JOB_REFRESH ms while the Jobs tab is shown: the open outputs of running jobs and the running times (not on a
+ * session made by an earlier version: the board stops polling, showEarlier). */
 function tickJobs() {
-  if (S.tab !== "jobs" || !S.state || (typeof document !== "undefined" && document.hidden)) return;
+  if (S.tab !== "jobs" || !S.state || S.earlier || (typeof document !== "undefined" && document.hidden)) return;
   for (const id of S.jobOpen) if (runningJobs().some((j) => Number(j.id) === id)) loadJobOutput(id);
   renderJobs();
 }
@@ -3012,7 +3030,8 @@ if (typeof module !== "undefined" && module.exports) {
   // pure helpers, exported for the Node-based UI tests (tests/test_ui.py); the browser ignores this
   module.exports = {
     I18N, S, COLUMNS, ALL_STATUSES, TASK_FORM, esc, escAttr, t, tv, linkify, highlightMentions, memberOptions, statusOptions,
-    dropAction, makeScheduler, threadOrder, threadHtml, dirtyFields, taskChanges, mentionQuery, mentionCandidates,
+    dropAction, makeScheduler, threadOrder, threadHtml, dirtyFields, readTaskForm, modalHasUnsaved, taskChanges,
+    mentionQuery, mentionCandidates,
     limitsArgs, describeEvent, changesText, activityHtml, messageHtml, cardHtml, boardHtml, boardColumns, rejectMcp,
     deleteTrigger, fillTaskForm, autoMarkRead, loadFeed, FEED_TYPES,
     // review, the hire dialog (role catalog), the goal dialog
@@ -3044,7 +3063,7 @@ if (typeof module !== "undefined" && module.exports) {
     boardFocusKey, onBoardClick, onBoardKeydown, onBoardPointerdown, onBoardDragstart, onSearchInput, taskMatches,
     OPEN_STATUSES, TERMINAL_STATUSES, EMPTY_CARD, STACK_DOTS,
     // crew tasks in the task forms: the crew number and the directions fields, the modal's subtasks, the feed's values
-    crewValue, crewOn, parseDirections, syncCrewField, taskSubtasksHtml, newTaskModal, saveTask, fmtValue, CREW_MAX,
+    crewValue, crewOn, parseDirections, syncCrewField, taskSubtasksHtml, renderTaskSubtasks, newTaskModal, saveTask, fmtValue, CREW_MAX,
     // the question before a parent with open subtasks is closed (moveTask, saveTask, reviewTask)
     closeQuestion,
     // a session made by an earlier version: its 409 and the close 1011 (docs/SPEC.md §18.1)

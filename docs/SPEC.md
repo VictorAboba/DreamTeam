@@ -5092,7 +5092,8 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       for a missing or malformed value), the error of a damaged session. The search also matches the path and the
       copy's source. A session made by an earlier version (summary `earlier_version`, §17.2) gets the badge
       «Прежняя версия» / "Earlier version" in place of its status and the message of §17.2 in its twin (ru / en);
-      its title is no link, and it has no «Открыть» or «Запустить», only delete (none for the legacy `main`: its
+      its title is no link, its goal has no «ждёт запуска» (it never starts here), and it has no «Открыть» or
+      «Запустить», only delete (none for the legacy `main`: its
       message names the file to remove). Such a card has the state `earlier` (`sessionState`): the top stripe and the
       dot of a stopped one, the badge in the warning colour, the message as a warning line under the error line; the
       folder line keeps its path and «папки нет» badge but not the warning that the session cannot start, and there
@@ -5368,10 +5369,12 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     stays on it across live re-renders of the board. A crew task's card adds a chip with the users icon
     and `2/3` (working / `crew`; its tooltip «Групповая задача: работают 2 из 3» / "Crew task: 2 of 3 working";
     the stack rows show the same chip). A subtask waiting for the user's review, at any level of a card's stack,
-    puts the badge «ждёт вашего ревью» on that card. A filter shows a parent when it or one of its descendants
+    puts the badge «ждёт вашего ревью» on that card (a card whose own task another member reviews keeps the chip
+    naming that reviewer next to it). A filter shows a parent when it or one of its descendants
     matches, expands that stack and marks the rows that match (an accent line, `.stack-row.match`); the stack is
     open while the filter holds without changing `S.expanded`, and the toggle closes it until the search text
-    changes. Column counts count cards. The task modal of a parent
+    changes (`S.unforced`; a stack the user had opened before the search opens again then). Column counts count
+    cards. The task modal of a parent
     lists its subtasks as rows and, for a crew task, «Групповая задача: до N участников, сейчас работают M» / "Crew
     task: up to N members, M working now"; the create form gets «Групповая задача: участников» / "Crew task:
     members" (a number: empty or 0 = обычная задача / an ordinary task, 2–8) and «Направления» / "Directions" (a
@@ -5381,12 +5384,13 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     refusal of 1 or 9 is the toast, and text that is not a whole number is sent as typed and refused (never read as
     0). Empty or 0 sends no `crew` in a create and `crew: 0` in an edit of a crew task (an ordinary task again).
     Directions are the trimmed non-blank lines, sent as a list and only while the number is on (not empty, not 0);
-    hiding the textarea empties it, so hidden text is neither sent nor an unsaved edit. The directions textarea's
+    hiding the textarea keeps its text (a number retyped through an empty field loses nothing), but hidden text is
+    neither sent nor an unsaved edit, and a save of the edit form empties it. The directions textarea's
     hint: «по одному в строке» / "one per line" in the create form, «новые, по одному в строке» / "new ones, one per
     line" in the edit form. The modal's rows are the task's direct subtasks, all of them (also one shown as its own
     card), in id order, under «Направления» / "Directions" for a crew task and «Подзадачи» / "Subtasks" otherwise; a
     row opens that subtask (asking first about unsaved edits, as every link to a task does). The crew line and the
-    rows read the board's snapshot, so they follow the subtasks live.
+    rows read the board's snapshot, so they follow the subtasks live (a row with the keyboard focus keeps it).
   - Hire dialog: the role input offers the visible catalog (`GET api/roles`) and shows the matched role's
     description and model profile (matched as the hire resolves it: any of its `names`, hidden roles included),
     or that a typed name is a new role to describe in the instructions; the

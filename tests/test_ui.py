@@ -613,9 +613,15 @@ def test_parent_card_carries_the_review_badge_of_a_subtask():
       out.direct = parent({json.dumps(board("user", 0))});
       out.deeper = parent({json.dumps(board("user", 1))});
       out.agent = parent({json.dumps(board("Bob Stone", 0))});
+      // the parent itself in another member's review keeps the chip naming that reviewer next to the badge
+      out.both = parent({json.dumps([stack_task(2, "review", title="Parent", reviewer="Ann Lee"),
+                                     stack_task(4, "review", 2, reviewer="user")])});
+      out.single = app.cardHtml({json.dumps(stack_task(5, "review", reviewer="user"))});
     """)
     badge = '<span class="badge warn"><i class="ic ic-eye"></i>waits for your review</span>'
     assert out["direct"].count(badge) == 1 and out["deeper"].count(badge) == 1
+    assert out["both"].count(badge) == 1 and '<span class="chip plain"><i class="ic ic-eye"></i>Ann Lee</span>' in out["both"]
+    assert out["single"].count(badge) == 1 and "chip plain\"><i class=\"ic ic-eye\"></i>" not in out["single"]
     assert "badge warn" not in out["agent"] and "ic-eye" not in out["agent"].split('<button type="button" class="stack-toggle"')[0]
 
 
@@ -696,6 +702,12 @@ def test_board_filter_shows_parents_of_matching_rows():
       out.userOpen = [Array.from(app.S.expanded), Array.from(app.S.unforced)];
       app.onSearchInput({{ target: {{ value: "" }} }});
       out.cleared = elements.board.innerHTML;
+      // a stack the user opened before the search, closed under it: open again once the search is gone
+      app.onSearchInput({{ target: {{ value: "needle" }} }});
+      app.toggleStack(2);
+      out.closedOwn = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded), Array.from(app.S.unforced)];
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.ownBack = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
     """)
     def count(html: str, col: str) -> str:
         return re.search(rf'data-col="{col}">\s*<div class="column-head">.*?<span class="count">(\d+)</span>', html, re.S).group(1)
@@ -714,6 +726,7 @@ def test_board_filter_shows_parents_of_matching_rows():
     assert 'class="stack"' in out["reopened"]
     assert out["userOpen"] == [[2], []]
     assert 'class="stack"' in out["cleared"] and 'data-id="7"' in out["cleared"] and "stack-row match" not in out["cleared"]
+    assert out["closedOwn"] == [False, [2], [2]] and out["ownBack"] == [True, [2]]
 
 
 @needs_node
@@ -847,15 +860,24 @@ def test_create_form_sends_crew_and_directions():
       app.newTaskModal();
       out.html = elements.modal.innerHTML;
       out.listens = typeof handlers["n-crew:input"];
-      // the directions field shows while the number is on; hiding it empties it
+      // the directions field shows while the number is on; hiding it keeps the text, which is then no unsaved edit
+      app.S.modalInitial = new Map([["n-dirs", ""]]);
+      elements["modal-backdrop"].classList.remove("hidden");
+      const qsa = document.querySelectorAll;
+      document.querySelectorAll = (sel) => (sel.startsWith("#modal input") ? [elements["n-dirs"]] : []);
+      elements["n-dirs"].hasAttribute = () => false;
       elements["n-crew"].value = "2"; app.syncCrewField("n");
       out.shown = !elements["n-dirs-field"].classList.contains("hidden");
-      elements["n-dirs"].value = "kept while shown"; app.syncCrewField("n");
+      elements["n-dirs"].value = "a\\nb\\nc"; app.syncCrewField("n");
       out.kept = elements["n-dirs"].value;
-      elements["n-crew"].value = "0"; app.syncCrewField("n");
+      out.unsavedShown = app.modalHasUnsaved();
+      // 2 -> 3 through an empty field (Backspace, then 3): the typed directions stay
+      elements["n-crew"].value = ""; app.syncCrewField("n");
       out.hidden = [elements["n-dirs-field"].classList.contains("hidden"), elements["n-dirs"].value];
-      elements["n-crew"].value = ""; elements["n-dirs"].value = "x"; app.syncCrewField("n");
-      out.hiddenEmpty = [elements["n-dirs-field"].classList.contains("hidden"), elements["n-dirs"].value];
+      out.unsavedHidden = app.modalHasUnsaved();
+      elements["n-crew"].value = "3"; app.syncCrewField("n");
+      out.retyped = [elements["n-dirs-field"].classList.contains("hidden"), elements["n-dirs"].value];
+      elements["modal-backdrop"].classList.add("hidden"); app.S.modalInitial = null; document.querySelectorAll = qsa;
       out.values = ["", " ", "0", "3", " 12 ", "-1", "2.5", "x"].map(app.crewValue);
       out.on = [null, 0, 3, "x"].map(app.crewOn);
       out.max = app.CREW_MAX;
@@ -876,8 +898,9 @@ def test_create_form_sends_crew_and_directions():
     assert re.search(r'<label class="field full hidden" id="n-dirs-field"><span>Направления <span class="hint">по одному в строке</span>', html)
     assert '<textarea id="n-dirs"' in html
     assert out["listens"] == "function"
-    assert out["shown"] is True and out["kept"] == "kept while shown"
-    assert out["hidden"] == [True, ""] and out["hiddenEmpty"] == [True, ""]
+    assert out["shown"] is True and out["kept"] == "a\nb\nc" and out["unsavedShown"] is True
+    assert out["hidden"] == [True, "a\nb\nc"] and out["unsavedHidden"] is False
+    assert out["retyped"] == [False, "a\nb\nc"]
     assert out["values"] == [None, None, 0, 3, 12, "-1", "2.5", "x"]
     assert out["on"] == [False, False, True, True]
     from dreamteam.models import CREW_MAX
@@ -920,9 +943,19 @@ def test_edit_form_crew_fields():
       out.crewValue = elements["f-crew"].value;
       out.dirsShown = !elements["f-dirs-field"].classList.contains("hidden");
       out.listens = typeof handlers["f-crew:input"];
-      // the user clears the number: the field hides and empties, so nothing is left unsaved there
+      // the user clears the number: the field hides and keeps its text, which is neither an unsaved edit nor sent
       elements["f-dirs"].value = "typed"; elements["f-crew"].value = ""; handlers["f-crew:input"]();
       out.cleared = [elements["f-dirs-field"].classList.contains("hidden"), elements["f-dirs"].value];
+      const read = app.readTaskForm();
+      out.hiddenRead = "f-dirs" in read;
+      out.hiddenDirty = app.dirtyFields(app.S.taskBase, read);
+      out.hiddenChanges = app.taskChanges(app.S.taskBase, read);
+      // a live update meanwhile (the number untouched there) keeps the hidden text too; the number back shows it
+      app.updateTaskModal({ task: Object.assign({ created_at: 0, updated_at: 0 }, crewTask, { crew: 0 }), discussion: [], events: [] });
+      out.live = elements["f-dirs"].value;
+      elements["f-crew"].value = "4"; handlers["f-crew:input"]();
+      out.back = [elements["f-dirs-field"].classList.contains("hidden"), elements["f-dirs"].value,
+                  app.taskChanges(app.S.taskBase, app.readTaskForm())];
     """)
     cases = out["cases"]
     assert cases[0] is None and cases[1] is None
@@ -939,7 +972,11 @@ def test_edit_form_crew_fields():
     assert html.index('id="task-meta"') < html.index('id="task-subtasks"') < html.index('id="task-result"')
     assert '<span class="hint">new ones, one per line</span>' in html and 'placeholder="2–8"' in html
     assert out["crewValue"] == "3" and out["dirsShown"] is True and out["listens"] == "function"
-    assert out["cleared"] == [True, ""]
+    assert out["cleared"] == [True, "typed"]
+    assert out["hiddenRead"] is False and out["hiddenDirty"] == {"f-crew": ""}
+    assert out["hiddenChanges"] == {"crew": 0}   # no directions with an ordinary task
+    assert out["live"] == "typed"
+    assert out["back"] == [False, "typed", {"crew": 4, "directions": ["typed"]}]
 
 
 @needs_node
@@ -978,6 +1015,28 @@ def test_task_modal_lists_subtasks_and_the_crew_line():
     assert "Групповая задача: до 3 участников, сейчас работают 1" in out["ru"] and ">Направления</div>" in out["ru"]
     assert "Crew task: up to 3 members, 2 working now" in out["noState"] and "data-open-task" not in out["noState"]
     assert out["noStateOrdinary"] == ""
+
+
+@needs_node
+def test_task_modal_rows_keep_the_focus():
+    tasks = [stack_task(10, "in_progress", crew=3, crew_working=["Ann Lee"]), stack_task(12, "todo", 10)]
+    out = run_js(f"""
+      app.S.lang = "en";
+      app.S.state = {{ agents: [], tasks: {json.dumps(tasks)} }};
+      const focused = [];
+      const box = el("task-subtasks", {{ contains: () => true,
+        querySelector: (sel) => {{ focused.push(sel); return {{ focus: (o) => focused.push(o) }}; }} }});
+      app.renderTaskSubtasks(app.S.state.tasks[0]);
+      out.first = box.innerHTML.includes('data-open-task="12"');
+      globalThis.document.activeElement = {{ dataset: {{ openTask: "12" }} }};
+      app.renderTaskSubtasks(app.S.state.tasks[0]);   // nothing changed: the DOM stays
+      out.same = focused.slice();
+      app.S.state.tasks[1].assignee = "Bob Stone";      // an agent took the direction
+      app.renderTaskSubtasks(app.S.state.tasks[0]);
+      out.changed = focused.slice();
+    """)
+    assert out["first"] is True and out["same"] == []
+    assert out["changed"] == ['[data-open-task="12"]', {"preventScroll": True}]
 
 
 def test_crew_line_styles():
@@ -2465,6 +2524,7 @@ def test_home_card_of_an_earlier_version_session():
       const home = loadHomeJs();
       home.H.hub = { version: "0.2.0", home: "C:/h" };
       const old = { id: "003-old", title: "Old", status: "stopped", earlier_version: true, skills: ["x"],
+                    goal: { title: "Old goal", status: "pending" },
                     skills_pending: ["x"], workspace: { path: "D:/gone", default: false, adopted: true, exists: false } };
       const main = { id: "main", title: "Main", legacy: true, dir: "C:/h", status: "stopped", earlier_version: true };
       for (const lang of ["en", "ru"]) {
@@ -2472,7 +2532,7 @@ def test_home_card_of_an_earlier_version_session():
         out[lang] = { old: home.sessionCard(old), main: home.sessionCard(main) };
       }
       home.H.lang = "en";
-      out.plain = home.sessionCard({ id: "004-new", title: "New", status: "stopped" });
+      out.plain = home.sessionCard({ id: "004-new", title: "New", status: "stopped", goal: { title: "G", status: "pending" } });
       out.state = home.sessionState(Object.assign({}, old, { goal: { title: "G", status: "done" } }));
       out.filters = ["stopped", "running", "all"].map((f) => home.filterSessions([old], f, "").length);
       home.H.hub = null;
@@ -2487,8 +2547,9 @@ def test_home_card_of_an_earlier_version_session():
     assert ('<div class="sc-warn sc-earlier"><i class="ic ic-alert" aria-hidden="true"></i><span>'
             + EARLIER_VERSION_TEXT.format(sid="003-old", version="0.2.0") + "</span></div>") in old
     assert '<span class="sc-title" title="Old">Old</span>' in old
-    for absent in ('href="/s/', "data-start", "data-stop", "data-skills-pending", "cannot start"):
+    for absent in ('href="/s/', "data-start", "data-stop", "data-skills-pending", "cannot start", "waiting to start"):
         assert absent not in old, absent
+    assert "Old goal" in old and "ждёт запуска" not in out["ru"]["old"]
     # the folder line stays with its badge; the skills count stays
     assert "D:/gone" in old and '<span class="badge err">missing</span>' in old and "skills: 1" in old
     assert 'data-delete="003-old"' in old
@@ -2503,6 +2564,7 @@ def test_home_card_of_an_earlier_version_session():
     # a plain stopped card is as before
     assert '<a class="sc-title" href="/s/004-new/" title="New">New</a>' in out["plain"]
     assert '<a class="btn primary small" href="/s/004-new/">Open</a>' in out["plain"] and "sc-earlier" not in out["plain"]
+    assert "(waiting to start)" in out["plain"]
     assert out["filters"] == [1, 0, 1]
 
 
@@ -2575,7 +2637,8 @@ def test_home_loads_the_hub_version_once_for_earlier_sessions():
     """)
     assert out["plainFetched"] == ["/api/sessions"]
     assert out["fetched"].count("/api/hub") == 1 and out["fetched"].count("/api/sessions") == 3
-    assert out["beforeHub"] == ""   # the list waits for the version rather than showing "?" first
+    # the cards show at once, the version «?» until the hub answers
+    assert "Session 002-old was made by an earlier version" in out["beforeHub"] and "(?)" in out["beforeHub"]
     assert "(9.9)" in out["html"] and "Session 002-old was made by an earlier version" in out["html"]
     assert out["failFetched"].count("/api/hub") == 1 and "(?)" in out["failHtml"]
 
@@ -3309,6 +3372,11 @@ def test_jobs_tab_cards_output_and_stop():
       app.tickJobs();                                   // every few seconds while it runs
       await new Promise((r) => setImmediate(r));
       out.ticks = calls.length;
+      app.S.earlier = true;                             // a session made by an earlier version: no polling
+      app.tickJobs();
+      await new Promise((r) => setImmediate(r));
+      out.earlierTicks = calls.length;
+      app.S.earlier = false;
       app.handleEvent({ id: 41, ts: 0, type: "job.ended", actor: "x", data: { job: { id: 3, status: "ended" } } });
       await new Promise((r) => setImmediate(r));
       out.onEvent = calls.length;
@@ -3355,7 +3423,7 @@ def test_jobs_tab_cards_output_and_stop():
     assert out["load"] == [["/api/act/jobs", {"job_id": "j3", "tail": 200}]]
     assert '<pre class="job-output" data-job-pre="3">Job j3 of x\n' + EVIL_ESC + "</pre>" in out["open"]
     assert 'aria-expanded="true">Hide output</button>' in out["open"]
-    assert out["ticks"] == 2 and out["onEvent"] == 3 and out["closed"] is False
+    assert out["ticks"] == 2 and out["earlierTicks"] == 2 and out["onEvent"] == 3 and out["closed"] is False
     assert out["cancelled"] is None and out["cancelCalls"] == 0
     assert out["stop"] == [["/api/act/job_stop", {"job_id": "j3"}]]
     assert out["clickOut"] == [True, [{"job_id": "j2", "tail": 200}]]

@@ -635,12 +635,12 @@ async function loadSessions() {
     const data = await api("GET", "/api/sessions");
     if (seq !== H.listSeq) return;
     const sessions = data.sessions || [];
-    if (sessions.some((s) => s.earlier_version) && !H.hub) {   // the version their message names
-      await loadHub();
-      if (seq !== H.listSeq) return;
-    }
     H.sessions = sessions;
     renderSessions();
+    if (sessions.some((s) => s.earlier_version) && !H.hub) {   // the version their message names: «?» until it answers
+      await loadHub();
+      if (seq === H.listSeq) renderSessions();
+    }
   } catch (e) {
     if (seq === H.listSeq && H.sessions === null) {
       const grid = $("#sessions");
@@ -763,7 +763,7 @@ function sessionCard(s) {
   // working: the accent, as everywhere
   const badgeCls = { running: "", paused: "warn", done: "done", stopped: "plain", earlier: "warn" }[state];
   const goal = s.goal && s.goal.title
-    ? `<div class="sc-goal" title="${esc(s.goal.description || s.goal.title)}"><i class="ic ic-goal"></i>${esc(s.goal.title)}${s.goal.status === "pending" ? ` <span class="muted">(${esc(t("st_pending"))})</span>` : ""}</div>`
+    ? `<div class="sc-goal" title="${esc(s.goal.description || s.goal.title)}"><i class="ic ic-goal"></i>${esc(s.goal.title)}${s.goal.status === "pending" && !earlier ? ` <span class="muted">(${esc(t("st_pending"))})</span>` : ""}</div>`
     : `<div class="sc-goal none">${esc(t("no_goal"))}</div>`;
   const budget = s.max_cost_usd > 0 ? `${money(s.spent_usd)} / ${money(s.max_cost_usd)}` : money(s.spent_usd);
   const running = s.status === "running";
