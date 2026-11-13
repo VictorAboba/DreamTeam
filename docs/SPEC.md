@@ -1441,9 +1441,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `crew_draft_no_result`), `n_direction_failed`, `n_direction_cancelled`, `n_marks_stalled`: "Finishing". `Task` gains
   `crew: int` (stored) and `crew_working:
   list[str]` (filled by `Board`, not stored); both are in `to_dict()`, so in the state API and the events (an
-  export copies the column `tasks.crew`). The web and the TUI compute a crew task's chip from the tasks they have
-  (its assignee and its subtasks), so a direction's `task.updated` is enough and the board emits no event for the
-  parent.
+  export copies the column `tasks.crew`). The web and the TUI show a crew task's chip from its `crew_working` in the
+  board's snapshot and fetch the snapshot again after changes (the web on every bus event, the TUI for `/board` and
+  `/task`), so a direction's `task.updated` is enough and the board emits no event for the parent.
   `n_crew_changed`: `{by} set the crew of #{id} "{title}" to {crew}
   (0 = an ordinary task).` `n_subtask_cancelled`: `{by} cancelled #{id} "{title}", your part of #{parent}: stop the
   work on it; if what you have done is still needed, say so in #{parent}'s discussion.`
