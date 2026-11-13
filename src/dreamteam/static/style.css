@@ -272,8 +272,7 @@ code { font-family: var(--mono); font-size: .92em; }
 .card-meta .tag { margin-right: -5px; }
 .blocked { color: var(--warn); font-size: 11.5px; display: inline-flex; align-items: center; gap: 4px; }
 /* subtasks: a parent card with its stack (docs/SPEC.md §18.4 "Subtasks"); collapsed, two thin strips under it (shadows
-   of the card's colour edged by the border colour; no var(--shadow) in the list: it is `none` in the dark theme, and
-   `none` inside a list drops the whole declaration) */
+   of the card's colour edged by the border colour) */
 .card.has-stack:not(.expanded) {
   margin-bottom: 5px;
   box-shadow: 0 4px 0 -2px var(--panel), 0 4px 0 -1px var(--border), 0 8px 0 -4px var(--panel), 0 8px 0 -3px var(--border);
