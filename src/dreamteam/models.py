@@ -34,6 +34,8 @@ class Status:
 
 
 PRIORITIES = {0: "low", 1: "normal", 2: "high", 3: "critical"}
+# the largest `crew` of a crew task: how many members may work on it at once, its owner included (docs/SPEC.md §4.2)
+CREW_MAX = 8
 
 
 class AgentKind:
@@ -66,8 +68,12 @@ class Task:
     result: str | None
     created_at: float
     updated_at: float
+    crew: int = 0  # stored (tasks.crew): 0 = an ordinary task, 2..CREW_MAX = a crew task (docs/SPEC.md §4.2)
     blocked_by: list[int] = field(default_factory=list)
     comments: int = 0
+    # the working set of a crew task (Board.crew_working: its assignee while open, then the assignees of its
+    # in_progress/waiting subtasks), filled by Board like blocked_by, not stored
+    crew_working: list[str] = field(default_factory=list)
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -87,6 +93,7 @@ class Task:
             result=row["result"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            crew=(row["crew"] or 0) if "crew" in row.keys() else 0,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -98,6 +105,8 @@ class Task:
             bits.append(f"@{self.assignee}")
         if self.status == Status.REVIEW and self.reviewer:
             bits.append(f"review:{self.reviewer}")
+        if self.crew >= 2:
+            bits.append(f"crew {len(self.crew_working)}/{self.crew}")
         if self.priority != 1:
             bits.append(f"({PRIORITIES.get(self.priority, self.priority)})")
         if self.tags:

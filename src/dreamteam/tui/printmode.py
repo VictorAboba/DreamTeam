@@ -50,6 +50,8 @@ TEXTS = {
         "stopped": "Сессия остановлена.",
         "interrupted": "Прервано.",
         "no_sessions": "Нет сессий, которые можно продолжить.",
+        "continue_earlier": "Последняя сессия, {sid}, создана более ранней версией DreamTeam, и эта версия "
+                            "({version}) не может её открыть. Начните новую сессию: запустите без -c.",
         "unknown_session": "Неизвестная сессия «{sid}».",
         "session": "Сессия {sid}: {title}",
         "folder": "Папка сессии: {path}",
@@ -73,6 +75,8 @@ TEXTS = {
         "stopped": "The session was stopped.",
         "interrupted": "Interrupted.",
         "no_sessions": "There is no session to continue.",
+        "continue_earlier": "The most recent session, {sid}, was made by an earlier version of DreamTeam and cannot be "
+                            "opened by this one ({version}). Start a new session: run without -c.",
         "unknown_session": "Unknown session '{sid}'.",
         "session": "Session {sid}: {title}",
         "folder": "Session folder: {path}",
@@ -347,10 +351,23 @@ class _PrintRun:
             summary = next((s for s in sessions if s.get("id") == self.session), None)
             if summary is None:
                 raise _Finished("error", _text(self.text_lang, "unknown_session", sid=self.session))
+            if summary.get("earlier_version"):  # never opened by this version (docs/SPEC.md §17.2): nothing created
+                from ..sessions import earlier_version_text   # (here only: the client needs no session code otherwise)
+
+                hub = await client.hub_info()
+                raise _Finished("error", earlier_version_text(str(summary["id"]), hub.get("home"), hub.get("version")))
         else:
+            # -c: the most recent session; one made by an earlier version is never opened, and never passed over for
+            # an older one the user did not ask for (docs/SPEC.md §17.2): nothing created
             if not sessions:
                 raise _Finished("error", _text(self.text_lang, "no_sessions"))
             summary = max(sessions, key=lambda s: s.get("last_activity") or s.get("created_at") or 0)
+            if summary.get("earlier_version"):
+                from .. import __version__
+
+                hub = await client.hub_info()
+                raise _Finished("error", _text(self.text_lang, "continue_earlier", sid=summary["id"],
+                                               version=hub.get("version") or __version__))
         if summary.get("status") != "running" or self.skills:   # (a running one attaches the skills live)
             summary = await (client.start_session(summary["id"], skills=self.skills) if self.skills else
                              client.start_session(summary["id"]))
@@ -444,6 +461,16 @@ class _PrintRun:
                         continue
                 if ev.get("type") == "_connection":
                     state = (ev.get("data") or {}).get("state")
+                    if state == "earlier":   # the hub closed the stream: an import replaced the session with one
+                        # made by an earlier version (docs/SPEC.md §17.2), which this version never opens
+                        from ..sessions import earlier_version_text   # (as for -r ID of one)
+
+                        try:
+                            hub = await self.client.hub_info()
+                        except HubError:
+                            hub = {}
+                        raise _Finished("error", earlier_version_text(str(self.sid), hub.get("home"),
+                                                                      hub.get("version")))
                     if state == "connected":
                         lost_since = None
                         await self.bounded(self.catch_up())

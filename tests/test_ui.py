@@ -34,6 +34,7 @@ from dreamteam.config import _MIN_ONE, Config, ShellSettings, WorkspaceSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status
 from dreamteam.swarm import Swarm
+from helpers.stacks import EXPECTED_CARDS, STACK_TASKS
 
 STATIC = Path(dreamteam.__file__).parent / "static"
 APP_JS = (STATIC / "app.js").read_text(encoding="utf-8")
@@ -88,7 +89,7 @@ def test_i18n_covers_every_value_the_backend_emits():
     ops = set(re.findall(r'"(\w+)"', " ".join(re.findall(r"_store_and_commit\(actor.*", workspace_src))))
     assert {"create", "write", "edit"} <= ops
     task_fields = {"title", "goal", "description", "status", "assignee", "reviewer", "priority", "tags",
-                   "depends_on", "result", "parent_id"}
+                   "depends_on", "result", "parent_id", "crew"}
     # (a member's question passes its details after the reason: .pause(asker, "question", asker=…))
     pause_reasons = {r for f in SRC.rglob("*.py")
                      for r in re.findall(r"\.pause\(\w+, \"([^\"]+)\"[,)]", f.read_text(encoding="utf-8"))}
@@ -127,7 +128,11 @@ def test_ids_used_by_app_js_exist():
     assert not missing, missing
     # the task modal live-update needs these sections
     assert {"task-head", "task-meta", "task-result", "task-review", "thread", "task-history", "post-text",
-            "mention-menu", "f-goal"} <= template_ids
+            "mention-menu", "f-goal", "task-subtasks"} <= template_ids
+    # the crew fields of the create form and of the task modal (§18.4 "Subtasks")
+    crew_ids = {"n-crew", "n-dirs", "n-dirs-field", "f-crew", "f-dirs", "f-dirs-field"}
+    assert crew_ids <= template_ids
+    assert {"n-crew", "n-dirs", "task-subtasks"} <= used
 
 
 def test_jobs_tab_feed_and_settings_fields():
@@ -199,11 +204,13 @@ def test_home_i18n_is_complete():
     sections = set(re.findall(r'\["\w+", "(s_\w+)"\]', HOME_JS))
     assert len(sections) == 11 and {"s_roles", "s_skills"} <= sections
     used |= sections | {s + "_hint" for s in sections}
-    used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending")}  # sessionState() + pending goal
+    # sessionState() + pending goal
+    used |= {f"st_{s}" for s in ("running", "paused", "stopped", "done", "pending", "earlier")}
     used |= WORKSPACE_KINDS_KEYS  # workspaceLine(): t("ws_" + kind), t("ws_" + kind + "_hint")
     assert {"new_session", "delete_text", "p_key_saved", "p_key_env_drop", "p_model_required", "discard_new",
             "started", "stopped", "p_model_ok", "create_open", "f_team", "team_over_max", "r_err_model", "sw_review",
-            "sw_review_hint", "f_goal_hint", "f_model_hint"} <= used
+            "sw_review_hint", "f_goal_hint", "f_model_hint", "sw_crew_review", "sw_crew_review_hint", "earlier_session",
+            "earlier_main"} <= used
     # the starting team is a composer now: the old number field and the comma list are gone
     assert not {"f_start_agents", "f_roles", "f_roles_ph", "f_roles_hint", "sw_start", "sw_roles"} & keys
     missing = sorted(k for k in used if k not in keys)
@@ -491,6 +498,702 @@ def test_review_on_the_board():
         ["/api/act/task_review", {"task_id": 4, "approve": False, "comment": "Add tests for the parser"}],
         ["/api/act/task_review", {"task_id": 4, "approve": True}],
     ]
+
+
+# ------------------------------------------------------------------------- subtasks in their parent's stack (§18.4)
+def stack_task(tid: int, status: str = "todo", parent_id: int | None = None, **extra: Any) -> dict[str, Any]:
+    task = {"id": tid, "title": f"Task {tid}", "goal": "", "description": "", "status": status, "assignee": None,
+            "reviewer": None, "parent_id": parent_id, "priority": 1, "tags": [], "depends_on": [], "blocked_by": [],
+            "comments": 0, "crew": 0, "crew_working": [], "updated_at": float(tid)}
+    task.update(extra)
+    return task
+
+
+# a parent #2 with a done, an in_progress (a review one under it) and a todo subtask, and a plain #1
+BOARD_STACK = [stack_task(1, title="Plain one"), stack_task(2, title="Parent"),
+               stack_task(3, "done", 2, title="Done child"), stack_task(4, "in_progress", 2, title="Busy child", assignee="Ann Lee"),
+               stack_task(5, "todo", 2, title="Later child"), stack_task(6, "review", 4, title="Needle grandchild", reviewer="Bob Stone")]
+BOARD_STUB = r"""
+  app.S.lang = "en"; app.S.tab = "board";
+  const asked = [];
+  el("board", { _html: undefined, style: { setProperty: (k, v) => { elements.board.cols = v; } },
+                querySelector: (sel) => { asked.push(sel); return null; } });
+"""
+
+
+@needs_node
+def test_board_stacks_subtasks_under_their_parent():
+    out = run_js(f"""
+      const cards = app.boardCards({json.dumps(STACK_TASKS)});
+      out.cards = cards.map((c) => [c.task.id, c.rows.map((r) => [r.task.id, r.level]), c.direct.map((x) => x.id)]);
+      // the input order does not matter, and nothing breaks on what is not a task
+      out.shuffled = app.boardCards({json.dumps(list(reversed(STACK_TASKS)))}.concat([null, 7])).map((c) => c.task.id);
+      // a self-parent and a task hanging under a loop with a lower id than the loop: the card starts at the loop
+      out.loops = app.boardCards([{{ id: 5, status: "todo", parent_id: 21 }}, {{ id: 20, status: "todo", parent_id: 21 }},
+                                  {{ id: 21, status: "todo", parent_id: 20 }}, {{ id: 30, status: "todo", parent_id: 30 }}])
+        .map((c) => [c.task.id, c.rows.map((r) => [r.task.id, r.level])]);
+      // two tasks of one id, the second (the one byId holds) leading into the loop #3 <-> #4: the walk ends
+      out.dup = app.boardCards([{{ id: 1, parent_id: 1, status: "done" }}, {{ id: 1, parent_id: 4, status: "cancelled" }},
+                                {{ id: 4, parent_id: 3, status: "weird" }}, {{ id: 3, parent_id: 4, status: "weird" }}])
+        .map((c) => [c.task.id, c.rows.map((r) => [r.task.id, r.level])]);
+    """)
+    assert out["dup"] == [[1, []], [3, [[4, 0]]]]
+    assert [(c[0], [tuple(r) for r in c[1]]) for c in out["cards"]] == list(EXPECTED_CARDS.items())
+    assert {c[0]: c[2] for c in out["cards"]}[2] == [3, 4, 5]
+    ids = [c[0] for c in out["cards"]] + [r[0] for c in out["cards"] for r in c[1]]
+    assert sorted(ids) == sorted(t["id"] for t in STACK_TASKS)  # every task once
+    assert out["shuffled"] == list(EXPECTED_CARDS)
+    assert out["loops"] == [[20, [[21, 0], [5, 1]]], [30, []]]
+
+
+@needs_node
+def test_stack_toggle_dots_more_and_done_total():
+    statuses = ["done", "in_progress", "todo", "waiting", "review", "failed", "cancelled"]
+    tasks = [stack_task(2, title="Parent")] + [stack_task(10 + i, statuses[i % 7] if i != 13 else "bogus", 2)
+                                                for i in range(14)]
+    tasks[-2]["status"] = "done"  # three done: #10, #17, #22
+    out = run_js(f"""
+      app.S.lang = "en";
+      const card = app.boardCards({json.dumps(tasks)}).find((c) => c.task.id === 2);
+      out.toggle = app.stackToggleHtml(card, false);
+      out.card = app.cardHtml(card.task, card);
+      out.plain = app.cardHtml({json.dumps(stack_task(1))});
+      out.plainCard = app.cardHtml({json.dumps(stack_task(1))}, {{ task: {{ id: 1 }}, rows: [], direct: [], forced: false, matches: new Set() }});
+      out.last = app.dotHtml("bogus");
+    """)
+    toggle = out["toggle"]
+    assert toggle.count('class="sdot ') == 12
+    assert '<span class="stack-more" aria-hidden="true">+2</span>' in toggle
+    assert '<span class="stack-count">3/14</span>' in toggle
+    assert 'aria-expanded="false"' in toggle and 'data-stack-toggle="2"' in toggle
+    assert 'title="Subtasks: 3 of 14 done" aria-label="Subtasks: 3 of 14 done"' in toggle
+    assert toggle.index('<span class="sdot done" style="--dc:var(--c-done)" aria-hidden="true"></span>') < toggle.index("sdot in_progress")
+    assert '<span class="sdot in_progress" style="--dc:var(--c-in_progress)"' in toggle
+    assert '<i class="ic ic-chevron" aria-hidden="true"></i></button>' in toggle
+    assert out["last"] == '<span class="sdot todo" style="--dc:var(--c-todo)" aria-hidden="true"></span>'
+    card = out["card"]
+    assert 'class="card p1 has-stack"' in card and 'role="group" aria-label="#2 Parent"' in card
+    assert 'role="button"' not in card and toggle in card and 'class="stack"' not in card
+    for plain in (out["plain"], out["plainCard"]):
+        assert 'class="card p1"' in plain and 'role="button"' in plain and "stack-toggle" not in plain
+    assert out["plain"] == out["plainCard"]
+
+
+@needs_node
+def test_crew_chip_and_its_tooltip():
+    tasks = [stack_task(2, title="Parent"),
+             stack_task(3, "in_progress", 2, title="Crew child", crew=3, crew_working=["Ann Lee", "Bob Stone"]),
+             stack_task(9, title="Crew one", crew=3, crew_working=["Ann Lee", "Bob Stone"])]
+    out = run_js(f"""
+      app.S.lang = "en";
+      out.en = app.crewChipHtml({{ crew: 3, crew_working: ["Ann", "Bob"] }});
+      app.S.lang = "ru";
+      out.ru = app.crewChipHtml({{ crew: 3, crew_working: ["Ann", "Bob"] }});
+      app.S.lang = "en";
+      out.none = [app.crewChipHtml({{ crew: 0 }}), app.crewChipHtml({{}}), app.crewChipHtml(null), app.crewChipHtml({{ crew: 1 }})];
+      const cards = app.boardCards({json.dumps(tasks)});
+      out.crewCard = app.cardHtml(cards[1].task, cards[1]);
+      app.S.expanded.add(2);
+      out.parent = app.cardHtml(cards[0].task, cards[0]);
+    """)
+    chip = '<span class="chip plain crew-chip" title="Crew task: 2 of 3 working"><i class="ic ic-users" aria-hidden="true"></i>2/3</span>'
+    assert out["en"] == chip
+    assert 'title="Групповая задача: работают 2 из 3"' in out["ru"]
+    assert out["none"] == ["", "", "", ""]
+    assert chip in out["crewCard"]
+    meta, stack = out["parent"].split('<div class="stack">')
+    assert "crew-chip" not in meta and chip in stack
+
+
+@needs_node
+def test_parent_card_carries_the_review_badge_of_a_subtask():
+    def board(reviewer: str, level: int) -> list[dict[str, Any]]:
+        tasks = [stack_task(2, title="Parent"), stack_task(3, "in_progress", 2)]
+        tasks.append(stack_task(4, "review", 2 if level == 0 else 3, reviewer=reviewer, assignee="Ann Lee"))
+        return tasks
+
+    out = run_js(f"""
+      app.S.lang = "en";
+      const parent = (tasks) => {{ const c = app.boardCards(tasks)[0]; return app.cardHtml(c.task, c); }};
+      out.direct = parent({json.dumps(board("user", 0))});
+      out.deeper = parent({json.dumps(board("user", 1))});
+      out.agent = parent({json.dumps(board("Bob Stone", 0))});
+      // the parent itself in another member's review keeps the chip naming that reviewer next to the badge
+      out.both = parent({json.dumps([stack_task(2, "review", title="Parent", reviewer="Ann Lee"),
+                                     stack_task(4, "review", 2, reviewer="user")])});
+      out.single = app.cardHtml({json.dumps(stack_task(5, "review", reviewer="user"))});
+    """)
+    badge = '<span class="badge warn"><i class="ic ic-eye"></i>waits for your review</span>'
+    assert out["direct"].count(badge) == 1 and out["deeper"].count(badge) == 1
+    assert out["both"].count(badge) == 1 and '<span class="chip plain"><i class="ic ic-eye"></i>Ann Lee</span>' in out["both"]
+    assert out["single"].count(badge) == 1 and "chip plain\"><i class=\"ic ic-eye\"></i>" not in out["single"]
+    assert "badge warn" not in out["agent"] and "ic-eye" not in out["agent"].split('<button type="button" class="stack-toggle"')[0]
+
+
+@needs_node
+def test_stack_rows_and_expanded_across_renders():
+    out = run_js(BOARD_STUB + f"""
+      app.S.state = {{ tasks: {json.dumps(BOARD_STACK)} }};
+      app.renderBoard();
+      out.first = elements.board.innerHTML;
+      app.onBoardClick({{ target: {{ closest: (sel) => (sel === "[data-stack-toggle]" ? {{ dataset: {{ stackToggle: "2" }} }} : null) }} }});
+      out.expanded = Array.from(app.S.expanded);
+      out.open = elements.board.innerHTML;
+      app.S.state = JSON.parse(JSON.stringify(app.S.state));   // a refresh: a new snapshot, same tasks
+      app.renderBoard();
+      out.again = elements.board.innerHTML;
+      out.cols = elements.board.cols;
+      // the focus on the toggle comes back after a re-render that changed the board
+      const toggle = {{ dataset: {{ stackToggle: "2" }} }};
+      globalThis.document.activeElement = {{ closest: (sel) => (sel === "[data-stack-toggle]" ? toggle : null) }};
+      elements.board.contains = () => true;
+      out.key = app.boardFocusKey();
+      const focused = [];
+      elements.board.querySelector = (sel) => {{ asked.push(sel); return {{ focus: (o) => focused.push(o) }}; }};
+      app.toggleStack(2);
+      out.closed = elements.board.innerHTML;
+      out.expandedAfter = Array.from(app.S.expanded);
+      out.asked = asked.slice(); out.focused = focused;
+      // a row and a card give their own keys
+      globalThis.document.activeElement = {{ closest: (sel) => (sel === ".card" ? {{ dataset: {{ id: "2" }} }}
+        : sel === "[data-open-task]" ? {{ dataset: {{ openTask: "6" }} }} : null) }};
+      out.rowKey = app.boardFocusKey();
+      globalThis.document.activeElement = {{ closest: (sel) => (sel === ".card" ? {{ dataset: {{ id: "1" }} }} : null) }};
+      out.cardKey = app.boardFocusKey();
+      elements.board.contains = () => false;
+      out.outside = app.boardFocusKey();
+    """)
+    assert 'class="stack"' not in out["first"] and 'aria-expanded="false"' in out["first"]
+    assert out["expanded"] == [2]
+    html = out["open"]
+    assert 'class="stack"' in html and 'aria-expanded="true"' in html and 'class="card p1 has-stack expanded"' in html
+    assert 'data-open-task="3"' in html and 'style="--lvl:1" data-open-task="6"' in html
+    assert 'style="--lvl:0" data-open-task="4"' in html
+    row6 = html.split('data-open-task="6"')[1].split("</button>")[0]
+    assert '<i class="ic ic-eye" aria-hidden="true"></i>' in row6
+    assert 'aria-label="#3 Done child · Done"' in html
+    assert 'aria-label="#4 Busy child · In progress · Ann Lee"' in html
+    assert '<span class="avatar xs" style="--c:' in html
+    assert html.index('data-open-task="4"') < html.index('data-open-task="6"') < html.index('data-open-task="5"')
+    assert out["again"] == html  # kept open across renders
+    assert out["key"] == '[data-stack-toggle="2"]'
+    assert 'class="stack"' not in out["closed"] and out["expandedAfter"] == []
+    assert '[data-stack-toggle="2"]' in out["asked"] and out["focused"] == [{"preventScroll": True}]
+    assert out["rowKey"] == '.card[data-id="2"] [data-open-task="6"]' and out["cardKey"] == '.card[data-id="1"]'
+    assert out["outside"] is None
+
+
+@needs_node
+def test_board_filter_shows_parents_of_matching_rows():
+    tasks = BOARD_STACK + [stack_task(7, title="Unrelated")]
+    out = run_js(BOARD_STUB + f"""
+      app.S.state = {{ tasks: {json.dumps(tasks)} }};
+      app.renderBoard();
+      out.plain = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: " needle " }} }});
+      out.found = elements.board.innerHTML;
+      out.expanded = Array.from(app.S.expanded);
+      app.toggleStack(2);   // closing the stack the search opened
+      out.closed = elements.board.innerHTML;
+      out.sets = [Array.from(app.S.expanded), Array.from(app.S.unforced)];
+      app.renderBoard();
+      out.stillClosed = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: "needle" }} }});   // the same search: stays closed
+      out.same = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: "needl" }} }});    // another search opens it again
+      out.reopened = elements.board.innerHTML;
+      app.onSearchInput({{ target: {{ value: "needle" }} }});
+      app.toggleStack(2); app.toggleStack(2);                   // closed, then opened by the user
+      out.userOpen = [Array.from(app.S.expanded), Array.from(app.S.unforced)];
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.cleared = elements.board.innerHTML;
+      // a stack the user opened before the search, closed under it: open again once the search is gone
+      app.onSearchInput({{ target: {{ value: "needle" }} }});
+      app.toggleStack(2);
+      out.closedOwn = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded), Array.from(app.S.unforced)];
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.ownBack = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
+    """)
+    def count(html: str, col: str) -> str:
+        return re.search(rf'data-col="{col}">\s*<div class="column-head">.*?<span class="count">(\d+)</span>', html, re.S).group(1)
+
+    assert count(out["plain"], "todo") == "3" and count(out["plain"], "in_progress") == "0"  # cards, not tasks
+    assert count(out["plain"], "done") == "0" and count(out["plain"], "review") == "0"
+    found = out["found"]
+    assert 'data-id="2"' in found and 'data-id="1"' not in found and 'data-id="7"' not in found
+    assert 'class="stack"' in found and out["expanded"] == []
+    assert 'class="stack-row match" style="--lvl:1" data-open-task="6"' in found
+    assert found.count("stack-row match") == 1 and 'class="stack-row" style="--lvl:0" data-open-task="4"' in found
+    assert count(found, "todo") == "1"
+    assert 'class="stack"' not in out["closed"] and 'aria-expanded="false"' in out["closed"]
+    assert out["sets"] == [[], [2]]
+    assert 'class="stack"' not in out["stillClosed"] and 'class="stack"' not in out["same"]
+    assert 'class="stack"' in out["reopened"]
+    assert out["userOpen"] == [[2], []]
+    assert 'class="stack"' in out["cleared"] and 'data-id="7"' in out["cleared"] and "stack-row match" not in out["cleared"]
+    assert out["closedOwn"] == [False, [2], [2]] and out["ownBack"] == [True, [2]]
+
+
+@needs_node
+def test_board_stack_opened_and_closed_under_a_search_stays_closed():
+    out = run_js(BOARD_STUB + f"""
+      app.S.state = {{ tasks: {json.dumps(BOARD_STACK)} }};
+      app.renderBoard();
+      app.onSearchInput({{ target: {{ value: "needle" }} }});   // the search opens the stack
+      app.toggleStack(2); app.toggleStack(2); app.toggleStack(2);   // closed, opened, closed by the user
+      out.closed = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.cleared = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
+      // opened under one search text, closed under the next: still the user's own last word
+      app.onSearchInput({{ target: {{ value: "needle" }} }});
+      app.toggleStack(2); app.toggleStack(2);
+      app.onSearchInput({{ target: {{ value: "needl" }} }});
+      app.toggleStack(2);
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.next = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
+    """)
+    assert out["closed"] == [False, []]
+    assert out["cleared"] == [False, []]
+    assert out["next"] == [False, []]
+
+
+@needs_node
+def test_board_keys_and_drags_ignore_the_stack():
+    pre = r"""
+      globalThis.fetch = async (url, opts) => {
+        calls.push({ url, body: opts && opts.body ? JSON.parse(opts.body) : null });
+        const task = { id: 2, title: "P", goal: "", description: "", status: "todo", priority: 1, assignee: null, reviewer: null,
+                       tags: [], depends_on: [], crew: 0, crew_working: [], created_at: 0, updated_at: 0 };
+        const data = { task, discussion: [], events: [] };
+        return { ok: true, json: async () => data, text: async () => JSON.stringify(data) };
+      };
+    """
+    out = run_js(r"""
+      el("modal"); el("modal-backdrop");
+      for (const id of Object.keys(app.TASK_FORM)) el(id, { focus: () => {} });
+      el("f-desc-view"); el("task-form"); el("task-head"); el("task-meta"); el("task-result"); el("task-review");
+      el("discussion-title"); el("thread"); el("task-history"); el("save-task"); el("post-btn"); el("post-text"); el("mention-menu");
+      app.S.state = { tasks: [] };
+      const card = { dataset: { id: "2" }, classList: { add: () => {} } };
+      const target = (inStack) => ({ closest: (sel) => (sel === ".stack-toggle, .stack" ? (inStack ? {} : null) : sel === ".card" ? card : null) });
+      let prevented = 0;
+      const key = (inStack, k = "Enter") => ({ key: k, target: target(inStack), preventDefault: () => { prevented++; } });
+      app.onBoardKeydown(key(true)); app.onBoardKeydown(key(true, " "));
+      out.stack = [calls.length, prevented];
+      app.onBoardKeydown(key(false));
+      await new Promise((r) => setImmediate(r));
+      out.card = [calls.map((c) => c.url), prevented];
+      const data = [];
+      const drag = (inStack) => ({ target: target(inStack), preventDefault: () => { prevented++; },
+                                   dataTransfer: { setData: (k, v) => data.push([k, v]) } });
+      prevented = 0;
+      app.onBoardPointerdown(drag(true)); app.onBoardDragstart(drag(false));
+      out.rowDrag = [prevented, app.S.dragging, data.length];
+      app.onBoardPointerdown(drag(false)); app.onBoardDragstart(drag(false));
+      out.cardDrag = [prevented, app.S.dragging && app.S.dragging.id, data];
+    """, pre=pre)
+    assert out["stack"] == [0, 0]
+    assert out["card"] == [["/api/tasks/2"], 1]
+    assert out["rowDrag"] == [1, None, 0]
+    assert out["cardDrag"] == [1, 2, [["application/x-dreamteam-task", "2"], ["text/plain", "#2"]]]
+
+
+@needs_node
+def test_stack_markup_escapes_task_data():
+    tasks = [stack_task(2, title='<i>x</i>"onclick="x', assignee='"><i>', status='x" onmouseover="y',
+                        crew='3" onclick="x', crew_working=["<i>"]),
+             stack_task(3, 'x" onmouseover="y', 2, title='<i>row</i>"onclick="x', assignee='"><i>',
+                        crew='3" onclick="x', crew_working=["<i>"])]
+    out = run_js(f"""
+      app.S.lang = "en";
+      const cards = app.boardCards({json.dumps(tasks)});
+      const c = cards[0];
+      app.S.expanded.add(2);
+      out.card = app.cardHtml(c.task, c);
+      // hostile ids and levels reach no attribute raw
+      out.row = app.stackRowHtml({{ task: {{ id: "7 onmouseover=x", title: "t", status: "todo" }}, level: "1;}}" }}, true);
+      out.toggle = app.stackToggleHtml({{ task: {{ id: "7 onmouseover=x" }}, rows: [], direct: [{{ status: '"><i>' }}] }}, true);
+    """)
+    for html in (out["card"], out["row"], out["toggle"]):
+        assert "<i>" not in html and "onclick=" not in html.replace("&quot;onclick=&quot;", "")
+        assert "onmouseover=" not in html.replace("&quot; onmouseover=&quot;", "")
+        assert all(re.fullmatch(r"\d+", m) for m in re.findall(r"--lvl:([^\"]*)\"", html))
+        assert all(re.fullmatch(r"\d+|NaN", m) for m in re.findall(r'data-(?:open-task|stack-toggle|id)="([^"]*)"', html))
+    assert "sdot todo" in out["card"] and "sdot x" not in out["card"]
+    assert "crew-chip" not in out["card"] and 'class="stack"' in out["card"]
+    assert 'style="--lvl:0"' in out["row"] and 'data-open-task="NaN"' in out["row"]  # "1;}" is no number
+    assert 'data-stack-toggle="NaN"' in out["toggle"] and "sdot todo" in out["toggle"]
+
+
+def test_stack_styles_and_icon():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    for rule in (".stack-toggle {", ".stack-row {", ".stack {", ".card.has-stack:not(.expanded) {", ".avatar.xs {",
+                 '.stack-toggle[aria-expanded="true"] .ic-chevron', ".stack-row.match {"):
+        assert rule in css, rule
+    keyframes = re.search(r"@keyframes subpulse \{(.*?)\}\s*\}", css, re.S).group(1)
+    assert "transform" in keyframes and "box-shadow" not in keyframes
+    reduced = css[css.index("@media (prefers-reduced-motion: reduce)"):]
+    assert ".stack-toggle .sdot.in_progress::after { animation: none;" in reduced.split("\n}\n")[0]
+    assert ".ic-chevron {" in (STATIC / "icons.css").read_text(encoding="utf-8")
+
+
+# ------------------------------------------------------------------------- crew tasks in the task forms (§18.4)
+@needs_node
+def test_crew_changes_in_the_feed():
+    out = run_js(r"""
+      const ev = (changes) => ({ type: "task.updated", actor: "Ann Lee", data: { task: { id: 3 }, changes } });
+      app.S.lang = "ru";
+      out.ru = [app.describeEvent(ev({ crew: [0, 3] })), app.describeEvent(ev({ crew: [3, 0] }))];
+      app.S.lang = "en";
+      out.en = app.describeEvent(ev({ crew: [0, 3] }));
+      out.none = app.changesText({ crew: [null, 2] });
+      out.other = [app.fmtValue("priority", 0), app.fmtValue("crew", "0"), app.fmtValue("crew", 5)];
+    """)
+    assert out["ru"][0].endswith("#3: групповая задача (участников): обычная задача → 3"), out["ru"]
+    assert out["ru"][1].endswith("#3: групповая задача (участников): 3 → обычная задача"), out["ru"]
+    assert out["en"] == "Ann Lee updated #3: crew: ordinary task → 3"
+    assert out["none"] == "crew: — → 2"
+    assert out["other"] == ["low", "ordinary task", "5"]
+
+
+CREATE_FORM = r"""
+  const handlers = {};
+  const on = (id, props) => el(id, Object.assign({ addEventListener: (type, fn) => { handlers[id + ":" + type] = fn; } }, props || {}));
+  el("modal"); el("modal-backdrop", { classList: classList(["hidden"]) });
+  for (const id of ["n-title", "n-goal", "n-desc", "n-assignee", "n-reviewer", "n-tags", "n-deps", "n-parent", "n-dirs"]) el(id);
+  el("n-priority", { value: "1" }); el("n-dirs-field", { classList: classList(["hidden"]) });
+  on("n-crew"); on("create-task");
+  const create = async (crew, dirs) => {
+    app.newTaskModal();
+    Object.assign(elements["n-title"], { value: "T" }); Object.assign(elements["n-goal"], { value: "G" });
+    elements["n-crew"].value = crew; elements["n-dirs"].value = dirs;
+    calls.length = 0;
+    await handlers["create-task:click"]();
+    return calls.filter((c) => c.url.endsWith("/api/act/task_create")).map((c) => c.body);
+  };
+"""
+
+
+@needs_node
+def test_create_form_sends_crew_and_directions():
+    dirs = "oauth2, flow\n\n  pkce \r\nоidc"
+    out = run_js(f"""
+      app.S.lang = "ru";
+      app.S.state = {{ agents: [] }};
+      out.crew = await create("3", {json.dumps(dirs, ensure_ascii=False)});
+      out.empty = await create("", "typed but no crew");
+      out.zero = await create("0", "typed");
+      out.text = await create(" 2e ", "");
+      out.closed = elements.modal.innerHTML;   // a create that went through closes the modal
+      app.newTaskModal();
+      out.html = elements.modal.innerHTML;
+      out.listens = typeof handlers["n-crew:input"];
+      // the directions field shows while the number is on; hiding it keeps the text, which is then no unsaved edit
+      app.S.modalInitial = new Map([["n-dirs", ""]]);
+      elements["modal-backdrop"].classList.remove("hidden");
+      const qsa = document.querySelectorAll;
+      document.querySelectorAll = (sel) => (sel.startsWith("#modal input") ? [elements["n-dirs"]] : []);
+      elements["n-dirs"].hasAttribute = () => false;
+      elements["n-crew"].value = "2"; app.syncCrewField("n");
+      out.shown = !elements["n-dirs-field"].classList.contains("hidden");
+      elements["n-dirs"].value = "a\\nb\\nc"; app.syncCrewField("n");
+      out.kept = elements["n-dirs"].value;
+      out.unsavedShown = app.modalHasUnsaved();
+      // 2 -> 3 through an empty field (Backspace, then 3): the typed directions stay
+      elements["n-crew"].value = ""; app.syncCrewField("n");
+      out.hidden = [elements["n-dirs-field"].classList.contains("hidden"), elements["n-dirs"].value];
+      out.unsavedHidden = app.modalHasUnsaved();
+      elements["n-crew"].value = "3"; app.syncCrewField("n");
+      out.retyped = [elements["n-dirs-field"].classList.contains("hidden"), elements["n-dirs"].value];
+      elements["modal-backdrop"].classList.add("hidden"); app.S.modalInitial = null; document.querySelectorAll = qsa;
+      out.values = ["", " ", "0", "3", " 12 ", "-1", "2.5", "x"].map(app.crewValue);
+      out.on = [null, 0, 3, "x"].map(app.crewOn);
+      out.max = app.CREW_MAX;
+    """, pre=CREATE_FORM)
+    [crew] = out["crew"]
+    assert crew["crew"] == 3 and crew["directions"] == ["oauth2, flow", "pkce", "оidc"]
+    assert crew["title"] == "T" and crew["goal"] == "G"
+    for case in ("empty", "zero"):
+        [body] = out[case]
+        assert "crew" not in body and "directions" not in body, (case, body)
+    [text] = out["text"]
+    assert text["crew"] == "2e" and "directions" not in text  # sent as typed: the tool refuses it
+    assert out["closed"] == ""
+    html = out["html"]
+    field = re.search(r'<label class="field"><span>(.*?)</span><input id="n-crew"[^>]*>', html).group(0)
+    assert 'inputmode="numeric"' in field and 'placeholder="2–8"' in field
+    assert "Групповая задача: участников" in field and '<span class="hint">пусто или 0 — обычная задача; 2–8</span>' in field
+    assert re.search(r'<label class="field full hidden" id="n-dirs-field"><span>Направления <span class="hint">по одному в строке</span>', html)
+    assert '<textarea id="n-dirs"' in html
+    assert out["listens"] == "function"
+    assert out["shown"] is True and out["kept"] == "a\nb\nc" and out["unsavedShown"] is True
+    assert out["hidden"] == [True, "a\nb\nc"] and out["unsavedHidden"] is False
+    assert out["retyped"] == [False, "a\nb\nc"]
+    assert out["values"] == [None, None, 0, 3, 12, "-1", "2.5", "x"]
+    assert out["on"] == [False, False, True, True]
+    from dreamteam.models import CREW_MAX
+    assert out["max"] == CREW_MAX
+
+
+@needs_node
+def test_edit_form_crew_fields():
+    out = run_js(r"""
+      app.S.lang = "en";
+      app.S.state = { agents: [] };
+      const ordinary = { id: 4, title: "T", goal: "G", description: "", status: "todo", priority: 1, assignee: null,
+                         reviewer: null, tags: [], depends_on: [], crew: 0, crew_working: [] };
+      const crewTask = Object.assign({}, ordinary, { crew: 3 });
+      const form = (task, extra) => Object.assign(Object.fromEntries(Object.entries(app.TASK_FORM).map(([id, f]) => [id, f(task)])), extra);
+      const ch = (task, extra) => app.taskChanges(task, form(task, extra));
+      out.cases = [
+        ch(crewTask, {}), ch(ordinary, {}),
+        ch(crewTask, { "f-crew": "" }), ch(ordinary, { "f-crew": "" }), ch(ordinary, { "f-crew": "0" }),
+        ch(crewTask, { "f-crew": "4" }), ch(crewTask, { "f-crew": "x" }), ch(crewTask, { "f-crew": " 03 " }),
+        ch(crewTask, { "f-dirs": "a\n\n b \r\n" }), ch(ordinary, { "f-crew": "2", "f-dirs": "a" }),
+        ch(crewTask, { "f-crew": "", "f-dirs": "a" }), ch(ordinary, { "f-crew": "", "f-dirs": "x" }),
+      ];
+      // a form of the time before crew tasks (no f-crew value) changes no crew
+      out.noField = app.taskChanges(crewTask, { "f-title": "T", "f-goal": "G", "f-desc": "", "f-priority": "1" });
+      out.dirty = app.dirtyFields(crewTask, form(crewTask, { "f-dirs": "x" }));
+      out.clean = app.dirtyFields(crewTask, form(crewTask, {}));
+      out.form = [app.TASK_FORM["f-crew"]({ crew: 0 }), app.TASK_FORM["f-crew"]({ crew: 3 }), app.TASK_FORM["f-crew"]({}),
+                  app.TASK_FORM["f-dirs"]({ crew: 3 })];
+      // the modal: the fields after the dependencies, the directions shown for a crew task, the subtasks block
+      const handlers = {};
+      for (const id of Object.keys(app.TASK_FORM)) el(id, { focus: () => {} });
+      el("f-crew", { addEventListener: (type, fn) => { handlers["f-crew:" + type] = fn; } });
+      el("f-dirs-field", { classList: classList(["hidden"]) });
+      el("modal"); el("modal-backdrop", { classList: classList(["hidden"]) });
+      el("f-desc-view"); el("task-form"); el("task-head"); el("task-meta"); el("task-result"); el("task-review"); el("task-subtasks");
+      el("discussion-title"); el("thread"); el("task-history"); el("save-task"); el("post-btn"); el("post-text"); el("mention-menu");
+      app.renderTaskModal({ task: Object.assign({ created_at: 0, updated_at: 0 }, crewTask), discussion: [], events: [] });
+      out.html = elements.modal.innerHTML;
+      out.crewValue = elements["f-crew"].value;
+      out.dirsShown = !elements["f-dirs-field"].classList.contains("hidden");
+      out.listens = typeof handlers["f-crew:input"];
+      // the user clears the number: the field hides and keeps its text, which is neither an unsaved edit nor sent
+      elements["f-dirs"].value = "typed"; elements["f-crew"].value = ""; handlers["f-crew:input"]();
+      out.cleared = [elements["f-dirs-field"].classList.contains("hidden"), elements["f-dirs"].value];
+      const read = app.readTaskForm();
+      out.hiddenRead = "f-dirs" in read;
+      out.hiddenDirty = app.dirtyFields(app.S.taskBase, read);
+      out.hiddenChanges = app.taskChanges(app.S.taskBase, read);
+      // a live update meanwhile (the number untouched there) keeps the hidden text too; the number back shows it
+      app.updateTaskModal({ task: Object.assign({ created_at: 0, updated_at: 0 }, crewTask, { crew: 0 }), discussion: [], events: [] });
+      out.live = elements["f-dirs"].value;
+      elements["f-crew"].value = "4"; handlers["f-crew:input"]();
+      out.back = [elements["f-dirs-field"].classList.contains("hidden"), elements["f-dirs"].value,
+                  app.taskChanges(app.S.taskBase, app.readTaskForm())];
+    """)
+    cases = out["cases"]
+    assert cases[0] is None and cases[1] is None
+    assert cases[2] == {"crew": 0} and cases[3] is None and cases[4] is None
+    assert cases[5] == {"crew": 4} and cases[6] == {"crew": "x"} and cases[7] is None
+    assert cases[8] == {"directions": ["a", "b"]}
+    assert cases[9] == {"crew": 2, "directions": ["a"]}
+    assert cases[10] == {"crew": 0} and cases[11] is None  # typed directions never go with an ordinary task
+    assert out["noField"] is None
+    assert out["dirty"] == {"f-dirs": "x"} and out["clean"] == {}
+    assert out["form"] == ["", "3", "", ""]
+    html = out["html"]
+    assert html.index('id="f-deps"') < html.index('id="f-crew"') < html.index('id="f-dirs"') < html.index('id="task-meta"')
+    assert html.index('id="task-meta"') < html.index('id="task-subtasks"') < html.index('id="task-result"')
+    assert '<span class="hint">new ones, one per line</span>' in html and 'placeholder="2–8"' in html
+    assert out["crewValue"] == "3" and out["dirsShown"] is True and out["listens"] == "function"
+    assert out["cleared"] == [True, "typed"]
+    assert out["hiddenRead"] is False and out["hiddenDirty"] == {"f-crew": ""}
+    assert out["hiddenChanges"] == {"crew": 0}   # no directions with an ordinary task
+    assert out["live"] == "typed"
+    assert out["back"] == [False, "typed", {"crew": 4, "directions": ["typed"]}]
+
+
+@needs_node
+def test_task_modal_lists_subtasks_and_the_crew_line():
+    tasks = [stack_task(10, "in_progress", title="Crew", crew=3, crew_working=["Ann Lee"], assignee="Ann Lee"),
+             stack_task(12, "review", 10, title="Second <b>", assignee="Bob Stone"),
+             stack_task(11, "todo", 10, title="First"),
+             stack_task(13, "todo", 11, title="Grandchild"),
+             stack_task(20, "done", title="Ordinary parent"), stack_task(21, "in_progress", 20, title="Open under done"),
+             stack_task(30, title="Alone")]
+    out = run_js(f"""
+      app.S.lang = "en";
+      app.S.state = {{ agents: [], tasks: {json.dumps(tasks)} }};
+      const stale = Object.assign({{}}, app.S.state.tasks[0], {{ crew_working: [] }});
+      out.crew = app.taskSubtasksHtml(stale);
+      out.ordinary = app.taskSubtasksHtml({{ id: 20 }});
+      out.alone = app.taskSubtasksHtml({{ id: 30 }});
+      out.unknown = app.taskSubtasksHtml({{ id: 99, crew: 0 }});
+      app.S.lang = "ru";
+      out.ru = app.taskSubtasksHtml({{ id: 10 }});
+      app.S.state = null;
+      app.S.lang = "en";
+      out.noState = app.taskSubtasksHtml({{ id: 10, crew: 3, crew_working: ["A", "B"] }});
+      out.noStateOrdinary = app.taskSubtasksHtml({{ id: 10 }});
+    """)
+    crew = out["crew"]
+    assert '<div class="crew-line"><i class="ic ic-users" aria-hidden="true"></i>Crew task: up to 3 members, 1 working now</div>' in crew
+    assert '<div class="section-title">Directions</div><div class="stack modal-stack">' in crew
+    # the direct subtasks only, in id order; the one in review has the eye; titles escaped
+    assert re.findall(r'data-open-task="(\d+)"', crew) == ["11", "12"]
+    assert crew.count("ic-eye") == 1 and "<b>" not in crew and "Second &lt;b&gt;" in crew
+    ordinary = out["ordinary"]
+    assert "crew-line" not in ordinary and '<div class="section-title">Subtasks</div>' in ordinary
+    assert re.findall(r'data-open-task="(\d+)"', ordinary) == ["21"]  # also one shown as its own card
+    assert out["alone"] == "" and out["unknown"] == ""
+    assert "Групповая задача: до 3 участников, сейчас работают 1" in out["ru"] and ">Направления</div>" in out["ru"]
+    assert "Crew task: up to 3 members, 2 working now" in out["noState"] and "data-open-task" not in out["noState"]
+    assert out["noStateOrdinary"] == ""
+
+
+@needs_node
+def test_task_modal_rows_keep_the_focus():
+    tasks = [stack_task(10, "in_progress", crew=3, crew_working=["Ann Lee"]), stack_task(12, "todo", 10)]
+    out = run_js(f"""
+      app.S.lang = "en";
+      app.S.state = {{ agents: [], tasks: {json.dumps(tasks)} }};
+      const focused = [];
+      const box = el("task-subtasks", {{ contains: () => true,
+        querySelector: (sel) => {{ focused.push(sel); return {{ focus: (o) => focused.push(o) }}; }} }});
+      app.renderTaskSubtasks(app.S.state.tasks[0]);
+      out.first = box.innerHTML.includes('data-open-task="12"');
+      globalThis.document.activeElement = {{ dataset: {{ openTask: "12" }} }};
+      app.renderTaskSubtasks(app.S.state.tasks[0]);   // nothing changed: the DOM stays
+      out.same = focused.slice();
+      app.S.state.tasks[1].assignee = "Bob Stone";      // an agent took the direction
+      app.renderTaskSubtasks(app.S.state.tasks[0]);
+      out.changed = focused.slice();
+    """)
+    assert out["first"] is True and out["same"] == []
+    assert out["changed"] == ['[data-open-task="12"]', {"preventScroll": True}]
+
+
+def test_crew_line_styles():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert ".crew-line {" in css and ".modal-stack {" in css
+
+
+# ----------------------------------------------------- closing a parent with open subtasks asks first (§18.4, §4.2)
+# parent #2 (in_progress): #3 todo unassigned (cancelled with it), #4 Ann's (told), #5 the user's own, #6 done (not
+# open), #8 waiting with nobody on it (nobody told); #10 is a grandchild (one level only); crew task #7 with #11, #12
+CLOSE_TASKS = [stack_task(1, title="Plain"), stack_task(2, "in_progress", title="Parent", assignee="Ann Lee"),
+               stack_task(3, "todo", 2), stack_task(4, "in_progress", 2, assignee="Ann Lee"),
+               stack_task(5, "waiting", 2, assignee="user"), stack_task(6, "done", 2),
+               stack_task(7, "in_progress", title="Crew", crew=3, assignee="Bob Stone"),
+               stack_task(8, "waiting", 2), stack_task(10, "todo", 4),
+               stack_task(11, "todo", 7), stack_task(12, "in_progress", 7, assignee="Bob Stone"),
+               stack_task(20, "in_progress", title="Finished children"), stack_task(21, "done", 20),
+               stack_task(22, "cancelled", 20)]
+
+
+@needs_node
+def test_close_anyway_question():
+    out = run_js(f"""
+      app.S.state = {{ agents: [], tasks: {json.dumps(CLOSE_TASKS)} }};
+      const task = (id) => app.S.state.tasks.find((x) => x.id === id);
+      const ask = () => [app.closeQuestion(task(2), "done"), app.closeQuestion(task(7), "cancelled")];
+      app.S.lang = "en"; out.en = ask();
+      app.S.lang = "ru"; out.ru = ask();
+      app.S.lang = "en";
+      out.failed = app.closeQuestion(task(2), "failed");
+      out.review = app.closeQuestion(Object.assign({{}}, task(2), {{ status: "review" }}), "done");
+      out.none = [app.closeQuestion(task(2), "todo"), app.closeQuestion(task(2), "in_progress"),
+                  app.closeQuestion(Object.assign({{}}, task(2), {{ status: "done" }}), "cancelled"),
+                  app.closeQuestion(task(20), "done"), app.closeQuestion(task(1), "failed"),
+                  app.closeQuestion(undefined, "done")];
+      app.S.state = null;
+      out.noState = app.closeQuestion({{ id: 2, status: "in_progress" }}, "done");
+    """)
+    en_task = ("Task #2 has open subtasks: #3, #4, #5, #8. Unassigned, cancelled with it: #3. Stay open, their holders"
+               " are told: #4. Stay open, yours: #5. Stay open: #8. Close anyway?")
+    assert out["en"] == [en_task, "Crew task #7 has open directions: #11, #12. Unassigned, cancelled with it: #11."
+                                  " Stay open, their holders are told: #12. Close anyway?"]
+    assert out["ru"] == [
+        "У задачи #2 открыты подзадачи: #3, #4, #5, #8. Без исполнителя, отменятся вместе с ней: #3. Останутся"
+        " открытыми, их исполнители получат уведомление: #4. Останутся открытыми ваши: #5. Останутся открытыми: #8."
+        " Закрыть всё равно?",
+        "У групповой задачи #7 открыты направления: #11, #12. Без исполнителя, отменятся вместе с ней: #11. Останутся"
+        " открытыми, их исполнители получат уведомление: #12. Закрыть всё равно?"]
+    assert out["failed"] == en_task and out["review"] == en_task  # one text for every terminal status
+    assert out["none"] == [None] * 6
+    assert out["noState"] is None
+
+
+@needs_node
+def test_move_save_and_approve_ask_before_closing_a_parent():
+    out = run_js(f"""
+      app.S.lang = "en";
+      const tasks = {json.dumps(CLOSE_TASKS)};
+      app.S.state = {{ agents: [{{ name: "Ann Lee", role: "Dev", status: "idle" }}], tasks }};
+      const asked = [];
+      globalThis.confirm = (q) => {{ asked.push(q); return answers.confirm; }};
+      const settle = () => new Promise((r) => setImmediate(r));
+      const acts = () => calls.filter((c) => c.url.includes("/api/act/")).map((c) => [c.url.split("/").pop(), c.body]);
+      el("toasts", {{ children: [], appendChild: () => {{}} }});
+      document.createElement = () => ({{ className: "", textContent: "", remove() {{}}, addEventListener() {{}} }});
+      // the board: a drop on «done» or «closed» asks, a cancel sends nothing
+      answers.confirm = false;
+      app.moveTask(2, "done"); app.moveTask(2, "closed"); await settle();
+      out.moveCancelled = [acts(), asked.length];
+      tasks[1].status = "review";
+      app.moveTask(2, "done"); await settle();
+      out.reviewDropCancelled = [acts(), asked.length];
+      tasks[1].status = "in_progress";
+      app.moveTask(2, "todo"); app.moveTask(20, "done"); await settle();   // not terminal; no open subtasks
+      out.noQuestion = [acts(), asked.length];
+      calls.length = 0; answers.confirm = true;
+      app.moveTask(2, "closed"); await settle();
+      out.moveConfirmed = [acts(), asked.length];
+      // the modal: saving done asks; a cancel keeps the form, its other edits, the base and the modal
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      const parent = tasks[1];
+      for (const [id, valueOf] of Object.entries(app.TASK_FORM)) el(id, {{ value: valueOf(parent) }});
+      el("save-task", {{ disabled: false }});
+      el("modal", {{ innerHTML: "the task form" }}); el("modal-backdrop", {{ classList: classList() }});
+      app.S.taskBase = parent; app.S.openTaskId = 2;
+      elements["f-title"].value = "Edited title"; elements["f-status"].value = "done";
+      await app.saveTask(); await settle();
+      out.saveCancelled = [acts(), asked.length, elements["f-title"].value, elements["f-status"].value,
+                           app.S.taskBase === parent, app.S.openTaskId, elements.modal.innerHTML,
+                           elements["modal-backdrop"].classList.contains("hidden"), elements["save-task"].disabled];
+      answers.confirm = true; app.S.openTaskId = 0;     // the modal moved on: no reload of the task after the save
+      await app.saveTask(); await settle();
+      out.saveConfirmed = [acts(), asked.length];
+      // a status that is not terminal, or no status change, never asks
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      elements["f-status"].value = "waiting"; await app.saveTask(); await settle();
+      elements["f-status"].value = "in_progress"; await app.saveTask(); await settle();
+      out.saveOther = [acts(), asked.length];
+      // «Принять» on a parent in review asks; a cancel keeps the comment; «Вернуть» never asks
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      tasks[1].status = "review"; app.S.openTaskId = 2; app.S.taskBase = null;
+      el("review-comment", {{ value: "Looks good", focus: () => {{}} }});
+      await app.reviewTask(true); await settle();
+      out.approveCancelled = [acts(), asked.length, elements["review-comment"].value];
+      answers.confirm = true;
+      await app.reviewTask(true); await settle();
+      out.approveConfirmed = [acts(), asked.length];
+      calls.length = 0; asked.length = 0; answers.confirm = false;
+      elements["review-comment"].value = "Fix the parser";
+      await app.reviewTask(false); await settle();
+      out.reject = [acts(), asked.length];
+      // a parent in review with no open subtasks is approved without a question
+      calls.length = 0; tasks.find((x) => x.id === 20).status = "review"; app.S.openTaskId = 20;
+      await app.reviewTask(true); await settle();
+      out.approvePlain = [acts(), asked.length];
+    """)
+    assert out["moveCancelled"] == [[], 2]
+    assert out["reviewDropCancelled"] == [[], 3]  # a review card dropped on «done» is approved, so it asks too
+    assert out["noQuestion"] == [[["task_update", {"task_id": 2, "status": "todo"}],
+                                  ["task_update", {"task_id": 20, "status": "done"}]], 3]
+    assert out["moveConfirmed"] == [[["task_update", {"task_id": 2, "status": "cancelled"}]], 4]
+    assert out["saveCancelled"] == [[], 1, "Edited title", "done", True, 2, "the task form", False, False]
+    assert out["saveConfirmed"] == [[["task_update", {"task_id": 2, "title": "Edited title", "status": "done"}]], 2]
+    assert out["saveOther"] == [[["task_update", {"task_id": 2, "title": "Edited title", "status": "waiting"}],
+                                 ["task_update", {"task_id": 2, "title": "Edited title"}]], 0]
+    assert out["approveCancelled"] == [[], 1, "Looks good"]
+    assert out["approveConfirmed"] == [[["task_review", {"task_id": 2, "approve": True, "comment": "Looks good"}]], 2]
+    assert out["reject"] == [[["task_review", {"task_id": 2, "approve": False, "comment": "Fix the parser"}]], 0]
+    assert out["approvePlain"] == [[["task_review", {"task_id": 20, "approve": True, "comment": ""}]], 0]
 
 
 @needs_node
@@ -1255,6 +1958,117 @@ def test_board_base_detection_and_readable_api_errors():
 
 
 @needs_node
+def test_board_keeps_the_earlier_version_message():
+    from dreamteam.sessions import earlier_version_text
+
+    text = earlier_version_text("s", "C:/h", "0.2.0")
+    out = run_js(r"""
+      const answer = (body) => async () => ({ ok: false, status: 409, text: async () => JSON.stringify(body) });
+      app.S.state = { swarm: { session: { id: "s", status: "stopped" } }, agents: [] };
+      globalThis.fetch = answer({ error: process.env.EARLIER, earlier_version: true });
+      out.earlier = await app.act("x", {});
+      for (const lang of ["ru", "en"]) {
+        app.S.lang = lang;
+        globalThis.fetch = answer({ ok: false, result: "The session is stopped.", error: "The session is stopped." });
+        out["stopped_" + lang] = await app.act("x", {});
+        out["want_" + lang] = app.t("session_stopped");
+      }
+      out.data = [app.responseData('{"a": 1}'), app.responseData("[1]"), app.responseData("<p>"), app.responseData("1")];
+    """, env={"EARLIER": text})
+    assert out["earlier"] == {"ok": False, "result": text}   # not «Сессия остановлена»
+    for lang in ("ru", "en"):   # a plain 409 of a stopped session still says it in the UI language
+        assert out[f"stopped_{lang}"] == {"ok": False, "result": out[f"want_{lang}"]}
+    assert out["data"] == [{"a": 1}, [1], None, None]
+
+
+EARLIER_WS = r"""
+  const sockets = [];
+  globalThis.WebSocket = class { constructor(url) { this.url = url; this.readyState = 0; sockets.push(this); } close() {} };
+  const timers = [];
+  globalThis.setTimeout = (fn, ms) => { timers.push({ fn, ms }); return timers.length; };
+  el("conn"); el("conn-banner", { classList: classList(["hidden"]) });
+  const held = [];
+  const gate = { held: false };
+  const release = () => held.splice(0).forEach((r) => r());
+  // EARLIER set: the 409 of a session made by an earlier version; else a plain failure
+  const body = process.env.EARLIER ? { error: process.env.EARLIER, earlier_version: true } : { error: "down" };
+  globalThis.fetch = async (url) => {
+    calls.push({ url });
+    if (gate.held) await new Promise((r) => held.push(r));
+    return { ok: false, status: process.env.EARLIER ? 409 : 502, text: async () => JSON.stringify(body) };
+  };
+  const ticks = async () => { for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r)); };
+  const look = () => ({
+    earlier: app.S.earlier, banner: elements["conn-banner"].textContent,
+    hidden: elements["conn-banner"].classList.contains("hidden"), live: elements.conn.classList.contains("on"),
+  });
+  const reconnects = () => timers.filter((x) => x.fn === app.connect).map((x) => x.ms);
+  const states = () => calls.filter((c) => c.url === "/s/a/api/state").length;
+"""
+
+
+@needs_node
+def test_board_stops_reconnecting_after_close_1011():
+    from dreamteam import launcher
+    from dreamteam.sessions import earlier_version_text
+
+    text = earlier_version_text("a", "C:/h", "0.2.0")
+    pre = 'globalThis.location = { pathname: "/s/a/", protocol: "http:", host: "h" };'
+    env = {"EARLIER": text}
+    # the launcher accepts the socket and then closes it: onopen (and its refresh) first, its 409 before the close
+    out = run_js(EARLIER_WS + r"""
+      out.reason = app.EARLIER_REASON;
+      app.connect();
+      const ws = sockets[0];
+      ws.readyState = 1; ws.onopen();
+      await ticks();
+      out.open = look();
+      ws.readyState = 3;
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      await ticks();
+      app.connect();   // returns at once
+      out.closed = look();
+      out.sockets = sockets.length; out.reconnects = reconnects(); out.states = states();
+    """, pre=pre, env=env)
+    assert out["reason"] == launcher.EARLIER_VERSION_REASON
+    want = {"earlier": True, "banner": text, "hidden": False, "live": False}
+    assert out["open"] == want and out["closed"] == want
+    assert out["sockets"] == 1 and out["reconnects"] == [] and out["states"] == 1
+    # the close before the refresh answers: the message arrives with the 409, still no reconnect
+    out = run_js(EARLIER_WS + r"""
+      gate.held = true;
+      app.connect();
+      const ws = sockets[0];
+      ws.readyState = 1; ws.onopen();
+      ws.readyState = 3;
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      ws.onclose({ code: 1011, reason: app.EARLIER_REASON });
+      out.closing = look();
+      out.held = held.length;
+      gate.held = false; release();
+      await ticks();
+      out.closed = look();
+      out.sockets = sockets.length; out.reconnects = reconnects(); out.states = states();
+    """, pre=pre, env=env)
+    closing = out["closing"]
+    assert closing["earlier"] is True and closing["hidden"] is True and closing["live"] is False
+    assert closing["banner"] != text and out["held"] == 4   # onopen's state and inbox, the close's state and inbox
+    assert out["closed"] == want
+    assert out["sockets"] == 1 and out["reconnects"] == [] and out["states"] <= 2
+    # any other close (a dropped link, the 1011 of a session that cannot be loaded) reconnects as before
+    for code, reason in ((1006, ""), (1011, "")):
+        out = run_js(EARLIER_WS + f"""
+          app.connect();
+          const ws = sockets[0];
+          ws.readyState = 1; ws.onopen(); await ticks();
+          ws.readyState = 3; ws.onclose({{ code: {code}, reason: {json.dumps(reason)} }});
+          out.reconnects = reconnects(); out.earlier = app.S.earlier;
+        """, pre=pre)
+        assert out == {"reconnects": [1000], "earlier": False}, code
+
+
+@needs_node
 def test_traces_html_escapes_every_agent_controlled_string():
     out = run_js(r"""
       const E = process.env.EVIL;
@@ -1393,6 +2207,11 @@ def test_home_cards_and_dialogs_escape_session_data():
       out.card = home.sessionCard(s);
       out.legacy = home.sessionCard({ id: "main", title: "Old", status: "stopped", legacy: true });
       out.broken = home.sessionCard({ id: "x", title: "x", status: "stopped", error: E });
+      home.H.hub = { version: E, home: E };
+      out.earlier = home.sessionCard({ id: E, title: E, status: "stopped", legacy: false, dir: E, earlier_version: true });
+      out.earlierMain = home.sessionCard({ id: "main", title: "Old", status: "stopped", legacy: true, dir: E,
+                                           earlier_version: true });
+      home.H.hub = null;
       el("modal"); el("modal-backdrop");
       home.H.sessions = [s];
       home.deleteModal(E);
@@ -1420,6 +2239,8 @@ def test_home_cards_and_dialogs_escape_session_data():
     assert "<b>0</b> agents" in card and "1 of 0 tasks" in card  # non-numeric counters are not injected
     assert "data-delete" not in out["legacy"] and "project · main" in out["legacy"]
     assert_escaped(out["broken"])
+    assert_escaped(out["earlier"], at_least=4)       # title (text and tooltip), id, the message's sid and version
+    assert_escaped(out["earlierMain"], at_least=3)   # the message's home (twice) and version
     assert_escaped(out["del"])
     assert_escaped(out["ns"], at_least=3)
     settings = out["settings"]
@@ -1651,11 +2472,15 @@ def test_home_clarify_checkbox_overrides():
       out.ru = elements.modal.innerHTML;
       home.H.lang = "en";
       el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
-      const v = { swarm: { name: "S", language: "en", clarify: true }, agents: {}, shell: {}, workspace: {}, server: {},
-                  tracing: {}, mcp: { external: {} }, models: {} };
+      const v = { swarm: { name: "S", language: "en", clarify: true, crew_review: true }, agents: {}, shell: {},
+                  workspace: {}, server: {}, tracing: {}, mcp: { external: {} }, models: {} };
       home.H.view = JSON.parse(JSON.stringify(v)); home.H.original = JSON.parse(JSON.stringify(v));
       home.renderSettings(true);
       out.settings = elements["settings-form"].innerHTML;
+      out.ns_crew = /crew/.test(out.ns_false + out.ns_true + out.ru);
+      home.H.lang = "ru";
+      home.renderSettings(true);
+      out.settings_ru = elements["settings-form"].innerHTML;
     """)
     assert out["on"] is True and out["off"] is False and out["equal"] == [False, False, False, False]
     html = out["ns_false"]
@@ -1673,7 +2498,18 @@ def test_home_clarify_checkbox_overrides():
     field = '<input type="checkbox" data-path="swarm.clarify" data-type="bool" checked> <span>Clarify the goal first'
     assert field in settings
     assert "No effect in dreamteam -p with automatic replies" in settings
-    assert settings.index('data-path="swarm.independent_review"') < settings.index('data-path="swarm.clarify"')
+    # «Проверять групповую задачу целиком» (docs/SPEC.md §18.4 Settings tab): between independent review and clarify,
+    # with its hint ending in a period like its neighbours; not a field of the new-session modal
+    crew = ('<input type="checkbox" data-path="swarm.crew_review" data-type="bool" checked> '
+            '<span>Check a crew task as a whole')
+    assert crew in settings
+    assert "whether there is a review at all follows independent review" in settings
+    assert "the task is done once its owner completes it, even with a reviewer named.</span>" in settings
+    assert (settings.index('data-path="swarm.independent_review"') < settings.index('data-path="swarm.crew_review"')
+            < settings.index('data-path="swarm.clarify"'))
+    assert out["ns_crew"] is False
+    assert "Проверять групповую задачу целиком" in out["settings_ru"]
+    assert "задача готова, как только владелец её завершит, даже с назначенным ревьюером.</span>" in out["settings_ru"]
 
 
 @needs_node
@@ -1707,7 +2543,135 @@ def test_home_card_shows_a_question():
     assert 'title="Anna Smith ждёт вашего ответа на вопрос #12">Ждёт вашего ответа</span>' in out["ru"]
 
 
-TEAM_CASES = [([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 2), (["Разработчик"], 1),
+@needs_node
+def test_home_card_of_an_earlier_version_session():
+    """A session made by an earlier version (docs/SPEC.md §17.2, §18.4 home card): the «Прежняя версия» badge in place
+    of its status and the message in the page's language; no link, Open, Start/Stop or proposals button; delete only
+    (none for the legacy main, whose message names the file); listed under stopped."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      home.H.hub = { version: "0.2.0", home: "C:/h" };
+      const old = { id: "003-old", title: "Old", status: "stopped", earlier_version: true, skills: ["x"],
+                    goal: { title: "Old goal", status: "pending" },
+                    skills_pending: ["x"], workspace: { path: "D:/gone", default: false, adopted: true, exists: false } };
+      const main = { id: "main", title: "Main", legacy: true, dir: "C:/h", status: "stopped", earlier_version: true };
+      for (const lang of ["en", "ru"]) {
+        home.H.lang = lang;
+        out[lang] = { old: home.sessionCard(old), main: home.sessionCard(main) };
+      }
+      home.H.lang = "en";
+      out.plain = home.sessionCard({ id: "004-new", title: "New", status: "stopped", goal: { title: "G", status: "pending" } });
+      out.state = home.sessionState(Object.assign({}, old, { goal: { title: "G", status: "done" } }));
+      out.filters = ["stopped", "running", "all"].map((f) => home.filterSessions([old], f, "").length);
+      home.H.hub = null;
+      out.unknown = home.sessionCard(old);
+      out.mainNoDir = home.earlierText({ id: "main", legacy: true });
+    """)
+    from dreamteam.sessions import EARLIER_VERSION_TEXT, MAIN_EARLIER_VERSION_TEXT
+    old, main = out["en"]["old"], out["en"]["main"]
+    assert old.startswith('<article class="session-card earlier" data-sid="003-old">')
+    assert '<span class="dot earlier"></span>' in old and out["state"] == "earlier"
+    assert '<span class="badge warn">Earlier version</span>' in old and "Stopped" not in old
+    assert ('<div class="sc-warn sc-earlier"><i class="ic ic-alert" aria-hidden="true"></i><span>'
+            + EARLIER_VERSION_TEXT.format(sid="003-old", version="0.2.0") + "</span></div>") in old
+    assert '<span class="sc-title" title="Old">Old</span>' in old
+    for absent in ('href="/s/', "data-start", "data-stop", "data-skills-pending", "cannot start", "waiting to start"):
+        assert absent not in old, absent
+    assert "Old goal" in old and "ждёт запуска" not in out["ru"]["old"]
+    # the folder line stays with its badge; the skills count stays
+    assert "D:/gone" in old and '<span class="badge err">missing</span>' in old and "skills: 1" in old
+    assert 'data-delete="003-old"' in old
+    assert "data-delete" not in main and "project · main" in main
+    assert MAIN_EARLIER_VERSION_TEXT.format(home="C:/h", version="0.2.0") in main
+    ru = out["ru"]
+    assert ("Сессия 003-old создана более ранней версией DreamTeam, и эта версия (0.2.0) не может её открыть."
+            in ru["old"]) and '<span class="badge warn">Прежняя версия</span>' in ru["old"]
+    assert "удалите вручную C:/h/.dreamteam/swarm.db" in ru["main"]
+    assert "(?)" in out["unknown"] and "(0.2.0)" not in out["unknown"]
+    assert out["mainNoDir"] == MAIN_EARLIER_VERSION_TEXT.format(home="?", version="?")
+    # a plain stopped card is as before
+    assert '<a class="sc-title" href="/s/004-new/" title="New">New</a>' in out["plain"]
+    assert '<a class="btn primary small" href="/s/004-new/">Open</a>' in out["plain"] and "sc-earlier" not in out["plain"]
+    assert "(waiting to start)" in out["plain"]
+    assert out["filters"] == [1, 0, 1]
+
+
+@needs_node
+def test_home_earlier_twins_match_the_server():
+    """The en twins are the server's texts word for word; the ru twins are docs/SPEC.md §17.2's."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      out.en = [home.I18N.en.earlier_session, home.I18N.en.earlier_main];
+      out.ru = [home.I18N.ru.earlier_session, home.I18N.ru.earlier_main];
+    """)
+    from dreamteam.sessions import EARLIER_VERSION_TEXT, MAIN_EARLIER_VERSION_TEXT
+    assert out["en"] == [EARLIER_VERSION_TEXT, MAIN_EARLIER_VERSION_TEXT]
+    spec = " ".join((Path(__file__).parent.parent / "docs" / "SPEC.md").read_text(encoding="utf-8").split())
+    start = spec.index("The web page and the TUI show the twin from the summary flag")
+    ru_session = re.search(r"«(Сессия \{sid\} создана.*?)»", spec[start:]).group(1)
+    ru_main = re.search(r"«(Сессия main \(рой в \{home\}\).*?)»", spec[start:]).group(1)
+    assert out["ru"] == [ru_session, ru_main]
+
+
+@needs_node
+def test_home_loads_the_hub_version_once_for_earlier_sessions():
+    """{version} of the earlier-version message comes from GET /api/hub: one request shared by overlapping list
+    loads, none while no listed session is such a one, and "?" (no unhandled rejection) when it fails."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      el("sessions"); el("sessions-empty");
+      const tick = () => new Promise((r) => setImmediate(r));
+      let list = [];
+      let hubAnswer = null;   // null: the request waits for releaseHub
+      let releaseHub = null;
+      const fetched = [];
+      globalThis.fetch = (url) => {
+        fetched.push(url);
+        const ok = (data) => ({ ok: true, status: 200, json: async () => data });
+        if (url === "/api/sessions") return new Promise((r) => setImmediate(() => r(ok({ sessions: list }))));
+        if (url === "/api/hub") {
+          if (hubAnswer === "fail") return Promise.resolve({ ok: false, status: 500, statusText: "Error", json: async () => ({ error: "boom" }) });
+          return new Promise((r) => { releaseHub = () => r(ok({ version: "9.9", home: "C:/h" })); });
+        }
+        throw new Error("unexpected " + url);
+      };
+      const reset = () => { home.H.hub = null; home.H.hubLoad = null; home.H.sessions = null; fetched.length = 0;
+                            elements.sessions.innerHTML = ""; elements.sessions._html = null; };
+      home.H.lang = "en";
+      // no earlier session: the hub is never asked
+      list = [{ id: "001-a", title: "A", status: "stopped" }];
+      await home.loadSessions();
+      out.plainFetched = fetched.slice();
+      // an earlier session: two overlapping loads and a third share one request
+      reset();
+      list = [{ id: "002-old", title: "Old", status: "stopped", earlier_version: true }];
+      const first = home.loadSessions();
+      for (let i = 0; i < 5 && !releaseHub; i++) await tick();
+      const second = home.loadSessions();
+      for (let i = 0; i < 5; i++) await tick();
+      out.beforeHub = elements.sessions.innerHTML;
+      releaseHub();
+      await first; await second;
+      await home.loadSessions();
+      out.fetched = fetched.slice();
+      out.html = elements.sessions.innerHTML;
+      // a failed request: "?" and no unhandled rejection
+      reset();
+      hubAnswer = "fail";
+      await home.loadSessions();
+      await home.loadSessions();
+      out.failFetched = fetched.slice();
+      out.failHtml = elements.sessions.innerHTML;
+    """)
+    assert out["plainFetched"] == ["/api/sessions"]
+    assert out["fetched"].count("/api/hub") == 1 and out["fetched"].count("/api/sessions") == 3
+    # the cards show at once, the version «?» until the hub answers
+    assert "Session 002-old was made by an earlier version" in out["beforeHub"] and "(?)" in out["beforeHub"]
+    assert "(9.9)" in out["html"] and "Session 002-old was made by an earlier version" in out["html"]
+    assert out["failFetched"].count("/api/hub") == 1 and "(?)" in out["failHtml"]
+
+
+TEAM_CASES =[([], 3), (["developer"], 3), (["dev", "tester"], 1), (["", "  "], 2), (["Разработчик"], 1),
               (["Tester", " tester ", "QA  lead", "generalist"], 5), (["generalist", "Developer"], 2), ([], 0)]
 
 
@@ -2436,6 +3400,11 @@ def test_jobs_tab_cards_output_and_stop():
       app.tickJobs();                                   // every few seconds while it runs
       await new Promise((r) => setImmediate(r));
       out.ticks = calls.length;
+      app.S.earlier = true;                             // a session made by an earlier version: no polling
+      app.tickJobs();
+      await new Promise((r) => setImmediate(r));
+      out.earlierTicks = calls.length;
+      app.S.earlier = false;
       app.handleEvent({ id: 41, ts: 0, type: "job.ended", actor: "x", data: { job: { id: 3, status: "ended" } } });
       await new Promise((r) => setImmediate(r));
       out.onEvent = calls.length;
@@ -2482,7 +3451,7 @@ def test_jobs_tab_cards_output_and_stop():
     assert out["load"] == [["/api/act/jobs", {"job_id": "j3", "tail": 200}]]
     assert '<pre class="job-output" data-job-pre="3">Job j3 of x\n' + EVIL_ESC + "</pre>" in out["open"]
     assert 'aria-expanded="true">Hide output</button>' in out["open"]
-    assert out["ticks"] == 2 and out["onEvent"] == 3 and out["closed"] is False
+    assert out["ticks"] == 2 and out["earlierTicks"] == 2 and out["onEvent"] == 3 and out["closed"] is False
     assert out["cancelled"] is None and out["cancelCalls"] == 0
     assert out["stop"] == [["/api/act/job_stop", {"job_id": "j3"}]]
     assert out["clickOut"] == [True, [{"job_id": "j2", "tail": 200}]]
@@ -3392,7 +4361,8 @@ async def test_api_provides_every_field_the_ui_reads(tmp_path):
         assert sw["workspace"] == {"path": str(swarm.workspace.root), "default": True, "adopted": False, "exists": True}
         assert {"title", "description", "status", "summary"} <= set(sw["goal"])
         task_keys = {"id", "title", "goal", "description", "status", "assignee", "reviewer", "created_by", "parent_id",
-                     "depends_on", "priority", "tags", "result", "created_at", "updated_at", "blocked_by", "comments"}
+                     "depends_on", "priority", "tags", "result", "created_at", "updated_at", "blocked_by", "comments",
+                     "crew", "crew_working"}
         assert all(task_keys <= set(t) for t in state["tasks"])
         second = next(t for t in state["tasks"] if t["id"] == 2)
         assert second["blocked_by"] == [1] and second["comments"] == 2 and second["goal"] == "It works"
@@ -3612,7 +4582,10 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             assert all(set(p["name"]) == set(p["description"]) == {"ru", "en"} for p in data["role_presets"])
             catalog_fields = {"key", "builtin", "customized", "hidden", "name", "description", "instructions", "model"}
             assert all(catalog_fields <= set(r) for r in data["role_catalog"]) and view["roles"] == []
-            assert {"starting_roles", "start_agents", "independent_review"} <= set(view["swarm"])
+            assert {"starting_roles", "start_agents", "independent_review", "crew_review"} <= set(view["swarm"])
+            # the version and home the message of a session made by an earlier version names (home.js earlierText)
+            hub = c.get("/api/hub").json()
+            assert hub["version"] == dreamteam.__version__ and hub["home"]
 
             # a session created with the form's overrides
             overrides = {"swarm": {"language": "en", "start_agents": 1, "max_agents": 3, "max_cost_usd": 1.5},
@@ -3624,8 +4597,9 @@ def test_launcher_api_provides_every_field_the_ui_reads(tmp_path):
             sid = session["id"]
             card_fields = {"id", "title", "status", "paused", "legacy", "dir", "created_at", "last_activity", "model",
                            "model_profile", "max_cost_usd", "spent_usd", "config_error", "goal", "tasks", "agents", "url",
-                           "workspace", "pause_reason", "question", "clarify", "copied_from"}
+                           "workspace", "pause_reason", "question", "clarify", "copied_from", "earlier_version"}
             assert card_fields <= set(session) and session["url"] == f"/s/{sid}/"
+            assert session["earlier_version"] is False
             assert session["copied_from"] is None   # the card's "copy of" line: only a session made with copy_from
             assert session["question"] is None and session["clarify"] is False   # the card's question badge
             folder_fields = {"path", "default", "adopted", "exists"}  # the folder line of the card / the Files tab

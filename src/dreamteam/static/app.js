@@ -20,6 +20,9 @@ const I18N = {
     goal_hint: "Зачем нужна задача и что считается успехом", description: "Описание", status: "Статус",
     assignee: "Исполнитель", reviewer: "Ревьюер", priority: "Приоритет", tags: "Теги (через запятую)",
     depends_on: "Зависит от задач (номера через запятую)", parent: "Родительская задача", none: "— нет —",
+    crew_members: "Групповая задача: участников", crew_members_hint: "пусто или 0 — обычная задача; 2–8",
+    directions: "Направления", directions_hint: "по одному в строке", directions_add_hint: "новые, по одному в строке",
+    subtasks: "Подзадачи", crew_line: "Групповая задача: до {n} участников, сейчас работают {m}",
     user: "пользователь (вы)", save: "Сохранить", cancel: "Отмена", create: "Создать", close: "Закрыть",
     result: "Итог", discussion: "Обсуждение", history: "История", write_post: "Написать в обсуждение… (@Имя — упомянуть, Ctrl+Enter — отправить)",
     post: "Опубликовать", reply: "Ответить", replying_to: "Ответ для", reply_to_post: "Перейти к посту, на который это ответ",
@@ -42,6 +45,7 @@ const I18N = {
     review_needed: "Задача ждёт ревью",
     review_drop: "На ревью задача уходит сама, когда исполнитель её завершает",
     review_you: "ждёт вашего ревью", review_needed_you: "Задача ждёт вашего ревью",
+    stack_toggle: "Подзадачи: готово {done} из {total}", crew_chip: "Групповая задача: работают {m} из {n}",
     review_instead: "Вы можете принять или вернуть её вместо ревьюера.", review_reason: "Напишите в комментарии, что исправить.",
     reviewer_auto: "— (выберет доска)",
     role_new: "Новая роль — её нет в каталоге: опишите обязанности в инструкциях.",
@@ -50,6 +54,11 @@ const I18N = {
     required: "Заполните обязательные поля", required_task: "Заполните заголовок и цель задачи",
     invalid_limits: "Бюджет должен быть ≥ 0, а максимум агентов — целым числом ≥ 1",
     discard_changes: "Закрыть без сохранения? Введённый текст пропадёт.",
+    close_open_subtasks: "У задачи #{id} открыты подзадачи: {ids}. {fate}Закрыть всё равно?",
+    close_open_directions: "У групповой задачи #{id} открыты направления: {ids}. {fate}Закрыть всё равно?",
+    close_fate_cancel: "Без исполнителя, отменятся вместе с ней: {ids}. ",
+    close_fate_told: "Останутся открытыми, их исполнители получат уведомление: {ids}. ",
+    close_fate_yours: "Останутся открытыми ваши: {ids}. ", close_fate_open: "Останутся открытыми: {ids}. ",
     edit: "Изменить", md_source: "Исходный текст", md_formatted: "Форматированный вид",
     truncated: "(обрезано)", system: "система", theme: "Тема: светлая / тёмная", language: "Язык интерфейса",
     collapse_team: "Свернуть панель команды", expand_team: "Развернуть панель команды",
@@ -64,7 +73,7 @@ const I18N = {
     retired_chat: "Агент покинул рой — написать ему нельзя",
     f_title: "заголовок", f_goal: "цель", f_description: "описание", f_status: "статус", f_assignee: "исполнитель",
     f_reviewer: "ревьюер", f_priority: "приоритет", f_tags: "теги", f_depends_on: "зависимости", f_result: "итог",
-    f_parent_id: "родитель",
+    f_parent_id: "родитель", f_crew: "групповая задача (участников)", crew_ordinary: "обычная задача",
     op_create: "создал(а) файл", op_write: "перезаписал(а) файл", op_edit: "изменил(а) файл",
     locked_by: "Заблокирован: {owner}", select_file: "Выберите файл слева", workspace: "workspace",
     unlock: "Снять блокировку",
@@ -186,6 +195,9 @@ const I18N = {
     goal_hint: "Why the task exists and what counts as success", description: "Description", status: "Status",
     assignee: "Assignee", reviewer: "Reviewer", priority: "Priority", tags: "Tags (comma-separated)",
     depends_on: "Depends on tasks (ids, comma-separated)", parent: "Parent task", none: "— none —",
+    crew_members: "Crew task: members", crew_members_hint: "empty or 0: an ordinary task; 2–8",
+    directions: "Directions", directions_hint: "one per line", directions_add_hint: "new ones, one per line",
+    subtasks: "Subtasks", crew_line: "Crew task: up to {n} members, {m} working now",
     user: "user (you)", save: "Save", cancel: "Cancel", create: "Create", close: "Close",
     result: "Result", discussion: "Discussion", history: "History", write_post: "Write to the discussion… (@Name to mention, Ctrl+Enter to post)",
     post: "Post", reply: "Reply", replying_to: "Replying to", reply_to_post: "Go to the post this replies to",
@@ -208,6 +220,7 @@ const I18N = {
     review_needed: "Task waits for review",
     review_drop: "A task goes to review by itself when its assignee completes it",
     review_you: "waits for your review", review_needed_you: "The task waits for your review",
+    stack_toggle: "Subtasks: {done} of {total} done", crew_chip: "Crew task: {m} of {n} working",
     review_instead: "You can approve or return it instead of the reviewer.", review_reason: "Write in the comment what to fix.",
     reviewer_auto: "— (the board picks)",
     role_new: "A new role, not in the catalog: describe its responsibilities in the instructions.",
@@ -216,6 +229,11 @@ const I18N = {
     required: "Fill in the required fields", required_task: "Fill in the title and the task goal",
     invalid_limits: "The budget must be ≥ 0 and max agents a whole number ≥ 1",
     discard_changes: "Close without saving? Your text will be lost.",
+    close_open_subtasks: "Task #{id} has open subtasks: {ids}. {fate}Close anyway?",
+    close_open_directions: "Crew task #{id} has open directions: {ids}. {fate}Close anyway?",
+    close_fate_cancel: "Unassigned, cancelled with it: {ids}. ",
+    close_fate_told: "Stay open, their holders are told: {ids}. ",
+    close_fate_yours: "Stay open, yours: {ids}. ", close_fate_open: "Stay open: {ids}. ",
     edit: "Edit", md_source: "Source", md_formatted: "Formatted",
     truncated: "(truncated)", system: "system", theme: "Theme: light / dark", language: "Interface language",
     collapse_team: "Collapse the team panel", expand_team: "Expand the team panel",
@@ -230,7 +248,7 @@ const I18N = {
     retired_chat: "This agent has left the swarm — you cannot message them",
     f_title: "title", f_goal: "goal", f_description: "description", f_status: "status", f_assignee: "assignee",
     f_reviewer: "reviewer", f_priority: "priority", f_tags: "tags", f_depends_on: "dependencies", f_result: "result",
-    f_parent_id: "parent",
+    f_parent_id: "parent", f_crew: "crew", crew_ordinary: "ordinary task",
     op_create: "created file", op_write: "rewrote file", op_edit: "edited file",
     locked_by: "Locked by {owner}", select_file: "Select a file on the left", workspace: "workspace",
     unlock: "Unlock",
@@ -335,6 +353,13 @@ const I18N = {
 
 const COLUMNS = ["todo", "in_progress", "waiting", "review", "done", "closed"];
 const ALL_STATUSES = ["todo", "in_progress", "waiting", "review", "done", "failed", "cancelled"];
+const OPEN_STATUSES = new Set(["todo", "in_progress", "waiting", "review"]);
+const TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
+const STACK_DOTS = 12;   // a parent card's toggle shows a dot for at most this many direct subtasks, then +N
+// the largest `crew` of a crew task (models.CREW_MAX): only the crew field's placeholder names it, the board checks it
+const CREW_MAX = 8;
+// a card with no stack (cardHtml(task) of one argument, a task that is a card with nothing under it)
+const EMPTY_CARD = Object.freeze({ rows: Object.freeze([]), direct: Object.freeze([]), forced: false, matches: new Set() });
 const ACTIVITY_PROSE = new Set(["text", "thinking", "compacted"]);   // activity kinds the LLM wrote: shown as Markdown
 // the feed asks the server only for these types: agent.activity / agent.usage would crowd everything else out
 const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*", "skill.*"];
@@ -350,12 +375,17 @@ const S = {
   state: null, lang: "ru", tab: "board", chatWith: null, dtab: "chat", fileDir: ".", fileEntries: [], openFile: null,
   search: "", feed: [], feedMaxId: 0, activityMaxId: 0, seenEvents: new Set(), userInbox: [], replyTo: null,
   openTaskId: null, taskBase: null, lastPostId: 0, ws: null, wsRetry: 0, wsEverOpen: false, dragging: null,
+  earlier: false, earlierText: "",   // made by an earlier version: the launcher's message (showEarlier)
   boardDirty: false, appliedSeq: 0, modalInitial: null, markingRead: new Set(), drafts: {},
   jobOpen: new Set(), jobOutputs: {}, jobLoading: new Set(),   // Jobs tab: ids whose output is shown, its text
   fileText: "", fileSource: false,   // Files tab: the open file's text; a Markdown file shown as its source
   // Skills tab: GET /api/skills (source digests, the attach dialog's lists, the standalone library), the cards and
   // dialog rows shown open (name or ref → their files and SKILL.md), the install logs shown ("name|python" → text)
   skillData: null, skillShown: {}, attachShown: {}, libShown: {}, skillLogs: {}, skillLibOpen: false,
+  // the board's stacks of subtasks: parents the user opened (kept across renders), stacks a search opened that the
+  // user closed while that search holds, the parents the user had open when the search began, a press on the toggle or
+  // the stack (dragstart cannot tell where it began)
+  expanded: new Set(), unforced: new Set(), preSearch: new Set(), noDrag: false,
 };
 
 /* ---------------------------------------------------------------- utils */
@@ -462,23 +492,36 @@ function toast(text, kind = "", onClick = null) {
 }
 // The board of one session lives under /s/{sid}/ on the launcher; a standalone swarm app serves it at /.
 const BASE = typeof location === "undefined" ? "" : (location.pathname.match(/^\/s\/[a-z0-9][a-z0-9-]{0,63}(?=\/|$)/) || [""])[0];
-/** Readable text of a failed response: the JSON `error` / `result` field when there is one. */
-function responseError(status, body) {
+/** The JSON object of a response body, or null. */
+function responseData(body) {
   let data = null;
   try { data = JSON.parse(body); } catch (e) { /* not JSON */ }
-  const text = data && typeof data === "object" && (data.error || data.result);
+  return data && typeof data === "object" ? data : null;
+}
+/** Readable text of a failed response: the JSON `error` / `result` field when there is one. */
+function responseError(status, body) {
+  const data = responseData(body);
+  const text = data && (data.error || data.result);
   return typeof text === "string" && text ? text : `${status} ${String(body || "").slice(0, 300)}`.trim();
+}
+/** The error of a failed response; `earlierVersion` marks the 409 of a session made by an earlier version (docs/SPEC.md
+ * §18.1), whose text is the launcher's message. */
+function responseFailure(status, body) {
+  const data = responseData(body);
+  const err = new Error(responseError(status, body));
+  err.earlierVersion = !!(data && data.earlier_version);
+  return err;
 }
 function errText(e) { return (e && e.message) || String(e); }
 async function api(path, options) {
   const resp = await fetch(path.startsWith("/api/") ? BASE + path : path, options);
-  if (!resp.ok) throw new Error(responseError(resp.status, await resp.text()));
+  if (!resp.ok) throw responseFailure(resp.status, await resp.text());
   return resp.json();
 }
 /** A launcher route (/api/sessions/{sid}, /api/settings): it is not under the session's BASE. */
 async function launcherApi(path, options) {
   const resp = await fetch(path, options);
-  if (!resp.ok) throw new Error(responseError(resp.status, await resp.text()));
+  if (!resp.ok) throw responseFailure(resp.status, await resp.text());
   return resp.json();
 }
 /** The id of the launcher session this board belongs to; "" for a standalone swarm app. */
@@ -500,8 +543,10 @@ async function act(tool, args, quiet = false) {
   }
 }
 /** The text of an action that failed: a stopped session answers every action with 409 (English text from the
- * launcher), said in the UI language. */
+ * launcher), said in the UI language. A session made by an earlier version keeps the launcher's own message (it is
+ * checked before the stopped answer there too). */
 function actError(e) {
+  if (e && e.earlierVersion) return errText(e);
   const stopped = S.state && S.state.swarm && S.state.swarm.session && S.state.swarm.session.status === "stopped";
   return stopped ? t("session_stopped") : errText(e);
 }
@@ -543,6 +588,23 @@ function priorityOptions(selected) {
 }
 function parseIds(text) { return String(text || "").split(/[,\s]+/).map((x) => x.replace("#", "")).filter(Boolean).map(Number).filter((n) => Number.isInteger(n)); }
 function parseTags(text) { return String(text || "").split(",").map((x) => x.trim()).filter(Boolean); }
+/** The crew number of a form field: null when empty, a number for digits only, else the trimmed text, sent as typed
+ * (the tool or the board refuses it with its own text; nothing is turned into 0, an ordinary task, silently). The
+ * board checks 0 or 2..CREW_MAX. */
+function crewValue(text) { const v = String(text ?? "").trim(); return v === "" ? null : /^\d+$/.test(v) ? Number(v) : v; }
+/** A crew number that makes a crew task (or a typo the board will refuse): not empty and not 0. */
+function crewOn(v) { return v !== null && v !== undefined && v !== 0; }
+/** Directions of the textarea: one per line, trimmed, blank lines dropped (sent as a JSON array: a plain string would
+ * be split on commas by the tools' coercion). */
+function parseDirections(text) { return norm(text).split("\n").map((x) => x.trim()).filter(Boolean); }
+/** Shows the directions field while the crew number is on. Hiding it keeps the typed text (a number retyped through
+ * an empty field loses nothing), but hidden text is neither sent (taskChanges, the create handler) nor an unsaved
+ * edit (readTaskForm, modalHasUnsaved: dirsHidden). `prefix`: "n" (the create form) or "f" (the task modal). */
+function syncCrewField(prefix) {
+  const on = crewOn(crewValue($(`#${prefix}-crew`)?.value));
+  $(`#${prefix}-dirs-field`)?.classList.toggle("hidden", !on);
+}
+function dirsHidden(prefix) { return !!$(`#${prefix}-dirs-field`)?.classList.contains("hidden"); }
 
 /**
  * A timer that runs `fn` at most once per window and is never starved: a pending run is only moved
@@ -577,6 +639,7 @@ async function refresh() {
     renderAll();
     autoMarkRead();
   } catch (e) {
+    if (e && e.earlierVersion) showEarlier(errText(e));
     console.error(e);
   }
 }
@@ -616,6 +679,8 @@ function renderAll() {
   if (S.tab === "files") renderFileList();
   if (S.chatWith) renderDrawerHead();
   if (modalOpen() && $("#sk-attach-list")) renderAttachList();   // (what is attached changed meanwhile)
+  // the open task's subtasks and crew line come from the snapshot (a subtask's change carries no event of the parent)
+  if (S.openTaskId && S.taskBase) renderTaskSubtasks(S.taskBase);
 }
 
 /* ---------------------------------------------------------------- header */
@@ -787,29 +852,175 @@ function dropAction(task, col) {
   if (task.status === "review" && col !== "closed") return { open: true };
   return { status: col === "closed" ? "cancelled" : col };
 }
+/** The question before a terminal status is set on an open parent with open subtasks (docs/SPEC.md §18.4
+ * "Subtasks" and §4.2 "Leaving and closing"): its open direct subtasks and what happens to them — todo ones without
+ * an assignee are cancelled with it; the others stay open and their holders are told (the user's own are named
+ * apart; an open one with no assignee tells nobody). null when there is nothing to ask. One text for moveTask,
+ * saveTask and the modal's «Принять» (an approval makes the task done). */
+function closeQuestion(task, status) {
+  if (!task || !TERMINAL_STATUSES.has(status) || !OPEN_STATUSES.has(task.status)) return null;
+  const open = ((S.state && S.state.tasks) || []).filter((x) => x && x.parent_id === task.id && OPEN_STATUSES.has(x.status))
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  if (!open.length) return null;
+  const ids = (list) => list.map((x) => "#" + Number(x.id)).join(", ");
+  const cancelled = open.filter((x) => x.status === "todo" && !x.assignee);
+  const rest = open.filter((x) => !cancelled.includes(x));
+  const told = rest.filter((x) => x.assignee && x.assignee !== "user");
+  const yours = rest.filter((x) => x.assignee === "user");
+  const left = rest.filter((x) => !x.assignee);   // nobody to tell
+  const part = (key, list) => (list.length ? t(key, { ids: ids(list) }) : "");
+  const fate = part("close_fate_cancel", cancelled) + part("close_fate_told", told) + part("close_fate_yours", yours)
+    + part("close_fate_open", left);
+  return t(Number(task.crew) >= 2 ? "close_open_directions" : "close_open_subtasks", { id: Number(task.id), ids: ids(open), fate });
+}
 
-function boardHtml() {
-  const tasks = (S.state.tasks || []).filter(taskMatches);
-  return COLUMNS.map((col) => {
-    const items = tasks.filter((x) => columnOf(x) === col)
-      .sort((a, b) => (col === "done" || col === "closed") ? b.updated_at - a.updated_at : (b.priority - a.priority) || (a.id - b.id));
+/** The board's cards and their stacks (docs/SPEC.md §18.4 "Subtasks"); the one place of this rule — the TUI's
+ * board (§4.2 "Surfaces": a subtask is its own line only where the web shows it as its own card) twins it, and
+ * both are pinned by tests/helpers/stacks.py. A task is a card when it has no parent, its parent is missing from
+ * the snapshot, or it is open while its parent is terminal (open work never hides in «done»; it leaves its
+ * ancestors' stacks with its own subtree). Every other task is a row of the stack of the card above it:
+ * depth-first by id, `level` 0 for a direct subtask of the card, each task once even when parent_id loops. A task
+ * no card reaches (it hangs under a parent_id loop with no root) is in the stack of a card made of the loop's
+ * lowest id. -> [{task, rows: [{task, level}], direct: [task]}] in task-id order; `direct` = the level-0 rows. */
+function boardCards(tasks) {
+  const list = (Array.isArray(tasks) ? tasks : []).filter((x) => x && typeof x === "object")
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  const byId = new Map(list.map((x) => [x.id, x]));
+  const kids = new Map();   // parent id -> its children in id order (only parents in the snapshot)
+  for (const x of list) {
+    if (x.parent_id === null || x.parent_id === undefined || !byId.has(x.parent_id)) continue;
+    if (!kids.has(x.parent_id)) kids.set(x.parent_id, []);
+    kids.get(x.parent_id).push(x);
+  }
+  const isCard = (x) => x.parent_id === null || x.parent_id === undefined || !byId.has(x.parent_id)
+    || (OPEN_STATUSES.has(x.status) && TERMINAL_STATUSES.has(byId.get(x.parent_id).status));
+  const placed = new Set();
+  const cards = [];
+  const build = (root) => {
+    placed.add(root.id);
+    const rows = [];
+    const todo = (kids.get(root.id) || []).map((k) => [k, 0]).reverse();   // an explicit stack: no recursion depth
+    while (todo.length) {
+      const [x, level] = todo.pop();
+      if (placed.has(x.id) || isCard(x)) continue;
+      placed.add(x.id);
+      rows.push({ task: x, level });
+      const children = kids.get(x.id) || [];
+      for (let i = children.length - 1; i >= 0; i--) todo.push([children[i], level + 1]);
+    }
+    cards.push({ task: root, rows, direct: rows.filter((r) => r.level === 0).map((r) => r.task) });
+  };
+  for (const x of list) if (isCard(x)) build(x);
+  for (const x of list) {
+    if (placed.has(x.id)) continue;
+    // no card reaches x: its parents lead into a parent_id loop; the card starts at the loop's lowest id
+    const seen = new Set();
+    let y = x;
+    while (y && !seen.has(y.id)) { seen.add(y.id); y = byId.get(y.parent_id); }
+    let root = y || x;
+    // around the loop back to y, by id: with two tasks of one id, y may be the one byId does not hold
+    const walked = new Set([root.id]);
+    for (let z = byId.get(root.parent_id); z && !walked.has(z.id); z = byId.get(z.parent_id)) {
+      walked.add(z.id);
+      if (Number(z.id) < Number(root.id)) root = z;
+    }
+    build(root);
+  }
+  return cards.sort((a, b) => Number(a.task.id) - Number(b.task.id));
+}
+
+/** The cards a search shows: a card when it or one of its stack rows matches (taskMatches). A card shown for a row
+ * is `forced` open (S.expanded untouched) unless the user closed it under this search (S.unforced); `matches` = the
+ * ids of the matching rows. Without a search: every card, none forced, no matches. */
+function visibleCards(cards) {
+  if (!S.search) return cards.map((c) => ({ ...c, forced: false, matches: new Set() }));
+  const shown = [];
+  for (const c of cards) {
+    const matches = new Set(c.rows.filter((r) => taskMatches(r.task)).map((r) => Number(r.task.id)));
+    if (!matches.size && !taskMatches(c.task)) continue;
+    shown.push({ ...c, forced: matches.size > 0 && !S.unforced.has(Number(c.task.id)), matches });
+  }
+  return shown;
+}
+
+/** The crew chip: the users icon and `working/crew`, its tooltip «Групповая задача: работают 2 из 3»; "" for an
+ * ordinary task. */
+function crewChipHtml(task) {
+  const n = Number(task && task.crew) || 0;
+  if (!Number.isInteger(n) || n < 2) return "";
+  const m = Array.isArray(task.crew_working) ? task.crew_working.length : 0;
+  return `<span class="chip plain crew-chip" title="${esc(t("crew_chip", { m, n }))}"><i class="ic ic-users" aria-hidden="true"></i>${m}/${n}</span>`;
+}
+/** A status as a class name and a colour variable: nothing unknown reaches either (an unknown one reads as todo). */
+function statusKey(status) { return ALL_STATUSES.includes(status) ? status : "todo"; }
+function dotHtml(status) {
+  const s = statusKey(status);
+  return `<span class="sdot ${s}" style="--dc:var(--c-${s})" aria-hidden="true"></span>`;
+}
+/** The toggle in a parent card's meta row: one dot per direct subtask in its stack (id order, status colour, up to
+ * STACK_DOTS, then +N), done/total, a chevron. */
+function stackToggleHtml(card, open) {
+  const total = card.direct.length;
+  const done = card.direct.filter((x) => x.status === "done").length;
+  const label = t("stack_toggle", { done, total });
+  const dots = card.direct.slice(0, STACK_DOTS).map((x) => dotHtml(x.status)).join("");
+  const more = total > STACK_DOTS ? `<span class="stack-more" aria-hidden="true">+${total - STACK_DOTS}</span>` : "";
+  return `<button type="button" class="stack-toggle" data-stack-toggle="${Number(card.task.id)}" aria-expanded="${!!open}" title="${esc(label)}" aria-label="${esc(label)}">${dots}${more}<span class="stack-count">${done}/${total}</span><i class="ic ic-chevron" aria-hidden="true"></i></button>`;
+}
+/** One row of an open stack: dot, #id, title, the assignee's avatar, the eye while in review, the crew chip. A
+ * button with data-open-task: onDocumentClick opens that subtask, the card's own click handler skips it. */
+function stackRowHtml(row, match) {
+  const task = row.task;
+  const id = Number(task.id);
+  const lvl = Math.max(0, Math.trunc(Number(row.level) || 0));
+  const status = statusKey(task.status);
+  const label = `#${id} ${task.title ?? ""} · ${t("s_" + status)}` + (task.assignee ? ` · ${displayName(task.assignee)}` : "");
+  return `<button type="button" class="stack-row${match ? " match" : ""}" style="--lvl:${lvl}" data-open-task="${id}" title="${esc(label)}" aria-label="${esc(label)}">`
+    + `${dotHtml(status)}<span class="card-id">#${id}</span><span class="stack-title">${esc(task.title)}</span>`
+    + `${task.assignee ? avatar(task.assignee, "xs") : ""}${status === "review" ? '<i class="ic ic-eye" aria-hidden="true"></i>' : ""}${crewChipHtml(task)}</button>`;
+}
+
+/** The board's cards as shown (search applied) and their tasks. */
+function boardView() {
+  const cards = visibleCards(boardCards((S.state && S.state.tasks) || []));
+  const html = COLUMNS.map((col) => {
+    const items = cards.filter((c) => columnOf(c.task) === col)
+      .sort((x, y) => { const a = x.task, b = y.task; return (col === "done" || col === "closed") ? b.updated_at - a.updated_at : (b.priority - a.priority) || (a.id - b.id); });
     return `<div class="column${items.length ? "" : " is-empty"}" data-col="${col}">
       <div class="column-head"><span class="dot" style="background:var(--c-${col === "closed" ? "failed" : col})"></span>${esc(t("s_" + col))}<span class="count">${items.length}</span></div>
-      <div class="column-body">${items.map(cardHtml).join("") || `<div class="empty">${esc(t("empty"))}</div>`}</div>
+      <div class="column-body">${items.map((c) => cardHtml(c.task, c)).join("") || `<div class="empty">${esc(t("empty"))}</div>`}</div>
     </div>`;
   }).join("");
+  return { html, tasks: cards.map((c) => c.task) };
+}
+function boardHtml() { return boardView().html; }
+
+/** The selector of the board element that has the keyboard focus (a card, a stack toggle or a stack row), to give
+ * it the focus back after a live re-render replaced it; null when the focus is elsewhere. */
+function boardFocusKey(board = $("#board")) {
+  const active = globalThis.document && document.activeElement;
+  if (!active || !board || typeof board.contains !== "function" || !board.contains(active) || typeof active.closest !== "function") return null;
+  const toggle = active.closest("[data-stack-toggle]");
+  if (toggle) return `[data-stack-toggle="${Number(toggle.dataset.stackToggle)}"]`;
+  const card = active.closest(".card");
+  if (!card) return null;
+  const row = active.closest("[data-open-task]");
+  if (row) return `.card[data-id="${Number(card.dataset.id)}"] [data-open-task="${Number(row.dataset.openTask)}"]`;
+  return `.card[data-id="${Number(card.dataset.id)}"]`;
 }
 
 function renderBoard() {
   if (S.dragging && Date.now() - S.dragging.since < 30000) { S.boardDirty = true; return; }
   const board = $("#board");
-  const html = boardHtml();
-  if (board._html === html) return; // nothing changed: keep the DOM (hover, focus, scroll) as it is
+  const view = boardView();
+  if (board._html === view.html) return; // nothing changed: keep the DOM (hover, focus, scroll) as it is
+  const focus = boardFocusKey(board);
   const scrolls = {};
   $$(".column", board).forEach((c) => { scrolls[c.dataset.col] = $(".column-body", c).scrollTop; });
-  setHtml(board, html);
+  setHtml(board, view.html);
   $$(".column", board).forEach((c) => { if (scrolls[c.dataset.col]) $(".column-body", c).scrollTop = scrolls[c.dataset.col]; });
-  board.style.setProperty("--cols", boardColumns((S.state.tasks || []).filter(taskMatches)));
+  board.style.setProperty("--cols", boardColumns(view.tasks));
+  if (focus) $(focus, board)?.focus?.({ preventScroll: true });
 }
 
 /** Grid columns of the board: empty columns get less room so the cards have more. */
@@ -818,42 +1029,94 @@ function boardColumns(tasks) {
   return COLUMNS.map((c) => (used.has(c) ? "minmax(140px, 1fr)" : "minmax(110px, .6fr)")).join(" ");
 }
 
-function cardHtml(task) {
+/** A card of the board; `card` (boardCards / visibleCards) brings its stack of subtasks: the strips, the toggle and,
+ * while open, the rows. A card with a stack is a `group` (a `button` role would make the toggle and the rows
+ * presentational); without one it stays a `button`. */
+function cardHtml(task, card) {
+  card = card && typeof card === "object" && Array.isArray(card.rows) ? card : EMPTY_CARD;
+  const hasStack = card.rows.length > 0;
+  // a stack the user closed under this search stays closed, also one the user had opened before (S.unforced wins)
+  const open = hasStack && !S.unforced.has(Number(task.id)) && (S.expanded.has(Number(task.id)) || !!card.forced);
+  const matches = card.matches instanceof Set ? card.matches : EMPTY_CARD.matches;
   const blocked = (task.blocked_by || []).length && task.status === "todo"
     ? `<span class="blocked"><i class="ic ic-blocked"></i>${esc(t("blocked_by"))} ${task.blocked_by.map((b) => "#" + Number(b)).join(", ")}</span>` : "";
   const assignee = task.assignee ? `<span class="chip">${avatar(task.assignee, "sm")}${esc(displayName(task.assignee))}</span>` : "";
   const tags = (task.tags || []).map((g) => `<span class="tag">${esc(g)}</span>`).join("");
   const comments = task.comments ? `<span class="chip plain"><i class="ic ic-chat"></i>${Number(task.comments)}</span>` : "";
-  const review = task.status === "review" && task.reviewer ? (task.reviewer === "user"
-    ? `<span class="badge warn"><i class="ic ic-eye"></i>${esc(t("review_you"))}</span>` : `<span class="chip plain"><i class="ic ic-eye"></i>${esc(displayName(task.reviewer))}</span>`) : "";
+  // the user's review: of the card's own task or of a subtask anywhere in its stack; the card's own review by another
+  // member keeps the chip naming its reviewer next to that badge
+  const userReview = (task.status === "review" && task.reviewer === "user")
+    || card.rows.some((r) => r.task.status === "review" && r.task.reviewer === "user");
+  const review = (userReview ? `<span class="badge warn"><i class="ic ic-eye"></i>${esc(t("review_you"))}</span>` : "")
+    + (task.status === "review" && task.reviewer && task.reviewer !== "user" ? `<span class="chip plain"><i class="ic ic-eye"></i>${esc(displayName(task.reviewer))}</span>` : "");
   const failed = task.status === "failed" ? `<span class="badge err">${esc(t("s_failed"))}</span>` : task.status === "cancelled" ? `<span class="badge st-cancelled">${esc(t("s_cancelled"))}</span>` : "";
   const prio = Math.max(0, Math.min(3, Number(task.priority) || 0));
-  return `<div class="card p${prio}" draggable="true" tabindex="0" role="button" data-id="${Number(task.id)}" title="${esc(t("p" + prio))}">
+  const role = hasStack ? `role="group" aria-label="${esc(`#${Number(task.id)} ${task.title ?? ""}`)}"` : 'role="button"';
+  const stack = open ? `<div class="stack">${card.rows.map((r) => stackRowHtml(r, matches.has(Number(r.task.id)))).join("")}</div>` : "";
+  return `<div class="card p${prio}${hasStack ? " has-stack" : ""}${open ? " expanded" : ""}" draggable="true" tabindex="0" ${role} data-id="${Number(task.id)}" title="${esc(t("p" + prio))}">
     <div class="card-top"><span class="card-id">#${Number(task.id)}</span><span class="card-title">${esc(task.title)}</span></div>
     ${task.goal ? `<div class="card-goal"><i class="ic ic-goal"></i>${esc(task.goal)}</div>` : ""}
-    <div class="card-meta">${assignee}${review}${comments}${tags}${blocked}${failed}</div>
+    <div class="card-meta">${assignee}${crewChipHtml(task)}${review}${comments}${tags}${blocked}${failed}${hasStack ? stackToggleHtml(card, open) : ""}</div>${stack}
   </div>`;
+}
+
+/** Opens or closes a parent's stack as it is shown: a stack a search opened (one of its rows matches) is closed for
+ * as long as that search holds (S.unforced), without touching the parents the user had open before the search
+ * (S.preSearch); one the user opened under the search leaves S.expanded when closed. */
+function toggleStack(id) {
+  id = Number(id);
+  const card = visibleCards(boardCards((S.state && S.state.tasks) || [])).find((c) => Number(c.task.id) === id);
+  const searched = !!(card && card.matches && card.matches.size);
+  if (!S.unforced.has(id) && (S.expanded.has(id) || !!(card && card.forced))) {
+    if (searched) S.unforced.add(id);
+    if (!searched || !S.preSearch.has(id)) S.expanded.delete(id);
+  } else {
+    S.expanded.add(id);
+    S.unforced.delete(id);
+  }
+  renderBoard();
+}
+/** The board's filter: a new search text opens again the stacks the user closed under the previous one; a search
+ * that begins notes the stacks the user has open (S.preSearch). */
+function onSearchInput(e) {
+  const search = String(e.target.value || "").trim();
+  if (search && !S.search) S.preSearch = new Set(S.expanded);
+  if (search !== S.search) S.unforced.clear();
+  S.search = search;
+  if (S.tab === "board") renderBoard();
+}
+// the board's own handlers: the toggle and the stack's rows are buttons of their own inside a card, so a click,
+// a key or a drag that begins on them is not the card's
+function onBoardClick(e) {
+  const toggle = e.target.closest("[data-stack-toggle]");
+  if (toggle) { toggleStack(Number(toggle.dataset.stackToggle)); return; }
+  const card = e.target.closest(".card");
+  // a stack row (data-open-task) opens its subtask through onDocumentClick, as task links do
+  if (card && !e.target.closest("[data-open-task]")) openTask(Number(card.dataset.id));
+}
+function onBoardKeydown(e) {
+  if (e.target.closest(".stack-toggle, .stack")) return;   // a native button: Enter / Space is its own click
+  const card = e.target.closest(".card");
+  if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openTask(Number(card.dataset.id)); }
+}
+function onBoardPointerdown(e) { S.noDrag = !!e.target.closest(".stack-toggle, .stack"); }
+function onBoardDragstart(e) {
+  if (S.noDrag) { e.preventDefault(); S.noDrag = false; return; }   // rows are not draggable (dragstart's target is the card)
+  const card = e.target.closest(".card");
+  if (!card) return;
+  S.dragging = { id: Number(card.dataset.id), since: Date.now() };
+  e.dataTransfer.setData(DND_TYPE, card.dataset.id);
+  e.dataTransfer.setData("text/plain", "#" + card.dataset.id);
+  e.dataTransfer.effectAllowed = "move";
+  card.classList.add("dragging");
 }
 
 function wireBoard() {
   const board = $("#board");
-  board.addEventListener("click", (e) => {
-    const card = e.target.closest(".card");
-    if (card && !e.target.closest("[data-open-task]")) openTask(Number(card.dataset.id));
-  });
-  board.addEventListener("keydown", (e) => {
-    const card = e.target.closest(".card");
-    if (card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); openTask(Number(card.dataset.id)); }
-  });
-  board.addEventListener("dragstart", (e) => {
-    const card = e.target.closest(".card");
-    if (!card) return;
-    S.dragging = { id: Number(card.dataset.id), since: Date.now() };
-    e.dataTransfer.setData(DND_TYPE, card.dataset.id);
-    e.dataTransfer.setData("text/plain", "#" + card.dataset.id);
-    e.dataTransfer.effectAllowed = "move";
-    card.classList.add("dragging");
-  });
+  board.addEventListener("click", onBoardClick);
+  board.addEventListener("keydown", onBoardKeydown);
+  board.addEventListener("pointerdown", onBoardPointerdown);
+  board.addEventListener("dragstart", onBoardDragstart);
   board.addEventListener("dragend", () => {
     S.dragging = null;
     $$(".column.drop, .card.dragging", board).forEach((el) => el.classList.remove("drop", "dragging"));
@@ -887,6 +1150,9 @@ function moveTask(id, col) {
   const action = dropAction(task, col);
   if (!action) return;
   if (action.error) { toast(t(action.error), "err"); return; }
+  // a terminal status on a parent with open subtasks asks first (a review card dropped on «done» is approved: done)
+  const question = action.open ? null : closeQuestion(task, action.review ? "done" : action.status);
+  if (question && !confirm(question)) return;
   if (action.review) { act("task_review", { task_id: id, approve: true }, true); return; }
   if (action.open) { openTask(id).then(() => { $("#review-comment")?.focus(); toast(t("review_reason")); }); return; }
   act("task_update", { task_id: id, status: action.status }, true);
@@ -1126,7 +1392,8 @@ function modalHasUnsaved() {
   // an emptied field is no edit, except where emptying it means something (data-empty-edit: a session setting
   // cleared to take the global value again)
   return $$("#modal input, #modal textarea").some((el) => el.id && S.modalInitial && S.modalInitial.has(el.id)
-    && el.value !== S.modalInitial.get(el.id) && (el.value.trim() !== "" || el.hasAttribute("data-empty-edit")));
+    && el.value !== S.modalInitial.get(el.id) && (el.value.trim() !== "" || el.hasAttribute("data-empty-edit"))
+    && !(el.id === "n-dirs" && dirsHidden("n")));
 }
 function closeModal(force = false) {
   if (!force && modalHasUnsaved() && !confirm(t("discard_changes"))) return false;
@@ -1151,6 +1418,8 @@ const TASK_FORM = {
   "f-reviewer": (task) => task.reviewer || "",
   "f-tags": (task) => (task.tags || []).join(", "),
   "f-deps": (task) => (task.depends_on || []).join(", "),
+  "f-crew": (task) => (Number(task.crew) ? String(task.crew) : ""),
+  "f-dirs": () => "",   // the directions to add: the field starts empty, typed lines are an edit
 };
 /** Form fields whose current value differs from what the form showed for `base` (= unsaved edits). */
 function dirtyFields(base, values) {
@@ -1162,7 +1431,10 @@ function dirtyFields(base, values) {
 }
 function readTaskForm() {
   const values = {};
-  for (const id of Object.keys(TASK_FORM)) { const el = $("#" + id); if (el) values[id] = el.value; }
+  for (const id of Object.keys(TASK_FORM)) {
+    const el = $("#" + id);
+    if (el && !(id === "f-dirs" && dirsHidden("f"))) values[id] = el.value;   // hidden directions: no edit
+  }
   return values;
 }
 /** task_update arguments for the edits in `values` relative to `task`, or null when nothing changed. */
@@ -1181,6 +1453,12 @@ function taskChanges(task, values) {
   if (tags.join(",") !== (task.tags || []).join(",")) changes.tags = tags;
   const deps = parseIds(values["f-deps"]);
   if (deps.join(",") !== (task.depends_on || []).join(",")) changes.depends_on = deps;
+  // the crew number: empty = 0 = an ordinary task again; text that is no whole number is sent as typed (refused)
+  const before = Number(task.crew) || 0;
+  const typed = "f-crew" in values ? (crewValue(values["f-crew"]) ?? 0) : before;
+  if (typed !== before) changes.crew = typed;
+  const dirs = parseDirections(values["f-dirs"]);
+  if (crewOn(typed) && dirs.length) changes.directions = dirs;   // never for a task that is (becoming) ordinary
   if (values["f-status"] && values["f-status"] !== task.status) changes.status = values["f-status"];
   return Object.keys(changes).length ? changes : null;
 }
@@ -1194,6 +1472,7 @@ function fillTaskForm(task, old, force) {
     else if (id === "f-assignee" || id === "f-reviewer") el.innerHTML = memberOptions(valueOf(task), true, id === "f-reviewer" ? reviewerNone() : undefined);
     if (el.value !== valueOf(task)) el.value = valueOf(task);
   }
+  syncCrewField("f");
 }
 
 function taskHeadHtml(task) {
@@ -1206,6 +1485,33 @@ function taskMetaHtml(task) {
   if (task.parent_id) parts.push(`${esc(t("parent"))}: <button type="button" class="link" data-open-task="${Number(task.parent_id)}">#${Number(task.parent_id)}</button>`);
   if ((task.blocked_by || []).length) parts.push(`<span class="blocked"><i class="ic ic-blocked"></i>${esc(t("blocked_by"))}</span> ${task.blocked_by.map((b) => `<button type="button" class="link" data-open-task="${Number(b)}">#${Number(b)}</button>`).join(", ")}`);
   return parts.join(" · ");
+}
+/** The task modal's crew line («Групповая задача: до N участников, сейчас работают M») and its direct subtasks (all of
+ * them in id order, also those shown as their own cards) as stack rows, under «Направления» for a crew task, else
+ * «Подзадачи»; "" with neither. Both read the snapshot: a crew task's working set changes with its directions, and
+ * no event carries the parent. */
+function taskSubtasksHtml(task) {
+  const tasks = (S.state && S.state.tasks) || [];
+  const id = Number(task.id);
+  const live = tasks.find((x) => Number(x.id) === id) || task;
+  const n = Number(live.crew) || 0;
+  const crew = Number.isInteger(n) && n >= 2;
+  const line = crew ? `<div class="crew-line"><i class="ic ic-users" aria-hidden="true"></i>${esc(t("crew_line", { n, m: (Array.isArray(live.crew_working) ? live.crew_working : []).length }))}</div>` : "";
+  const subs = tasks.filter((x) => Number(x.parent_id) === id && Number(x.id) !== id).sort((a, b) => a.id - b.id);
+  const rows = subs.length ? `<div class="section-title">${esc(t(crew ? "directions" : "subtasks"))}</div>`
+    + `<div class="stack modal-stack">${subs.map((sub) => stackRowHtml({ task: sub, level: 0 }, false)).join("")}</div>` : "";
+  return line + rows;
+}
+/** The modal's crew line and subtask rows after a change; a row that had the keyboard focus gets it back. */
+function renderTaskSubtasks(task) {
+  const box = $("#task-subtasks");
+  if (!box) return;
+  const active = globalThis.document && document.activeElement;
+  const row = active && typeof box.contains === "function" && box.contains(active) && active.dataset ? active.dataset.openTask : null;
+  const html = taskSubtasksHtml(task);
+  if (box._html === html) return;
+  setHtml(box, html);
+  if (row) $(`[data-open-task="${Number(row)}"]`, box)?.focus?.({ preventScroll: true });
 }
 function taskResultHtml(task) {
   return task.result ? `<div class="section-title">${esc(t("result"))}</div><div class="result-box">${md(task.result)}</div>` : "";
@@ -1283,8 +1589,11 @@ function renderTaskModal(data) {
       <label class="field"><span>${esc(t("reviewer"))}</span><select id="f-reviewer"></select></label>
       <label class="field"><span>${esc(t("tags"))}</span><input id="f-tags"></label>
       <label class="field"><span>${esc(t("depends_on"))}</span><input id="f-deps"></label>
+      <label class="field"><span><i class="ic ic-users" aria-hidden="true"></i>${esc(t("crew_members"))} <span class="hint">${esc(t("crew_members_hint"))}</span></span><input id="f-crew" inputmode="numeric" autocomplete="off" placeholder="2–${CREW_MAX}"></label>
+      <label class="field full hidden" id="f-dirs-field"><span>${esc(t("directions"))} <span class="hint">${esc(t("directions_add_hint"))}</span></span><textarea id="f-dirs" rows="3"></textarea></label>
     </div>
     <div class="task-meta muted" id="task-meta">${taskMetaHtml(task)}</div>
+    <div id="task-subtasks">${taskSubtasksHtml(task)}</div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("close"))}</button><button class="btn primary" id="save-task" type="button">${esc(t("save"))}</button></div>
     <div id="task-result">${taskResultHtml(task)}</div>
     <div id="task-review">${taskReviewHtml(task)}</div>
@@ -1301,6 +1610,7 @@ function renderTaskModal(data) {
   S.taskBase = task;
   S.lastPostId = posts.reduce((m, p) => Math.max(m, p.id), 0);
   $("#save-task").addEventListener("click", saveTask);
+  $("#f-crew").addEventListener("input", () => syncCrewField("f"));
   $("#post-btn").addEventListener("click", postComment);
   const box = $("#post-text");
   attachMentions(box, $("#mention-menu"));
@@ -1319,6 +1629,7 @@ function updateTaskModal(data, force = false) {
   syncMdField("f-desc", task.description, force);
   $("#task-head").innerHTML = taskHeadHtml(task);
   setHtml($("#task-meta"), taskMetaHtml(task));
+  renderTaskSubtasks(task);
   setHtml($("#task-result"), taskResultHtml(task));
   if ((old.status === "review") !== (task.status === "review")) { $("#task-review").innerHTML = taskReviewHtml(task); wireReview(); }
   $("#discussion-title").textContent = discussionTitle(task, posts);
@@ -1430,6 +1741,12 @@ async function reviewTask(approve) {
   const comment = ($("#review-comment")?.value || "").trim();
   // a return without a reason gives the agent nothing to act on
   if (!approve && !comment) { toast(t("review_reason"), "err"); $("#review-comment")?.focus(); return; }
+  if (approve) {
+    // the approval makes the task done: a parent with open subtasks asks first, and a cancel keeps the comment
+    const current = ((S.state && S.state.tasks) || []).find((x) => x && x.id === taskId) || S.taskBase;
+    const question = closeQuestion(current, "done");
+    if (question && !confirm(question)) return;
+  }
   const res = await act("task_review", { task_id: taskId, approve, comment });
   if (res.ok && S.openTaskId === taskId) {
     const box = $("#review-comment");
@@ -1443,6 +1760,9 @@ async function saveTask() {
   if (!task) return;
   const changes = taskChanges(task, readTaskForm());
   if (!changes) { closeModal(true); return; }
+  // a terminal status on a parent with open subtasks asks first; a cancel leaves the form and its other edits as typed
+  const question = changes.status ? closeQuestion(task, changes.status) : null;
+  if (question && !confirm(question)) return;
   const btn = $("#save-task");
   btn.disabled = true;
   const res = await act("task_update", { task_id: task.id, ...changes }, true);
@@ -1542,8 +1862,11 @@ function newTaskModal() {
       <label class="field"><span>${esc(t("tags"))}</span><input id="n-tags"></label>
       <label class="field"><span>${esc(t("depends_on"))}</span><input id="n-deps"></label>
       <label class="field"><span>${esc(t("parent"))}</span><input id="n-parent" inputmode="numeric"></label>
+      <label class="field"><span><i class="ic ic-users" aria-hidden="true"></i>${esc(t("crew_members"))} <span class="hint">${esc(t("crew_members_hint"))}</span></span><input id="n-crew" inputmode="numeric" autocomplete="off" placeholder="2–${CREW_MAX}"></label>
+      <label class="field full hidden" id="n-dirs-field"><span>${esc(t("directions"))} <span class="hint">${esc(t("directions_hint"))}</span></span><textarea id="n-dirs" rows="3"></textarea></label>
     </div>
     <div class="modal-actions"><button class="btn" type="button" data-close>${esc(t("cancel"))}</button><button class="btn primary" id="create-task" type="button">${esc(t("create"))}</button></div>`);
+  $("#n-crew").addEventListener("input", () => syncCrewField("n"));
   $("#create-task").addEventListener("click", async () => {
     const title = $("#n-title").value.trim();
     const goal = $("#n-goal").value.trim();
@@ -1554,6 +1877,12 @@ function newTaskModal() {
     const tags = parseTags($("#n-tags").value); if (tags.length) args.tags = tags;
     const deps = parseIds($("#n-deps").value); if (deps.length) args.depends_on = deps;
     const parent = parseIds($("#n-parent").value)[0]; if (parent) args.parent_id = parent;
+    // empty or 0: an ordinary task, no `crew`; directions only with a crew number
+    const crew = crewValue($("#n-crew").value);
+    if (crewOn(crew)) {
+      args.crew = crew;
+      const dirs = parseDirections($("#n-dirs").value); if (dirs.length) args.directions = dirs;
+    }
     const res = await act("task_create", args);
     if (res.ok) closeModal(true);
   });
@@ -2226,15 +2555,17 @@ function openJobLog(path) {
   S.fileDir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : ".";
   setTab("files");
 }
-/** Every JOB_REFRESH ms while the Jobs tab is shown: the open outputs of running jobs and the running times. */
+/** Every JOB_REFRESH ms while the Jobs tab is shown: the open outputs of running jobs and the running times (not on a
+ * session made by an earlier version: the board stops polling, showEarlier). */
 function tickJobs() {
-  if (S.tab !== "jobs" || !S.state || (typeof document !== "undefined" && document.hidden)) return;
+  if (S.tab !== "jobs" || !S.state || S.earlier || (typeof document !== "undefined" && document.hidden)) return;
   for (const id of S.jobOpen) if (runningJobs().some((j) => Number(j.id) === id)) loadJobOutput(id);
   renderJobs();
 }
 
 /* ---------------------------------------------------------------- feed */
 function fmtValue(field, value) {
+  if (field === "crew" && (value === 0 || value === "0")) return t("crew_ordinary");
   if (value === null || value === undefined || value === "") return "—";
   if (field === "status") return tv("s_", value);
   if (field === "priority") return tv("p", value);
@@ -2505,17 +2836,34 @@ function resync() {
 
 let connTimer = null;
 function setConnected(on, quiet = false) {
+  on = on && !S.earlier;
   const dot = $("#conn");
   dot.classList.toggle("on", on);
   dot.title = t(on ? "live" : "disconnected");
   clearTimeout(connTimer);
   const banner = $("#conn-banner");
+  if (S.earlierText) {   // a session made by an earlier version: its message stays (showEarlier)
+    banner.textContent = S.earlierText;
+    banner.classList.remove("hidden");
+    return;
+  }
   banner.textContent = t("disconnected");
   if (on || quiet) banner.classList.toggle("hidden", on || banner.classList.contains("hidden"));
   else connTimer = setTimeout(() => banner.classList.remove("hidden"), 3000);
 }
+// the close reason of the WebSocket of a session made by an earlier version (launcher.EARLIER_VERSION_REASON)
+const EARLIER_REASON = "made by an earlier version";
+/** The session was made by an earlier version (a 409 with `earlier_version`, or the close 1011 with EARLIER_REASON;
+ * docs/SPEC.md §18.1): the connection banner shows the launcher's message (English, like the hub's errors) and keeps
+ * it; the board no longer reconnects or polls. Idempotent: the 409 of the refresh may come before the close or after. */
+function showEarlier(text) {
+  S.earlier = true;
+  if (text) S.earlierText = text;
+  setConnected(false);
+}
 
 function connect() {
+  if (S.earlier) return;
   const proto = location.protocol === "https:" ? "wss" : "ws";
   const ws = new WebSocket(`${proto}://${location.host}${BASE}/ws`);
   S.ws = ws;
@@ -2526,8 +2874,12 @@ function connect() {
     S.wsEverOpen = true;
   };
   ws.onmessage = (msg) => { try { handleEvent(JSON.parse(msg.data)); } catch (e) { console.error(e); } };
-  ws.onclose = () => {
+  ws.onclose = (ev) => {
     if (S.ws !== ws) return;
+    if (ev && ev.code === 1011 && ev.reason === EARLIER_REASON) {   // accepted, then closed: no reconnect
+      if (!S.earlier) { showEarlier(""); refresh(); }   // the refresh's 409 brings the message
+      return;
+    }
     setConnected(false);
     const delay = Math.min(10000, 1000 * 2 ** Math.min(S.wsRetry++, 4));
     setTimeout(connect, delay);
@@ -2669,7 +3021,7 @@ function init() {
   $("#composer").insertAdjacentHTML("beforebegin", '<div class="chat-hint hidden" id="chat-hint" role="status"></div>');
   $("#composer").addEventListener("submit", (e) => { e.preventDefault(); sendComposer(); });
   $("#composer-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendComposer(); } });
-  $("#search").addEventListener("input", (e) => { S.search = e.target.value.trim(); if (S.tab === "board") renderBoard(); });
+  $("#search").addEventListener("input", onSearchInput);
   const backdrop = $("#modal-backdrop");
   let downOnBackdrop = false; // a text selection that starts in the modal and ends outside must not close it
   backdrop.addEventListener("mousedown", (e) => { downOnBackdrop = e.target === backdrop; });
@@ -2679,7 +3031,7 @@ function init() {
   document.addEventListener("visibilitychange", () => { if (!document.hidden) autoMarkRead(); });
   refresh();
   connect();
-  setInterval(() => { if (!S.ws || S.ws.readyState !== 1) refresh(); }, 10000);
+  setInterval(() => { if (!S.earlier && (!S.ws || S.ws.readyState !== 1)) refresh(); }, 10000);
   setInterval(tickJobs, JOB_REFRESH);
 }
 
@@ -2687,7 +3039,8 @@ if (typeof module !== "undefined" && module.exports) {
   // pure helpers, exported for the Node-based UI tests (tests/test_ui.py); the browser ignores this
   module.exports = {
     I18N, S, COLUMNS, ALL_STATUSES, TASK_FORM, esc, escAttr, t, tv, linkify, highlightMentions, memberOptions, statusOptions,
-    dropAction, makeScheduler, threadOrder, threadHtml, dirtyFields, taskChanges, mentionQuery, mentionCandidates,
+    dropAction, makeScheduler, threadOrder, threadHtml, dirtyFields, readTaskForm, modalHasUnsaved, taskChanges,
+    mentionQuery, mentionCandidates,
     limitsArgs, describeEvent, changesText, activityHtml, messageHtml, cardHtml, boardHtml, boardColumns, rejectMcp,
     deleteTrigger, fillTaskForm, autoMarkRead, loadFeed, FEED_TYPES,
     // review, the hire dialog (role catalog), the goal dialog
@@ -2714,6 +3067,16 @@ if (typeof module !== "undefined" && module.exports) {
     skillPreviewHtml, skillCardHtml, skillLibraryHtml, renderSkills, attachRows, attachWarnings, attachRowHtml, renderAttachList,
     attachSkillModal, toggleSkillPreview, attachSkill, detachSkill, saveSkill, rejectSkill, updateSkill, toggleSkillLog,
     reinstallSkill, deleteLibrarySkill,
+    // subtasks on the board: the cards and their stacks, the crew chip, the toggle and the rows, the board's handlers
+    boardCards, visibleCards, crewChipHtml, stackToggleHtml, stackRowHtml, dotHtml, statusKey, toggleStack, renderBoard,
+    boardFocusKey, onBoardClick, onBoardKeydown, onBoardPointerdown, onBoardDragstart, onSearchInput, taskMatches,
+    OPEN_STATUSES, TERMINAL_STATUSES, EMPTY_CARD, STACK_DOTS,
+    // crew tasks in the task forms: the crew number and the directions fields, the modal's subtasks, the feed's values
+    crewValue, crewOn, parseDirections, syncCrewField, taskSubtasksHtml, renderTaskSubtasks, newTaskModal, saveTask, fmtValue, CREW_MAX,
+    // the question before a parent with open subtasks is closed (moveTask, saveTask, reviewTask)
+    closeQuestion,
+    // a session made by an earlier version: its 409 and the close 1011 (docs/SPEC.md §18.1)
+    showEarlier, EARLIER_REASON, responseData, refresh,
   };
 }
 if (typeof document !== "undefined") document.addEventListener("DOMContentLoaded", init);

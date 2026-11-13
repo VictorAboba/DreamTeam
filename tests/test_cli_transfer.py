@@ -26,6 +26,7 @@ from dreamteam import settings as st
 from dreamteam.db import Database
 from dreamteam.sessions import SessionManager
 from dreamteam.skills import Library
+from dreamteam.tools import frozen
 from dreamteam.treecopy import scan_tree
 
 
@@ -100,6 +101,7 @@ def _exported(monkeypatch, tmp_path: Path) -> tuple[Path, list[str]]:
         try:
             db.execute("INSERT INTO events(ts, type, actor, data) VALUES (1.0, 'session.started', 'user', '{}')")
             db.execute("INSERT INTO history(agent, seq, msg) VALUES ('alice', 1, ?)", (json.dumps({"text": sid}),))
+            frozen.write(db, "alice", frozen.current_record("en"))  # an agent of this version
         finally:
             db.close()
     _skill(tmp_path, "csv-tool")

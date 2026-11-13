@@ -449,10 +449,20 @@ async def test_task_get_shows_structure_and_latest_posts(swarm):
         await ok(swarm, b, "task_comment", {"task_id": 1, "text": f"post {i}"})
     text = await ok(swarm, a, "task_get", {"task_id": 1})
     assert "Task #1: Epic" in text and "Goal: everything" in text and "Description:\nLong text" in text
-    assert "Subtasks: #2 [todo] Part" in text and "Required by (open): #3 [todo]" in text
+    assert '\nSubtasks:\n#2 [todo] "Part"\n' in text and "Required by (open): #3 [todo]" in text
+    assert "Crew task:" not in text  # an ordinary parent
     assert "Discussion: 7 post(s)" in text and "post 6" in text and "post 1" not in text
     assert "Parent: #1" in await ok(swarm, a, "task_get", {"task_id": 2})
     assert "Task #9 not found" in await err(swarm, a, "task_get", {"task_id": 9})
+    # closed dependents are not "required by (open)"
+    gone = swarm.board.create(USER, "Gone", goal="g", depends_on=[1])
+    swarm.board.update(USER, gone.id, status="cancelled")
+    done = swarm.board.create(USER, "Done", goal="g", depends_on=[1])
+    swarm.board.update(USER, done.id, status="done")
+    text = await ok(swarm, a, "task_get", {"task_id": 1})
+    assert "Required by (open): #3 [todo]\n" in text + "\n"
+    assert f"#{gone.id} [" not in text.split("Required by (open):", 1)[1].split("\n", 1)[0]
+    assert f"#{done.id} [" not in text.split("Required by (open):", 1)[1].split("\n", 1)[0]
 
 
 async def test_task_create_options(swarm):
@@ -570,8 +580,9 @@ async def test_claim_complete_and_review_flow(swarm):
     assert await ok(swarm, b, "task_review", {"task_id": 1, "approve": True}) == f"Task #1 is now done (assignee: {a})."
     assert "n_unblocked" not in notifications(swarm, ext)
     await ok(swarm, ext, "task_claim", {"task_id": 2})
-    # no reviewer: the board picks an agent that neither created (the user did) nor did it; both are idle and free
-    picked = min(a, b)
+    # no reviewer: the board picks an agent that neither created (the user did) nor did it; both are idle and free,
+    # and b has already given a review (#1), so a takes this one
+    picked = a
     assert await ok(swarm, ext, "task_complete", {"task_id": 2, "result": "ok"}) == \
         f"Task #2 was sent to {picked} for review: a member other than you checks it, and you will be told the verdict."
     # the user may complete and review anything

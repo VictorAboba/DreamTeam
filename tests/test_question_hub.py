@@ -294,6 +294,19 @@ def test_hub_tools_offer_pause_swarm():
     assert "is the answer" not in own and LAUNCHER_INSTRUCTIONS.count("is the answer") == 1
 
 
+def test_hub_tools_offer_crew_and_directions():
+    """The hub MCP lists the live registry: task_create and task_update have crew and directions (toolset revision 5),
+    optional, for external members and the user (`as_agent`) and for the launcher MCP (which adds `session`)."""
+    for tools in (list_hub_tools(SimpleNamespace(language="en")), list_hub_tools(SimpleNamespace(language="ru")),
+                  list_launcher_tools(SimpleNamespace(config=SimpleNamespace(swarm=SimpleNamespace(language="en"))))):
+        for name in ("task_create", "task_update"):
+            schema = next(t for t in tools if t.name == name).input_schema
+            props = schema["properties"]
+            assert props["crew"]["type"] == "integer", name
+            assert props["directions"]["type"] == "array" and props["directions"]["items"] == {"type": "string"}
+            assert not {"crew", "directions"} & set(schema.get("required", [])) and "as_agent" in props, name
+
+
 async def test_a_question_pause_through_the_launcher_mcp(tmp_path):
     """L20/L21 through the launcher MCP: an external member asks the user with pause_swarm (hub_call with as_agent),
     sessions_list and swarm_status name the question, and the user's send_message to the member answers it."""

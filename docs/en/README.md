@@ -4,7 +4,7 @@
 
 Getting started:
 
-- [Install and quick start](getting-started.md): installing, the first session, every `dreamteam` command
+- [Install and quick start](getting-started.md): installing, updating to 0.2.0, the first session, every `dreamteam` command
 - [Features](features.md): everything DreamTeam does, in one table
 
 Working with the swarm:
