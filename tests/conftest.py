@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from dreamteam import hubauth, prompts, skill_deps, web
+from dreamteam import hubauth, netoff, prompts, skill_deps, web
 from dreamteam.board import Board
 from dreamteam.config import Config
 from dreamteam.db import Database, dumps, loads
@@ -206,6 +206,14 @@ def _no_gateway_headers(monkeypatch):
     shell: they limit where a check may go (settings.profile_from_view)."""
     for name in ("ANTHROPIC_CUSTOM_HEADERS", "OPENAI_CUSTOM_HEADERS"):
         monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _outside_the_image(monkeypatch):
+    """No test takes the sandbox image's marker from the environment: the Dockerfile sets DREAMTEAM_IMAGE=1
+    (netoff.IMAGE_ENV), which turns on the workspace trust, the copy-from refusal and the image's hints, so the suite
+    run inside the image would take those paths. A test of the image sets the variable itself."""
+    monkeypatch.delenv(netoff.IMAGE_ENV, raising=False)
 
 
 def make_skill(folder: Path, name: str | None = "demo", description: str = "Does a demo thing.",
