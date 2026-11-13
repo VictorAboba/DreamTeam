@@ -61,7 +61,8 @@ from . import mcp_library
 from .config import (CONFIG_FILE, AgentSettings, MCPSettings, ModelProfile, RoleSettings, ServerSettings,
                      ShellSettings, SkillsSettings, SwarmSettings, TeamSettings, TracingSettings, WorkspaceSettings,
                      env_var_name, key_env_names, make_profile)
-from .db import foreign_objects, known_columns, loads, max_tools_revision, sqlite_uri, unknown_columns
+from .db import (foreign_objects, known_columns, loads, made_by_earlier_version, max_tools_revision, reading_file,
+                 sqlite_uri, unknown_columns)
 from .mcp_forge import _split_command
 from .roles import missing_roles, role_key, team_key
 from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_FILE, SESSION_ID,
@@ -1496,25 +1497,10 @@ def _read_db(path: Path, timeout: float = 30.0) -> Iterator[tuple[sqlite3.Connec
     """A connection that reads `path` without writing anything next to it, and whether it reads it immutable: a
     database with both its -wal and -shm files is read through them (?mode=ro: the WAL content is included); one
     with a -wal file only (a crash, a copy that skipped the -shm) is read from a private copy of both, since a
-    read-only open would create the -shm next to it; one closed cleanly has neither and is read as immutable."""
-    wal = os.path.lexists(path.with_name(path.name + "-wal"))
-    shm = os.path.lexists(path.with_name(path.name + "-shm"))
-    if wal and not shm:
-        with tempfile.TemporaryDirectory(prefix="dreamteam-db-") as folder:
-            copy = Path(folder) / path.name
-            shutil.copyfile(long_path(path), copy)
-            shutil.copyfile(long_path(path.with_name(path.name + "-wal")), copy.with_name(copy.name + "-wal"))
-            conn = sqlite3.connect(sqlite_uri(copy, "mode=ro"), uri=True, timeout=timeout)
-            try:
-                yield conn, False
-            finally:
-                conn.close()
-        return
-    conn = sqlite3.connect(sqlite_uri(path, "mode=ro" if wal else "immutable=1"), uri=True, timeout=timeout)
-    try:
-        yield conn, not wal
-    finally:
-        conn.close()
+    read-only open would create the -shm next to it; one closed cleanly has neither and is read as immutable
+    (db.reading_file)."""
+    with reading_file(path, timeout=timeout) as pair:
+        yield pair
 
 
 def _db_state(path: Path) -> tuple[Any, ...]:
@@ -1767,6 +1753,14 @@ def _session_part(manager: SessionManager, item: _Session, out: Path | None, rep
             entry["db_sha256"] = _sha256(copied)
         else:
             entry["db_bytes"] = sum(p.stat().st_size for p in (db, db.with_name(DB_FILE + "-wal")) if p.is_file())
+        try:  # docs/SPEC.md §17.2: exported like any other, but the same version will refuse it at import
+            earlier = made_by_earlier_version(copied if target is not None else db)
+        except (sqlite3.Error, OSError):
+            earlier = False
+        if earlier:
+            report.warnings.append(f"session {sid} was made by an earlier version of DreamTeam: this version and the "
+                                   "same one on the other computer refuse it; only the version that made it imports "
+                                   "and opens it (keep this folder)")
     size += entry["db_bytes"]
     modes: dict[str, int] = {}
     if target is not None:
@@ -2944,6 +2938,7 @@ def _check_export_db(path: Path, entry: dict[str, Any]) -> str | None:
         unknown = unknown_columns(path)
         revision = max_tools_revision(path)
         foreign = foreign_objects(path)
+        earlier = made_by_earlier_version(path)
     except (sqlite3.Error, OSError) as exc:
         return f"its database cannot be read: {exc}"
     if unknown:
@@ -2955,6 +2950,9 @@ def _check_export_db(path: Path, entry: dict[str, Any]) -> str | None:
     if revision is not None and revision > TOOLSET_REVISION:
         return (f"its agents use the tool set {revision}, which this DreamTeam does not know (it knows "
                 f"{TOOLSET_REVISION}): update DreamTeam here")
+    if earlier:  # docs/SPEC.md §17.2: this version never opens it
+        return (f"it was made by an earlier version of DreamTeam and cannot be opened by this one ({__version__}); "
+                "import it with the version that made it")
     return None
 
 

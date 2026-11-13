@@ -209,7 +209,9 @@ def session_line(s: dict[str, Any]) -> str:
             + (f" | jobs {jobs} running" if jobs and s.get("status") == "running" else "")
             + f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}"
             + (" | no network" if s.get("network") == "off" else "")
-            + (" | clarify" if s.get("clarify") else ""))   # [swarm] clarify: questions may pause it
+            + (" | clarify" if s.get("clarify") else "")   # [swarm] clarify: questions may pause it
+            # never opened by this version (docs/SPEC.md §17.2): listed, deleted and exported only
+            + (" | made by an earlier version: cannot be opened" if s.get("earlier_version") else ""))
     if goal:
         line += f"\n    goal [{goal.get('status', 'active')}]: {goal.get('title', '')}"
     if s.get("skills"):
@@ -501,6 +503,8 @@ async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[st
                 + listing), True
     if not manager.exists(str(sid)):
         return f"Error: unknown session '{sid}'. Use sessions_list.", True
+    if str(sid) not in manager.running and manager.earlier_version(str(sid)):
+        return f"Error: {manager.earlier_version_text(str(sid))}", True
     if str(sid) not in manager.running:
         return f"Error: session {sid} is stopped. Start it with session_start(session=\"{sid}\").", True
     return await _call_in_session(manager, str(sid), name, args)

@@ -115,14 +115,17 @@ class HubClient:
     async def trace_stats(self, sid, agent: str | None = None) -> dict
     def ws_url(self, sid) -> str                                   # ws(s)://host/{base}/ws
     def stream(self, sid) -> AsyncIterator[dict]
-        # Yields bus events (dicts as sent by the server, trace.* included), forever. It reconnects with
-        # backoff (0.5 s .. 10 s). On every (re)connect and loss it yields pseudo events
+        # Yields bus events (dicts as sent by the server, trace.* included) until the caller stops it. It
+        # reconnects with backoff (0.5 s .. 10 s). On every (re)connect and loss it yields pseudo events
         # {"type": "_connection", "data": {"state": "connected" | "lost"}}. When the hub answers the handshake
         # with an HTTP error instead (403: e.g. the session was deleted), {"state": "rejected", "status": N}
         # follows the "lost" (once per streak): consumers check over REST whether the session still exists, or
         # (also for a single swarm) whether the hub takes none of the tokens tried (HubError 401: its text is shown).
         # It stops when the iterator is closed (aclose) or the client is closed. Server close codes 1012
-        # (session restarted) / 1001 mean "reconnect now".
+        # (session restarted) / 1001 mean "reconnect now". A close 1011 with the reason `made by an earlier
+        # version` (EARLIER_REASON = launcher.EARLIER_VERSION_REASON: the hub accepts the socket of a session made
+        # by an earlier version, SPEC §17.2, then closes it) yields {"state": "earlier"} and ends the iterator:
+        # no reconnect opens that session.
 
 @dataclass
 class Connection:
@@ -177,11 +180,16 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     becomes its goal (`set_goal`). A session paused by the user (not by the budget) is resumed: the prompt
     is a new instruction to work on. A session paused for a member's question (the state's `swarm.question`,
     SPEC §3.1) is not resumed: the prompt goes to the asker instead, which makes it the answer.
+  - A session made by an earlier version (summary `earlier_version`, SPEC §17.2) is never opened and nothing is
+    created: `-r ID` of one exits 1 with its message (English, `sessions.earlier_version_text` with the hub's home
+    and version); `-c` whose most recent session is one exits 1 with `continue_earlier`.
 - It follows the session's WebSocket stream until it ends:
   - `goal.completed` → exit code 0;
   - `swarm.paused` with reason "budget" → 2;
   - timeout → 3;
   - an unrecoverable error (hub gone and not reconnecting for 60 s, or the session deleted) → 1;
+  - the stream's state `earlier` (the hub closed it 1011 «made by an earlier version»: an import replaced the
+    session) → 1 with the English message of `-r ID` above;
   - Ctrl+C → 130. The session is left as it is (running, if the hub is external).
 - When `dreamteam -p` runs the launcher in its own process (`main_print`, `conn.owned`), the session it used
   is stopped explicitly at the end, whatever the outcome: a one-shot run is not resumed by the next
@@ -317,7 +325,17 @@ class RenderContext:
     such a task adds the hint «Принять: /approve 3 [комментарий] · вернуть: /reject 3 что исправить»;
   - done: `☒ #3 Title — Анна` + `⎿ result (first line)` (verbose: more);
   - failed or cancelled: `✗ #3 …` (red or dim);
-  - discussion post: `💬 #3 Анна: text`.
+  - discussion post: `💬 #3 Анна: text`;
+  - board line of a parent: `☐ #2 Парсер — Анна · ●●● 1/3 · групповая 2/3 · ждёт вашего ревью`: one `●` per direct
+    subtask (ASCII `o`), each in its status colour (todo default, in progress accent, waiting dim, review warn, done
+    ok, failed error, cancelled dim; an unknown status as todo), at most 12, then `+N`; `done/total` of the direct
+    subtasks; the crew chip `групповая m/n` / "crew m/n" (m = members working, n = `crew`) when `crew` is an integer
+    ≥ 2, with or without subtasks; the review-for-you mark when any subtask of the stack (any level) waits for the
+    user's review, once per line (not again when the task itself waits for it). The tail ends the first line (after
+    the comments and the verbose tags, before the verbose goal) and wraps; the head does not move.
+  - a change of `crew` reads «групповая задача (участников)» / "crew", with 0 as «обычная задача» / "ordinary task"
+    (the verbose change line `✎ #4 … · изменена: групповая задача (участников)` and the `/task` history
+    `групповая задача (участников): обычная задача → 3`), as the web's `fmtValue`.
 - Goal: `goal.set` renders as a rounded panel titled «Цель» / "Goal". `goal.completed` renders as a green
   rounded panel «✓ Цель достигнута» with the summary as markdown.
 - Thinking (verbose only): `✻ Анна думает…` with the text dim italic, max 12 lines.
@@ -347,7 +365,7 @@ class RenderContext:
 - Wrap-up mode (`swarm.wrap_up`) renders as a warning line `⚠ вы: режим завершения — агенты завершают задачи с тем,
   что есть, без новых вычислений и фоновых процессов` / a dim `· вы: режим завершения выключен`.
 - Quiet shows only messages to/from the user, the goal, errors, approvals and pause/budget/wrap-up lines.
-- Unicode symbols have ASCII fallbacks (`*`, `|_`, `[ ]`, `[~]`, `[x]`, `x`, `>`), used when the terminal
+- Unicode symbols have ASCII fallbacks (`*`, `|_`, `[ ]`, `[~]`, `[x]`, `x`, `>`, `o`), used when the terminal
   encoding cannot encode them.
 
 ### 3.2 Functions
@@ -362,8 +380,20 @@ def event(ctx, ev: dict) -> RenderableType | None        # every bus event type 
 def user_echo(ctx, text: str, to: str | None) -> RenderableType
 def agent_message(ctx, msg: dict) -> RenderableType      # msg from /api/messages or message.sent data.message
 def goal_panel(ctx, goal: dict | None) -> RenderableType
-def board(ctx, tasks: list[dict]) -> RenderableType      # grouped by column, todo symbols, assignee, deps, 💬n
-def task_detail(ctx, data: dict) -> RenderableType       # /api/tasks/{id}: header, goal, description, result, discussion
+def board(ctx, tasks: list[dict]) -> RenderableType      # grouped by column, todo symbols, assignee, deps, 💬n;
+    # one line per card as the web's board (board_cards): a subtask is its own line only as an open subtask of a
+    # terminal parent or under a parent missing from the snapshot, other subtasks are dots in their card's line;
+    # a column header counts its lines (a done or closed column cut to its last 15 counts the `… +N` ones too)
+def board_cards(tasks: list[dict]) -> list[Card]         # the twin of app.js boardCards (tests/helpers/stacks.py):
+    # Card(task, rows=((task, level), ...) depth-first by id, direct=the level-0 rows), in task-id order; an id or
+    # parent_id that is not an int (a bool is none) or a str is no key: such a task is a card, never a parent
+def board_summary(ctx, tasks: list[dict] | dict) -> RenderableType   # `Задачи: ☐ 3 · ◐ 2 · ☒ 5`: counts every
+    # task, directions included (a task list or the snapshot counts {status: n})
+def task_detail(ctx, data: dict, tasks: list[dict] | None = None) -> RenderableType   # /api/tasks/{id}: header,
+    # goal, description, result, discussion (verbose: history); with the snapshot's `tasks`, between the description
+    # and the result: the crew line «Групповая задача: до N участников, сейчас работают M» (from the snapshot's copy
+    # of the task) and its direct subtasks (all, in id order) as board lines under «Направления (k)» / «Подзадачи (k)»,
+    # as the web modal's taskSubtasksHtml
 def agents_table(ctx, agents: list[dict]) -> RenderableType   # a member with running background jobs: `⚙N` after
                                                               # its tasks (narrow: after its status)
 def jobs_table(ctx, jobs: list[dict]) -> RenderableType       # /jobs: the state's "jobs" (running, then ended in the
@@ -393,7 +423,7 @@ def skill_deps_preview(ctx, deps, install=None, proposal=False) -> str   # what 
     # pages' Skills.previewLine); skill_states_preview(ctx, states): the same from the snapshot's deps states
 def skills_pending(ctx, sid, attached) -> RenderableType      # /skills pending: the proposals waiting
 def skill_log(ctx, data: dict) -> RenderableType              # /skills log: the install log's path and its end
-def sessions_table(ctx, sessions: list[dict], current: str | None = None) -> RenderableType
+def sessions_table(ctx, sessions: list[dict], current: str | None = None) -> RenderableType  # no command shows it
 def cost_table(ctx, state: dict) -> RenderableType       # per agent tokens in/out, cost; total vs budget
 def models_table(ctx, settings: dict) -> RenderableType  # /model, /settings: ✓ default, profile, model, provider
     # (≥ 80 columns), Цены / Prices from the public view's price_source ($in/$out of the profile, «встроенные» /
@@ -534,11 +564,11 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/help` | commands table + key hints |
 | `/new [цель]` | new session (asks for the goal when omitted: the next input is the goal); first line = title, the rest = description |
 | `/team [команда \| роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); a bare word is a team saved in the settings first (`roles.team_choice`, SPEC §17.3 "Saved teams"), then a catalog role; with teams saved any other bare word is refused (`word*1` makes a new role), and so are a saved team's name that is no catalog role in a list or with `*N`, and a team with a role the catalog lacks; quotes around the argument, or around each item of a list, are dropped, as in other commands; the window copies the team when it is chosen, so a later edit of the team reaches the window only after `/team NAME` again; without an argument shows the team the window holds and lists the saved teams; the settings stay as they are |
-| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" (warn) while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up" |
-| `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it |
+| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up"; a session made by an earlier version (SPEC §17.2) reads «прежняя версия» / "earlier version" (before any other status; the picker's hint `id · status · goal` is plain text with no task count): Enter and `/resume ID` print its message (`earlier_session`, or the legacy `main`'s `earlier_main`) and attach nothing, the picker closing; Del deletes it as usual |
+| `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it; the legacy `main`: `delete_legacy`, and when it was made by an earlier version its message instead, which names the file to remove by hand |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
-| `/board` | the board (`board`) |
-| `/task N` | task with discussion |
+| `/board` | the board (`board`): one line per card, a parent's subtasks as dots in its line |
+| `/task N` | task with discussion (`task_detail` with the snapshot's tasks: a crew task's line «Групповая задача: до N участников, сейчас работают M» and the direct subtasks indented under «Направления (k)» / «Подзадачи (k)», between the description and the result; when the snapshot cannot be fetched, the task prints without them) |
 | `/agents` | team table |
 | `/roles [роль]` | the role catalog (`roles_table`) / one role in full (`role_detail`) |
 | `/skills`, `/skills lib`, `/skills add X [--pick a,b] [--replace]`, `/skills update X`, `/skills rm X`, `/skills show X` | the session's skills (`skills_table` from the state; without a session: the next new session's) / the library, the host's and Claude Code's skills / attach a reference (`pdf`, `claude-user:pdf`) or import a folder, .zip (a relative path or `~` resolved here when the hub is on this computer) or Git URL and attach it (`skill_attach`); without a session it is kept for the next new session, as `--skill` / again from its own source (`<from>:X` with replace; refused for a member's proposal) / `skill_detach` / the session's copy of an attached skill, else the library's (`claude-user:x`: that one) |
@@ -592,15 +622,29 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   catch-up replays its journal (the starting team joining, the goal panel, the first tasks and messages),
   so nothing that happened before the stream connected is lost and the goal is printed once.
 - After attaching to an existing session:
-  - print the goal panel, a one-line board summary (`Задачи: ☐ 3 · ◐ 2 · ☒ 5`) and the last 6 messages between the
-    user and agents (the newest messages of everyone merged with the user's inbox, so an old question to the
-    user is not lost behind agent-to-agent traffic);
+  - print the goal panel, a one-line board summary (`Задачи: ☐ 3 · ◐ 2 · ☒ 5`; every task, directions included)
+    and the last 6 messages between the user and agents (the newest messages of everyone merged with the user's
+    inbox, so an old question to the user is not lost behind agent-to-agent traffic);
   - then follow `client.stream(sid)`; every event goes through `render.event` at the current verbosity.
   - Attaching is transactional: the start, the event baseline, the state and the history are fetched first;
     only then is the current session left. A failed `/resume` or picker choice keeps the current session.
     Answers for a session the user has left meanwhile (a slow state refresh) are not applied.
   - The event baseline is taken before the history; a message printed as history is not printed again
     when its `message.sent` is replayed (by message id).
+- Sessions made by an earlier version (summary `earlier_version`, SPEC §17.2) are never opened. Their message is
+  printed in the UI language (`earlier_session`, the twin of `sessions.EARLIER_VERSION_TEXT`; the legacy `main`:
+  `earlier_main`, which names `{home}/.dreamteam/swarm.db` to remove by hand); `{version}` is the hub's, `{home}` the
+  summary's `dir`, else the hub's home, else its project, the TUI's own home only for the launcher it runs itself,
+  else `earlier_home` («<домашняя папка>» / "the home"). `-r ID` of one: the message under the welcome box (no
+  session line in the box), no start request, nothing attached; a prompt given with it stays in the input line.
+  A refused session ends `--skill`'s resume attempt (no later resumed session gets the skills), and the skills go to
+  a session `/new` creates, as after `-c` with no sessions. A start answered 409 with `earlier_version` (a list gone
+  stale, or a message typed into a stopped session an import replaced) prints the message instead of the hub's
+  text: the typed message is not sent, and the session is left. A stream closed 1011 «made by an earlier version»
+  (the state `earlier`) prints it, leaves the session and stops reconnecting; the hub accepts the socket before
+  closing it, so «Связь с хабом восстановлена» / "Reconnected to the hub" can print just before.
+- Before updating to 0.2.0, finish or export the sessions in which agents already worked: 0.2.0 lists them but does
+  not open them, and there is no conversion.
 - Deleting a session (`/delete`, Del in the picker): the main session of a project home (`legacy`) is refused
   at once, as the hub would. Otherwise a `ConfirmDialog` («Удалить сессию «X»?», what is deleted, that a
   workspace folder outside the session stays, and that a running session's agents are stopped; «Нет»
@@ -740,8 +784,11 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   prompt.
 - `dreamteam -p "текст" [--output-format text|json|stream-json] [--verbose] [--timeout S]
   [--no-auto-reply]` runs print mode.
-- `-c/--continue` attaches to the most recently active session.
-- `-r/--resume [ID]` opens the picker, or attaches to ID.
+- `-c/--continue` attaches to the most recently active session. When that one was made by an earlier version
+  (SPEC §17.2) it never passes over it for an older one: `continue_earlier` under the welcome box, nothing attached,
+  a prompt given with it kept in the input line (`-p -c`: exit 1, §2).
+- `-r/--resume [ID]` opens the picker, or attaches to ID. `-r ID` of a session made by an earlier version: its
+  message under the welcome box, nothing attached (§4.5; `-p -r ID`: exit 1 with the English message, §2).
 - Shared options: `--home`, `--lang ru|en`, `--model PROFILE`, `--agents N`, `--team "ROLE[*N],…" | NAME`,
   `--max-agents N`, `--budget USD`, `--title T`, `--workspace DIR`, `--copy-from DIR|ZIP`, `--host`, `--port`.
   `--team` is the starting team of the session this run creates (`starting_roles`; `start_agents` = its size unless
@@ -749,7 +796,8 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   rule, its refusals and the note on stderr); `--agents` cannot go with a saved team. `-p` with `-c` or `-r ID` checks
   only its syntax.
 - `--skill REF|PATH|URL` (repeatable) is a skill of the session this run creates (with `-c` / `-r`: attached to the
-  session resumed first, also when it runs); `/skills add` without a session adds to the same list.
+  session resumed first, also when it runs; a session refused as one of an earlier version ends that attempt, and
+  the skills go to a session `/new` creates, §4.5); `/skills add` without a session adds to the same list.
 - `--workspace DIR` is the folder of the session this run creates (the TUI's first new session, or the
   session of `-p`): `~` and relative paths are resolved against the current directory; an empty or missing
   folder becomes its workspace, a folder with files (the user's project) is adopted (SPEC §17.2). With `-c` /

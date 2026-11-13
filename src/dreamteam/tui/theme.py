@@ -88,6 +88,7 @@ SYMBOLS: dict[str, str] = {
     "job": "⚙",        # background job of an agent
     "folder": "▸",
     "current": "▶",
+    "sub": "●",        # a direct subtask on its parent's board line (its colour = its status)
 }
 
 SYMBOLS_ASCII: dict[str, str] = {
@@ -123,6 +124,7 @@ SYMBOLS_ASCII: dict[str, str] = {
     "job": "&",
     "folder": ">",
     "current": ">",
+    "sub": "o",
 }
 
 SPINNER_FRAMES_UNICODE = ("·", "✢", "✳", "✶", "✻", "✽")

@@ -9,13 +9,14 @@ import asyncio
 import copy
 import hashlib
 import json
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Callable
 
 import pytest
 
-from dreamteam import cli, prompts
+from dreamteam import __version__, cli, prompts
 from dreamteam import swarm as swarm_module
 from dreamteam import tools as tools_module
 from dreamteam.agent import AgentRuntime
@@ -40,6 +41,9 @@ RELEASED = {
     # clarify mode: send_message gains pause_swarm (revision 3's array otherwise unchanged)
     4: {"en": "f20f4105ea7b5e56617f08a51a3bfae09f9c3162ac6eaa2293371403f9d21e0b",
         "ru": "d44f7431d93b9c59e3b514eac9faec16f6e31b001e5aeaa732ac2642cb55ebb9"},
+    # crew tasks: task_create and task_update gain crew and directions (revision 4's array otherwise unchanged)
+    5: {"en": "06d7f3ebc6d94f9e450256633804a57619bae3859d9e4aa9c21a50b7da9d2187",
+        "ru": "d0a9bbe1dc690b54ac30474843e8b53ec8c321997ef11afecfbbbfaf194656fa"},
 }
 # the digest tests/test_tools.py pinned for the tool set agents had before tool sets were frozen
 BASELINE_SORTED = "e3c5cbc798e3aafddcd44284bb515d9655e68b953e6ca707f67063dcad7cda85"
@@ -180,6 +184,20 @@ def test_released_tool_sets_never_change():
             assert sha(dumps(frozen.snapshot(rev, lang))) == digests[lang], (rev, lang)
 
 
+def test_the_oldest_revision_opened_is_a_fixed_5(later_revision):
+    """OLDEST_OPEN_REVISION is a literal: a later revision (here 99) still opens sessions of revision 5."""
+    assert frozen.TOOLSET_REVISION == LATER
+    assert frozen.OLDEST_OPEN_REVISION == 5 and 5 in frozen.revisions()
+
+
+def test_valid_rejects_unusable_records():
+    assert frozen.valid(frozen.record(1, "en", frozen.snapshot(1, "en")))
+    assert frozen.valid(frozen.current_record("ru")) and frozen.valid({"rev": 5, "tools": []})
+    for bad in ({"rev": "1", "tools": []}, {"rev": True, "tools": []}, {"rev": 1, "tools": [{"name": "board"}]},
+                {"rev": 1, "tools": "board"}, ["board"], None, "(not JSON)"):
+        assert not frozen.valid(bad), bad
+
+
 def test_the_code_builds_the_current_revision():
     for lang in LANGS:
         assert dumps(frozen.current(lang)) == dumps(frozen.snapshot(frozen.TOOLSET_REVISION, lang)), (
@@ -265,21 +283,18 @@ async def test_new_agent_freezes_its_tools_before_the_first_call(tmp_path):
         await shutdown(swarm)
 
 
-async def test_agent_created_before_frozen_tool_sets_keeps_the_baseline(tmp_path, later_revision):
-    swarm, rec = make_swarm(tmp_path, lambda m, t: call("wait"))
+async def test_a_runtime_without_a_record_gets_the_current_revision(tmp_path, later_revision):
+    """AgentRuntime itself does not check revisions (the session does): an agent without a record gets the current
+    revision, written at once, whether or not it has a history."""
+    swarm, _ = make_swarm(tmp_path, lambda m, t: call("wait"))
     await swarm.start(run_agents=False)
-    agent = swarm.members()[0]["name"]
-    seed_history(swarm, agent, pairs=2, size=50)  # it ran before tool sets were frozen: no record
-    assert tool_rows(swarm) == 0
-    await swarm.stop()
-    await swarm.start()
     try:
-        swarm.notify(agent, "n_restart")
-        await run_until(lambda: len(rec.tools(agent)) >= 1)
-        for lang_tools in rec.tools(agent):
-            assert dumps(lang_tools) == dumps(frozen.snapshot(1, "en"))
-        assert frozen.read(swarm.db, agent)["rev"] == 1
-        assert swarm.runtimes[agent].tools_rev == 1
+        agent = swarm.members()[0]["name"]
+        seed_history(swarm, agent, pairs=2, size=50)
+        assert tool_rows(swarm) == 0
+        runtime = AgentRuntime(swarm, agent)
+        assert runtime.tools_rev == LATER and "probe" in runtime.tool_names
+        assert frozen.read(swarm.db, agent) == frozen.current_record("en")
     finally:
         await shutdown(swarm)
 
@@ -353,8 +368,8 @@ async def test_arguments_outside_the_frozen_schema_are_ignored(tmp_path):
 
 # ------------------------------------------------------------------------------ the compaction upgrade
 async def _upgrade_run(tmp_path: Path, tool: str = "probe") -> tuple[Swarm, Recorder, str]:
-    """A baseline agent (history, no record) compacts while the code builds a later revision; after the
-    compaction it calls `tool` (a tool of that revision), then `wait`."""
+    """An agent frozen at revision 1 compacts while the code builds a later revision; after the compaction it calls
+    `tool` (a tool of that revision), then `wait`."""
 
     def policy(messages, tools):
         if is_compaction_request(messages):
@@ -367,6 +382,7 @@ async def _upgrade_run(tmp_path: Path, tool: str = "probe") -> tuple[Swarm, Reco
     swarm, rec = make_swarm(tmp_path, policy, agents={"context_tokens": 20000})
     await swarm.start(run_agents=False)
     agent = swarm.members()[0]["name"]
+    frozen.write(swarm.db, agent, frozen.record(1, "en", frozen.snapshot(1, "en")))
     seed_history(swarm, agent, pairs=20, size=4000)
     await swarm.stop()
     await swarm.start()
@@ -405,15 +421,16 @@ async def test_compaction_moves_an_agent_to_the_current_tool_set(tmp_path, later
 
 
 async def test_agents_of_revision_1_keep_it_when_later_revisions_are_released(tmp_path):
-    """Revisions 2 (background jobs), 3 (skill_propose) and 4 (send_message pause_swarm) change nothing for an agent
-    that already ran: one with a history but no record (it ran before tool sets were frozen) and one frozen at
-    revision 1 send revision 1 byte for byte, run after run; only a new agent gets the current revision."""
+    """Revisions 2 (background jobs), 3 (skill_propose), 4 (send_message pause_swarm) and 5 (crew tasks) change
+    nothing for an agent that already ran: one frozen at revision 1 with a history and one frozen at revision 1
+    without one send revision 1 byte for byte, run after run; only a new agent gets the current revision."""
     swarm, rec = make_swarm(tmp_path, lambda m, t: call("wait"), swarm={"start_agents": 3})
     await swarm.start(run_agents=False)
     names = [m["name"] for m in swarm.members()]
     before, kept, new = names
     seed_history(swarm, before, pairs=1, size=10)
-    frozen.write(swarm.db, kept, frozen.record(1, "en", frozen.snapshot(1, "en")))
+    for name in (before, kept):
+        frozen.write(swarm.db, name, frozen.record(1, "en", frozen.snapshot(1, "en")))
     await swarm.stop()
     try:
         counts: dict[str, int] = {}
@@ -435,9 +452,9 @@ async def test_agents_of_revision_1_keep_it_when_later_revisions_are_released(tm
 
 
 async def test_an_agent_of_revision_2_keeps_it_and_compacts_into_the_current_revision(tmp_path):
-    """Revision 3 adds only skill_propose, at the end, and revision 4 only a parameter: an agent frozen at revision 2
-    sends revision 2 byte for byte until its compaction, which moves it to the current revision and names the new
-    tool."""
+    """Revision 3 adds only skill_propose, at the end, and revisions 4 and 5 only parameters: an agent frozen at
+    revision 2 sends revision 2 byte for byte until its compaction, which moves it to the current revision and names
+    the new tool."""
 
     def policy(messages, tools):
         if is_compaction_request(messages):
@@ -487,10 +504,42 @@ def test_revision_4_only_adds_pause_swarm():
     assert _send_message(4, "en")["parameters"] == _send_message(4, "ru")["parameters"]
 
 
+def _tool(rev: int, lang: str, name: str) -> dict:
+    return next(t for t in frozen.snapshot(rev, lang) if t["name"] == name)
+
+
+def test_revision_5_only_adds_crew_and_directions():
+    """Revision 5 (crew tasks) changes two tools: task_create and task_update gain the optional integer crew and
+    the optional array of strings directions, last, and a last sentence of their descriptions; every other tool,
+    the names and their order are revision 4's (task_claim included)."""
+    for lang in LANGS:
+        r4, r5 = frozen.snapshot(4, lang), frozen.snapshot(5, lang)
+        assert frozen.names(r4) == frozen.names(r5)
+        changed = [a["name"] for a, b in zip(r4, r5) if dumps(a) != dumps(b)]
+        assert changed == ["task_create", "task_update"], (lang, changed)
+        for name in changed:
+            old, new = _tool(4, lang, name), _tool(5, lang, name)
+            props, old_props = new["parameters"]["properties"], old["parameters"]["properties"]
+            assert list(props) == [*old_props, "crew", "directions"], (lang, name)
+            assert {k: v for k, v in props.items() if k not in ("crew", "directions")} == old_props
+            assert set(props["crew"]) == {"type", "description"} and props["crew"]["type"] == "integer"
+            assert set(props["directions"]) == {"type", "items", "description"}
+            assert props["directions"]["type"] == "array" and props["directions"]["items"] == {"type": "string"}
+            assert new["parameters"]["required"] == old["parameters"]["required"]
+            assert len(new["description"]) <= 2000 and new["description"].startswith(old["description"])
+            assert "crew" in new["description"][len(old["description"]):]
+            assert "directions" in new["description"][len(old["description"]):]
+    # one shared English property text in both arrays
+    for name in ("task_create", "task_update"):
+        assert _tool(5, "en", name)["parameters"] == _tool(5, "ru", name)["parameters"]
+        assert _tool(5, "en", name)["description"] != _tool(5, "ru", name)["description"]
+
+
 async def test_an_agent_of_revision_3_ignores_pause_swarm_until_it_compacts(tmp_path):
     """An agent frozen at revision 3 has no pause_swarm: call_tool strips it (the existing note names the r3 usage),
     so its question is an ordinary message and the swarm keeps working, even in clarify mode. An agent of revision 4
-    pauses the swarm. A compaction moves the r3 agent to revision 4 with no tools_added line (no new tool)."""
+    pauses the swarm. A compaction moves the r3 agent to the current revision with no tools_added line (revisions 4
+    and 5 add no tool)."""
 
     def policy(messages, tools):
         if is_compaction_request(messages):
@@ -518,7 +567,8 @@ async def test_an_agent_of_revision_3_ignores_pause_swarm_until_it_compacts(tmp_
         assert not swarm.paused
     finally:
         await swarm.stop()
-    # the r3 agent compacts: it moves to revision 4, and no tool is named as new (pause_swarm is a parameter)
+    # the r3 agent compacts: it moves to the current revision, and no tool is named as new (pause_swarm, crew and
+    # directions are parameters)
     seed_history(swarm, old, pairs=20, size=4000)
     await swarm.start()
     try:
@@ -526,9 +576,11 @@ async def test_an_agent_of_revision_3_ignores_pause_swarm_until_it_compacts(tmp_
         await run_until(lambda: len(rec.calls.get(old, [])) >= 2)
         (compaction, old_tools), (after, new_tools) = rec.calls[old][:2]
         assert is_compaction_request(compaction) and dumps(old_tools) == dumps(frozen.snapshot(3, "en"))
-        assert dumps(new_tools) == dumps(frozen.snapshot(4, "en")) and frozen.read(swarm.db, old)["rev"] == 4
+        rev = frozen.TOOLSET_REVISION
+        assert dumps(new_tools) == dumps(frozen.snapshot(rev, "en")) and frozen.read(swarm.db, old)["rev"] == rev
         assert prompts.t("en", "tools_added", tools="x").split("x")[0] not in after[0]["content"]
         assert "pause_swarm" in swarm.runtimes[old].tool_parameters("send_message")["properties"]
+        assert "crew" in swarm.runtimes[old].tool_parameters("task_update")["properties"]
     finally:
         await shutdown(swarm)
 
@@ -555,6 +607,7 @@ async def test_the_upgrade_is_atomic_with_the_history_rewrite(tmp_path, later_re
     await swarm.start(run_agents=False)
     try:
         agent = swarm.members()[0]["name"]
+        frozen.write(swarm.db, agent, frozen.record(1, "en", frozen.snapshot(1, "en")))
         seed_history(swarm, agent, pairs=2, size=50)
         runtime = AgentRuntime(swarm, agent)
         runtime._load_history()
@@ -625,6 +678,9 @@ async def test_provider_requests_are_byte_identical_across_restarts(tmp_path):
 
 
 async def test_view_only_access_writes_no_tool_record(tmp_path, capsys):
+    """A member with a history and no tool-set record ran under an earlier version (the baseline revision): the
+    project is not opened again, neither to view it nor by `dreamteam status`, and nothing is written into its data
+    folder (no logs folder, no -wal or -shm next to the database)."""
     project = tmp_path / "swarm"
     assert cli.main(["init", str(project), "--lang", "en", "--name", "View only"]) == 0
     text = (project / "dreamteam.toml").read_text(encoding="utf-8")
@@ -635,27 +691,29 @@ async def test_view_only_access_writes_no_tool_record(tmp_path, capsys):
     await swarm.start(run_agents=False)  # members, but no runtime
     agent = swarm.members()[0]["name"]
     seed_history(swarm, agent, pairs=1, size=10)
-    span = swarm.tracer.begin(agent, "x").llm_start(1, tools_rev=1)
+    assert tool_rows(swarm) == 0
     await swarm.stop()
     swarm.close()
-    view = Swarm(project)
-    try:
-        for tool in ("swarm_status", "agents", "board"):
-            text, is_error = await call_tool(ToolContext(view, USER), tool, {})
-            assert not is_error, text
-        assert dumps(view.tracer.span_context(span.id)["tools"]) == dumps(frozen.snapshot(1, "en"))
-        assert frozen.member_tool_names(view, view.member(agent)) == frozenset(frozen.names(frozen.snapshot(1, "en")))
-        assert tool_rows(view) == 0
-    finally:
-        view.close()
+    data = Config.load(project).data_dir
+    shutil.rmtree(data / "logs")
+
+    def snapshot() -> dict[str, tuple[int, int]]:
+        return {p.relative_to(data).as_posix(): (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in sorted(data.rglob("*"))}
+
+    before = snapshot()
+    assert "swarm.db" in before and "swarm.db-wal" not in before and "swarm.db-shm" not in before
+    message = swarm_module.PROJECT_EARLIER_VERSION_TEXT.format(dir=Config.load(project).project_dir,
+                                                               version=__version__)
+    with pytest.raises(swarm_module.EarlierVersionError) as refused:
+        Swarm(project)
+    assert str(refused.value) == message and isinstance(refused.value, ValueError)
+    assert snapshot() == before
     capsys.readouterr()
-    assert await asyncio.to_thread(cli.main, ["status", str(project)]) == 0  # it runs its own event loop
-    assert "View only" in capsys.readouterr().out
-    view = Swarm(project)
-    try:
-        assert tool_rows(view) == 0
-    finally:
-        view.close()
+    assert await asyncio.to_thread(cli.main, ["status", str(project)]) == 1  # (status runs its own event loop)
+    out = capsys.readouterr()
+    assert out.err.strip() == message and "View only" not in out.out
+    assert snapshot() == before and not (data / "logs").exists()
 
 
 async def test_has_tool_and_member_tool_names(tmp_path, later_revision):
@@ -663,6 +721,7 @@ async def test_has_tool_and_member_tool_names(tmp_path, later_revision):
     await swarm.start(run_agents=False)
     try:
         old, new, unstarted = [m["name"] for m in swarm.members()]
+        frozen.write(swarm.db, old, frozen.record(1, "en", frozen.snapshot(1, "en")))
         seed_history(swarm, old, pairs=1, size=10)
         old_rt, new_rt = AgentRuntime(swarm, old), AgentRuntime(swarm, new)
         assert (old_rt.tools_rev, new_rt.tools_rev) == (1, LATER)
@@ -687,7 +746,7 @@ async def test_has_tool_and_member_tool_names(tmp_path, later_revision):
         rows = tool_rows(swarm)
         assert "probe" in names(swarm, swarm.member(unstarted))  # what its first start will freeze...
         seed_history(swarm, unstarted, pairs=1, size=10)
-        assert "probe" not in names(swarm, swarm.member(unstarted))
+        assert "probe" in names(swarm, swarm.member(unstarted))  # a history without a record: still the current set
         assert tool_rows(swarm) == rows  # ...and nothing is written
         assert "wait_for_events" in names(swarm, swarm.member("Claude Code"))
         assert names(swarm, {"name": USER, "kind": "user"}) == {s.name for s in tools_module.tools_for("user")}

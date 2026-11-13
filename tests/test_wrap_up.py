@@ -427,7 +427,7 @@ def test_read_stats_defaults_without_a_readable_database(tmp_path, monkeypatch):
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
-        "jobs": {"running": 0}, "question": None,
+        "jobs": {"running": 0}, "question": None, "earlier_version": False,
     }
     assert read_stats(tmp_path / "nope.db") == defaults
     garbage = tmp_path / "garbage.db"

@@ -1,6 +1,6 @@
 [project]
 name = "dreamteam"
-version = "0.1.1"
+version = "0.2.0"
 description = "A self-organizing swarm of AI agents with no leader: a shared task board, git workspace, messages, triggers, agents that write their own MCP tools, and the swarm itself as an MCP server"
 readme = "README.md"
 requires-python = ">=3.11"

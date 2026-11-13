@@ -344,6 +344,44 @@ async def test_execute_checks_and_dispatch():
     assert "Not a number: lots" in swarm_hub.text
 
 
+async def test_task_lists_the_subtasks_from_the_snapshot():
+    """/task N prints the task (GET /api/tasks/N) with the crew line and the direct subtasks of the snapshot."""
+    crew = {"id": 3, "title": "Calculator", "status": "in_progress", "assignee": ANNA, "crew": 3,
+            "crew_working": [ANNA]}
+    snapshot = {"tasks": [crew, {"id": 5, "title": "Input", "status": "todo", "parent_id": 3},
+                          {"id": 4, "title": "Math", "status": "in_progress", "parent_id": 3, "assignee": BORIS},
+                          {"id": 6, "title": "Other", "status": "todo"}]}
+    app = FakeApp(attached=True)
+    asked: list[tuple] = []
+
+    async def task(sid, task_id):
+        asked.append((sid, task_id))
+        return {"task": {**crew, "crew_working": []}, "discussion": []}
+
+    async def refresh_state():
+        app.calls.append(("state",))
+        return snapshot
+
+    app.client = SimpleNamespace(mode="launcher", task=task)
+    app.refresh_state = refresh_state
+    await execute(app, "/task 3")
+    assert asked == [("001-x", 3)] and ("state",) in app.calls
+    out = app.out[-1]
+    assert "Crew task: up to 3 members, 1 working now" in out and "Directions (2)" in out
+    assert out.index("#4 Math — Борис") < out.index("#5 Input") and "#6" not in out
+    await execute(app, "/task abc")
+    assert "Usage: /task N" in app.text and len(asked) == 1
+
+    async def failing_state():  # the snapshot fails after the task came: the task prints without its subtasks
+        raise HubError(500, "GET /api/state: 500")
+
+    app.refresh_state = failing_state
+    await execute(app, "/task 3")
+    out = app.out[-1]
+    assert len(asked) == 2 and "Calculator" in out and "Directions" not in out and "Crew task:" not in out
+    assert "/api/state" not in app.text
+
+
 def test_unknown_event_types_do_not_break_rendering():
     # the app prints render.event() for every bus event: odd payloads must render or be skipped
     ctx = render.RenderContext(lang="en")

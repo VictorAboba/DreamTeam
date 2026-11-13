@@ -34,8 +34,11 @@ from ..db import dumps
 log = logging.getLogger(__name__)
 
 # what schemas_for("llm", ...) builds; bump it with EVERY LLM schema change (2: background jobs; 3: skill_propose;
-# 4: send_message pause_swarm)
-TOOLSET_REVISION = 4
+# 4: send_message pause_swarm; 5: crew tasks, task_create and task_update gain crew and directions)
+TOOLSET_REVISION = 5
+# a session with a member recorded below it (or an agent with a history and no record) was made by an earlier
+# version and is not opened (docs/SPEC.md §17.2); a fixed literal, never derived from TOOLSET_REVISION
+OLDEST_OPEN_REVISION = 5
 BASELINE_REVISION = 1  # the array agents created before tool sets were frozen last sent (sorted digest e3c5cbc7…)
 KV_PREFIX = "tools:"
 LANGUAGES = ("en", "ru")
@@ -88,15 +91,9 @@ def current_record(language: str | None) -> dict:
     return record(TOOLSET_REVISION, language, current(language))
 
 
-def initial_record(language: str | None, has_history: bool) -> dict:
-    """The record of an agent that has none yet. An agent with a history ran before tool sets were frozen, so it
-    last sent the baseline revision; a new one gets the current revision."""
-    if has_history:
-        return record(BASELINE_REVISION, language, snapshot(BASELINE_REVISION, language))
-    return current_record(language)
-
-
-def _valid(rec: Any) -> bool:
+def valid(rec: Any) -> bool:
+    """A usable record: a dict with an integer (non-bool) `rev` and `tools` a list of dicts, each with a str `name`
+    and a dict `parameters`."""
     if not isinstance(rec, dict) or not isinstance(rec.get("rev"), int) or isinstance(rec.get("rev"), bool):
         return False
     tools = rec.get("tools")
@@ -113,7 +110,7 @@ def read(db: Any, name: str) -> dict | None:
         rec = "(not JSON)"
     if rec is None:
         return None
-    if _valid(rec):
+    if valid(rec):
         return rec
     log.warning("the stored tool set of %s is invalid and is ignored", name)
     return None
@@ -155,9 +152,8 @@ def member_tool_names(swarm: Any, member: dict) -> frozenset[str]:
     if kind != "llm":
         return frozenset(spec.name for spec in tools_for(kind))
     rec = read(swarm.db, name)
-    if rec is None:
-        has_history = swarm.db.scalar("SELECT 1 FROM history WHERE agent = ? LIMIT 1", (name,))
-        rec = initial_record(member.get("language") or swarm.language, bool(has_history))
+    if rec is None:  # a session this version opens has no agent with a history and no record (§17.2)
+        rec = current_record(member.get("language") or swarm.language)
     return frozenset(names(rec["tools"]))
 
 

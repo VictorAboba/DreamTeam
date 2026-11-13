@@ -382,6 +382,43 @@ async def test_stream_reports_a_deleted_session_as_rejected(conn: Connection):
         await feed.close()
 
 
+@pytest.mark.parametrize("reason", ["made by an earlier version", "internal error"])
+async def test_stream_ends_when_the_hub_says_the_session_is_of_an_earlier_version(reason):
+    """The hub accepts the socket of a session made by an earlier version, then closes it 1011 with the reason
+    (docs/SPEC.md §17.2): the stream yields "earlier" and ends; another 1011 is a loss, reconnected as before."""
+    from websockets.asyncio.server import serve
+
+    from dreamteam import launcher
+    from dreamteam.tui import client as client_module
+
+    assert client_module.EARLIER_REASON == launcher.EARLIER_VERSION_REASON
+    opened: list[str] = []
+
+    async def handler(ws) -> None:
+        opened.append(ws.request.path)
+        await ws.close(1011, reason)
+
+    async with serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = HubClient(f"http://127.0.0.1:{port}", timeout=5)
+        stream = client.stream("old")
+        try:
+            seen = [await asyncio.wait_for(stream.__anext__(), 10) for _ in range(2)]
+            assert seen[0] == {"type": "_connection", "data": {"state": "connected"}}
+            if reason == launcher.EARLIER_VERSION_REASON:
+                assert seen[1] == {"type": "_connection", "data": {"state": "earlier"}}
+                with pytest.raises(StopAsyncIteration):
+                    await asyncio.wait_for(stream.__anext__(), 5)
+                assert opened == ["/s/old/ws"]   # no reconnect
+            else:
+                assert seen[1] == {"type": "_connection", "data": {"state": "lost"}}
+                again = await asyncio.wait_for(stream.__anext__(), 10)
+                assert again == {"type": "_connection", "data": {"state": "connected"}} and len(opened) == 2
+        finally:
+            await stream.aclose()
+            await client.aclose()
+
+
 async def test_unreachable_hub_is_a_distinct_error():
     from dreamteam.tui.client import HubUnreachable
 

@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from dreamteam import hubauth, mcp_library, transfer
+from dreamteam import __version__, hubauth, mcp_library, transfer
 from dreamteam import sessions as sessions_module
 from dreamteam import settings as st
 from dreamteam.db import Database, known_columns
@@ -27,6 +27,7 @@ from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.mcp_forge import snapshot_digest
 from dreamteam.sessions import MOVE_JOURNAL, SessionManager, session_uid
 from dreamteam.skills import Library
+from dreamteam.tools import frozen
 from dreamteam.tools.frozen import TOOLSET_REVISION
 from dreamteam.transfer import (MANIFEST, SecretFound, Secrets, TransferError, apply_import, export_home,
                                 known_secrets, merge_external, merge_settings, parse_include, plan_import,
@@ -95,6 +96,7 @@ def _fill_db(home: Path, sid: str, text: str = "hello") -> None:
         db.execute("INSERT INTO events(ts, type, actor, data) VALUES (?, 'session.started', 'user', '{}')", (1.0,))
         db.execute("INSERT INTO events(ts, type, actor, data) VALUES (?, 'message', 'alice', '{}')", (2.0,))
         db.execute("INSERT INTO history(agent, seq, msg) VALUES ('alice', 1, ?)", (json.dumps({"text": text}),))
+        frozen.write(db, "alice", frozen.current_record("en"))  # an agent of this version (no earlier one)
     finally:
         db.close()
 
@@ -306,6 +308,7 @@ async def test_rows_still_in_the_wal_of_an_open_database_are_exported(tmp_path):
     try:
         db.execute("PRAGMA wal_autocheckpoint=0")
         db.execute("INSERT INTO history(agent, seq, msg) VALUES ('bob', 1, 'still in the wal')")
+        frozen.write(db, "bob", frozen.current_record("en"))
         assert (home / "sessions" / sid / ".dreamteam" / "swarm.db-wal").stat().st_size > 0
         report = export_home(home, tmp_path / "out", include=["sessions"], running={sid})
     finally:
@@ -1269,7 +1272,8 @@ async def test_a_session_of_a_newer_dreamteam_is_refused_and_the_others_are_impo
     dest = tmp_path / "usb"
     export_home(home_a, dest, include=["sessions"])
     for sid, sql in ((column, "ALTER TABLE agents ADD COLUMN future TEXT"),
-                     (tools, "INSERT INTO kv(key, value) VALUES ('tools:alice', '{\"rev\": 99, \"tools\": []}')"),
+                     (tools, "INSERT OR REPLACE INTO kv(key, value) VALUES ('tools:alice', "
+                             "'{\"rev\": 99, \"tools\": []}')"),
                      (changed, "INSERT INTO kv(key, value) VALUES ('x', 'y')")):
         conn = sqlite3.connect(dest / "sessions" / sid / ".dreamteam" / "swarm.db")
         conn.execute(sql)
@@ -1288,6 +1292,47 @@ async def test_a_session_of_a_newer_dreamteam_is_refused_and_the_others_are_impo
                                  ("sessions", changed): "refused", ("sessions", fine): "added"}
     assert result.exit_code == 1 and sorted(os.listdir(home_b / "sessions")) == [fine]
     assert f"sessions  {column}: refused (it was made by a newer DreamTeam" in render_import_result(result)
+    await manager.shutdown()
+
+
+async def test_a_session_of_an_earlier_dreamteam_is_exported_and_its_import_is_refused_last(tmp_path):
+    """docs/SPEC.md §17.2, §20.4: the export copies its database without opening the session; the import refuses
+    it before writing, and the earlier-version reason is checked last (a newer column says "newer" first)."""
+    home_a = _home_named(tmp_path, "a", _raw())
+    manager_a = _manager(home_a)
+    earlier = await _session(manager_a, "Earlier")
+    both = await _session(manager_a, "Both")
+    fine = await _session(manager_a, "Fine")
+    await manager_a.shutdown()
+    for sid in (earlier, both, fine):
+        _fill_db(home_a, sid)
+    for sid in (earlier, both):   # the member's record of tool set 4: made by an earlier version
+        db = _db(home_a, sid)
+        try:
+            frozen.write(db, "alice", frozen.record(4, "en", frozen.snapshot(4, "en")))
+        finally:
+            db.close()
+    source = _paths(home_a / "sessions" / earlier), _all_bytes(home_a / "sessions" / earlier)
+    dest = tmp_path / "usb"
+    export_home(home_a, dest, include=["sessions"])
+    assert (_paths(home_a / "sessions" / earlier), _all_bytes(home_a / "sessions" / earlier)) == source
+    assert {e["id"] for e in _manifest(dest)["sessions"]} == {earlier, both, fine}
+    conn = sqlite3.connect(dest / "sessions" / both / ".dreamteam" / "swarm.db")
+    try:
+        conn.execute("ALTER TABLE agents ADD COLUMN future TEXT")
+        conn.commit()
+    finally:
+        conn.close()
+    _set_db_sha(dest, both)
+    home_b = _home_named(tmp_path, "b", _raw_b())
+    manager, plan, result = await _import(home_b, dest)
+    reasons = {i.name: i.reason for i in plan.items}
+    assert reasons[earlier] == ("it was made by an earlier version of DreamTeam and cannot be opened by this one "
+                                f"({__version__}); import it with the version that made it")
+    assert reasons[both].startswith("it was made by a newer DreamTeam (its database has agents.future)")
+    assert _statuses(result) == {("sessions", earlier): "refused", ("sessions", both): "refused",
+                                 ("sessions", fine): "added"}
+    assert sorted(os.listdir(home_b / "sessions")) == [fine]
     await manager.shutdown()
 
 

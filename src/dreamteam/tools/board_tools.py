@@ -8,7 +8,7 @@ from .. import prompts
 from ..board import MAX_POST, UNSET
 from ..models import PRIORITIES, USER, Status, Task, ToolError
 from . import ToolContext, tool
-from .fmt import goal_line, post_line, task_detail, task_line, trim
+from .fmt import crew_line, goal_line, post_line, subtask_line, task_detail, task_line, trim
 
 _STATUS_DOC = "todo | in_progress | waiting | review | done | failed | cancelled"
 
@@ -70,13 +70,49 @@ async def board(ctx: ToolContext, args: dict[str, Any]) -> str:
         lines.append("No matching tasks.")
         return "\n".join(lines)
     with_goal = len(tasks) <= BOARD_GOALS_UP_TO
-    lines.extend(task_line(t, with_goal=with_goal) for t in tasks[:BOARD_MAX_TASKS])
+    lines.extend(task_line(t, with_goal=with_goal, indent="  " * depth + "↳ " if depth else "")
+                 for t, depth in _nested(tasks)[:BOARD_MAX_TASKS])
     if len(tasks) > BOARD_MAX_TASKS:
         lines.append(f"... and {len(tasks) - BOARD_MAX_TASKS} more tasks: narrow the list with status, "
                      "assignee or tag.")
     if not with_goal:
         lines.append(f"({len(tasks)} tasks: goals are omitted; task_get shows a task in full.)")
     return "\n".join(lines)
+
+
+def _nested(tasks: list[Task]) -> list[tuple[Task, int]]:
+    """The tasks in their order, each subtask moved right under its parent when the parent is listed too (docs/SPEC.md
+    §4.2 "Texts for agents"): (task, depth below the top level)."""
+    listed = {t.id for t in tasks}
+    children: dict[int, list[Task]] = {}
+    for t in tasks:
+        if t.parent_id is not None and t.parent_id in listed:
+            children.setdefault(t.parent_id, []).append(t)
+    out: list[tuple[Task, int]] = []
+    seen: set[int] = set()
+    # the top level first; a parent loop (the board never writes one) would leave tasks over: they start a walk too
+    for root in [t for t in tasks if t.parent_id not in listed] + tasks:
+        stack = [(root, 0)]
+        while stack:
+            task, depth = stack.pop()
+            if task.id in seen:
+                continue
+            seen.add(task.id)
+            out.append((task, depth))
+            stack.extend((c, depth + 1) for c in reversed(children.get(task.id, [])))
+    return out
+
+
+def _with_notes(text: str, notes: list[str]) -> str:
+    """The sentences the board wrote for the result of the actor's call (each starts with a space), on a line of
+    their own after `text`."""
+    joined = "".join(notes).lstrip()
+    return f"{text}\n{joined}" if joined else text
+
+
+def _directions_line(subtasks: list[Task]) -> str:
+    """Directions: #15 "parser", #16 "cli"."""
+    return "Directions: " + ", ".join(f'#{t.id} "{trim(t.title, 80)}"' for t in subtasks) + "."
 
 
 @tool(
@@ -97,11 +133,12 @@ async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
         text += ("\nYou hold it while it is blocked: if its result can be produced without some of "
                  f"{', '.join(f'#{d}' for d in task.blocked_by)}, remove those with task_update (depends_on = the "
                  "ones still needed) and say why in its discussion.")
-    every = board_.list(include_closed=True)
-    subtasks = [t for t in every if t.parent_id == task.id]
+    subtasks = board_.subtasks_of(task.id)
     if subtasks:
-        text += "\nSubtasks: " + "; ".join(f"#{t.id} [{t.status}] {trim(t.title, 60)}" for t in subtasks)
-    needed_by = [t for t in every if task.id in t.depends_on and t.status in Status.OPEN]
+        text += "\nSubtasks:\n" + "\n".join(subtask_line(t) for t in subtasks)
+    if task.crew >= 2:
+        text += "\n" + crew_line(task, subtasks)
+    needed_by = [t for t in board_.list() if task.id in t.depends_on]
     if needed_by:
         text += "\nRequired by (open): " + ", ".join(f"#{t.id} [{t.status}]" for t in needed_by)
     posts = board_.discussion(task.id)[-5:]
@@ -116,13 +153,19 @@ async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
        "Optional: description, assignee (member name or 'me'; they are notified), reviewer, depends_on (task ids "
        "that must be done first), parent_id (for subtasks), priority (0 low, 1 normal, 2 high, 3 critical), tags. "
        "Check the board first so you do not duplicate a task. Write the description for a member who has none "
-       "of your context (inputs, file paths, interfaces). Leave assignee empty to let free members claim it.",
+       "of your context (inputs, file paths, interfaces). Leave assignee empty to let free members claim it. "
+       "A deliverable too big for one member whose detailed split is unclear: pass crew (how many members may "
+       "work on it at once, its owner included) and directions (its areas; the members who take them write the "
+       "details).",
     ru="Создать задачу на доске. Всегда указывай goal (цель): зачем нужна задача и что считается успехом. "
        "Необязательно: description, assignee (имя участника или 'me'; он получит уведомление), reviewer, "
        "depends_on (номера задач, которые должны быть выполнены раньше), parent_id (для подзадач), "
        "priority (0 низкий, 1 обычный, 2 высокий, 3 критичный), tags. Сначала проверь доску, чтобы не "
        "создать дубликат. Пиши description для участника без твоего контекста (входные данные, пути к файлам, "
-       "интерфейсы). Оставь assignee пустым, чтобы задачу взял свободный участник.",
+       "интерфейсы). Оставь assignee пустым, чтобы задачу взял свободный участник. Если результат слишком "
+       "велик для одного участника и его подробное деление заранее неясно, передай crew (сколько участников "
+       "могут работать над задачей одновременно, включая её владельца) и directions (её направления; "
+       "подробности напишут те, кто их возьмёт).",
     properties={
         "title": {"type": "string", "description": "Short imperative title (max 200 characters)"},
         "goal": {"type": "string", "description": "Why the task exists / success criterion"},
@@ -133,11 +176,19 @@ async def task_get(ctx: ToolContext, args: dict[str, Any]) -> str:
         "parent_id": {"type": "integer", "description": "Parent task id (makes this a subtask)"},
         "priority": _PRIORITY,
         "tags": _TAGS,
+        # toolset revision 5 (tools/frozen.py): crew tasks (docs/SPEC.md §4.2)
+        "crew": {"type": "integer", "description": "Crew task: how many members may work on it at once, its owner "
+                                                   "included (2..8); 0 = an ordinary task"},
+        "directions": {"type": "array", "items": {"type": "string"},
+                       "description": "With crew: its areas, one title per item; each becomes a draft subtask whose "
+                                      "taker writes its card"},
     },
     required=["title", "goal"],
 )
 async def task_create(ctx: ToolContext, args: dict[str, Any]) -> str:
-    task = ctx.swarm.board.create(
+    board_ = ctx.swarm.board
+    notes: list[str] = []
+    task = board_.create(
         ctx.actor,
         args["title"],
         goal=args["goal"],
@@ -148,14 +199,37 @@ async def task_create(ctx: ToolContext, args: dict[str, Any]) -> str:
         depends_on=args.get("depends_on") or None,
         priority=1 if args.get("priority") is None else args["priority"],
         tags=args.get("tags") or None,
+        # 0 and [] reach the board as they are: [] gets its directions error, unless no crew task is meant
+        crew=0 if args.get("crew") is None else args["crew"],
+        directions=_directions_arg(args, 0),
+        notes=notes,
     )
     text = f"Created task {task_line(task, with_goal=False)}"
+    directions = board_.subtasks_of(task.id) if task.crew >= 2 else []
+    if directions:
+        text += "\n" + _directions_line(directions)
+    text = _with_notes(text, notes)
     # members that got one message at once may each create a task for it (run 006: three alike tasks from one
     # message to all): the task stays, and its creator is shown the likely duplicates (not the user)
-    similar = [] if ctx.is_user else ctx.swarm.board.similar_open(task)
+    similar = [] if ctx.is_user else board_.similar_open(task)
     if similar:
         text += "\n" + prompts.t(ctx.lang, "similar_tasks", tasks=", ".join(_similar_item(t) for t in similar))
     return text
+
+
+def _directions_arg(args: dict[str, Any], crew_before: int) -> Any:
+    """`directions` as the board gets it: [] is no value when the call is about no crew task (`crew` below 2 or
+    absent, and `crew_before`, the task's crew before the call, below 2), as empty tags and depends_on are, so a
+    model that sends every optional field empty can still create or change an ordinary task; otherwise [] reaches
+    the board, which refuses it (docs/SPEC.md §4.2 "Marking", Values)."""
+    directions = args.get("directions")
+    if directions != [] or crew_before >= 2:
+        return directions
+    try:
+        crew = int(args.get("crew") or 0)
+    except (TypeError, ValueError):
+        return directions  # the board's crew error comes first
+    return None if crew < 2 else directions
 
 
 def _similar_item(task: Task) -> str:
@@ -175,12 +249,17 @@ def _similar_item(task: Task) -> str:
     audience=("llm", "external"),
 )
 async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
+    notes: list[str] = []
     before = ctx.swarm.board.get(args["task_id"])
-    task = ctx.swarm.board.claim(ctx.actor, args["task_id"])
+    task = ctx.swarm.board.claim(ctx.actor, args["task_id"], notes=notes)
     text = f"You now work on {task_line(task)}"
     if before.reviewer == ctx.actor and task.reviewer is None:
-        text += "\nYou were its reviewer; since you execute it now, another member will review it."
-    return text
+        if task.crew >= 2:  # its review is the check of the whole, by a member that did not execute it
+            text += ("\nYou were its reviewer; since you execute it now, you do not check it as a whole: another "
+                     "member does, if a check applies.")
+        else:
+            text += "\nYou were its reviewer; since you execute it now, another member will review it."
+    return _with_notes(text, notes)
 
 
 @tool(
@@ -188,12 +267,18 @@ async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
     en="Change a task (fields of tasks you created or are assigned to): title, goal, description, priority, tags, "
        "depends_on, parent_id (0 = none), reviewer, assignee ('me', a name, '' to unassign), status. Status: "
        "in_progress, waiting (blocked: explain in comment), todo (releases the task), failed, cancelled; "
-       "finish with task_complete, not with done/review. comment is posted to the task discussion.",
+       "finish with task_complete, not with done/review. comment is posted to the task discussion. A task you "
+       "work on that turns out too big for one member: pass crew and directions; you then own it and the first "
+       "direction is your own part; each direction is handed in on its own, and when all of them are finished you "
+       "write the task's result and complete it (crew 0 makes it an ordinary task again).",
     ru="Изменить задачу (поля задач, которые ты создал или которые на тебе): title, goal, description, priority, "
        "tags, depends_on, parent_id (0 — без родителя), reviewer, assignee ('me', имя, '' — снять исполнителя), "
        "status. Статусы: in_progress, waiting (заблокирована: объясни в comment), todo (отпустить задачу), "
        "failed, cancelled; завершай через task_complete, а не через done/review. comment публикуется в "
-       "обсуждении задачи.",
+       "обсуждении задачи. Если задача, над которой ты работаешь, оказалась слишком велика для одного "
+       "участника, передай crew и directions: ты станешь её владельцем, а первое направление — твоя часть; "
+       "каждое направление сдаётся отдельно, а когда все они завершены, ты пишешь итог задачи и завершаешь её "
+       "(crew 0 снова делает её обычной задачей).",
     properties={
         "task_id": _TASK_ID,
         "title": {"type": "string"},
@@ -207,6 +292,12 @@ async def task_claim(ctx: ToolContext, args: dict[str, Any]) -> str:
         "depends_on": _DEPENDS,
         "parent_id": {"type": "integer", "description": "Parent task id; 0 = no parent"},
         "comment": {"type": "string", "description": "Why you change it (posted to the discussion)"},
+        # toolset revision 5 (tools/frozen.py): crew tasks (docs/SPEC.md §4.2)
+        "crew": {"type": "integer", "description": "Creator or assignee: 2..8 makes it a crew task (members at once, "
+                                                   "its owner included); 0 makes it an ordinary task again"},
+        "directions": {"type": "array", "items": {"type": "string"},
+                       "description": "Directions to add to a crew task (titles); the first is your own part while "
+                                      "you have none"},
     },
     required=["task_id"],
 )
@@ -214,9 +305,14 @@ async def task_update(ctx: ToolContext, args: dict[str, Any]) -> str:
     board_ = ctx.swarm.board
     task_id = args["task_id"]
     changes: dict[str, Any] = {}
-    for key in ("title", "goal", "description", "status", "priority", "tags", "depends_on"):
+    old = board_.get(task_id)
+    # crew 0 and directions [] are values too (0 makes an ordinary task again; [] gets the board's error unless no
+    # crew task is meant)
+    for key in ("title", "goal", "description", "status", "priority", "tags", "depends_on", "crew"):
         if args.get(key) is not None:
             changes[key] = args[key]
+    if _directions_arg(args, old.crew) is not None:
+        changes["directions"] = args["directions"]
     for key in ("assignee", "reviewer"):
         if args.get(key) is not None:
             changes[key] = _member_arg(ctx, args[key])
@@ -229,12 +325,17 @@ async def task_update(ctx: ToolContext, args: dict[str, Any]) -> str:
         raise ToolError("Nothing to change: pass at least one field (or a comment).")
     if len(comment) > MAX_POST:
         raise ToolError(f"comment is too long ({len(comment)} chars, max {MAX_POST}).")
-    old = board_.get(task_id)
-    task = board_.update(ctx.actor, task_id, **changes) if changes else old
+    adding = "directions" in changes
+    had = {t.id for t in board_.subtasks_of(old.id)} if adding else set()
+    notes: list[str] = []
+    task = board_.update(ctx.actor, task_id, notes=notes, **changes) if changes else old
+    added = [t for t in board_.subtasks_of(task.id) if t.id not in had] if adding else []
     post = board_.post(ctx.actor, task.id, comment) if comment else None
-    diff = _diff(old, task)
+    diff = _diff(old, task) + ([f"{len(added)} direction(s) added"] if added else [])
     if diff:
         text = f"Updated task #{task.id}: {'; '.join(diff)}.\n{task_line(task, with_goal=False)}"
+        if added:
+            text += "\n" + _directions_line(added)
     elif post is None:
         text = f"No changes: task #{task.id} already has these values.\n{task_line(task, with_goal=False)}"
     else:
@@ -250,7 +351,7 @@ async def task_update(ctx: ToolContext, args: dict[str, Any]) -> str:
             text += f"\nThe discussion records that you removed {ids}."
         if post is None:
             text += " Say there why the task can do without them (task_comment)."
-    return text
+    return _with_notes(text, notes)
 
 
 def _diff(old: Task, new: Task) -> list[str]:
@@ -265,7 +366,7 @@ def _diff(old: Task, new: Task) -> list[str]:
         return str(value) if value not in (None, "") else "-"
 
     out = []
-    for field in ("status", "assignee", "reviewer", "priority", "tags", "depends_on", "parent_id"):
+    for field in ("status", "assignee", "reviewer", "priority", "tags", "depends_on", "parent_id", "crew"):
         before, after = getattr(old, field), getattr(new, field)
         if before != after:
             out.append(f"{field} {show(field, before)} → {show(field, after)}")
@@ -286,8 +387,9 @@ def _diff(old: Task, new: Task) -> list[str]:
     required=["task_id", "result"],
 )
 async def task_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
+    notes: list[str] = []
     before = ctx.swarm.board.get(args["task_id"])
-    task = ctx.swarm.board.complete(ctx.actor, args["task_id"], args["result"])
+    task = ctx.swarm.board.complete(ctx.actor, args["task_id"], args["result"], notes=notes)
     # the new files the member's last command left are committed now, when the task changes hands (a reviewer or the
     # user looks at HEAD; the reviewer's wake-up comes later): they would otherwise wait for its next command
     # (docs/SPEC.md §7 "Held new files"). After complete(): a refused call commits nothing
@@ -296,7 +398,7 @@ async def task_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
         await workspace.commit_held(ctx.actor, f"when {ctx.actor} completed task #{task.id}")
     # locks are not tied to tasks, so none is released here: the member is reminded of those it still holds
     held = workspace.held_locks_note(ctx.actor) if workspace is not None and not ctx.is_user else ""
-    return _completed(task, before) + (f" {held}" if held else "")
+    return _with_notes(_completed(task, before) + (f" {held}" if held else ""), notes)
 
 
 def _completed(task: Any, before: Any) -> str:
@@ -322,8 +424,11 @@ def _completed(task: Any, before: Any) -> str:
     required=["task_id", "approve"],
 )
 async def task_review(ctx: ToolContext, args: dict[str, Any]) -> str:
-    task = ctx.swarm.board.review(ctx.actor, args["task_id"], args["approve"], args.get("comment") or "")
-    return f"Task #{task.id} is now {task.status}" + (f" (assignee: {task.assignee})." if task.assignee else ".")
+    notes: list[str] = []
+    task = ctx.swarm.board.review(ctx.actor, args["task_id"], args["approve"], args.get("comment") or "",
+                                  notes=notes)
+    text = f"Task #{task.id} is now {task.status}" + (f" (assignee: {task.assignee})." if task.assignee else ".")
+    return _with_notes(text, notes)
 
 
 @tool(

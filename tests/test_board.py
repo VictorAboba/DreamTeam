@@ -45,6 +45,10 @@ def quiet_flags(swarm, name: str) -> list[tuple[str, bool]]:
     return [(r["kind"], bool(loads(r["data"], {}).get(QUIET_KEY))) for r in rows]
 
 
+def notes_of_kind(swarm, name: str, key: str) -> list[dict]:
+    return [kw for k, kw in swarm.notifications_for(name) if k == key]
+
+
 def clear(swarm) -> None:
     swarm.notified.clear()
 
@@ -140,8 +144,9 @@ def test_create_retired_assignee_rejected(swarm, board):
 def test_create_with_deps_and_parent(swarm, board):
     a = board.create(ANNA, "a")
     b = board.create(ANNA, "b")
-    child = board.create(ANNA, "c", depends_on=[a.id, "#2", a.id], parent_id=b.id, priority=0)
-    assert child.depends_on == [a.id, b.id] and child.parent_id == b.id
+    p = board.create(ANNA, "p")
+    child = board.create(ANNA, "c", depends_on=[a.id, "#2", a.id], parent_id=p.id, priority=0)
+    assert child.depends_on == [a.id, b.id] and child.parent_id == p.id
     assert child.blocked_by == [a.id, b.id]
     assert board.blockers(child) == [a.id, b.id]
 
@@ -814,8 +819,9 @@ def test_review_reject_posts_comment(swarm, board):
     clear(swarm)
     upd = board.review(CARL, t.id, False, "  Tests are missing  ")
     assert upd.status == Status.IN_PROGRESS
+    plain = prompts.t("en", "review_rejected_plain")   # an ordinary task: fix it, then complete it again
     assert swarm.notifications_for(BOB) == [("n_review_rejected", {"id": t.id, "title": "t", "by": CARL,
-                                                                     "comment": "Tests are missing"})]
+                                                                     "comment": "Tests are missing", "ending": plain})]
     assert quiet_flags(swarm, BOB)[-1] == ("n_review_rejected", False)   # a rejection wakes the assignee
     posts = board.discussion(t.id)
     assert [(p["author"], p["text"]) for p in posts] == [(CARL, "Tests are missing")]
@@ -823,6 +829,24 @@ def test_review_reject_posts_comment(swarm, board):
     assert keys_for(swarm, ANNA) == ["n_discussion"]
     types = [e["type"] for e in swarm.bus.recent(limit=50) if e["type"].startswith("task.")]
     assert types[-2:] == ["task.updated", "task.comment"]
+
+
+def test_review_reject_ending_is_in_the_assignees_language(swarm, board):
+    """The `ending` of n_review_rejected is rendered by the board in the assignee's language, like the text."""
+    swarm.db.execute("UPDATE agents SET language = 'ru' WHERE name = ?", (BOB,))
+    t = _in_review(board)
+    clear(swarm)
+    board.review(CARL, t.id, False, "нет тестов")
+    (key, kw), = swarm.notifications_for(BOB)
+    assert key == "n_review_rejected" and kw["ending"] == "Исправь и снова вызови `task_complete`."
+    text = swarm.db.one("SELECT text FROM notifications WHERE recipient = ? ORDER BY id DESC", (BOB,))["text"]
+    assert text.endswith("на доработку: нет тестов\nИсправь и снова вызови `task_complete`.")
+    # an approval carries no ending
+    u = _in_review(board)
+    clear(swarm)
+    board.review(CARL, u.id, True)
+    assert swarm.notifications_for(BOB) == [("n_review_approved", {"id": u.id, "title": "t", "by": CARL,
+                                                                     "comment": ""})]
     assert board.complete(BOB, t.id, "fixed").status == Status.REVIEW
 
 
@@ -1068,6 +1092,7 @@ def test_review_comment_truncated_in_notification(swarm, board):
     board.review(CARL, t.id, False, "z" * 5000)
     (key, kw), = swarm.notifications_for(BOB)
     assert key == "n_review_rejected" and len(kw["comment"]) == NOTIFY_TEXT_LIMIT and kw["comment"].endswith("…")
+    assert kw["ending"] == prompts.t("en", "review_rejected_plain")
     assert board.discussion(t.id)[0]["text"] == "z" * 5000
 
 
@@ -1157,12 +1182,43 @@ def test_all_notifications_render_in_both_languages(swarm, board):
     board.complete(BOB, t.id, "res2")
     board.review(CARL, t.id, True, "nice")
     board.update(ANNA, dep.id, status="cancelled")
+    # a crew task (docs/SPEC.md §4.2): BOB owns it, ANNA created it and its directions
+    crew = board.create(ANNA, "crew", crew=3, directions=["a", "b", "c", "d"], assignee=BOB)  # n_crew_owner
+    a, b, c, d = board.subtasks_of(crew.id)
+    board.update(ANNA, crew.id, crew=4)  # n_crew_changed
+    board.claim(CARL, a.id)  # n_direction_taken
+    board.claim(ANNA, b.id)  # n_direction_taken
+    board.update(ANNA, b.id, status="failed")  # n_direction_failed
+    board.update(ANNA, c.id, status="cancelled")  # n_direction_cancelled
+    board.claim(BOB, d.id)
+    board.update(ANNA, d.id, status="cancelled")  # n_subtask_cancelled
+    board.release_all(CARL, USER)  # n_direction_freed
+    board.claim(CARL, a.id)
+    board.update(ANNA, b.id, status="cancelled")
+    board.update(CARL, a.id, goal="g")
+    board.complete(CARL, a.id, "res a")  # n_subtasks_done
+    board.claim(BOB, crew.id)
+    board.update(ANNA, crew.id, reviewer=CARL)
+    board.complete(BOB, crew.id, "the whole")  # n_crew_review_requested
+    board.review(CARL, crew.id, False, "fix")  # n_review_rejected with the crew ending
+    board.update(BOB, crew.id, directions=["e"])  # BOB's own part
+    board.update(ANNA, crew.id, status="cancelled")  # n_parent_closed
     kinds = {k for _, k, _ in swarm.notified}
+    crew_keys = {"n_crew_owner", "n_crew_changed", "n_direction_taken", "n_direction_failed", "n_direction_cancelled",
+                 "n_subtask_cancelled", "n_direction_freed", "n_subtasks_done", "n_crew_review_requested",
+                 "n_parent_closed"}
     assert {"n_assigned", "n_unassigned", "n_mention", "n_discussion", "n_review_requested",
-            "n_review_rejected", "n_review_approved", "n_unblocked", "n_task_closed"} <= kinds
+            "n_review_rejected", "n_review_approved", "n_unblocked", "n_task_closed", *crew_keys} <= kinds
+    assert notes_of_kind(swarm, BOB, "n_review_rejected")[-1]["ending"] == prompts.t(
+        "en", "review_rejected_crew", id=crew.id)
     for _, key, kw in swarm.notified:
         for lang in ("en", "ru"):
             assert prompts.t(lang, key, **kw)
+    # the crew notices wake, but for a direction taken or freed and a crew changed by someone else
+    for name in (BOB, CARL):
+        for kind, was_quiet in quiet_flags(swarm, name):
+            if kind in crew_keys:
+                assert was_quiet == (kind in {"n_direction_taken", "n_direction_freed", "n_crew_changed"}), kind
 
 
 # --- similar tasks (task_create warns about likely duplicates) -----------------------------------------
@@ -1245,7 +1301,9 @@ def test_similar_open_tasks_best_first(swarm, board):
     board.update(BOB, closed.id, status="cancelled")
     new = board.create(CARL, "Fix crash in parser on empty input", goal="The parser must not crash on empty input")
     assert [t.id for t in board.similar_open(new)] == [parser.id, near.id]   # open ones only, not itself
-    # its parent and the tasks it depends on share its words by design
+    # its parent and the tasks it depends on share its words by design (CARL may add subtasks to the parent it
+    # holds; the parent is skipped as the parent, it is not CARL's own task)
+    board.update(ANNA, parser.id, assignee=CARL)
     sub = board.create(CARL, "Parser: empty input crash test", parent_id=parser.id, depends_on=[near.id])
     assert not {parser.id, near.id} & {t.id for t in board.similar_open(sub)}
     many = [board.create(ANNA, f"Parser crash on empty input, case {i}") for i in range(5)]

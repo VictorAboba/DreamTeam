@@ -14,7 +14,18 @@
 - **Feed.** Agents' tool calls look like `⏺ Anna Smirnova · task_claim(task_id=3)` with the result under them after
   `⎿`. Messages to you are shown in full as markdown, tasks as a to-do list `☐ ◐ ◑ ☒`, the goal in a frame.
   `Shift+Tab` switches the verbosity: quiet, normal (the default) or verbose, with the agents' thoughts and tool
-  results. `Ctrl+O` toggles verbose mode.
+  results. `Ctrl+O` toggles verbose mode. In verbose mode a change of a task's crew is labelled "crew", and in the
+  history of `/task N` the value 0 is shown as "ordinary task" (`crew: ordinary task → 3`).
+- **Subtasks and crew tasks.** `/board` shows a task's subtasks in the task's own line: one `●` per direct subtask
+  in its status colour (at most 12, then `+N`), how many of them are done, `crew 2/3` for a crew task (members
+  working / `crew`) and `waits for your review` when one of its subtasks waits for yours, for example
+  `◐ #2 Parser — Anna · ●●● 1/3 · crew 2/3`. A subtask has a line of its own only where the web board shows it as a
+  card of its own: an open subtask of a task that is done, failed or cancelled, or one whose parent is not on the
+  board. The number in a column header is the number of lines in that column; subtasks shown in their parent's line
+  are not counted. `/task N` of a crew task shows `Crew task: up to 3 members, 2 working now`,
+  and `/task N` of any task lists its direct subtasks indented, under "Directions (k)" for a crew task, otherwise
+  "Subtasks (k)". [Crew tasks](features.md) are made in the web board's task forms, over MCP or by the agents; the
+  terminal has no command for that.
 - **The spinner** `✻ Huddling… (12s · ↑ 4.2k ↓ 310 · $0.12 · esc to pause)` is shown while the agents work.
   `Esc` pauses the swarm, `/pause` resumes it.
 - **Clarify mode and questions.** `/clarify on` (or `--clarify` at the start) makes the planner ask you about the goal
@@ -32,9 +43,16 @@
   `/model [profile]`,
   `/pause`, `/wrapup [off]`, `/clarify [on|off]`, `/budget N`, `/max N`, `/approve name|N`, `/reject name|N`, `/stop`,
   `/web`, `/settings`, `/verbose`, `/lang ru|en`, `/clear`, `/exit`.
+- **Sessions of an earlier version.** This version does not open a session in which agents of an earlier version
+  already worked (almost every session of 0.1.x). `/sessions` and the list of `dreamteam -r` show it with the status
+  "earlier version". Enter on it, `/resume ID` and `dreamteam -r ID` print why it does not open and attach nothing;
+  `Del` deletes it as usual. The `main` session of an old project is never deleted: when it is one of them, `Del`
+  and `/delete` print its own message, which names the file to delete by hand. See
+  [Updating to 0.2.0](getting-started.md#updating-to-020).
 - **Review.** A task the swarm handed to you for review shows as `◑ #3 … waits for your review`. `/approve 3`
   accepts it, `/reject 3 what to fix` returns it to the assignee. On the web board the task card has buttons for this,
-  and dragging a task from "Review" to "Done" also accepts it.
+  and dragging a task from "Review" to "Done" also accepts it. When a subtask waits for your review, its parent's
+  `/board` line carries the same mark; accept or return the subtask by its own number (`/approve 5`).
 - **Agents' background jobs.** While they run, the status line shows `jobs N`, and the agent in `/agents` shows
   `⚙N`. `/jobs` lists them (and the ones that finished in the last hour), `/jobs j3` shows a job's output,
   `/jobs stop j3` stops it together with everything it started. `Esc` and `/pause` do not stop them.
@@ -66,7 +84,9 @@
   the decision off: `/approve name` then approves only the code that dialog showed.
 
 If a server for the home folder is already running (`dreamteam serve`), the UI connects to it. Otherwise the server
-starts in the same process, and the sessions stop on exit; `dreamteam -c` continues the last one.
+starts in the same process, and the sessions stop on exit; `dreamteam -c` continues the last one. When the last one
+is of an earlier version, `-c` says so under the welcome box and opens nothing: start a new session. A prompt
+given with `-c` then stays in the input line unsent, as does one given with `-r ID` of a session that did not open.
 In Git Bash (mintty), run `winpty dreamteam` or use Windows Terminal / PowerShell.
 
 Non-interactive mode for scripts:
@@ -88,6 +108,9 @@ and a question that pauses the swarm one more (`stream-json` shows the events in
 `--verbose`, for the notice that a model profile's calls count as $0 (no prices, and the provider does not report
 the cost): one line on stderr.
 `--clarify` / `--no-clarify` do not work with `-c` / `-r`: change an existing session with `/clarify`.
+When the most recent session is of an earlier version, `-c` exits with code 1 and says to start a new session; `-r ID`
+of such a session exits with code 1 and its message. Neither creates anything. A run whose session an import replaced
+with one of an earlier version also exits with code 1 and that session's message.
 Background jobs still running at the end (for example, a dev server) are listed in the `jobs` field of the
 `--output-format json` result. A server started in the same process stops them together with the session. If the
 server was started separately, the jobs run until the session stops, and the text mode reports them on stderr.
@@ -117,5 +140,9 @@ for confirmation `y/N`, `--yes` skips the question),
 `/skills` (the attached skills) and `/skills lib | add X [--pick a,b] [--replace] | update X | rm X | show X |
 approve X [replace] | reject X [reason] | reinstall X | log X | clean-envs` ([skills](skills.md): the library,
 attaching by name, path or URL, the decision on a member's proposal, packages and their log).
+The console's `/board` lists subtasks indented under their parent, `/show N` of a task with subtasks lists them (for a
+crew task, also who works on it and its free directions), and `/task` creates an ordinary task.
 The console connects to a running session: `dreamteam console` (or `dreamteam console --session 003-snake`).
+`--session` of a session of an earlier version prints its message (exit code 1); without `--session` the
+console picks only among the sessions this version opens.
 It is a simple line-based client for terminals where the [terminal UI](#terminal-ui) does not work.

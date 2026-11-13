@@ -693,6 +693,33 @@ async def test_verbose_feed_keeps_results_under_their_calls(launch):
     assert "wait()" not in err  # housekeeping
 
 
+async def test_a_session_replaced_by_one_of_an_earlier_version_ends_the_run(launch, monkeypatch):
+    """The hub closes the stream 1011 «made by an earlier version» (an import replaced the session, docs/SPEC.md
+    §17.2): exit 1 with the English message and the hub's version, not "stream ended"."""
+    from dreamteam.sessions import EARLIER_VERSION_TEXT
+
+    conn = await launch(idler)
+    sid = (await conn.client.create_session("Later", "", start=False))["id"]
+    real_info = conn.client.hub_info
+    asked: list[int] = []
+
+    async def hub_info() -> dict:
+        asked.append(1)
+        return {**await real_info(), "version": "9.9.9"}
+
+    async def stream(sid_):
+        yield {"type": "_connection", "data": {"state": "connected"}}
+        await asyncio.sleep(0.2)
+        yield {"type": "_connection", "data": {"state": "earlier"}}
+
+    monkeypatch.setattr(conn.client, "hub_info", hub_info)
+    monkeypatch.setattr(conn.client, "stream", stream)
+    code, out, err = await run(conn, f"Write a {MARK}", session=sid, timeout=20)
+    assert code == 1 and out == ""
+    assert err.strip().splitlines()[-1] == EARLIER_VERSION_TEXT.format(sid=sid, version="9.9.9")
+    assert asked and "connection to the hub was closed" not in err
+
+
 async def test_hub_gone_is_an_error(launch, monkeypatch):
     conn = await launch(idler)
     monkeypatch.setattr(printmode, "LOST_LIMIT", 0.5)

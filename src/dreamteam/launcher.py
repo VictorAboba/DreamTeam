@@ -50,6 +50,9 @@ SESSION_PATH = re.compile(r"^/s/([a-z0-9][a-z0-9-]{0,63})(/.*)?$")
 ENV_CLEANUP_DELAY = 60.0
 ENV_CLEANUP_EVERY = 24 * 3600.0
 STOPPED_TEXT = "The session is stopped. Start it on the sessions page."
+# the WebSocket close reason for a session made by an earlier version (a reason holds at most 123 bytes; the page
+# and the JSON answers carry the full message)
+EARLIER_VERSION_REASON = "made by an earlier version"
 ERROR_HTML = """<!doctype html><html><head><meta charset="utf-8"><title>DreamTeam</title>
 <style>body{font-family:"Segoe UI",system-ui,sans-serif;background:#0b0b0d;color:#ebe9e6;display:grid;
 place-items:center;height:100vh;margin:0}p{color:#92929b}a{color:#e8916f}</style></head><body><div><h2>{title}</h2>
@@ -59,6 +62,16 @@ place-items:center;height:100vh;margin:0}p{color:#92929b}a{color:#e8916f}</style
 def _error_page(title: str, text: str, status: int) -> HTMLResponse:
     return HTMLResponse(ERROR_HTML.replace("{title}", html.escape(title)).replace("{text}", html.escape(text)),
                         status_code=status)
+
+
+async def _close_earlier(receive, send) -> None:
+    """Close a WebSocket of a session made by an earlier version with code 1011 and its reason: accepted first, since
+    a close before the accept reaches the browser as an HTTP 403 without the reason."""
+    message = await receive()
+    if message.get("type") != "websocket.connect":
+        return
+    await send({"type": "websocket.accept"})
+    await send({"type": "websocket.close", "code": 1011, "reason": EARLIER_VERSION_REASON})
 
 
 def _is_json_request(scope) -> bool:
@@ -213,6 +226,17 @@ class SessionRouter:
                 await send({"type": "websocket.close", "code": 1008})
             return
         running = sid in self.manager.running
+        # a session made by an earlier version is never opened (§17.2): before the stopped answer, which `/mcp` and
+        # `/api/act/` of a stopped session get, so every path says why
+        if not running and await asyncio.to_thread(self.manager.earlier_version, sid):
+            text = self.manager.earlier_version_text(sid)
+            if scope["type"] != "http":
+                await _close_earlier(receive, send)
+            elif api:
+                await JSONResponse({"error": text, "earlier_version": True}, status_code=409)(scope, receive, send)
+            else:
+                await _error_page("Cannot open the session", text, 409)(scope, receive, send)
+            return
         if scope["type"] == "http" and not running and (
                 (scope.get("method") == "POST" and rest.startswith("/api/act/")) or rest.startswith("/mcp")):
             await JSONResponse({"ok": False, "result": STOPPED_TEXT, "error": STOPPED_TEXT},
@@ -222,9 +246,12 @@ class SessionRouter:
             entry = await self.app_for(sid)
         except SessionError as exc:
             if scope["type"] != "http":
-                await send({"type": "websocket.close", "code": 1011})
+                if exc.extra.get("earlier_version"):
+                    await _close_earlier(receive, send)
+                else:
+                    await send({"type": "websocket.close", "code": 1011})
             elif api:
-                await JSONResponse({"error": str(exc)}, status_code=exc.status)(scope, receive, send)
+                await JSONResponse({"error": str(exc), **exc.extra}, status_code=exc.status)(scope, receive, send)
             else:  # the board page of a damaged session: say why instead of showing raw JSON
                 await _error_page("Cannot open the session", str(exc), exc.status)(scope, receive, send)
             return

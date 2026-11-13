@@ -137,6 +137,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "f_depends_on": "зависимости",
         "f_result": "итог",
         "f_parent_id": "родитель",
+        "f_crew": "групповая задача (участников)",
+        "crew_ordinary": "обычная задача",
         "op_create": "создан",
         "op_write": "перезаписан",
         "op_edit": "изменён",
@@ -187,6 +189,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "td_history": "История",
         "td_created": "создал(а) задачу",
         "task_review_you": "ждёт вашего ревью",
+        "task_crew": "групповая {m}/{n}",
+        "td_crew_line": "Групповая задача: до {n} участников, сейчас работают {m}",
+        "td_subtasks": "Подзадачи",
+        "td_directions": "Направления",
         "td_review_hint": "Принять: /approve {id} [комментарий] · вернуть: /reject {id} что исправить",
         "review_reason_required": "Напишите, что исправить: /reject {id} что исправить",
         # ---- tables
@@ -216,6 +222,17 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_wrap_up": "завершается",
         "sess_done": "цель достигнута",
         "sess_error": "ошибка конфигурации",
+        "sess_earlier": "прежняя версия",
+        # a session made by an earlier version (docs/SPEC.md §17.2): the twins of sessions.EARLIER_VERSION_TEXT and
+        # MAIN_EARLIER_VERSION_TEXT (and of home.js); earlier_home stands for {home} when nothing names the folder
+        "earlier_session": "Сессия {sid} создана более ранней версией DreamTeam, и эта версия ({version}) не может её "
+                           "открыть. Откройте её в той версии, которой она создана (экспортируйте её здесь и "
+                           "импортируйте в домашнюю папку той версии: после того как эта версия сохранила настройки, "
+                           "та может не прочитать эту папку), или удалите.",
+        "earlier_main": "Сессия main (рой в {home}) создана более ранней версией DreamTeam, и эта версия ({version}) "
+                        "не может её открыть. Откройте её в той версии, которой она создана, или удалите вручную "
+                        "{home}/.dreamteam/swarm.db (вместе с файлами -wal и -shm).",
+        "earlier_home": "<домашняя папка>",
         "spent_of": "Потрачено {spent} из {budget} ({pct}%)",
         "spent_unlimited": "Потрачено {spent} (без лимита)",
         "mt_title": "Профили моделей",
@@ -470,6 +487,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "session_deleting": "Удаляю сессию…",
         "session_deleted": "Сессия «{title}» ({id}) удалена",
         "no_sessions_continue": "Нет сессий, которые можно продолжить",
+        "continue_earlier": "Последняя сессия, {id}, создана более ранней версией DreamTeam, и эта версия ({version}) "
+                            "не может её открыть: начните новую сессию",
         "confirm_new_title": "Цель этой сессии уже достигнута",
         "confirm_new_text": "Начать новую сессию с этой целью? «Нет» — отправить как сообщение.",
         "mcp_tools": "Инструменты",
@@ -762,6 +781,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "f_depends_on": "dependencies",
         "f_result": "result",
         "f_parent_id": "parent",
+        "f_crew": "crew",
+        "crew_ordinary": "ordinary task",
         "op_create": "created",
         "op_write": "rewritten",
         "op_edit": "edited",
@@ -812,6 +833,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "td_history": "History",
         "td_created": "created the task",
         "task_review_you": "waits for your review",
+        "task_crew": "crew {m}/{n}",
+        "td_crew_line": "Crew task: up to {n} members, {m} working now",
+        "td_subtasks": "Subtasks",
+        "td_directions": "Directions",
         "td_review_hint": "Approve: /approve {id} [comment] · return: /reject {id} what to fix",
         "review_reason_required": "Say what to fix: /reject {id} what to fix",
         # ---- tables
@@ -841,6 +866,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_wrap_up": "wrapping up",
         "sess_done": "goal achieved",
         "sess_error": "config error",
+        "sess_earlier": "earlier version",
+        "earlier_session": "Session {sid} was made by an earlier version of DreamTeam and cannot be opened by this one "
+                           "({version}). Open it with the version that made it (export it here, then import it into a "
+                           "home of that version: once this one saved its settings, that version may not read this "
+                           "home), or delete it.",
+        "earlier_main": "Session main (the swarm in {home}) was made by an earlier version of DreamTeam and cannot be "
+                        "opened by this one ({version}). Open it with the version that made it, or remove "
+                        "{home}/.dreamteam/swarm.db (with its -wal and -shm files) by hand.",
+        "earlier_home": "the home",
         "spent_of": "Spent {spent} of {budget} ({pct}%)",
         "spent_unlimited": "Spent {spent} (no limit)",
         "mt_title": "Model profiles",
@@ -1099,6 +1133,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "session_deleting": "Deleting the session…",
         "session_deleted": "Session \"{title}\" ({id}) deleted",
         "no_sessions_continue": "There is no session to continue",
+        "continue_earlier": "The most recent session, {id}, was made by an earlier version of DreamTeam and cannot be "
+                            "opened by this one ({version}): start a new session",
         "confirm_new_title": "This session's goal is already achieved",
         "confirm_new_text": "Start a new session with this goal? \"No\" sends it as a message.",
         "mcp_tools": "Tools",

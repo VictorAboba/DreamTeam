@@ -4,6 +4,8 @@ level (wake-up text, reminders, hand-over, the user's notice, the scheduler) aga
 
 from __future__ import annotations
 
+import tomllib
+
 import pytest
 
 from dreamteam import prompts
@@ -13,6 +15,7 @@ from dreamteam.config import Config, SwarmSettings, render_template
 from dreamteam.db import loads
 from dreamteam.models import USER, AgentKind, AgentStatus, Status, Task, ToolError
 from dreamteam.swarm import QUIET_KEY
+from helpers.crew import finish_raw, make_crew_raw, set_raw
 from test_runtime import call, kinds_for, make_swarm, run_until, shutdown
 
 ANNA, BOB, CARL, DINA = "Anna Smith", "Bob Brown", "Carl Clark", "Dina Evans"
@@ -70,30 +73,120 @@ def test_completion_picks_a_member_who_neither_created_nor_did_it(swarm, board):
         "result": [None, "built it"], "status": ["in_progress", "review"], "reviewer": [None, CARL]}
 
 
-def test_pick_order_idle_then_load_then_name(swarm, board):
+def test_pick_order_follows_the_key(swarm, board):
+    """The key of docs/SPEC.md §4.1 "Reviewer selection": (cannot act now, is the creator, role rank, reviews
+    pending, reviews so far, open tasks held, status rank, name); one step at a time."""
     t = board.create(USER, "t", assignee=BOB)
     assert board.pick_reviewer(t) == ANNA                           # both idle and free: by name
     set_status(swarm, ANNA, AgentStatus.WORKING)
     assert board.pick_reviewer(t) == CARL                           # idle before working
     set_status(swarm, CARL, AgentStatus.ERROR)
-    assert board.pick_reviewer(t) == ANNA                           # working before any other status
+    assert board.pick_reviewer(t) == ANNA                           # a member that cannot act now comes last
+    set_status(swarm, ANNA, AgentStatus.PAUSED)
+    assert board.pick_reviewer(t) == ANNA                           # neither can act: the rest of the key decides
     set_status(swarm, ANNA, AgentStatus.IDLE)
     set_status(swarm, CARL, AgentStatus.IDLE)
     board.create(USER, "held", assignee=ANNA)
-    assert board.pick_reviewer(t) == CARL                           # fewer open tasks + pending reviews
-    in_review(board, USER, BOB, "pending", reviewer=CARL)
-    in_review(board, USER, BOB, "pending too", reviewer=CARL)
-    assert board.pick_reviewer(t) == ANNA                           # CARL now has 2 reviews waiting
+    assert board.pick_reviewer(t) == CARL                           # fewer open tasks held
+    set_status(swarm, CARL, AgentStatus.WORKING)
+    assert board.pick_reviewer(t) == CARL                           # open tasks held before the status rank
+    pending = in_review(board, USER, BOB, "pending", reviewer=CARL)
+    assert board.pick_reviewer(t) == ANNA                           # a review pending before open tasks held
     assert board.pick_reviewer(t, exclude=[ANNA]) == CARL
-    # the creator comes last among the agents, whatever its status or load
+    board.review(CARL, pending.id, True)
+    assert board.pick_reviewer(t) == ANNA                           # a review given before open tasks held
+    # the creator comes after the others whatever their load, but before a member that cannot act now
     by_carl = board.create(CARL, "by carl", assignee=BOB)
-    set_status(swarm, ANNA, AgentStatus.PAUSED)
     assert board.pick_reviewer(by_carl) == ANNA
-    assert board.pick_reviewer(by_carl, exclude={ANNA}) == CARL
+    set_status(swarm, ANNA, AgentStatus.PAUSED)
+    assert board.pick_reviewer(by_carl) == CARL
+    assert board.pick_reviewer(by_carl, exclude={CARL}) == ANNA
     # retired and external members are never picked: nobody left means the user
     set_status(swarm, ANNA, AgentStatus.RETIRED)
     set_status(swarm, CARL, AgentStatus.RETIRED)
     assert board.pick_reviewer(t) == USER
+
+
+def test_reviews_pending_come_before_reviews_so_far(swarm, board):
+    t = board.create(USER, "t", assignee=BOB)
+    for title in ("one", "two"):
+        board.review(ANNA, in_review(board, USER, BOB, title, reviewer=ANNA).id, True)
+    in_review(board, USER, BOB, "waits", reviewer=CARL)
+    assert board.pick_reviewer(t) == ANNA                           # two given, none pending: before one pending
+
+
+def test_reviews_so_far_count_from_when_the_newest_member_joined(swarm, board):
+    """A member hired late does not take every review until its count catches up: the reviews given before it
+    joined no longer count; a review handed over counts for the member that has it now."""
+    t = board.create(USER, "t", assignee=BOB)
+    given = in_review(board, USER, BOB, "given", reviewer=ANNA)
+    board.review(ANNA, given.id, True)
+    assert board.pick_reviewer(t) == CARL                           # ANNA has given one review
+    eve = swarm.add_member("Eve Ford", created_at=board.get(given.id).updated_at + 1)
+    assert board.pick_reviewer(t) == ANNA                           # not since Eve joined: by name again
+    # a review waiting counts for the member that has it now
+    waiting = in_review(board, USER, BOB, "waiting", reviewer=ANNA)
+    assert board.pick_reviewer(t) == CARL
+    board.update(USER, waiting.id, reviewer=eve)
+    assert board.pick_reviewer(t) == ANNA
+    assert board.pick_reviewer(t, exclude={ANNA}) == CARL           # Eve has it now
+
+
+def test_the_check_of_the_whole_prefers_a_member_outside_the_crew(swarm, board):
+    """With crew_review on and a done direction, `is a contributor` comes right after `cannot act now`
+    (docs/SPEC.md §4.2 "Reviews"); the owner holds the crew task and never reviews it."""
+    task, subs = make_crew_raw(board, USER, 3, ["parser", "cli"])
+    task = set_raw(board, task.id, assignee=ANNA, status=Status.IN_PROGRESS)
+    finish_raw(board, subs[0].id, Status.DONE, "parsed", assignee=BOB)
+    board.create(USER, "held", assignee=CARL)                       # without the contributor step: BOB
+    assert board._whole(task)
+    assert board.pick_reviewer(task) == CARL                        # outside the crew first
+    set_status(swarm, CARL, AgentStatus.PAUSED)
+    assert board.pick_reviewer(task) == BOB                         # cannot act now comes before it
+    set_status(swarm, CARL, AgentStatus.IDLE)
+    swarm.config.swarm.crew_review = False
+    assert not board._whole(task) and board.pick_reviewer(task) == BOB    # the ordinary pick
+    swarm.config.swarm.crew_review = True
+    set_raw(board, subs[0].id, status=Status.CANCELLED)
+    assert not board._whole(task) and board.pick_reviewer(task) == BOB    # no done direction
+    set_raw(board, subs[0].id, status=Status.DONE)
+    set_raw(board, task.id, crew=0)
+    assert not board._whole(board.get(task.id))                           # an ordinary parent
+
+
+def test_the_check_of_the_whole_goes_to_a_contributor_before_the_user(swarm, board):
+    task, subs = make_crew_raw(board, USER, 3, ["parser", "cli"])
+    task = set_raw(board, task.id, assignee=ANNA, status=Status.IN_PROGRESS)
+    finish_raw(board, subs[0].id, Status.DONE, "parsed", assignee=BOB)
+    set_raw(board, subs[1].id, assignee=CARL, status=Status.IN_PROGRESS)
+    assert board.pick_reviewer(task) == BOB                         # only contributors: the usual order (CARL holds one)
+    set_status(swarm, CARL, AgentStatus.RETIRED)
+    assert board.pick_reviewer(task) == BOB                         # a contributor before the user
+    set_status(swarm, BOB, AgentStatus.RETIRED)
+    finish_raw(board, subs[1].id, Status.DONE, "cli", assignee=ANNA)
+    assert board.pick_reviewer(task) == USER                        # the owner never reviews it, its own part included
+
+
+def test_the_creator_outside_the_crew_checks_it_before_a_contributor(swarm, board):
+    task, subs = make_crew_raw(board, CARL, 3, ["parser"])
+    task = set_raw(board, task.id, assignee=ANNA, status=Status.IN_PROGRESS)
+    finish_raw(board, subs[0].id, Status.DONE, "parsed", assignee=BOB)
+    assert board.pick_reviewer(task) == CARL
+    swarm.config.swarm.crew_review = False
+    assert board.pick_reviewer(task) == BOB                         # the ordinary pick: the creator after the others
+
+
+def test_reviews_of_a_leaving_member_spread_over_the_team(swarm, board):
+    """`release_all` re-picks the reviews of the member that leaves one at a time, each pick counting the ones
+    before it (docs/SPEC.md §4.1, the `release_all` row)."""
+    eve = swarm.add_member("Eve Ford")
+    tasks = [in_review(board, USER, DINA, f"t{i}", reviewer=CARL) for i in range(3)]
+    assert [t.reviewer for t in tasks] == [CARL] * 3
+    swarm.notified.clear()
+    assert board.release_all(CARL, USER) == []
+    assert [board.get(t.id).reviewer for t in tasks] == [ANNA, BOB, eve]
+    assert [(name, key) for name, key, _ in swarm.notified] == [
+        (ANNA, "n_review_requested"), (BOB, "n_review_requested"), (eve, "n_review_requested")]
 
 
 def test_creator_reviews_when_nobody_else_can(swarm, board):
@@ -378,9 +471,23 @@ def test_config_flag(make_fake_swarm, tmp_path):
     assert "\nindependent_review = true" in render_template("X", "ru", "anthropic")
 
 
+def test_crew_review_setting(tmp_path):
+    """`[swarm] crew_review` (default true) is a bool; the template has its line right after independent_review."""
+    assert SwarmSettings().crew_review is True
+    assert Config.from_dict(tmp_path, {"swarm": {"crew_review": False}}).swarm.crew_review is False
+    with pytest.raises(ValueError, match=r"\[swarm\] crew_review must be true or false"):
+        Config.from_dict(tmp_path / "bad", {"swarm": {"crew_review": "yes"}})
+    template = render_template("X", "ru", "anthropic")
+    lines = template.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.startswith("crew_review = "))
+    assert lines[at - 1].startswith("independent_review = ") and lines[at + 1].startswith("network = ")
+    assert lines[at].startswith("crew_review = true            # завершённую групповую задачу проверяет целиком")
+    assert tomllib.loads(template)["swarm"]["crew_review"] is True
+
+
 def test_pick_prefers_the_reviewer_role(swarm, board):
-    """The catalog's reviewer role («Ревьюер»/Reviewer, any language) comes right after the creator rule; a tester
-    is not preferred (its own test tasks would starve)."""
+    """The catalog's reviewer role («Ревьюер»/Reviewer, any language) comes right after the creator rule (and
+    `cannot act now` before it); a tester is not preferred (its own test tasks would starve)."""
     t = board.create(USER, "t", assignee=BOB)
     swarm.db.execute("UPDATE agents SET role = 'Tester' WHERE name = ?", (ANNA,))
     assert board.pick_reviewer(t) == ANNA                           # a tester is just a member: by name
@@ -388,11 +495,14 @@ def test_pick_prefers_the_reviewer_role(swarm, board):
     assert board.pick_reviewer(t) == CARL
     set_status(swarm, CARL, AgentStatus.WORKING)
     board.create(USER, "held", assignee=CARL)
-    assert board.pick_reviewer(t) == CARL                           # the role before status and load
+    in_review(board, USER, BOB, "pending", reviewer=CARL)
+    assert board.pick_reviewer(t) == CARL                           # the role before the reviews, load and status
     assert board.pick_reviewer(board.create(CARL, "by carl", assignee=BOB)) == ANNA   # the creator rule first
+    set_status(swarm, CARL, AgentStatus.PAUSED)
+    assert board.pick_reviewer(t) == ANNA                           # a reviewer that cannot act now comes last
     swarm.db.execute("UPDATE agents SET role = 'reviewer' WHERE name = ?", (ANNA,))
     set_status(swarm, CARL, AgentStatus.IDLE)
-    assert board.pick_reviewer(t) == ANNA                           # two reviewers: the usual order between them
+    assert board.pick_reviewer(t) == ANNA                           # two reviewers: CARL has a review pending
 
 
 # ================================================================== swarm level

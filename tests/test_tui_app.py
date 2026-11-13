@@ -743,6 +743,51 @@ async def test_connection_loss_is_reported_and_resynced(launch, monkeypatch):
     assert await h.quit() == 0
 
 
+async def test_a_session_replaced_by_one_of_an_earlier_version_is_left(launch, monkeypatch):
+    """An import replaced the attached session with one made by an earlier version (docs/SPEC.md §17.2): the hub
+    closes its stream 1011 (the client yields "earlier"), or answers the start of a stopped one 409 with
+    `earlier_version`. The message is printed in the UI language, the session is left, nothing is sent."""
+    from dreamteam import __version__
+    from dreamteam.sessions import EARLIER_VERSION_TEXT
+
+    monkeypatch.setattr(app_module, "LOST_GRACE", 0.05)
+    conn = await launch()
+    sid = (await conn.client.create_session("Calc", "Build a calculator"))["id"]
+    twin = EARLIER_VERSION_TEXT.format(sid=sid, version=__version__)
+    h = launch.tui(conn, session=sid, width=400)
+    await h.until(lambda: h.tui.attached and h.tui.members and not h.tui._first_connect, 20, "the stream")
+    # the stream: the hub accepts the socket before it closes it, so «connection restored» may come first
+    await h.tui._cancel(h.tui._stream_task)
+    await h.tui.on_event({"type": "_connection", "data": {"state": "lost"}})
+    await h.see("Lost connection to the hub")
+    await h.tui.on_event({"type": "_connection", "data": {"state": "connected"}})
+    await h.see("Reconnected to the hub")
+    start = len(h.out)
+    await h.tui.on_event({"type": "_connection", "data": {"state": "earlier"}})
+    assert len(h.out) == start + 1 and twin in h.out[start]   # the message alone
+    text = h.text
+    assert text.index("Lost connection to the hub") < text.index("Reconnected to the hub") < text.index(twin)
+    assert text.count(twin) == 1
+    assert not h.tui.attached and h.tui.sid is None and h.tui.box_title() == "new session"
+    await h.tui.on_event({"type": "_connection", "data": {"state": "earlier"}})   # (not attached: nothing more)
+    assert h.text.count(twin) == 1
+
+    # a start answered 409 `earlier_version`: the typed message is never sent, nor the hub's text printed
+    await h.run(f"/resume {sid}", "Build a calculator")
+    await conn.client.stop_session(sid)
+    await h.until(lambda: (h.tui.session or {}).get("status") == "stopped", 20, "the stopped status")
+
+    async def refused(sid_, **kwargs):
+        raise HubError(409, "the hub's text", {"error": "the hub's text", "earlier_version": True})
+
+    monkeypatch.setattr(h.tui.client, "start_session", refused)
+    await h.run("hello after the import", twin)
+    assert h.text.count(twin) == 2 and "the hub's text" not in h.text
+    assert not h.tui.attached and h.tui.sid is None
+    assert await messages_from_user(conn, sid, "hello after the import") == []
+    assert await h.quit() == 0
+
+
 class Terminal(io.StringIO):
     """What a UTF-8 terminal would receive."""
 

@@ -42,6 +42,9 @@ START_TIMEOUT = 120.0      # the in-process launcher must listen within this (it
 HUB_WAIT = 2.0             # the configured port is busy: how long a hub of this home may take to show up
 HUB_POLL = 0.2
 WS_MAX_SIZE = 32 * 2**20
+# the reason of the close 1011 the hub gives a session made by an earlier version (launcher.EARLIER_VERSION_REASON;
+# not imported: the client needs no hub code)
+EARLIER_REASON = "made by an earlier version"
 _LOOPBACK = frozenset({"127.0.0.1", "localhost", "::1"})
 _WS_PROXY_OPTION = "proxy" in inspect.signature(ws_connect.__init__).parameters  # websockets >= 15
 
@@ -378,15 +381,19 @@ class HubClient:
             await asyncio.wait_for(self._closed_event.wait(), delay)
 
     async def stream(self, sid: str | None) -> AsyncIterator[dict]:
-        """Bus events of the session (or of a single-swarm hub) as the server sends them, forever.
+        """Bus events of the session (or of a single-swarm hub) as the server sends them, until the caller stops
+        it, or until the hub says the session was made by an earlier version (state "earlier", then the iterator
+        ends).
 
         Reconnects with exponential backoff (BACKOFF_MIN .. BACKOFF_MAX); close codes 1012 (session
         restarted) and 1001 reconnect at once. Yields {"type": "_connection", "data": {"state": ...}}
         with "connected" on every (re)connect and "lost" when the connection goes (or cannot be made);
         "rejected" (with "status") follows when the hub answers the handshake with an HTTP error instead of
         a stream, e.g. 403 for a session that no longer exists or for a hub that takes none of the tokens tried
-        (_ws_open): the caller may check over REST whether retrying makes sense. Ends when the iterator is closed
-        or the client is closed."""
+        (_ws_open): the caller may check over REST whether retrying makes sense. A close 1011 with the reason
+        EARLIER_REASON (the hub accepts the socket of a session made by an earlier version, then closes it,
+        docs/SPEC.md §17.2) yields "earlier" and ends: no reconnect opens that session. Ends also when the
+        iterator is closed or the client is closed."""
         url = self.ws_url(sid)
         options: dict[str, Any] = {"open_timeout": 10, "close_timeout": 2, "max_size": WS_MAX_SIZE}
         if self._loopback and _WS_PROXY_OPTION:
@@ -396,6 +403,7 @@ class HubClient:
         while not self._closed:
             connected = False
             code: int | None = None
+            reason = ""
             refused: int | None = None
             try:
                 async with await self._ws_open(url, options) as ws:
@@ -414,15 +422,19 @@ class HubClient:
                                 yield event
                     finally:
                         self._sockets.discard(ws)
-                    code = ws.close_code
+                    code, reason = ws.close_code, ws.close_reason or ""
             except ConnectionClosed as exc:
                 code = exc.rcvd.code if exc.rcvd is not None else None
+                reason = exc.rcvd.reason if exc.rcvd is not None else ""
             except InvalidStatus as exc:  # the hub answered, but not with a stream
                 refused = exc.response.status_code
                 log.debug("stream %s: HTTP %s", url, refused)
             except Exception as exc:  # refused, timeout, protocol error...
                 log.debug("stream %s: %s", url, exc)
             if self._closed:
+                return
+            if code == 1011 and reason == EARLIER_REASON:   # never opened by this version: no retry helps
+                yield _connection_event("earlier")
                 return
             if state not in ("lost", "rejected"):
                 state = "lost"
