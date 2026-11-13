@@ -735,6 +735,29 @@ def test_board_filter_shows_parents_of_matching_rows():
 
 
 @needs_node
+def test_board_stack_opened_and_closed_under_a_search_stays_closed():
+    out = run_js(BOARD_STUB + f"""
+      app.S.state = {{ tasks: {json.dumps(BOARD_STACK)} }};
+      app.renderBoard();
+      app.onSearchInput({{ target: {{ value: "needle" }} }});   // the search opens the stack
+      app.toggleStack(2); app.toggleStack(2); app.toggleStack(2);   // closed, opened, closed by the user
+      out.closed = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.cleared = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
+      // opened under one search text, closed under the next: still the user's own last word
+      app.onSearchInput({{ target: {{ value: "needle" }} }});
+      app.toggleStack(2); app.toggleStack(2);
+      app.onSearchInput({{ target: {{ value: "needl" }} }});
+      app.toggleStack(2);
+      app.onSearchInput({{ target: {{ value: "" }} }});
+      out.next = [elements.board.innerHTML.includes('class="stack"'), Array.from(app.S.expanded)];
+    """)
+    assert out["closed"] == [False, []]
+    assert out["cleared"] == [False, []]
+    assert out["next"] == [False, []]
+
+
+@needs_node
 def test_board_keys_and_drags_ignore_the_stack():
     pre = r"""
       globalThis.fetch = async (url, opts) => {

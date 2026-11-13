@@ -5408,7 +5408,8 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     naming that reviewer next to it). A filter shows a parent when it or one of its descendants
     matches, expands that stack and marks the rows that match (an accent line, `.stack-row.match`); the stack is
     open while the filter holds without changing `S.expanded`, and the toggle closes it until the search text
-    changes (`S.unforced`; a stack the user had opened before the search opens again then). Column counts count
+    changes (`S.unforced`; a stack the user had opened before the search opens again then, one the user opened
+    under it and closed again stays closed). Column counts count
     cards. The task modal of a parent
     lists its subtasks as rows and, for a crew task, «Групповая задача: до N участников, сейчас работают M» / "Crew
     task: up to N members, M working now"; the create form gets «Групповая задача: участников» / "Crew task:

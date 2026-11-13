@@ -383,8 +383,9 @@ const S = {
   // dialog rows shown open (name or ref → their files and SKILL.md), the install logs shown ("name|python" → text)
   skillData: null, skillShown: {}, attachShown: {}, libShown: {}, skillLogs: {}, skillLibOpen: false,
   // the board's stacks of subtasks: parents the user opened (kept across renders), stacks a search opened that the
-  // user closed while that search holds, a press on the toggle or the stack (dragstart cannot tell where it began)
-  expanded: new Set(), unforced: new Set(), noDrag: false,
+  // user closed while that search holds, the parents the user had open when the search began, a press on the toggle or
+  // the stack (dragstart cannot tell where it began)
+  expanded: new Set(), unforced: new Set(), preSearch: new Set(), noDrag: false,
 };
 
 /* ---------------------------------------------------------------- utils */
@@ -1060,23 +1061,26 @@ function cardHtml(task, card) {
 }
 
 /** Opens or closes a parent's stack as it is shown: a stack a search opened (one of its rows matches) is closed for
- * as long as that search holds (S.unforced), without touching the parents the user opened (S.expanded). */
+ * as long as that search holds (S.unforced), without touching the parents the user had open before the search
+ * (S.preSearch); one the user opened under the search leaves S.expanded when closed. */
 function toggleStack(id) {
   id = Number(id);
   const card = visibleCards(boardCards((S.state && S.state.tasks) || [])).find((c) => Number(c.task.id) === id);
   const searched = !!(card && card.matches && card.matches.size);
   if (!S.unforced.has(id) && (S.expanded.has(id) || !!(card && card.forced))) {
     if (searched) S.unforced.add(id);
-    else S.expanded.delete(id);
+    if (!searched || !S.preSearch.has(id)) S.expanded.delete(id);
   } else {
     S.expanded.add(id);
     S.unforced.delete(id);
   }
   renderBoard();
 }
-/** The board's filter: a new search text opens again the stacks the user closed under the previous one. */
+/** The board's filter: a new search text opens again the stacks the user closed under the previous one; a search
+ * that begins notes the stacks the user has open (S.preSearch). */
 function onSearchInput(e) {
   const search = String(e.target.value || "").trim();
+  if (search && !S.search) S.preSearch = new Set(S.expanded);
   if (search !== S.search) S.unforced.clear();
   S.search = search;
   if (S.tab === "board") renderBoard();
