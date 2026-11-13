@@ -854,10 +854,14 @@ class Board:
         self.swarm.bus.emit("task.created", actor, task=task.to_dict())
         for sub_id in sorted(batch.inserts):
             self.swarm.bus.emit("task.created", actor, task=self.get(sub_id).to_dict())
+        # a direction created held back for its assignee (§4.2 "A held direction")
+        held = self._held_reason(task) if task.crew < 2 else None
         if task.crew >= 2:
             self._notify_crew_owner(assignee, actor, task)
-        else:
+        elif not self._held_notice(assignee, actor, task, held):
             self._notify_member(assignee, actor, "n_assigned", id=task.id, title=task.title, by=actor)
+        if held is not None:
+            batch.notes.append(self._held_note(actor, task, held))  # the actor included
         if notes is not None:
             notes.extend(batch.notes)
         return task
@@ -865,8 +869,9 @@ class Board:
     def claim(self, actor: str, task_id: int, notes: list[str] | None = None) -> Task:
         """The actor takes a todo task. A direction of a crew task has the checks of "Taking a direction"
         (docs/SPEC.md §4.2). `notes`: extended with the sentences for the result of the actor's call: the direction's
-        card, the crew task's reviewer cleared, and for a parent the owner sentence (a crew task) or the owner form
-        of the plain ending (an ordinary parent whose subtasks are all finished)."""
+        card, the crew task's reviewer cleared, its other todo directions assigned to the actor ("Also assigned"),
+        and for a parent the owner sentence (a crew task) or the owner form of the plain ending (an ordinary parent
+        whose subtasks are all finished)."""
         def plan(old: Task, batch: _Batch) -> dict[str, Any]:
             if old.assignee == actor and old.status in (Status.IN_PROGRESS, Status.WAITING):
                 return {}
@@ -890,6 +895,8 @@ class Board:
         mutation = self._mutate(actor, task_id, plan)
         task = mutation.task
         if mutation.changes and actor != USER:
+            # a direction taken: the actor's other todo directions of its crew task wait for it now
+            mutation.batch.notes.extend(self._also_assigned(actor, task))
             # the actor holds a parent now: what it does with it (for a crew task the owner sentence)
             instructions, directions = self._owner_sentence(task, actor, self.swarm.language_of(actor))
             if instructions:
@@ -952,6 +959,10 @@ class Board:
         old, task, changes = mutation.old, mutation.task, mutation.changes
         if changes:
             self._notify_assignment(actor, old, task, changes, mutation.batch.notes)
+            # a take of a direction by the actor (Taking a direction): its other todo directions of the crew task
+            if (task.assignee == actor and task.status in _WORKING
+                    and (old.assignee != actor or old.status == Status.TODO or "parent_id" in changes)):
+                mutation.batch.notes.extend(self._also_assigned(actor, task))
             if task.status == Status.REVIEW and ("reviewer" in changes or old.status != Status.REVIEW):
                 # the task already waits for review: the new reviewer must learn about it now
                 self._request_review(actor, task, auto=False)
@@ -973,7 +984,8 @@ class Board:
         [swarm] crew_review off, an agent's completion of a crew task is done: no second review, whatever
         independent_review says and whatever reviewer the task holds (cleared).
         `notes`: extended with the sentences for the result of the actor's call (a parent it holds whose subtasks
-        are all finished now)."""
+        are all finished now; for an agent, the first direction assigned to it that its claim would take now:
+        docs/SPEC.md §4.2 "The next direction")."""
         text = str(result if result is not None else "").strip()
         if not text:
             raise ToolError("Result must not be empty: say what was done, where it is and what is left.")
@@ -1005,6 +1017,8 @@ class Board:
         if task.status == Status.REVIEW:
             self._request_review(actor, task, auto="reviewer" in mutation.changes)
         self._after_status(actor, mutation)
+        if actor != USER:
+            self._next_direction(actor, mutation.batch.notes)
         if notes is not None:
             notes.extend(mutation.batch.notes)
         return task
@@ -2311,10 +2325,16 @@ class Board:
                     told = task.assignee
                 else:
                     quiet_crew_to = task.assignee
+        # the call gave a direction its assignee (an assignment, a reopening that keeps it, a move under a crew
+        # task) and left it held back (§4.2 "A held direction"); `told` is that assignee when it is told anything
+        gave = "assignee" in changes or reopened or "parent_id" in changes
+        held = self._held_reason(task) if gave and task.crew < 2 else None
         if task.crew >= 2:
             self._notify_crew_owner(told, actor, task)
-        else:
+        elif told != task.assignee or not self._held_notice(told, actor, task, held):
             self._notify_member(told, actor, "n_assigned", id=task.id, title=task.title, by=actor)
+        if held is not None:
+            notes.append(self._held_note(actor, task, held))  # the actor included
         self._notify_member(removed, actor, "n_unassigned", id=task.id, title=task.title, by=actor)
         self._notify_member(quiet_crew_to, actor, "n_crew_changed", wake=False, id=task.id, title=task.title,
                             by=actor, crew=task.crew)
@@ -2332,6 +2352,119 @@ class Board:
         instructions, directions = self._owner_sentence(task, name, self.swarm.language_of(name))
         self._notify_member(name, actor, "n_crew_owner", id=task.id, title=task.title, crew=task.crew,
                             instructions=instructions, directions=directions)
+
+    # --- held directions (docs/SPEC.md §4.2 "A held direction", "Also assigned", "The next direction") ----------
+
+    def _held_reason(self, task: Task) -> tuple[str, Task, int] | None:
+        """Why `task` (filled), a todo direction assigned to a member, may not be taken by its assignee now (held
+        back, §3 item 3): ("busy", crew task, #M) when the assignee works on another direction #M of it (in_progress
+        or waiting; the lowest id), ("full", crew task, 0) when the working set is full without it. None when it is
+        not held back, or its crew task is not todo, in_progress or waiting. Read now, after the call's writes; the
+        crew task comes filled (crew_working, blocked_by). The two reasons exclude each other: a member that works
+        on a direction is in the working set."""
+        if task.status != Status.TODO or task.assignee in (None, USER) or task.parent_id is None:
+            return None
+        parent = self._load(task.parent_id)
+        if parent.crew < 2 or parent.status not in _TAKEABLE:
+            return None
+        self._fill([parent])
+        row = self.db.one(f"SELECT id FROM tasks WHERE parent_id = ? AND assignee = ? AND id != ? AND status IN "
+                          f"({_qmarks(len(_WORKING))}) ORDER BY id LIMIT 1",
+                          (parent.id, task.assignee, task.id, *_WORKING))
+        if row is not None:
+            return "busy", parent, row["id"]
+        if task.assignee not in parent.crew_working and len(parent.crew_working) >= parent.crew:
+            return "full", parent, 0
+        return None
+
+    def _held_tail(self, task: Task, parent: Task, m: int, rows: dict[int, Any] | None = None) -> bool:
+        """The condition of a tail after a busy note: `parent` has a free place, `task` (filled) unassigned would be
+        a free direction (no blocker of its own, `parent` not blocked: "Offers"), and direction #m does not wait for
+        it (_wait_for_held: keeping it for its assignee would then leave both waiting). `rows`: a dict the caller
+        shares between calls, filled with every task's row on first need."""
+        if len(parent.crew_working) >= parent.crew or parent.blocked_by or task.blocked_by:
+            return False
+        if rows is None:
+            rows = {}
+        if not rows:
+            rows.update((r["id"], r) for r in self.db.all("SELECT id, status, depends_on, parent_id, crew FROM tasks"))
+        return not self._wait_for_held(rows, [m], {task.id})
+
+    def _held_note(self, actor: str, task: Task, held: tuple[str, Task, int]) -> str:
+        """The note for the result of `actor`'s call that gave `task` (filled) its assignee and left it held back
+        (`held`, from _held_reason): one sentence for the reason, then at most one tail."""
+        kind, parent, m = held
+        lang = self.swarm.language_of(actor)
+        working = parent.crew_working
+        you = actor == task.assignee
+        if kind == "full":
+            if you:
+                return prompts.t(lang, "note_direction_held_full_you", sub=task.id, id=parent.id, working=len(working),
+                                 crew=parent.crew, names=", ".join(working))
+            return prompts.t(lang, "note_direction_held_full", sub=task.id, id=parent.id, name=task.assignee,
+                             working=len(working), crew=parent.crew, names=", ".join(working))
+        if you:
+            text = prompts.t(lang, "note_direction_held_busy_you", sub=task.id, id=parent.id, m=m)
+            if self._held_tail(task, parent, m):
+                text += prompts.t(lang, "note_direction_held_tail_you", sub=task.id)
+            return text
+        text = prompts.t(lang, "note_direction_held_busy", sub=task.id, id=parent.id, name=task.assignee, m=m,
+                         working=len(working), crew=parent.crew)
+        # only those that may unassign it and add directions to the crew task get the tail
+        if (actor == USER or actor in (parent.created_by, parent.assignee)) and self._held_tail(task, parent, m):
+            text += prompts.t(lang, "note_direction_held_tail", sub=task.id, id=parent.id, name=task.assignee)
+        return text
+
+    def _held_notice(self, name: str | None, actor: str, task: Task, held: tuple[str, Task, int] | None) -> bool:
+        """In place of n_assigned to `name`, made or told the holder of `task` by `actor`'s call: the quiet
+        n_direction_held_busy or n_direction_held_full when `task` is held back for it (`held`, from _held_reason)
+        and it is an LLM member (an external member keeps n_assigned: nothing would tell it later). True when that
+        replaced n_assigned."""
+        if held is None or not name or name in (actor, USER) or self.swarm.kind_of(name) != AgentKind.LLM:
+            return False
+        kind, parent, m = held
+        if kind == "busy":
+            self._notify_member(name, actor, "n_direction_held_busy", wake=False, id=task.id, title=task.title,
+                                by=actor, parent=parent.id, m=m)
+        else:
+            working = parent.crew_working
+            self._notify_member(name, actor, "n_direction_held_full", wake=False, id=task.id, title=task.title,
+                                by=actor, parent=parent.id, working=len(working), crew=parent.crew,
+                                names=", ".join(working))
+        return True
+
+    def _also_assigned(self, actor: str, task: Task) -> list[str]:
+        """After `actor` took `task` (filled), a direction of a crew task: one note per other todo direction of that
+        crew task assigned to the actor (id ascending), each followed by the tail for itself on its condition, read
+        after the take (§4.2 "Also assigned")."""
+        if actor == USER or task.parent_id is None or task.assignee != actor:
+            return []
+        parent = self.get(task.parent_id)
+        if parent.crew < 2:
+            return []
+        lang = self.swarm.language_of(actor)
+        out: list[str] = []
+        rows: dict[int, Any] = {}  # every task's row, read once if a tail needs it
+        for sub in self.subtasks_of(parent.id, open_only=True):
+            if sub.id == task.id or sub.status != Status.TODO or sub.assignee != actor:
+                continue
+            text = prompts.t(lang, "note_direction_held_also", sub=sub.id, id=parent.id, m=task.id)
+            if self._held_tail(sub, parent, task.id, rows):
+                text += prompts.t(lang, "note_direction_held_tail_you", sub=sub.id)
+            out.append(text)
+        return out
+
+    def _next_direction(self, actor: str, notes: list[str]) -> None:
+        """The end of an agent's task_complete result (§4.2 "The next direction"): the "direction to take" sentence
+        for the first todo direction assigned to `actor` that its claim would take now. After a note that spans
+        lines (a crew draft) it starts on a line of its own, its leading space removed, as in mark_text."""
+        to_take = self.directions_to_take(actor)
+        if not to_take:
+            return
+        first = to_take[0]
+        text = prompts.t(self.swarm.language_of(actor), "mark_direction_to_take", sub=first.id,
+                         title=trim(first.title, 80), id=first.parent_id)
+        notes.append("\n" + text.lstrip() if notes and "\n" in notes[-1] else text)
 
     def _after_status(self, actor: str, mutation: _Mutation) -> None:
         """The side effects of a change of a task's status or parent, after the commit (docs/SPEC.md §4 side
