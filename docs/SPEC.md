@@ -684,7 +684,10 @@ Rules (USER may do anything; "member" = agent of any kind):
   depends on #d): none of them would ever finish. Remove one of these dependencies.`; `the new task` names a task
   being created; the parenthesis names the waits that are no depends_on entry). So a moved task's subtree never
   waits for its new ancestors, and a crew task never waits, through other tasks, for its own directions.
-  Status `todo`. Emits `task.created`. If assignee given and != actor: notify assignee `n_assigned`.
+  Status `todo`. Emits `task.created`. If assignee given and != actor: notify assignee `n_assigned` (for a
+  direction held back for it under the conditions of §4.2 "A held direction", a quiet `n_direction_held_*` in its
+  place). A direction created `todo` and held back for its assignee under those conditions, the actor included,
+  adds a note to the actor's result (§4.2 "A held direction").
 * `claim`: status must be `todo` (if already assigned to actor and in_progress/waiting: return as is).
   assignee must be None or actor (else ToolError naming the holder). No blockers (ToolError lists them). A direction
   of a crew task has more checks (§4.2 "Taking a direction").
@@ -705,13 +708,16 @@ Rules (USER may do anything; "member" = agent of any kind):
   status `in_progress`; not one becoming the assignee in the same call) adds `If the task can be done without some of them, remove those from its depends_on (task_update)
   and say why in its discussion.` assignee — anyone if task is unassigned; otherwise current assignee or creator.
   Reassignment of an in_progress/waiting task resets status to `todo`. Notify new assignee `n_assigned`
-  and removed assignee `n_unassigned` (never notify the actor themself).
+  (for a direction held back for it, under the conditions of §4.2 "A held direction", a quiet variant)
+  and removed assignee `n_unassigned` (never notify the actor themself); a call that leaves a direction held back
+  for its assignee under those conditions adds a note to the actor's result, the actor included.
   status transitions for members: assignee may set `in_progress` (only without blockers; an update that takes a
   direction of a crew task, a `parent_id` change too, has the checks of §4.2 "Taking a direction"), `waiting`,
   `todo` (= release: assignee cleared), `failed`; creator or assignee may set `cancelled`; creator may
   reopen a terminal task to `todo` (a `failed` subtask also its parent's creator and assignee, to `todo` or
   `cancelled`; never a subtask whose parent is in `review` or terminal, §4.2). A reopened task keeps its assignee
-  (which gets `n_assigned`) except a `failed` subtask, which is reopened unassigned (to be
+  (which gets `n_assigned`; for a direction held back for it, under the conditions of §4.2 "A held
+  direction", a quiet variant) except a `failed` subtask, which is reopened unassigned (to be
   done again; its old assignee gets nothing), and an assignee that is no longer an active member, which is
   cleared, so the task is ready (when the call passes no `assignee`, a reopening by USER into `in_progress` or
   `waiting` that clears it this way leaves the task `todo`). `done`/`review` only via `complete`/`review`; USER may
@@ -1128,6 +1134,83 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   assignee that is USER, and USER as the actor. Assigning a direction that stays
   `todo` takes no place: the checks run when its assignee sets `in_progress` or claims it. `claim` and
   `_check_transition` share one helper (`_check_direction_take`).
+- **A held direction.** Since assigning a direction that stays `todo` takes no place, a member can be handed one it
+  may not take now: held back (§3 item 3). The call that does so says it:
+  - *When.* A `task_create` or `task_update` gives a `todo` direction of crew task #8 its assignee, a member
+    (`assignee` changed, `task_create` with `assignee`, a reopening that keeps the assignee, or a `parent_id` move
+    under #8), #8 is `todo`, `in_progress` or `waiting`, and after the call's writes (every value below is read then:
+    the state the result reports) the direction is held back for that assignee, for one of two reasons, never both
+    (a member that works on a direction is in the working set): *busy*, the assignee works on another direction #M of
+    #8 (`in_progress` or `waiting`; the lowest id when there are several), or *full*, the working set is full without
+    it. The names are the working set in its order (`crew_working`).
+  - *The actor's note*, in the actor's language (USER's call too: the REST result carries the board's notes): one
+    sentence for the reason, then at most one tail.
+    - busy: ` #16 waits: Bob Brown works on #15, another direction of crew task #8, and can take #16 only after
+      handing #15 in; #8 has 2 of its 3 places taken now.` (`note_direction_held_busy` {sub, id, name, m, working,
+      crew}); when the actor is the assignee, ` #16 waits for you: you work on #15, another direction of crew task #8,
+      and can take #16 only after handing #15 in (task_complete). If you take other work after that, unassign
+      yourself from #16 first (task_update assignee=''), so it does not wait for you.` (`note_direction_held_busy_you`
+      {sub, id, m});
+    - full: ` #16 waits: all places in crew task #8 are taken (3 of 3: Anna Smith, Bob Brown, Carl Diaz), so Dan Ito
+      can take #16 only when a place is free.` (`note_direction_held_full` {sub, id, name, working, crew, names});
+      when the actor is the assignee, ` #16 waits for you: all places in crew task #8 are taken (3 of 3: …); you can
+      take #16 only when a place is free. If you take other work meanwhile that will take long, unassign yourself
+      from #16 first (task_update assignee=''), so it does not wait for you.` (`note_direction_held_full_you` {sub,
+      id, working, crew, names});
+    - the tail, for the busy reason only, while #8 has a free place, #16, unassigned, would be a free direction (no
+      blocker of its own, #8 not blocked: "Offers"), and #15 does not wait for #16 (`Board._wait_for_held`: keeping
+      #16 for its assignee would then leave both waiting): for the actor that is the assignee ` If another member can
+      do #16 now, unassign yourself (task_update assignee='') and a free member is offered it.`
+      (`note_direction_held_tail_you` {sub}); for an actor that created #8 or holds it, or USER, ` If another member
+      can do #16 now, unassign it (task_update assignee='') and a free member is offered it; if only Bob Brown can,
+      keep it: a free place need not be filled. Add a direction only for a part of #8 that no direction covers yet
+      and that can be done now (task_update directions).` (`note_direction_held_tail` {sub, id, name}); for any other
+      actor none.
+  - *The assignee's notice.* When someone else's call would send it `n_assigned` for that direction (an assignment,
+    `task_create` with `assignee`, a reopening that keeps the assignee: the creator's or USER's) and the assignee is
+    an LLM member, it gets in its place, quietly: busy, `n_direction_held_busy` {by, id, title, parent, m} `Task #16
+    "title", a direction of crew task #8, was assigned to you by X. You work on #15, another direction of #8: keep
+    working on it; you can take #16 only after handing #15 in (task_complete), and you are told when you can claim
+    #16 (task_claim). If you take other work after handing #15 in, unassign yourself from #16 first (task_update
+    assignee=''), so it does not wait for you.`; full, `n_direction_held_full` {by, id, title, parent, working, crew, names} `… All places in
+    #8 are taken now (3 of 3: Anna Smith, Bob Brown, Carl Diaz): you can take #16 only when a place is free, and you
+    are told when you can claim #16 (task_claim). If you take other work meanwhile that will take long, unassign
+    yourself from #16 first (task_update assignee=''), so it does not wait for you.` Quiet: it can do nothing about
+    it now, and a woken member would only try a claim that is refused. "You are told" is what the board does already
+    for an LLM member: `n_unblocked` when the direction's dependencies are done, and the "direction to take" mark
+    ("Finishing", Liveness) once its claim would take it, after the member has been idle with that liveness key for
+    `agents.idle_nudge_seconds` (once per key). An external member keeps `n_assigned` (nothing tells it later; the
+    refusal of its claim says why), and so do a direction that is not held back, one of a crew task in review or
+    terminal, and USER as the assignee (never held back); a `parent_id` move sends the assignee nothing, as before.
+  - *What stays.* The texts name no moment to claim: the direction may also have blockers of its own (often #M
+    itself, which a hand-in sends to review, and only a done dependency unblocks), and the board says when the claim
+    would take it. `n_unblocked` is unchanged: a direction still held back when its dependencies are done gets it
+    like any task, and the refusal of its claim says why. A wait that keeps the held direction or a place from ever
+    freeing (a working direction that waits for the held one) gets no text of its own: Liveness counts #8 among its
+    owner's stalled ids only while #8 is `in_progress` and every working direction waits for a held-back one (§3
+    items 2-3). The checks of "Taking a direction" are unchanged.
+- **Also assigned.** When a claim or an `update` takes direction #M for the actor, a member (a take of "Taking a
+  direction", with its checks), the result adds, after the card instruction and the reviewer sentence, for each
+  other `todo` direction of the same crew task assigned to the actor (id ascending), ` #16, also assigned to you,
+  waits: you can take it only after handing #15 in (task_complete), since a member works on one direction of crew
+  task #8 at a time. If you take other work after that, unassign yourself from #16 first (task_update
+  assignee=''), so it does not wait for you.` (`note_direction_held_also` {sub, id, m}), followed by `note_direction_held_tail_you` on the
+  tail's condition above, read after the take (the actor in the working set). So a member that was assigned several
+  directions before it took one learns at its take that the others now wait for it, and may let a free member have
+  one.
+- **The next direction.** The result of an agent's `task_complete` adds, after the other notes, the "direction to
+  take" sentence of Liveness (` #16 "title", your direction of crew task #8, can be taken now: claim it
+  (task_claim) and do it, or unassign yourself if you will not (task_update assignee='').`, `mark_direction_to_take`
+  {sub, title, id}) for the first `todo` direction assigned to the actor that its claim would take now
+  (`Board.directions_to_take`, the lowest id; the next one shows at the next `task_complete`). A direction handed to
+  it while it worked on the one it hands in usually becomes takeable by that call (no blocker of its own, #8 not
+  blocked, and the place just freed still free; one that depends on the direction handed in waits for its approval,
+  and `n_unblocked` tells it then), so it takes it in the same activation: the mark needs
+  `agents.idle_nudge_seconds` of idleness and never reaches a member at work, and the scheduler's offers
+  (`n_ready`), which reach an idle member within seconds, never name an assigned task. A sentence after a note that
+  spans lines (a crew draft) starts on a line of its own, its leading space removed, as in `Board.mark_text`. It
+  records no liveness key, so the mark still wakes the member later (once per key) if it does not take the
+  direction.
 - **Discussion.** The participants of a crew task (§4 `post`) also include the assignees of its open directions (in
   review too): its discussion is the crew's channel, and a post there wakes them (the economy rules of the system
   prompt apply). Taking a direction posts nothing: the board shows it.
@@ -1457,6 +1540,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   | a direction fails while another one is open and its crew task is open and not in review | the owner, unless it is the actor | `n_direction_failed` {by, id, title, parent} (in place of `n_task_closed` when the owner also created the direction) | yes |
   | a direction is cancelled while another one is open and its crew task is open and not in review | the owner, unless it is the actor or its assignee (`n_subtask_cancelled`) | `n_direction_cancelled` {by, id, title, parent} (in place of `n_task_closed` when the owner also created the direction) | yes |
   | an open subtask is cancelled by someone other than its assignee | its assignee (for one in review, its executor) | `n_subtask_cancelled` {by, id, title, parent} (in place of `n_task_closed` when it also created it) | yes |
+  | someone else's call would send `n_assigned` for a direction it leaves held back for its assignee ("A held direction") | that assignee, an LLM member | `n_direction_held_busy` {by, id, title, parent, m} or `n_direction_held_full` {by, id, title, parent, working, crew, names} (in place of `n_assigned`) | no |
   | a direction is taken (a claim, an `update`, a `parent_id` move) | the owner, unless it is the actor or the taker | `n_direction_taken` {by, id, title, parent} | no |
   | a direction's holder left the swarm | the crew task's assignee after the release | `n_direction_freed` {id, title, by} | no |
   | someone else makes or tells a member the holder of a crew task (an assignment, the creator's reopening, `crew` set) | that holder | `n_crew_owner` {id, title, crew, directions, instructions} (in place of `n_assigned`; with all directions finished, `instructions` is the all finished owner form with the draft, and `directions` "") | yes |

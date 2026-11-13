@@ -215,6 +215,20 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_direction_taken": "{by} took #{id} \"{title}\", a direction of your crew task #{parent}.",   # quiet
         "n_direction_freed": "#{id} \"{title}\", a direction of your crew task, is free again: {by} left the "
                              "swarm.",   # quiet
+        # in place of n_assigned for a direction the call leaves held back for its assignee (docs/SPEC.md §4.2
+        # "A held direction"): it works on another direction #{m} of #{parent}, or all places of #{parent} are
+        # taken ({names}: the working set); quiet; no moment to claim is named: the board says when
+        "n_direction_held_busy": "Task #{id} \"{title}\", a direction of crew task #{parent}, was assigned to you by "
+                                 "{by}. You work on #{m}, another direction of #{parent}: keep working on it; you can "
+                                 "take #{id} only after handing #{m} in (task_complete), and you are told when you "
+                                 "can claim #{id} (task_claim). If you take other work after handing #{m} in, "
+                                 "unassign yourself from #{id} first (task_update assignee=''), so it does not wait "
+                                 "for you.",
+        "n_direction_held_full": "Task #{id} \"{title}\", a direction of crew task #{parent}, was assigned to you by "
+                                 "{by}. All places in #{parent} are taken now ({working} of {crew}: {names}): you can "
+                                 "take #{id} only when a place is free, and you are told when you can claim #{id} "
+                                 "(task_claim). If you take other work meanwhile that will take long, unassign "
+                                 "yourself from #{id} first (task_update assignee=''), so it does not wait for you.",
         # someone else made the recipient the holder of a crew task; {instructions}: a crew_owner_* key, or " " and
         # an owner_prefix_* key with its ending; {directions}: crew_directions (+ crew_directions_more), or ""
         "n_crew_owner": "#{id} \"{title}\" is yours now (crew {crew}).{instructions}{directions}",
@@ -301,6 +315,37 @@ TEXTS: dict[str, dict[str, str]] = {
         # a direction left todo without an assignee under a terminal crew task is cancelled in its place
         "note_direction_closed": " #{parent} is {status}, so #{id} is cancelled instead of going back to the board: "
                                  "nobody takes a direction of a closed crew task.",
+        # the call left direction #{sub} of crew task #{id} todo and held back for its assignee (docs/SPEC.md §4.2
+        # "A held direction"): {name} works on #{m}, or all places are taken ({names}: the working set); the _you
+        # forms when the assignee is the actor; at most one tail follows
+        "note_direction_held_busy": " #{sub} waits: {name} works on #{m}, another direction of crew task #{id}, and "
+                                    "can take #{sub} only after handing #{m} in; #{id} has {working} of its {crew} "
+                                    "places taken now.",
+        "note_direction_held_busy_you": " #{sub} waits for you: you work on #{m}, another direction of crew task "
+                                        "#{id}, and can take #{sub} only after handing #{m} in (task_complete). If "
+                                        "you take other work after that, unassign yourself from #{sub} first "
+                                        "(task_update assignee=''), so it does not wait for you.",
+        "note_direction_held_full": " #{sub} waits: all places in crew task #{id} are taken ({working} of {crew}: "
+                                    "{names}), so {name} can take #{sub} only when a place is free.",
+        "note_direction_held_full_you": " #{sub} waits for you: all places in crew task #{id} are taken ({working} of "
+                                        "{crew}: {names}); you can take #{sub} only when a place is free. If you take "
+                                        "other work meanwhile that will take long, unassign yourself from #{sub} "
+                                        "first (task_update assignee=''), so it does not wait for you.",
+        # after note_direction_held_busy, for an actor that created #{id} or holds it (or USER), while #{id} has a
+        # free place, #{sub} unassigned would be a free direction, and #{m} does not wait for #{sub}
+        "note_direction_held_tail": " If another member can do #{sub} now, unassign it (task_update assignee='') and "
+                                    "a free member is offered it; if only {name} can, keep it: a free place need not "
+                                    "be filled. Add a direction only for a part of #{id} that no direction covers yet "
+                                    "and that can be done now (task_update directions).",
+        # after note_direction_held_busy_you or note_direction_held_also, on the same condition (any actor)
+        "note_direction_held_tail_you": " If another member can do #{sub} now, unassign yourself (task_update "
+                                        "assignee='') and a free member is offered it.",
+        # a take of direction #{m} by the actor, which also holds todo direction #{sub} of the same crew task #{id}
+        # (docs/SPEC.md §4.2 "Also assigned")
+        "note_direction_held_also": " #{sub}, also assigned to you, waits: you can take it only after handing #{m} in "
+                                    "(task_complete), since a member works on one direction of crew task #{id} at a "
+                                    "time. If you take other work after that, unassign yourself from #{sub} first "
+                                    "(task_update assignee=''), so it does not wait for you.",
         # a task became failed or cancelled while open tasks depend on it; {deps}: "#5, #7"
         "note_dependents_blocked": " {deps} depend on #{id}, which is {status} now: they stay blocked until that "
                                    "dependency is removed (task_update depends_on) or they are cancelled.",
@@ -676,6 +721,18 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_direction_taken": "{by} взял(а) #{id} «{title}», направление твоей групповой задачи #{parent}.",
         "n_direction_freed": "#{id} «{title}», направление твоей групповой задачи, снова свободно: {by} покинул(а) "
                              "рой.",
+        "n_direction_held_busy": "{by} назначил(а) тебе #{id} «{title}», направление групповой задачи #{parent}. Ты "
+                                 "ведёшь #{m}, другое направление #{parent}: продолжай работу над ним; взять #{id} ты "
+                                 "сможешь только после сдачи #{m} (task_complete), и тебе скажут, когда #{id} можно "
+                                 "будет взять (task_claim). Если после сдачи #{m} возьмёшься за другую работу, "
+                                 "сначала сними себя с #{id} (task_update assignee=''), чтобы это направление не "
+                                 "ждало тебя.",
+        "n_direction_held_full": "{by} назначил(а) тебе #{id} «{title}», направление групповой задачи #{parent}. "
+                                 "Сейчас в #{parent} заняты все места ({working} из {crew}: {names}): взять #{id} ты "
+                                 "сможешь только тогда, когда освободится место, и тебе скажут, когда #{id} можно "
+                                 "будет взять (task_claim). Если тем временем возьмёшься за другую долгую работу, "
+                                 "сначала сними себя с #{id} (task_update assignee=''), чтобы это направление не "
+                                 "ждало тебя.",
         "n_crew_owner": "Задача #{id} «{title}» теперь твоя (групповая задача: одновременно до {crew} "
                         "участников).{instructions}{directions}",
         "n_crew_changed": "{by} задал(а) для #{id} «{title}» crew = {crew} (сколько участников работают над ней "
@@ -755,6 +812,33 @@ TEXTS: dict[str, dict[str, str]] = {
                              "разбудит автора).",
         "note_direction_closed": " #{parent} в статусе {status}, поэтому #{id} отменена, а не возвращена на доску: "
                                  "направления закрытой групповой задачи никто не берёт.",
+        "note_direction_held_busy": " #{sub} пока ждёт: {name} ведёт #{m}, другое направление групповой задачи #{id}, "
+                                    "и сможет взять #{sub} только после сдачи #{m}; сейчас в #{id} занято мест: "
+                                    "{working} из {crew}.",
+        "note_direction_held_busy_you": " #{sub} ждёт тебя: ты ведёшь #{m}, другое направление групповой задачи "
+                                        "#{id}, и сможешь взять #{sub} только после сдачи #{m} (task_complete). Если "
+                                        "после сдачи #{m} возьмёшься за другую работу, сначала сними себя с #{sub} "
+                                        "(task_update assignee=''), чтобы это направление не ждало тебя.",
+        "note_direction_held_full": " #{sub} пока ждёт: в групповой задаче #{id} заняты все места ({working} из "
+                                    "{crew}: {names}), поэтому {name} сможет взять #{sub} только тогда, когда "
+                                    "освободится место.",
+        "note_direction_held_full_you": " #{sub} ждёт тебя: в групповой задаче #{id} заняты все места ({working} из "
+                                        "{crew}: {names}); взять #{sub} ты сможешь только тогда, когда освободится "
+                                        "место. Если тем временем возьмёшься за другую долгую работу, сначала сними "
+                                        "себя с #{sub} (task_update assignee=''), чтобы это направление не ждало тебя.",
+        "note_direction_held_tail": " Если #{sub} уже сейчас может сделать и другой участник, сними с #{sub} "
+                                    "исполнителя (task_update assignee=''), и #{sub} предложат свободному участнику; "
+                                    "если это может только {name}, оставь как есть: свободное место не обязательно "
+                                    "занимать. Добавляй направление, только если в #{id} есть часть, которую не "
+                                    "покрывает ни одно направление и которую можно делать уже сейчас (task_update "
+                                    "directions).",
+        "note_direction_held_tail_you": " Если #{sub} уже сейчас может сделать другой участник, сними себя с #{sub} "
+                                        "(task_update assignee=''), и #{sub} предложат свободному участнику.",
+        "note_direction_held_also": " Направление #{sub}, тоже назначенное тебе, пока ждёт: взять его ты сможешь "
+                                    "только после сдачи #{m} (task_complete), потому что участник ведёт одно "
+                                    "направление групповой задачи #{id} за раз. Если после сдачи #{m} возьмёшься за "
+                                    "другую работу, сначала сними себя с #{sub} (task_update assignee=''), чтобы это "
+                                    "направление не ждало тебя.",
         "note_dependents_blocked": " {deps} зависят от #{id}, которая теперь в статусе {status}: они останутся "
                                    "заблокированными, пока эту зависимость не уберут (task_update depends_on) или их "
                                    "не отменят.",

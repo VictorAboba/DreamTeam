@@ -461,6 +461,15 @@ CREW_KEYS = {
     "mark_subtasks_done": {"id", "title", "ending"}, "mark_free_directions": {"id", "directions"},
     "mark_direction_to_take": {"sub", "title", "id"},
     "lock_waiter_direction": {"id", "title", "parent"},
+    # held directions (docs/SPEC.md §4.2 "A held direction", "Also assigned")
+    "n_direction_held_busy": {"by", "id", "title", "parent", "m"},
+    "n_direction_held_full": {"by", "id", "title", "parent", "working", "crew", "names"},
+    "note_direction_held_busy": {"sub", "id", "name", "m", "working", "crew"},
+    "note_direction_held_busy_you": {"sub", "id", "m"},
+    "note_direction_held_full": {"sub", "id", "name", "working", "crew", "names"},
+    "note_direction_held_full_you": {"sub", "id", "working", "crew", "names"},
+    "note_direction_held_tail": {"sub", "id", "name"}, "note_direction_held_tail_you": {"sub"},
+    "note_direction_held_also": {"sub", "id", "m"},
 }
 # changed keys of existing texts
 CHANGED_KEYS = {"n_review_rejected": {"by", "id", "title", "comment", "ending"}, "n_stalled": {"tasks", "marks"}}
@@ -492,9 +501,12 @@ def test_crew_texts_say_crew_task_and_direction_in_russian():
         assert "команд" not in ru[key].lower(), key
     for key in ("n_direction_failed", "n_direction_cancelled", "n_direction_taken", "n_direction_freed",
                 "n_crew_review_requested", "crew_owner_take", "mark_free_directions", "note_direction_card",
-                "mark_direction_to_take"):
+                "mark_direction_to_take", "n_direction_held_busy", "n_direction_held_full", "note_direction_held_busy",
+                "note_direction_held_busy_you", "note_direction_held_also"):
         assert "групповой задачи" in ru[key] or "групповая задача" in ru[key], key
         assert "направлен" in ru[key], key
+    for key in ("note_direction_held_full", "note_direction_held_full_you"):  # the places of a crew task
+        assert "в групповой задаче #{id}" in ru[key], key
     for text in (prompts.SYSTEM_RU, prompts.planning_task("ru")[2]):
         lines = {int(m.group(1)): m.group(2) for m in re.finditer(r"^(\d+)\. (.*)$", text, re.M)}
         for number in (3, 6, 8) if text is prompts.SYSTEM_RU else (4, 9):
@@ -566,6 +578,48 @@ def test_crew_texts_render_the_spec_wording():
     assert t("en", "lock_waiter_direction", id=15, title="pkce", parent=7) == "#15 pkce (direction of #7)"
     assert t("en", "n_direction_freed", id=15, title="pkce", by="Anna Smith") == \
         '#15 "pkce", a direction of your crew task, is free again: Anna Smith left the swarm.'
+    # "A held direction", "Also assigned", "The next direction"
+    assert t("en", "note_direction_held_busy", sub=16, id=8, name="Bob Brown", m=15, working=2, crew=3) == (
+        " #16 waits: Bob Brown works on #15, another direction of crew task #8, and can take #16 only after handing "
+        "#15 in; #8 has 2 of its 3 places taken now.")
+    assert t("en", "note_direction_held_busy_you", sub=16, id=8, m=15) == (
+        " #16 waits for you: you work on #15, another direction of crew task #8, and can take #16 only after handing "
+        "#15 in (task_complete). If you take other work after that, unassign yourself from #16 first (task_update "
+        "assignee=''), so it does not wait for you.")
+    names = "Anna Smith, Bob Brown, Carl Diaz"
+    assert t("en", "note_direction_held_full", sub=16, id=8, name="Dan Ito", working=3, crew=3, names=names) == (
+        " #16 waits: all places in crew task #8 are taken (3 of 3: Anna Smith, Bob Brown, Carl Diaz), so Dan Ito can "
+        "take #16 only when a place is free.")
+    assert t("en", "note_direction_held_full_you", sub=16, id=8, working=3, crew=3, names="…") == (
+        " #16 waits for you: all places in crew task #8 are taken (3 of 3: …); you can take #16 only when a place is "
+        "free. If you take other work meanwhile that will take long, unassign yourself from #16 first (task_update "
+        "assignee=''), so it does not wait for you.")
+    assert t("en", "note_direction_held_tail_you", sub=16) == (
+        " If another member can do #16 now, unassign yourself (task_update assignee='') and a free member is offered "
+        "it.")
+    assert t("en", "note_direction_held_tail", sub=16, id=8, name="Bob Brown") == (
+        " If another member can do #16 now, unassign it (task_update assignee='') and a free member is offered it; if "
+        "only Bob Brown can, keep it: a free place need not be filled. Add a direction only for a part of #8 that no "
+        "direction covers yet and that can be done now (task_update directions).")
+    assigned = 'Task #16 "title", a direction of crew task #8, was assigned to you by X.'
+    assert t("en", "n_direction_held_busy", by="X", id=16, title="title", parent=8, m=15) == (
+        assigned + " You work on #15, another direction of #8: keep working on it; you can take #16 only after "
+        "handing #15 in (task_complete), and you are told when you can claim #16 (task_claim). If you take other "
+        "work after handing #15 in, unassign yourself from #16 first (task_update assignee=''), so it does not wait "
+        "for you.")
+    assert t("en", "n_direction_held_full", by="X", id=16, title="title", parent=8, working=3, crew=3,
+             names=names) == (
+        assigned + " All places in #8 are taken now (3 of 3: Anna Smith, Bob Brown, Carl Diaz): you can take #16 "
+        "only when a place is free, and you are told when you can claim #16 (task_claim). If you take other work "
+        "meanwhile that will take long, unassign yourself from #16 first (task_update assignee=''), so it does not "
+        "wait for you.")
+    assert t("en", "note_direction_held_also", sub=16, id=8, m=15) == (
+        " #16, also assigned to you, waits: you can take it only after handing #15 in (task_complete), since a member "
+        "works on one direction of crew task #8 at a time. If you take other work after that, unassign yourself from "
+        "#16 first (task_update assignee=''), so it does not wait for you.")
+    assert t("en", "mark_direction_to_take", sub=16, title="title", id=8) == (
+        ' #16 "title", your direction of crew task #8, can be taken now: claim it (task_claim) and do it, or unassign '
+        "yourself if you will not (task_update assignee='').")
 
 
 def test_russian_subtasks_done_needs_no_plural_forms():
