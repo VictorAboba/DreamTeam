@@ -4910,7 +4910,8 @@ def test_ui_sources_carry_no_mojibake():
     # regression: a "→" saved through the CP1251 codepage came back as "в†’" in app.js
     marks = ("в†", "вЂ", "Ð°", "Ñ€")
     paths = [*STATIC.glob("*.js"), *STATIC.glob("*.html"), *STATIC.glob("*.css"),
-             *(STATIC.parent / "tui").glob("*.py"), STATIC.parent / "prompts.py"]
+             *(STATIC.parent / "tui").glob("*.py"), STATIC.parent / "prompts.py",
+             *(STATIC.parent / name for name in ("uitext.py", "symbols.py", "eventtext.py"))]  # the feed's texts
     found = [(p.name, m) for p in paths for m in marks if m in p.read_text(encoding="utf-8")]
     assert not found
 

@@ -6940,23 +6940,24 @@ An event is a journal row (§9) with its id, plus a line for people:
 
 ```json
 {"id": 41, "type": "task.updated", "ts": 1794463609.8, "actor": "Anna Smith", "data": {...},
- "text": "◐ #3 Parse the document — Anna Smith"}
+ "text": "◐ #3 Parse the document — Anna"}
 ```
 
 - `data` is §9's and may gain fields.
 - `text`: one line from `eventtext.event_text(event, lang, me=USER)`, new and outside the `tui` package. It takes its
   words and symbols from `uitext.py` and `symbols.py`, moved out of `tui/i18n.py` and `tui/theme.py`, which keep
   shims. It has the meaning of the TUI's verbose feed line as the user sees it (`render.event`), without its terminal
-  parts: no wrapping, panels or colours, no clock (`ts` has the time), no width limit; whitespace is collapsed and
-  control characters are removed.
+  parts: no wrapping, panels or colours, no clock (`ts` has the time), no width limit; whitespace is collapsed, and
+  control characters and the invisible bidi and zero-width format characters are removed.
   - A tool call is journaled before the tool runs, so its event cannot gain the result later. The `tool_call`
     activity's text is the call line (`Anna Smith · task_claim(task_id=3)`), and the `tool_result` activity's text is
     a line of its own (`Anna Smith · task_claim ⎿ <first line>`, an error marked).
   - `text` is null only for the events no feed shows: `agent.usage` and `agent.compacted`.
   - `lang` (`ru` or `en`) defaults to the session's language.
   - The text adds no absolute path of its own: a folder is named by its last component, and the environment of
-    `skill.deps` and a job log outside the workspace are left out. What the agents wrote (message bodies, tool calls
-    and their results) is quoted as written, paths included (21.1).
+    `skill.deps` and a job log outside the workspace are left out. That holds for every text of DreamTeam's own a
+    line quotes (a notice, a wake-up, an agent's error, an installer's error), whatever it embeds. What the agents
+    wrote (message bodies, tool calls and their results) is quoted as written, paths included (21.1).
   - It never raises: an event it cannot word gets a generic `<type> · <actor>` line.
   - The TUI may later take its words from it. The wording is for people and may change (21.1).
 - `detail=timeline` (default) selects by an exact list of types, `type IN (...)`, so the database does the filtering

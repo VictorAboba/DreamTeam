@@ -55,16 +55,18 @@ class TestPure:
 
 
 def test_the_shared_run_modules_import_no_tui():
-    """Hub code imports autoreply, result and instruct: none of them may pull in dreamteam.tui, whose package imports
-    prompt_toolkit (a fresh, isolated interpreter, with this test run's sources first on its path)."""
+    """Hub code imports autoreply, result, instruct and the event texts (eventtext, uitext, symbols): none of them may
+    pull in dreamteam.tui, whose package imports prompt_toolkit, or rich (a fresh, isolated interpreter, with this
+    test run's sources first on its path)."""
     src = str(Path(dreamteam.__file__).resolve().parent.parent)
     code = (
         "import sys\n"
         f"sys.path.insert(0, {src!r})\n"
         "import dreamteam.autoreply, dreamteam.instruct, dreamteam.result\n"
+        "import dreamteam.eventtext, dreamteam.uitext, dreamteam.symbols\n"
         f"assert dreamteam.__file__.startswith({src!r}), dreamteam.__file__\n"
-        "bad = sorted(m for m in sys.modules if m == 'prompt_toolkit' or m.startswith(('prompt_toolkit.',"
-        " 'dreamteam.tui')))\n"
+        "bad = sorted(m for m in sys.modules if m in ('prompt_toolkit', 'rich') or m.startswith(('prompt_toolkit.',"
+        " 'rich.', 'dreamteam.tui')))\n"
         "assert not bad, bad\n"
     )
     done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60)
