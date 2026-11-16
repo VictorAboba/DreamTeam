@@ -502,10 +502,11 @@ def _ev_message(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 # the goal panel / hire line / the question's pause line (with the spinner and the input box's title) say it
 _QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined", "u_question"})
 # the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user, a model
-# profile whose calls count as $0
+# profile whose calls count as $0, the members' messages no longer answered automatically (u_auto_reply_limit)
 _WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
                          "u_review_handed_over", "u_reviews_waiting", "u_skill_proposed", "u_skill_deps_failed",
-                         "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left", "u_cost_unknown"})
+                         "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left", "u_cost_unknown",
+                         "u_auto_reply_limit"})
 
 
 def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:

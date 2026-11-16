@@ -90,8 +90,9 @@ src/dreamteam/
   launcher_mcp.py  the launcher as one MCP server (§18.2)
   api_v1.py      the external HTTP API under /api/v1: ApiV1(manager, host), its Starlette app, routes and aclose()
                  (§21; draft, not implemented)
-  autoreply.py   the hub's automatic answers for a session created with answers "auto", and the requests to the
-                 user, requests_of (§21.5; draft)
+  autoreply.py   the requests to the user (requests_of, read_requests, blocking_requests), the hub's automatic
+                 answers for a session created with answers "auto" (SessionAutoReply), and a session's journal
+                 followed by id (follow_journal, also for stop_when_done) (§21.4, §21.5; draft)
   eventtext.py   one plain line per event for people, outside the tui package (§21.6; draft)
   uitext.py      the feed's texts (ru/en), moved out of tui/i18n.py, which stays as a shim (§21.6; draft)
   symbols.py     the feed's symbols, moved out of tui/theme.py, which re-exports them (§21.6; draft)
@@ -553,9 +554,12 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
   the user after planning started from silencing the nags for ever; a comment on the task is no message and does
   not count. A question the user went on without is one that a `swarm.resumed` event, or the `swarm.paused` event of
   the budget pause it turned into, carries as `question` with outcome "dropped" (a manual resume, clarify switched
-  off; the `_DROPPED` query, on the events type index, runs only when the guard would hold otherwise): its asker was
-  told `n_question_unanswered` (take your defaults), so it waits for nothing, and the board's quiet `clarify_wait`
-  banner (§14.1) hides; its next message to the user turns the guard on again.
+  off; the `autoreply.QUESTION_DROPPED` query, on the events type index, runs only when the guard would hold
+  otherwise): its asker was told `n_question_unanswered` (take your defaults), so it waits for nothing, and the
+  board's quiet `clarify_wait` banner (§14.1) hides; its next message to the user turns the guard on again. The rule
+  past the tags is `autoreply.planner_question(scalar, name, task_id, since)` (the id of the question the planner
+  waits on, else None), which the requests to the user read from a session's file too (§21.5), so the guard, the
+  banner and the requests cannot drift apart.
 - **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm` (toolset revision 4,
   §6.1). The message is always stored first; then `ask_user(asker, message)` pauses only after these checks, in this
   order, each giving its outcome and result note (§12): `user` (the sender is the user), `no_user` ("user" is not a
@@ -4172,8 +4176,9 @@ settings; ValueError when they are invalid):
   `backups(sid)`, `import_overrides(overrides, models)`, `async import_add(staged, meta, workspace, *, sid,
   before_swap=None)`, `async import_rewrite(sid, staged, meta, workspace, *, expect=None, before_swap=None)`,
   `async import_settings(sid, meta, *, expect=None)`, `recover_swaps()` and `interrupted_swaps()`; module functions
-  `read_stats(db_path, conn=None)`, `read_lists(db_path, conn=None)`, `slugify(title)`, `external_workspaces(home)`,
-  `new_uid()`, `session_uid(meta)` and `api_meta(meta, *, create=False)`.
+  `read_stats(db_path, conn=None, *, clarify=False)`, `read_lists(db_path, conn=None)`, `slugify(title)`,
+  `external_workspaces(home)`,
+  `new_uid()`, `session_uid(meta)`, `api_meta(meta, *, create=False)` and `api_answers(api)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
 - **A run's start and end, waiting for a change** (§21.6, §21.7).
@@ -4257,6 +4262,19 @@ settings; ValueError when they are invalid):
     below one may be anyone's: `C:\Users\alice\x` must not become `Users\alice\x`); each also resolved. A start
     cancelled inside `swarm.start()` (the hub stops) writes `finished_at` and no `start_error`.
   - `_unload` of a running v1 session writes `finished_at` after `Swarm.stop`, whatever the reason.
+  - What runs beside a v1 session's run (`_RunWatch`, tied to its Swarm, kept in `_run_watch[sid]`):
+    `_start_locked(sid, auto_reply=False, *, resumed=False)` starts it once the swarm runs and its pending goal is
+    set (`_start_run_watch`), on every start path: `autoreply.SessionAutoReply` with `answers: "auto"` (§21.5), and
+    the stop_when_done watcher (`_watch_end`) with `stop_when_done` true, which follows the journal from its head
+    read just before `session.started` (§21.4). `resume()` passes `resumed=True`. `_unload` cancels both and waits
+    for them before `Swarm.stop`. The watcher never awaits a stop: `_stop_soon` schedules
+    `_stop(sid, reason=..., still=...)` as a task kept in `_stopping`; `_stop` is `stop()` with a check made under the
+    session's lock (`still`: the session still runs that Swarm and the reason still holds), else it does nothing; with
+    `still` it leaves the marks of starts announced meanwhile (`mark_starting`, `resume_pending`) alone.
+    `shutdown()` sets `_closing` (`_stop_soon` then schedules nothing: the resume check covers those), waits for the
+    scheduled stops, then unloads.
+  - `api_answers(api)`: the block's `answers`, `API_GIVEN`'s "auto" when it has none; the auto-reply hold,
+    `_start_run_watch` and `summary` read it.
   - `summary(sid)` adds `via` and `answers` for such a session only.
   - `control(sid, *, max_cost_usd=None, max_agents=None, wrap_up=None)` (v1's PATCH, §21.2) does what
     `swarm_control` does with the limits and wrap-up mode, as the user, under the session's lock: `set_limits` (a
@@ -4446,7 +4464,7 @@ settings; ValueError when they are invalid):
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
-   "question":{"asker","message_id"}|null,"clarify":bool,
+   "question":{"asker","message_id"}|null,"requests":n,"clarify":bool,
    "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names],
    "copied_from":{"source","files","bytes","at"}|null,"earlier_version":bool,"via"?,"answers"?}
   ```
@@ -4456,8 +4474,10 @@ settings; ValueError when they are invalid):
   `read_stats` opens its own connection through `db.reading_file`, so listing leaves no `-wal` or `-shm` behind.
   `question` (`read_stats`, from kv `paused`, default None): the member's question that holds the pause, set only
   for a paused slot with reason `question`, a non-empty asker and an integer message_id (the test of
-  `Swarm.pending_question`, §3.1); `clarify`: the session's `[swarm] clarify` setting (its own override, else the
-  global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
+  `Swarm.pending_question`, §3.1); `requests` (`read_stats`, default 0, in a try of its own): how many requests to
+  the user wait (`autoreply.requests_from` on the same connection, with the session's `clarify`: the kinds the HTTP
+  API v1 lists, §21.5), for every session; `clarify`: the session's `[swarm] clarify` setting (its own override,
+  else the global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
@@ -6971,14 +6991,25 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   path, a Git URL or Claude Code.
 - **`answers`**: who answers what the agents ask the user. `auto` (default): the hub itself, as `dreamteam -p` with
   auto-replies (21.5). `manual`: the client, through `requests`. `clarify: true` (the planner asks first, §3.1) only
-  with `manual` (400 `bad_request` otherwise, as `--clarify` needs `--no-auto-reply`).
+  with `manual` (400 `bad_request` otherwise, as `--clarify` needs `--no-auto-reply`). An `api` meta without the key
+  (a hand edit) counts as `auto`, as one without `stop_when_done` counts as true (`sessions.api_answers(api)`: the
+  hold, the automatic answers and the summary read it alike).
 - **`stop_when_done`** (default true): when the goal is completed, or the budget pauses the session, the session is
   stopped (its background jobs too), as `dreamteam -p` does with its own launcher, and journals `session.stopped` with
   reason `done` or `budget`; `continue` starts it again. false: it stays running like a board session.
   - A watcher runs with every start of such a session, on every start path. It reads the journal by id from where the
     start began (`goal.completed` → done, `swarm.paused` with reason `budget` → budget), woken by the bus but never
-    reading the bus's queue, which drops events when it is full. It stops the session through a task the manager keeps
-    and never awaits that stop itself (`_unload` cancels the watcher).
+    reading the bus's queue, which drops events when it is full (`autoreply.follow_journal`: the bus queue holds one
+    wake-up, and each pass reads the newest id, then the rows up to it). It stops the session through a task the
+    manager keeps and never awaits that stop itself (`_unload` cancels the watcher).
+  - That stop is made under the session's lock only while the session still runs the same Swarm and the reason still
+    holds (the goal is still completed, the budget pause still holds): a `continue` that reopened the goal, a raised
+    budget or a stop may come first. The watcher goes on watching meanwhile, so a later completion or budget pause of
+    the same run stops it then. Such a stop ends that run and nothing more: a start announced while it waited for the
+    lock (a `continue`) keeps its mark and starts the session again. A hub that stops waits for a stop already
+    scheduled, so such a job is not resumed, and schedules no new one: a completion or budget pause the watcher has
+    not acted on yet when the hub stops is left to the resume check below (a session whose work is finished, its goal
+    completed and no task open, is not resumed at all: it stays stopped, its last reason `shutdown`).
   - On a resume when the hub starts, a session already paused by the budget, or whose goal is completed, is stopped as
     soon as it starts: the hub may have stopped between that event and the stop. On any other start only the events of
     this run count, so a board start of a done session keeps it running.
@@ -7041,23 +7072,39 @@ retried answer never lands on a newer one:
 
 - **One definition.** `autoreply.requests_of(swarm)` lists them, and `autoreply.blocking_requests` says which of them
   block the work. `SessionAutoReply`'s sweep, the summary's `requests` count, the state `waiting` (21.7) and the
-  routes all use them. A stopped session's requests are read from its file (`read_requests(db_path)`, read-only, the
-  same kinds), and `_read_stats` counts the same kinds for its summary: a question pause (kv `paused`), a clarify
-  planner that waits, reviews for the user, MCP servers that wait, unanswered member messages.
+  routes all use them. A stopped session's requests are read from its file (`read_requests(db_path, *,
+  clarify=False)`, read-only, the same kinds), and `_read_stats` counts the same kinds for its summary: a question
+  pause (kv `paused`), a clarify planner that waits, reviews for the user, MCP servers that wait, unanswered member
+  messages. All three are `autoreply.requests_from(conn, *, clarify)` on a connection (a loaded swarm's under its
+  Database's lock, or a file's), where `clarify` is the session's `[swarm] clarify` (a planner waits for the user only
+  with it on, as `Swarm.asks_user` says). The list is oldest first (`ts`, the time it was asked: the message's, the
+  review round's event's, the MCP record's last update). `autoreply.request_key(id)` reads an id back:
+  `("question", message id)`, `("message", message id)`, `("review", task id, event id)` or
+  `("mcp", name, digest[:12] or "")`, None for anything else.
+- **Cost.** Every session summary (the sessions list, polled by the home page) reads the requests, so no query of
+  `requests_from` scans a whole table for each request: the newest round of each review is read back from the newest
+  `task.updated` on the events type index (`ORDER BY id DESC LIMIT 1`), and each member's last message to the user
+  (one grouped query on the inbox's recipient index) is checked against the messages written after it only. The time
+  grows with what was written since a request was asked, and with the messages to the user, not with the whole
+  journal: on a session of 100 000 messages and 50 000 `task.updated` events it is about 13 ms where every request is
+  recent, and about 110 ms where a message unanswered since the first and a review round behind all those events
+  wait. A row whose JSON cannot be read (a damaged tags, tools or `paused` value) is read as empty, and hides no other
+  request.
 - `question` (`q<message id>`): the question that holds a question pause (§3.1, `pauses_swarm: true`), or, while the
   snapshot's `clarify_wait` (§14.1) names a planner that waits for the user's answers, that planner's last message to
-  the user (`pauses_swarm: false`). The full text comes from the messages table: the snapshot's `question.text` is cut
-  to 600 characters, and `clarify_wait` carries only `{name, task_id}`. Answer `{"text"}`: a message to the asker with
-  `reply_to`, which ends the pause.
+  the user (`pauses_swarm: false`; `autoreply.planner_question`, the rule `Swarm.asks_user` uses too). The full text
+  comes from the messages table: the snapshot's `question.text` is cut to 600 characters, and `clarify_wait` carries
+  only `{name, task_id}`. Answer `{"text"}`: a message to the asker with `reply_to`, which ends the pause.
 - `message` (`m<message id>`): the last message of an active member to the user that no message of the user to that
   member followed (`Swarm.last_message_id(sender, recipient, since)`, a public form of the private `_LAST_TO` query; a
   message the user sends on the board closes it too). One per member at most. A message already listed as a question
   is left out, and so are the messages of retired members, which can never be answered. Answer `{"text"}`. It does not
   block: reports to the user land here too, and the state stays `running`.
 - `review` (`r<task id>-<event id>`): a task in review whose reviewer is the user. The event is the newest
-  `task.updated` in the journal that put the task in review for the user (`changes.status[1] == "review"`, or
-  `changes.reviewer[1] == "user"`), so a new submission is a new id. (The task's `updated_at` cannot name the round:
-  every write of the row changes it.) `task` is `{id, title, result}`: a task has no summary. Answer
+  `task.updated` in the journal that put the task in review for the user (the event's task is in review with the user
+  as its reviewer, and `changes.status[1] == "review"` or `changes.reviewer[1] == "user"`), so a new submission is a
+  new id; `0` when the journal has none. (The task's `updated_at` cannot name the round: every write of the row
+  changes it.) `task` is `{id, title, result}`: a task has no summary; `from` is its assignee. Answer
   `{"approve": bool, "comment"?}` → `task_review`.
 - `mcp` (`s-<name>-<digest[:12]>`): an agent-built MCP server that waits for the user's approval
   (`[mcp] require_approval`, §11; only servers the agents built wait). `server` is `{name, description, tools}` (a
@@ -7081,17 +7128,29 @@ retried answer never lands on a newer one:
     in `-p`;
   - a question pause is answered, past `AUTO_REPLY_MAX` too.
   - It runs as a task that reads the session's journal by id from where it stopped (`message.sent`, `task.updated`,
-    `swarm.paused` with reason `question`), woken by the bus, never inside a bus listener, which would re-enter
-    `emit`. At its start it sweeps what already waits, by the definitions of `requests_of`. Its actions run in process
-    as the user (`mail.send`, `board.review`); a ToolError is logged and skipped.
+    `swarm.paused` with reason `question`; `autoreply.follow_journal`, as the stop_when_done watcher does, 21.4), woken
+    by the bus, never inside a bus listener, which would re-enter `emit`. At its start it sweeps what already waits, by
+    the definitions of `requests_of`, then follows the journal from the head read just before `session.started`
+    (`SessionAutoReply.start(after=head)`, as the watcher): the sweep answers each member's last message, and the
+    follower each earlier one of that run, so a member that wrote twice while `swarm.start()` ran gets two answers. Its
+    actions run in process as the user (`mail.send`, `board.review`) in the session's language; a ToolError is logged
+    and skipped (never tried again). A review is approved only while the task is still in review for the user.
   - It is restart-safe: it skips a member's message that a later message of the user to that member followed, since
-    its in-memory sets are lost at a restart.
+    its in-memory sets are lost at a restart. Its own answers of this run do not count there, so each of two messages
+    a member sends in a row gets its answer, as with `-p`.
+  - A question pause is answered while it still holds, past `AUTO_REPLY_MAX` too: under the limit the answer to the
+    question's message has usually ended it already (the user's next message to the asker is the answer, §3.1). An
+    answer to a question pause does not count against the limit; an answer to a message does (a question's message
+    among them), as in `-p`.
   - `_start_locked` starts it when the `api` meta says `auto`, on every start path (the board, the TUI, `-r`, a resume
     when the hub starts, the launcher MCP, v1). There too, `Swarm.hold_auto_reply()` (new) takes the auto-reply lease
     for the whole run before `swarm.start()`, which may itself call `set_goal` from the settings: no planning question
     first, `pause_swarm` ignored (§3.1).
   - Past `AUTO_REPLY_MAX`, messages are no longer answered: they stay requests of kind `message`, and the session
-    notifies the user once, with a `notification` of the new kind `u_auto_reply_limit`.
+    notifies the user once per run, with a `notification` of the new kind `u_auto_reply_limit` {max} (quiet: no
+    member is woken; a warning line in the terminal's feed, `render._WARN_NOTES`).
+  - `_unload` stops it (and waits for its task) before `Swarm.stop`; it ends at its next wait, so no action is cut in
+    two.
   - `mcp` requests stay requests in this mode too. With `[mcp] require_approval = true`, an `auto` session can stay
     `waiting` until the client or the board answers.
   - The texts and the limit move from printmode.py to autoreply.py. `-p` keeps its client-side replies, except for a
@@ -7341,8 +7400,10 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     for the starts in flight, for a bounded time, or shields them; it never cancels them: `_start_locked` catches only
     `Exception`, so a cancel inside `swarm.start()` would skip its cleanup and leave running what the start launched
     (the MCP servers, the skills' tasks).
-  - `autoreply.py`: `SessionAutoReply`, `requests_of`, `blocking_requests`, `AUTO_REPLY`, `AUTO_REVIEW`,
-    `AUTO_REPLY_MAX` (moved from printmode.py, which imports them).
+  - `autoreply.py`: `SessionAutoReply`, `requests_of`, `requests_from`, `read_requests`, `blocking_requests`,
+    `request_key`, `follow_journal`, `journal_head`, `planner_question` and the queries it shares with the swarm
+    (`LAST_TO`, `QUESTION_DROPPED`, `PLANS`), `AUTO_REPLY`, `AUTO_REVIEW`, `AUTO_REPLY_MAX` (moved from printmode.py,
+    which imports them). It imports neither dreamteam.tui nor the swarm module (the swarm imports it).
   - `eventtext.py`: `event_text`. `uitext.py` and `symbols.py`: the feed's texts and symbols, moved out of
     `tui/i18n.py` and `tui/theme.py` (shims stay there).
   - `result.py`: `build_result`.

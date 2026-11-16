@@ -595,6 +595,10 @@ TEXTS: dict[str, dict[str, str]] = {
                       "/pause in dreamteam tui, /resume in the console, `swarm_control` action=resume).",
         "u_question_left": "{name} left the swarm, so it no longer waits for your answer to question #{id} and goes "
                            "on.",
+        "u_auto_reply_limit": "DreamTeam has answered {max} messages of the members to you automatically since this "
+                              "session started, the most it answers in one run. Their next messages wait for your "
+                              "answer: on the board, or through the requests of the HTTP API. Reviews and questions "
+                              "that pause the swarm are still answered automatically.",
         "u_goal_done": "{by} reports that the global goal is achieved: {summary}",
         "u_refusal": "Agent {name}: the model declined the request ({category}).",
         "u_member_joined": "{name} joined the swarm as \"{role}\" (hired by {by}).",
@@ -1057,6 +1061,10 @@ TEXTS: dict[str, dict[str, str]] = {
                       "action=resume).",
         "u_question_left": "{name} покинул(а) рой, поэтому рой больше не ждёт вашего ответа на вопрос #{id} и "
                            "продолжает работу.",
+        "u_auto_reply_limit": "DreamTeam автоматически ответил на {max} сообщений участников вам с запуска этой "
+                              "сессии — это предел для одного запуска. Их следующие сообщения ждут вашего ответа: на "
+                              "доске или через запросы HTTP API. Задачи на ревью по-прежнему принимаются "
+                              "автоматически, и на вопросы, которые ставят рой на паузу, DreamTeam тоже отвечает сам.",
         "u_goal_done": "{by} сообщает, что глобальная цель достигнута: {summary}",
         "u_refusal": "Агент {name}: модель отказалась выполнять запрос ({category}).",
         "u_member_joined": "{name} присоединился(ась) к рою в роли «{role}» (нанял(а) {by}).",

@@ -41,6 +41,7 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator
 
 from . import __version__, netoff
 from . import skills as skill_lib
+from .autoreply import SessionAutoReply, follow_journal, journal_head, requests_from
 from .config import Config
 from .copyfrom import (API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError,
                        CopyLimits, Source, Uploads, check_target, copy_into, copy_sources, done_with, hub_in_container,
@@ -665,16 +666,17 @@ def external_workspaces(home: str | Path) -> list[tuple[str, str]]:
     return found
 
 
-def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify: bool = False) -> dict[str, Any]:
     """Board/agent/budget figures of a session database (read-only; zeros when it does not exist), and whether an
     earlier version made it (`earlier_version`). A file of its own is read through db.reading_file, which writes
     nothing next to it (a plain read-only open of a WAL database would leave a -wal and a -shm in every stopped
-    session at each listing)."""
+    session at each listing). `requests`: how many requests to the user wait (autoreply.requests_from: the same kinds
+    the HTTP API v1 lists, docs/SPEC.md §21.5), `clarify` being the session's [swarm] clarify."""
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
-        "jobs": {"running": 0}, "question": None, "earlier_version": False,
+        "jobs": {"running": 0}, "question": None, "requests": 0, "earlier_version": False,
     }
     with contextlib.ExitStack() as stack:
         if conn is None:
@@ -684,11 +686,11 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
                 conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
             except (sqlite3.Error, OSError):
                 return stats
-        _read_stats(conn, db_path, stats)
+        _read_stats(conn, db_path, stats, clarify)
     return stats
 
 
-def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any]) -> None:
+def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], clarify: bool = False) -> None:
     """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default."""
     try:
         def kv(key: str) -> Any:
@@ -732,6 +734,10 @@ def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any]) 
             stats["jobs"]["running"] = int(row[0] or 0)
         except sqlite3.Error as exc:
             log.debug("cannot count the jobs of %s: %s", db_path, exc)
+        try:  # its own try too: a request it cannot read must not hide the figures above
+            stats["requests"] = len(requests_from(conn, clarify=clarify))
+        except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError) as exc:   # (a damaged row too)
+            log.debug("cannot count the requests of %s: %s", db_path, exc)
     except sqlite3.Error as exc:  # a database of an older version or locked: show what we have
         log.debug("cannot read stats of %s: %s", db_path, exc)
     try:  # its own try: the tables it reads may be all that is left of a damaged file
@@ -846,6 +852,12 @@ def api_meta(meta: Any, *, create: bool = False) -> dict[str, Any] | None:
     return block
 
 
+def api_answers(api: dict[str, Any]) -> Any:
+    """The `answers` of a v1 session's "api" block (api_meta), API_GIVEN's default ("auto") when the block has none (a
+    hand edit), as `stop_when_done` falls back to its own: the hold, the automatic answers and the summary agree."""
+    return api.get("answers", API_GIVEN["answers"])
+
+
 def _new_api_block(api: Any) -> dict[str, Any]:
     """The "api" block a create writes (docs/SPEC.md §21.4): what the caller gives (the keys of API_GIVEN, their
     defaults for the others) and the keys the manager fills later (API_LATER), null. SessionError 400 for another key
@@ -899,6 +911,29 @@ class _SessionLock(asyncio.Lock):
             log.exception("could not wake the waiters of a session")
 
 
+@dataclass
+class _RunWatch:
+    """What runs beside one run of a v1 session (docs/SPEC.md §21.4, §21.5), tied to its Swarm object: the hub's
+    automatic answers (`answers: "auto"`) and the stop_when_done watcher."""
+    swarm: "Swarm"
+    auto_reply: SessionAutoReply | None = None
+    watcher: asyncio.Task | None = None
+
+    async def stop(self) -> None:
+        """Cancel both and wait for them to end; never raises (but a cancel of the caller)."""
+        if self.watcher is not None:
+            self.watcher.cancel()
+            await asyncio.wait({self.watcher})
+            if not self.watcher.cancelled() and self.watcher.exception() is not None:
+                log.error("the stop_when_done watcher of session %s ended with an error", self.swarm.session_id,
+                          exc_info=self.watcher.exception())
+        if self.auto_reply is not None:
+            try:
+                await self.auto_reply.stop()
+            except Exception:
+                log.exception("could not stop the automatic answers of session %s", self.swarm.session_id)
+
+
 class SessionManager:
     def __init__(self, home: str | Path, *, llm_factory: Callable | None = None,
                  language: str = "ru", provider: str = "anthropic"):
@@ -933,6 +968,13 @@ class SessionManager:
         # and the marks of each: one per start on its way, so a start ends its own mark only
         self.starting: set[str] = set()
         self._marks: dict[str, set[object]] = {}
+        # what runs beside a started v1 session, tied to its Swarm (the hub's automatic answers, the stop_when_done
+        # watcher; docs/SPEC.md §21.4, §21.5): started by _start_locked, stopped by _unload before the swarm stops
+        self._run_watch: dict[str, _RunWatch] = {}
+        # the stops stop_when_done scheduled (detached: _unload cancels the watcher that scheduled them); none is
+        # scheduled while shutdown() runs (`_closing`): the resume check at the next start handles those jobs
+        self._stopping: set[asyncio.Task] = set()
+        self._closing = False
         # uid -> sid of every session, and the sids of the v1 sessions (sid_of_uid, api_sids), with the sessions
         # folder's mtime and the session folders they were read from; None: read again at the next use
         self._index: tuple[int | None, frozenset[str], dict[str, str], list[str]] | None = None
@@ -1747,11 +1789,12 @@ class SessionManager:
             cfg, config_error = self.config, str(exc)
         swarm = self.swarms.get(sid)
         db_path = cfg.data_dir / "swarm.db" if config_error is None else self.dir_of(sid) / ".dreamteam" / "swarm.db"
+        clarify = bool(cfg.swarm.clarify)   # (a clarify planner that waits for the user is a request: read_stats)
         if swarm is not None:
             with swarm.db._lock:
-                stats = read_stats(db_path, swarm.db.conn)
+                stats = read_stats(db_path, swarm.db.conn, clarify=clarify)
         else:
-            stats = read_stats(db_path)
+            stats = read_stats(db_path, clarify=clarify)
         limits = stats.pop("limits") or {}
         pending = pending_goal(meta)
         if stats["goal"] is None and pending:
@@ -1762,7 +1805,7 @@ class SessionManager:
         api = api_meta(meta)
         # a session of the HTTP API v1 says so (the sessions page marks it, `dreamteam -p` sends no automatic replies
         # of its own to an `auto` one); other sessions have neither key
-        made_by_api = {} if api is None else {"via": API_VIA, "answers": api.get("answers")}
+        made_by_api = {} if api is None else {"via": API_VIA, "answers": api_answers(api)}
         return {
             "id": sid, "uid": session_uid(meta), "title": meta.get("title") or sid, "legacy": meta.get("legacy", False),
             "dir": str(self.dir_of(sid)), "created_at": meta.get("created_at"),
@@ -2503,11 +2546,11 @@ class SessionManager:
         self._api_write(sid, start_error={"code": _error_code(exc), "text": self._public_text(sid, text)},
                         finished_at=time.time())
 
-    async def _start_locked(self, sid: str, auto_reply: bool = False) -> "Swarm":
+    async def _start_locked(self, sid: str, auto_reply: bool = False, *, resumed: bool = False) -> "Swarm":
         """Start the session (if it is not running). The caller holds the session's lock. `auto_reply`: a
         `dreamteam -p` client with automatic replies asks for it, so the swarm's auto-reply lease holds before its
         start (also of a running session): no question pauses it, and its goal gets the classic planning task
-        (Swarm.clarifying; docs/SPEC.md §3 "Clarify mode").
+        (Swarm.clarifying; docs/SPEC.md §3 "Clarify mode"). `resumed`: resume() starts it as the hub starts.
         The run is journaled (docs/SPEC.md §21.6): `session.started` right before `swarm.start()`, so this run's
         start events (agent.hired, goal.set...) follow it; a failed `swarm.start()` journals `session.stopped`
         {reason: "failed", error} before its unload (the session is not in `running` yet: _unload would not), the
@@ -2521,7 +2564,10 @@ class SessionManager:
         of Workspace.init: the first commit of its files, no agent's); a start that succeeds clears
         `api.start_error` and `api.finished_at`; one that fails (the session cannot be loaded, the checks before
         `swarm.start()` refuse it, or `swarm.start()` raises) writes `api.start_error` {code, text} and
-        `api.finished_at` before it raises, and before `session.stopped` is journaled."""
+        `api.finished_at` before it raises, and before `session.stopped` is journaled. Once it runs (its pending goal
+        set), the hub's automatic answers start with `answers: "auto"` (autoreply.SessionAutoReply), and the
+        stop_when_done watcher with `stop_when_done` (_watch_end, from the journal's head before `session.started`:
+        this run's events only, but on a resume the state it was stopped in), until _unload stops them."""
         # loaded under the lock: a swarm fetched before waiting could have been unloaded meanwhile
         try:
             swarm = self._load_locked(sid)
@@ -2532,7 +2578,7 @@ class SessionManager:
         api = api_meta(self.meta(sid)) if sid != LEGACY_ID else None
         if auto_reply:
             swarm.auto_reply_seen()
-        if api is not None and api.get("answers") == "auto":
+        if api is not None and api_answers(api) == "auto":
             swarm.hold_auto_reply()
         if sid not in self.running:
             first = api is not None and api.get("started_at") is None
@@ -2551,6 +2597,7 @@ class SessionManager:
                 raise
             swarm.workspace.record_head = first   # (base_commit: HEAD once Workspace.init made the first commit)
             try:
+                head = journal_head(swarm)   # (stop_when_done counts this run's events: those after it)
                 swarm.bus.emit("session.started", None)
                 await swarm.start()
             except Exception as exc:
@@ -2589,6 +2636,8 @@ class SessionManager:
                     log.exception("could not set the goal of session %s", sid)
             else:
                 meta.pop("pending_goal", None)
+            if api is not None:
+                self._start_run_watch(sid, swarm, api, after=head, resumed=resumed)
             notice = meta.pop("workspace_notice", None)
             if isinstance(notice, dict) and notice.get("key") in ("n_workspace_moved", "n_workspace_changed"):
                 try:  # news for the agents' next wake-up, not a reason to wake everybody; an external member (an
@@ -2619,33 +2668,122 @@ class SessionManager:
         way (mark_starting, resume_pending) that has not taken the lock yet then starts nothing."""
         if reason not in STOP_REQUEST_REASONS:
             raise ValueError(f"unknown stop reason {reason!r}")
+        await self._stop(sid, remember=remember, reason=reason)
+
+    async def _stop(self, sid: str, *, remember: bool = False, reason: str = "user",
+                    still: Callable[[], bool] | None = None) -> bool:
+        """stop(), and, with `still`, only when `still()` holds under the session's lock (stop_when_done: the session
+        still runs the same swarm, and its goal is still completed or its budget pause still holds); False when it did
+        nothing then. Such an automatic stop ends the run it watched and nothing more: a start announced meanwhile
+        (mark_starting, resume_pending; e.g. a `continue` waiting for the lock) keeps its mark and starts the session
+        again."""
         self._check(sid)
         self._refuse_earlier(sid)
         async with self._lock(sid):
+            if still is not None and not still():
+                return False
             try:
                 await self._unload(sid, reason)
             finally:
                 if not remember:
-                    self.resume_pending.discard(sid)
-                    self._drop_marks(sid)
+                    if still is None:
+                        self.resume_pending.discard(sid)
+                        self._drop_marks(sid)
                     if self.exists(sid):
                         meta = self.meta(sid)
                         meta["autostart"] = False
                         self._write_meta(sid, meta)
             self._check(sid)  # deleted while this call waited for the lock
         self._changed(sid, "stopped")
+        return True
+
+    # ---- what runs beside a v1 session (docs/SPEC.md §21.4 stop_when_done, §21.5 answers: "auto") -------------------
+    def _start_run_watch(self, sid: str, swarm: "Swarm", api: dict[str, Any], *, after: int, resumed: bool) -> None:
+        """A v1 session just started (_start_locked, the session's lock held): the hub's automatic answers when its
+        `answers` is "auto", and the stop_when_done watcher when its `stop_when_done` is true (the default), which
+        reads the journal from `after` (the head before `session.started`). An error is logged: the session runs."""
+        watch = _RunWatch(swarm)
+        if api_answers(api) == "auto":
+            try:   # (from `after` too: a member's messages while swarm.start() ran are answered each)
+                watch.auto_reply = SessionAutoReply(swarm)
+                watch.auto_reply.start(after=after)
+            except Exception:
+                log.exception("could not start the automatic answers of session %s", sid)
+        if api.get("stop_when_done", API_GIVEN["stop_when_done"]) is True:
+            watch.watcher = asyncio.create_task(self._watch_end(sid, swarm, after, resumed),
+                                                name=f"stop-when-done-{sid}")
+        if watch.auto_reply is not None or watch.watcher is not None:
+            self._run_watch[sid] = watch
+
+    @staticmethod
+    def _ended(swarm: "Swarm") -> list[str]:
+        """Why a stop_when_done session's job is over now: "done" (its goal is completed), "budget" (the budget paused
+        it); [] while it is not."""
+        reasons = []
+        if (swarm.goal() or {}).get("status") == "done":
+            reasons.append("done")
+        if swarm.paused and swarm.pause_reason == "budget":
+            reasons.append("budget")
+        return reasons
+
+    async def _watch_end(self, sid: str, swarm: "Swarm", after: int, resumed: bool) -> None:
+        """stop_when_done (docs/SPEC.md §21.4): the session is stopped when its goal is completed (`goal.completed`:
+        "done") or the budget pauses it (`swarm.paused` {budget}: "budget"), read from the journal by id after `after`,
+        woken by the bus (autoreply.follow_journal: never the bus's queue, which drops events when it is full). On a
+        resume as the hub starts, a session that is already so is stopped at once: the hub may have stopped between
+        that event and its stop. It never awaits a stop (_unload cancels this task): _stop_soon schedules it, and it
+        goes on watching in case that stop finds the job not over after all (a goal reopened meanwhile)."""
+        if resumed:
+            for reason in self._ended(swarm)[:1]:
+                self._stop_soon(sid, swarm, reason)
+        async with contextlib.aclosing(follow_journal(swarm, after, ("goal.completed", "swarm.paused"))) as events:
+            async for event in events:
+                if event["type"] == "goal.completed":
+                    self._stop_soon(sid, swarm, "done")
+                elif event["data"].get("reason") == "budget":
+                    self._stop_soon(sid, swarm, "budget")
+
+    def _stop_soon(self, sid: str, swarm: "Swarm", reason: str) -> None:
+        """Schedule the stop of a stop_when_done session's run (a task the manager keeps; shutdown() waits for it).
+        Nothing while shutdown() runs: such a task could outlive it, and the next start's resume check stops the
+        session instead (_watch_end)."""
+        if self._closing:
+            log.info("session %s: its stop (%s) is left to the next start (the hub stops)", sid, reason)
+            return
+        task = asyncio.create_task(self._stop_ended(sid, swarm, reason), name=f"stop-{reason}-{sid}")
+        self._stopping.add(task)
+        task.add_done_callback(self._stopping.discard)
+
+    async def _stop_ended(self, sid: str, swarm: "Swarm", reason: str) -> None:
+        """Stop the run of `swarm` with `reason` ("done" | "budget"), if, under the session's lock, the session still
+        runs that swarm and the reason still holds (a stop, a continue that reopened the goal or a raised budget may
+        have come first). An error is logged."""
+        def still() -> bool:
+            return self.swarms.get(sid) is swarm and sid in self.running and reason in self._ended(swarm)
+
+        try:
+            if await self._stop(sid, reason=reason, still=still):
+                log.info("session %s stopped: %s (stop_when_done)", sid, reason)
+        except SessionError as exc:   # deleted meanwhile
+            log.info("session %s was not stopped (%s): %s", sid, reason, exc)
+        except Exception:
+            log.exception("could not stop session %s (%s)", sid, reason)
 
     async def _unload(self, sid: str, reason: str | None = None) -> None:
         """Stop (when it runs) and close the session's Swarm. The caller holds the session's lock. `reason`: a running
         session journals `session.stopped` {reason} after its agents stopped and before its database closes (an emit
         after the close raises); None journals nothing (nor does a session that is not running). A running v1
-        session records `api.finished_at` first (docs/SPEC.md §21.4), whatever the reason."""
+        session records `api.finished_at` first (docs/SPEC.md §21.4), whatever the reason. What runs beside a v1
+        session's run (_RunWatch: the automatic answers, the stop_when_done watcher) stops first, before its agents."""
         swarm = self.swarms.pop(sid, None)
         was_running = sid in self.running
         self.running.discard(sid)
+        watch = self._run_watch.pop(sid, None)
         if swarm is None:
             return
         try:
+            if watch is not None:
+                await watch.stop()
             if was_running:
                 await swarm.stop()
         finally:
@@ -3546,7 +3684,7 @@ class SessionManager:
                     async with self._lock(sid):
                         if not still_wanted(sid):  # a stop or a delete held the lock while this call waited
                             continue
-                        await self._start_locked(sid)
+                        await self._start_locked(sid, resumed=True)
                     self._changed(sid, "started")
                     started.append(sid)
                 except SessionError as exc:  # e.g. its workspace folder is missing: the message says what to do
@@ -3562,15 +3700,23 @@ class SessionManager:
 
     async def shutdown(self) -> None:
         """Stop every loaded session, keeping the running ones marked for resume() (they journal `session.stopped`
-        {reason: "shutdown"})."""
-        # also sessions in the middle of an operation (a start, a workspace move that starts them again)
-        busy = [sid for sid, lock in self._locks.items() if lock.locked() and sid not in self.swarms]
-        for sid in list(self.swarms) + busy:
-            try:
-                async with self._lock(sid):
-                    await self._unload(sid, "shutdown")
-            except Exception:
-                log.exception("error stopping session %s", sid)
+        {reason: "shutdown"}). The stops stop_when_done scheduled end first: such a job is over, so it is not resumed
+        at the next start. None is scheduled from here on (`_closing`): a goal completed or a budget pause the watcher
+        has not acted on yet is left to the resume check of the next start (_watch_end)."""
+        self._closing = True
+        try:
+            while self._stopping:
+                await asyncio.gather(*list(self._stopping), return_exceptions=True)
+            # also sessions in the middle of an operation (a start, a workspace move that starts them again)
+            busy = [sid for sid, lock in self._locks.items() if lock.locked() and sid not in self.swarms]
+            for sid in list(self.swarms) + busy:
+                try:
+                    async with self._lock(sid):
+                        await self._unload(sid, "shutdown")
+                except Exception:
+                    log.exception("error stopping session %s", sid)
+        finally:
+            self._closing = False
 
     def copy_overrides(self, sid: str) -> dict[str, Any]:
         return copy.deepcopy(self.meta(sid).get("overrides") or {})

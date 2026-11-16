@@ -347,7 +347,9 @@ class RenderContext:
 - Notifications to the user: `🔔 text`. MCP pending → handled by the approval dialog (plus an info line). The
   review notices (`u_review_requested`, `u_review_fallback`, `u_review_handed_over`, `u_reviews_waiting`) are one
   warning line, like `u_budget`; so are the skill notices (`u_skill_proposed`, `u_skill_deps_failed`,
-  `u_role_skills_missing`, `u_role_skills_over_cap`) and `u_cost_unknown` (a model profile's calls count as $0).
+  `u_role_skills_missing`, `u_role_skills_over_cap`), `u_cost_unknown` (a model profile's calls count as $0) and
+  `u_auto_reply_limit` (the hub no longer answers the members' messages of an `answers: "auto"` session in this run,
+  SPEC §21.5).
 - Skills (normal and verbose; quiet has the notices): `⏺ вы · подключил(а) скилл pdf · library` (обновил(а) for a
   replace, отключил(а)), `⏺ Анна · предлагает скилл x` (warn), `⏺ вы · сохранил(а) скилл x в библиотеку` / «не
   стал(а) сохранять … · <the reason>». Packages (`skill.deps`): `✓ скилл pdf: пакеты установлены
