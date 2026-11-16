@@ -9,7 +9,7 @@ import re
 import tomllib
 import unicodedata
 from dataclasses import dataclass, field, fields
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable
 
 from . import roles
@@ -290,17 +290,49 @@ class TracingSettings:
     retention_days: float = 0          # delete finished traces older than this; 0 = keep forever
 
 
+# a root's name in [api.folders.<name>] (docs/SPEC.md §21.10), like a session id: never a leading '-'
+API_FOLDER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+_API_FOLDER_KEYS = frozenset({"path", "in_place"})
+
+
+@dataclass(frozen=True)
+class ApiFolder:
+    """One root of `[api] folders` (docs/SPEC.md §21.10): a folder of the hub's computer that an API client names by
+    `name`. Only its shape is checked at load (parse_api_folders: `path` is absolute on POSIX or on Windows); where it
+    lies is checked at each use, so an unplugged disk never stops the hub. A use outside the sandbox refuses a `path`
+    that is not absolute on this computer's own system (native_absolute) before resolving anything."""
+
+    name: str
+    path: str
+    in_place: bool = False
+
+
+@dataclass
+class ApiSettings:
+    """The external HTTP API v1 (docs/SPEC.md §21.9); global only (not a session override), edited by hand only: the
+    settings page has no section for it (settings.public_view leaves it out). Raw settings are never rebuilt from
+    `dataclasses.asdict` of it: each folder carries its `name`, which an [api.folders.<name>] table does not hold
+    (the raw form is what settings.read_raw returns)."""
+
+    max_running: int = 3          # running and starting sessions created through v1; 0 = no limit
+    uploads_pending: int = 32     # v1 uploads that wait for their session or arrive, at once
+    archive_max_mb: int = 1024    # the files of one archive of a session's folder, MB before packing
+    # [api.folders.<name>] tables, checked and normalized by parse_api_folders (_checked calls it for this type)
+    folders: dict[str, ApiFolder] = field(default_factory=dict)
+
+
 # TOML section of each settings class (error messages)
 _SECTION_OF = {"SwarmSettings": "swarm", "AgentSettings": "agents", "ServerSettings": "server",
                "ShellSettings": "shell", "WorkspaceSettings": "workspace", "MCPSettings": "mcp",
                "TracingSettings": "tracing", "SkillsSettings": "skills", "ModelProfile": "models",
-               "RoleSettings": "roles", "TeamSettings": "teams"}
+               "RoleSettings": "roles", "TeamSettings": "teams", "ApiSettings": "api"}
 # numbers are >= 0; these must be >= 1 (counts and sizes where 0 breaks the swarm; [skills] max_proposals = 0
-# turns proposals off)
+# turns proposals off; [api] max_running = 0 is no limit)
 _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "tool_output_chars",
                       "max_parallel_llm_calls", "max_tokens", "max_tokens_ceiling", "timeout", "max_timeout",
                       "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
-                      "install_timeout", "lock_ttl_minutes", "copy_max_mb", "copy_max_files"})
+                      "install_timeout", "lock_ttl_minutes", "copy_max_mb", "copy_max_files", "uploads_pending",
+                      "archive_max_mb"})
 _MAX = {"port": 65535}
 _INT64 = 2 ** 63
 
@@ -351,6 +383,8 @@ def _checked(where: str, key: str, annotation: str, value: Any) -> Any:
         if not isinstance(value, (list, tuple)) or not all(isinstance(v, str) for v in value):
             raise _bad(where, key, "a list of strings", value)
         return list(value)
+    if kind == "dict[str,ApiFolder]":  # [api] folders: every way in checks their shape
+        return parse_api_folders(value)
     if kind.startswith("dict["):
         if not isinstance(value, dict):
             raise _bad(where, key, "a table", value)
@@ -510,6 +544,57 @@ def parse_teams(raw: Any, entries: Iterable[RoleSettings]) -> list[TeamSettings]
     return out
 
 
+def _windows_absolute(path: str) -> bool:
+    """A drive (or share) and a root, as Windows reads `path`: what PureWindowsPath.is_absolute() means up to Python
+    3.12 (3.13 also calls `\\\\server` and `\\\\?\\x` absolute), so every version reads the same file alike."""
+    windows = PureWindowsPath(path)
+    return bool(windows.drive and windows.root)
+
+
+def _absolute_path(path: str) -> bool:
+    """Absolute on POSIX or on Windows: `dreamteam sandbox` serves the host's home in a Linux container, whose hub
+    reads the same settings file (it finds the roots where the sandbox mounts them)."""
+    return PurePosixPath(path).is_absolute() or _windows_absolute(path)
+
+
+def native_absolute(path: str) -> bool:
+    """`path` is absolute on this computer's own system (docs/SPEC.md §21.10). A root that is absolute only on the
+    other one (allowed at load, _absolute_path) is refused at use outside the sandbox, before anything resolves it: a
+    Windows path on POSIX would resolve under the current folder, a POSIX one on Windows on the current drive."""
+    return _windows_absolute(path) if os.name == "nt" else PurePosixPath(path).is_absolute()
+
+
+def parse_api_folders(raw: Any) -> dict[str, ApiFolder]:
+    """The checked `[api] folders` roots by name (docs/SPEC.md §21.10): shape only. A name is lowercase letters,
+    digits and '-' (not first), at most 64 characters; `path` is an absolute path (_absolute_path) without NUL;
+    `in_place` is a bool, false when not set; no other key. Where a root lies is not checked here: an unplugged disk
+    must not stop the hub (apifolders checks it at each use)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(f"[api] folders must be a table of folders (write each as an [api.folders.<name>] table), "
+                         f"got {repr(raw)[:60]}")
+    out: dict[str, ApiFolder] = {}
+    for name, spec in raw.items():
+        if not (isinstance(name, str) and API_FOLDER_NAME.fullmatch(name)):
+            raise ValueError(f"[api.folders] {repr(name)[:70]} is not a folder name: lowercase letters, digits and "
+                             "'-' (not first), at most 64 characters")
+        where = f"api.folders.{name}"
+        if not isinstance(spec, dict):
+            raise ValueError(f"[{where}] must be a table, got {repr(spec)[:60]}")
+        unknown = set(spec) - _API_FOLDER_KEYS
+        if unknown:
+            raise ValueError(f"Unknown keys for [{where}]: {', '.join(sorted(map(str, unknown)))}")
+        path = spec.get("path")
+        if not isinstance(path, str) or "\x00" in path or not _absolute_path(path):
+            raise _bad(where, "path", "an absolute path", path)
+        in_place = spec.get("in_place")  # None means "not set" (as everywhere in the settings)
+        if in_place is not None and not isinstance(in_place, bool):
+            raise _bad(where, "in_place", "true or false", in_place)
+        out[name] = ApiFolder(name=name, path=path, in_place=bool(in_place))
+    return out
+
+
 @dataclass
 class Config:
     project_dir: Path
@@ -521,6 +606,7 @@ class Config:
     mcp: MCPSettings = field(default_factory=MCPSettings)
     tracing: TracingSettings = field(default_factory=TracingSettings)
     skills: SkillsSettings = field(default_factory=SkillsSettings)
+    api: ApiSettings = field(default_factory=ApiSettings)
     models: dict[str, ModelProfile] = field(default_factory=lambda: {"default": ModelProfile()})
     # Not settings keys: a launcher session that works in another folder (sessions.py, session.json
     # "workspace"). None = `<project>/workspace`. `workspace_adopted`: the folder was the user's before
@@ -603,6 +689,7 @@ class Config:
             mcp=_fill(MCPSettings, {**mcp_raw, "external": external}),
             tracing=_fill(TracingSettings, raw.pop("tracing", None)),
             skills=_fill(SkillsSettings, raw.pop("skills", None)),
+            api=_fill(ApiSettings, raw.pop("api", None)),
         )
         if raw:
             raise ValueError(f"Unknown config sections: {', '.join(sorted(raw))}")
@@ -768,6 +855,17 @@ retention_days = 0            # 0 — хранить всегда
 # [mcp.external.fetch]
 # command = ["uvx", "mcp-server-fetch"]
 # description = "Загрузка веб-страниц"
+
+# Внешний HTTP API (/api/v1) для ваших программ; их токен — переменная окружения DREAMTEAM_API_TOKEN у хаба. Этот
+# раздел правится только здесь, вручную; по умолчанию:
+# [api]
+# max_running = 3             # сколько сессий, созданных через API, работает одновременно (0 — без предела)
+# uploads_pending = 32        # сколько загрузок через API ждут своей сессии или идут сейчас
+# archive_max_mb = 1024       # предел одного архива файлов сессии, МБ
+# Папки этого компьютера, которые программа может назвать по имени (только они); каждая — право для держателя токена:
+# [api.folders.jobs]
+# path = "/srv/site/jobs"     # абсолютный путь; в Windows — в одинарных кавычках: 'C:\\jobs' (или "C:/jobs")
+# in_place = false            # true — сессия может работать прямо в папке под ним, а не в своей копии
 
 # Сохранённые команды: именованные наборы ролей; при запуске можно выбрать команду целиком. Имя роли повторяется для
 # нескольких агентов; модель каждому агенту задаёт его роль:

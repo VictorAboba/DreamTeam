@@ -3985,7 +3985,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
 - `ensure_home(home, language="ru", provider="anthropic")` creates the directory, `sessions/` and the settings
   file from the template; `read_raw(home)`; `validate(home, raw) -> Config` (ValueError with a readable text);
   `dump_toml(data)` (a top-level non-empty list of tables is written as `[[name]]` blocks after every table,
-  None values skipped); `deep_merge(base, override)`.
+  None values skipped; a leaf `env` or `extra` table is written inline, except a root of that name under
+  `[api.folders]`); `deep_merge(base, override)`.
 - `[swarm] independent_review` (bool, default true; a non-bool is a ValueError naming `[swarm]
   independent_review`): an agent's finished task is approved by another member, or by the user when nobody else
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
@@ -4059,10 +4060,12 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   section has a field for each.
 - `[api]` (`ApiSettings`, global only: not one of the session `OVERRIDE_SECTIONS`; §21.9, §21.10): `max_running = 3`
   (0 = no limit), `uploads_pending = 32`, `archive_max_mb = 1024`, `folders = {}` (`[api.folders.<name>]` tables with
-  `path` and `in_place`, only their shape checked at load). It is edited by hand only: `public_view` leaves it out
-  (the settings page has no section for it), and `apply_update` drops an `[api]` key that is None or equal to its
-  default, and an empty section, so a save never writes it. The template has only a commented `# [api]` block.
-  `api.folders` is one of `LOCAL_KEYS` (§20.4).
+  `path` and `in_place`, only their shape checked at load). `Config.api` holds it; `config.parse_api_folders(raw)`
+  turns the folders into `{name: ApiFolder(name, path, in_place=False)}`. It is edited by hand only: `public_view`
+  leaves it out (the settings page has no section for it), and `apply_update` drops an `[api]` key that is None or
+  equal to its default, and an empty section (`settings.api_values`), so a save never writes it. The template has
+  only a commented `# [api]` block, with the defaults and one example root. `api.folders` is one of `LOCAL_KEYS`
+  (§20.4).
 - `[skills]` (`SkillsSettings`, global only: not one of the session `OVERRIDE_SECTIONS`; §19): `library_dir =
   "~/.dreamteam/skills"` (the shared skills library; `Config.skills_library_dir`, where `DREAMTEAM_SKILLS_DIR` wins:
   the Docker sandbox and the tests set it), `claude = true` (offer Claude Code's skills), `max_mb = 10` and
@@ -4095,7 +4098,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   file as `dreamteam.toml.bak`, writes atomically (temp file + replace, never left behind) and makes the
   settings and the backup owner-only on POSIX (they hold API keys).
 - `public_view(raw)`:
-  - every section with defaults filled in; no `swarm.goal` / `swarm.goal_description`;
+  - every section with defaults filled in, but no `api` (§21.9: edited by hand only); no `swarm.goal` /
+    `swarm.goal_description`;
   - in model profiles, `api_key` is null and comes with `api_key_set`, `api_key_hint` (`…abcd`) and
     `api_key_env_set` (true/false, or null when there is no env name); `api_key_env` is a variable name or
     null (a key pasted there is never shown); `price_source` is `ModelProfile.price_source()` (§10). These computed
@@ -4115,7 +4119,9 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
     not an object → "Team N must be an object"; only null values are dropped, so the file keeps what was sent, and
     `Config.teams` and the view normalize it at each load; `[]` removes the key; the rules themselves are checked by
     `validate` (`[teams.N] ...`);
-  - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays;
+  - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays; `api` (never
+    sent by the settings page) is stored without the keys equal to their default (`api_values`), and an empty one
+    removes the section;
   - masked `mcp.external.*.env` values get their stored value back (same server first, then a renamed one);
     an unknown mask is a ValueError;
   - `models` is the complete set of profiles (missing ones are deleted; names `[A-Za-z0-9_-]+`; at least one);
@@ -6523,7 +6529,9 @@ exported values winning; keys this version does not know, sections not in `_SECT
 names are dropped and listed; `swarm.goal` / `goal_description` are not taken; the machine-local keys
 `LOCAL_KEYS` = `server.host`, `server.port`, `shell.program`, `skills.library_dir`, `skills.envs_dir`,
 `skills.python`, `mcp.library_dir`, `api.folders` (§21.10) keep the target's value (listed as
-`kept as they are here` when they differ).
+`kept as they are here` when they differ). `[api]` counts as changed only when it differs as stored
+(`settings.api_values`, without its default values), so an exported default value changes nothing, while it still
+replaces a value set here.
 Profiles: missing ones are added, the others rewritten from the export (an exported `api_key` is never taken);
 profiles only here stay. When the profile's endpoint (`settings._endpoint`: provider, base_url) is the same, the
 stored key stays (no `api_key` in the update), and so do its secret `extra` entries and its `api_key_env` when the
@@ -7471,7 +7479,7 @@ under a root the owner lists in `[api] folders` can be named, by the root's name
 holds an absolute path, and summaries and error texts never name one (21.1).
 
 ```toml
-[api.folders.jobs]          # the root's name: lowercase letters, digits and '-', at most 64 characters
+[api.folders.jobs]          # the root's name: lowercase letters, digits and '-' (not first), at most 64 characters
 path = "/srv/site/jobs"     # absolute (in `dreamteam sandbox`: mounted, see "Sandbox")
 in_place = false            # true: a session may also work in a folder under it, in place
 ```
@@ -7479,10 +7487,19 @@ in_place = false            # true: a session may also work in a folder under it
 **Settings.**
 - `folders` (`ApiSettings.folders`) is a table of roots; `config.parse_api_folders` checks its shape at load: a bad
   name, a `path` that is not an absolute string or that holds a NUL, an `in_place` that is not a bool, or any other
-  key refuses the settings, like any other mistake. `in_place` defaults to false.
+  key refuses the settings, like any other mistake. `in_place` defaults to false. "Absolute" means absolute on POSIX
+  or on Windows, whatever the hub's system: `dreamteam sandbox` serves a Windows home from a Linux container, whose
+  hub reads the same file (and finds the roots where the sandbox mounts them, "Sandbox"). On Windows it takes a
+  drive or share and a root, on every Python version (3.13's `PureWindowsPath.is_absolute` also accepts `\\server`
+  and `\\?\x`; these are refused). Every way of filling `ApiSettings` checks the folders (`_checked` calls
+  `parse_api_folders`); raw settings are never rebuilt from `dataclasses.asdict(config.api)` (each `ApiFolder`
+  carries its `name`).
 - Where a root lies is checked at each use, so an unplugged disk never stops the hub (`apifolders.root_refusal`: the
   location rules of `resolve_source`, applied to the resolved root). A root is refused (403 `forbidden_folder`, and
   logged at the hub's start) when it is:
+  - not absolute on the hub's own system (`config.native_absolute`, checked before anything resolves the root: a
+    Windows path on a POSIX hub outside the sandbox, or a POSIX one on Windows, would resolve against the current
+    folder or drive);
   - a drive or file-system root;
   - the user's home folder, or a folder containing it;
   - inside or containing the DreamTeam home or one of DreamTeam's own folders (the MCP and skills libraries, the skill

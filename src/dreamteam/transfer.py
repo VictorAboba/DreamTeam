@@ -58,9 +58,9 @@ from urllib.parse import unquote, urlsplit
 
 from . import __version__, hubauth, hubgit
 from . import mcp_library
-from .config import (CONFIG_FILE, AgentSettings, MCPSettings, ModelProfile, RoleSettings, ServerSettings,
-                     ShellSettings, SkillsSettings, SwarmSettings, TeamSettings, TracingSettings, WorkspaceSettings,
-                     env_var_name, key_env_names, make_profile)
+from .config import (CONFIG_FILE, AgentSettings, ApiSettings, MCPSettings, ModelProfile, RoleSettings,
+                     ServerSettings, ShellSettings, SkillsSettings, SwarmSettings, TeamSettings, TracingSettings,
+                     WorkspaceSettings, env_var_name, key_env_names, make_profile)
 from .db import (foreign_objects, known_columns, loads, made_by_earlier_version, max_tools_revision, reading_file,
                  sqlite_uri, unknown_columns)
 from .mcp_forge import _split_command
@@ -68,8 +68,8 @@ from .roles import missing_roles, role_key, team_key
 from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_EVENTS, SESSION_FILE,
                        SESSION_ID, WORKSPACE_DIR, ImportedWorkspace, SessionError, SessionManager, _home_relative,
                        _in_thread, _to_end, new_uid, session_uid, slugify)
-from .settings import (PROVIDER_CHOICES, _endpoint, _private, _stored_key, apply_update, deep_merge, dump_toml,
-                       read_raw, settings_path, validate)
+from .settings import (PROVIDER_CHOICES, _endpoint, _private, _stored_key, api_values, apply_update, deep_merge,
+                       dump_toml, read_raw, settings_path, validate)
 from .shell import _KNOWN_SECRETS, _SECRET_RE, _URL_USERINFO, _is_secret, strip_url_credentials
 from .skills import META_FILE as SKILL_META, NAME_MAX, NAME_RE, ORIGINS, Library, Limits, SkillError, _read_json, \
     _rename, check_skill_dir, copy_skill
@@ -2161,17 +2161,18 @@ def _discard(work: Path, *, keep_folder: bool) -> list[Path]:
 
 
 # ==== import ====================================================================================================
-# settings keys of this computer: an import keeps their value here (global settings and session overrides alike)
+# settings keys of this computer: an import keeps their value here (global settings and session overrides alike);
+# [api] folders name folders of this computer, so an import never grants one (docs/SPEC.md §21.10)
 LOCAL_KEYS: tuple[tuple[str, str], ...] = (
     ("server", "host"), ("server", "port"), ("shell", "program"), ("skills", "library_dir"), ("skills", "envs_dir"),
-    ("skills", "python"), ("mcp", "library_dir"))
+    ("skills", "python"), ("mcp", "library_dir"), ("api", "folders"))
 # the order apply_import works in: the MCP library last but [mcp.external], since its entries name imported sessions
 APPLY_ORDER = ("settings", "skills", "sessions", "mcp")
 _SECTION_FIELDS: dict[str, frozenset[str]] = {
     name: frozenset(f.name for f in dataclasses.fields(cls)) for name, cls in (
         ("swarm", SwarmSettings), ("agents", AgentSettings), ("server", ServerSettings), ("shell", ShellSettings),
         ("workspace", WorkspaceSettings), ("mcp", MCPSettings), ("tracing", TracingSettings),
-        ("skills", SkillsSettings))}
+        ("skills", SkillsSettings), ("api", ApiSettings))}
 _PROFILE_FIELDS = frozenset(f.name for f in dataclasses.fields(ModelProfile)) - {"name"}
 _ROLE_FIELDS = frozenset(f.name for f in dataclasses.fields(RoleSettings))
 _TEAM_FIELDS = frozenset(f.name for f in dataclasses.fields(TeamSettings))
@@ -2476,7 +2477,9 @@ def merge_settings(target: dict[str, Any], exported: dict[str, Any], *, home: st
                     m.local_kept.append(f"{name}.{key}")
                 del values[key]
         merged = deep_merge(current, values)
-        if merged != current:
+        # [api] is stored without its default values (settings.api_values): an exported default changes nothing
+        changed = api_values(merged) != api_values(current) if name == "api" else merged != current
+        if changed:
             m.update[name] = merged
             m.sections.append(name)
     target_models = target.get("models") if isinstance(target.get("models"), dict) else {}
