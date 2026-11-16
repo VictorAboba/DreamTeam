@@ -493,21 +493,27 @@ async def test_serve_launcher_resumes_only_once_the_port_is_ours(tmp_path):
         port = busy.getsockname()[1]
         with pytest.raises(OSError):
             await asyncio.wait_for(serve_launcher(manager, "127.0.0.1", port, resume=True), 30)
-    assert resumed == [] and not manager.running and not manager.swarms
+    # (nothing is about to be resumed any more: the session is final again, docs/SPEC.md §21.7)
+    assert resumed == [] and not manager.running and not manager.swarms and not manager.resume_pending
 
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     seen: list[tuple[str, set]] = []
+    pending: list[set] = []
     server = asyncio.create_task(serve_launcher(
         manager, "127.0.0.1", port, resume=True,
-        on_listening=lambda: seen.append(("listening", set(manager.running))),  # hub.json goes here
-        on_started=lambda: seen.append(("started", set(manager.running)))))
+        # hub.json goes here; the sessions about to be resumed are known before the first request
+        on_listening=lambda: (seen.append(("listening", set(manager.running))),
+                              pending.append(set(manager.resume_pending))),
+        on_started=lambda: (seen.append(("started", set(manager.running))),
+                            pending.append(set(manager.resume_pending)))))
     for _ in range(300):
         if len(seen) == 2:
             break
         await asyncio.sleep(0.05)
     assert seen == [("listening", set()), ("started", {summary["id"]})]
+    assert pending == [{summary["id"]}, set()]
     server.cancel()
     with pytest.raises(asyncio.CancelledError):
         await server

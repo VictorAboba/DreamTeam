@@ -32,8 +32,8 @@ from rich.text import Text
 from .. import prompts, roles
 from ..eventtext import (_ANSI, _TASK_SYMBOL, TOOL_CALL_CHARS, TextContext, _clock, _crew_size, _d, _deps_reason,
                          _deps_word, _echo_target, _first_line, _float, _int, _job_result, _list, _names, _reason,
-                         _recipients_text, _review_text, _status_label, _via_text, _wake_summary, _who, clean,
-                         first_name, fmt_cost, fmt_elapsed, tool_call_text)
+                         _recipients_text, _review_text, _session_run, _status_label, _via_text, _wake_summary, _who,
+                         clean, first_name, fmt_cost, fmt_elapsed, tool_call_text)
 from . import theme
 
 log = logging.getLogger(__name__)
@@ -50,7 +50,7 @@ EVENT_TYPES = (
     "trigger.fired", "trigger.deleted", "mcp.created", "mcp.status", "swarm.paused", "swarm.resumed",
     "swarm.wrap_up", "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
     "job.silent", "skill.attached", "skill.detached", "skill.proposed", "skill.library", "skill.deps",
-    "sessions.changed", "_connection",
+    "session.started", "session.stopped", "sessions.changed", "_connection",
 )
 ACTIVITY_KINDS = ("wake", "thinking", "text", "tool_call", "tool_result", "error", "nudge", "compacted")
 
@@ -810,6 +810,16 @@ def _ev_skill_deps(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | No
     return _line(ctx, ctx.sym["dot"], "dim", Text(text, style="dim"))
 
 
+def _ev_session_run(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """A run's start or end the session manager journaled (session.started / session.stopped): verbose only, the
+    client says it in its own words otherwise (the session's status, a start's error)."""
+    if not ctx.verbose:
+        return None
+    symbol, text = _session_run(ctx, ev, d)
+    style = theme.WARN if symbol == "warn" else "dim"
+    return _line(ctx, ctx.sym[symbol], style, Text(text, style=style))
+
+
 def _ev_session(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     if not ctx.verbose:
         return None
@@ -864,6 +874,8 @@ _HANDLERS: dict[str, Callable[[RenderContext, dict, dict], RenderableType | None
     "skill.proposed": _ev_skill,
     "skill.library": _ev_skill,
     "skill.deps": _ev_skill_deps,
+    "session.started": _ev_session_run,
+    "session.stopped": _ev_session_run,
     "sessions.changed": _ev_session,
     "_connection": _ev_connection,
 }

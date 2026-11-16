@@ -33,6 +33,7 @@ from dreamteam import swarm as swarm_module
 from dreamteam.config import _MIN_ONE, Config, ShellSettings, WorkspaceSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status
+from dreamteam.sessions import STOP_REASONS as SESSION_STOP_REASONS
 from dreamteam.swarm import Swarm
 from helpers.stacks import EXPECTED_CARDS, STACK_TASKS
 
@@ -103,7 +104,8 @@ def test_i18n_covers_every_value_the_backend_emits():
                 | {f"mcp_{s}" for s in mcp_statuses} | {f"origin_{o}" for o in origins}
                 | {f"scope_{s}" for s in mcp_forge.SCOPES} | {f"op_{o}" for o in ops} | {f"f_{f}" for f in task_fields}
                 | {f"p{p}" for p in range(4)} | {f"job_origin_{o}" for o in job_origins}
-                | {f"job_stopped_{r}" for r in stop_reasons})
+                | {f"job_stopped_{r}" for r in stop_reasons}
+                | {f"ev_session_stopped_{r}" for r in SESSION_STOP_REASONS})   # session.stopped {reason}
     missing = sorted(expected - keys)
     assert not missing, missing
 
@@ -1369,6 +1371,30 @@ def test_feed_requests_only_feed_events_and_describes_changes():
     assert out["system"] == "MCP x: ждёт одобрения"
     assert out["en"] == "system edited file a.txt"
     assert out["limits"] == {"max_cost_usd": 2.5, "max_agents": 4} and out["bad"] == [None, None, None, None]
+
+
+@needs_node
+def test_feed_shows_a_runs_start_and_end():
+    """session.started / session.stopped {reason, error?} (docs/SPEC.md §9, §21.6): loaded with the feed, worded per
+    reason, escaped and never linkified (a failed start's error is DreamTeam's text)."""
+    out = run_js(r"""
+      const ev = (type, data) => ({ id: 9, ts: 1760000000, type, actor: null, data });
+      app.S.lang = "en";
+      out.feed = app.FEED_TYPES;
+      out.en = [app.describeEvent(ev("session.started", {})),
+                app.describeEvent(ev("session.stopped", { reason: "budget" })),
+                app.describeEvent(ev("session.stopped", { reason: "user" })),
+                app.describeEvent(ev("session.stopped", { reason: "later" })),
+                app.describeEvent(ev("session.stopped", {}))];
+      out.failed = app.feedLine(ev("session.stopped", { reason: "failed", error: "RuntimeError: <b>#3</b>" }));
+      app.S.lang = "ru";
+      out.ru = app.describeEvent(ev("session.stopped", { reason: "done" }));
+    """)
+    assert "session.*" in out["feed"]
+    assert out["en"] == ["session started", "session stopped: the budget is spent", "session stopped by you",
+                         "session stopped (later)", "session stopped"]
+    assert "session did not start: RuntimeError: &lt;b&gt;#3&lt;/b&gt;" in out["failed"] and "<a" not in out["failed"]
+    assert out["ru"] == "сессия остановлена: цель достигнута"
 
 
 @needs_node

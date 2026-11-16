@@ -65,9 +65,9 @@ from .db import (foreign_objects, known_columns, loads, made_by_earlier_version,
                  sqlite_uri, unknown_columns)
 from .mcp_forge import _split_command
 from .roles import missing_roles, role_key, team_key
-from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_FILE, SESSION_ID,
-                       WORKSPACE_DIR, ImportedWorkspace, SessionError, SessionManager, _home_relative, _in_thread,
-                       _to_end, new_uid, session_uid, slugify)
+from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_EVENTS, SESSION_FILE,
+                       SESSION_ID, WORKSPACE_DIR, ImportedWorkspace, SessionError, SessionManager, _home_relative,
+                       _in_thread, _to_end, new_uid, session_uid, slugify)
 from .settings import (PROVIDER_CHOICES, _endpoint, _private, _stored_key, apply_update, deep_merge, dump_toml,
                        read_raw, settings_path, validate)
 from .shell import _KNOWN_SECRETS, _SECRET_RE, _URL_USERINFO, _is_secret, strip_url_credentials
@@ -88,6 +88,10 @@ LIBRARY_DIR = "mcp/library"
 EXTERNAL_FILE = "mcp/external.json"
 SESSIONS_DIR = "sessions"
 DB_FILE = "swarm.db"
+# (id, ts, type) of a session database's last event of the work: a run's start and end (sessions.SESSION_EVENTS) are
+# left out, as for `last_activity`, so a start and a stop alone (a hub restart) do not make one side look newer
+_LAST_WORK_EVENT = ("SELECT id, ts, type FROM events WHERE type NOT IN ("
+                    + ", ".join("?" * len(SESSION_EVENTS)) + ") ORDER BY id DESC LIMIT 1")
 # what an export folder holds at its top level (a folder with anything else is never replaced by a new export)
 LAYOUT = frozenset({MANIFEST, "settings", SKILLS_DIR, "mcp", SESSIONS_DIR})
 # the parts of a session's .dreamteam/ that travel (its logs, launcher files and lock files stay)
@@ -1661,7 +1665,7 @@ def _finish_db(path: Path, sid: str, report: ExportReport, secrets: Secrets,
         stats: dict[str, Any] = {"events": 0, "last_event": None, "mcp_servers": [], "max_tools_rev": None}
         with contextlib.suppress(sqlite3.Error):
             stats["events"] = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
-            row = conn.execute("SELECT id, ts, type FROM events ORDER BY id DESC LIMIT 1").fetchone()
+            row = conn.execute(_LAST_WORK_EVENT, SESSION_EVENTS).fetchone()
             stats["last_event"] = {"id": row[0], "ts": row[1], "type": row[2]} if row else None
         with contextlib.suppress(sqlite3.Error):
             stats["mcp_servers"] = [{"name": r[0], "origin": r[1], "status": r[2]} for r in conn.execute(
@@ -2810,12 +2814,12 @@ def _workspace_kind(meta: Any) -> tuple[str, str | None, str | None, bool]:
 
 
 def _last_event(path: Path) -> tuple[Any, ...] | None:
-    """(id, ts, type) of the last event of a session database; None without one."""
+    """(id, ts, type) of the last event of the work of a session database (_LAST_WORK_EVENT); None without one."""
     if not path.is_file():
         return None
     try:
         with _read_db(path, 10.0) as (conn, _immutable):
-            row = conn.execute("SELECT id, ts, type FROM events ORDER BY id DESC LIMIT 1").fetchone()
+            row = conn.execute(_LAST_WORK_EVENT, SESSION_EVENTS).fetchone()
     except (sqlite3.Error, OSError):
         return None
     return tuple(row) if row else None

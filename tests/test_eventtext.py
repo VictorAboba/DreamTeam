@@ -442,7 +442,7 @@ _B = "\\"   # a Windows path's separator
     ("and/or 24/7 a/b/c /tmp", None),
 ])
 def test_dreamteams_own_texts_name_a_path_by_its_last_component(text, line):
-    assert eventtext._without_abs_paths(text) == (text if line is None else line)
+    assert eventtext.without_abs_paths(text) == (text if line is None else line)
 
 
 @pytest.mark.parametrize("lang", LANGS)

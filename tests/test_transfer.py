@@ -2612,6 +2612,28 @@ async def test_a_dropped_model_profile_leaves_a_reimport_unchanged(tmp_path, mon
     await manager.shutdown()
 
 
+async def test_a_runs_start_and_end_alone_leave_a_reimport_unchanged(tmp_path):
+    """A run's session.started / session.stopped are not work (as for last_activity, docs/SPEC.md §20.4, §21.6): a hub
+    restart, or a session opened and stopped, on either computer leaves a re-import unchanged; work does not."""
+    home_a, sid = await _one_session(tmp_path)
+    _fill_db(home_a, sid)
+    export_home(home_a, tmp_path / "x1", include=["sessions"])
+    home_b = _home_named(tmp_path, "b", _raw_b())
+    assert (await _import(home_b, tmp_path / "x1"))[2].ok
+    manager = _manager(home_b)
+    _event(home_b, sid, 9.0, "session.started")
+    _event(home_b, sid, 10.0, "session.stopped")
+    assert [i.action for i in plan_import(manager, tmp_path / "x1").items] == ["unchanged"]
+    _event(home_a, sid, 11.0, "session.started")
+    _event(home_a, sid, 12.0, "session.stopped")
+    export_home(home_a, tmp_path / "x2", include=["sessions"])
+    assert _manifest(tmp_path / "x2")["sessions"][0]["last_event"]["type"] == "message"
+    assert [i.action for i in plan_import(manager, tmp_path / "x2").items] == ["unchanged"]
+    _event(home_b, sid, 13.0)   # work here
+    item = _item(plan_import(manager, tmp_path / "x2").items, "sessions", sid)
+    assert item.action == "rewrite" and item.reason.startswith("this computer has newer work in it")
+
+
 async def test_an_export_without_the_workspace_folder_keeps_the_files_here(tmp_path, monkeypatch):
     home_a, sid = await _one_session(tmp_path)
     _fill_db(home_a, sid)

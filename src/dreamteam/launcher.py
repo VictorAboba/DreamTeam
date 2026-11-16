@@ -663,10 +663,11 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
                          on_listening: Callable[[], Any] | None = None) -> None:
     """Run the launcher until the task is cancelled, then shut the web server and every session down.
     Sessions that were running when the server last stopped are resumed (server.resume_sessions) once the port
-    is ours: a second launcher that loses the race for the port must not run them too, even for a moment.
-    `on_listening` is called as soon as the port is open (write hub.json there: other `dreamteam` commands then
-    find this hub during a long resume instead of starting a second one), `on_started` after the resume, so
-    callers see the resumed sessions running."""
+    is ours: a second launcher that loses the race for the port must not run them too, even for a moment. Which ones
+    is chosen before the port opens (manager.plan_resume), so a client's first request already sees them as about to
+    start (`resume_pending`), never as final. `on_listening` is called as soon as the port is open (write hub.json
+    there: other `dreamteam` commands then find this hub during a long resume instead of starting a second one),
+    `on_started` after the resume, so callers see the resumed sessions running."""
     check_hub_token(host)
     app = create_launcher_app(manager, host)
     config = hub_server_config(app, host, port, log_level)
@@ -675,6 +676,9 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
     manager.hub_url = public_base(host, port)
     for sid, swarm in manager.swarms.items():
         swarm.hub_url = f"{manager.hub_url}/s/{sid}/mcp"
+    resuming = manager.config.server.resume_sessions if resume is None else resume
+    if resuming:  # before the first request: a session about to be resumed is not final (docs/SPEC.md §21.7)
+        manager.plan_resume()
     task = asyncio.ensure_future(server.serve())
     try:
         waiter = asyncio.ensure_future(listening.wait())
@@ -685,10 +689,11 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
         if listening.is_set() and not task.done():
             if on_listening is not None:
                 on_listening()
-            if manager.config.server.resume_sessions if resume is None else resume:
+            if resuming:
                 await manager.resume()
             if on_started is not None:
                 on_started()
+        manager.cancel_resume()  # (the port was not ours: nothing is resumed)
         await asyncio.shield(task)
     except BaseException:  # cancelled (Ctrl+C), or on_started failed: the web server must not outlive this call
         if not task.done():
@@ -701,6 +706,7 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
                     task.cancel()
         raise
     finally:
+        manager.cancel_resume()
         try:
             await manager.shutdown()
         finally:

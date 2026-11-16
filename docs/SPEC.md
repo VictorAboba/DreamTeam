@@ -3005,7 +3005,15 @@ every fire (the flood guard limits those).
 goal.reopened agent.hired agent.retired agent.status agent.activity agent.compacted agent.usage
 file.changed file.locked file.unlocked trigger.created trigger.fired trigger.deleted
 mcp.created mcp.status swarm.paused swarm.resumed swarm.wrap_up swarm.limits job.started job.ended
-skill.attached skill.detached skill.proposed skill.library skill.deps`
+skill.attached skill.detached skill.proposed skill.library skill.deps session.started session.stopped`
+
+`session.started` {} and `session.stopped` {reason: `user` | `done` | `budget` | `shutdown` | `restart` | `failed`,
+error?}, actor None: the session manager journals them into the session's own journal when a run starts (right before
+the swarm starts, so the run's own start events follow it) and when it ends (after its agents stopped and before its
+database closes; a start that failed carries `error`, its absolute paths named by their last component). A start
+refused by the checks before the swarm starts journals nothing. Neither changes the session's `last_activity`
+(§17.2) or an import's comparison of histories (§20.4). The reasons and the rules are in §21.6; the web feed and the
+TUI's verbose feed show them as a line of their own.
 
 `skill.attached` {name, from, files, replaced: bool, via, attached_via} and `skill.detached` {name, via}, actor = the
 user (§19); `via` is the surface (`act`, `mcp`, `launcher-mcp`; `role` for the skills a role brings), `attached_via`
@@ -4139,8 +4147,9 @@ settings; ValueError when they are invalid):
   workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None)`,
   `async load(sid)`, `async start(sid, *, skills=None,
   via="home", auto_reply=False)`,
-  `async stop(sid, *, remember=False)`, `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None,
-  settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`, `global_config()`,
+  `async stop(sid, *, remember=False, reason="user")`, `async unload_idle(sid)`, `update(sid, *, title=None,
+  overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`,
+  `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `global_config()`,
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
@@ -4152,6 +4161,30 @@ settings; ValueError when they are invalid):
   `session_uid(meta)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
+- **A run's start and end, waiting for a change** (§21.6, §21.7).
+  - `_start_locked` journals `session.started` right before `swarm.start()` and, when that raises,
+    `session.stopped` {reason: `failed`, error} before its unload (`error` through `eventtext.without_abs_paths`: an
+    absolute path named by its last component; the log has the whole text); when it is cancelled (the hub stops),
+    `session.stopped` {reason: `shutdown`}. `_unload(sid, reason=None)` of a running session journals
+    `session.stopped` {reason} after `Swarm.stop` and before the database closes (errors logged, never raised). The
+    reasons: `stop()` passes its `reason` (`STOP_REQUEST_REASONS`: `user` by default; `done`, `budget` for
+    `stop_when_done`; another is a ValueError); `shutdown()` passes `shutdown`, a workspace move `restart`, a delete
+    `user` (the journal goes away with the session when the delete succeeds; when the folder cannot be renamed away,
+    409, the session stays stopped, without its resume mark).
+  - `watch(sid)` (a context manager) gives an `asyncio.Event` set by every journaled event of the session (one bus
+    listener per Swarm, added by `_load_locked`; live-only events do not count), by `_changed(sid, …)`, by resume()
+    handling the session, and by the release of the session's lock (the locks are `_SessionLock`, which pokes the
+    waiters on release: the end of a start, a stop, a move). It is keyed by session, never by a bus, so it outlives
+    an unload. Waiters clear it before each read.
+  - `is_final(sid)`: not running, not in `starting` (creates and v1 `continue`s in flight), not in `resume_pending`,
+    and the session's lock is not held.
+  - `resume_pending`: the sessions resume() will try. `plan_resume()` chooses them by their autostart mark alone
+    (session.json reads, no log line: the launcher calls it before its port opens) and fills the set;
+    `cancel_resume()` drops the plan when resume() does not run. resume() uses the plan (else chooses now) and
+    empties the set one session at a time. At each one's turn it skips, with its log line, a finished session and
+    one of an earlier version (both keep their mark), and a session stopped (out of the set, its mark cleared) or
+    deleted meanwhile; it checks that last condition again under the session's lock and starts it there
+    (`_start_locked`), so a stop that held the lock while resume() waited is never undone.
 - `SessionError(message, status=400, **extra)` (a ValueError) carries an HTTP status and `extra` (put into the
   JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid settings,
   404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
@@ -4851,8 +4884,10 @@ succeeded: either may have changed the library) and everything else to the launc
   sets `manager.hub_url` (and the loaded swarms' `hub_url`), starts uvicorn, calls `on_listening` as soon as
   the port is open (write hub.json there), then resumes the autostart sessions when `server.resume_sessions` is
   on (or `resume=True`) — only once the port is ours, so a second launcher losing the race never runs them —
-  then calls `on_started`. On exit (cancelled, or a callback failed) it stops the web server and
-  `manager.shutdown()` (sessions keep their autostart mark).
+  then calls `on_started`. Which sessions it will try is chosen before uvicorn starts (`manager.plan_resume()`: by
+  their mark alone, no log line), so the first request already finds them in `resume_pending`; a launcher that does
+  not get the port drops the plan (`cancel_resume()`). On exit (cancelled, or a callback failed) it stops the web
+  server and `manager.shutdown()` (sessions keep their autostart mark).
 
 ### 18.2 Launcher MCP (launcher_mcp.py)
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
@@ -5498,7 +5533,8 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     `swarm.resumed` with `question`: «ваш ответ на вопрос #N получили все участники, рой продолжил работу» (answered),
     «рой продолжил работу без ответа на вопрос #N» (dropped), with «уточнение цели выключено: …» (why `clarify_off`)
     and «{asker} покинул(а) рой: …» (why `left`); the feed's `swarm.*` lines are escaped, not linkified, so `#N` (a
-    message id) is no task link.
+    message id) is no task link. The feed also shows a run's start and end (FEED_TYPES `session.*`, §9): «сессия
+    запущена», «сессия остановлена: бюджет исчерпан», «сессия не запустилась: <error>»…, escaped like `swarm.*`.
   - Reviews (§4.1): a card waiting for the user's review has the badge «ждёт вашего ревью», another one in review
     names its reviewer; the task card's «Принять» / «Вернуть» (a return needs a comment: what to fix; for a
     task another member reviews, the card says the user may decide instead). Dragging a task from «review» to
@@ -6278,12 +6314,12 @@ sessions/<id>/workspace/              copy_tree of the session's own folder or i
   `-shm` is read through them (`?mode=ro`: WAL content included); one with a `-wal` only is read from a private
   copy of both; one without either as `immutable=1`, read again once when its file changed meanwhile, then
   refused. `_finish_db` on the copy: `journal_mode=DELETE`; command credentials stripped (§20.3); `VACUUM` (no free
-  page keeps deleted text); `PRAGMA quick_check` must be "ok"; then its figures (events, last event, MCP servers,
-  `max_tools_revision`). The session is never opened, so one made by an earlier version (§17.2) is exported like
-  any other (an import by this version refuses it, §20.4), with a warning in the report (`session {sid} was made by
-  an earlier version of DreamTeam: this version and the same one on the other computer refuse it; only the version
-  that made it imports and opens it (keep this folder)`; `db.made_by_earlier_version` of the copy, of the database
-  itself in a dry run), since the report's closing advice is to use the same version there.
+  page keeps deleted text); `PRAGMA quick_check` must be "ok"; then its figures (events, last event of the work as
+  §20.4, MCP servers, `max_tools_revision`). The session is never opened, so one made by an earlier version (§17.2)
+  is exported like any other (an import by this version refuses it, §20.4), with a warning in the report (`session
+  {sid} was made by an earlier version of DreamTeam: this version and the same one on the other computer refuse it;
+  only the version that made it imports and opens it (keep this folder)`; `db.made_by_earlier_version` of the copy,
+  of the database itself in a dry run), since the report's closing advice is to use the same version there.
 - **Order** (`_export_parts`): settings, skills, mcp, sessions; then `scan_for_secrets` over the whole folder; then
   the manifest; then the swap. Any exception (TransferError, OSError, KeyboardInterrupt) discards what was written
   (`_discard`: the temp folder, or the contents of the user's empty folder; retried `DISCARD_TRIES` times), naming
@@ -6425,10 +6461,11 @@ changes. All servers are saved by one `update_settings({"mcp": ...})`.
   `skip`.
 - No target: **add** under the exported id when it is free and not reserved by this import, else `_free_id(title)`
   (`as <id>: <id> is taken here`).
-- A target: **unchanged** when the last events `(id, ts, type)` are equal, the files match (`compare_digest` of the
-  exported workspace equals that of the target's folder; always true when the target works outside the home or the
-  export carries no files) and `_settings_differ` finds nothing (title, overrides as the import writes them,
-  `pending_goal`); when only those differ: **rewrite** of session.json alone (`settings_only`,
+- A target: **unchanged** when the last events of the work `(id, ts, type)` are equal (a run's `session.started` and
+  `session.stopped` are left out, as for `last_activity`, §21.6: a hub restart alone is no newer work), the files
+  match (`compare_digest` of the exported workspace equals that of the target's folder; always true when the target
+  works outside the home or the export carries no files) and `_settings_differ` finds nothing (title, overrides as
+  the import writes them, `pending_goal`); when only those differ: **rewrite** of session.json alone (`settings_only`,
   `import_settings`, no backup). When the export carries no workspace files and the target's folder has some:
   refused. Otherwise **rewrite**, whatever the history says, with the reason: `its files differ`, `the export has
   newer work in it` (the export holds the target's last event), `this computer has newer work in it` (the target
@@ -7005,13 +7042,18 @@ An event is a journal row (§9) with its id, plus a line for people:
     follow it. A start refused before `swarm.start()` (a missing folder, an adopted repository that is not clean, the
     checks of 21.10) journals nothing; it only wakes the waiters.
   - `session.stopped` by `_unload` of a running session, before `swarm.close()` (an emit after the close raises), its
-    errors suppressed. The reasons: `user` (a stop from the board, the TUI, MCP or v1), `done` and `budget`
-    (`stop_when_done`), `shutdown` (the hub stops), `restart` (a stop the hub makes to start the session again: a
-    workspace move). A failed start journals `session.stopped` {reason: `failed`, error} before its unload:
-    the session is not in `running` yet, so `_unload` alone would not.
-  - A delete journals nothing: its journal goes away.
+    errors suppressed. The reasons: `user` (a stop from the board, the TUI, MCP or v1, and a delete), `done` and
+    `budget` (`stop_when_done`), `shutdown` (the hub stops), `restart` (a stop the hub makes to start the session
+    again: a workspace move). A failed start journals `session.stopped` {reason: `failed`, error} before its unload:
+    the session is not in `running` yet, so `_unload` alone would not. `error` is DreamTeam's own text (an exception
+    of the start), with every absolute path named by its last component, as in `text`; the hub's log has it whole. A
+    start cancelled meanwhile (the hub stops during its `resume()`) journals {reason: `shutdown`}.
+  - A delete journals the stop of a running session as `user`. When the delete succeeds, the journal goes away with
+    the session; when its folder cannot be renamed away (files in use, 409), the session stays, stopped, with its
+    run's end journaled and its resume mark cleared.
   - Neither changes the session's `last_activity` (§17.2), which sorts the sessions list and picks the session of
-    `-c`: a hub shutdown would stamp every running session.
+    `-c`: a hub shutdown would stamp every running session. Nor are they work for an import's comparison of histories
+    (§20.4): a hub restart alone does not make one computer's copy newer.
   - Both types join §9's list, `render.EVENT_TYPES` and `static/app.js` together with the code that emits them
     (`tests/test_tui_render.py` checks that every type §9 names is in `render.EVENT_TYPES`).
 - **Polling** (`GET .../events`). `after` is the last id the client has (default 0: from the oldest event, in

@@ -118,6 +118,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "ev_part_of": "часть задачи #{id}",
         "ev_trigger_held": "пробуждение отложено",
         "ev_trigger_held_for": "пробуждение отложено на {t}",
+        # a run's start and end, journaled by the session manager (session.started / session.stopped {reason})
+        "ev_session_started": "Сессия запущена",
+        "ev_session_stopped": "Сессия остановлена",
+        "ev_session_stopped_user": "Сессия остановлена вами",
+        "ev_session_stopped_done": "Сессия остановлена: цель достигнута",
+        "ev_session_stopped_budget": "Сессия остановлена: бюджет исчерпан",
+        "ev_session_stopped_shutdown": "Сессия остановлена вместе с хабом",
+        "ev_session_stopped_restart": "Сессия остановлена для перезапуска",
+        "ev_session_stopped_failed": "Сессия не запустилась",
         # ---- labels of enum values
         "s_todo": "К работе",
         "s_in_progress": "В работе",
@@ -769,6 +778,15 @@ TEXTS: dict[str, dict[str, str]] = {
         "ev_part_of": "part of #{id}",
         "ev_trigger_held": "wake-up held",
         "ev_trigger_held_for": "wake-up held for {t}",
+        # a run's start and end, journaled by the session manager (session.started / session.stopped {reason})
+        "ev_session_started": "The session started",
+        "ev_session_stopped": "The session stopped",
+        "ev_session_stopped_user": "The session was stopped by you",
+        "ev_session_stopped_done": "The session stopped: the goal is achieved",
+        "ev_session_stopped_budget": "The session stopped: the budget is spent",
+        "ev_session_stopped_shutdown": "The session stopped with the hub",
+        "ev_session_stopped_restart": "The session stopped to start again",
+        "ev_session_stopped_failed": "The session did not start",
         # ---- labels of enum values
         "s_todo": "To do",
         "s_in_progress": "In progress",

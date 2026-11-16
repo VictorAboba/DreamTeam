@@ -37,7 +37,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Callable, Collection
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator
 
 from . import __version__, netoff
 from . import skills as skill_lib
@@ -46,6 +46,7 @@ from .copyfrom import (API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_
                        CopyLimits, Source, Uploads, check_target, copy_into, done_with, hub_in_container, left_over,
                        printable_line, resolve_source, staging_name)
 from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
+from .eventtext import without_abs_paths
 from .goal_text import shorten_title, split_goal
 from .models import USER, Status, ToolError
 from .settings import (
@@ -83,6 +84,15 @@ RENAME_PAUSE = 0.2
 # two homes both make 017-session. Fixed forever: it derives the uid of sessions made before "uid" was written.
 UID_NAMESPACE = uuid.UUID("545ad73f-3f1d-471d-a6b5-de9395f527da")
 _UID = re.compile(r"[0-9a-f]{32}")
+# the manager's own journal events: a run's start and end (docs/SPEC.md §21.6). They are not the session's activity:
+# `last_activity` leaves them out, or a hub shutdown would stamp every running session.
+SESSION_EVENTS = ("session.started", "session.stopped")
+# why `session.stopped`: a stop by the user (any surface), a goal or budget end (stop_when_done), the hub stopping, a
+# stop the hub makes to start the session again (a workspace move), a start that failed
+STOP_REASONS = ("user", "done", "budget", "shutdown", "restart", "failed")
+# the reasons a caller of SessionManager.stop may give; the others are the manager's own (shutdown(), a workspace
+# move, a failed start)
+STOP_REQUEST_REASONS = ("user", "done", "budget")
 LEGACY_WORKSPACE_TEXT = (
     "The main session lives in the home directory itself, and `dreamteam run` can still open that directory as a "
     "single-swarm project, which would not know about another folder: its workspace cannot be moved. Create a new "
@@ -686,7 +696,9 @@ def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any]) 
             stats["question"] = {"asker": paused["asker"], "message_id": paused["message_id"]}
         wrap_up = kv("wrap_up")  # the user's wrap-up mode (Swarm.wrap_up)
         stats["wrap_up"] = bool(wrap_up.get("on")) if isinstance(wrap_up, dict) else False
-        row = conn.execute("SELECT ts FROM events ORDER BY id DESC LIMIT 1").fetchone()
+        # the newest event of the session's own work: a run's start and end (SESSION_EVENTS) are not activity
+        row = conn.execute(f"SELECT ts FROM events WHERE type NOT IN ({', '.join('?' * len(SESSION_EVENTS))}) "
+                           "ORDER BY id DESC LIMIT 1", SESSION_EVENTS).fetchone()
         stats["last_activity"] = row[0] if row else None
         try:  # its own try: a database of a version before background jobs has no jobs table
             row = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'running'").fetchone()
@@ -762,6 +774,23 @@ def session_uid(meta: dict[str, Any]) -> str | None:
     return uuid.uuid5(UID_NAMESPACE, "created_at:" + repr(value)).hex
 
 
+class _SessionLock(asyncio.Lock):
+    """A session's lock that calls `on_release` each time it is released: the end of an operation that held it (a
+    start, a stop, a workspace move...) wakes the session's waiters (SessionManager.watch), since a held lock keeps
+    the session from being final (is_final) and its release changes no state a waiter could see otherwise."""
+
+    def __init__(self, on_release: Callable[[], None]) -> None:
+        super().__init__()
+        self._on_release = on_release
+
+    def release(self) -> None:
+        super().release()
+        try:
+            self._on_release()
+        except Exception:  # a waiter must never break the operation that held the lock
+            log.exception("could not wake the waiters of a session")
+
+
 class SessionManager:
     def __init__(self, home: str | Path, *, llm_factory: Callable | None = None,
                  language: str = "ru", provider: str = "anthropic"):
@@ -785,6 +814,15 @@ class SessionManager:
         # first and failing at the claim
         self._creating_in: set[Path] = set()
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
+        # the waiters of each session (watch): woken by a journaled event of the session, a change (_changed) and the
+        # end of an operation that held its lock (_SessionLock); each with the loop that waits on it
+        self._wakers: dict[str, dict[asyncio.Event, asyncio.AbstractEventLoop]] = {}
+        # the sessions resume() is about to start (docs/SPEC.md §21.7 `final`): filled before the launcher takes its
+        # first request (plan_resume), emptied one by one as resume() handles them
+        self.resume_pending: set[str] = set()
+        self._resume_planned: list[str] | None = None
+        # the sessions a create or a v1 `continue` is starting (filled by those paths; is_final reads it)
+        self.starting: set[str] = set()
         # zips the sessions page uploads for a new session's copy (POST /api/uploads, copy_from_upload)
         self.uploads = Uploads(self.home / ".dreamteam" / UPLOADS_DIR)
         # the files of the HTTP API v1 (POST /api/v1/uploads, docs/SPEC.md §21.3): a root of their own, so a token
@@ -800,6 +838,8 @@ class SessionManager:
             self._listeners.remove(listener)
 
     def _changed(self, sid: str | None, change: str) -> None:
+        if sid is not None:
+            self._poke(sid)
         event = {"type": "sessions.changed", "session": sid, "change": change, "ts": time.time()}
         for listener in list(self._listeners):
             try:
@@ -808,7 +848,64 @@ class SessionManager:
                 log.exception("session listener failed")
 
     def _lock(self, sid: str) -> asyncio.Lock:
-        return self._locks.setdefault(sid, asyncio.Lock())
+        lock = self._locks.get(sid)
+        if lock is None:
+            lock = self._locks[sid] = _SessionLock(lambda: self._poke(sid))
+        return lock
+
+    # ---- waiting for a session's changes (docs/SPEC.md §21.6) -----------------------------------------
+    @contextlib.contextmanager
+    def watch(self, sid: str) -> Iterator[asyncio.Event]:
+        """A waiter for any change of session `sid`: an asyncio.Event set by a new journaled event of the session
+        (one bus listener per Swarm, installed by _load_locked), a change the manager makes (_changed: created,
+        started, stopped, updated, deleted), the end of an operation that held the session's lock, and resume()
+        handling it. It is keyed by session, never by a bus: it outlives an unload, which replaces the Swarm and its
+        bus. Clear the event before each read, then wait on it:
+
+            with manager.watch(sid) as changed:
+                while ...:
+                    changed.clear()
+                    ... read ...
+                    await asyncio.wait_for(changed.wait(), timeout)
+
+        Call it on the event loop that waits (a poke from another thread is handed to that loop)."""
+        event = asyncio.Event()
+        waiters = self._wakers.setdefault(sid, {})
+        waiters[event] = asyncio.get_running_loop()
+        try:
+            yield event
+        finally:
+            waiters = self._wakers.get(sid)
+            if waiters is not None:
+                waiters.pop(event, None)
+                if not waiters:
+                    self._wakers.pop(sid, None)
+
+    def _poke(self, sid: str) -> None:
+        """Wake every waiter of session `sid` (watch). It only sets events: no database work, no await, no emit."""
+        waiters = self._wakers.get(sid)
+        if not waiters:
+            return
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        for event, loop in list(waiters.items()):
+            if loop is current:
+                event.set()
+            elif not loop.is_closed():
+                with contextlib.suppress(RuntimeError):   # its loop closed meanwhile
+                    loop.call_soon_threadsafe(event.set)
+
+    def is_final(self, sid: str) -> bool:
+        """The session is stopped and will not come back by itself (docs/SPEC.md §21.7): it is not running, not being
+        started (`starting`: a create or a `continue` in flight; `resume_pending`: resume() is about to start it), and
+        no operation holds its lock (_unload takes it out of `running` before it journals `session.stopped`). The
+        autostart mark does not count: resume() skips finished and earlier-version sessions but keeps their mark."""
+        if sid in self.running or sid in self.starting or sid in self.resume_pending:
+            return False
+        lock = self._locks.get(sid)
+        return lock is None or not lock.locked()
 
     # ---- global settings ----------------------------------------------------------------------
     def _settings_stamp(self) -> tuple[int, int] | None:
@@ -2031,6 +2128,8 @@ class SessionManager:
         swarm.session_pending_goal = pending_goal(meta)
         if self.hub_url:
             swarm.hub_url = f"{self.hub_url}/s/{sid}/mcp"
+        # every journaled event of this Swarm wakes the session's waiters (watch); live-only ones (id None) do not
+        swarm.bus.listen(lambda event: self._poke(sid) if event.get("id") is not None else None)
         self.swarms[sid] = swarm
         return swarm
 
@@ -2064,7 +2163,13 @@ class SessionManager:
         """Start the session (if it is not running). The caller holds the session's lock. `auto_reply`: a
         `dreamteam -p` client with automatic replies asks for it, so the swarm's auto-reply lease holds before its
         start (also of a running session): no question pauses it, and its goal gets the classic planning task
-        (Swarm.clarifying; docs/SPEC.md §3 "Clarify mode")."""
+        (Swarm.clarifying; docs/SPEC.md §3 "Clarify mode").
+        The run is journaled (docs/SPEC.md §21.6): `session.started` right before `swarm.start()`, so this run's
+        start events (agent.hired, goal.set...) follow it; a failed `swarm.start()` journals `session.stopped`
+        {reason: "failed", error} before its unload (the session is not in `running` yet: _unload would not), the
+        error with every absolute path named by its last component (the journal goes to v1 clients and exports; the
+        log has it whole); a start cancelled meanwhile (the hub stops) journals {reason: "shutdown"}. A start refused
+        by the checks before `swarm.start()` journals nothing: the release of the lock wakes the waiters."""
         # loaded under the lock: a swarm fetched before waiting could have been unloaded meanwhile
         swarm = self._load_locked(sid)
         if auto_reply:
@@ -2078,14 +2183,21 @@ class SessionManager:
                     await asyncio.to_thread(self._check_adopted_repo, sid, cfg.workspace_dir, servers,
                                             netoff.is_off(cfg))
             try:
+                swarm.bus.emit("session.started", None)
                 await swarm.start()
-            except Exception:
+            except Exception as exc:
                 log.exception("session %s failed to start", sid)
                 try:
                     await swarm.stop()  # whatever started before the failure
                 except Exception:
                     log.exception("cleanup after the failed start of %s", sid)
+                error = str(exc) if isinstance(exc, SessionError) else f"{type(exc).__name__}: {exc}"
+                self._journal_stopped(sid, swarm, "failed", error=without_abs_paths(error))
                 await self._unload(sid)
+                raise
+            except asyncio.CancelledError:  # the hub stops while the swarm starts (Ctrl+C during resume()): the run
+                # ends here, and shutdown()'s unload of a session that is not running journals nothing
+                self._journal_stopped(sid, swarm, "shutdown")
                 raise
             self.running.add(sid)
             meta = self.meta(sid)
@@ -2118,24 +2230,33 @@ class SessionManager:
             swarm.session_pending_goal = pending_goal(meta)
         return swarm
 
-    async def stop(self, sid: str, *, remember: bool = False) -> None:
+    async def stop(self, sid: str, *, remember: bool = False, reason: str = "user") -> None:
         """Stop the session's agents and unload it. remember=True keeps it marked for resume() (used at
-        server shutdown); an explicit stop clears the mark. A session made by an earlier version is refused (409):
-        it is never running, and its mark stays."""
+        server shutdown); an explicit stop clears the mark, and resume() no longer starts it. A session made by an
+        earlier version is refused (409): it is never running, and its mark stays. `reason`: the `session.stopped`
+        reason journaled when it was running (STOP_REQUEST_REASONS: "user" for a stop from any surface; "done" and
+        "budget" for stop_when_done); another one is a ValueError (the others are the manager's own)."""
+        if reason not in STOP_REQUEST_REASONS:
+            raise ValueError(f"unknown stop reason {reason!r}")
         self._check(sid)
         self._refuse_earlier(sid)
         async with self._lock(sid):
             try:
-                await self._unload(sid)
+                await self._unload(sid, reason)
             finally:
-                if not remember and self.exists(sid):
-                    meta = self.meta(sid)
-                    meta["autostart"] = False
-                    self._write_meta(sid, meta)
+                if not remember:
+                    self.resume_pending.discard(sid)
+                    if self.exists(sid):
+                        meta = self.meta(sid)
+                        meta["autostart"] = False
+                        self._write_meta(sid, meta)
             self._check(sid)  # deleted while this call waited for the lock
         self._changed(sid, "stopped")
 
-    async def _unload(self, sid: str) -> None:
+    async def _unload(self, sid: str, reason: str | None = None) -> None:
+        """Stop (when it runs) and close the session's Swarm. The caller holds the session's lock. `reason`: a running
+        session journals `session.stopped` {reason} after its agents stopped and before its database closes (an emit
+        after the close raises); None journals nothing (nor does a session that is not running)."""
         swarm = self.swarms.pop(sid, None)
         was_running = sid in self.running
         self.running.discard(sid)
@@ -2145,7 +2266,20 @@ class SessionManager:
             if was_running:
                 await swarm.stop()
         finally:
-            swarm.close()
+            try:
+                if was_running and reason is not None:
+                    self._journal_stopped(sid, swarm, reason)
+            finally:
+                swarm.close()
+
+    @staticmethod
+    def _journal_stopped(sid: str, swarm: "Swarm", reason: str, **data: Any) -> None:
+        """Journal `session.stopped` {reason, **data} into the session's journal; an error is logged, never raised (the
+        stop goes on)."""
+        try:
+            swarm.bus.emit("session.stopped", None, reason=reason, **data)
+        except Exception:
+            log.exception("could not journal the stop of session %s", sid)
 
     async def unload_idle(self, sid: str) -> None:
         """Drop a loaded but not running session (frees its database connection)."""
@@ -2295,8 +2429,9 @@ class SessionManager:
                 self._check_reserved(first.target)
             self._check_expected(sid, first, expect)
             was_loaded, was_running = sid in self.swarms, sid in self.running
-            try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now
-                await self._unload(sid)
+            try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now (a running
+                # session starts again afterwards, also after a failure: its stop is a restart)
+                await self._unload(sid, "restart")
             except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
                 log.exception("error stopping session %s before moving its workspace", sid)
             if was_loaded and notify:
@@ -2435,8 +2570,10 @@ class SessionManager:
                                    "session.", 409, pending_skills=pending)
             if pending and skills == "save":
                 await self._save_pending(sid, pending, via)
-            try:
-                await self._unload(sid)
+            self.resume_pending.discard(sid)
+            try:  # a user's stop: its journal goes away with the session, unless the rename below fails (files in
+                # use, 409) and the session stays, stopped
+                await self._unload(sid, "user")
             except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
                 log.exception("error stopping session %s before deleting it", sid)
             try:
@@ -2461,6 +2598,12 @@ class SessionManager:
                     raise SessionError(f"Unknown session '{sid}'.", 404) from None
                 except OSError as exc:  # Windows: a file inside is open (an editor, an antivirus scan...)
                     if attempt == 9:
+                        try:  # it stays, stopped as by the user (session.stopped above): a hub start does not resume it
+                            meta = self.meta(sid)
+                            meta["autostart"] = False
+                            self._write_meta(sid, meta)
+                        except Exception:
+                            log.exception("could not clear the resume mark of session %s", sid)
                         raise SessionError(f"Could not delete session {sid}: its files are in use ({exc}). Close "
                                            "the programs that use them and try again.", 409) from None
                     await asyncio.sleep(0.2)
@@ -2891,36 +3034,93 @@ class SessionManager:
         return ((stats.get("goal") or {}).get("status") == "done"
                 and not any(by_status.get(status) for status in Status.OPEN))
 
-    async def resume(self) -> list[str]:
-        """Start the sessions that were running when the server last stopped, except finished ones (finished()):
-        they stay stopped until started by hand; and except sessions made by an earlier version, which keep their
-        mark (one warning each)."""
-        started = []
+    def _resume_plan(self) -> list[str]:
+        """The sessions resume() will try: those marked for it (autostart), read from their session.json alone. It is
+        cheap and logs nothing, so the launcher can make it before its port opens; whether one is finished or made by
+        an earlier version is resume()'s to tell (and log) at its turn. A session.json that cannot be read is tried
+        too: resume() logs why it does not start that session."""
+        plan = []
         for sid in self.ids():
             try:
-                if self.meta(sid).get("autostart"):
+                marked = bool(self.meta(sid).get("autostart"))
+            except Exception:  # e.g. a damaged session.json: resume() says what to do
+                marked = True
+            if marked:
+                plan.append(sid)
+        return plan
+
+    def plan_resume(self) -> list[str]:
+        """Choose the sessions the next resume() tries and put them into `resume_pending` now: the launcher calls it
+        before it takes its first request, so a session about to be resumed is never seen final (is_final) by a
+        client that comes first. cancel_resume() drops the plan when resume() is not called after all."""
+        self._resume_planned = self._resume_plan()
+        self.resume_pending.update(self._resume_planned)
+        return list(self._resume_planned)
+
+    def cancel_resume(self) -> None:
+        """Forget a plan_resume() whose resume() will not run (the launcher lost the port, or stopped first)."""
+        planned, self._resume_planned = self._resume_planned or [], None
+        for sid in planned:
+            self._resume_done(sid)
+
+    def _resume_done(self, sid: str) -> None:
+        if sid in self.resume_pending:
+            self.resume_pending.discard(sid)
+            self._poke(sid)
+
+    async def resume(self) -> list[str]:
+        """Start the sessions that were running when the server last stopped (the plan of plan_resume(), else chosen
+        now), except finished ones (finished()): they stay stopped until started by hand; and except sessions made by
+        an earlier version, which keep their mark (one warning each). Each one is in `resume_pending` until it is
+        handled. One stopped by the user (out of `resume_pending`, its mark cleared) or deleted meanwhile is skipped,
+        and that is checked again under the session's lock: a stop that held it while this call waited is never
+        undone."""
+        sids, self._resume_planned = self._resume_planned, None
+        if sids is None:
+            sids = self._resume_plan()
+            self.resume_pending.update(sids)
+        started = []
+
+        def still_wanted(sid: str) -> bool:
+            return sid in self.resume_pending and bool(self.meta(sid).get("autostart"))
+
+        try:
+            for sid in sids:
+                try:
+                    if not still_wanted(sid):
+                        continue
                     if self.earlier_version(sid):
                         log.warning("session %s was made by an earlier version of DreamTeam: not resumed", sid)
                         continue
                     if self.finished(sid):
                         log.info("session %s is finished (goal achieved, no open task): not resumed", sid)
                         continue
-                    await self.start(sid)
+                    async with self._lock(sid):
+                        if not still_wanted(sid):  # a stop or a delete held the lock while this call waited
+                            continue
+                        await self._start_locked(sid)
+                    self._changed(sid, "started")
                     started.append(sid)
-            except SessionError as exc:  # e.g. its workspace folder is missing: the message says what to do
-                log.warning("could not resume session %s: %s", sid, exc)
-            except Exception:
-                log.exception("could not resume session %s", sid)
+                except SessionError as exc:  # e.g. its workspace folder is missing: the message says what to do
+                    log.warning("could not resume session %s: %s", sid, exc)
+                except Exception:
+                    log.exception("could not resume session %s", sid)
+                finally:
+                    self._resume_done(sid)
+        finally:  # (cancelled: the rest is not about to start any more)
+            for sid in sids:
+                self._resume_done(sid)
         return started
 
     async def shutdown(self) -> None:
-        """Stop every loaded session, keeping the running ones marked for resume()."""
+        """Stop every loaded session, keeping the running ones marked for resume() (they journal `session.stopped`
+        {reason: "shutdown"})."""
         # also sessions in the middle of an operation (a start, a workspace move that starts them again)
         busy = [sid for sid, lock in self._locks.items() if lock.locked() and sid not in self.swarms]
         for sid in list(self.swarms) + busy:
             try:
                 async with self._lock(sid):
-                    await self._unload(sid)
+                    await self._unload(sid, "shutdown")
             except Exception:
                 log.exception("error stopping session %s", sid)
 

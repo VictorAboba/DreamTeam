@@ -10,6 +10,8 @@ characters and the invisible bidi and zero-width format characters removed.
 - A tool call is journaled before the tool runs, so its line is the call alone, and the tool's result has a line of
   its own: "Anna Smith · task_claim ⎿ Claimed task #3" (an error marked ✗).
 - The goal panel is one line: "Goal: <title>", "✓ Goal achieved: <title> — <first line of the summary>".
+- A run's start and end, which the session manager journals: "▶ The session started", "· The session stopped: the
+  budget is spent", "⚠ The session did not start: <error>".
 - What the agents wrote (a message, a comment, a result, a thought) is quoted with its whitespace collapsed and cut
   to about QUOTE_CHARS characters; a tool result and a wake-up by their first line.
 - A crew task says so when it is created ("crew task, up to 3 members"), never with its working set (the event's copy
@@ -19,7 +21,7 @@ characters and the invisible bidi and zero-width format characters removed.
   skill's build log) names it by its last component, and a skill's environment (its Python, its packages' folder)
   is left out of the notices that list it (_PATH_NOTES). Every other absolute path in a text of DreamTeam's own (a
   notice, a wake-up, an agent's error, a trigger's errors, a skill environment's failure or state) is named by its
-  last component too (_without_abs_paths), whatever it quotes; the `env` of `skill.deps` and a job's log are never
+  last component too (without_abs_paths), whatever it quotes; the `env` of `skill.deps` and a job's log are never
   shown. What the agents wrote (a message, a task, a tool call or result) is quoted as written, paths included.
 - None only for the events no feed shows: `agent.usage` and `agent.compacted` (the live-only `trace.*` and
   `job.silent` are never sent). It never raises: an event it cannot word gets a generic `<type> · <actor>` line.
@@ -358,9 +360,10 @@ def _short_path(match: re.Match) -> str:
     return f"{quote}{parts[-1] if parts else ''}{quote}{tail}"
 
 
-def _without_abs_paths(value: Any) -> str:
+def without_abs_paths(value: Any) -> str:
     """clean(value) with every absolute path named by its last component (`'/home/me/x/lib'` → `'lib'`): for the texts
-    of DreamTeam's own a line quotes (a notice, a wake-up, an error), which may name a folder of the hub's computer."""
+    of DreamTeam's own a line quotes (a notice, a wake-up, an error), which may name a folder of the hub's computer.
+    The session manager journals the error of a failed start through it too (`session.stopped`, docs/SPEC.md §21.6)."""
     return _ABS_PATH.sub(_short_path, clean(value))
 
 
@@ -546,7 +549,7 @@ def _ev_notification(ctx: TextContext, ev: dict, d: dict) -> str | None:
     if kind in _PATH_NOTES:  # the paths of the hub's computer shortened (spaces in them too), never shown whole
         text = _without_paths(kind, text) or kind
     # any other a notice names (a job's log in the data folder, a skill outside the workspace, an installer's error)
-    text = _without_abs_paths(text)
+    text = without_abs_paths(text)
     if recipient != ctx.me:
         return f"{s['bell']} {s['arrow']} {first_name(recipient) or '?'}: {ctx.short(_first_line(text), 200)}"
     if kind == "u_agent_error":  # the feeds' error line
@@ -604,7 +607,7 @@ def _ev_activity(ctx: TextContext, ev: dict, d: dict) -> str | None:
     text = d.get("text")
     s = ctx.sym
     if kind == "error":   # the hub's or the provider's error text: a path in it shortened
-        return f"{s['warn']} {clean(agent) or ctx.t('system')}: {_quote(ctx, _without_abs_paths(text))}"
+        return f"{s['warn']} {clean(agent) or ctx.t('system')}: {_quote(ctx, without_abs_paths(text))}"
     if kind == "tool_call":
         return f"{_who(ctx, agent)} {s['dot']} {tool_call_text(ctx, d.get('tool'), text, TOOL_LINE_CHARS)}"
     if kind == "tool_result":
@@ -616,11 +619,11 @@ def _ev_activity(ctx: TextContext, ev: dict, d: dict) -> str | None:
     if kind == "text":
         return f"{_who(ctx, agent)} {s['dot']} {ctx.t('k_text')}: {_quote(ctx, text)}"
     if kind == "wake":   # the first notice of the wake-up text: a workspace move, a skill's Python... shortened
-        summary = _without_abs_paths(_wake_summary(text))
+        summary = without_abs_paths(_wake_summary(text))
         return f"{s['alarm']} {clean(agent) or '?'} {ctx.t('wakes')}: {ctx.short(summary, QUOTE_CHARS)}"
     if kind == "nudge":
         return (f"{s['nudge']} {clean(agent) or '?'}: {ctx.t('nudge')} {s['dash']} "
-                f"{ctx.short(_without_abs_paths(_first_line(text)), QUOTE_CHARS)}")
+                f"{ctx.short(without_abs_paths(_first_line(text)), QUOTE_CHARS)}")
     if kind == "compacted":
         return f"{s['spark']} {_who(ctx, agent)} {s['dot']} {ctx.t('compacted')} {s['cont']} {_quote(ctx, text)}"
     return _generic(ctx, ev)
@@ -642,7 +645,7 @@ def _ev_file(ctx: TextContext, ev: dict, d: dict) -> str | None:
 def _ev_trigger(ctx: TextContext, ev: dict, d: dict) -> str | None:
     trigger = _d(d.get("trigger"))
     tid = clean(trigger.get("id") if trigger.get("id") is not None else d.get("trigger_id")) or "?"
-    errors = [_without_abs_paths(e) for e in _list(d.get("errors")) if e]
+    errors = [without_abs_paths(e) for e in _list(d.get("errors")) if e]
     if errors:
         return f"{ctx.sym['warn']} {ctx.t('trigger_errors', id=tid, errors='; '.join(errors))}"
     key = {"trigger.created": "trigger_created", "trigger.fired": "trigger_fired"}.get(ev.get("type"),
@@ -751,7 +754,7 @@ def _ev_skill_deps(ctx: TextContext, ev: dict, d: dict) -> str | None:
     status = clean(d.get("status"))
     name, files = clean(d.get("name")) or "?", ", ".join(_names(d.get("files")))
     if status == "failed":
-        error = ctx.short(_without_abs_paths(d.get("error")), 200) or "?"
+        error = ctx.short(without_abs_paths(d.get("error")), 200) or "?"
         return f"{ctx.sym['warn']} {ctx.t('ev_skill_deps_failed', name=name, error=error)}"
     if status == "ready":
         took = "" if d.get("reused") or d.get("seconds") is None else f", {fmt_elapsed(d.get('seconds'))}"
@@ -759,7 +762,30 @@ def _ev_skill_deps(ctx: TextContext, ev: dict, d: dict) -> str | None:
     if status == "installing":
         return f"{ctx.sym['dot']} {ctx.t('ev_skill_deps_installing', name=name, files=files)}"
     return (f"{ctx.sym['dot']} {name}: {clean(d.get('ecosystem'))} {_deps_word(ctx, status)} "
-            f"({_without_abs_paths(_deps_reason(d.get('reason')))})")
+            f"({without_abs_paths(_deps_reason(d.get('reason')))})")
+
+
+def _session_run(ctx: TextContext, ev: dict, d: dict) -> tuple[str, str]:
+    """(symbol key, text) of a run's start or end, journaled by the session manager: `session.started` {} and
+    `session.stopped` {reason, error?} ("The session stopped: the budget is spent", "The session did not start:
+    <error>"; an unknown reason is named as it is). The error of a failed start is DreamTeam's own text: an absolute
+    path in it is named by its last component."""
+    if ev.get("type") == "session.started":
+        return "play", ctx.t("ev_session_started")
+    reason = _one_line(d.get("reason"))
+    if reason == "failed":
+        error = ctx.short(without_abs_paths(d.get("error")), 200)
+        return "warn", ctx.t("ev_session_stopped_failed") + (f": {error}" if error else "")
+    key = "ev_session_stopped_" + reason
+    text = ctx.t(key)
+    if text == key:   # no reason, or one this version has no words for
+        text = ctx.t("ev_session_stopped") + (f" ({reason})" if reason else "")
+    return "dot", text
+
+
+def _ev_session_run(ctx: TextContext, ev: dict, d: dict) -> str | None:
+    symbol, text = _session_run(ctx, ev, d)
+    return f"{ctx.sym[symbol]} {text}"
 
 
 def _ev_session(ctx: TextContext, ev: dict, d: dict) -> str | None:
@@ -812,6 +838,8 @@ _HANDLERS: dict[str, Callable[[TextContext, dict, dict], str | None]] = {
     "skill.proposed": _ev_skill,
     "skill.library": _ev_skill,
     "skill.deps": _ev_skill_deps,
+    "session.started": _ev_session_run,
+    "session.stopped": _ev_session_run,
     "sessions.changed": _ev_session,
     "_connection": _ev_connection,
 }
