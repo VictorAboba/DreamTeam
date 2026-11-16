@@ -767,8 +767,9 @@ def known_secrets(raw: dict[str, Any], overrides: dict[str, Any] | None = None,
     variables, names like *_TOKEN or *PASSWORD*); the header values of ANTHROPIC_CUSTOM_HEADERS /
     OPENAI_CUSTOM_HEADERS; the values of the [shell] pass_env and [skills] install_env variables; the env values of
     the [mcp.external] servers and the credentials in their commands (strip_command_credentials), global and of
-    each session (`overrides`: {session id: overrides}), whatever the export includes; the hub token of this
-    process and the tokens `dreamteam sandbox` stored. Placeholder keys of local endpoints are left out."""
+    each session (`overrides`: {session id: overrides}), whatever the export includes; the hub token and the API
+    token of this process (main() took both out of os.environ) and the tokens `dreamteam sandbox` stored. Placeholder
+    keys of local endpoints are left out."""
     lookup = os.environ if environ is None else environ   # (os.environ ignores the case of names on Windows)
     environ = dict(lookup)
     found = Secrets()
@@ -809,6 +810,7 @@ def known_secrets(raw: dict[str, Any], overrides: dict[str, Any] | None = None,
             for value in (strip_command_credentials(spec.get("command"))[1] if isinstance(spec, dict) else ()):
                 found.add(value, f"a credential in the command of {_server_place(server, sid or None)}")
     found.add(hubauth.env_token(), "the hub token")
+    found.add(hubauth.api_env_token(), "the API token")
     folder = hubauth.tokens_dir()
     with contextlib.suppress(OSError):
         for path in sorted(folder.glob("*.json")):

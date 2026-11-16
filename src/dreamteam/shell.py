@@ -29,7 +29,8 @@ from pathlib import Path
 
 from . import netoff
 from .config import Config, key_env_names
-from .hubauth import DIGEST_ENV as HUB_DIGEST_ENV, TOKEN_ENV as HUB_TOKEN_ENV
+from .hubauth import (API_DIGEST_ENV, API_TOKEN_ENV, DIGEST_ENV as HUB_DIGEST_ENV,
+                      TOKEN_ENV as HUB_TOKEN_ENV)
 from .procs import TOKEN_ENV, ProcessTree, daemon_call
 
 log = logging.getLogger(__name__)
@@ -51,11 +52,11 @@ _KNOWN_SECRETS = {
 # DreamTeam's own settings that must not point agents' commands at the skills library or the skills' shared
 # environments (docs/SPEC.md §19): dropped even when shell.pass_env names them. (DREAMTEAM_SKILLS, the folder of the
 # swarm's skills, is set for the shell.) The sandbox's markers of the offline firewall (netoff.py) are no business of
-# the commands either, and the hub token (hubauth.py) never reaches them, whatever shell.pass_env says.
+# the commands either, and neither the hub token nor the API token (hubauth.py) reaches them, whatever shell.pass_env
+# says. (The digests' names match no secret pattern: without this they would reach the agents.)
 _INTERNAL_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR",
                            "DREAMTEAM_MCP_LIBRARY_DIR", "DREAMTEAM_OFFLINE_USER", "DREAMTEAM_OFFLINE_FIREWALL",
-                           HUB_TOKEN_ENV,
-                           HUB_DIGEST_ENV})
+                           HUB_TOKEN_ENV, HUB_DIGEST_ENV, API_TOKEN_ENV, API_DIGEST_ENV})
 
 POWERSHELL_UTF8 = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
                    "$OutputEncoding = [System.Text.Encoding]::UTF8; ")

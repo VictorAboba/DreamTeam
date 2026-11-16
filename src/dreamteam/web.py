@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hmac
 import ipaddress
 import logging
 import os
@@ -642,7 +643,8 @@ def display_host(host: str) -> str:
 
 
 class NoTokenError(RuntimeError):
-    """A hub on an address other hosts reach, without a token: it does not start (hubauth.NO_TOKEN_ENV allows it)."""
+    """A hub on an address other hosts reach, without a token: it does not start (hubauth.NO_TOKEN_ENV allows it). Also
+    a hub whose API token is its hub token, which never starts (check_hub_token)."""
 
 
 def _loopback_bind(host: str) -> bool:
@@ -661,31 +663,57 @@ def _loopback_bind(host: str) -> bool:
     return (getattr(ip, "ipv4_mapped", None) or ip).is_loopback
 
 
-def check_hub_token(host: str, *, warn: bool = True) -> None:
+def check_hub_token(host: str, *, warn: bool = True, api: bool = False) -> None:
     """A hub other hosts can reach that asks nothing of them does not start (the image's default command, a plain
     `docker run` or compose without DREAMTEAM_HUB_TOKEN; `dreamteam sandbox` always sets one), unless the user allows
     it with DREAMTEAM_HUB_NO_TOKEN=1: then it says so (`warn`). Every loopback IP literal is loopback (_loopback_bind:
     127.0.0.2 too), not only the names: no other host reaches it, and GuardMiddleware takes such a bind's own address
     as its Host. The commands that serve a hub call it before they
     create or start anything (cli._token_missing, the TUI's in-process launcher), serve() and serve_launcher() once
-    more."""
-    if _loopback_bind(host) or hubauth.hub_digest() is not None:
-        return
-    if not hubauth.no_token_allowed():
-        # the image under docker compose: a DREAMTEAM_HUB_TOKEN of the host never reaches the container (another
-        # container, a devcontainer or CI, takes either variable as any host does)
-        if os.environ.get(netoff.IMAGE_ENV) == "1":
-            how = (f"Set {hubauth.DIGEST_ENV} to the token's SHA-256, computed on the host: docker-compose.yml passes "
-                   f"only it to the container, not {hubauth.TOKEN_ENV} (docs/en/sandbox.md, \"Access token\")")
-        else:
-            how = (f"Set {hubauth.TOKEN_ENV} (e.g. python -c \"import secrets; print(secrets.token_urlsafe(32))\"), "
-                   f"or its SHA-256 as {hubauth.DIGEST_ENV}")
-        raise NoTokenError(f"a hub on {host} needs a token: whoever reaches the port would control the swarm. {how}, "
-                           f"use `dreamteam sandbox`, which makes one, or set {hubauth.NO_TOKEN_ENV}=1 to serve "
-                           "without one")
-    if warn:
-        log.warning("listening on %s without a hub token (%s): whoever reaches the port controls the swarm", host,
-                    hubauth.NO_TOKEN_ENV)
+    more.
+
+    A hub whose API token (docs/SPEC.md §21.1) is its hub token never starts, on any address: whoever holds the API
+    token would open every internal route. `api`: the hub serves the external API (serve_launcher); with `warn`, an
+    API token without a hub token outside the image is said in the log (api_token_warning)."""
+    hub, api_digest = hubauth.hub_digest(), hubauth.api_digest()
+    if hub is not None and api_digest is not None and hmac.compare_digest(hub, api_digest):
+        raise NoTokenError(f"its API token ({hubauth.API_TOKEN_ENV} or {hubauth.API_DIGEST_ENV}) is its hub token "
+                           f"({hubauth.TOKEN_ENV} or {hubauth.DIGEST_ENV}): whoever holds the API token would open "
+                           "every route of the hub. Give the external API a token of its own")
+    if not (_loopback_bind(host) or hub is not None):
+        if not hubauth.no_token_allowed():
+            # the image under docker compose: a DREAMTEAM_HUB_TOKEN of the host never reaches the container (another
+            # container, a devcontainer or CI, takes either variable as any host does)
+            if os.environ.get(netoff.IMAGE_ENV) == "1":
+                how = (f"Set {hubauth.DIGEST_ENV} to the token's SHA-256, computed on the host: docker-compose.yml "
+                       f"passes only it to the container, not {hubauth.TOKEN_ENV} (docs/en/sandbox.md, \"Access "
+                       "token\")")
+            else:
+                how = (f"Set {hubauth.TOKEN_ENV} (e.g. python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+                       f"), or its SHA-256 as {hubauth.DIGEST_ENV}")
+            raise NoTokenError(f"a hub on {host} needs a token: whoever reaches the port would control the swarm. "
+                               f"{how}, use `dreamteam sandbox`, which makes one, or set {hubauth.NO_TOKEN_ENV}=1 to "
+                               "serve without one")
+        if warn:
+            log.warning("listening on %s without a hub token (%s): whoever reaches the port controls the swarm", host,
+                        hubauth.NO_TOKEN_ENV)
+    if api and warn:
+        text = api_token_warning()
+        if text:
+            log.warning("%s", text)
+
+
+def api_token_warning() -> str | None:
+    """The warning of a hub that has an API token and no hub token, outside the sandbox image (docs/SPEC.md §21.1 "The
+    rest of the hub"): the API token guards /api/v1 alone, so the internal routes answer whoever reaches the port,
+    and a site on the same computer exposes them to its own bugs (a request forgery reaches 127.0.0.1). None
+    otherwise: in the image the hub runs in the container, and a hub without the API token has no such client."""
+    if hubauth.api_digest() is None or hubauth.hub_digest() is not None or os.environ.get(netoff.IMAGE_ENV) == "1":
+        return None
+    return (f"the external API has a token ({hubauth.API_TOKEN_ENV}) but the hub has none ({hubauth.TOKEN_ENV}): the "
+            "board, the settings and /mcp answer whoever reaches this port without one, so a bug of a site on this "
+            f"computer that calls the API can reach them. Set {hubauth.TOKEN_ENV} too, or serve the site's hub with "
+            "`dreamteam sandbox`")
 
 
 def hub_server_config(app, host: str, port: int, log_level: str) -> uvicorn.Config:

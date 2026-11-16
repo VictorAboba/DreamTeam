@@ -668,7 +668,7 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
     start (`resume_pending`), never as final. `on_listening` is called as soon as the port is open (write hub.json
     there: other `dreamteam` commands then find this hub during a long resume instead of starting a second one),
     `on_started` after the resume, so callers see the resumed sessions running."""
-    check_hub_token(host)
+    check_hub_token(host, api=True)   # (api: the warning of an API token without a hub token, docs/SPEC.md §21.1)
     app = create_launcher_app(manager, host)
     config = hub_server_config(app, host, port, log_level)
     listening = asyncio.Event()

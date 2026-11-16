@@ -37,6 +37,10 @@ services:
       # `dreamteam console/tui/mcp/status` send DREAMTEAM_HUB_TOKEN, the board opens with
       # http://127.0.0.1:8765/?token=<token>.
       - DREAMTEAM_HUB_TOKEN_SHA256
+      # the SHA-256 of the external API's token (/api/v1, for a site's server; computed on the host like the one
+      # above, from DREAMTEAM_API_TOKEN): optional, and never the hub token's. Without it /api/v1 serves the hub
+      # token's holder alone.
+      - DREAMTEAM_API_TOKEN_SHA256
       # skills: the mounted host library is the read-only source "host-library"; the sandbox's own library is
       # inside the mounted home (the host never reads it by itself)
       # - DREAMTEAM_HOST_SKILLS_DIR=/dreamteam/host-skills

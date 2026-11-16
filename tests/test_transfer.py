@@ -598,7 +598,7 @@ async def test_the_placeholder_key_of_lm_studio_is_no_secret(tmp_path):
     await manager.shutdown()
 
 
-@pytest.mark.parametrize("kind", ["env", "hub", "hub_file", "headers", "install_env", "pass_env", "key_env",
+@pytest.mark.parametrize("kind", ["env", "hub", "hub_file", "api", "headers", "install_env", "pass_env", "key_env",
                                   "session_env"])
 async def test_secrets_of_the_environment_fail_the_export(tmp_path, monkeypatch, kind):
     value = f"value-of-{kind}-0123456789"
@@ -607,6 +607,10 @@ async def test_secrets_of_the_environment_fail_the_export(tmp_path, monkeypatch,
         monkeypatch.setenv("DT_SERVICE_TOKEN", value)
     elif kind == "hub":
         monkeypatch.setenv(hubauth.TOKEN_ENV, value)
+    elif kind == "api":   # the external API's token, out of os.environ as main() takes it (no name pattern finds it)
+        monkeypatch.setenv(hubauth.API_TOKEN_ENV, value)
+        hubauth.take_env_token()
+        assert hubauth.API_TOKEN_ENV not in os.environ and hubauth.api_env_token() == value
     elif kind == "hub_file":
         _write(hubauth.tokens_dir() / "8800.json", json.dumps({"port": 8800, "token": value}))
     elif kind == "headers":

@@ -2402,7 +2402,8 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None, *,
     # names: those reach them through [skills] install_env, the server's `env` table or pass_env)
     # except config.shell.pass_env, and always minus _INTERNAL_ENV (DREAMTEAM_SKILLS_DIR, DREAMTEAM_HOST_SKILLS_DIR,
     # DREAMTEAM_SKILL_ENVS_DIR: agents' commands are never pointed at the skills library or the skills'
-    # environments, even through pass_env; the offline markers; DREAMTEAM_HUB_TOKEN(_SHA256), §14.2); plus
+    # environments, even through pass_env; the offline markers; DREAMTEAM_HUB_TOKEN(_SHA256), §14.2;
+    # DREAMTEAM_API_TOKEN(_SHA256), §21.1); plus
     # PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
 def secret_free_env(names=()) -> dict[str, str]
     # os.environ minus _INTERNAL_ENV and the secrets whatever pass_env says (the known names, `names`, each
@@ -3749,9 +3750,15 @@ reaches it as well. The token closes that.
   web part is optional, logs serve()'s refusal and goes on over stdio. `serve` and `serve_launcher` check once more.
 - **The API token** (§21.1): a second token, `DREAMTEAM_API_TOKEN` or its SHA-256 in `DREAMTEAM_API_TOKEN_SHA256`
   (`hubauth.api_digest()`), for `/api/v1` only. `take_env_token` moves both out of os.environ with the hub token's
-  names, `shell._INTERNAL_ENV` drops both, `docker.env_passthrough` never passes the host's, and `dreamteam sandbox`
-  passes the digest by name, as `DIGEST_ENV`. It is never one of `client_tokens()`, never a cookie or `?token=`, and
-  it opens no other path. A hub whose API token equals its hub token does not start.
+  names (`_api_taken`, `_api_taken_digest`; `api_env_token()` is the token), `shell._INTERNAL_ENV` drops both,
+  `docker.env_passthrough` never passes the host's, and `dreamteam sandbox` of a home passes the digest by name, as
+  `DIGEST_ENV`. A digest variable that is no SHA-256 asks for a token nobody has, with one warning per value (never
+  its value; `_api_digest_warned` counts a value only once the log has a handler, so a command's early check before
+  `setup_logging` does not keep it out of the log file). It is never one of `client_tokens()`, never a cookie or
+  `?token=`, and it opens no other path. A hub whose API token equals its hub token does not start
+  (`check_hub_token` raises `NoTokenError`, `dreamteam run` included; the TUI's `_start_launcher` tries no other
+  port after it, and `dreamteam mcp` logs it and goes on over stdio as above); a launcher with an API token and no
+  hub token logs `api_token_warning()` outside the image (§21.1).
 - **`dreamteam sandbox`** (`docker.run_sandbox`): refuses when a container `dreamteam-<port>` exists
   (`container_exists`); makes `new_token()` (`secrets.token_urlsafe(32)`) per container; `store_token(port, token,
   mounted, also_mounted=[sandbox_host_library(config)])` writes `<tokens_dir>/<port>.json` `{"port","token","home"}`
@@ -3759,8 +3766,10 @@ reaches it as well. The token closes that.
   and `os.path.samefile` per ancestor for a case-insensitive file system Python does not know about; then None:
   nothing stored, the printed lines name `DREAMTEAM_HUB_TOKEN` instead); `tokens_dir()` is `DREAMTEAM_TOKENS_DIR` or
   `~/.dreamteam/hub-tokens`. `sandbox_command` passes `-e DREAMTEAM_HUB_TOKEN_SHA256` by name and
-  `subprocess.call(cmd, env={...without TOKEN_ENV/DIGEST_ENV, DIGEST_ENV: digest(token)})` gives the value (never on
-  a command line, never the token itself; `env_passthrough` never passes the host's own). `access_lines` prints the board URL with
+  `subprocess.call(cmd, env={...without docker.TOKEN_NAMES, DIGEST_ENV: digest(token)})` gives the value (never on
+  a command line, never the token itself; `env_passthrough` never passes the host's own); for a home with an API
+  token it also passes `-e DREAMTEAM_API_TOKEN_SHA256`, whose value `API_DIGEST_ENV: hubauth.api_digest()` joins
+  that env (§21.1). `access_lines` prints the board URL with
   `?token=`, the MCP URL and `claude mcp add --transport http dreamteam <base>/mcp --header "Authorization: Bearer
   <token>"`, and the stdio registration `claude mcp add dreamteam -- dreamteam mcp ...` that survives restarts.
   `forget_token(port, token)` removes the file when the container ends (only if it still holds this token).
@@ -6475,8 +6484,9 @@ journal, histories); each affected server is warned (`re-enter the credentials o
 `shell._is_secret` accepts with `_KNOWN_SECRETS`, `key_env_names()` and the profiles' variables; the header values
 of `ANTHROPIC_CUSTOM_HEADERS` / `OPENAI_CUSTOM_HEADERS`; the values of the `[shell] pass_env` and `[skills]
 install_env` variables; the env values and command credentials of the `[mcp.external]` servers of the global
-settings and of every session's overrides (also sessions not exported); `hubauth.env_token()` and the tokens in
-`hubauth.tokens_dir()`; plus everything the export itself removed.
+settings and of every session's overrides (also sessions not exported); `hubauth.env_token()`,
+`hubauth.api_env_token()` (the API token, §21.1: main() took it out of os.environ, so the scan of the variables misses
+it) and the tokens in `hubauth.tokens_dir()`; plus everything the export itself removed.
 
 `scan_for_secrets(root, secrets, *, git=None) -> [place]`: each value is searched for as it is, JSON-escaped (with
 and without ASCII escapes) and escaped twice, each as UTF-8 and UTF-16LE (`_Matcher`, chunked with an overlap).
@@ -6736,10 +6746,12 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
      `[shell] pass_env` says. (`DREAMTEAM_API_TOKEN_SHA256` does not match `_SECRET_RE`: without this it would reach
      the agents.)
   3. `docker.env_passthrough` subtracts both names.
-  4. `docker.run_sandbox` passes `DREAMTEAM_API_TOKEN_SHA256` by name when there is an API token (`sandbox_command`
-     adds `-e DREAMTEAM_API_TOKEN_SHA256`). Its value goes into the docker command's environment, taken from hubauth,
-     since `main()` has already popped both names from os.environ; neither name is inherited from the host's
-     environment there. The token itself never enters the container.
+  4. `docker.run_sandbox` of a home passes `DREAMTEAM_API_TOKEN_SHA256` by name when there is an API token
+     (`sandbox_command(..., api_token=True)` adds `-e DREAMTEAM_API_TOKEN_SHA256` for a home only: a single-swarm
+     project's `run` has no v1). Its value (`hubauth.api_digest()`) goes into the docker command's environment, taken
+     from hubauth, since `main()` has already popped both names from os.environ; none of the four token names
+     (`docker.TOKEN_NAMES`) is inherited from the host's environment there. The token itself never enters the
+     container.
   5. `docker-compose.yml` passes `DREAMTEAM_API_TOKEN_SHA256` by name.
   6. The export's secret check (`transfer.known_secrets`, §20.3) names the API token next to the hub token.
 - **Who.** On v1 the guard reads only the header `Authorization: Bearer <token>`. The hub token's cookie and a GET
@@ -6751,9 +6763,12 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   - Otherwise a request without a valid Bearer is 401 `token_required`, with
     `WWW-Authenticate: Bearer realm="DreamTeam"`. A hub with a hub token alone serves v1 to its owner only.
   - A hub whose API token equals its hub token does not start (`web.check_hub_token`, which the commands that serve a
-    hub run first and `serve_launcher` runs again): the API token would open every internal route.
+    hub run first and `serve_launcher` runs again), on any address, whichever form (token or digest) gives either;
+    `dreamteam run` too, though it has no v1: the API token would open every internal route.
   - A hub with an API token and no hub token, outside the image, starts with a warning in the log and in `serve`'s
-    output, which recommends a hub token or `dreamteam sandbox` ("The rest of the hub" below). A non-loopback bind
+    output (its log's warnings go to stderr), which recommends a hub token or `dreamteam sandbox` ("The rest of the
+    hub" below): `serve_launcher` calls `check_hub_token(host, api=True)`, which logs `web.api_token_warning()`; the
+    commands' early check (`warn=False`) and `dreamteam run` (no v1) say nothing. A non-loopback bind
     needs the hub token anyway (§14.2), unless `DREAMTEAM_HUB_NO_TOKEN=1`, which §14.2 warns about: such a hub then
     serves its internal routes to the network with no token at all.
 - **What the API token reaches.** The guard takes the API token only on v1 paths: it opens no internal route, no

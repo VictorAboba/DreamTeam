@@ -177,8 +177,8 @@ def env_passthrough(config: Config) -> list[str]:
     names = {p.api_key_env for p in config.models.values() if p.api_key_env}
     names |= {"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"} | set(config.shell.pass_env)
     # the skills variables are set by sandbox_command; a host value passed by name would come later and win. The
-    # hub token is run_sandbox's own, never the host's
-    names -= SKILLS_ENV | {hubauth.TOKEN_ENV, hubauth.DIGEST_ENV}
+    # hub token is run_sandbox's own, never the host's, and the API token's digest comes from run_sandbox alone
+    names -= SKILLS_ENV | TOKEN_NAMES
     return sorted(n for n in names if n and n in os.environ)
 
 
@@ -190,6 +190,9 @@ SANDBOX_SKILLS_DIR = "/swarm/.dreamteam/skills-library"
 SANDBOX_ENVS_DIR = "/dreamteam/skill-envs"   # the skills' dependency environments: a named volume per home
 SKILLS_ENV = frozenset({"DREAMTEAM_SKILLS_DIR", "DREAMTEAM_HOST_SKILLS_DIR", "DREAMTEAM_SKILL_ENVS_DIR",
                         "DREAMTEAM_MCP_LIBRARY_DIR", "UV_CACHE_DIR"})
+# the hub token's and the API token's names (hubauth.py): never passed from the host's environment, never inherited
+# by the docker command; run_sandbox sets the two digests itself
+TOKEN_NAMES = frozenset({hubauth.TOKEN_ENV, hubauth.DIGEST_ENV, hubauth.API_TOKEN_ENV, hubauth.API_DIGEST_ENV})
 
 
 def envs_volume(project_dir: Path) -> str:
@@ -230,7 +233,8 @@ def outside_home_warning(home: Path) -> list[str]:
 
 def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | None = None,
                     image: str = IMAGE, docker: str = "docker", tty: bool = False,
-                    home: bool | None = None, firewall: bool = False, network: str | None = None) -> list[str]:
+                    home: bool | None = None, firewall: bool = False, network: str | None = None,
+                    api_token: bool = False) -> list[str]:
     """`docker run` argv for the sandbox. The hub inside listens on CONTAINER_PORT, published on the host's
     127.0.0.1:port only; DREAMTEAM_PUBLIC_URL tells it that host URL, so the board shows the right MCP URL
     and hub.json (in the mounted project) lets host-side `dreamteam mcp/console/status` find it.
@@ -242,7 +246,9 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
     The hub token's SHA-256 (hubauth.DIGEST_ENV) is passed by name, its value from the environment of the docker
     command (run_sandbox): the hub has to listen on 0.0.0.0 (a published port reaches the container's interface, never
     its loopback), and so every container on the same bridge reaches it too unless it asks for the token. Only the
-    digest: the container's environment never holds the token itself."""
+    digest: the container's environment never holds the token itself. `api_token`: the host has an API token
+    (hubauth.api_digest), whose SHA-256 (hubauth.API_DIGEST_ENV) is passed the same way to a home's hub, the only one
+    that serves the external API (docs/SPEC.md §21.1)."""
     public = f"http://127.0.0.1:{port}"
     # --init: a tiny init (tini) is PID 1 and reaps orphans (processes the agents' commands leave running), so a
     # zombie never keeps a process group alive; it forwards SIGTERM/SIGINT to dreamteam. Ports that agents' dev
@@ -269,6 +275,8 @@ def sandbox_command(project_dir: Path, port: int, config: Config, goal: str | No
         cmd += ["-e", name]  # value taken from the host environment, never put on the command line
     if home is None:
         home = (project_dir / "sessions").is_dir()
+    if api_token and home:  # (a single-swarm project's `run` has no external API)
+        cmd += ["-e", hubauth.API_DIGEST_ENV]
     if home:  # a launcher home: the sessions page and all its sessions
         cmd += [image, "serve", "/swarm", "--host", "0.0.0.0", "--port", str(CONTAINER_PORT), "--no-console",
                 "--no-browser"]
@@ -345,8 +353,10 @@ def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | N
     # Docker would create a missing host folder of a bind mount itself, owned by root on Linux
     sandbox_host_library(config).mkdir(parents=True, exist_ok=True)
 
+    # the API token's SHA-256 from hubauth: main() has already taken both of its names out of os.environ
+    api_digest = hubauth.api_digest() if is_home else None
     cmd = sandbox_command(project_dir, port, config, goal, image, docker=_docker(), tty=_stdin_is_terminal(),
-                          home=home, firewall=firewall, network=network)
+                          home=home, firewall=firewall, network=network, api_token=api_digest is not None)
     if firewall:
         print("Sessions without network: their agents' commands run as a separate user whose network the "
               "container's firewall closes (NET_ADMIN only for setting it up).", file=sys.stderr)
@@ -354,10 +364,13 @@ def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | N
     # there); the hub gets only its SHA-256, through docker's environment, never on a command line
     token = hubauth.new_token()
     stored = hubauth.store_token(port, token, project_dir, also_mounted=[sandbox_host_library(config)])
-    env = {k: v for k, v in os.environ.items() if k not in (hubauth.TOKEN_ENV, hubauth.DIGEST_ENV)}
+    env = {k: v for k, v in os.environ.items() if k not in TOKEN_NAMES}
+    env[hubauth.DIGEST_ENV] = hubauth.digest(token)
+    if api_digest is not None:
+        env[hubauth.API_DIGEST_ENV] = api_digest
     try:
         for line in access_lines(project_dir.resolve(), port, token, stored, is_home):
             print(line, file=sys.stderr)
-        return subprocess.call(cmd, env={**env, hubauth.DIGEST_ENV: hubauth.digest(token)})
+        return subprocess.call(cmd, env=env)
     finally:
         hubauth.forget_token(port, token)

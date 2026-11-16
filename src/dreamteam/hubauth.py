@@ -12,7 +12,11 @@ no process it starts inherits them. Which token a client sends where is decided 
 A peer on the hub's own loopback needs the token too: the agents' commands in the sandbox's container come from
 there. The clients in the hub's own process (the console of `serve`/`run`, the TUI's launcher) can send own_token(),
 kept in memory, besides: a hub with DIGEST_ENV alone never has the token itself. A hub without a token (`dreamteam
-serve` on 127.0.0.1 by default) asks nothing of anyone."""
+serve` on 127.0.0.1 by default) asks nothing of anyone.
+
+The API token (docs/SPEC.md §21.1) is a second token, for the external API (/api/v1) alone: API_TOKEN_ENV or its
+SHA-256 in API_DIGEST_ENV (api_digest). It leaves the environment with the hub token's names (take_env_token), and it
+is never one of client_tokens(): DreamTeam's own clients never send it."""
 
 from __future__ import annotations
 
@@ -22,6 +26,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import secrets
 import urllib.error
@@ -30,8 +35,12 @@ import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
 
+log = logging.getLogger(__name__)
+
 TOKEN_ENV = "DREAMTEAM_HUB_TOKEN"            # the token: clients send it; a hub without DIGEST_ENV asks for it
 DIGEST_ENV = "DREAMTEAM_HUB_TOKEN_SHA256"    # what `dreamteam sandbox` gives the hub: the token's SHA-256 (hex)
+API_TOKEN_ENV = "DREAMTEAM_API_TOKEN"        # the external API's token (/api/v1 only); never sent by DreamTeam itself
+API_DIGEST_ENV = "DREAMTEAM_API_TOKEN_SHA256"   # its SHA-256 (hex): what `dreamteam sandbox` gives the hub
 NO_TOKEN_ENV = "DREAMTEAM_HUB_NO_TOKEN"      # "1": serve on a non-loopback address without a token all the same
 TOKENS_DIR_ENV = "DREAMTEAM_TOKENS_DIR"      # where `dreamteam sandbox` keeps its tokens (default ~/.dreamteam/hub-tokens)
 QUERY_PARAM = "token"                        # `?token=` of a board URL: the hub turns it into a cookie
@@ -41,6 +50,9 @@ FROM_ENV = object()   # web.GuardMiddleware's default token: hub_digest()
 
 _taken: str | None = None          # TOKEN_ENV as main() found it (take_env_token)
 _taken_digest: str | None = None   # DIGEST_ENV as main() found it
+_api_taken: str | None = None          # API_TOKEN_ENV as main() found it
+_api_taken_digest: str | None = None   # API_DIGEST_ENV as main() found it
+_api_digest_warned: set[str] = set()   # the API_DIGEST_ENV values that are no SHA-256 api_digest() warned about
 _own_token: str | None = None      # the token of the clients in this process's own hub (own_token)
 _own_digest: str | None = None
 _own: set[tuple[str, str, int]] = set()   # (scheme, host, port) of the hubs with a token this process serves
@@ -71,17 +83,23 @@ class TokenRequired(RuntimeError):
 
 
 def take_env_token() -> None:
-    """Move TOKEN_ENV and DIGEST_ENV out of os.environ (main(), before anything starts a process): no command, MCP
-    server, installer or git that DreamTeam starts inherits them, whatever filter its environment goes through.
-    (Popping them leaves the environment this process was started with as it was: hence DIGEST_ENV, the only form of
-    the token `dreamteam sandbox` passes.)"""
-    global _taken, _taken_digest
+    """Move TOKEN_ENV and DIGEST_ENV, and the API token's API_TOKEN_ENV and API_DIGEST_ENV, out of os.environ (main(),
+    before anything starts a process): no command, MCP server, installer or git that DreamTeam starts inherits them,
+    whatever filter its environment goes through. (Popping them leaves the environment this process was started with
+    as it was: hence DIGEST_ENV, the only form of the token `dreamteam sandbox` passes.)"""
+    global _taken, _taken_digest, _api_taken, _api_taken_digest
     value = os.environ.pop(TOKEN_ENV, None)
     if value is not None:
         _taken = value.strip() or None
     value = os.environ.pop(DIGEST_ENV, None)
     if value is not None:
         _taken_digest = value.strip() or None
+    value = os.environ.pop(API_TOKEN_ENV, None)
+    if value is not None:
+        _api_taken = value.strip() or None
+    value = os.environ.pop(API_DIGEST_ENV, None)
+    if value is not None:
+        _api_taken_digest = value.strip() or None
 
 
 def env_token() -> str | None:
@@ -102,6 +120,31 @@ def hub_digest() -> str | None:
         valid = len(raw) == 64 and all(c in "0123456789abcdef" for c in raw)
         return raw if valid else digest(secrets.token_urlsafe(32))
     token = env_token()
+    return digest(token) if token else None
+
+
+def api_env_token() -> str | None:
+    """API_TOKEN_ENV of this process: the external API's token (docs/SPEC.md §21.1). Only the hub's guard of /api/v1
+    and the export's secret check read it; no client of DreamTeam's sends it."""
+    return os.environ.get(API_TOKEN_ENV, "").strip() or _api_taken
+
+
+def api_digest() -> str | None:
+    """The SHA-256 of the API token: API_DIGEST_ENV (what `dreamteam sandbox` passes), else that of API_TOKEN_ENV; None
+    without either. An API_DIGEST_ENV that is no SHA-256 asks for a token nobody has (never for none), with a
+    warning, as hub_digest() does for the hub token: once per value (the guard and the start checks ask more than
+    once), counted only once the log is set up (a command's early check runs before setup_logging, and the warning
+    would then miss the log file)."""
+    raw = (os.environ.get(API_DIGEST_ENV, "").strip() or _api_taken_digest or "").lower()
+    if raw:
+        if len(raw) == 64 and all(c in "0123456789abcdef" for c in raw):
+            return raw
+        if raw not in _api_digest_warned:
+            log.warning("%s is not a SHA-256 (64 hex digits): no API token will match it", API_DIGEST_ENV)
+            if log.hasHandlers():
+                _api_digest_warned.add(raw)
+        return digest(secrets.token_urlsafe(32))
+    token = api_env_token()
     return digest(token) if token else None
 
 
@@ -403,8 +446,8 @@ def token_link_needed(url: str, opened: str) -> bool:
     return opened == url and hub_digest() is not None
 
 
-__all__ = ["DIGEST_ENV", "NO_TOKEN_ENV", "TOKEN_ENV", "TOKENS_DIR_ENV", "TokenRequired", "auth_headers", "browser_url",
-           "client_token", "client_tokens", "cookie_name", "digest", "env_token", "forget_token", "httpx_auth",
-           "hub_digest", "is_loopback_url", "matches", "new_token", "no_token_allowed", "open_hub", "own_digest",
-           "own_token", "refused", "serving", "store_token", "stored_token", "take_env_token", "token_link_needed",
-           "token_taken"]
+__all__ = ["API_DIGEST_ENV", "API_TOKEN_ENV", "DIGEST_ENV", "NO_TOKEN_ENV", "TOKEN_ENV", "TOKENS_DIR_ENV",
+           "TokenRequired", "api_digest", "api_env_token", "auth_headers", "browser_url", "client_token",
+           "client_tokens", "cookie_name", "digest", "env_token", "forget_token", "httpx_auth", "hub_digest",
+           "is_loopback_url", "matches", "new_token", "no_token_allowed", "open_hub", "own_digest", "own_token",
+           "refused", "serving", "store_token", "stored_token", "take_env_token", "token_link_needed", "token_taken"]
