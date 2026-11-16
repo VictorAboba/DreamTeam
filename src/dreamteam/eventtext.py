@@ -33,6 +33,7 @@ imports dreamteam.tui (whose package imports prompt_toolkit) or rich."""
 from __future__ import annotations
 
 import json
+import functools
 import logging
 import os
 import re
@@ -366,37 +367,51 @@ def _short_path(match: re.Match) -> str:
 _WORD_END = r"""$|[\s'"`<>|,;:!?()\[\]{}]|\.(?=$|\s)"""
 
 
-def _named_pattern(path: str, below: bool) -> re.Pattern[str] | None:
+def _named_pattern(path: str, below: bool | None) -> re.Pattern[str] | None:
     """Absolute path `path` as a text may name it: with either separator, single or doubled (str(), as_posix() and
     the repr an OSError shows alike), in any case (matching too much only shortens a text), whole components only and
-    not inside a longer path; `below`: also as the start of a path below it. None for a root."""
+    not inside a longer path; `below`: also as the start of a path below it; None: only a path below it, whole (to its
+    first space, quote, "<", ">" or "|"; group `rest` is what follows the folder). None for a root."""
     parts = re.split(r"[\\/]+", path.rstrip("\\/"))
     if len(parts) < 2 or not parts[-1]:
         return None
     body = r"[\\/]+".join(re.escape(part) for part in parts)
-    end = r"(?=[\\/]|" + _WORD_END + ")" if below else "(?=" + _WORD_END + ")"
+    if below is None:
+        end = r"""(?P<rest>[\\/]+[^\s'"`<>|\\/][^\s'"`<>|]*)"""
+    else:
+        end = r"(?=[\\/]|" + _WORD_END + ")" if below else "(?=" + _WORD_END + ")"
     return re.compile(r"(?<![\w.~-])" + body + end, re.IGNORECASE)
 
 
+def _hidden(name: str, match: re.Match) -> str:
+    rest = match.group("rest")
+    return name + rest[len(rest.rstrip(_PATH_END)):]   # (the punctuation that ends a sentence stays)
+
+
 def without_abs_paths(value: Any, named: Iterable[tuple[Any, str]] = (),
-                      exact: Iterable[tuple[Any, str]] = ()) -> str:
+                      exact: Iterable[tuple[Any, str]] = (), hidden: Iterable[tuple[Any, str]] = ()) -> str:
     """clean(value) with every absolute path named by its last component (`'/home/me/x/lib'` → `'lib'`): for the texts
     of DreamTeam's own a line quotes (a notice, a wake-up, an error), which may name a folder of the hub's computer.
     The session manager journals the error of a failed start through it too (`session.stopped`, docs/SPEC.md §21.6).
-    `named` and `exact`: (absolute path, name) pairs of folders the caller knows, replaced by their names first,
-    longest first, wherever the text names them, quoted or not: an unquoted path with a space in it is otherwise cut
-    at that space, and its later words would stay ("does not exist: C:\\Users\\Jane Doe\\jobs\\acme site." would keep
-    "Doe\\jobs\\acme site"). A `named` folder is also replaced at the start of a path below it, which then stays after
-    its name as a relative path (the folders whose content the reader may see: a session's own); an `exact` one only
-    where the text names that very folder (a folder above them: a path below it may be anyone's, "C:\\Users\\alice\\x"
-    must not become "Users\\alice\\x")."""
+    `named`, `exact` and `hidden`: (absolute path, name) pairs of folders the caller knows, replaced by their names
+    first, longest first, wherever the text names them, quoted or not: an unquoted path with a space in it is
+    otherwise cut at that space, and its later words would stay ("does not exist: C:\\Users\\Jane Doe\\jobs\\acme
+    site." would keep "Doe\\jobs\\acme site"). A `named` folder is also replaced at the start of a path below it,
+    which then stays after its name as a relative path (the folders whose content the reader may see: a session's
+    own); an `exact` one only where the text names that very folder (a folder above them: a path below it may be
+    anyone's, "C:\\Users\\alice\\x" must not become "Users\\alice\\x"); a `hidden` one only where the text names a
+    path below it, which its name then replaces whole (a folder whose content the reader may not even see named: the
+    other sessions' folders below the home's `sessions`, whose names are their titles). Of one path both `exact` and
+    `hidden` may be given: the folder itself by the one name, a path below it by the other."""
     text = clean(value)
     pairs = [(os.fspath(path), name, True) for path, name in named]
     pairs += [(os.fspath(path), name, False) for path, name in exact]
+    pairs += [(os.fspath(path), name, None) for path, name in hidden]
     for path, name, below in sorted(pairs, key=lambda pair: len(pair[0]), reverse=True):
         pattern = _named_pattern(path, below)
         if pattern is not None:
-            text = pattern.sub(lambda _match, name=name: name, text)
+            replace = functools.partial(_hidden, name) if below is None else (lambda _match, name=name: name)
+            text = pattern.sub(replace, text)
     return _ABS_PATH.sub(_short_path, text)
 
 

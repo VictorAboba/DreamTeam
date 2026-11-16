@@ -11,7 +11,7 @@ import os
 import time
 import urllib.parse
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping
 
 import uvicorn
 from starlette.applications import Starlette
@@ -47,6 +47,23 @@ GRACEFUL_SECONDS = 3                            # open connections (long polls) 
 INBOX_PAGE = 500                                # messages / notifications per /api/inbox response
 TOKEN_TEXT = ("This DreamTeam hub needs its token: open the board URL with ?token=<token> (the one `dreamteam sandbox` "
               "prints, or the one whose SHA-256 the hub was given), or send the header Authorization: Bearer <token>.")
+# the external HTTP API v1 (docs/SPEC.md §21): its paths, and the scope key the guard's v1 branch sets to who calls
+API_PREFIX = "/api/v1"
+API_CALLER = "dreamteam.api_caller"
+API_CALLERS = ("owner", "api")   # the hub token or the in-process own_token(); the API token
+BEARER_REALM = 'Bearer realm="DreamTeam"'
+API_TOKEN_TEXT = (f"The API needs a token: send the header Authorization: Bearer <token>, with the API token "
+                  f"({hubauth.API_TOKEN_ENV}) or the hub token ({hubauth.TOKEN_ENV}).")
+API_DISABLED_TEXT = (f"The API is off on this hub: it has neither an API token ({hubauth.API_TOKEN_ENV}) "
+                     f"nor a hub token ({hubauth.TOKEN_ENV}).")
+JSON_TYPE_TEXT = "Content-Type must be application/json"
+
+
+def is_api_path(path: str) -> bool:
+    """A path of the external API (docs/SPEC.md §21.1): `/api/v1` itself or a path under `/api/v1/`, as the server gave
+    it (`..` and `//` are never resolved: `/api/v1/../api/settings` is a v1 path, which v1 answers 404, and
+    `//api/v1/options` is none). The guard's v1 branch and the launcher's dispatcher decide by this one predicate."""
+    return path == API_PREFIX or path.startswith(API_PREFIX + "/")
 
 
 def _split_hostport(value: str) -> tuple[str, int | None] | None:
@@ -106,9 +123,9 @@ def env_public_origin() -> tuple[str, int] | None:
 
 class GuardMiddleware:
     """DNS-rebinding guard (Host check), cross-site guard (Origin check, also for WebSockets), the hub token and
-    JSON-only POSTs (blocks cross-site form posts), except `raw_posts`: an exact path mapped to the one other
-    content type a POST there may have (e.g. the launcher's zip upload, application/zip, which no cross-site page
-    can send without a preflight the hub never answers).
+    JSON-only POSTs (blocks cross-site form posts), except `raw_posts`: an exact path mapped to the other content
+    types a POST there may have, one (a string) or several (e.g. the launcher's zip upload, application/zip, which no
+    cross-site page can send without a preflight the hub never answers).
 
     Loopback bind: Host must be localhost / 127.0.0.1 / [::1]. Any other bind (0.0.0.0 in Docker, a LAN
     address): Host may also be the bind address, or an IP literal (a rebinding attack always arrives with the
@@ -126,14 +143,26 @@ class GuardMiddleware:
     token's SHA-256. A request the cookie authorizes takes no Origin but its own (host and port): browsers send a
     cookie to every port of a host, and a page on another port of 127.0.0.1 is the same site for SameSite. No token:
     nothing is asked of anyone (the default hub on 127.0.0.1).
+
+    `api` (the launcher's guard): the external API's branch (docs/SPEC.md §14, §21.1) for every path is_api_path
+    takes. There only the header `Authorization: Bearer` counts, never the cookie or a `?token=`: the hub token or
+    own_token() is the hub's owner, `api_token` (default: hubauth.api_digest(), read once here: a malformed digest
+    variable gives a new random digest at every call) the API caller; scope[API_CALLER] says which. A hub with neither
+    token answers 403 `api_disabled`, a request without a valid Bearer 401 `token_required`, and every refusal there is
+    JSON `{"error", "code"}`. The API token opens no other path: every other one keeps the rules above and their
+    plain texts.
     """
 
     def __init__(self, app, loopback: bool | None = None, *, host: str = "127.0.0.1",
                  extra_hosts: frozenset[str] | set[str] = frozenset(), token: str | None | object = hubauth.FROM_ENV,
-                 raw_posts: Mapping[str, str] | None = None):
+                 raw_posts: Mapping[str, str | Collection[str]] | None = None, api: bool = False,
+                 api_token: str | None | object = hubauth.FROM_ENV):
         self.app = app
-        # exact path -> the only other content type a POST there may have (no prefix: "/api/uploads/" is not it)
-        self.raw_posts = {path: kind.lower() for path, kind in (raw_posts or {}).items()}
+        # exact path -> the other content types a POST there may have, without parameters, lowercase (no prefix:
+        # "/api/uploads/" is not "/api/uploads")
+        self.raw_posts: dict[str, frozenset[str]] = {
+            path: frozenset([kinds.lower()] if isinstance(kinds, str) else (kind.lower() for kind in kinds))
+            for path, kinds in (raw_posts or {}).items()}
         self.loopback = (host in LOOPBACK_HOSTS) if loopback is None else loopback
         bind = _split_hostport(host if not (":" in host and not host.startswith("[")) else f"[{host}]")
         self.bind_host = bind[0] if bind else ""
@@ -143,6 +172,11 @@ class GuardMiddleware:
         self.digest: str | None = (hubauth.hub_digest() if token is hubauth.FROM_ENV
                                    else hubauth.digest(token) if token else None)  # type: ignore[arg-type]
         self.cookie = hubauth.cookie_name(self.digest) if self.digest else ""
+        self.api = api
+        self.api_digest: str | None = None   # the API token's SHA-256 (only with `api`)
+        if api:
+            self.api_digest = (hubauth.api_digest() if api_token is hubauth.FROM_ENV
+                               else hubauth.digest(api_token) if api_token else None)  # type: ignore[arg-type]
 
     def host_allowed(self, hostname: str, local: str = "", authorized: bool = False) -> bool:
         """`local`: the address the connection reached (ASGI "server"); `authorized`: the request has the token."""
@@ -168,6 +202,20 @@ class GuardMiddleware:
                 return "cookie"
         if scope["type"] == "http" and scope.get("method") in ("GET", "HEAD") and self._query_token(scope):
             return "query"
+        return None
+
+    def api_caller(self, headers: dict[str, str]) -> str | None:
+        """Who an external API request is (docs/SPEC.md §21.1), by its `Authorization: Bearer` header alone: "owner"
+        for the hub token or own_token(), "api" for the API token; None for anything else (no header, another scheme,
+        a wrong token, a cookie or a `?token=`)."""
+        scheme, _, value = headers.get("authorization", "").partition(" ")
+        if scheme.lower() != "bearer":
+            return None
+        value = value.strip()
+        if any(hubauth.matches(value, d) for d in (self.digest, hubauth.own_digest()) if d):
+            return "owner"
+        if self.api_digest is not None and hubauth.matches(value, self.api_digest):
+            return "api"
         return None
 
     def _query_token(self, scope) -> str | None:
@@ -220,43 +268,89 @@ class GuardMiddleware:
             return parsed in ((host[0], 80), (host[0], 443))
         return parsed == (host[0], host[1] or (443 if scheme in ("https", "wss") else 80))
 
-    async def _reject(self, scope, receive, send, text: str, status: int) -> None:
-        if scope["type"] == "http":
-            await PlainTextResponse(text, status_code=status)(scope, receive, send)
-        else:
+    @staticmethod
+    async def _answer(scope, receive, send, text: str, status: int, code: str, *, api: bool,
+                      headers: Mapping[str, str] | None = None) -> None:
+        """A refusal: JSON `{"error", "code"}` on the external API's paths (`api`), the plain text elsewhere; a
+        WebSocket is closed (1008) before it is accepted."""
+        if scope["type"] != "http":
             await send({"type": "websocket.close", "code": 1008})
+        elif api:
+            await JSONResponse({"error": text, "code": code}, status_code=status,
+                               headers=dict(headers or {}))(scope, receive, send)
+        else:
+            await PlainTextResponse(text, status_code=status, headers=dict(headers or {}))(scope, receive, send)
+
+    def _wrong_type(self, scope, path: str, content_type: str, *, exclusive: bool = False) -> str | None:
+        """The 415 text of a POST under /api/ whose body is neither JSON nor a type `raw_posts` gives its exact path;
+        None when the type may pass. `exclusive` (the external API's branch): a path `raw_posts` lists takes its own
+        types alone, JSON refused too (docs/SPEC.md §21.3: /api/v1/uploads stores any body it takes as a file)."""
+        if not (scope["type"] == "http" and scope.get("method") == "POST" and path.startswith("/api/")):
+            return None
+        kind = content_type.split(";")[0].strip()
+        kinds = self.raw_posts.get(path)
+        if exclusive and kinds is not None:
+            return None if kind in kinds else f"Content-Type must be {' or '.join(sorted(kinds))}"
+        return None if content_type.startswith("application/json") or kind in (kinds or ()) else JSON_TYPE_TEXT
+
+    async def _api_branch(self, scope, receive, send, headers: dict[str, str]) -> None:
+        """An external API request (docs/SPEC.md §21.1): the Host check (a valid Bearer counts as the token there),
+        the Origin check (never the cookie's rule), 403 `api_disabled` for a hub with neither token, 401
+        `token_required` without a valid Bearer, the 415 rule (a path `raw_posts` lists takes its own types alone);
+        then scope[API_CALLER] and the app. Every refusal is JSON with its code."""
+        host = _split_hostport(headers.get("host", ""))
+        caller = self.api_caller(headers)
+        local = str((scope.get("server") or ("",))[0] or "")
+        refusal: tuple[str, int, str, dict[str, str]] | None = None
+        wrong_type = self._wrong_type(scope, scope.get("path", ""), headers.get("content-type", "").lower(),
+                                      exclusive=True)
+        if host is None or not self.host_allowed(host[0], local, caller is not None):
+            refusal = ("Forbidden host", 403, "forbidden_host", {})
+        elif headers.get("origin") is not None and not self.origin_allowed(headers["origin"], host,
+                                                                           scope.get("scheme", "http")):
+            refusal = ("Forbidden origin", 403, "forbidden_origin", {})
+        elif self.digest is None and self.api_digest is None:
+            refusal = (API_DISABLED_TEXT, 403, "api_disabled", {})
+        elif caller is None:
+            refusal = (API_TOKEN_TEXT, 401, "token_required", {"WWW-Authenticate": BEARER_REALM})
+        elif wrong_type is not None:
+            refusal = (wrong_type, 415, "unsupported_media_type", {})
+        if refusal is not None:
+            text, status, code, extra = refusal
+            await self._answer(scope, receive, send, text, status, code, api=True, headers=extra)
+            return
+        scope[API_CALLER] = caller
+        await self.app(scope, receive, send)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] in ("http", "websocket"):
+            scope.pop(API_CALLER, None)   # (only the v1 branch below says who calls)
             headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+            if self.api and is_api_path(scope.get("path", "")):
+                await self._api_branch(scope, receive, send, headers)
+                return
             host = _split_hostport(headers.get("host", ""))
             credential = self.credential(scope, headers)
             local = str((scope.get("server") or ("",))[0] or "")
             if host is None or not self.host_allowed(host[0], local, credential is not None):
-                await self._reject(scope, receive, send, "Forbidden host", 403)
+                await self._answer(scope, receive, send, "Forbidden host", 403, "forbidden_host", api=False)
                 return
             origin = headers.get("origin")
             scheme = scope.get("scheme", "http")
             if origin is not None and not (self.cookie_origin_allowed(origin, host, scheme) if credential == "cookie"
                                            else self.origin_allowed(origin, host, scheme)):
-                await self._reject(scope, receive, send, "Forbidden origin", 403)
+                await self._answer(scope, receive, send, "Forbidden origin", 403, "forbidden_origin", api=False)
                 return
             if self.digest is not None and credential is None:   # (every peer: the hub's own loopback too)
-                if scope["type"] == "http":
-                    await PlainTextResponse(TOKEN_TEXT, status_code=401, headers={
-                        "WWW-Authenticate": 'Bearer realm="DreamTeam"'})(scope, receive, send)
-                else:
-                    await send({"type": "websocket.close", "code": 1008})
+                await self._answer(scope, receive, send, TOKEN_TEXT, 401, "token_required", api=False,
+                                   headers={"WWW-Authenticate": BEARER_REALM})
                 return
             if credential == "query":
                 await self._token_cookie(scope, receive, send)
                 return
-            path = scope.get("path", "")
-            content_type = headers.get("content-type", "").lower()
-            if (scope["type"] == "http" and scope.get("method") == "POST" and path.startswith("/api/")
-                    and not content_type.startswith("application/json")
-                    and self.raw_posts.get(path) != content_type.split(";")[0].strip()):
-                await PlainTextResponse("Content-Type must be application/json", status_code=415)(scope, receive, send)
+            wrong_type = self._wrong_type(scope, scope.get("path", ""), headers.get("content-type", "").lower())
+            if wrong_type is not None:
+                await self._answer(scope, receive, send, wrong_type, 415, "unsupported_media_type", api=False)
                 return
         await self.app(scope, receive, send)
 

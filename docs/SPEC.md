@@ -3593,7 +3593,8 @@ without one, nothing is asked, and `serve` refuses a non-loopback bind.
 takes (`/api/v1` itself, or a path under `/api/v1/`; the launcher's dispatcher uses the same predicate) goes through a
 branch of its own: the Host check (a valid Bearer counts as the token there), the Origin check (`origin_allowed`,
 never the cookie's rule), then 403 `api_disabled` when the hub has neither an API token nor a hub token, 401
-`token_required` (with `WWW-Authenticate`) without a valid `Authorization: Bearer`, and the 415 rule. Then
+`token_required` (with `WWW-Authenticate`) without a valid `Authorization: Bearer`, and the 415 rule, where a path
+`raw_posts` lists takes its own types alone, JSON refused too (`/api/v1/uploads` stores any body it takes, §21.3). Then
 `scope["dreamteam.api_caller"]` (`web.API_CALLER`) is `"owner"` for the hub token or `own_token()`, `"api"` for the
 API token (`hubauth.api_digest()`), and the request goes on. The cookie and `?token=` count for nothing on that branch
 (no 303). Its refusals are JSON `{"error", "code"}` (`forbidden_host`, `forbidden_origin`, `token_required`,
@@ -3771,7 +3772,9 @@ reaches it as well. The token closes that.
   token it also passes `-e DREAMTEAM_API_TOKEN_SHA256`, whose value `API_DIGEST_ENV: hubauth.api_digest()` joins
   that env (§21.1). `access_lines` prints the board URL with
   `?token=`, the MCP URL and `claude mcp add --transport http dreamteam <base>/mcp --header "Authorization: Bearer
-  <token>"`, and the stdio registration `claude mcp add dreamteam -- dreamteam mcp ...` that survives restarts.
+  <token>"`, and the stdio registration `claude mcp add dreamteam -- dreamteam mcp ...` that survives restarts; with
+  `api=True` (a home with an API token) also `API: <base>/api/v1  (header Authorization: Bearer <your
+  DREAMTEAM_API_TOKEN>)`, which names the variable, never the token or its digest.
   `forget_token(port, token)` removes the file when the container ends (only if it still holds this token).
 - **Clients.** `client_tokens(url, user_url=None)` is the one rule of where a token may go, in the order a client
   tries them: the token stored for the URL's port only to a loopback URL (127.0.0.1, localhost, [::1]); `env_token()`
@@ -4269,12 +4272,18 @@ settings; ValueError when they are invalid):
     `too_large`, an earlier version `earlier_version`), else `internal`; `text` through `_public_text(sid, text)`,
     as is the `session.stopped` error of a failed `swarm.start()`. An error names a folder unquoted, spaces included,
     and `without_abs_paths` alone would cut it at its first space, so `_public_text` names this computer's folders
-    first (`eventtext.without_abs_paths(value, named=(), exact=())`: (path, name) pairs, longest first, with either
-    separator, single or doubled, in any case, whole components only): `named`, also at the start of a path below
-    them, the user's home as `~` (the path below it is then named by its last component) and, by their last
-    component, the workspace, an unfinished move's two folders, the session's folder and the home (what lies below
-    them stays, relative); `exact`, only where the text names that very folder, every folder above those (a path
-    below one may be anyone's: `C:\Users\alice\x` must not become `Users\alice\x`); each also resolved. A start
+    first (`eventtext.without_abs_paths(value, named=(), exact=(), hidden=())`: (path, name) pairs, longest first,
+    with either separator, single or doubled, in any case, whole components only): `named`, also at the start of a
+    path below them, the user's home as `~` (the path below it is then named by its last component) and, by their
+    last component, the workspace, an unfinished move's two folders, the session's folder and the home (what lies
+    below them stays, relative); `exact`, only where the text names that very folder, every folder above those (a path
+    below one may be anyone's: `C:\Users\alice\x` must not become `Users\alice\x`) and the home's `sessions`;
+    `hidden`, only a path below it, replaced whole: the home's `sessions` as `SessionManager.OTHER_SESSION`
+    (`(a folder of another session)`), since another session's folder name is its title (the session's own folder is
+    longer, so named first); each also resolved. The external API's error texts go through it too
+    (`_public_text(sid | None, text, *, named=())`: `sid` None, an error of no session, names only the user's home and
+    the home; `named` takes the caller's pairs first, unresolved: the roots of `[api] folders` by their names, §21.1
+    "Paths in answers"). A start
     cancelled inside `swarm.start()` (the hub stops) writes `finished_at` and no `start_error`.
   - `_unload` of a running v1 session writes `finished_at` after `Swarm.stop`, whatever the reason.
   - What runs beside a v1 session's run (`_RunWatch`, tied to its Swarm, kept in `_run_watch[sid]`):
@@ -4941,11 +4950,16 @@ of a home or a project, never a session override (§17.2).
 
 ### 18.1 Web (launcher.py)
 `create_launcher_app(manager, host="127.0.0.1")` returns the app wrapped in the same `GuardMiddleware`
-(host/origin, JSON POSTs), with `raw_posts={"/api/uploads": "application/zip"}`: the guard's 415 rule lets a POST to
-`/api/...` pass when its content type starts with `application/json`, or when `raw_posts` maps that exact path (no
-prefix: `/api/uploads/` is not it) to its type without parameters, ignoring case. Host, Origin, token and cookie
+(host/origin, JSON POSTs), with `api=True` (the external API's branch, §14, §21.1) and
+`raw_posts={"/api/uploads": "application/zip", "/api/v1/uploads": ("application/octet-stream", "application/zip")}`:
+the guard's 415 rule lets a POST to `/api/...` pass when its content type starts with `application/json`, or when
+`raw_posts` maps that exact path (no prefix: `/api/uploads/` is not it) to its type, or to a set holding it, without
+parameters, ignoring case; on the v1 branch a path `raw_posts` lists takes its own types alone (`/api/v1/uploads`:
+415 for JSON too, §21.3), while `/api/uploads` keeps the rule above. Host, Origin, token and cookie
 checks run before that rule and are unchanged; `application/zip` is not a CORS-safelisted type, so a cross-site
-page cannot send it without a preflight, which the hub never answers. Session apps pass no `raw_posts`. A
+page cannot send it without a preflight, which the hub never answers. Session apps pass no `raw_posts`. Inside the
+guard `_ApiFirst` sends a path `web.is_api_path` takes to `ApiV1.app` (§21.1 "Dispatch"; `app.api` is the `ApiV1`)
+and every other path, and the lifespan, on. A
 `SessionRouter` in front sends `/s/{sid}/...` to that session's app
 (`web.create_app(swarm, on_library_change=...)`, §14, served with `root_path = /s/{sid}`; a library change there
 emits `sessions.changed` with change `skills`, also a `skill_attach` or `skill_approve` of `/api/act` that
@@ -6734,7 +6748,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   `dreamteam mcp` in a home (its web part), the TUI's in-process launcher, and `dreamteam sandbox` of a home (which
   runs `serve` in the container and passes the API token's digest). All of them go through `launcher.serve_launcher` →
   `create_launcher_app`. `dreamteam run` and `dreamteam sandbox` of a single-swarm project have none: `web.create_app`
-  never takes the API token.
+  never takes the API token. With an API token `serve` prints `API: <base>/api/v1` among its addresses, and
+  `dreamteam sandbox` of a home prints the same line with the header it needs (`docker.access_lines(..., api=True)`),
+  naming `DREAMTEAM_API_TOKEN`, never the token or its digest.
 - **Dispatch.** `create_launcher_app` makes `ApiV1(manager, host)` (21.9) and puts a dispatcher in front of
   `SessionRouter`: a path that `web.is_api_path` takes (`/api/v1` itself, or a path that starts with `/api/v1/`) goes
   to `ApiV1.app`, every other path to `SessionRouter` as before. The guard (§14) chooses its v1 branch by the same
@@ -6742,7 +6758,14 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   Starlette's plain-text 404 and 405 and its slash redirects. `ApiV1.app` has `redirect_slashes` off (a bare `/api/v1`
   is a JSON 404, never a 307) and an `HTTPException` handler that answers 404 `not_found` and 405 `method_not_allowed`
   (with its `Allow` header) as JSON. It has no catch-all route: Starlette takes the first full match before any
-  partial one, so a catch-all for every method would turn a wrong method into a 404.
+  partial one, so a catch-all for every method would turn a wrong method into a 404. A path is one route with its
+  handlers by method (`ApiV1._route(path, {method: handler})`), never one route per method: Starlette answers a wrong
+  method with the first partial match alone, so its 405 would name one route's methods. The 405's `Allow` names every
+  method of the path, sorted. A route takes only the methods it names: HEAD and OPTIONS are 405 like any other
+  (Starlette would add HEAD to a GET route). Every route goes through one wrapper, which answers 401 `token_required`
+  when the request did not come through the guard's v1 branch (no `scope["dreamteam.api_caller"]`), the manager's
+  errors (`api_v1.CODED_ERRORS`: `SessionError`, `CopyError`, `SkillError`) with their codes (`api_v1.error_code`)
+  and anything else as 500 `internal`, logged, with no text of the error's own, whatever attributes it has.
 - **The API token.** v1 has a token of its own, apart from the hub token (§14.2): `DREAMTEAM_API_TOKEN`
   (`hubauth.API_TOKEN_ENV`), or its SHA-256 (64 hex) in `DREAMTEAM_API_TOKEN_SHA256` (`API_DIGEST_ENV`), as
   `DIGEST_ENV` is for the hub token. `hubauth.api_digest()` is the digest variable, else the digest `take_env_token`
@@ -6800,12 +6823,17 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   server, never from its visitors' browsers.
 - **Format.** JSON bodies and answers (`httpjson.JSONResponse`), except uploads (the raw body) and file downloads (raw
   bytes). Every POST and PATCH under `/api/v1` sends `Content-Type: application/json`, a body-less one (`/stop`) too,
-  except uploads (21.3). The guard's 415 rule covers every POST under `/api/` but not PATCH, so the PATCH handler
-  checks the type itself (415 `unsupported_media_type`). A JSON body is read up to 1 MiB (413 `too_large` beyond it;
-  the launcher's own body helper has no bound). Times are Unix seconds (float), money is USD (float).
+  except uploads (21.3), which take their own two types and no JSON. The guard's 415 rule covers every POST under
+  `/api/` but not PATCH, so the PATCH handler checks the type itself (415 `unsupported_media_type`). A JSON body is
+  read up to 1 MiB (413 `too_large` beyond it, before any byte is read when the Content-Length says more; the
+  launcher's own body helper has no bound): an empty body is `{}`, and a body that is not a JSON object, or holds
+  `NaN` or `Infinity`, or a number that overflows to it (`1e999`: `httpjson` could never write it back), is 400
+  `bad_request` (`api_v1.read_json`). Times are Unix seconds (float), money is USD (float).
 - **Unknown fields.** A field the server does not know, in a JSON body or in a query that v1 reads, is 400
   `unknown_field`, so a typo never passes silently. One helper checks every route: the create, PATCH, `continue`, the
-  answers of requests, `messages` POST, the uploads query (`filename`, `unpack`) and the queries of the GET routes.
+  answers of requests, `messages` POST, the uploads query (`filename`, `unpack`) and the queries of the GET routes
+  (`api_v1.check_fields`, `query_fields`; `GET /api/v1/options` reads no query, so any field there is unknown). A
+  query field given twice is 400 `bad_request`.
 - **Errors** are `{"error": text, "code": code}` for every answer under `/api/v1/`, the guard's included; a code may
   add fields of its own, named where it is described. The text is English and for people; programs check `code`.
   - The guard: `token_required` (401), `api_disabled`, `forbidden_host`, `forbidden_origin` (403),
@@ -6819,10 +6847,22 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     started, stopped or changed (§17.2 "Sessions of an earlier version"), so every route that needs it loaded answers
     this code.
   - `CopyError` and `SessionError` carry a `code` where v1 maps them (`bad_name`, `file_conflict`, `folder_busy`,
-    `folder_not_ready`, `too_many_uploads`, ...). The internal REST answers do not show it.
+    `folder_not_ready`, `too_many_uploads`, ...). The internal REST answers do not show it. `api_v1.error_code` takes
+    that code when v1 knows it, `earlier_version` for such a session, else the error's `status` (400 `bad_request`,
+    404 `not_found`, 409 `conflict`, 413 `too_large`, 500 `internal`; another 4xx `bad_request`, anything else
+    `internal`); the code decides the answer's status (`api_v1.CODES`). So every 429 a v1 route can meet names its
+    code (`too_many_uploads`, `too_many_sessions`; a test reads the raises of sessions.py, copyfrom.py and skills.py),
+    or it would read `bad_request`. An `internal` error is logged with its traceback, except the 503 of a hub
+    shutting down, logged as information.
   - **Paths in answers.** For an API-token caller, an error text that would name a path of the hub's computer is
-    rewritten: a server folder as `<root>/<path>` (21.10), any other path left out (`SessionError` and `CopyError`
-    texts name the home, the user's home and folders). `folder_busy` is v1's own text, never a `SessionError` text
+    rewritten (`SessionError` and `CopyError` texts name the home, the user's home and folders): a server folder as
+    `<root>/<path>` (21.10; below the root, the hub's own separator: the text is for people), the home and, with the
+    session's id, its folders by their names, a path in another session's folder as `(a folder of another session)`
+    (`SessionManager.OTHER_SESSION`: a session's folder name is its title), any other absolute path by its last
+    component. `ApiV1.redact(text, sid=None)` is `manager._public_text(sid, text, named=<the roots of [api]
+    folders>)` (§17.2), a root not absolute on the hub's own system left out; `ApiV1.error_response` runs it in a
+    thread, since it resolves the roots (a disconnected network share would otherwise stall the hub) and reads the
+    session's files. `folder_busy` is v1's own text, never a `SessionError` text
     (21.10). Summaries (21.7) hold no absolute path, for any caller. Event data (21.6), task results, messages and
     files carry what the agents wrote, paths included: v1 does not scrub them.
 - **Compatibility**: within v1, fields, codes, states and event types are only added, never renamed, removed or given
@@ -6914,10 +6954,10 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   kind finds no such token (404 `not_found`): an API client never uses the owner's uploads, nor the reverse.
 - **The cap.** At most `[api] uploads_pending` (default 32) uploads wait or arrive at once, read at each upload; one
   more is 429 `too_many_uploads`. The board's 8 (`UPLOAD_MAX_PENDING`) is apart.
-- **Content type.** The guard's `raw_posts` (today one type per path, compared with `!=`) becomes a map of path → set
-  of types. `/api/v1/uploads` takes `application/octet-stream` and `application/zip` (neither is CORS-safelisted: a
-  cross-site page cannot send one without a preflight the hub never answers); anything else is 415
-  `unsupported_media_type`.
+- **Content type.** The guard's `raw_posts` maps a path to a set of types (§18.1; a plain string is one type).
+  `/api/v1/uploads` takes `application/octet-stream` and `application/zip` (neither is CORS-safelisted: a
+  cross-site page cannot send one without a preflight the hub never answers); anything else, JSON included, is 415
+  `unsupported_media_type` (the guard's v1 branch, which takes a listed path's own types alone, §14).
 - **The name.** `filename` becomes the file's name in the session folder, so it is refused (400 `bad_name`), never
   cleaned up (`copyfrom.check_upload_name`):
   - missing, empty, `.` or `..`;
@@ -7419,10 +7459,14 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
 - **Modules.** Hub code never imports `dreamteam.tui` (`tui/__init__.py` imports prompt_toolkit).
   - `api_v1.py`: `ApiV1(manager, host)`, with `.app` (21.1 "Dispatch"), the routes, the error mapping, the summary,
     state and result builders, and `aclose()`. It uses the manager and the session swarms in process, never the
-    internal routes over HTTP. The launcher's lifespan awaits `aclose()` before `router.aclose()`. `aclose()` waits
-    for the starts in flight, for a bounded time, or shields them; it never cancels them: `_start_locked` catches only
-    `Exception`, so a cancel inside `swarm.start()` would skip its cleanup and leave running what the start launched
-    (the MCP servers, the skills' tasks).
+    internal routes over HTTP. The launcher's lifespan awaits `aclose()` before `router.aclose()`. A route's
+    background work (a start after a create or a `continue`) runs as `ApiV1.spawn(coro, name=)`, and `aclose()` waits
+    for what is in flight, a task spawned meanwhile included, at most `START_WAIT` (30 s), then leaves the rest to
+    `manager.shutdown()`, which waits for the session locks; a cancel of `aclose()` leaves them running too. When
+    `serve_launcher` is cancelled (Ctrl+C) it gives the server `GRACEFUL_SECONDS + 3` (6 s) before it cancels it,
+    lifespan included, so the wait is then the smaller of the two. It never cancels them: `_start_locked` catches
+    only `Exception`, so a cancel inside `swarm.start()` would skip its cleanup and leave running what the start
+    launched (the MCP servers, the skills' tasks).
   - `autoreply.py`: `SessionAutoReply`, `requests_of`, `requests_from`, `read_requests`, `blocking_requests`,
     `request_key`, `follow_journal`, `journal_head`, `planner_question` and the queries it shares with the swarm
     (`LAST_TO`, `QUESTION_DROPPED`, `PLANS`), `AUTO_REPLY`, `AUTO_REVIEW`, `AUTO_REPLY_MAX` (moved from printmode.py,

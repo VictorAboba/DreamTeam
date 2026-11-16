@@ -931,7 +931,9 @@ async def _serve_home(home: Path, host: str, port: int, *, console: bool, open_b
                       file=sys.stderr)
                 code = 1
             return code
-        print(f"DreamTeam is running.\n  Sessions: {base}/\n  MCP:      {base}/mcp\n  Home:     {home}",
+        # the external API (docs/SPEC.md §21.1) when it has a token of its own; never the token or its digest
+        api = f"\n  API:      {base}/api/v1" if hubauth.api_digest() is not None else ""
+        print(f"DreamTeam is running.\n  Sessions: {base}/\n  MCP:      {base}/mcp{api}\n  Home:     {home}",
               file=sys.stderr)
         _print_unpriced(manager.config)
         if open_browser:

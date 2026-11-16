@@ -302,9 +302,12 @@ def container_exists(name: str) -> bool:
     return result.returncode == 0
 
 
-def access_lines(project_dir: Path, port: int, token: str, stored: Path | None, home: bool) -> list[str]:
+def access_lines(project_dir: Path, port: int, token: str, stored: Path | None, home: bool,
+                 api: bool = False) -> list[str]:
     """What `dreamteam sandbox` prints: the board URL with its one-time `?token=` (the hub turns it into a cookie),
-    the MCP URL with the header Claude Code needs, and how DreamTeam's commands on the host get the token."""
+    the MCP URL with the header Claude Code needs, and how DreamTeam's commands on the host get the token. `api`: a
+    home's hub with an API token (docs/SPEC.md §21.1): the external API's URL too, with the header it needs, which
+    names the variable, never the token or its digest."""
     base = f"http://127.0.0.1:{port}"
     where = f'--home "{project_dir}"' if home else f'"{project_dir}"'
     lines = [f"Swarm UI: {base}/?{hubauth.QUERY_PARAM}={token}",
@@ -312,6 +315,8 @@ def access_lines(project_dir: Path, port: int, token: str, stored: Path | None, 
              f'  claude mcp add --transport http dreamteam {base}/mcp --header "Authorization: Bearer {token}"',
              "  The token is new for every start of the sandbox; a registration that survives restarts:",
              f"  claude mcp add dreamteam -- dreamteam mcp {where}"]
+    if api:
+        lines.append(f"API:      {base}/api/v1  (header Authorization: Bearer <your {hubauth.API_TOKEN_ENV}>)")
     if stored is not None:
         lines.append(f"`dreamteam console`, `tui`, `mcp` and `status` on this computer read the token from {stored}.")
     else:
@@ -369,7 +374,7 @@ def run_sandbox(project_dir: Path, port: int, build: bool = False, goal: str | N
     if api_digest is not None:
         env[hubauth.API_DIGEST_ENV] = api_digest
     try:
-        for line in access_lines(project_dir.resolve(), port, token, stored, is_home):
+        for line in access_lines(project_dir.resolve(), port, token, stored, is_home, api=api_digest is not None):
             print(line, file=sys.stderr)
         return subprocess.call(cmd, env=env)
     finally:

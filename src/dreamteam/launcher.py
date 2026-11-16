@@ -2,7 +2,8 @@
 
 `/` is the sessions page with the global settings. Each session's board UI and API (the per-swarm app of
 web.create_app) is served under `/s/{sid}/`. `/mcp` is the launcher MCP. A stopped session can be
-viewed (its swarm is loaded without starting) but not changed.
+viewed (its swarm is loaded without starting) but not changed. `/api/v1` is the external HTTP API (api_v1.py,
+docs/SPEC.md §21).
 """
 
 from __future__ import annotations
@@ -25,7 +26,8 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__, netoff, procs, roles
-from .copyfrom import UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
+from .api_v1 import ApiV1
+from .copyfrom import API_UPLOAD_PATH, UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
 from .models import AUTO_REPLY_HEADER
@@ -35,7 +37,7 @@ from .skill_deps import EnvManager
 from .skills import SkillError
 from .web import (
     GRACEFUL_SECONDS, STATIC_DIR, GuardMiddleware, HubServer, UIStaticFiles, check_hub_token, create_app,
-    env_allowed_hosts, hub_server_config, public_base, skill_routes,
+    env_allowed_hosts, hub_server_config, is_api_path, public_base, skill_routes,
 )
 
 if TYPE_CHECKING:
@@ -267,6 +269,22 @@ class SessionRouter:
             await entry.app(child, receive, send)
 
 
+class _ApiFirst:
+    """ASGI dispatcher in front of SessionRouter (docs/SPEC.md §21.1 "Dispatch"): a request whose path web.is_api_path
+    takes goes to the external API's app, every other one (and the lifespan) to `rest`. The guard's v1 branch decides
+    by the same predicate, so no v1 path reaches the internal routes and no other path reaches v1."""
+
+    def __init__(self, api, rest):
+        self.api = api
+        self.rest = rest
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] in ("http", "websocket") and is_api_path(scope.get("path", "")):
+            await self.api(scope, receive, send)
+        else:
+            await self.rest(scope, receive, send)
+
+
 def _error(exc: Exception) -> JSONResponse:
     status = getattr(exc, "status", 400)
     # extra: e.g. "pending_skills" of a refused delete, "exists" of a skill clash
@@ -376,6 +394,7 @@ async def _sweep_copies_hourly(manager: "SessionManager") -> None:
 def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> GuardMiddleware:
     extra_hosts = env_allowed_hosts()
     endpoint = LauncherMCPEndpoint(manager, host, extra_hosts=extra_hosts)
+    api = ApiV1(manager, host)   # the external HTTP API (docs/SPEC.md §21)
     holder: dict[str, SessionRouter] = {}
 
     async def home(request: Request):
@@ -617,9 +636,12 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                 try:
                     yield
                 finally:
-                    router = holder.get("router")
-                    if router is not None:
-                        await router.aclose()
+                    try:   # the API's starts in flight first: waited for, never cancelled (docs/SPEC.md §21.9)
+                        await api.aclose()
+                    finally:
+                        router = holder.get("router")
+                        if router is not None:
+                            await router.aclose()
         finally:
             for task in (cleaner, sweeper):
                 task.cancel()
@@ -651,10 +673,14 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     holder["router"] = router
 
     # The router forwards "lifespan" (and every non-session path) to `inner`, whose lifespan runs the
-    # launcher MCP manager and closes the session apps at shutdown.
-    app = GuardMiddleware(router, host=host, extra_hosts=extra_hosts, raw_posts={UPLOAD_PATH: "application/zip"})
+    # launcher MCP manager and closes the API and the session apps at shutdown. /api/v1 goes to the API's own app
+    # (_ApiFirst), behind the guard's v1 branch (api=True: the API token, JSON refusals).
+    app = GuardMiddleware(_ApiFirst(api.app, router), host=host, extra_hosts=extra_hosts, api=True,
+                          raw_posts={UPLOAD_PATH: "application/zip",
+                                     API_UPLOAD_PATH: ("application/octet-stream", "application/zip")})
     app.session_router = router  # type: ignore[attr-defined]
     app.manager = manager  # type: ignore[attr-defined]
+    app.api = api  # type: ignore[attr-defined]
     return app
 
 

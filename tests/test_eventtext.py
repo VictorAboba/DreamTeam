@@ -472,6 +472,26 @@ def test_named_folders_are_replaced_whole_before_any_other_path(text, line):
     assert eventtext.without_abs_paths(text, named, exact) == line   # (a root names nothing)
 
 
+_SESSIONS = "C:" + _B + "home" + _B + "sessions"
+
+
+@pytest.mark.parametrize(("text", "line"), [
+    # a path below a hidden folder goes whole, what ends the sentence stays; the folder itself by its exact name
+    (f"Cannot use {_SESSIONS}{_B}003-acme-merger{_B}workspace{_B}plan.md.", "Cannot use (other)."),
+    (f"Cannot list {_SESSIONS}: busy", "Cannot list sessions: busy"),
+    (f"{_SESSIONS.lower()}/003-acme-merger, {_SESSIONS}{_B * 2}004-x{_B * 2}y)", "(other), (other))"),
+    # a named folder below it is longer, so named first: what lies below it stays; "005-xy" is another folder
+    (f"in {_SESSIONS}{_B}005-x{_B}workspace{_B}a.txt, not {_SESSIONS}{_B}005-xy{_B}b", "in 005-x\\workspace\\a.txt, "
+                                                                                       "not (other)"),
+    # a folder whose name only starts the same is another one (below the named home here)
+    (f"see {_SESSIONS}-old{_B}003-x", "see home\\sessions-old\\003-x"),
+])
+def test_a_hidden_folder_hides_every_path_below_it(text, line):
+    named = [(_SESSIONS + _B + "005-x", "005-x"), ("C:" + _B + "home", "home")]
+    hidden = eventtext.without_abs_paths(text, named, exact=[(_SESSIONS, "sessions")], hidden=[(_SESSIONS, "(other)")])
+    assert hidden == line
+
+
 @pytest.mark.parametrize("lang", LANGS)
 def test_no_absolute_path_of_the_hub_in_a_wake_up_an_error_or_a_skill_environment(lang):
     """docs/SPEC.md §21.6: the text adds no absolute path of the hub's computer, wherever DreamTeam's own text puts one:

@@ -37,7 +37,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterator
+from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator
 
 from . import __version__, netoff
 from . import skills as skill_lib
@@ -935,6 +935,9 @@ class _RunWatch:
 
 
 class SessionManager:
+    # what _public_text writes for a path in another session's folder (whose name is that session's title)
+    OTHER_SESSION = "(a folder of another session)"
+
     def __init__(self, home: str | Path, *, llm_factory: Callable | None = None,
                  language: str = "ru", provider: str = "anthropic"):
         self.home = ensure_home(home, language, provider)
@@ -2497,7 +2500,7 @@ class SessionManager:
         except Exception:
             log.exception("could not record %s in session %s", ", ".join(changes), sid)
 
-    def _public_text(self, sid: str, text: str) -> str:
+    def _public_text(self, sid: str | None, text: str, *, named: Iterable[tuple[Path, str]] = ()) -> str:
         """An error of the session's start for a reader outside the hub (api.start_error, the error of
         `session.stopped`): eventtext.without_abs_paths with the folders of this computer such an error names, which
         it names unquoted, spaces included ("does not exist: <path>. Bring it back"), and without_abs_paths alone
@@ -2505,14 +2508,19 @@ class SessionManager:
         path below it (without_abs_paths then names that path by its last component); the session's workspace, the
         two folders of a workspace move that did not finish, the session's own folder and the home by their last
         component, also at the start of a path below them (what lies there stays, relative); every folder above
-        those only where the text names that very folder (a path below one may be anyone's). Each also resolved.
-        Best effort: what cannot be read is left out."""
-        named: dict[str, tuple[Path, str]] = {}
+        those only where the text names that very folder (a path below one may be anyone's). A path in another
+        session's folder (below the home's `sessions`, the session's own aside) is OTHER_SESSION whole: a session's
+        folder name is its title. Each also resolved. Best effort: what cannot be read is left out. `sid` None: an
+        error of no session (the external API's), with the user's home and the home alone. `named`: (absolute folder,
+        name) pairs of the caller's, taken before all of these and named the same way (the external API's roots of
+        `[api] folders` by their names, docs/SPEC.md §21.1 "Paths in answers"); they are not resolved here."""
+        kept: dict[str, tuple[Path, str]] = {}
         exact: dict[str, tuple[Path, str]] = {}
+        hidden: dict[str, tuple[Path, str]] = {}
 
         def add(into: dict[str, tuple[Path, str]], path: Path, name: str) -> None:
             key = os.path.normcase(str(path))
-            if path.is_absolute() and path.name and key not in named:
+            if path.is_absolute() and path.name and key not in kept:
                 into.setdefault(key, (path, name))
 
         def variants(path: Path) -> list[Path]:
@@ -2521,23 +2529,29 @@ class SessionManager:
                 found.append(path.resolve())
             return found
 
+        for path, name in named:
+            add(kept, Path(path), name)
         with contextlib.suppress(RuntimeError, KeyError, OSError):
             for path in variants(Path.home()):
-                add(named, path, "~")
-        bases = [self.dir_of(sid), self.home]
-        with contextlib.suppress(SessionError, OSError, ValueError, TypeError):
-            bases.insert(0, Path(self.workspace_of(sid)["path"]))
-        with contextlib.suppress(OSError, ValueError):
-            moving = json.loads(self._journal(sid).read_text(encoding="utf-8"))
-            if isinstance(moving, dict):
-                bases += [Path(moving[key]) for key in ("from", "to") if isinstance(moving.get(key), str)]
+                add(kept, path, "~")
+        bases = [self.home] if sid is None else [self.dir_of(sid), self.home]
+        if sid is not None:
+            with contextlib.suppress(SessionError, OSError, ValueError, TypeError):
+                bases.insert(0, Path(self.workspace_of(sid)["path"]))
+            with contextlib.suppress(OSError, ValueError):
+                moving = json.loads(self._journal(sid).read_text(encoding="utf-8"))
+                if isinstance(moving, dict):
+                    bases += [Path(moving[key]) for key in ("from", "to") if isinstance(moving.get(key), str)]
         found = [path for base in bases for path in variants(base)]
         for path in found:
-            add(named, path, path.name)
+            add(kept, path, path.name)
         for path in found:
             for folder in path.parents:
                 add(exact, folder, folder.name)
-        return without_abs_paths(text, list(named.values()), exact=list(exact.values()))
+        for path in variants(self.sessions_dir):   # (the session's own folder is longer: it is named first)
+            add(exact, path, path.name)
+            add(hidden, path, self.OTHER_SESSION)
+        return without_abs_paths(text, list(kept.values()), exact=list(exact.values()), hidden=list(hidden.values()))
 
     def _start_failed(self, sid: str, exc: BaseException) -> None:
         """A v1 session's start failed: `api.start_error` {code, text} (the text through _public_text, as in the
