@@ -13,13 +13,24 @@ The sessions page uploads a zip with POST /api/uploads (the raw body, not base64
 the token claims it first (renames it to `<token>.claimed-<pid>-<run>-<hex8>.zip`) and removes it whatever happens.
 Leftovers (expired uploads, the claims and staging folders of processes that no longer run, and those of this one
 no longer in use: their removal failed) are removed at each create that copies and by the hub's hourly sweep.
+
+The HTTP API v1 (docs/SPEC.md §21.3) has uploads of its own, in another root (`<home>/.dreamteam/uploads/api`):
+any file (`<token>.bin`, its json naming the caller), checked without claiming (`peek_many`), claimed all or none
+(`claim_many`) and given back after a refused create (`unclaim`, `settle`); `copy_sources` copies several of them
+into one staging folder. `check_upload_name` and `check_rel` are v1's name and path rules (§21.3, §21.8).
+Both stores are the hub's alone (0o700 on POSIX), and an upload is read only as the file the hub wrote: never
+through a link, never a file with another name (`_open_upload`), since in the Docker sandbox the hub reads with more
+rights than the agents.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import errno
 import json
+import logging
 import os
 import re
 import secrets
@@ -27,20 +38,24 @@ import stat
 import sys
 import threading
 import time
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable
+from typing import TYPE_CHECKING, Any, AsyncIterator, BinaryIO, Callable, Iterable
 
 from . import hubauth, netoff, treecopy
 from .config import CONFIG_FILE
 from .console import unquote
-from .skills import ZIP_MAX_ENTRIES, SkillError, ZipRules, folded_names_text, printable_name, unpack_zip
+from .skills import (ZIP_MAX_ENTRIES, SkillError, ZipRules, _portable, folded_names_text, printable_name,
+                     unpack_zip)
 from .treecopy import TreeLimit, copy_tree, is_within, scan_tree
-from .workspace import long_path, pid_alive, rmtree
+from .workspace import _WIN_BAD_CHARS, _WIN_RESERVED, long_path, pid_alive, rmtree
 
 if TYPE_CHECKING:
     from .config import Config
+
+log = logging.getLogger(__name__)
 
 COPY_EXCLUDE_NAMES = treecopy.COPY_EXCLUDE_NAMES
 COPY_EXCLUDE_PATHS = treecopy.EXPORT_EXCLUDE_PATHS      # a DreamTeam workspace's skills mirror and stand-in folder
@@ -51,14 +66,30 @@ COPYING_NAME = re.compile(r"\.copying-(\d+)-([0-9a-f]{8})-([0-9a-f]{8})\Z")
 # the hub of the Docker sandbox has the same pid at every start, so a killed container's leftovers would look live
 RUN = secrets.token_hex(4)
 UPLOADS_DIR = "uploads"          # <home>/.dreamteam/uploads
+API_UPLOADS_DIR = "api"          # <home>/.dreamteam/uploads/api: the uploads of the HTTP API v1, apart from the board's
 UPLOAD_PATH = "/api/uploads"
+API_UPLOAD_PATH = "/api/v1/uploads"
 UPLOAD_TTL = 3600                # seconds an upload waits for its session
-UPLOAD_MAX_PENDING = 8           # uploads waiting at once
+UPLOAD_MAX_PENDING = 8           # uploads waiting at once (the board's; v1 passes [api] uploads_pending)
+UPLOAD_CALLERS = ("owner", "api")   # who made a v1 upload: the hub token's owner or the API token (web.API_CALLER)
 UPLOAD_TOKEN = re.compile(r"[A-Za-z0-9_-]{24}\Z")   # secrets.token_urlsafe(18)
-PENDING_NAME = re.compile(r"([A-Za-z0-9_-]{24})\.(zip|json|part)\Z")          # an upload waiting (or arriving)
-# claimed by a create: <token>.claimed-<pid>-<run>-<hex8>.zip
-CLAIMED_NAME = re.compile(r"([A-Za-z0-9_-]{24})\.claimed-(\d+)-([0-9a-f]{8})-([0-9a-f]{8})\.zip\Z")
-NAME_MAX = 200                   # characters kept of an upload's file name
+# an upload waiting (or arriving): the board's <token>.zip, v1's <token>.bin, their <token>.json, a <token>.part
+PENDING_NAME = re.compile(r"([A-Za-z0-9_-]{24})\.(zip|bin|json|part)\Z")
+# claimed by a create: <token>.claimed-<pid>-<run>-<hex8>.zip (the board's) or .bin (v1's)
+CLAIMED_NAME = re.compile(r"([A-Za-z0-9_-]{24})\.claimed-(\d+)-([0-9a-f]{8})-([0-9a-f]{8})\.(zip|bin)\Z")
+NAME_MAX = 200                   # characters kept of an upload's file name (v1: the most it may have)
+NAME_BYTES_MAX = 255             # v1: the most an upload's file name may have in UTF-8 bytes, and in UTF-16 units
+# names the folder of a new session keeps for itself (docs/SPEC.md §21.3): the members' folders, the session's own
+# .gitignore, DreamTeam's data folder name, the MCP servers the agents build. A v1 upload never takes one, and the
+# top level of what v1 unpacks or copies leaves them out (casefolded)
+SESSION_NAMES = frozenset({".scratch", ".gitignore", ".dreamteam", "mcp"})
+_COPY_EXCLUDE_FOLDED = frozenset(n.casefold() for n in COPY_EXCLUDE_NAMES)
+# what a v1 name or path cannot hold (docs/SPEC.md §21.3): controls (C0, C1), format characters (bidi overrides,
+# zero-width ones), surrogates, private use, the line and paragraph separators; spaces of any kind (U+3000, U+00A0)
+# and unassigned code points are fine, so a name is taken or refused alike whatever Unicode version Python has
+_UNPRINTABLE = frozenset({"Cc", "Cf", "Cs", "Co", "Zl", "Zp"})
+_FILE_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+_READ_FLAGS = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
 SHOWN_MAX = 20                   # left-out paths listed in a result
 SOURCE_SHOWN_MAX = 300           # characters of copied_from.source shown by summary() and session_line
 CHUNK = 1 << 20
@@ -70,11 +101,14 @@ _MOUNTINFO = "/proc/self/mountinfo"   # Linux: what is mounted where (_mount_roo
 
 
 class CopyError(ValueError):
-    """A copy that cannot be made; `status` is the HTTP status."""
+    """A copy that cannot be made; `status` is the HTTP status. `code`: the HTTP API v1's error code where the
+    status alone does not say it (docs/SPEC.md §21.1: `bad_name`, `file_conflict`, `too_many_uploads`); None
+    otherwise. The internal routes do not show it."""
 
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, code: str | None = None):
         super().__init__(message)
         self.status = status
+        self.code = code
 
 
 class CopyCancelled(Exception):
@@ -101,10 +135,12 @@ class CopyLimits:
 class Source:
     """What is copied into a new session."""
 
-    kind: str           # "folder" | "zip" | "upload"
+    # "folder" | "zip" | "upload" (a zip uploaded: the board's, or v1's with unpack) | "file" (v1's, kept as one file)
+    kind: str
     path: Path          # resolved folder or zip file (an upload: its claimed file)
     shown: str          # what copied_from records: str(path), or "upload: <file name>"
     token: str | None = None
+    filename: str | None = None   # a v1 upload: its file name (check_upload_name), the name of a "file" copied
 
 
 # the names of the staging folders and claims this process works with now (staging_name, Uploads.claim_path until
@@ -150,6 +186,123 @@ def printable_line(value: Any, limit: int | None = None) -> str:
     text = str(value or "").encode("utf-8", "replace").decode("utf-8")
     line = " ".join("".join(ch if ch.isprintable() else " " for ch in text).split())
     return line[:limit] if limit is not None else line
+
+
+# ---- names and paths of the HTTP API v1 -------------------------------------------------------------------------
+def _bad_name(text: str) -> CopyError:
+    return CopyError(text, 400, code="bad_name")
+
+
+def _shown(text: str) -> str:
+    return printable_name(text if len(text) <= 120 else text[:120] + "...")
+
+
+def _unprintable(text: str) -> bool:
+    """Whether `text` holds a character a v1 name cannot hold (_UNPRINTABLE's categories)."""
+    return any(unicodedata.category(ch) in _UNPRINTABLE for ch in text)
+
+
+def check_upload_name(name: Any) -> str:
+    """The file name a v1 upload gives (docs/SPEC.md §21.3 "The name"), returned as it is: it becomes the file's
+    name in the session's folder, so a bad one is refused, never cleaned up (CopyError 400 `bad_name`). Refused:
+    none, empty, '.' or '..'; a '/' or '\\'; a NUL or any other character that does not print (_UNPRINTABLE: C0
+    and C1 controls, format characters, U+2028, U+2029; spaces such as U+3000 are fine); over NAME_MAX characters,
+    or over NAME_BYTES_MAX bytes in UTF-8 or units in UTF-16; a name Windows cannot hold, on every OS (skills'
+    portable rule: < > : " | ? *, a trailing dot or space, reserved device names); the form of a Windows short
+    name (check_rel never serves one); case-folded, a name a copy leaves out (COPY_EXCLUDE_NAMES: .git,
+    node_modules, ...) or one the session keeps for itself (SESSION_NAMES)."""
+    if not isinstance(name, str) or not name:
+        raise _bad_name("Give the file's name: ?filename=<name>.")
+    shown = _shown(name)
+    if name in (".", ".."):
+        raise _bad_name(f"'{name}' is not a file name.")
+    if "/" in name or "\\" in name:
+        raise _bad_name(f"'{shown}': a file name cannot hold '/' or '\\'. An upload is one file at the top of the "
+                        "session's folder; send folders as a zip with unpack=true.")
+    if _unprintable(name):
+        raise _bad_name(f"'{shown}': a file name cannot hold control characters or other characters that do not "
+                        "print.")
+    if (len(name) > NAME_MAX or len(name.encode("utf-8")) > NAME_BYTES_MAX
+            or len(name.encode("utf-16-le")) // 2 > NAME_BYTES_MAX):
+        raise _bad_name(f"'{shown}': the file name is too long (at most {NAME_MAX} characters and "
+                        f"{NAME_BYTES_MAX} bytes in UTF-8).")
+    try:
+        _portable(name, name, "an upload")
+    except SkillError as exc:
+        raise _bad_name(str(exc)) from None
+    if _short_name(name):
+        raise _bad_name(f"'{shown}' has the form of a Windows short name (PROGRA~1), which can name another file; "
+                        "give the file another name.")
+    folded = name.casefold()
+    if folded in _COPY_EXCLUDE_FOLDED:
+        raise _bad_name(f"'{shown}': a copy into a session leaves out {', '.join(sorted(COPY_EXCLUDE_NAMES))}; "
+                        "give the file another name.")
+    if folded in SESSION_NAMES:
+        raise _bad_name(f"'{shown}': the session's folder keeps {', '.join(sorted(SESSION_NAMES))} for itself; "
+                        "give the file another name.")
+    return name
+
+
+def _short_name(part: str) -> bool:
+    """Whether `part` has the form of a Windows 8.3 short name with a '~<digit>' tail (PROGRA~1, GIT~1,
+    ABCDEF~1.TXT), which Windows may resolve to another file's long name (GIT~1 to .git)."""
+    base, _, ext = part.partition(".")
+    return 0 < len(base) <= 8 and len(ext) <= 3 and "." not in ext and re.search(r"~\d", base) is not None
+
+
+def check_rel(path: Any, *, scratch: bool = False, portable: bool = False) -> tuple[str, ...]:
+    """A path relative to a session's workspace (or to a root of [api] folders), with '/' (docs/SPEC.md §21.8): its
+    names, () for "" or None (the folder itself); CopyError 400 `bad_name` otherwise. Refused everywhere: an
+    absolute path, an empty name, '.' or '..', a NUL or a backslash, a name that case-folds to `.git`, and a name of
+    the form of a Windows short name ('~<digit>': GIT~1 is .git, SCRATC~1 is .scratch), which NTFS resolves for a
+    Linux hub too (WSL's /mnt/c, a Docker Desktop bind mount of a Windows folder). The other names Windows reads as
+    others (< > : " | ? * and control characters: `.git::$INDEX_ALLOCATION` names .git; reserved device names; a
+    trailing dot or space) are refused on a Windows hub only, where they would reach another file: on Linux and
+    macOS the agents may make such names. `.scratch` (the members' folders, at the top) only with `scratch`;
+    `.scratch/_skills` never. `portable`: a path a client makes up (a server folder's, §21.10): the Windows rules
+    on every OS, no character that does not print (_UNPRINTABLE), and no `.scratch` at any depth, whatever
+    `scratch` says."""
+    if path is None or path == "":
+        return ()
+    if not isinstance(path, str):
+        raise _bad_name("A path must be a text, relative to the folder, with '/'.")
+    shown = _shown(path)
+    if path.startswith("/"):
+        raise _bad_name(f"Invalid path '{shown}': give it relative to the folder, with '/'.")
+    if "\x00" in path:
+        raise _bad_name(f"Invalid path '{shown}': it holds a NUL character.")
+    if "\\" in path:
+        raise _bad_name(f"Invalid path '{shown}': use '/' between names, never '\\'.")
+    windows = portable or os.name == "nt"
+    parts = tuple(path.split("/"))
+    for part in parts:
+        if part in ("", ".", ".."):
+            raise _bad_name(f"Invalid path '{shown}': it holds an empty name, '.' or '..'.")
+        if part.casefold() == ".git":
+            raise _bad_name(f"Invalid path '{shown}': nothing in .git is reachable.")
+        if _short_name(part):
+            raise _bad_name(f"Invalid path '{shown}': '{_shown(part)}' has the form of a Windows short name "
+                            "(PROGRA~1), which can name another file.")
+        if portable and _unprintable(part):
+            raise _bad_name(f"Invalid path '{shown}': names cannot hold characters that do not print.")
+        if not windows:
+            continue
+        if _WIN_BAD_CHARS.search(part) or "\x7f" in part:
+            raise _bad_name(f"Invalid path '{shown}': names cannot hold < > : \" | ? * or control characters "
+                            "(Windows reads them as other names).")
+        if part != part.rstrip(". "):
+            raise _bad_name(f"Invalid path '{shown}': '{_shown(part)}' ends with a dot or a space, which Windows "
+                            "drops from names.")
+        if _WIN_RESERVED.fullmatch(part):
+            raise _bad_name(f"Invalid path '{shown}': '{_shown(part)}' is a reserved device name on Windows.")
+    folded = [part.casefold() for part in parts]
+    if portable:
+        if ".scratch" in folded:
+            raise _bad_name(f"Invalid path '{shown}': a .scratch folder (the members' own) cannot be named.")
+    elif folded[0] == ".scratch" and (not scratch or folded[1:2] == ["_skills"]):
+        raise _bad_name(f"Invalid path '{shown}': .scratch/_skills is never served." if folded[1:2] == ["_skills"]
+                        else f"Invalid path '{shown}': the members' .scratch folders need scratch=true.")
+    return parts
 
 
 # ---- the source -------------------------------------------------------------------------------------------------
@@ -454,27 +607,198 @@ def _result(source: Source, files: int, size: int, links: list[str], excluded: l
 
 
 def _copy_zip(source: Source, staging: Path, limits: CopyLimits,
-              check: Callable[[], None] | None) -> dict[str, Any]:
-    gone = _gone(source.token) if source.kind == "upload" else None
-    try:
-        size = os.path.getsize(source.path)
-    except FileNotFoundError:
-        if gone is not None:   # (another create took it: see Uploads.claim)
-            raise gone from None
-        raise CopyError(f"Cannot read {source.shown}: no such file.") from None
-    except OSError as exc:
-        raise CopyError(f"Cannot read {source.shown}: {exc.strerror or exc}") from None
-    if size > limits.max_bytes:
-        raise CopyError(f"The zip is larger than {limits.max_mb} MB ([workspace] copy_max_mb).", 413)
-    os.mkdir(staging)
-    try:
-        result = unpack_zip(source.path, staging, zip_rules(limits), check=check)
-    except SkillError as exc:
-        if gone is not None and not os.path.lexists(source.path):
-            raise gone from None
-        raise CopyError(str(exc), exc.status) from None
+              check: Callable[[], None] | None, rules: ZipRules | None = None) -> dict[str, Any]:
+    """Unpack the zip `source` into the new folder `staging` by `rules` (default: zip_rules(limits)). An upload (a
+    source with a token) is read from the file _open_upload opens, never through a link."""
+    with contextlib.ExitStack() as stack:
+        zipped: BinaryIO | Path
+        if source.token is not None:
+            zipped = stack.enter_context(_open_upload(source))
+            size = os.fstat(zipped.fileno()).st_size
+        else:
+            try:
+                size = os.path.getsize(source.path)
+            except FileNotFoundError:
+                raise CopyError(f"Cannot read {source.shown}: no such file.") from None
+            except OSError as exc:
+                raise CopyError(f"Cannot read {source.shown}: {exc.strerror or exc}") from None
+            zipped = source.path
+        if size > limits.max_bytes:
+            raise CopyError(f"The zip is larger than {limits.max_mb} MB ([workspace] copy_max_mb).", 413)
+        os.mkdir(staging)
+        try:
+            result = unpack_zip(zipped, staging, rules or zip_rules(limits), check=check)
+        except SkillError as exc:
+            raise CopyError(str(exc), exc.status) from None
     return _result(source, result.files, result.bytes, result.links, result.excluded,
                    special=0, skipped=len(result.skipped), top=result.top)
+
+
+def copy_sources(sources: list[Source], staging: Path, limits: CopyLimits,
+                 check: Callable[[], None] | None = None) -> dict[str, Any]:
+    """Copy the files of one v1 create (docs/SPEC.md §21.3 "Life") into the new folder `staging` (it must not exist
+    yet): each source into a folder of its own beside `staging` (staging_name, so a left-over one is cleaned like a
+    staging folder), then their top-level entries moved into `staging`. A zip (kind "zip", or "upload": a zip
+    uploaded with unpack) is unpacked by the zip rules of a copy, with the names the session keeps for itself
+    (SESSION_NAMES) also left out at its top level after the unwrap; a v1 upload of kind "file" becomes one file of
+    its name. One budget for all: `limits` caps the sum of their files and bytes (413). A top-level name that two
+    sources share is 409 `file_conflict`: compared in NFC and case-folded on Windows and macOS, exactly elsewhere,
+    and a name the file system folds onto another is one too. A folder source is not taken here (a server folder
+    is walked without following links, never with copy_tree). Returns copy_into's result for all of them
+    ("source": the shown names joined, "kind": "sources", "top": None) and "sources": [{shown, files, bytes}].
+    CopyError for a refusal, with nothing left behind, as for anything `check` raises. Blocking."""
+    if os.path.lexists(staging):   # never someone else's folder: only what this call made is removed
+        raise CopyError(f"Cannot copy into {staging}: it exists already.", 500)
+    os.mkdir(staging)
+    parts: list[Path] = []
+    try:
+        results: list[dict[str, Any]] = []
+        files = size = 0
+        many = len(sources) > 1
+        for source in sources:
+            if source.kind not in ("zip", "upload", "file"):
+                raise ValueError(f"copy_sources cannot copy a source of kind {source.kind!r}")
+            part = staging.parent / staging_name()
+            if os.path.lexists(part):
+                done_with(part)
+                raise CopyError(f"Cannot copy into {part}: it exists already.", 500)
+            parts.append(part)
+            if source.kind == "file":
+                got = _copy_file(source, part, limits, check, files=files, size=size, many=many)
+            else:
+                got = _copy_zip(source, part, limits, check, rules=_left_rules(limits, files, size, many))
+            files += got["files"]
+            size += got["bytes"]
+            results.append(got)
+        _merge(list(zip(parts, sources)), staging)
+        return _sources_result(sources, results)
+    except BaseException:
+        _remove_staging(staging)
+        raise
+    finally:
+        for part in parts:   # (empty after the merge)
+            try:
+                _remove_staging(part)
+            finally:
+                done_with(part)
+
+
+def _sum_texts(limits: CopyLimits) -> tuple[str, str]:
+    return (f"The files to copy come to more than {limits.max_mb} MB in all ([workspace] copy_max_mb).",
+            f"The files to copy are more than {limits.max_files} in all ([workspace] copy_max_files).")
+
+
+def _left_rules(limits: CopyLimits, files: int, size: int, many: bool) -> ZipRules:
+    """The zip rules of a copy for one of several sources, with what the sources before it left of the budget."""
+    rules = dataclasses.replace(zip_rules(limits), exclude_top=SESSION_NAMES)
+    if not many:
+        return rules
+    too_big, too_many = _sum_texts(limits)
+    return dataclasses.replace(rules, max_bytes=max(0, limits.max_bytes - size), too_big=too_big,
+                               max_files=max(0, limits.max_files - files), too_many_files=too_many)
+
+
+def _copy_file(source: Source, part: Path, limits: CopyLimits, check: Callable[[], None] | None, *,
+               files: int, size: int, many: bool) -> dict[str, Any]:
+    """Copy a v1 upload of kind "file" into the new folder `part` as one file of its name (O_EXCL, 0o644), within
+    what `files` and `size` (the sources before it) left of the budget. Read from the file _open_upload opens,
+    never through a link."""
+    name = check_upload_name(source.filename)
+    too_big, too_many = _sum_texts(limits) if many else (
+        f"The file is larger than {limits.max_mb} MB ([workspace] copy_max_mb).",
+        f"The files to copy are more than {limits.max_files} ([workspace] copy_max_files).")
+    written = 0
+    with _open_upload(source) as fin:
+        if files + 1 > limits.max_files:
+            raise CopyError(too_many, 413)
+        if size + os.fstat(fin.fileno()).st_size > limits.max_bytes:
+            raise CopyError(too_big, 413)
+        try:
+            os.mkdir(long_path(part))
+            fd_out = os.open(long_path(part / name), _FILE_FLAGS, 0o644)
+            with os.fdopen(fd_out, "wb") as fout:
+                while True:
+                    if check is not None:
+                        check()
+                    chunk = fin.read(CHUNK)
+                    if not chunk:
+                        break
+                    written += len(chunk)
+                    if size + written > limits.max_bytes:
+                        raise CopyError(too_big, 413)
+                    fout.write(chunk)
+        except OSError as exc:
+            raise CopyError(f"Cannot copy {source.shown} into the session's folder: {exc.strerror or exc}",
+                            500) from None
+    return _result(source, 1, written, [], [], special=0, skipped=0, top=None)
+
+
+def _name_key(name: str) -> str:
+    """A top-level name as two sources clash on it: NFC and case-folded where the default file systems ignore case
+    and Unicode form (Windows, macOS), as zip_rules' fold_collisions; exact elsewhere."""
+    if os.name == "nt" or sys.platform == "darwin":
+        return unicodedata.normalize("NFC", name).casefold()
+    return name
+
+
+def _clash(first: tuple[str, str], second: tuple[str, str]) -> CopyError:
+    (a, a_from), (b, b_from) = first, second
+    why = " (names that differ only in letter case or Unicode form are one name here)" if a != b else ""
+    return CopyError(f"'{printable_name(a)}' ({printable_name(a_from)}) and '{printable_name(b)}' "
+                     f"({printable_name(b_from)}) would both be at the top of the session's folder{why}. Rename one, "
+                     "or put them in folders.", 409, code="file_conflict")
+
+
+def _merge(parts: list[tuple[Path, Source]], staging: Path) -> None:
+    """Move the top-level entries of every part into `staging`; CopyError 409 `file_conflict` for a name two parts
+    share, found before anything is moved, or one the file system folds onto a name moved before."""
+    seen: dict[str, tuple[str, str]] = {}
+    moves: list[tuple[Path, str, str]] = []
+    for part, source in parts:
+        for name in sorted(os.listdir(long_path(part))):
+            key = _name_key(name)
+            if key in seen:
+                raise _clash(seen[key], (name, source.shown))
+            seen[key] = (name, source.shown)
+            moves.append((part, name, source.shown))
+    moved: list[tuple[str, str]] = []
+    for part, name, shown in moves:
+        target = long_path(staging / name)
+        # (os.rename on POSIX replaces a file, or an empty folder, that is there: look first)
+        if os.path.lexists(target):
+            raise _clash(_folded_onto(staging, name, moved), (name, shown))
+        try:
+            os.rename(long_path(part / name), target)
+        except OSError as exc:
+            if os.path.lexists(target):
+                raise _clash(_folded_onto(staging, name, moved), (name, shown)) from None
+            raise CopyError(f"Cannot copy into the session's folder: {exc.strerror or exc}", 500) from None
+        moved.append((name, shown))
+
+
+def _folded_onto(staging: Path, name: str, moved: list[tuple[str, str]]) -> tuple[str, str]:
+    """The entry moved before that the file system takes `name` for (by file identity), for the clash's text."""
+    for other, shown in moved:
+        with contextlib.suppress(OSError, ValueError):
+            if os.path.samefile(long_path(staging / other), long_path(staging / name)):
+                return other, shown
+    return moved[-1] if moved else (name, "?")
+
+
+def _sources_result(sources: list[Source], results: list[dict[str, Any]]) -> dict[str, Any]:
+    def joined(key: str) -> list[str]:
+        return [name for r in results for name in r[key]][:SHOWN_MAX]
+
+    def total(key: str) -> int:
+        return sum(int(r[key]) for r in results)
+
+    return {"source": ", ".join(s.shown for s in sources), "kind": "sources", "files": total("files"),
+            "bytes": total("bytes"), "links": joined("links"), "links_count": total("links_count"),
+            "excluded": joined("excluded"), "excluded_count": total("excluded_count"),
+            "special_count": total("special_count"), "skipped_count": total("skipped_count"),
+            "vanished": [], "vanished_count": 0, "top": None,
+            "sources": [{"shown": s.shown, "files": r["files"], "bytes": r["bytes"]}
+                        for s, r in zip(sources, results)]}
 
 
 def size_text(n: int) -> str:
@@ -521,8 +845,10 @@ def _upload_name(filename: Any) -> str:
 
 
 def _read_meta(path: Path) -> dict[str, Any] | None:
+    """An upload's json (None: missing, a link where the OS can tell, or not a json object)."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        with os.fdopen(os.open(path, _READ_FLAGS), "rb") as f:
+            data = json.loads(f.read().decode("utf-8"))
     except (OSError, ValueError):
         return None
     return data if isinstance(data, dict) else None
@@ -534,15 +860,66 @@ def _stamp(value: Any) -> float | None:
     return float(value)
 
 
-def _gone(token: Any) -> CopyError:
-    return CopyError(f"No upload {token}: uploads wait an hour for their session and are used once. Upload the "
-                     ".zip again.", 404)
+def _gone(token: Any, what: str = "zip") -> CopyError:
+    again = "the file" if what == "file" else "the .zip"
+    return CopyError(f"No upload {token}: uploads wait an hour for their session and are used once. Upload "
+                     f"{again} again.", 404)
+
+
+def _upload_what(source: Source) -> str:
+    """What an upload source was uploaded as: "file" for v1's (it has a file name), "zip" for the board's."""
+    return "file" if source.filename is not None else "zip"
+
+
+def _lone_file(st: os.stat_result) -> bool:
+    """A regular file with no other name: what the uploads store holds as the hub wrote it. A link, a folder, a
+    special file or a file with more hard links (another name of it may lie anywhere) is not."""
+    return stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+
+
+def _open_upload(source: Source) -> BinaryIO:
+    """Open the upload `source` (a claim, or a v1 "file") for reading, never through a link: its name must be a
+    _lone_file by lstat, it is opened with O_NOFOLLOW where the OS has it, and the opened file must be the one lstat
+    saw (st_dev, st_ino) and a _lone_file by fstat, so a link or another file swapped in meanwhile is caught on
+    Windows too. In the Docker sandbox the hub reads with more rights than the agents: a link to a file of the hub's
+    (/proc/<pid>/environ) put in the store would otherwise be copied into a session's folder. CopyError 404 (the
+    upload is gone: Upload ... again) for anything else, 500 when it cannot be read; with no token, 400."""
+    refusal = (_gone(source.token, _upload_what(source)) if source.token is not None
+               else CopyError(f"Cannot read {source.shown}: it is no regular file with one name."))
+    path = long_path(source.path)
+    try:
+        before = os.lstat(path)
+        if not _lone_file(before):
+            raise refusal
+        fd = os.open(path, _READ_FLAGS)
+    except FileNotFoundError:   # (another create took it: see Uploads.claim)
+        raise refusal from None
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):   # a link swapped in (O_NOFOLLOW: ELOOP; EMLINK on BSD)
+            raise refusal from None
+        raise CopyError(f"Cannot read {source.shown}: {exc.strerror or exc}", 500) from None
+    try:
+        try:
+            st = os.fstat(fd)
+        except OSError as exc:
+            raise CopyError(f"Cannot read {source.shown}: {exc.strerror or exc}", 500) from None
+        same = not (before.st_ino and st.st_ino) or (before.st_dev, before.st_ino) == (st.st_dev, st.st_ino)
+        if not (_lone_file(st) and same):
+            raise refusal
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 class Uploads:
     """Zips the sessions page uploads for a new session (POST /api/uploads): <root>/<token>.zip and its
     <token>.json ({"filename", "bytes", "at"}), kept UPLOAD_TTL seconds; a create claims one
-    (<token>.claimed-<pid>-<run>-<hex8>.zip) and removes it whatever happens."""
+    (<token>.claimed-<pid>-<run>-<hex8>.zip) and removes it whatever happens.
+    The uploads of the HTTP API v1 (POST /api/v1/uploads, docs/SPEC.md §21.3) live in a store of their own (another
+    root): any file, <root>/<token>.bin and its <token>.json ({"filename", "bytes", "at", "unpack", "caller"}),
+    received with kind="file"; a create checks them (peek_many), claims them all (claim_many: .claimed-...bin) and
+    settles every claim when it ends (settle: released when used, else unclaimed, usable again)."""
 
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -550,42 +927,73 @@ class Uploads:
         # moving the first one's claimed file), and one hub owns a home
         self._claiming = threading.Lock()
 
-    def _pending(self) -> int:
+    def _make_root(self) -> None:
+        """Make the store's folder (and the board's uploads folder it lies in, for v1's) the hub's alone, 0o700 on
+        POSIX: in the Docker sandbox the hub runs with the agents' group and umask 002, so a folder of the default
+        mode would let the agents rename the store, put a link or another file in place of an upload or rewrite
+        its json. (_open_upload never follows a link whatever the modes.)"""
         self.root.mkdir(parents=True, exist_ok=True)
+        if os.name == "nt":
+            return
+        for folder in (self.root, self.root.parent) if self.root.parent.name == UPLOADS_DIR else (self.root,):
+            with contextlib.suppress(OSError):
+                os.chmod(folder, 0o700)
+
+    def _pending(self) -> int:
+        self._make_root()
         self.clean()
         count = 0
         with os.scandir(self.root) as it:
             for entry in it:
                 m = PENDING_NAME.match(entry.name)
-                if m and m.group(2) in ("zip", "part"):
+                if m and m.group(2) in ("zip", "bin", "part"):
                     count += 1
         return count
 
-    def _finish(self, token: str, part: Path, name: str, total: int) -> None:
+    def _finish(self, token: str, part: Path, name: str, total: int, ext: str = "zip",
+                extra: dict[str, Any] | None = None) -> None:
         meta = self.root / f"{token}.json"
-        meta.write_text(json.dumps({"filename": name, "bytes": total, "at": time.time()}, ensure_ascii=False),
-                        encoding="utf-8")
+        data = json.dumps({"filename": name, "bytes": total, "at": time.time(), **(extra or {})}, ensure_ascii=False)
+        with os.fdopen(os.open(meta, _FILE_FLAGS, 0o600), "wb") as f:   # (new, the hub's alone, as the .part)
+            f.write(data.encode("utf-8"))
         try:
-            os.replace(part, self.root / f"{token}.zip")
+            os.replace(part, self.root / f"{token}.{ext}")
         except BaseException:
             with contextlib.suppress(OSError):
                 meta.unlink()
             raise
 
     async def receive(self, chunks: AsyncIterator[bytes], *, filename: Any, length: str | None,
-                      limits: CopyLimits) -> dict[str, Any]:
+                      limits: CopyLimits, kind: str = "zip", unpack: bool = False,
+                      max_pending: int = UPLOAD_MAX_PENDING, caller: str | None = None) -> dict[str, Any]:
         """Store an uploaded zip streamed as `chunks` (at most `limits.max_bytes`; `length`: the Content-Length
         header, checked before reading). Returns {"upload": token, "filename", "bytes", "expires_in"}; CopyError
-        413 (too large), 429 (UPLOAD_MAX_PENDING uploads wait), 400 (empty, not a zip). Whatever goes wrong (an
-        exception from `chunks` too, which goes on to the caller), the partial file is removed."""
-        name = _upload_name(filename)
+        413 (too large), 429 `too_many_uploads` (`max_pending` uploads wait), 400 (empty, not a zip). Whatever
+        goes wrong (an exception from `chunks` too, which goes on to the caller), the partial file is removed.
+        `kind="file"` (the HTTP API v1, docs/SPEC.md §21.3): any file, kept as <token>.bin under the name
+        `filename`, which check_upload_name refuses (400 `bad_name`, before anything is read) rather than cleans
+        up; a zip only with `unpack` (unpacked by the create); its json records `unpack` and `caller` (who
+        uploaded it: UPLOAD_CALLERS). Returns {"upload", "filename", "bytes", "unpack", "expires_in"}. `unpack`
+        is a bool (the route parses the query's text strictly), else ValueError."""
+        if kind not in ("zip", "file"):
+            raise ValueError(f"unknown upload kind {kind!r}")
+        if type(unpack) is not bool:
+            raise ValueError(f"unpack must be a bool, not {unpack!r}")
+        if kind == "file":
+            if caller not in UPLOAD_CALLERS:
+                raise ValueError(f"unknown upload caller {caller!r}")
+            name = check_upload_name(filename)
+        elif unpack or caller is not None:
+            raise ValueError("a zip upload of the sessions page has no unpack and no caller")
+        else:
+            name = _upload_name(filename)
         too_big = f"The file is larger than {limits.max_mb} MB ([workspace] copy_max_mb)."
         if isinstance(length, str) and length.isascii() and length.isdigit() and int(length) > limits.max_bytes:
             raise CopyError(too_big, 413)
         pending = await asyncio.to_thread(self._pending)
-        if pending >= UPLOAD_MAX_PENDING:
+        if pending >= max_pending:
             raise CopyError(f"{pending} uploads already wait for a session; each is removed when a session uses it "
-                            "or an hour after its upload. Try again later.", 429)
+                            "or an hour after its upload. Try again later.", 429, code="too_many_uploads")
         token = secrets.token_urlsafe(18)
         part = self.root / f"{token}.part"
         fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
@@ -610,9 +1018,16 @@ class Uploads:
             await asyncio.to_thread(f.close)
             if total == 0:
                 raise CopyError("The upload is empty.")
-            if not await asyncio.to_thread(zipfile.is_zipfile, part):
-                raise CopyError("The file is not a zip archive.")
-            await asyncio.to_thread(self._finish, token, part, name, total)
+            if kind == "zip" or unpack:
+                if not await asyncio.to_thread(zipfile.is_zipfile, part):
+                    raise CopyError("The file is not a zip archive." if kind == "zip" else
+                                    "The file is not a zip archive: send it without unpack=true to keep it as one "
+                                    "file.")
+            if kind == "file":
+                await asyncio.to_thread(self._finish, token, part, name, total, "bin",
+                                        {"unpack": bool(unpack), "caller": caller})
+            else:
+                await asyncio.to_thread(self._finish, token, part, name, total)
             done = True
         finally:
             if not done:
@@ -620,23 +1035,28 @@ class Uploads:
                     f.close()
                 with contextlib.suppress(OSError):
                     os.unlink(part)
+        if kind == "file":
+            return {"upload": token, "filename": name, "bytes": total, "unpack": bool(unpack),
+                    "expires_in": UPLOAD_TTL}
         return {"upload": token, "filename": name, "bytes": total, "expires_in": UPLOAD_TTL}
 
     @staticmethod
-    def _checked(token: Any) -> str:
+    def _checked(token: Any, refusal: str = "'copy_from_upload' must be a token from POST /api/uploads.") -> str:
         if not isinstance(token, str) or not UPLOAD_TOKEN.fullmatch(token):
-            raise CopyError("'copy_from_upload' must be a token from POST /api/uploads.")
+            raise CopyError(refusal)
         return token
 
     def peek(self, token: Any) -> dict[str, Any]:
         """The upload `token` names ({"filename", "bytes", "at"}): CopyError 400 for a malformed token (before any
-        path is built), 404 for one that is unknown, used or older than UPLOAD_TTL. Blocking."""
+        path is built), 404 for one that is unknown, used, older than UPLOAD_TTL or no _lone_file. Blocking."""
         token = self._checked(token)
         gone = _gone(token)
         try:
-            st = os.stat(self.root / f"{token}.zip")
+            st = os.lstat(self.root / f"{token}.zip")
         except OSError:
             raise gone from None
+        if not _lone_file(st):   # (a link or another name of a file is no upload: see _open_upload)
+            raise gone
         meta = _read_meta(self.root / f"{token}.json") or {}
         at = _stamp(meta.get("at"))
         at = st.st_mtime if at is None else at
@@ -646,11 +1066,13 @@ class Uploads:
         return {"filename": _upload_name(meta.get("filename")),
                 "bytes": size if isinstance(size, int) and not isinstance(size, bool) else st.st_size, "at": at}
 
-    def claim_path(self, token: str) -> Path:
+    def claim_path(self, token: str, ext: str = "zip") -> Path:
         """A fresh name for the claim of `token` (nothing is renamed): the caller knows it before `claim` runs. In
-        use until `release`."""
+        use until `release` (or `unclaim`). `ext`: "zip" (the board's), "bin" (v1's)."""
         token = self._checked(token)
-        return self.root / _hold(f"{token}.claimed-{os.getpid()}-{RUN}-{secrets.token_hex(4)}.zip")
+        if ext not in ("zip", "bin"):
+            raise ValueError(f"unknown upload extension {ext!r}")
+        return self.root / _hold(f"{token}.claimed-{os.getpid()}-{RUN}-{secrets.token_hex(4)}.{ext}")
 
     def claim(self, token: Any, claimed: Path) -> Source:
         """Take the upload for one create: renamed to `claimed` (claim_path). CopyError as peek's, 404 when another
@@ -678,6 +1100,112 @@ class Uploads:
                 os.unlink(self.root / f"{token}.json")
         finally:
             done_with(claimed)
+
+    # ---- the uploads of the HTTP API v1 (docs/SPEC.md §21.3) ----
+    def peek_many(self, tokens: Any, *, caller: str) -> list[dict[str, Any]]:
+        """The v1 uploads `tokens` names (a list, none twice), each {"token", "filename", "bytes", "at", "unpack"},
+        without claiming them: CopyError 400 for a malformed token or one given twice (before any path is built),
+        404 for one that is unknown, used, older than UPLOAD_TTL, no _lone_file (a link) or uploaded by the other
+        kind of caller (`caller`: an API client never uses the owner's uploads, nor the reverse). Blocking."""
+        if not isinstance(tokens, list):
+            raise CopyError("'files' must be a list of upload tokens.")
+        refusal = f"'files' must hold tokens from POST {API_UPLOAD_PATH}."
+        checked = [self._checked(token, refusal) for token in tokens]
+        if len(set(checked)) != len(checked):
+            raise CopyError("'files' names an upload twice.")
+        return [self._peek_file(token, caller) for token in checked]
+
+    def _peek_file(self, token: str, caller: str) -> dict[str, Any]:
+        gone = _gone(token, "file")
+        try:
+            st = os.lstat(self.root / f"{token}.bin")
+        except OSError:
+            raise gone from None
+        meta = _read_meta(self.root / f"{token}.json")
+        # (a link or another name of a file is no upload: see _open_upload; a json that does not name this caller,
+        # or that cannot be read, cannot say whose the upload is)
+        if not _lone_file(st) or meta is None or caller not in UPLOAD_CALLERS or meta.get("caller") != caller:
+            raise gone
+        at = _stamp(meta.get("at"))
+        at = st.st_mtime if at is None else at
+        if time.time() - at > UPLOAD_TTL:
+            raise gone
+        filename = meta.get("filename")
+        try:
+            check_upload_name(filename)
+        except CopyError:
+            raise gone from None
+        size = meta.get("bytes")
+        return {"token": token, "filename": filename,
+                "bytes": size if isinstance(size, int) and not isinstance(size, bool) else st.st_size, "at": at,
+                "unpack": meta.get("unpack") is True}
+
+    def claim_many(self, tokens: Any, *, caller: str) -> list[Source]:
+        """Take the v1 uploads `tokens` names for one create, all or none, under the lock claims are made under:
+        checked again (peek_many's CopyError), then each renamed to a claim (claim_path, .bin). 404 when another
+        create took one first, 500 when a rename fails; whatever fails, the ones already taken are given back
+        (unclaim). Each Source is of kind "upload" (a zip to unpack) or "file", with its token and file name. The
+        create settles every claim when it ends, whatever happens (settle). Blocking."""
+        taken: list[Source] = []
+        with self._claiming:
+            try:
+                for meta in self.peek_many(tokens, caller=caller):
+                    token = meta["token"]
+                    claimed = self.claim_path(token, "bin")
+                    try:
+                        os.rename(self.root / f"{token}.bin", claimed)
+                    except FileNotFoundError:
+                        done_with(claimed)
+                        raise _gone(token, "file") from None
+                    except OSError as exc:
+                        done_with(claimed)
+                        raise CopyError(f"Cannot use the upload {token}: {exc.strerror or exc}", 500) from None
+                    except BaseException:
+                        done_with(claimed)
+                        raise
+                    taken.append(Source("upload" if meta["unpack"] else "file", claimed,
+                                        f"upload: {meta['filename']}", token, filename=meta["filename"]))
+            except BaseException:
+                for source in reversed(taken):
+                    self.unclaim(source)
+                raise
+        return taken
+
+    def unclaim(self, source: Source) -> bool:
+        """Give back a claimed v1 upload (the create failed: a 4xx, a 5xx, a cancel): the claim is renamed back to
+        <token>.bin (or .zip), so the token works again until its hour is over (the clock is the json's `at`,
+        unchanged). False, logged, when that fails or `source` is no claim of this store: the next clean removes
+        what is left. Never raises for a file system error, and the claim is no longer in use afterwards
+        (done_with): call it in a `finally`."""
+        claimed = Path(source.path)
+        try:
+            m = CLAIMED_NAME.fullmatch(claimed.name)
+            if m is None or claimed.parent != self.root or m.group(1) != source.token:
+                return False
+            try:
+                os.rename(claimed, self.root / f"{m.group(1)}.{m.group(5)}")
+            except OSError as exc:
+                log.warning("could not give back the upload %s: %s", m.group(1), exc)
+                return False
+            return True
+        finally:
+            done_with(claimed)
+
+    def settle(self, sources: Iterable[Source], *, used: bool) -> None:
+        """Settle every claim of one create when it ends, whatever happened (synchronous: call it in a `finally`):
+        `used` (the session was created) removes them (release), otherwise each is given back (unclaim). Sources
+        that are no uploads are passed over. Never raises for a file system error."""
+        for source in sources:
+            if source.token is None or source.kind not in ("upload", "file"):
+                continue
+            try:
+                if used:
+                    self.release(source.token, source.path)
+                else:
+                    self.unclaim(source)
+            except Exception:   # (the others are settled all the same)
+                log.exception("could not settle the upload %s", source.token)
+                done_with(source.path)
 
     def clean(self) -> None:
         """Remove (best effort) the uploads older than UPLOAD_TTL (by their json's "at", else the file's time) and

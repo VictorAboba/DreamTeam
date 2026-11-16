@@ -42,9 +42,9 @@ from typing import TYPE_CHECKING, Any, Callable, Collection
 from . import __version__, netoff
 from . import skills as skill_lib
 from .config import Config
-from .copyfrom import (COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError, CopyLimits, Source,
-                       Uploads, check_target, copy_into, done_with, hub_in_container, left_over, printable_line,
-                       resolve_source, staging_name)
+from .copyfrom import (API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError,
+                       CopyLimits, Source, Uploads, check_target, copy_into, done_with, hub_in_container, left_over,
+                       printable_line, resolve_source, staging_name)
 from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
 from .goal_text import shorten_title, split_goal
 from .models import USER, Status, ToolError
@@ -787,6 +787,9 @@ class SessionManager:
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
         # zips the sessions page uploads for a new session's copy (POST /api/uploads, copy_from_upload)
         self.uploads = Uploads(self.home / ".dreamteam" / UPLOADS_DIR)
+        # the files of the HTTP API v1 (POST /api/v1/uploads, docs/SPEC.md §21.3): a root of their own, so a token
+        # of one store is never usable in the other
+        self.api_uploads = Uploads(self.home / ".dreamteam" / UPLOADS_DIR / API_UPLOADS_DIR)
 
     # ---- change notifications ------------------------------------------------------------------
     def listen(self, listener: Callable[[dict[str, Any]], None]) -> None:
@@ -1910,6 +1913,7 @@ class SessionManager:
         processes that no longer run (the launcher calls it at its start and hourly, create before a copy). Best
         effort; blocking."""
         self.uploads.clean()
+        self.api_uploads.clean()
         self._clean_copies()
 
     def _clean_copies(self) -> None:

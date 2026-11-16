@@ -1813,6 +1813,40 @@ async def test_a_create_removes_expired_uploads(tmp_path):
     await manager.shutdown()
 
 
+async def test_v1_uploads_have_a_root_and_a_cap_of_their_own(tmp_path):
+    """The HTTP API v1's uploads (docs/SPEC.md §21.3) live in .dreamteam/uploads/api: never counted against the
+    board's 8, never usable as its copy_from_upload, and swept with the board's."""
+    manager = _manager(tmp_path)
+    assert manager.api_uploads.root == manager.uploads.root / copyfrom.API_UPLOADS_DIR
+    limits = copyfrom.CopyLimits.from_config(manager.global_config())
+
+    async def chunks():
+        yield b"some text"
+
+    tokens = [(await manager.api_uploads.receive(chunks(), filename="a.txt", length=None, limits=limits,
+                                                  kind="file", caller="api", max_pending=32))["upload"]
+              for _ in range(copyfrom.UPLOAD_MAX_PENDING + 1)]
+    board = await _upload(manager, {"a.txt": "A"})   # the board's count ignores the api folder
+    with pytest.raises(SessionError) as err:   # a v1 token is no board upload
+        await manager.create("C", copy_from_upload=tokens[0], start=False)
+    assert err.value.status == 404 and manager.ids() == []
+    with pytest.raises(copyfrom.CopyError) as err:   # nor a board token a v1 one
+        manager.api_uploads.peek_many([board], caller="owner")
+    assert err.value.status == 404
+    api_root = manager.api_uploads.root
+    old = time.time() - copyfrom.UPLOAD_TTL - 1
+    meta = api_root / f"{tokens[1]}.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text(encoding="utf-8")), "at": old}), encoding="utf-8")
+    dead = 2 ** 22 + 12345
+    assert not sessions_mod._pid_alive(dead)
+    claim = _put(api_root / f"{'C' * 24}.claimed-{dead}-{copyfrom.RUN}-0123abcd.bin", "x")
+    manager.clean_copy_leftovers()   # (the hub's hourly sweep, or the next create)
+    left = sorted(p.name for p in api_root.iterdir())
+    assert f"{tokens[1]}.bin" not in left and not claim.exists() and f"{tokens[0]}.bin" in left
+    assert _upload_files(manager, board) == [f"{board}.json", f"{board}.zip"]
+    await manager.shutdown()
+
+
 async def test_stale_copying_folders_are_cleaned(tmp_path):
     manager = _manager(tmp_path)
     dead = 2 ** 22 + 12345

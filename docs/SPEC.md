@@ -80,7 +80,8 @@ src/dreamteam/
   settings.py    global settings of a home: read/write/validate, public view, updates, endpoint checks (§17.1)
   sessions.py    SessionManager — the sessions of a home (§17.2)
   copyfrom.py    a folder or a zip copied into a new session before its first start, and the uploaded zips
-                 (§17.2 "Copying files into a new session"); never imports sessions.py
+                 (§17.2 "Copying files into a new session"); v1's uploads, name and path rules (§21.3, §21.8);
+                 never imports sessions.py
   transfer.py    `dreamteam export` / `dreamteam import` of a home: the export folder, the secret check, the import
                  plan and its application (§20)
   treecopy.py    copy or measure a folder tree byte for byte, with a digest that is the same on every OS (§20)
@@ -4129,7 +4130,9 @@ settings; ValueError when they are invalid):
 - Attributes: `home`, `raw` / `config` (the global settings), `swarms` (loaded Swarm objects by sid),
   `running` (the set of started ones), `hub_url` (set by `launcher.serve_launcher`; a session swarm's `hub_url`
   is `f"{hub_url}/s/{sid}/mcp"`), `sessions_dir`, `uploads` (`copyfrom.Uploads(<home>/.dreamteam/uploads)`, the
-  zips of `POST /api/uploads`: "Copying files into a new session" below).
+  zips of `POST /api/uploads`: "Copying files into a new session" below), `api_uploads`
+  (`copyfrom.Uploads(<home>/.dreamteam/uploads/api)`, the files of `POST /api/v1/uploads`, §21.3;
+  `clean_copy_leftovers` sweeps both).
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
@@ -4541,7 +4544,8 @@ told where the files came from: no source path goes into `pending_goal` or any p
   "<src> holds names that the folder they are written to cannot tell apart (they differ only in letter case or
   Unicode form): '<rel>'." (the path relative to the source, not the staging path); another write error is 500.
 - **A zip** (a `.zip` path or a claimed upload): a file over `copy_max_mb` is 413 "The zip is larger than N MB
-  ([workspace] copy_max_mb)."; then `skills.unpack_zip(path, staging, copyfrom.zip_rules(limits), check=)`,
+  ([workspace] copy_max_mb)."; then `skills.unpack_zip(path, staging, copyfrom.zip_rules(limits), check=)` (a
+  claimed upload: the file `_open_upload` opened in place of the path),
   streamed from the file (§19): the directory pre-check; at most `max(5000, 2 × copy_max_files)` entries (folders
   and left-out ones count); the declared sizes of the planned files after planning (left-out members do not
   count) and the streamed bytes against `copy_max_mb`; at most `copy_max_files` files; no compression ratio bound
@@ -4626,7 +4630,16 @@ told where the files came from: no source path goes into `pending_goal` or any p
   gets FileNotFoundError: 404, another create took it (a claimed file that vanishes before `copy_into` reads it is
   the same 404). The create claims first (Order above), so from the claim on it is deleted whatever happens. `clean`
   (best effort) removes waiting names over the TTL and the claims `left_over` names (never by age, never one a
-  create of this run uses); names of neither pattern stay.
+  create of this run uses); names of neither pattern stay. The HTTP API v1 (§21.3) uses the same class on its own
+  root: `receive(..., kind="file", unpack=, max_pending=, caller=)` keeps any file as `<token>.bin` under a name
+  `check_upload_name` passes (refused, not cleaned up), a 429 carries the code `too_many_uploads`; `peek_many`,
+  `claim_many` (all or none, under the same lock), `unclaim` (renamed back, its hour unchanged) and `settle` (every
+  claim of a create, released or given back, in its `finally`); `copy_sources` copies several into one staging
+  folder, each in a `staging_name()` folder of its own beside it, then merged (`ZipRules.exclude_top`: the names
+  the session keeps for itself, `SESSION_NAMES`, left out at the top of an unpacked zip). Both stores are read
+  never through a link (§21.3 "Never through a link"): their folders are 0o700 on POSIX and a json 0o600; `peek`
+  is 404 for a `<token>.zip` that is not a regular file with one name (`lstat`); a claim is opened with
+  `O_NOFOLLOW` and checked again by `fstat` (`copyfrom._open_upload`), and its zip unpacked from that open file.
 - **Clients that give up waiting**: a large copy may take longer than a client waits. The TUI and `-p` wait 900 s
   (`MOVE_TIMEOUT`) on a plain REST request, which a client going away does not cancel: the hub finishes the copy
   and creates the session anyway, so they check `dreamteam sessions` or the sessions page before trying again. An
@@ -5774,11 +5787,13 @@ relative: 400), `{"zip": base64, "filename"}`, `{"git": url}`, `{"claude": name,
   a damaged archive is a 400; exec bits come from `external_attr`. `max_mb` / `max_files` apply per picked skill,
   so a multi-skill "Download ZIP" of a repository fits. Origin `zip`, `source = {filename, subdir?}`.
   `extract_zip` is a wrapper: `unpack_zip(source, dest, ZipRules.for_skills(limits)).skipped`. `unpack_zip(source:
-  bytes | path, dest, rules: ZipRules, *, check=None) -> ZipResult(files, bytes, skipped, excluded, links, top)` is
+  bytes | path | binary file (the caller's, left open), dest, rules: ZipRules, *, check=None) -> ZipResult(files,
+  bytes, skipped, excluded, links, top)` is
   the one unpacker, also for a zip copied into a new session (`copyfrom.zip_rules`, §17.2 "Copying files into a new
   session"). `ZipRules`: `max_bytes` / `too_big`, `max_entries` / `too_many_entries`, `max_files` /
   `too_many_files`, `skip_files`, `exclude_names` (casefolded path parts left out and listed), `links` ("refuse" |
-  "skip"), `exclude_paths` (exact '/' paths after the unwrap, left out and listed), `portable` (the Windows name
+  "skip"), `exclude_paths` (exact '/' paths after the unwrap, left out and listed), `exclude_top` (casefolded names
+  left out at the top level after the unwrap, listed like `exclude_paths`), `portable` (the Windows name
   rules), `fold_collisions` (False: exact names), `names_in` (the `_portable` message), `folders` (create folder
   entries), `unwrap` (one top folder with no excluded or link member beside it: its contents), `redecode_names`
   (names without the UTF-8 flag read again, once per archive, as UTF-8 or in the Windows OEM code page, the OEM
@@ -6711,6 +6726,16 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   `<home>/.dreamteam/uploads/api/`. A v1 token is never usable as the board's `copy_from_upload`, nor a board token in
   v1. Any file is stored, as `<token>.bin` with its `<token>.json` `{"filename", "bytes", "at", "unpack", "caller"}`;
   `clean()` knows `.bin` and a claimed `.bin`. The board's uploads (§17.2 "Uploads") are unchanged.
+- **Never through a link.** In the sandbox the hub reads with more rights than the agents and runs with their group
+  and umask 002, so the store is the hub's alone and an upload is read only as the file the hub wrote. The folders
+  of both stores (`uploads/` and `uploads/api/`) are made 0o700 on POSIX, a json is written O_EXCL with 0o600 like
+  the `.part`, and the json is read with `O_NOFOLLOW`. An upload must be a regular file with one name (`lstat`:
+  no link, no folder, `st_nlink == 1`) when it is checked (`peek`, `peek_many`: 404 otherwise), and the copy opens
+  the claim with `O_NOFOLLOW` and checks the opened file again (`fstat`: regular, one name, the `st_dev`/`st_ino`
+  that `lstat` saw, which also catches a swap on Windows); otherwise 404 `not_found`, "Upload the file again". So
+  an agent that put a link to `/proc/<hub>/environ` in place of an upload, or a hard link to a file of the hub's,
+  never gets it copied into a session. A zip is unpacked from that open file (`skills.unpack_zip` takes a binary
+  file), the board's claimed zips included.
 - **The caller.** `caller` is the kind of token that uploaded the file, `"owner"` or `"api"`. A create by the other
   kind finds no such token (404 `not_found`): an API client never uses the owner's uploads, nor the reverse.
 - **The cap.** At most `[api] uploads_pending` (default 32) uploads wait or arrive at once, read at each upload; one
@@ -6722,12 +6747,16 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 - **The name.** `filename` becomes the file's name in the session folder, so it is refused (400 `bad_name`), never
   cleaned up (`copyfrom.check_upload_name`):
   - missing, empty, `.` or `..`;
-  - a separator (`/`, `\`), a NUL or any other character that is not printable (C0 and C1 controls, U+2028, U+2029), a
-    `:`;
+  - a separator (`/`, `\`), a NUL or any other character that does not print, by Unicode category: `Cc` (C0 and C1
+    controls), `Cf` (bidi overrides, zero-width characters, a BOM), `Cs`, `Co` (private use), `Zl` and `Zp`
+    (U+2028, U+2029); a `:`. Spaces of any kind (U+3000, U+00A0) are names' characters, and so are code points
+    unassigned in Python's Unicode (a newer emoji), so a name is taken or refused alike on every Python;
   - over `NAME_MAX` (200) characters, or over 255 bytes in UTF-8 or 255 units in UTF-16 (200 Cyrillic letters are 400
     bytes, which the copy would refuse only after the claim);
   - a name Windows cannot hold, on every OS (`< > " | ? *`, reserved device names such as `CON` or `aux.txt`, a
     trailing dot or space: the portable rule of skills, §19);
+  - the form of a Windows short name (`GIT~1`, `PROGRA~1.TXT`: a base of at most 8 characters holding `~<digit>`,
+    an extension of at most 3), which `files/{path}` never serves (21.8);
   - case-folded, a name the copy leaves out (`COPY_EXCLUDE_NAMES`: `.git`, `node_modules`, ...) or one the session
     owns: `.scratch` (the members' folders), `.gitignore` (one with `*` would hide every output from the autocommits
     and `changed_files`; the session writes its own), `.dreamteam` (harmless to refuse: the data folder is
@@ -7100,11 +7129,18 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - an absolute path; an empty component, `.` or `..`;
   - a NUL or a backslash;
   - a component that case-folds to `.git`;
-  - on a Windows hub only, a name NTFS would read as another: a `:` (NTFS streams: `.git::$INDEX_ALLOCATION/config`
-    names `.git/config`), `< > " | ? *` or a control character, a reserved device name (`CON`, `NUL`, `aux.txt`), a
-    trailing dot or space (`workspace._check_windows_names`, which the workspace too applies on Windows only), or a
-    `~` short-name form (`PROGRA~1`). On Linux and macOS the agents may create such names (`run-10:00.log`,
+  - on every OS, a component of the form of a Windows short name (`PROGRA~1`, `GIT~1`, `SCRATC~1`: a base of at
+    most 8 characters holding `~<digit>`, an extension of at most 3). NTFS resolves short names for a Linux hub too:
+    WSL with a home on `/mnt/c`, or `dreamteam sandbox` of a Windows home under Docker Desktop, whose bind mount
+    goes through the same path; there `GIT~1/config` is `.git/config` and `SCRATC~1/_skills` the skills mirror. A
+    real Linux name of that form (`v1~2.md`) is then neither listed nor served;
+  - on a Windows hub only, the other names NTFS would read as another: a `:` (NTFS streams:
+    `.git::$INDEX_ALLOCATION/config` names `.git/config`), `< > " | ? *` or a control character, a reserved device
+    name (`CON`, `NUL`, `aux.txt`), a trailing dot or space (`workspace._check_windows_names`, which the workspace
+    too applies on Windows only). On Linux and macOS the agents may create such names (`run-10:00.log`,
     `what?.md`), and they are listed and served there.
+  - The no-follow open (`nofollow.py`) also takes a component only when its exact spelling is in its parent
+    folder's listing, which catches short names and case aliases on any file system.
 - Listings and archives leave out exactly the names `files/{path}` would refuse, so the three agree.
 - A name a client creates follows the Windows rules on every OS: an upload's `filename` (21.3) and a server folder's
   `path` (21.10).
@@ -7189,7 +7225,7 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - scope: the API token sees only `via: "api"` sessions; uid ids after a delete; earlier-version sessions (listed,
     409);
   - uploads: a file, an unpacked zip, every refused name (`.git` among them), a name clash, the limits, the tokens
-    kept after a 4xx, a 5xx and a cancel, a token of the other caller;
+    kept after a 4xx, a 5xx and a cancel, a token of the other caller, a link or a hard link put in the store;
   - create: an unknown field, team, model, role and skill; a blank goal; a `title` with a line break, over 200
     characters, or equal to the goal's title; `start_agents` 0, over `max_agents`, and with a `team` string;
     `client_ref` twice, with another body, and during a slow copy; a failed start; `max_running`;
