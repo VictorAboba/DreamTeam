@@ -15,13 +15,14 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 
-from . import __version__, roles
+from . import __version__
 from . import skills as skill_lib
 from .copyfrom import SOURCE_SHOWN_MAX, copy_text, printable_line
 from .hub_mcp import INSTRUCTIONS as HUB_INSTRUCTIONS
 from .hub_mcp import (LIBRARY_TOOLS, _StdinLines, client_key, hub_call, hub_specs, list_hub_tools, security_settings,
                       serving_client)
 from .models import USER, ToolError
+from .sessionopts import OptionError, overrides_from
 from .sessions import SessionError
 from .skills import Library, SkillError
 from .swarm_skills import files_text, source_spec
@@ -29,7 +30,6 @@ from .tools import REGISTRY
 from .workspace import format_size
 
 if TYPE_CHECKING:
-    from .config import Config
     from .sessions import SessionManager
     from .swarm import Swarm
 
@@ -370,51 +370,6 @@ async def _skill_library(manager: "SessionManager", args: dict[str, Any]) -> str
     raise ToolError("action must be list, show, import or delete.")
 
 
-def _int_or_none(value: Any) -> int | None:
-    try:
-        return None if value in (None, "") else int(value)
-    except (TypeError, ValueError):
-        raise ToolError(f"Expected an integer, got {value!r}.") from None
-
-
-def _team(value: Any) -> list[str]:
-    """`session_create`'s `team`: role names in order (normalized; [] when absent or empty)."""
-    if value is None:
-        return []
-    names = [roles.normalize(x) for x in value] if isinstance(value, list) and all(
-        isinstance(x, str) for x in value) else None
-    if names is None or not all(names):
-        raise ToolError("team must be a list of role names, e.g. [\"architect\", \"developer\", \"tester\"].")
-    if len(names) > roles.TEAM_MAX:
-        raise ToolError(f"A team has at most {roles.TEAM_MAX} agents.")
-    long = next((name for name in names if len(name) > roles.NAME_LIMIT), None)
-    if long is not None:
-        raise ToolError(f"'{long[:80]}': a role name cannot be longer than {roles.NAME_LIMIT} characters.")
-    # "developer*2" / "architect, developer" is the --team syntax: here each item is one agent's role
-    joined = next((name for name in names if "," in name or "*" in name), None)
-    if joined is not None:
-        raise ToolError(f"'{joined}': a role name cannot contain ',' or '*'; give one item per agent and repeat a "
-                        "name for several agents, e.g. [\"developer\", \"developer\"].")
-    return names
-
-
-def _saved_team(name: Any, config: "Config") -> list[str]:
-    """`team_name` of session_create: the roles of that saved team (docs/SPEC.md §17.3 "Saved teams"), checked now: the
-    session holds them as any other starting team and never looks the team up."""
-    if not isinstance(name, str):
-        raise ToolError("team_name must be the name of a saved team.")
-    team = roles.find_team(config.teams, name)
-    if team is None:
-        known = ", ".join(saved.name for saved in config.teams)
-        raise ToolError(f"No saved team '{roles.normalize(name)[:80]}'. "
-                        + (f"Saved teams: {known}." if known else "None are saved yet: Settings > Teams."))
-    missing = roles.missing_roles(team, config.roles)
-    if missing:
-        raise ToolError(f"The team '{team.name}' uses roles that are not in the role catalog: {', '.join(missing)}. "
-                        "Fix it in Settings > Teams.")
-    return list(team.roles)
-
-
 async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[str, Any]) -> tuple[str, bool]:
     args = dict(args or {})
     try:
@@ -427,34 +382,10 @@ async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[st
             goal = str(args.get("goal") or "").strip()
             if not goal:
                 raise ToolError("goal is required.")
-            swarm_over: dict[str, Any] = {}
-            for key in ("start_agents", "max_agents"):
-                if args.get(key) not in (None, ""):
-                    swarm_over[key] = _int_or_none(args[key])
-            team = _team(args.get("team"))
-            config = manager.global_config()
-            if args.get("team_name") not in (None, ""):
-                if team or "start_agents" in swarm_over:
-                    raise ToolError("team_name sets the roles and their number: give it without team and start_agents.")
-                team = _saved_team(args["team_name"], config)
-            elif team and (saved := roles.saved_team_in(team, config.teams, config.roles)):
-                raise ToolError(f"'{saved}' is a saved team, not a role: pass it as team_name.")
-            if team:  # the starting roles in order; the team's size unless start_agents is given
-                swarm_over["starting_roles"] = team
-                swarm_over.setdefault("start_agents", len(team))
-            if args.get("max_cost_usd") not in (None, ""):
-                swarm_over["max_cost_usd"] = float(args["max_cost_usd"])
-            if args.get("language"):
-                swarm_over["language"] = str(args["language"])
-            if args.get("network"):
-                swarm_over["network"] = str(args["network"])
-            if args.get("clarify") is not None:  # a bool: false overrides a global true
-                if not isinstance(args["clarify"], bool):
-                    raise ToolError("clarify must be true or false.")
-                swarm_over["clarify"] = args["clarify"]
-            overrides: dict[str, Any] = {"swarm": swarm_over} if swarm_over else {}
-            if args.get("model"):
-                overrides["agents"] = {"default_model": str(args["model"])}
+            try:   # team, model and limits -> overrides: the mapping v1's create shares (strict there)
+                overrides = overrides_from(args, manager.global_config(), strict=False)
+            except OptionError as exc:
+                raise ToolError(str(exc)) from None
             workspace = args.get("workspace")
             if workspace is not None and not isinstance(workspace, str):
                 raise ToolError("workspace must be an absolute folder path.")

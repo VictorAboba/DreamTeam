@@ -4186,7 +4186,7 @@ settings; ValueError when they are invalid):
   max_cost_usd=None, max_agents=None, wrap_up=None)`, `update(sid, *, title=None,
   overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`,
   `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `sid_of_uid(uid)`, `api_sids()`,
-  `global_config()`,
+  `sid_of_client_ref(ref)`, `global_config()`,
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
@@ -4236,22 +4236,23 @@ settings; ValueError when they are invalid):
     one of an earlier version (both keep their mark), and a session stopped (out of the set, its mark cleared) or
     deleted meanwhile; it checks that last condition again under the session's lock and starts it there
     (`_start_locked`), so a stop that held the lock while resume() waited is never undone.
-- `SessionError(message, status=400, *, code=None, **extra)` (a ValueError) carries an HTTP status and `extra` (put
-  into the JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid
-  settings,
-  404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
-  a folder of another session, a folder that changed since the user was asked, a missing workspace folder at
-  start, a `workspace` with files for a copy, a session made by an earlier version), 413 a copy over its limits,
-  500 damaged or cannot be opened (404 is
-  also an unknown or used upload of `copy_from_upload`). `code` is the HTTP API v1's code where the status alone does
-  not say it (§21.1), never in `extra`, so the internal answers do not show it: `folder_busy` (`FOLDER_BUSY`: `_plan`'s
-  folder of another session, `_check_reserved`'s create in progress), `folder_not_ready` (`FOLDER_NOT_READY`: every
-  `_repo_refusal`, so also `_check_adopted_repo`; `_check_workspace_ready`'s missing folder and `_check_journal`'s
-  unfinished move), `conflict` (`control`'s wrap-up before the first start), a CopyError's own code (`bad_name`,
-  `file_conflict`) when `create` turns it into a SessionError; `_move_error` keeps the code of the SessionError that
-  failed a workspace change, unless files could not be put back (500). v1 answers a code with that code's own status
-  (§21.1), which may differ from `status`: `folder_not_ready` is 409 there, also for the two refusals of a create
-  that are 400 on the internal routes (a folder inside a repository, a repository's own database).
+- `SessionError(message, status=400, *, code=None, holder=None, **extra)` (a ValueError) carries an HTTP status and
+  `extra` (put into the JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad
+  input or invalid settings, 404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to
+  adopt or to start in, a folder of another session, a folder that changed since the user was asked, a missing
+  workspace folder at start, a `workspace` with files for a copy, a session made by an earlier version), 413 a copy
+  over its limits, 500 damaged or cannot be opened (404 is also an unknown or used upload of `copy_from_upload`).
+  `code` is the HTTP API v1's code where the status alone does not say it (§21.1), never in `extra`, so the internal
+  answers do not show it: `folder_busy` (`FOLDER_BUSY`: `_plan`'s folder of another session, `_check_reserved`'s
+  create in progress), `folder_not_ready` (`FOLDER_NOT_READY`: every `_repo_refusal`, so also `_check_adopted_repo`;
+  `_check_workspace_ready`'s missing folder and `_check_journal`'s unfinished move), `conflict` (`control`'s wrap-up
+  before the first start), a CopyError's own code (`bad_name`, `file_conflict`) when `create` turns it into a
+  SessionError; `_move_error` keeps the code of the SessionError that failed a workspace change, unless files could
+  not be put back (500), and its `holder`. `holder`: the session whose folder it is (`_plan`'s `folder_busy`; none
+  for a create in progress), never in `extra` either: v1 names it by its uid, to a caller who sees it, in a text of
+  its own (§21.10). v1 answers a code with that code's own status (§21.1), which may differ from `status`:
+  `folder_not_ready` is 409 there, also for the two refusals of a create that are 400 on the internal routes (a
+  folder inside a repository, a repository's own database).
 - **Sessions of the HTTP API v1** (§21.4). `create(..., api={answers, stop_when_done, client_ref, request_digest,
   folder})` (those keys only, `API_GIVEN` defaults for the missing ones; another key or a value of the wrong kind is
   400) writes `"via": "api"` and the `api` block, with `base_commit`, `started_at`, `finished_at`, `start_error` and
@@ -4309,14 +4310,16 @@ settings; ValueError when they are invalid):
     goal its first start has not set yet (that `set_goal` ends wrap-up mode), decided before a database is made;
     409 for an earlier version. Nothing given: the summary, nothing loaded. It announces an `updated` change and
     returns the summary.
-  - `sid_of_uid(uid)` (32 lowercase hex, else None) and `api_sids()` read an index of every session.json (uid →
-    folder name, and the v1 sessions), built once and read again when a session comes or goes (`_changed`
-    `created` / `deleted`, an import's rewrite or settings) or the sessions folder's mtime changes (another
-    process). A uid the index does not know, and every `api_sids()`, also compare the session folders (`ids()`, no
+  - `sid_of_uid(uid)` (32 lowercase hex, else None), `api_sids()` and `sid_of_client_ref(ref)` read an index of every
+    session.json (uid → folder name, the v1 sessions, and their `client_ref` → folder name, the first by name when two
+    share one), built once and read again when a session comes or goes (`_changed` `created` / `deleted`, an
+    import's rewrite or settings) or the sessions folder's mtime changes (another process). A uid the index does not
+    know, and every `api_sids()` and `sid_of_client_ref()`, also compare the session folders (`ids()`, no
     session.json read) with those the index was read from: another process makes a session's folder before it writes
     its session.json, which changes no mtime of the sessions folder. A uid two sessions share (a folder copied by
     hand) names neither; the legacy `main` has no uid; a hit is checked against the session.json it names, so a
-    deleted session's uid never reaches the session that got its folder number.
+    deleted session's uid never reaches the session that got its folder number. So a v1 create with a `client_ref`
+    reads no session.json per session (§21.4).
   - `read_lists(db_path, conn=None)` → (tasks, agents) of a session database, read-only like `read_stats`, in the
     shape and order of the snapshot (`Task.to_dict()` by priority then id, closed ones too, without the board's
     computed fields; every `agents` row in hiring order): a stopped session's result without loading it (§21.7).
@@ -6764,8 +6767,10 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   method of the path, sorted. A route takes only the methods it names: HEAD and OPTIONS are 405 like any other
   (Starlette would add HEAD to a GET route). Every route goes through one wrapper, which answers 401 `token_required`
   when the request did not come through the guard's v1 branch (no `scope["dreamteam.api_caller"]`), the manager's
-  errors (`api_v1.CODED_ERRORS`: `SessionError`, `CopyError`, `SkillError`) with their codes (`api_v1.error_code`)
-  and anything else as 500 `internal`, logged, with no text of the error's own, whatever attributes it has.
+  errors (`api_v1.CODED_ERRORS`: `SessionError`, `CopyError`, `SkillError`, and `sessionopts.OptionError` of a
+  create's options) with their codes (`api_v1.error_code`) and anything else as 500 `internal`, logged, with no text
+  of the error's own, whatever attributes it has. A route about one session keeps the session `{id}` resolved to
+  (`scope["dreamteam.api_sid"]`), so its error texts name that session's folders by their names.
 - **The API token.** v1 has a token of its own, apart from the hub token (§14.2): `DREAMTEAM_API_TOKEN`
   (`hubauth.API_TOKEN_ENV`), or its SHA-256 (64 hex) in `DREAMTEAM_API_TOKEN_SHA256` (`API_DIGEST_ENV`), as
   `DIGEST_ENV` is for the hub token. `hubauth.api_digest()` is the digest variable, else the digest `take_env_token`
@@ -6862,9 +6867,12 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     component. `ApiV1.redact(text, sid=None)` is `manager._public_text(sid, text, named=<the roots of [api]
     folders>)` (§17.2), a root not absolute on the hub's own system left out; `ApiV1.error_response` runs it in a
     thread, since it resolves the roots (a disconnected network share would otherwise stall the hub) and reads the
-    session's files. `folder_busy` is v1's own text, never a `SessionError` text
-    (21.10). Summaries (21.7) hold no absolute path, for any caller. Event data (21.6), task results, messages and
-    files carry what the agents wrote, paths included: v1 does not scrub them.
+    session's files. A route of v1 that a text names (`GET /api/v1/options lists the roles`: `/api/v1` and lowercase
+    words or `{id}`-like placeholders after it, starting a word) is kept as it is, never named by its last component.
+    `folder_busy` is v1's own text (`api_v1.FOLDER_BUSY_TEXT`), for every caller, never a `SessionError` text; its
+    `session` names the other session (`SessionError.holder`) by its uid when the caller sees it (21.10). Summaries
+    (21.7) hold no absolute path, for any caller. Event data (21.6), task results, messages and files carry what the
+    agents wrote, paths included: v1 does not scrub them.
 - **Compatibility**: within v1, fields, codes, states and event types are only added, never renamed, removed or given
   another meaning; a client ignores what it does not know. The `text` of events (21.6) and of errors is for people and
   may be reworded. Anything else is `/api/v2`, and v1 then stays for at least one minor release. `GET /api/v1/options`
@@ -7022,6 +7030,10 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   first line is its title and the rest its description (`split_goal`, as §17.2).
   - `title`, when given, is one line with a character that is not whitespace, at most 200 characters
     (`TITLE_LIMIT` of a session's name, and `GOAL_TITLE_MAX` of a goal's title); 400 `bad_request` otherwise.
+  - The session's title (`title`, else the goal's first line) holds no control character (C0 or C1: a tab, NUL, an
+    escape sequence), no unpaired surrogate and no invisible format character other than the joiners of ordinary
+    text (U+200C, U+200D, the tags of a subdivision flag: a bidirectional override is refused), as a saved team's
+    name (400 `bad_request`): it reaches the owner's terminal (`dreamteam` prints it) and pages as it is.
   - With `title`, the goal's title is `title` and the whole `goal` text its description, so nothing of the goal is
     lost. When the goal's own title (as `split_goal` reads it) already equals `title`, whitespace collapsed, it is not
     repeated: the goal is split as without a title.
@@ -7036,12 +7048,16 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   `unknown_model` with the profile names). `language`, `network`, `max_cost_usd`, `max_agents`, `start_agents` and
   `clarify` become session overrides, as the board's do. `sessionopts.overrides_from(body, config, strict=True)` makes
   them; the launcher MCP's `session_create` uses the same mapping, not strict. No provider, key or endpoint is ever
-  taken: those are the settings of the computer DreamTeam runs on.
+  taken: those are the settings of the computer DreamTeam runs on. Strict, each has its kind: `start_agents` and
+  `max_agents` whole numbers of at least 1, `max_cost_usd` a number of at least 0, `language` `ru` or `en`, `network`
+  `on` or `off`, `clarify` a bool, a list `team` at least one role (400 `bad_request` otherwise); a refusal is a
+  `sessionopts.OptionError` with its code. In the body, a field that is `null` counts as not given.
 - **`start_agents`** is at least 1 and at most the session's `max_agents` (400 `bad_request`), also when a team (a
   saved team's roles or a list) sets it: the starting team ignores `max_agents`, and a session without members never
   finishes. A saved team sets `start_agents` to its size, so a `team` string with `start_agents` is 400
   `bad_request`, as `session_create` refuses `team_name` with `start_agents`. A list sets it only when `start_agents`
-  is not given.
+  is not given. A `max_agents` given alone is checked against the settings' `start_agents` the same way. The settings'
+  own values are not checked when the request sets neither (they are the owner's, as for the board).
 - **`files`**: at most 20 tokens of 21.3 (`files_per_session`), none twice; their files land in the session folder
   before the first start, as `copy_from_upload` does. Not with an `in_place` folder (400 `bad_request`).
 - **`folder`**: a folder of the hub's computer, named by its root (21.10). There is no other way to name a path of the
@@ -7079,14 +7095,19 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 - **`client_ref`**: at most 128 printable characters. A create whose `client_ref` and `request_digest` match a session
   that v1 still has (and the caller sees) answers 200 with that session and creates nothing: a retry after a timeout
   never makes a second job. The same `client_ref` with another body is 409 `conflict`. `request_digest` is the SHA-256
-  of the body's canonical JSON (keys sorted, no spaces). A create in flight holds an in-memory reservation of its
-  `client_ref`: a retry with the same body waits for it, then answers as a repeat (200), or goes on when that create
-  failed; a retry with another body is 409 at once.
+  of the body's canonical JSON (keys sorted, no spaces; a field that is `null` left out, as not given, and a whole
+  number with a fraction, `5.0`, written as `5`), stored for every v1 create. A create in flight holds an in-memory
+  reservation of its `client_ref`: a retry with the same body waits for it, then answers as a repeat (200), or goes
+  on when that create failed; a retry with another body is 409 at once. The stored sessions are found through the
+  manager's index (`SessionManager.sid_of_client_ref`, §17.2), on the event loop with no await before the
+  reservation, so a create that finishes meanwhile is never missed.
 - **Order**, so that a refused create costs nothing:
-  1. the body: unknown fields, types, `goal`, `title`, `start_agents`, `answers` with `clarify`, `client_ref`, `files`
-     with `in_place`;
-  2. `client_ref` (above);
-  3. the overrides: team, model, roles (`sessionopts`, then `validated_overrides`);
+  1. the body: unknown fields; `goal`, `title`, `description`, `answers` with `clarify`, `stop_when_done`,
+     `client_ref`, the kinds of `files` and `skills`, `files` with `in_place` (`api_v1.CreateRequest.parse`);
+  2. `client_ref` (above): a repeat of a stored create is answered before anything that depends on the settings, so
+     a retry gets its session also when the settings changed since;
+  3. the overrides: the kinds of the options of "Settings" above, `start_agents` against `max_agents`, team, model,
+     roles (`sessionopts`, then `validated_overrides`);
   4. the skills;
   5. the folder, resolved and checked (21.10);
   6. the uploads: every token checked without claiming it (`peek_many`);
@@ -7098,7 +7119,16 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
      `starting` with `m` before it announces it (§17.2);
   10. the claims settled (21.3);
   11. 202 with state `starting`; the start runs in the background (`manager.start(sid, marked=m)`: nothing when a
-      stop or a delete came first), as a task `ApiV1` keeps.
+      stop or a delete came first), as a task `ApiV1` keeps (`ApiV1.spawn`). A start that fails is in the summary;
+      the background task logs it at information only, whatever the exception: a `SessionError` by its text, any
+      other with its traceback (the manager logs a failed `swarm.start()` as an error, but records a check before
+      it that raised without logging it).
+- While the hub stops (`ApiV1.aclose()` runs) a create starts nothing: `SessionError` 503, answered 500 `internal`.
+  One that passed that check before is still started (`aclose()` waits for it); once `aclose()` has ended nothing is
+  spawned (`spawn` refuses, 503), and the create records that as a failed start (`api.start_error`
+  `{"code": "internal", "text": "DreamTeam is shutting down."}` and `api.finished_at`, while no operation holds the
+  session's lock) before it takes its mark away again: the session is `failed` and final, a repeat of its
+  `client_ref` says why, and a `continue` starts it.
 - Any 4xx leaves every token usable. A start that fails writes `api.start_error` (`{"code", "text"}`) and
   `api.finished_at`, and leaves the session stopped: state `failed`, the text in the summary's `error`. That includes
   the checks before `swarm.start()`, which raise before its `try`: a missing workspace folder
@@ -7466,7 +7496,15 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     `serve_launcher` is cancelled (Ctrl+C) it gives the server `GRACEFUL_SECONDS + 3` (6 s) before it cancels it,
     lifespan included, so the wait is then the smaller of the two. It never cancels them: `_start_locked` catches
     only `Exception`, so a cancel inside `swarm.start()` would skip its cleanup and leave running what the start
-    launched (the MCP servers, the skills' tasks).
+    launched (the MCP servers, the skills' tasks). Once `aclose()` has ended, `spawn` refuses (`SessionError` 503,
+    the coroutine closed): `manager.shutdown()` may be running, and nobody would wait for the task.
+  - `api_v1.py` also holds the one resolver of `{id}` (`ApiV1.resolve(uid, caller)`: `sid_of_uid`, then for the API
+    caller a session whose session.json says `"via": "api"`), the summary (`ApiV1.summary(sid)`, built on the board's
+    `manager.summary` with no path of it) and its state (`api_v1.state_of`), and `[api] max_running`'s count
+    (`ApiV1.running_count()`: the v1 sessions in `running`, `starting` or `resume_pending`, plus the creates past the
+    check that have not marked their session yet). A request of a running session that cannot be read blocks
+    nothing (as the summary's `requests` count skips it), and GET `/sessions` leaves out a session whose summary
+    fails (logged), as the sessions page does.
   - `autoreply.py`: `SessionAutoReply`, `requests_of`, `requests_from`, `read_requests`, `blocking_requests`,
     `request_key`, `follow_journal`, `journal_head`, `planner_question` and the queries it shares with the swarm
     (`LAST_TO`, `QUESTION_DROPPED`, `PLANS`), `AUTO_REPLY`, `AUTO_REVIEW`, `AUTO_REPLY_MAX` (moved from printmode.py,

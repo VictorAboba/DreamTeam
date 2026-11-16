@@ -6,17 +6,24 @@ its own: its routes, `redirect_slashes` off (a bare `/api/v1` is a JSON 404, nev
 handler, so that a wrong path or method is JSON too. Every answer under `/api/v1/` is JSON; an error is
 `{"error": text, "code": code}` with the code's status (CODES). This module also holds what every route uses: the JSON
 body read up to JSON_MAX, the check of a body's or a query's fields (`unknown_field`), the mapping of the manager's
-errors to codes with the redaction of paths for the API caller, and `aclose()`, which waits for the starts in flight
-and never cancels them. It uses the manager in process, never the internal routes over HTTP, and never imports
-dreamteam.tui."""
+errors to codes with the redaction of paths for the API caller, the one resolver of a session's `{id}`, the summary
+and its state (§21.7), and `aclose()`, which waits for the starts in flight and never cancels them. It uses the
+manager in process, never the internal routes over HTTP, and never imports dreamteam.tui."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import math
+import os
+import re
+import sqlite3
+import time
+import unicodedata
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Iterable, Mapping
 
@@ -27,13 +34,16 @@ from starlette.responses import Response
 from starlette.routing import Route
 
 from . import __version__, roles
-from .config import native_absolute
-from .copyfrom import CopyError
+from .autoreply import blocking_requests, requests_of
+from .config import _joins_text, native_absolute
+from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads
+from .goal_text import split_goal
 from .httpjson import JSONResponse
-from .sessions import SessionError
-from .skills import Library, SkillError
+from .sessionopts import OptionError, overrides_from
+from .sessions import API_ANSWERS, API_GIVEN, LEGACY_ID, TITLE_LIMIT, SessionError, api_answers, api_meta, session_uid
+from .skills import NAME_MAX, NAME_RE, Library, SkillError
 from .uitext import LANGS
-from .web import API_CALLER, API_CALLERS, API_TOKEN_TEXT, BEARER_REALM
+from .web import API_CALLER, API_CALLERS, API_TOKEN_TEXT, BEARER_REALM, PUBLIC_URL_ENV, _loopback_bind
 
 if TYPE_CHECKING:
     from .config import Config
@@ -47,6 +57,21 @@ FILES_PER_SESSION = 20      # uploads one create takes (docs/SPEC.md §21.2 "Opt
 START_WAIT = 30.0           # seconds aclose() waits for the background tasks (starts) in flight; it never cancels them
 FIELDS_SHOWN = 10           # unknown fields named in an unknown_field text
 FIELD_CHARS = 60            # characters of each
+SESSIONS_DEFAULT, SESSIONS_MAX = 50, 200   # GET /api/v1/sessions `limit`
+CLIENT_REF_MAX = 128        # characters of a create's client_ref
+API_SID = "dreamteam.api_sid"   # the scope key of the session a route resolved ({id}): its error texts name its folders
+UPLOAD_TYPES = ("application/octet-stream", "application/zip")   # what POST /api/v1/uploads takes (§21.3)
+# the states of a session (docs/SPEC.md §21.7), in the order they are tried: the first that holds
+STATES = ("starting", "failed", "created", "done", "budget", "waiting", "paused", "running", "stopped")
+# the fields of POST /api/v1/sessions (docs/SPEC.md §21.4); `folder` comes with the server folders (§21.10)
+CREATE_FIELDS = ("goal", "title", "description", "language", "team", "model", "start_agents", "max_agents",
+                 "max_cost_usd", "network", "files", "skills", "answers", "clarify", "stop_when_done", "client_ref")
+SHUTTING_DOWN_TEXT = "DreamTeam is shutting down."
+NO_SESSION_TEXT = "No such session: GET /api/v1/sessions lists the sessions this token sees."
+# v1's own text of `folder_busy` (docs/SPEC.md §21.10): the manager's names the other session's folder, so its title
+FOLDER_BUSY_TEXT = ("Another session works in this folder, in a folder inside it or in one containing it, or is being "
+                    "created there: two sessions cannot share files. Send that session's next instruction with "
+                    "POST /api/v1/sessions/{id}/continue, or DELETE it to free the folder (its files stay).")
 
 # every v1 error code and its HTTP status (docs/SPEC.md §21.1 "Errors"): the guard's, then ApiV1's
 CODES: dict[str, int] = {
@@ -67,9 +92,14 @@ CODES: dict[str, int] = {
 STATUS_CODES = {400: "bad_request", 401: "token_required", 404: "not_found", 405: "method_not_allowed",
                 409: "conflict", 413: "too_large", 415: "unsupported_media_type", 500: "internal"}
 NOT_FOUND_TEXT = "No such route in the API (/api/v1): GET /api/v1/options lists what a client may choose."
+# a route of v1 that an error text names ("GET /api/v1/options lists the roles"): lowercase words and `{id}`-like
+# placeholders after /api/v1, starting a word and ending at a space or at the punctuation that ends a sentence. No
+# path of the hub's computer: redact() keeps it as it is (the redaction would name it by its last component).
+_ROUTE = re.compile(r"""(?<![^\s(\[{<=,;:'"`])/api/v1(?:/(?:[a-z_]+|\{[a-z_]+\}))*(?![^\s'"`<>|.,;:!?)\]}])""")
 # the errors whose texts and codes a route answers as they are (error_code; for the API caller through redact()): the
-# manager's and the stores'. Any other exception is a 500 `internal` with no text of its own, whatever it carries.
-CODED_ERRORS: tuple[type[Exception], ...] = (SessionError, CopyError, SkillError)
+# manager's, the stores' and the create options'. Any other exception is a 500 `internal` with no text of its own,
+# whatever it carries.
+CODED_ERRORS: tuple[type[Exception], ...] = (SessionError, CopyError, SkillError, OptionError)
 
 
 class ApiError(Exception):
@@ -97,10 +127,10 @@ def fail(code: str, text: str, *, headers: Mapping[str, str] | None = None, **ex
 
 def error_code(exc: BaseException) -> str:
     """The v1 code of an error the manager raised (docs/SPEC.md §21.1; one of CODED_ERRORS): its own `code` when v1
-    knows it (SessionError, CopyError), `earlier_version` for a session made by an earlier version, else by its
-    `status` (STATUS_CODES; another 4xx is `bad_request`); `internal` for anything without a status. A code decides the
-    answer's status, which may differ from the error's own (`folder_not_ready` is 409 also where the internal routes
-    answer 400)."""
+    knows it (SessionError, CopyError, OptionError), `earlier_version` for a session made by an earlier version, else
+    by its `status` (STATUS_CODES; another 4xx is `bad_request`); `internal` for anything without a status. A code
+    decides the answer's status, which may differ from the error's own (`folder_not_ready` is 409 also where the
+    internal routes answer 400)."""
     code = getattr(exc, "code", None)
     if isinstance(code, str) and code in CODES:
         return code
@@ -240,6 +270,223 @@ def options_view(config: "Config", skills: list[dict[str, str]]) -> dict[str, An
     }
 
 
+def state_of(*, starting: bool, earlier: bool, failed: bool, never_started: bool, done: bool, budget: bool,
+             running: bool, paused: bool, blocking: Callable[[], bool]) -> str:
+    """A session's state (docs/SPEC.md §21.7), the first that holds: `starting` (a create or `continue` starts it, or
+    the hub's resume() is about to), then a session of an earlier version is `stopped`, `failed` (its last start
+    failed), `created` (never started), `done` (its goal is completed), `budget` (the budget paused it, or that pause
+    stopped it), `waiting` (running, a request that blocks the work waits: `blocking()`, asked only then), `paused`
+    (running, paused by the user), `running`, else `stopped`."""
+    if starting:
+        return "starting"
+    if earlier:
+        return "stopped"
+    if failed:
+        return "failed"
+    if never_started:
+        return "created"
+    if done:
+        return "done"
+    if budget:
+        return "budget"
+    if running:
+        if blocking():
+            return "waiting"
+        return "paused" if paused else "running"
+    return "stopped"
+
+
+def _error_text(api: Mapping[str, Any] | None) -> str | None:
+    """A v1 session's `error`: the text of `api.start_error`, else of `api.error` ({code, text} or a text)."""
+    for key in ("start_error", "error"):
+        value = (api or {}).get(key)
+        text = value.get("text") if isinstance(value, dict) else value
+        if isinstance(text, str) and text:
+            return text
+    return None
+
+
+def request_digest(body: Mapping[str, Any]) -> str:
+    """A create's `request_digest` (docs/SPEC.md §21.4 `client_ref`): the SHA-256 of the body's canonical JSON (keys
+    sorted, no spaces), so a retry is told from another job with the same client_ref. A field that is null is left
+    out (null counts as not given), and a whole number written with a fraction (5.0) is written as 5: a retry that
+    spells the same request another way is still a repeat."""
+    canonical = {key: int(value) if isinstance(value, float) and value.is_integer() else value
+                 for key, value in body.items() if value is not None}
+    text = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _one_line(text: str) -> bool:
+    return "".join(text.splitlines()) == text
+
+
+def _hidden_chars(text: str) -> bool:
+    """Whether a title holds a character that must not reach a terminal or a page as it is: a control character (C0
+    and C1: an escape sequence, NUL, a tab), an unpaired surrogate, or an invisible format character other than the
+    joiners of ordinary text (config._joins_text: emoji sequences; a bidirectional override is refused), as a saved
+    team's name may not."""
+    for char in text:
+        category = unicodedata.category(char)
+        if category in ("Cc", "Cs") or (category == "Cf" and not _joins_text(char)):
+            return True
+    return False
+
+
+@dataclass
+class CreateRequest:
+    """POST /api/v1/sessions after the body's own checks (docs/SPEC.md §21.4 "Order" 1): what `manager.create` is
+    called with. The team, model and limits are sessionopts' (overrides_from); the skills and the uploads are checked
+    against the library and the store later."""
+    title: str
+    goal: str
+    description: str
+    answers: str
+    stop_when_done: bool
+    client_ref: str | None
+    files: list[str] = field(default_factory=list)
+    skills: list[str] = field(default_factory=list)
+
+    @classmethod
+    def parse(cls, body: Mapping[str, Any]) -> "CreateRequest":
+        """400 `bad_request` for a value of the wrong kind; `goal` required, with a character that is not
+        whitespace; `title` one such line of at most TITLE_LIMIT characters; the session's title (`title`, else the
+        goal's first line) without a control or invisible format character (_hidden_chars: it reaches the owner's
+        terminal and pages); `clarify: true` only with `answers: "manual"`; `client_ref` at most CLIENT_REF_MAX
+        printable characters; `files` at most FILES_PER_SESSION tokens. The kinds of the team, model and limits
+        are sessionopts' (overrides_from), after client_ref (§21.4 "Order" 3). The goal and title combine as §21.4
+        says: without a title the goal's first line is its title
+        (create("", goal, description)); with one, the goal's title is the title and the whole goal its description
+        (create(title, title + "\\n" + goal, description)), unless the goal's own title, as split_goal reads it,
+        already is the title (create(title, goal, description))."""
+        def text(key: str) -> str | None:
+            value = body.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ApiError("bad_request", f"'{key}' must be a string.")
+            return value
+
+        def flag(key: str) -> bool | None:
+            value = body.get(key)
+            if value is not None and not isinstance(value, bool):
+                raise ApiError("bad_request", f"'{key}' must be true or false.")
+            return value
+
+        def names(key: str, what: str) -> list[str]:
+            value = body.get(key)
+            if value is None:
+                return []
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ApiError("bad_request", f"'{key}' must be a list of {what}.")
+            return list(value)
+
+        goal = text("goal")
+        if goal is None or not goal.strip():
+            raise ApiError("bad_request", "'goal' is required: what the session is to achieve (its first line is the "
+                                          "title).")
+        title = text("title")
+        if title is not None and (not title.strip() or not _one_line(title) or len(title) > TITLE_LIMIT):
+            raise ApiError("bad_request", f"'title' must be one line with a character that is not a space, at most "
+                                          f"{TITLE_LIMIT} characters.")
+        if title is not None and _hidden_chars(title):
+            raise ApiError("bad_request", "'title' cannot hold control characters (a tab, an escape sequence) or "
+                                          "invisible format characters.")
+        if title is None and _hidden_chars(split_goal(goal)[0]):
+            raise ApiError("bad_request", "The first line of 'goal' is the session's title: it cannot hold control "
+                                          "characters (an escape sequence) or invisible format characters.")
+        description = text("description") or ""
+        answers = body.get("answers")
+        answers = API_GIVEN["answers"] if answers is None else answers
+        if answers not in API_ANSWERS:
+            raise ApiError("bad_request", f"'answers' must be one of {', '.join(API_ANSWERS)}.")
+        if flag("clarify") and answers != "manual":
+            raise ApiError("bad_request", "'clarify': true needs 'answers': \"manual\": the planner's questions wait "
+                                          "for the client's answers (GET /api/v1/sessions/{id}/requests).")
+        stop_when_done = flag("stop_when_done")
+        client_ref = text("client_ref")
+        if client_ref is not None and (not client_ref or len(client_ref) > CLIENT_REF_MAX
+                                       or not client_ref.isprintable()):
+            raise ApiError("bad_request", f"'client_ref' must be 1 to {CLIENT_REF_MAX} printable characters.")
+        files = names("files", f"upload tokens from POST {API_UPLOAD_PATH}")
+        if len(files) > FILES_PER_SESSION:
+            raise ApiError("bad_request", f"'files' takes at most {FILES_PER_SESSION} uploads.")
+        skills = names("skills", "library skill names")
+        if title is None:
+            title, goal_text = "", goal
+        elif " ".join(title.split()) == split_goal(goal)[0]:
+            goal_text = goal
+        else:
+            goal_text = f"{title}\n{goal}"
+        return cls(title=title, goal=goal_text, description=description, answers=answers,
+                   stop_when_done=API_GIVEN["stop_when_done"] if stop_when_done is None else stop_when_done,
+                   client_ref=client_ref, files=files, skills=skills)
+
+
+def skill_refs(names: list[str], config: "Config") -> list[str]:
+    """The skills a create names (docs/SPEC.md §21.4 `skills`) as references `create` takes: `library:<name>`, or
+    `host-library:<name>` for one only the host library has (the Docker sandbox); never a bare name (it would also
+    search ~/.claude/skills) nor a source. 400 `unknown_skill` for a name that is no skill name (skills.NAME_RE) or in
+    neither library, `bad_request` past `[skills] max_attached`. Blocking (it reads the libraries)."""
+    unique = list(dict.fromkeys(names))
+    if len(unique) > config.skills.max_attached:
+        raise ApiError("bad_request", f"At most {config.skills.max_attached} skills can be attached to a session "
+                                      "([skills] max_attached).")
+    library, host = Library.from_config(config), Library.host(config)
+    refs = []
+    for name in unique:
+        if len(name) <= NAME_MAX and NAME_RE.fullmatch(name):
+            if library.path(name) is not None:
+                refs.append(f"library:{name}")
+                continue
+            if host is not None and host.path(name) is not None:
+                refs.append(f"host-library:{name}")
+                continue
+        raise ApiError("unknown_skill", f"No skill {_shown(name)} in the library: GET /api/v1/options lists the "
+                                        "skills a session can take.")
+    return refs
+
+
+def query_flag(value: str | None, name: str) -> bool:
+    """A true/false query field: "true" or "false", nothing else (400 `bad_request`); absent is false."""
+    if value is None:
+        return False
+    if value not in ("true", "false"):
+        raise ApiError("bad_request", f"'{name}' must be true or false.")
+    return value == "true"
+
+
+def query_count(value: str | None, name: str, default: int, most: int) -> int:
+    """A whole number from 1 to `most` given in a query (400 `bad_request` otherwise); absent is `default`."""
+    if value is None:
+        return default
+    if not (value.isascii() and value.isdigit()) or not 1 <= int(value) <= most:
+        raise ApiError("bad_request", f"'{name}' must be a whole number from 1 to {most}.")
+    return int(value)
+
+
+async def claim_uploads(uploads: Uploads, tokens: list[str], caller: str) -> list[Source]:
+    """`uploads.claim_many(tokens, caller=caller)` in a thread that a cancellation never leaves holding claims: a
+    cancel waits for the claims to end and gives back what they took (docs/SPEC.md §21.3 "Life": nothing stays
+    claimed after the create)."""
+    work = asyncio.ensure_future(asyncio.to_thread(uploads.claim_many, tokens, caller=caller))
+    try:
+        return await asyncio.shield(work)
+    except asyncio.CancelledError:
+        while not work.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({work})
+        if not work.cancelled() and work.exception() is None:
+            uploads.settle(work.result(), used=False)
+        raise
+
+
+@dataclass
+class _Ref:
+    """A create in flight that holds its client_ref (docs/SPEC.md §21.4 `client_ref`): a retry with the same body
+    waits for `done`, one with another body is 409 at once."""
+    digest: str
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 Handler = Callable[[Request, str], Awaitable[Response]]
 
 
@@ -251,8 +498,17 @@ class ApiV1:
         self.manager = manager
         self.host = host
         self._tasks: set[asyncio.Task] = set()
-        self.closing = False
-        routes = [self._route("/api/v1/options", {"GET": self._options})]
+        self.closing = False    # aclose() runs: no new create starts
+        self._closed = False    # aclose() ended: nothing more is spawned (manager.shutdown() may run)
+        self._reserved = 0      # creates past the max_running check whose session is not marked starting yet
+        self._refs: dict[str, _Ref] = {}   # the client_refs of the creates in flight
+        routes = [
+            self._route("/api/v1/options", {"GET": self._options}),
+            self._route(API_UPLOAD_PATH, {"POST": self._upload}),
+            self._route("/api/v1/sessions", {"GET": self._list, "POST": self._create}),
+            self._route("/api/v1/sessions/{id}", {"GET": self._get, "DELETE": self._delete}),
+            self._route("/api/v1/sessions/{id}/stop", {"POST": self._stop}),
+        ]
         self.app = Starlette(routes=routes, exception_handlers={HTTPException: self._http_error})
         self.app.router.redirect_slashes = False
 
@@ -279,8 +535,8 @@ class ApiV1:
             return await handler(request, caller)
         except ApiError as exc:
             return exc.response()
-        except CODED_ERRORS as exc:
-            return await self.error_response(exc, caller)
+        except CODED_ERRORS as exc:   # (the session the route resolved, if any: its folders are named in the text)
+            return await self.error_response(exc, caller, request.scope.get(API_SID))
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 - every answer under /api/v1 is JSON
@@ -305,26 +561,62 @@ class ApiV1:
         """An error text for the API caller (docs/SPEC.md §21.1 "Paths in answers"): a path below a root of
         `[api] folders` as `<root>/<path>`, the user's home as "~", the home, and with `sid` that session's folders, by
         their names, a path in another session's folder as SessionManager.OTHER_SESSION (SessionManager._public_text),
-        any other absolute path by its last component. Blocking (it resolves the roots, which may lie on a network
-        share, and reads the session's files): a route calls it through error_response, in a thread."""
-        return self.manager._public_text(sid, text, named=root_pairs(self.manager.config))
+        any other absolute path by its last component. A route of v1 the text names (_ROUTE: "GET /api/v1/options")
+        is kept as it is. Blocking (it resolves the roots, which may lie on a network share, and reads the session's
+        files): a route calls it through error_response, in a thread."""
+        routes: list[str] = []
+        marker = "APIROUTE"
+        while marker in text:
+            marker += "X"
+
+        def keep(match: re.Match) -> str:
+            routes.append(match.group(0))
+            return f"{marker}{len(routes) - 1}{marker}"
+
+        def back(match: re.Match) -> str:   # (a folder name the redaction put in may spell a marker too)
+            number = int(match.group(1))
+            return routes[number] if number < len(routes) else match.group(0)
+
+        public = self.manager._public_text(sid, _ROUTE.sub(keep, text), named=root_pairs(self.manager.config))
+        return re.sub(f"{marker}([0-9]+){marker}", back, public) if routes else public
 
     async def error_response(self, exc: BaseException, caller: str, sid: str | None = None) -> JSONResponse:
         """One of CODED_ERRORS as `{"error", "code"}` (error_code); for the API caller its text through redact(), in a
         thread, so that a root on an unplugged share never stalls the hub. An `internal` one is logged, with its
-        traceback unless it is the 503 of a hub shutting down (no fault of anyone's)."""
+        traceback unless it is the 503 of a hub shutting down (no fault of anyone's). `sid`: the session the route
+        is about (its folders are named by their names). `folder_busy` is v1's own text, whoever calls: the manager's
+        names the other session's folder, so its title; the answer's `session` names that session's id when the
+        caller sees it (docs/SPEC.md §21.10 "One folder, one session")."""
         code = error_code(exc)
         if code == "internal":
             if getattr(exc, "status", None) == 503:
                 log.info("API v1: %s", exc)
             else:
                 log.error("API v1: %s", exc, exc_info=exc)
+        if code == "folder_busy":
+            holder = getattr(exc, "holder", None)
+            uid = await asyncio.to_thread(self._uid_for, holder, caller) if isinstance(holder, str) else None
+            return fail(code, FOLDER_BUSY_TEXT, **({"session": uid} if uid else {}))
         text = str(exc)
         return fail(code, await asyncio.to_thread(self.redact, text, sid) if caller == "api" else text)
 
+    def _uid_for(self, sid: str, caller: str) -> str | None:
+        """The uid of session `sid` when `caller` sees it (resolve's scope), else None. Blocking (session.json)."""
+        try:
+            meta = self.manager.meta(sid)
+        except SessionError:
+            return None
+        uid = session_uid(meta)
+        return uid if uid is not None and (caller == "owner" or api_meta(meta) is not None) else None
+
     def spawn(self, coro: Coroutine[Any, Any, Any], *, name: str) -> asyncio.Task:
         """A background task of a route (a session's start after its create or `continue`), which aclose() waits for
-        and never cancels; its failure is logged."""
+        and never cancels; its failure is logged. Once aclose() has ended nothing more is spawned (the manager's
+        shutdown may be running, and nobody would wait for the task): SessionError 503, and `coro` is closed, so the
+        route gives back what it reserved for it (a create's start mark)."""
+        if self._closed:
+            coro.close()
+            raise SessionError(SHUTTING_DOWN_TEXT, 503)
         task = asyncio.get_running_loop().create_task(coro, name=name)
         self._tasks.add(task)
         task.add_done_callback(self._task_done)
@@ -343,19 +635,186 @@ class ApiV1:
         waits for. A cancel of aclose() itself leaves the tasks running too: launcher.serve_launcher, cancelled
         (Ctrl+C), gives the server GRACEFUL_SECONDS + 3 seconds before it cancels it, lifespan and this wait included,
         so the bound is then the smaller of the two. A task spawned while this waits is waited for too, up to the
-        deadline."""
+        deadline; none is spawned once it has ended (spawn). While it runs no new create starts (503)."""
         self.closing = True
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + START_WAIT
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + START_WAIT
+            while True:
+                pending = {task for task in self._tasks if not task.done()}
+                left = deadline - loop.time()
+                if not pending or left <= 0:
+                    break
+                await asyncio.wait(pending, timeout=left)
+            if pending:
+                log.warning("API v1: %d background task(s) still running at shutdown: the session manager waits for "
+                            "them", len(pending))
+        finally:
+            self._closed = True
+
+    # ---- sessions: the one resolver, the summary ------------------------------------------------------------------
+    def resolve(self, uid: Any, caller: str) -> str | None:
+        """The folder name of the session `{id}` names for `caller` (docs/SPEC.md §21.2 `{id}`), else None: the uid of
+        a session (sid_of_uid: never the legacy main session, never a deleted one whose folder number came back), and
+        for the API caller one created through v1 (§21.1 "Scope"). A long poll or a stream calls it again at every
+        pass. Blocking (session.json)."""
+        sid = self.manager.sid_of_uid(uid)
+        if sid is None or sid == LEGACY_ID:
+            return None
+        if caller == "owner":
+            return sid
+        try:
+            return sid if api_meta(self.manager.meta(sid)) is not None else None
+        except SessionError:
+            return None
+
+    def _session(self, request: Request, caller: str) -> str:
+        """The session of a route's `{id}` (resolve), else 404 `not_found`; kept in the scope, so an error text of the
+        route names its folders by their names (error_response)."""
+        sid = self.resolve(request.path_params.get("id"), caller)
+        if sid is None:
+            raise ApiError("not_found", NO_SESSION_TEXT)
+        request.scope[API_SID] = sid
+        return sid
+
+    def board_url(self, sid: str) -> str | None:
+        """The board of the session for people (docs/SPEC.md §21.7): the hub's address + /s/<name>/, only when the hub
+        knows its public address (DREAMTEAM_PUBLIC_URL, or a loopback bind); manager.hub_url alone says nothing (it is
+        set for a 0.0.0.0 bind too)."""
+        base = self.manager.hub_url
+        if not base or not (os.environ.get(PUBLIC_URL_ENV, "").strip() or _loopback_bind(self.host)):
+            return None
+        return f"{base.rstrip('/')}/s/{sid}/"
+
+    def summary(self, sid: str) -> dict[str, Any]:
+        """A session as v1 shows it (docs/SPEC.md §21.7 "Summary"), for any caller: never an absolute path (no `dir`,
+        `workspace` or `copied_from` of the board's summary, whose figures it takes). SessionError 404 for a session
+        that is gone. Blocking (it reads session.json and the database), as the board's summary."""
+        manager = self.manager
+        meta = manager.meta(sid)
+        board = manager.summary(sid)
+        api = api_meta(meta)
+        running = sid in manager.running
+        goal = board.get("goal")
+        stats_goal = goal if isinstance(goal, dict) else None
+        agents = (board.get("agents") or {}).get("total", 0)
+
+        def blocking() -> bool:   # (a request that cannot be read blocks nothing, as the summary's count skips it)
+            swarm = manager.swarms.get(sid)
+            if swarm is None:
+                return False
+            try:
+                return bool(blocking_requests(requests_of(swarm)))
+            except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError) as exc:
+                log.debug("API v1: cannot read the requests of session %s: %s", sid, exc)
+                return False
+
+        state = state_of(
+            starting=sid in manager.starting or sid in manager.resume_pending,
+            earlier=bool(board.get("earlier_version")),
+            failed=bool(api and api.get("start_error")),
+            never_started=(api.get("started_at") is None) if api is not None else (not running and not agents),
+            done=(stats_goal or {}).get("status") == "done",
+            budget=bool(board.get("paused")) and board.get("pause_reason") == "budget",
+            running=running, paused=bool(board.get("paused")), blocking=blocking)
+        folder = api.get("folder") if api is not None else None
+        return {
+            "id": session_uid(meta), "name": sid, "title": board.get("title") or sid, "state": state,
+            "final": manager.is_final(sid), "error": _error_text(api),
+            "goal": {key: stats_goal.get(key, "") for key in ("title", "description", "status", "summary")}
+            if stats_goal is not None else None,
+            "language": board.get("language"), "model": board.get("model_profile"),
+            "cost_usd": float(board.get("spent_usd") or 0.0), "max_cost_usd": board.get("max_cost_usd"),
+            "max_agents": board.get("max_agents"), "created_at": meta.get("created_at"),
+            "started_at": api.get("started_at") if api is not None else None,
+            "finished_at": api.get("finished_at") if api is not None else None,
+            "agents": agents, "tasks": dict((board.get("tasks") or {}).get("by_status") or {}),
+            "requests": board.get("requests", 0),
+            "answers": api_answers(api) if api is not None else None,
+            "stop_when_done": api.get("stop_when_done", API_GIVEN["stop_when_done"]) if api is not None else None,
+            "client_ref": api.get("client_ref") if api is not None else None,
+            "via": board.get("via"), "folder": folder if isinstance(folder, dict) else None,
+            "board_url": self.board_url(sid), "earlier_version": bool(board.get("earlier_version")),
+        }
+
+    def running_count(self) -> int:
+        """How many sessions created through v1 run or start now (docs/SPEC.md §21.4 `[api] max_running`): running,
+        `starting` (a create or a `continue`) or about to be resumed, whoever started them, plus the creates past the
+        check whose session is not marked yet."""
+        busy = self.manager.running | self.manager.starting | self.manager.resume_pending
+        return len(busy & set(self.manager.api_sids())) + self._reserved
+
+    def _check_running(self, config: "Config") -> None:
+        """429 `too_many_sessions` when `[api] max_running` (0: no limit) sessions of v1 run or start already. The
+        caller reserves its place right after, with no await between."""
+        limit = config.api.max_running
+        count = self.running_count() if limit else 0
+        if limit and count >= limit:
+            raise ApiError("too_many_sessions", f"{count} sessions of the API run or start already ([api] max_running "
+                                                f"= {limit}): wait for one to end, or stop one.")
+
+    def _stored_ref(self, ref: str) -> tuple[str, Any] | None:
+        """(sid, request_digest) of the v1 session created with client_ref `ref`, else None: the manager's index
+        (SessionManager.sid_of_client_ref), then that one session.json. Every caller sees such a session (it was made
+        through v1: §21.1 "Scope"). On the loop, with no await: a create in flight cannot finish between this read and
+        the reservation that follows it."""
+        sid = self.manager.sid_of_client_ref(ref)
+        if sid is None:
+            return None
+        try:
+            api = api_meta(self.manager.meta(sid))
+        except SessionError:
+            return None
+        return (sid, api.get("request_digest")) if api is not None and api.get("client_ref") == ref else None
+
+    def _never_started(self, sid: str, exc: BaseException) -> None:
+        """A created session whose start could not be spawned (the hub stopped: spawn's 503) records it as a failed
+        start (`api.start_error`, `api.finished_at`; state `failed`, so a repeat of its client_ref says why), before
+        its mark goes. Only while no operation holds the session's lock (a read-modify-write of session.json), with no
+        await between that check and the write; the error is logged, never raised (_api_write)."""
+        if isinstance(exc, SessionError) and not self.manager._lock(sid).locked():
+            self.manager._api_write(sid, start_error={"code": "internal", "text": str(exc)}, finished_at=time.time())
+
+    async def _hold_ref(self, ref: str, digest: str) -> tuple[dict[str, Any] | None, _Ref | None]:
+        """A create's `client_ref` (docs/SPEC.md §21.4): (the summary of the session it already made, None) for a
+        repeat, which creates nothing; (None, the reservation this create now holds) otherwise. A create with the
+        same client_ref in flight: the same body waits for it, then is a repeat or goes on when it failed; another
+        body is 409 `conflict` at once, and so is a stored session of another body."""
+        conflict = (f"client_ref {_shown(ref)} names another job: a session was created with it from another "
+                    "request body.")
         while True:
-            pending = {task for task in self._tasks if not task.done()}
-            left = deadline - loop.time()
-            if not pending or left <= 0:
-                break
-            await asyncio.wait(pending, timeout=left)
-        if pending:
-            log.warning("API v1: %d background task(s) still running at shutdown: the session manager waits for them",
-                        len(pending))
+            held = self._refs.get(ref)
+            if held is not None:
+                if held.digest != digest:
+                    raise ApiError("conflict", conflict)
+                await held.done.wait()
+                continue
+            stored = self._stored_ref(ref)
+            if stored is None:
+                mine = self._refs[ref] = _Ref(digest)
+                return None, mine
+            sid, stored_digest = stored
+            if stored_digest != digest:
+                raise ApiError("conflict", conflict)
+            try:
+                return self.summary(sid), None
+            except SessionError as exc:
+                if exc.status != 404:
+                    raise
+                # (deleted meanwhile: look again)
+
+    async def _start_later(self, sid: str, mark: object) -> None:
+        """A created session's start in the background (docs/SPEC.md §21.4 "Order" 11): nothing when a stop or a
+        delete came first (start(marked=...)). A refused or failed start is recorded in its `api.start_error` (state
+        `failed`), and a failed `swarm.start()` was logged by the manager with its traceback: logged here at info
+        only, any other exception with its traceback (the manager records a failed check before `swarm.start()`
+        without logging it)."""
+        try:
+            await self.manager.start(sid, via="api", marked=mark)
+        except SessionError as exc:
+            log.info("API v1: session %s did not start: %s", sid, exc)
+        except Exception as exc:  # noqa: BLE001 - recorded in api.start_error; never an error log of its own
+            log.info("API v1: session %s did not start: %s: %s", sid, type(exc).__name__, exc, exc_info=exc)
 
     # ---- routes ---------------------------------------------------------------------------------------------------
     async def _options(self, request: Request, caller: str) -> Response:
@@ -365,7 +824,140 @@ class ApiV1:
         skills = await asyncio.to_thread(library_skills, config)
         return JSONResponse(options_view(config, skills))
 
+    async def _upload(self, request: Request, caller: str) -> Response:
+        """POST /api/v1/uploads?filename=<name>[&unpack=true] (docs/SPEC.md §21.3): the raw body kept as one file of
+        this caller's for an hour, in v1's own store, under `[workspace] copy_max_mb` and `[api] uploads_pending`."""
+        query = query_fields(request, ("filename", "unpack"))
+        unpack = query_flag(query.get("unpack"), "unpack")
+        kind = request.headers.get("content-type", "").split(";")[0].strip().lower()
+        if kind not in UPLOAD_TYPES:   # (the guard says so too; this holds wherever the app is mounted)
+            raise ApiError("unsupported_media_type", f"Content-Type must be {' or '.join(UPLOAD_TYPES)}.")
+        config = self.manager.global_config()   # (a hand edit of the limits is picked up)
+        try:
+            data = await self.manager.api_uploads.receive(
+                request.stream(), filename=query.get("filename"), length=request.headers.get("content-length"),
+                limits=CopyLimits.from_config(config), kind="file", unpack=unpack,
+                max_pending=config.api.uploads_pending, caller=caller)
+        except ClientDisconnect:   # (receive removed the partial file already)
+            raise ApiError("bad_request", "The upload was interrupted.") from None
+        return JSONResponse(data, status_code=201)
 
-__all__ = ["API_VERSION", "CODED_ERRORS", "CODES", "FILES_PER_SESSION", "JSON_MAX", "START_WAIT", "STATUS_CODES",
-           "ApiError", "ApiV1", "check_fields", "error_code", "fail", "library_skills", "options_view", "query_fields",
-           "read_json", "root_pairs"]
+    async def _list(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions?state=&limit= (docs/SPEC.md §21.2): the sessions the caller sees, newest first by
+        created_at; `state` keeps those in that state (§21.7)."""
+        query = query_fields(request, ("state", "limit"))
+        state = query.get("state")
+        if state is not None and state not in STATES:
+            raise ApiError("bad_request", f"'state' must be one of {', '.join(STATES)}.")
+        limit = query_count(query.get("limit"), "limit", SESSIONS_DEFAULT, SESSIONS_MAX)
+        manager = self.manager
+        sids = manager.api_sids() if caller == "api" else [sid for sid in manager.ids() if sid != LEGACY_ID]
+        dated = []
+        for sid in sids:
+            try:
+                created = manager.meta(sid).get("created_at")
+            except SessionError:   # (gone meanwhile, or damaged: no uid to name it by)
+                continue
+            dated.append((created if isinstance(created, (int, float)) and not isinstance(created, bool) else 0.0,
+                          sid))
+        found: list[dict[str, Any]] = []
+        for _created, sid in sorted(dated, reverse=True):
+            try:
+                item = self.summary(sid)
+            except SessionError as exc:
+                log.debug("API v1: session %s is not listed: %s", sid, exc)
+                continue
+            except Exception:  # noqa: BLE001 - one broken session must not break the list (as manager.list())
+                log.exception("API v1: cannot summarize session %s: it is not listed", sid)
+                continue
+            if item["id"] is not None and (state is None or item["state"] == state):
+                found.append(item)
+                if len(found) >= limit:
+                    break
+        return JSONResponse({"sessions": found})
+
+    async def _create(self, request: Request, caller: str) -> Response:
+        """POST /api/v1/sessions (docs/SPEC.md §21.4), in the order of §21.4 "Order", so that a refused create costs
+        nothing: the body; client_ref; the overrides; the skills; the uploads checked; max_running checked and
+        reserved; the uploads claimed; manager.create(start=False, mark=...); the claims settled; 202, the start in
+        the background (spawn). 200 with the existing session for a repeated client_ref."""
+        if self.closing:
+            raise SessionError(SHUTTING_DOWN_TEXT, 503)
+        query_fields(request)
+        body = await read_json(request)
+        check_fields(body, CREATE_FIELDS)
+        ask = CreateRequest.parse(body)
+        digest = request_digest(body)
+        held: _Ref | None = None
+        if ask.client_ref is not None:
+            repeat, held = await self._hold_ref(ask.client_ref, digest)
+            if repeat is not None:
+                return JSONResponse({"session": repeat})
+        try:
+            manager = self.manager
+            config = manager.global_config()
+            overrides = manager.validated_overrides(overrides_from(body, config, strict=True))
+            skills = await asyncio.to_thread(skill_refs, ask.skills, config) if ask.skills else []
+            uploads = manager.api_uploads
+            if ask.files:   # every token checked, none claimed yet: a refusal here uses nothing up
+                await asyncio.to_thread(uploads.peek_many, ask.files, caller=caller)
+            self._check_running(config)
+            self._reserved += 1   # (no await since the check)
+            try:
+                sources = await claim_uploads(uploads, ask.files, caller) if ask.files else []
+                mark = object()
+                created = False
+                try:
+                    made = await manager.create(
+                        ask.title, ask.goal, ask.description, overrides=overrides, start=False, via="api",
+                        skills=skills or None, sources=sources or None, mark=mark,
+                        api={"answers": ask.answers, "stop_when_done": ask.stop_when_done,
+                             "client_ref": ask.client_ref, "request_digest": digest})
+                    created = True
+                finally:   # (synchronous: any outcome settles every claim, docs/SPEC.md §21.3 "Life")
+                    uploads.settle(sources, used=created)
+            finally:
+                self._reserved -= 1   # (the session is `starting` now, with its mark)
+            sid = made["id"]
+            try:
+                self.spawn(self._start_later(sid, mark), name=f"api-start-{sid}")
+            except BaseException as exc:
+                self._never_started(sid, exc)
+                manager.unmark_starting(sid, mark)
+                raise
+            return JSONResponse({"session": self.summary(sid)}, status_code=202)
+        finally:
+            if held is not None:
+                self._refs.pop(ask.client_ref, None)
+                held.done.set()
+
+    async def _get(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}: its summary."""
+        query_fields(request)
+        return JSONResponse({"session": self.summary(self._session(request, caller))})
+
+    async def _stop(self, request: Request, caller: str) -> Response:
+        """POST /api/v1/sessions/{id}/stop (docs/SPEC.md §21.2): manager.stop(reason="user"), its background jobs with
+        it; a body-less JSON POST (any field is unknown). 409 `earlier_version` for a session of an earlier version."""
+        query_fields(request)
+        check_fields(await read_json(request), ())
+        sid = self._session(request, caller)
+        await self.manager.stop(sid, reason="user")
+        return JSONResponse({"session": self.summary(sid)})
+
+    async def _delete(self, request: Request, caller: str) -> Response:
+        """DELETE /api/v1/sessions/{id}?confirm={id} (docs/SPEC.md §21.2): manager.delete(skills="discard"), the
+        session's folder with it."""
+        query = query_fields(request, ("confirm",))
+        sid = self._session(request, caller)
+        if query.get("confirm") != request.path_params.get("id"):
+            raise ApiError("bad_request", "Deleting a session takes ?confirm=<its id>.")
+        await self.manager.delete(sid, skills="discard", via="api")
+        return JSONResponse({"ok": True})
+
+
+__all__ = ["API_SID", "API_VERSION", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CREATE_FIELDS", "FILES_PER_SESSION",
+           "FOLDER_BUSY_TEXT", "JSON_MAX", "SESSIONS_DEFAULT", "SESSIONS_MAX", "START_WAIT", "STATES", "STATUS_CODES",
+           "UPLOAD_TYPES", "ApiError", "ApiV1", "CreateRequest", "check_fields", "claim_uploads", "error_code", "fail",
+           "library_skills", "options_view", "query_count", "query_fields", "query_flag", "read_json",
+           "request_digest", "root_pairs", "skill_refs", "state_of"]

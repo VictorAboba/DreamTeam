@@ -139,12 +139,16 @@ class SessionError(ValueError):
     `folder_not_ready`, `conflict`, a CopyError's `bad_name` or `file_conflict`); None otherwise. The internal
     routes do not show it. v1 answers a code with that code's own status (§21.1), which may differ from `status`:
     `folder_not_ready` is 409 there, also for the two refusals of a create that are 400 here (a folder inside a
-    repository, a repository's own database)."""
+    repository, a repository's own database). `holder`: the session whose folder it is (`folder_busy`), which v1
+    names, by its uid, only to a caller who sees that session (docs/SPEC.md §21.10); never in the internal answers
+    either."""
 
-    def __init__(self, message: str, status: int = 400, *, code: str | None = None, **extra: Any):
+    def __init__(self, message: str, status: int = 400, *, code: str | None = None, holder: str | None = None,
+                 **extra: Any):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.holder = holder
         self.extra = extra
 
 
@@ -978,9 +982,10 @@ class SessionManager:
         # scheduled while shutdown() runs (`_closing`): the resume check at the next start handles those jobs
         self._stopping: set[asyncio.Task] = set()
         self._closing = False
-        # uid -> sid of every session, and the sids of the v1 sessions (sid_of_uid, api_sids), with the sessions
-        # folder's mtime and the session folders they were read from; None: read again at the next use
-        self._index: tuple[int | None, frozenset[str], dict[str, str], list[str]] | None = None
+        # uid -> sid of every session, the sids of the v1 sessions and client_ref -> sid of those (sid_of_uid,
+        # api_sids, sid_of_client_ref), with the sessions folder's mtime and the session folders they were read from;
+        # None: read again at the next use
+        self._index: tuple[int | None, frozenset[str], dict[str, str], list[str], dict[str, str]] | None = None
         # zips the sessions page uploads for a new session's copy (POST /api/uploads, copy_from_upload)
         self.uploads = Uploads(self.home / ".dreamteam" / UPLOADS_DIR)
         # the files of the HTTP API v1 (POST /api/v1/uploads, docs/SPEC.md §21.3): a root of their own, so a token
@@ -1611,7 +1616,7 @@ class SessionManager:
                 how = "is the folder" if _same_path(target, folder) else \
                     ("is inside the folder" if _within(target, folder) else "contains the folder")
                 raise SessionError(f"{target} {how} of session {other} ({folder}); two sessions cannot share files.",
-                                   409, code=FOLDER_BUSY)
+                                   409, code=FOLDER_BUSY, holder=other)
         if target.exists() and not target.is_dir():
             raise SessionError(f"{target} is a file, not a folder.")
         if target.is_dir():
@@ -1861,27 +1866,29 @@ class SessionManager:
         except OSError:
             return None
 
-    def _uid_index(self, *, recount: bool = False) -> tuple[dict[str, str], list[str]]:
-        """(uid -> sid, the sids of the v1 sessions), read from every session.json once and kept until a session
-        comes or goes: here (_changed "created" / "deleted", an import's rewrite) or in another process (the sessions
-        folder's mtime). `recount`: also compare the session folders (ids(): no session.json is read) with those it
-        was read from, for a uid it does not know and for api_sids(): another process makes a session's folder before
-        it writes its session.json, which changes no mtime of the sessions folder. A uid two sessions share (a folder
-        copied by hand) names neither: a v1 id must never reach another job. The legacy main session has no uid; a
-        damaged session.json is left out."""
+    def _uid_index(self, *, recount: bool = False) -> tuple[dict[str, str], list[str], dict[str, str]]:
+        """(uid -> sid, the sids of the v1 sessions, client_ref -> sid of those: the first by name when two share
+        one), read from every session.json once and kept until a session comes or goes: here (_changed "created" /
+        "deleted", an import's rewrite) or in another process (the sessions folder's mtime). `recount`: also compare
+        the session folders (ids(): no session.json is read) with those it was read from, for a uid it does not know
+        and for api_sids(): another process makes a session's folder before it writes its session.json, which
+        changes no mtime of the sessions folder. A uid two sessions share (a folder copied by hand) names neither: a
+        v1 id must never reach another job. The legacy main session has no uid; a damaged session.json is left
+        out."""
         stamp = self._sessions_stamp()
         index = self._index
         ids: frozenset[str] | None = None
         if index is not None and index[0] == stamp:
             if not recount:
-                return index[2], index[3]
+                return index[2], index[3], index[4]
             ids = frozenset(self.ids()) - {LEGACY_ID}
             if ids == index[1]:
-                return index[2], index[3]
+                return index[2], index[3], index[4]
         if ids is None:
             ids = frozenset(self.ids()) - {LEGACY_ID}
         owners: dict[str, list[str]] = {}
         made_by_api: list[str] = []
+        refs: dict[str, str] = {}
         for sid in sorted(ids):
             try:
                 meta = self.meta(sid)
@@ -1890,16 +1897,19 @@ class SessionManager:
             uid = session_uid(meta)
             if uid is not None:
                 owners.setdefault(uid, []).append(sid)
-            if api_meta(meta) is not None:
+            api = api_meta(meta)
+            if api is not None:
                 made_by_api.append(sid)
+                if isinstance(api.get("client_ref"), str):
+                    refs.setdefault(api["client_ref"], sid)
         by_uid = {}
         for uid, sids in owners.items():
             if len(sids) == 1:
                 by_uid[uid] = sids[0]
             else:
                 log.warning("sessions %s share the uid %s: the HTTP API reaches neither", ", ".join(sids), uid)
-        self._index = (stamp, ids, by_uid, made_by_api)
-        return by_uid, made_by_api
+        self._index = (stamp, ids, by_uid, made_by_api, refs)
+        return by_uid, made_by_api, refs
 
     def _has_uid(self, sid: str, uid: str) -> bool:
         try:
@@ -1931,6 +1941,27 @@ class SessionManager:
         when the session folders changed since it was read. One deleted meanwhile by another process may still be
         named; its summary then says it is unknown (404)."""
         return list(self._uid_index(recount=True)[1])
+
+    def sid_of_client_ref(self, ref: Any) -> str | None:
+        """The folder name of the v1 session created with client_ref `ref` (docs/SPEC.md §21.4), else None, from the
+        index (_uid_index, read again when the session folders changed since: no session.json read per session at
+        each create), its answer checked against the session.json it names and read again once when that changed
+        behind it. A client_ref never changes after the create."""
+        if not isinstance(ref, str):
+            return None
+        sid = self._uid_index(recount=True)[2].get(ref)
+        if sid is None or self._has_client_ref(sid, ref):
+            return sid
+        self._index = None
+        sid = self._uid_index()[2].get(ref)
+        return sid if sid is not None and self._has_client_ref(sid, ref) else None
+
+    def _has_client_ref(self, sid: str, ref: str) -> bool:
+        try:
+            api = api_meta(self.meta(sid)) if self.exists(sid) else None
+        except SessionError:
+            return False
+        return api is not None and api.get("client_ref") == ref
 
     def earlier_version(self, sid: str) -> bool:
         """The session is not loaded and its database was made by an earlier version of DreamTeam (§17.2): this one
@@ -3108,6 +3139,7 @@ class SessionManager:
         """The error of a workspace change that failed; the code of a SessionError that caused it (a folder another
         session took meanwhile: `folder_busy`) is kept, unless files could not be put back (500)."""
         code = exc.code if isinstance(exc, SessionError) else None
+        holder = exc.holder if isinstance(exc, SessionError) else None
         if isinstance(exc, SessionError):
             reason = str(exc)
         elif isinstance(exc, OSError) and exc.strerror:
@@ -3122,7 +3154,7 @@ class SessionManager:
                     "Remove it by hand.", 500)
             return SessionError(f"Could not create the session in {plan.target} ({reason}); the session was not "
                                 "created and the folder is as it was.",
-                                exc.status if isinstance(exc, SessionError) else 500, code=code)
+                                exc.status if isinstance(exc, SessionError) else 500, code=code, holder=holder)
         if problems:
             return SessionError(
                 f"Could not change the folder of session {sid} to {plan.target} ({reason}), and some files could "
@@ -3134,7 +3166,8 @@ class SessionManager:
         return SessionError(
             f"Could not change the folder of session {sid} to {plan.target} ({reason})"
             + ("; a file is in use: close the programs that use it and try again" if in_use else "")
-            + f". Nothing was changed: the session still works in {plan.old}.", status, code=code)
+            + f". Nothing was changed: the session still works in {plan.old}.", status, code=code,
+            holder=holder)
 
     async def delete(self, sid: str, *, skills: str | None = None, via: str = "home") -> str | None:
         """Stop the session and delete its directory (board, messages, workspace, traces). The directory is
