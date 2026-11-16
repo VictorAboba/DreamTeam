@@ -39,15 +39,19 @@ from .config import _joins_text, native_absolute
 from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads
 from .goal_text import split_goal
 from .httpjson import JSONResponse
+from .instruct import continue_step
+from .mailbox import MAX_TEXT
+from .models import USER, ToolError
 from .sessionopts import OptionError, overrides_from
 from .sessions import API_ANSWERS, API_GIVEN, LEGACY_ID, TITLE_LIMIT, SessionError, api_answers, api_meta, session_uid
 from .skills import NAME_MAX, NAME_RE, Library, SkillError
 from .uitext import LANGS
-from .web import API_CALLER, API_CALLERS, API_TOKEN_TEXT, BEARER_REALM, PUBLIC_URL_ENV, _loopback_bind
+from .web import API_CALLER, API_CALLERS, API_TOKEN_TEXT, BEARER_REALM, JSON_TYPE_TEXT, PUBLIC_URL_ENV, _loopback_bind
 
 if TYPE_CHECKING:
     from .config import Config
     from .sessions import SessionManager
+    from .swarm import Swarm
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +70,11 @@ STATES = ("starting", "failed", "created", "done", "budget", "waiting", "paused"
 # the fields of POST /api/v1/sessions (docs/SPEC.md §21.4); `folder` comes with the server folders (§21.10)
 CREATE_FIELDS = ("goal", "title", "description", "language", "team", "model", "start_agents", "max_agents",
                  "max_cost_usd", "network", "files", "skills", "answers", "clarify", "stop_when_done", "client_ref")
+PATCH_FIELDS = ("max_cost_usd", "max_agents", "wrap_up")   # PATCH /api/v1/sessions/{id} (docs/SPEC.md §21.2)
+CONTINUE_FIELDS = ("text",)                                # POST /api/v1/sessions/{id}/continue
 SHUTTING_DOWN_TEXT = "DreamTeam is shutting down."
+# a continue's `api.error` when its start started nothing: a stop sent after it took the session's lock first
+NOT_DELIVERED_TEXT = "The session stopped before the text of a continue reached it: send the text again."
 NO_SESSION_TEXT = "No such session: GET /api/v1/sessions lists the sessions this token sees."
 # v1's own text of `folder_busy` (docs/SPEC.md §21.10): the manager's names the other session's folder, so its title
 FOLDER_BUSY_TEXT = ("Another session works in this folder, in a folder inside it or in one containing it, or is being "
@@ -463,6 +471,36 @@ def query_count(value: str | None, name: str, default: int, most: int) -> int:
     return int(value)
 
 
+def check_json_type(request: Request) -> None:
+    """415 `unsupported_media_type` unless the request says `Content-Type: application/json` (parameters such as a
+    charset aside): PATCH checks its type itself, since the guard's 415 rule covers POST only (docs/SPEC.md §21.1
+    "Format"). A body-less one sends it too."""
+    kind = request.headers.get("content-type", "").split(";")[0].strip().lower()
+    if kind != "application/json":
+        raise ApiError("unsupported_media_type", f"{JSON_TYPE_TEXT}.")
+
+
+def continue_text(body: Mapping[str, Any]) -> str:
+    """The `text` of a `continue` (docs/SPEC.md §21.2) without the whitespace around it, as every action that takes
+    it stores it (Mailbox.send strips a message, split_goal a goal; reopen_goal would keep it): a string with a
+    character that is not whitespace, at most MAX_TEXT characters so (the most a message holds: the text may become
+    one); 400 `bad_request` otherwise."""
+    text = body.get("text")
+    if not isinstance(text, str) or not text.strip():
+        raise ApiError("bad_request", "'text' is required: the next instruction for the session (its goal when it "
+                                      "has none, the answer to a pending question, else a message to the team).")
+    text = text.strip()
+    if len(text) > MAX_TEXT:
+        raise ApiError("bad_request", f"'text' takes at most {MAX_TEXT} characters.")
+    return text
+
+
+def budget_text(spent: float, limit: float) -> str:
+    """The text of `budget_exhausted` (docs/SPEC.md §21.2 `continue`)."""
+    return (f"The session's budget is spent (${spent:.2f} of ${limit:.2f}): raise max_cost_usd with "
+            "PATCH /api/v1/sessions/{id} first.")
+
+
 async def claim_uploads(uploads: Uploads, tokens: list[str], caller: str) -> list[Source]:
     """`uploads.claim_many(tokens, caller=caller)` in a thread that a cancellation never leaves holding claims: a
     cancel waits for the claims to end and gives back what they took (docs/SPEC.md §21.3 "Life": nothing stays
@@ -506,7 +544,8 @@ class ApiV1:
             self._route("/api/v1/options", {"GET": self._options}),
             self._route(API_UPLOAD_PATH, {"POST": self._upload}),
             self._route("/api/v1/sessions", {"GET": self._list, "POST": self._create}),
-            self._route("/api/v1/sessions/{id}", {"GET": self._get, "DELETE": self._delete}),
+            self._route("/api/v1/sessions/{id}", {"GET": self._get, "PATCH": self._patch, "DELETE": self._delete}),
+            self._route("/api/v1/sessions/{id}/continue", {"POST": self._continue}),
             self._route("/api/v1/sessions/{id}/stop", {"POST": self._stop}),
         ]
         self.app = Starlette(routes=routes, exception_handlers={HTTPException: self._http_error})
@@ -803,18 +842,104 @@ class ApiV1:
                     raise
                 # (deleted meanwhile: look again)
 
+    @staticmethod
+    def _no_start(sid: str, exc: Exception) -> None:
+        """A start in the background that raised: it is recorded in the session's `api.start_error` (state `failed`)
+        by the manager, which logged a failed `swarm.start()` with its traceback: logged here at info only, any other
+        exception with its traceback (the manager records a failed check before `swarm.start()` without logging it)."""
+        if isinstance(exc, SessionError):
+            log.info("API v1: session %s did not start: %s", sid, exc)
+        else:
+            log.info("API v1: session %s did not start: %s: %s", sid, type(exc).__name__, exc, exc_info=exc)
+
     async def _start_later(self, sid: str, mark: object) -> None:
         """A created session's start in the background (docs/SPEC.md §21.4 "Order" 11): nothing when a stop or a
-        delete came first (start(marked=...)). A refused or failed start is recorded in its `api.start_error` (state
-        `failed`), and a failed `swarm.start()` was logged by the manager with its traceback: logged here at info
-        only, any other exception with its traceback (the manager records a failed check before `swarm.start()`
-        without logging it)."""
+        delete came first (start(marked=...)); a refused or failed start is recorded in its `api.start_error`
+        (_no_start)."""
         try:
             await self.manager.start(sid, via="api", marked=mark)
-        except SessionError as exc:
-            log.info("API v1: session %s did not start: %s", sid, exc)
         except Exception as exc:  # noqa: BLE001 - recorded in api.start_error; never an error log of its own
-            log.info("API v1: session %s did not start: %s: %s", sid, type(exc).__name__, exc, exc_info=exc)
+            self._no_start(sid, exc)
+
+    async def _continue_later(self, sid: str, uid: str | None, mark: object, text: str) -> None:
+        """A `continue` of a session that does not run, in the background (docs/SPEC.md §21.2): its own start
+        (start(marked=...), a no-op when another start in flight had the session running first), which gives the text
+        under the same hold of the lock (_deliver_recorded as manager.start's `then`). A start that fails shows its own
+        error (`api.start_error`); one that started nothing (a stop or a delete sent after this `continue` took the
+        lock first) leaves `not_running` (_not_delivered)."""
+        try:
+            swarm = await self.manager.start(sid, via="api", marked=mark,
+                                             then=lambda swarm: self._deliver_recorded(sid, swarm, text))
+        except Exception as exc:  # noqa: BLE001 - recorded in api.start_error; never an error log of its own
+            self._no_start(sid, exc)
+            return
+        if swarm is None:
+            await self._not_delivered(sid, uid)
+
+    async def _not_delivered(self, sid: str, uid: str | None) -> None:
+        """A `continue` whose start started nothing: its text never reached the session, which its `api.error` says
+        (`not_running`, NOT_DELIVERED_TEXT) under the session's lock; nothing when the session is gone, or when the
+        folder name is another session's now (a delete gives the folder number to the next one: `uid` tells them
+        apart)."""
+        async with self.manager._lock(sid):
+            try:
+                same = session_uid(self.manager.meta(sid)) == uid
+            except SessionError:
+                return
+            if same:
+                self._record_error(sid, "not_running", NOT_DELIVERED_TEXT)
+
+    # ---- continue: the text delivered (docs/SPEC.md §21.2) ---------------------------------------------------------
+    def _deliver(self, sid: str, swarm: "Swarm", text: str) -> None:
+        """A `continue`'s text given to the running session, as the user, in process, the session's lock held (the
+        caller's): what instruct.continue_step decides from swarm.snapshot(), as `dreamteam -p -r` does with its
+        prompt (the goal set when there is none, a completed goal reopened with the text as the comment, a pending
+        question answered with a message to the asker, else a message to the coordinator or "all"), then a resume
+        when the user paused the session or a budget pause the budget now covers holds. 409 `budget_exhausted`
+        before anything is given while the budget is spent; 409 `conflict` for what the swarm refuses (a ToolError).
+        A delivery that succeeds clears the session's `api.error` (a failed one of an earlier `continue`)."""
+        if swarm.budget_exceeded():
+            raise ApiError("budget_exhausted", budget_text(swarm.spent_usd(), swarm.limits()["max_cost_usd"]))
+        step = continue_step(swarm.snapshot())
+        try:
+            if step.action == "set_goal":
+                swarm.set_goal(USER, text)
+            elif step.action == "reopen_goal":
+                swarm.reopen_goal(USER, text)
+            else:   # (to the asker of a pending question: Mailbox.send makes it the answer, which ends the pause)
+                swarm.mail.send(USER, [step.to], text)
+            if step.resume or (swarm.paused and swarm.pause_reason == "budget"):
+                swarm.resume(USER)
+        except ToolError as exc:
+            raise ApiError("conflict", str(exc)) from None
+        try:
+            failed = (api_meta(self.manager.meta(sid)) or {}).get("error")
+        except SessionError:
+            failed = None
+        if failed:
+            self.manager._api_write(sid, error=None)
+
+    def _record_error(self, sid: str, code: str, text: str) -> None:
+        """A `continue` whose text did not reach the session after a start: `api.error` {code, text}, shown in the
+        summary's `error` (docs/SPEC.md §21.4 session.json), logged at information. The caller holds the session's
+        lock (a read-modify-write of session.json); nothing for a session not made through v1, which has no `api`."""
+        log.info("API v1: the text of a continue did not reach session %s: %s", sid, text)
+        self.manager._api_write(sid, error={"code": code, "text": text})
+
+    def _deliver_recorded(self, sid: str, swarm: "Swarm", text: str) -> None:
+        """_deliver right after a `continue`'s start (manager.start's `then`, the session's lock held), never raising:
+        a refusal becomes the session's `api.error` with its code (a manager error's text through _public_text, as a
+        start's error), any other exception `internal`, logged with its traceback."""
+        try:
+            self._deliver(sid, swarm, text)
+        except ApiError as exc:
+            self._record_error(sid, exc.code, exc.text)
+        except CODED_ERRORS as exc:
+            self._record_error(sid, error_code(exc), self.manager._public_text(sid, str(exc)))
+        except Exception as exc:  # noqa: BLE001 - recorded in api.error; the session runs on
+            log.exception("API v1: could not give the text of a continue to session %s", sid)
+            self._record_error(sid, "internal", f"Internal error ({type(exc).__name__}): the hub's log has the "
+                                                "details.")
 
     # ---- routes ---------------------------------------------------------------------------------------------------
     async def _options(self, request: Request, caller: str) -> Response:
@@ -936,6 +1061,72 @@ class ApiV1:
         query_fields(request)
         return JSONResponse({"session": self.summary(self._session(request, caller))})
 
+    async def _patch(self, request: Request, caller: str) -> Response:
+        """PATCH /api/v1/sessions/{id} {max_cost_usd?, max_agents?, wrap_up?} (docs/SPEC.md §21.2): what
+        `swarm_control` does with them, as the user (manager.control, under the session's lock; a stopped session is
+        loaded to write them into its database, then unloaded again). Its own 415 first: the guard's covers POST
+        only. A field that is null is not given. 400 for a value of the wrong kind or one the swarm refuses, 409
+        `conflict` for `wrap_up: true` before the first start, `earlier_version` for a session of an earlier
+        version."""
+        check_json_type(request)
+        query_fields(request)
+        body = await read_json(request)
+        check_fields(body, PATCH_FIELDS)
+        sid = self._session(request, caller)
+        await self.manager.control(sid, max_cost_usd=body.get("max_cost_usd"), max_agents=body.get("max_agents"),
+                                   wrap_up=body.get("wrap_up"))
+        return JSONResponse({"session": self.summary(sid)})
+
+    async def _continue(self, request: Request, caller: str) -> Response:
+        """POST /api/v1/sessions/{id}/continue {"text"} (docs/SPEC.md §21.2): the session's next instruction, as
+        `dreamteam -p -r <id> "<text>"` gives its prompt (_deliver). The summary answers, whatever the path:
+        - running: the text is given at once, under the session's lock (409 `budget_exhausted` or `conflict` when it
+          cannot be, nothing given); a session that stopped while this request waited for the lock is taken as one
+          that does not run (below);
+        - not running (stopped, `starting`: a create or another `continue` in flight, or about to be resumed as the
+          hub starts): 503 while the hub stops; then, with no await between, `[api] max_running` for a session made
+          through v1 that holds no place in it yet (429), the budget (409 `budget_exhausted` while it is spent: raise
+          it with PATCH first), the session marked `starting` with a mark of this request's own, and its start in the
+          background (_continue_later), which gives the text under the same hold of the lock (manager.start's
+          `then`): queued on the lock in the order the requests came, behind a start in flight (then a no-op), before
+          a stop sent after it, and after a stop sent before it (which leaves this mark alone).
+        In the background a text that cannot be given is the session's `api.error` (its summary's `error`): what the
+        swarm refuses, a spent budget, or `not_running` when a stop sent after it took the lock first; a start that
+        fails shows its own error instead. 409 `earlier_version` for a session of an earlier version."""
+        query_fields(request)
+        body = await read_json(request)
+        check_fields(body, CONTINUE_FIELDS)
+        text = continue_text(body)
+        sid = self._session(request, caller)
+        manager = self.manager
+        manager._refuse_earlier(sid)
+        if sid in manager.running:
+            delivered = False
+            async with manager._lock(sid):
+                swarm = manager.swarms.get(sid)
+                if sid in manager.running and swarm is not None:   # (else stopped meanwhile: as a stopped one, below)
+                    self._deliver(sid, swarm, text)
+                    delivered = True
+            if delivered:
+                return JSONResponse({"session": self.summary(sid)})
+        if self.closing:
+            raise SessionError(SHUTTING_DOWN_TEXT, 503)
+        meta = manager.meta(sid)
+        held = sid in manager.starting or sid in manager.resume_pending   # (its place in max_running is held already)
+        if api_meta(meta) is not None and not held:
+            self._check_running(manager.global_config())
+        board = manager.summary(sid)
+        limit, spent = float(board.get("max_cost_usd") or 0.0), float(board.get("spent_usd") or 0.0)
+        if limit > 0 and spent >= limit:
+            raise ApiError("budget_exhausted", budget_text(spent, limit))
+        mark = manager.mark_starting(sid)   # (no await since the checks: max_running counts it from here)
+        try:
+            self.spawn(self._continue_later(sid, session_uid(meta), mark, text), name=f"api-continue-{sid}")
+        except BaseException:
+            manager.unmark_starting(sid, mark)
+            raise
+        return JSONResponse({"session": self.summary(sid)})
+
     async def _stop(self, request: Request, caller: str) -> Response:
         """POST /api/v1/sessions/{id}/stop (docs/SPEC.md §21.2): manager.stop(reason="user"), its background jobs with
         it; a body-less JSON POST (any field is unknown). 409 `earlier_version` for a session of an earlier version."""
@@ -956,8 +1147,9 @@ class ApiV1:
         return JSONResponse({"ok": True})
 
 
-__all__ = ["API_SID", "API_VERSION", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CREATE_FIELDS", "FILES_PER_SESSION",
-           "FOLDER_BUSY_TEXT", "JSON_MAX", "SESSIONS_DEFAULT", "SESSIONS_MAX", "START_WAIT", "STATES", "STATUS_CODES",
-           "UPLOAD_TYPES", "ApiError", "ApiV1", "CreateRequest", "check_fields", "claim_uploads", "error_code", "fail",
-           "library_skills", "options_view", "query_count", "query_fields", "query_flag", "read_json",
-           "request_digest", "root_pairs", "skill_refs", "state_of"]
+__all__ = ["API_SID", "API_VERSION", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS",
+           "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "JSON_MAX", "NOT_DELIVERED_TEXT", "PATCH_FIELDS",
+           "SESSIONS_DEFAULT", "SESSIONS_MAX", "START_WAIT", "STATES", "STATUS_CODES", "UPLOAD_TYPES", "ApiError",
+           "ApiV1", "CreateRequest", "budget_text", "check_fields", "check_json_type", "claim_uploads", "continue_text",
+           "error_code", "fail", "library_skills", "options_view", "query_count", "query_fields", "query_flag",
+           "read_json", "request_digest", "root_pairs", "skill_refs", "state_of"]

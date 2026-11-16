@@ -236,6 +236,15 @@ async def test_the_guards_refusals_on_v1_are_json_with_their_codes(hub_token, ap
     assert (await _ask(guard, headers={**API_BEARER, "origin": "https://127.0.0.1:8765"}))[0] == 200
     assert (await _ask(guard, method="POST", headers={**API_BEARER, **JSON}))[0] == 200
     assert (await _ask(guard, method="PATCH", headers=API_BEARER))[0] == 200   # (PATCH: the handler checks the type)
+    # on v1 exactly application/json (a charset aside), as the PATCH handler checks it; off v1 the rule of before
+    for kind, on_v1 in (("Application/JSON; charset=utf-8", 200), ("application/jsonx", 415),
+                        ("application/json-seq", 415)):
+        got, _, body = await _ask(guard, method="POST", headers={**API_BEARER, "content-type": kind})
+        assert got == on_v1, kind
+        if got == 415:
+            assert _json(body) == {"error": web.JSON_TYPE_TEXT, "code": "unsupported_media_type"}
+        assert (await _ask(guard, method="POST", path="/api/state", headers={**BEARER, "content-type": kind}))[0] \
+            == 200, kind
 
 
 async def test_both_upload_types_pass_the_guard_on_v1_only(tmp_path, hub_token, api_token):

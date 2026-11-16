@@ -4181,7 +4181,7 @@ settings; ValueError when they are invalid):
   workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None, api=None,
   sources=None, mark=None)`, `validated_overrides(overrides)`,
   `async load(sid)`, `async start(sid, *, skills=None,
-  via="home", auto_reply=False, marked=None)`, `mark_starting(sid, mark=None)`, `unmark_starting(sid, mark)`,
+  via="home", auto_reply=False, marked=None, then=None)`, `mark_starting(sid, mark=None)`, `unmark_starting(sid, mark)`,
   `async stop(sid, *, remember=False, reason="user")`, `async unload_idle(sid)`, `async control(sid, *,
   max_cost_usd=None, max_agents=None, wrap_up=None)`, `update(sid, *, title=None,
   overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`,
@@ -4221,14 +4221,22 @@ settings; ValueError when they are invalid):
     mark=None)` adds one (a new object unless the caller gives one), puts the session in `starting`, pokes its
     waiters and returns the mark; `unmark_starting(sid, mark)` takes that mark away (the session leaves `starting`
     with its last mark). `start(sid, marked=mark)` starts the session only while its mark is there, checked again
-    under the session's lock (None otherwise: a stop or a delete that held the lock while it waited is never undone),
+    under the session's lock (None otherwise: a delete, or a stop asked after the mark was placed, that held the lock
+    while it waited is never undone),
     and takes its own mark away when it ends, whatever its outcome, never another start's (a second caller's, or a
-    new session's that got the folder name of a deleted one). `stop()` (without `remember`) and `delete()` take every
-    mark of the session away, as they take it out of `resume_pending`. `create(..., start=True)` marks the new
+    new session's that got the folder name of a deleted one). `delete()` takes every mark of the session away, and
+    `stop()` (without `remember`) the marks placed before it was called (read before its first await), as they take
+    it out of `resume_pending`: a start announced after the stop (a v1 `continue` sent after it) keeps its mark and
+    starts the session again once the stop is over, whether the stop held the lock already or not, so requests
+    keep their order. `create(..., start=True)` marks the new
     session before it announces the `created` change and starts it with that mark; `create(..., start=False,
     mark=m)` puts the caller's mark `m` on it at the same point and the caller starts it later with
     `start(sid, marked=m)` (a v1 create or `continue` that starts a session in the background, which answers in
     between); a create that fails after marking takes its mark away.
+  - `start(sid, ..., then=fn)` calls `fn(swarm)` with the running Swarm once the start succeeded (also when the
+    session ran already), still under the session's lock, so nothing that waits for the lock (a stop sent meanwhile,
+    a `stop_when_done` stop) comes between the start and it: v1's `continue` gives its text there (§21.2). It is
+    synchronous; an error it raises is logged and the start stands. Nothing is called when nothing started.
   - `resume_pending`: the sessions resume() will try. `plan_resume()` chooses them by their autostart mark alone
     (session.json reads, no log line: the launcher calls it before its port opens) and fills the set;
     `cancel_resume()` drops the plan when resume() does not run. resume() uses the plan (else chooses now) and
@@ -6829,7 +6837,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 - **Format.** JSON bodies and answers (`httpjson.JSONResponse`), except uploads (the raw body) and file downloads (raw
   bytes). Every POST and PATCH under `/api/v1` sends `Content-Type: application/json`, a body-less one (`/stop`) too,
   except uploads (21.3), which take their own two types and no JSON. The guard's 415 rule covers every POST under
-  `/api/` but not PATCH, so the PATCH handler checks the type itself (415 `unsupported_media_type`). A JSON body is
+  `/api/` but not PATCH, so the PATCH handler checks the type itself (415 `unsupported_media_type`). Both take
+  exactly `application/json`, parameters such as a charset aside (`application/jsonx` is 415); off v1 the guard keeps
+  its rule of before, any type that starts with `application/json` (`web.GuardMiddleware._wrong_type`). A JSON body is
   read up to 1 MiB (413 `too_large` beyond it, before any byte is read when the Content-Length says more; the
   launcher's own body helper has no bound): an empty body is `{}`, and a body that is not a JSON object, or holds
   `NaN` or `Infinity`, or a number that overflows to it (`1e999`: `httpjson` could never write it back), is 400
@@ -6922,20 +6932,45 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   that never started is 409 `conflict`, because the
   goal set at the first start ends wrap-up mode. A `continue` that reopens a done goal ends it too. A `max_cost_usd`
   that covers what was spent lifts a budget pause. A value the swarm refuses (`max_agents` below 1, a negative cost)
-  is 400 `bad_request`.
-- **`continue`** does what `dreamteam -p -r <id> "<text>"` does with its prompt (`instruct.continue_step`, shared with
-  `-p`): without a goal the text becomes the goal; a completed goal is reopened with the text as the comment; a
-  pending question is answered by it (a message to the asker); otherwise it is a message to the coordinator (the
-  planning task's assignee, else the first AI member, else `"all"`). A session paused by the user is resumed as well.
-  A budget pause is lifted only when the budget now covers what was spent; otherwise 409 `budget_exhausted` (raise it
-  with PATCH first). A stopped session is checked first, against `[api] max_running` when it was created through v1
-  (429) and against its budget (409), then marked `starting` (`mark_starting`), and started in the background
-  (`start(sid, marked=...)`, nothing when a stop or a delete came first), which then delivers the text in process; a
-  delivery that fails after the start is recorded as `api.error` and shown in the summary's `error`. A running
-  session gets the text at once. A session already `starting` (a create or another `continue` in flight) holds its
-  place in `max_running` and is neither checked nor counted again: the text waits for that start and is then
-  delivered as to a running session. When that start fails, the text is not delivered, and the summary shows the
-  start's error.
+  is 400 `bad_request`. Its checks come in this order: the type (415 `unsupported_media_type` unless the
+  `Content-Type` is `application/json`, parameters such as a charset aside: `api_v1.check_json_type`), the query and
+  the body's fields (`unknown_field`; `api_v1.PATCH_FIELDS`), then the session. A field that is `null` is not given;
+  nothing given changes nothing.
+- **`continue`** does what `dreamteam -p -r <id> "<text>"` does with its prompt (`instruct.continue_step` on
+  `swarm.snapshot()`, shared with `-p`): without a goal the text becomes the goal; a completed goal is reopened with
+  the text as the comment; a pending question is answered by it (a message to the asker, which `Mailbox.send` makes
+  the answer: it ends the pause); otherwise it is a message to the coordinator (the planning task's assignee, else the
+  first AI member, else `"all"`). A session paused by the user is resumed as well. A budget pause is lifted only when
+  the budget now covers what was spent; while it is spent the answer is 409 `budget_exhausted` and nothing is given
+  (raise it with PATCH first). `text` is a string with a character that is not whitespace, the body's only field
+  (400 `bad_request`, `unknown_field`); the whitespace around it is dropped (`api_v1.continue_text`: a message and a
+  goal drop it anyway, a reopened goal's comment would keep it), and what is left takes at most 50 000 characters
+  (`mailbox.MAX_TEXT`: it may become a message). It is given in process, as the user (`ApiV1._deliver`: `set_goal`,
+  `reopen_goal`, `mail.send`, `resume`), always under the session's lock; what the swarm refuses (a ToolError) is
+  409 `conflict`. The answer is 200 with the summary, by the session's state:
+  - running: the text is given at once (the refusals above are the answer's, nothing given); a session that stops
+    while the request waits for its lock is taken as one that does not run (below).
+  - not running: stopped, `starting` (a create or another `continue` in flight), or about to be resumed as the hub
+    starts (`resume_pending`). While the hub stops (`ApiV1.aclose()` runs) 503, answered 500 `internal`, nothing
+    started. Then, with no await between: `[api] max_running` when it was created through v1 and holds no place in
+    it yet (429 `too_many_sessions`, whoever calls; a session `starting` or about to be resumed counts already, once,
+    and is not checked), its budget (the summary's limit and spent: 409 `budget_exhausted`), and a start mark of
+    this request's own (`mark_starting`). The session is then started in the background (`ApiV1._continue_later`:
+    `start(sid, marked=..., then=...)`), and its `then` gives the text under the same hold of the lock as the start.
+    The starts queue on the session's lock in the order the requests came. Behind a start in flight this one is a
+    no-op once the session runs, so the texts of several `continue`s are given in order; when that start failed,
+    this one tries again, as a `continue` of a failed session does, and gives the text only when it succeeds. A stop
+    sent after the `continue` comes after its text. A stop sent before it, even one that holds the lock already
+    (unloading the session), leaves this mark alone (§17.2 `starting`), so the session runs again with the text.
+    The stop that `stop_when_done` schedules when the hub's resume finds a done job finds the goal reopened.
+  - A text given in the background that cannot be given is recorded as the session's `api.error` `{code, text}`
+    (`budget_exhausted`, `conflict`, a manager error's code with its text through `_public_text`, `internal` for
+    anything else, logged) and shown in the summary's `error`. So is `not_running` (`api_v1.NOT_DELIVERED_TEXT`) when
+    the start started nothing: a stop or a delete sent after the `continue` took the lock before its start did. That
+    is recorded only while the folder name is still the same session's (the uid read when the request came: a
+    delete gives the folder number to the next session). A start that fails shows its own error (`start_error`)
+    instead. The next text given clears it. A session not made through v1 has no `api` block: there it is only
+    logged.
 - **DELETE**: `confirm` must be the `{id}` (400 `bad_request` otherwise). `manager.delete(sid, skills="discard")`: the
   session folder goes with it (§18.1 DELETE), except a folder the session worked in in place (21.10), which is kept
   and named: `"folder_kept": {"root", "path"}`.
@@ -7144,7 +7179,8 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   start: the first commit of the copied files is in it and no agent commit is; null with git off or after a failed
   init. `started_at` is the first start; `finished_at` when the session last reached a final state (21.7), null
   again from each start that succeeds (the result's `duration_s` runs to it, or to now);
-  `start_error` the last start's failure; `error` a `continue` whose delivery failed (21.2). The sessions page shows
+  `start_error` the last start's failure; `error` {code, text} of a `continue` whose text could not be given after a
+  start (21.2), null again from the next text a `continue` gives. The sessions page shows
   such a session like any other, marked "API". `dreamteam -c` and `-p -c` never pick one (a busy client would
   otherwise make its own sessions the most recent ones); `-r <id>` opens it.
 - **`[api] max_running`** (default 3, 0 = no limit) counts the running and starting sessions created through v1. Only
@@ -7490,7 +7526,8 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - `api_v1.py`: `ApiV1(manager, host)`, with `.app` (21.1 "Dispatch"), the routes, the error mapping, the summary,
     state and result builders, and `aclose()`. It uses the manager and the session swarms in process, never the
     internal routes over HTTP. The launcher's lifespan awaits `aclose()` before `router.aclose()`. A route's
-    background work (a start after a create or a `continue`) runs as `ApiV1.spawn(coro, name=)`, and `aclose()` waits
+    background work (a start after a create or a `continue`, the latter giving its text) runs as
+    `ApiV1.spawn(coro, name=)`, and `aclose()` waits
     for what is in flight, a task spawned meanwhile included, at most `START_WAIT` (30 s), then leaves the rest to
     `manager.shutdown()`, which waits for the session locks; a cancel of `aclose()` leaves them running too. When
     `serve_launcher` is cancelled (Ctrl+C) it gives the server `GRACEFUL_SECONDS + 3` (6 s) before it cancels it,
@@ -7541,8 +7578,15 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     woken by a change of state, `final` never before `session.stopped`) and the stream (resumed by `Last-Event-ID`,
     across a stop and a start, its `result`, a final session behind a gap the filter empties ending with its result);
     `last_activity` unchanged by `session.*` events;
-  - `stop_when_done`; PATCH of a stopped session followed by its start; `continue` after a budget stop, and while a
-    create's start is in flight (counted once in `max_running`);
+  - `stop_when_done`; PATCH of a running session and of a stopped one followed by its start; `continue` after a
+    budget stop, and while a create's start is in flight (counted once in `max_running`, the texts given after it in
+    order, the start tried again when it fails); `continue` on a running session (the coordinator, a pending
+    question, a pause by the user or a budget that covers what was spent), on a done job, on a session without a
+    goal, during the hub's resume of a done job and before a stop sent after it; a stop, then a `continue` (the
+    session runs again with the text, whether the stop is unloading the session, waits for its lock, or waits behind
+    a create's start); a `continue` whose session is deleted before its start, the folder name taken by a new one
+    (nothing reaches that one); a text that cannot be given after the start (the summary's `error`, cleared by the
+    next one; `not_running` when a stop sent after it takes the lock first);
   - files and archive (path escapes, a link swapped in, `.git` at depth, `.scratch`, hard links, a name with `:`
     listed and served on POSIX and left out on Windows); `changed_files` with a hook in `.git/config` that must not
     run;

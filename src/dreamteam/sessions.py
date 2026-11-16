@@ -1076,10 +1076,10 @@ class SessionManager:
         """A start of `sid` is on its way (a create with start=True, a v1 create or `continue` that starts it in the
         background): the session is `starting` (docs/SPEC.md §21.7), so never seen final, until that start ends.
         Returns the mark (`mark`, else a new object): `start(sid, marked=mark)` starts the session only while the mark
-        is there and takes it away when it ends; unmark_starting(sid, mark) takes it away without a start. A stop or a
-        delete meanwhile takes every mark of the session away, and those starts then start nothing. Each start has its
-        own mark: one that ends never takes away another's (a second caller's, or a new session's that got the folder
-        name of a deleted one)."""
+        is there and takes it away when it ends; unmark_starting(sid, mark) takes it away without a start. A delete
+        meanwhile takes every mark of the session away, a stop the marks placed before it was asked (_stop), and those
+        starts then start nothing. Each start has its own mark: one that ends never takes away another's (a second
+        caller's, or a new session's that got the folder name of a deleted one)."""
         mark = object() if mark is None else mark
         self._marks.setdefault(sid, set()).add(mark)
         self.starting.add(sid)
@@ -1100,8 +1100,14 @@ class SessionManager:
     def _marked(self, sid: str, mark: object) -> bool:
         return mark in self._marks.get(sid, ())
 
-    def _drop_marks(self, sid: str) -> None:
-        """A stop or a delete: no start on its way starts the session any more (start(..., marked=...))."""
+    def _drop_marks(self, sid: str, marks: Iterable[object] | None = None) -> None:
+        """A delete (`marks` None: every mark) or a stop (`marks`: those placed before it was asked): those starts on
+        their way start nothing any more (start(..., marked=...)); the session leaves `starting` with its last mark."""
+        held = self._marks.get(sid)
+        if held is not None and marks is not None:
+            held.difference_update(marks)
+            if held:
+                return
         self._marks.pop(sid, None)
         self.starting.discard(sid)
 
@@ -2486,15 +2492,21 @@ class SessionManager:
             return self._load_locked(sid)
 
     async def start(self, sid: str, *, skills: list[str] | None = None, via: str = "home",
-                    auto_reply: bool = False, marked: object | None = None) -> "Swarm | None":
+                    auto_reply: bool = False, marked: object | None = None,
+                    then: Callable[["Swarm"], None] | None = None) -> "Swarm | None":
         """Start the session (a no-op when it runs). `skills`: references or sources, as `create` takes them,
         attached first: live to a running session, written into a stopped one before it starts (`via`: the surface,
         recorded in the library for a source). SessionError before anything changes when one of them cannot be.
         `auto_reply`: as `create` takes it (see _start_locked).
         `marked`: the mark of the start mark_starting announced. It starts nothing (None) when a stop or a delete
-        took the mark away meanwhile, which is checked again under the session's lock (as resume() does): a stop that
-        held the lock while this call waited is never undone. This mark (and no other) goes when this call ends,
-        whatever its outcome."""
+        took the mark away meanwhile, which is checked again under the session's lock (as resume() does): a delete, or
+        a stop asked after the mark was placed, that held the lock while this call waited is never undone (a stop
+        asked before leaves the mark alone: _stop). This mark (and no other) goes when this call ends,
+        whatever its outcome.
+        `then`: called with the running Swarm once the start succeeded (also when the session ran already), still
+        under the session's lock, so nothing that waits for the lock (a stop, the stop of stop_when_done) comes
+        between the start and it: the HTTP API v1's `continue` delivers its text there (docs/SPEC.md §21.2). It is
+        synchronous and should not raise; an error it raises is logged, and the start stands."""
         try:
             if marked is not None and not self._marked(sid, marked):
                 return None
@@ -2508,6 +2520,11 @@ class SessionManager:
                 swarm = await self._start_locked(sid, auto_reply=auto_reply)
                 if written:
                     swarm.skills.attached_again(written)
+                if then is not None:
+                    try:
+                        then(swarm)
+                    except Exception:
+                        log.exception("session %s: the step after its start failed", sid)
             self._changed(sid, "started")
             return swarm
         finally:
@@ -2709,8 +2726,10 @@ class SessionManager:
         server shutdown); an explicit stop clears the mark, and resume() no longer starts it. A session made by an
         earlier version is refused (409): it is never running, and its mark stays. `reason`: the `session.stopped`
         reason journaled when it was running (STOP_REQUEST_REASONS: "user" for a stop from any surface; "done" and
-        "budget" for stop_when_done); another one is a ValueError (the others are the manager's own). A start on its
-        way (mark_starting, resume_pending) that has not taken the lock yet then starts nothing."""
+        "budget" for stop_when_done); another one is a ValueError (the others are the manager's own). A start announced
+        before this call (mark_starting, resume_pending) that has not taken the lock yet then starts nothing; one
+        announced after it (a v1 `continue` sent after the stop) keeps its mark and starts the session again once
+        this stop is over: the requests keep their order, whenever the stop takes the lock."""
         if reason not in STOP_REQUEST_REASONS:
             raise ValueError(f"unknown stop reason {reason!r}")
         await self._stop(sid, remember=remember, reason=reason)
@@ -2724,6 +2743,7 @@ class SessionManager:
         again."""
         self._check(sid)
         self._refuse_earlier(sid)
+        earlier = set(self._marks.get(sid, ()))   # (read before any await: the starts this stop was asked after)
         async with self._lock(sid):
             if still is not None and not still():
                 return False
@@ -2733,7 +2753,7 @@ class SessionManager:
                 if not remember:
                     if still is None:
                         self.resume_pending.discard(sid)
-                        self._drop_marks(sid)
+                        self._drop_marks(sid, earlier)
                     if self.exists(sid):
                         meta = self.meta(sid)
                         meta["autostart"] = False

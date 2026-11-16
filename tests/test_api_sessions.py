@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -576,7 +577,10 @@ async def test_a_create_start_is_starting_until_it_ends(tmp_path, monkeypatch):
         await manager.shutdown()
 
 
-async def test_a_stop_that_holds_the_lock_while_a_marked_start_waits_is_never_undone(tmp_path, monkeypatch):
+async def test_a_stop_takes_away_the_starts_announced_before_it_never_those_after(tmp_path, monkeypatch):
+    """A start announced before a stop was asked, waiting for the lock behind it, starts nothing: that stop is never
+    undone. One announced after it (a v1 `continue` sent after the stop), even while the stop holds the lock, keeps
+    its mark and starts the session again once the stop is over: the requests keep their order."""
     manager = _manager(_home(tmp_path))
     stopping, release = asyncio.Event(), asyncio.Event()
     real_stop = Swarm.stop
@@ -589,19 +593,25 @@ async def test_a_stop_that_holds_the_lock_while_a_marked_start_waits_is_never_un
     try:
         sid = (await manager.create("Calc", "Build a calculator", overrides=NO_GIT, api=AUTO))["id"]
         monkeypatch.setattr(Swarm, "stop", slow_stop)
+        before = manager.mark_starting(sid)   # a start on its way when the stop is asked
         stop = asyncio.ensure_future(manager.stop(sid))
         await asyncio.wait_for(stopping.wait(), 1)   # the stop holds the session's lock now
+        assert sid not in manager.running and sid in manager.starting
         with manager.watch(sid) as changed:
-            mark = manager.mark_starting(sid)   # a v1 `continue` starts it again meanwhile
-            assert changed.is_set() and sid in manager.starting
-        start = asyncio.ensure_future(manager.start(sid, marked=mark))
+            after = manager.mark_starting(sid)   # a v1 `continue` sent after the stop
+            assert changed.is_set()
+        early = asyncio.ensure_future(manager.start(sid, marked=before))
+        late = asyncio.ensure_future(manager.start(sid, marked=after))
         await asyncio.sleep(0.05)
-        assert not start.done() and not stop.done()
+        assert not early.done() and not late.done() and not stop.done()
         release.set()
         await asyncio.wait_for(stop, 1)
-        assert await asyncio.wait_for(start, 1) is None   # the stop took the mark: nothing started
-        assert sid not in manager.running and sid not in manager.starting and manager.is_final(sid)
-        assert stored(manager, sid)["autostart"] is False
+        assert await asyncio.wait_for(early, 1) is None   # the stop took its mark: nothing started
+        assert await asyncio.wait_for(late, 5) is manager.swarms[sid]   # started again, after the stop
+        assert sid in manager.running and sid not in manager.starting and not manager.is_final(sid)
+        runs = [row["type"] for row in manager.swarms[sid].db.all(
+            "SELECT type FROM events WHERE type LIKE 'session.%' ORDER BY id")]
+        assert runs == ["session.started", "session.stopped", "session.started"], runs
     finally:
         release.set()
         await manager.shutdown()
@@ -644,6 +654,36 @@ async def test_a_stop_or_a_delete_takes_every_mark_away_and_a_start_ends_its_own
         assert await manager.start(sid, marked=stale) is None   # the deleted session's start
         assert sid in manager.starting and sid not in manager.running   # did not take the new one's mark
         assert await manager.start(sid, marked=fresh) is manager.swarms[sid] and sid not in manager.starting
+    finally:
+        await manager.shutdown()
+
+
+async def test_start_then_runs_under_the_lock_with_the_running_swarm(tmp_path, caplog):
+    """start(then=...) calls `then` with the running Swarm while the start still holds the session's lock, also when
+    the session ran already; never when nothing started; an error it raises is logged and the start stands."""
+    manager = _manager(_home(tmp_path))
+    seen: list[tuple[Any, bool, bool]] = []
+
+    def then(swarm: Swarm) -> None:
+        seen.append((swarm, manager._lock(sid).locked(), sid in manager.running))
+
+    try:
+        sid = (await manager.create("Calc", "Build a calculator", overrides=NO_GIT, start=False, api=AUTO))["id"]
+        swarm = await manager.start(sid, then=then)
+        assert seen == [(swarm, True, True)]
+        assert await manager.start(sid, then=then) is swarm and seen[-1] == (swarm, True, True)   # (running already)
+        await manager.stop(sid)
+        mark = manager.mark_starting(sid)
+        await manager.stop(sid)
+        assert await manager.start(sid, marked=mark, then=then) is None and len(seen) == 2   # (nothing started)
+
+        def broken(swarm: Swarm) -> None:
+            raise RuntimeError("the step after")
+
+        with caplog.at_level(logging.ERROR):
+            swarm = await manager.start(sid, then=broken)
+        assert swarm is manager.swarms[sid] and sid in manager.running and not manager._lock(sid).locked()
+        assert any("the step after its start failed" in record.getMessage() for record in caplog.records)
     finally:
         await manager.shutdown()
 

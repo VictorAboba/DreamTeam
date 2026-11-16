@@ -1,8 +1,9 @@
 """The external HTTP API v1's sessions (docs/SPEC.md §21.2-§21.4, §21.7): uploads, create (the body's checks, the
 team, model and limits through sessionopts, the skills, the uploads with every token given back after a refusal, a
 5xx or a cancel, client_ref, max_running, the start in the background), the one resolver of `{id}` and the scope of
-the API token, the summary and its states, stop and DELETE. Every request goes through the launcher's app and its
-guard (create_launcher_app), on the test's own loop: no port, ScriptedLLM only."""
+the API token, the summary and its states, PATCH, continue (each path, and its order against stops), stop and DELETE.
+Every request goes through the launcher's app and its guard (create_launcher_app), on the test's own loop: no port,
+ScriptedLLM only."""
 
 from __future__ import annotations
 
@@ -13,21 +14,25 @@ import logging
 import os
 import sqlite3
 import threading
+import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
 from conftest import make_skill
-from dreamteam import api_v1, copyfrom, roles, sessionopts, web
+from dreamteam import api_v1, copyfrom, instruct, roles, sessionopts, web
 from dreamteam import sessions as sessions_module
 from dreamteam import settings as st
 from dreamteam.api_v1 import ApiV1, CreateRequest, ApiError, request_digest, state_of
 from dreamteam.config import Config
 from dreamteam.copyfrom import CopyError
+from dreamteam.db import reading_file
+from dreamteam.instruct import ContinueStep
 from dreamteam.launcher import create_launcher_app
 from dreamteam.llm.scripted import ScriptedLLM
+from dreamteam.mailbox import MAX_TEXT
 from dreamteam.models import USER, Status
 from dreamteam.sessionopts import OptionError, overrides_from
 from dreamteam.sessions import FOLDER_BUSY, SessionError, SessionManager, session_uid
@@ -78,8 +83,9 @@ class Hub:
                    token: str = API_TOKEN, content_type: str | None = None) -> tuple[int, Any]:
         headers = {"authorization": f"Bearer {token}"} if token else {}
         data = raw if raw is not None else (b"" if body is None else json.dumps(body).encode("utf-8"))
-        if method in ("POST", "PATCH"):
-            headers["content-type"] = content_type or "application/json"
+        kind = "application/json" if content_type is None else content_type   # ("": no Content-Type at all)
+        if method in ("POST", "PATCH") and kind:
+            headers["content-type"] = kind
         status, _, answer = await _ask(self.app, path=path, method=method, headers=headers, query=query, body=data,
                                        client=LOCAL)
         return status, (json.loads(answer.decode("utf-8")) if answer else None)
@@ -136,6 +142,29 @@ def _no_path(answer: Any, *paths: Path) -> None:
     for path in paths:
         for spelling in (str(path), path.as_posix(), json.dumps(str(path))[1:-1]):
             assert spelling not in text, spelling
+
+
+async def _until(condition: Callable[[], bool], what: str = "the condition", seconds: float = 5.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + seconds
+    while not condition():
+        if loop.time() > deadline:
+            raise AssertionError(f"never happened: {what}")
+        await asyncio.sleep(0.01)
+
+
+def _from_user(swarm: Swarm) -> list[tuple[list[str], str, Any]]:
+    """The user's messages of a loaded session: (recipients, text, reply_to), oldest first."""
+    return [(json.loads(row["recipients"]), row["text"], row["reply_to"])
+            for row in swarm.db.all("SELECT recipients, text, reply_to FROM messages WHERE sender = ? ORDER BY id",
+                                    (USER,))]
+
+
+def _running(hub: Hub, sid: str) -> bool:
+    return sid in hub.manager.running and hub.manager.swarms.get(sid) is not None
+
+
+MANUAL = {"answers": "manual", "stop_when_done": False}   # (a session that keeps running, nobody answering for it)
 
 
 # ---------------------------------------------------------------------------------------------- create and start
@@ -619,6 +648,8 @@ async def test_the_api_token_sees_only_the_sessions_of_v1(tmp_path, api_token, h
         status, answer = await hub.call("GET", "/api/v1/sessions")
         assert status == 200 and [s["id"] for s in answer["sessions"]] == [mine]
         for method, path, body in (("GET", f"/api/v1/sessions/{board_uid}", None),
+                                   ("PATCH", f"/api/v1/sessions/{board_uid}", {"max_agents": 2}),
+                                   ("POST", f"/api/v1/sessions/{board_uid}/continue", {"text": "Go on."}),
                                    ("POST", f"/api/v1/sessions/{board_uid}/stop", {}),
                                    ("DELETE", f"/api/v1/sessions/{board_uid}", None)):
             query = f"confirm={board_uid}" if method == "DELETE" else ""
@@ -671,6 +702,11 @@ async def test_a_session_of_an_earlier_version_is_listed_stopped_and_refused(tmp
         assert session["state"] == "stopped" and session["final"] is True
         status, answer = await hub.call("POST", f"/api/v1/sessions/{uid}/stop")
         assert status == 409 and answer["code"] == "earlier_version"
+        for method, path, body in (("PATCH", f"/api/v1/sessions/{uid}", {"max_agents": 2}),
+                                   ("POST", f"/api/v1/sessions/{uid}/continue", {"text": "Go on."})):
+            status, answer = await hub.call(method, path, body=body)
+            assert status == 409 and answer["code"] == "earlier_version", method
+        assert sid not in hub.manager.starting and sid not in hub.manager.swarms
         status, answer = await hub.call("DELETE", f"/api/v1/sessions/{uid}", query=f"confirm={uid}")
         assert status == 200 and hub.manager.ids() == []
     finally:
@@ -813,6 +849,522 @@ async def test_the_board_url_only_where_the_hub_knows_its_address(tmp_path, monk
         assert wide.summary(sid)["board_url"] == f"https://hub.example.org/s/{sid}/"
     finally:
         await manager.shutdown()
+
+
+# ---------------------------------------------------------------------------------------------- PATCH
+async def test_patch_changes_the_limits_and_wrap_up_of_a_running_session(tmp_path, api_token):
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        made = (await hub.create({"goal": "Write a haiku", **MANUAL}))[1]["session"]
+        await hub.settled()
+        path, swarm = f"/api/v1/sessions/{made['id']}", hub.manager.swarms[made["name"]]
+        status, answer = await hub.call("PATCH", path, body={"max_cost_usd": 2.5, "max_agents": 2, "wrap_up": True})
+        assert status == 200, answer
+        assert answer["session"]["max_cost_usd"] == 2.5 and answer["session"]["max_agents"] == 2
+        assert answer["session"]["state"] == "running"
+        assert swarm.limits() == {"max_cost_usd": 2.5, "max_agents": 2} and swarm.wrapping_up
+        events = [row["type"] for row in swarm.db.all("SELECT type FROM events ORDER BY id")]
+        assert "swarm.limits" in events and "swarm.wrap_up" in events
+        # null is not given; a charset may follow the type
+        status, answer = await hub.call("PATCH", path, body={"max_agents": None, "max_cost_usd": None,
+                                                             "wrap_up": False},
+                                        content_type="application/json; charset=utf-8")
+        assert status == 200 and answer["session"]["max_agents"] == 2 and not swarm.wrapping_up
+        assert (await hub.call("PATCH", path))[0] == 200   # (an empty body changes nothing)
+        for body, code in (({"max_agents": 0}, "bad_request"), ({"max_cost_usd": -1}, "bad_request"),
+                           ({"max_cost_usd": "5"}, "bad_request"), ({"max_agents": 2.5}, "bad_request"),
+                           ({"max_agents": True}, "bad_request"), ({"wrap_up": "yes"}, "bad_request"),
+                           ({"max_agents": 3, "colour": "red"}, "unknown_field")):
+            status, answer = await hub.call("PATCH", path, body=body)
+            assert status == 400 and answer["code"] == code, body
+        assert swarm.limits() == {"max_cost_usd": 2.5, "max_agents": 2}   # nothing written by a refusal
+        assert (await hub.call("PATCH", path, body={}, query="now=1"))[1]["code"] == "unknown_field"
+        for kind in ("text/plain", "", "application/jsonx"):   # (the guard's 415 covers POST only)
+            status, answer = await hub.call("PATCH", path, body={"max_agents": 3}, content_type=kind)
+            assert status == 415 and answer["code"] == "unsupported_media_type", kind
+        status, answer = await hub.call("PATCH", f"/api/v1/sessions/{UID}", body={"max_agents": 3})
+        assert status == 404 and answer["code"] == "not_found"
+        assert swarm.limits()["max_agents"] == 2
+    finally:
+        await hub.close()
+
+
+async def test_patch_of_a_stopped_session_writes_what_its_next_start_reads(tmp_path, api_token):
+    """A session that never started: wrap_up is 409 (its first start's goal would end it), the limits are written
+    into its database, which is unloaded again; `continue` starts it, and the limits hold."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        sid = (await hub.manager.create("Haiku", "Write a haiku", start=False, api=MANUAL))["id"]
+        path = f"/api/v1/sessions/{session_uid(hub.manager.meta(sid))}"
+        status, answer = await hub.call("PATCH", path, body={"wrap_up": True})
+        assert status == 409 and answer["code"] == "conflict"
+        status, answer = await hub.call("PATCH", path, body={"max_cost_usd": 3, "max_agents": 2})
+        assert status == 200 and answer["session"]["state"] == "created", answer
+        assert answer["session"]["max_cost_usd"] == 3.0 and answer["session"]["max_agents"] == 2
+        assert sid not in hub.manager.swarms   # (unloaded again: on Windows an open database blocks a delete)
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Start with the season."})
+        assert status == 200 and answer["session"]["state"] == "starting", answer
+        await hub.settled()
+        swarm = hub.manager.swarms[sid]
+        assert sid in hub.manager.running and swarm.limits() == {"max_cost_usd": 3.0, "max_agents": 2}
+        member = swarm.members()[0]["name"]
+        assert _from_user(swarm)[-1] == ([member], "Start with the season.", None)   # (to the coordinator)
+        assert (await hub.call("GET", path))[1]["session"]["state"] == "running"
+    finally:
+        await hub.close()
+
+
+# ---------------------------------------------------------------------------------------------- continue
+@pytest.mark.parametrize("body, query, code", [
+    ({}, "", "bad_request"),
+    ({"text": " \n "}, "", "bad_request"),
+    ({"text": 5}, "", "bad_request"),
+    ({"text": None}, "", "bad_request"),
+    ({"text": "x" * (MAX_TEXT + 1)}, "", "bad_request"),
+    ({"text": "Go on.", "to": ["all"]}, "", "unknown_field"),
+    ({"text": "Go on."}, "now=1", "unknown_field"),
+])
+async def test_a_continue_refused_by_its_body_changes_nothing(tmp_path, api_token, body, query, code):
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        sid = (await hub.manager.create("Haiku", "Write a haiku", start=False, api=MANUAL))["id"]
+        path = f"/api/v1/sessions/{session_uid(hub.manager.meta(sid))}/continue"
+        status, answer = await hub.call("POST", path, body=body, query=query)
+        assert status == 400 and answer["code"] == code, answer
+        assert sid not in hub.manager.starting and not hub.api._tasks and sid not in hub.manager.swarms
+    finally:
+        await hub.close()
+
+
+async def test_continue_gives_a_running_session_its_text_as_p_r_does(tmp_path, api_token, monkeypatch):
+    """A message to the coordinator; the answer to a pending question (a message to the asker that ends the
+    pause); a session paused by the user, or by a budget that covers what was spent, resumed; a spent budget and what
+    the swarm refuses are 409 with nothing given."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        made = (await hub.create({"goal": "Write a haiku", **MANUAL}))[1]["session"]
+        await hub.settled()
+        path, swarm = f"/api/v1/sessions/{made['id']}/continue", hub.manager.swarms[made["name"]]
+        member = swarm.members()[0]["name"]
+        status, answer = await hub.call("POST", path, body={"text": "Use the word 'cherry'."})
+        assert status == 200 and answer["session"]["state"] == "running", answer
+        assert _from_user(swarm)[-1] == ([member], "Use the word 'cherry'.", None)
+        asked = swarm.mail.send(member, [USER], "Which season?")
+        swarm.pause(member, "question", asker=member, message_id=asked["id"], since=time.time())
+        assert (await hub.call("GET", f"/api/v1/sessions/{made['id']}"))[1]["session"]["state"] == "waiting"
+        status, answer = await hub.call("POST", path, body={"text": "Spring."})
+        assert status == 200 and _from_user(swarm)[-1] == ([member], "Spring.", asked["id"])
+        assert not swarm.paused and answer["session"]["state"] == "running"
+        for reason in ("paused by the user", "budget"):   # (no budget set: it covers what was spent)
+            swarm.pause(USER, reason)
+            status, answer = await hub.call("POST", path, body={"text": f"Go on ({reason})."})
+            assert status == 200 and not swarm.paused and answer["session"]["state"] == "running", reason
+            assert _from_user(swarm)[-1] == ([member], f"Go on ({reason}).", None)   # (given, then resumed)
+        sent = len(_from_user(swarm))
+        swarm.set_limits(USER, max_cost_usd=1.0)
+        swarm.db.execute("UPDATE agents SET cost_usd = 2.0")
+        status, answer = await hub.call("POST", path, body={"text": "More."})
+        assert status == 409 and answer["code"] == "budget_exhausted" and "$2.00 of $1.00" in answer["error"]
+        swarm.set_limits(USER, max_cost_usd=0)
+        monkeypatch.setattr(api_v1, "continue_step", lambda state: ContinueStep("message", to="Nobody Here"))
+        status, answer = await hub.call("POST", path, body={"text": "More."})
+        assert status == 409 and answer["code"] == "conflict" and "Nobody Here" in answer["error"]
+        assert len(_from_user(swarm)) == sent and _running(hub, made["name"])
+    finally:
+        await hub.close()
+
+
+async def test_continue_reopens_the_goal_of_a_session_stop_when_done_stopped(tmp_path, api_token):
+    """A done job (stop_when_done) is started again by `continue`, its goal reopened with the text (the comment
+    without the whitespace around it) under the same lock hold as the start, so the job keeps running: the completion
+    that stopped it was the last run's."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        made = (await hub.create({"goal": "Write a limerick", "answers": "manual"}))[1]["session"]
+        await hub.settled()
+        sid, path = made["name"], f"/api/v1/sessions/{made['id']}"
+        hub.manager.swarms[sid].complete_goal(USER, "The limerick is written.")
+        await _until(lambda: hub.manager.is_final(sid), "the stop of the done job")
+        assert (await hub.call("GET", path))[1]["session"]["state"] == "done"
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "\n Make it rhyme better.\n"})
+        assert status == 200 and answer["session"]["state"] == "starting" and not answer["session"]["final"]
+        await hub.settled()
+        swarm = hub.manager.swarms[sid]
+        assert swarm.goal()["status"] == "active"
+        (row,) = swarm.db.all("SELECT data FROM events WHERE type = 'goal.reopened'")
+        assert json.loads(row["data"])["comment"] == "Make it rhyme better."
+        await asyncio.sleep(0.05)
+        while hub.manager._stopping:   # (none should be scheduled: the new run's watcher saw no completion)
+            await asyncio.gather(*list(hub.manager._stopping), return_exceptions=True)
+        status, answer = await hub.call("GET", path)
+        assert _running(hub, sid) and answer["session"]["state"] == "running", answer
+        assert answer["session"]["error"] is None and answer["session"]["finished_at"] is None
+    finally:
+        await hub.close()
+
+
+async def test_continue_of_a_done_job_the_hub_resumes_keeps_it_running(tmp_path, api_token):
+    """The hub stopped between a job's completion and its stop, so resume() starts it and its watcher stops it at
+    once, but a `continue` came meanwhile and waits for the lock behind resume(): its start (a no-op after resume's)
+    reopens the goal before that stop takes the lock, so the stop finds the job going on and the text is not lost."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        made = (await hub.create({"goal": "Write a limerick", "answers": "manual"}))[1]["session"]
+        await hub.settled()
+        sid, path = made["name"], f"/api/v1/sessions/{made['id']}"
+        swarm = hub.manager.swarms[sid]
+        swarm.board.create(USER, "Polish the rhymes")   # (an open task: resume() does not pass over the job)
+        swarm.complete_goal(USER, "The limerick is written.")
+        await _until(lambda: hub.manager.is_final(sid), "the stop of the done job")
+        meta = hub.manager.meta(sid)
+        meta["autostart"] = True   # (as a hub stopped before that stop leaves it)
+        hub.manager._write_meta(sid, meta)
+        assert hub.manager.plan_resume() == [sid]
+        lock = hub.manager._lock(sid)
+        await lock.acquire()   # (so that resume() takes the lock first and the continue's start second)
+        try:
+            resuming = asyncio.create_task(hub.manager.resume())
+            await asyncio.sleep(0.01)
+            status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Add a second verse."})
+            assert status == 200 and answer["session"]["state"] == "starting", answer
+            await asyncio.sleep(0.01)
+        finally:
+            lock.release()
+        assert await resuming == [sid]
+        await hub.settled()
+        while hub.manager._stopping:
+            await asyncio.gather(*list(hub.manager._stopping), return_exceptions=True)
+        swarm = hub.manager.swarms[sid]
+        assert _running(hub, sid) and swarm.goal()["status"] == "active"
+        assert hub.manager.meta(sid)["api"]["error"] is None
+    finally:
+        await hub.close()
+
+
+async def test_a_stop_sent_after_a_continue_comes_after_its_text(tmp_path, api_token, monkeypatch):
+    """A stop that waits for the lock while a `continue` starts the session takes it after the text was given (the
+    start's `then`, the same lock hold): the requests keep their order, and the text is in the journal when the
+    session stops."""
+    gate = asyncio.Event()
+    real = Swarm.start
+
+    async def gated(self, *args, **kwargs):
+        await gate.wait()
+        await real(self, *args, **kwargs)
+
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        sid = (await hub.manager.create("Haiku", "Write a haiku", start=False, api=MANUAL))["id"]
+        path = f"/api/v1/sessions/{session_uid(hub.manager.meta(sid))}"
+        monkeypatch.setattr(Swarm, "start", gated)
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Mind the syllables."})
+        assert status == 200 and answer["session"]["state"] == "starting"
+        await _until(lambda: hub.manager._lock(sid).locked(), "the continue's start")
+        stopping = asyncio.create_task(hub.call("POST", f"{path}/stop"))
+        await asyncio.sleep(0.02)
+        assert not stopping.done()   # (it waits for the lock)
+        gate.set()
+        status, answer = await stopping
+        assert status == 200 and answer["session"]["state"] == "stopped" and answer["session"]["error"] is None
+        await hub.settled()
+        with reading_file(hub.manager.dir_of(sid) / ".dreamteam" / "swarm.db") as (conn, _immutable):
+            texts = [row[0] for row in conn.execute("SELECT text FROM messages WHERE sender = ?", (USER,))]
+        assert texts == ["Mind the syllables."]
+    finally:
+        gate.set()
+        await hub.close()
+
+
+@pytest.mark.parametrize("moment", ["unloading", "queued", "starting"])
+async def test_a_continue_sent_after_a_stop_starts_the_session_again(tmp_path, api_token, monkeypatch, moment):
+    """Stop, then continue: the session runs again with the text, whenever the stop takes the session's lock (a stop
+    takes away the start marks placed before it was asked, never a later continue's): while the stop unloads a
+    running session (out of `running` already), while it waits for the lock of a stopped one, and while it waits
+    behind a create's start."""
+    gate, asked = asyncio.Event(), asyncio.Event()
+    hub = Hub(_manager(_home(tmp_path)))
+    real_manager_stop = hub.manager.stop
+
+    async def stop(*args: Any, **kwargs: Any) -> None:   # (asked: the stop has read the marks before it)
+        asked.set()
+        await real_manager_stop(*args, **kwargs)
+
+    monkeypatch.setattr(hub.manager, "stop", stop)
+    try:
+        if moment == "unloading":
+            made = (await hub.create({"goal": "Write a haiku", **MANUAL}))[1]["session"]
+            await hub.settled()
+            sid, path = made["name"], f"/api/v1/sessions/{made['id']}"
+            real_stop = Swarm.stop
+
+            async def slow_stop(self, *args: Any, **kwargs: Any) -> None:
+                await gate.wait()
+                await real_stop(self, *args, **kwargs)
+
+            monkeypatch.setattr(Swarm, "stop", slow_stop)
+            stopping = asyncio.create_task(hub.call("POST", f"{path}/stop"))
+            await _until(lambda: sid not in hub.manager.running, "the stop's unload")
+        elif moment == "queued":
+            sid = (await hub.manager.create("Haiku", "Write a haiku", start=False, api=MANUAL))["id"]
+            path = f"/api/v1/sessions/{session_uid(hub.manager.meta(sid))}"
+
+            async def hold() -> None:   # (another operation that holds the session's lock)
+                async with hub.manager._lock(sid):
+                    await gate.wait()
+
+            holder = asyncio.create_task(hold())
+            await _until(lambda: hub.manager._lock(sid).locked(), "the lock held")
+            stopping = asyncio.create_task(hub.call("POST", f"{path}/stop"))
+        else:
+            real_start = Swarm.start
+
+            async def gated(self, *args: Any, **kwargs: Any) -> None:
+                await gate.wait()
+                await real_start(self, *args, **kwargs)
+
+            monkeypatch.setattr(Swarm, "start", gated)
+            made = (await hub.create({"goal": "Write a haiku", **MANUAL}))[1]["session"]
+            sid, path = made["name"], f"/api/v1/sessions/{made['id']}"
+            await _until(lambda: hub.manager._lock(sid).locked(), "the create's start")
+            stopping = asyncio.create_task(hub.call("POST", f"{path}/stop"))
+        await asyncio.wait_for(asked.wait(), 5)
+        await asyncio.sleep(0.01)
+        assert not stopping.done()   # (it waits: for Swarm.stop, or for the lock)
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Now the second verse."})
+        assert status == 200 and answer["session"]["state"] == "starting", answer
+        gate.set()
+        assert (await stopping)[0] == 200
+        if moment == "queued":
+            await holder
+        await hub.settled()
+        session = (await hub.call("GET", path))[1]["session"]
+        assert session["state"] == "running" and session["error"] is None, session
+        swarm = hub.manager.swarms[sid]
+        assert _from_user(swarm)[-1][1] == "Now the second verse."
+        runs = [row["type"] for row in swarm.db.all("SELECT type FROM events WHERE type LIKE 'session.%' ORDER BY id")]
+        assert runs[-1] == "session.started" and (moment == "queued" or runs[-2] == "session.stopped"), runs
+    finally:
+        gate.set()
+        await hub.close()
+
+
+async def test_a_continue_never_reaches_the_session_that_took_its_folder_name(tmp_path, api_token, monkeypatch):
+    """A delete gives the folder number to the next session: a `continue` whose start had not taken the lock when its
+    session was deleted gives its text to no one, and writes nothing into the session that has the folder name now
+    (its mark went with the delete, so its start starts nothing; `not_running` is recorded for the same uid only)."""
+    hub = Hub(_manager(_home(tmp_path)))
+    gate = asyncio.Event()
+    try:
+        sid = (await hub.manager.create("Haiku", "Write a haiku", start=False, api=MANUAL))["id"]
+        uid = session_uid(hub.manager.meta(sid))
+        real = hub.manager.start
+
+        async def gated(*args: Any, **kwargs: Any) -> Any:   # (the continue's start, before it takes the lock)
+            await gate.wait()
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(hub.manager, "start", gated)
+        status, answer = await hub.call("POST", f"/api/v1/sessions/{uid}/continue", body={"text": "TEXT FOR X"})
+        assert status == 200 and answer["session"]["state"] == "starting", answer
+        assert (await hub.call("DELETE", f"/api/v1/sessions/{uid}", query=f"confirm={uid}"))[0] == 200
+        assert (await hub.manager.create("Haiku", "Another job", start=False, api=MANUAL))["id"] == sid
+        assert session_uid(hub.manager.meta(sid)) != uid   # (the same folder name, another session)
+        gate.set()
+        await hub.settled()
+        assert hub.manager.meta(sid)["api"].get("error") is None and sid not in hub.manager.starting
+        swarm = await real(sid)
+        assert all(text != "TEXT FOR X" for _, text, _ in _from_user(swarm))
+    finally:
+        gate.set()
+        await hub.close()
+
+
+async def test_continue_after_a_budget_stop_needs_a_higher_budget_first(tmp_path, api_token):
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        made = (await hub.create({"goal": "Write a haiku", "max_cost_usd": 1, "answers": "manual"}))[1]["session"]
+        await hub.settled()
+        sid, path = made["name"], f"/api/v1/sessions/{made['id']}"
+        swarm = hub.manager.swarms[sid]
+        swarm.db.execute("UPDATE agents SET cost_usd = 2.0")
+        swarm.pause(USER, "budget")
+        await _until(lambda: hub.manager.is_final(sid), "the stop of the budget-paused job")
+        assert (await hub.call("GET", path))[1]["session"]["state"] == "budget"
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Finish it."})
+        assert status == 409 and answer["code"] == "budget_exhausted", answer
+        assert "PATCH /api/v1/sessions/{id}" in answer["error"]
+        assert sid not in hub.manager.starting and not hub.api._tasks
+        status, answer = await hub.call("PATCH", path, body={"max_cost_usd": 10})
+        assert status == 200 and answer["session"]["state"] == "stopped", answer   # (the pause is lifted)
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Finish it."})
+        assert status == 200 and answer["session"]["state"] == "starting"
+        await hub.settled()
+        swarm = hub.manager.swarms[sid]
+        assert _running(hub, sid) and not swarm.paused and swarm.limits()["max_cost_usd"] == 10.0
+        assert _from_user(swarm)[-1][1] == "Finish it."
+    finally:
+        await hub.close()
+
+
+async def test_continue_sets_the_goal_of_a_session_without_one(tmp_path, api_token, hub_token):
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        board = (await hub.manager.create("Board", start=False))["id"]   # the owner's, no goal
+        path = f"/api/v1/sessions/{session_uid(hub.manager.meta(board))}/continue"
+        assert (await hub.call("POST", path, body={"text": "Draw a cat"}))[0] == 404   # (not the API token's)
+        status, answer = await hub.call("POST", path, body={"text": "Draw a cat\nIn ASCII."}, token=TOKEN)
+        assert status == 200 and answer["session"]["state"] == "starting", answer
+        await hub.settled()
+        goal = hub.manager.swarms[board].goal()
+        assert (goal["title"], goal["description"]) == ("Draw a cat", "In ASCII.")
+    finally:
+        await hub.close()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+async def test_continue_while_a_create_starts_the_session_comes_after_that_start(tmp_path, api_token, monkeypatch,
+                                                                                  fails):
+    """A session already `starting` holds its place in max_running: `continue` is not checked again and counts once.
+    Each has a start of its own, queued on the session's lock behind the create's in the order the requests came: a
+    no-op once that start has the session running, so the texts are given in order; when that start fails, each
+    tries again (as a `continue` of a failed session does), the text given only when one succeeds, else the summary
+    shows the start's error."""
+    gate = asyncio.Event()
+    real = Swarm.start
+    calls: list[str] = []
+
+    async def gated(self, *args, **kwargs):
+        await gate.wait()
+        calls.append("start")
+        if fails:
+            raise RuntimeError("no model answers")
+        await real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Swarm, "start", gated)
+    hub = Hub(_manager(_home(tmp_path, api={"max_running": 1})))
+    try:
+        made = (await hub.create({"goal": "Write a haiku", **MANUAL}))[1]["session"]
+        sid, path = made["name"], f"/api/v1/sessions/{made['id']}"
+        for text in ("Short lines.", "And a title."):
+            status, answer = await hub.call("POST", f"{path}/continue", body={"text": text})
+            assert status == 200 and answer["session"]["state"] == "starting", answer
+        assert hub.api.running_count() == 1 and len(hub.manager._marks[sid]) == 3   # (the create's and one each)
+        assert (await hub.create({"goal": "Another"}))[1]["code"] == "too_many_sessions"
+        gate.set()
+        await hub.settled()
+        session = (await hub.call("GET", path))[1]["session"]
+        assert sid not in hub.manager.starting and hub.api.running_count() == (0 if fails else 1)
+        if not fails:
+            swarm = hub.manager.swarms[sid]
+            member = swarm.members()[0]["name"]
+            assert _from_user(swarm) == [([member], "Short lines.", None), ([member], "And a title.", None)]
+            assert session["state"] == "running" and session["error"] is None and len(calls) == 1
+        else:
+            assert session["state"] == "failed" and session["error"] == "RuntimeError: no model answers"
+            assert hub.manager.meta(sid)["api"]["error"] is None and len(calls) == 3
+            with reading_file(hub.manager.dir_of(sid) / ".dreamteam" / "swarm.db") as (conn, _immutable):
+                assert conn.execute("SELECT COUNT(*) FROM messages WHERE sender = ?", (USER,)).fetchone()[0] == 0
+    finally:
+        gate.set()
+        await hub.close()
+
+
+async def test_continue_of_a_stopped_session_counts_against_max_running(tmp_path, api_token, hub_token, no_start):
+    hub = Hub(_manager(_home(tmp_path, api={"max_running": 1})))
+    hold = asyncio.Event()
+    no_start(hub.manager, hold)
+    try:
+        assert (await hub.create({"goal": "One"}))[0] == 202   # starting until `hold`
+        stopped = (await hub.manager.create("Two", "Write a haiku", start=False, api=MANUAL))["id"]
+        path = f"/api/v1/sessions/{session_uid(hub.manager.meta(stopped))}/continue"
+        for token in (API_TOKEN, TOKEN):   # (a session made through v1 counts, whoever starts it)
+            status, answer = await hub.call("POST", path, body={"text": "Go."}, token=token)
+            assert status == 429 and answer["code"] == "too_many_sessions", token
+        assert stopped not in hub.manager.starting
+        board = (await hub.manager.create("Board", "Mine", start=False))["id"]   # the owner's: never counted
+        status, answer = await hub.call("POST", f"/api/v1/sessions/{session_uid(hub.manager.meta(board))}/continue",
+                                        body={"text": "Go."}, token=TOKEN)
+        assert status == 200 and answer["session"]["state"] == "starting"
+        hub.manager.resume_pending.add(stopped)   # about to be resumed: it counts already, so it is not refused
+        status, answer = await hub.call("POST", path, body={"text": "Go."})
+        assert status == 200 and answer["session"]["state"] == "starting", answer
+        hub.manager.resume_pending.discard(stopped)
+        hold.set()
+        await hub.settled()
+        status, answer = await hub.call("POST", path, body={"text": "Go."})
+        assert status == 200   # (One no longer starts: no_start never runs it)
+        await hub.settled()
+        # no_start starts nothing (None, as a start whose mark a stop took): each text is recorded as not given
+        assert hub.manager.meta(stopped)["api"]["error"] == {"code": "not_running", "text": api_v1.NOT_DELIVERED_TEXT}
+        assert not hub.manager.starting and hub.api.running_count() == 0
+    finally:
+        hold.set()
+        await hub.close()
+
+
+async def test_a_text_that_cannot_be_given_after_the_start_is_the_sessions_error(tmp_path, api_token, monkeypatch):
+    """In the background a refused delivery is `api.error` {code, text}, the summary's `error`, while the session
+    runs; the next delivery that succeeds clears it. A stop sent after a `continue` that takes the session's lock
+    before that continue's start leaves `not_running`: the start starts nothing."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        sid = (await hub.manager.create("Haiku", "Write a haiku", start=False, api=MANUAL))["id"]
+        path = f"/api/v1/sessions/{session_uid(hub.manager.meta(sid))}"
+        monkeypatch.setattr(api_v1, "continue_step", lambda state: ContinueStep("message", to="Nobody Here"))
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Go on."})
+        assert status == 200 and answer["session"]["state"] == "starting"
+        await hub.settled()
+        session = (await hub.call("GET", path))[1]["session"]
+        assert session["state"] == "running" and "Unknown member 'Nobody Here'" in session["error"], session
+        assert hub.manager.meta(sid)["api"]["error"]["code"] == "conflict"
+        monkeypatch.setattr(api_v1, "continue_step", instruct.continue_step)
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Go on."})
+        assert status == 200 and answer["session"]["error"] is None and hub.manager.meta(sid)["api"]["error"] is None
+        await hub.call("POST", f"{path}/stop")
+        gate, real = asyncio.Event(), hub.manager.start
+
+        async def gated(*args: Any, **kwargs: Any) -> Any:   # (the continue's start, before it takes the lock)
+            await gate.wait()
+            return await real(*args, **kwargs)
+
+        monkeypatch.setattr(hub.manager, "start", gated)
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Again."})
+        assert status == 200 and answer["session"]["state"] == "starting"
+        status, answer = await hub.call("POST", f"{path}/stop")   # sent after it, first to take the lock
+        assert status == 200 and answer["session"]["state"] == "stopped" and sid not in hub.manager.starting
+        gate.set()
+        await hub.settled()
+        session = (await hub.call("GET", path))[1]["session"]
+        assert session["state"] == "stopped" and session["error"] == api_v1.NOT_DELIVERED_TEXT, session
+        assert hub.manager.meta(sid)["api"]["error"]["code"] == "not_running"
+        with reading_file(hub.manager.dir_of(sid) / ".dreamteam" / "swarm.db") as (conn, _immutable):
+            texts = [row[0] for row in conn.execute("SELECT text FROM messages WHERE sender = ?", (USER,))]
+        assert "Again." not in texts
+    finally:
+        await hub.close()
+
+
+async def test_a_failed_session_is_continued_and_a_hub_that_stops_starts_nothing(tmp_path, api_token):
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        sid = (await hub.manager.create("Haiku", "Write a haiku", start=False, api=MANUAL))["id"]
+        path = f"/api/v1/sessions/{session_uid(hub.manager.meta(sid))}"
+        hub.manager._api_write(sid, start_error={"code": "internal", "text": api_v1.SHUTTING_DOWN_TEXT},
+                               finished_at=time.time())   # (as a create the hub's stop left unstarted)
+        assert (await hub.call("GET", path))[1]["session"]["state"] == "failed"
+        hub.api.closing = True
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Go on."})
+        assert status == 500 and answer["code"] == "internal" and "shutting down" in answer["error"]
+        assert sid not in hub.manager.starting and not hub.api._tasks
+        hub.api.closing = False
+        status, answer = await hub.call("POST", f"{path}/continue", body={"text": "Go on."})
+        assert status == 200 and answer["session"]["state"] == "starting"
+        await hub.settled()
+        session = (await hub.call("GET", path))[1]["session"]
+        assert session["state"] == "running" and session["error"] is None and session["finished_at"] is None
+        assert hub.manager.meta(sid)["api"]["start_error"] is None
+    finally:
+        await hub.close()
 
 
 # ---------------------------------------------------------------------------------------------- errors

@@ -284,13 +284,17 @@ class GuardMiddleware:
     def _wrong_type(self, scope, path: str, content_type: str, *, exclusive: bool = False) -> str | None:
         """The 415 text of a POST under /api/ whose body is neither JSON nor a type `raw_posts` gives its exact path;
         None when the type may pass. `exclusive` (the external API's branch): a path `raw_posts` lists takes its own
-        types alone, JSON refused too (docs/SPEC.md §21.3: /api/v1/uploads stores any body it takes as a file)."""
+        types alone, JSON refused too (docs/SPEC.md §21.3: /api/v1/uploads stores any body it takes as a file), and
+        any other path exactly application/json (parameters such as a charset aside), as v1's PATCH checks it
+        (api_v1.check_json_type); off v1 any type that starts with application/json, as before."""
         if not (scope["type"] == "http" and scope.get("method") == "POST" and path.startswith("/api/")):
             return None
         kind = content_type.split(";")[0].strip()
         kinds = self.raw_posts.get(path)
-        if exclusive and kinds is not None:
-            return None if kind in kinds else f"Content-Type must be {' or '.join(sorted(kinds))}"
+        if exclusive:
+            if kinds is not None:
+                return None if kind in kinds else f"Content-Type must be {' or '.join(sorted(kinds))}"
+            return None if kind == "application/json" else JSON_TYPE_TEXT
         return None if content_type.startswith("application/json") or kind in (kinds or ()) else JSON_TYPE_TEXT
 
     async def _api_branch(self, scope, receive, send, headers: dict[str, str]) -> None:
