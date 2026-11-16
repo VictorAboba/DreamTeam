@@ -34,11 +34,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import string
 import time
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import prompts
 from .models import USER
@@ -360,11 +361,43 @@ def _short_path(match: re.Match) -> str:
     return f"{quote}{parts[-1] if parts else ''}{quote}{tail}"
 
 
-def without_abs_paths(value: Any) -> str:
+# where a named folder ends in a text: the end, or what ends a word ("." only at the end of a sentence: "acme.old" is
+# another folder); a folder that may be named with a path below it also ends at a separator
+_WORD_END = r"""$|[\s'"`<>|,;:!?()\[\]{}]|\.(?=$|\s)"""
+
+
+def _named_pattern(path: str, below: bool) -> re.Pattern[str] | None:
+    """Absolute path `path` as a text may name it: with either separator, single or doubled (str(), as_posix() and
+    the repr an OSError shows alike), in any case (matching too much only shortens a text), whole components only and
+    not inside a longer path; `below`: also as the start of a path below it. None for a root."""
+    parts = re.split(r"[\\/]+", path.rstrip("\\/"))
+    if len(parts) < 2 or not parts[-1]:
+        return None
+    body = r"[\\/]+".join(re.escape(part) for part in parts)
+    end = r"(?=[\\/]|" + _WORD_END + ")" if below else "(?=" + _WORD_END + ")"
+    return re.compile(r"(?<![\w.~-])" + body + end, re.IGNORECASE)
+
+
+def without_abs_paths(value: Any, named: Iterable[tuple[Any, str]] = (),
+                      exact: Iterable[tuple[Any, str]] = ()) -> str:
     """clean(value) with every absolute path named by its last component (`'/home/me/x/lib'` → `'lib'`): for the texts
     of DreamTeam's own a line quotes (a notice, a wake-up, an error), which may name a folder of the hub's computer.
-    The session manager journals the error of a failed start through it too (`session.stopped`, docs/SPEC.md §21.6)."""
-    return _ABS_PATH.sub(_short_path, clean(value))
+    The session manager journals the error of a failed start through it too (`session.stopped`, docs/SPEC.md §21.6).
+    `named` and `exact`: (absolute path, name) pairs of folders the caller knows, replaced by their names first,
+    longest first, wherever the text names them, quoted or not: an unquoted path with a space in it is otherwise cut
+    at that space, and its later words would stay ("does not exist: C:\\Users\\Jane Doe\\jobs\\acme site." would keep
+    "Doe\\jobs\\acme site"). A `named` folder is also replaced at the start of a path below it, which then stays after
+    its name as a relative path (the folders whose content the reader may see: a session's own); an `exact` one only
+    where the text names that very folder (a folder above them: a path below it may be anyone's, "C:\\Users\\alice\\x"
+    must not become "Users\\alice\\x")."""
+    text = clean(value)
+    pairs = [(os.fspath(path), name, True) for path, name in named]
+    pairs += [(os.fspath(path), name, False) for path, name in exact]
+    for path, name, below in sorted(pairs, key=lambda pair: len(pair[0]), reverse=True):
+        pattern = _named_pattern(path, below)
+        if pattern is not None:
+            text = pattern.sub(lambda _match, name=name: name, text)
+    return _ABS_PATH.sub(_short_path, text)
 
 
 def _ref(value: Any) -> str:

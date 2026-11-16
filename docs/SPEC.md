@@ -376,6 +376,9 @@ class Swarm:
         # `_considering` start (`_nudge_idle`'s decision window; an offer made during the pause counts from the resume)
     def pending_question(self) -> dict | None            # {asker, message_id, since} of the question holding the
                                                          # pause (kv `paused` with reason "question"), else None
+    def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None
+        # the newest message of `sender` that reached `recipient` (its inbox row: named or through "all"), sent at
+        # `since` (a timestamp) or later; None when none did (the public form of the `_LAST_TO` query, §21.5)
     def pause_text(self) -> str                          # "waiting for the user's answer to X's question #N" for a
                                                          # question, else the reason (swarm_status, traces)
     def ask_user(self, asker: str, message: dict) -> tuple[str, dict]
@@ -386,6 +389,7 @@ class Swarm:
         # the pause into a budget pause); never raises
     def asks_user(self, name: str, task: Task) -> bool   # the clarify planner waits for the user's answers (§3.1)
     clarifying: bool                                     # [swarm] clarify and no auto-reply lease (§3.1)
+    def hold_auto_reply(self) -> None                    # the lease for this object's whole life (§3.1, §21.5)
     wrapping_up: bool                                    # the user's wrap-up mode (kv "wrap_up" {"on", "by", "since"})
     def wrap_up(self, actor: str) -> bool
         # wrap-up mode on (False when it was on already): the team finishes with what it has. Emits `swarm.wrap_up`
@@ -600,10 +604,13 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
   the WebSocket handshake, only with automatic replies on. The Swarm keeps an in-memory lease:
   `auto_reply_stream()` (a context manager around an event WebSocket whose handshake carried the header),
   `auto_reply_seen()` (the launcher's `POST /api/sessions` and `/start` before `swarm.start()` and again right
-  before the pending `set_goal`; `POST /api/act/{tool}`), and `auto_reply_active`: a stream is open, or less than
-  `AUTO_REPLY_GRACE` (90 s, longer than print mode's 60 s without the hub) passed since the last sign (the clock is
-  the module's `_monotonic`). Nothing is persisted: a hub or session restart forgets it, a dead client's lease ends
-  90 s after its socket closed. Under the lease `clarifying` is false (the classic card) and `ask_user` gives `auto`
+  before the pending `set_goal`; `POST /api/act/{tool}`), `hold_auto_reply()` (the hub answers for the user itself:
+  a session of the HTTP API v1 with `answers: "auto"`, §21.5; `_start_locked` takes it before `swarm.start()` on
+  every start path, and it holds until the Swarm is unloaded) and `auto_reply_active`: held, a stream is open, or
+  less than `AUTO_REPLY_GRACE` (90 s, longer than print mode's 60 s without the hub) passed since the last sign (the
+  clock is the module's `_monotonic`). Nothing is persisted: a hub or session restart forgets it, a dead client's
+  lease ends 90 s after its socket closed. Under the lease `clarifying` is false (the classic card) and `ask_user`
+  gives `auto`
   ("the user is not available"). A gap in the lease (a hub restart, a session reload) can still give a short
   question pause, which print mode answers at once (an answer that failed is sent again after a state read that
   still shows the pause, never twice for one question: docs/TUI.md §2).
@@ -1885,7 +1892,12 @@ class Workspace:
     def __init__(self, swarm): ...
     async def init(self) -> None                 # mkdir; ensure_scratch() (with or without git); if git
                                                  # enabled+available: init repo, .gitignore, initial commit
-                                                 # (Swarm.start decides git_isolated before: _prepare_offline)
+                                                 # (Swarm.start decides git_isolated before: _prepare_offline);
+                                                 # with record_head, then (still under the git lock) HEAD into
+                                                 # head_at_init: `rev-parse --verify --quiet HEAD^{commit}` of
+                                                 # the folder's own .git, else None (§21.4 `base_commit`)
+    record_head: bool                            # set by SessionManager._start_locked for a v1 session's first
+    head_at_init: str | None                     # start; None with git off, without git, no commit or no .git
     git_isolated: bool                           # DreamTeam's git here may run isolated ("Defense in depth")
     def hold_git(self) -> None                   # the network went off: _git() waits (counted holds) until
     def release_git(self) -> None                # Swarm._network_changed's _prepare_offline has decided
@@ -4144,12 +4156,15 @@ settings; ValueError when they are invalid):
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
   `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
-  workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None)`,
+  workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None, api=None,
+  sources=None, mark=None)`, `validated_overrides(overrides)`,
   `async load(sid)`, `async start(sid, *, skills=None,
-  via="home", auto_reply=False)`,
-  `async stop(sid, *, remember=False, reason="user")`, `async unload_idle(sid)`, `update(sid, *, title=None,
+  via="home", auto_reply=False, marked=None)`, `mark_starting(sid, mark=None)`, `unmark_starting(sid, mark)`,
+  `async stop(sid, *, remember=False, reason="user")`, `async unload_idle(sid)`, `async control(sid, *,
+  max_cost_usd=None, max_agents=None, wrap_up=None)`, `update(sid, *, title=None,
   overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`,
-  `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `global_config()`,
+  `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `sid_of_uid(uid)`, `api_sids()`,
+  `global_config()`,
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
@@ -4157,14 +4172,15 @@ settings; ValueError when they are invalid):
   `backups(sid)`, `import_overrides(overrides, models)`, `async import_add(staged, meta, workspace, *, sid,
   before_swap=None)`, `async import_rewrite(sid, staged, meta, workspace, *, expect=None, before_swap=None)`,
   `async import_settings(sid, meta, *, expect=None)`, `recover_swaps()` and `interrupted_swaps()`; module functions
-  `read_stats(db_path, conn=None)`, `slugify(title)`, `external_workspaces(home)`, `new_uid()` and
-  `session_uid(meta)`.
+  `read_stats(db_path, conn=None)`, `read_lists(db_path, conn=None)`, `slugify(title)`, `external_workspaces(home)`,
+  `new_uid()`, `session_uid(meta)` and `api_meta(meta, *, create=False)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
 - **A run's start and end, waiting for a change** (§21.6, §21.7).
   - `_start_locked` journals `session.started` right before `swarm.start()` and, when that raises,
-    `session.stopped` {reason: `failed`, error} before its unload (`error` through `eventtext.without_abs_paths`: an
-    absolute path named by its last component; the log has the whole text); when it is cancelled (the hub stops),
+    `session.stopped` {reason: `failed`, error} before its unload (`error` through `_public_text`: an absolute path
+    named by its last component, the session's folders whole, see "Sessions of the HTTP API v1" below; the log has
+    the whole text); when it is cancelled (the hub stops),
     `session.stopped` {reason: `shutdown`}. `_unload(sid, reason=None)` of a running session journals
     `session.stopped` {reason} after `Swarm.stop` and before the database closes (errors logged, never raised). The
     reasons: `stop()` passes its `reason` (`STOP_REQUEST_REASONS`: `user` by default; `done`, `budget` for
@@ -4178,6 +4194,18 @@ settings; ValueError when they are invalid):
     an unload. Waiters clear it before each read.
   - `is_final(sid)`: not running, not in `starting` (creates and v1 `continue`s in flight), not in `resume_pending`,
     and the session's lock is not held.
+  - `starting`: the sessions with a start on its way. Each such start has a mark of its own: `mark_starting(sid,
+    mark=None)` adds one (a new object unless the caller gives one), puts the session in `starting`, pokes its
+    waiters and returns the mark; `unmark_starting(sid, mark)` takes that mark away (the session leaves `starting`
+    with its last mark). `start(sid, marked=mark)` starts the session only while its mark is there, checked again
+    under the session's lock (None otherwise: a stop or a delete that held the lock while it waited is never undone),
+    and takes its own mark away when it ends, whatever its outcome, never another start's (a second caller's, or a
+    new session's that got the folder name of a deleted one). `stop()` (without `remember`) and `delete()` take every
+    mark of the session away, as they take it out of `resume_pending`. `create(..., start=True)` marks the new
+    session before it announces the `created` change and starts it with that mark; `create(..., start=False,
+    mark=m)` puts the caller's mark `m` on it at the same point and the caller starts it later with
+    `start(sid, marked=m)` (a v1 create or `continue` that starts a session in the background, which answers in
+    between); a create that fails after marking takes its mark away.
   - `resume_pending`: the sessions resume() will try. `plan_resume()` chooses them by their autostart mark alone
     (session.json reads, no log line: the launcher calls it before its port opens) and fills the set;
     `cancel_resume()` drops the plan when resume() does not run. resume() uses the plan (else chooses now) and
@@ -4185,13 +4213,73 @@ settings; ValueError when they are invalid):
     one of an earlier version (both keep their mark), and a session stopped (out of the set, its mark cleared) or
     deleted meanwhile; it checks that last condition again under the session's lock and starts it there
     (`_start_locked`), so a stop that held the lock while resume() waited is never undone.
-- `SessionError(message, status=400, **extra)` (a ValueError) carries an HTTP status and `extra` (put into the
-  JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid settings,
+- `SessionError(message, status=400, *, code=None, **extra)` (a ValueError) carries an HTTP status and `extra` (put
+  into the JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid
+  settings,
   404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
   a folder of another session, a folder that changed since the user was asked, a missing workspace folder at
   start, a `workspace` with files for a copy, a session made by an earlier version), 413 a copy over its limits,
   500 damaged or cannot be opened (404 is
-  also an unknown or used upload of `copy_from_upload`).
+  also an unknown or used upload of `copy_from_upload`). `code` is the HTTP API v1's code where the status alone does
+  not say it (§21.1), never in `extra`, so the internal answers do not show it: `folder_busy` (`FOLDER_BUSY`: `_plan`'s
+  folder of another session, `_check_reserved`'s create in progress), `folder_not_ready` (`FOLDER_NOT_READY`: every
+  `_repo_refusal`, so also `_check_adopted_repo`; `_check_workspace_ready`'s missing folder and `_check_journal`'s
+  unfinished move), `conflict` (`control`'s wrap-up before the first start), a CopyError's own code (`bad_name`,
+  `file_conflict`) when `create` turns it into a SessionError; `_move_error` keeps the code of the SessionError that
+  failed a workspace change, unless files could not be put back (500). v1 answers a code with that code's own status
+  (§21.1), which may differ from `status`: `folder_not_ready` is 409 there, also for the two refusals of a create
+  that are 400 on the internal routes (a folder inside a repository, a repository's own database).
+- **Sessions of the HTTP API v1** (§21.4). `create(..., api={answers, stop_when_done, client_ref, request_digest,
+  folder})` (those keys only, `API_GIVEN` defaults for the missing ones; another key or a value of the wrong kind is
+  400) writes `"via": "api"` and the `api` block, with `base_commit`, `started_at`, `finished_at`, `start_error` and
+  `error` null (`API_LATER`), in the first session.json write; `api_meta(meta)` reads that block (None for any other
+  session; `{}` for a v1 session whose block is not an object). `create(..., sources=[copyfrom.Source])`: v1's
+  claimed uploads (and, later, a copy-mode server folder) copied by `copy_sources` instead of `copy_into`, not with
+  `copy_from` or `copy_from_upload` (400 before any claim); the caller claims and settles them. Every later write of
+  the block is a read-modify-write of session.json under the session's lock (`_api_write`, which logs and never
+  raises):
+  - `_start_locked`, on every start path: with `answers: "auto"` it calls `swarm.hold_auto_reply()` right after
+    loading, before `swarm.start()`; at the first start (`started_at` null) it sets `swarm.workspace.record_head`,
+    and once the start succeeded it writes `started_at` and `base_commit` (`Workspace.head_at_init`) with the rest of
+    session.json; every start that succeeds clears `start_error` and `finished_at`. A start that fails, because the
+    session cannot be loaded (not a 404, never a session of an earlier version, which is not written to), because
+    `_check_workspace_ready` or `_check_adopted_repo` refuse it, or because `swarm.start()` raises, writes
+    `start_error` {code, text} and `finished_at` before it raises (and before `session.stopped` is journaled): `code`
+    the error's own code, else by the SessionError's status (400 `bad_request`, 404 `not_found`, 409 `conflict`, 413
+    `too_large`, an earlier version `earlier_version`), else `internal`; `text` through `_public_text(sid, text)`,
+    as is the `session.stopped` error of a failed `swarm.start()`. An error names a folder unquoted, spaces included,
+    and `without_abs_paths` alone would cut it at its first space, so `_public_text` names this computer's folders
+    first (`eventtext.without_abs_paths(value, named=(), exact=())`: (path, name) pairs, longest first, with either
+    separator, single or doubled, in any case, whole components only): `named`, also at the start of a path below
+    them, the user's home as `~` (the path below it is then named by its last component) and, by their last
+    component, the workspace, an unfinished move's two folders, the session's folder and the home (what lies below
+    them stays, relative); `exact`, only where the text names that very folder, every folder above those (a path
+    below one may be anyone's: `C:\Users\alice\x` must not become `Users\alice\x`); each also resolved. A start
+    cancelled inside `swarm.start()` (the hub stops) writes `finished_at` and no `start_error`.
+  - `_unload` of a running v1 session writes `finished_at` after `Swarm.stop`, whatever the reason.
+  - `summary(sid)` adds `via` and `answers` for such a session only.
+  - `control(sid, *, max_cost_usd=None, max_agents=None, wrap_up=None)` (v1's PATCH, §21.2) does what
+    `swarm_control` does with the limits and wrap-up mode, as the user, under the session's lock: `set_limits` (a
+    budget pause the new limit covers is lifted), then `wrap_up` / `end_wrap_up`. A stopped session is loaded for it
+    (one that never started gets its database) and unloaded again unless it was loaded before (the board views
+    it). 400 for a value of the wrong kind (a bool, NaN, a `max_agents` that is no whole number) or one the swarm
+    refuses (ToolError), with nothing written; 409 `conflict` for `wrap_up: true` while the session has a pending
+    goal its first start has not set yet (that `set_goal` ends wrap-up mode), decided before a database is made;
+    409 for an earlier version. Nothing given: the summary, nothing loaded. It announces an `updated` change and
+    returns the summary.
+  - `sid_of_uid(uid)` (32 lowercase hex, else None) and `api_sids()` read an index of every session.json (uid →
+    folder name, and the v1 sessions), built once and read again when a session comes or goes (`_changed`
+    `created` / `deleted`, an import's rewrite or settings) or the sessions folder's mtime changes (another
+    process). A uid the index does not know, and every `api_sids()`, also compare the session folders (`ids()`, no
+    session.json read) with those the index was read from: another process makes a session's folder before it writes
+    its session.json, which changes no mtime of the sessions folder. A uid two sessions share (a folder copied by
+    hand) names neither; the legacy `main` has no uid; a hit is checked against the session.json it names, so a
+    deleted session's uid never reaches the session that got its folder number.
+  - `read_lists(db_path, conn=None)` → (tasks, agents) of a session database, read-only like `read_stats`, in the
+    shape and order of the snapshot (`Task.to_dict()` by priority then id, closed ones too, without the board's
+    computed fields; every `agents` row in hiring order): a stopped session's result without loading it (§21.7).
+  - An import keeps `via` and the block but sets `client_ref`, `request_digest`, `start_error`, `error` and `folder`
+    to null (`API_IMPORT_DROPS`, `_import_meta`, §21.9).
 - Session ids are `NNN-slug` from the title (Cyrillic and Ukrainian transliterated, accents dropped; e.g.
   `001-snake-game`) and match `^[a-z0-9][a-z0-9-]{0,63}\Z`. `main` is the legacy session: a home that was a
   single-swarm project (`<home>/.dreamteam/swarm.db`) lives in the home itself, uses the global settings
@@ -4492,7 +4580,9 @@ next start, which checks the folder).
 `copyfrom.py` (it imports treecopy, skills, workspace and hubauth, never sessions.py) copies a folder or a zip into
 the folder a new session works in, before its first start: `create(..., copy_from=<absolute folder or .zip path on
 this computer>)` or `create(..., copy_from_upload=<token of POST /api/uploads>)`, not both (400 "Give copy_from or
-copy_from_upload, not both."). The surfaces: REST `copy_from` / `copy_from_upload` (§18.1), the launcher MCP's
+copy_from_upload, not both."); the HTTP API v1 passes `sources` instead ("Sessions of the HTTP API v1" above), the
+same order with `copy_sources` in place of `copy_into` and no claim of its own. The surfaces: REST `copy_from` /
+`copy_from_upload` (§18.1), the launcher MCP's
 `session_create(copy_from=)` (§18.2), the CLI's `--copy-from` (§18.3), the TUI's `/copy-from` (docs/TUI.md) and the
 home page's «Файлы для работы» (§18.4). The source is only read and nothing is copied back. The members are never
 told where the files came from: no source path goes into `pending_goal` or any prompt.
@@ -6502,7 +6592,9 @@ database copied with its sha256 checked against the manifest, the data parts and
 modes="import")` with the recorded `modes`; a link or an unreadable file fails it). `_import_meta` writes the uid
 (it must be 32 hex), `autostart: false` (imported sessions never start by themselves), the overrides checked
 against this home, and the workspace entry rebuilt for this home (`_workspace_meta` for in_home, `{path, adopted}`
-for outside). `_finish_staged` opens the database once with `db.Database` (`ADDED_COLUMNS`, WAL again), points
+for outside); a session of the HTTP API v1 keeps `via` and its `api` block with `client_ref`, `request_digest`,
+`start_error`, `error` and `folder` set to null (§21.9). `_finish_staged` opens the database once with
+`db.Database` (`ADDED_COLUMNS`, WAL again), points
 absolute job-log paths at the copy's own `.dreamteam/jobs/` (or clears them), and writes session.json last.
 `before_swap(id)` (the CLI's holder check) runs right before the rename; an exception fails that session with
 nothing changed.
@@ -6734,8 +6826,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 - **PATCH** does what `swarm_control` does (`manager.control`, under the session's lock): `set_limits` and `wrap_up` /
   `end_wrap_up`, as the user. They write the kv keys `limits` and `wrap_up`, which the swarm reads at every use (§3).
   A stopped session is loaded to write them into its own database, not into its overrides (the database outranks
-  them); one that never started gets its database then. It is unloaded again afterwards: on Windows an open database
-  blocks a delete or a folder move. `wrap_up: true` on a session that never started is 409 `conflict`, because the
+  them); one that never started gets its database then. It is unloaded again afterwards, unless it was loaded before
+  (the board views it): on Windows an open database blocks a delete or a folder move. `wrap_up: true` on a session
+  that never started is 409 `conflict`, because the
   goal set at the first start ends wrap-up mode. A `continue` that reopens a done goal ends it too. A `max_cost_usd`
   that covers what was spent lifts a budget pause. A value the swarm refuses (`max_agents` below 1, a negative cost)
   is 400 `bad_request`.
@@ -6745,12 +6838,13 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   planning task's assignee, else the first AI member, else `"all"`). A session paused by the user is resumed as well.
   A budget pause is lifted only when the budget now covers what was spent; otherwise 409 `budget_exhausted` (raise it
   with PATCH first). A stopped session is checked first, against `[api] max_running` when it was created through v1
-  (429) and against its budget (409), then marked `starting`, and started in the background, which then delivers the
-  text in process; a delivery that fails after the start is recorded as `api.error` and shown in the summary's
-  `error`. A running session gets the text at once. A session already `starting` (a create or another `continue` in
-  flight) holds its place in `max_running` and is neither checked nor counted again: the text waits for that start
-  and is then delivered as to a running session. When that start fails, the text is not delivered, and the summary
-  shows the start's error.
+  (429) and against its budget (409), then marked `starting` (`mark_starting`), and started in the background
+  (`start(sid, marked=...)`, nothing when a stop or a delete came first), which then delivers the text in process; a
+  delivery that fails after the start is recorded as `api.error` and shown in the summary's `error`. A running
+  session gets the text at once. A session already `starting` (a create or another `continue` in flight) holds its
+  place in `max_running` and is neither checked nor counted again: the text waits for that start and is then
+  delivered as to a running session. When that start fails, the text is not delivered, and the summary shows the
+  start's error.
 - **DELETE**: `confirm` must be the `{id}` (400 `bad_request` otherwise). `manager.delete(sid, skills="discard")`: the
   session folder goes with it (§18.1 DELETE), except a folder the session worked in in place (21.10), which is kept
   and named: `"folder_kept": {"root", "path"}`.
@@ -6904,11 +6998,13 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   6. the uploads: every token checked without claiming it (`peek_many`);
   7. `[api] max_running`, checked and reserved with no await between;
   8. the uploads claimed (`claim_many`);
-  9. `manager.create(start=False, api=..., sources=..., workspace=..., within=...)`: the uploads and a `copy` folder
-     are copied into `sessions/.copying-*` before the session folder exists; `_create` then makes `sessions/<sid>`,
-     renames the staging in and writes session.json once, with `via` and `api`;
+  9. `manager.create(start=False, mark=m, api=..., sources=..., workspace=..., within=...)`: the uploads and a
+     `copy` folder are copied into `sessions/.copying-*` before the session folder exists; `_create` then makes
+     `sessions/<sid>`, renames the staging in, writes session.json once, with `via` and `api`, and marks the session
+     `starting` with `m` before it announces it (§17.2);
   10. the claims settled (21.3);
-  11. 202 with state `starting`; the start runs in the background, as a task `ApiV1` keeps.
+  11. 202 with state `starting`; the start runs in the background (`manager.start(sid, marked=m)`: nothing when a
+      stop or a delete came first), as a task `ApiV1` keeps.
 - Any 4xx leaves every token usable. A start that fails writes `api.start_error` (`{"code", "text"}`) and
   `api.finished_at`, and leaves the session stopped: state `failed`, the text in the summary's `error`. That includes
   the checks before `swarm.start()`, which raise before its `try`: a missing workspace folder
@@ -6922,7 +7018,8 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   (21.10).
   `base_commit` is the workspace's HEAD, recorded at the end of `Workspace.init` under its git lock at the first
   start: the first commit of the copied files is in it and no agent commit is; null with git off or after a failed
-  init. `started_at` is the first start; `finished_at` when the session last reached a final state (21.7);
+  init. `started_at` is the first start; `finished_at` when the session last reached a final state (21.7), null
+  again from each start that succeeds (the result's `duration_s` runs to it, or to now);
   `start_error` the last start's failure; `error` a `continue` whose delivery failed (21.2). The sessions page shows
   such a session like any other, marked "API". `dreamteam -c` and `-p -c` never pick one (a busy client would
   otherwise make its own sessions the most recent ones); `-r <id>` opens it.
@@ -7046,7 +7143,8 @@ An event is a journal row (§9) with its id, plus a line for people:
     `budget` (`stop_when_done`), `shutdown` (the hub stops), `restart` (a stop the hub makes to start the session
     again: a workspace move). A failed start journals `session.stopped` {reason: `failed`, error} before its unload:
     the session is not in `running` yet, so `_unload` alone would not. `error` is DreamTeam's own text (an exception
-    of the start), with every absolute path named by its last component, as in `text`; the hub's log has it whole. A
+    of the start), with every absolute path named by its last component, as in `text`, and the session's folders
+    matched whole, spaces included (§17.2 "Sessions of the HTTP API v1"); the hub's log has it whole. A
     start cancelled meanwhile (the hub stops during its `resume()`) journals {reason: `shutdown`}.
   - A delete journals the stop of a running session as `user`. When the delete succeeds, the journal goes away with
     the session; when its folder cannot be renamed away (files in use, 409), the session stays, stopped, with its

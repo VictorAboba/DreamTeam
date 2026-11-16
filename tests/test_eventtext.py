@@ -445,6 +445,33 @@ def test_dreamteams_own_texts_name_a_path_by_its_last_component(text, line):
     assert eventtext.without_abs_paths(text) == (text if line is None else line)
 
 
+_SITE = "C:" + _B + "Users" + _B + "Jane Doe" + _B + "jobs" + _B + "acme site"
+_JANE = "C:" + _B + "Users" + _B + "Jane Doe"
+_WORK = "D:" + _B + "Work Stuff" + _B + "big repo"
+
+
+@pytest.mark.parametrize(("text", "line"), [
+    # unquoted, spaces and all: the named folder whole, never cut at its first space
+    (f"does not exist: {_SITE}. Bring it back", "does not exist: acme site. Bring it back"),
+    # the other separator, another case; what lies below it stays after its name, relative
+    ("in c:/users/jane doe/jobs/acme site/sub dir/x.txt: busy", "in acme site/sub dir/x.txt: busy"),
+    # a folder below the user's home ("~"): then named by its last component as any other path
+    (f"inside the git repository {_JANE}{_B}jobs: move it", "inside the git repository jobs: move it"),
+    # whole components only ("acme site2" is another folder), and never inside a longer path (cut at the space then,
+    # as a path nobody named)
+    (f"{_SITE}2", "acme site2"),
+    ("/srv/home/jane doe/x and /home/jane doe/y", "jane doe/x and y"),
+    # an exact folder only as itself; the path of an OSError's repr (doubled separators) below one is anyone's
+    (f"inside the git repository {_WORK}: move it", "inside the git repository big repo: move it"),
+    ("No such file: 'C:" + _B * 2 + "Users" + _B * 2 + "alice" + _B * 2 + "f'", "No such file: 'f'"),
+    (f"{_WORK}{_B}x.txt and {_WORK}.old", "Work Stuff\\big repo\\x.txt and Work Stuff\\big repo.old"),
+])
+def test_named_folders_are_replaced_whole_before_any_other_path(text, line):
+    named = [(_SITE, "acme site"), (_JANE, "~"), ("/home/jane doe", "~"), ("/", "root"), ("C:" + _B, "drive")]
+    exact = [(_WORK, "big repo"), ("C:" + _B + "Users", "Users")]
+    assert eventtext.without_abs_paths(text, named, exact) == line   # (a root names nothing)
+
+
 @pytest.mark.parametrize("lang", LANGS)
 def test_no_absolute_path_of_the_hub_in_a_wake_up_an_error_or_a_skill_environment(lang):
     """docs/SPEC.md §21.6: the text adds no absolute path of the hub's computer, wherever DreamTeam's own text puts one:

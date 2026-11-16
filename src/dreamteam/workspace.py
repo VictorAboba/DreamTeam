@@ -693,6 +693,11 @@ class Workspace:
         self._write_seq = 0
         self._write_started: dict[str, int] = {}
         self._writing: dict[str, int] = {}
+        # record_head: init() records HEAD once its repository is ready (head_at_init), still under the git lock, so
+        # the first commit of the files already there is in it and no agent commit is (docs/SPEC.md §21.4
+        # `base_commit`); None with git off, without git, or when there is no commit
+        self.record_head = False
+        self.head_at_init: str | None = None
 
     # --- setup -----------------------------------------------------------------------------
     @property
@@ -705,6 +710,7 @@ class Workspace:
         return bool(getattr(self.swarm.config, "workspace_adopted", False))
 
     async def init(self) -> None:
+        self.head_at_init = None
         if getattr(self.swarm.config, "workspace_path", None) is not None and not self.root.is_dir():
             # a folder outside the session (a project of the user, an unplugged drive, a path of the host inside a
             # Docker sandbox) is never created silently: the agents would work in an empty stand-in
@@ -725,6 +731,21 @@ class Workspace:
                     await self._configure_repo()
             except (OSError, subprocess.SubprocessError) as exc:
                 log.warning("git init failed: %s", exc)
+            if self.record_head:
+                self.head_at_init = await self._head_commit()
+
+    async def _head_commit(self) -> str | None:
+        """The commit HEAD names in the workspace's own repository, or None (no `.git` here: a git run from the
+        folder would read a repository above it; an unborn HEAD; git failed). Caller holds the git lock."""
+        if not (self.root / ".git").exists():
+            return None
+        try:
+            proc = await self._git(None, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("could not read the workspace's HEAD: %s", exc)
+            return None
+        head = proc.stdout.decode("ascii", "replace").strip() if proc.returncode == 0 else ""
+        return head or None
 
     def ensure_scratch(self, actor: str | None = None) -> None:
         """`.scratch/` with its self-ignoring `.gitignore` (written again when missing or changed) and, for `actor`, the

@@ -160,6 +160,9 @@ class Swarm:
         # streams, and the _monotonic() deadline of the grace after its last sign
         self._auto_reply_streams = 0
         self._auto_reply_until = 0.0
+        # the hub answers for the user itself (hold_auto_reply: a v1 session with `answers: auto`), for this object's
+        # whole life
+        self._auto_reply_held = False
         # agent idle (not busy, nothing pending) holding in-progress tasks or with liveness marks -> (that liveness
         # key, idle with it since)
         self._idle_holding: dict[str, tuple[StallKey, float]] = {}
@@ -1057,6 +1060,12 @@ class Swarm:
             return {"asker": p["asker"], "message_id": p["message_id"], "since": p.get("since")}
         return None
 
+    def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None:
+        """The id of the newest message from `sender` that reached `recipient` (named, or through "all": the inbox
+        row), sent at `since` (a timestamp) or later; None when there is none (docs/SPEC.md §21.5 `message`)."""
+        found = self.db.scalar(_LAST_TO, (sender, recipient, since))
+        return int(found) if found is not None else None
+
     def pause_text(self) -> str:
         """The pause reason as readable text (swarm_status, an agent's trace)."""
         q = self.pending_question()
@@ -1194,9 +1203,15 @@ class Swarm:
             self._auto_reply_streams = max(0, self._auto_reply_streams - 1)
             self.auto_reply_seen()
 
+    def hold_auto_reply(self) -> None:
+        """The hub itself answers what the members ask the user (HTTP API v1 `answers: "auto"`, docs/SPEC.md §21.5):
+        the lease holds from now until this Swarm is unloaded, with no client sign. SessionManager._start_locked
+        takes it before `swarm.start()`, which may itself set a goal from the settings."""
+        self._auto_reply_held = True
+
     @property
     def auto_reply_active(self) -> bool:
-        return self._auto_reply_streams > 0 or _monotonic() < self._auto_reply_until
+        return self._auto_reply_held or self._auto_reply_streams > 0 or _monotonic() < self._auto_reply_until
 
     @property
     def clarifying(self) -> bool:
