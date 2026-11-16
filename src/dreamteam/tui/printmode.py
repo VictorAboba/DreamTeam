@@ -16,8 +16,11 @@ import sys
 import time
 from typing import Any, Callable, TextIO
 
+from ..autoreply import AUTO_REPLY, AUTO_REPLY_MAX, AUTO_REVIEW, reply_text, review_key, review_text, wants_reply
 from ..copyfrom import size_text
+from ..instruct import continue_step
 from ..models import USER
+from ..result import build_result
 from .client import Connection, HubError
 
 log = logging.getLogger(__name__)
@@ -28,19 +31,12 @@ LOST_LIMIT = 60.0        # seconds without the hub before giving up
 TICK = 0.5               # deadlines are checked at least this often
 EVENTS_PAGE = 2000       # /api/events page size when catching up after a (re)connect
 FINAL_STATE_TIMEOUT = 5.0
-AUTO_REPLY_MAX = 50      # a safety net against an endless question / auto-answer ping-pong (not approvals)
+# AUTO_REPLY, AUTO_REVIEW and AUTO_REPLY_MAX live in dreamteam.autoreply (shared with the hub); AUTO_REPLY_MAX is read
+# from this module's globals, so a test can patch printmode.AUTO_REPLY_MAX
 HEAL_AFTER = 2.0         # s after a failed auto-reply before the state is read again (doubling up to HEAL_MAX)
 HEAL_MAX = 30.0
 PROGRESS_SKIP = ("agent.status", "agent.usage", "agent.activity", "trace.")  # fallback feed: too noisy
 
-AUTO_REPLY = {
-    "ru": "Пользователь недоступен (неинтерактивный режим): прими решение сам и продолжай работу.",
-    "en": "The user is not available (non-interactive mode): decide yourself and continue.",
-}
-AUTO_REVIEW = {
-    "ru": "Принято автоматически: пользователь недоступен (неинтерактивный режим), задачу никто не проверял.",
-    "en": "Approved automatically: the user is not available (non-interactive mode); nobody reviewed the task.",
-}
 TEXTS = {
     "ru": {
         "timeout": "Время ожидания истекло ({seconds:g} с): цель не достигнута.",
@@ -224,16 +220,6 @@ class _Progress:
             return []
 
 
-def _coordinator(state: dict) -> str | None:
-    """Who gets the prompt in an existing session: the planning task's assignee, else the first LLM agent."""
-    agents = [a for a in state.get("agents") or [] if a.get("status") != "retired"]
-    names = {a.get("name") for a in agents}
-    for task in state.get("tasks") or []:
-        if "planning" in (task.get("tags") or []) and task.get("assignee") in names:
-            return task["assignee"]
-    return next((a["name"] for a in agents if a.get("kind") == "llm"), None)
-
-
 class _PrintRun:
     def __init__(self, conn: Connection, prompt: str, *, session: str | None, continue_last: bool,
                  title: str | None, overrides: dict | None, output_format: str, verbose: bool,
@@ -380,7 +366,8 @@ class _PrintRun:
     async def attach(self, sid: str | None) -> None:
         """An existing session: the prompt becomes the goal when there is none, reopens a completed goal,
         else goes to the coordinator as a message (to the asker when the swarm waits for the user's answer to a
-        member's question: the prompt is the answer). Only what happens from now on is followed."""
+        member's question: the prompt is the answer); the decision is instruct.continue_step's. Only what happens
+        from now on is followed."""
         client = self.client
         self.sid = sid
         latest = await client.events(sid, limit=1)
@@ -391,25 +378,21 @@ class _PrintRun:
         self.lang = swarm.get("language") or self.lang
         if isinstance(swarm.get("clarify"), bool):
             self.clarify = swarm["clarify"]
-        question = swarm.get("question") if isinstance(swarm.get("question"), dict) else None
-        if question is not None and not (question.get("asker") and isinstance(question.get("message_id"), int)):
-            question = None
+        step = continue_step(state)
         for task in state.get("tasks") or []:  # reviews that were already waiting for the user
             if isinstance(task, dict):
                 await self.on_task(task)
-        goal = swarm.get("goal")
-        if not goal:
+        if step.action == "set_goal":
             ok, text = await client.act(sid, "set_goal", {"title": self.prompt})
-        elif goal.get("status") == "done":
+        elif step.action == "reopen_goal":
             ok, text = await client.act(sid, "swarm_control", {"reopen_goal_comment": self.prompt})
         else:
-            to = question["asker"] if question else (_coordinator(state) or "all")
-            ok, text = await client.act(sid, "send_message", {"to": [to], "text": self.prompt})
-            if ok and question:
-                self.replied_to.add(question["message_id"])
+            ok, text = await client.act(sid, "send_message", {"to": [step.to], "text": self.prompt})
+            if ok and step.answers_question is not None:
+                self.replied_to.add(step.answers_question)
         if not ok:
             raise _Finished("error", _text(self.text_lang, "error", error=text))
-        if swarm.get("paused") and swarm.get("pause_reason") not in ("budget", "question"):
+        if step.resume:
             # paused by the user: the new instruction is meant to be worked on (a budget pause ends the run; the
             # answer ends a question pause by itself, and a resume would drop the question)
             ok, text = await client.act(sid, "swarm_control", {"action": "resume"})
@@ -585,9 +568,9 @@ class _PrintRun:
         if not isinstance(mid, int) or mid in self.seen_messages:
             return
         self.seen_messages.add(mid)
-        sender = msg.get("sender")
-        if sender == USER or USER not in (msg.get("recipients") or []):
+        if not wants_reply(msg):
             return
+        sender = msg.get("sender")
         if not self.auto_reply:
             # a clarifying session: the planner asks before it plans (no pause), and nobody here answers
             if self.clarify and self.format != "stream-json" and mid not in self.asked_told:
@@ -628,7 +611,7 @@ class _PrintRun:
         here, so a catch-up goes on with the next events, and it schedules heal."""
         try:
             ok, text = await self.client.act(self.sid, "send_message", {
-                "to": [to], "text": AUTO_REPLY.get(self.lang, AUTO_REPLY["en"]), "reply_to": mid})
+                "to": [to], "text": reply_text(self.lang), "reply_to": mid})
         except HubError as exc:
             ok, text = False, exc.message
         if ok:
@@ -654,14 +637,12 @@ class _PrintRun:
         counterpart of AUTO_REPLY for questions; --no-auto-reply leaves it waiting). Approvals do not count
         against AUTO_REPLY_MAX: an approval settles the task (no ping-pong), and a one-agent run sends every
         task, the planning task included, to the user."""
-        if task.get("status") != "review" or task.get("reviewer") != USER or not isinstance(task.get("id"), int):
-            return
-        key = (task["id"], task.get("updated_at"))
-        if key in self.auto_reviewed or not self.auto_reply:
+        key = review_key(task)
+        if key is None or key in self.auto_reviewed or not self.auto_reply:
             return
         self.auto_reviewed.add(key)
         ok, text = await self.client.act(self.sid, "task_review", {
-            "task_id": task["id"], "approve": True, "comment": AUTO_REVIEW.get(self.lang, AUTO_REVIEW["en"])})
+            "task_id": task["id"], "approve": True, "comment": review_text(self.lang)})
         if not ok:
             log.warning("auto-approval of task #%s failed: %s", task["id"], text)
 
@@ -678,21 +659,12 @@ class _PrintRun:
         if status == "done" and self.goal and (goal or {}).get("status") != "done":
             goal = self.goal  # the state may already be newer (e.g. reopened)
         summary = (goal or {}).get("summary", "") if status == "done" else ""
-        result: dict[str, Any] = {
-            "type": "result", "status": status, "session": self.sid, "goal": goal, "summary": summary,
-            "tasks": [{"id": t.get("id"), "title": t.get("title"), "status": t.get("status"),
-                       "assignee": t.get("assignee")} for t in (state or {}).get("tasks") or []],
-            "cost_usd": float(swarm.get("spent_usd") or 0.0),
-            "duration_s": round(time.monotonic() - self.started, 3),
-            "agents": [a.get("name") for a in (state or {}).get("agents") or [] if a.get("status") != "retired"],
-            # the agents' background jobs still running (e.g. a dev server after the goal): with an external hub
-            # they go on after this run, until the session stops
-            "jobs": [{"id": j.get("id"), "label": j.get("label"), "owner": j.get("owner"), "command": j.get("command"),
-                      "origin": j.get("origin")}
-                     for j in (state or {}).get("jobs") or [] if isinstance(j, dict) and j.get("status") == "running"],
-        }
-        if status != "done" and reason:
-            result["error"] = reason
+        # (the jobs still running: with an external hub they go on after this run, until the session stops)
+        result = build_result(status=status, session=self.sid, goal=goal, summary=summary,
+                              tasks=(state or {}).get("tasks") or [], agents=(state or {}).get("agents") or [],
+                              jobs=(state or {}).get("jobs") or [], cost_usd=float(swarm.get("spent_usd") or 0.0),
+                              duration_s=round(time.monotonic() - self.started, 3),
+                              error=reason if status != "done" and reason else None)
         if self.format == "text":
             if status == "done":
                 self.out.write((summary or (goal or {}).get("title") or "").rstrip() + "\n")
