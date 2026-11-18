@@ -106,8 +106,12 @@ _REVIEW_ROUND = ("SELECT id, ts FROM events WHERE type = 'task.updated' AND json
                  "AND json_extract(data, '$.task.status') = 'review' AND json_extract(data, '$.task.reviewer') = 'user' "
                  "AND (json_extract(data, '$.changes.status[1]') = 'review' "
                  "OR json_extract(data, '$.changes.reviewer[1]') = 'user') ORDER BY id DESC LIMIT 1")
-_REQUEST_ID = re.compile(r"(?:(?P<kind>[qm])(?P<mid>[1-9][0-9]*)|r(?P<task>[1-9][0-9]*)-(?P<event>0|[1-9][0-9]*)"
+# a request's id (request_key): its numbers have at most 19 digits, as SQLite's integers (ID_MAX), so a client's id
+# of thousands of digits never reaches int() (Python refuses a text of over 4300 digits: a ValueError)
+_REQUEST_ID = re.compile(r"(?:(?P<kind>[qm])(?P<mid>[1-9][0-9]{0,18})"
+                         r"|r(?P<task>[1-9][0-9]{0,18})-(?P<event>0|[1-9][0-9]{0,18})"
                          r"|s-(?P<name>.+)-(?P<digest>[0-9a-f]{12})?)\Z")
+ID_MAX = (1 << 63) - 1   # the largest id SQLite holds (a message's, a task's, an event's)
 
 
 def planner_question(scalar: Callable[[str, tuple], Any], name: str, task_id: int, since: Any) -> int | None:
@@ -265,15 +269,18 @@ def blocking_requests(requests: Iterable[dict[str, Any]]) -> list[dict[str, Any]
 
 def request_key(rid: Any) -> tuple[Any, ...] | None:
     """What a request id names: ("question", message id), ("message", message id), ("review", task id, event id) or
-    ("mcp", server name, digest[:12] or ""); None for anything else."""
+    ("mcp", server name, digest[:12] or ""); None for anything else, a number above ID_MAX among them (no request
+    has one)."""
     match = _REQUEST_ID.match(rid) if isinstance(rid, str) else None
     if match is None:
         return None
     if match["kind"]:
-        return ("question" if match["kind"] == "q" else "message"), int(match["mid"])
-    if match["task"]:
-        return "review", int(match["task"]), int(match["event"])
-    return "mcp", match["name"], match["digest"] or ""
+        key: tuple[Any, ...] = ("question" if match["kind"] == "q" else "message"), int(match["mid"])
+    elif match["task"]:
+        key = "review", int(match["task"]), int(match["event"])
+    else:
+        return "mcp", match["name"], match["digest"] or ""
+    return key if all(number <= ID_MAX for number in key[1:]) else None
 
 
 # ---- a session's journal, followed by id ----------------------------------------------------------------------------
@@ -480,7 +487,7 @@ class SessionAutoReply:
         self.swarm.notify(USER, "u_auto_reply_limit", wake=False, max=self.limit)
 
 
-__all__ = ["AUTO_REPLY", "AUTO_REVIEW", "AUTO_REPLY_MAX", "BLOCKING_KINDS", "JOURNAL_BATCH", "LAST_TO", "PLANS",
-           "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests", "follow_journal",
+__all__ = ["AUTO_REPLY", "AUTO_REVIEW", "AUTO_REPLY_MAX", "BLOCKING_KINDS", "ID_MAX", "JOURNAL_BATCH", "LAST_TO",
+           "PLANS", "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests", "follow_journal",
            "journal_head", "planner_question", "read_requests", "reply_text", "request_key", "requests_from",
            "requests_of", "review_key", "review_text", "wants_reply"]

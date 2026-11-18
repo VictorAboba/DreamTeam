@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import contextvars
 import logging
+import sqlite3
 import time
+from pathlib import Path
 from typing import Any, Iterable, Iterator
 
-from .db import Database, dumps, loads
+from .db import Database, dumps, loads, reading_file
 from .models import ALL, USER, ToolError
 
 log = logging.getLogger(__name__)
@@ -58,6 +60,35 @@ def _as_limit(value: Any) -> int:
 
 
 _TO_ME = "EXISTS (SELECT 1 FROM inbox i WHERE i.message_id = m.id AND i.recipient = ?)"
+# the user's conversation with the members (docs/SPEC.md §21.5 "Messages"): the messages the user sent and those that
+# reached the user, with an id above `after`, oldest first: (after, USER, USER, limit). A range of ids from `after` on,
+# read until `limit` of the user's are found: a poll from the last id costs what was written since, a page where the
+# user's messages are few among the members' may read every message after `after`. Only the columns every version of
+# the table has (no to_all): a stopped session's file may be an older one.
+_USER_CONVERSATION = ("SELECT m.id, m.ts, m.sender, m.recipients, m.text, m.reply_to FROM messages m "
+                      f"WHERE m.id > ? AND (m.sender = ? OR {_TO_ME}) ORDER BY m.id ASC LIMIT ?")
+
+
+def _conversation(rows: Iterable[Any]) -> list[dict]:
+    """Rows of _USER_CONVERSATION as {id, ts, sender, recipients, text, reply_to}."""
+    return [{"id": row["id"], "ts": row["ts"], "sender": row["sender"], "recipients": loads(row["recipients"], []),
+             "text": row["text"], "reply_to": row["reply_to"]} for row in rows]
+
+
+def read_user_conversation(db_path: str | Path, after: int = 0, limit: int = 200) -> list[dict]:
+    """Mailbox.user_conversation of a session that is not loaded, read from its database file (db.reading_file:
+    nothing is written next to it); [] without a database. sqlite3.Error or OSError for a file it cannot read."""
+    path = Path(db_path)
+    if not path.exists():
+        return []
+    with reading_file(path, timeout=2.0) as (conn, _immutable):
+        cur = conn.cursor()
+        cur.row_factory = sqlite3.Row
+        try:
+            return _conversation(cur.execute(_USER_CONVERSATION, (_as_id(after, "after"), USER, USER,
+                                                                  _as_limit(limit))).fetchall())
+        finally:
+            cur.close()
 
 
 class Mailbox:
@@ -225,6 +256,13 @@ class Mailbox:
 
     def recent(self, limit: int = 100, since_id: int = 0) -> list[dict]:
         return self._page("1 = 1", [], limit, since_id)
+
+    def user_conversation(self, after: int = 0, limit: int = 200) -> list[dict]:
+        """The user's conversation with the members (docs/SPEC.md §21.5 "Messages"): the messages the user sent and
+        those that reached the user, with an id above `after`, oldest first, at most `limit` of them, as
+        {id, ts, sender, recipients, text, reply_to}. Unlike conversation() and history(), `after` 0 gives the oldest
+        page, not the latest. read_user_conversation reads a session's file the same way."""
+        return _conversation(self.db.all(_USER_CONVERSATION, (_as_id(after, "after"), USER, USER, _as_limit(limit))))
 
     # --- helpers ---------------------------------------------------------------------------------------
 

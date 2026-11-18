@@ -19,7 +19,7 @@ import pytest
 import dreamteam
 from dreamteam import autoreply, prompts
 from dreamteam import settings as st
-from dreamteam.autoreply import (AUTO_REPLY, AUTO_REVIEW, BLOCKING_KINDS, SessionAutoReply, blocking_requests,
+from dreamteam.autoreply import (AUTO_REPLY, AUTO_REVIEW, BLOCKING_KINDS, ID_MAX, SessionAutoReply, blocking_requests,
                                  follow_journal, journal_head, read_requests, reply_text, request_key, requests_of,
                                  review_key, review_text, wants_reply)
 from dreamteam.config import Config
@@ -101,9 +101,14 @@ def test_request_key():
     assert request_key("s-web-3f9a0c1b2d4e") == ("mcp", "web", "3f9a0c1b2d4e")
     assert request_key("s-web-api-3f9a0c1b2d4e") == ("mcp", "web-api", "3f9a0c1b2d4e")
     assert request_key("s-old-") == ("mcp", "old", "")   # a record of an older version has no digest
+    assert request_key(f"q{ID_MAX}") == ("question", ID_MAX)
+    assert request_key(f"r{ID_MAX}-{ID_MAX}") == ("review", ID_MAX, ID_MAX)
     for wrong in ("q0", "q012", "q12x", "x12", "r7", "r7-", "r-1", "r7-01", "s--", "s-web", "q 12", "", "q12\n",
-                  "Q12", "s-web-3F9A0C1B2D4E", "s-web-3f9a0c1b2d4", None, 12):
-        assert request_key(wrong) is None, wrong
+                  "Q12", "s-web-3F9A0C1B2D4E", "s-web-3f9a0c1b2d4", None, 12,
+                  # numbers no SQLite id has; thousands of digits never reach int() (a ValueError past 4300)
+                  f"q{ID_MAX + 1}", f"m{'1' * 20}", f"r{ID_MAX + 1}-1", f"r1-{ID_MAX + 1}", "q" + "9" * 5000,
+                  "r1-" + "9" * 5000, "m" + "1" * 4400):
+        assert request_key(wrong) is None, wrong[:30] if isinstance(wrong, str) else wrong
 
 
 def test_the_limit_notice():

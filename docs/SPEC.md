@@ -1693,6 +1693,12 @@ class Mailbox:
     def conversation(self, a: str, b: str, limit: int = 200, since_id: int = 0) -> list[dict]
         # messages where (sender a and b in recipients) or (sender b and a in recipients), ascending
     def recent(self, limit: int = 100, since_id: int = 0) -> list[dict]
+    def user_conversation(self, after: int = 0, limit: int = 200) -> list[dict]
+        # the user's conversation with the members (HTTP API v1, §21.5 "Messages"): messages the user sent or that
+        # reached the user, id > after, ascending; after 0 is the OLDEST page (conversation/recent give the latest).
+        # Dicts {"id","ts","sender","recipients","text","reply_to"} (no to_all: the columns every version has)
+def read_user_conversation(db_path, after: int = 0, limit: int = 200) -> list[dict]
+    # the same from a session's database file (db.reading_file, nothing written next to it); [] without one
 # message dict: {"id","ts","sender","recipients":[...],"text","reply_to","to_all"}
 # to_all: sent to "all" (column messages.to_all; Database adds it to a file of an older version: db.ADDED_COLUMNS)
 ```
@@ -3198,8 +3204,10 @@ class MCPForge:
   `u_mcp_pending` show it; the dialog and the web card send the one they show, `/approve <name> <sha256>` in the
   console and the TUI takes it, and the TUI's `/approve <name>` alone sends the one of the last dialog shown for
   that server) refuses the approval when the record's digest does not start with it (the message shows the
-  current one): the owner created the server again meanwhile. The TUI closes an open dialog whose server is created again with another
-  digest and asks about the new code. A record of an older version has no digest: its first start tests the working
+  current one): the owner created the server again meanwhile. A rejection given with a `digest` (the HTTP API v1
+  sends one, §21.5) is refused the same way; one without (the dialog, the card) rejects whatever waits. The TUI
+  closes an open dialog whose server is created again with another digest and asks about the new code. A record of
+  an older version has no digest: its first start tests the working
   copy again (with `require_approval` it waits for approval once); an `approve` of such a pending record tests it,
   raises with a plain message (recorded by an older version, without a snapshot) and leaves it pending with its new
   digest.
@@ -6965,9 +6973,10 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   (raise it with PATCH first). `text` is a string with a character that is not whitespace, the body's only field
   (400 `bad_request`, `unknown_field`); the whitespace around it is dropped (`api_v1.continue_text`: a message and a
   goal drop it anyway, a reopened goal's comment would keep it), and what is left takes at most 50 000 characters
-  (`mailbox.MAX_TEXT`: it may become a message). It is given in process, as the user (`ApiV1._deliver`: `set_goal`,
-  `reopen_goal`, `mail.send`, `resume`), always under the session's lock; what the swarm refuses (a ToolError) is
-  409 `conflict`. The answer is 200 with the summary, by the session's state:
+  (`mailbox.MAX_TEXT`: it may become a message) and no unpaired surrogate (a `\ud800` in the JSON: SQLite stores
+  UTF-8, so no message could hold it; `api_v1.required_text`). It is given in process, as the user
+  (`ApiV1._deliver`: `set_goal`, `reopen_goal`, `mail.send`, `resume`), always under the session's lock; what the
+  swarm refuses (a ToolError) is 409 `conflict`. The answer is 200 with the summary, by the session's state:
   - running: the text is given at once (the refusals above are the answer's, nothing given); a session that stops
     while the request waits for its lock is taken as one that does not run (below).
   - not running: stopped, `starting` (a create or another `continue` in flight), or about to be resumed as the hub
@@ -7230,7 +7239,9 @@ retried answer never lands on a newer one:
   with it on, as `Swarm.asks_user` says). The list is oldest first (`ts`, the time it was asked: the message's, the
   review round's event's, the MCP record's last update). `autoreply.request_key(id)` reads an id back:
   `("question", message id)`, `("message", message id)`, `("review", task id, event id)` or
-  `("mcp", name, digest[:12] or "")`, None for anything else.
+  `("mcp", name, digest[:12] or "")`, None for anything else, a number of more than 19 digits or above 2^63−1
+  (`autoreply.ID_MAX`, SQLite's largest integer) among them: no request has one, and Python's `int()` refuses a text
+  of over 4300 digits.
 - **Cost.** Every session summary (the sessions list, polled by the home page) reads the requests, so no query of
   `requests_from` scans a whole table for each request: the newest round of each review is read back from the newest
   `task.updated` on the events type index (`ORDER BY id DESC LIMIT 1`), and each member's last message to the user
@@ -7263,14 +7274,58 @@ retried answer never lands on a newer one:
   do not block the work, and the board decides them.
 - `question`, `review` and `mcp` requests block the work: the state is then `waiting` (21.7). `message` requests do
   not.
-- An answer first checks that its request is still current: an answered or vanished one is 404 `not_found`. A field of
-  another kind's answer is 400 `unknown_field`, a missing one 400 `bad_request`. An answer needs the session running
-  (409 `not_running`).
-- **Messages.** `GET messages` reads the user's conversation with the members, oldest first, after `after` (`limit`
-  1–500, default 200; `last` is the newest id returned, else `after`), through a new ascending query,
-  `Mailbox.user_conversation(after, limit)`. (`Mailbox.conversation` gives one pair's messages and, with `since_id`
-  0, its latest page rather than the oldest; `history` also gives the latest page.) A stopped session's messages are
-  read from its file.
+- `GET requests` reads a loaded session's requests through its swarm (`requests_of`) and any other session's from its
+  file (`read_requests` with the session's `[swarm] clarify`: its overrides on the global settings, as its summary
+  reads it), never loading it; also from the file when an unload closed the swarm's connection while it read
+  (`sqlite3.ProgrammingError`). In a thread (`ApiV1._read_db`): the file may be large. A stopped session's file that
+  cannot be read (a damaged one) gives `{"requests": []}`, as its summary counts none, and `GET messages` gives
+  `{"messages": [], "last": after}` (`ApiV1._stored_conversation`); the hub's log says why at debug level, since
+  clients poll. A loaded session's database error other than a closed connection is 500 `internal`.
+- An answer (`POST requests/{rid}`, `ApiV1._answer`) is checked in this order: the query; the body; the id (an id that
+  `request_key` cannot read names no request: 404 `not_found`); the body's fields for the kind it names
+  (`api_v1.answer_of`, `ANSWER_FIELDS`): a field of another kind's answer is 400 `unknown_field`, a missing one or a
+  value of the wrong kind 400 `bad_request` (null is not given); then the session (404), `earlier_version` (409), and
+  it must run (409 `not_running`, `api_v1.NOT_RUNNING_TEXT`, also when it stopped while the answer waited for its
+  lock). Under the session's lock the request must still be current (`requests_of` lists that id; an answered,
+  vanished or older one, a review round handed in again or an MCP server built again, is 404 `not_found`), checked on
+  the loop with no await before the action, so the agents, on the same loop, cannot come between. It is given in
+  process, as the user (`ApiV1._give_answer`): a question or a message is the user's message to its member with
+  `reply_to` (to the asker of a question pause `Mailbox.send` makes it the answer, which ends the pause), and that
+  message is marked read in the user's inbox (`Mailbox.mark_read`: the client was shown it). Only that one: the
+  member's earlier messages, which no request listed, stay unread on the board. A review is
+  `Board.review(USER, task, approve, comment)`. An MCP server is `MCPForge.approve(USER, name, approve, digest=<the
+  id's 12 hex>)` (`ApiV1._approve_server`), called right after the check, after the session's lock: leaving that lock
+  and taking the forge's free lock of the server never yield, and while another call holds the forge's lock (its owner
+  builds it again), the forge's own digest check refuses an approval or a rejection of a server built again
+  meanwhile. It is not under the session's lock, as the board's approval is not: an approval whose working copy
+  changed builds and smoke-tests it again first (up to `[mcp] startup_timeout`), and a stop, a delete or the hub's
+  shutdown would wait for that. A session that stopped meanwhile (its database closed) is 409 `not_running`; a
+  second answer to the same server sent while the first one runs is 409 `conflict` (the forge: it waits no more).
+  What the swarm refuses (a ToolError) is 409 `conflict`; its text, which may name a path of the hub's computer (a
+  failed smoke test's), goes to the API caller through the redaction of 21.1, as a manager error's (`ApiError(...,
+  redact=True)`; the same for `continue`'s refusals and `POST messages`). The answer is
+  `{"ok": true, "session": summary}`. The text of a question's or a message's answer
+  follows `continue`'s rule (21.2: stripped, non-blank, at most 50 000 characters, no unpaired surrogate); a review's
+  `comment` is a string or null, at most `board.MAX_POST` (20 000) characters once stripped (it becomes a post of the
+  task).
+- **Messages.** `GET messages` reads the user's conversation with the members (what the user sent and what reached
+  the user; a member's message to `"all"` never reaches the user), oldest first, after `after` (a whole number from 0
+  up to 2^63−1, `api_v1.query_after`; `limit` 1–500, default 200; `last` is the newest id returned, else `after`),
+  through a new ascending query, `Mailbox.user_conversation(after, limit)` (`{id, ts, sender, recipients, text,
+  reply_to}`, the columns every version of the table has). (`Mailbox.conversation` gives one pair's messages and, with
+  `since_id` 0, its latest page rather than the oldest; `history` also gives the latest page.) A session that is not
+  loaded is read from its file (`mailbox.read_user_conversation(db_path, after, limit)`, through `db.reading_file`;
+  [] without a database), as `GET requests` reads it, in a thread. A message is `{id, ts, from, to, text, reply_to}`
+  (`api_v1.message_view`). A page reads the messages after `after` until it has `limit` of the user's: a poll from
+  `last` costs what was written since, while a first page of a long session where the members wrote much to each
+  other and little to the user reads them all (about 0.2 s for 200 000 messages, under a loaded session's database
+  lock).
+- `POST messages` (`ApiV1._send`) takes `{"to", "text", "reply_to"?}` (`api_v1.message_of`, `MESSAGE_FIELDS`): `to` a
+  list of 1 to 100 member names or `"all"` (every active member; `api_v1.TO_MAX`), `text` as an answer's, `reply_to`
+  a message id or null; another field is 400 `unknown_field`. Its checks come in an answer's order, and it is sent
+  under the session's lock as the board's user sends it (`Mailbox.send(USER, to, text, reply_to)`: one to the asker of
+  a question pause is its answer). What the mailbox refuses (an unknown or retired member, the user alone, a
+  `reply_to` that names no message) is 400 `bad_request`, with the mailbox's text. 201 `{"message"}`.
 - **`answers: "auto"`**: `autoreply.SessionAutoReply(swarm)` does for that session what the `-p` client does
   (docs/TUI.md §2):
   - every message of a member to the user gets `AUTO_REPLY`, at most `AUTO_REPLY_MAX` per start;
@@ -7634,7 +7689,14 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     characters, or equal to the goal's title; `start_agents` 0, over `max_agents`, and with a `team` string;
     `client_ref` twice, with another body, and during a slow copy; a failed start; `max_running`;
   - auto answers (a question, a review per round, a question pause, past `AUTO_REPLY_MAX`, after a hub restart) and
-    manual requests with their answers;
+    manual requests with their answers (`tests/test_api_v1_requests.py`: a question pause, a clarify planner's
+    question read from the stopped session's file too, a message, a review answered once per round, an MCP server
+    approved through its digest and a stale digest refused, its code changed after the listing (tested again, the
+    refusal's text redacted, the old id 404), a server built again while the answer waits for the forge, a stop that
+    does not wait for an approval testing the server again; the answers' fields by kind, an answered or unknown
+    request, an id of thousands of digits, a stopped session, a stop that takes the lock first, an earlier-version
+    session; the user's conversation from `after`, a message sent, what the mailbox refuses; a damaged file of a
+    stopped session; the API token's scope);
   - polling (`after=0` from the oldest, a page the filter emptied answered at once, an `after` past the head, `wait`
     woken by a change of state, `final` never before `session.stopped`) and the stream (resumed by `Last-Event-ID`,
     across a stop and a start, its `result`, a final session behind a gap the filter empties ending with its result);

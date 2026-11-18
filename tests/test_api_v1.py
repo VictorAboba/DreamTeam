@@ -923,6 +923,7 @@ async def test_patch_of_a_stopped_session_writes_what_its_next_start_reads(tmp_p
     ({"text": 5}, "", "bad_request"),
     ({"text": None}, "", "bad_request"),
     ({"text": "x" * (MAX_TEXT + 1)}, "", "bad_request"),
+    ({"text": "Go on \ud800"}, "", "bad_request"),   # (an unpaired surrogate: no message could hold it)
     ({"text": "Go on.", "to": ["all"]}, "", "unknown_field"),
     ({"text": "Go on."}, "now=1", "unknown_field"),
 ])

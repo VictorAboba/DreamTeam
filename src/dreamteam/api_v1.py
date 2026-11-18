@@ -35,13 +35,14 @@ from starlette.routing import Route
 
 from . import __version__, apifolders, roles
 from .apifolders import FOLDER_FIELDS, MODES, FolderRequest
-from .autoreply import blocking_requests, requests_of
+from .autoreply import ID_MAX, blocking_requests, read_requests, request_key, requests_of
+from .board import MAX_POST
 from .config import _joins_text, native_absolute
 from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads
 from .goal_text import split_goal
 from .httpjson import JSONResponse
 from .instruct import continue_step
-from .mailbox import MAX_TEXT
+from .mailbox import MAX_TEXT, read_user_conversation
 from .models import USER, ToolError
 from .sessionopts import OptionError, overrides_from
 from .sessions import API_ANSWERS, API_GIVEN, LEGACY_ID, TITLE_LIMIT, SessionError, api_answers, api_meta, session_uid
@@ -63,6 +64,10 @@ START_WAIT = 30.0           # seconds aclose() waits for the background tasks (s
 FIELDS_SHOWN = 10           # unknown fields named in an unknown_field text
 FIELD_CHARS = 60            # characters of each
 SESSIONS_DEFAULT, SESSIONS_MAX = 50, 200   # GET /api/v1/sessions `limit`
+MESSAGES_DEFAULT, MESSAGES_MAX = 200, 500  # GET /api/v1/sessions/{id}/messages `limit`
+# ID_MAX (autoreply's, SQLite's largest integer): the largest id a query's `after`, a message's `reply_to` or a
+# request's id names
+TO_MAX = 100                # names in the `to` of a message the client sends
 CLIENT_REF_MAX = 128        # characters of a create's client_ref
 API_SID = "dreamteam.api_sid"   # the scope key of the session a route resolved ({id}): its error texts name its folders
 UPLOAD_TYPES = ("application/octet-stream", "application/zip")   # what POST /api/v1/uploads takes (§21.3)
@@ -74,7 +79,15 @@ CREATE_FIELDS = ("goal", "title", "description", "language", "team", "model", "s
                  "client_ref")
 PATCH_FIELDS = ("max_cost_usd", "max_agents", "wrap_up")   # PATCH /api/v1/sessions/{id} (docs/SPEC.md §21.2)
 CONTINUE_FIELDS = ("text",)                                # POST /api/v1/sessions/{id}/continue
+MESSAGE_FIELDS = ("to", "text", "reply_to")                # POST /api/v1/sessions/{id}/messages (docs/SPEC.md §21.5)
+# the fields of an answer, by the kind of the request it answers (POST /api/v1/sessions/{id}/requests/{rid}, §21.5)
+ANSWER_FIELDS = {"question": ("text",), "message": ("text",), "review": ("approve", "comment"), "mcp": ("approve",)}
 SHUTTING_DOWN_TEXT = "DreamTeam is shutting down."
+NO_REQUEST_TEXT = ("No such request: it was answered, or it waits no more. GET /api/v1/sessions/{id}/requests lists "
+                   "what waits now.")
+# `not_running` of an answer or a message (docs/SPEC.md §21.2): they need the session running
+NOT_RUNNING_TEXT = ("The session is not running: POST /api/v1/sessions/{id}/continue starts it with a text (the "
+                    "answer to a pending question, else a message to its team).")
 # a continue's `api.error` when its start started nothing: a stop sent after it took the session's lock first
 NOT_DELIVERED_TEXT = "The session stopped before the text of a continue reached it: send the text again."
 NO_SESSION_TEXT = "No such session: GET /api/v1/sessions lists the sessions this token sees."
@@ -115,15 +128,19 @@ CODED_ERRORS: tuple[type[Exception], ...] = (SessionError, CopyError, SkillError
 class ApiError(Exception):
     """A refusal of a v1 route (a helper's or the route's own): the route wrapper answers it as
     `{"error": text, "code": code, **extra}` with the code's status (CODES). `extra`: a code's own fields, named where
-    docs/SPEC.md §21 describes that code."""
+    docs/SPEC.md §21 describes that code. `redact`: the text is not v1's own but what the swarm refused with (a
+    ToolError's, which may name a path of the hub's computer, e.g. a failed smoke test's): for the API caller it goes
+    through ApiV1.redact, as a manager error's does."""
 
-    def __init__(self, code: str, text: str, *, headers: Mapping[str, str] | None = None, **extra: Any):
+    def __init__(self, code: str, text: str, *, headers: Mapping[str, str] | None = None, redact: bool = False,
+                 **extra: Any):
         if code not in CODES:
             raise ValueError(f"not an API v1 code: {code!r}")
         super().__init__(text)
         self.code = code
         self.text = text
         self.headers = dict(headers or {})
+        self.redact = redact
         self.extra = extra
 
     def response(self) -> JSONResponse:
@@ -495,13 +512,36 @@ def query_flag(value: str | None, name: str) -> bool:
     return value == "true"
 
 
+def _whole(value: str, most: int) -> int | None:
+    """A whole number written in a query (ASCII digits, leading zeros allowed) when it is at most `most`, else None.
+    Never int() of more digits than `most` has: Python refuses to convert a text of over 4300 digits (a ValueError,
+    which would answer 500)."""
+    if not (value.isascii() and value.isdigit()):
+        return None
+    digits = value.lstrip("0") or "0"
+    return int(digits) if len(digits) <= len(str(most)) and int(digits) <= most else None
+
+
 def query_count(value: str | None, name: str, default: int, most: int) -> int:
     """A whole number from 1 to `most` given in a query (400 `bad_request` otherwise); absent is `default`."""
     if value is None:
         return default
-    if not (value.isascii() and value.isdigit()) or not 1 <= int(value) <= most:
+    number = _whole(value, most)
+    if number is None or number < 1:
         raise ApiError("bad_request", f"'{name}' must be a whole number from 1 to {most}.")
-    return int(value)
+    return number
+
+
+def query_after(value: str | None, name: str = "after") -> int:
+    """An id given in a query (`after`): a whole number from 0 up to ID_MAX, the largest SQLite holds (400
+    `bad_request` otherwise); absent is 0."""
+    if value is None:
+        return 0
+    number = _whole(value, ID_MAX)
+    if number is None:
+        raise ApiError("bad_request", f"'{name}' must be a whole number from 0 to {ID_MAX} (an id this route "
+                                      "answered).")
+    return number
 
 
 def check_json_type(request: Request) -> None:
@@ -513,19 +553,82 @@ def check_json_type(request: Request) -> None:
         raise ApiError("unsupported_media_type", f"{JSON_TYPE_TEXT}.")
 
 
+def _text_value(value: str, key: str, most: int) -> str:
+    """A body's text `value` (a string) without the whitespace around it, at most `most` characters so, and without
+    an unpaired surrogate ("\\ud800" in the JSON: SQLite stores UTF-8, so a message or a post holding one could not be
+    kept, a 500); 400 `bad_request` otherwise."""
+    text = value.strip()
+    if len(text) > most:
+        raise ApiError("bad_request", f"'{key}' takes at most {most} characters.")
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        raise ApiError("bad_request", f"'{key}' holds an unpaired surrogate (\\ud800 to \\udfff): it is no "
+                                      "text.") from None
+    return text
+
+
+def required_text(body: Mapping[str, Any], key: str, hint: str, most: int = MAX_TEXT) -> str:
+    """The text field `key` of a body (_text_value): a string with a character that is not whitespace (400
+    `bad_request`, "'<key>' is required: <hint>.", otherwise; null is not given)."""
+    value = body.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ApiError("bad_request", f"'{key}' is required: {hint}.")
+    return _text_value(value, key, most)
+
+
 def continue_text(body: Mapping[str, Any]) -> str:
     """The `text` of a `continue` (docs/SPEC.md §21.2) without the whitespace around it, as every action that takes
     it stores it (Mailbox.send strips a message, split_goal a goal; reopen_goal would keep it): a string with a
     character that is not whitespace, at most MAX_TEXT characters so (the most a message holds: the text may become
-    one); 400 `bad_request` otherwise."""
-    text = body.get("text")
-    if not isinstance(text, str) or not text.strip():
-        raise ApiError("bad_request", "'text' is required: the next instruction for the session (its goal when it "
-                                      "has none, the answer to a pending question, else a message to the team).")
-    text = text.strip()
-    if len(text) > MAX_TEXT:
-        raise ApiError("bad_request", f"'text' takes at most {MAX_TEXT} characters.")
-    return text
+    one), no unpaired surrogate; 400 `bad_request` otherwise."""
+    return required_text(body, "text", "the next instruction for the session (its goal when it has none, the answer "
+                                       "to a pending question, else a message to the team)")
+
+
+def answer_of(kind: str, body: Mapping[str, Any]) -> dict[str, Any]:
+    """The answer to a request of `kind` (docs/SPEC.md §21.5) in a POST's body: `{"text"}` for a question or a message
+    (required_text: it becomes the user's message, at most MAX_TEXT characters), `{"approve": bool, "comment"?}` for a
+    review (the comment at most board.MAX_POST characters: it becomes a post of the task), `{"approve": bool}` for an
+    MCP server. 400 `unknown_field` for a field another kind's answer has (ANSWER_FIELDS), `bad_request` for a missing
+    one or a value of the wrong kind; null is not given."""
+    check_fields(body, ANSWER_FIELDS[kind])
+    if kind in ("question", "message"):
+        return {"text": required_text(body, "text", f"the answer to the {kind}, sent to its member as your message")}
+    approve = body.get("approve")
+    if not isinstance(approve, bool):
+        raise ApiError("bad_request", "'approve' is required: true or false.")
+    if kind == "mcp":
+        return {"approve": approve}
+    comment = body.get("comment")
+    if comment is not None and not isinstance(comment, str):
+        raise ApiError("bad_request", "'comment' must be a string.")
+    return {"approve": approve, "comment": _text_value(comment or "", "comment", MAX_POST)}
+
+
+def message_of(body: Mapping[str, Any]) -> tuple[list[str], str, int | None]:
+    """(to, text, reply_to) of a message the client sends (POST messages, docs/SPEC.md §21.5): `to` a list of 1 to
+    TO_MAX member names or "all", `text` as required_text, `reply_to` a message id or null. 400 `unknown_field` for
+    another field, `bad_request` for a missing or wrong value."""
+    check_fields(body, MESSAGE_FIELDS)
+    to = body.get("to")
+    if (not isinstance(to, list) or not 1 <= len(to) <= TO_MAX
+            or not all(isinstance(name, str) and name.strip() for name in to)):
+        raise ApiError("bad_request", f"'to' is required: a list of 1 to {TO_MAX} member names, or [\"all\"] for "
+                                      "every member.")
+    text = required_text(body, "text", "the message")
+    reply_to = body.get("reply_to")
+    if reply_to is not None and (isinstance(reply_to, bool) or not isinstance(reply_to, int)
+                                 or not 1 <= reply_to <= ID_MAX):
+        raise ApiError("bad_request", "'reply_to' must be the id of a message (GET /api/v1/sessions/{id}/messages "
+                                      "lists them).")
+    return list(to), text, reply_to
+
+
+def message_view(message: Mapping[str, Any]) -> dict[str, Any]:
+    """A message as v1 shows it (docs/SPEC.md §21.2 `messages`): {id, ts, from, to, text, reply_to}."""
+    return {"id": message["id"], "ts": message["ts"], "from": message["sender"],
+            "to": list(message.get("recipients") or []), "text": message["text"], "reply_to": message.get("reply_to")}
 
 
 def budget_text(spent: float, limit: float) -> str:
@@ -580,6 +683,9 @@ class ApiV1:
             self._route("/api/v1/sessions/{id}", {"GET": self._get, "PATCH": self._patch, "DELETE": self._delete}),
             self._route("/api/v1/sessions/{id}/continue", {"POST": self._continue}),
             self._route("/api/v1/sessions/{id}/stop", {"POST": self._stop}),
+            self._route("/api/v1/sessions/{id}/requests", {"GET": self._requests}),
+            self._route("/api/v1/sessions/{id}/requests/{rid}", {"POST": self._answer}),
+            self._route("/api/v1/sessions/{id}/messages", {"GET": self._messages, "POST": self._send}),
         ]
         self.app = Starlette(routes=routes, exception_handlers={HTTPException: self._http_error})
         self.app.router.redirect_slashes = False
@@ -606,6 +712,9 @@ class ApiV1:
         try:
             return await handler(request, caller)
         except ApiError as exc:
+            if exc.redact and caller == "api":   # (the swarm's own text: in a thread, as error_response's)
+                text = await asyncio.to_thread(self.redact, exc.text, request.scope.get(API_SID))
+                return fail(exc.code, text, headers=exc.headers, **exc.extra)
             return exc.response()
         except CODED_ERRORS as exc:   # (the session the route resolved, if any: its folders are named in the text)
             return await self.error_response(exc, caller, request.scope.get(API_SID))
@@ -929,8 +1038,9 @@ class ApiV1:
         prompt (the goal set when there is none, a completed goal reopened with the text as the comment, a pending
         question answered with a message to the asker, else a message to the coordinator or "all"), then a resume
         when the user paused the session or a budget pause the budget now covers holds. 409 `budget_exhausted`
-        before anything is given while the budget is spent; 409 `conflict` for what the swarm refuses (a ToolError).
-        A delivery that succeeds clears the session's `api.error` (a failed one of an earlier `continue`)."""
+        before anything is given while the budget is spent; 409 `conflict` for what the swarm refuses (a ToolError,
+        its text redacted for the API caller). A delivery that succeeds clears the session's `api.error` (a failed one
+        of an earlier `continue`)."""
         if swarm.budget_exceeded():
             raise ApiError("budget_exhausted", budget_text(swarm.spent_usd(), swarm.limits()["max_cost_usd"]))
         step = continue_step(swarm.snapshot())
@@ -944,7 +1054,7 @@ class ApiV1:
             if step.resume or (swarm.paused and swarm.pause_reason == "budget"):
                 swarm.resume(USER)
         except ToolError as exc:
-            raise ApiError("conflict", str(exc)) from None
+            raise ApiError("conflict", str(exc), redact=True) from None
         try:
             failed = (api_meta(self.manager.meta(sid)) or {}).get("error")
         except SessionError:
@@ -961,18 +1071,89 @@ class ApiV1:
 
     def _deliver_recorded(self, sid: str, swarm: "Swarm", text: str) -> None:
         """_deliver right after a `continue`'s start (manager.start's `then`, the session's lock held), never raising:
-        a refusal becomes the session's `api.error` with its code (a manager error's text through _public_text, as a
-        start's error), any other exception `internal`, logged with its traceback."""
+        a refusal becomes the session's `api.error` with its code (a manager error's text and the swarm's own refusal
+        through _public_text, as a start's error), any other exception `internal`, logged with its traceback."""
         try:
             self._deliver(sid, swarm, text)
         except ApiError as exc:
-            self._record_error(sid, exc.code, exc.text)
+            self._record_error(sid, exc.code, self.manager._public_text(sid, exc.text) if exc.redact else exc.text)
         except CODED_ERRORS as exc:
             self._record_error(sid, error_code(exc), self.manager._public_text(sid, str(exc)))
         except Exception as exc:  # noqa: BLE001 - recorded in api.error; the session runs on
             log.exception("API v1: could not give the text of a continue to session %s", sid)
             self._record_error(sid, "internal", f"Internal error ({type(exc).__name__}): the hub's log has the "
                                                 "details.")
+
+    # ---- requests and messages (docs/SPEC.md §21.5) ----------------------------------------------------------------
+    def _read_db(self, sid: str, loaded: Callable[["Swarm"], Any], stored: Callable[[Path], Any]) -> Any:
+        """What a route reads from session `sid`'s database: `loaded(swarm)` for a loaded session (its own connection,
+        under its Database's lock), else `stored(path)` from its file, read-only, never through manager.load (which
+        would build and keep a whole Swarm); from the file also when an unload closed the connection meanwhile
+        (sqlite3.ProgrammingError). Blocking: a route calls it in a thread."""
+        swarm = self.manager.swarms.get(sid)
+        if swarm is not None:
+            try:
+                return loaded(swarm)
+            except sqlite3.ProgrammingError as exc:   # (unloaded meanwhile: its connection is closed)
+                log.debug("API v1: session %s was unloaded while it was read (%s): read from its file", sid, exc)
+        return stored(self.manager._data_dir(sid) / "swarm.db")
+
+    def _clarify(self, sid: str) -> bool:
+        """A session's [swarm] clarify (a clarify planner that waits is a request only with it on), as its summary
+        reads it: its overrides on the global settings, the global settings alone when its overrides fail."""
+        try:
+            return bool(self.manager.config_for(sid).swarm.clarify)
+        except (ValueError, SessionError):
+            return bool(self.manager.config.swarm.clarify)
+
+    @staticmethod
+    def _stored_conversation(path: Path, after: int, limit: int) -> list[dict]:
+        """read_user_conversation of a session's file; [] for a file it cannot read (a damaged one), as
+        read_requests gives no requests and the summary counts none then (logged at debug level: clients poll)."""
+        try:
+            return read_user_conversation(path, after, limit)
+        except (sqlite3.Error, OSError, ValueError, TypeError, KeyError, IndexError) as exc:   # (a damaged file)
+            log.debug("API v1: cannot read the messages of %s: %s", path, exc)
+            return []
+
+    def _give_answer(self, swarm: "Swarm", rid: str, key: tuple[Any, ...], answer: Mapping[str, Any]) -> None:
+        """The answer to request `rid` (`key`: request_key's reading of it) of the running session, given as the
+        user, in process, the session's lock held (the caller's). The request must wait still (requests_of, read on
+        the loop with no await before the action, which the agents, on the same loop, cannot come between): an
+        answered or vanished one is 404 `not_found`. A question or a message: the user's message to its member in
+        reply to it (to the asker of a question pause, Mailbox.send makes it the answer, which ends the pause), and
+        that message (only it: the client was shown it) read in the user's inbox; a review: Board.review. 409
+        `conflict` for what the swarm refuses (a ToolError). An MCP server's request is only checked here:
+        _approve_server answers it, after the lock."""
+        current = next((item for item in requests_of(swarm) if item["id"] == rid), None)
+        if current is None:
+            raise ApiError("not_found", NO_REQUEST_TEXT)
+        try:
+            if key[0] in ("question", "message"):
+                swarm.mail.send(USER, [current["from"]], answer["text"], reply_to=key[1])
+                swarm.mail.mark_read(USER, [key[1]])
+            elif key[0] == "review":
+                swarm.board.review(USER, key[1], answer["approve"], answer["comment"])
+        except ToolError as exc:
+            raise ApiError("conflict", str(exc), redact=True) from None
+
+    async def _approve_server(self, sid: str, swarm: "Swarm", key: tuple[Any, ...], approve: bool) -> None:
+        """An MCP server's request answered (MCPForge.approve as the user, with the request's digest), right after
+        _give_answer checked it under the session's lock: leaving that lock and taking the forge's free lock of the
+        server never yield, so nothing comes between; while another call holds the forge's lock (an agent building
+        the server again), the forge's own digest check, on an approval and on a rejection, refuses a server built
+        again meanwhile. Not under the session's lock, as the board's approval: one whose working copy changed builds
+        and smoke-tests it again first (up to [mcp] startup_timeout), and a stop, a delete or the hub's shutdown would
+        wait for that. 409 `conflict` for what the forge refuses (a ToolError: also a second answer to the same server
+        given while this one ran), `not_running` when the session stopped meanwhile (its database closed)."""
+        try:
+            await swarm.forge.approve(USER, key[1], approve, digest=key[2])
+        except ToolError as exc:
+            raise ApiError("conflict", str(exc), redact=True) from None
+        except sqlite3.ProgrammingError:   # (the session stopped while the forge worked: its connection is closed)
+            if self.manager.swarms.get(sid) is swarm:
+                raise
+            raise ApiError("not_running", NOT_RUNNING_TEXT) from None
 
     # ---- routes ---------------------------------------------------------------------------------------------------
     async def _options(self, request: Request, caller: str) -> Response:
@@ -1199,10 +1380,90 @@ class ApiV1:
             answer["folder_kept"] = {"root": folder["root"], "path": folder["path"]}
         return JSONResponse(answer)
 
+    async def _requests(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/requests (docs/SPEC.md §21.5): what waits for the user now, oldest first; a loaded
+        session's from its swarm (requests_of), any other's from its file (read_requests with its [swarm] clarify:
+        nothing from a file it cannot read, as its summary's count). In a thread: the file may be large."""
+        query_fields(request)
+        sid = self._session(request, caller)
+        found = await asyncio.to_thread(self._read_db, sid, requests_of,
+                                        lambda path: read_requests(path, clarify=self._clarify(sid)))
+        return JSONResponse({"requests": found})
 
-__all__ = ["API_SID", "API_VERSION", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS",
-           "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "JSON_MAX", "NOT_DELIVERED_TEXT", "PATCH_FIELDS",
-           "SESSIONS_DEFAULT", "SESSIONS_MAX", "START_WAIT", "STATES", "STATUS_CODES", "UPLOAD_TYPES", "ApiError",
-           "ApiV1", "CreateRequest", "budget_text", "check_fields", "check_json_type", "claim_uploads", "continue_text",
-           "error_code", "fail", "library_skills", "options_view", "query_count", "query_fields", "query_flag",
-           "read_json", "request_digest", "root_pairs", "skill_refs", "state_of"]
+    async def _answer(self, request: Request, caller: str) -> Response:
+        """POST /api/v1/sessions/{id}/requests/{rid} (docs/SPEC.md §21.5): the user's answer to one request, `{"text"}`
+        for a question or a message, `{"approve", "comment"?}` for a review, `{"approve"}` for an MCP server
+        (answer_of), given by _give_answer under the session's lock (an MCP server's by _approve_server right after
+        it); `{"ok": true, "session"}`. In this order: the query, the body, the id (an id that request_key cannot read
+        names no request: 404 `not_found`), the body's fields for the kind it names (400), the session (404),
+        `earlier_version` (409), then the session must run (409 `not_running`, also when it stopped while this waited
+        for its lock) and the request must wait still (404)."""
+        query_fields(request)
+        body = await read_json(request)
+        rid = request.path_params.get("rid")
+        key = request_key(rid)
+        if key is None:
+            raise ApiError("not_found", NO_REQUEST_TEXT)
+        answer = answer_of(key[0], body)
+        sid = self._session(request, caller)
+        manager = self.manager
+        manager._refuse_earlier(sid)
+        given: "Swarm | None" = None
+        if sid in manager.running:
+            async with manager._lock(sid):
+                swarm = manager.swarms.get(sid)
+                if sid in manager.running and swarm is not None:
+                    self._give_answer(swarm, rid, key, answer)
+                    given = swarm
+        if given is None:
+            raise ApiError("not_running", NOT_RUNNING_TEXT)
+        if key[0] == "mcp":   # (no await since the check under the lock)
+            await self._approve_server(sid, given, key, answer["approve"])
+        return JSONResponse({"ok": True, "session": self.summary(sid)})
+
+    async def _messages(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/messages?after=&limit= (docs/SPEC.md §21.5 "Messages"): the user's conversation
+        with the members after message `after`, oldest first (Mailbox.user_conversation; a session that is not loaded
+        from its file, read_user_conversation: nothing from a file it cannot read, as GET requests), at most `limit`
+        (1 to MESSAGES_MAX, default MESSAGES_DEFAULT); `last` is the newest id it gives, else `after`. In a thread:
+        the file may be large."""
+        query = query_fields(request, ("after", "limit"))
+        after = query_after(query.get("after"))
+        limit = query_count(query.get("limit"), "limit", MESSAGES_DEFAULT, MESSAGES_MAX)
+        sid = self._session(request, caller)
+        found = await asyncio.to_thread(self._read_db, sid, lambda swarm: swarm.mail.user_conversation(after, limit),
+                                        lambda path: self._stored_conversation(path, after, limit))
+        messages = [message_view(item) for item in found]
+        return JSONResponse({"messages": messages, "last": messages[-1]["id"] if messages else after})
+
+    async def _send(self, request: Request, caller: str) -> Response:
+        """POST /api/v1/sessions/{id}/messages {"to", "text", "reply_to"?} (docs/SPEC.md §21.5): a message of the user,
+        as the board's user sends it (Mailbox.send: one to the asker of a question pause is its answer), under the
+        session's lock; 201 `{"message"}`. Its checks come in the order of an answer's (_answer): 409 `not_running`
+        for a session that does not run (`continue` gives a stopped one its next instruction); 400 `bad_request` for
+        what the mailbox refuses (an unknown or retired member, a reply_to that names no message)."""
+        query_fields(request)
+        to, text, reply_to = message_of(await read_json(request))
+        sid = self._session(request, caller)
+        manager = self.manager
+        manager._refuse_earlier(sid)
+        if sid in manager.running:
+            async with manager._lock(sid):
+                swarm = manager.swarms.get(sid)
+                if sid in manager.running and swarm is not None:
+                    try:
+                        sent = swarm.mail.send(USER, to, text, reply_to)
+                    except ToolError as exc:
+                        raise ApiError("bad_request", str(exc), redact=True) from None
+                    return JSONResponse({"message": message_view(sent)}, status_code=201)
+        raise ApiError("not_running", NOT_RUNNING_TEXT)
+
+
+__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS",
+           "CREATE_FIELDS", "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "ID_MAX", "JSON_MAX",
+           "MESSAGES_DEFAULT", "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT",
+           "NO_REQUEST_TEXT", "PATCH_FIELDS", "SESSIONS_DEFAULT", "SESSIONS_MAX", "START_WAIT", "STATES",
+           "STATUS_CODES", "TO_MAX", "UPLOAD_TYPES", "ApiError", "ApiV1", "CreateRequest", "answer_of", "budget_text",
+           "check_fields", "check_json_type", "claim_uploads", "continue_text", "error_code", "fail", "library_skills",
+           "message_of", "message_view", "options_view", "query_after", "query_count", "query_fields", "query_flag",
+           "read_json", "request_digest", "required_text", "root_pairs", "skill_refs", "state_of"]
