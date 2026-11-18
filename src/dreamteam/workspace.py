@@ -16,7 +16,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import hubgit, netoff, prompts
 from .models import USER, Status, ToolError
@@ -418,14 +418,17 @@ def git_argv(git: str, root: Path, actor: str | None, args: tuple[str, ...] | li
 
 def run_git(root: Path, *args: str, actor: str | None = None, git: str | None = None,
             safe_directory: str | None = None, timeout: float = GIT_TIMEOUT, adopted: bool = False,
-            literal: bool = True, unfiltered: bool = False, offline: bool = False) -> subprocess.CompletedProcess:
+            literal: bool = True, unfiltered: bool = False, offline: bool = False,
+            env: dict[str, str] | None = None, secret_names: Iterable[str] = ()) -> subprocess.CompletedProcess:
     """Run git in `root` synchronously (call it from a thread), hardened like every DreamTeam git call (hubgit.py:
     its environment filtered of secrets, nothing the repository's config names runs); OSError when git cannot be run.
     `unfiltered`: the command stages, commits or checks its pathspecs, which then leave out the files of a disarmed
     required filter (hubgit.run_unfiltered), as in Workspace._run_git. `offline`: like the members' commands of a
-    session without network (hubgit.run; `isolated_git()` says when)."""
+    session without network (hubgit.run; `isolated_git()` says when). `env`: variables added to that environment
+    (e.g. GIT_OPTIONAL_LOCKS); `secret_names`: further variables it never has (the session's key variables, as
+    Workspace._secret_names)."""
     git = git or shutil.which("git") or "git"
-    env = hubgit.environment()
+    env = {**hubgit.environment(secret_names), **(env or {})}
     guard = hubgit.guard(git, root, env, offline=offline)
 
     def argv(args: list[str], literal: bool) -> list[str]:
@@ -594,6 +597,79 @@ def commit_paths(root: Path, paths: list[str], message: str, git: str | None = N
     return head.stdout.decode("ascii", "replace").strip() or None, None
 
 
+# a commit id as DreamTeam records it (`api.base_commit`: SHA-1 or SHA-256 hex): anything else never reaches git's
+# command line, where a text such as "--output=x" would be an option
+COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# what `git diff --name-status` says of a path, as v1's `changed_files` names it (docs/SPEC.md §21.7); any other
+# letter (T: a type change, U: unmerged, X) is "modified"
+_DIFF_CHANGES = {"A": "added", "D": "deleted"}
+
+
+class BaseCommitGone(LookupError):
+    """changed_since: the base commit is not (or no longer) in the repository."""
+
+
+def changed_since(root: Path, base: str, *, adopted: bool = False, network_off: bool = False,
+                  git: str | None = None, secret_names: Iterable[str] = ()) -> list[dict[str, str]]:
+    """The files of the working tree at `root` that differ from commit `base` (docs/SPEC.md §21.7 `changed_files`), as
+    [{"path", "change": "added" | "modified" | "deleted"}] sorted by path ('/' between names, relative to `root`, the
+    top folder of its repository). Untracked files count (one the autocommit holds back too, §7 "Held new files");
+    ignored ones and `.scratch/` do not; a path both deleted and untracked is "modified". Read with DreamTeam's
+    guarded git (hubgit: the repository's hooks, filters, textconv and diff drivers and core.fsmonitor disarmed; the
+    files of a disarmed required filter left out, as from every commit), with GIT_OPTIONAL_LOCKS=0 (it never takes
+    index.lock) and without the workspace's git lock, so the agents' commits never wait for it: `git rev-parse
+    --verify --quiet <base>^{commit}`, `git diff --name-status -z --no-renames --no-ext-diff --no-textconv
+    --ignore-submodules=none <base> -- . ':(exclude).scratch'`, `git ls-files --others --exclude-standard -z`. A
+    module function: a stopped session needs no Swarm. `adopted`: the folder is the user's (its own line-ending
+    settings apply, as in its commits); `network_off`: the session's setting (isolated_git: its git then runs like the
+    members' commands); `secret_names`: the session's key variables. ValueError for a `base` that is no commit id
+    (COMMIT_ID: it never reaches git's command line), BaseCommitGone when the repository opens and lacks it (rev-parse's
+    exit 1), OSError when git cannot be run or fails, also when it cannot open the repository (its output is logged,
+    never in the text: it may name the folder). Blocking: call it in a thread."""
+    if not isinstance(base, str) or not COMMIT_ID.fullmatch(base):
+        raise ValueError("not a commit id")
+    root = Path(root)
+    if not os.path.lexists(root / ".git"):
+        raise OSError("the folder has no repository of its own")
+    offline = isolated_git(network_off)
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        try:
+            return run_git(root, *args, git=git, adopted=adopted, literal=False, unfiltered="--" in args,
+                           offline=offline, env={"GIT_OPTIONAL_LOCKS": "0"}, secret_names=secret_names)
+        except subprocess.SubprocessError as exc:   # (a timeout)
+            raise OSError(f"git {args[0]} did not finish") from exc
+
+    def failed(proc: subprocess.CompletedProcess, what: str) -> OSError:
+        log.info("git %s in %s failed (%s): %s", what, root, proc.returncode, git_output(proc)[:500])
+        return OSError(f"git {what} failed with exit code {proc.returncode}")
+
+    # exit 1: the repository opened and holds no such commit; anything else (128: git could not open the repository, a
+    # damaged one, a permission refused) is a failure, never "gone"
+    probe = run("rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
+    if probe.returncode == 1:
+        raise BaseCommitGone(base)
+    if probe.returncode != 0:
+        raise failed(probe, "rev-parse")
+    diff = run("diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+               "--ignore-submodules=none", base, "--", ".", f":(exclude){SCRATCH_DIR}")
+    if diff.returncode != 0:
+        raise failed(diff, "diff")
+    changes: dict[str, str] = {}
+    fields = diff.stdout.decode("utf-8", "replace").split("\0")
+    for status, path in zip(fields[0::2], fields[1::2]):
+        if status and path:
+            changes[path] = _DIFF_CHANGES.get(status[0], "modified")
+    others = run("ls-files", "--others", "--exclude-standard", "-z", "--", ".", f":(exclude){SCRATCH_DIR}")
+    if others.returncode != 0:
+        raise failed(others, "ls-files")
+    for name in others.stdout.decode("utf-8", "replace").split("\0"):
+        path = name.rstrip("/")   # (a nested repository: its folder, named once)
+        if path:
+            changes[path] = "modified" if changes.get(path) == "deleted" else changes.get(path, "added")
+    return [{"path": path, "change": change} for path, change in sorted(changes.items())]
+
+
 def _check_windows_names(parts: tuple[str, ...], shown: str) -> None:
     for part in parts:
         if _WIN_BAD_CHARS.search(part):
@@ -746,6 +822,13 @@ class Workspace:
             return None
         head = proc.stdout.decode("ascii", "replace").strip() if proc.returncode == 0 else ""
         return head or None
+
+    async def changed_since(self, base: str) -> list[dict[str, str]]:
+        """The module's changed_since for this workspace, in a thread, without the git lock (the agents' commits
+        never wait for it): the files that differ from commit `base` (docs/SPEC.md §21.7 `changed_files`)."""
+        return await asyncio.to_thread(changed_since, self.root, base, adopted=self.adopted,
+                                       network_off=netoff.is_off(getattr(self.swarm, "config", None)),
+                                       git=self._git_exe, secret_names=self._secret_names())
 
     def ensure_scratch(self, actor: str | None = None) -> None:
         """`.scratch/` with its self-ignoring `.gitignore` (written again when missing or changed) and, for `actor`, the

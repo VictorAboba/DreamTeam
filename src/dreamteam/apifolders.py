@@ -51,6 +51,9 @@ NAME_SHOWN = 64                         # characters of an unknown root's name q
 # (git_dir_refusal)
 GIT_WRITES = ("objects", "refs", "logs", "packed-refs", "index", "HEAD", "COMMIT_EDITMSG")
 SHOWN_NAME = 120                        # characters of a name inside a repository quoted in a text
+# git_dir_refusal's reason when git fails on the folder's repository: followed by git's own output, which v1's
+# `changed_files_error` leaves out (docs/SPEC.md §21.7: its texts are never git's output)
+GIT_UNREADABLE = "git cannot read its repository"
 
 
 def roots(config: "Config") -> dict[str, ApiFolder]:
@@ -259,7 +262,7 @@ def git_dir_refusal(folder: Path, git: str | None = None, *, offline: bool = Fal
     except OSError as exc:
         return f"git cannot be run ({exc.strerror or exc})"
     if proc.returncode != 0:
-        return None if st is None else f"git cannot read its repository: {git_output(proc)[:300]}"
+        return None if st is None else f"{GIT_UNREADABLE}: {git_output(proc)[:300]}"
     lines = [line.strip() for line in proc.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
     if len(lines) < 2 + len(GIT_WRITES):
         return "git does not name its repository's folders"
@@ -347,5 +350,6 @@ def log_refusals(config: "Config", home: Path) -> None:
             log.log(level, "[api.folders.%s] path = %s: %s", name, folder.path, exc)
 
 
-__all__ = ["FOLDER_FIELDS", "GIT_WRITES", "MODES", "ApiFolder", "FolderRequest", "folder_meta", "git_dir_refusal",
-           "in_place_folder", "log_refusals", "resolve_request", "resolve_root", "root_refusal", "roots", "shown"]
+__all__ = ["FOLDER_FIELDS", "GIT_UNREADABLE", "GIT_WRITES", "MODES", "ApiFolder", "FolderRequest", "folder_meta",
+           "git_dir_refusal", "in_place_folder", "log_refusals", "resolve_request", "resolve_root", "root_refusal",
+           "roots", "shown"]

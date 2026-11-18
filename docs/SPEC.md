@@ -31,7 +31,7 @@ src/dreamteam/
   config.py      Config / ModelProfile / templates                  (exists)
   db.py          Database (sqlite)                                   (exists)
   models.py      USER, ALL, ToolError, Status, Task, AgentKind...    (exists)
-  events.py      EventBus                                            (exists)
+  events.py      EventBus; read_page: a page of the journal by id (§21.6)  (exists)
   names.py       generate_name                                       (exists)
   prompts.py     system_prompt(), t(), PLANNING_TASK, DEFAULT_ROLE   (exists)
   roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team, saved teams (§17.3); imports
@@ -2186,7 +2186,8 @@ another folder (§17.2 "Workspace folder"). Then:
 #### DreamTeam's own git (hubgit.py)
 Every git process DreamTeam starts in a folder the members can write is built by hubgit.py: the autocommits and path
 commits (`Workspace._git` → `_run_git`, in a thread) and `run_git` (`init_repo`, `repo_state`, `tracked`,
-`commit_paths`: `init()` and sessions.py's checks of a folder of the user). A member's shell reaches `.git`, so what
+`commit_paths`: `init()` and sessions.py's checks of a folder of the user; `changed_since`: the HTTP API v1's
+`changed_files`, §21.7). A member's shell reaches `.git`, so what
 the repository's config names for git to run is the members' to choose: hooks, `core.fsmonitor`, filter, textconv,
 diff and merge drivers with a matching `.gitattributes`, ssh, credential and askpass helpers, an included config
 file, config-based hooks (`hook.<name>.*`, git 2.54+), and the same in a submodule's own config (git runs a child
@@ -2342,10 +2343,23 @@ def git_argv(git, root, actor, args, safe_directory=None, *, adopted=False, lite
     # pathspec magic such as `:(exclude)` works (only the autocommit's fixed pathspecs use it; Workspace._git(...,
     # literal=) passes it on); guard: hubgit.Guard.args (a git older than 2.31)
 def run_git(root, *args, actor=None, git=None, safe_directory=None, timeout=GIT_TIMEOUT, adopted=False,
-            literal=True, unfiltered=False, offline=False) -> CompletedProcess   # hardened: hubgit.environment(),
+            literal=True, unfiltered=False, offline=False, env=None,
+            secret_names=()) -> CompletedProcess   # hardened: hubgit.environment(secret_names) plus `env`,
     # hubgit.guard() ("DreamTeam's own git"); unfiltered: the command stages, commits or checks pathspecs,
     # hubgit.run_unfiltered leaves out the files of a disarmed required filter (init_repo's add, commit_paths'
-    # commit, repo_state's status); offline: hubgit.run(offline=True), "Defense in depth"
+    # commit, repo_state's status, changed_since's diff and ls-files); offline: hubgit.run(offline=True), "Defense in
+    # depth"
+def changed_since(root, base, *, adopted=False, network_off=False, git=None, secret_names=()) -> list[dict]
+    # the HTTP API v1's `changed_files` (§21.7): [{"path", "change": added | modified | deleted}] of the working tree
+    # against commit `base`, sorted by path; untracked files count, ignored ones and .scratch/ do not; deleted and
+    # untracked is "modified". `git rev-parse --verify --quiet <base>^{commit}`, `git diff --name-status -z
+    # --no-renames --no-ext-diff --no-textconv --ignore-submodules=none <base> -- . ':(exclude).scratch'`, `git
+    # ls-files --others --exclude-standard -z`, through run_git with GIT_OPTIONAL_LOCKS=0 (never index.lock) and
+    # without the workspace's git lock. ValueError for a `base` that is not COMMIT_ID (40 or 64 lowercase hex: nothing
+    # else reaches git's command line, where "--output=x" would be an option), BaseCommitGone (a LookupError) when
+    # the repository opens and lacks it (rev-parse's exit 1), OSError when the folder has no `.git` or git fails, a
+    # repository git cannot open included (exit 128: never "gone"; its output logged, never in the text). Blocking;
+    # `Workspace.changed_since(base)` runs it in a thread for a loaded swarm
 def isolated_git(network_off, folder=None) -> bool     # network_off and netoff.isolation() in ("docker", "netns");
     # in the Docker sandbox `folder` (where that git writes) is opened to the offline user first. Synchronous
 def init_repo(root, git=None, *, adopted=False, offline=False) -> str | None   # git init + .gitignore if missing +
@@ -4193,8 +4207,8 @@ settings; ValueError when they are invalid):
   `async stop(sid, *, remember=False, reason="user")`, `async unload_idle(sid)`, `async control(sid, *,
   max_cost_usd=None, max_agents=None, wrap_up=None)`, `update(sid, *, title=None,
   overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`,
-  `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `sid_of_uid(uid)`, `api_sids()`,
-  `sid_of_client_ref(ref)`, `global_config()`,
+  `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `journal(sid, after, limit, types=None, *,
+  recipient=None)`, `sid_of_uid(uid)`, `api_sids()`, `sid_of_client_ref(ref)`, `global_config()`,
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
@@ -4225,6 +4239,15 @@ settings; ValueError when they are invalid):
     an unload. Waiters clear it before each read.
   - `is_final(sid)`: not running, not in `starting` (creates and v1 `continue`s in flight), not in `resume_pending`,
     and the session's lock is not held.
+  - `journal(sid, after, limit, types=None, *, recipient=None)` → (events, last, more): one page of the session's
+    journal (`events.read_page`, §21.6 "Polling"). A loaded session's through its own connection under its
+    `Database`'s lock (never the session's lock); any other's from its file through `db.reading_file`, opened and
+    closed for the read, never through `load`; from the file also when an unload closed the connection meanwhile
+    (`sqlite3.ProgrammingError`). The rows' `data` is decoded after the `Database`'s lock is released
+    (`read_page(..., decode=False)`, then `events.event_data`), since the event loop takes that lock too. A session
+    without a database has no events (head 0). A file that cannot be read now is `SessionError` 503
+    (`sessions.JOURNAL_TEXT`, the cause logged), never an empty page: that would tell a client which has read `final`
+    that nothing more will come, and it would stop early. Blocking: v1 calls it in a thread.
   - `starting`: the sessions with a start on its way. Each such start has a mark of its own: `mark_starting(sid,
     mark=None)` adds one (a new object unless the caller gives one), puts the session in `starting`, pokes its
     waiters and returns the mark; `unmark_starting(sid, mark)` takes that mark away (the session leaves `starting`
@@ -7380,7 +7403,7 @@ An event is a journal row (§9) with its id, plus a line for people:
     activity's text is the call line (`Anna Smith · task_claim(task_id=3)`), and the `tool_result` activity's text is
     a line of its own (`Anna Smith · task_claim ⎿ <first line>`, an error marked).
   - `text` is null only for the events no feed shows: `agent.usage` and `agent.compacted`.
-  - `lang` (`ru` or `en`) defaults to the session's language.
+  - `lang` (`ru` or `en`, 400 `bad_request` for another) defaults to the session's language.
   - The text adds no absolute path of its own: a folder is named by its last component, and the environment of
     `skill.deps` and a job log outside the workspace are left out. That holds for every text of DreamTeam's own a
     line quotes (a notice, a wake-up, an agent's error, an installer's error), whatever it embeds. What the agents
@@ -7388,14 +7411,19 @@ An event is a journal row (§9) with its id, plus a line for people:
   - It never raises: an event it cannot word gets a generic `<type> · <actor>` line.
   - The TUI may later take its words from it. The wording is for people and may change (21.1).
 - `detail=timeline` (default) selects by an exact list of types, `type IN (...)`, so the database does the filtering
-  (not `EventBus.recent`'s `LIKE` patterns, which ignore case, take `_` as a wildcard and do not use the type index):
+  within the id window it reads by its primary key (below), not `EventBus.recent`'s `LIKE` patterns, which ignore
+  case and take `_` as a wildcard:
   `task.created`, `task.updated`, `task.comment`, `message.sent`, `notification`, `goal.set`, `goal.completed`,
   `goal.reopened`, `agent.hired`, `agent.retired`, `swarm.paused`, `swarm.resumed`, `swarm.wrap_up`, `swarm.limits`,
   `session.started`, `session.stopped`, `job.started`, `job.ended`, `mcp.created`, `mcp.status`, `skill.attached`,
   `skill.detached`, `skill.proposed`, `skill.library`, `skill.deps`, `file.changed`. In the timeline a `notification`
   counts only when it is addressed to the user (`swarm.notify` journals one per recipient). `detail=all`: every
   journaled event (`agent.activity`, `agent.usage`, `agent.status`, `trigger.*`, the locks too). The live-only
-  `trace.*` and `job.silent` (§9) have no id and are never sent.
+  `trace.*` and `job.silent` (§9) have no id and are never sent. Another `detail` is 400 `bad_request`. The list is
+  `api_v1.TIMELINE`.
+- An event is answered with its `data` as journaled, except a float that is not finite (a model's `NaN` in a tool
+  argument is journaled as it came), which reads null there: no JSON answer could carry it, and a stream would fail
+  again at every reconnect (`api_v1.safe_json`). Data that is not JSON at all reads `{}`.
 - **Session events.** `session.started` {} and `session.stopped` {reason: `done` | `budget` | `user` | `failed` |
   `shutdown` | `restart`, error?} are journaled by the manager into the session's journal, so that a client sees a
   run's start and end as events:
@@ -7420,39 +7448,65 @@ An event is a journal row (§9) with its id, plus a line for people:
     (`tests/test_tui_render.py` checks that every type §9 names is in `render.EVENT_TYPES`).
 - **Polling** (`GET .../events`). `after` is the last id the client has (default 0: from the oldest event, in
   ascending id order, unlike `EventBus.recent(since=0)`, which gives the newest). `limit` 1–500 (default 200).
-  - The read (`events.read_page`) takes the newest id (`head`) first, then the rows with
-    `after < id <= min(head, after + 5000)` that the filter keeps, in id order, at most `limit` of them. A single
-    query with a `LIMIT` could not say what it examined.
+  The answer: `{"events", "last", "more", "state", "final"}`.
+  - The read (`events.read_page(conn, after, limit, types=None, scan=None, *, recipient=None, decode=True)`, through
+    `SessionManager.journal`) takes the newest id (`head`) first, then the rows with
+    `after < id <= min(head, after + 5000)` (`events.SCAN`) that the filter keeps, in id order, at most `limit` of
+    them. A single query with a `LIMIT` could not say what it examined. The timeline's notification rule is the SQL's
+    own (`recipient`: `json_extract(data, '$.recipient')`, guarded by `json_valid` so a damaged row cannot fail the
+    page).
+  - A stopped session's journal that cannot be read now (a file held by another program, a share unplugged) is an
+    error, 500 `internal` with `sessions.JOURNAL_TEXT` (`SessionManager.journal`'s `SessionError` 503), never a page
+    with no events: with `final` true, `more` false would tell the client that the run has nothing more, and it would
+    stop with events missing. The client asks again later; the stream ends without a result (below).
   - `last` is the last row's id when the page is full, else the upper end of that window: the highest id the read
     examined, so a page whose rows the filter dropped still moves on. `more` is true when `head > last`. An `after`
     past the newest id answers no events, with `last` = the newest id.
   - The reads come in this order: `state` and `final` (21.7) first, then `head`, then the rows. So when `final` is
     true and `more` false, nothing will follow unless the session is started again (the board, the TUI, the launcher
     MCP or v1 `continue` can start it).
-  - `wait` 0–60 seconds (default 0). The request waits only when nothing can be answered yet: the page has no row,
+  - `wait` 0–60 seconds (default 0), a whole or decimal number written with digits (`2.5`; no sign, exponent or
+    `inf`: 400 `bad_request`). The request waits only when nothing can be answered yet: the page has no row,
     the read reached the head (`more` false, `after` not past it) and the state is not final. Otherwise it answers at
     once: a page the filter emptied while `more` is true (no events, `last` moved on, so the client asks again at
     once), an `after` past the head (above), a final session.
   - A waiting request is woken by a new event of that session, a change of its state, or the end of an operation that
     held its lock (`manager.watch(sid)`, a waiter keyed by session, poked by one bus listener per Swarm and by the
-    manager). Each pass resolves `{id}` again and reads again in the order above. It answers with rows, on a change of
-    state, or at the deadline.
+    manager). Each pass resolves `{id}` again and reads again in the order above (`ApiV1.read_events`: the id and the
+    summary on the loop, as every route builds a summary, since they read state that only the loop changes; then
+    `events_page`, the journal and the lines, in a thread); after a wake-up it first waits `api_v1.SETTLE_SECONDS`
+    (50 ms), so a burst of events (an agent's tool calls) is read once. It answers with rows, on a change of `state`
+    or `final` (a lock released), or at the deadline; 404 `not_found` once `{id}` no longer resolves (a delete
+    meanwhile). The waiter follows the folder name the id resolves to at each pass (`api_v1._Watch`).
   - A stopped session's journal is read from its file, read-only and closed after each read (`db.reading_file`), never
     through `manager.load`, which would build and keep a whole Swarm. A loaded session's journal is read through its
     connection, under the database's own lock (`Database` serializes its calls), never the session's lock: that one is
     held for a whole start, stop or folder move. A connection closed meanwhile (`sqlite3.ProgrammingError`) is read
     again through the file.
 - **Stream** (`GET .../events/stream`). `text/event-stream`, with `Cache-Control: no-cache` and
-  `X-Accel-Buffering: no`; each event is `id: <id>`, `event: <type>`, `data: <the event JSON>`; it starts after
-  `after` or after the `Last-Event-ID` header. A `: ping` comment every 15 s.
-  - It reads the journal by id, in pages of 500, as polling does: window after window while `more` is true. It waits
-    only at the head of a session that is not final, until a wake-up or the next ping, then reads again.
+  `X-Accel-Buffering: no`; each event is `id: <id>`, `event: <type>`, `data: <the event JSON>` (one line: the JSON
+  escapes line breaks; `api_v1.sse_event`); it starts after `after` or after the `Last-Event-ID` header, which wins
+  when both are there (an `EventSource` sends it as it reconnects, with the URL it first opened). Its query, the
+  header and the session are checked before the answer starts (400, `unknown_field`, 404); an error once the answer
+  has started is logged and ends the stream. A `: ping` comment after 15 s without a line (`api_v1.PING_SECONDS`).
+  - It reads the journal by id, in pages of 500, as polling does: window after window while `more` is true. Each pass
+    reads in the order of polling, but only what the stream needs: `{id}` resolved again, `final`
+    (`manager.is_final`, in memory), then the head and the rows (`events_page`, in a thread). The full summary is built
+    only once per folder name for the session's language (when the query names no `lang`) and on the final pass for
+    the result. It waits only at the head of a session that is not final, until a wake-up (then `SETTLE_SECONDS`) or
+    the next ping, then reads again.
   - It never holds a Swarm, a bus or a connection across a wait. An unload (a stop) replaces the session's Swarm and
     bus, while a start of a loaded session reuses them, so the stream's wake-ups are keyed by session
     (`manager.watch`), never by a bus: nothing is lost when a bus queue overflows or the swarm changes.
   - When the state is final and `more` is false, one `event: result` (no id) with the result (21.7), and the stream
-    ends. A delete ends it without a result (`{id}` no longer resolves), and so does a hub shutdown (the session comes
-    back with the hub when it has its autostart mark): a client reconnects with `Last-Event-ID`.
+    ends. The result is built from a summary read after that pass's rows (the hub's settings read again first, as GET
+    `result` does), in a thread, and sent only when nothing changed since the pass began: no wake-up of the session
+    (an event, a start announced, a lock released), `final` still true, `{id}` still resolving to the same folder.
+    Otherwise the stream reads on, so a session started again meanwhile (a `continue` that arrived while the result
+    was built) never gets a result that says final; it gets one when it is final again.
+  - A delete ends it without a result (`{id}` no longer resolves), and so do a journal that cannot be read now
+    (polling's 500 above; logged) and a hub shutdown (the server ends the open answers after `GRACEFUL_SECONDS`; the
+    session comes back with the hub when it has its autostart mark): a client reconnects with `Last-Event-ID`.
 
 ### 21.7 State, summary, result
 
@@ -7509,23 +7563,54 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
 
 - `-p` passes its own words for `status` (done, budget, timeout, error, interrupted), its sid and its monotonic
   duration.
-- v1 passes the v1 state as `status`, the uid as `session` (folder names come back after a delete, §17.2) and
-  `duration_s` from `api.started_at` to `finished_at` or now; its tasks gain `parent_id` and `crew` (§4.2). It adds
-  `final`, `error` (always; null when none), `board_url`, and
-  `"changed_files": [{"path", "change": "added" | "modified" | "deleted"}]` with `changed_files_error`. A final result
-  is cached, keyed by uid and `finished_at`.
+- v1 passes the v1 state as `status`, the uid as `session` (folder names come back after a delete, §17.2), the
+  summary's `goal` (`{title, description, status, summary}` or null) and `duration_s` from `api.started_at` to
+  `finished_at` or now (null without `started_at`: a session not made through v1, or one that never started); its
+  tasks and members are read as the snapshot lists them (`sessions.read_lists`: a stopped session from its file,
+  never loaded), and its tasks gain `parent_id` and `crew` (§4.2); `jobs` are the running ones of a running session,
+  read on the loop from the jobs themselves (`api_v1.job_view`: never their process lists), none otherwise. It adds,
+  in this order after `jobs`: `error` (always; null when none), `final`, `board_url`,
+  `"changed_files": [{"path", "change": "added" | "modified" | "deleted"}]`, `changed_files_error` and
+  `changed_files_truncated` (`ApiV1.result(sid, summary, jobs)`, in a thread, after the summary and the jobs were read
+  on the loop; the route is `GET .../result`, whose query takes no field, and it reads the hub's settings again first,
+  as a start does, so a hand edit of `[api] folders` or `[workspace] git` counts at once; the stream's `result` is
+  built as 21.6 "Stream" says).
+- `changed_files` lists at most `api_v1.CHANGED_FILES_MAX` = 10 000 entries, the first ones by path; then
+  `changed_files_truncated` is true (false otherwise, also when the list is null). A tree of untracked files that the
+  folder's own `.gitignore` does not ignore (a `node_modules`) would otherwise put every file into every answer and
+  into the cache.
+- A final result is cached (`ApiV1._results`, the newest `api_v1.RESULTS_CACHED` = 64), keyed by uid and
+  `finished_at`, and also by the state and the journal's head: a PATCH of a stopped session writes no `finished_at` but
+  may change its state (a budget pause lifted), and anything changed while the board had it loaded leaves an event. A
+  cached result is answered with its `board_url` read again. Only a result whose `changed_files_error` stays as it is
+  while the session stays final is cached (`api_v1.LASTING_TEXTS`: none, `GIT_OFF_TEXT`, `NO_BASE_TEXT`,
+  `BASE_GONE_TEXT`); git not installed, settings or a repository that cannot be read, git failing (a timeout) and an
+  in-place folder refused may pass, so such a result is computed again at the next request.
 - `changed_files` is the working tree against `base_commit`:
   - untracked files are included (files still held back from the autocommit, §7 "Held new files", count); ignored ones
     and `.scratch` are not, so an output the agents put into `.gitignore` is not listed. A path both deleted and
     untracked is `modified`;
   - it is read with DreamTeam's guarded git (`hubgit`, §7: the repository's hooks, filters and `core.fsmonitor`
-    disarmed): `git cat-file -e <base>^{commit}`, then `git diff --name-status -z --no-renames --no-ext-diff
-    --no-textconv --ignore-submodules=none <base> -- . ':(exclude).scratch'` and
-    `git ls-files --others --exclude-standard -z`;
+    disarmed): `git rev-parse --verify --quiet <base>^{commit}` (exit 1: the repository opened and lacks the commit,
+    `BASE_GONE_TEXT`; any other failure, such as a repository git cannot open, is a failure of git, never "gone"),
+    then `git diff --name-status -z --no-renames --no-ext-diff --no-textconv --ignore-submodules=none <base> -- .
+    ':(exclude).scratch'` and `git ls-files --others --exclude-standard -z`;
   - it runs without the workspace's git lock (the private per-Swarm `Workspace._git_lock`: holding it would delay the
     agents' commits) and with `GIT_OPTIONAL_LOCKS=0`, so it never takes `index.lock`. It is a module function
-    (`workspace.changed_since`), so a stopped session needs no Swarm;
-  - it is null, with `changed_files_error`, when git is off, the session has no `base_commit`, or that commit is gone.
+    (`workspace.changed_since`), so a stopped session needs no Swarm. It uses the session's own settings (git on, its
+    folder, adopted or not, its network setting: `isolated_git`, as its other git runs) and keeps its key variables
+    out of git's environment;
+  - a session that works in a server folder in place (21.10) is checked first as every start checks it
+    (`_check_server_folder`, then `apifolders.git_dir_refusal`): git never reads a repository whose database lies
+    outside the folder, nor a folder that no longer leads to itself inside its root;
+  - it is null, with `changed_files_error`, when git is off (or not installed), the session has no `base_commit`
+    (`api_v1.NO_BASE_TEXT`; also a value that is no commit id, `workspace.COMMIT_ID`: it never reaches git's command
+    line), that commit is gone, the folder has no repository of its own, git fails, or the in-place checks above
+    refuse. The texts are DreamTeam's own (`api_v1.GIT_OFF_TEXT`, `BASE_GONE_TEXT`, ...), never git's output: when
+    `git_dir_refusal` says git cannot read the folder's repository, it quotes git, so `changed_files_error` names
+    only `apifolders.GIT_UNREADABLE` and the hub's log has the rest. Those that can quote a path (the in-place
+    checks' reasons, a failure to run git) go through `ApiV1.redact` for every caller: a result holds no absolute
+    path.
 
 ### 21.8 Files
 
@@ -7698,9 +7783,14 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     session; the user's conversation from `after`, a message sent, what the mailbox refuses; a damaged file of a
     stopped session; the API token's scope);
   - polling (`after=0` from the oldest, a page the filter emptied answered at once, an `after` past the head, `wait`
-    woken by a change of state, `final` never before `session.stopped`) and the stream (resumed by `Last-Event-ID`,
-    across a stop and a start, its `result`, a final session behind a gap the filter empties ending with its result);
-    `last_activity` unchanged by `session.*` events;
+    woken by an event, a change of state and a released lock, `final` never before `session.stopped`, the user's
+    notifications only in the timeline, a stopped session read without loading it, a `NaN` in an event's data, the
+    lines in the session's language (ru) unless `lang` names one, a journal that cannot be read answered as an error
+    and never as complete, a 404 once the session is deleted during the wait) and the stream (resumed by
+    `Last-Event-ID`, across a stop and a start, its `result`, a final session behind a gap the filter empties ending
+    with its result, no result while the session is started again meanwhile, `detail=all` with `lang`, pings, a delete
+    ending it without a result, its refusals before it starts; `tests/test_api_v1_events.py`); `last_activity`
+    unchanged by `session.*` events;
   - `stop_when_done`; PATCH of a running session and of a stopped one followed by its start; `continue` after a
     budget stop, and while a create's start is in flight (counted once in `max_running`, the texts given after it in
     order, the start tried again when it fails); `continue` on a running session (the coordinator, a pending
@@ -7712,7 +7802,12 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     next one; `not_running` when a stop sent after it takes the lock first);
   - files and archive (path escapes, a link swapped in, `.git` at depth, `.scratch`, hard links, a name with `:`
     listed and served on POSIX and left out on Windows); `changed_files` with a hook in `.git/config` that must not
-    run;
+    run (`tests/test_api_v1_result.py`: added, modified, deleted, untracked and held files, `.scratch` and ignored
+    ones left out, a path deleted and untracked; a stopped session's files; a list cut at `CHANGED_FILES_MAX`; git
+    off, no base commit, one gone, one that is no commit id, a repository git cannot open; an in-place folder whose
+    `.git` became a gitfile, one whose git fails (no git output in the text), one whose root a hand edit removed; the
+    result while running, a done one, the cache by state and head, a git failure not cached; `changed_since` without
+    the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
   - settings and import: a settings-page save never writes `[api]` (`public_view`, `apply_update`); an import keeps
     the target's `api.folders` and drops a v1 session's `client_ref`, `request_digest`, `start_error`, `error` and
     `folder`;

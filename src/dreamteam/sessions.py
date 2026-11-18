@@ -47,6 +47,7 @@ from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOW
                        CopyError, CopyLimits, Source, Uploads, _other_home, check_target, copy_into, copy_sources,
                        done_with, hub_in_container, left_over, printable_line, resolve_source, staging_name)
 from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
+from .events import event_data, read_page
 from .eventtext import without_abs_paths
 from .goal_text import shorten_title, split_goal
 from .models import USER, Status, Task, ToolError
@@ -112,6 +113,8 @@ API_LATER = ("base_commit", "started_at", "finished_at", "start_error", "error")
 API_IMPORT_DROPS = ("client_ref", "request_digest", "start_error", "error", "folder")
 # a SessionError's status as a v1 code, for a start_error without a code of its own
 _STATUS_CODES = {400: "bad_request", 404: "not_found", 409: "conflict", 413: "too_large"}
+# SessionManager.journal's 503 when a stopped session's journal file cannot be read now (docs/SPEC.md §21.6 "Polling")
+JOURNAL_TEXT = "The session's journal cannot be read now (the hub's log says why): ask again later."
 LEGACY_WORKSPACE_TEXT = (
     "The main session lives in the home directory itself, and `dreamteam run` can still open that directory as a "
     "single-swarm project, which would not know about another folder: its workspace cannot be moved. Create a new "
@@ -2102,6 +2105,39 @@ class SessionManager:
         """409 with the message when the session was made by an earlier version: it is not opened or changed."""
         if self.earlier_version(sid):
             raise SessionError(self.earlier_version_text(sid), 409, earlier_version=True)
+
+    def journal(self, sid: str, after: int, limit: int, types: tuple[str, ...] | None = None, *,
+                recipient: str | None = None) -> tuple[list[dict[str, Any]], int, bool]:
+        """One page of the session's journal (events.read_page: (events, last, more); docs/SPEC.md §21.6 "Polling").
+        A loaded session's through its own connection, under its Database's lock (never the session's lock, which a
+        start, a stop or a folder move holds for long); any other's from its file, read-only, opened and closed for
+        this read (db.reading_file), never through load(), which would build and keep a whole Swarm; from the file
+        also when an unload closed the connection meanwhile (sqlite3.ProgrammingError). The rows' data is decoded after
+        the Database's lock is released (the event loop takes it too). A session without a database has no events
+        (head 0). A file that cannot be read is SessionError 503 (JOURNAL_TEXT, the cause logged), never an empty page,
+        which would say "nothing more" to a client that has missed events. Blocking: call it in a thread."""
+        swarm = self.swarms.get(sid)
+        page = None
+        if swarm is not None:
+            try:
+                with swarm.db._lock:
+                    page = read_page(swarm.db.conn, after, limit, types, recipient=recipient, decode=False)
+            except sqlite3.ProgrammingError as exc:   # (unloaded meanwhile: its connection is closed)
+                log.debug("session %s was unloaded while its journal was read (%s): read from its file", sid, exc)
+        if page is None:
+            path = self._data_dir(sid) / "swarm.db"
+            if not path.is_file():
+                return [], 0, False
+            try:
+                with reading_file(path, timeout=2.0) as (conn, _immutable):
+                    page = read_page(conn, after, limit, types, recipient=recipient, decode=False)
+            except (sqlite3.Error, OSError) as exc:
+                log.info("cannot read the journal of session %s: %s", sid, exc)
+                raise SessionError(JOURNAL_TEXT, 503) from None
+        events, last, more = page
+        for event in events:
+            event["data"] = event_data(event["data"])
+        return events, last, more
 
     # ---- skills (docs/SPEC.md §19) -------------------------------------------------------------
     def _data_dir(self, sid: str) -> Path:

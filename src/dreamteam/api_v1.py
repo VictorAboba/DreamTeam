@@ -20,35 +20,44 @@ import logging
 import math
 import os
 import re
+import shutil
 import sqlite3
+import threading
 import time
 import unicodedata
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Coroutine, Iterable, Mapping
+from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Mapping
 
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect, Request
-from starlette.responses import Response
+from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
-from . import __version__, apifolders, roles
+from . import __version__, apifolders, netoff, roles
 from .apifolders import FOLDER_FIELDS, MODES, FolderRequest
-from .autoreply import ID_MAX, blocking_requests, read_requests, request_key, requests_of
+from .autoreply import ID_MAX, blocking_requests, journal_head, read_requests, request_key, requests_of
 from .board import MAX_POST
 from .config import _joins_text, native_absolute
 from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads
+from .db import reading_file
+from .eventtext import event_text
 from .goal_text import split_goal
-from .httpjson import JSONResponse
+from .httpjson import JSONResponse, json_text
 from .instruct import continue_step
+from .jobs import COMMAND_CHARS
 from .mailbox import MAX_TEXT, read_user_conversation
 from .models import USER, ToolError
+from .result import build_result
 from .sessionopts import OptionError, overrides_from
-from .sessions import API_ANSWERS, API_GIVEN, LEGACY_ID, TITLE_LIMIT, SessionError, api_answers, api_meta, session_uid
+from .sessions import (API_ANSWERS, API_GIVEN, LEGACY_ID, TITLE_LIMIT, SessionError, api_answers, api_meta,
+                       read_lists, session_uid)
 from .skills import NAME_MAX, NAME_RE, Library, SkillError
 from .uitext import LANGS
 from .web import API_CALLER, API_CALLERS, API_TOKEN_TEXT, BEARER_REALM, JSON_TYPE_TEXT, PUBLIC_URL_ENV, _loopback_bind
+from .workspace import BaseCommitGone, changed_since, isolated_git
 
 if TYPE_CHECKING:
     from .config import Config
@@ -65,6 +74,25 @@ FIELDS_SHOWN = 10           # unknown fields named in an unknown_field text
 FIELD_CHARS = 60            # characters of each
 SESSIONS_DEFAULT, SESSIONS_MAX = 50, 200   # GET /api/v1/sessions `limit`
 MESSAGES_DEFAULT, MESSAGES_MAX = 200, 500  # GET /api/v1/sessions/{id}/messages `limit`
+EVENTS_DEFAULT, EVENTS_MAX = 200, 500      # GET /api/v1/sessions/{id}/events `limit` (docs/SPEC.md §21.6)
+WAIT_MAX = 60                              # ... and its `wait`, in seconds
+STREAM_PAGE = 500                          # the events/stream's pages
+PING_SECONDS = 15.0                        # a `: ping` comment of the stream after this long without a line
+# after a wake-up, a long poll or a stream waits this long before it reads: a burst of events (an agent's tool calls)
+# is read once, not once per event
+SETTLE_SECONDS = 0.05
+RESULTS_CACHED = 64                        # final results kept (ApiV1.result; docs/SPEC.md §21.7)
+CHANGED_FILES_MAX = 10_000                 # entries of a result's `changed_files` (the first ones by path)
+DETAILS = ("timeline", "all")              # the events' `detail`
+# detail=timeline (docs/SPEC.md §21.6): the types a client's timeline shows, as an exact list (`type IN (...)`, never a
+# LIKE pattern); a `notification` only when it is addressed to the user
+TIMELINE = ("task.created", "task.updated", "task.comment", "message.sent", "notification", "goal.set",
+            "goal.completed", "goal.reopened", "agent.hired", "agent.retired", "swarm.paused", "swarm.resumed",
+            "swarm.wrap_up", "swarm.limits", "session.started", "session.stopped", "job.started", "job.ended",
+            "mcp.created", "mcp.status", "skill.attached", "skill.detached", "skill.proposed", "skill.library",
+            "skill.deps", "file.changed")
+EVENTS_FIELDS = ("after", "wait", "limit", "detail", "lang")   # GET .../events
+STREAM_FIELDS = ("after", "detail", "lang")                    # GET .../events/stream
 # ID_MAX (autoreply's, SQLite's largest integer): the largest id a query's `after`, a message's `reply_to` or a
 # request's id names
 TO_MAX = 100                # names in the `to` of a message the client sends
@@ -91,6 +119,19 @@ NOT_RUNNING_TEXT = ("The session is not running: POST /api/v1/sessions/{id}/cont
 # a continue's `api.error` when its start started nothing: a stop sent after it took the session's lock first
 NOT_DELIVERED_TEXT = "The session stopped before the text of a continue reached it: send the text again."
 NO_SESSION_TEXT = "No such session: GET /api/v1/sessions lists the sessions this token sees."
+# `changed_files_error` (docs/SPEC.md §21.7): why `changed_files` is null; DreamTeam's own words, never git's output
+# (it may name the folder)
+GIT_OFF_TEXT = "Git is off in this session ([workspace] git): its changes are not tracked."
+NO_GIT_TEXT = "git is not installed on the hub's computer."
+NO_BASE_TEXT = ("The session has no base commit: its first start found no git, git was off, or it was not created "
+                "through the API.")
+BASE_GONE_TEXT = "The session's base commit is no longer in its repository (its history was rewritten or replaced)."
+NO_REPOSITORY_TEXT = "The session's folder has no repository of its own any more."
+SETTINGS_TEXT = "The session's settings cannot be read, so its folder is not known."
+# the reasons that stay as they are while the session stays final: a final result with one of them (or none) is kept;
+# any other (git not installed, settings or a repository that cannot be read, git failing, an in-place folder refused)
+# may pass, so it is computed again at the next request
+LASTING_TEXTS = (None, GIT_OFF_TEXT, NO_BASE_TEXT, BASE_GONE_TEXT)
 # v1's own text of `folder_busy` (docs/SPEC.md §21.10): the manager's names the other session's folder, so its title
 FOLDER_BUSY_TEXT = ("Another session works in this folder, in a folder inside it or in one containing it, or is being "
                     "created there: two sessions cannot share files. Send that session's next instruction with "
@@ -544,6 +585,77 @@ def query_after(value: str | None, name: str = "after") -> int:
     return number
 
 
+_SECONDS = re.compile(r"[0-9]{1,6}(?:\.[0-9]{1,6})?")
+
+
+def query_wait(value: str | None, name: str = "wait") -> float:
+    """A long poll's `wait` (docs/SPEC.md §21.6): seconds from 0 to WAIT_MAX, a whole or decimal number written with
+    digits (no exponent, no sign, no "inf"); absent is 0. 400 `bad_request` otherwise."""
+    if value is None:
+        return 0.0
+    if not _SECONDS.fullmatch(value) or float(value) > WAIT_MAX:
+        raise ApiError("bad_request", f"'{name}' must be a number of seconds from 0 to {WAIT_MAX}.")
+    return float(value)
+
+
+def query_choice(value: str | None, name: str, choices: tuple[str, ...], default: str | None) -> str | None:
+    """A query field that names one of `choices` (400 `bad_request` otherwise); absent is `default`."""
+    if value is None:
+        return default
+    if value not in choices:
+        raise ApiError("bad_request", f"'{name}' must be one of {', '.join(choices)}.")
+    return value
+
+
+def session_lang(summary: Mapping[str, Any]) -> str:
+    """The language of a session's event lines when the client names none (docs/SPEC.md §21.6 `lang`): its own, from
+    its summary; "en" for one v1 does not know."""
+    language = summary.get("language")
+    return language if language in LANGS else "en"
+
+
+def event_view(row: Mapping[str, Any], lang: str) -> dict[str, Any]:
+    """A journaled event as v1 shows it (docs/SPEC.md §21.6): {id, type, ts, actor, data, text}, `text` the line of
+    eventtext.event_text in `lang` as the user sees it (null for agent.usage and agent.compacted)."""
+    return {"id": row["id"], "type": row["type"], "ts": row["ts"], "actor": row["actor"], "data": row["data"],
+            "text": event_text(row, lang, me=USER)}
+
+
+def _without_inf(value: Any) -> Any:
+    """`value` with every float that is not finite as null: an event's data may hold one (a model's `NaN` in a tool
+    argument, journaled as it was), which no JSON answer can carry."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _without_inf(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_without_inf(item) for item in value]
+    return value
+
+
+def safe_json(value: Any) -> str:
+    """httpjson.json_text of `value`, its non-finite floats as null when it has any (_without_inf): an answer that
+    shows journaled data never fails on them (a stream would fail again at every reconnect)."""
+    try:
+        return json_text(value)
+    except ValueError:
+        return json_text(_without_inf(value))
+
+
+def sse_event(event: Mapping[str, Any]) -> str:
+    """One event of the stream (docs/SPEC.md §21.6 "Stream"): `id: <id>`, `event: <type>`, `data: <the event JSON>`,
+    then a blank line. The JSON is one line (json_text escapes line breaks); the type line never holds one."""
+    kind = re.sub(r"[\r\n]", " ", str(event["type"]))
+    return f"id: {event['id']}\nevent: {kind}\ndata: {safe_json(event)}\n\n"
+
+
+class SafeJSONResponse(JSONResponse):
+    """httpjson.JSONResponse that answers journaled data whatever floats it holds (safe_json)."""
+
+    def render(self, content: Any) -> bytes:
+        return safe_json(content).encode("utf-8")
+
+
 def check_json_type(request: Request) -> None:
     """415 `unsupported_media_type` unless the request says `Content-Type: application/json` (parameters such as a
     charset aside): PATCH checks its type itself, since the guard's 415 rule covers POST only (docs/SPEC.md §21.1
@@ -661,6 +773,52 @@ class _Ref:
     done: asyncio.Event = field(default_factory=asyncio.Event)
 
 
+class _Watch:
+    """The waiter of a long poll or a stream (SessionManager.watch, docs/SPEC.md §21.6): keyed by the session's folder
+    name, so it follows `{id}` from pass to pass; when the id resolves to another folder name, the waiter moves there
+    (follow) and the caller reads again, since a wake-up may have come before. Enter, move and close it on the event
+    loop."""
+
+    def __init__(self, manager: "SessionManager"):
+        self.manager = manager
+        self.sid: str | None = None
+        self.changed = asyncio.Event()
+        self._stack = contextlib.ExitStack()
+
+    def follow(self, sid: str) -> bool:
+        """Watch session `sid`; True when that is a change."""
+        if sid == self.sid:
+            return False
+        self._stack.close()
+        self._stack = contextlib.ExitStack()
+        self.changed = self._stack.enter_context(self.manager.watch(sid))
+        self.sid = sid
+        return True
+
+    async def wait(self, timeout: float) -> bool:
+        """True when a change came within `timeout` seconds (clear `changed` before the read that precedes this)."""
+        try:
+            await asyncio.wait_for(self.changed.wait(), max(0.0, timeout))
+        except TimeoutError:
+            return False
+        return True
+
+    def close(self) -> None:
+        self._stack.close()
+
+
+def job_view(job: Any) -> dict[str, Any]:
+    """A running background job as a result names it (result.build_result keeps `{id, label, owner, command,
+    origin}` of the running ones), from the Job itself: its public() lists its processes, which a result never
+    shows."""
+    return {"id": job.id, "label": job.label, "owner": job.owner, "command": str(job.command)[:COMMAND_CHARS],
+            "origin": job.origin, "status": job.status}
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
 Handler = Callable[[Request, str], Awaitable[Response]]
 
 
@@ -676,6 +834,10 @@ class ApiV1:
         self._closed = False    # aclose() ended: nothing more is spawned (manager.shutdown() may run)
         self._reserved = 0      # creates past the max_running check whose session is not marked starting yet
         self._refs: dict[str, _Ref] = {}   # the client_refs of the creates in flight
+        # the results of final sessions (docs/SPEC.md §21.7), newest last, at most RESULTS_CACHED: key (_result_key)
+        # -> the result without its board_url
+        self._results: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._results_lock = threading.Lock()   # (results are built in threads)
         routes = [
             self._route("/api/v1/options", {"GET": self._options}),
             self._route(API_UPLOAD_PATH, {"POST": self._upload}),
@@ -686,6 +848,9 @@ class ApiV1:
             self._route("/api/v1/sessions/{id}/requests", {"GET": self._requests}),
             self._route("/api/v1/sessions/{id}/requests/{rid}", {"POST": self._answer}),
             self._route("/api/v1/sessions/{id}/messages", {"GET": self._messages, "POST": self._send}),
+            self._route("/api/v1/sessions/{id}/events", {"GET": self._events}),
+            self._route("/api/v1/sessions/{id}/events/stream", {"GET": self._stream}),
+            self._route("/api/v1/sessions/{id}/result", {"GET": self._result}),
         ]
         self.app = Starlette(routes=routes, exception_handlers={HTTPException: self._http_error})
         self.app.router.redirect_slashes = False
@@ -1155,6 +1320,238 @@ class ApiV1:
                 raise
             raise ApiError("not_running", NOT_RUNNING_TEXT) from None
 
+    # ---- events and the result (docs/SPEC.md §21.6, §21.7) ----------------------------------------------------------
+    def current(self, uid: Any, caller: str) -> tuple[str, dict[str, Any]] | None:
+        """(sid, summary) of the session `uid` names for `caller` now (resolve, then summary), None when it names none
+        (any more: a delete gives the folder number to the next session). On the loop, as the other routes build a
+        summary: it reads the manager's and the swarm's state in memory, which only the loop changes."""
+        sid = self.resolve(uid, caller)
+        if sid is None:
+            return None
+        summary = self._summary_of(sid)
+        return None if summary is None else (sid, summary)
+
+    def _summary_of(self, sid: str) -> dict[str, Any] | None:
+        """summary(sid), None for a session that is gone (deleted meanwhile). On the loop (current)."""
+        try:
+            return self.summary(sid)
+        except SessionError as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def events_page(self, sid: str, after: int, limit: int, detail: str, lang: str) -> dict[str, Any]:
+        """A page of a poll or a stream, read after its state and `final` (docs/SPEC.md §21.6 "Polling"): the
+        journal's head, then its rows (SessionManager.journal: a loaded session through its connection, any other from
+        its file; SessionError 503 when the file cannot be read now), so a page read after a `final` that says no more
+        holds every event of the run. {"events", "last", "more"}, each event with its line in `lang`. `detail`
+        "timeline": TIMELINE's types, a notification only when it is the user's; "all": every journaled event.
+        Blocking (the database, the lines): in a thread."""
+        timeline = detail == "timeline"
+        events, last, more = self.manager.journal(sid, after, limit, TIMELINE if timeline else None,
+                                                  recipient=USER if timeline else None)
+        return {"events": [event_view(event, lang) for event in events], "last": last, "more": more}
+
+    async def read_events(self, uid: Any, caller: str, after: int, limit: int, detail: str,
+                          lang: str | None) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+        """One pass of a poll (docs/SPEC.md §21.6), in this order: `{id}` resolved again, the state and `final`
+        (current, on the loop), then the journal's head and rows (events_page, in a thread; the lines in `lang`, else
+        the session's language). (sid, summary, page: {"events", "last", "more", "state", "final"}); None when the
+        id names no session for `caller` any more."""
+        found = self.current(uid, caller)
+        if found is None:
+            return None
+        sid, summary = found
+        page = await asyncio.to_thread(self.events_page, sid, after, limit, detail, lang or session_lang(summary))
+        return sid, summary, {**page, "state": summary["state"], "final": summary["final"]}
+
+    def _file_head(self, path: Path) -> int | None:
+        """The newest event id of a session database file (0 without one), None when it cannot be read."""
+        if not path.is_file():
+            return 0
+        try:
+            with reading_file(path, timeout=2.0) as (conn, _immutable):
+                row = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()
+        except (sqlite3.Error, OSError) as exc:
+            log.debug("API v1: cannot read the journal of %s: %s", path, exc)
+            return None
+        return int(row[0] or 0)
+
+    @staticmethod
+    def _lists(swarm: "Swarm") -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        with swarm.db._lock:   # (a loaded session's connection: read_lists leaves its row factory alone)
+            return read_lists(swarm.db.path, swarm.db.conn)
+
+    def changed_files(self, sid: str, meta: dict[str, Any], api: Mapping[str, Any]) -> tuple[list | None, str | None]:
+        """(changed_files, changed_files_error) of a session's result (docs/SPEC.md §21.7): its working tree against
+        `api.base_commit` (workspace.changed_since, with the session's own settings: git, its folder, adopted or not,
+        its network setting), or null with the reason (git off or not installed, no base commit, the commit gone,
+        git failed; DreamTeam's words, any path in them redacted: a result holds none). A session working in a server
+        folder in place is checked first as a start checks it (SessionManager._check_server_folder, then
+        apifolders.git_dir_refusal): git never reads a repository whose database lies outside the folder. Blocking
+        (git): in a thread."""
+        manager = self.manager
+        swarm = manager.swarms.get(sid)
+        try:
+            config = swarm.config if swarm is not None else manager.config_for(sid)
+        except (ValueError, SessionError) as exc:
+            log.debug("API v1: no changed files for session %s: %s", sid, exc)
+            return None, SETTINGS_TEXT
+        if not config.workspace.git:
+            return None, GIT_OFF_TEXT
+        base = api.get("base_commit")
+        if not isinstance(base, str) or not base:
+            return None, NO_BASE_TEXT
+        git = shutil.which("git")
+        if git is None:
+            return None, NO_GIT_TEXT
+        folder = config.workspace_dir
+        network_off = netoff.is_off(config)
+        if apifolders.in_place_folder(api.get("folder")) is not None:   # (as every start checks it, §21.10)
+            try:
+                manager._check_server_folder(sid, meta)
+            except SessionError as exc:
+                return None, self.redact(str(exc), sid)
+            problem = apifolders.git_dir_refusal(folder, git, offline=isolated_git(network_off))
+            if problem is not None:
+                if problem.startswith(apifolders.GIT_UNREADABLE):   # (never git's own output: logged instead)
+                    log.info("API v1: no changed files for session %s: %s", sid, problem)
+                    problem = apifolders.GIT_UNREADABLE
+                return None, self.redact(f"Its folder's repository is not read: {problem}.", sid)
+        secrets = [profile.api_key_env for profile in config.models.values() if getattr(profile, "api_key_env", None)]
+        try:
+            files = changed_since(folder, base, adopted=config.workspace_adopted, network_off=network_off, git=git,
+                                  secret_names=secrets)
+        except ValueError:   # (no commit id: a hand edit of session.json)
+            return None, NO_BASE_TEXT
+        except BaseCommitGone:
+            return None, BASE_GONE_TEXT
+        except OSError as exc:
+            log.info("API v1: no changed files for session %s: %s", sid, exc)
+            if not os.path.lexists(folder / ".git"):
+                return None, NO_REPOSITORY_TEXT
+            return None, self.redact(f"git could not compare the files: {exc}.", sid)
+        return files, None
+
+    def _result_key(self, sid: str, summary: Mapping[str, Any], api: Mapping[str, Any]) -> tuple[Any, ...] | None:
+        """The key a final result is cached by (docs/SPEC.md §21.7): its uid and `api.finished_at`, with its state and
+        the journal's head (a PATCH of a stopped session, which writes no finished_at, may lift a budget pause, and
+        a change made while the session was loaded for the board leaves an event); None for a result that is not
+        cached (not final, no finished_at, a journal that cannot be read). Blocking."""
+        finished = api.get("finished_at")
+        if not summary["final"] or summary["id"] is None or not _number(finished):
+            return None
+        head = self._read_db(sid, journal_head, self._file_head)
+        return None if head is None else (summary["id"], finished, summary["state"], head)
+
+    def result(self, sid: str, summary: Mapping[str, Any], jobs: list[dict[str, Any]]) -> dict[str, Any]:
+        """The result of a session (docs/SPEC.md §21.7), also while it runs (`final` false), from its `summary` and its
+        running `jobs`, which the caller read on the loop (current, job_view): result.build_result with v1's state as
+        `status`, the uid as `session`, the summary's goal (the goal's summary as `summary` when the state is done),
+        its tasks (with `parent_id` and `crew`) and members read as the snapshot lists them (sessions.read_lists: a
+        stopped session from its file, never loaded) and `duration_s` from `api.started_at` to `api.finished_at` or
+        now; then `error` (always, null when none), `final`, `board_url`, `changed_files` (the first CHANGED_FILES_MAX
+        by path), `changed_files_error` and `changed_files_truncated` (true when the list stops there), in that order.
+        A final result is kept (RESULTS_CACHED, _result_key) unless its `changed_files_error` may pass (LASTING_TEXTS).
+        SessionError 404 for a session that is gone. Blocking (the database, git): in a thread."""
+        meta = self.manager.meta(sid)
+        api = api_meta(meta) or {}
+        key = self._result_key(sid, summary, api)
+        if key is not None:
+            with self._results_lock:
+                cached = self._results.get(key)
+                if cached is not None:
+                    self._results.move_to_end(key)
+            if cached is not None:
+                return {**cached, "board_url": summary["board_url"]}
+        tasks, agents = self._read_db(sid, self._lists, read_lists)
+        files, files_error = self.changed_files(sid, meta, api)
+        started, finished = api.get("started_at"), api.get("finished_at")
+        duration = (round(max(0.0, (finished if _number(finished) else time.time()) - started), 3)
+                    if _number(started) else None)
+        goal, state = summary["goal"], summary["state"]
+        result = build_result(status=state, session=summary["id"], goal=goal,
+                              summary=str((goal or {}).get("summary") or "") if state == "done" else "",
+                              tasks=tasks, agents=agents, jobs=jobs, cost_usd=summary["cost_usd"],
+                              duration_s=duration)
+        for shown, task in zip(result["tasks"], tasks):
+            shown.update(parent_id=task.get("parent_id"), crew=task.get("crew"))
+        truncated = files is not None and len(files) > CHANGED_FILES_MAX
+        result.update(error=summary["error"], final=summary["final"], board_url=summary["board_url"],
+                      changed_files=files[:CHANGED_FILES_MAX] if truncated else files,
+                      changed_files_error=files_error, changed_files_truncated=truncated)
+        if key is not None and files_error in LASTING_TEXTS:
+            with self._results_lock:
+                self._results[key] = result
+                self._results.move_to_end(key)
+                while len(self._results) > RESULTS_CACHED:
+                    self._results.popitem(last=False)
+        return result
+
+    async def _sse(self, uid: Any, caller: str, sid: str, after: int, detail: str,
+                   lang: str | None) -> AsyncIterator[str]:
+        """The events of a stream (docs/SPEC.md §21.6 "Stream"), read by id as a poll reads them, window after window
+        while `more` holds. Each pass reads, in this order: `{id}` resolved again (resolve), `final` (manager.is_final,
+        in memory), then the journal's head and rows (events_page, in a thread); the lines are in `lang`, else in the
+        session's language, read from its summary once per folder name. At the head of a session that is not final it
+        waits for a wake-up of the session (manager.watch: keyed by session, never by a bus, so an unload that replaces
+        the Swarm loses nothing) or the next `: ping` (PING_SECONDS without a line). Once `final` holds and nothing
+        more is there: the summary, then the result built on it (in a thread, the hub's settings read again first, as
+        GET result does), sent as one `event: result` (no id) only when nothing changed since that pass began (no
+        wake-up, still final, `{id}` still there): else the stream reads on, so a session started again meanwhile
+        never gets a result that says final. Then the end. A session that is gone (a delete) ends it without a result,
+        and so do the hub's shutdown and a journal that cannot be read now (SessionError: the client reconnects with
+        Last-Event-ID). It holds no Swarm, bus or connection across a wait."""
+        loop = asyncio.get_running_loop()
+        watch = _Watch(self.manager)
+        ping_at = loop.time() + PING_SECONDS
+        language = lang
+        try:
+            watch.follow(sid)
+            while not self.closing:
+                watch.changed.clear()
+                now = self.resolve(uid, caller)
+                if now is None:
+                    return
+                if watch.follow(now):   # (another folder name: the waiter moved; a wake-up may have come before)
+                    sid, language = now, lang
+                    continue
+                if language is None:
+                    summary = self._summary_of(sid)
+                    if summary is None:
+                        return
+                    language = session_lang(summary)
+                final = self.manager.is_final(sid)
+                page = await asyncio.to_thread(self.events_page, sid, after, STREAM_PAGE, detail, language)
+                after = page["last"]
+                if page["events"]:
+                    yield "".join(sse_event(event) for event in page["events"])
+                    ping_at = loop.time() + PING_SECONDS
+                if page["more"]:
+                    continue
+                if final:
+                    self.manager._refresh_settings()
+                    summary = self._summary_of(sid)
+                    if summary is None:
+                        return
+                    result = await asyncio.to_thread(self.result, sid, summary, [])
+                    if (watch.changed.is_set() or not summary["final"] or not self.manager.is_final(sid)
+                            or self.resolve(uid, caller) != sid):
+                        continue
+                    yield f"event: result\ndata: {safe_json(result)}\n\n"
+                    return
+                if await watch.wait(ping_at - loop.time()):
+                    await asyncio.sleep(SETTLE_SECONDS)
+                    continue
+                yield ": ping\n\n"
+                ping_at = loop.time() + PING_SECONDS
+        except SessionError as exc:   # (gone, or the journal cannot be read now: the client reconnects)
+            log.info("API v1: the event stream of session %s ended: %s", sid, exc)
+        except Exception:   # (the answer has started: the client sees the stream end and reconnects)
+            log.exception("API v1: the event stream of session %s failed", sid)
+        finally:
+            watch.close()
+
     # ---- routes ---------------------------------------------------------------------------------------------------
     async def _options(self, request: Request, caller: str) -> Response:
         """GET /api/v1/options (docs/SPEC.md §21.2): the hub's global settings, a hand edit picked up first."""
@@ -1458,12 +1855,89 @@ class ApiV1:
                     return JSONResponse({"message": message_view(sent)}, status_code=201)
         raise ApiError("not_running", NOT_RUNNING_TEXT)
 
+    async def _events(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/events?after=&wait=&limit=&detail=&lang= (docs/SPEC.md §21.6 "Polling"): the
+        events after id `after` (0: from the oldest), at most `limit` (1 to EVENTS_MAX, default EVENTS_DEFAULT), with
+        `last`, `more`, `state` and `final` (read_events). With `wait` (0 to WAIT_MAX seconds) it waits only when
+        nothing can be answered yet: no row, the head reached (`more` false, `after` not past it) and the state not
+        final; it answers on rows, on a change of the state or of `final`, or at the deadline, reading again (the id
+        resolved again) at every wake-up of the session (manager.watch: a new event, a change, the end of an
+        operation that held its lock). 404 once the id names no session (a delete meanwhile); a journal that cannot be
+        read now is SessionError 503 (`internal`), never an empty page."""
+        query = query_fields(request, EVENTS_FIELDS)
+        after = query_after(query.get("after"))
+        wait = query_wait(query.get("wait"))
+        limit = query_count(query.get("limit"), "limit", EVENTS_DEFAULT, EVENTS_MAX)
+        detail = query_choice(query.get("detail"), "detail", DETAILS, "timeline")
+        lang = query_choice(query.get("lang"), "lang", tuple(LANGS), None)
+        uid = request.path_params.get("id")
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + wait
+        watch = _Watch(self.manager)
+        seen: tuple[Any, Any] | None = None
+        try:
+            watch.follow(self._session(request, caller))
+            while True:
+                watch.changed.clear()
+                found = await self.read_events(uid, caller, after, limit, detail, lang)
+                if found is None:
+                    raise ApiError("not_found", NO_SESSION_TEXT)
+                sid, _summary, page = found
+                request.scope[API_SID] = sid
+                if watch.follow(sid):
+                    continue
+                now = (page["state"], page["final"])
+                left = deadline - loop.time()
+                if (page["events"] or page["more"] or page["last"] < after or page["final"] or left <= 0
+                        or (seen is not None and now != seen)):
+                    return SafeJSONResponse(page)
+                seen = seen or now
+                if await watch.wait(left):
+                    await asyncio.sleep(SETTLE_SECONDS)
+        finally:
+            watch.close()
 
-__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS",
-           "CREATE_FIELDS", "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "ID_MAX", "JSON_MAX",
-           "MESSAGES_DEFAULT", "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT",
-           "NO_REQUEST_TEXT", "PATCH_FIELDS", "SESSIONS_DEFAULT", "SESSIONS_MAX", "START_WAIT", "STATES",
-           "STATUS_CODES", "TO_MAX", "UPLOAD_TYPES", "ApiError", "ApiV1", "CreateRequest", "answer_of", "budget_text",
-           "check_fields", "check_json_type", "claim_uploads", "continue_text", "error_code", "fail", "library_skills",
-           "message_of", "message_view", "options_view", "query_after", "query_count", "query_fields", "query_flag",
-           "read_json", "request_digest", "required_text", "root_pairs", "skill_refs", "state_of"]
+    async def _stream(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/events/stream?after=&detail=&lang= (docs/SPEC.md §21.6 "Stream"): Server-Sent
+        Events (_sse) after `after`, or after the `Last-Event-ID` header when it is there (a client's EventSource sends
+        it as it reconnects, with the URL of the first connect: the header wins). Its checks and the session come
+        before the answer starts (400, 404)."""
+        query = query_fields(request, STREAM_FIELDS)
+        after = query_after(query.get("after"))
+        resumed = request.headers.get("last-event-id", "").strip()
+        if resumed:
+            after = query_after(resumed, "Last-Event-ID")
+        detail = query_choice(query.get("detail"), "detail", DETAILS, "timeline")
+        lang = query_choice(query.get("lang"), "lang", tuple(LANGS), None)
+        sid = self._session(request, caller)
+        return StreamingResponse(self._sse(request.path_params.get("id"), caller, sid, after, detail, lang),
+                                 media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+    async def _result(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/result (docs/SPEC.md §21.7): the result, also while the session runs (`final`
+        false); the hub's settings read again first (a hand edit of `[api] folders` or `[workspace] git` counts at
+        once, as for a start), its summary and its running jobs read here, on the loop, the rest in a thread
+        (result)."""
+        query_fields(request)
+        sid = self._session(request, caller)
+        self.manager._refresh_settings()
+        summary = self.summary(sid)
+        swarm = self.manager.swarms.get(sid)
+        jobs = ([job_view(job) for job in swarm.jobs.running_of()]
+                if swarm is not None and sid in self.manager.running else [])
+        return SafeJSONResponse(await asyncio.to_thread(self.result, sid, summary, jobs))
+
+
+__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "BASE_GONE_TEXT", "CHANGED_FILES_MAX", "CLIENT_REF_MAX",
+           "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS", "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS",
+           "EVENTS_MAX", "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX",
+           "LASTING_TEXTS", "MESSAGES_DEFAULT", "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT",
+           "NOT_RUNNING_TEXT", "NO_BASE_TEXT", "NO_GIT_TEXT", "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS",
+           "PING_SECONDS", "RESULTS_CACHED", "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS",
+           "START_WAIT", "STATES", "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES",
+           "WAIT_MAX", "ApiError", "ApiV1", "CreateRequest", "SafeJSONResponse", "answer_of", "budget_text",
+           "check_fields", "check_json_type", "claim_uploads", "continue_text", "error_code", "event_view", "fail",
+           "job_view", "library_skills", "message_of", "message_view", "options_view", "query_after", "query_choice",
+           "query_count", "query_fields", "query_flag", "query_wait", "read_json", "request_digest", "required_text",
+           "root_pairs", "safe_json", "session_lang", "skill_refs", "sse_event", "state_of"]
