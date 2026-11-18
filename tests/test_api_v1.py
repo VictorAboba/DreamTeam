@@ -232,7 +232,9 @@ async def test_a_failed_start_is_failed_with_its_error(tmp_path, api_token, monk
     ({"goal": "  \n "}, "bad_request"),
     ({"goal": 5}, "bad_request"),
     ({"goal": "G", "colour": "red"}, "unknown_field"),
-    ({"goal": "G", "folder": {"root": "jobs"}}, "unknown_field"),   # (with the server folders, §21.10)
+    ({"goal": "G", "folder": {"root": "jobs"}}, "unknown_folder"),   # (no root listed: the server folders, §21.10)
+    ({"goal": "G", "folder": {"root": "jobs", "colour": "red"}}, "unknown_field"),
+    ({"goal": "G", "folder": "jobs"}, "bad_request"),
     ({"goal": "G", "title": "two\nlines"}, "bad_request"),
     ({"goal": "G", "title": "x" * 201}, "bad_request"),
     ({"goal": "G", "title": "   "}, "bad_request"),

@@ -33,7 +33,8 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from . import __version__, roles
+from . import __version__, apifolders, roles
+from .apifolders import FOLDER_FIELDS, MODES, FolderRequest
 from .autoreply import blocking_requests, requests_of
 from .config import _joins_text, native_absolute
 from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads
@@ -67,9 +68,10 @@ API_SID = "dreamteam.api_sid"   # the scope key of the session a route resolved 
 UPLOAD_TYPES = ("application/octet-stream", "application/zip")   # what POST /api/v1/uploads takes (§21.3)
 # the states of a session (docs/SPEC.md §21.7), in the order they are tried: the first that holds
 STATES = ("starting", "failed", "created", "done", "budget", "waiting", "paused", "running", "stopped")
-# the fields of POST /api/v1/sessions (docs/SPEC.md §21.4); `folder` comes with the server folders (§21.10)
+# the fields of POST /api/v1/sessions (docs/SPEC.md §21.4); `folder` is an object of FOLDER_FIELDS (§21.10)
 CREATE_FIELDS = ("goal", "title", "description", "language", "team", "model", "start_agents", "max_agents",
-                 "max_cost_usd", "network", "files", "skills", "answers", "clarify", "stop_when_done", "client_ref")
+                 "max_cost_usd", "network", "files", "folder", "skills", "answers", "clarify", "stop_when_done",
+                 "client_ref")
 PATCH_FIELDS = ("max_cost_usd", "max_agents", "wrap_up")   # PATCH /api/v1/sessions/{id} (docs/SPEC.md §21.2)
 CONTINUE_FIELDS = ("text",)                                # POST /api/v1/sessions/{id}/continue
 SHUTTING_DOWN_TEXT = "DreamTeam is shutting down."
@@ -230,7 +232,7 @@ def root_pairs(config: "Config") -> list[tuple[Path, str]]:
     "Paths in answers"): a path below a root then reads `<root>/<path>`. Each as written and resolved; a root that is
     not absolute on this computer's own system (config.native_absolute) is never resolved, nor named."""
     pairs: list[tuple[Path, str]] = []
-    for folder in config.api.folders.values():
+    for folder in apifolders.roots(config).values():
         if not native_absolute(folder.path):
             continue
         path = Path(folder.path)
@@ -271,7 +273,8 @@ def options_view(config: "Config", skills: list[dict[str, str]]) -> dict[str, An
                    for name, profile in config.models.items()],
         "default_model": config.agents.default_model,
         "skills": skills,
-        "folders": [{"name": name, "in_place": folder.in_place} for name, folder in sorted(config.api.folders.items())],
+        "folders": [{"name": name, "in_place": folder.in_place}
+                    for name, folder in sorted(apifolders.roots(config).items())],
         "limits": {"upload_max_mb": config.workspace.copy_max_mb, "upload_max_files": config.workspace.copy_max_files,
                    "files_per_session": FILES_PER_SESSION, "uploads_pending": config.api.uploads_pending,
                    "max_running": config.api.max_running, "archive_max_mb": config.api.archive_max_mb},
@@ -354,6 +357,9 @@ class CreateRequest:
     client_ref: str | None
     files: list[str] = field(default_factory=list)
     skills: list[str] = field(default_factory=list)
+    # the server folder (docs/SPEC.md §21.10): {"root", "path" ("" for the root itself), "mode"}, checked as a shape
+    # here, resolved later (apifolders.resolve_request, §21.4 "Order" 5)
+    folder: dict[str, Any] | None = None
 
     @classmethod
     def parse(cls, body: Mapping[str, Any]) -> "CreateRequest":
@@ -361,8 +367,11 @@ class CreateRequest:
         whitespace; `title` one such line of at most TITLE_LIMIT characters; the session's title (`title`, else the
         goal's first line) without a control or invisible format character (_hidden_chars: it reaches the owner's
         terminal and pages); `clarify: true` only with `answers: "manual"`; `client_ref` at most CLIENT_REF_MAX
-        printable characters; `files` at most FILES_PER_SESSION tokens. The kinds of the team, model and limits
-        are sessionopts' (overrides_from), after client_ref (§21.4 "Order" 3). The goal and title combine as §21.4
+        printable characters; `files` at most FILES_PER_SESSION tokens; `folder` an object of FOLDER_FIELDS
+        (`unknown_field` for another; `root` a string, `path` a string, `mode` one of MODES, a null one not given),
+        and `files` never with an `in_place` folder (the client puts its files into the folder itself). The kinds
+        of the team, model and limits are sessionopts' (overrides_from), after client_ref (§21.4 "Order" 3); the
+        folder is resolved after the skills (apifolders.resolve_request, "Order" 5). The goal and title combine as §21.4
         says: without a title the goal's first line is its title
         (create("", goal, description)); with one, the goal's title is the title and the whole goal its description
         (create(title, title + "\\n" + goal, description)), unless the goal's own title, as split_goal reads it,
@@ -418,6 +427,10 @@ class CreateRequest:
         if len(files) > FILES_PER_SESSION:
             raise ApiError("bad_request", f"'files' takes at most {FILES_PER_SESSION} uploads.")
         skills = names("skills", "library skill names")
+        folder = cls._folder(body.get("folder"))
+        if folder is not None and folder["mode"] == "in_place" and files:
+            raise ApiError("bad_request", "'files' cannot go with an in_place folder: put the files into the folder "
+                                          "itself.")
         if title is None:
             title, goal_text = "", goal
         elif " ".join(title.split()) == split_goal(goal)[0]:
@@ -426,7 +439,27 @@ class CreateRequest:
             goal_text = f"{title}\n{goal}"
         return cls(title=title, goal=goal_text, description=description, answers=answers,
                    stop_when_done=API_GIVEN["stop_when_done"] if stop_when_done is None else stop_when_done,
-                   client_ref=client_ref, files=files, skills=skills)
+                   client_ref=client_ref, files=files, skills=skills, folder=folder)
+
+    @staticmethod
+    def _folder(value: Any) -> dict[str, Any] | None:
+        """A create's `folder` (docs/SPEC.md §21.10 "Request") as {"root", "path", "mode"}: None when not given; 400
+        `unknown_field` for a field of it v1 does not know, `bad_request` for a value of the wrong kind."""
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise ApiError("bad_request", "'folder' must be an object: {\"root\", \"path\", \"mode\"}.")
+        check_fields(value, FOLDER_FIELDS, where="folder")
+        root, path, mode = value.get("root"), value.get("path"), value.get("mode")
+        if not isinstance(root, str) or not root:
+            raise ApiError("bad_request", "'folder' needs 'root': the name of a root of [api] folders (GET "
+                                          "/api/v1/options lists them).")
+        if path is not None and not isinstance(path, str):
+            raise ApiError("bad_request", "The folder's 'path' must be a string, relative to its root, with '/'.")
+        mode = "copy" if mode is None else mode
+        if mode not in MODES:
+            raise ApiError("bad_request", f"The folder's 'mode' must be one of {', '.join(MODES)}.")
+        return {"root": root, "path": path or "", "mode": mode}
 
 
 def skill_refs(names: list[str], config: "Config") -> list[str]:
@@ -756,7 +789,7 @@ class ApiV1:
             done=(stats_goal or {}).get("status") == "done",
             budget=bool(board.get("paused")) and board.get("pause_reason") == "budget",
             running=running, paused=bool(board.get("paused")), blocking=blocking)
-        folder = api.get("folder") if api is not None else None
+        folder = apifolders.folder_meta(api.get("folder")) if api is not None else None
         return {
             "id": session_uid(meta), "name": sid, "title": board.get("title") or sid, "state": state,
             "final": manager.is_final(sid), "error": _error_text(api),
@@ -772,7 +805,7 @@ class ApiV1:
             "answers": api_answers(api) if api is not None else None,
             "stop_when_done": api.get("stop_when_done", API_GIVEN["stop_when_done"]) if api is not None else None,
             "client_ref": api.get("client_ref") if api is not None else None,
-            "via": board.get("via"), "folder": folder if isinstance(folder, dict) else None,
+            "via": board.get("via"), "folder": folder,
             "board_url": self.board_url(sid), "earlier_version": bool(board.get("earlier_version")),
         }
 
@@ -1003,16 +1036,19 @@ class ApiV1:
 
     async def _create(self, request: Request, caller: str) -> Response:
         """POST /api/v1/sessions (docs/SPEC.md §21.4), in the order of §21.4 "Order", so that a refused create costs
-        nothing: the body; client_ref; the overrides; the skills; the uploads checked; max_running checked and
-        reserved; the uploads claimed; manager.create(start=False, mark=...); the claims settled; 202, the start in
-        the background (spawn). 200 with the existing session for a repeated client_ref."""
+        nothing: the body; client_ref; the overrides; the skills; the server folder resolved (apifolders,
+        §21.10); the uploads checked; max_running checked and reserved; the uploads claimed; manager.create(start=False,
+        mark=...) with the folder to copy among the sources (read below its root without following a link), or the
+        folder to work in in place as its workspace, checked again inside its root (`within`); the claims settled;
+        202, the start in the background (spawn). 200 with the existing session for a repeated client_ref."""
         if self.closing:
             raise SessionError(SHUTTING_DOWN_TEXT, 503)
         query_fields(request)
         body = await read_json(request)
         check_fields(body, CREATE_FIELDS)
         ask = CreateRequest.parse(body)
-        digest = request_digest(body)
+        # (the folder as parsed: {"root": "jobs"} and {"root": "jobs", "path": null, "mode": "copy"} are one request)
+        digest = request_digest({**body, "folder": ask.folder} if ask.folder is not None else body)
         held: _Ref | None = None
         if ask.client_ref is not None:
             repeat, held = await self._hold_ref(ask.client_ref, digest)
@@ -1023,24 +1059,33 @@ class ApiV1:
             config = manager.global_config()
             overrides = manager.validated_overrides(overrides_from(body, config, strict=True))
             skills = await asyncio.to_thread(skill_refs, ask.skills, config) if ask.skills else []
+            folder: FolderRequest | None = None
+            if ask.folder is not None:   # resolved and checked (docs/SPEC.md §21.10), checked again by the create
+                folder = await asyncio.to_thread(apifolders.resolve_request, ask.folder["root"], ask.folder["path"],
+                                                 ask.folder["mode"], config=config, home=manager.home)
             uploads = manager.api_uploads
             if ask.files:   # every token checked, none claimed yet: a refusal here uses nothing up
                 await asyncio.to_thread(uploads.peek_many, ask.files, caller=caller)
+            copied = [folder.source()] if folder is not None and folder.mode == "copy" else []
+            in_place = folder is not None and folder.mode == "in_place"
             self._check_running(config)
             self._reserved += 1   # (no await since the check)
             try:
-                sources = await claim_uploads(uploads, ask.files, caller) if ask.files else []
+                claimed = await claim_uploads(uploads, ask.files, caller) if ask.files else []
                 mark = object()
                 created = False
                 try:
                     made = await manager.create(
                         ask.title, ask.goal, ask.description, overrides=overrides, start=False, via="api",
-                        skills=skills or None, sources=sources or None, mark=mark,
+                        skills=skills or None, sources=(copied + claimed) or None, mark=mark,
+                        workspace=str(folder.target) if in_place else None,
+                        within=folder.root_real if in_place else None,
                         api={"answers": ask.answers, "stop_when_done": ask.stop_when_done,
-                             "client_ref": ask.client_ref, "request_digest": digest})
+                             "client_ref": ask.client_ref, "request_digest": digest,
+                             "folder": folder.meta() if folder is not None else None})
                     created = True
                 finally:   # (synchronous: any outcome settles every claim, docs/SPEC.md §21.3 "Life")
-                    uploads.settle(sources, used=created)
+                    uploads.settle(claimed, used=created)
             finally:
                 self._reserved -= 1   # (the session is `starting` now, with its mark)
             sid = made["id"]
@@ -1138,17 +1183,25 @@ class ApiV1:
 
     async def _delete(self, request: Request, caller: str) -> Response:
         """DELETE /api/v1/sessions/{id}?confirm={id} (docs/SPEC.md §21.2): manager.delete(skills="discard"), the
-        session's folder with it."""
+        session's folder with it, except a server folder it worked in in place (§21.10), which is kept and named:
+        `folder_kept: {root, path}`."""
         query = query_fields(request, ("confirm",))
         sid = self._session(request, caller)
         if query.get("confirm") != request.path_params.get("id"):
             raise ApiError("bad_request", "Deleting a session takes ?confirm=<its id>.")
-        await self.manager.delete(sid, skills="discard", via="api")
-        return JSONResponse({"ok": True})
+        try:
+            folder = apifolders.in_place_folder((api_meta(self.manager.meta(sid)) or {}).get("folder"))
+        except SessionError:
+            folder = None
+        kept = await self.manager.delete(sid, skills="discard", via="api")
+        answer: dict[str, Any] = {"ok": True}
+        if folder is not None and kept is not None:
+            answer["folder_kept"] = {"root": folder["root"], "path": folder["path"]}
+        return JSONResponse(answer)
 
 
 __all__ = ["API_SID", "API_VERSION", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS",
-           "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "JSON_MAX", "NOT_DELIVERED_TEXT", "PATCH_FIELDS",
+           "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "JSON_MAX", "NOT_DELIVERED_TEXT", "PATCH_FIELDS",
            "SESSIONS_DEFAULT", "SESSIONS_MAX", "START_WAIT", "STATES", "STATUS_CODES", "UPLOAD_TYPES", "ApiError",
            "ApiV1", "CreateRequest", "budget_text", "check_fields", "check_json_type", "claim_uploads", "continue_text",
            "error_code", "fail", "library_skills", "options_view", "query_count", "query_fields", "query_flag",

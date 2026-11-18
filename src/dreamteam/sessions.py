@@ -39,13 +39,13 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator
 
-from . import __version__, netoff
+from . import __version__, apifolders, hubauth, netoff
 from . import skills as skill_lib
 from .autoreply import SessionAutoReply, follow_journal, journal_head, requests_from
 from .config import Config
-from .copyfrom import (API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError,
-                       CopyLimits, Source, Uploads, check_target, copy_into, copy_sources, done_with, hub_in_container,
-                       left_over, printable_line, resolve_source, staging_name)
+from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled,
+                       CopyError, CopyLimits, Source, Uploads, _other_home, check_target, copy_into, copy_sources,
+                       done_with, hub_in_container, left_over, printable_line, resolve_source, staging_name)
 from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
 from .eventtext import without_abs_paths
 from .goal_text import shorten_title, split_goal
@@ -96,9 +96,11 @@ STOP_REASONS = ("user", "done", "budget", "shutdown", "restart", "failed")
 STOP_REQUEST_REASONS = ("user", "done", "budget")
 # the HTTP API v1's codes of SessionError (docs/SPEC.md §21.1, §21.10): a folder another session works in (or is being
 # created in); a folder the session cannot work in now (a missing workspace folder, a repository not ready for the
-# agents' commits, a workspace move that did not finish)
+# agents' commits, a workspace move that did not finish); a server folder out of its root, or under a root that no
+# longer allows it
 FOLDER_BUSY = "folder_busy"
 FOLDER_NOT_READY = "folder_not_ready"
+FORBIDDEN_FOLDER = "forbidden_folder"
 # session.json "via" of a session created through the HTTP API v1, and its "api" block (docs/SPEC.md §21.4): what the
 # create gives (API_GIVEN, with their defaults) and what the manager writes later
 API_VIA = "api"
@@ -337,6 +339,19 @@ def _move_back(moved: Path, original: Path, copied: bool = False) -> None:
     _remove(moved)  # (a file's original is still whole: it is deleted at once or not at all)
 
 
+def _check_inside(path: Path, within: Path) -> None:
+    """The folder `path` of a plan (resolved when it was planned) still resolves to itself inside the resolved root
+    `within` of a server folder (docs/SPEC.md §21.10 "Resolution"): 403 `forbidden_folder` otherwise, a link or a
+    junction swapped in on its way since (the text names the planned path, never where it leads). Blocking."""
+    try:
+        real: Path | None = path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        real = None
+    if real is None or not (_same_path(real, path) and is_within(real, within)):
+        raise SessionError(f"{path} does not lie inside its folder root any more: a link or a junction on the way "
+                           "leads out of it.", 403, code=FORBIDDEN_FOLDER)
+
+
 def _check_writable(folder: Path, shown: Path) -> None:
     try:
         fd, probe = tempfile.mkstemp(prefix=".dreamteam-probe-", dir=folder)
@@ -366,6 +381,9 @@ class _Plan:
     old_tracked: list[str] = field(default_factory=list)
     # the session has no network: DreamTeam's git in both folders runs like its members' commands (isolated_git)
     network_off: bool = False
+    # a server folder of the HTTP API v1 (docs/SPEC.md §21.10): its resolved root, which _carry_out finds every level
+    # of the target inside again, right before and after it makes one, and before and after git init (_check_inside)
+    within: Path | None = None
 
     def result(self, git: str | None = None) -> dict[str, Any]:
         # old_kept: the previous folder still holds its files (an adopt, or the user's folder left as it was)
@@ -1432,16 +1450,67 @@ class SessionManager:
 
     def _check_workspace_ready(self, sid: str, meta: dict[str, Any]) -> None:
         """Before a start: a folder outside the session is never created silently (a deleted project, an unplugged
-        drive, a host path inside the Docker sandbox): the agents would work in an empty stand-in."""
+        drive, a host path inside the Docker sandbox): the agents would work in an empty stand-in. A session that
+        works in a server folder of the HTTP API v1 in place (`api.folder`, docs/SPEC.md §21.10 "Starts") is checked
+        again too, whoever starts it (_check_server_folder). Blocking (a folder may lie on a share that does not
+        answer): _start_locked runs it in a thread, with the settings read again just before."""
         self._check_journal(sid, meta)
         info = self.workspace_of(sid, meta)
-        if info["default"] or info["exists"]:
+        if not (info["default"] or info["exists"]):
+            what = "is not a folder" if Path(info["path"]).exists() else "does not exist"
+            raise SessionError(
+                f"The workspace folder of session {sid} {what}: {info['path']}. Bring it back (e.g. reconnect the "
+                f"drive), or move the session to another folder: /cd <folder> (/cd --default for its own folder) in "
+                f"`dreamteam` or `dreamteam console --session {sid}`, session_cd in MCP.", 409, code=FOLDER_NOT_READY)
+        self._check_server_folder(sid, meta)
+
+    def _check_server_folder(self, sid: str, meta: dict[str, Any]) -> None:
+        """Before a start of a session that works in a server folder in place (api.folder mode "in_place",
+        docs/SPEC.md §21.10 "Starts"; nothing for any other session): its root must still be listed in `[api]
+        folders` with `in_place = true` (the settings as _start_locked read them again: a hand edit counts at once)
+        and must not be refused (apifolders.resolve_root; a missing root is 409 `folder_not_ready`), and the stored
+        folder must still resolve to itself inside that root, by text and by file identity: a component swapped for a
+        link after the create, or a root moved elsewhere, refuses the start (403 `forbidden_folder`). The git rules
+        of the folder are checked apart (_check_server_git). Blocking: in a thread."""
+        folder = apifolders.in_place_folder((api_meta(meta) or {}).get("folder")) if sid != LEGACY_ID else None
+        if folder is None:
             return
-        what = "is not a folder" if Path(info["path"]).exists() else "does not exist"
-        raise SessionError(
-            f"The workspace folder of session {sid} {what}: {info['path']}. Bring it back (e.g. reconnect the drive), "
-            f"or move the session to another folder: /cd <folder> (/cd --default for its own folder) in `dreamteam` "
-            f"or `dreamteam console --session {sid}`, session_cd in MCP.", 409, code=FOLDER_NOT_READY)
+        where = apifolders.shown(folder["root"], folder["path"])
+        config = self.config   # (never _refresh_settings here: it writes the manager's settings, off the loop)
+        root = apifolders.roots(config).get(folder["root"])
+        if root is None or not root.in_place:
+            raise SessionError(
+                f"Session {sid} works in {where}, under the folder root '{folder['root']}', which [api] folders no "
+                "longer lists with in_place = true: it does not start there.", 403, code=FORBIDDEN_FOLDER)
+        try:
+            root_real = apifolders.resolve_root(root, home=self.home, config=config)
+        except CopyError as exc:
+            missing = exc.code == "not_found"
+            raise SessionError(str(exc), 409 if missing else 403,
+                               code=FOLDER_NOT_READY if missing else FORBIDDEN_FOLDER) from None
+        stored = Path(self.workspace_of(sid, meta)["path"])
+        try:
+            real = stored.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            raise SessionError(f"The folder {where} of session {sid} cannot be read: it does not start.", 409,
+                               code=FOLDER_NOT_READY) from None
+        if not (_same_path(real, stored) and is_within(real, root_real)):
+            raise SessionError(
+                f"The folder {where} of session {sid} no longer leads to itself inside its root (a link or a junction "
+                "on the way, or the root moved): it does not start.", 403, code=FORBIDDEN_FOLDER)
+
+    def _check_server_git(self, sid: str, folder: Path, network_off: bool = False) -> None:
+        """Before a start of a session that works in a server folder in place, with git on (docs/SPEC.md §21.10
+        `in_place`): DreamTeam's git must write inside the folder only (apifolders.git_dir_refusal: a `.git` that is
+        a link or a gitfile, a link or a hard-linked file in its repository's folders, a git dir, common dir or path
+        git writes outside it): 409 `folder_not_ready`. Blocking (git): run it in a thread."""
+        git_exe = shutil.which("git")
+        if git_exe is None:
+            return
+        problem = apifolders.git_dir_refusal(folder, git_exe, offline=isolated_git(network_off))
+        if problem is not None:
+            raise SessionError(f"The folder session {sid} works in ({folder}) cannot take DreamTeam's commits: "
+                               f"{problem}.", 409, code=FOLDER_NOT_READY)
 
     def _check_adopted_repo(self, sid: str, folder: Path, mcp: list[str], network_off: bool = False) -> None:
         """Before a start in a folder the session adopted, with git on: the same rules as when it was adopted, since
@@ -1495,8 +1564,9 @@ class SessionManager:
         """Why the folder `target` (resolved) can never be the workspace of session `sid` (None: a session about to
         be created; an id that does not exist yet is fine): a drive root, the user's home or a folder containing it,
         the DreamTeam home or a folder containing it, DreamTeam's own data folder, the sessions folder (except the
-        session's own default folder), a git database, the MCP and skills libraries and the skill environments.
-        None when it can be."""
+        session's own default folder), a git database, another DreamTeam home or a folder inside one, the hub tokens'
+        folder (inside or containing it), on POSIX /proc, /sys and /dev, the MCP and skills libraries and the skill
+        environments. None when it can be."""
         try:
             home = self.home.resolve()
             sessions = self.sessions_dir.resolve()
@@ -1531,6 +1601,21 @@ class SessionManager:
         if any(part.casefold() == ".git" for part in target.parts) or looks_like_git_dir(target):
             return (f"{target} is a git repository's own database (a .git folder or a bare repository), not a folder "
                     "of files: choose the folder of its work tree.")
+        # (this home and its sessions folder: above; the session's own folder is its own whatever its agents built
+        # there, even a home's layout: /cd --default always leads back)
+        other = _other_home(target) if not is_default else None
+        if other is not None and not same(other, home):
+            return (f"{target} is a DreamTeam home ({other}) or inside one: its settings (API keys too) and sessions "
+                    "are never a session's folder; choose another folder.")
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
+            tokens = hubauth.tokens_dir().resolve()
+            if within(target, tokens) or within(tokens, target):
+                return (f"{target} is the folder of DreamTeam's hub tokens {tokens}, or inside it or contains it; "
+                        "choose another folder.")
+        if os.name != "nt":
+            for system in _SYSTEM_ROOTS:
+                if _within(target, Path(system)):
+                    return f"{target} is a system folder ({system}); choose another folder."
         libraries = [self.config.library_dir]
         if sid is not None and os.path.lexists(self.dir_of(sid) / SESSION_FILE):
             with contextlib.suppress(ValueError, SessionError):
@@ -1570,12 +1655,18 @@ class SessionManager:
                                    "that folder is taken.", 409, code=FOLDER_BUSY)
 
     def _plan(self, sid: str | None, path: Any, *, git_on: bool, mcp: list[str] | None = None,
-              network_off: bool = False, copying: bool = False) -> _Plan:
+              network_off: bool = False, copying: bool = False, within: Path | None = None) -> _Plan:
         """Check a new workspace folder for a session (sid None: a session about to be created) and decide what
         to do; SessionError (400 bad target, 409 conflict) before anything changes. `network_off`: the session's
         setting, for its git checks here and later (_Plan.network_off; the first check runs while the session's
         members may still run commands). `copying`: files are copied into the new session (create's copy_from),
-        so a folder with files is refused (409). Blocking (git): run it in a thread."""
+        so a folder with files is refused (409). `within`: the resolved root of a server folder of the HTTP API v1
+        (docs/SPEC.md §21.10): the folder, once resolved here, must lie inside it by text and by file identity (403
+        `forbidden_folder`: a link swapped in on the way since the request was resolved), and with git on its
+        repository must keep DreamTeam's git inside it (apifolders.git_dir_refusal: 409 `folder_not_ready`). A
+        folder another session works in, inside it or containing it, is compared by text and by file identity
+        (treecopy.is_within: another letter case or Unicode form of a name is the same folder where the file system
+        says so). Blocking (git): run it in a thread."""
         meta = self.meta(sid) if sid is not None else {}
         if sid is not None:
             old, old_stored, old_adopted = self._workspace_entry(sid, meta)
@@ -1603,6 +1694,10 @@ class SessionManager:
             session_dir = self.dir_of(sid).resolve() if sid is not None else None
         except (OSError, ValueError, RuntimeError) as exc:
             raise SessionError(f"Cannot use the folder {path}: {exc}") from None
+        if within is not None and not is_within(target, within):   # (named as asked: never where it leads)
+            asked = os.fspath(path).strip() if path is not None else target
+            raise SessionError(f"{asked} does not lie inside its folder root any more: a link or a junction on the "
+                               "way leads out of it.", 403, code=FORBIDDEN_FOLDER)
         is_default = default_real is not None and _same_path(target, default_real)
         refusal = self._target_refusal(target, sid)
         if refusal is not None:
@@ -1618,9 +1713,12 @@ class SessionManager:
             raise SessionError(f"{target} contains the session's current folder {old_real}; choose a folder that "
                                "does not.")
         for other, folder in self._other_workspaces(sid):
-            if _within(target, folder) or _within(folder, target):
-                how = "is the folder" if _same_path(target, folder) else \
-                    ("is inside the folder" if _within(target, folder) else "contains the folder")
+            # by file identity too: a file system that ignores case or Unicode form where normcase does not (APFS,
+            # a casefold mount) takes jobs/Acme for jobs/acme
+            inside, holds = is_within(target, folder), is_within(folder, target)
+            if inside or holds:
+                how = "is the folder" if inside and holds else ("is inside the folder" if inside else
+                                                                "contains the folder")
                 raise SessionError(f"{target} {how} of session {other} ({folder}); two sessions cannot share files.",
                                    409, code=FOLDER_BUSY, holder=other)
         if target.exists() and not target.is_dir():
@@ -1645,7 +1743,7 @@ class SessionManager:
         plan = _Plan(target=target, old=old_real if old_real is not None else target, mode="moved",
                      default=is_default, adopted=False, git="none", old_exists=old_exists,
                      old_is_default=old_stored is None and old is not None, old_adopted=old_adopted,
-                     network_off=network_off)
+                     network_off=network_off, within=within)
         carried = [name for name in (mcp or []) if old_exists and (old_real / "mcp" / name).is_dir()]
         if old_adopted and carried and git_exe:  # leaving the user's folder: did the agents commit the servers there?
             plan.old_tracked = tracked(old_real, [f"mcp/{name}" for name in carried], git_exe,
@@ -1680,6 +1778,11 @@ class SessionManager:
         elif empty or is_default:
             plan.git = "existing" if (target / ".git").exists() else "initialized"
         else:
+            if within is not None:   # a server folder: DreamTeam's git stays inside it (checked before git reads it)
+                problem = apifolders.git_dir_refusal(target, git_exe, offline=isolated_git(network_off))
+                if problem is not None:
+                    raise SessionError(f"The repository in {target} cannot take DreamTeam's commits: {problem}.",
+                                       409, code=FOLDER_NOT_READY)
             # the session's own servers (absent there: checked above) are left out, as at every start: a folder it
             # worked in before may track them, and their move brings them back (else it could never return there)
             state = repo_state(target, git_exe, exclude=[f"mcp/{name}" for name in carried],
@@ -1692,7 +1795,10 @@ class SessionManager:
 
     def _carry_out(self, sid: str | None, plan: _Plan, undo: _Undo) -> str:
         """Do what the plan says (blocking: run it in a thread). Returns the git outcome; on an exception `undo`
-        knows how to put everything back."""
+        knows how to put everything back. A server folder's plan (`within`, docs/SPEC.md §21.10) finds the deepest
+        level that is there, each level it makes right after making it, and the folder before and after git init,
+        inside its root again (_check_inside, 403 `forbidden_folder`): the levels are made by path, so a link
+        swapped in on the way since the last _plan ends the change, and the undo removes what was made."""
         if sid is not None:
             journal = self._journal(sid)
             journal.parent.mkdir(parents=True, exist_ok=True)
@@ -1703,9 +1809,13 @@ class SessionManager:
         while not folder.exists():
             missing.append(folder)
             folder = folder.parent
+        if plan.within is not None:
+            _check_inside(folder, plan.within)
         for folder in reversed(missing):
             folder.mkdir()
             undo.created.append(folder)
+            if plan.within is not None:
+                _check_inside(folder, plan.within)
         if plan.old_exists and plan.old_adopted and not plan.move_all:
             # leaving the user's folder: copies of library or Claude Code skills never stay in their project (not
             # undone on a rollback: every start rebuilds the mirror)
@@ -1743,9 +1853,13 @@ class SessionManager:
             if not os.path.lexists(plan.target / ".gitignore"):
                 undo.gitignore = plan.target / ".gitignore"
             undo.git_dir = plan.target / ".git"
+            if plan.within is not None:
+                _check_inside(plan.target, plan.within)
             error = init_repo(plan.target, adopted=plan.adopted, offline=isolated_git(plan.network_off, plan.target))
             if error:
                 raise OSError(f"git init in {plan.target} failed: {error}")
+            if plan.within is not None:
+                _check_inside(plan.target, plan.within)
         return plan.git
 
     def config_view(self, sid: str) -> dict[str, Any]:
@@ -2222,7 +2336,8 @@ class SessionManager:
                      workspace: str | os.PathLike | None = None, skills: list[str] | None = None,
                      via: str = "home", auto_reply: bool = False, copy_from: str | os.PathLike | None = None,
                      copy_from_upload: str | None = None, api: dict[str, Any] | None = None,
-                     sources: list[Source] | None = None, mark: object | None = None) -> dict[str, Any]:
+                     sources: list[Source] | None = None, mark: object | None = None,
+                     within: Path | None = None) -> dict[str, Any]:
         """Create a session (and start it with the goal unless start=False). Returns its summary.
         `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
         an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
@@ -2248,7 +2363,11 @@ class SessionManager:
         its start ends. `mark`: a start mark of the caller's (any object): the new session is `starting` with it from
         before the "created" change is announced, and with start=False the caller starts it later (in the background:
         v1's create, docs/SPEC.md §21.4) with `start(sid, marked=mark)`, so nobody sees it final in between; a create
-        that fails after the mark takes it away."""
+        that fails after the mark takes it away.
+        `within`: with `workspace`, the resolved root of the HTTP API v1's server folder it lies in (docs/SPEC.md
+        §21.10 `in_place`): every check of the folder on the create's way (_plan, the last one under the home's
+        workspace claims just before the missing folders are made) finds it inside that root again, by text and by
+        file identity, or refuses the create (403 `forbidden_folder`)."""
         # the goal split as set_goal splits it: its first line also names the session (cut at a word)
         goal_title, goal_description = split_goal(_text(goal), _text(description))
         title = (_one_line(title) or shorten_title(goal_title, 60) or "Session")[:TITLE_LIMIT].strip()
@@ -2288,7 +2407,7 @@ class SessionManager:
             if workspace is not None:  # checked before anything is created
                 new = validate(self.sessions_dir / "new", self._merged(self.raw, overrides))
                 plan = await asyncio.to_thread(self._plan, None, workspace, git_on=new.workspace.git,
-                                               network_off=netoff.is_off(new), copying=copying)
+                                               network_off=netoff.is_off(new), copying=copying, within=within)
                 if source is not None and copy_from is not None:
                     try:
                         check_target(source, plan.target)
@@ -2326,7 +2445,7 @@ class SessionManager:
             summary = await self._create(title, goal_title, goal_description, overrides, start, actor, workspace,
                                          prepared, via, auto_reply=auto_reply,
                                          copied=(staging, copied) if staging is not None and copied is not None
-                                         else None, api=api_block, mark=mark)
+                                         else None, api=api_block, mark=mark, within=within)
         finally:
             if reserved is not None:
                 self._creating_in.discard(reserved)
@@ -2373,7 +2492,8 @@ class SessionManager:
                       start: bool, actor: str, workspace: str | os.PathLike | None, prepared: list[_SkillItem],
                       via: str, *, auto_reply: bool = False,
                       copied: tuple[Path, dict[str, Any]] | None = None,
-                      api: dict[str, Any] | None = None, mark: object | None = None) -> dict[str, Any]:
+                      api: dict[str, Any] | None = None, mark: object | None = None,
+                      within: Path | None = None) -> dict[str, Any]:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         for _attempt in range(100):  # another process (a second launcher, the CLI) may take the same id
             sid = self._new_id(title)
@@ -2419,7 +2539,7 @@ class SessionManager:
             try:
                 # with a copy, the folder must still be new or empty: the copied files move there
                 result = await self._set_workspace(sid, workspace, creating=True,
-                                                   expect="moved" if copied is not None else None)
+                                                   expect="moved" if copied is not None else None, within=within)
             except BaseException:
                 await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
                 raise
@@ -2561,7 +2681,9 @@ class SessionManager:
         folder name is its title. Each also resolved. Best effort: what cannot be read is left out. `sid` None: an
         error of no session (the external API's), with the user's home and the home alone. `named`: (absolute folder,
         name) pairs of the caller's, taken before all of these and named the same way (the external API's roots of
-        `[api] folders` by their names, docs/SPEC.md §21.1 "Paths in answers"); they are not resolved here."""
+        `[api] folders` by their names, docs/SPEC.md §21.1 "Paths in answers"); they are not resolved here. A session
+        that works in a server folder in place (api.folder) has its folder named `<root>/<path>` (§21.10 "Answers"),
+        before the generic names."""
         kept: dict[str, tuple[Path, str]] = {}
         exact: dict[str, tuple[Path, str]] = {}
         hidden: dict[str, tuple[Path, str]] = {}
@@ -2579,6 +2701,12 @@ class SessionManager:
 
         for path, name in named:
             add(kept, Path(path), name)
+        if sid is not None:   # a server folder the session works in in place: `<root>/<path>` (docs/SPEC.md §21.10)
+            with contextlib.suppress(SessionError, OSError, ValueError, TypeError):
+                folder = apifolders.in_place_folder((api_meta(self.meta(sid)) or {}).get("folder"))
+                if folder is not None:
+                    for path in variants(Path(self.workspace_of(sid)["path"])):   # (below the root: the hub's
+                        add(kept, path, apifolders.shown(folder["root"], folder["path"], os.sep))   # separator)
         with contextlib.suppress(RuntimeError, KeyError, OSError):
             for path in variants(Path.home()):
                 add(kept, path, "~")
@@ -2646,8 +2774,14 @@ class SessionManager:
             first = api is not None and api.get("started_at") is None
             try:
                 if sid != LEGACY_ID:
-                    self._check_workspace_ready(sid, self.meta(sid))
+                    server_folder = apifolders.in_place_folder((api or {}).get("folder")) is not None
+                    if server_folder:   # `[api] folders` as the owner left it (_check_server_folder), read on the loop
+                        self._refresh_settings()
+                    # in a thread: a folder on a share that does not answer never stalls the hub
+                    await asyncio.to_thread(self._check_workspace_ready, sid, self.meta(sid))
                     cfg = swarm.config  # what this start will use (the loaded swarm got any new settings)
+                    if cfg.workspace.git and server_folder:
+                        await asyncio.to_thread(self._check_server_git, sid, cfg.workspace_dir, netoff.is_off(cfg))
                     if cfg.workspace_adopted and cfg.workspace.git:
                         servers = [r["name"] for r in
                                    swarm.db.all("SELECT name FROM mcp_servers WHERE origin != 'config'")]
@@ -3048,7 +3182,7 @@ class SessionManager:
                            f"(session {sid}).", 409)
 
     async def _set_workspace(self, sid: str, path: Any, *, creating: bool = False,
-                             expect: str | None = None) -> dict[str, Any]:
+                             expect: str | None = None, within: Path | None = None) -> dict[str, Any]:
         notify = not creating
         async with self._lock(sid):
             self._check(sid)  # deleted while this call waited for the lock
@@ -3062,7 +3196,7 @@ class SessionManager:
                 raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
             git_on, network_off = cfg.workspace.git, netoff.is_off(cfg)
             first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
-                                            network_off=network_off)
+                                            network_off=network_off, within=within)
             if first.mode == "unchanged":
                 return {**first.result(), "restarted": False, "start_error": None}
             if not creating:   # (a create checked its own folder against the others before it copied)
@@ -3079,7 +3213,7 @@ class SessionManager:
             try:
                 async with self._claims:  # no other session takes a folder until this one's session.json names it
                     plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating,
-                                                                       network_off)
+                                                                       network_off, within)
             except BaseException:
                 if was_running:
                     with contextlib.suppress(Exception):
@@ -3104,14 +3238,19 @@ class SessionManager:
         return result
 
     async def _change_folder(self, sid: str, path: Any, git_on: bool, first: _Plan, expect: str | None,
-                             creating: bool, network_off: bool = False) -> tuple[_Plan, str, dict[str, Any] | None]:
+                             creating: bool, network_off: bool = False,
+                             within: Path | None = None) -> tuple[_Plan, str, dict[str, Any] | None]:
         """The change itself, with the session unloaded and the home's workspace claims held: the final check, the
         moves, session.json. Returns (plan, git outcome, what changed in the user's folder it left); raises with
-        everything put back (or, when that failed too, an error that says where the files are)."""
+        everything put back (or, when that failed too, an error that says where the files are). `within`: the root
+        of a create's server folder (_plan). A move by the owner (not `creating`) of a session that works in a server
+        folder in place drops its `api.folder` (docs/SPEC.md §21.10 "Starts"): it then works in a folder the owner
+        chose, and the checks of that folder no longer apply."""
         # checked again with nothing running: an agent may have forged a server, the folder may have changed, and
-        # another session may have taken the folder meanwhile (it is in its session.json now)
+        # another session may have taken the folder meanwhile (it is in its session.json now); for a server folder,
+        # the last containment check before the missing folders are made (a link swapped in meanwhile)
         plan = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
-                                       network_off=network_off)
+                                       network_off=network_off, within=within)
         if plan.mode == "unchanged":
             raise SessionError(f"The folder of session {sid} changed meanwhile; try again.", 409)
         self._check_expected(sid, plan, expect, first)
@@ -3126,6 +3265,9 @@ class SessionManager:
             if not creating:  # the members hear of it at their next wake-up (the next start delivers it)
                 meta["workspace_notice"] = {"key": "n_workspace_moved" if plan.move_all else "n_workspace_changed",
                                             "path": str(plan.target), "old": str(plan.old)}
+                block = api_meta(meta)
+                if block is not None and apifolders.in_place_folder(block.get("folder")) is not None:
+                    block["folder"] = None
             self._write_meta(sid, meta)
         except BaseException as exc:
             problems = await _in_thread(undo.run)

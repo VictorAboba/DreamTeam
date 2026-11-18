@@ -17,7 +17,9 @@ no longer in use: their removal failed) are removed at each create that copies a
 The HTTP API v1 (docs/SPEC.md §21.3) has uploads of its own, in another root (`<home>/.dreamteam/uploads/api`):
 any file (`<token>.bin`, its json naming the caller), checked without claiming (`peek_many`), claimed all or none
 (`claim_many`) and given back after a refused create (`unclaim`, `settle`); `copy_sources` copies several of them
-into one staging folder. `check_upload_name` and `check_rel` are v1's name and path rules (§21.3, §21.8).
+into one staging folder, a server folder of `[api] folders` among them (§21.10: a Source with a `root`, read below
+it by its names without ever following a link, nofollow.walk_inside, never with copy_tree). `check_upload_name` and
+`check_rel` are v1's name and path rules (§21.3, §21.8).
 Both stores are the hub's alone (0o700 on POSIX), and an upload is read only as the file the hub wrote: never
 through a link, never a file with another name (`_open_upload`), since in the Docker sandbox the hub reads with more
 rights than the agents.
@@ -42,14 +44,14 @@ import unicodedata
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, AsyncIterator, BinaryIO, Callable, Iterable
+from typing import TYPE_CHECKING, Any, AsyncIterator, BinaryIO, Callable, Iterable, Iterator
 
-from . import hubauth, netoff, treecopy
+from . import hubauth, netoff, nofollow, treecopy
 from .config import CONFIG_FILE
 from .console import unquote
 from .skills import (ZIP_MAX_ENTRIES, SkillError, ZipRules, _portable, folded_names_text, printable_name,
                      unpack_zip)
-from .treecopy import TreeLimit, copy_tree, is_within, scan_tree
+from .treecopy import TreeLimit, copy_tree, is_within, scan_tree, writable_bits
 from .workspace import _WIN_BAD_CHARS, _WIN_RESERVED, long_path, pid_alive, rmtree
 
 if TYPE_CHECKING:
@@ -102,8 +104,9 @@ _MOUNTINFO = "/proc/self/mountinfo"   # Linux: what is mounted where (_mount_roo
 
 class CopyError(ValueError):
     """A copy that cannot be made; `status` is the HTTP status. `code`: the HTTP API v1's error code where the
-    status alone does not say it (docs/SPEC.md §21.1: `bad_name`, `file_conflict`, `too_many_uploads`); None
-    otherwise. The internal routes do not show it."""
+    status alone does not say it (docs/SPEC.md §21.1: `bad_name`, `file_conflict`, `too_many_uploads`, and for the
+    server folders of §21.10 `unknown_folder`, `forbidden_folder`, `not_found`); None otherwise. The internal routes
+    do not show it."""
 
     def __init__(self, message: str, status: int = 400, code: str | None = None):
         super().__init__(message)
@@ -138,9 +141,14 @@ class Source:
     # "folder" | "zip" | "upload" (a zip uploaded: the board's, or v1's with unpack) | "file" (v1's, kept as one file)
     kind: str
     path: Path          # resolved folder or zip file (an upload: its claimed file)
-    shown: str          # what copied_from records: str(path), or "upload: <file name>"
+    shown: str          # what copied_from records: str(path), "upload: <file name>", or "<root>/<path>"
     token: str | None = None
     filename: str | None = None   # a v1 upload: its file name (check_upload_name), the name of a "file" copied
+    # a server folder of the HTTP API v1 (docs/SPEC.md §21.10, kind "folder" or "zip"): its root, resolved, and the
+    # names below it as the root's folders spell them; the copy reads from the root by these names, never following
+    # a link (nofollow), never by `path`
+    root: Path | None = None
+    parts: tuple[str, ...] = ()
 
 
 # the names of the staging folders and claims this process works with now (staging_name, Uploads.claim_path until
@@ -384,12 +392,14 @@ def _disk_mount(path: Path) -> bool:
     return root is None or root == "/"
 
 
-def resolve_source(text: Any, *, home: Path, config: "Config", sandbox: bool) -> Source:
+def resolve_source(text: Any, *, home: Path, config: "Config", sandbox: bool, within: Path | None = None) -> Source:
     """The folder or .zip file `text` names, checked: CopyError (400) for a path that is not absolute, missing, a
     file that is not a .zip, a drive or file system root, the user's home folder or one containing it, inside or
     containing the DreamTeam home or one of DreamTeam's own folders, or a system folder (/proc, /sys, /dev).
     `sandbox`: the hub runs in a Docker container (hub_in_container: a missing or Windows path suggests the zip
-    upload). Blocking."""
+    upload). `within`: a root of the HTTP API v1's server folders (resolved, docs/SPEC.md §21.10): the path, once
+    resolved here, must still lie inside it, by text and by file identity (CopyError 403 `forbidden_folder`: a link
+    swapped in on the way since the caller resolved it). Blocking."""
     # (one pair of quotes around the path is dropped: Explorer's "Copy as path" adds them)
     if not isinstance(text, str) or not unquote(text):
         raise CopyError("'copy_from' must be an absolute path of a folder or a .zip file.")
@@ -408,6 +418,9 @@ def resolve_source(text: Any, *, home: Path, config: "Config", sandbox: bool) ->
         exists = os.path.lexists(path)
     except (OSError, RuntimeError, ValueError) as exc:
         raise CopyError(f"Cannot use {given}: {exc}") from None
+    if within is not None and not _within(path, within):   # (named as given: never where it leads)
+        raise CopyError(f"{given} does not lie inside its folder root any more: a link or a junction on the way leads "
+                        "out of it.", 403, code="forbidden_folder")
     if not exists:
         if sandbox:
             raise CopyError(_sandbox_text(home, text))
@@ -609,11 +622,12 @@ def _result(source: Source, files: int, size: int, links: list[str], excluded: l
 def _copy_zip(source: Source, staging: Path, limits: CopyLimits,
               check: Callable[[], None] | None, rules: ZipRules | None = None) -> dict[str, Any]:
     """Unpack the zip `source` into the new folder `staging` by `rules` (default: zip_rules(limits)). An upload (a
-    source with a token) is read from the file _open_upload opens, never through a link."""
+    source with a token) is read from the file _open_upload opens, never through a link; a server folder's (a source
+    with a root) from the file _open_in_root opens below its root."""
     with contextlib.ExitStack() as stack:
         zipped: BinaryIO | Path
-        if source.token is not None:
-            zipped = stack.enter_context(_open_upload(source))
+        if source.token is not None or source.root is not None:
+            zipped = stack.enter_context(_open_upload(source) if source.token is not None else _open_in_root(source))
             size = os.fstat(zipped.fileno()).st_size
         else:
             try:
@@ -641,12 +655,18 @@ def copy_sources(sources: list[Source], staging: Path, limits: CopyLimits,
     staging folder), then their top-level entries moved into `staging`. A zip (kind "zip", or "upload": a zip
     uploaded with unpack) is unpacked by the zip rules of a copy, with the names the session keeps for itself
     (SESSION_NAMES) also left out at its top level after the unwrap; a v1 upload of kind "file" becomes one file of
-    its name. One budget for all: `limits` caps the sum of their files and bytes (413). A top-level name that two
+    its name. A server folder of the HTTP API v1 (docs/SPEC.md §21.10: kind "folder" or "zip" with a `root`) is read
+    below its root without following a link (nofollow): a folder by _copy_server_folder, a zip unpacked as an
+    upload's. One budget for all: `limits` caps the sum of their files and bytes (413). A top-level name that two
     sources share is 409 `file_conflict`: compared in NFC and case-folded on Windows and macOS, exactly elsewhere,
-    and a name the file system folds onto another is one too. A folder source is not taken here (a server folder
-    is walked without following links, never with copy_tree). Returns copy_into's result for all of them
-    ("source": the shown names joined, "kind": "sources", "top": None) and "sources": [{shown, files, bytes}].
-    CopyError for a refusal, with nothing left behind, as for anything `check` raises. Blocking."""
+    and a name the file system folds onto another is one too. A folder without a root is not taken here (never
+    with copy_tree: ValueError). Returns copy_into's result for all of them ("source": the shown names joined,
+    "kind": "sources", "top": None) and "sources": [{shown, files, bytes}]. CopyError for a refusal, with nothing
+    left behind, as for anything `check` raises. Blocking."""
+    for source in sources:   # (before anything is made)
+        if source.kind not in ("zip", "upload", "file", "folder") or (source.kind == "folder" and source.root is None):
+            raise ValueError(f"copy_sources cannot copy a source of kind {source.kind!r}"
+                             + (" without a root" if source.kind == "folder" else ""))
     if os.path.lexists(staging):   # never someone else's folder: only what this call made is removed
         raise CopyError(f"Cannot copy into {staging}: it exists already.", 500)
     os.mkdir(staging)
@@ -656,8 +676,6 @@ def copy_sources(sources: list[Source], staging: Path, limits: CopyLimits,
         files = size = 0
         many = len(sources) > 1
         for source in sources:
-            if source.kind not in ("zip", "upload", "file"):
-                raise ValueError(f"copy_sources cannot copy a source of kind {source.kind!r}")
             part = staging.parent / staging_name()
             if os.path.lexists(part):
                 done_with(part)
@@ -665,6 +683,8 @@ def copy_sources(sources: list[Source], staging: Path, limits: CopyLimits,
             parts.append(part)
             if source.kind == "file":
                 got = _copy_file(source, part, limits, check, files=files, size=size, many=many)
+            elif source.kind == "folder":
+                got = _copy_server_folder(source, part, limits, check, files=files, size=size, many=many)
             else:
                 got = _copy_zip(source, part, limits, check, rules=_left_rules(limits, files, size, many))
             files += got["files"]
@@ -733,6 +753,219 @@ def _copy_file(source: Source, part: Path, limits: CopyLimits, check: Callable[[
     return _result(source, 1, written, [], [], special=0, skipped=0, top=None)
 
 
+# ---- a server folder of the HTTP API v1 (docs/SPEC.md §21.10), read below its root without following a link ------
+def _below(source: Source, rel: str) -> str:
+    """A path nofollow names (relative to the root, '/') as `<root>/<path>` for a text: below the source, its shown
+    name and what lies below it; on the way to it, the root's name and the path."""
+    start = "/".join(source.parts)
+    if not start or rel == start or rel.startswith(start + "/"):
+        inner = rel[len(start):].lstrip("/")
+        return f"{source.shown}/{inner}" if inner else source.shown
+    return f"{source.shown.split('/', 1)[0]}/{rel}" if rel else source.shown.split("/", 1)[0]
+
+
+def _refused(source: Source, exc: nofollow.Refused) -> CopyError:
+    """A link met on the way (or swapped in), or a path that now leads out of the root: 403 `forbidden_folder`; a
+    file with another name (a hard link) or a special file in the place of the .zip: the same, it is never read."""
+    where = _below(source, exc.rel)
+    named = f"{printable_name(where)}: " if where != source.shown else ""
+    return CopyError(f"Cannot copy {source.shown}: {named}{exc.strerror}. Nothing was copied.", 403,
+                     code="forbidden_folder")
+
+
+def _open_in_root(source: Source) -> BinaryIO:
+    """The .zip of a server folder, opened below its root by its names without following a link
+    (nofollow.open_inside): never a link, a file with another name or a special file (403 `forbidden_folder`); 404
+    `not_found` when it is gone, 400 when it is a folder now."""
+    try:
+        fd = nofollow.open_inside(source.root, source.parts)
+    except nofollow.Refused as exc:
+        raise _refused(source, exc) from None
+    except FileNotFoundError:
+        raise CopyError(f"Nothing to copy at {source.shown} any more: no such file.", 404, code="not_found") from None
+    except (IsADirectoryError, NotADirectoryError):
+        raise CopyError(f"{source.shown} is no .zip file any more.") from None
+    except OSError as exc:
+        raise CopyError(f"Cannot read {source.shown}: {exc.strerror or exc}", 500) from None
+    try:
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _server_skip(parts: tuple[str, ...]) -> bool:
+    """What a copy of a server folder leaves out unopened (nofollow.walk_inside's `skip`): COPY_EXCLUDE_NAMES at any
+    depth (case-folded), the names the session keeps for itself (SESSION_NAMES) at the top, COPY_EXCLUDE_PATHS."""
+    folded = parts[-1].casefold()
+    return (folded in _COPY_EXCLUDE_FOLDED or (len(parts) == 1 and folded in SESSION_NAMES)
+            or "/".join(parts) in COPY_EXCLUDE_PATHS)
+
+
+def _server_entries(source: Source, *, open_files: bool) -> Iterator[nofollow.Entry]:
+    """nofollow.walk_inside of the source below its root, its refusals as CopyError: a link met or swapped in, or a
+    path out of the root, 403 `forbidden_folder` (the walk ends there); the folder gone 404 `not_found`. The other
+    troubles of single entries come as ERROR entries."""
+    walk = nofollow.walk_inside(source.root, source.parts, skip=_server_skip, open_files=open_files)
+    try:
+        while True:
+            try:
+                entry = next(walk)
+            except StopIteration:
+                return
+            except nofollow.Refused as exc:
+                raise _refused(source, exc) from None
+            except FileNotFoundError:   # (the start folder: an entry's own errors are ERROR entries)
+                raise CopyError(f"Nothing to copy at {source.shown} any more: no such folder.", 404,
+                                code="not_found") from None
+            except NotADirectoryError:
+                raise CopyError(f"{source.shown} is no folder any more.") from None
+            except OSError as exc:
+                raise CopyError(f"Cannot read {source.shown}: {exc.strerror or exc}", 500) from None
+            yield entry
+    finally:
+        walk.close()
+
+
+def _copy_server_folder(source: Source, part: Path, limits: CopyLimits, check: Callable[[], None] | None, *,
+                        files: int, size: int, many: bool) -> dict[str, Any]:
+    """Copy the server folder `source` (docs/SPEC.md §21.10 `copy`) into the new folder `part`, within what `files`
+    and `size` (the sources before it) left of the budget. Every folder and file is opened below the root by its
+    names without following a link (nofollow.walk_inside), never by a path: a link met is left out (listed), one
+    swapped in meanwhile, or a path that now leads out of the root, ends the copy (403 `forbidden_folder`). Left
+    out: COPY_EXCLUDE_NAMES at any depth and the session's own names at the top (_server_skip), files with more
+    than one name (st_nlink > 1: another name may lie outside the root), counted as excluded; links and special
+    files, listed and counted as copy_tree does; COPY_SKIP_FILES without a word. A first walk only measures (413
+    before a byte is written); the second copies, each file read through the walk's open file before the walk goes
+    on, its bytes counted again. Files get the modes of copy_tree's "writable" and their modification time. A file
+    or folder gone meanwhile is reported (vanished); one that cannot be read, or whose name another file took
+    meanwhile, refuses the copy ("Cannot read ..."), as for a folder of copy_from."""
+    shown = source.shown
+    too_big, too_many = _sum_texts(limits) if many else (
+        f"{shown} holds more than {limits.max_mb} MB to copy ([workspace] copy_max_mb; {_LEFT_OUT}). Nothing was "
+        "copied.",
+        f"{shown} holds more than {limits.max_files} files to copy ([workspace] copy_max_files; {_LEFT_OUT}). "
+        "Nothing was copied.")
+    count = total = 0
+    with contextlib.closing(_server_entries(source, open_files=False)) as entries:   # measured before any write
+        for entry in entries:
+            if check is not None:
+                check()
+            if entry.kind == nofollow.FILE and entry.name not in COPY_SKIP_FILES:
+                count += 1
+                total += entry.size
+                if files + count > limits.max_files:
+                    raise CopyError(too_many, 413)
+                if size + total > limits.max_bytes:
+                    raise CopyError(too_big, 413)
+    try:
+        os.mkdir(long_path(part))
+    except OSError as exc:
+        raise CopyError(f"Cannot copy into the session's folder: {exc.strerror or exc}", 500) from None
+    no_posix = treecopy.without_posix_bits(source.path)   # (the folder's own file system: a mount below the root)
+    copied = written = special = skipped = 0
+    links: list[str] = []
+    excluded: list[str] = []
+    vanished: list[str] = []
+    errors: list[tuple[str, str]] = []
+    with contextlib.closing(_server_entries(source, open_files=True)) as entries:
+        for entry in entries:
+            if check is not None:
+                check()
+            rel = entry.rel
+            if entry.kind == nofollow.DIR:
+                _make(part, entry, shown, folder=True)
+            elif entry.kind == nofollow.FILE:
+                if entry.name in COPY_SKIP_FILES:
+                    skipped += 1
+                    continue
+                if files + copied + 1 > limits.max_files:
+                    raise CopyError(too_many, 413)
+                got = _copy_entry(part, entry, shown, lambda n: size + written + n > limits.max_bytes, too_big,
+                                  no_posix, check)
+                if isinstance(got, OSError):
+                    errors.append((rel, got.strerror or str(got)))
+                    continue
+                copied += 1
+                written += got
+            elif entry.kind == nofollow.LINK:
+                links.append(rel)
+            elif entry.kind == nofollow.SPECIAL:
+                special += 1
+            elif entry.kind in (nofollow.HARD_LINK, nofollow.EXCLUDED):
+                excluded.append(rel)
+            else:   # ERROR: gone meanwhile (a file or a folder, also one renamed or moved on Windows), else unreadable
+                error = entry.error
+                if isinstance(error, FileNotFoundError):
+                    vanished.append(rel)
+                else:
+                    errors.append((rel, (error.strerror if error is not None else None) or str(error)))
+    if errors:
+        listed = printable_name("; ".join(f"{rel} ({reason})" for rel, reason in errors[:_ERRORS_SHOWN]))
+        more = "; ..." if len(errors) > _ERRORS_SHOWN else ""
+        raise CopyError(f"Cannot read {len(errors)} file(s) in {shown}: {listed}{more}. Nothing was copied: check "
+                        "the permissions, or close the program that holds them.")
+    return _result(source, copied, written, links, excluded, special=special, skipped=skipped, top=None,
+                   vanished=vanished)
+
+
+def _make(part: Path, entry: nofollow.Entry, shown: str, *, folder: bool) -> int | None:
+    """Make the folder of `entry` in `part` (None), or open its new file (O_EXCL: the descriptor); two names of the
+    source that the file system written to takes for one (letter case, Unicode form) are a CopyError, as
+    copy_from's."""
+    target = long_path(part.joinpath(*entry.parts))
+    try:
+        if folder:
+            os.mkdir(target)
+            return None
+        return os.open(target, _FILE_FLAGS, 0o600)
+    except FileExistsError:
+        raise CopyError(folded_names_text(shown, entry.rel)) from None
+    except OSError as exc:
+        raise CopyError(f"Cannot copy into the session's folder: {exc.strerror or exc}", 500) from None
+
+
+def _copy_entry(part: Path, entry: nofollow.Entry, shown: str, over: Callable[[int], bool], too_big: str,
+                no_posix: bool, check: Callable[[], None] | None) -> int | OSError:
+    """Copy the walk's open FILE `entry` into `part` before the walk goes on: its bytes written (`over(n)` says when
+    n more bytes pass the budget: 413 `too_big`), or the OSError of a read that failed (the partial file removed)."""
+    fd_out = _make(part, entry, shown, folder=False)
+    target = long_path(part.joinpath(*entry.parts))
+    reader = entry.reader()
+    got, head, failed = 0, b"", None
+    with os.fdopen(fd_out, "wb") as fout:
+        while True:
+            if check is not None:
+                check()
+            try:
+                chunk = reader.read(CHUNK)
+            except OSError as exc:
+                failed = exc
+                break
+            if not chunk:
+                break
+            if not got:
+                head = chunk[:4]
+            got += len(chunk)
+            if over(got):
+                raise CopyError(too_big, 413)
+            try:
+                fout.write(chunk)
+            except OSError as exc:
+                raise CopyError(f"Cannot copy {shown} into the session's folder: {exc.strerror or exc}",
+                                500) from None
+    if failed is not None:
+        with contextlib.suppress(OSError):
+            os.unlink(target)
+        return failed
+    try:
+        os.utime(target, ns=(entry.mtime_ns, entry.mtime_ns))
+        os.chmod(target, writable_bits(entry.mode, head, no_posix))
+    except OSError as exc:
+        raise CopyError(f"Cannot copy {shown} into the session's folder: {exc.strerror or exc}", 500) from None
+    return got
+
+
 def _name_key(name: str) -> str:
     """A top-level name as two sources clash on it: NFC and case-folded where the default file systems ignore case
     and Unicode form (Windows, macOS), as zip_rules' fold_collisions; exact elsewhere."""
@@ -796,7 +1029,7 @@ def _sources_result(sources: list[Source], results: list[dict[str, Any]]) -> dic
             "bytes": total("bytes"), "links": joined("links"), "links_count": total("links_count"),
             "excluded": joined("excluded"), "excluded_count": total("excluded_count"),
             "special_count": total("special_count"), "skipped_count": total("skipped_count"),
-            "vanished": [], "vanished_count": 0, "top": None,
+            "vanished": joined("vanished"), "vanished_count": total("vanished_count"), "top": None,
             "sources": [{"shown": s.shown, "files": r["files"], "bytes": r["bytes"]}
                         for s, r in zip(sources, results)]}
 

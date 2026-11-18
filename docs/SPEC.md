@@ -4253,21 +4253,32 @@ settings; ValueError when they are invalid):
   `code` is the HTTP API v1's code where the status alone does not say it (§21.1), never in `extra`, so the internal
   answers do not show it: `folder_busy` (`FOLDER_BUSY`: `_plan`'s folder of another session, `_check_reserved`'s
   create in progress), `folder_not_ready` (`FOLDER_NOT_READY`: every `_repo_refusal`, so also `_check_adopted_repo`;
-  `_check_workspace_ready`'s missing folder and `_check_journal`'s unfinished move), `conflict` (`control`'s wrap-up
-  before the first start), a CopyError's own code (`bad_name`, `file_conflict`) when `create` turns it into a
-  SessionError; `_move_error` keeps the code of the SessionError that failed a workspace change, unless files could
-  not be put back (500), and its `holder`. `holder`: the session whose folder it is (`_plan`'s `folder_busy`; none
-  for a create in progress), never in `extra` either: v1 names it by its uid, to a caller who sees it, in a text of
-  its own (§21.10). v1 answers a code with that code's own status (§21.1), which may differ from `status`:
-  `folder_not_ready` is 409 there, also for the two refusals of a create that are 400 on the internal routes (a
-  folder inside a repository, a repository's own database).
+  `_check_workspace_ready`'s missing folder and `_check_journal`'s unfinished move; a server folder's repository that
+  would make DreamTeam's git write outside it, `_plan` with `within` and `_check_server_git`; a missing root at a
+  start), `forbidden_folder` (`FORBIDDEN_FOLDER`, 403: a server folder that no longer lies inside its root, `_plan`
+  with `within`, or whose root no longer allows it, `_check_server_folder`, §21.10), `conflict` (`control`'s wrap-up
+  before the first start), a CopyError's own code (`bad_name`, `file_conflict`, and a server folder's
+  `forbidden_folder`, `not_found`) when `create` turns it into a SessionError; `_move_error` keeps the code of the
+  SessionError that failed a workspace change, unless files could not be put back (500), and its `holder`.
+  `holder`: the session whose folder it is (`_plan`'s `folder_busy`; none for a create in progress), never in
+  `extra` either: v1 names it by its uid, to a caller who sees it, in a text of its own (§21.10). v1 answers a code
+  with that code's own status (§21.1), which may differ from `status`: `folder_not_ready` is 409 there, also for the
+  two refusals of a create that are 400 on the internal routes (a folder inside a repository, a repository's own
+  database).
 - **Sessions of the HTTP API v1** (§21.4). `create(..., api={answers, stop_when_done, client_ref, request_digest,
   folder})` (those keys only, `API_GIVEN` defaults for the missing ones; another key or a value of the wrong kind is
   400) writes `"via": "api"` and the `api` block, with `base_commit`, `started_at`, `finished_at`, `start_error` and
   `error` null (`API_LATER`), in the first session.json write; `api_meta(meta)` reads that block (None for any other
   session; `{}` for a v1 session whose block is not an object). `create(..., sources=[copyfrom.Source])`: v1's
-  claimed uploads (and, later, a copy-mode server folder) copied by `copy_sources` instead of `copy_into`, not with
-  `copy_from` or `copy_from_upload` (400 before any claim); the caller claims and settles them. Every later write of
+  claimed uploads and a copy-mode server folder (a Source with `root` and `parts`, read below its root by
+  `nofollow`, §21.10) copied by `copy_sources` instead of `copy_into`, not with `copy_from` or `copy_from_upload`
+  (400 before any claim); the caller claims and settles the uploads. `create(..., workspace=, within=root)`: an
+  in-place server folder, which every `_plan` on the create's way (`create`'s own, `_set_workspace`'s and
+  `_change_folder`'s last one, under the workspace claims just before `_carry_out` makes the missing folders), and
+  `_carry_out` itself around each folder it makes and around `git init` (`_Plan.within`, `_check_inside`), finds
+  inside `within` again, by text and by file identity, else 403 `forbidden_folder`; with git on, a folder with files
+  there must also pass `apifolders.git_dir_refusal` (409 `folder_not_ready`), before git reads it. A workspace move
+  by the owner (`_change_folder` without `creating`) sets an in-place `api.folder` to null. Every later write of
   the block is a read-modify-write of session.json under the session's lock (`_api_write`, which logs and never
   raises):
   - `_start_locked`, on every start path: with `answers: "auto"` it calls `swarm.hold_auto_reply()` right after
@@ -4292,7 +4303,8 @@ settings; ValueError when they are invalid):
     longer, so named first); each also resolved. The external API's error texts go through it too
     (`_public_text(sid | None, text, *, named=())`: `sid` None, an error of no session, names only the user's home and
     the home; `named` takes the caller's pairs first, unresolved: the roots of `[api] folders` by their names, §21.1
-    "Paths in answers"). A start
+    "Paths in answers"; then a session that works in a server folder in place has that folder named `<root>` and
+    its path below the root with the hub's separator, `apifolders.shown(root, path, os.sep)`, §21.10). A start
     cancelled inside `swarm.start()` (the hub stops) writes `finished_at` and no `start_error`.
   - `_unload` of a running v1 session writes `finished_at` after `Swarm.stop`, whatever the reason.
   - What runs beside a v1 session's run (`_RunWatch`, tied to its Swarm, kept in `_run_watch[sid]`):
@@ -4553,9 +4565,14 @@ next start, which checks the folder).
   DreamTeam's skill environments folder ..., or inside it or contains it (every session runs its skills' packages
   from there)") or a folder inside or containing it, a folder inside the current workspace or containing it (or
   containing the session directory), an existing file, a folder that cannot be created or written (a temporary
-  probe file). 409: a folder another session works in, or inside / containing one (the legacy `main` works in
-  `<home>/workspace`). The current folder itself: `"unchanged"`, nothing happens. 404 unknown session; 409 for
-  `main` (see below).
+  probe file), another DreamTeam home (a folder with `sessions/` and `dreamteam.toml`; never the session's own
+  folder, whatever its agents built there, so `--default` always leads back) or a folder inside one, the
+  hub tokens' folder (`hubauth.tokens_dir()`) or a folder inside or containing it, and on POSIX a folder under
+  /proc, /sys or /dev (as `copyfrom.resolve_source` refuses them to a copy). 409: a folder another session works
+  in, or inside / containing one (the legacy `main` works in `<home>/workspace`), compared by text and by file
+  identity (`treecopy.is_within`: on a file system that ignores letter case or Unicode form where `normcase` does
+  not, APFS or a casefold mount, `jobs/Acme` is `jobs/acme`). The current folder itself: `"unchanged"`, nothing
+  happens. 404 unknown session; 409 for `main` (see below).
 - `expect` (`"moved"` | `"adopted"`, anything else 400): the mode the user agreed to; the TUI and the console send
   the one their question announced. 409 when the folder turns out otherwise (e.g. files appeared in a folder that
   was empty when the user was asked); nothing changes.
@@ -4617,7 +4634,10 @@ next start, which checks the folder).
   start (the user may have worked there while the session was stopped, or git was off at the adopt): 409 for
   uncommitted changes or untracked files (the session's own `mcp/<name>` folders and `.scratch/` are left out), a
   detached HEAD, an operation in progress, an unreadable repository, or a folder inside another repository (a folder in no
-  repository gets one at the start, as at an adopt).
+  repository gets one at the start, as at an adopt). A session that works in a server folder of the HTTP API v1 in
+  place (`api.folder`) is checked again too, from every surface (§21.10 "Starts": `_check_server_folder` in
+  `_check_workspace_ready`, then `_check_server_git`, before the adopted-folder check). `_start_locked` runs
+  `_check_workspace_ready` in a thread (a folder on a share that does not answer never stalls the hub).
 - **Legacy `main`**: refused (409, `LEGACY_WORKSPACE_TEXT`): `dreamteam run` can still open the home as a
   single-swarm project, which reads only `dreamteam.toml` and would work in `<home>/workspace` again.
 - `create(..., workspace=path)`: the same checks before anything is created (with the overrides' `workspace.git`),
@@ -7131,7 +7151,8 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   that v1 still has (and the caller sees) answers 200 with that session and creates nothing: a retry after a timeout
   never makes a second job. The same `client_ref` with another body is 409 `conflict`. `request_digest` is the SHA-256
   of the body's canonical JSON (keys sorted, no spaces; a field that is `null` left out, as not given, and a whole
-  number with a fraction, `5.0`, written as `5`), stored for every v1 create. A create in flight holds an in-memory
+  number with a fraction, `5.0`, written as `5`; `folder` as parsed, `{"root", "path", "mode"}` with `path` `""` and
+  `mode` `"copy"` when not given, 21.10), stored for every v1 create. A create in flight holds an in-memory
   reservation of its `client_ref`: a retry with the same body waits for it, then answers as a repeat (200), or goes
   on when that create failed; a retry with another body is 409 at once. The stored sessions are found through the
   manager's index (`SessionManager.sid_of_client_ref`, §17.2), on the event loop with no await before the
@@ -7672,6 +7693,8 @@ in_place = false            # true: a session may also work in a folder under it
     environments, the hub tokens);
   - another DreamTeam home, or inside one;
   - on POSIX, under /proc, /sys or /dev.
+  The texts name the root by its name only. At the hub's start the launcher logs every root it cannot use now, in a
+  daemon thread (`apifolders.log_refusals`: a refused one as a warning with its path, a missing one as information).
 - A change takes effect at the next request, with no restart.
 - `api.folders` is a setting of this computer: an export carries it, an import never takes it (`LOCAL_KEYS`, 21.9).
 
@@ -7686,16 +7709,23 @@ in_place = false            # true: a session may also work in a folder under it
 - `files` cannot go with `in_place` (400 `bad_request`): the client puts its files into the folder itself.
 
 **Resolution** (`apifolders.resolve_request`).
-- The root is resolved, following links and junctions. A missing root is 404 `not_found`; a refused one is 403
-  (Settings).
+- The root is resolved, following links and junctions (`apifolders.resolve_root`). A missing root, or one that is no
+  folder, is 404 `not_found`; a refused one, or one that cannot be read, is 403 (Settings).
 - Then the root joined with `path` is resolved. The result must lie inside the resolved root, compared as text and by
   file identity (`treecopy.is_within`). A link or junction under the root that leads out of it is 403
   `forbidden_folder`. For `copy`, a `path` that names nothing is 404 `not_found`, and a file that is not a `.zip` is
-  400 `bad_request`.
+  400 `bad_request`; in place, a file is 400 `bad_request` (a missing folder is made).
 - The create works with that resolved folder and checks it again after its own resolution, given the resolved root
-  (`within=`): `resolve_source` for a copy; for in place, every `_plan` on the create path, the last of them under the
-  home's workspace claims just before the missing folders are made (`_change_folder` → `_carry_out`). A link swapped
-  in meanwhile ends the create, and every start checks again ("Starts").
+  (`within=`): for a copy, `resolve_source(..., within=)` right after `resolve_request` (its location rules for the
+  folder itself: another DreamTeam home under the root is 403 `forbidden_folder` too), then the copy itself reads
+  below the root by the folder's names as the root's folders spell them (the resolved folder relative to the resolved
+  root: another spelling is 404 there), never by a path, so a link swapped in on the way is met, never followed (403);
+  for in place, every `_plan` on the create path, the last of them under the home's workspace claims just before the
+  missing folders are made (`_change_folder` → `_carry_out`), and then `_carry_out` itself (`_Plan.within`): the
+  deepest level that is there, each level right after it makes it (by path), and the folder before and after `git
+  init` must still resolve to themselves inside the root (`sessions._check_inside`, 403 `forbidden_folder`; the undo
+  removes what was made, so at most an empty folder made through a junction swapped in at that instant exists
+  outside for that instant). A link swapped in meanwhile ends the create, and every start checks again ("Starts").
 - Every rule of `copy_from` and `workspace` (§17.2) applies as well.
 
 **`copy`.**
@@ -7704,7 +7734,14 @@ in_place = false            # true: a session may also work in a folder under it
 - Left out: `.git`, `node_modules`, `.venv`, `venv` and `__pycache__` at any depth, links and special files; at the
   top level, the names the session owns (`.scratch`, `.gitignore`, `.dreamteam`, `mcp`, 21.3), counted as excluded;
   regular files with more than one hard link (`st_nlink > 1`: another name of the file may lie outside the root; read
-  as 21.8 says), counted as excluded.
+  as 21.8 says), counted as excluded; `.DS_Store` and `Thumbs.db` without a word.
+- A first walk only counts and measures (`open_files=False`: 413 before any byte is written); the second copies,
+  each file read through the walk's own open file before the walk goes on, its bytes counted again
+  (`copyfrom._copy_server_folder`). The files get the modes of `copy_tree`'s "writable" (`treecopy.writable_bits`)
+  and their modification time. A file or folder gone meanwhile (on Windows also one renamed or moved inside the root)
+  is reported as vanished and not copied; one that cannot be read, or whose name another file, folder or special file
+  took meanwhile (`Refused` `replaced`, `special`), refuses the copy (400 "Cannot read ..."), as for a folder of
+  `copy_from`. A `.zip` with another name (a hard link) is 403 `forbidden_folder`.
 - The walk never follows a link, not only when it checks one: every folder and file under the root is opened with
   `nofollow` (21.8). `copy_tree` is not used for this: on Windows it checks a link by path and then lists by path, and
   its replaced-file check never fires there, so a junction swapped in would be copied through. A `.zip` is opened the
@@ -7718,8 +7755,15 @@ in_place = false            # true: a session may also work in a folder under it
 - A folder with files is adopted as it is. With git on, it must be one of:
   - a repository's own top folder, on a branch, with nothing uncommitted and no merge or rebase halfway, whose `.git`
     is a folder (not a link, and not a gitfile `gitdir: ...`, such as a linked worktree's) and whose git dir and
-    common dir (`git rev-parse --absolute-git-dir` and `--git-common-dir`) resolve inside the folder. Otherwise
-    DreamTeam's own git (the autocommits, `changed_files`) would write objects, refs and the index outside the root;
+    common dir (`git rev-parse --absolute-git-dir` and `--git-common-dir`) resolve inside the folder, as do the paths
+    git writes (`--git-path` of `objects`, `refs`, `logs`, `packed-refs`, `index`, `HEAD`, `COMMIT_EDITMSG`:
+    `apifolders.GIT_WRITES`). Nothing in the `.git` folder (walked before git reads it), or in a git dir or common
+    dir elsewhere in the folder, may be a link or a junction (`objects` or `logs/refs/heads` pointing elsewhere), and
+    no regular file there outside `objects/` may have another hard link (git appends to a reflog and rewrites
+    `COMMIT_EDITMSG` in place: the other name would change too). `hooks/` is not looked at: DreamTeam's git runs no
+    hook. Otherwise DreamTeam's own git (the autocommits, `changed_files`) would write objects, refs, reflogs and the
+    index outside the root. These rules are checked at the create and at every start; while a session runs, its
+    agents can change `.git` like any file of the folder;
   - in no repository at all. It then gets `git init`, a `.gitignore` when it has none, and a first commit of its
     files.
 - Otherwise the create is 409 `folder_not_ready`.
@@ -7741,21 +7785,32 @@ in_place = false            # true: a session may also work in a folder under it
   files (`folder_kept: {root, path}`).
 
 **Starts.** Every start of a session with an in-place `api.folder`, from any surface (v1 `continue`, the resume when
-the hub starts, the board, the TUI, MCP), checks again in `_check_workspace_ready`, before anything starts:
-- its root is still listed with `in_place = true` and is not refused (Settings);
-- the folder still resolves inside the root, by text and by file identity;
-- with git on, its `.git` still follows the rules of `in_place` above.
+the hub starts, the board, the TUI, MCP), checks again in `_start_locked`, before anything starts:
+- in `_check_workspace_ready` (`SessionManager._check_server_folder`), in a thread (a root on a share that does not
+  answer never stalls the hub): its root is still listed with `in_place = true` (the settings read again on the
+  loop just before: a hand edit counts at once) and is not refused (Settings); the
+  stored folder still resolves to itself (no link on its way, not even one that leads to another folder of the root)
+  and inside the root, by text and by file identity (a root the owner pointed elsewhere no longer holds it);
+- then, with git on, in a thread (`SessionManager._check_server_git`, before the adopted-folder check, so git never
+  reads a repository whose database lies elsewhere): its `.git` still follows the rules of `in_place` above
+  (`apifolders.git_dir_refusal`).
 
-A failed check is 403 `forbidden_folder` (409 `folder_not_ready` for the git rules or a missing folder), recorded as
-`start_error` (21.4). This also catches a component of the path swapped for a link after the create. A workspace move
-of such a session by the owner (`/cd`, `session_cd`, `set_workspace`) drops `api.folder`: the session then works in a
-folder the owner chose, and these checks no longer apply. An import drops it as well (21.9).
+A failed check is 403 `forbidden_folder` (409 `folder_not_ready` for the git rules, a missing folder or a missing
+root), recorded as `start_error` (21.4). This also catches a component of the path swapped for a link after the
+create. A workspace move of such a session by the owner (`/cd`, `session_cd`, `set_workspace`) drops `api.folder`
+(`_change_folder`): the session then works in a folder the owner chose, and these checks no longer apply. An import
+drops it as well (21.9).
 
 **Limits.** `[api] max_running` counts these sessions like any other.
 
 **Answers.**
 - The summary has `"folder": {"root", "path", "mode"}`. Only the owner's board shows the absolute path.
-- An error text that would name a path of the hub's computer names `<root>/<path>` instead (21.1).
+- An error text that would name a path of the hub's computer names `<root>/<path>` instead (21.1): the root's name,
+  then the path below it with the hub's separator (`ApiV1.redact` with the roots, and `_public_text` for the folder
+  of a session that works in it in place, so its `start_error` too). A text of v1's own quotes a request's path as
+  the client wrote it, with '/'.
+- DELETE answers `folder_kept: {root, path}` for a session that worked in its folder in place (the folder and its
+  files stay); a copy is the session's own folder and goes with it.
 - `GET /api/v1/options` lists `"folders": [{"name", "in_place"}]`, never a path.
 
 **Sandbox.**

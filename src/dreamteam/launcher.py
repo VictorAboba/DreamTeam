@@ -25,7 +25,7 @@ from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, netoff, procs, roles
+from . import __version__, apifolders, netoff, procs, roles
 from .api_v1 import ApiV1
 from .copyfrom import API_UPLOAD_PATH, UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
 from .httpjson import JSONResponse, json_text
@@ -391,6 +391,16 @@ async def _sweep_copies_hourly(manager: "SessionManager") -> None:
         await asyncio.sleep(UPLOAD_TTL)
 
 
+async def _check_folder_roots(manager: "SessionManager") -> None:
+    """Log the roots of `[api] folders` that the HTTP API v1 cannot use now (docs/SPEC.md §21.10: each is checked
+    again at every use), once at the launcher's start. In a daemon thread: a root on a network share that does not
+    answer never holds the hub's exit."""
+    try:
+        await procs.daemon_call(apifolders.log_refusals, manager.global_config(), manager.home)
+    except Exception:  # noqa: BLE001 - every use checks the roots again
+        log.exception("cannot check the roots of [api] folders")
+
+
 def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> GuardMiddleware:
     extra_hosts = env_allowed_hosts()
     endpoint = LauncherMCPEndpoint(manager, host, extra_hosts=extra_hosts)
@@ -631,6 +641,7 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     async def lifespan(app):
         cleaner = asyncio.create_task(_clean_envs_daily(manager), name="skill-envs-cleanup")
         sweeper = asyncio.create_task(_sweep_copies_hourly(manager), name="copy-leftovers-cleanup")
+        roots = asyncio.create_task(_check_folder_roots(manager), name="api-folders-check")
         try:
             async with endpoint.manager.run():
                 try:
@@ -643,7 +654,7 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                         if router is not None:
                             await router.aclose()
         finally:
-            for task in (cleaner, sweeper):
+            for task in (cleaner, sweeper, roots):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
