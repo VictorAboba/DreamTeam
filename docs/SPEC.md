@@ -7468,7 +7468,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     too applies on Windows only). On Linux and macOS the agents may create such names (`run-10:00.log`,
     `what?.md`), and they are listed and served there.
   - The no-follow open (`nofollow.py`) also takes a component only when its exact spelling is in its parent
-    folder's listing, which catches short names and case aliases on any file system.
+    folder's listing, which catches short names and case aliases on any file system (FileNotFoundError: the name
+    is not there). On Windows the final path of the opened handle shows it: it names each component as the folder
+    holds it, long and in its letter case.
 - Listings and archives leave out exactly the names `files/{path}` would refuse, so the three agree.
 - A name a client creates follows the Windows rules on every OS: an upload's `filename` (21.3) and a server folder's
   `path` (21.10).
@@ -7476,10 +7478,48 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   swapped for one meanwhile, ends the request instead of reading outside the workspace (in the sandbox the hub reads
   with more rights than the agents, `/proc` included).
   - On POSIX the path is opened one component at a time from the workspace's folder, with `O_NOFOLLOW` and directory
-    descriptors (`dir_fd`); a link (ELOOP, ENOTDIR) ends the request.
+    descriptors (`dir_fd`); a link (ELOOP, ENOTDIR) ends the request. A folder already opened is read through its
+    descriptor even if it is moved or renamed meanwhile (its own entries, wherever it now lies); nothing is read
+    through a link put in its place.
   - On Windows every component is checked for a name-surrogate reparse point (a link or a junction), and the opened
     handle's identity (`fstat`) and final path (`GetFinalPathNameByHandleW`) are compared with the path's and the
     root's.
+    - A component is opened by its full path below its parent's final path (`\\?\` form) with
+      `FILE_FLAG_OPEN_REPARSE_POINT`, so the component itself is never followed: its lstat just before and the
+      handle's own attributes must show no name-surrogate reparse point, the handle must be what lstat saw, and its
+      final path must be the parent's final path and the name. A link above it, swapped in after the parent was
+      checked, leads elsewhere: a final path out of the root is refused (`outside`); one still below the root's
+      final path (a final path holds no link) is not that name, FileNotFoundError: a case alias, a short name, or
+      the name or a folder above it renamed or moved inside the root meanwhile.
+    - A folder is listed through its open handle (`GetFileInformationByHandleEx`), never by its path.
+    - Another reparse point (a cloud placeholder, a deduplicated file) is an ordinary file or folder: it is opened
+      again without the flag, so its driver gives the data, and checked the same way.
+    - The handles share reading, writing and deleting, so an agent can still rename or delete a file while it is
+      downloaded or copied, and rename a folder the walk is in. A folder that holds the file being read (a download,
+      or the walk's current file) cannot be renamed until that read ends: Windows refuses to rename a folder with an
+      open file below it.
+  - The module (stdlib, ctypes on Windows; blocking: run in a thread):
+    - `open_inside(root, parts, *, want_dir=False) -> fd`: the file (or folder) `parts` names below `root`, open for
+      reading; the caller closes it.
+    - `list_inside(root, parts) -> [Entry]`: the folders and the regular files with one name of that folder, in name
+      order.
+    - `walk_inside(root, parts, *, skip=None, open_files=True)`: every entry below that folder, depth first in name
+      order. Each regular file comes open (`Entry.reader()`: a file object the walk owns) until the walk goes on,
+      when the walk closes it: read later, it is a ValueError, never another file's bytes (`Entry.fd` is its
+      descriptor meanwhile). With `open_files` False a file comes without one, for a pass that only counts and
+      measures (a copy's or an archive's first). Links, hard-linked files and special files are given as such but
+      never read (on Windows only a handle tells how many names a file has, so a hard-linked file is opened there
+      and closed unread). `skip(parts)` leaves an entry out unopened (a folder is never entered). What cannot be
+      opened or listed is an `error` entry (FileNotFoundError: gone, or on Windows renamed or moved, meanwhile), and
+      so is a name the listing gave that another file, folder or special file took meanwhile (`Refused`
+      `replaced` or `special`: never read). The walk enters at most `nofollow.MAX_DEPTH` (256) folder levels below
+      its start folder, since it holds one descriptor per level; a folder deeper is an `error` entry.
+    - `nofollow.Refused` (an OSError, ELOOP, with `reason` and `rel`) is raised for a link on the way or swapped in,
+      a path that now leads out of the root, and, from `open_inside`, a hard-linked or special file or one replaced
+      while it was opened. A link or a path out of the root ends a walk.
+    - A name the folder does not hold in exactly that spelling is FileNotFoundError, the other kind
+      IsADirectoryError or NotADirectoryError. Every error names the path relative to the root, with '/', never a
+      path of the computer.
   - `treecopy.py` is not the model. It opens each folder and file by its full path: `O_NOFOLLOW` guards only the last
     component, and a swap is caught by comparing with the parent's listing. On Windows it checks a link by path and
     then lists the folder by path, and its replaced-file check never fires there, because `DirEntry.stat()` has
