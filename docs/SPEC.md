@@ -8436,9 +8436,12 @@ drops it as well (21.9).
   `folder_not_ready` at the session's start).
 - Git in the container reads a repository's own config and the image's, never the host's system or global git
   config. On a Windows host a repository checked out with Git for Windows' defaults (`core.autocrlf=true` in its
-  system config: CRLF in the files, LF in the repository) is therefore changed for it: an `in_place` create, and
-  every start, is 409 `folder_not_ready`, whose text says which changes line endings alone make and names
-  `git config core.autocrlf true` in the repository, which both gits then read. Docker Desktop's 9p reports every
+  system config: CRLF in the files, LF in the repository) is therefore changed for it: an `in_place` create, and a
+  start whose status sees those files changed, is 409 `folder_not_ready`, whose text says which changes line endings
+  alone make and names `git config core.autocrlf true` in the repository, which both gits then read. The check is
+  git's status, so it trusts git's index: when the setting is removed after a session ran with it, the index holds
+  the stamps git in the container last wrote, and a start takes the files for unchanged (as `git add -A` does) until
+  git on the host, or a change of a file, refreshes them. Docker Desktop's 9p reports every
   file Windows wrote as 0o777: a folder in no repository gets one with `core.filemode=false` (§17.2), so neither its
   first commit nor git on the host takes those files for executable ones.
 - `outside_home_warning(home, mounts)` leaves out the sessions whose stored folder lies under
