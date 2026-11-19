@@ -147,6 +147,13 @@ inside looks for each root there, not at its path on the host.
 - An in-place session made in the sandbox stores the container's path of its folder: a hub outside the container does
   not find that folder (409 at the session's start), and the reverse. The start's list of sessions that cannot start
   in the sandbox leaves out those under a root it mounts writable.
+- On a Windows host git in the container does not read your git settings, only a repository's own. A repository you
+  cloned with Git for Windows' defaults (`core.autocrlf=true`) has CRLF line endings in its files and LF in git, so in
+  the container its text files look changed: an `in_place` session there is refused (409), and the text says which
+  changes are line endings only. Set the setting in the repository itself once, `git config core.autocrlf true` in
+  its folder: your git and the container's then agree. A folder that is not a repository gets one with
+  `core.filemode=false`: in the container every file Windows wrote looks executable, and without it your git on
+  Windows would show each of them as changed.
 - With `docker compose` you mount the roots yourself, and nothing is checked on the host: `docker-compose.yml` shows
   the mount line and `DREAMTEAM_API_FOLDERS_DIR` as comments.
 

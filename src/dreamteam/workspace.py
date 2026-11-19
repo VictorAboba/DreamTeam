@@ -477,19 +477,30 @@ def init_repo(root: Path, git: str | None = None, *, adopted: bool = False, offl
               check: Callable[[], None] | None = None, held: int | None = None) -> str | None:
     """`git init` in `root` with a `.gitignore` (unless one exists) and an initial commit of what is there,
     as for a new workspace (synchronous). `adopted`: a folder of the user (its files are committed with the user's
-    own line-ending settings, as every later commit there is); `offline`: run_git's. `check`: called before each
-    step (each git command, the .gitignore), it ends the init by raising (a server folder of the HTTP API v1 must
-    still be the folder it held inside its root: sessions._check_held). `held` (POSIX): `root` open as a descriptor
-    (sessions._hold); every step then works in that folder wherever it lies now, not through a link swapped in for
-    `root` or a folder above it after a check: each git command starts in it and its config is read there
-    (hubgit.in_folder; git then goes on by the path it finds there, docs/SPEC.md §21.10), and the .gitignore is made
-    through it (O_EXCL, O_NOFOLLOW). Returns None on success, else git's error text."""
+    own line-ending settings, as every later commit there is; on a file system without POSIX bits the new repository
+    gets core.filemode=false, see below); `offline`: run_git's. `check`: called before each step (each git command,
+    the .gitignore), it ends the init by raising (a server folder of the HTTP API v1 must still be the folder it held
+    inside its root: sessions._check_held). `held` (POSIX): `root` open as a descriptor (sessions._hold); every step
+    then works in that folder wherever it lies now, not through a link swapped in for `root` or a folder above it
+    after a check: each git command starts in it and its config is read there (hubgit.in_folder; git then goes on by
+    the path it finds there, docs/SPEC.md §21.10), and the .gitignore is made through it (O_EXCL, O_NOFOLLOW).
+    Returns None on success, else git's error text."""
+    from . import treecopy  # (treecopy imports this module)
+
     step = check or (lambda: None)
     with hubgit.in_folder(root, held):
         step()
         proc = run_git(root, "-c", "init.defaultBranch=main", "init", "-q", git=git, adopted=adopted, offline=offline)
         if proc.returncode != 0:
             return git_output(proc) or f"git init failed with code {proc.returncode}"
+        if adopted and treecopy.without_posix_bits(root):
+            # A folder of Windows seen from Linux (Docker Desktop's 9p, WSL's drvfs) reports 0o777 for the files
+            # Windows wrote, while git init's probe passes on the config file it makes there: with core.filemode=true
+            # every one of them would be committed as 100755, and git on Windows would see each of them as changed
+            step()
+            proc = run_git(root, "config", "core.filemode", "false", git=git, adopted=adopted, offline=offline)
+            if proc.returncode != 0:
+                return git_output(proc) or f"git config failed with code {proc.returncode}"
         gitignore = root / ".gitignore"
         step()
         if held is not None and not _WINDOWS:
@@ -542,25 +553,30 @@ def looks_like_git_dir(folder: Path) -> bool:
 
 
 def repo_state(root: Path, git: str | None = None, exclude: tuple[str, ...] | list[str] = (), *,
-               offline: bool = False) -> dict[str, Any]:
+               offline: bool = False, line_endings: bool = False) -> dict[str, Any]:
     """What an existing folder is to git, before it is adopted as a workspace or before a session starts in a
     folder it adopted (synchronous): {"toplevel": the root of the work tree that contains it (None: not in a
     repository), "git_dir": True when it is a repository database (a bare repository or a .git folder), "branch":
     the current branch (None: detached HEAD), "operation": a merge, rebase, cherry-pick, revert or bisect that
     stopped halfway (None: none), "changes": `git status --porcelain` lines (uncommitted changes and untracked,
     not ignored files; `exclude`: folders relative to `root` left out, e.g. the session's own MCP servers),
+    "line_endings": the lines of "changes" that line endings alone make (with `line_endings` only, else []),
     "error": why git could not read a repository there (None: fine)}.
     The user's own git configuration applies (line endings: no core.autocrlf override), except settings that
     would hide changes from this check (status.showUntrackedFiles, ignored submodules). The files of a required
     filter DreamTeam's git does not run (git-crypt...: hubgit.Guard.excludes) are left out, as from every commit of
-    DreamTeam: with that filter off, a file merely touched would look changed. `offline`: run_git's."""
+    DreamTeam: with that filter off, a file merely touched would look changed. `offline`: run_git's.
+    `line_endings`: when a tracked file looks changed, the status runs again with core.autocrlf=true, and the
+    changes it no longer lists (CRLF in the file, LF in the repository) are "line_endings": a checkout made by Git
+    for Windows, whose system config sets core.autocrlf=true, read by a git that does not read that config (the
+    Docker sandbox's)."""
     state: dict[str, Any] = {"toplevel": None, "git_dir": False, "branch": None, "operation": None, "changes": [],
-                             "error": None}
+                             "line_endings": [], "error": None}
 
-    def run(*args: str, unfiltered: bool = False) -> subprocess.CompletedProcess:
+    def run(*args: str, unfiltered: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         # safe.directory=*: only reading here, and a repository created by another account must not look like none
         return run_git(root, *args, git=git, safe_directory="*", adopted=True, literal=False, unfiltered=unfiltered,
-                       offline=offline)
+                       offline=offline, env=env)
 
     probe = run("rev-parse", "--is-inside-git-dir", "--is-bare-repository", "--absolute-git-dir")
     if probe.returncode != 0:
@@ -585,12 +601,20 @@ def repo_state(root: Path, git: str | None = None, exclude: tuple[str, ...] | li
     # explicit flags: the user's status.showUntrackedFiles=no or submodule ignore settings must not hide changes
     # that the agents' `git add -A` would commit
     excluded = [f":(exclude,literal){path}" for path in exclude]
-    status = run("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none", "--",
-                 ":(literal).", *excluded, unfiltered=True)
+    listing = ("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none", "--", ":(literal).",
+               *excluded)
+    status = run(*listing, unfiltered=True)
     if status.returncode != 0:
         state["error"] = git_output(status) or f"git status failed with code {status.returncode}"
-    else:
-        state["changes"] = [line for line in status.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
+        return state
+    state["changes"] = [line for line in status.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
+    if line_endings and any(not line.startswith("??") for line in state["changes"]):
+        # (no optional locks: a status that found those files unchanged would store that in the index, and the next
+        # check without the setting would take them for unchanged too)
+        converted = run("-c", "core.autocrlf=true", *listing, unfiltered=True, env={"GIT_OPTIONAL_LOCKS": "0"})
+        if converted.returncode == 0:
+            left = set(converted.stdout.decode("utf-8", "replace").splitlines())
+            state["line_endings"] = [line for line in state["changes"] if line not in left]
     return state
 
 

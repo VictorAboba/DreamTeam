@@ -522,7 +522,9 @@ under a root the owner lists in `[api] folders` can be named, by the root's name
   agents commit to its current branch. With git on, the folder must be a repository's own top folder, on a branch, with
   nothing uncommitted, whose `.git` is a folder inside it (not a linked worktree or a link), or in no repository at all
   (it then gets `git init` and a first commit); otherwise 409 `folder_not_ready`. Every start of the session checks the
-  root and the folder again. `files` cannot go with it (400): put the files into the folder yourself.
+  root and the folder again. `files` cannot go with it (400): put the files into the folder yourself. In the Docker
+  sandbox on Windows, a repository cloned with Git for Windows' defaults needs `git config core.autocrlf true` in its
+  own config first ([The HTTP API in the sandbox](sandbox.md#the-http-api-in-the-sandbox)).
 - **One folder, one session.** A folder another session works in, or a folder inside or around it, is 409
   `folder_busy`; its `session` names that session's id when the token sees it. Send the next instruction there with
   `continue`; DELETE frees the folder and keeps its files.

@@ -29,7 +29,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from dreamteam import api_v1, apifolders, cli, copyfrom, docker as docker_module, hubauth, netoff, nofollow, sessions
-from dreamteam import shell
+from dreamteam import shell, treecopy
 from dreamteam import workspace as workspace_module
 from dreamteam import settings as st
 from dreamteam.config import API_FOLDERS_ENV, ApiFolder, Config
@@ -717,6 +717,34 @@ async def test_in_place_in_a_missing_or_empty_folder_makes_a_repository_and_dele
 
 
 @needs_git
+async def test_in_place_on_a_file_system_without_posix_bits_commits_no_file_as_executable(tmp_path, api_token,
+                                                                                         monkeypatch):
+    """A folder of Windows seen from Linux (Docker Desktop's 9p in the sandbox, WSL's drvfs) reports every file Windows
+    wrote as 0o777, while git init's probe passes there on the config file it makes: the repository DreamTeam makes
+    gets core.filemode=false, so its first commit records no such file as executable and git on Windows sees none of
+    them changed."""
+    hub, _jobs, places = _hub(tmp_path, git_on=True)
+    folder = places / "existing"
+    for path in (_write(folder / "notes.txt", "my notes\n"), _write(folder / "src" / "app.py", "print('hi')\n")):
+        os.chmod(path, 0o777)   # (what such a file system reports for them)
+    seen: list[Path] = []
+    monkeypatch.setattr(treecopy, "without_posix_bits", lambda path: seen.append(Path(path)) or True)
+    try:
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "existing",
+                                                                   "mode": "in_place"}})
+        assert status == 202, answer
+        await hub.settled()
+        assert folder.resolve() in [path.resolve() for path in seen]
+        assert git(folder, "config", "--local", "core.filemode") == "false"
+        assert git(folder, "ls-files", "-s").splitlines() == [
+            f"100644 {git(folder, 'rev-parse', f'HEAD:{name}')} 0\t{name}"
+            for name in (".gitignore", "notes.txt", "src/app.py")]
+        assert git(folder, "status", "--porcelain") == ""
+    finally:
+        await hub.close()
+
+
+@needs_git
 async def test_in_place_in_a_clean_repository_works_on_it(tmp_path, api_token):
     hub, _jobs, places = _hub(tmp_path, git_on=True)
     commits = repository(places / "repo", 2)
@@ -769,6 +797,59 @@ async def test_a_dirty_repository_is_not_ready_at_the_create_and_at_a_later_star
         assert f"places{os.sep}repo" in session["error"]
         _no_path(session, tmp_path)
         assert hub.manager.meta(session["name"])["api"]["start_error"]["code"] == "folder_not_ready"
+    finally:
+        await hub.close()
+
+
+def _stale(path: Path) -> None:
+    """The file's stamp is no longer the one the index holds (the folder seen from another system): git compares its
+    content again."""
+    seen = os.stat(path)
+    os.utime(path, ns=(seen.st_atime_ns, seen.st_mtime_ns - 5_000_000_000))
+
+
+@needs_git
+async def test_changes_of_line_endings_alone_name_core_autocrlf_at_the_create_and_at_a_later_start(tmp_path,
+                                                                                                   api_token):
+    """A clone made by Git for Windows (core.autocrlf=true in its system config: CRLF in the files, LF in the
+    repository) is clean for the owner's git and changed for a git that does not read that config (the Docker
+    sandbox's). The refusal says which changes line endings alone make and names the setting in the repository
+    itself, which both then read."""
+    hub, _jobs, places = _hub(tmp_path, git_on=True)
+    repo = places / "repo"
+    repository(repo, 2)
+    git(repo, "config", "core.autocrlf", "true")    # as Git for Windows' system config has it
+    for name in ("file0.txt", "file1.txt"):
+        (repo / name).unlink()
+    git(repo, "checkout", "--", ".")                # CRLF in the files, LF in the repository
+    git(repo, "config", "core.autocrlf", "false")   # a git that does not read that setting, on every system
+    for name in ("file0.txt", "file1.txt"):
+        _stale(repo / name)                         # seen from elsewhere (the container)
+    folder = {"root": "places", "path": "repo", "mode": "in_place"}
+    hint = "only the line endings differ (CRLF in the files, LF in the repository)"
+    try:
+        status, answer = await hub.create({"goal": "G", "folder": folder})
+        assert status == 409 and answer["code"] == "folder_not_ready", answer
+        assert f"In all of them {hint}" in answer["error"] and "`git config core.autocrlf true`" in answer["error"]
+        _no_path(answer, tmp_path)
+        git(repo, "config", "core.autocrlf", "true")
+        status, answer = await hub.create({"goal": "G", "folder": folder})
+        assert status == 202, answer
+        uid = answer["session"]["id"]
+        await hub.settled()
+        assert (await hub.call("POST", f"/api/v1/sessions/{uid}/stop"))[0] == 200
+        assert git(repo, "status", "--porcelain") == ""   # the owner's git, with the setting: clean
+        git(repo, "config", "core.autocrlf", "false")
+        _stale(repo / "file1.txt")           # (the host's git wrote the index meanwhile)
+        _write(repo / "draft.txt", "mine")   # and a change that is not line endings
+        status, answer = await hub.call("POST", f"/api/v1/sessions/{uid}/continue", body={"text": "Go on"})
+        assert status == 200, answer
+        await hub.settled()
+        session = await _state(hub, uid)
+        assert session["state"] == "failed" and "?? draft.txt" in session["error"], session
+        assert "(2:  M file1.txt; ?? draft.txt)" in session["error"] and f"In 1 of them {hint}" in session["error"]
+        assert "`git config core.autocrlf true`" in session["error"]
+        _no_path(session, tmp_path)
     finally:
         await hub.close()
 

@@ -611,7 +611,8 @@ class _Undo:
 def _repo_refusal(folder: Path, state: dict[str, Any], *, starting: str | None = None) -> SessionError | None:
     """Why the agents cannot work with git in a folder of the user (`repo_state(folder)`), or None. `starting`: the
     session about to start in a folder it adopted before (else the folder is about to be adopted). Every refusal
-    carries the v1 code `folder_not_ready` (docs/SPEC.md §21.10)."""
+    carries the v1 code `folder_not_ready` (docs/SPEC.md §21.10). A refusal for changes that line endings alone make
+    (`repo_state(line_endings=True)`) names core.autocrlf in the repository itself."""
     where = f"{folder} (the folder session {starting} works in)" if starting else str(folder)
     first = "before starting the session" if starting else "first"
 
@@ -645,10 +646,17 @@ def _repo_refusal(folder: Path, state: dict[str, Any], *, starting: str | None =
                        f"{first} (the agents' next commit would conclude it in their name).")
     if state["changes"]:
         shown = "; ".join(state["changes"][:5]) + ("; ..." if len(state["changes"]) > 5 else "")
-        return refused(
-            f"The git repository in {where} has uncommitted changes or untracked files ({len(state['changes'])}: "
-            f"{shown}). Commit or stash them {first}: the agents commit with `git add -A`, which would mix your "
-            "changes into their commits.")
+        text = (f"The git repository in {where} has uncommitted changes or untracked files "
+                f"({len(state['changes'])}: {shown}). Commit or stash them {first}: the agents commit with "
+                "`git add -A`, which would mix your changes into their commits.")
+        eol = state.get("line_endings") or []
+        if eol:
+            which = "all" if len(eol) == len(state["changes"]) else str(len(eol))
+            text += (f" In {which} of them only the line endings differ (CRLF in the files, LF in the repository), "
+                     "which git here does not convert: core.autocrlf is not true for this repository here (git in "
+                     "the Docker sandbox does not read the settings of your computer's git). If your git converts "
+                     "line endings, set it in the repository itself: `git config core.autocrlf true` in that folder.")
+        return refused(text)
     return None
 
 
@@ -1738,7 +1746,7 @@ class SessionManager:
         if git_exe is None:
             return
         state = repo_state(folder, git_exe, exclude=[*(f"mcp/{name}" for name in mcp), SCRATCH_DIR],
-                           offline=isolated_git(network_off))
+                           offline=isolated_git(network_off), line_endings=True)
         refusal = _repo_refusal(folder, state, starting=sid)
         if refusal is not None:
             raise refusal
@@ -2000,7 +2008,7 @@ class SessionManager:
             # the session's own servers (absent there: checked above) are left out, as at every start: a folder it
             # worked in before may track them, and their move brings them back (else it could never return there)
             state = repo_state(target, git_exe, exclude=[f"mcp/{name}" for name in carried],
-                               offline=isolated_git(network_off))
+                               offline=isolated_git(network_off), line_endings=True)
             refusal = _repo_refusal(target, state)
             if refusal is not None:
                 raise refusal

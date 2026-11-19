@@ -68,9 +68,12 @@ Safety rules for a folder that is not the session's own:
 - The settings of your repository don't change: DreamTeam does not write `user.name`, `user.email`, `core.autocrlf`
   or other keys into it. The author of each agent commit is set with flags of the git command itself, and your commits
   stay yours. Line endings in the agents' commits follow your settings (`core.autocrlf` and the like), as in your own
-  commits.
+  commits. In the Docker sandbox git reads only the repository's own settings, not your computer's: set
+  `core.autocrlf` in the repository there ([The HTTP API in the sandbox](sandbox.md#the-http-api-in-the-sandbox)).
 - If the folder is not a git repository and git is turned on (`workspace.git`), DreamTeam creates a repository in it:
-  `git init`, `.gitignore` (if there is none) and an initial commit with your files. The reply says so.
+  `git init`, `.gitignore` (if there is none) and an initial commit with your files. The reply says so. On a file
+  system without Linux permissions (a Windows folder seen from WSL or from the Docker sandbox) that repository gets
+  `core.filemode=false`: there every file Windows wrote looks executable.
 - If the folder already has `mcp/<name>/` with the same name as one of the session's MCP servers, the move is refused
   before any change.
 - You can't choose the root of a drive, the user's home folder, the DreamTeam home folder or the folders of other

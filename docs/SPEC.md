@@ -2144,7 +2144,7 @@ three independent layers:
 | new session folder (`init_repo` by DreamTeam) | created at `init()` | DreamTeam's, with `.scratch/` | `_configure_repo` |
 | workspace created before `.scratch/` existed | created at the next `init()` | unchanged (the marker covers it) | `_configure_repo`, as before |
 | adopted repository of the user | created at `init()` (untracked, self-ignored: `git status` stays clean, so a later adopt or start check does not see it) | never touched | never touched |
-| adopted folder without a repository | created at `init()` | written by `init_repo` only when missing | never touched |
+| adopted folder without a repository | created at `init()` | written by `init_repo` only when missing | filemode only |
 | `workspace.git = false` or no git | created (harmless) | none | none |
 
 Edge cases: `.scratch/` is never emptied by DreamTeam (the user can inspect it); a move with `/cd` carries it
@@ -2169,7 +2169,8 @@ another folder (§17.2 "Workspace folder"). Then:
 - `init()` never creates a missing root (FileNotFoundError): a folder outside the session (the user's project,
   an unplugged drive, a host path inside the Docker sandbox) is not replaced by an empty stand-in.
 - `adopted` (= `config.workspace_adopted`, the folder was the user's): `init()` never writes the repo-local
-  settings, not even into a repository it initialized there. Every git call of the workspace passes its identity
+  settings, not even into a repository it initialized there (`init_repo` itself sets only `core.filemode=false`, and
+  only on a file system without POSIX bits, §17.2). Every git call of the workspace passes its identity
   and settings per command (`-c user.name=<actor> -c user.email=… -c core.autocrlf=false -c core.quotepath=false
   -c safe.directory=<root>`, after hubgit's fixed options, "DreamTeam's own git" below), so autocommits never need
   the repository's config. Outside an adopted folder, on Windows, `-c core.longpaths=true` is added too: Git for
@@ -2369,9 +2370,10 @@ def changed_since(root, base, *, adopted=False, network_off=False, git=None, sec
 def isolated_git(network_off, folder=None) -> bool     # network_off and netoff.isolation() in ("docker", "netns");
     # in the Docker sandbox `folder` (where that git writes) is opened to the offline user first. Synchronous
 def init_repo(root, git=None, *, adopted=False, offline=False) -> str | None   # git init + .gitignore if missing +
-    # initial commit of what is there (with the user's line endings when adopted); None = ok, else git's error text
+    # initial commit of what is there (with the user's line endings when adopted); None = ok, else git's error text;
+    # adopted, on a file system without POSIX bits (treecopy.without_posix_bits): core.filemode=false after git init
 def looks_like_git_dir(folder) -> bool                 # a repository database itself (HEAD + objects/ + refs/)
-def repo_state(root, git=None, exclude=(), *, offline=False) -> dict
+def repo_state(root, git=None, exclude=(), *, offline=False, line_endings=False) -> dict
     # what an existing folder is to git (the user's config applies, read-only, safe.directory=*): {"toplevel":
     # work tree root containing root | None, "git_dir": a bare repository or a .git folder, "branch": current branch | None (detached), "operation": "merge" | "rebase" |
     # "cherry-pick" | "revert" | "bisect" ... stopped halfway (GIT_OPERATIONS: MERGE_HEAD, CHERRY_PICK_HEAD,
@@ -2379,7 +2381,10 @@ def repo_state(root, git=None, exclude=(), *, offline=False) -> dict
     # `git status --porcelain --untracked-files=normal --ignore-submodules=none` lines (the user's
     # status.showUntrackedFiles or submodule settings cannot hide what `git add -A` would commit; `exclude`:
     # folders relative to root left out, e.g. the session's own `mcp/<name>`; so are the files of a disarmed
-    # required filter, as from DreamTeam's commits: git-crypt's after `git-crypt unlock`), "error": str | None}
+    # required filter, as from DreamTeam's commits: git-crypt's after `git-crypt unlock`), "line_endings": the
+    # "changes" lines that a status with `-c core.autocrlf=true` (GIT_OPTIONAL_LOCKS=0: it stores nothing in the
+    # index) no longer lists, only with line_endings=True (the adopt and start checks, §17.2), else [],
+    # "error": str | None}
 def tracked(root, paths, git=None, *, offline=False) -> list[str]   # which of `paths` hold files the repository tracks
 def commit_paths(root, paths, message, git=None, *, offline=False) -> (commit | None, error | None)
     # commit only the current state of `paths` (e.g. their removal) as DreamTeam, other changes left as they are;
@@ -4669,10 +4674,22 @@ next start, which checks the folder).
   repository but not its root; a folder that is not in a repository gets one (`init_repo`: git init, `.gitignore`
   if missing, an initial commit of the files there; `"initialized"`). The repository's configuration is never
   modified (no `_configure_repo`, §7), and the agents' commits there follow the user's line-ending settings. The
-  old folder stays as it was (`old_kept`). The session's forged and imported MCP servers (`mcp_servers` rows with
-  another origin than `config`, folders `<old>/mcp/<name>/`) move to `<target>/mcp/<name>/` (409 before anything
-  changes when one of those exists there). Adopting the session's own default folder (which still holds its old
-  files) is a plain switch back (stored without "workspace", not adopted, no git checks).
+  one setting DreamTeam writes goes into a repository it creates on a Linux file system without POSIX bits
+  (`treecopy.without_posix_bits`: WSL's drvfs, Docker Desktop's 9p, such as a Windows folder in the sandbox):
+  `core.filemode=false`, right after git init. There every file Windows wrote reports 0o777, while git init's own
+  probe passes on the file it makes; with `core.filemode=true` the first commit would record each of those files as
+  100755, and git on Windows (which keeps no such bit) would see every one of them as changed.
+  The refusal for changes says which of them line endings alone make (`repo_state(line_endings=True)`: the lines a
+  second status with `-c core.autocrlf=true` no longer lists; it runs with `GIT_OPTIONAL_LOCKS=0`, since a status
+  that found those files unchanged would store their stamps in the index, and the next check without the setting
+  would take them for unchanged too) and names `git config core.autocrlf true` in the repository itself: a checkout
+  of Git for Windows, whose system config sets `core.autocrlf=true` (CRLF in the files, LF in the repository), is
+  changed for a git that does not read that config, the Docker sandbox's (§21.10 "Sandbox"). The start check of an
+  adopted folder says the same. The old folder stays as it was (`old_kept`). The session's forged and imported MCP
+  servers (`mcp_servers` rows with another origin than `config`, folders `<old>/mcp/<name>/`) move to
+  `<target>/mcp/<name>/` (409 before anything changes when one of those exists there). Adopting the session's own
+  default folder (which still holds its old files) is a plain switch back (stored without "workspace", not adopted, no
+  git checks).
 - **Leaving an adopted folder** (for an empty folder or the default one): the user's files stay, only the
   session's MCP servers move along. Those of them that the user's repository tracks (`tracked`: the agents'
   `git add -A` committed them there) would leave deletions behind, so with git on DreamTeam commits just their
@@ -8279,20 +8296,20 @@ in_place = false            # true: a session may also work in a folder under it
   guard reads its config there, never a scan kept for the path; the `.gitignore` is made through it (`O_EXCL`,
   `O_NOFOLLOW`); in the Docker sandbox without network the offline user is given it through it
   (`netoff.prepare_workspace(dir_fd=)`). The folder must also still resolve to itself inside the root and be the
-  folder held (its identity, `_check_held`) before each step of `init_repo` (`check=`: git init, the `.gitignore`,
-  ls-files, add, commit) and after the last, so a link swapped in ends the create at the next step (403), the step
-  in between still working in the folder held. What git init made (`.git`, and the `.gitignore` when there was none)
-  is removed, when a step fails, through the held folder (`_remove_held`: `dir_fd` on POSIX; on Windows by its path,
-  which the hold keeps), never by a path that may lead elsewhere. The undo of a later failure removes them only from
-  that folder, held again with the same identity (`_Undo.held`); a folder no longer reached so keeps them, and the
-  error says so (500, "not removed"). Nothing is removed through a link swapped in, and DreamTeam writes nothing
-  through one. What remains on POSIX is git's own: a git command takes the held folder's path when it starts
-  (`getcwd`) and goes on by that path (git init for its new `.git`, every command for its work tree), so a link
-  swapped in at that path while the command runs (the folder held moved away after the command started, before it
-  writes) makes that command write in the folder the link leads to. That window is the whole run of each git command
-  of the init, not an instant; the next check then ends the create (403). Closing it would take the folder's path
-  itself held, which POSIX offers no unprivileged way to do. A link swapped in meanwhile ends the create, and every
-  start checks again ("Starts").
+  folder held (its identity, `_check_held`) before each step of `init_repo` (`check=`: git init, `core.filemode`
+  where it is set ("`in_place`"), the `.gitignore`, ls-files, add, commit) and after the last, so a link swapped in
+  ends the create at the next step (403), the step in between still working in the folder held. What git init made
+  (`.git`, and the `.gitignore` when there was none) is removed, when a step fails, through the held folder
+  (`_remove_held`: `dir_fd` on POSIX; on Windows by its path, which the hold keeps), never by a path that may lead
+  elsewhere. The undo of a later failure removes them only from that folder, held again with the same identity
+  (`_Undo.held`); a folder no longer reached so keeps them, and the error says so (500, "not removed"). Nothing is
+  removed through a link swapped in, and DreamTeam writes nothing through one. What remains on POSIX is git's own: a git
+  command takes the held folder's path when it starts (`getcwd`) and goes on by that path (git init for its new `.git`,
+  every command for its work tree), so a link swapped in at that path while the command runs (the folder held moved away
+  after the command started, before it writes) makes that command write in the folder the link leads to. That window is
+  the whole run of each git command of the init, not an instant; the next check then ends the create (403). Closing it
+  would take the folder's path itself held, which POSIX offers no unprivileged way to do. A link swapped in meanwhile
+  ends the create, and every start checks again ("Starts").
 - Every rule of `copy_from` and `workspace` (§17.2) applies as well.
 
 **`copy`.**
@@ -8333,8 +8350,10 @@ in_place = false            # true: a session may also work in a folder under it
     index outside the root. These rules are checked at the create and at every start; while a session runs, its
     agents can change `.git` like any file of the folder;
   - in no repository at all. It then gets `git init`, a `.gitignore` when it has none, and a first commit of its
-    files.
-- Otherwise the create is 409 `folder_not_ready`.
+    files. On a file system without POSIX bits (a Windows folder in the sandbox) the new repository gets
+    `core.filemode=false` (§17.2).
+- Otherwise the create is 409 `folder_not_ready`. A refusal for uncommitted changes says which of them line endings
+  alone make and names `git config core.autocrlf true` in the repository itself (§17.2, "Sandbox").
 - The folder keeps its own `.gitignore`: it is the owner's repository.
 - The agents commit to the current branch.
 - DreamTeam leaves `.scratch/` in the folder, and `mcp/<name>/` for the MCP servers the agents build.
@@ -8415,6 +8434,13 @@ drops it as well (21.9).
   no check runs on the host.
 - An in-place session made there stores the container path. A hub outside the container finds that folder missing (409
   `folder_not_ready` at the session's start).
+- Git in the container reads a repository's own config and the image's, never the host's system or global git
+  config. On a Windows host a repository checked out with Git for Windows' defaults (`core.autocrlf=true` in its
+  system config: CRLF in the files, LF in the repository) is therefore changed for it: an `in_place` create, and
+  every start, is 409 `folder_not_ready`, whose text says which changes line endings alone make and names
+  `git config core.autocrlf true` in the repository, which both gits then read. Docker Desktop's 9p reports every
+  file Windows wrote as 0o777: a folder in no repository gets one with `core.filemode=false` (§17.2), so neither its
+  first commit nor git on the host takes those files for executable ones.
 - `outside_home_warning(home, mounts)` leaves out the sessions whose stored folder lies under
   `/dreamteam/api-folders/<name>` of a root it mounts writable (made in the container; `docker.api_root_of`, which
   reads the stored path as a POSIX one and takes none with a `..`). A session made outside the container in a root's

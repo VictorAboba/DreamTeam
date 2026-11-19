@@ -723,7 +723,7 @@ def test_repo_state(tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     assert repo_state(plain) == {"toplevel": None, "git_dir": False, "branch": None, "operation": None, "changes": [],
-                                 "error": None}
+                                 "line_endings": [], "error": None}
     # a repository's own database is not a folder of files
     git(tmp_path, "init", "-q", "--bare", "bare.git")
     assert repo_state(tmp_path / "bare.git")["git_dir"] is True and repo_state(project / ".git")["git_dir"] is True
@@ -731,6 +731,34 @@ def test_repo_state(tmp_path):
     _halfway_merge(project)
     state = repo_state(project)
     assert state["changes"] == [] and state["operation"] == "merge"
+
+
+@needs_git
+def test_repo_state_names_the_changes_that_line_endings_alone_make(tmp_path):
+    """CRLF in the files over LF in the repository (a checkout of Git for Windows, whose system config sets
+    core.autocrlf=true), read by a git without that setting (the Docker sandbox's): `line_endings` names those
+    changes, and asking leaves them changed for the next check (the status with core.autocrlf=true stores nothing in
+    the index)."""
+    project = _user_repo(tmp_path / "project")
+    (project / "app.py").write_bytes(b"a = 1\nb = 2\n")
+    (project / "lib.py").write_bytes(b"c = 3\n")
+    _commit(project, "Code")
+    git(project, "config", "--local", "core.autocrlf", "true")   # as Git for Windows' system config has it
+    for name in ("app.py", "lib.py"):
+        (project / name).unlink()
+    git(project, "checkout", "--", ".")   # CRLF in the folder, LF in the repository
+    git(project, "config", "--local", "core.autocrlf", "false")   # a git without that setting, on every system
+    for name in ("app.py", "lib.py"):   # seen from elsewhere (the container): not the stamps the index holds
+        seen = os.stat(project / name)
+        os.utime(project / name, ns=(seen.st_atime_ns, seen.st_mtime_ns - 5_000_000_000))
+    (project / "new.txt").write_text("x", encoding="utf-8")
+    assert repo_state(project)["line_endings"] == []   # only when asked
+    for _ in range(2):
+        state = repo_state(project, line_endings=True)
+        assert state["changes"] == [" M app.py", " M lib.py", "?? new.txt"], state
+        assert state["line_endings"] == [" M app.py", " M lib.py"], state
+    (project / "app.py").write_bytes(b"a = 1\r\nb = 22\r\n")
+    assert repo_state(project, line_endings=True)["line_endings"] == [" M lib.py"]   # app.py: a change of its own
 
 
 async def test_a_stopped_agent_command_is_killed(tmp_path):
