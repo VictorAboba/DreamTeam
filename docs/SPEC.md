@@ -7699,9 +7699,11 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   not read", not in a start's words; it gives the resolved root and the resolved folder: 403 `forbidden_folder` when
   the root no longer allows it or the folder no longer leads to itself inside it, 409 `folder_not_ready` when it or
   its root is missing), then reached from that root name by name (`_Where.base`: the resolved folder's names below
-  the resolved root, as the folders on the way spell them, so a folder on the way renamed in letter case only is
-  still read), so a link put on the way after the check is met, never followed. A folder inside its root by file
-  identity only (a bind mount, another spelling whose resolved path does not name it below the root) is 403
+  the resolved root, each as its folder lists it, `apifolders.as_listed`; on POSIX a resolved path keeps the spelling
+  it was given, so on a file system that ignores letter case or Unicode form, such as APFS or a Windows drive seen
+  from WSL or a Docker Desktop bind mount, the listing gives the name; a folder on the way renamed in letter case
+  only is still read, on any OS), so a link put on the way after the check is met, never followed. A folder inside
+  its root by file identity only (a bind mount, a path whose resolved form does not name it below the root) is 403
   `forbidden_folder` (`FOLDER_LINKED_TEXT`): it is never read by its own path after the check. A folder that is not
   there is 409 `folder_not_ready` (`FOLDER_GONE_TEXT`).
 - **Codes** of what nofollow meets (`api_v1._read_error`), by where it meets it: a name replaced while it was opened
@@ -7951,8 +7953,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     cannot be read on POSIX (409); a running session, then the stopped one read without loading it; the API token's
     scope; a missing folder; a session folder swapped for a link (403); an in-place folder read below its root, a
     link put on the way to it before and after the check, its root taken back by the owner (403, in v1's words), a
-    folder on its way renamed in letter case only (Windows: still read), one inside its root by file identity only
-    (403)); `changed_files` with a hook in `.git/config` that must not
+    folder on its way renamed in letter case only and one created or copied with another letter case of its names
+    (still read, on a file system that ignores case, also with a resolution that keeps the given spelling as POSIX
+    does), one inside its root by file identity only (403)); `changed_files` with a hook in `.git/config` that must not
     run (`tests/test_api_v1_result.py`: added, modified, deleted, untracked and held files, `.scratch` and ignored
     ones left out, a path deleted and untracked; a stopped session's files; a list cut at `CHANGED_FILES_MAX`; git
     off, no base commit, one gone, one that is no commit id, a repository git cannot open; an in-place folder whose
@@ -8045,11 +8048,18 @@ in_place = false            # true: a session may also work in a folder under it
   file identity (`treecopy.is_within`). A link or junction under the root that leads out of it is 403
   `forbidden_folder`. For `copy`, a `path` that names nothing is 404 `not_found`, and a file that is not a `.zip` is
   400 `bad_request`; in place, a file is 400 `bad_request` (a missing folder is made).
+- The resolved folder's names below the resolved root are then each taken as its folder lists it
+  (`apifolders.as_listed`: a name the listing does not hold exactly is replaced by the listed name of the same entry,
+  by device and inode). On a file system that ignores letter case or Unicode form (APFS, a Windows drive seen from WSL
+  or a Docker Desktop bind mount) `{"root": "jobs", "path": "Acme"}` names the folder listed as `acme`, and on POSIX a
+  resolved path keeps the spelling it was given; the session stores, and a copy reads, the listed names, which the
+  no-follow reads of 21.8 require. The names from the first one that is not there on (the folders an in-place create
+  makes) stay as given.
 - The create works with that resolved folder and checks it again after its own resolution, given the resolved root
   (`within=`): for a copy, `resolve_source(..., within=)` right after `resolve_request` (its location rules for the
   folder itself: another DreamTeam home under the root is 403 `forbidden_folder` too), then the copy itself reads
-  below the root by the folder's names as the root's folders spell them (the resolved folder relative to the resolved
-  root: another spelling is 404 there), never by a path, so a link swapped in on the way is met, never followed (403);
+  below the root by those listed names, never by a path (a name renamed meanwhile is 404 there), so a link swapped in
+  on the way is met, never followed (403);
   for in place, every `_plan` on the create path, the last of them under the home's workspace claims just before the
   missing folders are made (`_change_folder` → `_carry_out`), and then `_carry_out` itself (`_Plan.within`): the
   deepest level that is there, each level right after it makes it (by path), and the folder before and after `git

@@ -1924,11 +1924,12 @@ class ApiV1:
         without following its own name; for a session that works in a server folder in place, the folder checked as
         a start checks it (SessionManager._check_server_folder, with the settings the caller read again on the loop:
         403 `forbidden_folder`, 409 `folder_not_ready`; its texts end in FILES_REFUSAL), then reached from its resolved
-        root name by name, the names as the resolved folder spells them (a folder on the way renamed in letter case
-        only is still read), so that a link put on the way after the check is met, never followed. A folder inside
-        its root by file identity only (a bind mount, another spelling) is 403 `forbidden_folder`: it is never read
-        by its own path after the check. 409 `folder_not_ready` for a folder that is not there. Blocking
-        (session.json, the folder): in a thread."""
+        root name by name, the resolved folder's names each as its folder lists it (apifolders.as_listed: a folder on
+        the way renamed in letter case only is still read, on any OS), so that a link put on the way after the check
+        is met, never followed. A folder inside its root by file identity only (a bind mount, a path whose resolved
+        form does not name it below the root) is 403 `forbidden_folder`: it is never read by its own path after the
+        check. 409 `folder_not_ready` for a folder that is not there. Blocking (session.json, the folder): in a
+        thread."""
         manager = self.manager
         meta = manager.meta(sid)
         info = manager.workspace_of(sid, meta)
@@ -1936,9 +1937,10 @@ class ApiV1:
         if checked is not None:
             root, real = checked
             try:
-                return _Where(root, real.relative_to(root).parts)
+                below = real.relative_to(root).parts
             except ValueError:
                 raise ApiError("forbidden_folder", FOLDER_LINKED_TEXT) from None
+            return _Where(root, apifolders.as_listed(root, below))
         if not info["exists"]:
             raise ApiError("folder_not_ready", FOLDER_GONE_TEXT)
         return _Where(Path(info["path"]))

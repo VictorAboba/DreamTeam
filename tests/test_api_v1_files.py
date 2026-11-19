@@ -35,7 +35,7 @@ from dreamteam.sessions import SessionManager
 from test_api_v1 import LOCAL, Hub, _home, _manager, _no_path, _until, no_start  # noqa: F401 - a fixture
 from test_api_v1_events import _manager as waiting_manager
 from test_api_v1_events import running
-from test_api_v1_folders import _dir_link, _hub, _outside, _swap_for_link
+from test_api_v1_folders import _dir_link, _hub, _outside, _swap_for_link, folds_case, resolve_keeps_spelling
 from test_api_v1_guard import api_token, hub_token  # noqa: F401 - fixtures
 from test_hub_auth import API_TOKEN, TOKEN
 
@@ -962,12 +962,18 @@ async def test_an_in_place_folder_whose_root_the_owner_took_back_is_not_read(tmp
         await hub.close()
 
 
-@pytest.mark.skipif(not WINDOWS, reason="a file system that ignores letter case, whose final paths name the case")
+@pytest.mark.parametrize("resolution", ["native", "keeps the given spelling"])
 async def test_an_in_place_folder_whose_parent_was_renamed_in_letter_case_is_still_read(tmp_path, api_token,
-                                                                                        no_start):
-    """The names below the root are the resolved folder's (its spelling on disk), not the stored path's."""
+                                                                                        no_start, monkeypatch,
+                                                                                        resolution):
+    """The names below the root are those the folders list (apifolders.as_listed), not the stored path's, also
+    where a resolved path keeps the stored spelling (POSIX)."""
+    if not folds_case(tmp_path):
+        pytest.skip("a file system that tells letter cases apart")
     hub, _jobs, places = _hub(tmp_path)
     no_start(hub.manager)
+    if resolution != "native":
+        resolve_keeps_spelling(monkeypatch)
     try:
         status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "acme/site",
                                                                    "mode": "in_place"}})
@@ -977,6 +983,40 @@ async def test_an_in_place_folder_whose_parent_was_renamed_in_letter_case_is_sti
         (places / "acme").rename(places / "ACME")
         got = await download(hub, answer["session"]["id"], "index.html")
         assert got.status == 200 and got.body == b"<h1>Acme</h1>", got.body
+    finally:
+        await hub.close()
+
+
+@pytest.mark.parametrize("resolution", ["native", "keeps the given spelling"])
+async def test_a_server_folder_named_in_another_letter_case_is_the_one_its_folders_list(tmp_path, api_token,
+                                                                                       no_start, monkeypatch,
+                                                                                       resolution):
+    """A create whose path spells existing folders in another letter case works in, or copies, the folders as they
+    are listed (apifolders.as_listed): the session's files are then read below the root by those names."""
+    if not folds_case(tmp_path):
+        pytest.skip("a file system that tells letter cases apart")
+    hub, jobs, places = _hub(tmp_path)
+    no_start(hub.manager)
+    _write(places / "acme" / "site" / "index.html", "<h1>Acme</h1>")
+    _write(jobs / "acme" / "site" / "index.html", "<h1>Copy</h1>")
+    if resolution != "native":
+        resolve_keeps_spelling(monkeypatch)
+    try:
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "ACME/Site",
+                                                                   "mode": "in_place"}})
+        assert status == 202, answer
+        await hub.settled()
+        uid = answer["session"]["id"]
+        assert answer["session"]["folder"]["path"] == "ACME/Site"   # (as the request gave it)
+        stored = Path(hub.manager.meta(answer["session"]["name"])["workspace"]["path"])
+        assert (stored.parent.name, stored.name) == ("acme", "site")
+        assert _names(_json(await listing(hub, uid))["entries"]) == ["index.html"]
+        assert (await download(hub, uid, "index.html")).body == b"<h1>Acme</h1>"
+        assert _zip(await archive(hub, uid)) == {"index.html": b"<h1>Acme</h1>"}
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "jobs", "path": "Acme/SITE"}})
+        assert status == 202, answer
+        await hub.settled()
+        assert (await download(hub, answer["session"]["id"], "index.html")).body == b"<h1>Copy</h1>"
     finally:
         await hub.close()
 

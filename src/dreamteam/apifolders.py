@@ -12,8 +12,10 @@ where `dreamteam sandbox` mounts it (roots: config.API_FOLDERS_ENV). Where a roo
   folders (inside or containing it), another DreamTeam home (or inside one), on POSIX /proc, /sys and /dev.
 A request's `path` is a path a client makes up (copyfrom.check_rel(portable=True): 400 `bad_name`); the root joined
 with it is resolved and must lie inside the resolved root, by text and by file identity (treecopy.is_within), so a
-link or junction under the root that leads out of it is 403 `forbidden_folder` (resolve_request). The create checks
-it again after its own resolution (`within=`), and a copy reads below the root without following any link
+link or junction under the root that leads out of it is 403 `forbidden_folder` (resolve_request). Its names below the
+root are then taken as their folders list them (as_listed: on a file system that ignores letter case or Unicode form,
+`Docs` names the folder listed as `docs`, and on POSIX a resolved path keeps the spelling it was given). The create
+checks it again after its own resolution (`within=`), and a copy reads below the root without following any link
 (copyfrom.copy_sources, nofollow).
 
 Errors are copyfrom.CopyError with their v1 code (`unknown_folder`, `forbidden_folder`, `not_found`, `bad_name`, or
@@ -29,6 +31,7 @@ import dataclasses
 import logging
 import os
 import stat
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -181,9 +184,11 @@ def resolve_request(root: Any, path: Any = None, mode: Any = "copy", *, config: 
     text) for a root `[api] folders` does not list; 403 `forbidden_folder` for `in_place` under a root without
     `in_place = true`; 400 `bad_name` for a path a client may not make (check_rel portable); the root resolved
     (resolve_root); the root joined with the path resolved, which must lie inside the resolved root by text and by
-    file identity (403 `forbidden_folder`: a link or junction on the way leads out). For `copy`: a path that names
-    nothing is 404 `not_found`, a file that is not a .zip 400; and resolve_source's rules again, after its own
-    resolution, given the root (`within`). For `in_place`: a file is 400 (a missing folder is fine: it is made)."""
+    file identity (403 `forbidden_folder`: a link or junction on the way leads out), its names below the root then
+    taken as their folders list them (as_listed: the folder an in-place session stores, the names a copy reads). For
+    `copy`: a path that names nothing is 404 `not_found`, a file that is not a .zip 400; and resolve_source's rules
+    again, after its own resolution, given the root (`within`). For `in_place`: a file is 400 (a missing folder is
+    fine: it is made)."""
     known = roots(config)
     if not isinstance(root, str) or root not in known:
         names = ", ".join(sorted(known)) or "none"
@@ -212,6 +217,9 @@ def resolve_request(root: Any, path: Any = None, mode: Any = "copy", *, config: 
         below: tuple[str, ...] | None = target.relative_to(root_real).parts
     except ValueError:
         below = None
+    if below:   # (another letter case or Unicode form of a name that is there: its folder's own spelling)
+        below = as_listed(root_real, below)
+        target = root_real.joinpath(*below)
     if mode == "in_place":
         if os.path.lexists(target) and not target.is_dir():
             raise CopyError(f"{where} is a file, not a folder: a session works in a folder.")
@@ -236,6 +244,55 @@ def resolve_request(root: Any, path: Any = None, mode: Any = "copy", *, config: 
             raise
         raise CopyError(str(exc), 403, code=FORBIDDEN) from None
     return FolderRequest(root, rel, mode, root_real, target, kind, below)
+
+
+def as_listed(root: Path, parts: tuple[str, ...]) -> tuple[str, ...]:
+    """`parts`, names below the folder `root`, each spelled as its folder lists it (docs/SPEC.md §21.8, §21.10). A file
+    system that ignores letter case or Unicode form (APFS, NTFS seen from WSL or a Docker Desktop bind mount) opens
+    `Docs` for the folder it lists as `docs`, and on POSIX a resolved path keeps the spelling it was given, while
+    nofollow takes a name only as its folder lists it. A name the listing does not hold exactly is replaced by the
+    listed name of the same entry (lstat: device and inode; with no file ids, the one listed name that differs in
+    letter case or Unicode form only). From the first name that is not there (a folder an in-place create makes, or
+    one gone meanwhile) on, the names stay as given. Blocking: a listing of each folder on the way."""
+    out: list[str] = []
+    folder = root
+    for i, name in enumerate(parts):
+        listed = _listed_name(folder, name)
+        if listed is None:
+            return (*out, *parts[i:])
+        out.append(listed)
+        folder = folder / listed
+    return tuple(out)
+
+
+def _name_key(name: str) -> str:
+    return unicodedata.normalize("NFC", name.casefold())
+
+
+def _listed_name(folder: Path, name: str) -> str | None:
+    """The name of `folder`'s listing that `name` opens (as_listed); None when `name` names nothing there."""
+    try:
+        names = os.listdir(long_path(folder))
+    except OSError:
+        return None
+    if name in names:
+        return name
+    try:
+        given = os.lstat(long_path(folder / name))
+    except OSError:
+        return None
+    key = _name_key(name)
+    alike = [other for other in names if _name_key(other) == key]
+    if not given.st_ino:   # (a file system without file ids)
+        return alike[0] if len(alike) == 1 else None
+    for other in alike + [other for other in names if _name_key(other) != key]:
+        try:
+            st = os.lstat(long_path(folder / other))
+        except OSError:
+            continue
+        if (st.st_dev, st.st_ino) == (given.st_dev, given.st_ino):
+            return other
+    return None
 
 
 def git_dir_refusal(folder: Path, git: str | None = None, *, offline: bool = False) -> str | None:
@@ -359,6 +416,6 @@ def log_refusals(config: "Config", home: Path) -> None:
             log.log(level, "[api.folders.%s] path = %s: %s", name, folder.path, exc)
 
 
-__all__ = ["FOLDER_FIELDS", "GIT_UNREADABLE", "GIT_WRITES", "MODES", "ApiFolder", "FolderRequest", "folder_meta",
-           "git_dir_refusal", "in_place_folder", "log_refusals", "resolve_request", "resolve_root", "root_refusal",
-           "roots", "shown"]
+__all__ = ["FOLDER_FIELDS", "GIT_UNREADABLE", "GIT_WRITES", "MODES", "ApiFolder", "FolderRequest", "as_listed",
+           "folder_meta", "git_dir_refusal", "in_place_folder", "log_refusals", "resolve_request", "resolve_root",
+           "root_refusal", "roots", "shown"]

@@ -818,6 +818,56 @@ async def test_another_spelling_of_a_folder_is_the_same_folder_where_the_file_sy
         await hub.close()
 
 
+def folds_case(folder: Path) -> bool:
+    """The file system of `folder` ignores letter case (NTFS, APFS as macOS formats it)."""
+    probe = folder / "Case-Probe"
+    probe.mkdir(parents=True)
+    try:
+        return (folder / "CASE-PROBE").exists()
+    finally:
+        probe.rmdir()
+
+
+def resolve_keeps_spelling(monkeypatch) -> None:
+    """Path.resolve as POSIX resolves on a file system that ignores letter case (APFS, a Windows drive seen from WSL
+    or a Docker Desktop bind mount): a path naming an entry in another letter case keeps the spelling it was given,
+    where Windows gives the folders' own."""
+    resolve = Path.resolve
+
+    def keeps(self: Path, strict: bool = False) -> Path:
+        found = resolve(self, strict=strict)
+        given = Path(os.path.abspath(self))
+        return given if str(given).casefold() == str(found).casefold() else found
+
+    monkeypatch.setattr(Path, "resolve", keeps)
+
+
+def test_each_name_below_a_root_is_taken_as_its_folder_lists_it(tmp_path, monkeypatch):
+    """apifolders.as_listed: a name the file system opens in another letter case or Unicode form is replaced by the
+    listed name of the same entry; from a name that is not there on, the names stay as given."""
+    _write(tmp_path / "Docs" / "api" / "Read.md")
+    nfc = unicodedata.normalize("NFC", "café")
+    nfd = unicodedata.normalize("NFD", nfc)
+    (tmp_path / "Docs" / nfc).mkdir()
+    folds = folds_case(tmp_path)
+    assert apifolders.as_listed(tmp_path, ()) == ()
+    assert apifolders.as_listed(tmp_path, ("Docs", "api", "Read.md")) == ("Docs", "api", "Read.md")
+    assert apifolders.as_listed(tmp_path, ("Docs", "new", "api")) == ("Docs", "new", "api")
+    other = ("DOCS", "API", "read.MD")
+    assert apifolders.as_listed(tmp_path, other) == (("Docs", "api", "Read.md") if folds else other)
+    form = (tmp_path / "Docs" / nfd).exists()   # (the file system folds Unicode form: APFS)
+    assert apifolders.as_listed(tmp_path, ("Docs", nfd)) == ("Docs", nfc if form else nfd)
+    if folds:   # a file system without file ids: the one listed name that differs in letter case only
+        lstat = os.lstat
+
+        def without_ids(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+            found = lstat(path, *args, **kwargs)
+            return os.stat_result((found.st_mode, 0, *tuple(found)[2:10]))
+
+        monkeypatch.setattr(os, "lstat", without_ids)
+        assert apifolders.as_listed(tmp_path, ("dOCS", "Api")) == ("Docs", "api")
+
+
 async def test_the_other_sessions_folders_are_compared_by_file_identity_too(tmp_path, monkeypatch):
     """A folder that another session's stored path names by another spelling (here: through a link, which the
     file system resolves to the same folder) is that session's folder: _plan compares by identity, not by text

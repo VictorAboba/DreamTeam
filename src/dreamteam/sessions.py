@@ -1483,9 +1483,10 @@ class SessionManager:
         folder must still resolve to itself inside that root, by text and by file identity: a component swapped for a
         link after the create, or a root moved elsewhere, refuses the start (403 `forbidden_folder`). `refusal` ends
         the texts of its own refusals (what does not happen: v1 reading the files passes its own). The git rules of
-        the folder are checked apart (_check_server_git). (The root resolved, the folder resolved: its names as the
-        folders on the way spell them; v1's files are read below the root by those names, §21.8), None for any other
-        session. Blocking: in a thread."""
+        the folder are checked apart (_check_server_git). (The root resolved, the folder resolved: on Windows its names
+        as the folders on the way spell them, on POSIX as session.json spells them; v1 reads the files below the root
+        by the names as their folders list them, apifolders.as_listed, §21.8), None for any other session. Blocking:
+        in a thread."""
         folder = apifolders.in_place_folder((api_meta(meta) or {}).get("folder")) if sid != LEGACY_ID else None
         if folder is None:
             return None
