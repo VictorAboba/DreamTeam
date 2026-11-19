@@ -4852,9 +4852,10 @@ told where the files came from: no source path goes into `pending_goal` or any p
   (`POST /api/uploads`, §18.1): the file name cut to its last part (`\` read as `/`) and to one printable line of
   at most 200 characters ("upload.zip" when empty); a Content-Length of ASCII digits above `copy_max_mb` is 413
   "The file is larger than N MB ([workspace] copy_max_mb)." before reading; `clean()`; at most 8 uploads waiting
-  or arriving (`UPLOAD_MAX_PENDING`, else 429; the count and the create are not atomic: a guard against a runaway
-  page, not a quota: "N uploads already wait for a session; each is removed when a session uses it or an hour after
-  its upload. Try again later."); `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
+  or arriving (`UPLOAD_MAX_PENDING`, else 429 "N uploads already wait for a session; each is removed when a session
+  uses it or an hour after its upload. Try again later."; the count and the create of the upload's `<token>.part`
+  are made one upload at a time per store, under an `asyncio.Lock`, so uploads that arrive together each count the
+  ones before them); `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
   400 "The upload is empty.", a file that is not a zip 400 "The file is not a zip archive."; then `<token>.json`
   `{"filename",
   "bytes", "at"}` and the rename to `<token>.zip`. Any failure (an exception from `chunks`, a disconnect included,
@@ -7073,7 +7074,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 - **The caller.** `caller` is the kind of token that uploaded the file, `"owner"` or `"api"`. A create by the other
   kind finds no such token (404 `not_found`): an API client never uses the owner's uploads, nor the reverse.
 - **The cap.** At most `[api] uploads_pending` (default 32) uploads wait or arrive at once, read at each upload; one
-  more is 429 `too_many_uploads`. The board's 8 (`UPLOAD_MAX_PENDING`) is apart.
+  more is 429 `too_many_uploads`. Uploads sent at the same time are counted one after another (the count and the
+  `.part` of each are made under the store's lock, §17.2 "Uploads"), so the cap holds for them too. The board's 8
+  (`UPLOAD_MAX_PENDING`) is apart.
 - **Content type.** The guard's `raw_posts` maps a path to a set of types (§18.1; a plain string is one type).
   `/api/v1/uploads` takes `application/octet-stream` and `application/zip` (neither is CORS-safelisted: a
   cross-site page cannot send one without a preflight the hub never answers); anything else, JSON included, is 415

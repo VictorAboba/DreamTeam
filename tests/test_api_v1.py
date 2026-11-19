@@ -437,6 +437,21 @@ async def test_the_uploads_cap_and_size_limit(tmp_path, api_token):
         await hub.close()
 
 
+async def test_the_uploads_cap_holds_for_uploads_that_arrive_together(tmp_path, api_token):
+    """Each upload counts the ones waiting or arriving and creates its own .part one at a time, so uploads sent at
+    once cannot all pass the cap on the same count."""
+    hub = Hub(_manager(_home(tmp_path, api={"uploads_pending": 2})))
+    try:
+        answers = await asyncio.gather(*(hub.upload(f"f{n}.txt", b"x" * 1000) for n in range(10)))
+        statuses = sorted(status for status, _ in answers)
+        assert statuses == [201] * 2 + [429] * 8, statuses
+        assert {answer["code"] for status, answer in answers if status == 429} == {"too_many_uploads"}
+        assert len(list(hub.manager.api_uploads.root.glob("*.bin"))) == 2
+        assert not list(hub.manager.api_uploads.root.glob("*.part"))
+    finally:
+        await hub.close()
+
+
 async def test_files_land_in_the_session_folder_and_their_tokens_are_used_up(tmp_path, api_token, no_start):
     hub = Hub(_manager(_home(tmp_path)))
     no_start(hub.manager)

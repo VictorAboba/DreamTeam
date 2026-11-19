@@ -1165,6 +1165,9 @@ class Uploads:
         # claims are made one at a time: a rename on Windows is not exclusive (two can both succeed, the second
         # moving the first one's claimed file), and one hub owns a home
         self._claiming = threading.Lock()
+        # an upload's count of the uploads waiting or arriving and the create of its .part are made one upload at a
+        # time (receive): uploads that arrive together each count the ones before them, so the cap holds
+        self._admitting = asyncio.Lock()
 
     def _make_root(self) -> None:
         """Make the store's folder (and the board's uploads folder it lies in, for v1's) the hub's alone, 0o700 on
@@ -1229,13 +1232,14 @@ class Uploads:
         too_big = f"The file is larger than {limits.max_mb} MB ([workspace] copy_max_mb)."
         if isinstance(length, str) and length.isascii() and length.isdigit() and int(length) > limits.max_bytes:
             raise CopyError(too_big, 413)
-        pending = await asyncio.to_thread(self._pending)
-        if pending >= max_pending:
-            raise CopyError(f"{pending} uploads already wait for a session; each is removed when a session uses it "
-                            "or an hour after its upload. Try again later.", 429, code="too_many_uploads")
-        token = secrets.token_urlsafe(18)
-        part = self.root / f"{token}.part"
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+        async with self._admitting:   # (the count, then this upload's .part, which the next count sees)
+            pending = await asyncio.to_thread(self._pending)
+            if pending >= max_pending:
+                raise CopyError(f"{pending} uploads already wait for a session; each is removed when a session uses "
+                                "it or an hour after its upload. Try again later.", 429, code="too_many_uploads")
+            token = secrets.token_urlsafe(18)
+            part = self.root / f"{token}.part"
+            fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
         f = os.fdopen(fd, "wb")
         total = 0
         done = False
