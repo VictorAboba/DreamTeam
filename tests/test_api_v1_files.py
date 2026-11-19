@@ -424,17 +424,18 @@ async def test_a_step_cancelled_waits_for_its_thread_then_releases_what_it_gave(
 
 async def test_folder_work_runs_in_v1s_own_threads_never_the_default_executor(tmp_path, api_token, no_start,
                                                                               monkeypatch):
-    """A listing, a download, an archive, a result and an error's redaction run in v1's own daemon threads
-    (api_v1._Threads), at most FOLDER_THREADS at once: reads that hang (a share that stops answering) hold none of the
-    loop's default executor, which the rest of the hub shares (GET events reads the journal through it), a read past
-    FOLDER_THREADS waits for a place, and a read whose client is gone keeps its place until its thread ends."""
+    """A listing, a download, an archive and a result run in v1's own daemon threads (api_v1._Threads), at most
+    FOLDER_THREADS at once: reads that hang (a share that stops answering) hold none of the loop's default executor,
+    which the rest of the hub shares (GET events reads the journal through it), a read past FOLDER_THREADS waits for a
+    place, and a read whose client is gone keeps its place until its thread ends. (A create's copy of a server folder:
+    test_api_v1_folders; an error's redaction: the test below.)"""
     monkeypatch.setattr(api_v1, "FOLDER_THREADS", 2)
     hub = Hub(_manager(_home(tmp_path)))
     no_start(hub.manager)
     gate = threading.Event()
     used: list[threading.Thread] = []
     real_list, real_open, real_walk = nofollow.list_some, nofollow.open_inside, nofollow.walk_inside
-    real_result, real_redact = ApiV1.result, ApiV1.redact
+    real_result = ApiV1.result
 
     def hung_list(*args: Any, **kwargs: Any) -> Any:
         used.append(threading.current_thread())
@@ -462,13 +463,64 @@ async def test_folder_work_runs_in_v1s_own_threads_never_the_default_executor(tm
         monkeypatch.setattr(nofollow, "open_inside", seen(real_open))
         monkeypatch.setattr(nofollow, "walk_inside", seen(real_walk))
         monkeypatch.setattr(ApiV1, "result", seen(real_result))
-        monkeypatch.setattr(ApiV1, "redact", seen(real_redact))
         assert (await download(hub, uid, "a.txt")).body == b"A"
         assert (await archive(hub, uid)).status == 200
         assert (await hub.call("GET", f"/api/v1/sessions/{uid}/result"))[0] == 200
-        assert (await hub.create({"goal": "G", "model": "no-such-model"}))[1]["code"] == "unknown_model"
-        assert len(used) >= 7
+        assert len(used) >= 6
         assert all(thread.name == "dreamteam-api-folder" and thread.daemon for thread in used), used
+    finally:
+        gate.set()
+        await hub.close()
+
+
+async def test_an_error_waits_for_a_folder_thread_only_when_it_resolves_a_folder_outside_the_home(
+        tmp_path, api_token, no_start, monkeypatch):
+    """An error's text is redacted off the loop (docs/SPEC.md §21.1 "Paths in answers"): in the loop's default executor
+    when the redaction looks at no folder outside the home (no session, a session in its own folder), so with every
+    folder thread held by reads that hang (a share that stops answering) such an error still answers at once; in one
+    of v1's folder threads when it resolves the session's folder outside the home (in place in a server folder), so it
+    waits for a place there and never holds the default executor."""
+    monkeypatch.setattr(api_v1, "FOLDER_THREADS", 2)
+    hub, _jobs, _places = _hub(tmp_path)
+    no_start(hub.manager)
+    gate = threading.Event()
+    held: list[threading.Thread] = []
+    redacted: list[tuple[str | None, threading.Thread]] = []
+    real_list, real_redact = nofollow.list_some, ApiV1.redact
+
+    def hung_list(*args: Any, **kwargs: Any) -> Any:
+        held.append(threading.current_thread())
+        gate.wait(5)
+        return real_list(*args, **kwargs)
+
+    def seen_redact(self: ApiV1, text: str, sid: str | None = None) -> str:
+        redacted.append((sid, threading.current_thread()))
+        return real_redact(self, text, sid)
+
+    try:
+        uid, own, _folder = await session_with(hub, {"a.txt": "A"})
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "a", "mode": "in_place"}})
+        assert status == 202, answer
+        placed, in_place = answer["session"]["id"], answer["session"]["name"]
+        monkeypatch.setattr(nofollow, "list_some", hung_list)
+        monkeypatch.setattr(ApiV1, "redact", seen_redact)
+        reads = [asyncio.ensure_future(listing(hub, uid)) for _ in range(2)]
+        await _until(lambda: len(held) == 2, "every folder thread held")
+        status, answer = await asyncio.wait_for(hub.create({"goal": "G", "model": "no-such-model"}), 2)
+        assert (status, answer["code"]) == (400, "unknown_model"), answer
+        status, answer = await asyncio.wait_for(hub.call("PATCH", f"/api/v1/sessions/{uid}",
+                                                         body={"wrap_up": True}), 2)
+        assert (status, answer["code"]) == (409, "conflict"), answer
+        waiting = asyncio.ensure_future(hub.call("PATCH", f"/api/v1/sessions/{placed}", body={"wrap_up": True}))
+        await asyncio.sleep(0.3)
+        assert not waiting.done()   # (its redaction waits for a folder thread)
+        gate.set()
+        status, answer = await asyncio.wait_for(waiting, 5)
+        assert (status, answer["code"]) == (409, "conflict"), answer
+        _no_path(answer, tmp_path)
+        assert [got.status for got in await asyncio.gather(*reads)] == [200, 200]
+        assert [sid for sid, _thread in redacted] == [None, own, in_place], redacted
+        assert [thread.name == "dreamteam-api-folder" for _sid, thread in redacted] == [False, False, True], redacted
     finally:
         gate.set()
         await hub.close()

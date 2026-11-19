@@ -4317,11 +4317,14 @@ settings; ValueError when they are invalid):
   session; `{}` for a v1 session whose block is not an object). `create(..., sources=[copyfrom.Source])`: v1's
   claimed uploads and a copy-mode server folder (a Source with `root` and `parts`, read below its root by
   `nofollow`, §21.10) copied by `copy_sources` instead of `copy_into`, not with `copy_from` or `copy_from_upload`
-  (400 before any claim); the caller claims and settles the uploads. `create(..., workspace=, within=root)`: an
-  in-place server folder, which every `_plan` on the create's way (`create`'s own, `_set_workspace`'s and
-  `_change_folder`'s last one, under the workspace claims just before `_carry_out` makes the missing folders), and
-  `_carry_out` itself around each folder it makes and around `git init` (`_Plan.within`, `_check_inside`), finds
-  inside `within` again, by text and by file identity, else 403 `forbidden_folder`; with git on, a folder with files
+  (400 before any claim); the caller claims and settles the uploads. `create(..., folder_threads=)`: where that copy
+  runs instead of the loop's default executor (`_in_thread(threads=)`, which still waits for it after a cancel):
+  v1 passes its folder threads (`ApiV1.threads.start`) when a server folder is among the sources (§21.1 "Threads").
+  `create(..., workspace=, within=root)`: an in-place server folder, which every `_plan` on the create's way
+  (`create`'s own, `_set_workspace`'s and `_change_folder`'s last one, under the workspace claims just before
+  `_carry_out` makes the missing folders), and `_carry_out` itself around each folder it makes and around `git init`
+  (`_Plan.within`, `_check_inside`), finds inside `within` again, by text and by file identity, else 403
+  `forbidden_folder` (these run in the loop's default executor, as for any workspace); with git on, a folder with files
   there must also pass `apifolders.git_dir_refusal` (409 `folder_not_ready`), before git reads it. A workspace move
   by the owner (`_change_folder` without `creating`) sets an in-place `api.folder` to null. Every later write of
   the block is a read-modify-write of session.json under the session's lock (`_api_write`, which logs and never
@@ -4351,8 +4354,11 @@ settings; ValueError when they are invalid):
     (`_public_text(sid | None, text, *, named=())`: `sid` None, an error of no session, names only the user's home and
     the home; `named` takes the caller's pairs first, unresolved: the roots of `[api] folders` by their names, §21.1
     "Paths in answers"; then a session that works in a server folder in place has that folder named `<root>` and
-    its path below the root with the hub's separator, `apifolders.shown(root, path, os.sep)`, §21.10). A start
-    cancelled inside `swarm.start()` (the hub stops) writes `finished_at` and no `start_error`.
+    its path below the root with the hub's separator, `apifolders.shown(root, path, os.sep)`, §21.10).
+    `_public_text_in_home(sid | None)` says whether it looks at no folder outside the home (the user's home aside): no
+    session, one whose session.json cannot be read, or one in its own folder or another folder of the home, with no
+    move journal; v1 then redacts in the loop's default executor rather than its folder threads (§21.1 "Paths in
+    answers"). A start cancelled inside `swarm.start()` (the hub stops) writes `finished_at` and no `start_error`.
   - `_unload` of a running v1 session writes `finished_at` after `Swarm.stop`, whatever the reason.
   - What runs beside a v1 session's run (`_RunWatch`, tied to its Swarm, kept in `_run_watch[sid]`):
     `_start_locked(sid, auto_reply=False, *, resumed=False)` starts it once the swarm runs and its pending goal is
@@ -4865,6 +4871,8 @@ told where the files came from: no source path goes into `pending_goal` or any p
   failed (a file still open on Windows) is removed by the next clean, while the hub runs. `RUN`
   (`secrets.token_hex(4)` at import) is in the names because a pid alone is not enough: the hub of the
   Docker sandbox has the same pid at every container start, so a killed container's leftovers would look live.
+  `_in_thread(..., threads=)` runs the work in threads of the caller's instead of the loop's default executor
+  (v1's folder threads for the copy of a server folder, §21.1), and waits for them the same way.
 - **Docker sandbox** (`copyfrom.hub_in_container(config)`: `config.skills_host_library_dir is not None` for
   `dreamteam sandbox`, or `DREAMTEAM_IMAGE=1` for docker compose and a plain docker run of the image; not any
   container, since DreamTeam run directly in a devcontainer sees its folders; the `container` of `/api/hub` and
@@ -6984,23 +6992,35 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     they resolved the last time the hub resolved them (`api_v1.root_pairs`, `apifolders.resolved_root`: at the hub's
     start, then at each use of a root, which comes before any text that names a path below it), never resolved for
     an error: an error that has nothing to do with a root never waits on one on a share that does not answer.
-    `ApiV1.error_response` runs it in one of v1's folder threads ("Threads"), since it reads the session's files and
-    resolves its folders. A route of v1 that a text names (`GET /api/v1/options lists the roles`: `/api/v1` and
-    lowercase words or `{id}`-like placeholders after it, starting a word) is kept as it is, never named by its last
-    component. `folder_busy` is v1's own text (`api_v1.FOLDER_BUSY_TEXT`), for every caller, never a `SessionError`
-    text; its `session` names the other session (`SessionError.holder`) by its uid when the caller sees it (21.10).
-    Summaries (21.7) hold no absolute path, for any caller. Event data (21.6), task results, messages and files carry
+    `ApiV1.error_response` runs it off the loop (`ApiV1._redacted`), since it reads the session's files and resolves
+    its folders: in the loop's default executor, with the home's other reads, when it looks at no folder outside the
+    home (`SessionManager._public_text_in_home`: no session, one whose `session.json` cannot be read, or one that works
+    in its own folder or another folder of the home, with no workspace move left halfway), so such an error never
+    waits for v1's folder threads, which reads on a share that stops answering may all hold; else (an in-place server
+    folder, a folder the owner chose) in one of those threads ("Threads"), since it resolves that folder. A route of
+    v1 that a text names (`GET /api/v1/options lists the roles`: `/api/v1` and lowercase words or `{id}`-like
+    placeholders after it, starting a word) is kept as it is, never named by its last component. `folder_busy` is v1's
+    own text (`api_v1.FOLDER_BUSY_TEXT`), for every caller, never a `SessionError` text; its `session` names the other
+    session (`SessionError.holder`) by its uid when the caller sees it (21.10). Summaries (21.7) hold no absolute
+    path, for any caller. Event data (21.6), task results, messages and files carry
     what the agents wrote, paths included: v1 does not scrub them.
 - **Threads.** What may touch a folder of the hub's computer runs in v1's own daemon threads (`api_v1._Threads`,
   `ApiV1.threads`), at most `api_v1.FOLDER_THREADS` (8) at once: a session's folder or a server folder and its root,
   read by GET files, a download's reads, an archive's measure and steps (21.8), a result's changed files (21.7), a
-  create's `folder` (`apifolders.resolve_request`, 21.10) and the redaction of an error text. A call past them waits
-  for one to end; a cancel while it waits starts nothing, and a thread whose client left keeps its place until its
-  call returns (a download or an archive closes its file or its walk only then: `api_v1._thread_step`). Never the
-  loop's default executor, which the rest of the hub shares (workspace git, the triggers, the forge, v1's reads of
-  the journals and the uploads store) and which `asyncio.run` waits for at exit: a share that stops answering holds
-  at most these threads until its calls return, never the hub's other work, and never its exit. The checks of a
-  start (`_check_workspace_ready`, §17.2) are the manager's.
+  create's `folder` (`apifolders.resolve_request`, 21.10) and the copy of a `copy` one (`copyfrom.copy_sources` of
+  the create's sources: `manager.create(folder_threads=)`; a cancel still waits for the copy to end, so its staging
+  folder is removed), and the redaction of an error text about a session that works outside the home ("Paths in
+  answers"). A call past them waits for one to end; a cancel while it waits starts nothing, and a thread whose client
+  left keeps its place until its call returns (a download or an archive closes its file or its walk only then:
+  `api_v1._thread_step`). Never the loop's default executor, which the rest of the hub shares (workspace git, the
+  triggers, the forge, v1's reads of the journals and the uploads store) and which `asyncio.run` waits for at exit: a
+  share that stops answering holds at most these threads until its calls return, never the hub's other work, and
+  never its exit. A folder worked in `in_place` (21.10) is not covered: it is the session's workspace, and the
+  manager's work on it runs where the manager runs any session's, in the loop's default executor, as for a folder on
+  a share that the owner gave a board session (§17.2): the create's `_plan` and the folder's set-up (`_carry_out`: the
+  missing folders, `git init` and the first commit), the checks of every start (`_check_workspace_ready`,
+  `_check_server_git`, `_check_adopted_repo`) and the running session's workspace git. An in-place root on a share
+  that stops answering after `resolve_request` touched it may so hold threads of the default executor.
 - **Compatibility**: within v1, fields, codes, states and event types are only added, never renamed, removed or given
   another meaning; a client ignores what it does not know. The `text` of events (21.6) and of errors is for people and
   may be reworded. Anything else is `/api/v2`, and v1 then stays for at least one minor release. `GET /api/v1/options`
@@ -8068,7 +8088,9 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     headers in chunks, one that shrinks while it is sent (cut), one its client leaves (its file closed), one replaced
     while it is opened (409); a step cancelled twice waits for its thread, then releases what it gave; the folder work
     in v1's own daemon threads (at most `FOLDER_THREADS`: reads that hang hold none of the default executor, and GET
-    events still answers; a listing, a download, an archive, a result, a redaction); a client gone during a long step
+    events still answers; a listing, a download, an archive, a result; the redaction of an error about an in-place
+    session, which waits for a place, while an error about no session or a session in its own folder answers at once
+    with every folder thread held, in the loop's default executor); a client gone during a long step
     leaves the event loop idle (its passes counted); path escapes and `.git` at any depth as `bad_name`, the NTFS
     names refused on Windows only, a name with `:` listed and served on POSIX, names NTFS reads as others left out on
     Windows; a link to outside and hard links never listed, served or archived; a folder swapped for a link while it
@@ -8107,10 +8129,11 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
     spelling (one folder), each name taken as its folder lists it (`as_listed`), a root under /run or /var/run
     refused and never mounted, an error text that never resolves a root (yet names a path below one in its resolved
-    spelling), a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, a
-    link swapped in before git init, between its steps, after it and after `_carry_out` (nothing written or removed in
-    the repository it leads to; on Windows the folder held refuses the swap; `tests/test_nofollow.py`: `hold_inside`),
-    and `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;
+    spelling), a copy in v1's folder threads (a create cancelled during it waits for it, then leaves no staging
+    folder, no session and no place held), a `.git` that is a gitfile or a linked worktree's, a common dir outside the
+    folder, a link swapped in before git init, between its steps, after it and after `_carry_out` (nothing written or
+    removed in the repository it leads to; on Windows the folder held refuses the swap; `tests/test_nofollow.py`:
+    `hold_inside`), and `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;
   - the clients (`tests/test_tui_print.py`, `tests/test_tui_app.py`, `tests/test_tui_commands.py`,
     `tests/test_tui_render.py`, `tests/test_cli_launcher.py`, `tests/test_launcher.py`, `tests/test_ui.py`,
     `tests/test_instruct.py`): `-p -r` on an `answers: "auto"` session
@@ -8234,6 +8257,7 @@ in_place = false            # true: a session may also work in a folder under it
   top level, the names the session owns (`.scratch`, `.gitignore`, `.dreamteam`, `mcp`, 21.3), counted as excluded;
   regular files with more than one hard link (`st_nlink > 1`: another name of the file may lie outside the root; read
   as 21.8 says), counted as excluded; `.DS_Store` and `Thumbs.db` without a word.
+- The copy runs in v1's folder threads, never the loop's default executor (21.1 "Threads").
 - A first walk only counts and measures (`open_files=False`: 413 before any byte is written); the second copies,
   each file read through the walk's own open file before the walk goes on, its bytes counted again
   (`copyfrom._copy_server_folder`). The files get the modes of `copy_tree`'s "writable" (`treecopy.writable_bits`)
@@ -8285,11 +8309,12 @@ in_place = false            # true: a session may also work in a folder under it
 
 **Starts.** Every start of a session with an in-place `api.folder`, from any surface (v1 `continue`, the resume when
 the hub starts, the board, the TUI, MCP), checks again in `_start_locked`, before anything starts:
-- in `_check_workspace_ready` (`SessionManager._check_server_folder`), in a thread (a root on a share that does not
-  answer never stalls the hub): its root is still listed with `in_place = true` (the settings read again on the
-  loop just before: a hand edit counts at once) and is not refused (Settings); the
-  stored folder still resolves to itself (no link on its way, not even one that leads to another folder of the root)
-  and inside the root, by text and by file identity (a root the owner pointed elsewhere no longer holds it);
+- in `_check_workspace_ready` (`SessionManager._check_server_folder`), in a thread of the loop's default executor (a
+  root on a share that does not answer never stalls the event loop; 21.1 "Threads"): its root is still listed with
+  `in_place = true` (the settings read again on the loop just before: a hand edit counts at once) and is not refused
+  (Settings); the stored folder still resolves to itself (no link on its way, not even one that leads to another
+  folder of the root) and inside the root, by text and by file identity (a root the owner pointed elsewhere no longer
+  holds it);
 - then, with git on, in a thread (`SessionManager._check_server_git`, before the adopted-folder check, so git never
   reads a repository whose database lies elsewhere): its `.git` still follows the rules of `in_place` above
   (`apifolders.git_dir_refusal`).

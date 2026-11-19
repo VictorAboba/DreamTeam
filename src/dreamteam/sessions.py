@@ -37,7 +37,7 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Collection, Iterable, Iterator
 
 from . import __version__, apifolders, hubauth, netoff, nofollow
 from . import skills as skill_lib
@@ -650,11 +650,14 @@ def _repo_refusal(folder: Path, state: dict[str, Any], *, starting: str | None =
     return None
 
 
-async def _in_thread(fn: Callable[..., Any], *args: Any, on_cancel: Callable[[], None] | None = None) -> Any:
+async def _in_thread(fn: Callable[..., Any], *args: Any, on_cancel: Callable[[], None] | None = None,
+                     threads: Callable[..., Awaitable[asyncio.Future[Any]]] | None = None) -> Any:
     """Blocking file work in a thread that a cancellation cannot abandon halfway (a move whose undo would run
     while it still moves files): the caller waits for it to end before the CancelledError goes on. `on_cancel()`
-    is called at the first cancellation, before the wait (it tells the work to stop early: a copy)."""
-    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    is called at the first cancellation, before the wait (it tells the work to stop early: a copy). `threads`: where
+    the work runs instead of the loop's default executor, `threads(fn, *args)` awaited for a future of its result
+    (the HTTP API v1's folder threads, api_v1._Threads.start: a cancel while it waits for a place starts nothing)."""
+    work = await threads(fn, *args) if threads is not None else asyncio.ensure_future(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(work)
     except asyncio.CancelledError:
@@ -2592,7 +2595,8 @@ class SessionManager:
                      via: str = "home", auto_reply: bool = False, copy_from: str | os.PathLike | None = None,
                      copy_from_upload: str | None = None, api: dict[str, Any] | None = None,
                      sources: list[Source] | None = None, mark: object | None = None,
-                     within: Path | None = None) -> dict[str, Any]:
+                     within: Path | None = None,
+                     folder_threads: Callable[..., Awaitable[asyncio.Future[Any]]] | None = None) -> dict[str, Any]:
         """Create a session (and start it with the goal unless start=False). Returns its summary.
         `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
         an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
@@ -2610,7 +2614,10 @@ class SessionManager:
         `sources`: the HTTP API v1's files instead (docs/SPEC.md §21.4), already claimed by the caller, which also
         settles the claims (copyfrom.Uploads.settle): copied together by copyfrom.copy_sources (its result is the
         "copy_result"); not with copy_from or copy_from_upload. A CopyError keeps its code (`bad_name`,
-        `file_conflict`) in the SessionError.
+        `file_conflict`) in the SessionError. `folder_threads`: with `sources`, where their copy runs instead of the
+        loop's default executor (_in_thread's `threads`): v1 passes its folder threads when a server folder is among
+        them (docs/SPEC.md §21.1 "Threads"), so a share that stops answering in the middle of the copy holds none of
+        the threads the rest of the hub shares, nor its exit.
         `api`: the session is the HTTP API v1's: session.json gets "via": "api" and the "api" block (the keys of
         API_GIVEN: answers, stop_when_done, client_ref, request_digest, folder; the others null) in its first write,
         before any start (see _start_locked for what every start does with it).
@@ -2694,7 +2701,8 @@ class SessionManager:
 
                     limits = CopyLimits.from_config(self.config)
                     if sources is not None:
-                        copied = await _in_thread(copy_sources, sources, staging, limits, check, on_cancel=cancel.set)
+                        copied = await _in_thread(copy_sources, sources, staging, limits, check, on_cancel=cancel.set,
+                                                  threads=folder_threads)
                     else:
                         copied = await _in_thread(copy_into, source, staging, limits, check, on_cancel=cancel.set)
                 except CopyError as exc:
@@ -2988,6 +2996,22 @@ class SessionManager:
             add(exact, path, path.name)
             add(hidden, path, self.OTHER_SESSION)
         return without_abs_paths(text, list(kept.values()), exact=list(exact.values()), hidden=list(hidden.values()))
+
+    def _public_text_in_home(self, sid: str | None) -> bool:
+        """Whether _public_text(sid, ...) looks at no folder outside the home (the user's home aside): no session, one
+        whose session.json cannot be read, or one that works in its own folder or another folder of the home
+        ("in_home"), with no workspace move left halfway (its journal names folders anywhere). Otherwise it resolves
+        the session's folder outside the home (an in-place server folder of the HTTP API v1, a folder the owner chose),
+        maybe on a share that does not answer. Blocking: the journal's presence and session.json, both in the home."""
+        if sid is None:
+            return True
+        if os.path.lexists(self._journal(sid)):
+            return False
+        try:
+            workspace = self.meta(sid).get("workspace")
+        except SessionError:
+            return True
+        return not isinstance(workspace, dict) or _home_relative(workspace) is not None
 
     def _start_failed(self, sid: str, exc: BaseException) -> None:
         """A v1 session's start failed: `api.start_error` {code, text} (the text through _public_text, as in the

@@ -804,11 +804,12 @@ async def _outlive(work: asyncio.Future[Any]) -> None:
 class _Threads:
     """v1's own daemon threads for the work that may touch a folder of the hub's computer (docs/SPEC.md §21.1
     "Threads"): a session's folder, a server folder or its root (the files and archives, a result's changed files, a
-    create's folder, the redaction of an error text). At most `size` run at once; a call past them waits for one to
-    end, and a cancel while it waits starts nothing. Never the loop's default executor, which the rest of the hub
-    shares (workspace git, the triggers, the forge, v1's journal reads) and which asyncio.run waits for at exit: a
-    folder on a share that stops answering holds at most `size` threads of v1's, each until its own call returns (a
-    cancelled caller's thread keeps its place until then), never the hub's other work nor its exit."""
+    create's folder and the copy of it, the redaction of an error text about a session that works outside the home).
+    At most `size` run at once; a call past them waits for one to end, and a cancel while it waits starts nothing.
+    Never the loop's default executor, which the rest of the hub shares (workspace git, the triggers, the forge, v1's
+    journal reads) and which asyncio.run waits for at exit: a folder on a share that stops answering holds at most
+    `size` threads of v1's, each until its own call returns (a cancelled caller's thread keeps its place until then),
+    never the hub's other work nor its exit."""
 
     def __init__(self, size: int) -> None:
         self._slots = asyncio.Semaphore(size)
@@ -1409,7 +1410,7 @@ class ApiV1:
             return await handler(request, caller)
         except ApiError as exc:
             if exc.redact and caller == "api":   # (the swarm's own text: in a thread, as error_response's)
-                text = await self.threads.run(self.redact, exc.text, request.scope.get(API_SID))
+                text = await self._redacted(exc.text, request.scope.get(API_SID))
                 return fail(exc.code, text, headers=exc.headers, **exc.extra)
             return exc.response()
         except CODED_ERRORS as exc:   # (the session the route resolved, if any: its folders are named in the text)
@@ -1441,7 +1442,7 @@ class ApiV1:
         any other absolute path by its last component. A route of v1 the text names (_ROUTE: "GET /api/v1/options")
         is kept as it is. The roots are named as written and as they resolved before (root_pairs), never resolved
         here. Blocking (it reads the session's files and resolves its folders, an in-place one maybe on a network
-        share): a route calls it through error_response, in one of v1's folder threads."""
+        share): a route calls it through _redacted."""
         routes: list[str] = []
         marker = "APIROUTE"
         while marker in text:
@@ -1458,12 +1459,28 @@ class ApiV1:
         public = self.manager._public_text(sid, _ROUTE.sub(keep, text), named=root_pairs(self.manager.config))
         return re.sub(f"{marker}([0-9]+){marker}", back, public) if routes else public
 
+    def _redact_in_home(self, text: str, sid: str | None) -> str | None:
+        """redact(text, sid) when it looks at the home's folders and the user's home only
+        (SessionManager._public_text_in_home: no session, or one that works in a folder of the home), else None.
+        Blocking (session.json, in the home)."""
+        return self.redact(text, sid) if self.manager._public_text_in_home(sid) else None
+
+    async def _redacted(self, text: str, sid: str | None) -> str:
+        """redact(text, sid) off the event loop (docs/SPEC.md §21.1 "Paths in answers"): in the loop's default
+        executor, with the home's other reads, when it looks at no folder outside the home (_redact_in_home), so an
+        error about no session or about a session in its own folder never waits for v1's folder threads, which reads
+        on a share that stops answering may all hold; else in one of them (_Threads): it resolves the session's folder
+        outside the home (an in-place server folder, a folder the owner chose), maybe on such a share."""
+        public = await asyncio.to_thread(self._redact_in_home, text, sid)
+        return public if public is not None else await self.threads.run(self.redact, text, sid)
+
     async def error_response(self, exc: BaseException, caller: str, sid: str | None = None) -> JSONResponse:
-        """One of CODED_ERRORS as `{"error", "code"}` (error_code); for the API caller its text through redact(), in
-        one of v1's folder threads (_Threads), so that a session's folder on an unplugged share never holds the loop's
-        default executor (redact never resolves a root at all). An `internal` one is logged, with its
-        traceback unless it is the 503 of a hub shutting down (no fault of anyone's). `sid`: the session the route
-        is about (its folders are named by their names). `folder_busy` is v1's own text, whoever calls: the manager's
+        """One of CODED_ERRORS as `{"error", "code"}` (error_code); for the API caller its text through redact(), off
+        the loop (_redacted: in one of v1's folder threads when the session works outside the home, so that its folder
+        on a share that stops answering never holds the loop's default executor, else in that executor, so that such
+        a share never holds the error; redact never resolves a root at all). An `internal` one is logged, with its
+        traceback unless it is the 503 of a hub shutting down (no fault of anyone's). `sid`: the session the route is
+        about (its folders are named by their names). `folder_busy` is v1's own text, whoever calls: the manager's
         names the other session's folder, so its title; the answer's `session` names that session's id when the
         caller sees it (docs/SPEC.md §21.10 "One folder, one session"). An error's `retry_after` (CopyError's, of
         `too_many_uploads`) is sent as Retry-After."""
@@ -1480,8 +1497,7 @@ class ApiV1:
         text = str(exc)
         wait = getattr(exc, "retry_after", None)   # (CopyError's: `too_many_uploads`)
         headers = {"Retry-After": str(wait)} if isinstance(wait, int) and not isinstance(wait, bool) else None
-        return fail(code, await self.threads.run(self.redact, text, sid) if caller == "api" else text,
-                    headers=headers)
+        return fail(code, await self._redacted(text, sid) if caller == "api" else text, headers=headers)
 
     def _uid_for(self, sid: str, caller: str) -> str | None:
         """The uid of session `sid` when `caller` sees it (resolve's scope), else None. Blocking (session.json)."""
@@ -2332,9 +2348,10 @@ class ApiV1:
         """POST /api/v1/sessions (docs/SPEC.md §21.4), in the order of §21.4 "Order", so that a refused create costs
         nothing: the body; client_ref; the overrides; the skills; the server folder resolved (apifolders,
         §21.10); the uploads checked; max_running checked and reserved; the uploads claimed; manager.create(start=False,
-        mark=...) with the folder to copy among the sources (read below its root without following a link), or the
-        folder to work in in place as its workspace, checked again inside its root (`within`); the claims settled;
-        202, the start in the background (spawn). 200 with the existing session for a repeated client_ref."""
+        mark=...) with the folder to copy among the sources (read below its root without following a link, in v1's
+        folder threads: `folder_threads`), or the folder to work in in place as its workspace, checked again inside its
+        root (`within`); the claims settled; 202, the start in the background (spawn). 200 with the existing session
+        for a repeated client_ref."""
         if self.closing:
             raise SessionError(SHUTTING_DOWN_TEXT, 503)
         query_fields(request)
@@ -2373,6 +2390,7 @@ class ApiV1:
                     made = await manager.create(
                         ask.title, ask.goal, ask.description, overrides=overrides, start=False, via="api",
                         skills=skills or None, sources=(copied + claimed) or None, mark=mark,
+                        folder_threads=self.threads.start if copied else None,   # (a server folder's copy)
                         workspace=str(folder.target) if in_place else None,
                         within=folder.root_real if in_place else None,
                         api={"answers": ask.answers, "stop_when_done": ask.stop_when_done,

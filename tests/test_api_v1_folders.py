@@ -28,7 +28,8 @@ from typing import Any
 import pytest
 from starlette.testclient import TestClient
 
-from dreamteam import apifolders, cli, copyfrom, docker as docker_module, hubauth, netoff, nofollow, sessions, shell
+from dreamteam import api_v1, apifolders, cli, copyfrom, docker as docker_module, hubauth, netoff, nofollow, sessions
+from dreamteam import shell
 from dreamteam import workspace as workspace_module
 from dreamteam import settings as st
 from dreamteam.config import API_FOLDERS_ENV, ApiFolder, Config
@@ -37,7 +38,7 @@ from dreamteam.launcher import create_launcher_app
 from dreamteam.sessions import FOLDER_BUSY, SessionError, SessionManager
 from dreamteam.workspace import rmtree
 from test_api_sessions import git, needs_git, repository
-from test_api_v1 import Hub, _home, _manager, _no_path, no_start  # noqa: F401 - a fixture
+from test_api_v1 import Hub, _home, _manager, _no_path, _until, no_start  # noqa: F401 - a fixture
 from test_api_v1_guard import api_token, hub_token  # noqa: F401 - fixtures
 from test_hub_auth import TOKEN
 
@@ -243,6 +244,48 @@ async def test_two_copies_of_one_folder_at_once(tmp_path, api_token, no_start):
         for _, answer in answers:
             assert "index.html" in _files(hub.manager.default_workspace(answer["session"]["name"]))
     finally:
+        await hub.close()
+
+
+async def test_a_copy_runs_in_v1s_folder_threads_and_a_cancel_waits_for_it(tmp_path, api_token, no_start,
+                                                                            monkeypatch):
+    """A create's copy of a server folder runs in v1's own daemon threads (docs/SPEC.md §21.1 "Threads"), never the
+    loop's default executor: a share that stops answering in the middle of the copy holds none of the threads the rest
+    of the hub shares, nor its exit. A create cancelled meanwhile (its client gone) waits for the copy to end, then
+    leaves no staging folder, no session and no thread's place behind."""
+    monkeypatch.setattr(api_v1, "FOLDER_THREADS", 1)
+    hub, jobs, _places = _hub(tmp_path)
+    no_start(hub.manager)
+    _site(jobs)
+    gate = threading.Event()
+    copying: list[threading.Thread] = []
+    real_copy = copyfrom._copy_server_folder
+
+    def hung_copy(*args: Any, **kwargs: Any) -> Any:
+        copying.append(threading.current_thread())
+        gate.wait(5)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(copyfrom, "_copy_server_folder", hung_copy)
+    body = {"goal": "G", "folder": {"root": "jobs", "path": "acme/site"}}
+    try:
+        create = asyncio.ensure_future(hub.create(body))
+        await _until(lambda: len(copying) == 1, "the copy in its thread")
+        assert copying[0].name == "dreamteam-api-folder" and copying[0].daemon, copying
+        create.cancel()
+        await asyncio.sleep(0.2)
+        assert not create.done()   # (the cancel waits for the copy)
+        gate.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(create, 5)
+        assert hub.manager.ids() == []
+        assert [p.name for p in hub.manager.sessions_dir.iterdir() if p.name.startswith(".copying-")] == []
+        status, answer = await asyncio.wait_for(hub.create(body), 5)   # (the one place was given back)
+        assert status == 202, answer
+        assert "index.html" in _files(hub.manager.default_workspace(answer["session"]["name"]))
+        assert len(copying) == 2 and copying[1].name == "dreamteam-api-folder", copying
+    finally:
+        gate.set()
         await hub.close()
 
 
