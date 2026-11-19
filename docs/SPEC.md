@@ -8447,5 +8447,5 @@ paths, Git URLs or Claude Code; changing the settings (providers, keys, roles, t
 a settings page section for `[api]` (it is edited by hand, 21.9); CORS; several users with their own quotas (every
 client with the API token acts as the one user of the hub); a callback URL called when a session ends; automatic
 answers to `mcp` requests; mounting only some roots into the sandbox (it mounts every one, 21.10); paging of file
-listings (`GET files` gives a folder's whole listing: only the session's own agents fill the folder, 21.8); an OpenAPI
-document.
+listings (`GET files` gives the first `FILES_MAX_ENTRIES` names of a folder with `truncated`, and the archive or the
+listings of its folders have the rest, 21.8); an OpenAPI document.
