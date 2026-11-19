@@ -6896,17 +6896,20 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     needs the hub token anyway (§14.2), unless `DREAMTEAM_HUB_NO_TOKEN=1`, which §14.2 warns about: such a hub then
     serves its internal routes to the network with no token at all.
 - **What the API token reaches.** The guard takes the API token only on v1 paths: it opens no internal route, no
-  `/mcp`, no `/ws` and no board. So a client cannot change the settings, read the keys' profiles, reach a session it
-  did not create, or name a folder of the hub's computer outside `[api] folders` (21.10). That limits what a client
-  can name, not what the agents can reach. The API token is the power to run a goal: the agents run commands with the
-  hub user's rights (in the sandbox, the container's), so they can read the home, its settings (a `dreamteam.toml` may
-  hold a literal `api_key`) and the keys there, and an uploaded document may carry instructions to them. Every root of
-  `[api] folders` is a further grant to whoever holds the token (21.10). A hub that serves a site runs in
-  `dreamteam sandbox`.
+  `/mcp`, no `/ws` and no board. So a client cannot change the settings, read the keys' profiles, reach a session not
+  created through v1 ("Scope"), or name a folder of the hub's computer outside `[api] folders` (21.10). That limits
+  what a client can name, not what the agents can reach. The API token is the power to run a goal: the agents run
+  commands with the hub user's rights (in the sandbox, the container's), so they can read the home, its settings (a
+  `dreamteam.toml` may hold a literal `api_key`) and the keys there, and an uploaded document may carry instructions
+  to them. Every root of `[api] folders` is a further grant to whoever holds the token (21.10). A hub that serves a
+  site runs in `dreamteam sandbox`.
 - **Scope.** With the API token, v1 sees only the sessions created through v1 (`"via": "api"`, 21.4): every route
   about any other session (listing, reading, events, requests, messages, files, PATCH, `continue`, stop, DELETE)
-  answers 404 `not_found`. With the hub token, every session. The legacy main session has no uid (`session_uid` is
-  None for a `legacy` meta), so v1 never reaches it, with the hub token either.
+  answers 404 `not_found`. The scope is how a session was made, not who made it: a session the owner creates through
+  v1 with the hub token is `"via": "api"` too, and the API token lists, reads, continues, stops and deletes it like
+  its own (no caller is recorded; only upload tokens are per caller, 21.3). With the hub token, every session. The
+  legacy main session has no uid (`session_uid` is None for a `legacy` meta), so v1 never reaches it, with the hub
+  token either.
 - **The rest of the hub.** A site on the same computer that calls a loopback hub without a hub token exposes the
   internal routes to its own bugs (a server-side request forgery reaches `127.0.0.1`), so the docs say: run the hub
   that serves a site with a hub token too, or in `dreamteam sandbox`, which the docs recommend anyway (the agents run
@@ -7896,8 +7899,8 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     hub with an API token and no hub token;
   - the JSON error shape of the guard's answers; JSON 404 and 405 (with `Allow`), a bare `/api/v1` included;
     `unknown_field` on every body and query; a PATCH without a JSON `Content-Type` (415);
-  - scope: the API token sees only `via: "api"` sessions; uid ids after a delete; earlier-version sessions (listed,
-    409);
+  - scope: the API token sees only `via: "api"` sessions, the owner's made through v1 with the hub token among them;
+    uid ids after a delete; earlier-version sessions (listed, 409);
   - uploads: a file, an unpacked zip, every refused name (`.git` among them), a name clash, the limits, the tokens
     kept after a 4xx, a 5xx and a cancel, a token of the other caller, a link or a hard link put in the store;
   - create: an unknown field, team, model, role and skill; a blank goal; a `title` with a line break, over 200

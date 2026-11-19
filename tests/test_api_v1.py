@@ -692,6 +692,13 @@ async def test_the_api_token_sees_only_the_sessions_of_v1(tmp_path, api_token, h
         assert session["state"] == "created" and session["client_ref"] is None and session["started_at"] is None
         for wrong in ("nope", mine.upper(), UID, board):
             assert (await hub.call("GET", f"/api/v1/sessions/{wrong}", token=TOKEN))[0] == 404, wrong
+        # the scope is how a session was made, not who made it: the owner's own made through v1 is the API token's too
+        status, made = await hub.create({"goal": "The owner's, through the API"}, token=TOKEN)
+        assert status == 202 and made["session"]["via"] == "api"
+        owned = made["session"]["id"]
+        status, answer = await hub.call("GET", "/api/v1/sessions")
+        assert status == 200 and [s["id"] for s in answer["sessions"]] == [owned, mine]
+        assert (await hub.call("GET", f"/api/v1/sessions/{owned}"))[0] == 200
     finally:
         await hub.close()
 

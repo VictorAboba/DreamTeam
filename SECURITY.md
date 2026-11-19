@@ -40,12 +40,12 @@ These are documented and expected:
   reach the hub from its loopback and cannot use the API without the token. A hub without one (the default
   `dreamteam serve` on `127.0.0.1`) asks nothing: every program on that computer, the agents' commands outside Docker
   among them, can use its API.
-- The HTTP API's token (`DREAMTEAM_API_TOKEN`) opens only `/api/v1` and the sessions created through it, but it is the
-  power to run a goal: the agents of those sessions run commands with the hub user's rights (in the sandbox, the
-  container's), so they can read the home, its settings and keys, and an uploaded document may carry instructions to
-  them. Every root of `[api] folders` is a further grant to whoever holds the token, and in `dreamteam sandbox` every
-  agent in the container can reach the mounted roots. A hub that serves a site runs in `dreamteam sandbox`
-  ([HTTP API](docs/en/http-api.md#security)).
+- The HTTP API's token (`DREAMTEAM_API_TOKEN`) opens only `/api/v1` and the sessions created through `/api/v1` (those
+  the owner creates there with the hub token too), but it is the power to run a goal: the agents of those sessions run
+  commands with the hub user's rights (in the sandbox, the container's), so they can read the home, its settings and
+  keys, and an uploaded document may carry instructions to them. Every root of `[api] folders` is a further grant to
+  whoever holds the token, and in `dreamteam sandbox` every agent in the container can reach the mounted roots. A hub
+  that serves a site runs in `dreamteam sandbox` ([HTTP API](docs/en/http-api.md#security)).
 - With `[mcp] require_approval = true` an approval covers one snapshot of an agent's MCP server (a SHA-256 over its
   code, requirements and start command), kept in the session's `.dreamteam` folder: out of reach of the agents' file
   tools, not of their console commands. The approval marks in the shared MCP library (`~/.dreamteam/library` by

@@ -523,7 +523,7 @@ under a root the owner lists in `[api] folders` can be named, by the root's name
 | `unknown_team`, `unknown_model`, `unknown_role`, `unknown_skill`, `unknown_folder` | 400 | a name the hub does not have; the text lists the names |
 | `bad_name` | 400 | a file name or path the hub refuses |
 | `forbidden_folder` | 403 | a folder outside what `[api] folders` allows |
-| `not_found` | 404 | no such session, file, request, upload, root or route (a session of another caller too) |
+| `not_found` | 404 | no such session, file, request, upload, root or route (for the API token, a session not created through the API too) |
 | `method_not_allowed` | 405 | a method the route does not take (`Allow` names those it does) |
 | `conflict` | 409 | the state does not allow it now, or the swarm refused it |
 | `earlier_version` | 409 | a session made by an earlier version of DreamTeam |
@@ -551,14 +551,17 @@ version.
 ## Security
 
 - **What the API token reaches.** Only `/api/v1`: no route of the board, no `/mcp`, no WebSocket. With it a client
-  cannot change the settings, read the model profiles' keys, reach a session it did not create, or name a folder
-  outside `[api] folders`. That limits what a client can name, not what the agents can reach: the API token is the
-  power to run a goal. The agents run commands with the hub user's rights (in the sandbox, the container's), so they
-  can read the home, its settings (a `dreamteam.toml` may hold a key) and the keys there, and an uploaded document may
-  carry instructions to them. Every root of `[api] folders` is a further grant to whoever holds the token: with
-  `in_place`, the agents write there.
+  cannot change the settings, read the model profiles' keys, reach a session not created through the API, or name a
+  folder outside `[api] folders`. That limits what a client can name, not what the agents can reach: the API token
+  is the power to run a goal. The agents run commands with the hub user's rights (in the sandbox, the container's),
+  so they can read the home, its settings (a `dreamteam.toml` may hold a key) and the keys there, and an uploaded
+  document may carry instructions to them. Every root of `[api] folders` is a further grant to whoever holds the
+  token: with `in_place`, the agents write there.
 - **Who sees what.** The API token sees only the sessions created through the API (every other session is 404 for
-  it); the hub token sees every session. The `main` session of an old project is never reachable.
+  it), whoever created them: a session you create on `/api/v1` with the hub token is the API token's too, which can
+  read, continue, stop and delete it. Keep a job of your own away from it by starting it on the board, in the
+  terminal or through `/mcp`. The hub token sees every session. The `main` session of an old project is never
+  reachable.
 - **A hub for a site** runs in [`dreamteam sandbox`](sandbox.md#the-http-api-in-the-sandbox):
   the agents run commands and an uploaded document may carry instructions to them, and a hub on the same computer as
   the site without a hub token exposes its other routes to the site's bugs (a request forgery reaches `127.0.0.1`).
