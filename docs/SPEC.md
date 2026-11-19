@@ -8284,12 +8284,13 @@ in_place = false            # true: a session may also work in a folder under it
   which the hold keeps), never by a path that may lead elsewhere. The undo of a later failure removes them only from
   that folder, held again with the same identity (`_Undo.held`); a folder no longer reached so keeps them, and the
   error says so (500, "not removed"). Nothing is removed through a link swapped in, and DreamTeam writes nothing
-  through one. What remains on POSIX is git's own: a git command takes its folder's path when it starts (`getcwd`)
-  and goes on by that path (git init for its new `.git`, every command for its work tree), so when the folder held
-  is renamed back to its own name just as a command starts and a link is swapped in for it before the command
-  writes, that command writes in the folder the link leads to, and the next check ends the create (403). Closing
-  that would take the folder's path itself held, which POSIX offers no unprivileged way to do. A link swapped in
-  meanwhile ends the create, and every start checks again ("Starts").
+  through one. What remains on POSIX is git's own: a git command takes the held folder's path when it starts
+  (`getcwd`) and goes on by that path (git init for its new `.git`, every command for its work tree), so a link
+  swapped in at that path while the command runs (the folder held moved away after the command started, before it
+  writes) makes that command write in the folder the link leads to. That window is the whole run of each git command
+  of the init, not an instant; the next check then ends the create (403). Closing it would take the folder's path
+  itself held, which POSIX offers no unprivileged way to do. A link swapped in meanwhile ends the create, and every
+  start checks again ("Starts").
 - Every rule of `copy_from` and `workspace` (§17.2) applies as well.
 
 **`copy`.**
