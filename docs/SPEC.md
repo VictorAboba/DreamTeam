@@ -7086,8 +7086,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 
 - **Where.** v1's uploads are its own: `manager.api_uploads`, a `copyfrom.Uploads` on
   `<home>/.dreamteam/uploads/api/`. A v1 token is never usable as the board's `copy_from_upload`, nor a board token in
-  v1. Any file is stored, as `<token>.bin` with its `<token>.json` `{"filename", "bytes", "at", "unpack", "caller"}`;
-  `clean()` knows `.bin` and a claimed `.bin`. The board's uploads (§17.2 "Uploads") are unchanged.
+  v1. Any file is stored, an empty one too (an empty CSV, a `.gitkeep`), as `<token>.bin` with its `<token>.json`
+  `{"filename", "bytes", "at", "unpack", "caller"}`; `clean()` knows `.bin` and a claimed `.bin`. The board's
+  uploads (§17.2 "Uploads": an empty body is 400 there) are unchanged.
 - **Never through a link.** In the sandbox the hub reads with more rights than the agents and runs with their group
   and umask 002, so the store is the hub's alone and an upload is read only as the file the hub wrote. The folders
   of both stores (`uploads/` and `uploads/api/`) are made 0o700 on POSIX, a json is written O_EXCL with 0o600 like
@@ -7128,11 +7129,11 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     build). A file named `.git` would be taken for a linked worktree's gitfile, and the autocommits would go to the
     repository it names.
 - **`unpack`** (`true` or `false`, default false). With `unpack=true` the file must be a zip (400 `bad_request`
-  otherwise), and its files go into the session folder under the zip rules of `copy_from` (§17.2: a zip of one folder
-  gives that folder's files; `.git`, links and the excluded names are left out). At its top level, after that unwrap,
-  the names the session owns (`.scratch`, `.gitignore`, `.dreamteam`, `mcp`) are left out too and counted as excluded:
-  today only `.scratch/_skills` is, so a zip could write into the members' folders. Without `unpack` a zip is one file
-  like any other.
+  otherwise, an empty body too: "The upload is empty."), and its files go into the session folder under the zip
+  rules of `copy_from` (§17.2: a zip of one folder gives that folder's files; `.git`, links and the excluded names
+  are left out). At its top level, after that unwrap, the names the session owns (`.scratch`, `.gitignore`,
+  `.dreamteam`, `mcp`) are left out too and counted as excluded: today only `.scratch/_skills` is, so a zip could
+  write into the members' folders. Without `unpack` a zip is one file like any other.
 - **Limits.** `[workspace] copy_max_mb` caps one upload (413 `too_large`, before any byte is read when the
   Content-Length says more) and the sum of what one create copies in; `copy_max_files` caps the files one create
   copies in. An unpacked size is known only by unpacking, so the sum is checked while the create copies, after the

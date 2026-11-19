@@ -458,6 +458,10 @@ async def test_uploads_keep_any_file_under_a_checked_name(tmp_path, api_token, h
         assert status == 400 and answer["code"] == "bad_request"
         status, answer = await hub.upload("a.txt", b"not a zip", unpack=True)
         assert status == 400 and answer["code"] == "bad_request"
+        status, answer = await hub.upload("empty.csv", b"")   # an empty file is any file too
+        assert status == 201 and answer["bytes"] == 0 and answer["unpack"] is False
+        status, answer = await hub.upload("e.zip", b"", unpack=True, content_type="application/zip")
+        assert status == 400 and answer["code"] == "bad_request" and "empty" in answer["error"]
         status, answer = await hub.call("POST", "/api/v1/uploads", raw=b"x", query="filename=a.txt&mode=x",
                                         content_type="application/octet-stream")
         assert status == 400 and answer["code"] == "unknown_field"

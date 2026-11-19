@@ -784,9 +784,26 @@ async def test_a_v1_upload_to_unpack_must_be_a_zip(tmp_path):
     assert zipped["unpack"] is True and uploads.peek_many([zipped["upload"]], caller="api")[0]["unpack"] is True
     kept = await _file_upload(uploads, _zip({"a.txt": "A"}), filename="w.zip")   # without unpack: one file
     assert kept["unpack"] is False
-    with pytest.raises(CopyError, match="empty") as err:
-        await _file_upload(uploads, b"", filename="e.txt")
+    with pytest.raises(CopyError, match="empty") as err:   # (no zip to unpack)
+        await _file_upload(uploads, b"", filename="e.zip", unpack=True)
     assert err.value.status == 400
+
+
+async def test_an_empty_v1_file_is_kept_and_copied_as_one(tmp_path):
+    """Any file, an empty one too (an empty CSV, a .gitkeep): only a zip to unpack must hold something."""
+    uploads = Uploads(tmp_path / "api")
+    empty = await _file_upload(uploads, b"", filename=".gitkeep")
+    assert (empty["bytes"], empty["unpack"]) == (0, False)
+    assert (uploads.root / f"{empty['upload']}.bin").read_bytes() == b""
+    assert uploads.peek_many([empty["upload"]], caller="api")[0]["bytes"] == 0
+    sources = uploads.claim_many([empty["upload"]], caller="api")
+    sessions = _sessions(tmp_path)
+    try:
+        result = copy_sources(sources, sessions / "stage", LIMITS)
+    finally:
+        uploads.settle(sources, used=True)
+    assert (sessions / "stage" / ".gitkeep").read_bytes() == b""
+    assert (result["files"], result["bytes"]) == (1, 0) and _names(uploads.root) == []
 
 
 async def test_a_refused_upload_name_reads_nothing(tmp_path):

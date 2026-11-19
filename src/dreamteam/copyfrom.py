@@ -1212,9 +1212,9 @@ class Uploads:
         header, checked before reading). Returns {"upload": token, "filename", "bytes", "expires_in"}; CopyError
         413 (too large), 429 `too_many_uploads` (`max_pending` uploads wait), 400 (empty, not a zip). Whatever
         goes wrong (an exception from `chunks` too, which goes on to the caller), the partial file is removed.
-        `kind="file"` (the HTTP API v1, docs/SPEC.md §21.3): any file, kept as <token>.bin under the name
-        `filename`, which check_upload_name refuses (400 `bad_name`, before anything is read) rather than cleans
-        up; a zip only with `unpack` (unpacked by the create); its json records `unpack` and `caller` (who
+        `kind="file"` (the HTTP API v1, docs/SPEC.md §21.3): any file, an empty one too, kept as <token>.bin under
+        the name `filename`, which check_upload_name refuses (400 `bad_name`, before anything is read) rather than
+        cleans up; a zip only with `unpack` (unpacked by the create; empty, 400); its json records `unpack` and `caller` (who
         uploaded it: UPLOAD_CALLERS). Returns {"upload", "filename", "bytes", "unpack", "expires_in"}. `unpack`
         is a bool (the route parses the query's text strictly), else ValueError."""
         if kind not in ("zip", "file"):
@@ -1259,7 +1259,7 @@ class Uploads:
             if buf:
                 await asyncio.to_thread(f.write, bytes(buf))
             await asyncio.to_thread(f.close)
-            if total == 0:
+            if total == 0 and (kind == "zip" or unpack):   # (a plain v1 file may be empty: an empty CSV, a .gitkeep)
                 raise CopyError("The upload is empty.")
             if kind == "zip" or unpack:
                 if not await asyncio.to_thread(zipfile.is_zipfile, part):

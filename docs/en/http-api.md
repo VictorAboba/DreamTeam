@@ -183,14 +183,15 @@ create copies in), `files_per_session` (20), `uploads_pending`, `max_running` an
 
 ## Uploads
 
-`POST /api/v1/uploads?filename=<name>` stores the body as one file (any file: a PDF, a CSV, a zip) and answers its
-token. The token goes into `files` of a create, which puts the file into the session's folder under that name before
-the first start.
+`POST /api/v1/uploads?filename=<name>` stores the body as one file (any file: a PDF, a CSV, a zip, an empty file too)
+and answers its token. The token goes into `files` of a create, which puts the file into the session's folder under
+that name before the first start.
 
-- `unpack=true` takes a zip and unpacks it into the session's folder instead, by the rules of
-  [a copy of files](projects.md#working-on-a-copy-of-files): a zip of one folder gives that folder's files; `.git`,
-  `node_modules`, `.venv`, `venv`, `__pycache__`, links and, at the top, the session's own names (`.scratch`,
-  `.gitignore`, `.dreamteam`, `mcp`) are left out. Without it a zip is one file like any other.
+- `unpack=true` takes a zip (400 `bad_request` for anything else, an empty body included) and unpacks it into the
+  session's folder instead, by the rules of [a copy of files](projects.md#working-on-a-copy-of-files): a zip of one
+  folder gives that folder's files; `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`, links and, at the top,
+  the session's own names (`.scratch`, `.gitignore`, `.dreamteam`, `mcp`) are left out. Without it a zip is one file
+  like any other.
 - The name is refused (400 `bad_name`), never cleaned up, when it is empty, `.` or `..`; holds `/`, `\`, `:`, a NUL or
   another character that does not print (controls, bidirectional overrides, zero-width characters, private use, the
   line and paragraph separators); is longer than 200 characters, 255 bytes of UTF-8 or 255 UTF-16 units; is a name
