@@ -1014,6 +1014,8 @@ class ZipRules:
     exclude_names: frozenset[str] = frozenset()   # casefolded: a member with such a path part is left out
     # paths with '/' (exact, relative to what is unpacked: after unwrap): a member at or below one is left out
     exclude_paths: frozenset[str] = frozenset()
+    # casefolded names left out at the top level of what is unpacked (after unwrap), listed like exclude_paths
+    exclude_top: frozenset[str] = frozenset()
     links: str = "refuse"                # "skip": a link member is left out and listed
     portable: bool = True                # the Windows name rules (_portable) on every OS
     fold_collisions: bool = True         # names that differ only in case / Unicode form collide (False: exact)
@@ -1099,17 +1101,20 @@ def _zip_directory(f: BinaryIO) -> tuple[int, int] | None:
         return None
 
 
-def unpack_zip(source: bytes | str | os.PathLike, dest: Path, rules: ZipRules, *,
+def unpack_zip(source: bytes | str | os.PathLike | BinaryIO, dest: Path, rules: ZipRules, *,
                check: Callable[[], None] | None = None) -> ZipResult:
-    """Unpack a zip (its bytes, or the path of a zip file, streamed from the file) into the fresh folder `dest`
-    with every member checked as `rules` say: no absolute paths, '..', drive letters, duplicates or collisions,
-    encrypted members; links refused or left out; sizes streamed against `max_bytes`. A directory pre-check reads
+    """Unpack a zip (its bytes, the path of a zip file, or a seekable binary file the caller opened and closes; a
+    file is streamed from) into the fresh folder `dest` with every member checked as `rules` say: no absolute
+    paths, '..', drive letters, duplicates or collisions, encrypted members; links refused or left out; sizes
+    streamed against `max_bytes`. A directory pre-check reads
     the entry count and the directory size from the end record before zipfile parses the directory. `check()` is
     called before each member is written and after each chunk; what it raises stops the unpack (the partial files
     stay: the caller removes `dest`). SkillError with `.status` for a refusal."""
     with contextlib.ExitStack() as stack:
         if isinstance(source, (bytes, bytearray, memoryview)):
             f: BinaryIO = io.BytesIO(source)
+        elif hasattr(source, "read"):   # (opened by the caller: copyfrom reads an upload without following links)
+            f = source
         else:
             try:
                 f = stack.enter_context(open(source, "rb"))
@@ -1255,10 +1260,13 @@ def _unpack(archive: zipfile.ZipFile, dest: Path, rules: ZipRules, check: Callab
                 and all(p[1][0] in names for p in tops) and not left_tops - names:
             result.top = printable_name(rest[0][1][0])
             planned = [(info, parts[1:], is_dir) for info, parts, is_dir in rest]
-    if rules.exclude_paths:
+    if rules.exclude_paths or rules.exclude_top:
         kept = []
         for info, parts, is_dir in planned:
-            hit = next((i for i in range(len(parts)) if "/".join(parts[:i + 1]) in rules.exclude_paths), None)
+            if _fold(parts[0]) in rules.exclude_top:
+                hit: int | None = 0
+            else:
+                hit = next((i for i in range(len(parts)) if "/".join(parts[:i + 1]) in rules.exclude_paths), None)
             if hit is None:
                 kept.append((info, parts, is_dir))
                 continue

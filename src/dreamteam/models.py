@@ -13,6 +13,10 @@ ALL = "all"
 # a `dreamteam -p` client with automatic replies sends it ("1") on every request and WebSocket handshake: the session
 # then neither asks the user first nor pauses for a member's question (the auto-reply lease, Swarm.auto_reply_seen)
 AUTO_REPLY_HEADER = "X-DreamTeam-Auto-Reply"
+# session.json "via", and the summary's, of a session created through the HTTP API v1 (docs/SPEC.md §21.4): the hub
+# writes it (sessions.py), and the clients read it (`-c` passes over such a session, `-p` leaves an `answers: "auto"`
+# one to the hub's own answers, the sessions page marks it)
+API_VIA = "api"
 
 
 class ToolError(Exception):

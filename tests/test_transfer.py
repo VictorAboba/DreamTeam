@@ -598,7 +598,7 @@ async def test_the_placeholder_key_of_lm_studio_is_no_secret(tmp_path):
     await manager.shutdown()
 
 
-@pytest.mark.parametrize("kind", ["env", "hub", "hub_file", "headers", "install_env", "pass_env", "key_env",
+@pytest.mark.parametrize("kind", ["env", "hub", "hub_file", "api", "headers", "install_env", "pass_env", "key_env",
                                   "session_env"])
 async def test_secrets_of_the_environment_fail_the_export(tmp_path, monkeypatch, kind):
     value = f"value-of-{kind}-0123456789"
@@ -607,6 +607,10 @@ async def test_secrets_of_the_environment_fail_the_export(tmp_path, monkeypatch,
         monkeypatch.setenv("DT_SERVICE_TOKEN", value)
     elif kind == "hub":
         monkeypatch.setenv(hubauth.TOKEN_ENV, value)
+    elif kind == "api":   # the external API's token, out of os.environ as main() takes it (no name pattern finds it)
+        monkeypatch.setenv(hubauth.API_TOKEN_ENV, value)
+        hubauth.take_env_token()
+        assert hubauth.API_TOKEN_ENV not in os.environ and hubauth.api_env_token() == value
     elif kind == "hub_file":
         _write(hubauth.tokens_dir() / "8800.json", json.dumps({"port": 8800, "token": value}))
     elif kind == "headers":
@@ -2610,6 +2614,28 @@ async def test_a_dropped_model_profile_leaves_a_reimport_unchanged(tmp_path, mon
     again = plan_import(manager, tmp_path / "usb")
     assert [i.action for i in again.items] == ["unchanged"] and again.exit_code == 0
     await manager.shutdown()
+
+
+async def test_a_runs_start_and_end_alone_leave_a_reimport_unchanged(tmp_path):
+    """A run's session.started / session.stopped are not work (as for last_activity, docs/SPEC.md §20.4, §21.6): a hub
+    restart, or a session opened and stopped, on either computer leaves a re-import unchanged; work does not."""
+    home_a, sid = await _one_session(tmp_path)
+    _fill_db(home_a, sid)
+    export_home(home_a, tmp_path / "x1", include=["sessions"])
+    home_b = _home_named(tmp_path, "b", _raw_b())
+    assert (await _import(home_b, tmp_path / "x1"))[2].ok
+    manager = _manager(home_b)
+    _event(home_b, sid, 9.0, "session.started")
+    _event(home_b, sid, 10.0, "session.stopped")
+    assert [i.action for i in plan_import(manager, tmp_path / "x1").items] == ["unchanged"]
+    _event(home_a, sid, 11.0, "session.started")
+    _event(home_a, sid, 12.0, "session.stopped")
+    export_home(home_a, tmp_path / "x2", include=["sessions"])
+    assert _manifest(tmp_path / "x2")["sessions"][0]["last_event"]["type"] == "message"
+    assert [i.action for i in plan_import(manager, tmp_path / "x2").items] == ["unchanged"]
+    _event(home_b, sid, 13.0)   # work here
+    item = _item(plan_import(manager, tmp_path / "x2").items, "sessions", sid)
+    assert item.action == "rewrite" and item.reason.startswith("this computer has newer work in it")
 
 
 async def test_an_export_without_the_workspace_folder_keeps_the_files_here(tmp_path, monkeypatch):

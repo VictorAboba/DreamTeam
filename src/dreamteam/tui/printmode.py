@@ -16,8 +16,13 @@ import sys
 import time
 from typing import Any, Callable, TextIO
 
+from ..autoreply import (
+    AUTO_REPLY, AUTO_REPLY_MAX, AUTO_REVIEW, hub_answers, reply_text, review_key, review_text, wants_reply,
+)
 from ..copyfrom import size_text
+from ..instruct import continue_step, without_api_sessions
 from ..models import USER
+from ..result import build_result
 from .client import Connection, HubError
 
 log = logging.getLogger(__name__)
@@ -28,19 +33,12 @@ LOST_LIMIT = 60.0        # seconds without the hub before giving up
 TICK = 0.5               # deadlines are checked at least this often
 EVENTS_PAGE = 2000       # /api/events page size when catching up after a (re)connect
 FINAL_STATE_TIMEOUT = 5.0
-AUTO_REPLY_MAX = 50      # a safety net against an endless question / auto-answer ping-pong (not approvals)
+# AUTO_REPLY, AUTO_REVIEW and AUTO_REPLY_MAX live in dreamteam.autoreply (shared with the hub); AUTO_REPLY_MAX is read
+# from this module's globals, so a test can patch printmode.AUTO_REPLY_MAX
 HEAL_AFTER = 2.0         # s after a failed auto-reply before the state is read again (doubling up to HEAL_MAX)
 HEAL_MAX = 30.0
 PROGRESS_SKIP = ("agent.status", "agent.usage", "agent.activity", "trace.")  # fallback feed: too noisy
 
-AUTO_REPLY = {
-    "ru": "Пользователь недоступен (неинтерактивный режим): прими решение сам и продолжай работу.",
-    "en": "The user is not available (non-interactive mode): decide yourself and continue.",
-}
-AUTO_REVIEW = {
-    "ru": "Принято автоматически: пользователь недоступен (неинтерактивный режим), задачу никто не проверял.",
-    "en": "Approved automatically: the user is not available (non-interactive mode); nobody reviewed the task.",
-}
 TEXTS = {
     "ru": {
         "timeout": "Время ожидания истекло ({seconds:g} с): цель не достигнута.",
@@ -50,6 +48,8 @@ TEXTS = {
         "stopped": "Сессия остановлена.",
         "interrupted": "Прервано.",
         "no_sessions": "Нет сессий, которые можно продолжить.",
+        "no_sessions_api": "Нет сессий, которые можно продолжить: сессию, созданную через HTTP API, -c не выбирает, "
+                           "её продолжают через -r <id>.",
         "continue_earlier": "Последняя сессия, {sid}, создана более ранней версией DreamTeam, и эта версия "
                             "({version}) не может её открыть. Начните новую сессию: запустите без -c.",
         "unknown_session": "Неизвестная сессия «{sid}».",
@@ -66,6 +66,8 @@ TEXTS = {
                  "рой может ждать вас (и этот запуск тоже ждёт).",
         "asked_timeout": "{name} спрашивает вас (сообщение #{id}): ответьте на доске ({url}) или в dreamteam tui. До "
                          "тех пор рой может ждать вас (а этот запуск закончится по --timeout).",
+        "hub_answers": "Эта сессия создана через HTTP API с answers = \"auto\": на вопросы и ревью агентов за вас "
+                       "отвечает сам хаб, этот запуск автоответов не шлёт.",
     },
     "en": {
         "timeout": "Timed out after {seconds:g} s: the goal is not achieved.",
@@ -75,6 +77,8 @@ TEXTS = {
         "stopped": "The session was stopped.",
         "interrupted": "Interrupted.",
         "no_sessions": "There is no session to continue.",
+        "no_sessions_api": "There is no session to continue: -c never picks a session created through the HTTP API; "
+                           "continue one with -r <id>.",
         "continue_earlier": "The most recent session, {sid}, was made by an earlier version of DreamTeam and cannot be "
                             "opened by this one ({version}). Start a new session: run without -c.",
         "unknown_session": "Unknown session '{sid}'.",
@@ -91,6 +95,8 @@ TEXTS = {
                  "swarm may wait for you (and this run waits too).",
         "asked_timeout": "{name} asks you (message #{id}): answer on the board ({url}) or in dreamteam tui. Until "
                          "then the swarm may wait for you (and this run ends at --timeout).",
+        "hub_answers": "This session was created through the HTTP API with answers \"auto\": the hub itself answers "
+                       "the agents' questions and reviews in your place, so this run sends no automatic replies.",
     },
 }
 
@@ -224,16 +230,6 @@ class _Progress:
             return []
 
 
-def _coordinator(state: dict) -> str | None:
-    """Who gets the prompt in an existing session: the planning task's assignee, else the first LLM agent."""
-    agents = [a for a in state.get("agents") or [] if a.get("status") != "retired"]
-    names = {a.get("name") for a in agents}
-    for task in state.get("tasks") or []:
-        if "planning" in (task.get("tags") or []) and task.get("assignee") in names:
-            return task["assignee"]
-    return next((a["name"] for a in agents if a.get("kind") == "llm"), None)
-
-
 class _PrintRun:
     def __init__(self, conn: Connection, prompt: str, *, session: str | None, continue_last: bool,
                  title: str | None, overrides: dict | None, output_format: str, verbose: bool,
@@ -260,6 +256,9 @@ class _PrintRun:
         # then never pauses for a member's question and plans as usual; run_print gives the client its old value back
         self._header_before = getattr(self.client, "auto_reply", False)
         self.client.auto_reply = auto_reply
+        # the session is one the hub answers for itself (autoreply.hub_answers: the HTTP API's `answers: "auto"`): this
+        # run then sends no reply or approval of its own, and announces no question (the hub answers it)
+        self.hub_replies = False
         self.replied_to: set[int] = set()     # questions (message ids) answered by this run
         self._heal_at: float | None = None    # an auto-reply failed: when the state is read again (heal)
         self._heal_delay = HEAL_AFTER
@@ -357,11 +356,13 @@ class _PrintRun:
                 hub = await client.hub_info()
                 raise _Finished("error", earlier_version_text(str(summary["id"]), hub.get("home"), hub.get("version")))
         else:
-            # -c: the most recent session; one made by an earlier version is never opened, and never passed over for
-            # an older one the user did not ask for (docs/SPEC.md §17.2): nothing created
-            if not sessions:
-                raise _Finished("error", _text(self.text_lang, "no_sessions"))
-            summary = max(sessions, key=lambda s: s.get("last_activity") or s.get("created_at") or 0)
+            # -c: the most recent session, never one created through the HTTP API (instruct.without_api_sessions,
+            # docs/SPEC.md §21.4); one made by an earlier version is never opened, and never passed over for an older
+            # one the user did not ask for (docs/SPEC.md §17.2): nothing created
+            mine = without_api_sessions(sessions)
+            if not mine:   # (with sessions of the API only, it says how to reach one)
+                raise _Finished("error", _text(self.text_lang, "no_sessions_api" if sessions else "no_sessions"))
+            summary = max(mine, key=lambda s: s.get("last_activity") or s.get("created_at") or 0)
             if summary.get("earlier_version"):
                 from .. import __version__
 
@@ -374,13 +375,17 @@ class _PrintRun:
         self.started_session(summary["id"])
         self.lang = summary.get("language") or self.lang
         self.clarify = bool(summary.get("clarify"))
+        self.hub_replies = hub_answers(summary)   # (`answers` is set at the create: it never changes)
         self.progress(_text(self.text_lang, "session", sid=summary["id"], title=summary.get("title", "")))
+        if self.hub_replies:
+            self.progress(_text(self.text_lang, "hub_answers"))
         await self.attach(summary["id"])
 
     async def attach(self, sid: str | None) -> None:
         """An existing session: the prompt becomes the goal when there is none, reopens a completed goal,
         else goes to the coordinator as a message (to the asker when the swarm waits for the user's answer to a
-        member's question: the prompt is the answer). Only what happens from now on is followed."""
+        member's question: the prompt is the answer); the decision is instruct.continue_step's. Only what happens
+        from now on is followed."""
         client = self.client
         self.sid = sid
         latest = await client.events(sid, limit=1)
@@ -391,25 +396,21 @@ class _PrintRun:
         self.lang = swarm.get("language") or self.lang
         if isinstance(swarm.get("clarify"), bool):
             self.clarify = swarm["clarify"]
-        question = swarm.get("question") if isinstance(swarm.get("question"), dict) else None
-        if question is not None and not (question.get("asker") and isinstance(question.get("message_id"), int)):
-            question = None
+        step = continue_step(state)
         for task in state.get("tasks") or []:  # reviews that were already waiting for the user
             if isinstance(task, dict):
                 await self.on_task(task)
-        goal = swarm.get("goal")
-        if not goal:
+        if step.action == "set_goal":
             ok, text = await client.act(sid, "set_goal", {"title": self.prompt})
-        elif goal.get("status") == "done":
+        elif step.action == "reopen_goal":
             ok, text = await client.act(sid, "swarm_control", {"reopen_goal_comment": self.prompt})
         else:
-            to = question["asker"] if question else (_coordinator(state) or "all")
-            ok, text = await client.act(sid, "send_message", {"to": [to], "text": self.prompt})
-            if ok and question:
-                self.replied_to.add(question["message_id"])
+            ok, text = await client.act(sid, "send_message", {"to": [step.to], "text": self.prompt})
+            if ok and step.answers_question is not None:
+                self.replied_to.add(step.answers_question)
         if not ok:
             raise _Finished("error", _text(self.text_lang, "error", error=text))
-        if swarm.get("paused") and swarm.get("pause_reason") not in ("budget", "question"):
+        if step.resume:
             # paused by the user: the new instruction is meant to be worked on (a budget pause ends the run; the
             # answer ends a question pause by itself, and a resume would drop the question)
             ok, text = await client.act(sid, "swarm_control", {"action": "resume"})
@@ -585,9 +586,9 @@ class _PrintRun:
         if not isinstance(mid, int) or mid in self.seen_messages:
             return
         self.seen_messages.add(mid)
-        sender = msg.get("sender")
-        if sender == USER or USER not in (msg.get("recipients") or []):
+        if not wants_reply(msg) or self.hub_replies:   # (the hub answers it: SessionAutoReply)
             return
+        sender = msg.get("sender")
         if not self.auto_reply:
             # a clarifying session: the planner asks before it plans (no pause), and nobody here answers
             if self.clarify and self.format != "stream-json" and mid not in self.asked_told:
@@ -609,8 +610,8 @@ class _PrintRun:
         reload), and an unanswered one would hold the run until --timeout. After a failed auto-reply only heal
         answers (`recheck`): it reads the state first, so an answer the hub took although its call failed is not
         sent twice. Without auto-replies, one stderr line says that the run waits (stream-json carries the
-        swarm.paused event itself)."""
-        if not asker or not isinstance(mid, int):
+        swarm.paused event itself). Nothing for a session the hub answers for itself (`hub_replies`)."""
+        if not asker or not isinstance(mid, int) or self.hub_replies:
             return
         if self.auto_reply:
             if mid in self.replied_to or (self._heal_at is not None and not recheck):
@@ -628,7 +629,7 @@ class _PrintRun:
         here, so a catch-up goes on with the next events, and it schedules heal."""
         try:
             ok, text = await self.client.act(self.sid, "send_message", {
-                "to": [to], "text": AUTO_REPLY.get(self.lang, AUTO_REPLY["en"]), "reply_to": mid})
+                "to": [to], "text": reply_text(self.lang), "reply_to": mid})
         except HubError as exc:
             ok, text = False, exc.message
         if ok:
@@ -653,15 +654,14 @@ class _PrintRun:
         """A task waiting for the user's review would block the run: with auto-replies on, approve it (the
         counterpart of AUTO_REPLY for questions; --no-auto-reply leaves it waiting). Approvals do not count
         against AUTO_REPLY_MAX: an approval settles the task (no ping-pong), and a one-agent run sends every
-        task, the planning task included, to the user."""
-        if task.get("status") != "review" or task.get("reviewer") != USER or not isinstance(task.get("id"), int):
-            return
-        key = (task["id"], task.get("updated_at"))
-        if key in self.auto_reviewed or not self.auto_reply:
+        task, the planning task included, to the user. Never for a session the hub answers for itself
+        (`hub_replies`): the hub approves it."""
+        key = review_key(task)
+        if key is None or key in self.auto_reviewed or not self.auto_reply or self.hub_replies:
             return
         self.auto_reviewed.add(key)
         ok, text = await self.client.act(self.sid, "task_review", {
-            "task_id": task["id"], "approve": True, "comment": AUTO_REVIEW.get(self.lang, AUTO_REVIEW["en"])})
+            "task_id": task["id"], "approve": True, "comment": review_text(self.lang)})
         if not ok:
             log.warning("auto-approval of task #%s failed: %s", task["id"], text)
 
@@ -678,21 +678,12 @@ class _PrintRun:
         if status == "done" and self.goal and (goal or {}).get("status") != "done":
             goal = self.goal  # the state may already be newer (e.g. reopened)
         summary = (goal or {}).get("summary", "") if status == "done" else ""
-        result: dict[str, Any] = {
-            "type": "result", "status": status, "session": self.sid, "goal": goal, "summary": summary,
-            "tasks": [{"id": t.get("id"), "title": t.get("title"), "status": t.get("status"),
-                       "assignee": t.get("assignee")} for t in (state or {}).get("tasks") or []],
-            "cost_usd": float(swarm.get("spent_usd") or 0.0),
-            "duration_s": round(time.monotonic() - self.started, 3),
-            "agents": [a.get("name") for a in (state or {}).get("agents") or [] if a.get("status") != "retired"],
-            # the agents' background jobs still running (e.g. a dev server after the goal): with an external hub
-            # they go on after this run, until the session stops
-            "jobs": [{"id": j.get("id"), "label": j.get("label"), "owner": j.get("owner"), "command": j.get("command"),
-                      "origin": j.get("origin")}
-                     for j in (state or {}).get("jobs") or [] if isinstance(j, dict) and j.get("status") == "running"],
-        }
-        if status != "done" and reason:
-            result["error"] = reason
+        # (the jobs still running: with an external hub they go on after this run, until the session stops)
+        result = build_result(status=status, session=self.sid, goal=goal, summary=summary,
+                              tasks=(state or {}).get("tasks") or [], agents=(state or {}).get("agents") or [],
+                              jobs=(state or {}).get("jobs") or [], cost_usd=float(swarm.get("spent_usd") or 0.0),
+                              duration_s=round(time.monotonic() - self.started, 3),
+                              error=reason if status != "done" and reason else None)
         if self.format == "text":
             if status == "done":
                 self.out.write((summary or (goal or {}).get("title") or "").rstrip() + "\n")

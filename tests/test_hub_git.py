@@ -952,6 +952,52 @@ def test_run_git_is_hardened_too(tmp_path):
     assert proc.returncode != 0 and b"not allowed" in proc.stderr
 
 
+@needs_git
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX enters a folder held by its descriptor; Windows holds paths")
+def test_in_a_folder_held_git_runs_and_reads_its_config_there_whatever_its_path_leads_to(tmp_path):
+    """hubgit.in_folder: while a folder is held, DreamTeam's git for its path starts in that folder through its
+    descriptor (below it for a path below it), and the guard scans that folder's config, never a scan kept for the
+    path: a link swapped in for the path is never crossed, and what git may run there is disarmed by the folder's own
+    config. init_repo with `held` makes the repository, its .gitignore and its commit in the folder held."""
+    exe = shutil.which("git")
+    env = hubgit.environment()
+    other = tmp_path / "other"   # where the path leads once a link is swapped in
+    other.mkdir()
+    git(other, "init", "-q")
+    folder = tmp_path / "job"
+    put(folder, "sub/x.txt", "x\n")
+    git(folder, "init", "-q")
+    git(folder, "config", "filter.held.clean", "evil")
+    assert _guard_pairs(hubgit.guard(exe, folder, env))["filter.held.clean"] == ""   # (scanned by path, kept)
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        folder.rename(tmp_path / "job.old")
+        os.symlink(other, folder, target_is_directory=True)
+        with hubgit.in_folder(folder, fd):
+            assert _guard_pairs(hubgit.guard(exe, folder, env))["filter.held.clean"] == ""
+            top = run_git(folder, "rev-parse", "--show-toplevel").stdout.decode().strip()
+            assert os.path.samefile(top, tmp_path / "job.old")
+            below = hubgit.run([exe, "rev-parse", "--show-prefix"], cwd=folder / "sub", env=env, timeout=60)
+            assert below.stdout.decode().strip() == "sub/"
+            assert hubgit.lexists(folder / "sub" / "x.txt") and not hubgit.lexists(folder / "nothing")
+        assert "filter.held.clean" not in _guard_pairs(hubgit.guard(exe, folder, env))   # (by path: other's)
+        assert os.path.samefile(run_git(folder, "rev-parse", "--show-toplevel").stdout.decode().strip(), other)
+    finally:
+        os.close(fd)
+    fresh = tmp_path / "fresh"
+    put(fresh, "a.txt", "a\n")
+    fd = os.open(fresh, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fresh.rename(tmp_path / "fresh.old")
+        os.symlink(other, fresh, target_is_directory=True)
+        assert init_repo(fresh, held=fd) is None
+    finally:
+        os.close(fd)
+    assert sorted(os.listdir(tmp_path / "fresh.old")) == [".git", ".gitignore", "a.txt"]
+    assert git(tmp_path / "fresh.old", "ls-files").split() == [".gitignore", "a.txt"]
+    assert sorted(os.listdir(other)) == [".git"] and git(other, "rev-list", "--all").strip() == ""
+
+
 # ---- defense in depth: the isolation of sessions without network --------------------------------------------------
 def test_dreamteams_git_runs_isolated_only_with_network_off_and_a_real_isolation(tmp_path, monkeypatch):
     from conftest import FakeSwarm

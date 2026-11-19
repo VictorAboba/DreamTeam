@@ -33,6 +33,7 @@ from dreamteam import swarm as swarm_module
 from dreamteam.config import _MIN_ONE, Config, ShellSettings, WorkspaceSettings
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentStatus, Status
+from dreamteam.sessions import STOP_REASONS as SESSION_STOP_REASONS
 from dreamteam.swarm import Swarm
 from helpers.stacks import EXPECTED_CARDS, STACK_TASKS
 
@@ -103,7 +104,8 @@ def test_i18n_covers_every_value_the_backend_emits():
                 | {f"mcp_{s}" for s in mcp_statuses} | {f"origin_{o}" for o in origins}
                 | {f"scope_{s}" for s in mcp_forge.SCOPES} | {f"op_{o}" for o in ops} | {f"f_{f}" for f in task_fields}
                 | {f"p{p}" for p in range(4)} | {f"job_origin_{o}" for o in job_origins}
-                | {f"job_stopped_{r}" for r in stop_reasons})
+                | {f"job_stopped_{r}" for r in stop_reasons}
+                | {f"ev_session_stopped_{r}" for r in SESSION_STOP_REASONS})   # session.stopped {reason}
     missing = sorted(expected - keys)
     assert not missing, missing
 
@@ -1372,6 +1374,30 @@ def test_feed_requests_only_feed_events_and_describes_changes():
 
 
 @needs_node
+def test_feed_shows_a_runs_start_and_end():
+    """session.started / session.stopped {reason, error?} (docs/SPEC.md §9, §21.6): loaded with the feed, worded per
+    reason, escaped and never linkified (a failed start's error is DreamTeam's text)."""
+    out = run_js(r"""
+      const ev = (type, data) => ({ id: 9, ts: 1760000000, type, actor: null, data });
+      app.S.lang = "en";
+      out.feed = app.FEED_TYPES;
+      out.en = [app.describeEvent(ev("session.started", {})),
+                app.describeEvent(ev("session.stopped", { reason: "budget" })),
+                app.describeEvent(ev("session.stopped", { reason: "user" })),
+                app.describeEvent(ev("session.stopped", { reason: "later" })),
+                app.describeEvent(ev("session.stopped", {}))];
+      out.failed = app.feedLine(ev("session.stopped", { reason: "failed", error: "RuntimeError: <b>#3</b>" }));
+      app.S.lang = "ru";
+      out.ru = app.describeEvent(ev("session.stopped", { reason: "done" }));
+    """)
+    assert "session.*" in out["feed"]
+    assert out["en"] == ["session started", "session stopped: the budget is spent", "session stopped by you",
+                         "session stopped (later)", "session stopped"]
+    assert "session did not start: RuntimeError: &lt;b&gt;#3&lt;/b&gt;" in out["failed"] and "<a" not in out["failed"]
+    assert out["ru"] == "сессия остановлена: цель достигнута"
+
+
+@needs_node
 def test_held_trigger_fires_in_the_triggers_tab_and_the_feed():
     """A repeating trigger whose notice waits for [agents] trigger_wake_seconds (docs/SPEC.md §8): the Triggers tab
     says how many fires are held and until when, the feed line of such a fire says so too."""
@@ -2541,6 +2567,48 @@ def test_home_card_shows_a_question():
     assert '<span class="badge plain">Stopped</span>' in out["stopped"] and "your answer" not in out["stopped"]
     assert_escaped(out["evil"], at_least=1)
     assert 'title="Anna Smith ждёт вашего ответа на вопрос #12">Ждёт вашего ответа</span>' in out["ru"]
+
+
+def test_the_api_badge_is_translated():
+    """The sessions page's «API» badge of a session created through the HTTP API (docs/SPEC.md §18.4): its label and
+    both tooltips exist in ru and en, and the card uses all three."""
+    blocks = home_i18n()
+    keys = {"api_badge", "api_hint_auto", "api_hint_manual"}
+    assert keys <= blocks["ru"] and keys <= blocks["en"]
+    assert keys <= used_keys(HOME_JS)
+
+
+@needs_node
+def test_home_card_marks_a_session_of_the_http_api():
+    """A session created through the HTTP API v1 (summary `via` "api"): a plain «API» badge after the others, its
+    tooltip by `answers` (the hub answers, or the API client does), in the page's language; none for another session,
+    whatever its `answers`."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      const base = { id: "s1", title: "S", status: "running", network: "off", tasks: { total: 0, done: 0 },
+                     agents: { total: 0, working: 0 } };
+      const card = (extra) => home.sessionCard(Object.assign({}, base, extra));
+      for (const lang of ["en", "ru"]) {
+        home.H.lang = lang;
+        out[lang] = { auto: card({ via: "api", answers: "auto" }), manual: card({ via: "api", answers: "manual" }),
+                      plain: card({}), other: card({ via: "home", answers: "auto" }),
+                      hintAuto: home.esc(home.t("api_hint_auto")), hintManual: home.esc(home.t("api_hint_manual")),
+                      label: home.t("api_badge") };
+      }
+    """)
+    for lang in ("en", "ru"):
+        cards = out[lang]
+        assert cards["label"] == "API" and cards["hintAuto"] != cards["hintManual"]
+        auto = f'<span class="badge plain" title="{cards["hintAuto"]}">API</span>'
+        manual = f'<span class="badge plain" title="{cards["hintManual"]}">API</span>'
+        assert auto in cards["auto"] and manual not in cards["auto"]
+        assert manual in cards["manual"] and auto not in cards["manual"]
+        # after the status and «no internet» badges, in the card's head
+        head = cards["auto"].split('<div class="sc-head">', 1)[1].split("</div>", 1)[0]
+        assert head.index(auto) > head.index("badge warn") > 0
+        assert ">API</span>" not in cards["plain"] and ">API</span>" not in cards["other"]
+    assert "hub itself answers" in out["en"]["hintAuto"] and "API client answers" in out["en"]["hintManual"]
+    assert "dreamteam -c" in out["en"]["hintAuto"] and "dreamteam -c" in out["ru"]["hintManual"]
 
 
 @needs_node
@@ -4910,7 +4978,8 @@ def test_ui_sources_carry_no_mojibake():
     # regression: a "→" saved through the CP1251 codepage came back as "в†’" in app.js
     marks = ("в†", "вЂ", "Ð°", "Ñ€")
     paths = [*STATIC.glob("*.js"), *STATIC.glob("*.html"), *STATIC.glob("*.css"),
-             *(STATIC.parent / "tui").glob("*.py"), STATIC.parent / "prompts.py"]
+             *(STATIC.parent / "tui").glob("*.py"), STATIC.parent / "prompts.py",
+             *(STATIC.parent / name for name in ("uitext.py", "symbols.py", "eventtext.py"))]  # the feed's texts
     found = [(p.name, m) for p in paths for m in marks if m in p.read_text(encoding="utf-8")]
     assert not found
 

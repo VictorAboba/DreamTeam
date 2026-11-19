@@ -31,7 +31,7 @@ src/dreamteam/
   config.py      Config / ModelProfile / templates                  (exists)
   db.py          Database (sqlite)                                   (exists)
   models.py      USER, ALL, ToolError, Status, Task, AgentKind...    (exists)
-  events.py      EventBus                                            (exists)
+  events.py      EventBus; read_page: a page of the journal by id (§21.6)  (exists)
   names.py       generate_name                                       (exists)
   prompts.py     system_prompt(), t(), PLANNING_TASK, DEFAULT_ROLE   (exists)
   roles.py       role catalog: presets, [[roles]] overlay, resolution, starting team, saved teams (§17.3); imports
@@ -80,18 +80,33 @@ src/dreamteam/
   settings.py    global settings of a home: read/write/validate, public view, updates, endpoint checks (§17.1)
   sessions.py    SessionManager — the sessions of a home (§17.2)
   copyfrom.py    a folder or a zip copied into a new session before its first start, and the uploaded zips
-                 (§17.2 "Copying files into a new session"); never imports sessions.py
+                 (§17.2 "Copying files into a new session"); v1's uploads, name and path rules (§21.3, §21.8);
+                 never imports sessions.py
   transfer.py    `dreamteam export` / `dreamteam import` of a home: the export folder, the secret check, the import
                  plan and its application (§20)
   treecopy.py    copy or measure a folder tree byte for byte, with a digest that is the same on every OS (§20)
   mcp_library.py the shared MCP library on disk, usable without a Swarm: list, read, add atomically, remove (§20)
   launcher.py    launcher web app: sessions page, settings, /s/{sid}/ routing (§18.1)
   launcher_mcp.py  the launcher as one MCP server (§18.2)
+  api_v1.py      the external HTTP API under /api/v1: ApiV1(manager, host), its Starlette app, routes and aclose()
+                 (§21)
+  autoreply.py   the requests to the user (requests_of, read_requests, blocking_requests), the hub's automatic
+                 answers for a session created with answers "auto" (SessionAutoReply), and a session's journal
+                 followed by id (follow_journal, also for stop_when_done) (§21.4, §21.5)
+  eventtext.py   one plain line per event for people, outside the tui package (§21.6)
+  uitext.py      the feed's texts (ru/en), moved out of tui/i18n.py, which stays as a shim (§21.6)
+  symbols.py     the feed's symbols, moved out of tui/theme.py, which re-exports them (§21.6)
+  result.py      the result object of a run, shared by `dreamteam -p` and the API (§21.7)
+  instruct.py    what `dreamteam -p -r` and the API's continue do with a prompt: coordinator, continue_step; the
+                 sessions `-c` picks from: without_api_sessions (§21.2, §21.4)
+  sessionopts.py team, model and limits of a request -> session overrides, shared with the launcher MCP (§21.4)
+  apifolders.py  [api] folders: the roots, their checks, a request's folder (§21.10)
+  nofollow.py    open, list and walk inside a root without following links (§21.8)
   static/        index.html app.js traces.js style.css traces.css (board), home.html home.js home.css (launcher),
                  markdown.js and icons.css (both); no build step
   console.py     terminal chat client (talks to the REST API)
   tui/           terminal UI client (docs/TUI.md)
-  docker.py      sandbox: build & run DreamTeam in Docker
+  docker.py      sandbox: build & run DreamTeam in Docker (for a home also its [api] folders roots, §21.10)
   cli.py         `dreamteam` command
 tests/  conftest.py (FakeSwarm fixture) + test_*.py
 ```
@@ -361,6 +376,9 @@ class Swarm:
         # `_considering` start (`_nudge_idle`'s decision window; an offer made during the pause counts from the resume)
     def pending_question(self) -> dict | None            # {asker, message_id, since} of the question holding the
                                                          # pause (kv `paused` with reason "question"), else None
+    def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None
+        # the newest message of `sender` that reached `recipient` (its inbox row: named or through "all"), sent at
+        # `since` (a timestamp) or later; None when none did (the public form of the `_LAST_TO` query, §21.5)
     def pause_text(self) -> str                          # "waiting for the user's answer to X's question #N" for a
                                                          # question, else the reason (swarm_status, traces)
     def ask_user(self, asker: str, message: dict) -> tuple[str, dict]
@@ -371,6 +389,7 @@ class Swarm:
         # the pause into a budget pause); never raises
     def asks_user(self, name: str, task: Task) -> bool   # the clarify planner waits for the user's answers (§3.1)
     clarifying: bool                                     # [swarm] clarify and no auto-reply lease (§3.1)
+    def hold_auto_reply(self) -> None                    # the lease for this object's whole life (§3.1, §21.5)
     wrapping_up: bool                                    # the user's wrap-up mode (kv "wrap_up" {"on", "by", "since"})
     def wrap_up(self, actor: str) -> bool
         # wrap-up mode on (False when it was on already): the team finishes with what it has. Emits `swarm.wrap_up`
@@ -534,9 +553,12 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
   the user after planning started from silencing the nags for ever; a comment on the task is no message and does
   not count. A question the user went on without is one that a `swarm.resumed` event, or the `swarm.paused` event of
   the budget pause it turned into, carries as `question` with outcome "dropped" (a manual resume, clarify switched
-  off; the `_DROPPED` query, on the events type index, runs only when the guard would hold otherwise): its asker was
-  told `n_question_unanswered` (take your defaults), so it waits for nothing, and the board's quiet `clarify_wait`
-  banner (§14.1) hides; its next message to the user turns the guard on again.
+  off; the `autoreply.QUESTION_DROPPED` query, on the events type index, runs only when the guard would hold
+  otherwise): its asker was told `n_question_unanswered` (take your defaults), so it waits for nothing, and the
+  board's quiet `clarify_wait` banner (§14.1) hides; its next message to the user turns the guard on again. The rule
+  past the tags is `autoreply.planner_question(scalar, name, task_id, since)` (the id of the question the planner
+  waits on, else None), which the requests to the user read from a session's file too (§21.5), so the guard, the
+  banner and the requests cannot drift apart.
 - **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm` (toolset revision 4,
   §6.1). The message is always stored first; then `ask_user(asker, message)` pauses only after these checks, in this
   order, each giving its outcome and result note (§12): `user` (the sender is the user), `no_user` ("user" is not a
@@ -585,10 +607,13 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
   the WebSocket handshake, only with automatic replies on. The Swarm keeps an in-memory lease:
   `auto_reply_stream()` (a context manager around an event WebSocket whose handshake carried the header),
   `auto_reply_seen()` (the launcher's `POST /api/sessions` and `/start` before `swarm.start()` and again right
-  before the pending `set_goal`; `POST /api/act/{tool}`), and `auto_reply_active`: a stream is open, or less than
-  `AUTO_REPLY_GRACE` (90 s, longer than print mode's 60 s without the hub) passed since the last sign (the clock is
-  the module's `_monotonic`). Nothing is persisted: a hub or session restart forgets it, a dead client's lease ends
-  90 s after its socket closed. Under the lease `clarifying` is false (the classic card) and `ask_user` gives `auto`
+  before the pending `set_goal`; `POST /api/act/{tool}`), `hold_auto_reply()` (the hub answers for the user itself:
+  a session of the HTTP API v1 with `answers: "auto"`, §21.5; `_start_locked` takes it before `swarm.start()` on
+  every start path, and it holds until the Swarm is unloaded) and `auto_reply_active`: held, a stream is open, or
+  less than `AUTO_REPLY_GRACE` (90 s, longer than print mode's 60 s without the hub) passed since the last sign (the
+  clock is the module's `_monotonic`). Nothing is persisted: a hub or session restart forgets it, a dead client's
+  lease ends 90 s after its socket closed. Under the lease `clarifying` is false (the classic card) and `ask_user`
+  gives `auto`
   ("the user is not available"). A gap in the lease (a hub restart, a session reload) can still give a short
   question pause, which print mode answers at once (an answer that failed is sent again after a state read that
   still shows the pause, never twice for one question: docs/TUI.md §2).
@@ -1594,7 +1619,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   (`render.board_summary`) count tasks, directions included (the TUI's `/sessions` picker, a plain `id · status ·
   goal` hint per session, and its status line show no task count). A change of `crew` in the task history and the feed (web `changesText`, TUI history
   and change lines) is labelled by `f_crew` (ru «групповая задача (участников)», en "crew"; the value 0 reads
-  «обычная задача» / "ordinary task"), in app.js and tui/i18n.py.
+  «обычная задача» / "ordinary task"), in app.js and uitext.py (tui/i18n.py is its shim, §21.6).
 - **Docs** (en and ru alike): README.md / README.ru.md (a "Crew tasks" bullet), docs/en|ru/features.md (a row of
   its own, and subtasks in the "Task board", terminal and live board rows), agent-tools.md (`crew`, `directions`,
   `task_get`, `board`), configuration.md (the `crew_review` line of the `[swarm]` block and a "Reviews" / «Ревью»
@@ -1667,6 +1692,12 @@ class Mailbox:
     def conversation(self, a: str, b: str, limit: int = 200, since_id: int = 0) -> list[dict]
         # messages where (sender a and b in recipients) or (sender b and a in recipients), ascending
     def recent(self, limit: int = 100, since_id: int = 0) -> list[dict]
+    def user_conversation(self, after: int = 0, limit: int = 200) -> list[dict]
+        # the user's conversation with the members (HTTP API v1, §21.5 "Messages"): messages the user sent or that
+        # reached the user, id > after, ascending; after 0 is the OLDEST page (conversation/recent give the latest).
+        # Dicts {"id","ts","sender","recipients","text","reply_to"} (no to_all: the columns every version has)
+def read_user_conversation(db_path, after: int = 0, limit: int = 200) -> list[dict]
+    # the same from a session's database file (db.reading_file, nothing written next to it); [] without one
 # message dict: {"id","ts","sender","recipients":[...],"text","reply_to","to_all"}
 # to_all: sent to "all" (column messages.to_all; Database adds it to a file of an older version: db.ADDED_COLUMNS)
 ```
@@ -1870,7 +1901,12 @@ class Workspace:
     def __init__(self, swarm): ...
     async def init(self) -> None                 # mkdir; ensure_scratch() (with or without git); if git
                                                  # enabled+available: init repo, .gitignore, initial commit
-                                                 # (Swarm.start decides git_isolated before: _prepare_offline)
+                                                 # (Swarm.start decides git_isolated before: _prepare_offline);
+                                                 # with record_head, then (still under the git lock) HEAD into
+                                                 # head_at_init: `rev-parse --verify --quiet HEAD^{commit}` of
+                                                 # the folder's own .git, else None (§21.4 `base_commit`)
+    record_head: bool                            # set by SessionManager._start_locked for a v1 session's first
+    head_at_init: str | None                     # start; None with git off, without git, no commit or no .git
     git_isolated: bool                           # DreamTeam's git here may run isolated ("Defense in depth")
     def hold_git(self) -> None                   # the network went off: _git() waits (counted holds) until
     def release_git(self) -> None                # Swarm._network_changed's _prepare_offline has decided
@@ -2108,7 +2144,7 @@ three independent layers:
 | new session folder (`init_repo` by DreamTeam) | created at `init()` | DreamTeam's, with `.scratch/` | `_configure_repo` |
 | workspace created before `.scratch/` existed | created at the next `init()` | unchanged (the marker covers it) | `_configure_repo`, as before |
 | adopted repository of the user | created at `init()` (untracked, self-ignored: `git status` stays clean, so a later adopt or start check does not see it) | never touched | never touched |
-| adopted folder without a repository | created at `init()` | written by `init_repo` only when missing | never touched |
+| adopted folder without a repository | created at `init()` | written by `init_repo` only when missing | filemode only |
 | `workspace.git = false` or no git | created (harmless) | none | none |
 
 Edge cases: `.scratch/` is never emptied by DreamTeam (the user can inspect it); a move with `/cd` carries it
@@ -2133,7 +2169,8 @@ another folder (§17.2 "Workspace folder"). Then:
 - `init()` never creates a missing root (FileNotFoundError): a folder outside the session (the user's project,
   an unplugged drive, a host path inside the Docker sandbox) is not replaced by an empty stand-in.
 - `adopted` (= `config.workspace_adopted`, the folder was the user's): `init()` never writes the repo-local
-  settings, not even into a repository it initialized there. Every git call of the workspace passes its identity
+  settings, not even into a repository it initialized there (`init_repo` itself sets only `core.filemode=false`, and
+  only on a file system without POSIX bits, §17.2). Every git call of the workspace passes its identity
   and settings per command (`-c user.name=<actor> -c user.email=… -c core.autocrlf=false -c core.quotepath=false
   -c safe.directory=<root>`, after hubgit's fixed options, "DreamTeam's own git" below), so autocommits never need
   the repository's config. Outside an adopted folder, on Windows, `-c core.longpaths=true` is added too: Git for
@@ -2149,7 +2186,8 @@ another folder (§17.2 "Workspace folder"). Then:
 #### DreamTeam's own git (hubgit.py)
 Every git process DreamTeam starts in a folder the members can write is built by hubgit.py: the autocommits and path
 commits (`Workspace._git` → `_run_git`, in a thread) and `run_git` (`init_repo`, `repo_state`, `tracked`,
-`commit_paths`: `init()` and sessions.py's checks of a folder of the user). A member's shell reaches `.git`, so what
+`commit_paths`: `init()` and sessions.py's checks of a folder of the user; `changed_since`: the HTTP API v1's
+`changed_files`, §21.7). A member's shell reaches `.git`, so what
 the repository's config names for git to run is the members' to choose: hooks, `core.fsmonitor`, filter, textconv,
 diff and merge drivers with a matching `.gitattributes`, ssh, credential and askpass helpers, an included config
 file, config-based hooks (`hook.<name>.*`, git 2.54+), and the same in a submodule's own config (git runs a child
@@ -2247,6 +2285,13 @@ environment or network.
   with checked-out submodules a call after one that rewrote the index (`add`, `commit`, `status`) costs one
   `git ls-files -s` more.
   `hubgit.forget()` (tests).
+- **A folder held** (`hubgit.in_folder(root, fd)`, POSIX; the HTTP API v1's in-place git init, §21.10): while it is
+  open, every git command the thread runs in `root` or below it starts in the folder open as `fd`, or below it,
+  wherever the folder lies now (`preexec_fn`: `fchdir`, then `chdir` to the path below it, in the child before
+  `exec`; a child that cannot is an OSError), so a link swapped in for `root` is not crossed when git starts; the
+  guard scans that folder's config each time (never reused nor kept: the cache reads its files by path) and looks
+  for checked-out submodules through the descriptor (`hubgit.lexists`, also `workspace.nested_repo_paths`).
+  Windows: nothing changes (the folder held there cannot be renamed).
 - **Defense in depth**: a key a member's command adds while DreamTeam's git is starting is not seen in time, and under
   the "netns" isolation the members can write the user's global config. So in a session without network under
   "docker" or "netns" every git DreamTeam runs for it runs like the members' commands: `hubgit.run(...,
@@ -2305,16 +2350,30 @@ def git_argv(git, root, actor, args, safe_directory=None, *, adopted=False, lite
     # pathspec magic such as `:(exclude)` works (only the autocommit's fixed pathspecs use it; Workspace._git(...,
     # literal=) passes it on); guard: hubgit.Guard.args (a git older than 2.31)
 def run_git(root, *args, actor=None, git=None, safe_directory=None, timeout=GIT_TIMEOUT, adopted=False,
-            literal=True, unfiltered=False, offline=False) -> CompletedProcess   # hardened: hubgit.environment(),
+            literal=True, unfiltered=False, offline=False, env=None,
+            secret_names=()) -> CompletedProcess   # hardened: hubgit.environment(secret_names) plus `env`,
     # hubgit.guard() ("DreamTeam's own git"); unfiltered: the command stages, commits or checks pathspecs,
     # hubgit.run_unfiltered leaves out the files of a disarmed required filter (init_repo's add, commit_paths'
-    # commit, repo_state's status); offline: hubgit.run(offline=True), "Defense in depth"
+    # commit, repo_state's status, changed_since's diff and ls-files); offline: hubgit.run(offline=True), "Defense in
+    # depth"
+def changed_since(root, base, *, adopted=False, network_off=False, git=None, secret_names=()) -> list[dict]
+    # the HTTP API v1's `changed_files` (§21.7): [{"path", "change": added | modified | deleted}] of the working tree
+    # against commit `base`, sorted by path; untracked files count, ignored ones and .scratch/ do not; deleted and
+    # untracked is "modified". `git rev-parse --verify --quiet <base>^{commit}`, `git diff --name-status -z
+    # --no-renames --no-ext-diff --no-textconv --ignore-submodules=none <base> -- . ':(exclude).scratch'`, `git
+    # ls-files --others --exclude-standard -z`, through run_git with GIT_OPTIONAL_LOCKS=0 (never index.lock) and
+    # without the workspace's git lock. ValueError for a `base` that is not COMMIT_ID (40 or 64 lowercase hex: nothing
+    # else reaches git's command line, where "--output=x" would be an option), BaseCommitGone (a LookupError) when
+    # the repository opens and lacks it (rev-parse's exit 1), OSError when the folder has no `.git` or git fails, a
+    # repository git cannot open included (exit 128: never "gone"; its output logged, never in the text). Blocking;
+    # `Workspace.changed_since(base)` runs it in a thread for a loaded swarm
 def isolated_git(network_off, folder=None) -> bool     # network_off and netoff.isolation() in ("docker", "netns");
     # in the Docker sandbox `folder` (where that git writes) is opened to the offline user first. Synchronous
 def init_repo(root, git=None, *, adopted=False, offline=False) -> str | None   # git init + .gitignore if missing +
-    # initial commit of what is there (with the user's line endings when adopted); None = ok, else git's error text
+    # initial commit of what is there (with the user's line endings when adopted); None = ok, else git's error text;
+    # adopted, on a file system without POSIX bits (treecopy.without_posix_bits): core.filemode=false after git init
 def looks_like_git_dir(folder) -> bool                 # a repository database itself (HEAD + objects/ + refs/)
-def repo_state(root, git=None, exclude=(), *, offline=False) -> dict
+def repo_state(root, git=None, exclude=(), *, offline=False, line_endings=False) -> dict
     # what an existing folder is to git (the user's config applies, read-only, safe.directory=*): {"toplevel":
     # work tree root containing root | None, "git_dir": a bare repository or a .git folder, "branch": current branch | None (detached), "operation": "merge" | "rebase" |
     # "cherry-pick" | "revert" | "bisect" ... stopped halfway (GIT_OPERATIONS: MERGE_HEAD, CHERRY_PICK_HEAD,
@@ -2322,7 +2381,10 @@ def repo_state(root, git=None, exclude=(), *, offline=False) -> dict
     # `git status --porcelain --untracked-files=normal --ignore-submodules=none` lines (the user's
     # status.showUntrackedFiles or submodule settings cannot hide what `git add -A` would commit; `exclude`:
     # folders relative to root left out, e.g. the session's own `mcp/<name>`; so are the files of a disarmed
-    # required filter, as from DreamTeam's commits: git-crypt's after `git-crypt unlock`), "error": str | None}
+    # required filter, as from DreamTeam's commits: git-crypt's after `git-crypt unlock`), "line_endings": the
+    # "changes" lines that a status with `-c core.autocrlf=true` (GIT_OPTIONAL_LOCKS=0: it stores nothing in the
+    # index) no longer lists, only with line_endings=True (the adopt and start checks, §17.2), else [],
+    # "error": str | None}
 def tracked(root, paths, git=None, *, offline=False) -> list[str]   # which of `paths` hold files the repository tracks
 def commit_paths(root, paths, message, git=None, *, offline=False) -> (commit | None, error | None)
     # commit only the current state of `paths` (e.g. their removal) as DreamTeam, other changes left as they are;
@@ -2371,7 +2433,8 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None, *,
     # names: those reach them through [skills] install_env, the server's `env` table or pass_env)
     # except config.shell.pass_env, and always minus _INTERNAL_ENV (DREAMTEAM_SKILLS_DIR, DREAMTEAM_HOST_SKILLS_DIR,
     # DREAMTEAM_SKILL_ENVS_DIR: agents' commands are never pointed at the skills library or the skills'
-    # environments, even through pass_env; the offline markers; DREAMTEAM_HUB_TOKEN(_SHA256), §14.2); plus
+    # environments, even through pass_env; the offline markers; DREAMTEAM_HUB_TOKEN(_SHA256), §14.2;
+    # DREAMTEAM_API_TOKEN(_SHA256), §21.1; DREAMTEAM_API_FOLDERS_DIR, §21.10 "Sandbox"); plus
     # PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
 def secret_free_env(names=()) -> dict[str, str]
     # os.environ minus _INTERNAL_ENV and the secrets whatever pass_env says (the known names, `names`, each
@@ -2990,7 +3053,15 @@ every fire (the flood guard limits those).
 goal.reopened agent.hired agent.retired agent.status agent.activity agent.compacted agent.usage
 file.changed file.locked file.unlocked trigger.created trigger.fired trigger.deleted
 mcp.created mcp.status swarm.paused swarm.resumed swarm.wrap_up swarm.limits job.started job.ended
-skill.attached skill.detached skill.proposed skill.library skill.deps`
+skill.attached skill.detached skill.proposed skill.library skill.deps session.started session.stopped`
+
+`session.started` {} and `session.stopped` {reason: `user` | `done` | `budget` | `shutdown` | `restart` | `failed`,
+error?}, actor None: the session manager journals them into the session's own journal when a run starts (right before
+the swarm starts, so the run's own start events follow it) and when it ends (after its agents stopped and before its
+database closes; a start that failed carries `error`, its absolute paths named by their last component). A start
+refused by the checks before the swarm starts journals nothing. Neither changes the session's `last_activity`
+(§17.2) or an import's comparison of histories (§20.4). The reasons and the rules are in §21.6; the web feed and the
+TUI's verbose feed show them as a line of their own.
 
 `skill.attached` {name, from, files, replaced: bool, via, attached_via} and `skill.detached` {name, via}, actor = the
 user (§19); `via` is the surface (`act`, `mcp`, `launcher-mcp`; `role` for the skills a role brings), `attached_via`
@@ -3158,8 +3229,10 @@ class MCPForge:
   `u_mcp_pending` show it; the dialog and the web card send the one they show, `/approve <name> <sha256>` in the
   console and the TUI takes it, and the TUI's `/approve <name>` alone sends the one of the last dialog shown for
   that server) refuses the approval when the record's digest does not start with it (the message shows the
-  current one): the owner created the server again meanwhile. The TUI closes an open dialog whose server is created again with another
-  digest and asks about the new code. A record of an older version has no digest: its first start tests the working
+  current one): the owner created the server again meanwhile. A rejection given with a `digest` (the HTTP API v1
+  sends one, §21.5) is refused the same way; one without (the dialog, the card) rejects whatever waits. The TUI
+  closes an open dialog whose server is created again with another digest and asks about the new code. A record of
+  an older version has no digest: its first start tests the working
   copy again (with `require_approval` it waits for approval once); an `approve` of such a pending record tests it,
   raises with a plain message (recorded by an older version, without a snapshot) and leaves it pending with its new
   digest.
@@ -3536,8 +3609,8 @@ one.
 
 `create_app(swarm, host, *, on_library_change=None) -> Starlette` is the app of ONE swarm: the whole server of `dreamteam run`, and the
 per-session app the launcher serves under `/s/{sid}/` (§18.1). All JSON (`httpjson.JSONResponse`; the
-WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json` (the one
-exception is the launcher's zip upload, `raw_posts`, §18.1). Guard
+WebSocket sends `httpjson.json_text`). POST /api/* bodies require `Content-Type: application/json` (the
+exceptions are the launcher's uploads, `raw_posts`: §18.1 and §21.3). Guard
 (`GuardMiddleware`, every bind, also 0.0.0.0 in Docker): Host must be localhost/127.0.0.1/[::1]; for
 non-loopback binds also the bind address, or an IP literal that is the address the connection reached (ASGI
 `server`; any IP literal only on a request with the hub token: a port mapping that rewrites the address); plus names
@@ -3547,6 +3620,20 @@ allowed name, WebSockets and `/mcp` too: never another port of a loopback name, 
 computer (for a request the hub token's cookie authorizes, same-origin also by scheme). Then the hub token
 (§14.2): with one, every peer needs it, the hub's own loopback too (401 / WebSocket closed 1008 before accept);
 without one, nothing is asked, and `serve` refuses a non-loopback bind.
+
+**The external API's branch** (`/api/v1`, §21.1). The launcher's guard is `GuardMiddleware(..., api=True)`, and its
+`raw_posts` maps a path to a set of content types (a plain string is one type). A request whose path `web.is_api_path`
+takes (`/api/v1` itself, or a path under `/api/v1/`; the launcher's dispatcher uses the same predicate) goes through a
+branch of its own: the Host check (a valid Bearer counts as the token there), the Origin check (`origin_allowed`,
+never the cookie's rule), then 403 `api_disabled` when the hub has neither an API token nor a hub token, 401
+`token_required` (with `WWW-Authenticate`) without a valid `Authorization: Bearer`, and the 415 rule, where a path
+`raw_posts` lists takes its own types alone, JSON refused too (`/api/v1/uploads` stores any body it takes, §21.3). Then
+`scope["dreamteam.api_caller"]` (`web.API_CALLER`) is `"owner"` for the hub token or `own_token()`, `"api"` for the
+API token (`hubauth.api_digest()`), and the request goes on. The cookie and `?token=` count for nothing on that branch
+(no 303). Its refusals are JSON `{"error", "code"}` (`forbidden_host`, `forbidden_origin`, `token_required`,
+`api_disabled`, `unsupported_media_type`); every other path keeps the plain texts above and never takes the API token.
+`web.create_app` (`dreamteam run`) has no such branch.
+
 `DREAMTEAM_PUBLIC_URL` is the base URL users reach the hub at (shown as the MCP URL and written to
 hub.json; `dreamteam sandbox` sets it). `serve(swarm, host, port, ..., on_started=)` sets
 `swarm.hub_url = public_base(host, port) + "/mcp"`, calls back once listening and shuts down gracefully when
@@ -3695,17 +3782,33 @@ reaches it as well. The token closes that.
   `_start_launcher` checks a free configured port before its launcher marker (`HubError(0, ...)`, which `dreamteam`
   and `dreamteam -p` print; a busy port keeps the fallback to an ephemeral port on 127.0.0.1); `dreamteam mcp`, whose
   web part is optional, logs serve()'s refusal and goes on over stdio. `serve` and `serve_launcher` check once more.
+- **The API token** (§21.1): a second token, `DREAMTEAM_API_TOKEN` or its SHA-256 in `DREAMTEAM_API_TOKEN_SHA256`
+  (`hubauth.api_digest()`), for `/api/v1` only. `take_env_token` moves both out of os.environ with the hub token's
+  names (`_api_taken`, `_api_taken_digest`; `api_env_token()` is the token), `shell._INTERNAL_ENV` drops both,
+  `docker.env_passthrough` never passes the host's, and `dreamteam sandbox` of a home passes the digest by name, as
+  `DIGEST_ENV`. A digest variable that is no SHA-256 asks for a token nobody has, with one warning per value (never
+  its value; `_api_digest_warned` counts a value only once the log has a handler, so a command's early check before
+  `setup_logging` does not keep it out of the log file). It is never one of `client_tokens()`, never a cookie or
+  `?token=`, and it opens no other path. A hub whose API token equals its hub token does not start
+  (`check_hub_token` raises `NoTokenError`, `dreamteam run` included; the TUI's `_start_launcher` tries no other
+  port after it, and `dreamteam mcp` logs it and goes on over stdio as above); a launcher with an API token and no
+  hub token logs `api_token_warning()` outside the image (§21.1).
 - **`dreamteam sandbox`** (`docker.run_sandbox`): refuses when a container `dreamteam-<port>` exists
   (`container_exists`); makes `new_token()` (`secrets.token_urlsafe(32)`) per container; `store_token(port, token,
-  mounted, also_mounted=[sandbox_host_library(config)])` writes `<tokens_dir>/<port>.json` `{"port","token","home"}`
+  mounted, also_mounted=[sandbox_host_library(config), <each mounted [api] folders root>])` (§21.10 "Sandbox") writes
+  `<tokens_dir>/<port>.json` `{"port","token","home"}`
   (mode 0600, folder 0700 on POSIX) unless the folder is inside any mounted directory (`_inside`: `os.path.normcase`,
   and `os.path.samefile` per ancestor for a case-insensitive file system Python does not know about; then None:
   nothing stored, the printed lines name `DREAMTEAM_HUB_TOKEN` instead); `tokens_dir()` is `DREAMTEAM_TOKENS_DIR` or
   `~/.dreamteam/hub-tokens`. `sandbox_command` passes `-e DREAMTEAM_HUB_TOKEN_SHA256` by name and
-  `subprocess.call(cmd, env={...without TOKEN_ENV/DIGEST_ENV, DIGEST_ENV: digest(token)})` gives the value (never on
-  a command line, never the token itself; `env_passthrough` never passes the host's own). `access_lines` prints the board URL with
+  `subprocess.call(cmd, env={...without docker.TOKEN_NAMES, DIGEST_ENV: digest(token)})` gives the value (never on
+  a command line, never the token itself; `env_passthrough` never passes the host's own); for a home with an API
+  token it also passes `-e DREAMTEAM_API_TOKEN_SHA256`, whose value `API_DIGEST_ENV: hubauth.api_digest()` joins
+  that env (§21.1). `access_lines` prints the board URL with
   `?token=`, the MCP URL and `claude mcp add --transport http dreamteam <base>/mcp --header "Authorization: Bearer
-  <token>"`, and the stdio registration `claude mcp add dreamteam -- dreamteam mcp ...` that survives restarts.
+  <token>"`, and the stdio registration `claude mcp add dreamteam -- dreamteam mcp ...` that survives restarts; with
+  `api=True` (a home with an API token) also `API: <base>/api/v1  (header Authorization: Bearer <your
+  DREAMTEAM_API_TOKEN>)`, which names the variable, never the token or its digest.
   `forget_token(port, token)` removes the file when the container ends (only if it still holds this token).
 - **Clients.** `client_tokens(url, user_url=None)` is the one rule of where a token may go, in the order a client
   tries them: the token stored for the URL's port only to a loopback URL (127.0.0.1, localhost, [::1]); `env_token()`
@@ -3913,13 +4016,14 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
 ### 17.1 Settings (settings.py, config.py)
 - The **home** is `$DREAMTEAM_HOME`, else `~/DreamTeam` (`default_home()`); the CLI flags `--home` / DIR
   override both. Its settings file is `<home>/dreamteam.toml` (`settings_path(home)`) with the sections
-  `SECTIONS = swarm, agents, server, shell, workspace, mcp, skills, tracing, teams, roles, models` (same format as a
-  project's `dreamteam.toml`; `teams` and `roles` are arrays of tables, `[[teams]]`, the saved teams, and `[[roles]]`,
-  the role catalog, both of §17.3).
+  `SECTIONS = swarm, agents, server, shell, workspace, mcp, skills, tracing, api, teams, roles, models` (same format
+  as a project's `dreamteam.toml`; `teams` and `roles` are arrays of tables, `[[teams]]`, the saved teams, and
+  `[[roles]]`, the role catalog, both of §17.3; `api` is edited by hand only, below).
 - `ensure_home(home, language="ru", provider="anthropic")` creates the directory, `sessions/` and the settings
   file from the template; `read_raw(home)`; `validate(home, raw) -> Config` (ValueError with a readable text);
   `dump_toml(data)` (a top-level non-empty list of tables is written as `[[name]]` blocks after every table,
-  None values skipped); `deep_merge(base, override)`.
+  None values skipped; a leaf `env` or `extra` table is written inline, except a root of that name under
+  `[api.folders]`); `deep_merge(base, override)`.
 - `[swarm] independent_review` (bool, default true; a non-bool is a ValueError naming `[swarm]
   independent_review`): an agent's finished task is approved by another member, or by the user when nobody else
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
@@ -3991,6 +4095,14 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   held it this long, `n_lock_wanted`, §7 "Lock waiters"; 0: at the first refusal). The lock keys are read at each
   use; session overrides apply. The template has them with Russian comments; the settings page's «Workspace»
   section has a field for each.
+- `[api]` (`ApiSettings`, global only: not one of the session `OVERRIDE_SECTIONS`; §21.9, §21.10): `max_running = 3`
+  (0 = no limit), `uploads_pending = 32`, `archive_max_mb = 1024`, `folders = {}` (`[api.folders.<name>]` tables with
+  `path` and `in_place`, only their shape checked at load). `Config.api` holds it; `config.parse_api_folders(raw)`
+  turns the folders into `{name: ApiFolder(name, path, in_place=False)}`. It is edited by hand only: `public_view`
+  leaves it out (the settings page has no section for it), and `apply_update` drops an `[api]` key that is None or
+  equal to its default, and an empty section (`settings.api_values`), so a save never writes it. The template has
+  only a commented `# [api]` block, with the defaults and one example root. `api.folders` is one of `LOCAL_KEYS`
+  (§20.4).
 - `[skills]` (`SkillsSettings`, global only: not one of the session `OVERRIDE_SECTIONS`; §19): `library_dir =
   "~/.dreamteam/skills"` (the shared skills library; `Config.skills_library_dir`, where `DREAMTEAM_SKILLS_DIR` wins:
   the Docker sandbox and the tests set it), `claude = true` (offer Claude Code's skills), `max_mb = 10` and
@@ -4023,7 +4135,8 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   file as `dreamteam.toml.bak`, writes atomically (temp file + replace, never left behind) and makes the
   settings and the backup owner-only on POSIX (they hold API keys).
 - `public_view(raw)`:
-  - every section with defaults filled in; no `swarm.goal` / `swarm.goal_description`;
+  - every section with defaults filled in, but no `api` (§21.9: edited by hand only); no `swarm.goal` /
+    `swarm.goal_description`;
   - in model profiles, `api_key` is null and comes with `api_key_set`, `api_key_hint` (`…abcd`) and
     `api_key_env_set` (true/false, or null when there is no env name); `api_key_env` is a variable name or
     null (a key pasted there is never shown); `price_source` is `ModelProfile.price_source()` (§10). These computed
@@ -4043,7 +4156,9 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
     not an object → "Team N must be an object"; only null values are dropped, so the file keeps what was sent, and
     `Config.teams` and the view normalize it at each load; `[]` removes the key; the rules themselves are checked by
     `validate` (`[teams.N] ...`);
-  - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays;
+  - each section present replaces the stored one (null values dropped); a stored `swarm.goal` stays; `api` (never
+    sent by the settings page) is stored without the keys equal to their default (`api_values`), and an empty one
+    removes the section;
   - masked `mcp.external.*.env` values get their stored value back (same server first, then a renamed one);
     an unknown mask is a ValueError;
   - `models` is the complete set of profiles (missing ones are deleted; names `[A-Za-z0-9_-]+`; at least one);
@@ -4091,15 +4206,26 @@ settings; ValueError when they are invalid):
 - Attributes: `home`, `raw` / `config` (the global settings), `swarms` (loaded Swarm objects by sid),
   `running` (the set of started ones), `hub_url` (set by `launcher.serve_launcher`; a session swarm's `hub_url`
   is `f"{hub_url}/s/{sid}/mcp"`), `sessions_dir`, `uploads` (`copyfrom.Uploads(<home>/.dreamteam/uploads)`, the
-  zips of `POST /api/uploads`: "Copying files into a new session" below).
+  zips of `POST /api/uploads`: "Copying files into a new session" below), `api_uploads`
+  (`copyfrom.Uploads(<home>/.dreamteam/uploads/api)`, the files of `POST /api/v1/uploads`, §21.3;
+  `clean_copy_leftovers` sweeps both).
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
-  `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
+  `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid, *, workspace=True,
+  requests=False)` (`workspace` False: `"workspace": None`, the folder not looked at; `requests` True: its
+  `requests` count, which only v1's summary asks for), `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
-  workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None)`,
+  workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None, api=None,
+  sources=None, mark=None)`, `validated_overrides(overrides)`,
   `async load(sid)`, `async start(sid, *, skills=None,
-  via="home", auto_reply=False)`,
-  `async stop(sid, *, remember=False)`, `async unload_idle(sid)`, `update(sid, *, title=None, overrides=None,
-  settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`, `global_config()`,
+  via="home", auto_reply=False, marked=None, then=None)`, `mark_starting(sid, mark=None)`, `unmark_starting(sid, mark)`,
+  `async stop(sid, *, remember=False, reason="user", uid=None)`, `async unload_idle(sid)`, `async control(sid, *,
+  max_cost_usd=None, max_agents=None, wrap_up=None, uid=None)`, `update(sid, *, title=None,
+  overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home", uid=None)`, `async resume()`,
+  `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `journal(sid, after, limit, types=None, *,
+  recipient=None)`, `sid_of_uid(uid)` (`uid=` of `stop`, `control` and `delete`: the uid the caller resolved,
+  checked again once the session's lock is taken, 404 when the folder name holds another session by then),
+  `api_sids()`, `sid_of_client_ref(ref)`, `global_config()`, `reading(sid)` (the Swarm a reader in a thread uses:
+  `journal` below),
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
@@ -4107,17 +4233,183 @@ settings; ValueError when they are invalid):
   `backups(sid)`, `import_overrides(overrides, models)`, `async import_add(staged, meta, workspace, *, sid,
   before_swap=None)`, `async import_rewrite(sid, staged, meta, workspace, *, expect=None, before_swap=None)`,
   `async import_settings(sid, meta, *, expect=None)`, `recover_swaps()` and `interrupted_swaps()`; module functions
-  `read_stats(db_path, conn=None)`, `slugify(title)`, `external_workspaces(home)`, `new_uid()` and
-  `session_uid(meta)`.
+  `read_stats(db_path, conn=None, *, clarify=False, running=True, requests=False)`, `read_lists(db_path, conn=None)`,
+  `slugify(title)`, `external_workspaces(home)`,
+  `new_uid()`, `session_uid(meta)`, `api_meta(meta, *, create=False)` and `api_answers(api)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
-- `SessionError(message, status=400, **extra)` (a ValueError) carries an HTTP status and `extra` (put into the
-  JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad input or invalid settings,
-  404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to adopt or to start in,
-  a folder of another session, a folder that changed since the user was asked, a missing workspace folder at
-  start, a `workspace` with files for a copy, a session made by an earlier version), 413 a copy over its limits,
-  500 damaged or cannot be opened (404 is
-  also an unknown or used upload of `copy_from_upload`).
+- **A run's start and end, waiting for a change** (§21.6, §21.7).
+  - `_start_locked` journals `session.started` right before `swarm.start()` and, when that raises,
+    `session.stopped` {reason: `failed`, error} before its unload (`error` through `_public_text`: an absolute path
+    named by its last component, the session's folders whole, see "Sessions of the HTTP API v1" below; the log has
+    the whole text); when it is cancelled (the hub stops),
+    `session.stopped` {reason: `shutdown`}. `_unload(sid, reason=None)` of a running session journals
+    `session.stopped` {reason} after `Swarm.stop` and before the database closes (errors logged, never raised). The
+    reasons: `stop()` passes its `reason` (`STOP_REQUEST_REASONS`: `user` by default; `done`, `budget` for
+    `stop_when_done`; another is a ValueError); `shutdown()` passes `shutdown`, a workspace move `restart`, a delete
+    `user` (the journal goes away with the session when the delete succeeds; when the folder cannot be renamed away,
+    409, the session stays stopped, without its resume mark).
+  - `watch(sid)` (a context manager) gives an `asyncio.Event` set by every journaled event of the session (one bus
+    listener per Swarm, added by `_load_locked`; live-only events do not count), by `_changed(sid, …)`, by resume()
+    handling the session, and by the release of the session's lock (the locks are `_SessionLock`, which pokes the
+    waiters on release: the end of a start, a stop, a move). It is keyed by session, never by a bus, so it outlives
+    an unload. Waiters clear it before each read.
+  - `is_final(sid)`: not running, not in `starting` (creates and v1 `continue`s in flight), not in `resume_pending`,
+    and the session's lock is not held.
+  - `journal(sid, after, limit, types=None, *, recipient=None)` → (events, last, more): one page of the session's
+    journal (`events.read_page`, §21.6 "Polling"). A loaded session's through its own connection under its
+    `Database`'s lock (never the session's lock); any other's from its file through `db.reading_file`, opened and
+    closed for the read, never through `load`; from the file also when an unload closed the connection meanwhile
+    (`sqlite3.ProgrammingError`). The connection is the one `reading(sid)` gives: the loaded Swarm's, or, while
+    `_unload` stops it, the Swarm it took out of `swarms` until its database is closed (`_unloading`, filled before
+    the Swarm leaves `swarms`, emptied after the close). So no reader in a thread opens the file next to an open
+    writer: one that did, at the moment of the close, would keep SQLite from folding the `-wal` file back into
+    `swarm.db`, and the stopped session would be left with `-wal` and `-shm` files holding its run. The close waits
+    for a reader that holds the `Database`'s lock. The rows' `data` is decoded after the `Database`'s lock is released
+    (`read_page(..., decode=False)`, then `events.event_data`), since the event loop takes that lock too. A session
+    without a database has no events (head 0). A file that cannot be read now is `SessionError` 503
+    (`sessions.JOURNAL_TEXT`, the cause logged), never an empty page: that would tell a client which has read `final`
+    that nothing more will come, and it would stop early. Blocking: v1 calls it in a thread.
+  - `starting`: the sessions with a start on its way. Each such start has a mark of its own: `mark_starting(sid,
+    mark=None)` adds one (a new object unless the caller gives one), puts the session in `starting`, pokes its
+    waiters and returns the mark; `unmark_starting(sid, mark)` takes that mark away (the session leaves `starting`
+    with its last mark). `start(sid, marked=mark)` starts the session only while its mark is there, checked again
+    under the session's lock (None otherwise: a delete, or a stop asked after the mark was placed, that held the lock
+    while it waited is never undone),
+    and takes its own mark away when it ends, whatever its outcome, never another start's (a second caller's, or a
+    new session's that got the folder name of a deleted one). `delete()` takes every mark of the session away, and
+    `stop()` (without `remember`) the marks placed before it was called (read before its first await), as they take
+    it out of `resume_pending`: a start announced after the stop (a v1 `continue` sent after it) keeps its mark and
+    starts the session again once the stop is over, whether the stop held the lock already or not, so requests
+    keep their order. `create(..., start=True)` marks the new
+    session before its first write of session.json (which lists it: `ids()`, v1's listing) and starts it with that
+    mark; `create(..., start=False, mark=m)` puts the caller's mark `m` on it at the same point and the caller starts
+    it later with `start(sid, marked=m)` (a v1 create or `continue` that starts a session in the background, which
+    answers in between); a create that fails after marking takes its mark away. The create holds the session's lock
+    from that first write until the session is made (its skills committed, its folder set: `_set_workspace_locked`),
+    so a listing shows it `starting`, never final, and a stop, a start, a `continue`, a folder change or a delete
+    asked meanwhile waits for it: a run never starts without the skills asked for, a delete never leaves a half-made
+    folder behind, and a stop or a delete then takes the create's mark away (its start starts nothing).
+  - `start(sid, ..., then=fn)` calls `fn(swarm)` with the running Swarm once the start succeeded (also when the
+    session ran already), still under the session's lock, so nothing that waits for the lock (a stop sent meanwhile,
+    a `stop_when_done` stop) comes between the start and it: v1's `continue` gives its text there (§21.2). It is
+    synchronous; an error it raises is logged and the start stands. Nothing is called when nothing started.
+  - `resume_pending`: the sessions resume() will try. `plan_resume()` chooses them by their autostart mark alone
+    (session.json reads, no log line: the launcher calls it before its port opens) and fills the set;
+    `cancel_resume()` drops the plan when resume() does not run. resume() uses the plan (else chooses now) and
+    empties the set one session at a time. At each one's turn it skips, with its log line, a finished session and
+    one of an earlier version (both keep their mark), and a session stopped (out of the set, its mark cleared) or
+    deleted meanwhile; it checks that last condition again under the session's lock and starts it there
+    (`_start_locked`), so a stop that held the lock while resume() waited is never undone.
+- `SessionError(message, status=400, *, code=None, holder=None, **extra)` (a ValueError) carries an HTTP status and
+  `extra` (put into the JSON answer: `exists` for a skills clash, `pending_skills` for a refused delete): 400 bad
+  input or invalid settings, 404 unknown session, 409 conflict (deleting `main`, files in use, a dirty repository to
+  adopt or to start in, a folder of another session, a folder that changed since the user was asked, a missing
+  workspace folder at start, a `workspace` with files for a copy, a session made by an earlier version), 413 a copy
+  over its limits, 500 damaged or cannot be opened (404 is also an unknown or used upload of `copy_from_upload`).
+  `code` is the HTTP API v1's code where the status alone does not say it (§21.1), never in `extra`, so the internal
+  answers do not show it: `folder_busy` (`FOLDER_BUSY`: `_plan`'s folder of another session, `_check_reserved`'s
+  create in progress), `folder_not_ready` (`FOLDER_NOT_READY`: every `_repo_refusal`, so also `_check_adopted_repo`;
+  `_check_workspace_ready`'s missing folder and `_check_journal`'s unfinished move; a server folder's repository that
+  would make DreamTeam's git write outside it, `_plan` with `within` and `_check_server_git`; a missing root at a
+  start), `forbidden_folder` (`FORBIDDEN_FOLDER`, 403: a server folder that no longer lies inside its root, `_plan`
+  with `within`, or whose root no longer allows it, `_check_server_folder`, §21.10), `conflict` (`control`'s wrap-up
+  before the first start), a CopyError's own code (`bad_name`, `file_conflict`, and a server folder's
+  `forbidden_folder`, `not_found`) when `create` turns it into a SessionError; `_move_error` keeps the code of the
+  SessionError that failed a workspace change, unless files could not be put back (500), and its `holder`.
+  `holder`: the session whose folder it is (`_plan`'s `folder_busy`; none for a create in progress), never in
+  `extra` either: v1 names it by its uid, to a caller who sees it, in a text of its own (§21.10). v1 answers a code
+  with that code's own status (§21.1), which may differ from `status`: `folder_not_ready` is 409 there, also for the
+  two refusals of a create that are 400 on the internal routes (a folder inside a repository, a repository's own
+  database).
+- **Sessions of the HTTP API v1** (§21.4). `create(..., api={answers, stop_when_done, client_ref, request_digest,
+  folder})` (those keys only, `API_GIVEN` defaults for the missing ones; another key or a value of the wrong kind is
+  400) writes `"via": "api"` and the `api` block, with `base_commit`, `started_at`, `finished_at`, `start_error` and
+  `error` null (`API_LATER`), in the first session.json write; `api_meta(meta)` reads that block (None for any other
+  session; `{}` for a v1 session whose block is not an object). `create(..., sources=[copyfrom.Source])`: v1's
+  claimed uploads and a copy-mode server folder (a Source with `root` and `parts`, read below its root by
+  `nofollow`, §21.10) copied by `copy_sources` instead of `copy_into`, not with `copy_from` or `copy_from_upload`
+  (400 before any claim); the caller claims and settles the uploads. `create(..., folder_threads=)`: where that copy
+  runs instead of the loop's default executor (`_in_thread(threads=)`, which still waits for it after a cancel):
+  v1 passes its folder threads (`ApiV1.threads.start`) when a server folder is among the sources (§21.1 "Threads").
+  `create(..., workspace=, within=root)`: an in-place server folder, which every `_plan` on the create's way
+  (`create`'s own, `_set_workspace`'s and `_change_folder`'s last one, under the workspace claims just before
+  `_carry_out` makes the missing folders), and `_carry_out` itself around each folder it makes and around `git init`
+  (`_Plan.within`, `_check_inside`), finds inside `within` again, by text and by file identity, else 403
+  `forbidden_folder` (these run in the loop's default executor, as for any workspace); with git on, a folder with files
+  there must also pass `apifolders.git_dir_refusal` (409 `folder_not_ready`), before git reads it. A workspace move
+  by the owner (`_change_folder` without `creating`) sets an in-place `api.folder` to null. Every later write of
+  the block is a read-modify-write of session.json under the session's lock (`_api_write`, which logs and never
+  raises):
+  - `_start_locked`, on every start path: with `answers: "auto"` it calls `swarm.hold_auto_reply()` right after
+    loading, before `swarm.start()`; at the first start (`started_at` null) it sets `swarm.workspace.record_head`,
+    and once the start succeeded it writes `started_at` and `base_commit` (`Workspace.head_at_init`) with the rest of
+    session.json; every start that succeeds clears `start_error` and `finished_at`. That write comes once the swarm
+    runs, so its failure is logged, never raised (the start is no failed one: its callers would record a start error
+    for a running session). A start that fails, because the
+    session cannot be loaded (not a 404, never a session of an earlier version, which is not written to), because
+    `_check_workspace_ready` or `_check_adopted_repo` refuse it, or because `swarm.start()` raises, writes
+    `start_error` {code, text} and `finished_at` before it raises (and before `session.stopped` is journaled): `code`
+    the error's own code, else by the SessionError's status (400 `bad_request`, 404 `not_found`, 409 `conflict`, 413
+    `too_large`, an earlier version `earlier_version`), else `internal`; `text` through `_public_text(sid, text)`,
+    as is the `session.stopped` error of a failed `swarm.start()`. An error names a folder unquoted, spaces included,
+    and `without_abs_paths` alone would cut it at its first space, so `_public_text` names this computer's folders
+    first (`eventtext.without_abs_paths(value, named=(), exact=(), hidden=())`: (path, name) pairs, longest first,
+    with either separator, single or doubled, in any case, whole components only): `named`, also at the start of a
+    path below them, the user's home as `~` (the path below it is then named by its last component) and, by their
+    last component, the workspace, an unfinished move's two folders, the session's folder and the home (what lies
+    below them stays, relative); `exact`, only where the text names that very folder, every folder above those (a path
+    below one may be anyone's: `C:\Users\alice\x` must not become `Users\alice\x`) and the home's `sessions`;
+    `hidden`, only a path below it, replaced whole: the home's `sessions` as `SessionManager.OTHER_SESSION`
+    (`(a folder of another session)`), since another session's folder name is its title (the session's own folder is
+    longer, so named first); each also resolved. The external API's error texts go through it too
+    (`_public_text(sid | None, text, *, named=())`: `sid` None, an error of no session, names only the user's home and
+    the home; `named` takes the caller's pairs first, unresolved: the roots of `[api] folders` by their names, §21.1
+    "Paths in answers"; then a session that works in a server folder in place has that folder named `<root>` and
+    its path below the root with the hub's separator, `apifolders.shown(root, path, os.sep)`, §21.10).
+    `_public_text_in_home(sid | None)` says whether it looks at no folder outside the home (the user's home aside): no
+    session, one whose session.json cannot be read, or one in its own folder or another folder of the home, with no
+    move journal; v1 then redacts in the loop's default executor rather than its folder threads (§21.1 "Paths in
+    answers"). A start cancelled inside `swarm.start()` (the hub stops) writes `finished_at` and no `start_error`.
+  - `_unload` of a running v1 session writes `finished_at` after `Swarm.stop`, whatever the reason.
+  - What runs beside a v1 session's run (`_RunWatch`, tied to its Swarm, kept in `_run_watch[sid]`):
+    `_start_locked(sid, auto_reply=False, *, resumed=False)` starts it once the swarm runs and its pending goal is
+    set (`_start_run_watch`), on every start path: `autoreply.SessionAutoReply` with `answers: "auto"` (§21.5), and
+    the stop_when_done watcher (`_watch_end`) with `stop_when_done` true, which follows the journal from its head
+    read just before `session.started` (§21.4). `resume()` passes `resumed=True`. `_unload` cancels both and waits
+    for them before `Swarm.stop`. The watcher never awaits a stop: `_stop_soon` schedules
+    `_stop(sid, reason=..., still=...)` as a task kept in `_stopping`; `_stop` is `stop()` with a check made under the
+    session's lock (`still`: the session still runs that Swarm and the reason still holds), else it does nothing; with
+    `still` it leaves the marks of starts announced meanwhile (`mark_starting`, `resume_pending`) alone.
+    `shutdown()` sets `_closing` (`_stop_soon` then schedules nothing: the resume check covers those), waits for the
+    scheduled stops, then unloads.
+  - `api_answers(api)`: the block's `answers`, `API_GIVEN`'s "auto" when it has none; the auto-reply hold,
+    `_start_run_watch` and `summary` read it.
+  - `summary(sid)` adds `via` and `answers` for such a session only.
+  - `control(sid, *, max_cost_usd=None, max_agents=None, wrap_up=None)` (v1's PATCH, §21.2) does what
+    `swarm_control` does with the limits and wrap-up mode, as the user, under the session's lock: `set_limits` (a
+    budget pause the new limit covers is lifted), then `wrap_up` / `end_wrap_up`. A stopped session is loaded for it
+    (one that never started gets its database) and unloaded again unless it was loaded before (the board views
+    it). 400 for a value of the wrong kind (a bool, NaN, a `max_agents` that is no whole number) or one the swarm
+    refuses (ToolError), with nothing written; 409 `conflict` for `wrap_up: true` while the session has a pending
+    goal its first start has not set yet (that `set_goal` ends wrap-up mode), decided before a database is made;
+    409 for an earlier version. Nothing given: the summary, nothing loaded. It announces an `updated` change and
+    returns the summary.
+  - `sid_of_uid(uid)` (32 lowercase hex, else None), `api_sids()` and `sid_of_client_ref(ref)` read an index of every
+    session.json (uid → folder name, the v1 sessions, and their `client_ref` → folder name, the first by name when two
+    share one), built once and read again when a session comes or goes (`_changed` `created` / `deleted`, an
+    import's rewrite or settings) or the sessions folder's mtime changes (another process). A uid the index does not
+    know, and every `api_sids()` and `sid_of_client_ref()`, also compare the session folders (`ids()`, no
+    session.json read) with those the index was read from: another process makes a session's folder before it writes
+    its session.json, which changes no mtime of the sessions folder. A uid two sessions share (a folder copied by
+    hand) names neither; the legacy `main` has no uid; a hit is checked against the session.json it names, so a
+    deleted session's uid never reaches the session that got its folder number. So a v1 create with a `client_ref`
+    reads no session.json per session (§21.4).
+  - `read_lists(db_path, conn=None)` → (tasks, agents) of a session database, read-only like `read_stats`, in the
+    shape and order of the snapshot (`Task.to_dict()` by priority then id, closed ones too, without the board's
+    computed fields; every `agents` row in hiring order): a stopped session's result without loading it (§21.7).
+  - An import keeps `via` and the block but sets `client_ref`, `request_digest`, `start_error`, `error` and `folder`
+    to null (`API_IMPORT_DROPS`, `_import_meta`, §21.9).
 - Session ids are `NNN-slug` from the title (Cyrillic and Ukrainian transliterated, accents dropped; e.g.
   `001-snake-game`) and match `^[a-z0-9][a-z0-9-]{0,63}\Z`. `main` is the legacy session: a home that was a
   single-swarm project (`<home>/.dreamteam/swarm.db`) lives in the home itself, uses the global settings
@@ -4127,7 +4419,10 @@ settings; ValueError when they are invalid):
   server derive it).
 - **Identity.** The sequence id is not an identity across homes (two homes both make `017-session`). `create`
   writes `"uid": new_uid()` (uuid4, 32 lowercase hex) into session.json; `_write_meta` keeps unknown keys, so
-  `update`, `set_workspace` and `start` keep it. `session_uid(meta)` is the stored uid when it is 32 hex characters
+  `update`, `set_workspace` and `start` keep it. (`_write_meta` writes a temporary file and puts it in place with
+  `os.replace`; a replace refused with PermissionError, as on Windows while a reader holds session.json open for a
+  moment, such as a thread of the HTTP API v1, is tried again, `META_REPLACE_TRIES` = 10 × `META_REPLACE_PAUSE`
+  0.02 s, before the error is raised.) `session_uid(meta)` is the stored uid when it is 32 hex characters
   (lowercased), else `uuid5(UID_NAMESPACE, "created_at:" + repr(float(created_at))).hex`, derived on read and never
   written (so a session made before uids existed, or a folder copied by hand, has the same identity in every home
   it is in); None without a finite numeric `created_at` and for the legacy `main` session (never matched).
@@ -4275,7 +4570,9 @@ settings; ValueError when they are invalid):
   while the server runs are picked up (mtime/size) before reads and updates; an invalid hand edit is ignored
   with a warning.
 - `default_session()`: the running session (the most recently active one when several run), else the only
-  session, else None; a session made by an earlier version is never it ("Sessions of an earlier version").
+  session, else None; a session made by an earlier version is never it ("Sessions of an earlier version"), nor one
+  created through the HTTP API v1 (`instruct.without_api_sessions`, and `api_sids()` for the fallback: an API
+  client's job never takes the launcher MCP's calls without `session` or `serve`'s console, §21.4).
 - Summary (`list()` sorts running first, then by last activity or creation, newest first; a session that
   cannot be summarized appears as `{"id", "title", "status": "stopped", "error"}`):
   ```json
@@ -4284,9 +4581,9 @@ settings; ValueError when they are invalid):
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
-   "question":{"asker","message_id"}|null,"clarify":bool,
+   "question":{"asker","message_id"}|null,"requests"?:n,"clarify":bool,
    "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names],
-   "copied_from":{"source","files","bytes","at"}|null,"earlier_version":bool}
+   "copied_from":{"source","files","bytes","at"}|null,"earlier_version":bool,"via"?,"answers"?}
   ```
   `earlier_version` (`read_stats`, `db.made_by_earlier_version` on the same read-only connection, in a try of its
   own after the other figures, so a database missing a table they read still reports it; false without a
@@ -4294,8 +4591,14 @@ settings; ValueError when they are invalid):
   `read_stats` opens its own connection through `db.reading_file`, so listing leaves no `-wal` or `-shm` behind.
   `question` (`read_stats`, from kv `paused`, default None): the member's question that holds the pause, set only
   for a paused slot with reason `question`, a non-empty asker and an integer message_id (the test of
-  `Swarm.pending_question`, §3.1); `clarify`: the session's `[swarm] clarify` setting (its own override, else the
-  global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
+  `Swarm.pending_question`, §3.1); `requests` (`read_stats(..., requests=True)`, default 0, in a try of its own),
+  present only with `summary(sid, requests=True)`, which only the HTTP API v1's summary passes (§21.7): how
+  many requests to the user wait (`autoreply.requests_from` on the same connection, with the session's `clarify`:
+  the kinds the HTTP API v1 lists, §21.5), and for a session that does not run only those that block its work
+  (`read_stats(..., running=False)`, `autoreply.listed_requests`). The board's summaries (`list()`, which the
+  sessions page polls, `default_session()`, the routes of §18.1) leave it out: its queries take longer as the
+  journal grows (§21.5 "Cost"), and nothing there shows it. `clarify`: the session's `[swarm] clarify`
+  setting (its own override, else the global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
@@ -4303,6 +4606,16 @@ settings; ValueError when they are invalid):
   `skills_pending`: those members proposed that wait for the user's library decision (from memory when loaded,
   else `read_session_skills` of the session's data dir). `copied_from`: the files copied in at create ("Copying
   files into a new session" below), None for a session made without a copy.
+  `via` and `answers` are there only for a session created through `/api/v1` (§21.4): session.json's `via`
+  (`models.API_VIA`, `"api"`) and its `api.answers` (`"auto"` or `"manual"`), so the sessions page marks it "API"
+  (§18.4), `session_line` marks it ` | HTTP API` (§18.2), and `dreamteam -p` sends no
+  automatic replies or approvals of its own to an `auto` one (`autoreply.hub_answers(summary)`, §21.5).
+  `last_activity` (the time of the newest journal event) leaves out `session.started` and `session.stopped` (§21.6),
+  and `dreamteam -c` and `-p -c` never pick a session whose `via` is `"api"`, nor do the other picks the user did
+  not name (`console` and `traces` without `--session`, the hub's `default_session()`):
+  `instruct.without_api_sessions(sessions)` drops them first. When nothing is picked only because of that, the
+  message says how to reach one (`-p -c`: printmode `no_sessions_api`; the TUI: `no_sessions_continue_api`;
+  `console` / `traces`: cli `API_NOT_PICKED`). `-r <id>` and `--session` open such a session as any other.
 
 #### Workspace folder
 A session works in `<session dir>/workspace` (`default_workspace(sid)`) unless its `session.json` has
@@ -4331,9 +4644,14 @@ next start, which checks the folder).
   DreamTeam's skill environments folder ..., or inside it or contains it (every session runs its skills' packages
   from there)") or a folder inside or containing it, a folder inside the current workspace or containing it (or
   containing the session directory), an existing file, a folder that cannot be created or written (a temporary
-  probe file). 409: a folder another session works in, or inside / containing one (the legacy `main` works in
-  `<home>/workspace`). The current folder itself: `"unchanged"`, nothing happens. 404 unknown session; 409 for
-  `main` (see below).
+  probe file), another DreamTeam home (a folder with `sessions/` and `dreamteam.toml`; never the session's own
+  folder, whatever its agents built there, so `--default` always leads back) or a folder inside one, the
+  hub tokens' folder (`hubauth.tokens_dir()`) or a folder inside or containing it, and on POSIX a folder under
+  /proc, /sys or /dev (as `copyfrom.resolve_source` refuses them to a copy). 409: a folder another session works
+  in, or inside / containing one (the legacy `main` works in `<home>/workspace`), compared by text and by file
+  identity (`treecopy.is_within`: on a file system that ignores letter case or Unicode form where `normcase` does
+  not, APFS or a casefold mount, `jobs/Acme` is `jobs/acme`). The current folder itself: `"unchanged"`, nothing
+  happens. 404 unknown session; 409 for `main` (see below).
 - `expect` (`"moved"` | `"adopted"`, anything else 400): the mode the user agreed to; the TUI and the console send
   the one their question announced. 409 when the folder turns out otherwise (e.g. files appeared in a folder that
   was empty when the user was asked); nothing changes.
@@ -4356,10 +4674,22 @@ next start, which checks the folder).
   repository but not its root; a folder that is not in a repository gets one (`init_repo`: git init, `.gitignore`
   if missing, an initial commit of the files there; `"initialized"`). The repository's configuration is never
   modified (no `_configure_repo`, §7), and the agents' commits there follow the user's line-ending settings. The
-  old folder stays as it was (`old_kept`). The session's forged and imported MCP servers (`mcp_servers` rows with
-  another origin than `config`, folders `<old>/mcp/<name>/`) move to `<target>/mcp/<name>/` (409 before anything
-  changes when one of those exists there). Adopting the session's own default folder (which still holds its old
-  files) is a plain switch back (stored without "workspace", not adopted, no git checks).
+  one setting DreamTeam writes goes into a repository it creates on a Linux file system without POSIX bits
+  (`treecopy.without_posix_bits`: WSL's drvfs, Docker Desktop's 9p, such as a Windows folder in the sandbox):
+  `core.filemode=false`, right after git init. There every file Windows wrote reports 0o777, while git init's own
+  probe passes on the file it makes; with `core.filemode=true` the first commit would record each of those files as
+  100755, and git on Windows (which keeps no such bit) would see every one of them as changed.
+  The refusal for changes says which of them line endings alone make (`repo_state(line_endings=True)`: the lines a
+  second status with `-c core.autocrlf=true` no longer lists; it runs with `GIT_OPTIONAL_LOCKS=0`, since a status
+  that found those files unchanged would store their stamps in the index, and the next check without the setting
+  would take them for unchanged too) and names `git config core.autocrlf true` in the repository itself: a checkout
+  of Git for Windows, whose system config sets `core.autocrlf=true` (CRLF in the files, LF in the repository), is
+  changed for a git that does not read that config, the Docker sandbox's (§21.10 "Sandbox"). The start check of an
+  adopted folder says the same. The old folder stays as it was (`old_kept`). The session's forged and imported MCP
+  servers (`mcp_servers` rows with another origin than `config`, folders `<old>/mcp/<name>/`) move to
+  `<target>/mcp/<name>/` (409 before anything changes when one of those exists there). Adopting the session's own
+  default folder (which still holds its old files) is a plain switch back (stored without "workspace", not adopted, no
+  git checks).
 - **Leaving an adopted folder** (for an empty folder or the default one): the user's files stay, only the
   session's MCP servers move along. Those of them that the user's repository tracks (`tracked`: the agents'
   `git add -A` committed them there) would leave deletions behind, so with git on DreamTeam commits just their
@@ -4382,8 +4712,9 @@ next start, which checks the folder).
   recorded once its destination holds the entry; a destination that exists is never replaced or merged into
   (FileExistsError, also across volumes); an entry is put back only where nothing new appeared meanwhile (else it
   is reported); created folders are removed only when empty; `.git` / `.gitignore` only when the change created
-  them (a `.git` that appears in the target meanwhile is a 409, never initialized over). When the undo cannot
-  finish, the error (500) lists the files left in the target and the journal stays: `start` and `set_workspace`
+  them (a `.git` that appears in the target meanwhile is a 409, never initialized over); in a server folder of the
+  HTTP API only from the folder git init ran in, found again inside its root (§21.10 "Resolution"). When the undo
+  cannot finish, the error (500) lists the files left in the target and the journal stays: `start` and `set_workspace`
   then refuse (409) naming both folders and the journal to delete once the files are together.
 - The members hear of it at the next start: `n_workspace_moved` {path, old}, or `n_workspace_changed` {path, old}
   after an adopt or a fresh start (session.json `workspace_notice` until then); quietly for LLM members (their
@@ -4395,7 +4726,10 @@ next start, which checks the folder).
   start (the user may have worked there while the session was stopped, or git was off at the adopt): 409 for
   uncommitted changes or untracked files (the session's own `mcp/<name>` folders and `.scratch/` are left out), a
   detached HEAD, an operation in progress, an unreadable repository, or a folder inside another repository (a folder in no
-  repository gets one at the start, as at an adopt).
+  repository gets one at the start, as at an adopt). A session that works in a server folder of the HTTP API v1 in
+  place (`api.folder`) is checked again too, from every surface (§21.10 "Starts": `_check_server_folder` in
+  `_check_workspace_ready`, then `_check_server_git`, before the adopted-folder check). `_start_locked` runs
+  `_check_workspace_ready` in a thread (a folder on a share that does not answer never stalls the hub).
 - **Legacy `main`**: refused (409, `LEGACY_WORKSPACE_TEXT`): `dreamteam run` can still open the home as a
   single-swarm project, which reads only `dreamteam.toml` and would work in `<home>/workspace` again.
 - `create(..., workspace=path)`: the same checks before anything is created (with the overrides' `workspace.git`),
@@ -4413,7 +4747,9 @@ next start, which checks the folder).
 `copyfrom.py` (it imports treecopy, skills, workspace and hubauth, never sessions.py) copies a folder or a zip into
 the folder a new session works in, before its first start: `create(..., copy_from=<absolute folder or .zip path on
 this computer>)` or `create(..., copy_from_upload=<token of POST /api/uploads>)`, not both (400 "Give copy_from or
-copy_from_upload, not both."). The surfaces: REST `copy_from` / `copy_from_upload` (§18.1), the launcher MCP's
+copy_from_upload, not both."); the HTTP API v1 passes `sources` instead ("Sessions of the HTTP API v1" above), the
+same order with `copy_sources` in place of `copy_into` and no claim of its own. The surfaces: REST `copy_from` /
+`copy_from_upload` (§18.1), the launcher MCP's
 `session_create(copy_from=)` (§18.2), the CLI's `--copy-from` (§18.3), the TUI's `/copy-from` (docs/TUI.md) and the
 home page's «Файлы для работы» (§18.4). The source is only read and nothing is copied back. The members are never
 told where the files came from: no source path goes into `pending_goal` or any prompt.
@@ -4498,7 +4834,8 @@ told where the files came from: no source path goes into `pending_goal` or any p
   "<src> holds names that the folder they are written to cannot tell apart (they differ only in letter case or
   Unicode form): '<rel>'." (the path relative to the source, not the staging path); another write error is 500.
 - **A zip** (a `.zip` path or a claimed upload): a file over `copy_max_mb` is 413 "The zip is larger than N MB
-  ([workspace] copy_max_mb)."; then `skills.unpack_zip(path, staging, copyfrom.zip_rules(limits), check=)`,
+  ([workspace] copy_max_mb)."; then `skills.unpack_zip(path, staging, copyfrom.zip_rules(limits), check=)` (a
+  claimed upload: the file `_open_upload` opened in place of the path),
   streamed from the file (§19): the directory pre-check; at most `max(5000, 2 × copy_max_files)` entries (folders
   and left-out ones count); the declared sizes of the planned files after planning (left-out members do not
   count) and the streamed bytes against `copy_max_mb`; at most `copy_max_files` files; no compression ratio bound
@@ -4558,6 +4895,8 @@ told where the files came from: no source path goes into `pending_goal` or any p
   failed (a file still open on Windows) is removed by the next clean, while the hub runs. `RUN`
   (`secrets.token_hex(4)` at import) is in the names because a pid alone is not enough: the hub of the
   Docker sandbox has the same pid at every container start, so a killed container's leftovers would look live.
+  `_in_thread(..., threads=)` runs the work in threads of the caller's instead of the loop's default executor
+  (v1's folder threads for the copy of a server folder, §21.1), and waits for them the same way.
 - **Docker sandbox** (`copyfrom.hub_in_container(config)`: `config.skills_host_library_dir is not None` for
   `dreamteam sandbox`, or `DREAMTEAM_IMAGE=1` for docker compose and a plain docker run of the image; not any
   container, since DreamTeam run directly in a devcontainer sees its folders; the `container` of `/api/hub` and
@@ -4569,9 +4908,10 @@ told where the files came from: no source path goes into `pending_goal` or any p
   (`POST /api/uploads`, §18.1): the file name cut to its last part (`\` read as `/`) and to one printable line of
   at most 200 characters ("upload.zip" when empty); a Content-Length of ASCII digits above `copy_max_mb` is 413
   "The file is larger than N MB ([workspace] copy_max_mb)." before reading; `clean()`; at most 8 uploads waiting
-  or arriving (`UPLOAD_MAX_PENDING`, else 429; the count and the create are not atomic: a guard against a runaway
-  page, not a quota: "N uploads already wait for a session; each is removed when a session uses it or an hour after
-  its upload. Try again later."); `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
+  or arriving (`UPLOAD_MAX_PENDING`, else 429 "N uploads already wait for a session; each is removed when a session
+  uses it or an hour after its upload. Try again later."; the count and the create of the upload's `<token>.part`
+  are made one upload at a time per store, under an `asyncio.Lock`, so uploads that arrive together each count the
+  ones before them); `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
   400 "The upload is empty.", a file that is not a zip 400 "The file is not a zip archive."; then `<token>.json`
   `{"filename",
   "bytes", "at"}` and the rename to `<token>.zip`. Any failure (an exception from `chunks`, a disconnect included,
@@ -4583,7 +4923,16 @@ told where the files came from: no source path goes into `pending_goal` or any p
   gets FileNotFoundError: 404, another create took it (a claimed file that vanishes before `copy_into` reads it is
   the same 404). The create claims first (Order above), so from the claim on it is deleted whatever happens. `clean`
   (best effort) removes waiting names over the TTL and the claims `left_over` names (never by age, never one a
-  create of this run uses); names of neither pattern stay.
+  create of this run uses); names of neither pattern stay. The HTTP API v1 (§21.3) uses the same class on its own
+  root: `receive(..., kind="file", unpack=, max_pending=, caller=)` keeps any file as `<token>.bin` under a name
+  `check_upload_name` passes (refused, not cleaned up), a 429 carries the code `too_many_uploads`; `peek_many`,
+  `claim_many` (all or none, under the same lock), `unclaim` (renamed back, its hour unchanged) and `settle` (every
+  claim of a create, released or given back, in its `finally`); `copy_sources` copies several into one staging
+  folder, each in a `staging_name()` folder of its own beside it, then merged (`ZipRules.exclude_top`: the names
+  the session keeps for itself, `SESSION_NAMES`, left out at the top of an unpacked zip). Both stores are read
+  never through a link (§21.3 "Never through a link"): their folders are 0o700 on POSIX and a json 0o600; `peek`
+  is 404 for a `<token>.zip` that is not a regular file with one name (`lstat`); a claim is opened with
+  `O_NOFOLLOW` and checked again by `fstat` (`copyfrom._open_upload`), and its zip unpacked from that open file.
 - **Clients that give up waiting**: a large copy may take longer than a client waits. The TUI and `-p` wait 900 s
   (`MOVE_TIMEOUT`) on a plain REST request, which a client going away does not cancel: the hub finishes the copy
   and creates the session anyway, so they check `dreamteam sessions` or the sessions page before trying again. An
@@ -4727,11 +5076,16 @@ of a home or a project, never a session override (§17.2).
 
 ### 18.1 Web (launcher.py)
 `create_launcher_app(manager, host="127.0.0.1")` returns the app wrapped in the same `GuardMiddleware`
-(host/origin, JSON POSTs), with `raw_posts={"/api/uploads": "application/zip"}`: the guard's 415 rule lets a POST to
-`/api/...` pass when its content type starts with `application/json`, or when `raw_posts` maps that exact path (no
-prefix: `/api/uploads/` is not it) to its type without parameters, ignoring case. Host, Origin, token and cookie
+(host/origin, JSON POSTs), with `api=True` (the external API's branch, §14, §21.1) and
+`raw_posts={"/api/uploads": "application/zip", "/api/v1/uploads": ("application/octet-stream", "application/zip")}`:
+the guard's 415 rule lets a POST to `/api/...` pass when its content type starts with `application/json`, or when
+`raw_posts` maps that exact path (no prefix: `/api/uploads/` is not it) to its type, or to a set holding it, without
+parameters, ignoring case; on the v1 branch a path `raw_posts` lists takes its own types alone (`/api/v1/uploads`:
+415 for JSON too, §21.3), while `/api/uploads` keeps the rule above. Host, Origin, token and cookie
 checks run before that rule and are unchanged; `application/zip` is not a CORS-safelisted type, so a cross-site
-page cannot send it without a preflight, which the hub never answers. Session apps pass no `raw_posts`. A
+page cannot send it without a preflight, which the hub never answers. Session apps pass no `raw_posts`. Inside the
+guard `_ApiFirst` sends a path `web.is_api_path` takes to `ApiV1.app` (§21.1 "Dispatch"; `app.api` is the `ApiV1`)
+and every other path, and the lifespan, on. A
 `SessionRouter` in front sends `/s/{sid}/...` to that session's app
 (`web.create_app(swarm, on_library_change=...)`, §14, served with `root_path = /s/{sid}`; a library change there
 emits `sessions.changed` with change `skills`, also a `skill_attach` or `skill_approve` of `/api/act` that
@@ -4741,7 +5095,7 @@ succeeded: either may have changed the library) and everything else to the launc
 |---|---|
 | GET `/` | `static/home.html` (launcher page, `no-store`) |
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
-| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox","container"}` (`container`: `copyfrom.hub_in_container`, §17.2 "Copying files into a new session") |
+| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox","container","api"}` (`container`: `copyfrom.hub_in_container`, §17.2 "Copying files into a new session"; `api`: the hub has an API token of its own, `hubauth.api_digest() is not None`, §21.1: `dreamteam status` then prints the API's address; never the token or its digest) |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
 | POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`); `copy_from` (an absolute folder or .zip path on the hub's computer) or `copy_from_upload` (a token of POST `/api/uploads`), strings, not both: copied into the new session's folder before its first start (§17.2 "Copying files into a new session"), the answer then also has `"copy"` (`copy_result`); 404 for an unknown or used upload, 409 for a `workspace` with files, 413 over `[workspace] copy_max_mb` / `copy_max_files` |
 | POST `/api/uploads?filename=<name>` | the raw zip as the body (`Content-Type: application/zip`, not base64 JSON; the guard's `raw_posts`) → 201 `{"upload": token, "filename", "bytes", "expires_in": 3600}` (`manager.uploads.receive` with the limits of `manager.global_config()`); 415 JSON when not `application/zip` (the handler checks too), 413 over `copy_max_mb` (Content-Length or streamed), 429 when 8 uploads wait, 400 empty, not a zip, or interrupted (starlette's `ClientDisconnect`: "The upload was interrupted."), 500 for other failures (`_failure`); the token is used once by `POST /api/sessions` within an hour |
@@ -4759,6 +5113,7 @@ succeeded: either may have changed the library) and everything else to the launc
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result; 400 when the fallback would send the stored key to another provider or base_url than the saved one, or a key from the hub's environment to an endpoint that neither the provider's default, a preset nor a saved profile uses with that variable |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
 | `/mcp` | launcher MCP (§18.2) |
+| `/api/v1/...` | the external HTTP API v1 (§21; dispatched in front of `SessionRouter` to `ApiV1.app`) |
 | GET `/s/{sid}` | 307 redirect to `/s/{sid}/` (query kept) |
 | GET `/s/{sid}/` | the session's `index.html` (board UI) |
 | `/s/{sid}/api/*`, `/s/{sid}/ws`, `/s/{sid}/mcp` | the session app; `manager.load(sid)` loads a stopped session for viewing |
@@ -4794,8 +5149,10 @@ succeeded: either may have changed the library) and everything else to the launc
   sets `manager.hub_url` (and the loaded swarms' `hub_url`), starts uvicorn, calls `on_listening` as soon as
   the port is open (write hub.json there), then resumes the autostart sessions when `server.resume_sessions` is
   on (or `resume=True`) — only once the port is ours, so a second launcher losing the race never runs them —
-  then calls `on_started`. On exit (cancelled, or a callback failed) it stops the web server and
-  `manager.shutdown()` (sessions keep their autostart mark).
+  then calls `on_started`. Which sessions it will try is chosen before uvicorn starts (`manager.plan_resume()`: by
+  their mark alone, no log line), so the first request already finds them in `resume_pending`; a launcher that does
+  not get the port drops the plan (`cancel_resume()`). On exit (cancelled, or a callback failed) it stops the web
+  server and `manager.shutdown()` (sessions keep their autostart mark).
 
 ### 18.2 Launcher MCP (launcher_mcp.py)
 `build_launcher_server(manager)`, `LauncherMCPEndpoint(manager, host, extra_hosts=())` (served at `/mcp`) and
@@ -4834,7 +5191,9 @@ succeeded: either may have changed the library) and everything else to the launc
   summary may be a remote hub's JSON), and for a
   running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
   in the user's wrap-up mode is `[running, wrapping up]`; one paused for a member's question (summary `question`,
-  §3.1) is `[paused (waiting for your answer to Anna Smith, question #12)]`; a session without network ends its first
+  §3.1) is `[paused (waiting for your answer to Anna Smith, question #12)]`; a session created through the HTTP API
+  v1 (summary `via` "api", §21.4) has ` | HTTP API` right after the cost, before the marks that follow; a session
+  without network ends its first
   line with ` | no network` (summary `network`, §7.2), one in clarify mode with ` | clarify` (summary `clarify`,
   after ` | no network`); a session made by an earlier version (summary `earlier_version`, §17.2) is `[stopped]`
   ending its first line with ` | made by an earlier version: cannot be opened` (`session_start`, `session_cd` and
@@ -4848,8 +5207,9 @@ succeeded: either may have changed the library) and everything else to the launc
   entry (the sessions keep their copies). Library changes emit `sessions.changed` (change `skills`). There is no
   `session_delete` tool.
 - Every hub tool (§13) with an extra optional `session` property. Without it the call goes to
-  `manager.default_session()`; when there is none, the error lists the sessions. An unknown or stopped session
-  is an error result (`session_start` is suggested; for a session made by an earlier version, its message).
+  `manager.default_session()` (never a session created through the HTTP API v1, §17.1); when there is none, the
+  error lists the sessions, and adds `A session created through the HTTP API is never the default.` when one is
+  listed. An unknown or stopped session is an error result (`session_start` is suggested; for a session made by an earlier version, its message).
 - Calls run `hub_mcp.hub_call` on the session's swarm (same actor rules: `as_agent`). A call still running when
   its session stops or is deleted ends with `Error: session X was stopped while <tool> was running.` Each call is
   dispatched inside `hub_mcp.serving_client(client_key(ctx, local))` (`local` = `local:<uuid>` per launcher server),
@@ -5099,7 +5459,10 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   stderr, exit 1, and its database is not opened: `db.made_by_earlier_version` runs right after `_session_db`
   returns an existing path, before `Database(...)`, so one check covers the home and the project).
 - Sessions made by an earlier version (§17.2 "Sessions of an earlier version"): `sessions` and `status` list them
-  marked (`session_line`, as in §18.2); `-c` and `-p -c` continue the most recent session, and when that one was
+  marked (`session_line`, as in §18.2); `-c` and `-p -c` continue the most recent session (never one created
+  through the HTTP API v1, which they pass over as if it were not listed: `instruct.without_api_sessions`, §17.2;
+  with only such sessions they say there is no session to continue and that `-r <id>` / `/resume id` opens one),
+  and when that one was
   made by an earlier version they never pass over it for an older session the user did not ask for: they say so
   and that a new session is needed, and create nothing (`-p` exits 1 with the print mode's `continue_earlier` on
   stderr, en `The most recent session, {sid}, was made by an earlier version of DreamTeam and cannot be opened by
@@ -5110,7 +5473,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   {id}, создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть: начните новую
   сессию», and attaches nothing; a prompt given with `-c`, or with `-r ID` of a session that did not open, is
   never sent (nor when the hub or its session list failed): it is left in the input line, to send on purpose; `{version}` is the hub's); a default picked without the user asking for the last
-  session (`console` and `traces` without `--session`) still skips sessions made by an earlier version; `-r ID` of
+  session (`console` and `traces` without `--session`) still skips sessions made by an earlier version, and those
+  created through the HTTP API v1 too (which the `-r` picker and `/sessions` mark `HTTP API` after the status,
+  uitext `sess_api`, as `session_line`'s ` | HTTP API`); `-r ID` of
   one prints its message (the TUI says it under the welcome box and creates nothing; `-p` exits 1); the `-r`
   picker and `/sessions` show them with the status «прежняя версия» / "earlier version", Enter shows the message
   instead of attaching (the picker closes and the message is printed; `/resume ID` the same; the legacy `main`'s Del
@@ -5118,7 +5483,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   its stopped check; without `--session` it picks, like `traces`, only among the sessions this version opens);
   `sessions rm` deletes them as any session (the legacy `main` stays undeletable there too, and its message names
   the file to remove by hand).
-- `status` of a home lists the sessions (from the hub, or read from the home); of a project, `swarm_status`.
+- `status` of a home lists the sessions (from the hub, or read from the home), then `Home:` and `Hub:`, and `API:
+  <hub>/api/v1` when the running hub's `/api/hub` says `api` (it has an API token, §21.1; the line `serve` prints,
+  never the token); of a project, `swarm_status`. `sessions` prints the same list without the `API:` line.
+- `console` prints the session it opens as `Session <id>: <title>`, the title as one printable line
+  (`copyfrom.printable_line`: one made on the board or over MCP, or a remote hub's, may hold control characters).
 - `sandbox` refuses when a hub runs for the directory; the container runs `serve /swarm` for a home and
   `run /swarm` for a project, on `--host 0.0.0.0` with a hub token of its own (§14.2: printed with the board URL and
   the MCP command, kept on the host outside the mounted folders for the host's `dreamteam` commands; the container gets only its SHA-256). `docker.sandbox_command` starts it with `docker run --rm --init ...`: a tiny init
@@ -5128,9 +5497,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   last final commits may be cut off; the processes die with the container anyway). Ports that agents' dev servers
   open inside the container are not published. `--security-opt no-new-privileges:true`: no program in the
   container gains privileges through a set-user-ID bit or file capabilities (the firewall's `NET_ADMIN` is given at
-  the start, `setpriv` only drops). Only the directory is mounted: for a home,
-  `docker.outside_home_warning(home)` prints a warning listing the sessions whose workspace folder is outside it
-  (`external_workspaces`): they cannot start in the container (their start reports the missing folder). A folder
+  the start, `setpriv` only drops). Only the directory is mounted (and for a home the roots of its `[api] folders`,
+  §21.10 "Sandbox"): for a home, `docker.outside_home_warning(home, mounts)` prints a warning listing the sessions
+  whose workspace folder is outside it (`external_workspaces`), but for those under a writable mounted root's mount
+  point:
+  they cannot start in the container (their start reports the missing folder). A folder
   inside the home is found in the container (session.json `in_home`, §17.2). The host's skills library is mounted
   read-only at `/dreamteam/host-skills` with `DREAMTEAM_HOST_SKILLS_DIR` pointing there and `DREAMTEAM_SKILLS_DIR=
   /swarm/.dreamteam/skills-library` (the sandbox's own library inside the mounted home; not `.dreamteam/skills`,
@@ -5199,7 +5570,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       stays in the paused state, its badge reads «Ждёт вашего ответа» / "Waiting for your answer" with the tooltip
       «{name} ждёт вашего ответа на вопрос #{id}» from the summary's `question`) and, for a running session in the
       user's wrap-up mode (summary `wrap_up`, read
-      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity (the time of
+      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», after the «Без
+      интернета» badge (§7.2) a plain badge «API» for a session created through the HTTP API v1 (summary `via`
+      "api", §21.4; `apiBadge`), its tooltip by summary `answers`: `api_hint_auto` (the hub itself answers the agents'
+      questions and reviews) or `api_hint_manual` (the API client answers them, or the user on the board), both
+      saying that `dreamteam -c` does not pick it, task progress bar, agents (working), spent/budget, model, last activity (the time of
       the session's last event, its tooltip «Активность: … · Создана: …»; without an event, the creation time and
       «Создана: …»),
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
@@ -5441,7 +5816,8 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     `swarm.resumed` with `question`: «ваш ответ на вопрос #N получили все участники, рой продолжил работу» (answered),
     «рой продолжил работу без ответа на вопрос #N» (dropped), with «уточнение цели выключено: …» (why `clarify_off`)
     and «{asker} покинул(а) рой: …» (why `left`); the feed's `swarm.*` lines are escaped, not linkified, so `#N` (a
-    message id) is no task link.
+    message id) is no task link. The feed also shows a run's start and end (FEED_TYPES `session.*`, §9): «сессия
+    запущена», «сессия остановлена: бюджет исчерпан», «сессия не запустилась: <error>»…, escaped like `swarm.*`.
   - Reviews (§4.1): a card waiting for the user's review has the badge «ждёт вашего ревью», another one in review
     names its reviewer; the task card's «Принять» / «Вернуть» (a return needs a comment: what to fix; for a
     task another member reviews, the card says the user may decide instead). Dragging a task from «review» to
@@ -5730,11 +6106,13 @@ relative: 400), `{"zip": base64, "filename"}`, `{"git": url}`, `{"claude": name,
   a damaged archive is a 400; exec bits come from `external_attr`. `max_mb` / `max_files` apply per picked skill,
   so a multi-skill "Download ZIP" of a repository fits. Origin `zip`, `source = {filename, subdir?}`.
   `extract_zip` is a wrapper: `unpack_zip(source, dest, ZipRules.for_skills(limits)).skipped`. `unpack_zip(source:
-  bytes | path, dest, rules: ZipRules, *, check=None) -> ZipResult(files, bytes, skipped, excluded, links, top)` is
+  bytes | path | binary file (the caller's, left open), dest, rules: ZipRules, *, check=None) -> ZipResult(files,
+  bytes, skipped, excluded, links, top)` is
   the one unpacker, also for a zip copied into a new session (`copyfrom.zip_rules`, §17.2 "Copying files into a new
   session"). `ZipRules`: `max_bytes` / `too_big`, `max_entries` / `too_many_entries`, `max_files` /
   `too_many_files`, `skip_files`, `exclude_names` (casefolded path parts left out and listed), `links` ("refuse" |
-  "skip"), `exclude_paths` (exact '/' paths after the unwrap, left out and listed), `portable` (the Windows name
+  "skip"), `exclude_paths` (exact '/' paths after the unwrap, left out and listed), `exclude_top` (casefolded names
+  left out at the top level after the unwrap, listed like `exclude_paths`), `portable` (the Windows name
   rules), `fold_collisions` (False: exact names), `names_in` (the `_portable` message), `folders` (create folder
   entries), `unwrap` (one top folder with no excluded or link member beside it: its contents), `redecode_names`
   (names without the UTF-8 flag read again, once per archive, as UTF-8 or in the Windows OEM code page, the OEM
@@ -6219,12 +6597,12 @@ sessions/<id>/workspace/              copy_tree of the session's own folder or i
   `-shm` is read through them (`?mode=ro`: WAL content included); one with a `-wal` only is read from a private
   copy of both; one without either as `immutable=1`, read again once when its file changed meanwhile, then
   refused. `_finish_db` on the copy: `journal_mode=DELETE`; command credentials stripped (§20.3); `VACUUM` (no free
-  page keeps deleted text); `PRAGMA quick_check` must be "ok"; then its figures (events, last event, MCP servers,
-  `max_tools_revision`). The session is never opened, so one made by an earlier version (§17.2) is exported like
-  any other (an import by this version refuses it, §20.4), with a warning in the report (`session {sid} was made by
-  an earlier version of DreamTeam: this version and the same one on the other computer refuse it; only the version
-  that made it imports and opens it (keep this folder)`; `db.made_by_earlier_version` of the copy, of the database
-  itself in a dry run), since the report's closing advice is to use the same version there.
+  page keeps deleted text); `PRAGMA quick_check` must be "ok"; then its figures (events, last event of the work as
+  §20.4, MCP servers, `max_tools_revision`). The session is never opened, so one made by an earlier version (§17.2)
+  is exported like any other (an import by this version refuses it, §20.4), with a warning in the report (`session
+  {sid} was made by an earlier version of DreamTeam: this version and the same one on the other computer refuse it;
+  only the version that made it imports and opens it (keep this folder)`; `db.made_by_earlier_version` of the copy,
+  of the database itself in a dry run), since the report's closing advice is to use the same version there.
 - **Order** (`_export_parts`): settings, skills, mcp, sessions; then `scan_for_secrets` over the whole folder; then
   the manifest; then the swap. Any exception (TransferError, OSError, KeyboardInterrupt) discards what was written
   (`_discard`: the temp folder, or the contents of the user's empty folder; retried `DISCARD_TRIES` times), naming
@@ -6270,8 +6648,9 @@ journal, histories); each affected server is warned (`re-enter the credentials o
 `shell._is_secret` accepts with `_KNOWN_SECRETS`, `key_env_names()` and the profiles' variables; the header values
 of `ANTHROPIC_CUSTOM_HEADERS` / `OPENAI_CUSTOM_HEADERS`; the values of the `[shell] pass_env` and `[skills]
 install_env` variables; the env values and command credentials of the `[mcp.external]` servers of the global
-settings and of every session's overrides (also sessions not exported); `hubauth.env_token()` and the tokens in
-`hubauth.tokens_dir()`; plus everything the export itself removed.
+settings and of every session's overrides (also sessions not exported); `hubauth.env_token()`,
+`hubauth.api_env_token()` (the API token, §21.1: main() took it out of os.environ, so the scan of the variables misses
+it) and the tokens in `hubauth.tokens_dir()`; plus everything the export itself removed.
 
 `scan_for_secrets(root, secrets, *, git=None) -> [place]`: each value is searched for as it is, JSON-escaped (with
 and without ASCII escapes) and escaped twice, each as UTF-8 and UTF-16LE (`_Matcher`, chunked with an overlap).
@@ -6307,7 +6686,10 @@ frozen instructions and its paths in their histories).
 exported values winning; keys this version does not know, sections not in `_SECTION_FIELDS` and invalid profile
 names are dropped and listed; `swarm.goal` / `goal_description` are not taken; the machine-local keys
 `LOCAL_KEYS` = `server.host`, `server.port`, `shell.program`, `skills.library_dir`, `skills.envs_dir`,
-`skills.python`, `mcp.library_dir` keep the target's value (listed as `kept as they are here` when they differ).
+`skills.python`, `mcp.library_dir`, `api.folders` (§21.10) keep the target's value (listed as
+`kept as they are here` when they differ). `[api]` counts as changed only when it differs as stored
+(`settings.api_values`, without its default values), so an exported default value changes nothing, while it still
+replaces a value set here.
 Profiles: missing ones are added, the others rewritten from the export (an exported `api_key` is never taken);
 profiles only here stay. When the profile's endpoint (`settings._endpoint`: provider, base_url) is the same, the
 stored key stays (no `api_key` in the update), and so do its secret `extra` entries and its `api_key_env` when the
@@ -6365,10 +6747,11 @@ changes. All servers are saved by one `update_settings({"mcp": ...})`.
   `skip`.
 - No target: **add** under the exported id when it is free and not reserved by this import, else `_free_id(title)`
   (`as <id>: <id> is taken here`).
-- A target: **unchanged** when the last events `(id, ts, type)` are equal, the files match (`compare_digest` of the
-  exported workspace equals that of the target's folder; always true when the target works outside the home or the
-  export carries no files) and `_settings_differ` finds nothing (title, overrides as the import writes them,
-  `pending_goal`); when only those differ: **rewrite** of session.json alone (`settings_only`,
+- A target: **unchanged** when the last events of the work `(id, ts, type)` are equal (a run's `session.started` and
+  `session.stopped` are left out, as for `last_activity`, §21.6: a hub restart alone is no newer work), the files
+  match (`compare_digest` of the exported workspace equals that of the target's folder; always true when the target
+  works outside the home or the export carries no files) and `_settings_differ` finds nothing (title, overrides as
+  the import writes them, `pending_goal`); when only those differ: **rewrite** of session.json alone (`settings_only`,
   `import_settings`, no backup). When the export carries no workspace files and the target's folder has some:
   refused. Otherwise **rewrite**, whatever the history says, with the reason: `its files differ`, `the export has
   newer work in it` (the export holds the target's last event), `this computer has newer work in it` (the target
@@ -6405,7 +6788,9 @@ database copied with its sha256 checked against the manifest, the data parts and
 modes="import")` with the recorded `modes`; a link or an unreadable file fails it). `_import_meta` writes the uid
 (it must be 32 hex), `autostart: false` (imported sessions never start by themselves), the overrides checked
 against this home, and the workspace entry rebuilt for this home (`_workspace_meta` for in_home, `{path, adopted}`
-for outside). `_finish_staged` opens the database once with `db.Database` (`ADDED_COLUMNS`, WAL again), points
+for outside); a session of the HTTP API v1 keeps `via` and its `api` block with `client_ref`, `request_digest`,
+`start_error`, `error` and `folder` set to null (§21.9). `_finish_staged` opens the database once with
+`db.Database` (`ADDED_COLUMNS`, WAL again), points
 absolute job-log paths at the copy's own `.dreamteam/jobs/` (or clears them), and writes session.json last.
 `before_swap(id)` (the CLI's holder check) runs right before the rename; an exception fails that session with
 nothing changed.
@@ -6491,3 +6876,1605 @@ never followed. mcp_forge keeps its own library code in stage 1.
 Export and import through a running hub (launcher routes), in the TUI, console or web UI; an MCP tool for either;
 `--update` of an existing export; a path map for folders outside the home; the legacy `main` session and
 `dreamteam run` projects; a command that lists or restores `.replaced-*` backups.
+
+## 21. External HTTP API v1 (api_v1.py, autoreply.py, eventtext.py)
+
+A stable HTTP interface for programs that use the swarm as a service: a site uploads a document (or names a folder the
+owner listed, 21.10), starts a session with a goal, shows its timeline, answers the agents if asked and gets the
+result as JSON and files. It is the HTTP form of `dreamteam -p` (docs/TUI.md §2), not a mirror of the board:
+everything is said in terms of a session, its goal, events, requests to the user, the result and files, so that a
+session in another mode (a feed instead of a task board) can answer the same routes. The internal routes (§14, §18.1)
+stay as they are and may change; `/api/v1` changes only as 21.1 says.
+
+### 21.1 Where, who, format
+
+- **Where.** Every launcher serves v1 under `/api/v1/`, next to the routes of §18.1: `dreamteam serve`,
+  `dreamteam mcp` in a home (its web part), the TUI's in-process launcher, and `dreamteam sandbox` of a home (which
+  runs `serve` in the container and passes the API token's digest). All of them go through `launcher.serve_launcher` →
+  `create_launcher_app`. `dreamteam run` and `dreamteam sandbox` of a single-swarm project have none: `web.create_app`
+  never takes the API token. With an API token `serve` prints `API: <base>/api/v1` among its addresses, and
+  `dreamteam sandbox` of a home prints the same line with the header it needs (`docker.access_lines(..., api=True)`),
+  naming `DREAMTEAM_API_TOKEN`, never the token or its digest.
+- **Dispatch.** `create_launcher_app` makes `ApiV1(manager, host)` (21.9) and puts a dispatcher in front of
+  `SessionRouter`: a path that `web.is_api_path` takes (`/api/v1` itself, or a path that starts with `/api/v1/`) goes
+  to `ApiV1.app`, every other path to `SessionRouter` as before. The guard (§14) chooses its v1 branch by the same
+  predicate. v1 is a Starlette app of its own because the routes of `inner` sit behind `SessionRouter` and get
+  Starlette's plain-text 404 and 405 and its slash redirects. `ApiV1.app` has `redirect_slashes` off (a bare `/api/v1`
+  is a JSON 404, never a 307) and an `HTTPException` handler that answers 404 `not_found` and 405 `method_not_allowed`
+  (with its `Allow` header) as JSON. It has no catch-all route: Starlette takes the first full match before any
+  partial one, so a catch-all for every method would turn a wrong method into a 404. A path is one route with its
+  handlers by method (`ApiV1._route(path, {method: handler})`), never one route per method: Starlette answers a wrong
+  method with the first partial match alone, so its 405 would name one route's methods. The 405's `Allow` names every
+  method of the path, sorted. A route takes only the methods it names: HEAD and OPTIONS are 405 like any other
+  (Starlette would add HEAD to a GET route). Every route goes through one wrapper, which answers 401 `token_required`
+  when the request did not come through the guard's v1 branch (no `scope["dreamteam.api_caller"]`), the manager's
+  errors (`api_v1.CODED_ERRORS`: `SessionError`, `CopyError`, `SkillError`, and `sessionopts.OptionError` of a
+  create's options) with their codes (`api_v1.error_code`) and anything else as 500 `internal`, logged, with no text
+  of the error's own, whatever attributes it has. A route about one session keeps the session `{id}` resolved to
+  (`scope["dreamteam.api_sid"]`), so its error texts name that session's folders by their names.
+- **The API token.** v1 has a token of its own, apart from the hub token (§14.2): `DREAMTEAM_API_TOKEN`
+  (`hubauth.API_TOKEN_ENV`), or its SHA-256 (64 hex) in `DREAMTEAM_API_TOKEN_SHA256` (`API_DIGEST_ENV`), as
+  `DIGEST_ENV` is for the hub token. `hubauth.api_digest()` is the digest variable, else the digest `take_env_token`
+  took, else the digest of the token; a digest variable that is no SHA-256 becomes the digest of a random token, with
+  a warning (never "no token"). The API token is never one of `client_tokens()`: DreamTeam's own clients never send
+  it. It is kept from the agents and from every process DreamTeam starts:
+  1. `take_env_token()` also pops `DREAMTEAM_API_TOKEN` and `DREAMTEAM_API_TOKEN_SHA256`.
+  2. Both names join `shell._INTERNAL_ENV`, so `scrubbed_env` and `secret_free_env` drop them whatever
+     `[shell] pass_env` says. (`DREAMTEAM_API_TOKEN_SHA256` does not match `_SECRET_RE`: without this it would reach
+     the agents.)
+  3. `docker.env_passthrough` subtracts both names.
+  4. `docker.run_sandbox` of a home passes `DREAMTEAM_API_TOKEN_SHA256` by name when there is an API token
+     (`sandbox_command(..., api_token=True)` adds `-e DREAMTEAM_API_TOKEN_SHA256` for a home only: a single-swarm
+     project's `run` has no v1). Its value (`hubauth.api_digest()`) goes into the docker command's environment, taken
+     from hubauth, since `main()` has already popped both names from os.environ; none of the four token names
+     (`docker.TOKEN_NAMES`) is inherited from the host's environment there. The token itself never enters the
+     container.
+  5. `docker-compose.yml` passes `DREAMTEAM_API_TOKEN_SHA256` by name.
+  6. The export's secret check (`transfer.known_secrets`, §20.3) names the API token next to the hub token.
+- **Who.** On v1 the guard reads only the header `Authorization: Bearer <token>`. The hub token's cookie and a GET
+  `?token=` count for nothing there, and a `?token=` is never turned into a cookie (no 303). The hub token and the
+  in-process `own_token()` act as the hub's owner; the API token acts as the API caller
+  (`scope["dreamteam.api_caller"]`, `web.API_CALLER`: `"owner"` or `"api"`).
+  - A hub with neither an API token nor a hub token answers every v1 request 403 `api_disabled`, on a loopback bind
+    too.
+  - Otherwise a request without a valid Bearer is 401 `token_required`, with
+    `WWW-Authenticate: Bearer realm="DreamTeam"`. A hub with a hub token alone serves v1 to its owner only.
+  - A hub whose API token equals its hub token does not start (`web.check_hub_token`, which the commands that serve a
+    hub run first and `serve_launcher` runs again), on any address, whichever form (token or digest) gives either;
+    `dreamteam run` too, though it has no v1: the API token would open every internal route.
+  - A hub with an API token and no hub token, outside the image, starts with a warning in the log and in `serve`'s
+    output (its log's warnings go to stderr), which recommends a hub token or `dreamteam sandbox` ("The rest of the
+    hub" below): `serve_launcher` calls `check_hub_token(host, api=True)`, which logs `web.api_token_warning()`; the
+    commands' early check (`warn=False`) and `dreamteam run` (no v1) say nothing. A non-loopback bind
+    needs the hub token anyway (§14.2), unless `DREAMTEAM_HUB_NO_TOKEN=1`, which §14.2 warns about: such a hub then
+    serves its internal routes to the network with no token at all.
+- **What the API token reaches.** The guard takes the API token only on v1 paths: it opens no internal route, no
+  `/mcp`, no `/ws` and no board. So a client cannot change the settings, read the keys' profiles, reach a session not
+  created through v1 ("Scope"), or name a folder of the hub's computer outside `[api] folders` (21.10). That limits
+  what a client can name, not what the agents can reach. The API token is the power to run a goal: the agents run
+  commands with the hub user's rights (in the sandbox, the container's), so they can read the home, its settings (a
+  `dreamteam.toml` may hold a literal `api_key`) and the keys there, and an uploaded document may carry instructions
+  to them. Every root of `[api] folders` is a further grant to whoever holds the token (21.10). A hub that serves a
+  site runs in `dreamteam sandbox`.
+- **Scope.** With the API token, v1 sees only the sessions created through v1 (`"via": "api"`, 21.4): every route
+  about any other session (listing, reading, events, requests, messages, files, PATCH, `continue`, stop, DELETE)
+  answers 404 `not_found`. The scope is how a session was made, not who made it: a session the owner creates through
+  v1 with the hub token is `"via": "api"` too, and the API token lists, reads, continues, stops and deletes it like
+  its own (no caller is recorded; only upload tokens are per caller, 21.3). With the hub token, every session. The
+  legacy main session has no uid (`session_uid` is None for a `legacy` meta), so v1 never reaches it, with the hub
+  token either.
+- **The rest of the hub.** A site on the same computer that calls a loopback hub without a hub token exposes the
+  internal routes to its own bugs (a server-side request forgery reaches `127.0.0.1`), so the docs say: run the hub
+  that serves a site with a hub token too, or in `dreamteam sandbox`, which the docs recommend anyway (the agents run
+  commands, and an uploaded document may carry instructions to them). For another computer the hub listens on a
+  non-loopback address, which needs the hub token (§14.2), and the name the client uses goes into
+  `DREAMTEAM_ALLOWED_HOSTS`. No CORS: a page of another origin is refused, as on the board (the guard's Origin check,
+  §14.2), so a site calls the API from its server, never from its visitors' browsers.
+- **Format.** JSON bodies and answers (`httpjson.JSONResponse`), except uploads (the raw body) and file downloads (raw
+  bytes). Every POST and PATCH under `/api/v1` sends `Content-Type: application/json`, a body-less one (`/stop`) too,
+  except uploads (21.3), which take their own two types and no JSON. The guard's 415 rule covers every POST under
+  `/api/` but not PATCH, so the PATCH handler checks the type itself (415 `unsupported_media_type`). Both take
+  exactly `application/json`, parameters such as a charset aside (`application/jsonx` is 415); off v1 the guard keeps
+  its rule of before, any type that starts with `application/json` (`web.GuardMiddleware._wrong_type`). A JSON body is
+  read up to 1 MiB (413 `too_large` beyond it, before any byte is read when the Content-Length says more; the
+  launcher's own body helper has no bound): an empty body is `{}`, and a body that is not a JSON object, or holds
+  `NaN` or `Infinity`, or a number that overflows to it (`1e999`: `httpjson` could never write it back), is 400
+  `bad_request` (`api_v1.read_json`). Times are Unix seconds (float), money is USD (float).
+- **Unknown fields.** A field the server does not know, in a JSON body or in a query that v1 reads, is 400
+  `unknown_field`, so a typo never passes silently. One helper checks every route: the create, PATCH, `continue`, the
+  answers of requests, `messages` POST, the uploads query (`filename`, `unpack`) and the queries of the GET and
+  DELETE routes (`api_v1.check_fields`, `query_fields`; `GET /api/v1/options` and `DELETE /api/v1/uploads/{token}`
+  read no query, so any field there is unknown). A query field given twice is 400 `bad_request`.
+- **Errors** are `{"error": text, "code": code}` for every answer under `/api/v1/`, the guard's included; a code may
+  add fields of its own, named where it is described. The text is English and for people; programs check `code`.
+  - The guard: `token_required` (401), `api_disabled`, `forbidden_host`, `forbidden_origin` (403),
+    `unsupported_media_type` (415). Off v1 the guard's refusals keep their plain texts.
+  - `ApiV1`: `bad_request`, `unknown_field`, `unknown_team`, `unknown_model`, `unknown_role`, `unknown_skill`,
+    `unknown_folder`, `bad_name` (400); `forbidden_folder` (403); `not_found` (404: a session, file, request, upload
+    or folder root); `method_not_allowed` (405); `conflict`, `earlier_version`, `file_conflict`, `folder_busy`,
+    `folder_not_ready`, `not_running`, `budget_exhausted` (409); `too_large` (413); `too_many_uploads`,
+    `too_many_sessions`, `too_many_archives` (429; `too_many_uploads` with `Retry-After`, 21.3); `internal` (500,
+    logged).
+  - `earlier_version`: the session was made by an earlier tool revision. Since 0.2.0 such a session cannot be loaded,
+    started, stopped or changed (§17.2 "Sessions of an earlier version"), so every route that needs it loaded answers
+    this code.
+  - `CopyError` and `SessionError` carry a `code` where v1 maps them (`bad_name`, `file_conflict`, `folder_busy`,
+    `folder_not_ready`, `too_many_uploads`, ...). The internal REST answers do not show it. `api_v1.error_code` takes
+    that code when v1 knows it, `earlier_version` for such a session, else the error's `status` (400 `bad_request`,
+    404 `not_found`, 409 `conflict`, 413 `too_large`, 500 `internal`; another 4xx `bad_request`, anything else
+    `internal`); the code decides the answer's status (`api_v1.CODES`). So every 429 a v1 route can meet names its
+    code (`too_many_uploads`, `too_many_sessions`; a test reads the raises of sessions.py, copyfrom.py and skills.py),
+    or it would read `bad_request`. An `internal` error is logged with its traceback, except the 503 of a hub
+    shutting down, logged as information.
+  - **Paths in answers.** For an API-token caller, an error text that would name a path of the hub's computer is
+    rewritten (`SessionError` and `CopyError` texts name the home, the user's home and folders): a server folder as
+    `<root>/<path>` (21.10; below the root, the hub's own separator: the text is for people), the home and, with the
+    session's id, its folders by their names, a path in another session's folder as `(a folder of another session)`
+    (`SessionManager.OTHER_SESSION`: a session's folder name is its title), any other absolute path by its last
+    component. `ApiV1.redact(text, sid=None)` is `manager._public_text(sid, text, named=<the roots of [api]
+    folders>)` (§17.2), a root not absolute on the hub's own system left out. The roots are named as written and as
+    they resolved the last time the hub resolved them (`api_v1.root_pairs`, `apifolders.resolved_root`: at the hub's
+    start, then at each use of a root, which comes before any text that names a path below it), never resolved for
+    an error: an error that has nothing to do with a root never waits on one on a share that does not answer.
+    `ApiV1.error_response` runs it off the loop (`ApiV1._redacted`), since it reads the session's files and resolves
+    its folders: in the loop's default executor, with the home's other reads, when it looks at no folder outside the
+    home (`SessionManager._public_text_in_home`: no session, one whose `session.json` cannot be read, or one that works
+    in its own folder or another folder of the home, with no workspace move left halfway), so such an error never
+    waits for v1's folder threads, which reads on a share that stops answering may all hold; else (an in-place server
+    folder, a folder the owner chose) in one of those threads ("Threads"), since it resolves that folder. A route of
+    v1 that a text names (`GET /api/v1/options lists the roles`: `/api/v1` and lowercase words or `{id}`-like
+    placeholders after it, starting a word) is kept as it is, never named by its last component. `folder_busy` is v1's
+    own text (`api_v1.FOLDER_BUSY_TEXT`), for every caller, never a `SessionError` text; its `session` names the other
+    session (`SessionError.holder`) by its uid when the caller sees it (21.10). Summaries (21.7) hold no absolute
+    path, for any caller. Event data (21.6), task results, messages and files carry
+    what the agents wrote, paths included: v1 does not scrub them.
+- **Threads.** What may touch a folder of the hub's computer runs in v1's own daemon threads (`api_v1._Threads`,
+  `ApiV1.threads`), at most `api_v1.FOLDER_THREADS` (8) at once: a session's folder or a server folder and its root,
+  read by GET files, a download's reads, an archive's measure and steps (21.8), a result's changed files (21.7), a
+  create's `folder` (`apifolders.resolve_request`, 21.10) and the copy of a `copy` one (`copyfrom.copy_sources` of
+  the create's sources: `manager.create(folder_threads=)`; a cancel still waits for the copy to end, so its staging
+  folder is removed), and the redaction of an error text about a session that works outside the home ("Paths in
+  answers"). A call past them waits for one to end; a cancel while it waits starts nothing, and a thread whose client
+  left keeps its place until its call returns (a download or an archive closes its file or its walk only then:
+  `api_v1._thread_step`). Never the loop's default executor, which the rest of the hub shares (workspace git, the
+  triggers, the forge, v1's reads of the journals and the uploads store) and which `asyncio.run` waits for at exit: a
+  share that stops answering holds at most these threads until its calls return, never the hub's other work. The
+  hub's exit still waits, as long as the call lasts, for a call whose caller waits for it through a cancel: a create's
+  copy (so that its staging folder is removed) and a download's or an archive's step (`_thread_step`, so that its file
+  or its walk is closed after it). The shutdown cancels those callers, and `asyncio.run` then waits for them. The
+  other calls (GET files, a result's changed files, a create's `resolve_request`, a redaction) are left to their
+  thread at a cancel, and the exit does not wait for them. A folder worked in `in_place` (21.10) is not covered: it is
+  the session's workspace, and the manager's work on it runs where the manager runs any session's, in the loop's default
+  executor, as for a folder on a share that the owner gave a board session (§17.2): the create's `_plan` and the
+  folder's set-up (`_carry_out`: the missing folders, `git init` and the first commit), the checks of every start
+  (`_check_workspace_ready`, `_check_server_git`, `_check_adopted_repo`) and the running session's workspace git. An
+  in-place root on a share that stops answering after `resolve_request` touched it may so hold threads of the default
+  executor.
+- **Compatibility**: within v1, fields, codes, states and event types are only added, never renamed, removed or given
+  another meaning; a client ignores what it does not know. The `text` of events (21.6) and of errors is for people and
+  may be reworded. Anything else is `/api/v2`, and v1 then stays for at least one minor release. `GET /api/v1/options`
+  names the DreamTeam version.
+
+### 21.2 Routes
+
+| method path | answer |
+|---|---|
+| GET `/api/v1/options` | `{"api": 1, "version", "languages": ["ru","en"], "language": the default, "teams": [{name, roles}], "roles": [{key, name, description}], "models": [{name, provider, model}], "default_model", "skills": [{name, description}], "folders": [{name, in_place}], "limits": {"upload_max_mb", "upload_max_files", "files_per_session", "uploads_pending", "max_running", "archive_max_mb"}}`: what a client may choose (below) |
+| POST `/api/v1/uploads?filename=<name>[&unpack=true]` | the file as the raw body, `Content-Type: application/octet-stream` or `application/zip` → 201 `{"upload": token, "filename", "bytes", "unpack", "expires_in": 3600}` (21.3) |
+| DELETE `/api/v1/uploads/{token}` | `{"ok": true}`: the caller's upload that no create used is removed, its place under `[api] uploads_pending` free at once (21.3 "Life") |
+| POST `/api/v1/sessions` | 21.4 → 202 `{"session": summary}`; 200 with the existing one for a repeated `client_ref` |
+| GET `/api/v1/sessions?state=&limit=` | `{"sessions": [summary]}`, newest first by `created_at` (`limit` 1–200, default 50); `state` keeps the sessions in that state (21.7) |
+| GET `/api/v1/sessions/{id}` | `{"session": summary}` |
+| PATCH `/api/v1/sessions/{id}` | `{max_cost_usd?, max_agents?, wrap_up?: bool}` → `{"session"}` (below) |
+| POST `/api/v1/sessions/{id}/continue` | `{"text"}` → `{"session"}` (below) |
+| POST `/api/v1/sessions/{id}/stop` | `{"session"}`: `manager.stop(sid, reason="user")`; its background jobs stop with it |
+| DELETE `/api/v1/sessions/{id}?confirm={id}` | `{"ok": true}`, plus `"folder_kept": {root, path}` for an in-place folder (below) |
+| GET `/api/v1/sessions/{id}/events?after=&wait=&limit=&detail=&lang=` | `{"events": [event], "last": id, "more": bool, "state", "final": bool}` (21.6) |
+| GET `/api/v1/sessions/{id}/events/stream?after=&detail=&lang=` | Server-Sent Events (21.6) |
+| GET `/api/v1/sessions/{id}/requests` | `{"requests": [request]}`: what waits for the user now, oldest first (21.5) |
+| POST `/api/v1/sessions/{id}/requests/{rid}` | the answer (21.5) → `{"ok": true, "session"}` |
+| GET `/api/v1/sessions/{id}/messages?after=&limit=` | `{"messages": [{id, ts, from, to, text, reply_to}], "last"}`: the user's conversation with the members, oldest first (21.5) |
+| POST `/api/v1/sessions/{id}/messages` | `{"to": ["all"] or [names], "text", "reply_to"?}` → 201 `{"message"}` (as `send_message` of the user); 409 `not_running` for a stopped session (use `continue`) |
+| GET `/api/v1/sessions/{id}/result` | the result (21.7), also while it runs (`"final": false`) |
+| GET `/api/v1/sessions/{id}/files?path=&scratch=` | `{"path", "entries": [{name, path, type: file\|dir, size, modified}], "truncated"}` of a folder of the session's workspace (21.8) |
+| GET `/api/v1/sessions/{id}/files/{path}?scratch=` | the file's bytes (21.8) |
+| GET `/api/v1/sessions/{id}/archive?path=&scratch=` | a zip of the workspace or of one folder in it (21.8) |
+
+- **Options.** Never a key, a `base_url`, an env name or a path. `skills`: the library's skills, and in the sandbox
+  the host library's too (a name in both is the library's). `folders`: the roots of `[api] folders` by name (21.10).
+  `limits`: `upload_max_mb` (`[workspace] copy_max_mb`: one upload, and the sum of what one create copies in),
+  `upload_max_files` (`[workspace] copy_max_files`: the files one create copies in), `files_per_session` (20), and the
+  `[api]` values `uploads_pending`, `max_running` and `archive_max_mb` (21.9). `[api]` has no upload limits of its
+  own.
+- **`{id}`** is the session's `uid` (§17.2: 32 hex, never reused), not its folder name: folder numbers come back after
+  a delete (`_new_id` takes the highest number + 1), so a stored id could reach another job. The summary also has
+  `name`, the folder name the board shows (`/s/<name>/`). One resolver serves every route: the uid → the folder name
+  (`sid_of_uid`), the API caller's scope (21.1), the legacy main session never; 404 `not_found` otherwise. A route
+  that needs the session loaded answers 409 `earlier_version` for such a session. A long poll and a stream resolve the
+  id again at every pass, since a delete can give the folder number to a new session. For the same reason a route
+  checks the uid again after every await, before it acts or answers (`ApiV1._still`: the folder name must still hold
+  that uid, else 404 `not_found`): under the session's lock (PATCH, stop and DELETE pass it to `manager.control`,
+  `stop` and `delete` as `uid=`, which `_check(sid, uid)` tests once the lock is taken; `continue`, an answer and
+  a message of a running session test it once they hold the lock), and after a read in a thread (files, a download
+  once its file is open, an archive after its measure and again in its walk, requests, messages, the result; a page
+  of events or of the stream is read again when the name changed hands during the read). So a request that waited
+  behind a delete never deletes, changes, starts or writes to the session that took the folder name meanwhile, and
+  never answers with what it read of it.
+- **PATCH** does what `swarm_control` does (`manager.control`, under the session's lock): `set_limits` and `wrap_up` /
+  `end_wrap_up`, as the user. They write the kv keys `limits` and `wrap_up`, which the swarm reads at every use (§3).
+  A stopped session is loaded to write them into its own database, not into its overrides (the database outranks
+  them); one that never started gets its database then. It is unloaded again afterwards, unless it was loaded before
+  (the board views it): on Windows an open database blocks a delete or a folder move. `wrap_up: true` on a session
+  that never started is 409 `conflict`, because the
+  goal set at the first start ends wrap-up mode. A `continue` that reopens a done goal ends it too. A `max_cost_usd`
+  that covers what was spent lifts a budget pause. A value the swarm refuses (`max_agents` below 1, a negative cost)
+  is 400 `bad_request`, and so is a number a float cannot hold (a whole number of 400 digits, which JSON may write;
+  `sessions._finite`) or a `max_agents` past 64 bits (`config.INT64_LIMIT`, as the create's `[swarm] max_agents`),
+  with nothing written. Its checks come in this order: the type (415 `unsupported_media_type` unless the
+  `Content-Type` is `application/json`, parameters such as a charset aside: `api_v1.check_json_type`), the query and
+  the body's fields (`unknown_field`; `api_v1.PATCH_FIELDS`), then the session. A field that is `null` is not given;
+  nothing given changes nothing.
+- **`continue`** does what `dreamteam -p -r <id> "<text>"` does with its prompt (`instruct.continue_step` on
+  `swarm.snapshot()`, shared with `-p`): without a goal the text becomes the goal; a completed goal is reopened with
+  the text as the comment; a pending question is answered by it (a message to the asker, which `Mailbox.send` makes
+  the answer: it ends the pause); otherwise it is a message to the coordinator (the planning task's assignee, else the
+  first AI member, else `"all"`). A session paused by the user is resumed as well. A budget pause is lifted only when
+  the budget now covers what was spent; while it is spent the answer is 409 `budget_exhausted` and nothing is given
+  (raise it with PATCH first). `text` is a string with a character that is not whitespace, the body's only field
+  (400 `bad_request`, `unknown_field`); the whitespace around it is dropped (`api_v1.continue_text`: a message and a
+  goal drop it anyway, a reopened goal's comment would keep it), and what is left takes at most 50 000 characters
+  (`mailbox.MAX_TEXT`: it may become a message) and no unpaired surrogate (a `\ud800` in the JSON: SQLite stores
+  UTF-8, so no message could hold it; `api_v1.required_text`). It is given in process, as the user
+  (`ApiV1._deliver`: `set_goal`, `reopen_goal`, `mail.send`, `resume`), always under the session's lock; what the
+  swarm refuses (a ToolError) is 409 `conflict`. The answer is 200 with the summary, by the session's state:
+  - running: the text is given at once (the refusals above are the answer's, nothing given); a session that stops
+    while the request waits for its lock is taken as one that does not run (below).
+  - not running: stopped, `starting` (a create or another `continue` in flight), or about to be resumed as the hub
+    starts (`resume_pending`). While the hub stops (`ApiV1.aclose()` runs) 503, answered 500 `internal`, nothing
+    started. Then, with no await between: `[api] max_running` when it was created through v1 and holds no place in
+    it yet (429 `too_many_sessions`, whoever calls; a session `starting` or about to be resumed counts already, once,
+    and is not checked), its budget (the summary's limit and spent: 409 `budget_exhausted`), and a start mark of
+    this request's own (`mark_starting`). The session is then started in the background (`ApiV1._continue_later`:
+    `start(sid, marked=..., then=...)`), and its `then` gives the text under the same hold of the lock as the start.
+    The starts queue on the session's lock in the order the requests came. Behind a start in flight this one is a
+    no-op once the session runs, so the texts of several `continue`s are given in order; when that start failed,
+    this one tries again, as a `continue` of a failed session does, and gives the text only when it succeeds. A stop
+    sent after the `continue` comes after its text. A stop sent before it, even one that holds the lock already
+    (unloading the session), leaves this mark alone (§17.2 `starting`), so the session runs again with the text.
+    The stop that `stop_when_done` schedules when the hub's resume finds a done job finds the goal reopened.
+  - A text given in the background that cannot be given is recorded as the session's `api.error` `{code, text}`
+    (`budget_exhausted`, `conflict`, a manager error's code with its text through `_public_text`, `internal` for
+    anything else, logged) and shown in the summary's `error`. So is `not_running` (`api_v1.NOT_DELIVERED_TEXT`) when
+    the start started nothing: a stop or a delete sent after the `continue` took the lock before its start did. That
+    is recorded only while the folder name is still the same session's (the uid read when the request came: a
+    delete gives the folder number to the next session). A start that fails shows its own error (`start_error`)
+    instead. The next text given clears it. A session not made through v1 has no `api` block: there it is only
+    logged.
+- **DELETE**: `confirm` must be the `{id}` (400 `bad_request` otherwise). `manager.delete(sid, skills="discard")`: the
+  session folder goes with it (§18.1 DELETE), except a folder the session worked in in place (21.10), which is kept
+  and named: `"folder_kept": {"root", "path"}`.
+- `continue` starts a stopped session; `messages` POST and the answers of requests need it running (409
+  `not_running`).
+
+### 21.3 Uploads
+
+- **Where.** v1's uploads are its own: `manager.api_uploads`, a `copyfrom.Uploads` on
+  `<home>/.dreamteam/uploads/api/`. A v1 token is never usable as the board's `copy_from_upload`, nor a board token in
+  v1. Any file is stored, an empty one too (an empty CSV, a `.gitkeep`), as `<token>.bin` with its `<token>.json`
+  `{"filename", "bytes", "at", "unpack", "caller"}`; `clean()` knows `.bin` and a claimed `.bin`. The board's
+  uploads (§17.2 "Uploads": an empty body is 400 there) are unchanged.
+- **Never through a link.** In the sandbox the hub reads with more rights than the agents and runs with their group
+  and umask 002, so the store is the hub's alone and an upload is read only as the file the hub wrote. The folders
+  of both stores (`uploads/` and `uploads/api/`) are made 0o700 on POSIX, a json is written O_EXCL with 0o600 like
+  the `.part`, and the json is read with `O_NOFOLLOW`. An upload must be a regular file with one name (`lstat`:
+  no link, no folder, `st_nlink == 1`) when it is checked (`peek`, `peek_many`: 404 otherwise), and the copy opens
+  the claim with `O_NOFOLLOW` and checks the opened file again (`fstat`: regular, one name, the `st_dev`/`st_ino`
+  that `lstat` saw, which also catches a swap on Windows); otherwise 404 `not_found`, "Upload the file again". So
+  an agent that put a link to `/proc/<hub>/environ` in place of an upload, or a hard link to a file of the hub's,
+  never gets it copied into a session. A zip is unpacked from that open file (`skills.unpack_zip` takes a binary
+  file), the board's claimed zips included.
+- **The caller.** `caller` is the kind of token that uploaded the file, `"owner"` or `"api"`. A create by the other
+  kind finds no such token (404 `not_found`): an API client never uses the owner's uploads, nor the reverse.
+- **The cap.** At most `[api] uploads_pending` (default 32) uploads wait or arrive at once, read at each upload; one
+  more is 429 `too_many_uploads`. Uploads sent at the same time are counted one after another (the count and the
+  `.part` of each are made under the store's lock, §17.2 "Uploads"), so the cap holds for them too. The 429 carries
+  `Retry-After` (and its text the same number): the whole seconds until the first upload waiting or arriving is past
+  its hour, by its json's `at`, else its file's time, as `clean()` reads it (`Uploads._first_free`; the next upload's
+  `clean()` then removes it; at least 1, at most `UPLOAD_TTL` + 1). A client frees a place at once by deleting an
+  upload it no longer needs ("Life"). The board's 8 (`UPLOAD_MAX_PENDING`) is apart; its 429 has no `Retry-After`.
+- **Content type.** The guard's `raw_posts` maps a path to a set of types (§18.1; a plain string is one type).
+  `/api/v1/uploads` takes `application/octet-stream` and `application/zip` (neither is CORS-safelisted: a
+  cross-site page cannot send one without a preflight the hub never answers); anything else, JSON included, is 415
+  `unsupported_media_type` (the guard's v1 branch, which takes a listed path's own types alone, §14).
+- **The name.** `filename` becomes the file's name in the session folder, so it is refused (400 `bad_name`), never
+  cleaned up (`copyfrom.check_upload_name`):
+  - missing, empty, `.` or `..`;
+  - a separator (`/`, `\`), a NUL or any other character that does not print, by Unicode category: `Cc` (C0 and C1
+    controls), `Cf` (bidi overrides, zero-width characters, a BOM), `Cs`, `Co` (private use), `Zl` and `Zp`
+    (U+2028, U+2029); a `:`. Spaces of any kind (U+3000, U+00A0) are names' characters, and so are code points
+    unassigned in Python's Unicode (a newer emoji), so a name is taken or refused alike on every Python;
+  - over `NAME_MAX` (200) characters, or over 255 bytes in UTF-8 or 255 units in UTF-16 (200 Cyrillic letters are 400
+    bytes, which the copy would refuse only after the claim);
+  - a name Windows cannot hold, on every OS (`< > " | ? *`, reserved device names such as `CON` or `aux.txt`, a
+    trailing dot or space: the portable rule of skills, §19);
+  - the form of a Windows short name (`GIT~1`, `PROGRA~1.TXT`: a base of at most 8 characters holding `~<digit>`,
+    an extension of at most 3), which `files/{path}` never serves (21.8);
+  - case-folded, a name the copy leaves out (`COPY_EXCLUDE_NAMES`: `.git`, `node_modules`, ...) or one the session
+    owns: `.scratch` (the members' folders), `.gitignore` (one with `*` would hide every output from the autocommits
+    and `changed_files`; the session writes its own), `.dreamteam` (harmless to refuse: the data folder is
+    `sessions/<sid>/.dreamteam`, next to `workspace/`, not in it) and `mcp` (the folder of the MCP servers the agents
+    build). A file named `.git` would be taken for a linked worktree's gitfile, and the autocommits would go to the
+    repository it names.
+- **`unpack`** (`true` or `false`, default false). With `unpack=true` the file must be a zip (400 `bad_request`
+  otherwise, an empty body too: "The upload is empty."), and its files go into the session folder under the zip
+  rules of `copy_from` (§17.2: a zip of one folder gives that folder's files; `.git`, links and the excluded names
+  are left out). At its top level, after that unwrap, the names the session owns (`.scratch`, `.gitignore`,
+  `.dreamteam`, `mcp`) are left out too and counted as excluded (`copyfrom.SESSION_NAMES`), so a zip never writes
+  into the members' folders. Without `unpack` a zip is one file like any other.
+- **Limits.** `[workspace] copy_max_mb` caps one upload (413 `too_large`, before any byte is read when the
+  Content-Length says more) and the sum of what one create copies in; `copy_max_files` caps the files one create
+  copies in. An unpacked size is known only by unpacking, so the sum is checked while the create copies, after the
+  claim (21.4).
+- **Life.** A token lives an hour (`UPLOAD_TTL`) and is used by one successful create, unless its caller deletes it
+  first: `DELETE /api/v1/uploads/{token}` (`Uploads.discard`, under the lock claims are made under) removes an upload
+  of the caller's that no create used, and answers `{"ok": true}`; a malformed token is 400 `bad_request`, one that
+  is unknown, used, claimed by a create in flight, past its hour or the other caller's 404 `not_found` (a create that
+  fails gives its tokens back: they can be deleted then). The create checks every token without claiming it
+  (`peek_many`: 400 for a malformed token, 404 for one that is unknown, expired, used or of the other caller), then
+  claims them all (`claim_many`, under one lock: a failure renames back what it took), then copies them into one
+  staging folder (`copy_sources`: each source into a part of its own, then merged; a top-level name two sources
+  share is 409 `file_conflict`, compared in NFC and case-folded on Windows and macOS, exactly elsewhere). Every
+  outcome settles the claims synchronously in a `finally`: a success releases them (used up); a 4xx unclaims every
+  token (a 413 or a clash found while copying included), so any 4xx leaves every token usable; a 5xx, a cancel, a
+  client's disconnect or a hub shutdown unclaims them too. Nothing stays claimed (`copyfrom._IN_USE`) after the
+  create.
+
+### 21.4 Creating a session
+
+```json
+{"goal": "text, required: the first line is the title, the rest the description (as §17.2)",
+ "title": "one line: the goal's title instead of the goal's first line",
+ "description": "more description, after the goal's own",
+ "language": "ru | en",
+ "team": "name of a saved team | [\"role\", ...]",
+ "model": "profile name",
+ "start_agents": 3, "max_agents": 8, "max_cost_usd": 5.0,
+ "network": "on | off",
+ "files": ["upload token", "..."],
+ "folder": {"root": "jobs", "path": "acme/site", "mode": "copy | in_place"},
+ "skills": ["library skill name", "..."],
+ "answers": "auto | manual",
+ "clarify": false,
+ "stop_when_done": true,
+ "client_ref": "the caller's own id of this job, at most 128 printable characters"}
+```
+
+- **Goal and title.** `goal` is required, a text with a character that is not whitespace (400 `bad_request`): a blank
+  goal would give the session no goal, and with `stop_when_done` it would never end. Without `title`, the goal's
+  first line is its title and the rest its description (`split_goal`, as §17.2).
+  - `title`, when given, is one line with a character that is not whitespace, at most 200 characters
+    (`TITLE_LIMIT` of a session's name, and `GOAL_TITLE_MAX` of a goal's title); 400 `bad_request` otherwise.
+  - The session's title (`title`, else the goal's first line) holds no control character (C0 or C1: a tab, NUL, an
+    escape sequence), no unpaired surrogate and no invisible format character other than the joiners of ordinary
+    text (U+200C, U+200D, the tags of a subdivision flag: a bidirectional override is refused), as a saved team's
+    name (400 `bad_request`): it reaches the owner's terminal (`dreamteam` prints it) and pages as it is.
+  - With `title`, the goal's title is `title` and the whole `goal` text its description, so nothing of the goal is
+    lost. When the goal's own title (as `split_goal` reads it) already equals `title`, whitespace collapsed, it is not
+    repeated: the goal is split as without a title.
+  - A `description` follows that description after a blank line.
+  - So v1 calls `create("", goal, description)` without a title, `create(title, goal, description)` when the goal's
+    own title equals `title`, and `create(title, title + "\n" + goal, description)` otherwise. The session's name is
+    `title`, else the goal's title cut to 60 characters at a word (§17.2).
+- **Settings.** Unset values come from the settings, as for the board. `team`: a string is a saved team (§17.3; 400
+  `unknown_team` with the saved names), a list is the starting roles in order, as `session_create` of the launcher MCP
+  (§18.2: it sets `start_agents` unless that is given), except that a name `roles.find_role` does not resolve is 400
+  `unknown_role` (the board invents a role; a program's typo should fail). `model`: a profile name (400
+  `unknown_model` with the profile names). `language`, `network`, `max_cost_usd`, `max_agents`, `start_agents` and
+  `clarify` become session overrides, as the board's do. `sessionopts.overrides_from(body, config, strict=True)` makes
+  them; the launcher MCP's `session_create` uses the same mapping, not strict. No provider, key or endpoint is ever
+  taken: those are the settings of the computer DreamTeam runs on. Strict, each has its kind: `start_agents` and
+  `max_agents` whole numbers of at least 1, `max_cost_usd` a number of at least 0, `language` `ru` or `en`, `network`
+  `on` or `off`, `clarify` a bool, a list `team` at least one role (400 `bad_request` otherwise); a refusal is a
+  `sessionopts.OptionError` with its code. In the body, a field that is `null` counts as not given.
+- **`start_agents`** is at least 1 and at most the session's `max_agents` (400 `bad_request`), also when a team (a
+  saved team's roles or a list) sets it: the starting team ignores `max_agents`, and a session without members never
+  finishes. A saved team sets `start_agents` to its size, so a `team` string with `start_agents` is 400
+  `bad_request`, as `session_create` refuses `team_name` with `start_agents`. A list sets it only when `start_agents`
+  is not given. A `max_agents` given alone is checked against the settings' `start_agents` the same way. The settings'
+  own values are not checked when the request sets neither (they are the owner's, as for the board).
+- **`files`**: at most 20 tokens of 21.3 (`files_per_session`), none twice; their files land in the session folder
+  before the first start, as `copy_from_upload` does. Not with an `in_place` folder (400 `bad_request`).
+- **`folder`**: a folder of the hub's computer, named by its root (21.10). There is no other way to name a path of the
+  hub's computer: no `workspace`, no `copy_from`.
+- **`skills`**: names of library skills, at most `[skills] max_attached`. Each must match `skills.NAME_RE` and be in
+  the library, or in the sandbox in the host library. It is passed to `create` as `library:<name>`, or as
+  `host-library:<name>` for one only the host library has (`resolve_ref` with an explicit source searches that source
+  alone). Anything else is 400 `unknown_skill`. (`create(skills=)` itself imports any string that is no reference as a
+  source, an absolute path or a Git URL, and a bare name falls back to `~/.claude/skills`.) No skill comes from a
+  path, a Git URL or Claude Code.
+- **`answers`**: who answers what the agents ask the user. `auto` (default): the hub itself, as `dreamteam -p` with
+  auto-replies (21.5). `manual`: the client, through `requests`. `clarify: true` (the planner asks first, §3.1) only
+  with `manual` (400 `bad_request` otherwise, as `--clarify` needs `--no-auto-reply`). An `api` meta without the key
+  (a hand edit) counts as `auto`, as one without `stop_when_done` counts as true (`sessions.api_answers(api)`: the
+  hold, the automatic answers and the summary read it alike).
+- **`stop_when_done`** (default true): when the goal is completed, or the budget pauses the session, the session is
+  stopped (its background jobs too), as `dreamteam -p` does with its own launcher, and journals `session.stopped` with
+  reason `done` or `budget`; `continue` starts it again. false: it stays running like a board session.
+  - A watcher runs with every start of such a session, on every start path. It reads the journal by id from where the
+    start began (`goal.completed` → done, `swarm.paused` with reason `budget` → budget), woken by the bus but never
+    reading the bus's queue, which drops events when it is full (`autoreply.follow_journal`: the bus queue holds one
+    wake-up, and each pass reads the newest id, then the rows up to it). It stops the session through a task the
+    manager keeps and never awaits that stop itself (`_unload` cancels the watcher).
+  - That stop is made under the session's lock only while the session still runs the same Swarm and the reason still
+    holds (the goal is still completed, the budget pause still holds): a `continue` that reopened the goal, a raised
+    budget or a stop may come first. The watcher goes on watching meanwhile, so a later completion or budget pause of
+    the same run stops it then. Such a stop ends that run and nothing more: a start announced while it waited for the
+    lock (a `continue`) keeps its mark and starts the session again. A hub that stops waits for a stop already
+    scheduled, so such a job is not resumed, and schedules no new one: a completion or budget pause the watcher has
+    not acted on yet when the hub stops is left to the resume check below (a session whose work is finished, its goal
+    completed and no task open, is not resumed at all: it stays stopped, its last reason `shutdown`).
+  - On a resume when the hub starts, a session already paused by the budget, or whose goal is completed, is stopped as
+    soon as it starts: the hub may have stopped between that event and the stop. On any other start only the events of
+    this run count, so a board start of a done session keeps it running.
+- **`client_ref`**: at most 128 printable characters. A create whose `client_ref` and `request_digest` match a session
+  that v1 still has (and the caller sees) answers 200 with that session and creates nothing: a retry after a timeout
+  never makes a second job. The same `client_ref` with another body is 409 `conflict`; when a session was made with
+  it, the answer's `session` names that session's id (every caller sees it: it was made through v1), so a client
+  that cannot resend the same body finds its session. `request_digest` is the SHA-256 of the body's canonical JSON
+  (keys sorted, no spaces; a field that is `null` left out, as not given, and a whole number with a fraction, `5.0`,
+  written as `5`; `folder` as parsed, `{"root", "path", "mode"}` with `path` `""` and `mode` `"copy"` when not
+  given, 21.10), stored for every v1 create. The upload tokens of `files` are part of the body: a retry resends the
+  same tokens (a token used up by the create is not checked again: the repeat is answered first, "Order" 2), and
+  one that uploaded its files again is another body. A create in flight holds an in-memory reservation of its
+  `client_ref`: a retry with the same body waits for it, then answers as a repeat (200), or goes on when that create
+  failed; a retry with another body is 409 at once (no session to name yet). The stored sessions are found through
+  the manager's index (`SessionManager.sid_of_client_ref`, §17.2), on the event loop with no await before the
+  reservation, so a create that finishes meanwhile is never missed.
+- **Order**, so that a refused create costs nothing:
+  1. the body: unknown fields; `goal`, `title`, `description`, `answers` with `clarify`, `stop_when_done`,
+     `client_ref`, the kinds of `files` and `skills`, `files` with `in_place` (`api_v1.CreateRequest.parse`);
+  2. `client_ref` (above): a repeat of a stored create is answered before anything that depends on the settings, so
+     a retry gets its session also when the settings changed since;
+  3. the overrides: the kinds of the options of "Settings" above, `start_agents` against `max_agents`, team, model,
+     roles (`sessionopts`, then `validated_overrides`);
+  4. the skills;
+  5. the folder, resolved and checked (21.10);
+  6. the uploads: every token checked without claiming it (`peek_many`);
+  7. `[api] max_running`, checked and reserved with no await between;
+  8. the uploads claimed (`claim_many`);
+  9. `manager.create(start=False, mark=m, api=..., sources=..., workspace=..., within=...)`: the uploads and a
+     `copy` folder are copied into `sessions/.copying-*` before the session folder exists; `_create` then makes
+     `sessions/<sid>`, renames the staging in, marks the session `starting` with `m`, then writes session.json once,
+     with `via` and `api`, and holds the session's lock until its skills are committed and its folder set, before it
+     announces it (§17.2): a listing shows it `starting` from the first, and a stop, `continue` or DELETE sent
+     meanwhile waits for the create;
+  10. the claims settled (21.3);
+  11. 202 with state `starting`; the start runs in the background (`manager.start(sid, marked=m)`: nothing when a
+      stop or a delete came first), as a task `ApiV1` keeps (`ApiV1.spawn`). A start that fails is in the summary;
+      the background task logs it at information only, whatever the exception: a `SessionError` by its text, any
+      other with its traceback (the manager logs a failed `swarm.start()` as an error, but records a check before
+      it that raised without logging it).
+- While the hub stops (`ApiV1.aclose()` runs) a create starts nothing: `SessionError` 503, answered 500 `internal`.
+  One that passed that check before is still started (`aclose()` waits for it); once `aclose()` has ended nothing is
+  spawned (`spawn` refuses, 503), and the create records that as a failed start (`api.start_error`
+  `{"code": "internal", "text": "DreamTeam is shutting down."}` and `api.finished_at`, while no operation holds the
+  session's lock) before it takes its mark away again: the session is `failed` and final, a repeat of its
+  `client_ref` says why, and a `continue` starts it.
+- Any 4xx leaves every token usable. A start that fails writes `api.start_error` (`{"code", "text"}`) and
+  `api.finished_at`, and leaves the session stopped: state `failed`, the text in the summary's `error`. That includes
+  the checks before `swarm.start()`, which raise before its `try`: a missing workspace folder
+  (`_check_workspace_ready`), an adopted repository that is not clean (`_check_adopted_repo`) and the checks of 21.10
+  "Starts". The next start that succeeds clears `start_error`.
+- **session.json** (§17.2) gets `"via": "api"` and `"api": {"answers", "stop_when_done", "client_ref",
+  "request_digest", "folder", "base_commit", "started_at", "finished_at", "start_error", "error"}` in its first write,
+  before any start (a later write would race the start). Each later write of the `api` block is a read-modify-write
+  of session.json under the session's lock: in `_start_locked` and its failed-start path, in `_unload` (every caller
+  holds the lock) and in the `continue` delivery, which takes it. `folder` is `{"root", "path", "mode"}` or null
+  (21.10).
+  `base_commit` is the workspace's HEAD, recorded at the end of `Workspace.init` under its git lock at the first
+  start: the first commit of the copied files is in it and no agent commit is; null with git off or after a failed
+  init. `started_at` is the first start; `finished_at` when the session last reached a final state (21.7), null
+  again from each start that succeeds (the result's `duration_s` runs to it, or to now);
+  `start_error` the last start's failure; `error` {code, text} of a `continue` whose text could not be given after a
+  start (21.2), null again from the next text a `continue` gives. The sessions page shows
+  such a session like any other, marked "API". `dreamteam -c` and `-p -c` never pick one (a busy client would
+  otherwise make its own sessions the most recent ones), nor do `console` and `traces` without `--session`, nor is
+  one the hub's `default_session()` (the launcher MCP's calls without `session`, `serve`'s console; §17.1, §17.2);
+  `-r <id>` opens it.
+- **`[api] max_running`** (default 3, 0 = no limit) counts the running and starting sessions created through v1. Only
+  v1's starts (create, `continue`) are refused, 429 `too_many_sessions`. A resume when the hub starts and the owner's
+  starts from the board, the TUI or MCP are never refused, but they count.
+
+### 21.5 Requests to the user, automatic answers (autoreply.py)
+
+A **request** is something only the user can give, in board-neutral words. Its id names the exact thing asked, so a
+retried answer never lands on a newer one:
+
+```json
+{"id": "q12", "kind": "question", "ts", "from": "Anna Smith", "text", "pauses_swarm": true}
+{"id": "m15", "kind": "message",  "ts", "from": "Anna Smith", "text"}
+{"id": "r7-418", "kind": "review", "ts", "from": "Anna Smith", "task": {"id", "title", "result"}}
+{"id": "s-web-3f9a0c1b2d4e", "kind": "mcp", "ts", "from": "Anna Smith", "server": {"name", "description", "tools"}}
+```
+
+- **One definition.** `autoreply.requests_of(swarm)` lists them, and `autoreply.blocking_requests` says which of them
+  block the work. `SessionAutoReply`'s sweep, the summary's `requests` count, the state `waiting` (21.7) and the
+  routes all use them. A stopped session's requests are read from its file (`read_requests(db_path, *,
+  clarify=False)`, read-only, the same kinds), and `_read_stats` reads the same kinds for its summary: a question
+  pause (kv `paused`), a clarify planner that waits, reviews for the user, MCP servers that wait, unanswered member
+  messages. A session that does not run lists and counts only those that block its work
+  (`autoreply.listed_requests(requests, running=)`): a `message` can be answered only while the session runs, and a
+  job that stopped with its member's last report unanswered (a done job, which `stop_when_done` stops) would
+  otherwise list a request for good that only a `continue`, which reopens the goal, could reach. The report stays in
+  the user's conversation (GET `messages`), and is listed again if the session runs again with it unanswered.
+  All three are `autoreply.requests_from(conn, *, clarify)` on a connection (a loaded swarm's under its
+  Database's lock, or a file's), where `clarify` is the session's `[swarm] clarify` (a planner waits for the user only
+  with it on, as `Swarm.asks_user` says). The list is oldest first (`ts`, the time it was asked: the message's, the
+  review round's event's, the MCP record's last update). `autoreply.request_key(id)` reads an id back:
+  `("question", message id)`, `("message", message id)`, `("review", task id, event id)` or
+  `("mcp", name, digest[:12] or "")`, None for anything else, a number of more than 19 digits or above 2^63−1
+  (`autoreply.ID_MAX`, SQLite's largest integer) among them: no request has one, and Python's `int()` refuses a text
+  of over 4300 digits.
+- **Cost.** Only v1's summary counts the requests (`manager.summary(sid, requests=True)`): the board's summaries (the
+  sessions list the home page polls, `default_session()`) never run these queries. v1 builds one for every route,
+  every pass of a poll or a stream and every session GET `/sessions` lists, so no query of `requests_from` scans a
+  whole table for each request: the newest round of each review is read back from the newest
+  `task.updated` on the events type index (`ORDER BY id DESC LIMIT 1`), and each member's last message to the user
+  (one grouped query on the inbox's recipient index) is checked against the messages written after it only. The time
+  grows with what was written since a request was asked, and with the messages to the user, not with the whole
+  journal: on a session of 100 000 messages and 50 000 `task.updated` events it is about 13 ms where every request is
+  recent, and about 110 ms where a message unanswered since the first and a review round behind all those events
+  wait. A row whose JSON cannot be read (a damaged tags, tools or `paused` value) is read as empty, and hides no other
+  request.
+- `question` (`q<message id>`): the question that holds a question pause (§3.1, `pauses_swarm: true`), or, while the
+  snapshot's `clarify_wait` (§14.1) names a planner that waits for the user's answers, that planner's last message to
+  the user (`pauses_swarm: false`; `autoreply.planner_question`, the rule `Swarm.asks_user` uses too). The full text
+  comes from the messages table: the snapshot's `question.text` is cut to 600 characters, and `clarify_wait` carries
+  only `{name, task_id}`. Answer `{"text"}`: a message to the asker with `reply_to`, which ends the pause.
+- `message` (`m<message id>`): the last message of an active member to the user that no message of the user to that
+  member followed (`Swarm.last_message_id(sender, recipient, since)`, a public form of the private `_LAST_TO` query; a
+  message the user sends on the board closes it too). One per member at most. A message already listed as a question
+  is left out, and so are the messages of retired members, which can never be answered. Answer `{"text"}`. It does not
+  block: reports to the user land here too, and the state stays `running`. Listed only while the session runs (see
+  "One definition").
+- `review` (`r<task id>-<event id>`): a task in review whose reviewer is the user. The event is the newest
+  `task.updated` in the journal that put the task in review for the user (the event's task is in review with the user
+  as its reviewer, and `changes.status[1] == "review"` or `changes.reviewer[1] == "user"`), so a new submission is a
+  new id; `0` when the journal has none. (The task's `updated_at` cannot name the round: every write of the row
+  changes it.) `task` is `{id, title, result}`: a task has no summary; `from` is its assignee. Answer
+  `{"approve": bool, "comment"?}` → `task_review`.
+- `mcp` (`s-<name>-<digest[:12]>`): an agent-built MCP server that waits for the user's approval
+  (`[mcp] require_approval`, §11; only servers the agents built wait). `server` is `{name, description, tools}` (a
+  forged server's `command` is always []). Answer `{"approve": bool}` → `mcp_approve` with that digest, which refuses
+  a stale one: the server was rebuilt meanwhile. Never answered automatically. Skill proposals are not requests: they
+  do not block the work, and the board decides them.
+- `question`, `review` and `mcp` requests block the work: the state is then `waiting` (21.7). `message` requests do
+  not.
+- `GET requests` reads a loaded session's requests through its swarm (`requests_of`; also while an unload stops it,
+  until its database is closed: `SessionManager.reading`, §17.2) and any other session's from its
+  file (`read_requests` with the session's `[swarm] clarify`: its overrides on the global settings, as its summary
+  reads it), never loading it; also from the file when an unload closed the swarm's connection while it read
+  (`sqlite3.ProgrammingError`). In a thread (`ApiV1._read_db`): the file may be large. A stopped session's file that
+  cannot be read (a damaged one) gives `{"requests": []}`, as its summary counts none, and `GET messages` gives
+  `{"messages": [], "last": after}` (`ApiV1._stored_conversation`); the hub's log says why at debug level, since
+  clients poll. A loaded session's database error other than a closed connection is 500 `internal`.
+- An answer (`POST requests/{rid}`, `ApiV1._answer`) is checked in this order: the query; the body; the id (an id that
+  `request_key` cannot read names no request: 404 `not_found`); the body's fields for the kind it names
+  (`api_v1.answer_of`, `ANSWER_FIELDS`): a field of another kind's answer is 400 `unknown_field`, a missing one or a
+  value of the wrong kind 400 `bad_request` (null is not given); then the session (404), `earlier_version` (409), and
+  it must run (409 `not_running`, `api_v1.NOT_RUNNING_TEXT`, also when it stopped while the answer waited for its
+  lock: "The session is not running: POST /api/v1/sessions/{id}/continue starts it again with a text, the answer to
+  a pending question, else a message to its team; a completed goal is reopened with it, and its agents work on it
+  again."). Under the session's lock the request must still be current (`requests_of` lists that id; an answered,
+  vanished or older one, a review round handed in again or an MCP server built again, is 404 `not_found`), checked on
+  the loop with no await before the action, so the agents, on the same loop, cannot come between. It is given in
+  process, as the user (`ApiV1._give_answer`): a question or a message is the user's message to its member with
+  `reply_to` (to the asker of a question pause `Mailbox.send` makes it the answer, which ends the pause), and that
+  message is marked read in the user's inbox (`Mailbox.mark_read`: the client was shown it). Only that one: the
+  member's earlier messages, which no request listed, stay unread on the board. A review is
+  `Board.review(USER, task, approve, comment)`. An MCP server is `MCPForge.approve(USER, name, approve, digest=<the
+  id's 12 hex>)` (`ApiV1._approve_server`), called right after the check, after the session's lock: leaving that lock
+  and taking the forge's free lock of the server never yield, and while another call holds the forge's lock (its owner
+  builds it again), the forge's own digest check refuses an approval or a rejection of a server built again
+  meanwhile. It is not under the session's lock, as the board's approval is not: an approval whose working copy
+  changed builds and smoke-tests it again first (up to `[mcp] startup_timeout`), and a stop, a delete or the hub's
+  shutdown would wait for that. A session that stopped meanwhile (its database closed) is 409 `not_running`; a
+  second answer to the same server sent while the first one runs is 409 `conflict` (the forge: it waits no more).
+  What the swarm refuses (a ToolError) is 409 `conflict`; its text, which may name a path of the hub's computer (a
+  failed smoke test's), goes to the API caller through the redaction of 21.1, as a manager error's (`ApiError(...,
+  redact=True)`; the same for `continue`'s refusals and `POST messages`). The answer is
+  `{"ok": true, "session": summary}`. The text of a question's or a message's answer
+  follows `continue`'s rule (21.2: stripped, non-blank, at most 50 000 characters, no unpaired surrogate); a review's
+  `comment` is a string or null, at most `board.MAX_POST` (20 000) characters once stripped (it becomes a post of the
+  task).
+- **Messages.** `GET messages` reads the user's conversation with the members (what the user sent and what reached
+  the user; a member's message to `"all"` never reaches the user), oldest first, after `after` (a whole number from 0
+  up to 2^63−1, `api_v1.query_after`; `limit` 1–500, default 200; `last` is the newest id returned, else `after`),
+  through a new ascending query, `Mailbox.user_conversation(after, limit)` (`{id, ts, sender, recipients, text,
+  reply_to}`, the columns every version of the table has). (`Mailbox.conversation` gives one pair's messages and, with
+  `since_id` 0, its latest page rather than the oldest; `history` also gives the latest page.) A session that is not
+  loaded is read from its file (`mailbox.read_user_conversation(db_path, after, limit)`, through `db.reading_file`;
+  [] without a database), as `GET requests` reads it, in a thread. A message is `{id, ts, from, to, text, reply_to}`
+  (`api_v1.message_view`). A page reads the messages after `after` until it has `limit` of the user's: a poll from
+  `last` costs what was written since, while a first page of a long session where the members wrote much to each
+  other and little to the user reads them all (about 0.2 s for 200 000 messages, under a loaded session's database
+  lock).
+- `POST messages` (`ApiV1._send`) takes `{"to", "text", "reply_to"?}` (`api_v1.message_of`, `MESSAGE_FIELDS`): `to` a
+  list of 1 to 100 member names or `"all"` (every active member; `api_v1.TO_MAX`), `text` as an answer's, `reply_to`
+  a message id or null; another field is 400 `unknown_field`. Its checks come in an answer's order, and it is sent
+  under the session's lock as the board's user sends it (`Mailbox.send(USER, to, text, reply_to)`: one to the asker of
+  a question pause is its answer). What the mailbox refuses (an unknown or retired member, the user alone, a
+  `reply_to` that names no message) is 400 `bad_request`, with the mailbox's text. 201 `{"message"}`.
+- **`answers: "auto"`**: `autoreply.SessionAutoReply(swarm)` does for that session what the `-p` client does
+  (docs/TUI.md §2):
+  - every message of a member to the user gets `AUTO_REPLY`, at most `AUTO_REPLY_MAX` per start;
+  - a task waiting for the user's review is approved with `AUTO_REVIEW` once per round, past `AUTO_REPLY_MAX` too, as
+    in `-p`;
+  - a question pause is answered, past `AUTO_REPLY_MAX` too.
+  - It runs as a task that reads the session's journal by id from where it stopped (`message.sent`, `task.updated`,
+    `swarm.paused` with reason `question`; `autoreply.follow_journal`, as the stop_when_done watcher does, 21.4), woken
+    by the bus, never inside a bus listener, which would re-enter `emit`. At its start it sweeps what already waits, by
+    the definitions of `requests_of`, then follows the journal from the head read just before `session.started`
+    (`SessionAutoReply.start(after=head)`, as the watcher): the sweep answers each member's last message, and the
+    follower each earlier one of that run, so a member that wrote twice while `swarm.start()` ran gets two answers. Its
+    actions run in process as the user (`mail.send`, `board.review`) in the session's language; a ToolError is logged
+    and skipped (never tried again). A review is approved only while the task is still in review for the user.
+  - It is restart-safe: it skips a member's message that a later message of the user to that member followed, since
+    its in-memory sets are lost at a restart. Its own answers of this run do not count there, so each of two messages
+    a member sends in a row gets its answer, as with `-p`.
+  - A question pause is answered while it still holds, past `AUTO_REPLY_MAX` too: under the limit the answer to the
+    question's message has usually ended it already (the user's next message to the asker is the answer, §3.1). An
+    answer to a question pause does not count against the limit; an answer to a message does (a question's message
+    among them), as in `-p`.
+  - `_start_locked` starts it when the `api` meta says `auto`, on every start path (the board, the TUI, `-r`, a resume
+    when the hub starts, the launcher MCP, v1). There too, `Swarm.hold_auto_reply()` takes the auto-reply lease
+    for the whole run before `swarm.start()`, which may itself call `set_goal` from the settings: no planning question
+    first, `pause_swarm` ignored (§3.1).
+  - Past `AUTO_REPLY_MAX`, messages are no longer answered: they stay requests of kind `message`, and the session
+    notifies the user once per run, with a `notification` of the kind `u_auto_reply_limit` {max} (quiet: no
+    member is woken; a warning line in the terminal's feed, `render._WARN_NOTES`).
+  - `_unload` stops it (and waits for its task) before `Swarm.stop`; it ends at its next wait, so no action is cut in
+    two.
+  - `mcp` requests stay requests in this mode too. With `[mcp] require_approval = true`, an `auto` session can stay
+    `waiting` until the client or the board answers.
+  - The texts and the limit live in autoreply.py. `-p` keeps its client-side replies, except for a
+    session whose summary says `answers: "auto"` (`autoreply.hub_answers(summary)`, read from the summary `-p -r`
+    starts or attaches; `answers` never changes after the create): there it sends no reply, approval or answer to a
+    question pause, and writes no line that a member waits for the user, so nothing is answered twice; with
+    `--verbose` it says once that the hub answers (printmode `hub_answers`).
+
+### 21.6 Events
+
+An event is a journal row (§9) with its id, plus a line for people:
+
+```json
+{"id": 41, "type": "task.updated", "ts": 1794463609.8, "actor": "Anna Smith", "data": {...},
+ "text": "◐ #3 Parse the document — Anna"}
+```
+
+- `data` is §9's and may gain fields.
+- `text`: one line from `eventtext.event_text(event, lang, me=USER)`, outside the `tui` package. It takes its
+  words and symbols from `uitext.py` and `symbols.py`, moved out of `tui/i18n.py` and `tui/theme.py`, which keep
+  shims. It has the meaning of the TUI's verbose feed line as the user sees it (`render.event`), without its terminal
+  parts: no wrapping, panels or colours, no clock (`ts` has the time), no width limit; whitespace is collapsed, and
+  control characters and the invisible bidi and zero-width format characters are removed.
+  - A tool call is journaled before the tool runs, so its event cannot gain the result later. The `tool_call`
+    activity's text is the call line (`Anna Smith · task_claim(task_id=3)`), and the `tool_result` activity's text is
+    a line of its own (`Anna Smith · task_claim ⎿ <first line>`, an error marked).
+  - `text` is null only for the events no feed shows: `agent.usage` and `agent.compacted`.
+  - `lang` (`ru` or `en`, 400 `bad_request` for another) defaults to the session's language.
+  - The text adds no absolute path of its own: a folder is named by its last component, and the environment of
+    `skill.deps` and a job log outside the workspace are left out. That holds for every text of DreamTeam's own a
+    line quotes (a notice, a wake-up, an agent's error, an installer's error), whatever it embeds. What the agents
+    wrote (message bodies, tool calls and their results) is quoted as written, paths included (21.1).
+  - It never raises: an event it cannot word gets a generic `<type> · <actor>` line.
+  - The TUI may later take its words from it. The wording is for people and may change (21.1).
+- `detail=timeline` (default) selects by an exact list of types, `type IN (...)`, so the database does the filtering
+  within the id window it reads by its primary key (below), not `EventBus.recent`'s `LIKE` patterns, which ignore
+  case and take `_` as a wildcard:
+  `task.created`, `task.updated`, `task.comment`, `message.sent`, `notification`, `goal.set`, `goal.completed`,
+  `goal.reopened`, `agent.hired`, `agent.retired`, `swarm.paused`, `swarm.resumed`, `swarm.wrap_up`, `swarm.limits`,
+  `session.started`, `session.stopped`, `job.started`, `job.ended`, `mcp.created`, `mcp.status`, `skill.attached`,
+  `skill.detached`, `skill.proposed`, `skill.library`, `skill.deps`, `file.changed`. In the timeline a `notification`
+  counts only when it is addressed to the user (`swarm.notify` journals one per recipient). `detail=all`: every
+  journaled event (`agent.activity`, `agent.usage`, `agent.status`, `trigger.*`, the locks too). The live-only
+  `trace.*` and `job.silent` (§9) have no id and are never sent. Another `detail` is 400 `bad_request`. The list is
+  `api_v1.TIMELINE`.
+- An event is answered with its `data` as journaled, except a float that is not finite (a model's `NaN` in a tool
+  argument is journaled as it came), which reads null there: no JSON answer could carry it, and a stream would fail
+  again at every reconnect (`api_v1.safe_json`). Data that is not JSON at all reads `{}`.
+- **Session events.** `session.started` {} and `session.stopped` {reason: `done` | `budget` | `user` | `failed` |
+  `shutdown` | `restart`, error?} are journaled by the manager into the session's journal, so that a client sees a
+  run's start and end as events:
+  - `session.started` just before `swarm.start()`, so this run's `agent.hired`, `goal.set` and other start events
+    follow it. A start refused before `swarm.start()` (a missing folder, an adopted repository that is not clean, the
+    checks of 21.10) journals nothing; it only wakes the waiters.
+  - `session.stopped` by `_unload` of a running session, before `swarm.close()` (an emit after the close raises), its
+    errors suppressed. The reasons: `user` (a stop from the board, the TUI, MCP or v1, and a delete), `done` and
+    `budget` (`stop_when_done`), `shutdown` (the hub stops), `restart` (a stop the hub makes to start the session
+    again: a workspace move). A failed start journals `session.stopped` {reason: `failed`, error} before its unload:
+    the session is not in `running` yet, so `_unload` alone would not. `error` is DreamTeam's own text (an exception
+    of the start), with every absolute path named by its last component, as in `text`, and the session's folders
+    matched whole, spaces included (§17.2 "Sessions of the HTTP API v1"); the hub's log has it whole. A
+    start cancelled meanwhile (the hub stops during its `resume()`) journals {reason: `shutdown`}.
+  - A delete journals the stop of a running session as `user`. When the delete succeeds, the journal goes away with
+    the session; when its folder cannot be renamed away (files in use, 409), the session stays, stopped, with its
+    run's end journaled and its resume mark cleared.
+  - Neither changes the session's `last_activity` (§17.2), which sorts the sessions list and picks the session of
+    `-c`: a hub shutdown would stamp every running session. Nor are they work for an import's comparison of histories
+    (§20.4): a hub restart alone does not make one computer's copy newer.
+  - Both types join §9's list, `render.EVENT_TYPES` and `static/app.js` together with the code that emits them
+    (`tests/test_tui_render.py` checks that every type §9 names is in `render.EVENT_TYPES`).
+- **Polling** (`GET .../events`). `after` is the last id the client has (default 0: from the oldest event, in
+  ascending id order, unlike `EventBus.recent(since=0)`, which gives the newest). `limit` 1–500 (default 200).
+  The answer: `{"events", "last", "more", "state", "final"}`.
+  - The read (`events.read_page(conn, after, limit, types=None, scan=None, *, recipient=None, decode=True)`, through
+    `SessionManager.journal`) takes the newest id (`head`) first, then the rows with
+    `after < id <= min(head, after + 5000)` (`events.SCAN`) that the filter keeps, in id order, at most `limit` of
+    them. A single query with a `LIMIT` could not say what it examined. The timeline's notification rule is the SQL's
+    own (`recipient`: `json_extract(data, '$.recipient')`, guarded by `json_valid` so a damaged row cannot fail the
+    page).
+  - A stopped session's journal that cannot be read now (a file held by another program, a share unplugged) is an
+    error, 500 `internal` with `sessions.JOURNAL_TEXT` (`SessionManager.journal`'s `SessionError` 503), never a page
+    with no events: with `final` true, `more` false would tell the client that the run has nothing more, and it would
+    stop with events missing. The client asks again later; the stream ends without a result (below).
+  - `last` is the last row's id when the page is full, else the upper end of that window: the highest id the read
+    examined, so a page whose rows the filter dropped still moves on. `more` is true when `head > last`. An `after`
+    past the newest id answers no events, with `last` = the newest id.
+  - The reads come in this order: `state` and `final` (21.7) first, then `head`, then the rows. So when `final` is
+    true and `more` false, nothing will follow unless the session is started again (the board, the TUI, the launcher
+    MCP or v1 `continue` can start it).
+  - `wait` 0–60 seconds (default 0), a whole or decimal number written with digits (`2.5`; no sign, exponent or
+    `inf`: 400 `bad_request`). The request waits only when nothing can be answered yet: the page has no row,
+    the read reached the head (`more` false, `after` not past it) and the state is not final. Otherwise it answers at
+    once: a page the filter emptied while `more` is true (no events, `last` moved on, so the client asks again at
+    once), an `after` past the head (above), a final session.
+  - A waiting request is woken by a new event of that session, a change of its state, or the end of an operation that
+    held its lock (`manager.watch(sid)`, a waiter keyed by session, poked by one bus listener per Swarm and by the
+    manager). Each pass resolves `{id}` again and reads again in the order above (`ApiV1.read_events`: the id and the
+    summary on the loop, as every route builds a summary, since they read state that only the loop changes; then
+    `events_page`, the journal and the lines, in a thread); after a wake-up it first waits `api_v1.SETTLE_SECONDS`
+    (50 ms), so a burst of events (an agent's tool calls) is read once. It answers with rows, on a change of `state`
+    or `final` (a lock released), or at the deadline; 404 `not_found` once `{id}` no longer resolves (a delete
+    meanwhile). The waiter follows the folder name the id resolves to at each pass (`api_v1._Watch`).
+  - A stopped session's journal is read from its file, read-only and closed after each read (`db.reading_file`), never
+    through `manager.load`, which would build and keep a whole Swarm. A loaded session's journal is read through its
+    connection, under the database's own lock (`Database` serializes its calls), never the session's lock: that one is
+    held for a whole start, stop or folder move. So is a session's that a stop is unloading, until its database is
+    closed (`SessionManager.reading`): no read in a thread opens the file next to the open writer, so the close
+    leaves `swarm.db` alone, with no `-wal` or `-shm` file. A connection closed meanwhile (`sqlite3.ProgrammingError`)
+    is read again through the file.
+- **Stream** (`GET .../events/stream`). `text/event-stream`, with `Cache-Control: no-cache` and
+  `X-Accel-Buffering: no`; each event is `id: <id>`, `event: <type>`, `data: <the event JSON>` (one line: the JSON
+  escapes line breaks; `api_v1.sse_event`); it starts after `after` or after the `Last-Event-ID` header, which wins
+  when both are there (an `EventSource` sends it as it reconnects, with the URL it first opened). Its query, the
+  header and the session are checked before the answer starts (400, `unknown_field`, 404); an error once the answer
+  has started is logged and ends the stream. A `: ping` comment after 15 s without a line (`api_v1.PING_SECONDS`).
+  - It reads the journal by id, in pages of 500, as polling does: window after window while `more` is true. Each pass
+    reads in the order of polling, but only what the stream needs: `{id}` resolved again, `final`
+    (`manager.is_final`, in memory), then the head and the rows (`events_page`, in a thread). The full summary is built
+    only once per folder name for the session's language (when the query names no `lang`) and on the final pass for
+    the result. It waits only at the head of a session that is not final, until a wake-up (then `SETTLE_SECONDS`) or
+    the next ping, then reads again.
+  - It never holds a Swarm, a bus or a connection across a wait. An unload (a stop) replaces the session's Swarm and
+    bus, while a start of a loaded session reuses them, so the stream's wake-ups are keyed by session
+    (`manager.watch`), never by a bus: nothing is lost when a bus queue overflows or the swarm changes.
+  - When the state is final and `more` is false, one `event: result` (no id) with the result (21.7), and the stream
+    ends. The result is built from a summary read after that pass's rows (the hub's settings read again first, as GET
+    `result` does), in a thread, and sent only when nothing changed since the pass began: no wake-up of the session
+    (an event, a start announced, a lock released), `final` still true, `{id}` still resolving to the same folder.
+    Otherwise the stream reads on, so a session started again meanwhile (a `continue` that arrived while the result
+    was built) never gets a result that says final; it gets one when it is final again.
+  - A delete ends it without a result (`{id}` no longer resolves), and so do a journal that cannot be read now
+    (polling's 500 above; logged) and a hub shutdown (the server ends the open answers after `GRACEFUL_SECONDS`; the
+    session comes back with the hub when it has its autostart mark): a client reconnects with `Last-Event-ID`.
+
+### 21.7 State, summary, result
+
+`state`, the first that holds:
+
+| state | when |
+|---|---|
+| `starting` | a create or `continue` is starting it, or the hub's `resume()` is about to |
+| `failed` | its last start failed (`api.start_error`), a check before `swarm.start()` included |
+| `created` | never started: no `api.started_at` (for a session not made through v1: no database or no members yet) |
+| `done` | the goal is completed (running with `stop_when_done: false`, or stopped) |
+| `budget` | the budget paused it (running), or that pause stopped it |
+| `waiting` | running, and a request that blocks the work waits (21.5) |
+| `paused` | running, paused by the user |
+| `running` | running |
+| `stopped` | stopped otherwise (by the user, a DELETE in progress, a hub shutdown) |
+
+- A session made by an earlier tool revision is `stopped` and final, with `"earlier_version": true` in its summary;
+  every route that needs it loaded answers 409 `earlier_version` (21.1).
+- `final` (`manager.is_final(sid)`) is true when the session is stopped and will not come back by itself:
+  - it is not running;
+  - it is not starting: not in `starting` (the creates and `continue`s in flight) and not in `resume_pending` (the
+    sessions the hub's `resume()` will try, filled before the launcher takes its first request and emptied one by one
+    as `resume()` handles them);
+  - no operation holds the session's lock: `_unload` takes the session out of `running` before it journals
+    `session.stopped`.
+- The autostart mark does not count for `final`: `resume()` skips finished sessions and earlier-version ones but keeps
+  their mark, only logs a failed start, and resumes nothing when `[server] resume_sessions` is false. Under a rule
+  based on the mark, such sessions would never become final and their streams would never end.
+- With `stop_when_done`, the end of a job is `done` or `budget` with `final: true`.
+
+Summary: `{"id": uid, "name", "title", "state", "final", "error", "goal": {title, description, status, summary} |
+null, "language", "model", "cost_usd", "max_cost_usd", "max_agents", "created_at", "started_at", "finished_at",
+"agents": n, "tasks": {status: n}, "requests": n, "answers", "stop_when_done", "client_ref", "via", "folder",
+"board_url", "earlier_version"}`.
+
+- `name` is the folder name; `model` the default model profile's name; `agents` the members that are not retired;
+  `requests` how many requests GET `requests` lists now (21.5); `error` the text of `api.start_error` or of
+  `api.error`, else null.
+- `answers`, `stop_when_done`, `client_ref`, `started_at` and `finished_at` come from the `api` meta; they and `via`
+  are null for a session not made through v1. `folder` is the `{root, path, mode}` of 21.10, else null.
+- No absolute path, for any caller: no `dir`, `workspace` or `copied_from` (the board's summary, §17.2, has them).
+- `board_url` is `manager.hub_url` + `/s/<name>/`, but only when the hub knows its public address:
+  `DREAMTEAM_PUBLIC_URL` is set, or the bind is loopback (`web._loopback_bind`); else null. `manager.hub_url` is set
+  for every bind, 0.0.0.0 included, so it alone says nothing. Opening `board_url` takes the hub token, not the API
+  token.
+
+Result: `result.build_result(*, status, session, goal, summary, tasks, agents, jobs, cost_usd, duration_s,
+error=None)`, a builder `_PrintRun.report` shares (it passes a monotonic duration). It takes the raw snapshot lists
+and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
+`session`, `goal`, `summary` (the goal's summary when `status` is `done`, else ""), `tasks`
+(`{id, title, status, assignee}`), `cost_usd`, `duration_s`, `agents` (the names of the members not retired), `jobs`
+(the running ones, `{id, label, owner, command, origin}`), and `error` only when given.
+
+- `-p` passes its own words for `status` (done, budget, timeout, error, interrupted), its sid and its monotonic
+  duration.
+- v1 passes the v1 state as `status`, the uid as `session` (folder names come back after a delete, §17.2), the
+  summary's `goal` (`{title, description, status, summary}` or null) and `duration_s` from `api.started_at` to
+  `finished_at` or now (null without `started_at`: a session not made through v1, or one that never started); its
+  tasks and members are read as the snapshot lists them (`sessions.read_lists`: a stopped session from its file,
+  never loaded), and its tasks gain `parent_id` and `crew` (§4.2); `jobs` are the running ones of a running session,
+  read on the loop from the jobs themselves (`api_v1.job_view`: never their process lists), none otherwise. It adds,
+  in this order after `jobs`: `error` (always; null when none), `final`, `board_url`,
+  `"changed_files": [{"path", "change": "added" | "modified" | "deleted"}]`, `changed_files_error` and
+  `changed_files_truncated` (`ApiV1.result(sid, summary, jobs)`, in a thread, after the summary and the jobs were read
+  on the loop; the route is `GET .../result`, whose query takes no field, and it reads the hub's settings again first,
+  as a start does, so a hand edit of `[api] folders` or `[workspace] git` counts at once; the stream's `result` is
+  built as 21.6 "Stream" says).
+- `changed_files` lists at most `api_v1.CHANGED_FILES_MAX` = 10 000 entries, the first ones by path; then
+  `changed_files_truncated` is true (false otherwise, also when the list is null). A tree of untracked files that the
+  folder's own `.gitignore` does not ignore (a `node_modules`) would otherwise put every file into every answer and
+  into the cache.
+- A final result is cached (`ApiV1._results`, the newest `api_v1.RESULTS_CACHED` = 64), keyed by uid and
+  `finished_at`, and also by the state and the journal's head: a PATCH of a stopped session writes no `finished_at` but
+  may change its state (a budget pause lifted), and anything changed while the board had it loaded leaves an event. A
+  cached result is answered with its `error` and `board_url` read again from the summary (a `continue` whose text was
+  not delivered records `api.error` `not_running` and changes nothing else, 21.2). The cache holds only results made
+  with the hub's settings of now (`ApiV1._results_settings`, the `manager.config` object, which a hand edit picked up
+  or a save replaces): once they change, every kept result goes, since `[api] folders` and `[workspace] git` decide
+  `changed_files`. Only a result whose `changed_files_error` stays as it is while the session stays final and the
+  settings stay the same is cached (`api_v1.LASTING_TEXTS`: none, `GIT_OFF_TEXT`, `NO_BASE_TEXT`, `BASE_GONE_TEXT`);
+  git not installed, settings or a repository that cannot be read, git failing (a timeout) and an in-place folder
+  refused may pass, so such a result is computed again at the next request.
+- `changed_files` is the working tree against `base_commit`:
+  - untracked files are included (files still held back from the autocommit, §7 "Held new files", count); ignored ones
+    and `.scratch` are not, so an output the agents put into `.gitignore` is not listed. A path both deleted and
+    untracked is `modified`;
+  - it is read with DreamTeam's guarded git (`hubgit`, §7: the repository's hooks, filters and `core.fsmonitor`
+    disarmed): `git rev-parse --verify --quiet <base>^{commit}` (exit 1: the repository opened and lacks the commit,
+    `BASE_GONE_TEXT`; any other failure, such as a repository git cannot open, is a failure of git, never "gone"),
+    then `git diff --name-status -z --no-renames --no-ext-diff --no-textconv --ignore-submodules=none <base> -- .
+    ':(exclude).scratch'` and `git ls-files --others --exclude-standard -z`;
+  - it runs without the workspace's git lock (the private per-Swarm `Workspace._git_lock`: holding it would delay the
+    agents' commits) and with `GIT_OPTIONAL_LOCKS=0`, so it never takes `index.lock`. It is a module function
+    (`workspace.changed_since`), so a stopped session needs no Swarm. It uses the session's own settings (git on, its
+    folder, adopted or not, its network setting: `isolated_git`, as its other git runs) and keeps its key variables
+    out of git's environment;
+  - a session that works in a server folder in place (21.10) is checked first as every start checks it
+    (`_check_server_folder`, its refusals ending in "its changed files are not listed", then
+    `apifolders.git_dir_refusal`): git never reads a repository whose database lies outside the folder, nor a folder
+    that no longer leads to itself inside its root;
+  - it is null, with `changed_files_error`, when git is off (or not installed), the session has no `base_commit`
+    (`api_v1.NO_BASE_TEXT`; also a value that is no commit id, `workspace.COMMIT_ID`: it never reaches git's command
+    line), that commit is gone, the folder has no repository of its own, git fails, the in-place checks above refuse,
+    or a folder session.json names is one no session may work in (`ApiV1._own_folder`, as for its files, 21.8:
+    `api_v1.FOLDER_REFUSED_TEXT`). The texts are DreamTeam's own (`api_v1.GIT_OFF_TEXT`, `BASE_GONE_TEXT`, ...), never
+    git's output: when `git_dir_refusal` says git cannot read the folder's repository, it quotes git, so
+    `changed_files_error` names only `apifolders.GIT_UNREADABLE` and the hub's log has the rest. Those that can quote
+    a path (the in-place checks' reasons, a failure to run git) go through `ApiV1.redact` for every caller: a result
+    holds no absolute path.
+
+### 21.8 Files
+
+- Paths are relative to the session's workspace, with `/` (`copyfrom.check_rel`). They are 400 `bad_name` for:
+  - an absolute path; an empty component, `.` or `..`;
+  - a NUL or a backslash;
+  - a component that case-folds to `.git`;
+  - a first component that case-folds to `.scratch` (the members' folders) without `scratch=true` ("the members'
+    .scratch folders need scratch=true"), and `.scratch/_skills` (the skills mirror) even with it (".scratch/_skills
+    is never served"): `files?path=.scratch`, `files/.scratch/anna/notes.md` and `archive?path=.scratch/_skills` are
+    400, never 404;
+  - on every OS, a component of the form of a Windows short name (`PROGRA~1`, `GIT~1`, `SCRATC~1`: a base of at
+    most 8 characters holding `~<digit>`, an extension of at most 3). NTFS resolves short names for a Linux hub too:
+    WSL with a home on `/mnt/c`, or `dreamteam sandbox` of a Windows home under Docker Desktop, whose bind mount
+    goes through the same path; there `GIT~1/config` is `.git/config` and `SCRATC~1/_skills` the skills mirror. A
+    real Linux name of that form (`v1~2.md`) is then neither listed nor served;
+  - on a Windows hub only, the other names NTFS would read as another: a `:` (NTFS streams:
+    `.git::$INDEX_ALLOCATION/config` names `.git/config`), `< > " | ? *` or a control character, a reserved device
+    name (`CON`, `NUL`, `aux.txt`), a trailing dot or space (`workspace._check_windows_names`, which the workspace
+    too applies on Windows only). On Linux and macOS the agents may create such names (`run-10:00.log`,
+    `what?.md`), and they are listed and served there.
+  - on every OS, a name that is no UTF-8 text (an unpaired surrogate: a POSIX name whose bytes are not UTF-8, as
+    `os.listdir` gives it), which no URL can name and no JSON answer or zip can hold; the text quotes it with `?`.
+  - The no-follow open (`nofollow.py`) also takes a component only when its exact spelling is in its parent
+    folder's listing, which catches short names and case aliases on any file system (FileNotFoundError: the name
+    is not there). On Windows the final path of the opened handle shows it: it names each component as the folder
+    holds it, long and in its letter case. A component longer than a folder can hold (over 255 UTF-16 units,
+    `nofollow._WINDOWS_NAME_MAX`, which Windows would answer with EINVAL) is FileNotFoundError on Windows before
+    anything is opened, as on POSIX, where no listing holds it: 404 `not_found` like any missing path.
+- Listings and archives leave out exactly the names `files/{path}` would refuse, so the three agree: one predicate,
+  `api_v1.served(parts, scratch)`, is `check_rel` of the path relative to the session's folder (a walk is given it
+  as its `skip`, `api_v1._skipped`: such a name is never opened, such a folder never entered).
+- Each route checks, in this order: its query (`unknown_field`; `api_v1.FILES_FIELDS`, `FILE_FIELDS`,
+  `ARCHIVE_FIELDS`; `scratch` is `true` or `false`), the path (`bad_name`), the session (404), then reads in a
+  thread, the hub's settings read again first. A stopped session is never loaded.
+- **Where the files are read** (`ApiV1._where`): the session's folder (`workspace_of`), which nofollow opens without
+  following its own name. A folder other than the session's own default one is the one its session.json names,
+  which in the Docker sandbox the agents of a session without network can write while the hub reads with more
+  rights than theirs: it is read, resolved, only when it is one a session may work in (`ApiV1._own_folder`:
+  `SessionManager._target_refusal`, §17.2: never inside DreamTeam's own data folder, where the uploads wait, nor the
+  hub tokens' folder, another DreamTeam home, the user's home itself, on POSIX `/proc`, `/sys`, `/dev`...), else
+  403 `forbidden_folder` (`FOLDER_REFUSED_TEXT`), nothing read. (What else such agents can do there with that write
+  is the sandbox's, not v1's.) A session that works in a server folder in place is first checked as a start checks
+  it (`SessionManager._check_server_folder(..., refusal=api_v1.FILES_REFUSAL)`, whose texts then end in "its files
+  are not read", not in a start's words; it gives the resolved root and the resolved folder: 403 `forbidden_folder` when
+  the root no longer allows it or the folder no longer leads to itself inside it, 409 `folder_not_ready` when it or
+  its root is missing), then reached from that root name by name (`_Where.base`: the resolved folder's names below
+  the resolved root, each as its folder lists it, `apifolders.as_listed`; on POSIX a resolved path keeps the spelling
+  it was given, so on a file system that ignores letter case or Unicode form, such as APFS or a Windows drive seen
+  from WSL or a Docker Desktop bind mount, the listing gives the name; a folder on the way renamed in letter case
+  only is still read, on any OS; each listing is read until the name and keeps none of the other names, so a root of
+  many jobs costs no list of its names), so a link put on the way after the check is met, never followed. A folder
+  inside its root by file identity only (a bind mount, a path whose resolved form does not name it below the root) is
+  403 `forbidden_folder` (`FOLDER_LINKED_TEXT`): it is never read by its own path after the check. A folder that is not
+  there is 409 `folder_not_ready` (`FOLDER_GONE_TEXT`).
+- **Codes** of what nofollow meets (`api_v1._read_error`), by where it meets it: a name replaced while it was opened
+  is 409 `conflict` (try again); the session's folder itself, or a folder above it below a root, gone is 409
+  `folder_not_ready`, not readable by the hub (its permissions) 409 `folder_not_ready` (`FOLDER_UNREADABLE_TEXT`),
+  reached through a link 403 `forbidden_folder` (`FOLDER_LINKED_TEXT`); a file or folder in it the hub may not read
+  (a PermissionError: what is asked, a folder on its way or one a walk enters) is 409 `conflict` ("cannot be read on
+  the hub's computer", with the system's words for why), in a listing, a download and an archive alike; the path
+  asked or a folder on its way missing is 404 `not_found`, a link, a file with more than one name or a special file
+  404 ("is not served": it is never listed either), one of the other kind 400 `bad_request` (`files/{path}` of a
+  folder, `files` or `archive` of a file); below it (what a walk meets), a link swapped in or a path that now leads
+  out is 409 `conflict`. A conflict quotes the path where it was met, from the session's folder (`'sub' changed
+  while it was read`, also for an archive of the whole folder). Anything else is 500 `internal`, logged. No text
+  names a path of the computer: the path quoted is the client's.
+- A name a client creates follows the Windows rules on every OS: an upload's `filename` (21.3) and a server folder's
+  `path` (21.10).
+- Nothing is followed when a file is opened, not only when it is checked (`nofollow.py`), so a link, or a folder
+  swapped for one meanwhile, ends the request instead of reading outside the workspace (in the sandbox the hub reads
+  with more rights than the agents, `/proc` included).
+  - On POSIX the path is opened one component at a time from the workspace's folder, with `O_NOFOLLOW` and directory
+    descriptors (`dir_fd`); a link (ELOOP, ENOTDIR) ends the request. A folder already opened is read through its
+    descriptor even if it is moved or renamed meanwhile (its own entries, wherever it now lies); nothing is read
+    through a link put in its place. A component counts only when its folder's listing holds that name exactly
+    (`_Posix.spelled`); that listing is read through the folder's descriptor until the name and keeps none of the
+    other names, so reaching a file, or a folder to list or walk, below a folder of any size holds no list of its
+    names (nor do the names above an in-place session's folder, taken by `as_listed` the same way, on any OS).
+  - On Windows every component is checked for a name-surrogate reparse point (a link or a junction), and the opened
+    handle's identity (`fstat`) and final path (`GetFinalPathNameByHandleW`) are compared with the path's and the
+    root's.
+    - A component is opened by its full path below its parent's final path (`\\?\` form) with
+      `FILE_FLAG_OPEN_REPARSE_POINT`, so the component itself is never followed: its lstat just before and the
+      handle's own attributes must show no name-surrogate reparse point, the handle must be what lstat saw, and its
+      final path must be the parent's final path and the name. A link above it, swapped in after the parent was
+      checked, leads elsewhere: a final path out of the root is refused (`outside`); one still below the root's
+      final path (a final path holds no link) is not that name, FileNotFoundError: a case alias, a short name, or
+      the name or a folder above it renamed or moved inside the root meanwhile.
+    - A folder is listed through its open handle (`GetFileInformationByHandleEx`), never by its path.
+    - Another reparse point (a cloud placeholder, a deduplicated file) is an ordinary file or folder: it is opened
+      again without the flag, so its driver gives the data, and checked the same way.
+    - The handles share reading, writing and deleting, so an agent can still rename or delete a file while it is
+      downloaded or copied, and rename a folder the walk is in. A folder that holds the file being read (a download,
+      or the walk's current file) cannot be renamed until that read ends: Windows refuses to rename a folder with an
+      open file below it (a delete of the session therefore cuts the hub's own reads first: "A delete" below).
+  - The module (stdlib, ctypes on Windows; blocking: run in a thread):
+    - `open_inside(root, parts, *, want_dir=False) -> fd`: the file (or folder) `parts` names below `root`, open for
+      reading; the caller closes it.
+    - `hold_inside(root, parts) -> fd`: the folder `parts` names, reached as `open_inside` reaches it, held where it
+      is: on Windows its handle shares no deleting, so while it is open neither the folder nor a folder above it
+      can be renamed, moved or removed; POSIX has no such hold, and work in that very folder goes through the
+      descriptor (`dir_fd`). Used by an in-place create's git init (21.10 "Resolution").
+    - `list_inside(root, parts) -> [Entry]`: the folders and the regular files with one name of that folder, in name
+      order. `list_some(root, parts, limit) -> ([Entry], more)`: the same of its first `limit` names in name order,
+      and whether it holds more; the listing keeps only `limit` + 1 names while it reads the folder (`heapq.nsmallest`
+      over the system's listing), however many it holds.
+    - `walk_inside(root, parts, *, skip=None, open_files=True, limit=None)`: every entry below that folder, depth
+      first in name order. Each regular file comes open (`Entry.reader()`: a file object the walk owns) until the walk
+      goes on, when the walk closes it: read later, it is a ValueError, never another file's bytes (`Entry.fd` is its
+      descriptor meanwhile). With `open_files` False a file comes without one, for a pass that only counts and
+      measures (a copy's or an archive's first). Links, hard-linked files and special files are given as such but
+      never read (on Windows only a handle tells how many names a file has, so a hard-linked file is opened there and
+      closed unread). `skip(parts)` leaves an entry out unopened (a folder is never entered). What cannot be opened or
+      listed is an `error` entry (FileNotFoundError: gone, or on Windows renamed or moved, meanwhile), and so is a
+      name the listing gave that another file, folder or special file took meanwhile (`Refused` `replaced` or
+      `special`: never read). The walk enters at most `nofollow.MAX_DEPTH` (64) folder levels below its start folder,
+      since it holds one descriptor per level (and one for its current file); a folder deeper is an `error` entry. So
+      one walk holds at most 66 descriptors however deep an agent nests a tree; how many walks run at once is up to
+      their callers (`archive?path=` below: an archive's client decides how long its walk stays open). With `limit` it
+      gives at most that many entries (every name counts, a left-out one too) and raises `nofollow.TooMany` at the
+      next one; each folder's listing then keeps only the names the walk may still reach (`limit` minus the entries
+      given, plus one), so what a walk holds is bounded by `limit` too, however many names a folder holds.
+    - `nofollow.Refused` (an OSError, ELOOP, with `reason` and `rel`) is raised for a link on the way or swapped in,
+      a path that now leads out of the root, and, from `open_inside`, a hard-linked or special file or one replaced
+      while it was opened. A link or a path out of the root ends a walk.
+    - A name the folder does not hold in exactly that spelling is FileNotFoundError, the other kind
+      IsADirectoryError or NotADirectoryError. Every error names the path relative to the root, with '/', never a
+      path of the computer.
+  - `treecopy.py` is not the model. It opens each folder and file by its full path: `O_NOFOLLOW` guards only the last
+    component, and a swap is caught by comparing with the parent's listing. On Windows it checks a link by path and
+    then lists the folder by path, and its replaced-file check never fires there, because `DirEntry.stat()` has
+    `st_ino` 0.
+- Left out of listings, never served and never archived: links; regular files with more than one hard link
+  (`st_nlink > 1`: another name of the file may lie anywhere); `.git` (case-folded, at any depth: nested repositories
+  and gitfiles too); `.scratch/_skills` (copies of library and private Claude Code skills), even with `scratch=true`.
+  `.scratch` (the members' own files) only with `?scratch=true`. Asked for by path, the names left out by rule
+  (`.git`, `.scratch/_skills`, `.scratch` without `scratch=true`) are 400 `bad_name` (above), and a link or a file
+  with another name 404.
+  - `st_nlink` is read with `os.stat` or `fstat` of the opened handle, never `DirEntry.stat()`, which reports 0 on
+    Windows (as it does `st_ino`).
+  - So an environment installed with hard links in the workspace (uv's `.venv`, pnpm's `node_modules`) is neither
+    listed nor archived.
+- A session whose folder is missing (an in-place folder deleted, a drive not connected, its own folder removed by
+  hand) is 409 `folder_not_ready`.
+- `files?path=`: `{"path", "entries", "truncated"}`, the entries of one folder in name order, `{name, path (from
+  the session's folder, '/'), type: file | dir, size (bytes; 0 for a folder), modified (Unix seconds)}`. No `path` is
+  the session's folder itself. Only the first `api_v1.FILES_MAX_ENTRIES` (10 000) names of the folder in name order
+  are read (`nofollow.list_some`: the listing keeps no more, however many the folder holds), then `served`;
+  `truncated` is true when the folder holds more (its archive, or its folders' listings, have the rest). The answer
+  is rendered in the thread that reads the folder, never on the event loop.
+- `files/{path}`: the bytes, streamed in 1 MiB reads (`api_v1.FILE_CHUNK`, each in a thread),
+  `Content-Type: application/octet-stream` whatever the name (the agents wrote them, so a site that passes them to its
+  visitors must not have them rendered), `Content-Disposition: attachment; filename="<ASCII>"; filename*=UTF-8''<name>`
+  (`api_v1.attachment`: the name in UTF-8, after an ASCII fallback for older clients whose other characters are
+  `_`), `X-Content-Type-Options: nosniff`, `Content-Length` (the size when it was opened), `Cache-Control: no-store`.
+  A folder is 400 `bad_request` (list it instead, or ask for its archive). Exactly `Content-Length` bytes are sent: a
+  file that grew meanwhile is cut there; one that shrank, or a read that fails, ends the answer with an error
+  (logged), so the client sees it cut short, never a whole file that is not.
+- `archive?path=`: a zip streamed as it is built, of the session's folder or of that folder in it, with the same
+  rules, names relative to that folder, every folder an entry of its own (empty ones too), files deflated with their
+  time (clamped to 1980-2107) and a Unix mode of 0o644, 0o755 for a folder and for a file someone may execute (never
+  writable by others, never setuid, whatever the hub's computer says: a Windows hub says 0o666 of every file),
+  `Content-Type: application/zip`, no `Content-Length`, named `<folder>.zip` (the session's `name` for its whole
+  folder), with the headers of a download. At most `api_v1.archives_at_once()` archives are measured or sent at once
+  on a hub, each from its measure until its answer ends (an archive whose client stops reading keeps its walk, and
+  with it up to `MAX_DEPTH` + 2 descriptors, open); one more is 429 `too_many_archives` (the files can still be
+  downloaded one by one). That is `ARCHIVES_AT_ONCE` (4), fewer when the descriptors their walks may hold together
+  would pass a third of the process's soft limit of open files (`RLIMIT_NOFILE`; the rest is the hub's own), one at
+  the least: 4 at 1024, 2 at 512, 1 at 256. A hub raises a soft limit below `api_v1.OPEN_FILES_WANTED` (1024) to it
+  at its start (`raise_open_files_limit`, from `launcher.serve_launcher`), as far as the hard limit allows: macOS
+  starts a program from Terminal with 256. Never higher, and for its own process only (the programs it starts,
+  the agents' commands among them, inherit it; select() takes no descriptor past 1024); a limit that stays below 792,
+  where fewer than 4 are sent (a hard limit that low, a sandbox that refuses), is logged with the number of archives
+  it allows. Windows has no such limit to read (its C runtime gives a process 8192 descriptors): 4. A folder more than
+  `MAX_DEPTH` levels below the folder archived is 409 `conflict` (the first walk cannot read it). Two walks
+  (`nofollow.walk_inside`, the same `skip`, `limit=api_v1.ARCHIVE_MAX_ENTRIES`: 100 000 names, the ones left out counted
+  too, since each costs the hub memory while the zip is made, whatever its size; a folder's listing keeps only the names
+  the walk may still reach, and one more raises `nofollow.TooMany`):
+  - the first measures without opening a file (`ApiV1._measure`, `open_files` False; `scan_tree` would walk by path):
+    over `[api] archive_max_mb` (default 1024, read again at each request) or over `ARCHIVE_MAX_ENTRIES` names is 413
+    `too_large` before any byte, and an entry it cannot read (a folder it cannot list) is 409 `conflict`, since the
+    archive would lack it; what it measured (path -> kind) is all the second walk is given, which takes each path out
+    as it meets it;
+  - the second writes the zip (`api_v1._zip_parts`, one step at a time in a thread: a step ends once 256 KiB of zip
+    are ready, `ZIP_SENT`, or about one `FILE_CHUNK` was read, an entry counting as `ZIP_ENTRY_COST` = 4 KiB, one it
+    leaves out too), each
+    file read through the walk's own open file before the walk goes on, exactly the size it had when it was opened
+    (what was written to it meanwhile is left for the next archive; so zipfile's own zip64 rule from that size
+    always holds). What came meanwhile is taken. A file or folder of the first walk that is gone, or became a link,
+    a file with another name, a special file or the other kind, a file that shrank while it was read, an entry that
+    cannot be read, a link swapped in (the walk ends), more than the limit of bytes, or more than
+    `ARCHIVE_MAX_ENTRIES` names (what came meanwhile counts), cuts it: the error ends the
+    answer before the central directory is written, so the client's zip is no valid zip (never a valid one that lacks
+    files or holds a torn one, as a download is never a whole file that is not); it is logged.
+- A client that goes away ends the read: the file or the walk is closed once no thread reads it any more
+  (`api_v1._Streamed`, `_thread_step`), also when it goes before the first byte. The wait for that thread is
+  shielded from the anyio cancel scope through which Starlette cancels a streamed answer (`api_v1._outlive`: that
+  scope cancels a task still waiting again at every pass of the event loop, which would keep the loop busy for the
+  whole step); a cancel of the task itself (the hub shutting down) is waited through as well, after it set the step's
+  stop flag (`_thread_step(..., stop=)`), at which an archive's measure ends at its next entry. A create's upload
+  claims use the same helper (`claim_uploads`).
+- An archive's measure sends nothing, and the server cancels nothing before an answer starts: while it runs, the
+  archive reads the request's `receive` itself (`api_v1._until_gone`), and at `http.disconnect` its walk ends at its
+  next entry and its place among the archives sent at once is given back, instead of walking the whole folder for a
+  client that left.
+- **A delete.** A download and an archive are among the manager's readers of the session
+  (`SessionManager.add_reader` .. `drop_reader`, `api_v1._Reading`) from before they open anything in its folder
+  until their answer ends; each runs its blocking work one step at a time in a thread (`_Reading.step`) and closes
+  what it holds (its file; its walk, then its archive place) on the event loop, once. `SessionManager.delete` cuts
+  them (`cut()`) before it stops the session and renames its folder away, since Windows renames no folder that holds
+  an open file (the handles share deleting, but not a rename above them): one between two steps (its client reads
+  slowly) is closed at once, one in a step as soon as that step ends (an archive's measure stops at its next entry;
+  the rename's retries, 10 × 0.2 s, wait for it). No reader is added while the delete runs (`_deleting`): a download
+  or an archive asked then is 409 `conflict` (`api_v1.DELETING_TEXT`), and so is one cut before its answer started,
+  unless the session is gone by then (404). One cut after its answer started ends with an error, as a read that
+  fails does. A delete that still cannot rename the folder (another program holds a file in it) is 409 with the
+  system's reason, never the paths it names.
+
+### 21.9 Settings, modules, tests
+
+- **`[api]`** (`ApiSettings`, global only: not one of the session `OVERRIDE_SECTIONS`): `max_running = 3` (0 = no
+  limit), `uploads_pending = 32` and `archive_max_mb = 1024` (whole numbers, at least 1), `folders = {}` (21.10). A
+  wrong type is a ValueError naming `[api]`.
+  - It is edited by hand only. `api` joins `settings.SECTIONS` before `teams`, but `public_view` leaves it out, so the
+    settings page has no section for it. `apply_update` drops an `[api]` key that is None or equal to its default, and
+    an empty section. The settings page PUTs its whole view back (`home.js`), which is how 0.2.0 wrote `crew_review`
+    into every home; this way a save never writes `[api]`, and the home stays readable by an older version, which
+    refuses unknown sections.
+  - The template of a new home has only a commented `# [api]` block.
+  - Export carries `[api]` (`scrub_settings` copies the raw settings whole). Import: `("api", ApiSettings)` joins
+    `_SECTION_FIELDS` (an import drops any section missing there), and `("api", "folders")` joins `LOCAL_KEYS`, so an
+    import never grants folders on this computer (§20.4).
+  - An imported v1 session keeps `via` and `api` (session.json's keys travel, §20.4) but drops `api.client_ref`,
+    `api.request_digest`, `api.start_error` and `api.error`, and, like every imported session, has no autostart mark.
+    It drops `api.folder` too, as an owner's workspace move does (21.10 "Starts"): the import rebuilds the workspace
+    entry for this computer, where the `{root, path}` would name another folder or none, so the session works where
+    the import put it and its summary's `folder` is null. `sessions._import_meta` drops these keys.
+- **Modules.** Hub code never imports `dreamteam.tui` (`tui/__init__.py` imports prompt_toolkit).
+  - `api_v1.py`: `ApiV1(manager, host)`, with `.app` (21.1 "Dispatch"), the routes, the error mapping, the summary,
+    state and result builders, and `aclose()`. It uses the manager and the session swarms in process, never the
+    internal routes over HTTP. The launcher's lifespan awaits `aclose()` before `router.aclose()`. A route's
+    background work (a start after a create or a `continue`, the latter giving its text) runs as
+    `ApiV1.spawn(coro, name=)`, and `aclose()` waits
+    for what is in flight, a task spawned meanwhile included, at most `START_WAIT` (30 s), then leaves the rest to
+    `manager.shutdown()`, which waits for the session locks; a cancel of `aclose()` leaves them running too. When
+    `serve_launcher` is cancelled (Ctrl+C) it gives the server `GRACEFUL_SECONDS + 3` (6 s) before it cancels it,
+    lifespan included, so the wait is then the smaller of the two. It never cancels them: `_start_locked` catches
+    only `Exception`, so a cancel inside `swarm.start()` would skip its cleanup and leave running what the start
+    launched (the MCP servers, the skills' tasks). Once `aclose()` has ended, `spawn` refuses (`SessionError` 503,
+    the coroutine closed): `manager.shutdown()` may be running, and nobody would wait for the task.
+  - `api_v1.py` also holds the one resolver of `{id}` (`ApiV1.resolve(uid, caller)`: `sid_of_uid`, then for the API
+    caller a session whose session.json says `"via": "api"`), the summary (`ApiV1.summary(sid)`, built on the board's
+    `manager.summary` with no path of it, without its `workspace` entry and with its `requests` count:
+    `manager.summary(sid, workspace=False, requests=True)`; `continue` reads the budget with `workspace=False` alone,
+    since `workspace_of` looks at the folder the session works in, which may lie on a
+    share that does not answer, and a summary is built on the loop for every route, every pass of a poll or a stream
+    and every session listed) and its state (`api_v1.state_of`), and `[api] max_running`'s count
+    (`ApiV1.running_count()`: the v1 sessions in `running`, `starting` or `resume_pending`, plus the creates past the
+    check that have not marked their session yet; a create counts once, by its start mark in `ApiV1._reserved` until
+    `manager.marked_session(mark)` names its session, then by that session, also before its session.json is written
+    and while its skills are committed or its in-place folder is made). A request of a running session that cannot be
+    read blocks nothing (as the summary's `requests` count skips it), and GET `/sessions` leaves out a session whose
+    summary fails (logged), as the sessions page does.
+  - `autoreply.py`: `SessionAutoReply`, `requests_of`, `requests_from`, `read_requests`, `blocking_requests`,
+    `request_key`, `follow_journal`, `journal_head`, `planner_question` and the queries it shares with the swarm
+    (`LAST_TO`, `QUESTION_DROPPED`, `PLANS`), `AUTO_REPLY`, `AUTO_REVIEW`, `AUTO_REPLY_MAX` (moved from printmode.py,
+    which imports them), and `hub_answers(summary)` (21.5: `-p` sends nothing of its own there). It imports neither
+    dreamteam.tui nor the swarm module (the swarm imports it).
+  - `eventtext.py`: `event_text`. `uitext.py` and `symbols.py`: the feed's texts and symbols, moved out of
+    `tui/i18n.py` and `tui/theme.py` (shims stay there).
+  - `result.py`: `build_result`.
+  - `instruct.py`: `coordinator(state)` and `continue_step(state)`: what `-p -r` and v1 `continue` do with a prompt;
+    `without_api_sessions(sessions)`: the sessions `-c` and the CLI's other unnamed picks choose from (21.4).
+  - `models.py`: `API_VIA` ("api"), the `via` the hub writes and the clients read.
+  - `sessionopts.py`: `overrides_from(body, config, *, strict)`: team, model and limits → session overrides, shared
+    with the launcher MCP's `session_create`.
+  - `apifolders.py`: the roots of `[api] folders` (in the sandbox's container, where it mounts them), their checks,
+    a request's folder (21.10).
+  - `nofollow.py`: open, list and walk inside a root without following links, and hold a folder there (21.8, 21.10).
+  - `hubauth.py`: the API token (21.1). `web.py`: `is_api_path`, `API_CALLER` and the guard's v1 branch (§14).
+- **Docs** (en and ru alike): docs/en|ru/http-api.md, the guide for a client (a curl walk-through, the routes,
+  states, errors, the compatibility rule and the security notes), linked from the docs indexes and the READMEs (an
+  "HTTP API" row under Interfaces); a row in features.md (and the sessions page's «API» badge); `[api]` in
+  configuration.md; the API token and the folders' grant in security.md, sandbox.md and SECURITY.md; in-place
+  server folders and the workspace refusals in projects.md; `[api]` and v1 sessions in transfer.md; the clients'
+  picks and marks in terminal.md, traces.md, claude-code.md, getting-started.md and docs/TUI.md; the code map in
+  CONTRIBUTING.md.
+- **Tests** (ScriptedLLM, no network, no port: Starlette's `TestClient` on `create_launcher_app`):
+  - the token: absent (`api_disabled`, on loopback too); a hub token alone (its Bearer works, none is 401); equal
+    tokens refused at the start; the API token opens no internal route (`/api/settings`, `/api/sessions`,
+    `/api/uploads`, `/api/skills`, `/s/<sid>/api/state`, `/mcp`, `/ws`); paths that are not v1
+    (`/api/v1/../api/settings`, `/api/v1/%2e%2e/api/settings`, `//api/v1/options`, `/s/x/api/v1/options`); the cookie
+    and `?token=` do nothing on v1; the API token kept out of `scrubbed_env`, `secret_free_env` (also when
+    `[shell] pass_env` names it) and `docker.env_passthrough`; the sandbox passes its digest by name; the warning of a
+    hub with an API token and no hub token;
+  - the JSON error shape of the guard's answers; JSON 404 and 405 (with `Allow`), a bare `/api/v1` included;
+    `unknown_field` on every body and query; a PATCH without a JSON `Content-Type` (415);
+  - scope: the API token sees only `via: "api"` sessions, the owner's made through v1 with the hub token among them;
+    uid ids after a delete; earlier-version sessions (listed, 409);
+  - uploads: a file, an empty file, an unpacked zip, every refused name (`.git` among them), a name clash, the
+    limits, the cap's `Retry-After`, an upload deleted by its caller (not by the other, not once used), the tokens
+    kept after a 4xx, a 5xx and a cancel, a token of the other caller, a link or a hard link put in the store;
+  - create: an unknown field, team, model, role and skill; a blank goal; a `title` with a line break, over 200
+    characters, or equal to the goal's title; `start_agents` 0, over `max_agents`, and with a `team` string;
+    `client_ref` twice, with another body, and during a slow copy; a failed start; `max_running`; a session listed
+    `starting` while its create commits its skills, and a DELETE, a stop or a `continue` sent then waiting for the
+    create;
+  - session.json put in place again while a reader holds it (a thread that has it open, on Windows; a refusal past
+    `META_REPLACE_TRIES` raised, no temporary file left), and a start whose last write fails running, logged
+    (`tests/test_api_sessions.py`);
+  - auto answers (a question, a review per round, a question pause, past `AUTO_REPLY_MAX`, after a hub restart) and
+    manual requests with their answers (`tests/test_api_v1_requests.py`: a question pause, a clarify planner's
+    question read from the stopped session's file too, a message, a review answered once per round, an MCP server
+    approved through its digest and a stale digest refused, its code changed after the listing (tested again, the
+    refusal's text redacted, the old id 404), a server built again while the answer waits for the forge, a stop that
+    does not wait for an approval testing the server again; the answers' fields by kind, an answered or unknown
+    request, an id of thousands of digits, a stopped session (only what blocks its work listed), a done job stopped
+    with its member's report unanswered (no request, the reopen named by `not_running`, the report listed again once
+    it runs), a stop that takes the lock first, an earlier-version session; the user's conversation from `after`, a
+    message sent, what the mailbox refuses; a damaged file of a stopped session; the API token's scope);
+  - polling (`after=0` from the oldest, a page the filter emptied answered at once, an `after` past the head, `wait`
+    woken by an event, a change of state and a released lock, `final` never before `session.stopped`, the user's
+    notifications only in the timeline, a stopped session read without loading it, reads in threads during a stop
+    leaving the stopped session's `swarm.db` alone, with no `-wal` or `-shm` file, a `NaN` in an event's data, the
+    lines in the session's language (ru) unless `lang` names one, a journal that cannot be read answered as an error
+    and never as complete, a 404 once the session is deleted during the wait) and the stream (resumed by
+    `Last-Event-ID`, across a stop and a start, its `result`, a final session behind a gap the filter empties ending
+    with its result, no result while the session is started again meanwhile, `detail=all` with `lang`, pings, a delete
+    ending it without a result, its refusals before it starts; `tests/test_api_v1_events.py`); `last_activity`
+    unchanged by `session.*` events;
+  - `stop_when_done`; a create counted once in `max_running` while it is made (before its session.json and while its
+    skills are committed: another create and a `continue` meanwhile are not refused for it); PATCH of a running
+    session and of a stopped one followed by its start; `continue` after a
+    budget stop, and while a create's start is in flight (counted once in `max_running`, the texts given after it in
+    order, the start tried again when it fails); `continue` on a running session (the coordinator, a pending
+    question, a pause by the user or a budget that covers what was spent), on a done job, on a session without a
+    goal, during the hub's resume of a done job and before a stop sent after it; a stop, then a `continue` (the
+    session runs again with the text, whether the stop is unloading the session, waits for its lock, or waits behind
+    a create's start); a `continue` whose session is deleted before its start, the folder name taken by a new one
+    (nothing reaches that one); DELETE, PATCH, stop, `continue`, an answer and a message that waited for the lock,
+    and files, a download, an archive, requests, messages, the result and events read in a thread, while the session
+    was deleted and its folder name taken by the owner's new session (404, that session untouched); a text that
+    cannot be given after the start (the summary's `error`, cleared by the next one; `not_running` when a stop sent
+    after it takes the lock first);
+  - files and archive (`tests/test_api_v1_files.py`: the one rule of `served`, a name that is no UTF-8 text, the
+    attachment's name; a listing in name order without `.git` or `.scratch`, `.scratch` only with `scratch=true` and
+    `.scratch/_skills` never; what is asked missing or of the other kind, unknown query fields; a download with its
+    headers in chunks, one that shrinks while it is sent (cut), one its client leaves (its file closed), one replaced
+    while it is opened (409); a step cancelled twice waits for its thread, then releases what it gave; the folder work
+    in v1's own daemon threads (at most `FOLDER_THREADS`: reads that hang hold none of the default executor, and GET
+    events still answers; a listing, a download, an archive, a result; the redaction of an error about an in-place
+    session, which waits for a place, while an error about no session or a session in its own folder answers at once
+    with every folder thread held, in the loop's default executor); a client gone during a long step
+    leaves the event loop idle (its passes counted); path escapes and `.git` at any depth as `bad_name`, the NTFS
+    names refused on Windows only, a name with `:` listed and served on POSIX, names NTFS reads as others left out on
+    Windows; a link to outside and hard links never listed, served or archived; a folder swapped for a link while it
+    is archived and a file gone between the two walks (a cut zip), one swapped while it is measured (409 before any
+    byte, naming it), a file that shrinks while it is archived (a cut zip) and one that grows (taken at its size when
+    opened), a folder that cannot be read (409 for a listing, a download and an archive alike) and a session folder
+    that cannot be read (`folder_not_ready`), an archive its client leaves (its walk closed), also during its
+    measure (the walk stopped, its place given back at once), a step cancelled (its stop flag set first), a step of
+    entries left out only (it ends as others do); a DELETE while the hub sends a file or an archive of the session to
+    a client that reads slowly (both cut and closed, the delete done), a download or an archive asked while a delete
+    runs (409); at most
+    `ARCHIVES_AT_ONCE` archives while their clients do not read (429 `too_many_archives`, every slot given back by an
+    archive that ends, is refused or is left; the descriptors they may hold together stay within a third of 1024),
+    fewer under a soft limit of open files below 792 (one at 256), which a hub's start raises to 1024 as far as the hard
+    limit allows, never higher (a stand-in for `resource`); the
+    archive a zip of exactly what is listed, with its folders, normalized modes and clamped times, of the whole folder
+    and of one inside it; over `archive_max_mb` (413 before any byte); over `ARCHIVE_MAX_ENTRIES` names (413 before
+    any byte, a cut zip when it grows past them between the walks; a walk's `limit` and `list_some` keep no more
+    names, and on POSIX a path below a large folder keeps none of its names, `tests/test_nofollow.py`); a listing of
+    the first `FILES_MAX_ENTRIES` names with `truncated`, rendered in
+    its thread; a folder that cannot be read on POSIX (409); a running session, then the stopped one read without
+    loading it; the API token's scope; a missing folder; a session folder swapped for a link (403); a folder
+    session.json names that no session may work in (DreamTeam's data with the uploads, another home: 403, nothing
+    read); an in-place folder read below its root, a link put on the way to it before and after the check, its root
+    taken back by the owner (403, in v1's words), a folder on its way renamed in letter case only and one created or
+    copied with another letter case of its names (still read, on a file system that ignores case, also with a
+    resolution that keeps the given spelling as POSIX does), one inside its root by file identity only (403));
+    `changed_files` with a hook in `.git/config` that must not run (`tests/test_api_v1_result.py`: added, modified,
+    deleted, untracked and held files, `.scratch` and ignored ones left out, a path deleted and untracked; a stopped
+    session's files; a list cut at `CHANGED_FILES_MAX`; git off, no base commit, one gone, one that is no commit id, a
+    repository git cannot open; an in-place folder whose `.git` became a gitfile, one whose git fails (no git output
+    in the text), one whose root a hand edit removed, also once its result was kept, and one whose root became copy
+    only; the result while running, a done one, the cache by state and head, a git failure not cached, a kept result
+    gone once `[workspace] git` is edited by hand, and its `error` read again (a `continue` not delivered);
+    `changed_since` without the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
+  - settings and import: a settings-page save never writes `[api]` (`public_view`, `apply_update`); an import keeps
+    the target's `api.folders` and drops a v1 session's `client_ref`, `request_digest`, `start_error`, `error` and
+    `folder`;
+  - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
+    spelling (one folder), each name taken as its folder lists it (`as_listed`, below a root of 5000 names without
+    keeping its listing), a root under /run or /var/run refused and never mounted, an error text that never resolves a
+    root (yet names a path below one in its resolved spelling), a copy in v1's folder threads (a create cancelled during
+    it waits for it, then leaves no staging folder, no session and no place held), a `.git` that is a gitfile or a
+    linked worktree's, a common dir outside the folder, a link swapped in before git init, between its steps, after it
+    and after `_carry_out`, and right after each check before the step it lets through, that step then working in the
+    folder held (nothing written or removed in the repository it leads to; on Windows the folder held refuses the swap;
+    `tests/test_nofollow.py`: `hold_inside`; `tests/test_hub_git.py`: git and its guard in a folder held whatever its
+    path leads to; `tests/test_netoff.py`: `prepare_workspace` of a folder held), and `DREAMTEAM_API_FOLDERS_DIR`
+    ignored outside the container; `aclose()` with a start in flight;
+  - the clients (`tests/test_tui_print.py`, `tests/test_tui_app.py`, `tests/test_tui_commands.py`,
+    `tests/test_tui_render.py`, `tests/test_cli_launcher.py`, `tests/test_launcher.py`, `tests/test_ui.py`,
+    `tests/test_instruct.py`): `-p -r` on an `answers: "auto"` session
+    answering nothing itself (one answer per message and review, the hub's), and on a `manual` one as on any session;
+    `-c` of the TUI and of `-p`, the CLI's `console` / `traces` picks and the hub's `default_session()` (the launcher
+    MCP's calls without `session`), passing over v1 sessions (only v1 sessions: no session to continue, and how to
+    open one); `-p --no-auto-reply` on an `auto` session writing no line that a member waits for the user; the
+    sessions page's «API» badge and its tooltips in both languages; `session_line`'s
+    ` | HTTP API` and the TUI picker's `HTTP API`; `/api/hub`'s `api` and `status` printing `API:` only for a hub that says it; the console's title
+    as one printable line;
+  - the sandbox (21.10 "Sandbox", in `tests/test_api_v1_folders.py`, no Docker run: the argv and the container's hub):
+    the roots mounted as resolved (one through a link), read-only unless `in_place`, and not a missing one, the user's
+    home folder, one inside the DreamTeam home, one around the store of hub tokens or the host's skills library, or
+    one absolute on the other OS only (each named in a warning), nor a Windows one on a network share or a `\\?\`
+    path, nor on POSIX one with ':' in its path; a Windows host path in `-v`; a read-only root inside a writable one
+    named in a warning; the mounts given or computed, none and no variable for a single-swarm project, the variable
+    never the host's (`[shell] pass_env` naming it); `run_sandbox` checking the roots once, saying which it mounts,
+    never storing the token inside a mounted root (`root_refusal` switched off), and `outside_home_warning` leaving
+    out the sessions under a writable mounted root's mount point (listing a host path, a root not mounted, a root
+    mounted read-only and a `..`); `apifolders.roots` from the variable in the image's container only (either marker
+    of `hub_in_container`), not for a value that is not absolute there, and the variable kept from the agents; a copy
+    and an in-place session made through v1 at the mounted roots, its start checking the folder there, a root not
+    mounted 404 there though its host folder exists, answers without a path.
+
+### 21.10 Folders on the hub's computer
+
+A client whose files already lie on the hub's computer names a folder there instead of uploading it. Only folders
+under a root the owner lists in `[api] folders` can be named, by the root's name and a path inside it. A request never
+holds an absolute path, and summaries and error texts never name one (21.1).
+
+```toml
+[api.folders.jobs]          # the root's name: lowercase letters, digits and '-' (not first), at most 64 characters
+path = "/srv/site/jobs"     # absolute (in `dreamteam sandbox`: mounted, see "Sandbox")
+in_place = false            # true: a session may also work in a folder under it, in place
+```
+
+**Settings.**
+- `folders` (`ApiSettings.folders`) is a table of roots; `config.parse_api_folders` checks its shape at load: a bad
+  name, a `path` that is not an absolute string or that holds a NUL, an `in_place` that is not a bool, or any other
+  key refuses the settings, like any other mistake. `in_place` defaults to false. "Absolute" means absolute on POSIX
+  or on Windows, whatever the hub's system: `dreamteam sandbox` serves a Windows home from a Linux container, whose
+  hub reads the same file (and finds the roots where the sandbox mounts them, "Sandbox"). On Windows it takes a
+  drive or share and a root, on every Python version (3.13's `PureWindowsPath.is_absolute` also accepts `\\server`
+  and `\\?\x`; these are refused). Every way of filling `ApiSettings` checks the folders (`_checked` calls
+  `parse_api_folders`); raw settings are never rebuilt from `dataclasses.asdict(config.api)` (each `ApiFolder`
+  carries its `name`).
+- Where a root lies is checked at each use, so an unplugged disk never stops the hub (`apifolders.root_refusal`: the
+  location rules of `resolve_source`, applied to the resolved root). A root is refused (403 `forbidden_folder`, and
+  logged at the hub's start) when it is:
+  - not absolute on the hub's own system (`config.native_absolute`, checked before anything resolves the root: a
+    Windows path on a POSIX hub outside the sandbox, or a POSIX one on Windows, would resolve against the current
+    folder or drive);
+  - a drive or file-system root;
+  - the user's home folder, or a folder containing it;
+  - inside or containing the DreamTeam home or one of DreamTeam's own folders (the MCP and skills libraries, the skill
+    environments, the hub tokens);
+  - another DreamTeam home, or inside one;
+  - on POSIX, under /proc, /sys or /dev;
+  - on POSIX, /run or /var/run (macOS: /private/var/run), or under one (`apifolders.RUNTIME_FOLDERS`): they hold the
+    running system's sockets, the Docker daemon's and containerd's among them (a rootless daemon's in /run/user/<uid>),
+    and a socket stays reachable through the sandbox's read-only mount ("Sandbox"), so that a copies-only root there
+    would hand every agent in the container the Docker daemon. A folder under /run/media, where removable disks are
+    mounted, is not refused for that (the disk's own root is, as a drive's root).
+  The texts name the root by its name only. At the hub's start the launcher logs every root it cannot use now, in a
+  daemon thread (`apifolders.log_refusals`: a refused one as a warning with its path, a missing one as information).
+- A change takes effect at the next request, with no restart.
+- `api.folders` is a setting of this computer: an export carries it, an import never takes it (`LOCAL_KEYS`, 21.9).
+
+**Request.** In POST `/api/v1/sessions`:
+`"folder": {"root": "jobs", "path": "acme/site", "mode": "copy" | "in_place"}`.
+- `path` is relative to the root, with `/`; `""` or no `path` means the root itself.
+- `path` follows the path rules of 21.8, with the Windows rules on every OS, as a name a client creates (400
+  `bad_name`); a `.scratch` component is refused too.
+- `mode` defaults to `copy`.
+- An unknown root is 400 `unknown_folder`, with the root names in the text.
+- `in_place` under a root without `in_place = true` is 403 `forbidden_folder`.
+- `files` cannot go with `in_place` (400 `bad_request`): the client puts its files into the folder itself.
+
+**Resolution** (`apifolders.resolve_request`).
+- The root is resolved, following links and junctions (`apifolders.resolve_root`). A missing root, or one that is no
+  folder, is 404 `not_found`; a refused one, or one that cannot be read, is 403 (Settings).
+- Then the root joined with `path` is resolved. The result must lie inside the resolved root, compared as text and by
+  file identity (`treecopy.is_within`). A link or junction under the root that leads out of it is 403
+  `forbidden_folder`. For `copy`, a `path` that names nothing is 404 `not_found`, and a file that is not a `.zip` is
+  400 `bad_request`; in place, a file is 400 `bad_request` (a missing folder is made).
+- The resolved folder's names below the resolved root are then each taken as its folder lists it
+  (`apifolders.as_listed`: a name the listing does not hold exactly is replaced by the listed name of the same entry,
+  by device and inode). On a file system that ignores letter case or Unicode form (APFS, a Windows drive seen from WSL
+  or a Docker Desktop bind mount) `{"root": "jobs", "path": "Acme"}` names the folder listed as `acme`, and on POSIX a
+  resolved path keeps the spelling it was given; the session stores, and a copy reads, the listed names, which the
+  no-follow reads of 21.8 require. The names from the first one that is not there on (the folders an in-place create
+  makes) stay as given. Each listing is read (`scandir`) until the name and keeps none of the other names; only for a
+  name it does not hold exactly is it read again, keeping one name at most and comparing by device and inode only
+  the names that differ in letter case or Unicode form (once more, the others, only when none of those is the same
+  entry: a short name), so a root of many folders costs a create, and each request for an in-place session's files
+  (21.8), no list of its names and no lstat of each of them.
+- The create works with that resolved folder and checks it again after its own resolution, given the resolved root
+  (`within=`): for a copy, `resolve_source(..., within=)` right after `resolve_request` (its location rules for the
+  folder itself: another DreamTeam home under the root is 403 `forbidden_folder` too), then the copy itself reads
+  below the root by those listed names, never by a path (a name renamed meanwhile is 404 there), so a link swapped in
+  on the way is met, never followed (403);
+  for in place, every `_plan` on the create path, the last of them under the home's workspace claims just before the
+  missing folders are made (`_change_folder` → `_carry_out`), and then `_carry_out` itself (`_Plan.within`): the
+  deepest level that is there and each level right after it makes it (by path) must still resolve to themselves
+  inside the root (`sessions._check_inside`, 403 `forbidden_folder`). The undo removes a level it made only while its
+  path still names the folder made (its identity, `_Undo.made`), so at most an empty folder made through a junction
+  swapped in at that instant exists outside for that instant, and never one that was there before.
+  `git init` runs with the folder held (`sessions._init_held`): `nofollow.hold_inside` opens it from the resolved
+  root name by name, never through a link. On Windows that handle shares no deleting, so until git is done neither
+  the folder nor a folder above it can be renamed, moved or removed, and no link can take a place on its way. POSIX
+  has no such hold, so every step works in the folder held, through its descriptor (`init_repo(held=)`): each git
+  command starts in it (`hubgit.in_folder`: `fchdir` in the child before `exec`; below it for a submodule) and the
+  guard reads its config there, never a scan kept for the path; the `.gitignore` is made through it (`O_EXCL`,
+  `O_NOFOLLOW`); in the Docker sandbox without network the offline user is given it through it
+  (`netoff.prepare_workspace(dir_fd=)`). The folder must also still resolve to itself inside the root and be the
+  folder held (its identity, `_check_held`) before each step of `init_repo` (`check=`: git init, `core.filemode`
+  where it is set ("`in_place`"), the `.gitignore`, ls-files, add, commit) and after the last, so a link swapped in
+  ends the create at the next step (403), the step in between still working in the folder held. What git init made
+  (`.git`, and the `.gitignore` when there was none) is removed, when a step fails, through the held folder
+  (`_remove_held`: `dir_fd` on POSIX; on Windows by its path, which the hold keeps), never by a path that may lead
+  elsewhere. The undo of a later failure removes them only from that folder, held again with the same identity
+  (`_Undo.held`); a folder no longer reached so keeps them, and the error says so (500, "not removed"). Nothing is
+  removed through a link swapped in, and DreamTeam writes nothing through one. What remains on POSIX is git's own: a git
+  command takes the held folder's path when it starts (`getcwd`) and goes on by that path (git init for its new `.git`,
+  every command for its work tree), so a link swapped in at that path while the command runs (the folder held moved away
+  after the command started, before it writes) makes that command write in the folder the link leads to. That window is
+  the whole run of each git command of the init, not an instant; the next check then ends the create (403). Closing it
+  would take the folder's path itself held, which POSIX offers no unprivileged way to do. A link swapped in meanwhile
+  ends the create, and every start checks again ("Starts").
+- Every rule of `copy_from` and `workspace` (§17.2) applies as well.
+
+**`copy`.**
+- The folder, or a `.zip` file under the root, is copied into the session's own folder, as `copy_from` does, under
+  `[workspace] copy_max_mb` and `copy_max_files` (413 `too_large`).
+- Left out: `.git`, `node_modules`, `.venv`, `venv` and `__pycache__` at any depth, links and special files; at the
+  top level, the names the session owns (`.scratch`, `.gitignore`, `.dreamteam`, `mcp`, 21.3), counted as excluded;
+  regular files with more than one hard link (`st_nlink > 1`: another name of the file may lie outside the root; read
+  as 21.8 says), counted as excluded; `.DS_Store` and `Thumbs.db` without a word.
+- The copy runs in v1's folder threads, never the loop's default executor (21.1 "Threads").
+- A first walk only counts and measures (`open_files=False`: 413 before any byte is written); the second copies,
+  each file read through the walk's own open file before the walk goes on, its bytes counted again
+  (`copyfrom._copy_server_folder`). The files get the modes of `copy_tree`'s "writable" (`treecopy.writable_bits`)
+  and their modification time. A file or folder gone meanwhile (on Windows also one renamed or moved inside the root)
+  is reported as vanished and not copied; one that cannot be read, or whose name another file, folder or special file
+  took meanwhile (`Refused` `replaced`, `special`), refuses the copy (400 "Cannot read ..."), as for a folder of
+  `copy_from`. A `.zip` with another name (a hard link) is 403 `forbidden_folder`.
+- The walk never follows a link, not only when it checks one: every folder and file under the root is opened with
+  `nofollow` (21.8). `copy_tree` is not used for this: on Windows it checks a link by path and then lists by path, and
+  its replaced-file check never fires there, so a junction swapped in would be copied through. A `.zip` is opened the
+  same way and unpacked under the rules of `unpack=true` (21.3).
+- The original is never written. Several sessions may copy one folder at the same time: a copy is never busy.
+- With `files`, the uploads land next to the copy. A top-level name both have is 409 `file_conflict`, and every token
+  stays usable.
+
+**`in_place`.** The session works in that folder, as `workspace` does (§17.2):
+- A missing or empty folder is created and, with git on, gets a new repository.
+- A folder with files is adopted as it is. With git on, it must be one of:
+  - a repository's own top folder, on a branch, with nothing uncommitted and no merge or rebase halfway, whose `.git`
+    is a folder (not a link, and not a gitfile `gitdir: ...`, such as a linked worktree's) and whose git dir and
+    common dir (`git rev-parse --absolute-git-dir` and `--git-common-dir`) resolve inside the folder, as do the paths
+    git writes (`--git-path` of `objects`, `refs`, `logs`, `packed-refs`, `index`, `HEAD`, `COMMIT_EDITMSG`:
+    `apifolders.GIT_WRITES`). Nothing in the `.git` folder (walked before git reads it), or in a git dir or common
+    dir elsewhere in the folder, may be a link or a junction (`objects` or `logs/refs/heads` pointing elsewhere), and
+    no regular file there outside `objects/` may have another hard link (git appends to a reflog and rewrites
+    `COMMIT_EDITMSG` in place: the other name would change too). `hooks/` is not looked at: DreamTeam's git runs no
+    hook. Otherwise DreamTeam's own git (the autocommits, `changed_files`) would write objects, refs, reflogs and the
+    index outside the root. These rules are checked at the create and at every start; while a session runs, its
+    agents can change `.git` like any file of the folder;
+  - in no repository at all. It then gets `git init`, a `.gitignore` when it has none, and a first commit of its
+    files. On a file system without POSIX bits (a Windows folder in the sandbox) the new repository gets
+    `core.filemode=false` (§17.2).
+- Otherwise the create is 409 `folder_not_ready`. A refusal for uncommitted changes says which of them line endings
+  alone make and names `git config core.autocrlf true` in the repository itself (§17.2, "Sandbox").
+- The folder keeps its own `.gitignore`: it is the owner's repository.
+- The agents commit to the current branch.
+- DreamTeam leaves `.scratch/` in the folder, and `mcp/<name>/` for the MCP servers the agents build.
+- session.json's `api.folder` is `{"root", "path", "mode": "in_place"}`. The session keeps the folder until its DELETE
+  ("One folder, one session").
+
+**One folder, one session.**
+- A folder another session works in is 409 `folder_busy`. This covers stopped sessions, creates in progress and board
+  sessions, and a folder inside that folder or containing it.
+- The overlap is compared by file identity as well as by text (`treecopy.is_within` in `_plan`'s check of the other
+  sessions' folders, in place of the text-only `_within`), so another letter case or Unicode form of a name
+  (`jobs/Acme` and `jobs/acme` on APFS, an NFD spelling) is the same folder.
+- v1 builds this answer's text itself. It never passes on a `SessionError` text, which names the other session's
+  folder name and so its title. When that session is visible to the caller, the answer's `session` names its id.
+- The next instruction for the same folder is a `continue` of that session. DELETE releases the folder and keeps its
+  files (`folder_kept: {root, path}`).
+
+**Starts.** Every start of a session with an in-place `api.folder`, from any surface (v1 `continue`, the resume when
+the hub starts, the board, the TUI, MCP), checks again in `_start_locked`, before anything starts:
+- in `_check_workspace_ready` (`SessionManager._check_server_folder`), in a thread of the loop's default executor (a
+  root on a share that does not answer never stalls the event loop; 21.1 "Threads"): its root is still listed with
+  `in_place = true` (the settings read again on the loop just before: a hand edit counts at once) and is not refused
+  (Settings); the stored folder still resolves to itself (no link on its way, not even one that leads to another
+  folder of the root) and inside the root, by text and by file identity (a root the owner pointed elsewhere no longer
+  holds it);
+- then, with git on, in a thread (`SessionManager._check_server_git`, before the adopted-folder check, so git never
+  reads a repository whose database lies elsewhere): its `.git` still follows the rules of `in_place` above
+  (`apifolders.git_dir_refusal`).
+
+A failed check is 403 `forbidden_folder` (409 `folder_not_ready` for the git rules, a missing folder or a missing
+root), recorded as `start_error` (21.4). This also catches a component of the path swapped for a link after the
+create. A workspace move of such a session by the owner (`/cd`, `session_cd`, `set_workspace`) drops `api.folder`
+(`_change_folder`): the session then works in a folder the owner chose, and these checks no longer apply. An import
+drops it as well (21.9).
+
+**Limits.** `[api] max_running` counts these sessions like any other.
+
+**Answers.**
+- The summary has `"folder": {"root", "path", "mode"}`. Only the owner's board shows the absolute path.
+- An error text that would name a path of the hub's computer names `<root>/<path>` instead (21.1): the root's name,
+  then the path below it with the hub's separator (`ApiV1.redact` with the roots, and `_public_text` for the folder
+  of a session that works in it in place, so its `start_error` too). A text of v1's own quotes a request's path as
+  the client wrote it, with '/'.
+- DELETE answers `folder_kept: {root, path}` for a session that worked in its folder in place (the folder and its
+  files stay); a copy is the session's own folder and goes with it.
+- `GET /api/v1/options` lists `"folders": [{"name", "in_place"}]`, never a path.
+
+**Sandbox.**
+- `dreamteam sandbox` of a home mounts each root into the container at `/dreamteam/api-folders/<name>`
+  (`docker.API_FOLDERS_MOUNT`), read-only unless `in_place`: `-v <host folder>:/dreamteam/api-folders/<name>[:ro]`
+  (`docker.FolderMount.volume`). Before that it checks each root on the host as the hub outside the container checks
+  it at each use (`docker.api_folder_mounts` → `apifolders.resolve_root`: absolute on the host's own system, there, a
+  folder, and not refused by `root_refusal`), and mounts the resolved folder. The check has to run on the host: the
+  hub in the container sees only the mount point, where a root that is the user's home folder or contains the
+  DreamTeam home, the store of hub tokens (where `run_sandbox` keeps the container's token) or the host's skills
+  library (mounted read-only) would pass. A root that is missing, refused, or whose resolved path docker's `-v` cannot
+  take (`docker.volume_source_refusal`: on Windows a path on no drive letter, such as a network share's
+  `\\server\share\...`, which a root on a mapped network drive resolves to, or a `\\?\` one; anywhere a ':' past
+  the drive letter) is not mounted, with a warning naming it and why, so one root never makes the whole `docker run`
+  fail; in the container it is then not there (404 `not_found`). A read-only root that lies inside a writable one gets
+  a warning too: agents write it through the other's mount point. When it mounts any root, `run_sandbox` says which,
+  read-only or writable, and that every agent in the container can read them and write the writable ones. It also
+  passes the mounted folders to `hubauth.store_token(also_mounted=)`, so the token is never stored inside one.
+- `run_sandbox` computes the mounts once (for its warnings and the command); `sandbox_command(..., folders=)` takes
+  them (None: it computes them, dropping the warnings). It reads the roots and creates nothing.
+- It sets `DREAMTEAM_API_FOLDERS_DIR=/dreamteam/api-folders` (`config.API_FOLDERS_ENV`) for every home, with or
+  without roots, so that a root added while the container runs is looked for there, never at its host path.
+  `apifolders.roots` then takes `<that folder>/<name>` as each root's path (its `in_place` stays the settings'), but
+  only when the value is absolute there and `copyfrom.hub_in_container(config)` holds, so a stray variable on a hub
+  outside the image changes nothing. The name joins `shell._INTERNAL_ENV`, and `docker.env_passthrough` subtracts it
+  (a host value passed by name would come later and win). A single-swarm project's sandbox gets neither the mounts nor
+  the variable: its `run` has no external API.
+- The mounts are made when the container starts. The hub there reads the settings at each request, so a root taken out
+  of `[api] folders`, or made copy-only, is refused to v1 at once; but its folder stays mounted as it was (writable for
+  an `in_place` one) until the sandbox's next start, and a root added, or made `in_place`, is mounted (or writable)
+  only from then on.
+- `docker-compose.yml` shows the mount and the variable as comments: with compose the owner mounts the folders, and
+  no check runs on the host.
+- An in-place session made there stores the container path. A hub outside the container finds that folder missing (409
+  `folder_not_ready` at the session's start).
+- Git in the container reads a repository's own config and the image's, never the host's system or global git
+  config. On a Windows host a repository checked out with Git for Windows' defaults (`core.autocrlf=true` in its
+  system config: CRLF in the files, LF in the repository) is therefore changed for it: an `in_place` create, and a
+  start whose status sees those files changed, is 409 `folder_not_ready`, whose text says which changes line endings
+  alone make and names `git config core.autocrlf true` in the repository, which both gits then read. The check is
+  git's status, so it trusts git's index: when the setting is removed after a session ran with it, the index holds
+  the stamps git in the container last wrote, and a start takes the files for unchanged (as `git add -A` does) until
+  git on the host, or a change of a file, refreshes them. Docker Desktop's 9p reports every
+  file Windows wrote as 0o777: a folder in no repository gets one with `core.filemode=false` (§17.2), so neither its
+  first commit nor git on the host takes those files for executable ones.
+- `outside_home_warning(home, mounts)` leaves out the sessions whose stored folder lies under
+  `/dreamteam/api-folders/<name>` of a root it mounts writable (made in the container; `docker.api_root_of`, which
+  reads the stored path as a POSIX one and takes none with a `..`). A session made outside the container in a root's
+  folder stores the host path, cannot start in the container (as above, the other way round) and stays listed, as do
+  one under the mount point of a root not mounted this time and one under a root mounted read-only now (it works in
+  place, and its start refuses a root that is no longer `in_place`).
+- What this grants: every agent of every session in that container, board sessions included, has a shell there, so it
+  can read every `copy` root and write every `in_place` root (and a `copy` root inside an `in_place` one, through
+  that one). Without `[api] folders` a sandboxed agent reaches no folder of the host but the home and, read-only, the
+  host's skills library. In the sandbox the list limits what a v1 client can name, and it widens what the sandbox's
+  agents can reach. The container runs as root (sessions without network run their agents' commands as its
+  `dreamteam-agent` user): on a Linux host with rootful Docker a `copy` root is read with root's rights, not the hub
+  user's, and the files a session makes in an `in_place` root are owned there by root (or by that user's uid 10001),
+  in the owner's own folder.
+
+**Security.**
+- A root is a grant to whoever holds the API token. With `in_place`, the agents run commands in that folder with the
+  hub's rights (in the sandbox, the container's).
+- The list limits what v1 can name, not what the agents can reach (21.1). A hub that serves a site runs in the
+  sandbox.
+- On a loopback hub without a hub token, the internal routes take any folder anyway (21.1 "The rest of the hub").
+
+The codes of 21.1 for folders: `unknown_folder` (400), `forbidden_folder` (403), `folder_busy` (409),
+`folder_not_ready` (409).
+
+### 21.11 Not in v1
+
+WebSocket; multipart uploads; absolute paths of the hub's computer: folders only by a root's name (21.10); skills from
+paths, Git URLs or Claude Code; changing the settings (providers, keys, roles, teams, `[api]` itself) through v1, and
+a settings page section for `[api]` (it is edited by hand, 21.9); CORS; several users with their own quotas (every
+client with the API token acts as the one user of the hub); a callback URL called when a session ends; automatic
+answers to `mcp` requests; mounting only some roots into the sandbox (it mounts every one, 21.10); paging of file
+listings (`GET files` gives the first `FILES_MAX_ENTRIES` names of a folder with `truncated`, and the archive or the
+listings of its folders have the rest, 21.8); an OpenAPI document.

@@ -855,6 +855,10 @@ async def test_an_approval_names_the_digest_the_user_was_shown(forge_factory):
         await forge.approve(USER, "calc", True, digest=shown)
     v2 = forge.get("calc")["digest"]
     assert forge.get("calc")["status"] == "pending" and v2 != shown and v2[:12] in str(refused.value)
+    # a rejection given with a digest (the HTTP API v1's) is about that code too; one without rejects what waits
+    with pytest.raises(ToolError, match="was not rejected: digest"):
+        await forge.approve(USER, "calc", False, digest=shown)
+    assert forge.get("calc")["status"] == "pending"
     # the digest shown now, in full or its start (as /approve in the console takes it), approves that code
     assert "approved and active" in await forge.approve(USER, "calc", True, digest=v2[:12].upper())
     assert swarm.db.one("SELECT approved_digest FROM mcp_servers WHERE name = 'calc'")["approved_digest"] == v2

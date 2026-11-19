@@ -58,18 +58,18 @@ from urllib.parse import unquote, urlsplit
 
 from . import __version__, hubauth, hubgit
 from . import mcp_library
-from .config import (CONFIG_FILE, AgentSettings, MCPSettings, ModelProfile, RoleSettings, ServerSettings,
-                     ShellSettings, SkillsSettings, SwarmSettings, TeamSettings, TracingSettings, WorkspaceSettings,
-                     env_var_name, key_env_names, make_profile)
+from .config import (CONFIG_FILE, AgentSettings, ApiSettings, MCPSettings, ModelProfile, RoleSettings,
+                     ServerSettings, ShellSettings, SkillsSettings, SwarmSettings, TeamSettings, TracingSettings,
+                     WorkspaceSettings, env_var_name, key_env_names, make_profile)
 from .db import (foreign_objects, known_columns, loads, made_by_earlier_version, max_tools_revision, reading_file,
                  sqlite_uri, unknown_columns)
 from .mcp_forge import _split_command
 from .roles import missing_roles, role_key, team_key
-from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_FILE, SESSION_ID,
-                       WORKSPACE_DIR, ImportedWorkspace, SessionError, SessionManager, _home_relative, _in_thread,
-                       _to_end, new_uid, session_uid, slugify)
-from .settings import (PROVIDER_CHOICES, _endpoint, _private, _stored_key, apply_update, deep_merge, dump_toml,
-                       read_raw, settings_path, validate)
+from .sessions import (LEGACY_ID, MOVE_JOURNAL, OVERRIDE_SECTIONS, REPLACED_PREFIX, SESSION_EVENTS, SESSION_FILE,
+                       SESSION_ID, WORKSPACE_DIR, ImportedWorkspace, SessionError, SessionManager, _home_relative,
+                       _in_thread, _to_end, new_uid, session_uid, slugify)
+from .settings import (PROVIDER_CHOICES, _endpoint, _private, _stored_key, api_values, apply_update, deep_merge,
+                       dump_toml, read_raw, settings_path, validate)
 from .shell import _KNOWN_SECRETS, _SECRET_RE, _URL_USERINFO, _is_secret, strip_url_credentials
 from .skills import META_FILE as SKILL_META, NAME_MAX, NAME_RE, ORIGINS, Library, Limits, SkillError, _read_json, \
     _rename, check_skill_dir, copy_skill
@@ -88,6 +88,10 @@ LIBRARY_DIR = "mcp/library"
 EXTERNAL_FILE = "mcp/external.json"
 SESSIONS_DIR = "sessions"
 DB_FILE = "swarm.db"
+# (id, ts, type) of a session database's last event of the work: a run's start and end (sessions.SESSION_EVENTS) are
+# left out, as for `last_activity`, so a start and a stop alone (a hub restart) do not make one side look newer
+_LAST_WORK_EVENT = ("SELECT id, ts, type FROM events WHERE type NOT IN ("
+                    + ", ".join("?" * len(SESSION_EVENTS)) + ") ORDER BY id DESC LIMIT 1")
 # what an export folder holds at its top level (a folder with anything else is never replaced by a new export)
 LAYOUT = frozenset({MANIFEST, "settings", SKILLS_DIR, "mcp", SESSIONS_DIR})
 # the parts of a session's .dreamteam/ that travel (its logs, launcher files and lock files stay)
@@ -763,8 +767,9 @@ def known_secrets(raw: dict[str, Any], overrides: dict[str, Any] | None = None,
     variables, names like *_TOKEN or *PASSWORD*); the header values of ANTHROPIC_CUSTOM_HEADERS /
     OPENAI_CUSTOM_HEADERS; the values of the [shell] pass_env and [skills] install_env variables; the env values of
     the [mcp.external] servers and the credentials in their commands (strip_command_credentials), global and of
-    each session (`overrides`: {session id: overrides}), whatever the export includes; the hub token of this
-    process and the tokens `dreamteam sandbox` stored. Placeholder keys of local endpoints are left out."""
+    each session (`overrides`: {session id: overrides}), whatever the export includes; the hub token and the API
+    token of this process (main() took both out of os.environ) and the tokens `dreamteam sandbox` stored. Placeholder
+    keys of local endpoints are left out."""
     lookup = os.environ if environ is None else environ   # (os.environ ignores the case of names on Windows)
     environ = dict(lookup)
     found = Secrets()
@@ -805,6 +810,7 @@ def known_secrets(raw: dict[str, Any], overrides: dict[str, Any] | None = None,
             for value in (strip_command_credentials(spec.get("command"))[1] if isinstance(spec, dict) else ()):
                 found.add(value, f"a credential in the command of {_server_place(server, sid or None)}")
     found.add(hubauth.env_token(), "the hub token")
+    found.add(hubauth.api_env_token(), "the API token")
     folder = hubauth.tokens_dir()
     with contextlib.suppress(OSError):
         for path in sorted(folder.glob("*.json")):
@@ -1661,7 +1667,7 @@ def _finish_db(path: Path, sid: str, report: ExportReport, secrets: Secrets,
         stats: dict[str, Any] = {"events": 0, "last_event": None, "mcp_servers": [], "max_tools_rev": None}
         with contextlib.suppress(sqlite3.Error):
             stats["events"] = int(conn.execute("SELECT COUNT(*) FROM events").fetchone()[0])
-            row = conn.execute("SELECT id, ts, type FROM events ORDER BY id DESC LIMIT 1").fetchone()
+            row = conn.execute(_LAST_WORK_EVENT, SESSION_EVENTS).fetchone()
             stats["last_event"] = {"id": row[0], "ts": row[1], "type": row[2]} if row else None
         with contextlib.suppress(sqlite3.Error):
             stats["mcp_servers"] = [{"name": r[0], "origin": r[1], "status": r[2]} for r in conn.execute(
@@ -2155,17 +2161,18 @@ def _discard(work: Path, *, keep_folder: bool) -> list[Path]:
 
 
 # ==== import ====================================================================================================
-# settings keys of this computer: an import keeps their value here (global settings and session overrides alike)
+# settings keys of this computer: an import keeps their value here (global settings and session overrides alike);
+# [api] folders name folders of this computer, so an import never grants one (docs/SPEC.md §21.10)
 LOCAL_KEYS: tuple[tuple[str, str], ...] = (
     ("server", "host"), ("server", "port"), ("shell", "program"), ("skills", "library_dir"), ("skills", "envs_dir"),
-    ("skills", "python"), ("mcp", "library_dir"))
+    ("skills", "python"), ("mcp", "library_dir"), ("api", "folders"))
 # the order apply_import works in: the MCP library last but [mcp.external], since its entries name imported sessions
 APPLY_ORDER = ("settings", "skills", "sessions", "mcp")
 _SECTION_FIELDS: dict[str, frozenset[str]] = {
     name: frozenset(f.name for f in dataclasses.fields(cls)) for name, cls in (
         ("swarm", SwarmSettings), ("agents", AgentSettings), ("server", ServerSettings), ("shell", ShellSettings),
         ("workspace", WorkspaceSettings), ("mcp", MCPSettings), ("tracing", TracingSettings),
-        ("skills", SkillsSettings))}
+        ("skills", SkillsSettings), ("api", ApiSettings))}
 _PROFILE_FIELDS = frozenset(f.name for f in dataclasses.fields(ModelProfile)) - {"name"}
 _ROLE_FIELDS = frozenset(f.name for f in dataclasses.fields(RoleSettings))
 _TEAM_FIELDS = frozenset(f.name for f in dataclasses.fields(TeamSettings))
@@ -2470,7 +2477,9 @@ def merge_settings(target: dict[str, Any], exported: dict[str, Any], *, home: st
                     m.local_kept.append(f"{name}.{key}")
                 del values[key]
         merged = deep_merge(current, values)
-        if merged != current:
+        # [api] is stored without its default values (settings.api_values): an exported default changes nothing
+        changed = api_values(merged) != api_values(current) if name == "api" else merged != current
+        if changed:
             m.update[name] = merged
             m.sections.append(name)
     target_models = target.get("models") if isinstance(target.get("models"), dict) else {}
@@ -2810,12 +2819,12 @@ def _workspace_kind(meta: Any) -> tuple[str, str | None, str | None, bool]:
 
 
 def _last_event(path: Path) -> tuple[Any, ...] | None:
-    """(id, ts, type) of the last event of a session database; None without one."""
+    """(id, ts, type) of the last event of the work of a session database (_LAST_WORK_EVENT); None without one."""
     if not path.is_file():
         return None
     try:
         with _read_db(path, 10.0) as (conn, _immutable):
-            row = conn.execute("SELECT id, ts, type FROM events ORDER BY id DESC LIMIT 1").fetchone()
+            row = conn.execute(_LAST_WORK_EVENT, SESSION_EVENTS).fetchone()
     except (sqlite3.Error, OSError):
         return None
     return tuple(row) if row else None

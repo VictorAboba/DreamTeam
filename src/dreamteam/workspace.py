@@ -16,7 +16,7 @@ import time
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from . import hubgit, netoff, prompts
 from .models import USER, Status, ToolError
@@ -418,14 +418,17 @@ def git_argv(git: str, root: Path, actor: str | None, args: tuple[str, ...] | li
 
 def run_git(root: Path, *args: str, actor: str | None = None, git: str | None = None,
             safe_directory: str | None = None, timeout: float = GIT_TIMEOUT, adopted: bool = False,
-            literal: bool = True, unfiltered: bool = False, offline: bool = False) -> subprocess.CompletedProcess:
+            literal: bool = True, unfiltered: bool = False, offline: bool = False,
+            env: dict[str, str] | None = None, secret_names: Iterable[str] = ()) -> subprocess.CompletedProcess:
     """Run git in `root` synchronously (call it from a thread), hardened like every DreamTeam git call (hubgit.py:
     its environment filtered of secrets, nothing the repository's config names runs); OSError when git cannot be run.
     `unfiltered`: the command stages, commits or checks its pathspecs, which then leave out the files of a disarmed
     required filter (hubgit.run_unfiltered), as in Workspace._run_git. `offline`: like the members' commands of a
-    session without network (hubgit.run; `isolated_git()` says when)."""
+    session without network (hubgit.run; `isolated_git()` says when). `env`: variables added to that environment
+    (e.g. GIT_OPTIONAL_LOCKS); `secret_names`: further variables it never has (the session's key variables, as
+    Workspace._secret_names)."""
     git = git or shutil.which("git") or "git"
-    env = hubgit.environment()
+    env = {**hubgit.environment(secret_names), **(env or {})}
     guard = hubgit.guard(git, root, env, offline=offline)
 
     def argv(args: list[str], literal: bool) -> list[str]:
@@ -438,15 +441,17 @@ def run_git(root: Path, *args: str, actor: str | None = None, git: str | None = 
                       offline=offline)
 
 
-def isolated_git(network_off: bool, folder: Path | None = None) -> bool:
+def isolated_git(network_off: bool, folder: Path | None = None, *, held: int | None = None) -> bool:
     """Whether DreamTeam's git for a session runs like its members' commands (run_git offline=True): the session has
     no network (`network_off`) and this machine's isolation is "docker" or "netns" (detected here: synchronous, call
     it from a thread). In the Docker sandbox `folder`, where that git is about to write, is first opened to the
-    offline user (netoff.prepare_workspace), as at every start of such a session."""
+    offline user (netoff.prepare_workspace), as at every start of such a session; `held`: `folder` open
+    (sessions._hold), opened through that descriptor, wherever it lies now."""
     if not network_off or netoff.isolation() not in ("docker", "netns"):
         return False
-    if folder is not None and netoff.detected() == "docker" and Path(folder).is_dir():
-        failed = netoff.prepare_workspace(Path(folder))
+    if folder is not None and netoff.detected() == "docker" and (held is not None or Path(folder).is_dir()):
+        failed = (netoff.prepare_workspace(Path(folder)) if held is None
+                  else netoff.prepare_workspace(Path(folder), dir_fd=held))
         if failed:
             log.warning("%d entries of %s stay closed to the offline user", failed, folder)
     return True
@@ -463,36 +468,74 @@ def nested_repo_paths(root: Path, listed: bytes) -> list[str]:
     found: list[str] = []
     for name in listed.decode("utf-8", "replace").split("\0"):
         path = name.rstrip("/")
-        if name.endswith("/") and path and not in_scratch(path) and os.path.lexists(Path(root) / path / ".git"):
+        if name.endswith("/") and path and not in_scratch(path) and hubgit.lexists(Path(root) / path / ".git"):
             found.append(path)
     return found
 
 
-def init_repo(root: Path, git: str | None = None, *, adopted: bool = False, offline: bool = False) -> str | None:
+def init_repo(root: Path, git: str | None = None, *, adopted: bool = False, offline: bool = False,
+              check: Callable[[], None] | None = None, held: int | None = None) -> str | None:
     """`git init` in `root` with a `.gitignore` (unless one exists) and an initial commit of what is there,
     as for a new workspace (synchronous). `adopted`: a folder of the user (its files are committed with the user's
-    own line-ending settings, as every later commit there is); `offline`: run_git's. Returns None on success, else
-    git's error text."""
-    proc = run_git(root, "-c", "init.defaultBranch=main", "init", "-q", git=git, adopted=adopted, offline=offline)
-    if proc.returncode != 0:
-        return git_output(proc) or f"git init failed with code {proc.returncode}"
-    gitignore = root / ".gitignore"
-    if not gitignore.exists():
-        gitignore.write_bytes(DEFAULT_GITIGNORE.encode("utf-8"))
-    # An adopted folder may hold cloned or generated projects: left out like in every autocommit (the next shell
-    # call's autocommit tells the agent about them), not committed as gitlinks without a .gitmodules
-    listed = run_git(root, "ls-files", "--others", "--exclude-standard", "-z", git=git, adopted=adopted,
-                     offline=offline)
-    nested = nested_repo_paths(root, listed.stdout) if listed.returncode == 0 else []
-    if nested:
-        log.info("initial commit of %s leaves out nested repositories: %s", root, ", ".join(nested))
-    run_git(root, "add", "-A", "--ignore-errors", "--", ".", *(f":(exclude,literal){path}" for path in nested),
-            git=git, adopted=adopted, literal=False, unfiltered=True, offline=offline)
-    proc = run_git(root, "commit", "-q", "--no-verify", "--allow-empty", "-m", "Initialize workspace", git=git,
-                   adopted=adopted, offline=offline)
-    if proc.returncode != 0:
-        return git_output(proc) or f"git commit failed with code {proc.returncode}"
-    return None
+    own line-ending settings, as every later commit there is; on a file system without POSIX bits the new repository
+    gets core.filemode=false, see below); `offline`: run_git's. `check`: called before each step (each git command,
+    the .gitignore), it ends the init by raising (a server folder of the HTTP API v1 must still be the folder it held
+    inside its root: sessions._check_held). `held` (POSIX): `root` open as a descriptor (sessions._hold); every step
+    then works in that folder wherever it lies now, not through a link swapped in for `root` or a folder above it
+    after a check: each git command starts in it and its config is read there (hubgit.in_folder; git then goes on by
+    the path it finds there, docs/SPEC.md §21.10), and the .gitignore is made through it (O_EXCL, O_NOFOLLOW).
+    Returns None on success, else git's error text."""
+    from . import treecopy  # (treecopy imports this module)
+
+    step = check or (lambda: None)
+    with hubgit.in_folder(root, held):
+        step()
+        proc = run_git(root, "-c", "init.defaultBranch=main", "init", "-q", git=git, adopted=adopted, offline=offline)
+        if proc.returncode != 0:
+            return git_output(proc) or f"git init failed with code {proc.returncode}"
+        if adopted and treecopy.without_posix_bits(root):
+            # A folder of Windows seen from Linux (Docker Desktop's 9p, WSL's drvfs) reports 0o777 for the files
+            # Windows wrote, while git init's probe passes on the config file it makes there: with core.filemode=true
+            # every one of them would be committed as 100755, and git on Windows would see each of them as changed
+            step()
+            proc = run_git(root, "config", "core.filemode", "false", git=git, adopted=adopted, offline=offline)
+            if proc.returncode != 0:
+                return git_output(proc) or f"git config failed with code {proc.returncode}"
+        gitignore = root / ".gitignore"
+        step()
+        if held is not None and not _WINDOWS:
+            _create_in(held, ".gitignore", DEFAULT_GITIGNORE.encode("utf-8"))
+        elif not gitignore.exists():
+            gitignore.write_bytes(DEFAULT_GITIGNORE.encode("utf-8"))
+        # An adopted folder may hold cloned or generated projects: left out like in every autocommit (the next shell
+        # call's autocommit tells the agent about them), not committed as gitlinks without a .gitmodules
+        step()
+        listed = run_git(root, "ls-files", "--others", "--exclude-standard", "-z", git=git, adopted=adopted,
+                         offline=offline)
+        nested = nested_repo_paths(root, listed.stdout) if listed.returncode == 0 else []
+        if nested:
+            log.info("initial commit of %s leaves out nested repositories: %s", root, ", ".join(nested))
+        step()
+        run_git(root, "add", "-A", "--ignore-errors", "--", ".", *(f":(exclude,literal){path}" for path in nested),
+                git=git, adopted=adopted, literal=False, unfiltered=True, offline=offline)
+        step()
+        proc = run_git(root, "commit", "-q", "--no-verify", "--allow-empty", "-m", "Initialize workspace", git=git,
+                       adopted=adopted, offline=offline)
+        if proc.returncode != 0:
+            return git_output(proc) or f"git commit failed with code {proc.returncode}"
+        return None
+
+
+def _create_in(folder: int, name: str, data: bytes) -> None:
+    """The new file `name` with `data` in the folder open as `folder` (POSIX `dir_fd`), never through a link; nothing
+    when the name is taken (a file, a folder or a link)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(name, flags, 0o666, dir_fd=folder)
+    except FileExistsError:
+        return
+    with open(fd, "wb") as out:
+        out.write(data)
 
 
 # A git operation that stopped halfway (a file or folder in the git dir): the next commit would conclude it.
@@ -510,25 +553,30 @@ def looks_like_git_dir(folder: Path) -> bool:
 
 
 def repo_state(root: Path, git: str | None = None, exclude: tuple[str, ...] | list[str] = (), *,
-               offline: bool = False) -> dict[str, Any]:
+               offline: bool = False, line_endings: bool = False) -> dict[str, Any]:
     """What an existing folder is to git, before it is adopted as a workspace or before a session starts in a
     folder it adopted (synchronous): {"toplevel": the root of the work tree that contains it (None: not in a
     repository), "git_dir": True when it is a repository database (a bare repository or a .git folder), "branch":
     the current branch (None: detached HEAD), "operation": a merge, rebase, cherry-pick, revert or bisect that
     stopped halfway (None: none), "changes": `git status --porcelain` lines (uncommitted changes and untracked,
     not ignored files; `exclude`: folders relative to `root` left out, e.g. the session's own MCP servers),
+    "line_endings": the lines of "changes" that line endings alone make (with `line_endings` only, else []),
     "error": why git could not read a repository there (None: fine)}.
     The user's own git configuration applies (line endings: no core.autocrlf override), except settings that
     would hide changes from this check (status.showUntrackedFiles, ignored submodules). The files of a required
     filter DreamTeam's git does not run (git-crypt...: hubgit.Guard.excludes) are left out, as from every commit of
-    DreamTeam: with that filter off, a file merely touched would look changed. `offline`: run_git's."""
+    DreamTeam: with that filter off, a file merely touched would look changed. `offline`: run_git's.
+    `line_endings`: when a tracked file looks changed, the status runs again with core.autocrlf=true, and the
+    changes it no longer lists (CRLF in the file, LF in the repository) are "line_endings": a checkout made by Git
+    for Windows, whose system config sets core.autocrlf=true, read by a git that does not read that config (the
+    Docker sandbox's)."""
     state: dict[str, Any] = {"toplevel": None, "git_dir": False, "branch": None, "operation": None, "changes": [],
-                             "error": None}
+                             "line_endings": [], "error": None}
 
-    def run(*args: str, unfiltered: bool = False) -> subprocess.CompletedProcess:
+    def run(*args: str, unfiltered: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         # safe.directory=*: only reading here, and a repository created by another account must not look like none
         return run_git(root, *args, git=git, safe_directory="*", adopted=True, literal=False, unfiltered=unfiltered,
-                       offline=offline)
+                       offline=offline, env=env)
 
     probe = run("rev-parse", "--is-inside-git-dir", "--is-bare-repository", "--absolute-git-dir")
     if probe.returncode != 0:
@@ -553,12 +601,20 @@ def repo_state(root: Path, git: str | None = None, exclude: tuple[str, ...] | li
     # explicit flags: the user's status.showUntrackedFiles=no or submodule ignore settings must not hide changes
     # that the agents' `git add -A` would commit
     excluded = [f":(exclude,literal){path}" for path in exclude]
-    status = run("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none", "--",
-                 ":(literal).", *excluded, unfiltered=True)
+    listing = ("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none", "--", ":(literal).",
+               *excluded)
+    status = run(*listing, unfiltered=True)
     if status.returncode != 0:
         state["error"] = git_output(status) or f"git status failed with code {status.returncode}"
-    else:
-        state["changes"] = [line for line in status.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
+        return state
+    state["changes"] = [line for line in status.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
+    if line_endings and any(not line.startswith("??") for line in state["changes"]):
+        # (no optional locks: a status that found those files unchanged would store that in the index, and the next
+        # check without the setting would take them for unchanged too)
+        converted = run("-c", "core.autocrlf=true", *listing, unfiltered=True, env={"GIT_OPTIONAL_LOCKS": "0"})
+        if converted.returncode == 0:
+            left = set(converted.stdout.decode("utf-8", "replace").splitlines())
+            state["line_endings"] = [line for line in state["changes"] if line not in left]
     return state
 
 
@@ -592,6 +648,79 @@ def commit_paths(root: Path, paths: list[str], message: str, git: str | None = N
         return None, git_output(proc) or f"git commit failed with code {proc.returncode}"
     head = run_git(root, "rev-parse", "HEAD", git=git, adopted=True, offline=offline)
     return head.stdout.decode("ascii", "replace").strip() or None, None
+
+
+# a commit id as DreamTeam records it (`api.base_commit`: SHA-1 or SHA-256 hex): anything else never reaches git's
+# command line, where a text such as "--output=x" would be an option
+COMMIT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# what `git diff --name-status` says of a path, as v1's `changed_files` names it (docs/SPEC.md §21.7); any other
+# letter (T: a type change, U: unmerged, X) is "modified"
+_DIFF_CHANGES = {"A": "added", "D": "deleted"}
+
+
+class BaseCommitGone(LookupError):
+    """changed_since: the base commit is not (or no longer) in the repository."""
+
+
+def changed_since(root: Path, base: str, *, adopted: bool = False, network_off: bool = False,
+                  git: str | None = None, secret_names: Iterable[str] = ()) -> list[dict[str, str]]:
+    """The files of the working tree at `root` that differ from commit `base` (docs/SPEC.md §21.7 `changed_files`), as
+    [{"path", "change": "added" | "modified" | "deleted"}] sorted by path ('/' between names, relative to `root`, the
+    top folder of its repository). Untracked files count (one the autocommit holds back too, §7 "Held new files");
+    ignored ones and `.scratch/` do not; a path both deleted and untracked is "modified". Read with DreamTeam's
+    guarded git (hubgit: the repository's hooks, filters, textconv and diff drivers and core.fsmonitor disarmed; the
+    files of a disarmed required filter left out, as from every commit), with GIT_OPTIONAL_LOCKS=0 (it never takes
+    index.lock) and without the workspace's git lock, so the agents' commits never wait for it: `git rev-parse
+    --verify --quiet <base>^{commit}`, `git diff --name-status -z --no-renames --no-ext-diff --no-textconv
+    --ignore-submodules=none <base> -- . ':(exclude).scratch'`, `git ls-files --others --exclude-standard -z`. A
+    module function: a stopped session needs no Swarm. `adopted`: the folder is the user's (its own line-ending
+    settings apply, as in its commits); `network_off`: the session's setting (isolated_git: its git then runs like the
+    members' commands); `secret_names`: the session's key variables. ValueError for a `base` that is no commit id
+    (COMMIT_ID: it never reaches git's command line), BaseCommitGone when the repository opens and lacks it (rev-parse's
+    exit 1), OSError when git cannot be run or fails, also when it cannot open the repository (its output is logged,
+    never in the text: it may name the folder). Blocking: call it in a thread."""
+    if not isinstance(base, str) or not COMMIT_ID.fullmatch(base):
+        raise ValueError("not a commit id")
+    root = Path(root)
+    if not os.path.lexists(root / ".git"):
+        raise OSError("the folder has no repository of its own")
+    offline = isolated_git(network_off)
+
+    def run(*args: str) -> subprocess.CompletedProcess:
+        try:
+            return run_git(root, *args, git=git, adopted=adopted, literal=False, unfiltered="--" in args,
+                           offline=offline, env={"GIT_OPTIONAL_LOCKS": "0"}, secret_names=secret_names)
+        except subprocess.SubprocessError as exc:   # (a timeout)
+            raise OSError(f"git {args[0]} did not finish") from exc
+
+    def failed(proc: subprocess.CompletedProcess, what: str) -> OSError:
+        log.info("git %s in %s failed (%s): %s", what, root, proc.returncode, git_output(proc)[:500])
+        return OSError(f"git {what} failed with exit code {proc.returncode}")
+
+    # exit 1: the repository opened and holds no such commit; anything else (128: git could not open the repository, a
+    # damaged one, a permission refused) is a failure, never "gone"
+    probe = run("rev-parse", "--verify", "--quiet", f"{base}^{{commit}}")
+    if probe.returncode == 1:
+        raise BaseCommitGone(base)
+    if probe.returncode != 0:
+        raise failed(probe, "rev-parse")
+    diff = run("diff", "--name-status", "-z", "--no-renames", "--no-ext-diff", "--no-textconv",
+               "--ignore-submodules=none", base, "--", ".", f":(exclude){SCRATCH_DIR}")
+    if diff.returncode != 0:
+        raise failed(diff, "diff")
+    changes: dict[str, str] = {}
+    fields = diff.stdout.decode("utf-8", "replace").split("\0")
+    for status, path in zip(fields[0::2], fields[1::2]):
+        if status and path:
+            changes[path] = _DIFF_CHANGES.get(status[0], "modified")
+    others = run("ls-files", "--others", "--exclude-standard", "-z", "--", ".", f":(exclude){SCRATCH_DIR}")
+    if others.returncode != 0:
+        raise failed(others, "ls-files")
+    for name in others.stdout.decode("utf-8", "replace").split("\0"):
+        path = name.rstrip("/")   # (a nested repository: its folder, named once)
+        if path:
+            changes[path] = "modified" if changes.get(path) == "deleted" else changes.get(path, "added")
+    return [{"path": path, "change": change} for path, change in sorted(changes.items())]
 
 
 def _check_windows_names(parts: tuple[str, ...], shown: str) -> None:
@@ -693,6 +822,11 @@ class Workspace:
         self._write_seq = 0
         self._write_started: dict[str, int] = {}
         self._writing: dict[str, int] = {}
+        # record_head: init() records HEAD once its repository is ready (head_at_init), still under the git lock, so
+        # the first commit of the files already there is in it and no agent commit is (docs/SPEC.md §21.4
+        # `base_commit`); None with git off, without git, or when there is no commit
+        self.record_head = False
+        self.head_at_init: str | None = None
 
     # --- setup -----------------------------------------------------------------------------
     @property
@@ -705,6 +839,7 @@ class Workspace:
         return bool(getattr(self.swarm.config, "workspace_adopted", False))
 
     async def init(self) -> None:
+        self.head_at_init = None
         if getattr(self.swarm.config, "workspace_path", None) is not None and not self.root.is_dir():
             # a folder outside the session (a project of the user, an unplugged drive, a path of the host inside a
             # Docker sandbox) is never created silently: the agents would work in an empty stand-in
@@ -725,6 +860,28 @@ class Workspace:
                     await self._configure_repo()
             except (OSError, subprocess.SubprocessError) as exc:
                 log.warning("git init failed: %s", exc)
+            if self.record_head:
+                self.head_at_init = await self._head_commit()
+
+    async def _head_commit(self) -> str | None:
+        """The commit HEAD names in the workspace's own repository, or None (no `.git` here: a git run from the
+        folder would read a repository above it; an unborn HEAD; git failed). Caller holds the git lock."""
+        if not (self.root / ".git").exists():
+            return None
+        try:
+            proc = await self._git(None, "rev-parse", "--verify", "--quiet", "HEAD^{commit}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            log.warning("could not read the workspace's HEAD: %s", exc)
+            return None
+        head = proc.stdout.decode("ascii", "replace").strip() if proc.returncode == 0 else ""
+        return head or None
+
+    async def changed_since(self, base: str) -> list[dict[str, str]]:
+        """The module's changed_since for this workspace, in a thread, without the git lock (the agents' commits
+        never wait for it): the files that differ from commit `base` (docs/SPEC.md §21.7 `changed_files`)."""
+        return await asyncio.to_thread(changed_since, self.root, base, adopted=self.adopted,
+                                       network_off=netoff.is_off(getattr(self.swarm, "config", None)),
+                                       git=self._git_exe, secret_names=self._secret_names())
 
     def ensure_scratch(self, actor: str | None = None) -> None:
         """`.scratch/` with its self-ignoring `.gitignore` (written again when missing or changed) and, for `actor`, the

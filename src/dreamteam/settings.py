@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 from .config import (
     CONFIG_FILE,
     PRICE_FIELDS,
+    ApiSettings,
     Config,
     ModelProfile,
     env_var_name,
@@ -33,8 +34,11 @@ from .config import (
 
 HOME_ENV = "DREAMTEAM_HOME"
 # `teams` and `roles` are lists of tables ([[teams]], the saved teams; [[roles]], the role catalog: docs/SPEC.md §17.3);
-# the others are tables
-SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "teams", "roles", "models")
+# the others are tables. `api` is edited by hand only: the public view leaves it out (docs/SPEC.md §21.9)
+SECTIONS = ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "api", "teams", "roles",
+            "models")
+# sections the public view (and so the settings page) does not fill: lists of entries, profiles, and [api]
+_NOT_FILLED = ("api", "teams", "roles", "models")
 _ROLE_FIELDS = ("name", "description", "instructions", "model", "hidden", "skills")
 # fields the public view computes for each model profile; never stored (an update or a check drops them)
 _PUBLIC_KEY_FIELDS = ("api_key_set", "api_key_hint", "api_key_env_set", "price_source")
@@ -196,9 +200,11 @@ def dump_toml(data: dict[str, Any]) -> str:
     def table(prefix: list[str], body: dict[str, Any]) -> None:
         scalars = {k: v for k, v in body.items() if v is not None and not isinstance(v, dict)}
         tables = {k: v for k, v in body.items() if isinstance(v, dict)}
-        # small inline-able dicts (e.g. env of an external MCP server) stay inline when they are leaves
+        # small inline-able dicts (e.g. env of an external MCP server) stay inline when they are leaves; under
+        # [api.folders] `env` and `extra` are names of roots, written as tables like the others
         inline = {k: v for k, v in tables.items()
-                  if prefix and v and all(not isinstance(x, dict) for x in v.values()) and k in ("env", "extra")}
+                  if prefix and prefix[:2] != ["api", "folders"] and v
+                  and all(not isinstance(x, dict) for x in v.values()) and k in ("env", "extra")}
         if prefix and (scalars or inline or not tables):
             out.append(f"[{'.'.join(_key(p) for p in prefix)}]")
         for k, v in scalars.items():
@@ -266,11 +272,12 @@ def public_view(raw: dict[str, Any]) -> dict[str, Any]:
     call's prices come from (ModelProfile.price_source: "none" / "partial" count tokens as $0). Values of
     `env` tables of external MCP servers (usually tokens) are masked too. `teams`: the [[teams]] entries as stored,
     normalized, [] when there are none. `roles`: the [[roles]] entries as stored, normalized (a built-in role by its
-    id)."""
+    id). No `api`: it is edited by hand only, and the settings page PUTs its whole view back, which would write its
+    defaults into the file (docs/SPEC.md §21.9)."""
     cfg = validate(".", raw)
     view: dict[str, Any] = {}
     for name in SECTIONS:
-        if name in ("teams", "roles", "models"):
+        if name in _NOT_FILLED:
             continue
         view[name] = dataclasses.asdict(getattr(cfg, name))
     view["swarm"].pop("goal", None)
@@ -341,6 +348,23 @@ def _restore_secrets(mcp: dict[str, Any], old_mcp: Any) -> None:
                                  "enter the value again")
 
 
+# [api] as ApiSettings() has it: a key equal to its default is not stored (api_values)
+_API_DEFAULTS: dict[str, Any] = dataclasses.asdict(ApiSettings())
+
+
+def api_values(section: dict[str, Any]) -> dict[str, Any]:
+    """[api] as the file keeps it (docs/SPEC.md §21.9): without the keys that are None or equal to their default, so
+    the section is written only when a value differs and a home stays readable by an older version (which refuses
+    unknown sections). Anything else stays, for `validate` to judge."""
+    def default(key: Any, value: Any) -> bool:
+        if key not in _API_DEFAULTS:
+            return False
+        known = _API_DEFAULTS[key]
+        return isinstance(value, bool) == isinstance(known, bool) and value == known  # true never stands for a 1
+
+    return {k: copy.deepcopy(v) for k, v in section.items() if v is not None and not default(k, v)}
+
+
 def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     """New raw settings from a UI update. Sections present in `update` replace the stored ones; `models`
     is the complete list of profiles (missing ones are deleted). For each profile `api_key` absent or
@@ -349,7 +373,9 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
     `roles` is the complete list of [[roles]] entries ([] removes every customization); a stored role's model
     profile follows a rename. An `agents.default_model` or role model sent with the update that names one of its
     profiles is taken as a new name (not renamed again: a swap). `teams` is the complete list of [[teams]] entries
-    ([] removes the key). Their rules are checked by `validate`."""
+    ([] removes the key). `api` (which the settings page never sends: public_view has none) is stored without its
+    None and default values (api_values), and an empty one removes the section. Their rules are checked by
+    `validate`."""
     if not isinstance(update, dict):
         raise ValueError("The settings update must be an object")
     result = copy.deepcopy(raw)
@@ -388,6 +414,13 @@ def apply_update(raw: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(section, dict):
             raise ValueError(f"Section {name} must be an object")
         section = copy.deepcopy(section)
+        if name == "api":
+            values = api_values(section)
+            if values:
+                result["api"] = values
+            else:
+                result.pop("api", None)
+            continue
         if name != "models":
             clean = {k: v for k, v in section.items() if v is not None}
             if name == "swarm":  # the goal belongs to sessions, not to the global settings

@@ -49,6 +49,12 @@
   `Del` deletes it as usual. The `main` session of an old project is never deleted: when it is one of them, `Del`
   and `/delete` print its own message, which names the file to delete by hand. See
   [Updating to 0.2.0](getting-started.md#updating-to-020).
+- **Sessions of the HTTP API.** A session a program created through the [HTTP API](http-api.md) is that program's
+  job: `/sessions` and the list of `dreamteam -r` mark it "HTTP API", and `dreamteam -c` never picks it, so a busy
+  client never makes its sessions the ones you continue. When all the sessions are such, `-c` says so: "There is no
+  session to continue: -c never picks a session created through the HTTP API; open one with /resume id". Open one
+  with `/resume ID` or `dreamteam -r ID`, and watch or answer it like any session; with `answers: "auto"` the hub
+  itself answers its agents' questions and reviews.
 - **Review.** A task the swarm handed to you for review shows as `◑ #3 … waits for your review`. `/approve 3`
   accepts it, `/reject 3 what to fix` returns it to the assignee. On the web board the task card has buttons for this,
   and dragging a task from "Review" to "Done" also accepts it. When a subtask waits for your review, its parent's
@@ -84,12 +90,13 @@
   the decision off: `/approve name` then approves only the code that dialog showed.
 
 If a server for the home folder is already running (`dreamteam serve`), the UI connects to it. Otherwise the server
-starts in the same process, and the sessions stop on exit; `dreamteam -c` continues the last one. When the last one
-is of an earlier version, `-c` says so under the welcome box and opens nothing: start a new session. A prompt
+starts in the same process, and the sessions stop on exit; `dreamteam -c` continues the last one (never one created
+through the HTTP API, see above). When the last one is of an earlier version, `-c` says so under the welcome box and
+opens nothing: start a new session. A prompt
 given with `-c` then stays in the input line unsent, as does one given with `-r ID` of a session that did not open.
 In Git Bash (mintty), run `winpty dreamteam` or use Windows Terminal / PowerShell.
 
-Non-interactive mode for scripts:
+Non-interactive mode for scripts (for a site or another program the same run is the [HTTP API](http-api.md)):
 
 ```bash
 dreamteam -p "Write a script that counts the lines of code in the repository" --output-format json
@@ -108,6 +115,11 @@ and a question that pauses the swarm one more (`stream-json` shows the events in
 `--verbose`, for the notice that a model profile's calls count as $0 (no prices, and the provider does not report
 the cost): one line on stderr.
 `--clarify` / `--no-clarify` do not work with `-c` / `-r`: change an existing session with `/clarify`.
+A session created through the [HTTP API](http-api.md) with `answers: "auto"` is answered by the hub itself. `-r ID`
+of such a session sends no reply, approval or answer of its own, with or without `--no-auto-reply`, and prints no line
+that a member waits for you, so nothing is answered twice; with `--verbose` it says so in one line on stderr. `-p -c`
+never picks a session created through the HTTP API: with only such sessions it exits with code 1 and "There is no
+session to continue: -c never picks a session created through the HTTP API; continue one with -r <id>".
 When the most recent session is of an earlier version, `-c` exits with code 1 and says to start a new session; `-r ID`
 of such a session exits with code 1 and its message. Neither creates anything. A run whose session an import replaced
 with one of an earlier version also exits with code 1 and that session's message.
@@ -144,5 +156,8 @@ The console's `/board` lists subtasks indented under their parent, `/show N` of 
 crew task, also who works on it and its free directions), and `/task` creates an ordinary task.
 The console connects to a running session: `dreamteam console` (or `dreamteam console --session 003-snake`).
 `--session` of a session of an earlier version prints its message (exit code 1); without `--session` the
-console picks only among the sessions this version opens.
-It is a simple line-based client for terminals where the [terminal UI](#terminal-ui) does not work.
+console picks only among the sessions this version opens, and never a session created through the
+[HTTP API](http-api.md): when it finds no session to pick and the home has sessions created through the HTTP API,
+its message adds "A session created through the HTTP API is never picked without --session ID." The console that
+`dreamteam serve` opens in its own terminal never attaches to such a session either. It is a simple line-based client
+for terminals where the [terminal UI](#terminal-ui) does not work.

@@ -59,7 +59,8 @@ dreamteam "Build a snake game in Python with tests"
 | **Terminal UI** | `dreamteam` opens a Claude Code–style terminal UI: a feed of agents' actions (`⏺ Anna Smirnova · task_claim(task_id=3)`), slash commands, `@mentions`, `esc` to pause. `dreamteam -p "goal"` runs headless for scripts and CI with `text`, `json` or `stream-json` output. |
 | **Web board** | `http://127.0.0.1:8765` — sessions page, settings, and per session a live kanban with drag-and-drop, subtasks in their parent's stack, task threads, chat with any agent, its live activity, files, MCP servers, triggers, background jobs and traces. Light/dark, English/Russian. |
 | **MCP** | `/mcp` over HTTP or `dreamteam mcp` over stdio: session management plus every board, message and trace tool. |
-| **REST + WebSocket** | Everything the board does, for your own tooling. |
+| **HTTP API** | `/api/v1` with a token of its own, the HTTP form of `dreamteam -p` for a site or any program: upload files (or name a folder you allowed), start a session with a goal, follow its events, answer the agents and take the result and the files. Stable within v1 — see [HTTP API](docs/en/http-api.md). |
+| **REST + WebSocket** | Everything the board does, for your own tooling; these routes may change between releases. |
 
 ## Install
 
@@ -186,8 +187,11 @@ Every section and key: [Configuration](docs/en/configuration.md).
 
 Agents run commands and MCP server code **with your user's rights**. For untrusted goals use
 `dreamteam sandbox`. API keys and other secrets from the environment are not passed to agents' commands.
-The server listens on `127.0.0.1` and has no authentication: don't expose it without a reverse proxy that adds
-one. A hub with a token (the Docker sandbox, docker compose) asks every client for it, inside its container too.
+By default the server listens on `127.0.0.1` and asks for no token: set `DREAMTEAM_HUB_TOKEN` before you expose it
+(a hub on another address refuses to start without one), or put it behind a reverse proxy with authentication.
+A hub with a token (the Docker sandbox, docker compose) asks every client for it, inside its container too. The HTTP
+API has a token of its own, `DREAMTEAM_API_TOKEN`, which opens `/api/v1` and nothing else; a hub that serves a site
+runs in `dreamteam sandbox`.
 Details: [Security](docs/en/security.md); to report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Documentation
@@ -197,7 +201,8 @@ The full guide is in [docs/en](docs/en/README.md):
 - [Install and quick start](docs/en/getting-started.md) — every `dreamteam` command
 - [Features](docs/en/features.md) — everything DreamTeam does, in one table
 - [Terminal UI and console](docs/en/terminal.md) · [Session folder and an existing project](docs/en/projects.md) ·
-  [Connecting Claude Code](docs/en/claude-code.md) · [Skills](docs/en/skills.md) · [Agent traces](docs/en/traces.md)
+  [Connecting Claude Code](docs/en/claude-code.md) · [HTTP API](docs/en/http-api.md) · [Skills](docs/en/skills.md) ·
+  [Agent traces](docs/en/traces.md)
 - [Configuration](docs/en/configuration.md) · [Docker sandbox and sessions without network](docs/en/sandbox.md) ·
   [Moving to another computer and backups](docs/en/transfer.md) · [Security](docs/en/security.md)
 - [How it works](docs/en/architecture.md) · [Agent tools](docs/en/agent-tools.md) ·

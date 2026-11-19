@@ -10,6 +10,8 @@ import sys
 import zlib
 from typing import Any
 
+from ..symbols import SYMBOLS, SYMBOLS_ASCII, symbols  # noqa: F401  (re-exported)
+
 # ---- colours (rich style strings) ----------------------------------------------------------------
 ACCENT = "#d97757"        # Claude orange: welcome box, input border, spinner, commands
 OK = "#3a9e4a"            # done tasks, achieved goal, resumed swarm
@@ -54,79 +56,9 @@ def agent_style(name: str | None) -> str:
     return agent_color(name)
 
 
-# ---- symbols --------------------------------------------------------------------------------------
-SYMBOLS: dict[str, str] = {
-    "bullet": "⏺",     # activity line
-    "cont": "⎿",       # continuation ("  ⎿  result")
-    "todo": "☐",
-    "doing": "◐",
-    "review": "◑",
-    "done": "☒",
-    "failed": "✗",
-    "spark": "✻",      # thinking, welcome
-    "mail": "✉",       # agent-to-agent message
-    "chat": "💬",      # task discussion
-    "bell": "🔔",      # notification to the user
-    "warn": "⚠",
-    "alarm": "⏰",     # wake-up
-    "nudge": "↻",
-    "pause": "⏸",
-    "play": "▶",
-    "plus": "+",
-    "minus": "−",
-    "arrow": "→",
-    "reply": "↳",
-    "up": "↑",
-    "down": "↓",
-    "check": "✓",
-    "dot": "·",
-    "ellipsis": "…",
-    "dash": "—",
-    "prompt": ">",
-    "edit": "✎",       # file changed / locked
-    "trigger": "⚡",
-    "job": "⚙",        # background job of an agent
-    "folder": "▸",
-    "current": "▶",
-    "sub": "●",        # a direct subtask on its parent's board line (its colour = its status)
-}
-
-SYMBOLS_ASCII: dict[str, str] = {
-    "bullet": "*",
-    "cont": "|_",
-    "todo": "[ ]",
-    "doing": "[~]",
-    "review": "[?]",
-    "done": "[x]",
-    "failed": "x",
-    "spark": "*",
-    "mail": ">",
-    "chat": "#",
-    "bell": "!",
-    "warn": "!",
-    "alarm": "@",
-    "nudge": "~",
-    "pause": "||",
-    "play": ">",
-    "plus": "+",
-    "minus": "-",
-    "arrow": "->",
-    "reply": ">",
-    "up": "^",
-    "down": "v",
-    "check": "ok",
-    "dot": "-",
-    "ellipsis": "...",
-    "dash": "-",
-    "prompt": ">",
-    "edit": "~",
-    "trigger": "!",
-    "job": "&",
-    "folder": ">",
-    "current": ">",
-    "sub": "o",
-}
-
+# ---- symbols -------------------------------------------------------------------------------------
+# SYMBOLS, SYMBOLS_ASCII and symbols() live in dreamteam/symbols.py (the HTTP API's event texts use them too)
+# and are re-exported here.
 SPINNER_FRAMES_UNICODE = ("·", "✢", "✳", "✶", "✻", "✽")
 SPINNER_FRAMES_ASCII = ("-", "\\", "|", "/")
 # box drawing of rounded panels, plus typography used in the UI texts
@@ -153,10 +85,6 @@ def unicode_supported(stream: Any = None) -> bool:
 
 def pick_symbols(stream: Any = None) -> dict[str, str]:
     return SYMBOLS if unicode_supported(stream) else SYMBOLS_ASCII
-
-
-def symbols(unicode: bool) -> dict[str, str]:
-    return SYMBOLS if unicode else SYMBOLS_ASCII
 
 
 # ---- prompt_toolkit -------------------------------------------------------------------------------

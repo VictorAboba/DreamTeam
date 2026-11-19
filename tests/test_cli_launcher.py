@@ -360,6 +360,109 @@ def test_traces_offline_reads_the_most_recent_session(tmp_path, capsys):
     assert not (home / "sessions" / "003-never" / ".dreamteam" / "swarm.db").exists()
 
 
+# ---- sessions of the HTTP API v1 (docs/SPEC.md §17.2, §18.3, §21.4) -------------------------------------------------
+def test_traces_offline_passes_over_the_sessions_of_the_http_api(tmp_path, capsys):
+    """`traces` without --session never picks a session created through the HTTP API, though it is the most recent
+    one; --session reads it as any other, and a home with only such sessions has none to pick."""
+    home = make_home(tmp_path, free_port())
+
+    async def prepare() -> tuple[str, str, list[str]]:
+        manager = SessionManager(home)
+        mine = (await manager.create("Mine", "Plan it", start=False))["id"]
+        await asyncio.sleep(0.05)
+        job = (await manager.create("Job", "Parse it", start=False, api={"answers": "auto"}))["id"]
+        listed = [s["id"] for s in manager.list()]
+        await manager.shutdown()
+        return mine, job, listed
+
+    async def delete(sid: str) -> None:
+        manager = SessionManager(home)
+        try:
+            await manager.delete(sid)
+        finally:
+            await manager.shutdown()
+
+    mine, job, listed = asyncio.run(prepare())
+    assert listed == [job, mine]   # the API's session is the most recent one
+    capsys.readouterr()
+    assert cli.main(["traces", "--home", str(home)]) == 0
+    out, err = capsys.readouterr()
+    assert f"Session {mine}" in err and job not in err and "No traces." in out
+    assert cli.main(["traces", "--home", str(home), "--session", job]) == 0
+    assert "No traces." in capsys.readouterr().out
+    asyncio.run(delete(mine))
+    assert cli.main(["traces", "--home", str(home)]) == 1
+    assert capsys.readouterr().err.strip() == f"No session to read traces from. {cli.API_NOT_PICKED}"
+    asyncio.run(delete(job))   # no session at all: the line as before
+    assert cli.main(["traces", "--home", str(home)]) == 1
+    assert capsys.readouterr().err.strip() == "No session to read traces from."
+
+
+def test_a_pick_the_user_did_not_name_passes_over_the_sessions_of_the_http_api(monkeypatch):
+    """`console` and `traces` against a hub: without --session never a session created through the HTTP API, even
+    the only running one, and the error says so; with --session, any."""
+    listed: list[dict] = []
+    monkeypatch.setattr(cli, "_hub_json", lambda base, path, *args, **kwargs: {"sessions": list(listed)})
+    base = "http://127.0.0.1:9"
+    job = {"id": "002-job", "status": "running", "via": "api", "answers": "auto"}
+    mine = {"id": "001-mine", "status": "stopped"}
+    listed[:] = [job, mine]
+    assert cli._pick_session(base, None) is mine   # the only one this pick may open
+    running = {**mine, "status": "running"}
+    listed[:] = [job, running]
+    assert cli._pick_session(base, None) is running
+    listed[:] = [job]
+    with pytest.raises(LookupError, match=r"No running session\. .* Sessions: 002-job\. A session created through "
+                       r"the HTTP API is never picked without --session ID\.$"):
+        cli._pick_session(base, None)
+    assert cli._pick_session(base, "002-job") is job
+    listed[:] = [{**mine, "id": "003-other"}, {**mine, "id": "004-more"}]   # two stopped, none of the API's
+    with pytest.raises(LookupError) as caught:
+        cli._pick_session(base, None)
+    assert "HTTP API" not in str(caught.value)
+
+
+def test_status_prints_the_address_of_the_api_of_a_hub_with_an_api_token(tmp_path, monkeypatch, capsys):
+    """`status` of a home whose hub says `api` in /api/hub (it has an API token) prints `API: <hub>/api/v1` after the
+    hub, as `serve` does; never otherwise, and `sessions` never. The session's line says it is the API's."""
+    home = make_home(tmp_path, free_port())
+    base = "http://127.0.0.1:9"
+    ident: dict = {"mode": "launcher"}
+    monkeypatch.setattr(cli, "running_hub", lambda project: base)
+    monkeypatch.setattr(cli, "hub_identity", lambda url, *args, **kwargs: dict(ident))
+    monkeypatch.setattr(cli, "_hub_json", lambda url, path, *args, **kwargs: {"sessions": [
+        {"id": "001-job", "status": "stopped", "title": "Job", "via": "api", "answers": "auto"}]})
+    for api, shown in ((None, False), (False, False), ("yes", False), (True, True)):
+        if api is None:
+            ident.pop("api", None)
+        else:
+            ident["api"] = api
+        assert cli.main(["status", "--home", str(home)]) == 0
+        out = capsys.readouterr().out
+        assert "001-job [stopped] Job" in out and " | HTTP API" in out
+        assert out.rstrip().splitlines()[-2 if shown else -1] == f"Hub: {base}"
+        assert (f"API: {base}/api/v1" in out) is shown
+    assert cli.main(["sessions", "--home", str(home)]) == 0
+    assert "API:" not in capsys.readouterr().out
+
+
+def test_console_prints_the_title_of_its_session_as_one_printable_line(tmp_path, monkeypatch, capsys):
+    """A title made on the board or over MCP, or a remote hub's, may hold control characters: `console` prints it as
+    one printable line (copyfrom.printable_line)."""
+    home = make_home(tmp_path, free_port())
+    base = "http://127.0.0.1:9"
+    opened: list[str] = []
+    monkeypatch.setattr(cli, "running_hub", lambda project: base)
+    monkeypatch.setattr(cli, "hub_identity", lambda url, *args, **kwargs: {"mode": "launcher"})
+    monkeypatch.setattr(cli, "_hub_json", lambda url, path, *args, **kwargs: {"sessions": [
+        {"id": "001-x", "status": "running", "title": "Evil\x1b]0;owned\x07\ntitle", "language": "en"}]})
+    monkeypatch.setattr(console_module, "run_console", lambda url, lang, **kwargs: opened.append(url))
+    assert cli.main(["console", "--home", str(home)]) == 0
+    err = capsys.readouterr().err
+    assert "Session 001-x: Evil ]0;owned title\n" in err and "\x1b" not in err and "\x07" not in err
+    assert opened == [f"{base}/s/001-x"]
+
+
 def test_sandbox_serves_a_home_without_sessions_dir(tmp_path, monkeypatch, capsys):
     seen = {}
     monkeypatch.setattr(docker_module, "run_sandbox",

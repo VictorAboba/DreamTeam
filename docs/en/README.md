@@ -13,6 +13,8 @@ Working with the swarm:
 - [Session folder and an existing project](projects.md): pointing the swarm at your own repository (`/cd`,
   `--workspace`), working on a copy of files (`--copy-from`)
 - [Connecting Claude Code](claude-code.md): the swarm as an MCP server, `join_swarm`
+- [HTTP API](http-api.md): the swarm as a service for your own programs (`/api/v1`): upload files, start a session,
+  follow its events, answer the agents, take the result and the files
 - [Skills](skills.md): Agent Skills for the swarm — library, attaching, agents' proposals, dependencies
 - [Agent traces](traces.md): every agent wake-up step by step, with tokens and cost
 

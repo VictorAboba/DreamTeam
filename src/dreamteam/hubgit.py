@@ -29,6 +29,7 @@ environment, no more of DreamTeam's than the members' commands get."""
 from __future__ import annotations
 
 import atexit
+import contextlib
 import functools
 import logging
 import os
@@ -38,7 +39,7 @@ import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -131,13 +132,80 @@ def environment(secret_names: Iterable[str] = ()) -> dict[str, str]:
 def run(argv: list[str], *, cwd: Path | str, env: dict[str, str], timeout: float, input: bytes | None = None,
         offline: bool = False) -> subprocess.CompletedProcess:
     """Run a git command (synchronous: call it from a thread). `offline`: like a member's command in a session
-    without network (netoff.wrap and its environment: the offline user's ids, or the session's network namespace)."""
+    without network (netoff.wrap and its environment: the offline user's ids, or the session's network namespace).
+    A `cwd` in the folder of in_folder() starts in that folder, through its descriptor."""
     if offline:
         argv, env = netoff.wrap(argv), netoff.environment(env)
     kwargs: dict[str, Any] = {"stdin": subprocess.DEVNULL} if input is None else {"input": input}
     if _WINDOWS:
         kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    return subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, timeout=timeout, **kwargs)
+    below = _held_below(cwd)
+    if below is None:
+        return subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, timeout=timeout, **kwargs)
+    try:
+        return subprocess.run(argv, env=env, capture_output=True, timeout=timeout,
+                              preexec_fn=functools.partial(_enter, *below), **kwargs)
+    except subprocess.TimeoutExpired:
+        raise
+    except subprocess.SubprocessError as exc:   # (the child could not enter the folder: "Exception occurred in...")
+        raise OSError(f"git could not start in {cwd}: {exc}") from None
+
+
+# ---- a folder held: what lies at its path may be another folder by now -------------------------------------------
+_here = threading.local()   # .folder: in_folder's (path, descriptor) in this thread
+
+
+@contextlib.contextmanager
+def in_folder(root: Path | str, fd: int | None) -> Iterator[None]:
+    """POSIX, `fd` the folder `root` open (sessions._hold): while it is open, every git command this thread runs (run)
+    in `root` or below it starts in that folder, or below it, wherever the folder lies now (fchdir in the child, before
+    exec), so a link swapped in for `root` or a folder above it is not crossed when git starts (git then goes on by
+    the path it finds there: docs/SPEC.md §21.10); guard() reads that folder's config so too, never a scan kept for
+    the path (it reads files by path), and keeps none. Windows, or `fd` None: nothing changes (sessions._hold keeps
+    the path there)."""
+    if fd is None or _WINDOWS:
+        yield
+        return
+    before = getattr(_here, "folder", None)
+    _here.folder = (os.fspath(Path(root)), fd)
+    try:
+        yield
+    finally:
+        _here.folder = before
+
+
+def _held_below(path: Path | str) -> tuple[int, str] | None:
+    """(the descriptor of in_folder's folder, `path` relative to it: "" for the folder itself), or None when this
+    thread holds no folder or `path` is not in it."""
+    held = getattr(_here, "folder", None)
+    if held is None:
+        return None
+    root, fd = held
+    text = os.fspath(Path(path))
+    if text == root:
+        return fd, ""
+    prefix = root.rstrip(os.sep) + os.sep
+    return (fd, text[len(prefix):]) if text.startswith(prefix) else None
+
+
+def _enter(fd: int, rel: str) -> None:
+    """run's preexec_fn, in the child before exec: into the folder held, then `rel` below it."""
+    os.fchdir(fd)
+    if rel:
+        os.chdir(rel)
+
+
+def lexists(path: Path | str) -> bool:
+    """os.path.lexists, through the folder of in_folder() for a path in it."""
+    below = _held_below(path)
+    if below is None:
+        return os.path.lexists(path)
+    fd, rel = below
+    try:
+        os.stat(rel or ".", dir_fd=fd, follow_symlinks=False)
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 # ---- what a repository's own config names -----------------------------------------------------------------------
@@ -394,7 +462,10 @@ def _cached_scan(git: str, folder: Path, env: dict[str, str], offline: bool) -> 
     and in the Docker sandbox): a few small reads. Never reused when the config includes other files (one that does
     not exist yet would not be watched), when there is no `.git` of its own in `folder` or it is a link, when one of
     those files is no regular file, too large or growing (_read), nor when git read the config of another repository
-    than the one _locate found. Scan.index_dir: where git keeps the index then."""
+    than the one _locate found. Scan.index_dir: where git keeps the index then. In the folder of in_folder(): scanned
+    there, neither reused nor kept (its files are read by path here, and the path may lead elsewhere by now)."""
+    if _held_below(folder) is not None:
+        return scan(git, folder, env, offline=offline)
     key = (os.path.normcase(str(folder)), offline)
     where = _locate(folder)
     watch = [*(where[0] if where is not None else ()), *_global_files(env, offline)]
@@ -517,7 +588,7 @@ def guard(git: str, root: Path | str, env: dict[str, str], *, offline: bool = Fa
         hooks |= result.hooks
         maintenance_off = maintenance_off or result.maintenance_off
         for path in _gitlinks(git, folder, env, result.index_dir, offline):
-            if os.path.lexists(folder / path / ".git"):   # checked out: git starts a child git there
+            if lexists(folder / path / ".git"):   # checked out: git starts a child git there
                 todo.append(folder / path)
     pairs = list(keys.items())
     for name in sorted(hooks):

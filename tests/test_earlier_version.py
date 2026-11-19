@@ -449,8 +449,8 @@ async def make_old_latest(tmp_path: Path) -> tuple[SimpleNamespace, str]:
     made = await make_old(tmp_path, "record")
     older = (await made.manager.create("Older", "", start=False))["id"]
     db = Database(made.folder / ".dreamteam" / "swarm.db")
-    try:
-        db.execute("INSERT INTO events(ts, type, actor, data) VALUES (?, 'session.started', 'user', '{}')",
+    try:   # (an event of the work: a run's session.started / session.stopped are not activity, docs/SPEC.md §21.6)
+        db.execute("INSERT INTO events(ts, type, actor, data) VALUES (?, 'message.sent', 'user', '{}')",
                    (time.time() + 3600,))
     finally:
         db.close()
