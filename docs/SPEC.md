@@ -89,20 +89,19 @@ src/dreamteam/
   launcher.py    launcher web app: sessions page, settings, /s/{sid}/ routing (§18.1)
   launcher_mcp.py  the launcher as one MCP server (§18.2)
   api_v1.py      the external HTTP API under /api/v1: ApiV1(manager, host), its Starlette app, routes and aclose()
-                 (§21; draft, not implemented)
+                 (§21)
   autoreply.py   the requests to the user (requests_of, read_requests, blocking_requests), the hub's automatic
                  answers for a session created with answers "auto" (SessionAutoReply), and a session's journal
-                 followed by id (follow_journal, also for stop_when_done) (§21.4, §21.5; draft)
-  eventtext.py   one plain line per event for people, outside the tui package (§21.6; draft)
-  uitext.py      the feed's texts (ru/en), moved out of tui/i18n.py, which stays as a shim (§21.6; draft)
-  symbols.py     the feed's symbols, moved out of tui/theme.py, which re-exports them (§21.6; draft)
-  result.py      the result object of a run, shared by `dreamteam -p` and the API (§21.7; draft)
+                 followed by id (follow_journal, also for stop_when_done) (§21.4, §21.5)
+  eventtext.py   one plain line per event for people, outside the tui package (§21.6)
+  uitext.py      the feed's texts (ru/en), moved out of tui/i18n.py, which stays as a shim (§21.6)
+  symbols.py     the feed's symbols, moved out of tui/theme.py, which re-exports them (§21.6)
+  result.py      the result object of a run, shared by `dreamteam -p` and the API (§21.7)
   instruct.py    what `dreamteam -p -r` and the API's continue do with a prompt: coordinator, continue_step; the
-                 sessions `-c` picks from: without_api_sessions (§21.2, §21.4; draft)
-  sessionopts.py team, model and limits of a request -> session overrides, shared with the launcher MCP (§21.4;
-                 draft)
-  apifolders.py  [api] folders: the roots, their checks, a request's folder (§21.10; draft)
-  nofollow.py    open, list and walk inside a root without following links (§21.8; draft)
+                 sessions `-c` picks from: without_api_sessions (§21.2, §21.4)
+  sessionopts.py team, model and limits of a request -> session overrides, shared with the launcher MCP (§21.4)
+  apifolders.py  [api] folders: the roots, their checks, a request's folder (§21.10)
+  nofollow.py    open, list and walk inside a root without following links (§21.8)
   static/        index.html app.js traces.js style.css traces.css (board), home.html home.js home.css (launcher),
                  markdown.js and icons.css (both); no build step
   console.py     terminal chat client (talks to the REST API)
@@ -1620,7 +1619,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   (`render.board_summary`) count tasks, directions included (the TUI's `/sessions` picker, a plain `id · status ·
   goal` hint per session, and its status line show no task count). A change of `crew` in the task history and the feed (web `changesText`, TUI history
   and change lines) is labelled by `f_crew` (ru «групповая задача (участников)», en "crew"; the value 0 reads
-  «обычная задача» / "ordinary task"), in app.js and tui/i18n.py.
+  «обычная задача» / "ordinary task"), in app.js and uitext.py (tui/i18n.py is its shim, §21.6).
 - **Docs** (en and ru alike): README.md / README.ru.md (a "Crew tasks" bullet), docs/en|ru/features.md (a row of
   its own, and subtasks in the "Task board", terminal and live board rows), agent-tools.md (`crew`, `directions`,
   `task_get`, `board`), configuration.md (the `crew_review` line of the `[swarm]` block and a "Reviews" / «Ревью»
@@ -5057,7 +5056,7 @@ succeeded: either may have changed the library) and everything else to the launc
 | POST `/api/settings/check` | body `{"profile": {...}, "name"?: stored profile name for the key fallback, "live"?: bool}` → `check_profile` result; 400 when the fallback would send the stored key to another provider or base_url than the saved one, or a key from the hub's environment to an endpoint that neither the provider's default, a preset nor a saved profile uses with that variable |
 | WS `/ws` | pushes `sessions.changed` events (manager.listen) |
 | `/mcp` | launcher MCP (§18.2) |
-| `/api/v1/...` | the external HTTP API v1 (§21; draft, not implemented) |
+| `/api/v1/...` | the external HTTP API v1 (§21; dispatched in front of `SessionRouter` to `ApiV1.app`) |
 | GET `/s/{sid}` | 307 redirect to `/s/{sid}/` (query kept) |
 | GET `/s/{sid}/` | the session's `index.html` (board UI) |
 | `/s/{sid}/api/*`, `/s/{sid}/ws`, `/s/{sid}/mcp` | the session app; `manager.load(sid)` loads a stopped session for viewing |
@@ -6821,7 +6820,7 @@ Export and import through a running hub (launcher routes), in the TUI, console o
 `--update` of an existing export; a path map for folders outside the home; the legacy `main` session and
 `dreamteam run` projects; a command that lists or restores `.replaced-*` backups.
 
-## 21. External HTTP API v1 (api_v1.py, autoreply.py, eventtext.py) — DRAFT, issue #55, not implemented
+## 21. External HTTP API v1 (api_v1.py, autoreply.py, eventtext.py)
 
 A stable HTTP interface for programs that use the swarm as a service: a site uploads a document (or names a folder the
 owner listed, 21.10), starts a session with a goal, shows its timeline, answers the agents if asked and gets the
@@ -7849,6 +7848,13 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     a request's folder (21.10).
   - `nofollow.py`: open, list and walk inside a root without following links (21.8, 21.10).
   - `hubauth.py`: the API token (21.1). `web.py`: `is_api_path`, `API_CALLER` and the guard's v1 branch (§14).
+- **Docs** (en and ru alike): docs/en|ru/http-api.md, the guide for a client (a curl walk-through, the routes,
+  states, errors, the compatibility rule and the security notes), linked from the docs indexes and the READMEs (an
+  "HTTP API" row under Interfaces); a row in features.md (and the sessions page's «API» badge); `[api]` in
+  configuration.md; the API token and the folders' grant in security.md, sandbox.md and SECURITY.md; in-place
+  server folders and the workspace refusals in projects.md; `[api]` and v1 sessions in transfer.md; the clients'
+  picks and marks in terminal.md, traces.md, claude-code.md, getting-started.md and docs/TUI.md; the code map in
+  CONTRIBUTING.md.
 - **Tests** (ScriptedLLM, no network, no port: Starlette's `TestClient` on `create_launcher_app`):
   - the token: absent (`api_disabled`, on loopback too); a hub token alone (its Bearer works, none is 401); equal
     tokens refused at the start; the API token opens no internal route (`/api/settings`, `/api/sessions`,
@@ -8166,5 +8172,6 @@ WebSocket; multipart uploads; absolute paths of the hub's computer: folders only
 paths, Git URLs or Claude Code; changing the settings (providers, keys, roles, teams, `[api]` itself) through v1, and
 a settings page section for `[api]` (it is edited by hand, 21.9); CORS; several users with their own quotas (every
 client with the API token acts as the one user of the hub); a callback URL called when a session ends; automatic
-answers to `mcp` requests; mounting only some roots into the sandbox (it mounts every one, 21.10); an OpenAPI document
-(it could come with the implementation).
+answers to `mcp` requests; mounting only some roots into the sandbox (it mounts every one, 21.10); paging of file
+listings (`GET files` gives a folder's whole listing: only the session's own agents fill the folder, 21.8); an OpenAPI
+document.

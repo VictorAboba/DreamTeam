@@ -20,7 +20,9 @@ The same is available without the UI:
 
 * Session REST (paths from `/s/<id>`): `/api/traces`, `/api/traces/<n>`, `/api/spans/<n>`, `/api/spans/<n>/context`,
   `/api/traces/stats`, `/api/traces/<n>/export`, `/api/agents/<name>/traces.jsonl`.
-* Terminal: `dreamteam traces "Anna Smirnova" --status failed`.
+* Terminal: `dreamteam traces "Anna Smirnova" --status failed`. Without `--session ID` it picks the session itself
+  (the running one, or the most recently active), but never one created through the [HTTP API](http-api.md): name
+  that one with `--session ID`.
 * MCP: `agent_traces(agent=..., trace_id=..., span_id=..., context=true)`.
 
 The settings are in the `[tracing]` section: `enabled`, `max_payload_chars` (the limit for one field) and

@@ -17,9 +17,10 @@ checkout (compose, `uv tool install --editable .`) has one, and the build stops 
 the version ranges of `pyproject.toml`.
 `dreamteam sandbox --build` rebuilds an image built earlier.
 Local models (Ollama, vLLM) are reachable from the container at `http://host.docker.internal:<port>`.
-Only the home folder is mounted into the container, so sessions that `/cd` moved to a folder outside it don't start
-in the sandbox: `dreamteam sandbox` lists them at startup. Before the start, return such sessions to the home folder
-(`/cd --default` or `/cd` to a folder inside it: such folders are found in the container too).
+Only the home folder is mounted into the container (and the host's skills library read-only, and the roots of
+`[api] folders` for the [HTTP API](#the-http-api-in-the-sandbox)), so sessions that `/cd` moved to a folder outside it
+don't start in the sandbox: `dreamteam sandbox` lists them at startup. Before the start, return such sessions to the
+home folder (`/cd --default` or `/cd` to a folder inside it: such folders are found in the container too).
 Files from your computer reach a new session through the .zip upload of the "New session" dialog ("More" → "Files
 to work on"): a folder path from the host is not there in the container (see
 [Working on a copy of files](projects.md#working-on-a-copy-of-files)).
@@ -95,6 +96,58 @@ With a plain `docker run`, pass `-e DREAMTEAM_HUB_TOKEN_SHA256` computed the sam
 `DREAMTEAM_HUB_TOKEN=<token>` for the host's commands. Prefer `DREAMTEAM_HUB_TOKEN_SHA256`: then the token itself is
 never in the container's environment. `DREAMTEAM_HUB_NO_TOKEN=1` starts a hub without a token all the same (it logs a
 warning): then every container of its network controls the swarm.
+
+### The HTTP API in the sandbox
+
+A hub that serves a site runs here (see [HTTP API](http-api.md#security)). Set the API token on the host before the
+start:
+
+```bash
+export DREAMTEAM_API_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+dreamteam sandbox ~/DreamTeam
+```
+
+`dreamteam sandbox` of a home gives the container only the token's SHA-256 (`DREAMTEAM_API_TOKEN_SHA256`), never the
+token, and prints the API's address with the header a client sends:
+`API:      http://127.0.0.1:8765/api/v1  (header Authorization: Bearer <your DREAMTEAM_API_TOKEN>)`. The board and
+`/mcp` still take the sandbox's own hub token (above); the API token opens `/api/v1` alone. The sandbox of a single
+project (`dreamteam run`) has no API. With `docker compose`, compute the digest on the host as for the hub
+token; compose passes `DREAMTEAM_API_TOKEN_SHA256` by name, and without it `/api/v1` serves the hub token's holder
+alone:
+
+```bash
+export DREAMTEAM_API_TOKEN=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+export DREAMTEAM_API_TOKEN_SHA256=$(python3 -c "import hashlib, os; print(hashlib.sha256(os.environ['DREAMTEAM_API_TOKEN'].encode()).hexdigest())")
+```
+
+**Folders.** `dreamteam sandbox` of a home mounts each root of `[api] folders`
+([HTTP API settings](configuration.md#http-api-settings)) into the container at `/dreamteam/api-folders/<name>`,
+read-only unless the root is `in_place`, and sets `DREAMTEAM_API_FOLDERS_DIR=/dreamteam/api-folders`, so that the hub
+inside looks for each root there, not at its path on the host.
+
+- Before the start it checks each root on the host, as a hub outside the container checks it at each use: an absolute
+  path of the host's system that exists, is a folder and is not refused (your home folder, the DreamTeam home, the
+  store of hub tokens, the skills library and the like). It mounts the folder the root resolves to. A root that fails,
+  or whose path docker's `-v` cannot take, is not mounted, with a warning that names it and says why; in the container
+  that root is then missing (404 for a client). On Windows that is a root on a network share (`\\server\share`, a
+  mapped network drive too) or a `\\?\` path: use a folder on a local drive. On any system it is a path with a `:`
+  past the drive letter.
+- When it mounts a root, the start says which ones, read-only or writable, and that every agent in the container can
+  read them and write the writable ones. That is a grant to every agent of every session in the container, board
+  sessions included: without `[api] folders` a sandboxed agent reaches no folder of the host but the home and,
+  read-only, the skills library. A `copy` root that lies inside an `in_place` root is writable through that one; the
+  start warns about it.
+- The mounts are made when the container starts. The hub reads the settings at each request, so a root taken out of
+  `[api] folders`, or made copy-only, is refused to clients at once, but its folder stays mounted as it was until the
+  sandbox's next start, and a root added, or made `in_place`, is mounted (or writable) only from then on: restart the
+  sandbox after you edit `[api] folders`.
+- The container runs as root: on a Linux host with rootful Docker a `copy` root is read with root's rights, and the
+  files the agents of a session with network make in an `in_place` root belong to root there.
+- An in-place session made in the sandbox stores the container's path of its folder: a hub outside the container does
+  not find that folder (409 at the session's start), and the reverse. The start's list of sessions that cannot start
+  in the sandbox leaves out those under a root it mounts writable.
+- With `docker compose` you mount the roots yourself, and nothing is checked on the host: `docker-compose.yml` shows
+  the mount line and `DREAMTEAM_API_FOLDERS_DIR` as comments.
 
 ## Session without internet
 

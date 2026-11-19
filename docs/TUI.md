@@ -28,8 +28,8 @@ Package layout: `src/dreamteam/tui/`.
 |---|---|---|
 | `client.py` | client | `HubClient` (async HTTP + WebSocket), `Connection`, `connect()` |
 | `printmode.py` | client | `run_print()` — `dreamteam -p` |
-| `i18n.py` | render | `t(lang, key, **kw)`, `TEXTS = {"ru": {...}, "en": {...}}` (same keys in both) |
-| `theme.py` | render | colours, symbols (unicode + ASCII fallback), `agent_style(name)` |
+| `i18n.py` | render | `t(lang, key, **kw)`, `TEXTS = {"ru": {...}, "en": {...}}` (same keys in both): a shim, the very module `dreamteam/uitext.py`, where the texts live outside the package (the HTTP API's event texts use them too, SPEC §21.6) |
+| `theme.py` | render | colours, `agent_style(name)`; the symbols (unicode + ASCII fallback) live in `dreamteam/symbols.py`, which it re-exports |
 | `render.py` | render | every renderable, the spinner line, the status line, `to_ansi()`, `to_plain()` |
 | `commands.py` | app | slash-command registry and handlers |
 | `input.py` | app | suggestions (slash commands, `@agents`, `#tasks`, locked paths after `/unlock`), input modes, history |
@@ -174,7 +174,11 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
 - The prompt is used as follows:
   - Without `session` / `continue_last`, it creates a session with `prompt` as the goal and starts it. The
     title is `title`, else `""`: the hub splits the goal (first line = title, the rest = description).
-  - With `session` (or `continue_last`, which picks the most recently active session), the session is
+  - With `session` (or `continue_last`, which picks the most recently active session, never one created through the
+    HTTP API: `instruct.without_api_sessions`, SPEC §21.4; when only such sessions exist it exits 1 with
+    `no_sessions_api`, ru «Нет сессий, которые можно продолжить: сессию, созданную через HTTP API, -c не выбирает,
+    её продолжают через -r <id>.», en "There is no session to continue: -c never picks a session created through
+    the HTTP API; continue one with -r <id>.", and with no session at all with `no_sessions`), the session is
     started if stopped. The prompt is then sent as a user message to the session's coordinator: the
     assignee of the planning task, else the first LLM agent. When that session has no goal yet, the prompt
     becomes its goal (`set_goal`). A session paused by the user (not by the budget) is resumed: the prompt
@@ -198,7 +202,8 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
 - A reader of `out` / `err` that goes away (`| head -1`) does not crash the run: the output is dropped and
   the exit code is returned as usual.
 - `auto_reply`: every message an agent sends to the user is answered automatically (at most `AUTO_REPLY_MAX` = 50
-  answers per run, a safety net against a question / answer ping-pong):
+  answers per run, a safety net against a question / answer ping-pong; the limit and both texts below live in
+  `dreamteam/autoreply.py`, which the hub's own automatic answers of the HTTP API share, SPEC §21.5):
   - ru: «Пользователь недоступен (неинтерактивный режим): прими решение сам и продолжай работу.»
   - en: "The user is not available (non-interactive mode): decide yourself and continue."
 
@@ -211,6 +216,15 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
 
   `--no-auto-reply` leaves such a task in review: the run then waits until `--timeout` (exit 3), and without a
   timeout until it is interrupted.
+- A session the hub answers for itself (the summary `-r` starts or attaches says `answers: "auto"`: a session created
+  through the HTTP API, SPEC §21.5; `autoreply.hub_answers(summary)`, kept in `_PrintRun.hub_replies`; `answers` never
+  changes after the create): the run sends no auto-reply, no review approval and no answer to a question pause of its
+  own, with or without `auto_reply`, and writes none of the `asked`, `asked_timeout` and `question` lines below (the
+  hub answers), so nothing is answered twice. With `verbose` `err` gets once (`hub_answers`; not in `stream-json`):
+  - ru: «Эта сессия создана через HTTP API с answers = "auto": на вопросы и ревью агентов за вас отвечает сам хаб,
+    этот запуск автоответов не шлёт.»
+  - en: "This session was created through the HTTP API with answers "auto": the hub itself answers the agents'
+    questions and reviews in your place, so this run sends no automatic replies."
 - Questions that pause the swarm (`[swarm] clarify`, SPEC §3.1):
   - With `auto_reply` the client sends `X-DreamTeam-Auto-Reply: 1` (`client.auto_reply`; `run_print` gives it back
     its earlier value at the end) on every request and on the stream's handshake. That holds the session's
@@ -277,7 +291,7 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
   - `stream-json`: every received bus event as one JSON line `{"type": ev.type, "ts": ..., "actor": ...,
     "data": ...}` (trace.* and agent.activity included), then the same `result` object as the last line.
 
-## 3. Rendering (i18n.py, theme.py, render.py)
+## 3. Rendering (i18n.py and uitext.py, theme.py and symbols.py, render.py)
 
 All render functions are **pure** (input: dicts as returned by the API, plus a `RenderContext`) and return
 rich renderables (or `None` when nothing is shown at the current verbosity). `to_ansi(renderable, width)`
@@ -343,7 +357,15 @@ class RenderContext:
   verbose. Errors are always shown in red with `⚠`.
 - Triggers (verbose only; their errors at every verbosity): `⚡ сработал триггер #4: every(60) · Анна`; a fire whose
   notice the wake limit holds (SPEC §8, trigger dict `held` > 0 with `wake_at`) adds `(пробуждение отложено до
-  18:48)` / "(wake-up held until 18:48)" (i18n `trigger_held`).
+  18:48)` / "(wake-up held until 18:48)" (uitext `trigger_held`; the HTTP API's event text says how long instead,
+  `ev_trigger_held_for`, since it has no clock).
+- A run's start and end, journaled by the session manager (`session.started`, `session.stopped` {reason, error?}, SPEC
+  §9): verbose only (the status line and the start's error say it otherwise), dim lines `▶ Сессия запущена` / "The
+  session started" and `· Сессия остановлена вами` / "The session was stopped by you" by reason (uitext
+  `ev_session_started`, `ev_session_stopped_<reason>` for `user`, `done`, `budget`, `shutdown`, `restart`;
+  `ev_session_stopped` with an unknown reason in brackets), and for `failed` a warning line «Сессия не запустилась:
+  <error>» / "The session did not start: <error>" (`ev_session_stopped_failed`, the error cut to 200 characters,
+  absolute paths named by their last component).
 - Notifications to the user: `🔔 text`. MCP pending → handled by the approval dialog (plus an info line). The
   review notices (`u_review_requested`, `u_review_fallback`, `u_review_handed_over`, `u_reviews_waiting`) are one
   warning line, like `u_budget`; so are the skill notices (`u_skill_proposed`, `u_skill_deps_failed`,
@@ -426,6 +448,8 @@ def skill_deps_preview(ctx, deps, install=None, proposal=False) -> str   # what 
 def skills_pending(ctx, sid, attached) -> RenderableType      # /skills pending: the proposals waiting
 def skill_log(ctx, data: dict) -> RenderableType              # /skills log: the install log's path and its end
 def sessions_table(ctx, sessions: list[dict], current: str | None = None) -> RenderableType  # no command shows it
+    # (a session created through the HTTP API, summary `via` "api": its title row ends with ` · HTTP API`, uitext
+    # `sess_api`)
 def cost_table(ctx, state: dict) -> RenderableType       # per agent tokens in/out, cost; total vs budget
 def models_table(ctx, settings: dict) -> RenderableType  # /model, /settings: ✓ default, profile, model, provider
     # (≥ 80 columns), Цены / Prices from the public view's price_source ($in/$out of the profile, «встроенные» /
@@ -566,7 +590,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/help` | commands table + key hints |
 | `/new [цель]` | new session (asks for the goal when omitted: the next input is the goal); first line = title, the rest = description |
 | `/team [команда \| роль*N, …]` | the starting team of the sessions this window creates next (like `--team`; `/team -` back to the settings); a bare word is a team saved in the settings first (`roles.team_choice`, SPEC §17.3 "Saved teams"), then a catalog role; with teams saved any other bare word is refused (`word*1` makes a new role), and so are a saved team's name that is no catalog role in a list or with `*N`, and a team with a role the catalog lacks; quotes around the argument, or around each item of a list, are dropped, as in other commands; the window copies the team when it is chosen, so a later edit of the team reaches the window only after `/team NAME` again; without an argument shows the team the window holds and lists the saved teams; the settings stay as they are |
-| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up"; a session made by an earlier version (SPEC §17.2) reads «прежняя версия» / "earlier version" (before any other status; the picker's hint `id · status · goal` is plain text with no task count): Enter and `/resume ID` print its message (`earlier_session`, or the legacy `main`'s `earlier_main`) and attach nothing, the picker closing; Del deletes it as usual |
+| `/sessions`, `/resume [id]` | session picker (↑↓, Enter = attach and start if stopped, Del = delete the selected session, Esc) / attach by id; a running session's status reads paused («пауза»), «ждёт ответа» / "waits for you" while paused for a member's question, or, in the user's wrap-up mode, «завершается» / "wrapping up"; a session made by an earlier version (SPEC §17.2) reads «прежняя версия» / "earlier version" (before any other status; the picker's hint `id · status · goal` is plain text with no task count; a session created through the HTTP API, summary `via` "api", adds `HTTP API` after its status, uitext `sess_api`, SPEC §21.4): Enter and `/resume ID` print its message (`earlier_session`, or the legacy `main`'s `earlier_main`) and attach nothing, the picker closing; Del deletes it as usual |
 | `/delete [id]` | delete a session after a confirmation («Нет» preselected); without an id a picker chooses it; the legacy `main`: `delete_legacy`, and when it was made by an earlier version its message instead, which names the file to remove by hand |
 | `/goal [текст]` | show the goal panel / set a new goal (`set_goal`; first line = title, the rest = description) |
 | `/board` | the board (`board`): one line per card, a parent's subtasks as dots in its line |
@@ -786,9 +810,15 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
   prompt.
 - `dreamteam -p "текст" [--output-format text|json|stream-json] [--verbose] [--timeout S]
   [--no-auto-reply]` runs print mode.
-- `-c/--continue` attaches to the most recently active session. When that one was made by an earlier version
-  (SPEC §17.2) it never passes over it for an older one: `continue_earlier` under the welcome box, nothing attached,
-  a prompt given with it kept in the input line (`-p -c`: exit 1, §2).
+- `-c/--continue` attaches to the most recently active session, never one created through the HTTP API (summary
+  `via` "api": a client's job, which a busy client would otherwise make the most recent;
+  `instruct.without_api_sessions`, SPEC §21.4). When only such sessions exist, nothing is attached and the welcome
+  box is followed by `no_sessions_continue_api` (ru «Нет сессий, которые можно продолжить: сессию, созданную через
+  HTTP API, -c не выбирает, её открывают через /resume id», en "There is no session to continue: -c never picks a
+  session created through the HTTP API; open one with /resume id"; `no_sessions_continue` with no session at all).
+  When the one it picks was made by an earlier version (SPEC §17.2) it never passes over it for an older one:
+  `continue_earlier` under the welcome box, nothing attached, a prompt given with it kept in the input line
+  (`-p -c`: exit 1, §2).
 - `-r/--resume [ID]` opens the picker, or attaches to ID. `-r ID` of a session made by an earlier version: its
   message under the welcome box, nothing attached (§4.5; `-p -r ID`: exit 1 with the English message, §2).
 - Shared options: `--home`, `--lang ru|en`, `--model PROFILE`, `--agents N`, `--team "ROLE[*N],…" | NAME`,

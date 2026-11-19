@@ -64,15 +64,16 @@ dreamteam
 | Area | Files | Tests |
 |---|---|---|
 | Command line | `cli.py`, `console.py` | `test_cli*.py` |
-| Terminal UI | `tui/` (`app.py`, `render.py`, `commands.py`, `i18n.py` with all its texts) | `test_tui_*.py` |
+| Terminal UI | `tui/` (`app.py`, `render.py`, `commands.py`); its texts in `uitext.py` and symbols in `symbols.py` (`tui/i18n.py` and `tui/theme.py` re-export them) | `test_tui_*.py` |
 | Web board and REST | `web.py`, `launcher.py`, `static/` (`app.js` board, `home.js` sessions page, `traces.js`) | `test_ui.py`, `test_surfaces.py`, `test_launcher.py` |
+| HTTP API (`/api/v1`) | `api_v1.py` (routes, summaries, results, files), `autoreply.py` (requests to the user, the hub's automatic answers), `eventtext.py` (one line of text per event), `result.py`, `instruct.py`, `sessionopts.py`, `apifolders.py` (`[api] folders`), `nofollow.py`, `copyfrom.py` (uploads), `hubauth.py` and `web.py` (the API token, the guard), `docker.py` (`[api] folders` mounted into the sandbox) | `test_api_v1*.py`, `test_api_sessions.py`, `test_api_settings.py`, `test_autoreply.py`, `test_eventtext.py`, `test_result.py`, `test_instruct.py`, `test_nofollow.py`, `test_session_events.py`; the clients' side in `test_tui_print.py`, `test_tui_commands.py`, `test_cli_launcher.py` |
 | Task board, messages, triggers | `board.py`, `mailbox.py`, `triggers.py` | `test_board.py`, `test_mailbox.py`, `test_triggers.py` |
 | Files, git, shell, jobs | `workspace.py`, `shell.py`, `jobs.py`, `procs.py`, `netoff.py` | `test_workspace.py`, `test_shell.py`, `test_jobs.py`, `test_procs.py`, `test_netoff.py` |
 | Skills | `skills.py`, `swarm_skills.py`, `skill_deps.py`, `tools/skill_tools.py` | `test_skills.py`, `test_swarm_skills.py`, `test_skill_deps.py`, `test_skill_envs.py` |
 | MCP | `mcp_forge.py` (servers agents write), `hub_mcp.py`, `launcher_mcp.py` (the swarm as an MCP server) | `test_mcp_forge.py`, `test_hub_clients.py` |
 | Agents | `agent.py` (the agent loop), `prompts.py` (texts in ru/en), `roles.py`, `tools/` (agents' tools) | `test_runtime.py`, `test_prompts.py`, `test_roles.py`, `test_tools.py` |
 | Models | `llm/` (`anthropic_llm.py`, `openai_llm.py`, `scripted.py` for tests) | `test_llm.py` |
-| Settings | `config.py` (defaults), `settings.py` (the Settings page) | `test_launcher.py` |
+| Settings | `config.py` (defaults), `settings.py` (the Settings page) | `test_launcher.py`, `test_api_settings.py` |
 
 `docs/SPEC.md` describes every module's contract: read the section of the module you change first.
 

@@ -102,7 +102,8 @@ put the project at the same path or run `/cd` in the session (see
 - Files of this computer: `dreamteam.toml.bak`, `.dreamteam/hub.json`, the markers of running processes
   `launcher-*.pid`, the DreamTeam logs (`.dreamteam/*.log` of the home and of each session; the logs of background
   jobs do travel with the session), the terminal interface's input history, the skills' dependency environments
-  (`~/.dreamteam/skill-envs`), hub tokens (`DREAMTEAM_HUB_TOKEN` and `~/.dreamteam/hub-tokens`).
+  (`~/.dreamteam/skill-envs`), hub tokens (`DREAMTEAM_HUB_TOKEN` and `~/.dreamteam/hub-tokens`), the
+  [HTTP API's](http-api.md) token (`DREAMTEAM_API_TOKEN`), and the HTTP API's uploads waiting for their session.
 - The internal folders `sessions/.deleted-*`, `.importing-*` and `.replaced-*`.
 - The `main` session of an old project: it cannot be moved yet (the report says so). So when it was made by an
   earlier version, no export keeps it either: finish its work before updating to 0.2.0; afterwards it can only be
@@ -121,7 +122,7 @@ Before the export is complete, DreamTeam searches every file it wrote for the se
 - the values of the `[shell] pass_env` and `[skills] install_env` variables;
 - the `env` values and the command credentials of the `[mcp.external]` servers, global and of every session, also
   of the sessions not exported;
-- the hub token.
+- the hub token and the HTTP API's token (`DREAMTEAM_API_TOKEN`).
 
 Each value is searched for as UTF-8 and as UTF-16 (how Windows PowerShell 5.1 writes files), and in its escaped
 JSON form. Session databases are read row by row, and for every exported git repository its whole history is read,
@@ -209,8 +210,10 @@ A category you named in `--include` that the export does not hold gives a warnin
 - Sections are merged: the exported values win, keys that exist only here stay.
 - Keys that belong to the computer itself keep the value they have here, in the global settings and in the
   settings of sessions: `server.host`, `server.port`, `shell.program`, `skills.library_dir`, `skills.envs_dir`,
-  `skills.python`, `mcp.library_dir`. For the global settings the plan lists those whose exported value differs
-  under "kept as they are here"; in the settings of sessions they are kept without a mention.
+  `skills.python`, `mcp.library_dir`, and in the global settings `api.folders`, the folders of this computer that the
+  [HTTP API](http-api.md)'s clients may name: an import never grants folders here. For the global settings the plan
+  lists those whose exported value differs under "kept as they are here"; in the settings of sessions they are kept
+  without a mention. The other keys of `[api]` are merged like any section.
 - The goal of `[swarm]` (`goal`) is not imported: goals belong to sessions.
 - Keys this version does not know (an export from a newer version) are left out and listed.
 - Model profiles are matched by name: new ones are added, existing ones rewritten, profiles that exist only here
@@ -288,6 +291,11 @@ so a folder you once copied by hand is recognized on both computers too.
   PowerShell) in their instructions, and the paths in their histories are that computer's paths.
 
 Imported sessions never start by themselves: start them on the sessions page or with `dreamteam -r ID`.
+
+A session created through the [HTTP API](http-api.md) stays one after the import (its `answers` and `stop_when_done`
+too), so the API token of this computer's hub reaches it by the same id. It arrives without its `client_ref` (a retry
+of the create here makes a new session), without the error of a failed start or of an undelivered `continue`, and
+without its server folder: it works where the import put it, as any session, and its `folder` is null.
 
 Where a session works:
 

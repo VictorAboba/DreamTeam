@@ -26,7 +26,9 @@ back to its own folder), and also `skill_library` (the skill library); `session_
 `skills=[...]`, `session_create(..., team_name=...)` starts with a team saved in the settings, and
 `session_create(..., clarify=true)` turns on [clarify mode](features.md) (`false` turns it off over the global
 setting). The other tools work inside a session, which the `session="<id>"` parameter sets; by
-default the running session is chosen. To connect to one session directly, use `http://127.0.0.1:8765/s/<id>/mcp`.
+default the running session is chosen, but never a session a program created through the [HTTP API](http-api.md):
+`sessions_list` marks such a session `| HTTP API`, and a tool reaches it only with `session="<id>"`. To connect to one
+session directly, use `http://127.0.0.1:8765/s/<id>/mcp`.
 
 By default, Claude Code acts as the user of the swarm: it sets the goal, looks at the board, writes to the agents,
 approves MCP servers, reads traces (`agent_traces`) and waits for messages with `wait_for_events`. When an agent's

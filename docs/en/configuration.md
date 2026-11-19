@@ -95,6 +95,9 @@ retention_days = 0       # 0 means keep forever
 host = "127.0.0.1"
 port = 8765
 resume_sessions = true   # resume the sessions that were running when the server stopped
+
+[api]                    # the HTTP API (/api/v1), edited by hand only: see "HTTP API settings"
+max_running = 3
 ```
 
 Prices of known Claude models are built in. For other models, set `input_price` and `output_price` in dollars per
@@ -163,6 +166,49 @@ hire button on the board. **The starting team** is the roles of the agents a ses
 
 Agents beyond the list become generalists.
 
+## HTTP API settings
+
+The `[api]` section holds the limits of the [HTTP API](http-api.md) and the folders of this computer that its clients
+may name. It is edited in `dreamteam.toml` by hand only: the "Settings" page has no section for it, and saving that
+page never writes it. A change counts at the next request, with no restart.
+
+```toml
+[api]
+max_running = 3          # sessions created through the API that run or start at once (0 means no limit)
+uploads_pending = 32     # uploads waiting for their session at once (at least 1)
+archive_max_mb = 1024    # the largest zip of a session's files, MB (at least 1)
+
+[api.folders.jobs]       # a root: lowercase letters, digits and '-' (not first), at most 64 characters
+path = "/srv/site/jobs"  # absolute
+in_place = false         # true: a session may also work right in a folder under it
+```
+
+- The values above are the defaults. The size and the number of files of an upload or a copy are
+  `[workspace] copy_max_mb` and `copy_max_files`: `[api]` has no upload limits of its own.
+- `max_running` counts only the sessions created through the API. It refuses only the API's own starts; your starts
+  from the board, the terminal or MCP, and the resume when the hub starts, are never refused, but they count.
+- `folders` lists the roots a client may name, by the root's name and a path inside it
+  (`"folder": {"root": "jobs", "path": "acme/site"}`, see
+  [Folders on the hub's computer](http-api.md#folders-on-the-hubs-computer)). A client sees only the names and
+  `in_place`, never a path. Without `folders` no client can name a folder of this computer.
+- Loading checks the shape only: a bad name, a `path` that is not absolute, an `in_place` that is not `true` or
+  `false`, or another key refuses the settings, like any other mistake. "Absolute" means absolute on Linux and macOS or
+  on Windows when the file is read (the sandbox's Linux hub reads the file of a Windows home), and absolute on the
+  hub's own system when the root is used: a `C:\jobs` root of a hub on Linux outside the sandbox is refused then.
+- On Windows put the path in single quotes, `path = 'C:\jobs'` (in double quotes every `\` must be doubled), or write
+  it with forward slashes, `path = "C:/jobs"`.
+- Where a root lies is checked at each use, so an unplugged disk never stops the hub; at its start the hub's log names
+  the roots it cannot use now. A root is refused (403 `forbidden_folder`) when it is the root of a drive, your home
+  folder or a folder that contains it, the DreamTeam home or one of DreamTeam's own folders (the MCP and skills
+  libraries, the skill environments, the hub tokens) or a folder inside or around them, another DreamTeam home, or, on
+  Linux and macOS, a folder under `/proc`, `/sys` or `/dev`.
+- A root is a grant to whoever holds the API token: the agents of a session work on a copy of what the client names
+  there, and with `in_place` they run commands right in that folder with the hub's rights
+  ([Security](security.md)). In `dreamteam sandbox` every root is mounted into the container, and every agent there
+  can reach it ([The HTTP API in the sandbox](sandbox.md#the-http-api-in-the-sandbox)).
+- `api.folders` is a setting of this computer: an [export](transfer.md) carries it, an import never takes it, so the
+  folders allowed here stay as they are. The other `[api]` keys travel like any setting.
+
 ## Shared folders and this computer's settings
 
 Some folders are shared by all sessions and live outside the home, in `~/.dreamteam`: the skills library
@@ -174,5 +220,5 @@ console never gets these variables.
 
 An [import](transfer.md) (`dreamteam import`) never changes the settings that belong to the computer itself, in
 the global settings or in a session's settings: `server.host`, `server.port`, `shell.program`, `skills.library_dir`,
-`skills.envs_dir`, `skills.python` and `mcp.library_dir` keep the value they have here, and API keys and the `env`
-values of external MCP servers never go into an export at all.
+`skills.envs_dir`, `skills.python`, `mcp.library_dir` and `api.folders` (the [HTTP API's](http-api.md) folders) keep
+the value they have here, and API keys and the `env` values of external MCP servers never go into an export at all.
