@@ -469,8 +469,9 @@ is resumed as well.
   once (from the measure until the answer ends, however slowly its client reads): one more is 429
   `too_many_archives`; ask again later, or download the files one by one.
 - Paths are relative to the session's folder, with `/`. An absolute path, `..`, `.`, an empty name, a NUL, a backslash,
-  a `.git` component or a Windows short name (`GIT~1`) is 400 `bad_name`; on a Windows hub so are `:`,
-  `< > " | ? *`, reserved names (`CON`) and a trailing dot or space.
+  a `.git` component or a Windows short name (`GIT~1`) is 400 `bad_name`; so is a path in `.scratch` without
+  `scratch=true`, and one in `.scratch/_skills` ever; on a Windows hub so are `:`, `< > " | ? *`, reserved names
+  (`CON`) and a trailing dot or space.
 - Never listed, served or archived: links; files with more than one hard link (so an environment installed with hard
   links, such as uv's `.venv` or pnpm's `node_modules`, is left out); `.git` at any depth; `.scratch` (the members' own
   files) unless `scratch=true`; `.scratch/_skills` ever.

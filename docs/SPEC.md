@@ -7693,6 +7693,10 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - an absolute path; an empty component, `.` or `..`;
   - a NUL or a backslash;
   - a component that case-folds to `.git`;
+  - a first component that case-folds to `.scratch` (the members' folders) without `scratch=true` ("the members'
+    .scratch folders need scratch=true"), and `.scratch/_skills` (the skills mirror) even with it (".scratch/_skills
+    is never served"): `files?path=.scratch`, `files/.scratch/anna/notes.md` and `archive?path=.scratch/_skills` are
+    400, never 404;
   - on every OS, a component of the form of a Windows short name (`PROGRA~1`, `GIT~1`, `SCRATC~1`: a base of at
     most 8 characters holding `~<digit>`, an extension of at most 3). NTFS resolves short names for a Linux hub too:
     WSL with a home on `/mnt/c`, or `dreamteam sandbox` of a Windows home under Docker Desktop, whose bind mount
@@ -7800,7 +7804,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
 - Left out of listings, never served and never archived: links; regular files with more than one hard link
   (`st_nlink > 1`: another name of the file may lie anywhere); `.git` (case-folded, at any depth: nested repositories
   and gitfiles too); `.scratch/_skills` (copies of library and private Claude Code skills), even with `scratch=true`.
-  `.scratch` (the members' own files) only with `?scratch=true`.
+  `.scratch` (the members' own files) only with `?scratch=true`. Asked for by path, the names left out by rule
+  (`.git`, `.scratch/_skills`, `.scratch` without `scratch=true`) are 400 `bad_name` (above), and a link or a file
+  with another name 404.
   - `st_nlink` is read with `os.stat` or `fstat` of the opened handle, never `DirEntry.stat()`, which reports 0 on
     Windows (as it does `st_ino`).
   - So an environment installed with hard links in the workspace (uv's `.venv`, pnpm's `node_modules`) is neither
