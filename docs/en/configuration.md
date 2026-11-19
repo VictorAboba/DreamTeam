@@ -201,7 +201,8 @@ in_place = false         # true: a session may also work right in a folder under
   the roots it cannot use now. A root is refused (403 `forbidden_folder`) when it is the root of a drive, your home
   folder or a folder that contains it, the DreamTeam home or one of DreamTeam's own folders (the MCP and skills
   libraries, the skill environments, the hub tokens) or a folder inside or around them, another DreamTeam home, or, on
-  Linux and macOS, a folder under `/proc`, `/sys` or `/dev`.
+  Linux and macOS, a folder under `/proc`, `/sys` or `/dev`, or `/run` or `/var/run` or a folder under them (they hold
+  the system's sockets, the Docker daemon's among them; a removable disk's folder under `/run/media` is fine).
 - A root is a grant to whoever holds the API token: the agents of a session work on a copy of what the client names
   there, and with `in_place` they run commands right in that folder with the hub's rights
   ([Security](security.md)). In `dreamteam sandbox` every root is mounted into the container, and every agent there

@@ -22,6 +22,7 @@ import time
 import unicodedata
 import zipfile
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1040,6 +1041,26 @@ def test_a_read_only_root_inside_a_writable_one_is_named_in_a_warning(tmp_path):
     assert [(m.name, m.read_only) for m in mounts] == [("drafts", True), ("places", False)]
     assert notes == ["Warning: [api.folders.drafts] is mounted read-only, but it lies inside [api.folders.places], "
                      "which is mounted writable: agents in the container can write it there."]
+
+
+def test_a_root_under_run_is_refused_and_never_mounted(tmp_path, monkeypatch):
+    """/run and /var/run hold the running system's sockets (the Docker daemon's, which a read-only mount still lets an
+    agent use), so on POSIX neither they nor a folder under them is a root; a removable disk's folder under
+    /run/media is (apifolders.root_refusal: path logic, checked on Windows with the module's os.name as POSIX's)."""
+    if WINDOWS:
+        monkeypatch.setattr(apifolders, "os", SimpleNamespace(**{**vars(os), "name": "posix"}))
+    home = _home(tmp_path)
+    config = Config.load(home)
+    for path in ("/run", "/run/user/1000", "/run/containerd", "/var/run", "/var/run/docker", "/private/var/run"):
+        reason = apifolders.root_refusal(Path(path), home=home, config=config)
+        assert reason is not None and "/run or /var/run" in reason, (path, reason)
+    for path in ("/run/media/me/disk/jobs", "/srv/jobs", "/var/jobs"):
+        assert apifolders.root_refusal(Path(path), home=home, config=config) is None, path
+    if not WINDOWS and os.path.isdir("/var/run"):   # the sandbox mounts none of it, read-only or not
+        (tmp_path / "sandboxed").mkdir()
+        home = _home(tmp_path / "sandboxed", api={"folders": {"state": {"path": "/var/run"}}})
+        mounts, notes = docker_module.api_folder_mounts(home, Config.load(home))
+        assert mounts == [] and len(notes) == 1 and "/run or /var/run" in notes[0], notes
 
 
 def test_the_sandbox_warning_leaves_out_the_sessions_of_a_mounted_root(tmp_path, monkeypatch, capsys):

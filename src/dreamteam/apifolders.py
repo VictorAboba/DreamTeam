@@ -9,7 +9,9 @@ where `dreamteam sandbox` mounts it (roots: config.API_FOLDERS_ENV). Where a roo
 - it is resolved, following links and junctions; a missing root is 404 `not_found`;
 - it is refused (403 `forbidden_folder`, root_refusal) where copyfrom.resolve_source refuses a folder to copy: a drive
   or file-system root, the user's home folder or a folder containing it, the DreamTeam home or one of DreamTeam's own
-  folders (inside or containing it), another DreamTeam home (or inside one), on POSIX /proc, /sys and /dev.
+  folders (inside or containing it), another DreamTeam home (or inside one), on POSIX /proc, /sys and /dev; and on
+  POSIX /run and /var/run, the running system's sockets (a socket stays reachable through the sandbox's read-only
+  mount), but not a removable disk's folder under /run/media.
 A request's `path` is a path a client makes up (copyfrom.check_rel(portable=True): 400 `bad_name`); the root joined
 with it is resolved and must lie inside the resolved root, by text and by file identity (treecopy.is_within), so a
 link or junction under the root that leads out of it is 403 `forbidden_folder` (resolve_request). Its names below the
@@ -58,6 +60,11 @@ SHOWN_NAME = 120                        # characters of a name inside a reposito
 # git_dir_refusal's reason when git fails on the folder's repository: followed by git's own output, which v1's
 # `changed_files_error` leaves out (docs/SPEC.md §21.7: its texts are never git's output)
 GIT_UNREADABLE = "git cannot read its repository"
+# POSIX: the folders of the running system's sockets (the Docker daemon's, containerd's, a user's rootless daemon's in
+# /run/user/<uid>), never a root nor inside one (root_refusal): a socket stays reachable through a read-only mount of
+# the sandbox. Below RUNTIME_DISKS lie removable disks, not sockets.
+RUNTIME_FOLDERS = ("/run", "/var/run", "/private/var/run")
+RUNTIME_DISKS = "/run/media"
 
 
 def roots(config: "Config") -> dict[str, ApiFolder]:
@@ -96,8 +103,8 @@ def in_place_folder(value: Any) -> dict[str, str] | None:
 
 def root_refusal(root_real: Path, *, home: Path, config: "Config") -> str | None:
     """Why the resolved root `root_real` can never be a root of `[api] folders` (the location rules of
-    copyfrom.resolve_source, docs/SPEC.md §21.10 "Settings"), as words that follow its name ("is ..."), without a
-    path of the computer; None when it can be."""
+    copyfrom.resolve_source, docs/SPEC.md §21.10 "Settings", and on POSIX /run and /var/run, RUNTIME_FOLDERS), as
+    words that follow its name ("is ..."), without a path of the computer; None when it can be."""
     if root_real.parent == root_real or (os.name != "nt" and _disk_mount(root_real)):
         return "is the root of a drive or of the file system"
     try:
@@ -120,6 +127,10 @@ def root_refusal(root_real: Path, *, home: Path, config: "Config") -> str | None
         return "is a DreamTeam home, or lies inside one (its settings hold API keys)"
     if os.name != "nt" and any(is_within(root_real, Path(system)) for system in _SYSTEM_ROOTS):
         return "lies under /proc, /sys or /dev"
+    if (os.name != "nt" and any(is_within(root_real, Path(folder)) for folder in RUNTIME_FOLDERS)
+            and not is_within(root_real, Path(RUNTIME_DISKS))):
+        return ("lies under /run or /var/run, which hold the running system's sockets (the Docker daemon's among "
+                "them)")
     return None
 
 

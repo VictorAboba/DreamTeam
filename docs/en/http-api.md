@@ -492,7 +492,7 @@ under a root the owner lists in `[api] folders` can be named, by the root's name
 - `path` is relative to the root, with `/`; empty or absent is the root itself. It follows the rules of a name a client
   creates (400 `bad_name`). An unknown root is 400 `unknown_folder`; a root that is missing is 404; a link under the
   root that leads out of it, or a root that is not allowed (a drive root, your home folder, the DreamTeam home or its
-  own folders, another DreamTeam home, `/proc`, `/sys`, `/dev`), is 403 `forbidden_folder`.
+  own folders, another DreamTeam home, `/proc`, `/sys`, `/dev`, `/run`), is 403 `forbidden_folder`.
 - **`copy`** (the default): the folder, or a `.zip` under the root, is copied into the session's own folder, as
   [a copy of files](projects.md#working-on-a-copy-of-files) is: `.git`, `node_modules`, `.venv`, `venv`, `__pycache__`,
   links, special files and files with more than one hard link are left out, and so are the session's own names at the

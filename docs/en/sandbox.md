@@ -127,7 +127,8 @@ inside looks for each root there, not at its path on the host.
 
 - Before the start it checks each root on the host, as a hub outside the container checks it at each use: an absolute
   path of the host's system that exists, is a folder and is not refused (your home folder, the DreamTeam home, the
-  store of hub tokens, the skills library and the like). It mounts the folder the root resolves to. A root that fails,
+  store of hub tokens, the skills library, `/run` with the Docker daemon's socket, which a read-only mount would still
+  let the agents use, and the like). It mounts the folder the root resolves to. A root that fails,
   or whose path docker's `-v` cannot take, is not mounted, with a warning that names it and says why; in the container
   that root is then missing (404 for a client). On Windows that is a root on a network share (`\\server\share`, a
   mapped network drive too) or a `\\?\` path: use a folder on a local drive. On any system it is a path with a `:`

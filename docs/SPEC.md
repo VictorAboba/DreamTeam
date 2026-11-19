@@ -7966,7 +7966,8 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     the target's `api.folders` and drops a v1 session's `client_ref`, `request_digest`, `start_error`, `error` and
     `folder`;
   - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
-    spelling (one folder), a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, and
+    spelling (one folder), each name taken as its folder lists it (`as_listed`), a root under /run or /var/run
+    refused and never mounted, a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, and
     `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;
   - the clients (`tests/test_tui_print.py`, `tests/test_tui_app.py`, `tests/test_tui_commands.py`,
     `tests/test_tui_render.py`, `tests/test_cli_launcher.py`, `tests/test_launcher.py`, `tests/test_ui.py`,
@@ -8025,7 +8026,12 @@ in_place = false            # true: a session may also work in a folder under it
   - inside or containing the DreamTeam home or one of DreamTeam's own folders (the MCP and skills libraries, the skill
     environments, the hub tokens);
   - another DreamTeam home, or inside one;
-  - on POSIX, under /proc, /sys or /dev.
+  - on POSIX, under /proc, /sys or /dev;
+  - on POSIX, /run or /var/run (macOS: /private/var/run), or under one (`apifolders.RUNTIME_FOLDERS`): they hold the
+    running system's sockets, the Docker daemon's and containerd's among them (a rootless daemon's in /run/user/<uid>),
+    and a socket stays reachable through the sandbox's read-only mount ("Sandbox"), so that a copies-only root there
+    would hand every agent in the container the Docker daemon. A folder under /run/media, where removable disks are
+    mounted, is not refused for that (the disk's own root is, as a drive's root).
   The texts name the root by its name only. At the hub's start the launcher logs every root it cannot use now, in a
   daemon thread (`apifolders.log_refusals`: a refused one as a warning with its path, a missing one as information).
 - A change takes effect at the next request, with no restart.
