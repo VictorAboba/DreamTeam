@@ -293,6 +293,11 @@ class TracingSettings:
 # a root's name in [api.folders.<name>] (docs/SPEC.md §21.10), like a session id: never a leading '-'
 API_FOLDER_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 _API_FOLDER_KEYS = frozenset({"path", "in_place"})
+# the folder of the Docker sandbox's container where `dreamteam sandbox` mounts the roots of [api] folders, one per
+# name (docs/SPEC.md §21.10 "Sandbox"): set by docker.sandbox_command for a home; apifolders.roots takes
+# `<it>/<name>` as a root's path there, and only in the image's container (copyfrom.hub_in_container). Never in the
+# agents' environment (shell._INTERNAL_ENV), never passed from the host by name (docker.env_passthrough)
+API_FOLDERS_ENV = "DREAMTEAM_API_FOLDERS_DIR"
 
 
 @dataclass(frozen=True)

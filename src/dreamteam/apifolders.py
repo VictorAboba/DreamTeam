@@ -1,9 +1,9 @@
 """The folders of the hub's computer that an HTTP API v1 client may name (docs/SPEC.md §21.10): the roots of
 `[api] folders`, their checks, a create's `folder` resolved, and the git rules of a folder a session works in in place.
 
-A client names a root by its name and a path inside it, never a path of the computer. Where a root lies is checked at
-each use (resolve_root), so an unplugged disk never stops the hub and a hand edit of the settings counts at the next
-request:
+A client names a root by its name and a path inside it, never a path of the computer. In the Docker sandbox a root is
+where `dreamteam sandbox` mounts it (roots: config.API_FOLDERS_ENV). Where a root lies is checked at each use
+(resolve_root), so an unplugged disk never stops the hub and a hand edit of the settings counts at the next request:
 - its path must be absolute on this computer's own system (config.native_absolute), checked before anything resolves
   it (403 `forbidden_folder`);
 - it is resolved, following links and junctions; a missing root is 404 `not_found`;
@@ -25,6 +25,7 @@ a network share; git_dir_refusal runs git and walks the repository's folders): r
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import stat
@@ -32,9 +33,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from .config import ApiFolder, native_absolute
+from .config import API_FOLDERS_ENV, ApiFolder, native_absolute
 from .copyfrom import (_SYSTEM_ROOTS, CopyError, Source, _disk_mount, _other_home, _own_folders, check_rel,
-                       printable_line, resolve_source)
+                       hub_in_container, printable_line, resolve_source)
 from .treecopy import is_within
 from .workspace import git_output, is_link, long_path, run_git
 
@@ -57,8 +58,16 @@ GIT_UNREADABLE = "git cannot read its repository"
 
 
 def roots(config: "Config") -> dict[str, ApiFolder]:
-    """The roots of `[api] folders` by name, as this hub uses them (docs/SPEC.md §21.10)."""
-    return dict(config.api.folders)
+    """The roots of `[api] folders` by name, as this hub uses them (docs/SPEC.md §21.10). In the container of the
+    Docker sandbox (copyfrom.hub_in_container), with API_FOLDERS_ENV naming a folder that is absolute there, a root's
+    path is `<that folder>/<name>`, where `dreamteam sandbox` mounts it (the settings name the host's folders, maybe
+    a Windows path); its `in_place` stays the settings'. Anywhere else the variable changes nothing, so a stray one on
+    a hub outside the image never points a root elsewhere."""
+    folders = dict(config.api.folders)
+    mounted = os.environ.get(API_FOLDERS_ENV, "")
+    if not folders or not mounted or not native_absolute(mounted) or not hub_in_container(config):
+        return folders
+    return {name: dataclasses.replace(folder, path=str(Path(mounted) / name)) for name, folder in folders.items()}
 
 
 def shown(root: str, path: str = "", sep: str = "/") -> str:

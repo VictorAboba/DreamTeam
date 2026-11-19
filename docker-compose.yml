@@ -21,6 +21,10 @@ services:
       # skills' dependency environments: a named volume (`dreamteam sandbox` uses dreamteam-skill-envs-<hash>;
       # `docker volume rm` it to reset them; declare it under a top-level `volumes:` key)
       # - "dreamteam-skill-envs:/dreamteam/skill-envs"
+      # [api] folders (the external API's server folders): each root at /dreamteam/api-folders/<name>, read-only
+      # unless it is in_place (`dreamteam sandbox` mounts them itself, after checking each root on the host as the
+      # hub would: the hub in here sees only the mount point). Every agent in the container can read them.
+      # - "/srv/jobs:/dreamteam/api-folders/jobs:ro"
     environment:
       - ANTHROPIC_API_KEY
       - ANTHROPIC_BASE_URL
@@ -47,6 +51,9 @@ services:
       # - DREAMTEAM_SKILLS_DIR=/swarm/.dreamteam/skills-library
       # - DREAMTEAM_SKILL_ENVS_DIR=/dreamteam/skill-envs
       # - UV_CACHE_DIR=/dreamteam/skill-envs/.cache/uv
+      # [api] folders: the hub takes each root at /dreamteam/api-folders/<name> (mounted above), not at its path in
+      # the settings
+      # - DREAMTEAM_API_FOLDERS_DIR=/dreamteam/api-folders
       # sessions without network ([swarm] network = "off"): the firewall that cuts their agents' commands off
       # (`dreamteam sandbox` adds both itself when a session needs it; DreamTeam drops NET_ADMIN right after)
       # - DREAMTEAM_OFFLINE_FIREWALL=1

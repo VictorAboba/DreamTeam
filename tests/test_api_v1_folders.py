@@ -2,7 +2,9 @@
 (read below the root without following a link) or worked in in place, the checks of the roots and of the paths, the
 link swapped in at each step, one folder for one session (by file identity too), the git rules of an in-place
 folder (no gitfile, no git dir or common dir outside it), the checks at every later start, DELETE keeping the folder,
-and answers that never name a path of the hub's computer. Every request goes through the launcher's app and its guard
+answers that never name a path of the hub's computer, and the roots in the Docker sandbox (mounted after a check on
+the host, found there through DREAMTEAM_API_FOLDERS_DIR in the container only; no Docker runs: the argv and the
+container's hub are tested). Every request goes through the launcher's app and its guard
 on the test's own loop (test_api_v1.Hub): no port, ScriptedLLM only. Links are junctions on Windows (no privilege
 needed) and symlinks elsewhere."""
 
@@ -10,21 +12,24 @@ from __future__ import annotations
 
 import asyncio
 import io
+import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
 import unicodedata
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
 
-from dreamteam import apifolders, copyfrom, nofollow, sessions
+from dreamteam import apifolders, cli, copyfrom, docker as docker_module, hubauth, netoff, nofollow, sessions, shell
 from dreamteam import settings as st
+from dreamteam.config import API_FOLDERS_ENV, ApiFolder, Config
 from dreamteam.copyfrom import CopyError, CopyLimits, Source, copy_sources
 from dreamteam.launcher import create_launcher_app
 from dreamteam.sessions import FOLDER_BUSY, SessionError, SessionManager
@@ -861,6 +866,272 @@ async def test_max_running_counts_the_sessions_of_server_folders(tmp_path, api_t
         assert status == 429 and answer["code"] == "too_many_sessions" and len(hub.manager.ids()) == 1
     finally:
         hold.set()
+        await hub.close()
+
+
+# ---- the Docker sandbox ---------------------------------------------------------------------------------------------
+def _sandboxed_home(tmp_path: Path, monkeypatch) -> tuple[Path, dict[str, Path]]:
+    """A home whose [api] folders list roots of every kind for `dreamteam sandbox`: `jobs` (copies), `places` (in
+    place) and `linked` (a link to the folder `real`), which it mounts, and `gone` (missing), `mine` (the user's home
+    folder), `inner` (inside the DreamTeam home), `foreign` (absolute on the other OS only), `keep` (holds the store
+    of hub tokens, where run_sandbox keeps the container's token) and `shelf` (holds the host's skills library, which
+    the sandbox mounts read-only), which it must not."""
+    user = tmp_path / "people" / "me"
+    user.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", lambda: user)
+    srv = tmp_path / "srv"
+    folders = {name: srv / name for name in ("jobs", "places", "real", "keep", "shelf")}
+    for folder in folders.values():
+        folder.mkdir(parents=True)
+    monkeypatch.setenv(hubauth.TOKENS_DIR_ENV, str(folders["keep"] / "hub-tokens"))
+    monkeypatch.setenv("DREAMTEAM_SKILLS_DIR", str(folders["shelf"] / "library"))
+    _dir_link(folders["real"], srv / "linked")
+    roots = {"jobs": {"path": str(folders["jobs"])}, "places": {"path": str(folders["places"]), "in_place": True},
+             "linked": {"path": str(srv / "linked")}, "gone": {"path": str(tmp_path / "gone")},
+             "mine": {"path": str(user), "in_place": True}, "inner": {"path": str(tmp_path / "home" / "drop")},
+             "foreign": {"path": "/srv/jobs" if WINDOWS else "C:\\jobs"},
+             "keep": {"path": str(folders["keep"]), "in_place": True},
+             "shelf": {"path": str(folders["shelf"]), "in_place": True}}
+    home = _home(tmp_path, api={"folders": roots})
+    (home / "drop").mkdir()
+    (home / "sessions").mkdir()
+    return home, {**folders, "user": user}
+
+
+def _root_volumes(cmd: list[str]) -> list[str]:
+    """The `-v` arguments of a sandbox command that mount a root of [api] folders."""
+    image = cmd.index(docker_module.IMAGE)
+    return [cmd[i + 1] for i in range(image) if cmd[i] == "-v" and ":/dreamteam/api-folders/" in cmd[i + 1]]
+
+
+def test_the_sandbox_mounts_the_roots_it_checked_on_the_host(tmp_path, monkeypatch):
+    """docs/SPEC.md §21.10 "Sandbox": each root is checked on the host as the hub outside the container checks it (the
+    hub inside sees only the mount point), then mounted as resolved at /dreamteam/api-folders/<name>, read-only unless
+    in_place; the others are named in warnings. The variable for a home's hub only, never the host's own."""
+    home, folders = _sandboxed_home(tmp_path, monkeypatch)
+    config = Config.load(home)
+    mounts, notes = docker_module.api_folder_mounts(home, config)
+    assert [(m.name, m.source, m.read_only) for m in mounts] == [
+        ("jobs", folders["jobs"].resolve(), True), ("linked", folders["real"].resolve(), True),
+        ("places", folders["places"].resolve(), False)]
+    warned = {re.match(r"Warning: \[api\.folders\.([a-z]+)\] ", note).group(1): note for note in notes}
+    assert set(warned) == {"foreign", "gone", "inner", "mine", "keep", "shelf"}
+    assert "is not there" in warned["gone"] and "user's home folder" in warned["mine"]
+    assert "DreamTeam home" in warned["inner"] and "not an absolute path" in warned["foreign"]
+    # (writable in the container, the token store would hand every agent the hub's token; the skills library, which
+    # the sandbox mounts read-only, would be writable through the root)
+    assert "DreamTeam's own folders" in warned["keep"] and "DreamTeam's own folders" in warned["shelf"]
+    assert all("is not mounted into the container" in note for note in notes)
+
+    cmd = docker_module.sandbox_command(home, 9320, config, docker="docker")
+    assert _root_volumes(cmd) == [f"{folders['jobs'].resolve()}:/dreamteam/api-folders/jobs:ro",
+                                  f"{folders['real'].resolve()}:/dreamteam/api-folders/linked:ro",
+                                  f"{folders['places'].resolve()}:/dreamteam/api-folders/places"]
+    image = cmd.index(docker_module.IMAGE)
+    at = cmd.index(f"{API_FOLDERS_ENV}=/dreamteam/api-folders")
+    assert cmd[at - 1] == "-e" and at < image
+    # (the skills library inside `shelf` is mounted, read-only, as the host's library only)
+    assert not any(str(folders["user"]) in part or str(tmp_path / "gone") in part for part in cmd)
+    assert not any(f"{folders['keep']}" in part for part in cmd)
+    # the mounts run_sandbox computed, as given (none: the variable all the same, so a root added later is looked for
+    # there); a single-swarm project's `run` serves no external API: neither
+    assert _root_volumes(docker_module.sandbox_command(home, 9320, config, docker="docker",
+                                                       folders=mounts[:1])) == _root_volumes(cmd)[:1]
+    bare = docker_module.sandbox_command(home, 9320, config, docker="docker", folders=[])
+    assert _root_volumes(bare) == [] and f"{API_FOLDERS_ENV}=/dreamteam/api-folders" in bare
+    project = docker_module.sandbox_command(home, 9320, config, docker="docker", home=False)
+    assert _root_volumes(project) == [] and not any(API_FOLDERS_ENV in part for part in project)
+    # never the host's own value, not even through [shell] pass_env (a `-e NAME` would come later and win)
+    monkeypatch.setenv(API_FOLDERS_ENV, str(tmp_path / "elsewhere"))
+    passing = Config.from_dict(home, {"shell": {"pass_env": [API_FOLDERS_ENV]}})
+    assert API_FOLDERS_ENV not in docker_module.env_passthrough(passing)
+    assert [part for part in docker_module.sandbox_command(home, 9320, passing, docker="docker")
+            if API_FOLDERS_ENV in part] == [f"{API_FOLDERS_ENV}=/dreamteam/api-folders"]
+
+
+def test_a_root_is_mounted_by_a_path_dockers_volume_option_reads(tmp_path, monkeypatch):
+    """`-v SOURCE:TARGET[:ro]` is split at ':': a Windows host's drive letter is kept as it is, any other ':' would cut
+    the source, and a Windows path on no drive letter (a network share's, which a root on a mapped network drive
+    resolves to, or a \\\\?\\ one) is no host folder for docker: such a root is not mounted (a warning says why), so one
+    root cannot make the whole `docker run` fail."""
+    windows = docker_module.FolderMount("jobs", PureWindowsPath("C:/srv/jobs"), read_only=True)
+    assert windows.volume == "C:\\srv\\jobs:/dreamteam/api-folders/jobs:ro"
+    posix = docker_module.FolderMount("places", PurePosixPath("/srv/places"), read_only=False)
+    assert posix.volume == "/srv/places:/dreamteam/api-folders/places"
+    assert posix.target == "/dreamteam/api-folders/places"
+    refusal = docker_module.volume_source_refusal
+    assert refusal(PureWindowsPath("C:/srv/jobs")) is None and refusal(PureWindowsPath("d:\\x")) is None
+    assert refusal(PurePosixPath("/srv/jobs")) is None
+    assert "':'" in refusal(PurePosixPath("/srv/a:b")) and "':'" in refusal(PureWindowsPath("C:/srv/a:b"))
+    for share in ("\\\\server\\share\\jobs", "\\\\?\\C:\\very\\long", "\\\\?\\UNC\\server\\share\\x",
+                  "\\\\.\\C:\\jobs"):
+        assert "drive letter" in refusal(PureWindowsPath(share)), share
+    if WINDOWS:   # a root on a share (as the resolution of a mapped network drive gives it): a warning, no mount
+        home = _home(tmp_path, api={"folders": {"share": {"path": "\\\\server\\share\\jobs"}}})
+        monkeypatch.setattr(apifolders, "resolve_root", lambda folder, **_: Path(folder.path))
+        mounts, notes = docker_module.api_folder_mounts(home, Config.load(home))
+        assert mounts == [] and len(notes) == 1 and "drive letter" in notes[0] and "[api.folders.share]" in notes[0]
+    else:   # (NTFS takes no ':' in a name)
+        odd = tmp_path / "srv" / "a:b"
+        odd.mkdir(parents=True)
+        home = _home(tmp_path, api={"folders": {"odd": {"path": str(odd)}}})
+        mounts, notes = docker_module.api_folder_mounts(home, Config.load(home))
+        assert mounts == [] and len(notes) == 1 and "':'" in notes[0] and "[api.folders.odd]" in notes[0]
+
+
+def test_a_read_only_root_inside_a_writable_one_is_named_in_a_warning(tmp_path):
+    """A copy root inside an in_place one is mounted read-only at its own mount point, but the agents write it through
+    the other's: a warning says so (docs/SPEC.md §21.10 "Sandbox")."""
+    places = tmp_path / "srv" / "places"
+    (places / "drafts").mkdir(parents=True)
+    home = _home(tmp_path, api={"folders": {"places": {"path": str(places), "in_place": True},
+                                            "drafts": {"path": str(places / "drafts")}}})
+    mounts, notes = docker_module.api_folder_mounts(home, Config.load(home))
+    assert [(m.name, m.read_only) for m in mounts] == [("drafts", True), ("places", False)]
+    assert notes == ["Warning: [api.folders.drafts] is mounted read-only, but it lies inside [api.folders.places], "
+                     "which is mounted writable: agents in the container can write it there."]
+
+
+def test_the_sandbox_warning_leaves_out_the_sessions_of_a_mounted_root(tmp_path, monkeypatch, capsys):
+    """run_sandbox checks the roots once, for its warnings and for the command; outside_home_warning leaves out a
+    session made in an earlier container in a folder of a root it mounts writable (stored under the mount point), and
+    lists one made by a hub outside the container (the host's path), one of a root not mounted this time and one of a
+    root mounted read-only now (an in-place session there cannot start: its root is no longer in_place). The token is
+    never stored inside a mounted root, even were the check of the roots to let one around the token store through."""
+    home, folders = _sandboxed_home(tmp_path, monkeypatch)
+    stored = {"made-there": "/dreamteam/api-folders/places/site", "root-itself": "/dreamteam/api-folders/places",
+              "not-mounted": "/dreamteam/api-folders/gone/site", "made-here": str(folders["places"] / "site"),
+              "climbing": "/dreamteam/api-folders/places/../../swarm", "copy-only": "/dreamteam/api-folders/jobs/x"}
+    for sid, folder in stored.items():
+        _write(home / "sessions" / sid / "session.json", json.dumps({"workspace": {"path": folder,
+                                                                                 "adopted": False}}))
+    assert [docker_module.api_root_of(folder) for folder in stored.values()] == ["places", "places", "gone", None,
+                                                                                 None, "jobs"]
+    assert docker_module.api_root_of("/dreamteam/api-folders") is None
+    assert docker_module.api_root_of("/dreamteam/api-folders-old/places") is None
+    calls: list[list[str]] = []
+    computed: list[int] = []
+    real_mounts = docker_module.api_folder_mounts
+    monkeypatch.setattr(docker_module, "api_folder_mounts", lambda *a: computed.append(1) or real_mounts(*a))
+    monkeypatch.setattr(docker_module, "_docker", lambda: "docker")
+    monkeypatch.setattr(docker_module, "image_exists", lambda image=docker_module.IMAGE: True)
+    same = docker_module.dockerfile_hash()
+    monkeypatch.setattr(docker_module, "image_dockerfile", lambda image=docker_module.IMAGE: same)
+    monkeypatch.setattr(docker_module, "container_exists", lambda name: False)
+    monkeypatch.setattr(docker_module.subprocess, "call", lambda cmd, env=None: calls.append(cmd) or 0)
+    monkeypatch.setattr(cli, "_stdin_is_terminal", lambda: False)
+    assert docker_module.run_sandbox(home, 9321) == 0
+    assert computed == [1] and len(_root_volumes(calls[0])) == 3
+    err = capsys.readouterr().err
+    listed = {line.split(":")[0].strip() for line in err.splitlines() if re.match(r"  [a-z-]+: ", line)}
+    assert listed == {"not-mounted", "made-here", "climbing", "copy-only"}
+    assert "and the in_place roots of [api] folders are mounted writable into the container" in err
+    assert ("[api] folders mounted into the container: jobs (read-only), linked (read-only), places (writable). "
+            "Every agent of every session there can read them, and write the writable ones.") in err
+    refused = ("foreign", "gone", "inner", "mine", "keep", "shelf")
+    assert {name for name in refused if f"Warning: [api.folders.{name}]" in err} == set(refused)
+    assert "is inside a mounted folder, so the token is not stored" not in err
+    # a single-swarm project: no roots looked at, nothing said about them
+    calls.clear()
+    computed.clear()
+    assert docker_module.run_sandbox(home, 9321, home=False) == 0
+    err = capsys.readouterr().err
+    assert computed == [] and _root_volumes(calls[0]) == [] and "[api" not in err
+    # no mounted root: the old warning, word for word
+    lines = docker_module.outside_home_warning(home)
+    assert lines[0] == (f"Warning: only {home} is mounted into the container; these sessions work in a folder "
+                        "outside it and cannot start there:") and len(lines) == 2 + len(stored)
+    # were root_refusal to let `keep` through, it would be mounted, but the token is still not stored in it
+    monkeypatch.setattr(apifolders, "root_refusal", lambda *a, **k: None)
+    calls.clear()
+    assert docker_module.run_sandbox(home, 9321) == 0
+    assert any(volume.endswith("/dreamteam/api-folders/keep") for volume in _root_volumes(calls[0]))
+    err = capsys.readouterr().err
+    assert "is inside a mounted folder, so the token is not stored" in err
+    assert not (folders["keep"] / "hub-tokens" / "9321.json").exists()
+
+
+def test_the_roots_are_where_the_sandbox_mounts_them_in_its_container_only(tmp_path, monkeypatch):
+    """apifolders.roots: in the image's container (copyfrom.hub_in_container) DREAMTEAM_API_FOLDERS_DIR gives each
+    root's path, `<it>/<name>`, whatever the settings say (a Windows home's path too), `in_place` kept; elsewhere, or
+    with a value that is not absolute there, the settings' paths. The variable never reaches the agents."""
+    home = _home(tmp_path, api={"folders": {"jobs": {"path": "C:\\host\\jobs"},
+                                            "places": {"path": "/host/places", "in_place": True}}})
+    config = Config.load(home)
+    settings = dict(config.api.folders)
+    mounted = tmp_path / "api-folders"
+    inside = {"jobs": ApiFolder("jobs", str(mounted / "jobs")),
+              "places": ApiFolder("places", str(mounted / "places"), in_place=True)}
+    assert apifolders.roots(config) == settings
+    monkeypatch.setenv(API_FOLDERS_ENV, str(mounted))
+    assert apifolders.roots(config) == settings   # a stray variable on a hub outside the image changes nothing
+    monkeypatch.setenv(netoff.IMAGE_ENV, "1")
+    assert apifolders.roots(config) == inside and config.api.folders == settings
+    for value in ("", "api-folders", "/x" if WINDOWS else "C:\\x"):   # nothing absolute here
+        monkeypatch.setenv(API_FOLDERS_ENV, value)
+        assert apifolders.roots(config) == settings, value
+    monkeypatch.delenv(netoff.IMAGE_ENV)
+    monkeypatch.setenv(API_FOLDERS_ENV, str(mounted))
+    monkeypatch.setenv("DREAMTEAM_HOST_SKILLS_DIR", "/dreamteam/host-skills")   # `dreamteam sandbox`'s own marker
+    assert apifolders.roots(config) == inside
+    (tmp_path / "bare").mkdir()
+    assert apifolders.roots(Config.load(_home(tmp_path / "bare"))) == {}
+    # never in the agents' environment nor in DreamTeam's own git's, whatever [shell] pass_env says
+    passing = Config.from_dict(home, {"shell": {"pass_env": [API_FOLDERS_ENV]}})
+    assert API_FOLDERS_ENV not in shell.scrubbed_env(passing) and API_FOLDERS_ENV not in shell.secret_free_env()
+
+
+async def test_in_the_sandbox_v1_finds_each_root_where_it_is_mounted(tmp_path, api_token, monkeypatch):
+    """The hub in the sandbox's container: the settings name the host's folders (one a Windows path); a copy and an
+    in-place session reach each root at `<DREAMTEAM_API_FOLDERS_DIR>/<name>`, the start checks the folder there
+    again, a root not mounted is not there (404, though its host folder is), and no answer names a path. Outside the
+    image the same variable changes nothing."""
+    mounted = tmp_path / "api-folders"
+    _site(mounted / "jobs")
+    (mounted / "places").mkdir()
+    gone = tmp_path / "host" / "gone"   # there on the host, but not mounted (no api-folders/gone)
+    _site(gone)
+    hub, _jobs, _places = _hub(tmp_path, folders={
+        "jobs": {"path": "/host/jobs" if WINDOWS else "C:\\host\\jobs"},
+        "places": {"path": str(tmp_path / "host" / "places"), "in_place": True},
+        "gone": {"path": str(gone), "in_place": True}})
+    monkeypatch.setenv(API_FOLDERS_ENV, str(mounted))
+    try:
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "jobs", "path": "acme/site"}})
+        assert (status, answer["code"]) == (403, "forbidden_folder"), answer   # the settings' path, not absolute here
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "new",
+                                                                   "mode": "in_place"}})
+        assert (status, answer["code"]) == (404, "not_found"), answer   # the settings' path, not there
+        monkeypatch.setenv(netoff.IMAGE_ENV, "1")   # the image's container
+        status, answer = await hub.create({"goal": "Fix the site", "folder": {"root": "jobs", "path": "acme/site"}})
+        assert status == 202, answer
+        _no_path(answer, tmp_path)
+        meta = hub.manager.meta(answer["session"]["name"])
+        assert meta["copied_from"]["source"] == "jobs/acme/site" and meta["copied_from"]["files"] == 3
+        workspace = hub.manager.default_workspace(answer["session"]["name"])
+        assert (workspace / "index.html").read_bytes() == b"<h1>Acme</h1>" and not (workspace / ".git").exists()
+        folder = {"root": "places", "path": "new/site", "mode": "in_place"}
+        status, answer = await hub.create({"goal": "Build a site", "folder": folder})
+        assert status == 202, answer
+        _no_path(answer, tmp_path)
+        session = answer["session"]
+        await hub.settled()
+        state = await _state(hub, session["id"])
+        assert state["state"] == "running" and state["folder"] == folder   # its start checked the folder there
+        target = mounted / "places" / "new" / "site"
+        assert target.is_dir() and Path(hub.manager.meta(session["name"])["workspace"]["path"]) == target.resolve()
+        # a root the sandbox did not mount is not there in the container, whatever its host folder holds
+        for mode in ("copy", "in_place"):
+            status, answer = await hub.create({"goal": "G", "folder": {"root": "gone", "path": "acme/site",
+                                                                       "mode": mode}})
+            assert (status, answer["code"]) == (404, "not_found"), answer
+            _no_path(answer, tmp_path)
+        status, options = await hub.call("GET", "/api/v1/options")
+        assert status == 200 and options["folders"] == [{"name": "gone", "in_place": True},
+                                                        {"name": "jobs", "in_place": False},
+                                                        {"name": "places", "in_place": True}]
+        _no_path(options, tmp_path)
+    finally:
         await hub.close()
 
 

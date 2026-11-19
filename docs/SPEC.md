@@ -107,7 +107,7 @@ src/dreamteam/
                  markdown.js and icons.css (both); no build step
   console.py     terminal chat client (talks to the REST API)
   tui/           terminal UI client (docs/TUI.md)
-  docker.py      sandbox: build & run DreamTeam in Docker
+  docker.py      sandbox: build & run DreamTeam in Docker (for a home also its [api] folders roots, §21.10)
   cli.py         `dreamteam` command
 tests/  conftest.py (FakeSwarm fixture) + test_*.py
 ```
@@ -2423,7 +2423,7 @@ def scrubbed_env(config: Config, extra: dict[str, str] | None = None, *,
     # except config.shell.pass_env, and always minus _INTERNAL_ENV (DREAMTEAM_SKILLS_DIR, DREAMTEAM_HOST_SKILLS_DIR,
     # DREAMTEAM_SKILL_ENVS_DIR: agents' commands are never pointed at the skills library or the skills'
     # environments, even through pass_env; the offline markers; DREAMTEAM_HUB_TOKEN(_SHA256), §14.2;
-    # DREAMTEAM_API_TOKEN(_SHA256), §21.1); plus
+    # DREAMTEAM_API_TOKEN(_SHA256), §21.1; DREAMTEAM_API_FOLDERS_DIR, §21.10 "Sandbox"); plus
     # PYTHONIOENCODING=utf-8, PYTHONUTF8=1 and `extra`
 def secret_free_env(names=()) -> dict[str, str]
     # os.environ minus _INTERNAL_ENV and the secrets whatever pass_env says (the known names, `names`, each
@@ -3784,7 +3784,8 @@ reaches it as well. The token closes that.
   hub token logs `api_token_warning()` outside the image (§21.1).
 - **`dreamteam sandbox`** (`docker.run_sandbox`): refuses when a container `dreamteam-<port>` exists
   (`container_exists`); makes `new_token()` (`secrets.token_urlsafe(32)`) per container; `store_token(port, token,
-  mounted, also_mounted=[sandbox_host_library(config)])` writes `<tokens_dir>/<port>.json` `{"port","token","home"}`
+  mounted, also_mounted=[sandbox_host_library(config), <each mounted [api] folders root>])` (§21.10 "Sandbox") writes
+  `<tokens_dir>/<port>.json` `{"port","token","home"}`
   (mode 0600, folder 0700 on POSIX) unless the folder is inside any mounted directory (`_inside`: `os.path.normcase`,
   and `os.path.samefile` per ancestor for a case-insensitive file system Python does not know about; then None:
   nothing stored, the printed lines name `DREAMTEAM_HUB_TOKEN` instead); `tokens_dir()` is `DREAMTEAM_TOKENS_DIR` or
@@ -5421,9 +5422,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   last final commits may be cut off; the processes die with the container anyway). Ports that agents' dev servers
   open inside the container are not published. `--security-opt no-new-privileges:true`: no program in the
   container gains privileges through a set-user-ID bit or file capabilities (the firewall's `NET_ADMIN` is given at
-  the start, `setpriv` only drops). Only the directory is mounted: for a home,
-  `docker.outside_home_warning(home)` prints a warning listing the sessions whose workspace folder is outside it
-  (`external_workspaces`): they cannot start in the container (their start reports the missing folder). A folder
+  the start, `setpriv` only drops). Only the directory is mounted (and for a home the roots of its `[api] folders`,
+  §21.10 "Sandbox"): for a home, `docker.outside_home_warning(home, mounts)` prints a warning listing the sessions
+  whose workspace folder is outside it (`external_workspaces`), but for those under a writable mounted root's mount
+  point:
+  they cannot start in the container (their start reports the missing folder). A folder
   inside the home is found in the container (session.json `in_home`, §17.2). The host's skills library is mounted
   read-only at `/dreamteam/host-skills` with `DREAMTEAM_HOST_SKILLS_DIR` pointing there and `DREAMTEAM_SKILLS_DIR=
   /swarm/.dreamteam/skills-library` (the sandbox's own library inside the mounted home; not `.dreamteam/skills`,
@@ -7811,7 +7814,8 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - `instruct.py`: `coordinator(state)` and `continue_step(state)`: what `-p -r` and v1 `continue` do with a prompt.
   - `sessionopts.py`: `overrides_from(body, config, *, strict)`: team, model and limits → session overrides, shared
     with the launcher MCP's `session_create`.
-  - `apifolders.py`: the roots of `[api] folders`, their checks, a request's folder (21.10).
+  - `apifolders.py`: the roots of `[api] folders` (in the sandbox's container, where it mounts them), their checks,
+    a request's folder (21.10).
   - `nofollow.py`: open, list and walk inside a root without following links (21.8, 21.10).
   - `hubauth.py`: the API token (21.1). `web.py`: `is_api_path`, `API_CALLER` and the guard's v1 branch (§14).
 - **Tests** (ScriptedLLM, no network, no port: Starlette's `TestClient` on `create_launcher_app`):
@@ -7889,7 +7893,20 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
     spelling (one folder), a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, and
     `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight; `-c` passing over
-    v1 sessions.
+    v1 sessions;
+  - the sandbox (21.10 "Sandbox", in `tests/test_api_v1_folders.py`, no Docker run: the argv and the container's hub):
+    the roots mounted as resolved (one through a link), read-only unless `in_place`, and not a missing one, the user's
+    home folder, one inside the DreamTeam home, one around the store of hub tokens or the host's skills library, or
+    one absolute on the other OS only (each named in a warning), nor a Windows one on a network share or a `\\?\`
+    path, nor on POSIX one with ':' in its path; a Windows host path in `-v`; a read-only root inside a writable one
+    named in a warning; the mounts given or computed, none and no variable for a single-swarm project, the variable
+    never the host's (`[shell] pass_env` naming it); `run_sandbox` checking the roots once, saying which it mounts,
+    never storing the token inside a mounted root (`root_refusal` switched off), and `outside_home_warning` leaving
+    out the sessions under a writable mounted root's mount point (listing a host path, a root not mounted, a root
+    mounted read-only and a `..`); `apifolders.roots` from the variable in the image's container only (either marker
+    of `hub_in_container`), not for a value that is not absolute there, and the variable kept from the agents; a copy
+    and an in-place session made through v1 at the mounted roots, its start checking the folder there, a root not
+    mounted 404 there though its host folder exists, answers without a path.
 
 ### 21.10 Folders on the hub's computer
 
@@ -8046,22 +8063,52 @@ drops it as well (21.9).
 - `GET /api/v1/options` lists `"folders": [{"name", "in_place"}]`, never a path.
 
 **Sandbox.**
-- `dreamteam sandbox` of a home mounts each root whose host folder exists into the container at
-  `/dreamteam/api-folders/<name>`, read-only unless `in_place`. A root missing on the host is not mounted, with a
-  warning.
-- It sets `DREAMTEAM_API_FOLDERS_DIR=/dreamteam/api-folders`. `apifolders.roots` then takes `<that folder>/<name>` as
-  each root's path, but only when `copyfrom.hub_in_container(config)` holds, so a stray variable on a hub outside the
-  image changes nothing. The name joins `shell._INTERNAL_ENV`, and `docker.env_passthrough` subtracts it (a host value
-  passed by name would come later and win).
+- `dreamteam sandbox` of a home mounts each root into the container at `/dreamteam/api-folders/<name>`
+  (`docker.API_FOLDERS_MOUNT`), read-only unless `in_place`: `-v <host folder>:/dreamteam/api-folders/<name>[:ro]`
+  (`docker.FolderMount.volume`). Before that it checks each root on the host as the hub outside the container checks
+  it at each use (`docker.api_folder_mounts` → `apifolders.resolve_root`: absolute on the host's own system, there, a
+  folder, and not refused by `root_refusal`), and mounts the resolved folder. The check has to run on the host: the
+  hub in the container sees only the mount point, where a root that is the user's home folder or contains the
+  DreamTeam home, the store of hub tokens (where `run_sandbox` keeps the container's token) or the host's skills
+  library (mounted read-only) would pass. A root that is missing, refused, or whose resolved path docker's `-v` cannot
+  take (`docker.volume_source_refusal`: on Windows a path on no drive letter, such as a network share's
+  `\\server\share\...`, which a root on a mapped network drive resolves to, or a `\\?\` one; anywhere a ':' past
+  the drive letter) is not mounted, with a warning naming it and why, so one root never makes the whole `docker run`
+  fail; in the container it is then not there (404 `not_found`). A read-only root that lies inside a writable one gets
+  a warning too: agents write it through the other's mount point. When it mounts any root, `run_sandbox` says which,
+  read-only or writable, and that every agent in the container can read them and write the writable ones. It also
+  passes the mounted folders to `hubauth.store_token(also_mounted=)`, so the token is never stored inside one.
+- `run_sandbox` computes the mounts once (for its warnings and the command); `sandbox_command(..., folders=)` takes
+  them (None: it computes them, dropping the warnings). It reads the roots and creates nothing.
+- It sets `DREAMTEAM_API_FOLDERS_DIR=/dreamteam/api-folders` (`config.API_FOLDERS_ENV`) for every home, with or
+  without roots, so that a root added while the container runs is looked for there, never at its host path.
+  `apifolders.roots` then takes `<that folder>/<name>` as each root's path (its `in_place` stays the settings'), but
+  only when the value is absolute there and `copyfrom.hub_in_container(config)` holds, so a stray variable on a hub
+  outside the image changes nothing. The name joins `shell._INTERNAL_ENV`, and `docker.env_passthrough` subtracts it
+  (a host value passed by name would come later and win). A single-swarm project's sandbox gets neither the mounts nor
+  the variable: its `run` has no external API.
+- The mounts are made when the container starts. The hub there reads the settings at each request, so a root taken out
+  of `[api] folders`, or made copy-only, is refused to v1 at once; but its folder stays mounted as it was (writable for
+  an `in_place` one) until the sandbox's next start, and a root added, or made `in_place`, is mounted (or writable)
+  only from then on.
+- `docker-compose.yml` shows the mount and the variable as comments: with compose the owner mounts the folders, and
+  no check runs on the host.
 - An in-place session made there stores the container path. A hub outside the container finds that folder missing (409
   `folder_not_ready` at the session's start).
-- `outside_home_warning` leaves out the sessions whose stored folder lies under `/dreamteam/api-folders/<name>` of a
-  root it mounts (made in the container). A session made outside the container in a root's folder stores the host
-  path, cannot start in the container (as above, the other way round) and stays listed.
+- `outside_home_warning(home, mounts)` leaves out the sessions whose stored folder lies under
+  `/dreamteam/api-folders/<name>` of a root it mounts writable (made in the container; `docker.api_root_of`, which
+  reads the stored path as a POSIX one and takes none with a `..`). A session made outside the container in a root's
+  folder stores the host path, cannot start in the container (as above, the other way round) and stays listed, as do
+  one under the mount point of a root not mounted this time and one under a root mounted read-only now (it works in
+  place, and its start refuses a root that is no longer `in_place`).
 - What this grants: every agent of every session in that container, board sessions included, has a shell there, so it
-  can read every `copy` root and write every `in_place` root. Without `[api] folders` a sandboxed agent reaches no
-  folder of the host but the home and, read-only, the host's skills library. In the sandbox the list limits what a
-  v1 client can name, and it widens what the sandbox's agents can reach.
+  can read every `copy` root and write every `in_place` root (and a `copy` root inside an `in_place` one, through
+  that one). Without `[api] folders` a sandboxed agent reaches no folder of the host but the home and, read-only, the
+  host's skills library. In the sandbox the list limits what a v1 client can name, and it widens what the sandbox's
+  agents can reach. The container runs as root (sessions without network run their agents' commands as its
+  `dreamteam-agent` user): on a Linux host with rootful Docker a `copy` root is read with root's rights, not the hub
+  user's, and the files a session makes in an `in_place` root are owned there by root (or by that user's uid 10001),
+  in the owner's own folder.
 
 **Security.**
 - A root is a grant to whoever holds the API token. With `in_place`, the agents run commands in that folder with the

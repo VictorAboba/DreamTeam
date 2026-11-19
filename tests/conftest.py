@@ -13,7 +13,7 @@ import pytest
 
 from dreamteam import hubauth, netoff, prompts, skill_deps, web
 from dreamteam.board import Board
-from dreamteam.config import Config
+from dreamteam.config import API_FOLDERS_ENV, Config
 from dreamteam.db import Database, dumps, loads
 from dreamteam.events import EventBus
 from dreamteam.goal_text import split_goal
@@ -215,8 +215,10 @@ def _no_gateway_headers(monkeypatch):
 def _outside_the_image(monkeypatch):
     """No test takes the sandbox image's marker from the environment: the Dockerfile sets DREAMTEAM_IMAGE=1
     (netoff.IMAGE_ENV), which turns on the workspace trust, the copy-from refusal and the image's hints, so the suite
-    run inside the image would take those paths. A test of the image sets the variable itself."""
+    run inside the image would take those paths. A test of the image sets the variable itself. Nor the folder where
+    `dreamteam sandbox` mounts the roots of [api] folders (config.API_FOLDERS_ENV)."""
     monkeypatch.delenv(netoff.IMAGE_ENV, raising=False)
+    monkeypatch.delenv(API_FOLDERS_ENV, raising=False)
 
 
 def make_skill(folder: Path, name: str | None = "demo", description: str = "Does a demo thing.",
