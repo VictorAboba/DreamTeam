@@ -7820,7 +7820,7 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     - The handles share reading, writing and deleting, so an agent can still rename or delete a file while it is
       downloaded or copied, and rename a folder the walk is in. A folder that holds the file being read (a download,
       or the walk's current file) cannot be renamed until that read ends: Windows refuses to rename a folder with an
-      open file below it.
+      open file below it (a delete of the session therefore cuts the hub's own reads first: "A delete" below).
   - The module (stdlib, ctypes on Windows; blocking: run in a thread):
     - `open_inside(root, parts, *, want_dir=False) -> fd`: the file (or folder) `parts` names below `root`, open for
       reading; the caller closes it.
@@ -7902,7 +7902,8 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     archive would lack it; what it measured (path -> kind) is all the second walk is given, which takes each path out
     as it meets it;
   - the second writes the zip (`api_v1._zip_parts`, one step at a time in a thread: a step ends once 256 KiB of zip
-    are ready, `ZIP_SENT`, or about one `FILE_CHUNK` was read, an entry counting as `ZIP_ENTRY_COST` = 4 KiB), each
+    are ready, `ZIP_SENT`, or about one `FILE_CHUNK` was read, an entry counting as `ZIP_ENTRY_COST` = 4 KiB, one it
+    leaves out too), each
     file read through the walk's own open file before the walk goes on, exactly the size it had when it was opened
     (what was written to it meanwhile is left for the next archive; so zipfile's own zip64 rule from that size
     always holds). What came meanwhile is taken. A file or folder of the first walk that is gone, or became a link,
@@ -7915,8 +7916,25 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   (`api_v1._Streamed`, `_thread_step`), also when it goes before the first byte. The wait for that thread is
   shielded from the anyio cancel scope through which Starlette cancels a streamed answer (`api_v1._outlive`: that
   scope cancels a task still waiting again at every pass of the event loop, which would keep the loop busy for the
-  whole step); a cancel of the task itself (the hub shutting down) is waited through as well. A create's upload
+  whole step); a cancel of the task itself (the hub shutting down) is waited through as well, after it set the step's
+  stop flag (`_thread_step(..., stop=)`), at which an archive's measure ends at its next entry. A create's upload
   claims use the same helper (`claim_uploads`).
+- An archive's measure sends nothing, and the server cancels nothing before an answer starts: while it runs, the
+  archive reads the request's `receive` itself (`api_v1._until_gone`), and at `http.disconnect` its walk ends at its
+  next entry and its place among the `ARCHIVES_AT_ONCE` is given back, instead of walking the whole folder for a
+  client that left.
+- **A delete.** A download and an archive are among the manager's readers of the session
+  (`SessionManager.add_reader` .. `drop_reader`, `api_v1._Reading`) from before they open anything in its folder
+  until their answer ends; each runs its blocking work one step at a time in a thread (`_Reading.step`) and closes
+  what it holds (its file; its walk, then its archive place) on the event loop, once. `SessionManager.delete` cuts
+  them (`cut()`) before it stops the session and renames its folder away, since Windows renames no folder that holds
+  an open file (the handles share deleting, but not a rename above them): one between two steps (its client reads
+  slowly) is closed at once, one in a step as soon as that step ends (an archive's measure stops at its next entry;
+  the rename's retries, 10 × 0.2 s, wait for it). No reader is added while the delete runs (`_deleting`): a download
+  or an archive asked then is 409 `conflict` (`api_v1.DELETING_TEXT`), and so is one cut before its answer started,
+  unless the session is gone by then (404). One cut after its answer started ends with an error, as a read that
+  fails does. A delete that still cannot rename the folder (another program holds a file in it) is 409 with the
+  system's reason, never the paths it names.
 
 ### 21.9 Settings, modules, tests
 
@@ -8057,7 +8075,11 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     is archived and a file gone between the two walks (a cut zip), one swapped while it is measured (409 before any
     byte, naming it), a file that shrinks while it is archived (a cut zip) and one that grows (taken at its size when
     opened), a folder that cannot be read (409 for a listing, a download and an archive alike) and a session folder
-    that cannot be read (`folder_not_ready`), an archive its client leaves (its walk closed); at most
+    that cannot be read (`folder_not_ready`), an archive its client leaves (its walk closed), also during its
+    measure (the walk stopped, its place given back at once), a step cancelled (its stop flag set first), a step of
+    entries left out only (it ends as others do); a DELETE while the hub sends a file or an archive of the session to
+    a client that reads slowly (both cut and closed, the delete done), a download or an archive asked while a delete
+    runs (409); at most
     `ARCHIVES_AT_ONCE` archives while their clients do not read (429 `too_many_archives`, every slot given back by an
     archive that ends, is refused or is left; the descriptors they may hold together stay within a third of 1024); the
     archive a zip of exactly what is listed, with its folders, normalized modes and clamped times, of the whole folder

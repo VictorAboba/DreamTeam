@@ -429,7 +429,8 @@ is resumed as well.
   nothing changes. PATCH checks its own `Content-Type` (415).
 - `POST .../stop` stops the session and its background jobs (reason `user`); `continue` starts it again.
 - `DELETE .../{id}?confirm={id}` deletes the session with its folder. A folder the session worked in in place is kept,
-  with its files, and named: `"folder_kept": {"root", "path"}`.
+  with its files, and named: `"folder_kept": {"root", "path"}`. A download or an archive of the session still being
+  sent is cut first (its client gets it short); one asked while the delete runs is 409 `conflict`.
 
 ## The result
 
@@ -477,7 +478,8 @@ is resumed as well.
   it is opened. A file or folder that goes, is replaced or shrinks while the zip is written cuts the answer before the
   zip's end, so the client gets an invalid zip, never a valid one that lacks files. A hub sends at most 4 archives at
   once (from the measure until the answer ends, however slowly its client reads): one more is 429
-  `too_many_archives`; ask again later, or download the files one by one.
+  `too_many_archives`; ask again later, or download the files one by one. A client that leaves during the measure
+  gives its place back at once.
 - Paths are relative to the session's folder, with `/`. An absolute path, `..`, `.`, an empty name, a NUL, a backslash,
   a `.git` component or a Windows short name (`GIT~1`) is 400 `bad_name`; so is a path in `.scratch` without
   `scratch=true`, and one in `.scratch/_skills` ever; on a Windows hub so are `:`, `< > " | ? *`, reserved names

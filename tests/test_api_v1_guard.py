@@ -75,7 +75,8 @@ async def _ask(app, *, path: str = "/api/v1/options", method: str = "GET", heade
                ) -> tuple[int, dict[str, str], bytes]:
     """(status, response headers, body) of one request made as the server would make it: the path exactly as given
     (no `..` or `//` resolved, as uvicorn passes it), 1008 for a WebSocket closed before it was accepted, 200 for one
-    the app took."""
+    the app took. An HTTP client stays until the answer ends: `http.disconnect` comes only then (an app that waits
+    for it, such as an archive's measure, is never told the client left)."""
     sent_headers = [(b"host", host.encode()), *((k.encode(), v.encode()) for k, v in (headers or {}).items())]
     scope = {"type": kind, "method": method, "path": path, "raw_path": path.encode(), "headers": sent_headers,
              "query_string": query.encode(), "scheme": "ws" if kind == "websocket" else "http", "root_path": "",
@@ -83,15 +84,21 @@ async def _ask(app, *, path: str = "/api/v1/options", method: str = "GET", heade
     sent: list[dict] = []
     messages = [{"type": "http.request", "body": body, "more_body": False}] if kind == "http" else \
         [{"type": "websocket.connect"}]
+    answered = asyncio.Event()
 
     async def receive():
         if messages:
             return messages.pop(0)
+        if kind == "http":
+            await answered.wait()
+            return {"type": "http.disconnect"}
         await asyncio.sleep(0.01)
-        return {"type": "http.disconnect"} if kind == "http" else {"type": "websocket.disconnect", "code": 1000}
+        return {"type": "websocket.disconnect", "code": 1000}
 
     async def send(message):
         sent.append(message)
+        if message["type"] == "http.response.body" and not message.get("more_body", False):
+            answered.set()
 
     await app(scope, receive, send)
     if not sent:

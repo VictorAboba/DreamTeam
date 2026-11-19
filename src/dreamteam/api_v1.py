@@ -165,6 +165,8 @@ LASTING_TEXTS = (None, GIT_OFF_TEXT, NO_BASE_TEXT, BASE_GONE_TEXT)
 FOLDER_GONE_TEXT = "The session's folder is not there (deleted or moved, or on a drive that is not connected)."
 FOLDER_LINKED_TEXT = "The session's folder is reached through a link now: nothing in it is read."
 FOLDER_UNREADABLE_TEXT = "The session's folder cannot be read on the hub's computer (its permissions)."
+# a download or an archive that a delete of its session cut (_Reading), or asked for while one runs
+DELETING_TEXT = "The session is being deleted: its files are not read any more."
 # a folder session.json names that no session may work in (ApiV1._own_folder): nothing in it is read
 FOLDER_REFUSED_TEXT = ("The session's folder is one no session may work in (DreamTeam's own data, its hub tokens, "
                        "another DreamTeam home, the home folder itself, a system folder): nothing in it is read.")
@@ -848,12 +850,13 @@ class _Threads:
 
 
 async def _thread_step(fn: Callable[..., Any], *args: Any, release: Callable[[Any], None] | None = None,
-                       threads: _Threads | None = None) -> Any:
+                       threads: _Threads | None = None, stop: threading.Event | None = None) -> Any:
     """fn(*args) in a thread that a cancellation (the client gone) never leaves running behind the caller: a cancel
-    waits for it to end (_outlive), hands what it gave to `release` (a file it opened, to close; claims it took, to
-    give back), then goes on. So a download or an archive closes its file or its walk only once no thread reads it,
-    and a create holds no claim after it. `threads`: v1's folder threads (a read of a folder of the hub's computer),
-    else the loop's default executor (the home's own files)."""
+    sets `stop` (a work that checks it, such as an archive's measure, ends at its next entry), waits for it to end
+    (_outlive), hands what it gave to `release` (a file it opened, to close; claims it took, to give back), then goes
+    on. So a download or an archive closes its file or its walk only once no thread reads it, and a create holds no
+    claim after it. `threads`: v1's folder threads (a read of a folder of the hub's computer), else the loop's default
+    executor (the home's own files)."""
     if threads is not None:
         work = await threads.start(fn, *args)   # (a cancel while it waits for a place starts nothing)
     else:
@@ -861,6 +864,8 @@ async def _thread_step(fn: Callable[..., Any], *args: Any, release: Callable[[An
     try:
         return await asyncio.shield(work)
     except asyncio.CancelledError:
+        if stop is not None:
+            stop.set()
         await _outlive(work)
         if not work.cancelled() and work.exception() is None and release is not None:
             release(work.result())
@@ -1074,15 +1079,108 @@ class _Streamed(StreamingResponse):
                     log.exception("API v1: a download could not close what it read")
 
 
-async def _file_bytes(file: BinaryIO, size: int, label: str, threads: _Threads | None = None) -> AsyncIterator[bytes]:
-    """The bytes of an opened file (`files/{path}`), FILE_CHUNK at a time in a thread (`threads`: _thread_step's),
-    exactly `size` of them (the Content-Length sent): a file that grew meanwhile is cut there; one that shrank, or a
-    read that fails, ends the answer with an error (logged), so the client sees it cut short, never a whole file that
-    is not."""
+class _Reading:
+    """A download or an archive of a session's files (docs/SPEC.md §21.8 "A delete"), among the manager's readers of
+    the session (SessionManager.add_reader) from before it opens anything in the session's folder until its answer
+    ends: a delete of the session cuts it (cut) before it renames the folder away, since Windows renames no folder
+    that holds an open file. Its blocking work runs one step at a time in a thread (step); what it holds (`callback`,
+    closed in reverse order, once: close) is closed on the loop when no step runs: at once when it is cut between two
+    steps, else as soon as the running step ends, which `stop` makes short (an archive's measure ends at its next
+    entry). A cancel of a step (the hub shutting down) sets `stop` too, and so does an archive's client gone during
+    its measure (_until_gone)."""
+
+    def __init__(self, manager: "SessionManager", sid: str) -> None:
+        self.manager, self.sid = manager, sid
+        self.stop = threading.Event()
+        self.why = "the client is gone"
+        self._busy = False
+        self._closed = False
+        self._held = False
+        self._stack = contextlib.ExitStack()
+
+    def hold(self) -> None:
+        """Among the manager's readers of the session; 409 `conflict` (DELETING_TEXT) while a delete of it runs."""
+        try:
+            self.manager.add_reader(self.sid, self)
+        except SessionError:
+            raise ApiError("conflict", DELETING_TEXT) from None
+        self._held = True
+
+    def callback(self, fn: Callable[[], Any]) -> None:
+        """fn() runs when it is closed (after those added later)."""
+        self._stack.callback(fn)
+
+    def cut(self, why: str = DELETING_TEXT) -> None:
+        """Stop it (`why`: what its answer says, when it has not started): what it holds is closed now when no step
+        runs, else when the running one ends. On the loop."""
+        if not self.stop.is_set():
+            self.why = why
+        self.stop.set()
+        if not self._busy:
+            self.close()
+
+    def close(self) -> None:
+        """What it holds closed (once) and it leaves the manager's readers. On the loop, never while a step runs."""
+        if self._closed:
+            return
+        self._closed = True
+        if self._held:
+            self.manager.drop_reader(self.sid, self)
+        try:
+            self._stack.close()
+        except Exception:  # noqa: BLE001 - the answer's own outcome goes on
+            log.exception("API v1: a download could not close what it read")
+
+    async def step(self, fn: Callable[..., Any], *args: Any, threads: _Threads | None,
+                   release: Callable[[Any], None] | None = None) -> Any:
+        """fn(*args) in a thread (_thread_step: a cancel sets `stop`, waits for the thread and hands what it gave to
+        `release`); _Cut with `why` when it was stopped before or meanwhile (what fn gave to `release`, what it holds
+        closed), whatever fn raised then."""
+        if self.stop.is_set():
+            self.close()
+            raise _Cut(self.why)
+        self._busy = True
+        try:
+            value = await _thread_step(fn, *args, release=release, threads=threads, stop=self.stop)
+        except Exception:
+            if not self.stop.is_set():
+                raise
+            self._busy = False
+            self.close()
+            raise _Cut(self.why) from None
+        finally:
+            self._busy = False
+        if self.stop.is_set():
+            try:
+                if release is not None:
+                    release(value)
+            finally:
+                self.close()
+            raise _Cut(self.why)
+        return value
+
+
+async def _until_gone(receive: Receive, reading: _Reading) -> None:
+    """Cut `reading` once its client is gone (`http.disconnect`), until this is cancelled: an archive's measure, which
+    sends nothing, would otherwise walk the whole folder for nobody (the server cancels nothing before an answer
+    starts)."""
+    while True:
+        message = await receive()
+        if message.get("type") == "http.disconnect":
+            reading.cut("the client is gone")
+            return
+
+
+async def _file_bytes(file: BinaryIO, size: int, label: str, threads: _Threads | None,
+                      reading: _Reading) -> AsyncIterator[bytes]:
+    """The bytes of an opened file (`files/{path}`), FILE_CHUNK at a time in a thread (`reading`'s steps, `threads`:
+    _thread_step's), exactly `size` of them (the Content-Length sent): a file that grew meanwhile is cut there; one
+    that shrank, a read that fails, or a delete of the session (`reading` cut) ends the answer with an error (logged),
+    so the client sees it cut short, never a whole file that is not."""
     sent = 0
     try:
         while sent < size:
-            chunk = await _thread_step(file.read, min(FILE_CHUNK, size - sent), threads=threads)
+            chunk = await reading.step(file.read, min(FILE_CHUNK, size - sent), threads=threads)
             if not chunk:
                 raise OSError(errno.EIO, f"the file ended after {sent} of its {size} bytes")
             sent += len(chunk)
@@ -1151,9 +1249,10 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: d
     or another kind, a file that shrank while it was read, an entry that cannot be read, a link swapped in
     (nofollow.Refused), more than `limit` bytes, or more than ARCHIVE_MAX_ENTRIES entries (what came meanwhile
     counts too: nofollow.TooMany), raise (_Cut, OSError) before the central directory is written, so the client's
-    zip is never a valid one that lacks files or holds a torn one. What came meanwhile is taken. Blocking: one step at a time in a thread (_zip_bytes); a step ends (a part, b"" when there
-    is no zip to send yet) once ZIP_SENT bytes of zip are ready or about FILE_CHUNK bytes were read (an entry counts
-    as ZIP_ENTRY_COST), so that a client gone waits for one short step only. `still()` says whether the session's
+    zip is never a valid one that lacks files or holds a torn one. What came meanwhile is taken. Blocking: one step at
+    a time in a thread (_zip_bytes); a step ends (a part, b"" when there is no zip to send yet) once ZIP_SENT bytes of
+    zip are ready or about FILE_CHUNK bytes were read (an entry counts as ZIP_ENTRY_COST, one left out too), so that a
+    client gone or a delete of the session waits for one short step only. `still()` says whether the session's
     folder name still holds the session asked for (ApiV1._still): asked once the walk has opened its folder, before
     any part, and again before the central directory, so an archive never holds the files of another session that
     took the name meanwhile (_Cut)."""
@@ -1170,6 +1269,9 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: d
                     checked = True
                     if still is not None and not still():
                         raise _Cut("the session is gone")
+                if work >= FILE_CHUNK or sink.size >= ZIP_SENT:   # (also after entries left out, which add nothing)
+                    work = 0
+                    yield sink.take()
                 rel, was = entry.rel, measured.pop(entry.rel, None)
                 work += ZIP_ENTRY_COST
                 if entry.kind == nofollow.EXCLUDED:
@@ -1205,9 +1307,6 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: d
                             if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
                                 work = 0
                                 yield sink.take()
-                if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
-                    work = 0
-                    yield sink.take()
         except nofollow.TooMany:
             raise _Cut(f"more than {ARCHIVE_MAX_ENTRIES} files and folders") from None
         missing = sorted(measured)
@@ -1221,12 +1320,14 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: d
         walk.close()
 
 
-async def _zip_bytes(parts: Iterator[bytes], label: str, threads: _Threads | None = None) -> AsyncIterator[bytes]:
-    """The parts of an archive (_zip_parts), each step in a thread (_thread_step, `threads`: the walk is closed only
-    once no thread reads it); an error ends the answer (logged), so the client's zip has no central directory."""
+async def _zip_bytes(parts: Iterator[bytes], label: str, threads: _Threads | None,
+                     reading: _Reading) -> AsyncIterator[bytes]:
+    """The parts of an archive (_zip_parts), each step in a thread (`reading`'s steps, `threads`: _thread_step's: the
+    walk is closed only once no thread reads it); an error, or a delete of the session (`reading` cut), ends the
+    answer (logged), so the client's zip has no central directory."""
     try:
         while True:
-            chunk = await _thread_step(next, parts, None, threads=threads)
+            chunk = await reading.step(next, parts, None, threads=threads)
             if chunk is None:
                 return
             if chunk:
@@ -2119,14 +2220,15 @@ class ApiV1:
             raise
         return file, size
 
-    def _measure(self, sid: str, asked: tuple[str, ...], scratch: bool,
-                 limit_mb: int) -> tuple[_Where, dict[str, str]]:
+    def _measure(self, sid: str, asked: tuple[str, ...], scratch: bool, limit_mb: int,
+                 stop: threading.Event | None = None) -> tuple[_Where, dict[str, str]]:
         """An archive's first walk (docs/SPEC.md §21.8 `archive`), before any byte is sent: what `served` takes below
         the folder `asked`, measured without opening a file (nofollow.walk_inside, open_files False). 413
         `too_large` past `limit_mb` MiB of files ([api] archive_max_mb) or past ARCHIVE_MAX_ENTRIES entries (each
         costs memory, not bytes: the walk keeps no more); 409 `conflict` for an entry that cannot be read (the archive
-        would lack it). (where it read, {rel: "dir" | "file"} of what the second walk must find again). Blocking: in a
-        thread."""
+        would lack it); _Cut at the first entry after `stop` is set (the archive's reading cut: its client gone, a
+        delete of the session, the hub shutting down). (where it read, {rel: "dir" | "file"} of what the second walk
+        must find again). Blocking: in a thread."""
         where = self._where(sid)
         measured: dict[str, str] = {}
         total = 0
@@ -2134,6 +2236,8 @@ class ApiV1:
                                     limit=ARCHIVE_MAX_ENTRIES)
         try:
             for entry in walk:
+                if stop is not None and stop.is_set():
+                    raise _Cut("the archive was stopped")
                 if entry.kind == nofollow.FILE:
                     total += entry.size
                     if total > limit_mb << 20:
@@ -2577,15 +2681,22 @@ class ApiV1:
             raise ApiError("bad_request", _is_folder_text("."))
         sid = self._session(request, caller)
         self.manager._refresh_settings()
-        file, size = await _thread_step(self._open_file, sid, asked, release=lambda opened: opened[0].close(),
-                                        threads=self.threads)
-        try:   # (the file opened is the session's only when its name is still the session's after the open)
-            self._still(request, sid)
+        reading = _Reading(self.manager, sid)   # (a delete of the session cuts it: _Reading)
+        reading.hold()
+        try:
+            file, size = await reading.step(self._open_file, sid, asked, threads=self.threads,
+                                            release=lambda opened: opened[0].close())
+            reading.callback(file.close)
+            self._still(request, sid)   # (the file opened is the session's only when its name still is the session's)
+        except _Cut:
+            reading.close()
+            self._still(request, sid)   # (a delete that took the session: 404)
+            raise ApiError("conflict", reading.why) from None
         except BaseException:
-            file.close()
+            reading.close()
             raise
-        return _Streamed(_file_bytes(file, size, f"{'/'.join(asked)} of session {sid}", self.threads),
-                         closing=file.close, media_type="application/octet-stream",
+        return _Streamed(_file_bytes(file, size, f"{'/'.join(asked)} of session {sid}", self.threads, reading),
+                         closing=reading.close, media_type="application/octet-stream",
                          headers=_download_headers(asked[-1], size))
 
     async def _archive(self, request: Request, caller: str) -> Response:
@@ -2594,7 +2705,9 @@ class ApiV1:
         measured first (_measure: 413 `too_large` past `[api] archive_max_mb` before any byte); an error once the
         answer has started cuts it (the zip then lacks its central directory). Checked in the order of GET files.
         At most ARCHIVES_AT_ONCE archives are measured or sent at once, from the measure until the answer ends (each
-        holds its walk's descriptors while its client reads): one more is 429 `too_many_archives`."""
+        holds its walk's descriptors while its client reads): one more is 429 `too_many_archives`. The measure stops at
+        its next entry, and gives its place back, when its client goes away (_until_gone), the hub shuts down or a
+        delete of the session cuts it (_Reading)."""
         query = query_fields(request, ARCHIVE_FIELDS)
         scratch = query_flag(query.get("scratch"), "scratch")
         asked = check_rel(query.get("path"), scratch=scratch)
@@ -2603,40 +2716,42 @@ class ApiV1:
             raise ApiError("too_many_archives", f"{ARCHIVES_AT_ONCE} archives are being sent already, the most the "
                                                 "hub sends at once: ask again once one has ended, or download the "
                                                 "files one by one (files/{path}).")
+        reading = _Reading(self.manager, sid)
+        reading.hold()
         self._archives += 1
-        held = [True]
-
-        def release() -> None:
-            if held[0]:
-                held[0] = False
-                self._archives -= 1
-
+        reading.callback(self._archive_ended)   # (the place is given back once the walk's descriptors are closed)
         try:
             limit_mb = self.manager.global_config().api.archive_max_mb   # (a hand edit is picked up)
-            # (a cancel waits for the walk's thread to end: the slot is given back once its descriptors are closed)
-            where, measured = await _thread_step(self._measure, sid, asked, scratch, limit_mb, threads=self.threads)
+            gone = asyncio.ensure_future(_until_gone(request.receive, reading))
+            try:
+                where, measured = await reading.step(self._measure, sid, asked, scratch, limit_mb, reading.stop,
+                                                     threads=self.threads)
+            finally:
+                gone.cancel()
+                gone.add_done_callback(lambda task: task.cancelled() or task.exception())
             self._still(request, sid)
             uid = request.path_params.get("id")
             parts = _zip_parts(where, asked, scratch, measured, limit_mb << 20,
                                still=lambda: self.manager._has_uid(sid, uid))
+            reading.callback(parts.close)
+        except _Cut:
+            reading.close()
+            self._still(request, sid)   # (a delete that took the session: 404)
+            raise ApiError("conflict", reading.why) from None
         except BaseException:
-            release()
+            reading.close()
             raise
-
-        def closing() -> None:
-            try:
-                parts.close()
-            finally:
-                release()
-
-        return _Streamed(_zip_bytes(parts, f"{'/'.join(asked) or '.'} of session {sid}", self.threads),
-                         closing=closing, media_type="application/zip",
+        return _Streamed(_zip_bytes(parts, f"{'/'.join(asked) or '.'} of session {sid}", self.threads, reading),
+                         closing=reading.close, media_type="application/zip",
                          headers=_download_headers(f"{asked[-1] if asked else sid}.zip"))
+
+    def _archive_ended(self) -> None:
+        self._archives -= 1
 
 
 __all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVES_AT_ONCE", "ARCHIVE_FIELDS", "ARCHIVE_MAX_ENTRIES",
            "BASE_GONE_TEXT", "CHANGED_FILES_MAX", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS",
-           "CREATE_FIELDS", "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS",
+           "CREATE_FIELDS", "DELETING_TEXT", "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS",
            "FILES_MAX_ENTRIES", "FILES_PER_SESSION", "FILES_REFUSAL", "FILE_CHUNK", "FILE_FIELDS", "FOLDER_BUSY_TEXT",
            "FOLDER_FIELDS", "FOLDER_GONE_TEXT", "FOLDER_LINKED_TEXT", "FOLDER_REFUSED_TEXT", "FOLDER_THREADS",
            "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX", "LASTING_TEXTS", "MESSAGES_DEFAULT",

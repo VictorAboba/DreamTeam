@@ -63,12 +63,12 @@ def _write(path: Path, data: bytes | str) -> Path:
 
 async def fetch(hub: Hub, path: str, query: dict[str, str] | str = "", *, token: str = API_TOKEN,
                 on_body: Any = None, leave_after: int | None = None,
-                hold: asyncio.Event | None = None) -> SimpleNamespace:
+                hold: asyncio.Event | None = None, leave: asyncio.Event | None = None) -> SimpleNamespace:
     """GET `path` through the hub's app as the server would call it (ASGI 2.3: Starlette listens for the
     disconnect), read as it comes: status, headers, body, `ended` (the last body message came), `error` (what the
     app raised: an answer cut after it started). `on_body(n)` runs at the n-th body message; `leave_after`: the
     client goes away after that many; `hold`: after the first body message the client reads nothing more until it
-    is set (the server's send waits)."""
+    is set (the server's send waits); `leave`: the client goes away once it is set, also before the answer starts."""
     if isinstance(query, dict):
         query = urllib.parse.urlencode(query)
     sent = [(b"host", b"127.0.0.1:8765"), (b"authorization", f"Bearer {token}".encode())]
@@ -76,7 +76,7 @@ async def fetch(hub: Hub, path: str, query: dict[str, str] | str = "", *, token:
              "raw_path": urllib.parse.quote(path).encode(), "headers": sent, "query_string": query.encode(),
              "scheme": "http", "root_path": "", "server": ("172.17.0.2", 8765), "client": LOCAL, "http_version": "1.1"}
     got = SimpleNamespace(status=None, headers={}, body=b"", ended=False, error=None, messages=0)
-    gone = asyncio.Event()
+    gone = leave if leave is not None else asyncio.Event()
     asked = [False]
 
     async def receive() -> dict[str, Any]:
@@ -832,6 +832,158 @@ async def test_at_most_archives_at_once_are_sent_while_their_clients_do_not_read
         assert got.status == 200 and not got.ended and hub.api._archives == 0
     finally:
         hold.set()
+        await hub.close()
+
+
+def _slow_measure(monkeypatch: pytest.MonkeyPatch, walked: list[str], pause: float = 0.05) -> None:
+    """An archive's measure (nofollow.walk_inside without open files) takes `pause` per entry: a large folder."""
+    real = nofollow.walk_inside
+
+    def walk_inside(*args: Any, **kwargs: Any) -> Any:
+        walk = real(*args, **kwargs)
+        if kwargs.get("open_files", True):
+            return walk
+
+        def slow() -> Any:
+            try:
+                for entry in walk:
+                    walked.append(entry.rel)
+                    time.sleep(pause)
+                    yield entry
+            finally:
+                walk.close()
+        return slow()
+
+    monkeypatch.setattr(nofollow, "walk_inside", walk_inside)
+
+
+async def test_an_archive_whose_client_leaves_during_its_measure_stops_and_gives_its_place_back(
+        tmp_path, api_token, no_start, monkeypatch):
+    """The measure sends nothing, so the server cancels nothing when its client goes away: the archive watches for the
+    disconnect itself, and its walk stops at the next entry instead of walking the whole folder for nobody."""
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    walked: list[str] = []
+    leave = asyncio.Event()
+    try:
+        uid, _sid, _folder = await session_with(hub, {f"f{i:02}.txt": "x" for i in range(40)})
+        _slow_measure(monkeypatch, walked)
+        task = asyncio.ensure_future(archive(hub, uid, leave=leave))
+        await _until(lambda: len(walked) >= 2, "the measure")
+        assert hub.api._archives == 1
+        leave.set()
+        began = time.monotonic()
+        await _until(lambda: hub.api._archives == 0, "the place given back")
+        assert time.monotonic() - began < 1.0 and len(walked) < 30, len(walked)   # (40 entries take 2 s)
+        got = await task
+        assert got.status == 409 and got.messages == 1 and not hub.manager._readers
+    finally:
+        leave.set()
+        await hub.close()
+
+
+async def test_a_step_cancelled_sets_its_stop_before_it_waits_for_its_thread():
+    """The hub shutting down cancels an archive's measure: its walk ends at its next entry, so neither the slot nor
+    the hub's exit waits for the whole folder."""
+    stop = threading.Event()
+    deadline = time.monotonic() + 5
+
+    def work() -> str:
+        while not stop.wait(0.01) and time.monotonic() < deadline:
+            pass
+        return "ended"
+
+    task = asyncio.ensure_future(api_v1._thread_step(work, stop=stop))
+    await asyncio.sleep(0.05)
+    began = time.monotonic()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stop.is_set() and time.monotonic() - began < 1.0
+
+
+def test_an_archive_step_ends_after_entries_left_out_too(tmp_path, monkeypatch):
+    """Entries the archive leaves out (node_modules, .venv...) count for ZIP_ENTRY_COST each, so a step that meets only
+    those still ends after about FILE_CHUNK of them: a client gone or a delete waits for one short step."""
+    count = 4 * api_v1.FILE_CHUNK // api_v1.ZIP_ENTRY_COST
+
+    def walk_inside(*args: Any, **kwargs: Any) -> Any:
+        for i in range(count):
+            yield nofollow.Entry((f"node_modules{i}",), nofollow.EXCLUDED)
+
+    monkeypatch.setattr(nofollow, "walk_inside", walk_inside)
+    steps = list(api_v1._zip_parts(api_v1._Where(tmp_path), (), False, {}, 1 << 20))
+    assert len(steps) >= 4 and steps[:3] == [b"", b"", b""], len(steps)
+
+
+# ---------------------------------------------------------------------------------------------- a delete meanwhile
+@pytest.mark.parametrize("kind", ["download", "archive"])
+async def test_a_delete_cuts_the_hubs_own_download_or_archive_of_the_session(tmp_path, api_token, no_start,
+                                                                            monkeypatch, kind):
+    """A client that reads slowly holds a file (a download) or a walk (an archive) open in the session's folder, and
+    Windows renames no folder that holds an open file: a DELETE of the session closes them first, and succeeds. The
+    answer is cut, never finished."""
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    monkeypatch.setattr(api_v1, "FILE_CHUNK", 4)
+    monkeypatch.setattr(api_v1, "ZIP_SENT", 1)
+    opened: list[Any] = []
+    real = ApiV1._open_file
+
+    def spy(self: ApiV1, sid: str, asked: tuple[str, ...]) -> Any:
+        file, size = real(self, sid, asked)
+        opened.append(file)
+        return file, size
+
+    monkeypatch.setattr(ApiV1, "_open_file", spy)
+    hold, started = asyncio.Event(), asyncio.Event()
+    try:
+        uid, sid, folder = await session_with(hub, {"big.bin": b"x" * 400, **{f"f{i}.txt": "x" * 100
+                                                                               for i in range(5)}})
+        reading = (download(hub, uid, "big.bin", hold=hold, on_body=lambda n: started.set()) if kind == "download"
+                   else archive(hub, uid, hold=hold, on_body=lambda n: started.set()))
+        task = asyncio.ensure_future(reading)
+        await asyncio.wait_for(started.wait(), 5)
+        status, answer = await hub.call("DELETE", f"/api/v1/sessions/{uid}", query=f"confirm={uid}")
+        assert status == 200, answer
+        assert not hub.manager.exists(sid) and not folder.exists()
+        if kind == "download":
+            assert len(opened) == 1 and opened[0].closed   # (closed by the delete, the client still there)
+        assert hub.api._archives == 0 and not hub.manager._readers
+        hold.set()
+        got = await task
+        assert got.status == 200 and not got.ended and isinstance(got.error, Exception)
+    finally:
+        hold.set()
+        await hub.close()
+
+
+async def test_a_download_or_an_archive_asked_while_a_delete_runs_is_a_conflict(tmp_path, api_token, no_start,
+                                                                                monkeypatch):
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    entered, gate = asyncio.Event(), asyncio.Event()
+    unload = hub.manager._unload
+
+    async def held_unload(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        await gate.wait()
+        return await unload(*args, **kwargs)
+
+    try:
+        uid, sid, _folder = await session_with(hub, {"a.txt": "A"})
+        monkeypatch.setattr(hub.manager, "_unload", held_unload)
+        deleting = asyncio.ensure_future(hub.call("DELETE", f"/api/v1/sessions/{uid}", query=f"confirm={uid}"))
+        await asyncio.wait_for(entered.wait(), 5)
+        for got in (await download(hub, uid, "a.txt"), await archive(hub, uid)):
+            assert got.status == 409 and _json(got) == {"error": api_v1.DELETING_TEXT, "code": "conflict"}, got.body
+        assert hub.api._archives == 0 and not hub.manager._readers
+        gate.set()
+        status, answer = await deleting
+        assert status == 200, answer
+        assert (await download(hub, uid, "a.txt")).status == 404
+    finally:
+        gate.set()
         await hub.close()
 
 

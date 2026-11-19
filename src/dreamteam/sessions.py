@@ -1158,6 +1158,11 @@ class SessionManager:
         # and the marks of each: one per start on its way, so a start ends its own mark only
         self.starting: set[str] = set()
         self._marks: dict[str, set[object]] = {}
+        # the hub's own readers of a session's files while they are sent (the HTTP API v1's downloads and archives,
+        # each with cut(); add_reader .. drop_reader): delete() cuts them before it renames the session's folder away
+        # (Windows renames no folder that holds an open file), and none is added while it runs (`_deleting`)
+        self._readers: dict[str, set[Any]] = {}
+        self._deleting: set[str] = set()
         # what runs beside a started v1 session, tied to its Swarm (the hub's automatic answers, the stop_when_done
         # watcher; docs/SPEC.md §21.4, §21.5): started by _start_locked, stopped by _unload before the swarm stops
         self._run_watch: dict[str, _RunWatch] = {}
@@ -1297,6 +1302,22 @@ class SessionManager:
                 return
         self._marks.pop(sid, None)
         self.starting.discard(sid)
+
+    def add_reader(self, sid: str, reader: Any) -> None:
+        """`reader` (cut(): it stops and closes what it holds in the session's folder, at once or when its running
+        step ends) reads the session's files until drop_reader: a delete of the session cuts it first. SessionError
+        409 while a delete of the session runs. On the loop."""
+        if sid in self._deleting:
+            raise SessionError(f"Session {sid} is being deleted.", 409)
+        self._readers.setdefault(sid, set()).add(reader)
+
+    def drop_reader(self, sid: str, reader: Any) -> None:
+        """`reader` holds nothing of the session's any more (add_reader)."""
+        readers = self._readers.get(sid)
+        if readers is not None:
+            readers.discard(reader)
+            if not readers:
+                del self._readers[sid]
 
     # ---- global settings ----------------------------------------------------------------------
     def _settings_stamp(self) -> tuple[int, int] | None:
@@ -3616,8 +3637,10 @@ class SessionManager:
     async def delete(self, sid: str, *, skills: str | None = None, via: str = "home",
                      uid: str | None = None) -> str | None:
         """Stop the session and delete its directory (board, messages, workspace, traces). The directory is
-        first renamed away, so a session whose files are in use stays intact (409) instead of being
-        half-deleted. A workspace folder outside the directory (set_workspace) is never deleted: it is the
+        first renamed away, so a session whose files are in use stays intact (409, the system's reason without its
+        paths) instead of being half-deleted; the hub's own readers of its files (add_reader: the HTTP API v1's
+        downloads and archives) are cut first, and none starts while the delete runs. A workspace folder outside the
+        directory (set_workspace) is never deleted: it is the
         user's folder (the skills mirror in it goes). Returns that folder (read under the session's lock, so a
         workspace change that ran just before is taken into account), else None.
         Skills members proposed that wait for the user's library decision are not lost silently: 409
@@ -3643,42 +3666,53 @@ class SessionManager:
                 await self._save_pending(sid, pending, via)
             self.resume_pending.discard(sid)
             self._drop_marks(sid)   # (a start on its way starts nothing: start(..., marked=...))
-            try:  # a user's stop: its journal goes away with the session, unless the rename below fails (files in
-                # use, 409) and the session stays, stopped
-                await self._unload(sid, "user")
-            except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
-                log.exception("error stopping session %s before deleting it", sid)
+            self._deleting.add(sid)   # (no reader of its files starts while this runs: add_reader)
             try:
-                workspace = self.workspace_of(sid)
-                kept = None if workspace["default"] else workspace["path"]
-            except SessionError:  # a damaged session.json: it can still be deleted
-                workspace, kept = {}, None
-            if workspace.get("adopted") and workspace.get("exists"):
-                # the user's folder keeps no copy of the session's skills (Swarm.stop removes it too: this covers a
-                # crashed or never-stopped one)
+                # the hub's own readers of its files (the HTTP API v1's downloads and archives) close what they hold
+                # before the rename, at once or when their running step ends (the retries below wait for that)
+                for reader in list(self._readers.get(sid, ())):
+                    reader.cut()
+                try:  # a user's stop: its journal goes away with the session, unless the rename below fails (files
+                    # in use, 409) and the session stays, stopped
+                    await self._unload(sid, "user")
+                except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
+                    log.exception("error stopping session %s before deleting it", sid)
                 try:
-                    await asyncio.to_thread(_drop_mirror, Path(workspace["path"]))
-                except OSError as exc:
-                    log.warning("could not remove the skills mirror in %s: %s", workspace["path"], exc)
-            path = self.dir_of(sid)
-            trash = self.sessions_dir / f"{TRASH_PREFIX}{sid}-{time.time_ns()}"
-            for attempt in range(10):
-                try:
-                    os.rename(path, trash)
-                    break
-                except FileNotFoundError:
-                    raise SessionError(f"Unknown session '{sid}'.", 404) from None
-                except OSError as exc:  # Windows: a file inside is open (an editor, an antivirus scan...)
-                    if attempt == 9:
-                        try:  # it stays, stopped as by the user (session.stopped above): a hub start does not resume it
-                            meta = self.meta(sid)
-                            meta["autostart"] = False
-                            self._write_meta(sid, meta)
-                        except Exception:
-                            log.exception("could not clear the resume mark of session %s", sid)
-                        raise SessionError(f"Could not delete session {sid}: its files are in use ({exc}). Close "
-                                           "the programs that use them and try again.", 409) from None
-                    await asyncio.sleep(0.2)
+                    workspace = self.workspace_of(sid)
+                    kept = None if workspace["default"] else workspace["path"]
+                except SessionError:  # a damaged session.json: it can still be deleted
+                    workspace, kept = {}, None
+                if workspace.get("adopted") and workspace.get("exists"):
+                    # the user's folder keeps no copy of the session's skills (Swarm.stop removes it too: this covers
+                    # a crashed or never-stopped one)
+                    try:
+                        await asyncio.to_thread(_drop_mirror, Path(workspace["path"]))
+                    except OSError as exc:
+                        log.warning("could not remove the skills mirror in %s: %s", workspace["path"], exc)
+                path = self.dir_of(sid)
+                trash = self.sessions_dir / f"{TRASH_PREFIX}{sid}-{time.time_ns()}"
+                for attempt in range(10):
+                    try:
+                        os.rename(path, trash)
+                        break
+                    except FileNotFoundError:
+                        raise SessionError(f"Unknown session '{sid}'.", 404) from None
+                    except OSError as exc:  # Windows: a file inside is open (an editor, an antivirus scan...)
+                        if attempt == 9:
+                            try:  # it stays, stopped as by the user (session.stopped above): a hub start does not
+                                # resume it
+                                meta = self.meta(sid)
+                                meta["autostart"] = False
+                                self._write_meta(sid, meta)
+                            except Exception:
+                                log.exception("could not clear the resume mark of session %s", sid)
+                            log.info("could not delete session %s: %s", sid, exc)
+                            raise SessionError(f"Could not delete session {sid}: its files are in use "
+                                               f"({exc.strerror or exc}). Close the programs that use them and try "
+                                               "again.", 409) from None
+                        await asyncio.sleep(0.2)
+            finally:
+                self._deleting.discard(sid)
         self._changed(sid, "deleted")
         await asyncio.to_thread(self._purge_trash)
         return kept
