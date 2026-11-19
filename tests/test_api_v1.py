@@ -390,6 +390,56 @@ async def test_skills_come_from_the_library_or_the_host_library_only(tmp_path, a
         await hub.close()
 
 
+@pytest.mark.parametrize("request_", ["delete", "stop", "continue"])
+async def test_a_session_being_created_is_starting_and_waited_for(tmp_path, api_token, monkeypatch, request_):
+    """From its first write of session.json until its skills are committed, a new session is listed `starting`, never
+    final, and a request on it waits for the create (SessionManager._create holds its lock): a DELETE then deletes
+    all of it, a stop leaves it stopped (the create's start starts nothing), a `continue` starts it with its skills."""
+    make_skill(Path(os.environ["DREAMTEAM_SKILLS_DIR"]) / "demo", "demo", "The library's demo.")
+    hub = Hub(_manager(_home(tmp_path)))
+    gate, entered = threading.Event(), threading.Event()
+    commit = SessionManager._commit_skills
+
+    def slow_commit(self: SessionManager, *args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        gate.wait(5)
+        return commit(self, *args, **kwargs)
+
+    monkeypatch.setattr(SessionManager, "_commit_skills", slow_commit)
+    try:
+        create = asyncio.ensure_future(hub.create({"goal": "G", "skills": ["demo"], **MANUAL}))
+        await _until(entered.is_set, "the skills commit")
+        status, answer = await hub.call("GET", "/api/v1/sessions")
+        assert status == 200 and [(s["state"], s["final"]) for s in answer["sessions"]] == [("starting", False)]
+        uid, sid = answer["sessions"][0]["id"], answer["sessions"][0]["name"]
+        path = f"/api/v1/sessions/{uid}"
+        call = {"delete": lambda: hub.call("DELETE", path, query=f"confirm={uid}"),
+                "stop": lambda: hub.call("POST", f"{path}/stop"),
+                "continue": lambda: hub.call("POST", f"{path}/continue", body={"text": "Go on."})}[request_]
+        sent = asyncio.ensure_future(call())
+        await asyncio.sleep(0.2)
+        assert not sent.done() or request_ == "continue"   # (a continue answers at once: its start waits)
+        assert sid not in hub.manager.running
+        gate.set()
+        status, made = await create
+        assert status == 202 and made["session"]["id"] == uid, made
+        status, answer = await sent
+        assert status == 200, answer
+        await hub.settled()
+        if request_ == "delete":
+            assert answer == {"ok": True} and not hub.manager.dir_of(sid).exists()
+        else:
+            session = (await hub.call("GET", path))[1]["session"]
+            assert [skill.name for skill in hub.manager._attached_skills(sid)] == ["demo"]
+            if request_ == "stop":
+                assert answer["session"]["final"] and (session["state"], session["final"]) == ("created", True)
+            else:
+                assert session["state"] == "running" and session["error"] is None, session
+    finally:
+        gate.set()
+        await hub.close()
+
+
 # ---------------------------------------------------------------------------------------------- uploads
 async def test_uploads_keep_any_file_under_a_checked_name(tmp_path, api_token, hub_token):
     hub = Hub(_manager(_home(tmp_path)))
@@ -728,10 +778,16 @@ async def test_a_deleted_sessions_id_never_reaches_the_one_that_took_its_number(
 async def _took_the_name(hub: Hub, sid: str, files: dict[str, bytes] | None = None) -> str:
     """The session `sid` goes away as a delete makes it go (its folder renamed away) and the owner makes a board session
     with the same title, which gets the same folder name (a delete gives its number to the next one): that session's
-    name, with `files` in its folder."""
+    name, with `files` in its folder. It is made by another process on the home (a second launcher, the CLI: here a
+    second manager), whose create never waits for this hub's lock of that name, which the caller may hold (a create
+    of this hub's own waits for it: SessionManager._create)."""
     manager = hub.manager
     os.rename(manager.dir_of(sid), manager.sessions_dir / f".deleted-{sid}-{time.time_ns()}")
-    other = (await manager.create("Job", "The owner's own job", start=False))["id"]
+    second = _manager(manager.home)
+    try:
+        other = (await second.create("Job", "The owner's own job", start=False))["id"]
+    finally:
+        await second.shutdown()
     assert other == sid and manager.meta(other).get("via") is None
     if files:
         folder = Path(manager.workspace_of(other)["path"])

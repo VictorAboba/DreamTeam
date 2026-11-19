@@ -2417,11 +2417,13 @@ class SessionManager:
         `api`: the session is the HTTP API v1's: session.json gets "via": "api" and the "api" block (the keys of
         API_GIVEN: answers, stop_when_done, client_ref, request_digest, folder; the others null) in its first write,
         before any start (see _start_locked for what every start does with it).
-        With `start`, the session is `starting` (mark_starting) from before the "created" change is announced until
-        its start ends. `mark`: a start mark of the caller's (any object): the new session is `starting` with it from
-        before the "created" change is announced, and with start=False the caller starts it later (in the background:
+        With `start`, the session is `starting` (mark_starting) from its first write of session.json (which lists it)
+        until its start ends. `mark`: a start mark of the caller's (any object): the new session is `starting` with it
+        from its first write of session.json, and with start=False the caller starts it later (in the background:
         v1's create, docs/SPEC.md §21.4) with `start(sid, marked=mark)`, so nobody sees it final in between; a create
-        that fails after the mark takes it away.
+        that fails after the mark takes it away. The session's lock is held from that first write until the session
+        is made (its skills committed, its folder set), so a stop, a start, a folder change or a delete asked
+        meanwhile waits for the create (a stop or a delete then takes the mark away: the start starts nothing).
         `within`: with `workspace`, the resolved root of the HTTP API v1's server folder it lies in (docs/SPEC.md
         §21.10 `in_place`): every check of the folder on the create's way (_plan, the last one under the home's
         workspace claims just before the missing folders are made) finds it inside that root again, by text and by
@@ -2585,32 +2587,35 @@ class SessionManager:
         if api is not None:   # in this first write: any later one could race a start (docs/SPEC.md §21.4)
             meta["via"] = API_VIA
             meta["api"] = copy.deepcopy(api)
-        self._write_meta(sid, meta)
-        if prepared:  # before the folder: a failure leaves nothing in it; the members find them at the first start
-            try:
-                await asyncio.to_thread(self._commit_skills, self.config, prepared, self._data_dir(sid), via=via)
-            except BaseException:
-                await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
-                raise
-        result = None
-        if workspace is not None:
-            try:
-                # with a copy, the folder must still be new or empty: the copied files move there
-                result = await self._set_workspace(sid, workspace, creating=True,
-                                                   expect="moved" if copied is not None else None, within=within)
-            except BaseException:
-                await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
-                raise
-            if result["mode"] == "moved":
-                result["mode"] = "created"
-            elif result["old_kept"]:  # adopted: the session's own folder was never used
-                with contextlib.suppress(OSError):
-                    self.default_workspace(sid).rmdir()
-                result["old_kept"] = None
-        # `starting` before anyone hears of the session: it is never seen final before its first start
+        # `starting` from the first write of session.json, which lists the session, until its first start: it is never
+        # seen final before; and the session's lock is held until it is made (its skills, its folder), so a stop, a
+        # start, a folder change or a delete asked meanwhile waits for it and never meets it half made
         token = self.mark_starting(sid, mark) if start or mark is not None else None
-        self._changed(sid, "created")
+        result = None
         try:
+            async with self._lock(sid):
+                self._write_meta(sid, meta)
+                try:
+                    if prepared:  # before the folder: a failure leaves nothing in it; the members find them at the
+                        # first start
+                        await asyncio.to_thread(self._commit_skills, self.config, prepared, self._data_dir(sid),
+                                                via=via)
+                    if workspace is not None:
+                        # with a copy, the folder must still be new or empty: the copied files move there
+                        result = await self._set_workspace_locked(
+                            sid, workspace, creating=True, expect="moved" if copied is not None else None,
+                            within=within)
+                except BaseException:
+                    await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
+                    raise
+            if result is not None:
+                if result["mode"] == "moved":
+                    result["mode"] = "created"
+                elif result["old_kept"]:  # adopted: the session's own folder was never used
+                    with contextlib.suppress(OSError):
+                        self.default_workspace(sid).rmdir()
+                    result["old_kept"] = None
+            self._changed(sid, "created")
             if start:
                 await self.start(sid, auto_reply=auto_reply, marked=token)
             summary = self.summary(sid)
@@ -3263,60 +3268,70 @@ class SessionManager:
         raise SessionError(f"The folder {plan.target} {what}. Nothing was changed; check the folder and try again "
                            f"(session {sid}).", 409)
 
-    async def _set_workspace(self, sid: str, path: Any, *, creating: bool = False,
-                             expect: str | None = None, within: Path | None = None) -> dict[str, Any]:
-        notify = not creating
+    async def _set_workspace(self, sid: str, path: Any, *, expect: str | None = None) -> dict[str, Any]:
+        """set_workspace's change under the session's lock (_set_workspace_locked); a session that ran again
+        afterwards is announced "started" once the lock is released."""
         async with self._lock(sid):
-            self._check(sid)  # deleted while this call waited for the lock
-            meta = self.meta(sid)
-            self._check_journal(sid, meta)
-            try:
-                cfg = self.config_for(sid)
-            except SessionError:
-                raise
-            except ValueError as exc:
-                raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
-            git_on, network_off = cfg.workspace.git, netoff.is_off(cfg)
-            first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
-                                            network_off=network_off, within=within)
-            if first.mode == "unchanged":
-                return {**first.result(), "restarted": False, "start_error": None}
-            if not creating:   # (a create checked its own folder against the others before it copied)
-                self._check_reserved(first.target)
-            self._check_expected(sid, first, expect)
-            was_loaded, was_running = sid in self.swarms, sid in self.running
-            try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now (a running
-                # session starts again afterwards, also after a failure: its stop is a restart)
-                await self._unload(sid, "restart")
-            except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
-                log.exception("error stopping session %s before moving its workspace", sid)
-            if was_loaded and notify:
-                self._changed(sid, "stopped")
-            try:
-                async with self._claims:  # no other session takes a folder until this one's session.json names it
-                    plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating,
-                                                                       network_off, within)
-            except BaseException:
-                if was_running:
-                    with contextlib.suppress(Exception):
-                        await self._start_locked(sid)
-                    if notify and sid in self.running:
-                        self._changed(sid, "started")
-                raise
-            log.info("session %s now works in %s (%s, git %s)", sid, plan.target, plan.mode, git)
-            if notify:
-                self._changed(sid, "updated")
-            result = {**plan.result(git), "old_changed": old_changed, "restarted": False, "start_error": None}
-            if was_running:
-                try:
-                    await self._start_locked(sid)
-                    result["restarted"] = True
-                except Exception as exc:  # the move stands; the session stays stopped and says why
-                    log.exception("session %s did not start again after moving its workspace", sid)
-                    result["start_error"] = str(exc) if isinstance(exc, SessionError) else \
-                        f"{type(exc).__name__}: {exc}"
-        if was_running and result["restarted"] and notify:
+            result = await self._set_workspace_locked(sid, path, expect=expect)
+        if result["restarted"]:
             self._changed(sid, "started")
+        return result
+
+    async def _set_workspace_locked(self, sid: str, path: Any, *, creating: bool = False,
+                                    expect: str | None = None, within: Path | None = None) -> dict[str, Any]:
+        """The folder session `sid` works in changed to `path` (set_workspace's rules); the caller holds the session's
+        lock (_set_workspace; _create, from its first write of session.json). `creating`: the create's own folder
+        (no change announced, the reservation checked by the create). Returns the result, "restarted" True when a
+        running session ran again afterwards (the caller announces it)."""
+        notify = not creating
+        self._check(sid)  # deleted while the caller waited for the lock
+        meta = self.meta(sid)
+        self._check_journal(sid, meta)
+        try:
+            cfg = self.config_for(sid)
+        except SessionError:
+            raise
+        except ValueError as exc:
+            raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
+        git_on, network_off = cfg.workspace.git, netoff.is_off(cfg)
+        first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
+                                        network_off=network_off, within=within)
+        if first.mode == "unchanged":
+            return {**first.result(), "restarted": False, "start_error": None}
+        if not creating:   # (a create checked its own folder against the others before it copied)
+            self._check_reserved(first.target)
+        self._check_expected(sid, first, expect)
+        was_loaded, was_running = sid in self.swarms, sid in self.running
+        try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now (a running
+            # session starts again afterwards, also after a failure: its stop is a restart)
+            await self._unload(sid, "restart")
+        except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
+            log.exception("error stopping session %s before moving its workspace", sid)
+        if was_loaded and notify:
+            self._changed(sid, "stopped")
+        try:
+            async with self._claims:  # no other session takes a folder until this one's session.json names it
+                plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating,
+                                                                   network_off, within)
+        except BaseException:
+            if was_running:
+                with contextlib.suppress(Exception):
+                    await self._start_locked(sid)
+                if notify and sid in self.running:
+                    self._changed(sid, "started")
+            raise
+        log.info("session %s now works in %s (%s, git %s)", sid, plan.target, plan.mode, git)
+        if notify:
+            self._changed(sid, "updated")
+        result = {**plan.result(git), "old_changed": old_changed, "restarted": False, "start_error": None}
+        if was_running:
+            try:
+                await self._start_locked(sid)
+                result["restarted"] = True
+            except Exception as exc:  # the move stands; the session stays stopped and says why
+                log.exception("session %s did not start again after moving its workspace", sid)
+                result["start_error"] = str(exc) if isinstance(exc, SessionError) else \
+                    f"{type(exc).__name__}: {exc}"
         return result
 
     async def _change_folder(self, sid: str, path: Any, git_on: bool, first: _Plan, expect: str | None,

@@ -4269,10 +4269,14 @@ settings; ValueError when they are invalid):
     it out of `resume_pending`: a start announced after the stop (a v1 `continue` sent after it) keeps its mark and
     starts the session again once the stop is over, whether the stop held the lock already or not, so requests
     keep their order. `create(..., start=True)` marks the new
-    session before it announces the `created` change and starts it with that mark; `create(..., start=False,
-    mark=m)` puts the caller's mark `m` on it at the same point and the caller starts it later with
-    `start(sid, marked=m)` (a v1 create or `continue` that starts a session in the background, which answers in
-    between); a create that fails after marking takes its mark away.
+    session before its first write of session.json (which lists it: `ids()`, v1's listing) and starts it with that
+    mark; `create(..., start=False, mark=m)` puts the caller's mark `m` on it at the same point and the caller starts
+    it later with `start(sid, marked=m)` (a v1 create or `continue` that starts a session in the background, which
+    answers in between); a create that fails after marking takes its mark away. The create holds the session's lock
+    from that first write until the session is made (its skills committed, its folder set: `_set_workspace_locked`),
+    so a listing shows it `starting`, never final, and a stop, a start, a `continue`, a folder change or a delete
+    asked meanwhile waits for it: a run never starts without the skills asked for, a delete never leaves a half-made
+    folder behind, and a stop or a delete then takes the create's mark away (its start starts nothing).
   - `start(sid, ..., then=fn)` calls `fn(swarm)` with the running Swarm once the start succeeded (also when the
     session ran already), still under the session's lock, so nothing that waits for the lock (a stop sent meanwhile,
     a `stop_when_done` stop) comes between the start and it: v1's `continue` gives its text there (§21.2). It is
@@ -7252,8 +7256,10 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   8. the uploads claimed (`claim_many`);
   9. `manager.create(start=False, mark=m, api=..., sources=..., workspace=..., within=...)`: the uploads and a
      `copy` folder are copied into `sessions/.copying-*` before the session folder exists; `_create` then makes
-     `sessions/<sid>`, renames the staging in, writes session.json once, with `via` and `api`, and marks the session
-     `starting` with `m` before it announces it (§17.2);
+     `sessions/<sid>`, renames the staging in, marks the session `starting` with `m`, then writes session.json once,
+     with `via` and `api`, and holds the session's lock until its skills are committed and its folder set, before it
+     announces it (§17.2): a listing shows it `starting` from the first, and a stop, `continue` or DELETE sent
+     meanwhile waits for the create;
   10. the claims settled (21.3);
   11. 202 with state `starting`; the start runs in the background (`manager.start(sid, marked=m)`: nothing when a
       stop or a delete came first), as a task `ApiV1` keeps (`ApiV1.spawn`). A start that fails is in the summary;
@@ -7918,7 +7924,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     kept after a 4xx, a 5xx and a cancel, a token of the other caller, a link or a hard link put in the store;
   - create: an unknown field, team, model, role and skill; a blank goal; a `title` with a line break, over 200
     characters, or equal to the goal's title; `start_agents` 0, over `max_agents`, and with a `team` string;
-    `client_ref` twice, with another body, and during a slow copy; a failed start; `max_running`;
+    `client_ref` twice, with another body, and during a slow copy; a failed start; `max_running`; a session listed
+    `starting` while its create commits its skills, and a DELETE, a stop or a `continue` sent then waiting for the
+    create;
   - auto answers (a question, a review per round, a question pause, past `AUTO_REPLY_MAX`, after a hub restart) and
     manual requests with their answers (`tests/test_api_v1_requests.py`: a question pause, a clarify planner's
     question read from the stopped session's file too, a message, a review answered once per round, an MCP server
