@@ -13,6 +13,7 @@ import asyncio
 import json
 import math
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -22,7 +23,7 @@ import pytest
 from dreamteam import api_v1, events
 from dreamteam import sessions as sessions_module
 from dreamteam.api_v1 import TIMELINE, ApiError, query_wait, safe_json, sse_event
-from dreamteam.autoreply import journal_head
+from dreamteam.autoreply import journal_head, read_requests, requests_of
 from dreamteam.db import SCHEMA, dumps
 from dreamteam.events import read_page
 from dreamteam.eventtext import event_text
@@ -455,6 +456,40 @@ async def test_a_stopped_session_is_read_from_its_file_without_loading_it(tmp_pa
         assert sid not in hub.manager.swarms
         db = hub.manager.dir_of(sid) / ".dreamteam" / "swarm.db"
         assert not db.with_name("swarm.db-wal").exists() and not db.with_name("swarm.db-shm").exists()
+    finally:
+        await hub.close()
+
+
+async def test_reads_in_threads_during_a_stop_leave_the_stopped_session_one_file(tmp_path, api_token):
+    """Reads in threads (a poll's journal, the requests, the result's lists) of a session being stopped go on through
+    its connection until its database is closed (SessionManager.reading), never through its file next to the open
+    writer, which would keep the close from folding the -wal file back: the stopped session is swarm.db alone."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        for _ in range(3):
+            uid, sid, _swarm = await running(hub)
+            done = threading.Event()
+
+            def read() -> None:
+                while not done.is_set():
+                    try:
+                        hub.manager.journal(sid, 0, 500)
+                        hub.api._read_db(sid, requests_of, lambda path: read_requests(path))
+                    except Exception:  # noqa: BLE001 - (a read refused meanwhile: the next one goes on)
+                        pass
+
+            reader = threading.Thread(target=read, daemon=True)
+            reader.start()
+            try:
+                assert (await hub.call("POST", f"/api/v1/sessions/{uid}/stop"))[0] == 200
+            finally:
+                done.set()
+                reader.join(5)
+            data = hub.manager.dir_of(sid) / ".dreamteam"
+            assert sorted(p.name for p in data.iterdir() if p.name.startswith("swarm.db")) == ["swarm.db"]
+            assert sid not in hub.manager._unloading
+            status, page = await poll(hub, uid, "detail=all")
+            assert status == 200 and page["events"][-1]["type"] == "session.stopped"
     finally:
         await hub.close()
 

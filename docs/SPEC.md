@@ -4210,7 +4210,8 @@ settings; ValueError when they are invalid):
   `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `journal(sid, after, limit, types=None, *,
   recipient=None)`, `sid_of_uid(uid)` (`uid=` of `stop`, `control` and `delete`: the uid the caller resolved,
   checked again once the session's lock is taken, 404 when the folder name holds another session by then),
-  `api_sids()`, `sid_of_client_ref(ref)`, `global_config()`,
+  `api_sids()`, `sid_of_client_ref(ref)`, `global_config()`, `reading(sid)` (the Swarm a reader in a thread uses:
+  `journal` below),
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
@@ -4245,7 +4246,12 @@ settings; ValueError when they are invalid):
     journal (`events.read_page`, §21.6 "Polling"). A loaded session's through its own connection under its
     `Database`'s lock (never the session's lock); any other's from its file through `db.reading_file`, opened and
     closed for the read, never through `load`; from the file also when an unload closed the connection meanwhile
-    (`sqlite3.ProgrammingError`). The rows' `data` is decoded after the `Database`'s lock is released
+    (`sqlite3.ProgrammingError`). The connection is the one `reading(sid)` gives: the loaded Swarm's, or, while
+    `_unload` stops it, the Swarm it took out of `swarms` until its database is closed (`_unloading`, filled before
+    the Swarm leaves `swarms`, emptied after the close). So no reader in a thread opens the file next to an open
+    writer: one that did, at the moment of the close, would keep SQLite from folding the `-wal` file back into
+    `swarm.db`, and the stopped session would be left with `-wal` and `-shm` files holding its run. The close waits
+    for a reader that holds the `Database`'s lock. The rows' `data` is decoded after the `Database`'s lock is released
     (`read_page(..., decode=False)`, then `events.event_data`), since the event loop takes that lock too. A session
     without a database has no events (head 0). A file that cannot be read now is `SessionError` 503
     (`sessions.JOURNAL_TEXT`, the cause logged), never an empty page: that would tell a client which has read `final`
@@ -7347,7 +7353,8 @@ retried answer never lands on a newer one:
   do not block the work, and the board decides them.
 - `question`, `review` and `mcp` requests block the work: the state is then `waiting` (21.7). `message` requests do
   not.
-- `GET requests` reads a loaded session's requests through its swarm (`requests_of`) and any other session's from its
+- `GET requests` reads a loaded session's requests through its swarm (`requests_of`; also while an unload stops it,
+  until its database is closed: `SessionManager.reading`, §17.2) and any other session's from its
   file (`read_requests` with the session's `[swarm] clarify`: its overrides on the global settings, as its summary
   reads it), never loading it; also from the file when an unload closed the swarm's connection while it read
   (`sqlite3.ProgrammingError`). In a thread (`ApiV1._read_db`): the file may be large. A stopped session's file that
@@ -7536,8 +7543,10 @@ An event is a journal row (§9) with its id, plus a line for people:
   - A stopped session's journal is read from its file, read-only and closed after each read (`db.reading_file`), never
     through `manager.load`, which would build and keep a whole Swarm. A loaded session's journal is read through its
     connection, under the database's own lock (`Database` serializes its calls), never the session's lock: that one is
-    held for a whole start, stop or folder move. A connection closed meanwhile (`sqlite3.ProgrammingError`) is read
-    again through the file.
+    held for a whole start, stop or folder move. So is a session's that a stop is unloading, until its database is
+    closed (`SessionManager.reading`): no read in a thread opens the file next to the open writer, so the close
+    leaves `swarm.db` alone, with no `-wal` or `-shm` file. A connection closed meanwhile (`sqlite3.ProgrammingError`)
+    is read again through the file.
 - **Stream** (`GET .../events/stream`). `text/event-stream`, with `Cache-Control: no-cache` and
   `X-Accel-Buffering: no`; each event is `id: <id>`, `event: <type>`, `data: <the event JSON>` (one line: the JSON
   escapes line breaks; `api_v1.sse_event`); it starts after `after` or after the `Last-Event-ID` header, which wins
@@ -7918,7 +7927,8 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     message sent, what the mailbox refuses; a damaged file of a stopped session; the API token's scope);
   - polling (`after=0` from the oldest, a page the filter emptied answered at once, an `after` past the head, `wait`
     woken by an event, a change of state and a released lock, `final` never before `session.stopped`, the user's
-    notifications only in the timeline, a stopped session read without loading it, a `NaN` in an event's data, the
+    notifications only in the timeline, a stopped session read without loading it, reads in threads during a stop
+    leaving the stopped session's `swarm.db` alone, with no `-wal` or `-shm` file, a `NaN` in an event's data, the
     lines in the session's language (ru) unless `lang` names one, a journal that cannot be read answered as an error
     and never as complete, a 404 once the session is deleted during the wait) and the stream (resumed by
     `Last-Event-ID`, across a stop and a start, its `result`, a final session behind a gap the filter empties ending

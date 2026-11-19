@@ -978,6 +978,8 @@ class SessionManager:
             raise ValueError(f"Invalid settings in {settings_path(self.home)}: {exc}") from None
         self._stamp = self._settings_stamp()
         self.swarms: dict[str, "Swarm"] = {}   # loaded sessions (running or not)
+        # sessions _unload took out of `swarms` whose database is not closed yet: readers in threads use it (reading)
+        self._unloading: dict[str, "Swarm"] = {}
         self.running: set[str] = set()
         self.hub_url: str | None = None        # base URL of the web server (no trailing /), set by launcher.serve
         self._locks: dict[str, asyncio.Lock] = {}  # kept after a delete: a waiter may still hold the old lock
@@ -2125,14 +2127,15 @@ class SessionManager:
     def journal(self, sid: str, after: int, limit: int, types: tuple[str, ...] | None = None, *,
                 recipient: str | None = None) -> tuple[list[dict[str, Any]], int, bool]:
         """One page of the session's journal (events.read_page: (events, last, more); docs/SPEC.md §21.6 "Polling").
-        A loaded session's through its own connection, under its Database's lock (never the session's lock, which a
-        start, a stop or a folder move holds for long); any other's from its file, read-only, opened and closed for
-        this read (db.reading_file), never through load(), which would build and keep a whole Swarm; from the file
-        also when an unload closed the connection meanwhile (sqlite3.ProgrammingError). The rows' data is decoded after
-        the Database's lock is released (the event loop takes it too). A session without a database has no events
-        (head 0). A file that cannot be read is SessionError 503 (JOURNAL_TEXT, the cause logged), never an empty page,
-        which would say "nothing more" to a client that has missed events. Blocking: call it in a thread."""
-        swarm = self.swarms.get(sid)
+        A loaded session's, or one being unloaded until its database is closed (reading), through its own connection,
+        under its Database's lock (never the session's lock, which a start, a stop or a folder move holds for long);
+        any other's from its file, read-only, opened and closed for this read (db.reading_file), never through load(),
+        which would build and keep a whole Swarm; from the file also when an unload closed the connection meanwhile
+        (sqlite3.ProgrammingError). The rows' data is decoded after the Database's lock is released (the event loop
+        takes it too). A session without a database has no events (head 0). A file that cannot be read is SessionError
+        503 (JOURNAL_TEXT, the cause logged), never an empty page, which would say "nothing more" to a client that has
+        missed events. Blocking: call it in a thread."""
+        swarm = self.reading(sid)
         page = None
         if swarm is not None:
             try:
@@ -3029,8 +3032,15 @@ class SessionManager:
         session journals `session.stopped` {reason} after its agents stopped and before its database closes (an emit
         after the close raises); None journals nothing (nor does a session that is not running). A running v1
         session records `api.finished_at` first (docs/SPEC.md §21.4), whatever the reason. What runs beside a v1
-        session's run (_RunWatch: the automatic answers, the stop_when_done watcher) stops first, before its agents."""
-        swarm = self.swarms.pop(sid, None)
+        session's run (_RunWatch: the automatic answers, the stop_when_done watcher) stops first, before its agents.
+        Until its database is closed the Swarm stays in `_unloading` (put there before it leaves `swarms`), so a reader
+        in a thread (reading: the journal, v1's reads) goes on through its connection, which the close waits for, and
+        never opens the file next to an open writer: a reader of the file at that moment would keep the close from
+        folding the -wal file back into it."""
+        swarm = self.swarms.get(sid)
+        if swarm is not None:
+            self._unloading[sid] = swarm
+        self.swarms.pop(sid, None)
         was_running = sid in self.running
         self.running.discard(sid)
         watch = self._run_watch.pop(sid, None)
@@ -3048,7 +3058,18 @@ class SessionManager:
                     if reason is not None:
                         self._journal_stopped(sid, swarm, reason)
             finally:
-                swarm.close()
+                try:
+                    swarm.close()
+                finally:
+                    if self._unloading.get(sid) is swarm:
+                        del self._unloading[sid]
+
+    def reading(self, sid: str) -> "Swarm | None":
+        """The Swarm whose connection a reader of session `sid` in a thread uses (docs/SPEC.md §21.6): the loaded one,
+        or one _unload is stopping whose database is not closed yet; None when the session's file is read (no writer
+        is open). Under its Database's lock; a sqlite3.ProgrammingError means it closed meanwhile: read the file."""
+        swarm = self.swarms.get(sid)
+        return swarm if swarm is not None else self._unloading.get(sid)
 
     @staticmethod
     def _journal_stopped(sid: str, swarm: "Swarm", reason: str, **data: Any) -> None:

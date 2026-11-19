@@ -1613,11 +1613,12 @@ class ApiV1:
 
     # ---- requests and messages (docs/SPEC.md §21.5) ----------------------------------------------------------------
     def _read_db(self, sid: str, loaded: Callable[["Swarm"], Any], stored: Callable[[Path], Any]) -> Any:
-        """What a route reads from session `sid`'s database: `loaded(swarm)` for a loaded session (its own connection,
-        under its Database's lock), else `stored(path)` from its file, read-only, never through manager.load (which
-        would build and keep a whole Swarm); from the file also when an unload closed the connection meanwhile
-        (sqlite3.ProgrammingError). Blocking: a route calls it in a thread."""
-        swarm = self.manager.swarms.get(sid)
+        """What a route reads from session `sid`'s database: `loaded(swarm)` for a loaded session, or one being unloaded
+        until its database is closed (SessionManager.reading: its own connection, under its Database's lock), else
+        `stored(path)` from its file, read-only, never through manager.load (which would build and keep a whole Swarm);
+        from the file also when an unload closed the connection meanwhile (sqlite3.ProgrammingError). Blocking: a
+        route calls it in a thread."""
+        swarm = self.manager.reading(sid)
         if swarm is not None:
             try:
                 return loaded(swarm)
