@@ -16,8 +16,8 @@ from pathlib import Path
 import pytest
 
 from dreamteam import nofollow as nf
-from dreamteam.nofollow import (DIR, ERROR, EXCLUDED, FILE, HARD_LINK, LINK, SPECIAL, Refused, list_inside,
-                                open_inside, walk_inside)
+from dreamteam.nofollow import (DIR, ERROR, EXCLUDED, FILE, HARD_LINK, LINK, SPECIAL, Refused, hold_inside,
+                                list_inside, open_inside, walk_inside)
 
 WINDOWS = sys.platform == "win32"
 SECRET = b"SECRET outside the root"
@@ -226,6 +226,38 @@ def test_a_root_that_is_a_link_is_refused(tmp_path):
         list_inside(tmp_path / "root-link")
     with pytest.raises(Refused):
         list(walk_inside(tmp_path / "root-link"))
+
+
+def test_a_folder_held_stays_where_it_is_on_windows(tmp_path):
+    """hold_inside reaches a folder as open_inside does (a link on the way is refused). On Windows, while it is open,
+    neither the folder nor a folder above it can be renamed, what is inside the folder can; POSIX has no such hold,
+    and the descriptor stays the folder wherever it is moved."""
+    root, outside = _tree(tmp_path)
+    _write(root / "b" / "c" / "f.txt", "F")
+    _dir_link(outside, root / "j")
+    with pytest.raises(Refused):
+        hold_inside(root, ("j",))
+    with pytest.raises(FileNotFoundError):
+        hold_inside(root, ("b", "none"))
+    os.close(hold_inside(root))
+    fd = hold_inside(root, ["b", "c"])
+    try:
+        assert os.path.samestat(os.fstat(fd), os.stat(root / "b" / "c"))
+        (root / "b" / "c" / "f.txt").rename(root / "b" / "c" / "g.txt")
+        (root / "b" / "c" / "d").mkdir()
+        if WINDOWS:
+            for folder in (root / "b" / "c", root / "b", root):
+                with pytest.raises(PermissionError):
+                    folder.rename(folder.with_name(folder.name + ".old"))
+        else:
+            (root / "b").rename(root / "b.old")
+            _dir_link(outside, root / "b")
+            assert sorted(os.listdir(fd)) == ["d", "g.txt"]
+    finally:
+        os.close(fd)
+    if WINDOWS:   # (free again)
+        (root / "b").rename(root / "b.old")
+    assert sorted(os.listdir(root / "b.old" / "c")) == ["d", "g.txt"]
 
 
 def test_a_swap_between_the_check_and_the_open_is_refused(tmp_path, monkeypatch):
@@ -630,8 +662,8 @@ def _tracked(monkeypatch):
     fs = nf._FS
     real_root, real_child, real_close, real_reader = fs.root, fs.child, nf._close, nf._reader
 
-    def root(path):
-        folder = real_root(path)
+    def root(path, **kw):
+        folder = real_root(path, **kw)
         opened.append(folder.fd)
         return folder
 

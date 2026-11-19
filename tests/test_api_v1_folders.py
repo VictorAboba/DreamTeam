@@ -29,6 +29,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from dreamteam import apifolders, cli, copyfrom, docker as docker_module, hubauth, netoff, nofollow, sessions, shell
+from dreamteam import workspace as workspace_module
 from dreamteam import settings as st
 from dreamteam.config import API_FOLDERS_ENV, ApiFolder, Config
 from dreamteam.copyfrom import CopyError, CopyLimits, Source, copy_sources
@@ -364,34 +365,22 @@ async def test_a_link_swapped_in_after_the_request_was_resolved_ends_the_create(
         await hub.close()
 
 
-@pytest.mark.parametrize("when", ["before_carry_out", pytest.param("during_git_init", marks=needs_git)])
 async def test_a_link_swapped_in_after_the_last_plan_leaves_nothing_outside(tmp_path, api_token, no_start,
-                                                                             monkeypatch, when):
+                                                                             monkeypatch):
     """_carry_out finds the folders it makes inside the root again: a link swapped in after _change_folder's last
-    _plan (under the workspace claims) ends the create before a folder is made outside, and one swapped in while git
-    init runs (by path) is found right after it, the repository it made outside removed by the undo."""
-    hub, _jobs, places = _hub(tmp_path, git_on=when == "during_git_init")
+    _plan (under the workspace claims) ends the create before a folder is made outside."""
+    hub, _jobs, places = _hub(tmp_path)
     no_start(hub.manager)
     outside = _outside(tmp_path)
     (places / "acme" / "site").mkdir(parents=True)
-    if when == "before_carry_out":
-        real_carry_out = SessionManager._carry_out
+    real_carry_out = SessionManager._carry_out
 
-        def swap_then_carry_out(self, sid, plan, undo):
-            if plan.within is not None:
-                _swap_for_link(places / "acme", outside)
-            return real_carry_out(self, sid, plan, undo)
-
-        monkeypatch.setattr(SessionManager, "_carry_out", swap_then_carry_out)
-    else:
-        (outside / "site" / "new").mkdir()   # where the swapped-in junction leads git init
-        real_init = sessions.init_repo
-
-        def swap_then_init(folder: Path, *args: Any, **kwargs: Any) -> str | None:
+    def swap_then_carry_out(self, sid, plan, undo):
+        if plan.within is not None:
             _swap_for_link(places / "acme", outside)
-            return real_init(folder, *args, **kwargs)
+        return real_carry_out(self, sid, plan, undo)
 
-        monkeypatch.setattr(sessions, "init_repo", swap_then_init)
+    monkeypatch.setattr(SessionManager, "_carry_out", swap_then_carry_out)
     try:
         status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "acme/site/new",
                                                                    "mode": "in_place"}})
@@ -399,9 +388,86 @@ async def test_a_link_swapped_in_after_the_last_plan_leaves_nothing_outside(tmp_
         assert "places/acme/site" in answer["error"].replace(os.sep, "/"), answer
         _no_path(answer, tmp_path)
         assert hub.manager.ids() == [] and os.listdir(outside / "site") == ["secret.txt"]
-        made = os.listdir(places / "acme.old" / "site")   # (made inside before the swap: an empty folder at most)
-        assert made == ([] if when == "before_carry_out" else ["new"])
-        assert all(os.listdir(places / "acme.old" / "site" / name) == [] for name in made)
+        assert os.listdir(places / "acme.old" / "site") == []
+    finally:
+        await hub.close()
+
+
+@needs_git
+@pytest.mark.parametrize("when", ["before_init", "between_steps", "after_init", "after_carry_out"])
+async def test_git_init_in_place_never_writes_or_removes_through_a_link_swapped_in(tmp_path, api_token, no_start,
+                                                                                    monkeypatch, when):
+    """Git init in an in-place folder runs with the folder held (sessions._init_held): on Windows nothing on its way
+    can be renamed until git is done, so a writer of the root cannot swap it for a link then; on POSIX the folder is
+    found inside the root again, as the folder held, before each step of init_repo and after the last, and what git
+    made is removed through the held folder's descriptor. The undo of a later failure removes .git / .gitignore only
+    from the folder held, found again: through a link swapped in after git init it removes nothing and says so (500).
+    Never is anything written or removed in the repository the link leads to."""
+    hub, _jobs, places = _hub(tmp_path, git_on=True)
+    no_start(hub.manager)
+    victim = tmp_path / "owner-project"   # a repository outside the root, with no .gitignore
+    repository(victim, 1)
+    _write(places / "job" / "owner.txt", "the owner's file\n")
+    blocked: list[bool] = []
+
+    def swap() -> None:
+        try:
+            _swap_for_link(places / "job", victim)
+        except PermissionError:   # (Windows: the folder is held while git init runs)
+            blocked.append(True)
+
+    if when == "before_init" or when == "after_init":
+        real_init = sessions.init_repo
+
+        def swap_around_init(folder: Path, *args: Any, **kwargs: Any) -> str | None:
+            if when == "before_init":
+                swap()
+            error = real_init(folder, *args, **kwargs)
+            if when == "after_init":
+                swap()
+            return error
+
+        monkeypatch.setattr(sessions, "init_repo", swap_around_init)
+    elif when == "between_steps":
+        real_run_git = workspace_module.run_git
+
+        def run_git_then_swap(root: Path, *args: str, **kwargs: Any):
+            proc = real_run_git(root, *args, **kwargs)
+            if "init" in args:   # (git init done: the .gitignore, ls-files, add and commit follow)
+                swap()
+            return proc
+
+        monkeypatch.setattr(workspace_module, "run_git", run_git_then_swap)
+    else:
+        real_carry_out = SessionManager._carry_out
+
+        def carry_out_swap_then_fail(self, sid, plan, undo):
+            git_done = real_carry_out(self, sid, plan, undo)
+            if plan.within is not None:
+                swap()
+                raise OSError("a later step failed")
+            return git_done
+
+        monkeypatch.setattr(SessionManager, "_carry_out", carry_out_swap_then_fail)
+    try:
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "job",
+                                                                   "mode": "in_place"}})
+        _no_path(answer, tmp_path)
+        if blocked:
+            assert WINDOWS and when != "after_carry_out"
+            assert status == 202, answer
+            assert (places / "job" / ".git").is_dir() and (places / "job" / ".gitignore").is_file()
+        elif when == "after_carry_out":
+            assert status == 500 and "not removed" in answer["error"], answer
+            assert (places / "job.old" / ".git").is_dir()   # (left in the folder the hub can no longer reach)
+        else:
+            assert not WINDOWS
+            assert status == 403 and answer["code"] == "forbidden_folder", answer
+            assert sorted(os.listdir(places / "job.old")) == ["owner.txt"]   # (what git made there: removed)
+        if status != 202:
+            assert hub.manager.ids() == []
+        assert sorted(os.listdir(victim)) == [".git", "file0.txt"]
+        assert git(victim, "rev-list", "--count", "HEAD") == "1" and git(victim, "status", "--porcelain") == ""
     finally:
         await hub.close()
 

@@ -22,10 +22,11 @@ when it was put in place of a folder or a file after it was checked (a swap whil
   parent's descriptor, never DirEntry.stat(), which says 0 on Windows) is never read: another name of it may lie
   outside the root. FIFOs, sockets and devices are never opened.
 
-`open_inside` opens one file (or folder) and gives its descriptor, `list_inside` lists one folder, `walk_inside`
-walks a tree in name order and gives each regular file open, as a file object the walk owns. Paths of the computer
-never appear in their errors: an error names the path relative to the root, with '/'. Everything here blocks (run
-it in a thread). Stdlib only, ctypes on Windows.
+`open_inside` opens one file (or folder) and gives its descriptor, `hold_inside` opens a folder that (on Windows)
+nothing on its way can be renamed from while it is open, `list_inside` lists one folder, `walk_inside` walks a tree
+in name order and gives each regular file open, as a file object the walk owns. Paths of the computer never appear
+in their errors: an error names the path relative to the root, with '/'. Everything here blocks (run it in a
+thread). Stdlib only, ctypes on Windows.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ from dataclasses import dataclass, field
 from typing import Any, BinaryIO, Callable, Iterator
 
 __all__ = ["DIR", "FILE", "LINK", "HARD_LINK", "SPECIAL", "EXCLUDED", "ERROR", "REASONS", "MAX_DEPTH", "Entry",
-           "Refused", "open_inside", "list_inside", "walk_inside"]
+           "Refused", "open_inside", "hold_inside", "list_inside", "walk_inside"]
 
 # what an Entry is
 DIR = "dir"                # a folder (walk_inside: entered next)
@@ -259,8 +260,9 @@ def _listed(name: str, st: os.stat_result) -> _Listed:
 
 # ---- POSIX: descriptors all the way down -------------------------------------------------------------------------
 class _Posix:
+    # (`hold`, hold_inside's: POSIX has no hold; the descriptor stays the folder wherever it is moved)
     @staticmethod
-    def root(path: str) -> _Dir:
+    def root(path: str, *, hold: bool = False) -> _Dir:
         try:
             return _Dir(os.open(path, _DIR_FLAGS))
         except OSError as exc:
@@ -285,8 +287,8 @@ class _Posix:
             raise FileNotFoundError(errno.ENOENT, "no such name in the folder (names are compared exactly)", rel)
 
     @staticmethod
-    def child(parent: _Dir, name: str, rel: str, *, want_dir: bool,
-              data: bool = True) -> tuple[int, os.stat_result, str | None]:
+    def child(parent: _Dir, name: str, rel: str, *, want_dir: bool, data: bool = True,
+              hold: bool = False) -> tuple[int, os.stat_result, str | None]:
         """Open `name` in `parent` without following it: (descriptor, its fstat, None)."""
         try:
             before = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
@@ -341,6 +343,9 @@ _FILE_READ_DATA = 0x1            # FILE_LIST_DIRECTORY for a folder
 _FILE_READ_ATTRIBUTES = 0x80
 _SYNCHRONIZE = 0x100000
 _SHARE_ALL = 0x1 | 0x2 | 0x4     # FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE
+# hold_inside's folder: no FILE_SHARE_DELETE, so while the handle (which reads data: an attributes-only handle is never
+# checked for sharing) is open, neither the folder nor a folder above it can be renamed, moved or removed
+_SHARE_HOLD = 0x1 | 0x2
 _OPEN_EXISTING = 3
 _FLAG_BACKUP_SEMANTICS = 0x02000000   # (needed to open a folder)
 _FLAG_OPEN_REPARSE_POINT = 0x00200000
@@ -403,11 +408,13 @@ class _WindowsApi:
         code = self.ctypes.get_last_error() if code is None else code
         return OSError(None, self.ctypes.FormatError(code).strip(), rel or ".", code)
 
-    def open(self, full: str, rel: str, *, folder: bool, data: bool, reparse: bool) -> int:
-        """A handle of `full` (`reparse`: the reparse point itself, never followed), as a C runtime descriptor."""
-        access = (_FILE_READ_DATA if data else 0) | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE
+    def open(self, full: str, rel: str, *, folder: bool, data: bool, reparse: bool, hold: bool = False) -> int:
+        """A handle of `full` (`reparse`: the reparse point itself, never followed; `hold`: sharing no deleting,
+        _SHARE_HOLD), as a C runtime descriptor."""
+        access = (_FILE_READ_DATA if data or hold else 0) | _FILE_READ_ATTRIBUTES | _SYNCHRONIZE
         flags = (_FLAG_BACKUP_SEMANTICS if folder else 0) | (_FLAG_OPEN_REPARSE_POINT if reparse else 0)
-        handle = self.create_file(full, access, _SHARE_ALL, None, _OPEN_EXISTING, flags, None)
+        handle = self.create_file(full, access, _SHARE_HOLD if hold else _SHARE_ALL, None, _OPEN_EXISTING, flags,
+                                  None)
         if handle is None or handle == self.invalid:
             raise self.error(rel)
         try:
@@ -475,16 +482,18 @@ class _Windows:
             self._api = _WindowsApi()
         return self._api
 
-    def _open(self, full: str, rel: str, *, want_dir: bool, data: bool) -> tuple[int, os.stat_result, str]:
+    def _open(self, full: str, rel: str, *, want_dir: bool, data: bool,
+              hold: bool = False) -> tuple[int, os.stat_result, str]:
         """Open `full` without following it: lstat first (no link, the kind asked), then a handle of the entry
-        itself, which must show no link either, be what lstat saw, and gives its final path."""
+        itself, which must show no link either, be what lstat saw, and gives its final path. `hold`: the handle
+        shares no deleting (hold_inside)."""
         try:
             before = os.lstat(full)
         except OSError as exc:
             raise _named(exc, rel) from None
         _expect(before, rel, want_dir)
         api = self.api
-        fd = api.open(full, rel, folder=want_dir, data=data, reparse=True)
+        fd = api.open(full, rel, folder=want_dir, data=data, reparse=True, hold=hold)
         try:
             attributes, tag = api.attribute_tag(fd, rel)
             if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT:
@@ -494,7 +503,7 @@ class _Windows:
                 # handle must still be what lstat saw (and, for a name below a folder, end at its final path)
                 checked, fd = fd, -1
                 _close(checked)
-                fd = api.open(full, rel, folder=want_dir, data=data, reparse=False)
+                fd = api.open(full, rel, folder=want_dir, data=data, reparse=False, hold=hold)
             st = os.fstat(fd)
             if not _same(before, st):
                 raise Refused(rel, "replaced")
@@ -504,8 +513,8 @@ class _Windows:
                 _close(fd)
             raise
 
-    def root(self, path: str) -> _Dir:
-        fd, _st, final = self._open(_long(path), "", want_dir=True, data=True)
+    def root(self, path: str, *, hold: bool = False) -> _Dir:
+        fd, _st, final = self._open(_long(path), "", want_dir=True, data=True, hold=hold)
         return _Dir(fd, final, final)
 
     @staticmethod
@@ -516,17 +525,19 @@ class _Windows:
         if len(name.encode("utf-16-le")) // 2 > _WINDOWS_NAME_MAX:
             raise FileNotFoundError(errno.ENOENT, "no such name in the folder (longer than a name can be)", rel)
 
-    def child(self, parent: _Dir, name: str, rel: str, *, want_dir: bool,
-              data: bool = True) -> tuple[int, os.stat_result, str]:
+    def child(self, parent: _Dir, name: str, rel: str, *, want_dir: bool, data: bool = True,
+              hold: bool = False) -> tuple[int, os.stat_result, str]:
         """Open `name` below the parent's final path without following it: (descriptor, fstat, final path). The
         final path must be the parent's and `name`. One that lies out of the root (a link above, swapped in after
         the parent was checked) is Refused "outside". One still below the root's final path is not this name
         (FileNotFoundError): another spelling of it (letter case, a short name), or it or a folder above it renamed
-        or moved inside the root meanwhile; a final path has no link in it, so the file is inside, but not read."""
+        or moved inside the root meanwhile; a final path has no link in it, so the file is inside, but not read.
+        `hold`: the handle shares no deleting (hold_inside), so once its final path is checked nothing on the way
+        can be renamed any more."""
         assert parent.final is not None and parent.root_final is not None
         head = parent.final.rstrip("\\")
         expected = f"{head}\\{name}"
-        fd, st, final = self._open(expected, rel, want_dir=want_dir, data=data)
+        fd, st, final = self._open(expected, rel, want_dir=want_dir, data=data, hold=hold)
         if final != expected:
             _close(fd)
             if final.startswith(parent.root_final.rstrip("\\") + "\\"):
@@ -553,15 +564,15 @@ class _Windows:
 _FS: Any = _Windows() if _WINDOWS else _Posix()
 
 
-def _open_folder(root: str | os.PathLike, parts: tuple[str, ...]) -> _Dir:
-    """The folder `parts` below `root`, open, reached name by name."""
+def _open_folder(root: str | os.PathLike, parts: tuple[str, ...], *, hold: bool = False) -> _Dir:
+    """The folder `parts` below `root`, open, reached name by name (`hold`: the last one held, hold_inside)."""
     fs = _FS
-    folder = fs.root(_root_text(root))
+    folder = fs.root(_root_text(root), hold=hold and not parts)
     try:
         for i, name in enumerate(parts):
             rel = "/".join(parts[:i + 1])
             fs.spelled(folder, name, rel)
-            fd, _st, final = fs.child(folder, name, rel, want_dir=True)
+            fd, _st, final = fs.child(folder, name, rel, want_dir=True, hold=hold and i == len(parts) - 1)
             _close(folder.fd)
             folder = _Dir(fd, final, folder.root_final)
     except BaseException:
@@ -594,6 +605,17 @@ def open_inside(root: str | os.PathLike, parts: Any = (), *, want_dir: bool = Fa
         _close(fd)
         raise Refused(rel, "hard_link")
     return fd
+
+
+def hold_inside(root: str | os.PathLike, parts: Any = ()) -> int:
+    """A descriptor of the folder `parts` below the folder `root` (absolute, resolved by the caller; the root itself
+    for no parts), reached as open_inside reaches it, that holds it where it is. On Windows its handle shares no
+    deleting: while it is open, neither the folder nor any folder above it can be renamed, moved or removed, so its
+    path, checked name by name, stays the folder and no link can take a place on the way (what is inside the folder
+    can still change). POSIX has no such hold: the descriptor stays the folder wherever it is moved, so what must
+    happen in that very folder goes through it (`dir_fd`). The caller closes it. Errors as open_inside's for a folder;
+    on Windows also PermissionError while another handle of the folder is open for deleting. Blocking."""
+    return _open_folder(root, _check_parts(parts), hold=True).fd
 
 
 def list_inside(root: str | os.PathLike, parts: Any = ()) -> list[Entry]:

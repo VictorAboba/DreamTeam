@@ -4677,8 +4677,9 @@ next start, which checks the folder).
   recorded once its destination holds the entry; a destination that exists is never replaced or merged into
   (FileExistsError, also across volumes); an entry is put back only where nothing new appeared meanwhile (else it
   is reported); created folders are removed only when empty; `.git` / `.gitignore` only when the change created
-  them (a `.git` that appears in the target meanwhile is a 409, never initialized over). When the undo cannot
-  finish, the error (500) lists the files left in the target and the journal stays: `start` and `set_workspace`
+  them (a `.git` that appears in the target meanwhile is a 409, never initialized over); in a server folder of the
+  HTTP API only from the folder git init ran in, found again inside its root (§21.10 "Resolution"). When the undo
+  cannot finish, the error (500) lists the files left in the target and the journal stays: `start` and `set_workspace`
   then refuse (409) naming both folders and the journal to delete once the files are together.
 - The members hear of it at the next start: `n_workspace_moved` {path, old}, or `n_workspace_changed` {path, old}
   after an adopt or a fresh start (session.json `workspace_notice` until then); quietly for LLM members (their
@@ -7930,7 +7931,7 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     with the launcher MCP's `session_create`.
   - `apifolders.py`: the roots of `[api] folders` (in the sandbox's container, where it mounts them), their checks,
     a request's folder (21.10).
-  - `nofollow.py`: open, list and walk inside a root without following links (21.8, 21.10).
+  - `nofollow.py`: open, list and walk inside a root without following links, and hold a folder there (21.8, 21.10).
   - `hubauth.py`: the API token (21.1). `web.py`: `is_api_path`, `API_CALLER` and the guard's v1 branch (§14).
 - **Docs** (en and ru alike): docs/en|ru/http-api.md, the guide for a client (a curl walk-through, the routes,
   states, errors, the compatibility rule and the security notes), linked from the docs indexes and the READMEs (an
@@ -8024,8 +8025,10 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     `folder`;
   - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
     spelling (one folder), each name taken as its folder lists it (`as_listed`), a root under /run or /var/run
-    refused and never mounted, a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, and
-    `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;
+    refused and never mounted, a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, a
+    link swapped in before git init, between its steps, after it and after `_carry_out` (nothing written or removed in
+    the repository it leads to; on Windows the folder held refuses the swap; `tests/test_nofollow.py`: `hold_inside`),
+    and `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;
   - the clients (`tests/test_tui_print.py`, `tests/test_tui_app.py`, `tests/test_tui_commands.py`,
     `tests/test_tui_render.py`, `tests/test_cli_launcher.py`, `tests/test_launcher.py`, `tests/test_ui.py`,
     `tests/test_instruct.py`): `-p -r` on an `answers: "auto"` session
@@ -8125,10 +8128,21 @@ in_place = false            # true: a session may also work in a folder under it
   on the way is met, never followed (403);
   for in place, every `_plan` on the create path, the last of them under the home's workspace claims just before the
   missing folders are made (`_change_folder` → `_carry_out`), and then `_carry_out` itself (`_Plan.within`): the
-  deepest level that is there, each level right after it makes it (by path), and the folder before and after `git
-  init` must still resolve to themselves inside the root (`sessions._check_inside`, 403 `forbidden_folder`; the undo
-  removes what was made, so at most an empty folder made through a junction swapped in at that instant exists
-  outside for that instant). A link swapped in meanwhile ends the create, and every start checks again ("Starts").
+  deepest level that is there and each level right after it makes it (by path) must still resolve to themselves
+  inside the root (`sessions._check_inside`, 403 `forbidden_folder`). The undo removes a level it made only while its
+  path still names the folder made (its identity, `_Undo.made`), so at most an empty folder made through a junction
+  swapped in at that instant exists outside for that instant, and never one that was there before.
+  `git init` runs with the folder held (`sessions._init_held`): `nofollow.hold_inside` opens it from the resolved
+  root name by name, never through a link. On Windows that handle shares no deleting, so until git is done neither
+  the folder nor a folder above it can be renamed, moved or removed, and no link can take a place on its way. POSIX
+  has no such hold: the folder must still resolve to itself inside the root and be the folder held (its identity,
+  `_check_held`) before each step of `init_repo` (`check=`: git init, the `.gitignore`, ls-files, add, commit) and
+  after the last, so a link swapped in ends it at the next step (403). What git init made (`.git`, and the
+  `.gitignore` when there was none) is removed, when a step fails, through the held folder (`_remove_held`: `dir_fd`
+  on POSIX; on Windows by its path, which the hold keeps), never by a path that may lead elsewhere. The undo of a later
+  failure removes them only from that folder, held again with the same identity (`_Undo.held`); a folder no longer
+  reached so keeps them, and the error says so (500, "not removed"). Nothing is written or removed through a link
+  swapped in. A link swapped in meanwhile ends the create, and every start checks again ("Starts").
 - Every rule of `copy_from` and `workspace` (§17.2) applies as well.
 
 **`copy`.**

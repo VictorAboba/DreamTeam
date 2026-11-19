@@ -471,26 +471,35 @@ def nested_repo_paths(root: Path, listed: bytes) -> list[str]:
     return found
 
 
-def init_repo(root: Path, git: str | None = None, *, adopted: bool = False, offline: bool = False) -> str | None:
+def init_repo(root: Path, git: str | None = None, *, adopted: bool = False, offline: bool = False,
+              check: Callable[[], None] | None = None) -> str | None:
     """`git init` in `root` with a `.gitignore` (unless one exists) and an initial commit of what is there,
     as for a new workspace (synchronous). `adopted`: a folder of the user (its files are committed with the user's
-    own line-ending settings, as every later commit there is); `offline`: run_git's. Returns None on success, else
-    git's error text."""
+    own line-ending settings, as every later commit there is); `offline`: run_git's. `check`: called before each
+    step (each git command, the .gitignore), it ends the init by raising (a server folder of the HTTP API v1 must
+    still be the folder it held inside its root: sessions._check_held). Returns None on success, else git's error
+    text."""
+    step = check or (lambda: None)
+    step()
     proc = run_git(root, "-c", "init.defaultBranch=main", "init", "-q", git=git, adopted=adopted, offline=offline)
     if proc.returncode != 0:
         return git_output(proc) or f"git init failed with code {proc.returncode}"
     gitignore = root / ".gitignore"
+    step()
     if not gitignore.exists():
         gitignore.write_bytes(DEFAULT_GITIGNORE.encode("utf-8"))
     # An adopted folder may hold cloned or generated projects: left out like in every autocommit (the next shell
     # call's autocommit tells the agent about them), not committed as gitlinks without a .gitmodules
+    step()
     listed = run_git(root, "ls-files", "--others", "--exclude-standard", "-z", git=git, adopted=adopted,
                      offline=offline)
     nested = nested_repo_paths(root, listed.stdout) if listed.returncode == 0 else []
     if nested:
         log.info("initial commit of %s leaves out nested repositories: %s", root, ", ".join(nested))
+    step()
     run_git(root, "add", "-A", "--ignore-errors", "--", ".", *(f":(exclude,literal){path}" for path in nested),
             git=git, adopted=adopted, literal=False, unfiltered=True, offline=offline)
+    step()
     proc = run_git(root, "commit", "-q", "--no-verify", "--allow-empty", "-m", "Initialize workspace", git=git,
                    adopted=adopted, offline=offline)
     if proc.returncode != 0:

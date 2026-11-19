@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator
 
-from . import __version__, apifolders, hubauth, netoff
+from . import __version__, apifolders, hubauth, netoff, nofollow
 from . import skills as skill_lib
 from .autoreply import SessionAutoReply, follow_journal, journal_head, listed_requests, requests_from
 from .config import INT64_LIMIT, Config
@@ -361,8 +361,127 @@ def _check_inside(path: Path, within: Path) -> None:
     except (OSError, RuntimeError, ValueError):
         real = None
     if real is None or not (_same_path(real, path) and is_within(real, within)):
-        raise SessionError(f"{path} does not lie inside its folder root any more: a link or a junction on the way "
-                           "leads out of it.", 403, code=FORBIDDEN_FOLDER)
+        raise _left_root(path)
+
+
+def _left_root(path: Path) -> SessionError:
+    return SessionError(f"{path} does not lie inside its folder root any more: a link or a junction on the way leads "
+                        "out of it.", 403, code=FORBIDDEN_FOLDER)
+
+
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return st.st_dev, st.st_ino
+
+
+def _same_identity(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """The same file, where the file system gives file ids (st_ino 0 on both sides or either: it does not say)."""
+    return not (a[1] and b[1]) or a == b
+
+
+def _hold(folder: Path, within: Path) -> int:
+    """The folder of a server folder's plan held: nofollow.hold_inside from its resolved root `within`, name by name,
+    never through a link (on Windows nothing on its way can be renamed while the descriptor is open; POSIX has no such
+    hold). A descriptor the caller closes; 403 `forbidden_folder` when the folder is not reached so (a link or a
+    junction on the way, the folder renamed or gone). Blocking."""
+    try:
+        return nofollow.hold_inside(within, folder.relative_to(within).parts)
+    except (ValueError, nofollow.Refused, FileNotFoundError, NotADirectoryError):
+        raise _left_root(folder) from None
+
+
+def _check_held(folder: Path, within: Path, held: tuple[int, int]) -> None:
+    """The folder of a server folder's plan still resolves to itself inside `within` (_check_inside) and is still the
+    folder held (`held`: its identity when _hold opened it), else 403 `forbidden_folder`. Blocking."""
+    _check_inside(folder, within)
+    try:
+        now = _identity(os.stat(folder))
+    except OSError:
+        raise _left_root(folder) from None
+    if not _same_identity(now, held):
+        raise _left_root(folder)
+
+
+def _remove_held(fd: int, folder: Path, names: Iterable[str]) -> list[str]:
+    """Remove the entries `names` of the folder held as `fd` (_hold): on POSIX through the descriptor (`dir_fd`), so
+    in that very folder wherever it lies now and never through a link; on Windows by path, which the hold keeps naming
+    that folder (a link in a name's own place is removed itself, never followed). Returns what could not be removed.
+    Blocking."""
+    problems = []
+    for name in names:
+        try:
+            if os.name == "nt":
+                path = folder / name
+                if is_link(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        os.rmdir(path)
+                elif os.path.lexists(path):
+                    _remove(path)
+                continue
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(name, dir_fd=fd)
+            else:
+                os.unlink(name, dir_fd=fd)
+        except (OSError, NotImplementedError) as exc:
+            problems.append(f"{folder / name}: {exc}")
+    return problems
+
+
+def _remove_from_held(folder: Path, within: Path, held: tuple[int, int], names: list[str]) -> list[str]:
+    """The undo's removal of what git init made in a server folder (`names` of `folder`): only from the folder held then
+    (`held`, its identity), held again (_hold); a folder that is not reached so any more (renamed, moved, a link or a
+    junction on its way) keeps them, reported, since its path leads elsewhere now. Returns what could not be removed.
+    Blocking."""
+    try:
+        fd = _hold(folder, within)
+    except SessionError:
+        fd = None
+    except OSError as exc:
+        return [f"{folder / name}: not removed: {exc}" for name in names]
+    try:
+        if fd is not None and _same_identity(_identity(os.fstat(fd)), held):
+            return _remove_held(fd, folder, names)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return [f"{folder / name}: not removed: the folder is no longer there inside its folder root (renamed or moved, or "
+            "a link or a junction on its way)" for name in names]
+
+
+def _init_held(plan: "_Plan", within: Path, undo: "_Undo", names: list[str]) -> None:
+    """Git init in a server folder in place (docs/SPEC.md §21.10 "Resolution") with the folder held (_hold): on Windows
+    nothing on its way can then be renamed until git is done; on POSIX, which has no such hold, the folder must still
+    be the one held, inside its root, before each of init_repo's steps and after the last (_check_held), so a link
+    swapped in ends it at the next step. What a step that fails leaves of `names` (.git, and .gitignore when it was not
+    there) is removed through the held folder (_remove_held), never by a path; once it is done, the undo of a later
+    failure removes them from that folder only (`undo.held`). Blocking."""
+    fd = _hold(plan.target, within)
+    try:
+        held = _identity(os.fstat(fd))
+
+        def check() -> None:
+            _check_held(plan.target, within, held)
+
+        try:
+            check()
+            error = init_repo(plan.target, adopted=plan.adopted, offline=isolated_git(plan.network_off, plan.target),
+                              check=check)
+            if error:
+                raise OSError(f"git init in {plan.target} failed: {error}")
+            check()
+        except BaseException:
+            undo.problems += _remove_held(fd, plan.target, names)
+            raise
+        undo.held = (within, held)
+        undo.git_dir = plan.target / ".git"
+        undo.gitignore = plan.target / ".gitignore" if ".gitignore" in names else None
+    finally:
+        os.close(fd)
 
 
 def _check_writable(folder: Path, shown: Path) -> None:
@@ -437,12 +556,21 @@ class _Undo:
         self.removed_old: Path | None = None          # the emptied default folder that was removed
         self.git_dir: Path | None = None              # a repository created by the change
         self.gitignore: Path | None = None            # a .gitignore created with it
+        # a server folder's (docs/SPEC.md §21.10 "Resolution"): its resolved root and the identity of the folder git
+        # init ran in, held (_init_held); .git / .gitignore are then removed only from that folder, held again
+        self.held: tuple[Path, tuple[int, int]] | None = None
+        # a server folder's: the identity of each level made (None: unknown), removed only while its path names it
+        self.made: dict[Path, tuple[int, int] | None] = {}
+        self.problems: list[str] = []                 # what a step that failed could not remove itself
 
     def run(self) -> list[str]:
         """Undo in reverse order; returns what could not be undone (empty: everything is back)."""
-        problems: list[str] = []
-        for path in (self.git_dir, self.gitignore):
-            if path is not None and os.path.lexists(path):
+        problems: list[str] = list(self.problems)
+        made = [path for path in (self.git_dir, self.gitignore) if path is not None]
+        if self.held is not None and made:
+            problems += _remove_from_held(made[0].parent, *self.held, [path.name for path in made])
+        for path in made if self.held is None else ():
+            if os.path.lexists(path):
                 try:
                     _remove(path)
                 except OSError as exc:
@@ -458,6 +586,14 @@ class _Undo:
             except OSError as exc:
                 problems.append(f"{moved} (belongs in {original}): {exc}")
         for folder in reversed(self.created):
+            if folder in self.made:   # (a server folder's level: only while its path still names the folder made)
+                try:
+                    st = os.lstat(folder)
+                except OSError:
+                    continue
+                ident = self.made[folder]
+                if ident is None or not stat.S_ISDIR(st.st_mode) or not _same_identity(_identity(st), ident):
+                    continue
             try:
                 folder.rmdir()
             except OSError:
@@ -1829,9 +1965,10 @@ class SessionManager:
     def _carry_out(self, sid: str | None, plan: _Plan, undo: _Undo) -> str:
         """Do what the plan says (blocking: run it in a thread). Returns the git outcome; on an exception `undo`
         knows how to put everything back. A server folder's plan (`within`, docs/SPEC.md §21.10) finds the deepest
-        level that is there, each level it makes right after making it, and the folder before and after git init,
-        inside its root again (_check_inside, 403 `forbidden_folder`): the levels are made by path, so a link
-        swapped in on the way since the last _plan ends the change, and the undo removes what was made."""
+        level that is there and each level it makes right after making it inside its root again (_check_inside, 403
+        `forbidden_folder`): the levels are made by path, so a link swapped in on the way since the last _plan ends
+        the change, and the undo removes each level it made while its path still names it (its identity). Git init
+        there runs in the folder held (_init_held), and what it made is removed only from that folder."""
         if sid is not None:
             journal = self._journal(sid)
             journal.parent.mkdir(parents=True, exist_ok=True)
@@ -1848,6 +1985,10 @@ class SessionManager:
             folder.mkdir()
             undo.created.append(folder)
             if plan.within is not None:
+                try:
+                    undo.made[folder] = _identity(os.lstat(folder))
+                except OSError:
+                    undo.made[folder] = None
                 _check_inside(folder, plan.within)
         if plan.old_exists and plan.old_adopted and not plan.move_all:
             # leaving the user's folder: copies of library or Claude Code skills never stay in their project (not
@@ -1883,16 +2024,15 @@ class SessionManager:
             if os.path.lexists(plan.target / ".git"):  # not ours: never initialized over, nor removed by the undo
                 raise SessionError(f"A git repository appeared in {plan.target} meanwhile; check the folder and "
                                    "try again.", 409)
-            if not os.path.lexists(plan.target / ".gitignore"):
-                undo.gitignore = plan.target / ".gitignore"
-            undo.git_dir = plan.target / ".git"
+            names = [".git"] if os.path.lexists(plan.target / ".gitignore") else [".git", ".gitignore"]
             if plan.within is not None:
-                _check_inside(plan.target, plan.within)
+                _init_held(plan, plan.within, undo, names)
+                return plan.git
+            undo.gitignore = plan.target / ".gitignore" if ".gitignore" in names else None
+            undo.git_dir = plan.target / ".git"
             error = init_repo(plan.target, adopted=plan.adopted, offline=isolated_git(plan.network_off, plan.target))
             if error:
                 raise OSError(f"git init in {plan.target} failed: {error}")
-            if plan.within is not None:
-                _check_inside(plan.target, plan.within)
         return plan.git
 
     def config_view(self, sid: str) -> dict[str, Any]:
