@@ -50,7 +50,8 @@ from .db import Database, loads, made_by_earlier_version, reading_file, remap_sq
 from .events import event_data, read_page
 from .eventtext import without_abs_paths
 from .goal_text import shorten_title, split_goal
-from .models import USER, Status, Task, ToolError
+from .instruct import without_api_sessions
+from .models import API_VIA, USER, Status, Task, ToolError
 from .settings import (
     apply_update, deep_merge, ensure_home, profile_renames, public_view, read_raw, settings_path, validate, write_raw,
 )
@@ -102,9 +103,9 @@ STOP_REQUEST_REASONS = ("user", "done", "budget")
 FOLDER_BUSY = "folder_busy"
 FOLDER_NOT_READY = "folder_not_ready"
 FORBIDDEN_FOLDER = "forbidden_folder"
-# session.json "via" of a session created through the HTTP API v1, and its "api" block (docs/SPEC.md §21.4): what the
-# create gives (API_GIVEN, with their defaults) and what the manager writes later
-API_VIA = "api"
+# session.json "via" of a session created through the HTTP API v1 (models.API_VIA, which the clients read too), and its
+# "api" block (docs/SPEC.md §21.4): what the create gives (API_GIVEN, with their defaults) and what the manager writes
+# later
 API_ANSWERS = ("auto", "manual")
 API_GIVEN = {"answers": "auto", "stop_when_done": True, "client_ref": None, "request_digest": None, "folder": None}
 API_LATER = ("base_commit", "started_at", "finished_at", "start_error", "error")
@@ -1978,13 +1979,15 @@ class SessionManager:
         return items
 
     def default_session(self) -> str | None:
-        """The session MCP calls without `session` go to: the only running one, else the most recently
-        active running one, else the only session this version opens (one made by an earlier version is never
-        it)."""
-        running = [s for s in self.list() if s.get("status") == "running"]
+        """The session MCP calls without `session` go to (and `serve`'s console): the only running one, else the most
+        recently active running one, else the only session this version opens (one made by an earlier version is
+        never it). Never one created through the HTTP API v1 (instruct.without_api_sessions, as `-c` and the CLI's
+        other unnamed picks): an API client's job would otherwise take the owner's calls; `session=` reaches it."""
+        running = [s for s in without_api_sessions(self.list()) if s.get("status") == "running"]
         if running:
             return running[0]["id"]
-        ids = [sid for sid in self.ids() if not self.earlier_version(sid)]
+        api = set(self.api_sids())
+        ids = [sid for sid in self.ids() if sid not in api and not self.earlier_version(sid)]
         return ids[0] if len(ids) == 1 else None
 
     # ---- the HTTP API v1's lookups (docs/SPEC.md §21.1 "Scope", §21.2 `{id}`) ----------------------------------

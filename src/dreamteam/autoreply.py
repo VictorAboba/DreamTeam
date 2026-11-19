@@ -1,7 +1,8 @@
 """Requests to the user and automatic answers in the user's place (docs/TUI.md §2, docs/SPEC.md §21.5).
 
 - What `dreamteam -p` sends when a member writes to the user (AUTO_REPLY) or a task waits for the user's review
-  (AUTO_REVIEW), and which messages and tasks call for one.
+  (AUTO_REVIEW), which messages and tasks call for one, and which sessions the hub answers for itself (`hub_answers`:
+  `-p` sends nothing there).
 - The requests to the user (`requests_of` for a loaded swarm, `read_requests` for a session's file, `requests_from`
   for a connection): what only the user can give now, in board-neutral words, and `blocking_requests`, those of them
   that hold the work. The one definition behind SessionAutoReply's sweep, a session summary's `requests`, the v1 state
@@ -23,7 +24,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Iterable
 
 from .db import loads, reading_file
-from .models import USER, AgentStatus, Status, ToolError
+from .models import API_VIA, USER, AgentStatus, Status, ToolError
 from .prompts import CLARIFY_TAG
 
 log = logging.getLogger(__name__)
@@ -68,6 +69,13 @@ def review_key(task: dict) -> tuple[int, Any] | None:
     if task.get("status") != Status.REVIEW or task.get("reviewer") != USER or not isinstance(task.get("id"), int):
         return None
     return task["id"], task.get("updated_at")
+
+
+def hub_answers(summary: Any) -> bool:
+    """Whether the hub itself answers in the user's place for the session of this summary (the hub's GET
+    /api/sessions): one created through the HTTP API v1 with `answers: "auto"` (SessionAutoReply, docs/SPEC.md
+    §21.5). `dreamteam -p` then sends no automatic replies or approvals of its own, so nothing is answered twice."""
+    return isinstance(summary, dict) and summary.get("via") == API_VIA and summary.get("answers") == "auto"
 
 
 # ---- requests to the user (docs/SPEC.md §21.5) ----------------------------------------------------------------------
@@ -489,5 +497,5 @@ class SessionAutoReply:
 
 __all__ = ["AUTO_REPLY", "AUTO_REVIEW", "AUTO_REPLY_MAX", "BLOCKING_KINDS", "ID_MAX", "JOURNAL_BATCH", "LAST_TO",
            "PLANS", "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests", "follow_journal",
-           "journal_head", "planner_question", "read_requests", "reply_text", "request_key", "requests_from",
-           "requests_of", "review_key", "review_text", "wants_reply"]
+           "hub_answers", "journal_head", "planner_question", "read_requests", "reply_text", "request_key",
+           "requests_from", "requests_of", "review_key", "review_text", "wants_reply"]

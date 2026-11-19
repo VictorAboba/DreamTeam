@@ -1,15 +1,16 @@
 """What an instruction to an existing session does: the prompt of `dreamteam -p -r <id> "<text>"` (docs/TUI.md §2)
 and the text of the HTTP API's `continue` (docs/SPEC.md §21.2). `continue_step` decides it from the session's state
 (Swarm.snapshot(), the board's /api/state); `-p` then carries it out over HTTP, the API in process.
+`without_api_sessions` is which sessions `-c` (and a command's other picks the user did not name) choose from.
 
 Stdlib and models only: hub code imports it, and it never imports dreamteam.tui."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Iterable, Literal
 
-from .models import ALL
+from .models import ALL, API_VIA
 
 
 @dataclass(frozen=True)
@@ -67,4 +68,13 @@ def continue_step(state: dict) -> ContinueStep:
     return ContinueStep("message", to=coordinator(state) or ALL, resume=resume)
 
 
-__all__ = ["ContinueStep", "continue_step", "coordinator"]
+def without_api_sessions(sessions: Iterable[Any]) -> list[dict]:
+    """The listed sessions (summaries, the hub's GET /api/sessions) that a pick the user did not name may choose:
+    `dreamteam -c` and `-p -c` (the most recent one), `console` and `traces` without `--session`. Never one created
+    through the HTTP API v1 (summary `via` "api", docs/SPEC.md §21.4): a busy API client would otherwise make its own
+    sessions the most recent ones, and the owner's next `-c` would go on with the client's job. `-r <id>` and
+    `--session` still open any session."""
+    return [s for s in sessions if isinstance(s, dict) and s.get("via") != API_VIA]
+
+
+__all__ = ["ContinueStep", "continue_step", "coordinator", "without_api_sessions"]

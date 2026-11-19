@@ -49,6 +49,9 @@ const I18N = {
     f_more: "Дополнительно", f_steps: "Шагов за пробуждение", f_approval: "Подтверждать MCP-серверы агентов", f_start_now: "Запустить сразу",
     f_network: "Без интернета для агентов", sw_network: "Интернет для команд агентов", net_on: "есть", net_off: "нет",
     net_badge: "Без интернета",
+    api_badge: "API",
+    api_hint_auto: "Создана через HTTP API (/api/v1): это задание клиента API. На вопросы и ревью агентов за вас отвечает сам хаб. dreamteam -c её не выбирает.",
+    api_hint_manual: "Создана через HTTP API (/api/v1): это задание клиента API. На вопросы агентов отвечает клиент API (или вы на доске). dreamteam -c её не выбирает.",
     f_clarify: "Сначала уточнить цель",
     f_clarify_hint: "планировщик сначала задаст вам вопросы по неясным местам цели, остальные агенты подождут план и не потратят токены; важный вопрос агента поставит весь рой на паузу до вашего ответа",
     net_hint_docker: "Команды агентов, их фоновые процессы и MCP-серверы идут от отдельного пользователя, чью сеть закрывает файрвол контейнера. LLM и localhost работают.",
@@ -293,6 +296,9 @@ const I18N = {
     f_more: "More", f_steps: "Steps per wake-up", f_approval: "Require approval of agents' MCP servers", f_start_now: "Start right away",
     f_network: "No internet for the agents", sw_network: "Internet for the agents' commands", net_on: "on", net_off: "off",
     net_badge: "No internet",
+    api_badge: "API",
+    api_hint_auto: "Created through the HTTP API (/api/v1): a job of an API client. The hub itself answers the agents' questions and reviews in your place. dreamteam -c does not pick it.",
+    api_hint_manual: "Created through the HTTP API (/api/v1): a job of an API client. The API client answers the agents' questions (or you, on the board). dreamteam -c does not pick it.",
     f_clarify: "Clarify the goal first",
     f_clarify_hint: "the planner first asks you about the unclear points of the goal while the other agents wait for the plan without spending tokens; an agent's critical question pauses the whole swarm until you answer",
     net_hint_docker: "The agents' commands, their background jobs and MCP servers run as a separate user whose network the container's firewall closes. The LLM and localhost work.",
@@ -753,6 +759,13 @@ function earlierText(s) {
     : t("earlier_session", { sid: s.id, version });
 }
 
+/** The «API» badge of a session created through the HTTP API v1 (summary `via` "api", docs/SPEC.md §21.4), its tooltip
+ * by who answers the agents (`answers`: "auto", the hub itself; else the API client); "" for any other session. */
+function apiBadge(s) {
+  if (s.via !== "api") return "";
+  return `<span class="badge plain" title="${esc(t(s.answers === "auto" ? "api_hint_auto" : "api_hint_manual"))}">${esc(t("api_badge"))}</span>`;
+}
+
 function sessionCard(s) {
   const state = sessionState(s);
   const earlier = state === "earlier";   // listed and deleted only: no link, no Open, Start or Stop, no proposals
@@ -782,6 +795,7 @@ function sessionCard(s) {
       <span class="badge ${badgeCls}"${badgeTip}>${esc(asks ? t("st_question") : t("st_" + state))}</span>
       ${state === "running" && s.wrap_up ? `<span class="badge warn" title="${esc(t("st_wrap_up_hint"))}">${esc(t("st_wrap_up"))}</span>` : ""}
       ${s.network === "off" ? `<span class="badge warn" title="${esc(networkHint(H.isolation))}">${esc(t("net_badge"))}</span>` : ""}
+      ${apiBadge(s)}
     </div>
     ${goal}
     <div class="sc-progress"><div class="meter"><div style="width:${pct}%"></div></div><span>${esc(t("tasks_done", { done: Number(tasks.done) || 0, total: Number(tasks.total) || 0 }))}</span></div>

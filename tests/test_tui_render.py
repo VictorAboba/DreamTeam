@@ -1370,6 +1370,10 @@ def test_tables():
     assert "▶" in out and "Калькулятор  001-calc" in out and "работает" in out and "цель достигнута" in out
     assert "$0.42/$5.00" in out and "1/3" in out and "4/4" in out
     assert plain(render.sessions_table(ctx(lang="en"), [])).startswith("  ⎿  No sessions yet")
+    # a session created through the HTTP API v1 (summary `via` "api", docs/SPEC.md §21.4): marked after its id, as
+    # session_line's ` | HTTP API`; the others are not
+    out = plain(render.sessions_table(ctx(lang="en"), [{**SESSIONS[0], "via": "api", "answers": "auto"}, SESSIONS[1]]))
+    assert "001-calc · HTTP API" in out and out.count("HTTP API") == 1
     out = plain(render.models_table(ctx(width=140), SETTINGS), 140)
     assert "Профили моделей" in out and "✓" in out and "ключ задан …abcd" in out
     assert "переменная $OLLAMA_KEY не задана" in out and "abcd" in out and "api_key" not in out

@@ -21,7 +21,7 @@ from .copyfrom import SOURCE_SHOWN_MAX, copy_text, printable_line
 from .hub_mcp import INSTRUCTIONS as HUB_INSTRUCTIONS
 from .hub_mcp import (LIBRARY_TOOLS, _StdinLines, client_key, hub_call, hub_specs, list_hub_tools, security_settings,
                       serving_client)
-from .models import USER, ToolError
+from .models import API_VIA, USER, ToolError
 from .sessionopts import OptionError, overrides_from
 from .sessions import SessionError
 from .skills import Library, SkillError
@@ -208,6 +208,8 @@ def session_line(s: dict[str, Any]) -> str:
             f" | agents {agents.get('total', 0)} ({agents.get('working', 0)} working)"
             + (f" | jobs {jobs} running" if jobs and s.get("status") == "running" else "")
             + f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}"
+            # created through the HTTP API v1 (docs/SPEC.md §21.4): its client's job, which `dreamteam -c` passes over
+            + (" | HTTP API" if s.get("via") == API_VIA else "")
             + (" | no network" if s.get("network") == "off" else "")
             + (" | clarify" if s.get("clarify") else "")   # [swarm] clarify: questions may pause it
             # never opened by this version (docs/SPEC.md §17.2): listed, deleted and exported only
@@ -429,8 +431,12 @@ async def call_launcher_tool(manager: "SessionManager", name: str, args: dict[st
     # a hub tool inside a session
     sid = args.pop("session", None) or manager.default_session()
     if not sid:
-        listing = "\n".join(session_line(s) for s in manager.list()) or "(none)"
-        return ("Error: pass session=\"<id>\" (no single running session to default to). Sessions:\n"
+        listed = manager.list()
+        listing = "\n".join(session_line(s) for s in listed) or "(none)"
+        # (a session of the HTTP API v1 is never the default one: default_session)
+        api = (" A session created through the HTTP API is never the default." if any(
+            s.get("via") == API_VIA for s in listed) else "")
+        return ("Error: pass session=\"<id>\" (no single running session to default to)." + api + " Sessions:\n"
                 + listing), True
     if not manager.exists(str(sid)):
         return f"Error: unknown session '{sid}'. Use sessions_list.", True

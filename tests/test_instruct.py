@@ -79,3 +79,19 @@ def test_coordinator():
         "Claude Code"
     assert coordinator(state(WORKING, agents=(CLAUDE,), tasks=())) is None
     assert coordinator({}) is None
+
+
+def test_without_api_sessions_keeps_the_order_and_every_session_not_made_through_the_api():
+    """`-c` and the CLI's other unnamed picks never choose a session created through the HTTP API v1 (summary `via`
+    "api", docs/SPEC.md §21.4); every other session stays, in its order, whatever else its `via` or `answers` say."""
+    from dreamteam import sessions
+    from dreamteam.instruct import without_api_sessions
+    from dreamteam.models import API_VIA
+
+    assert API_VIA == "api" and sessions.API_VIA is API_VIA   # the hub writes the value the clients read
+    mine, old = {"id": "001-mine"}, {"id": "002-old", "earlier_version": True}
+    listed = [{"id": "003-job", "via": "api", "answers": "auto"}, mine, {"id": "004-job", "via": "api"}, old,
+              {"id": "005-other", "via": "home"}, {"id": "006-none", "via": None}]
+    assert [s["id"] for s in without_api_sessions(listed)] == ["001-mine", "002-old", "005-other", "006-none"]
+    assert without_api_sessions(iter(listed))[:2] == [mine, old]   # any iterable; the summaries themselves
+    assert without_api_sessions([]) == [] and without_api_sessions([None, "x", 3]) == []

@@ -430,6 +430,37 @@ async def test_session_picker_and_resume(launch):
     assert await h.quit() == 0
 
 
+async def test_continue_passes_over_the_sessions_of_the_http_api(launch):
+    """-c never attaches a session created through the HTTP API (docs/SPEC.md §21.4), though it is the most recent
+    one: with only such sessions there is no session to continue, as with none, and the line says how to open one;
+    else the most recent other session is attached. /resume still opens one of the API's."""
+    conn = await launch()
+    h = launch.tui(conn, continue_last=True, width=400)   # no session at all: the line as before
+    await h.see(h.tui.t("no_sessions_continue"))
+    assert h.tui.t("no_sessions_continue_api") not in h.text
+    await h.close()
+    api = {"answers": "auto", "stop_when_done": False}
+    first = (await conn.manager.create("Job", "", start=False, api=api))["id"]
+    h = launch.tui(conn, continue_last=True, width=400)
+    await h.see(h.tui.t("no_sessions_continue_api"))
+    assert "/resume id" in h.tui.t("no_sessions_continue_api")
+    assert not h.tui.attached and h.tui.sid is None and not conn.manager.running
+    await h.close()
+
+    mine = (await conn.client.create_session("Mine", "", start=False))["id"]
+    await asyncio.sleep(0.05)
+    job = (await conn.manager.create("Job two", "", start=False, api=api))["id"]
+    listed = {s["id"]: s for s in await conn.client.sessions()}
+    assert listed[job]["created_at"] > listed[mine]["created_at"]
+    h = launch.tui(conn, continue_last=True)
+    await h.until(lambda: h.tui.attached, 20, "the attach")
+    assert h.tui.sid == mine and sorted(conn.manager.running) == [mine]
+    await h.run(f"/resume {job}", 'Starting session "Job two"')
+    await h.until(lambda: h.tui.sid == job, 20, "the switch")
+    assert first not in conn.manager.running
+    assert await h.quit() == 0
+
+
 async def test_text_after_an_achieved_goal_asks_before_a_new_session(launch):
     conn = await launch(finisher)
     sid = (await conn.client.create_session("Haiku", "Write a haiku"))["id"]

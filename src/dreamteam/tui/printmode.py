@@ -16,9 +16,11 @@ import sys
 import time
 from typing import Any, Callable, TextIO
 
-from ..autoreply import AUTO_REPLY, AUTO_REPLY_MAX, AUTO_REVIEW, reply_text, review_key, review_text, wants_reply
+from ..autoreply import (
+    AUTO_REPLY, AUTO_REPLY_MAX, AUTO_REVIEW, hub_answers, reply_text, review_key, review_text, wants_reply,
+)
 from ..copyfrom import size_text
-from ..instruct import continue_step
+from ..instruct import continue_step, without_api_sessions
 from ..models import USER
 from ..result import build_result
 from .client import Connection, HubError
@@ -46,6 +48,8 @@ TEXTS = {
         "stopped": "Сессия остановлена.",
         "interrupted": "Прервано.",
         "no_sessions": "Нет сессий, которые можно продолжить.",
+        "no_sessions_api": "Нет сессий, которые можно продолжить: сессию, созданную через HTTP API, -c не выбирает, "
+                           "её продолжают через -r <id>.",
         "continue_earlier": "Последняя сессия, {sid}, создана более ранней версией DreamTeam, и эта версия "
                             "({version}) не может её открыть. Начните новую сессию: запустите без -c.",
         "unknown_session": "Неизвестная сессия «{sid}».",
@@ -62,6 +66,8 @@ TEXTS = {
                  "рой может ждать вас (и этот запуск тоже ждёт).",
         "asked_timeout": "{name} спрашивает вас (сообщение #{id}): ответьте на доске ({url}) или в dreamteam tui. До "
                          "тех пор рой может ждать вас (а этот запуск закончится по --timeout).",
+        "hub_answers": "Эта сессия создана через HTTP API с answers = \"auto\": на вопросы и ревью агентов за вас "
+                       "отвечает сам хаб, этот запуск автоответов не шлёт.",
     },
     "en": {
         "timeout": "Timed out after {seconds:g} s: the goal is not achieved.",
@@ -71,6 +77,8 @@ TEXTS = {
         "stopped": "The session was stopped.",
         "interrupted": "Interrupted.",
         "no_sessions": "There is no session to continue.",
+        "no_sessions_api": "There is no session to continue: -c never picks a session created through the HTTP API; "
+                           "continue one with -r <id>.",
         "continue_earlier": "The most recent session, {sid}, was made by an earlier version of DreamTeam and cannot be "
                             "opened by this one ({version}). Start a new session: run without -c.",
         "unknown_session": "Unknown session '{sid}'.",
@@ -87,6 +95,8 @@ TEXTS = {
                  "swarm may wait for you (and this run waits too).",
         "asked_timeout": "{name} asks you (message #{id}): answer on the board ({url}) or in dreamteam tui. Until "
                          "then the swarm may wait for you (and this run ends at --timeout).",
+        "hub_answers": "This session was created through the HTTP API with answers \"auto\": the hub itself answers "
+                       "the agents' questions and reviews in your place, so this run sends no automatic replies.",
     },
 }
 
@@ -246,6 +256,9 @@ class _PrintRun:
         # then never pauses for a member's question and plans as usual; run_print gives the client its old value back
         self._header_before = getattr(self.client, "auto_reply", False)
         self.client.auto_reply = auto_reply
+        # the session is one the hub answers for itself (autoreply.hub_answers: the HTTP API's `answers: "auto"`): this
+        # run then sends no reply or approval of its own, and announces no question (the hub answers it)
+        self.hub_replies = False
         self.replied_to: set[int] = set()     # questions (message ids) answered by this run
         self._heal_at: float | None = None    # an auto-reply failed: when the state is read again (heal)
         self._heal_delay = HEAL_AFTER
@@ -343,11 +356,13 @@ class _PrintRun:
                 hub = await client.hub_info()
                 raise _Finished("error", earlier_version_text(str(summary["id"]), hub.get("home"), hub.get("version")))
         else:
-            # -c: the most recent session; one made by an earlier version is never opened, and never passed over for
-            # an older one the user did not ask for (docs/SPEC.md §17.2): nothing created
-            if not sessions:
-                raise _Finished("error", _text(self.text_lang, "no_sessions"))
-            summary = max(sessions, key=lambda s: s.get("last_activity") or s.get("created_at") or 0)
+            # -c: the most recent session, never one created through the HTTP API (instruct.without_api_sessions,
+            # docs/SPEC.md §21.4); one made by an earlier version is never opened, and never passed over for an older
+            # one the user did not ask for (docs/SPEC.md §17.2): nothing created
+            mine = without_api_sessions(sessions)
+            if not mine:   # (with sessions of the API only, it says how to reach one)
+                raise _Finished("error", _text(self.text_lang, "no_sessions_api" if sessions else "no_sessions"))
+            summary = max(mine, key=lambda s: s.get("last_activity") or s.get("created_at") or 0)
             if summary.get("earlier_version"):
                 from .. import __version__
 
@@ -360,7 +375,10 @@ class _PrintRun:
         self.started_session(summary["id"])
         self.lang = summary.get("language") or self.lang
         self.clarify = bool(summary.get("clarify"))
+        self.hub_replies = hub_answers(summary)   # (`answers` is set at the create: it never changes)
         self.progress(_text(self.text_lang, "session", sid=summary["id"], title=summary.get("title", "")))
+        if self.hub_replies:
+            self.progress(_text(self.text_lang, "hub_answers"))
         await self.attach(summary["id"])
 
     async def attach(self, sid: str | None) -> None:
@@ -568,7 +586,7 @@ class _PrintRun:
         if not isinstance(mid, int) or mid in self.seen_messages:
             return
         self.seen_messages.add(mid)
-        if not wants_reply(msg):
+        if not wants_reply(msg) or self.hub_replies:   # (the hub answers it: SessionAutoReply)
             return
         sender = msg.get("sender")
         if not self.auto_reply:
@@ -592,8 +610,8 @@ class _PrintRun:
         reload), and an unanswered one would hold the run until --timeout. After a failed auto-reply only heal
         answers (`recheck`): it reads the state first, so an answer the hub took although its call failed is not
         sent twice. Without auto-replies, one stderr line says that the run waits (stream-json carries the
-        swarm.paused event itself)."""
-        if not asker or not isinstance(mid, int):
+        swarm.paused event itself). Nothing for a session the hub answers for itself (`hub_replies`)."""
+        if not asker or not isinstance(mid, int) or self.hub_replies:
             return
         if self.auto_reply:
             if mid in self.replied_to or (self._heal_at is not None and not recheck):
@@ -636,9 +654,10 @@ class _PrintRun:
         """A task waiting for the user's review would block the run: with auto-replies on, approve it (the
         counterpart of AUTO_REPLY for questions; --no-auto-reply leaves it waiting). Approvals do not count
         against AUTO_REPLY_MAX: an approval settles the task (no ping-pong), and a one-agent run sends every
-        task, the planning task included, to the user."""
+        task, the planning task included, to the user. Never for a session the hub answers for itself
+        (`hub_replies`): the hub approves it."""
         key = review_key(task)
-        if key is None or key in self.auto_reviewed or not self.auto_reply:
+        if key is None or key in self.auto_reviewed or not self.auto_reply or self.hub_replies:
             return
         self.auto_reviewed.add(key)
         ok, text = await self.client.act(self.sid, "task_review", {

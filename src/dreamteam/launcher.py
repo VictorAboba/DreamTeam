@@ -25,7 +25,7 @@ from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, apifolders, netoff, procs, roles
+from . import __version__, apifolders, hubauth, netoff, procs, roles
 from .api_v1 import ApiV1
 from .copyfrom import API_UPLOAD_PATH, UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
 from .httpjson import JSONResponse, json_text
@@ -411,10 +411,13 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
         return FileResponse(STATIC_DIR / "home.html", headers={"Cache-Control": "no-store"})
 
     async def hub_info(request: Request):
+        # `api`: the hub has an API token of its own (docs/SPEC.md §21.1), so `dreamteam status` prints the API's
+        # address as `serve` does; never the token or its digest
         return JSONResponse({"pid": os.getpid(), "project": str(manager.home), "home": str(manager.home),
                              "name": "DreamTeam", "version": __version__, "mode": "launcher",
                              "sandbox": manager.config.skills_host_library_dir is not None,
-                             "container": hub_in_container(manager.config)})
+                             "container": hub_in_container(manager.config),
+                             "api": hubauth.api_digest() is not None})
 
     async def sessions(request: Request):
         if request.method == "GET":

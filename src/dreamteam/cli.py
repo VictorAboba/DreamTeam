@@ -25,6 +25,7 @@ from . import __version__, hubauth, netoff, roles
 from .config import CONFIG_FILE, PROVIDER_PRESETS, Config, render_template
 from .goal_text import split_goal
 from .hubauth import open_hub
+from .instruct import without_api_sessions
 from .models import USER
 from .workspace import pid_alive
 
@@ -564,6 +565,7 @@ def cmd_run(args) -> int:
 
 def cmd_console(args) -> int:
     from .console import run_console
+    from .copyfrom import printable_line
 
     local: bool | None = None  # the hub's address decides (a loopback one is local)
     user_url = None  # an address the user typed: DREAMTEAM_HUB_TOKEN may go there, whatever its host (hubauth.py)
@@ -606,7 +608,8 @@ def cmd_console(args) -> int:
             print(f"Session {session['id']} is stopped. Start it on the sessions page ({base}/) first.",
                   file=sys.stderr)
             return 1
-        print(f"Session {session['id']}: {session.get('title', '')}", file=sys.stderr)
+        # (a title made on the board or over MCP, or a remote hub's, may hold control characters: one printable line)
+        print(f"Session {session['id']}: {printable_line(session.get('title', ''))}", file=sys.stderr)
         if session.get("status") != "running":  # it cannot start: /cd is what this console can do for it
             print(f"It is stopped and cannot start: its folder {folder.get('path')} does not exist. Move it with "
                   "/cd <folder> (or /cd --default for its own folder), then start it on the sessions page "
@@ -726,8 +729,10 @@ def cmd_sandbox(args) -> int:
 def cmd_status(args) -> int:
     project = _home_arg(args)
     base = running_hub(project)
-    if (base and (hub_identity(base) or {}).get("mode") == "launcher") or (not base and _home_mode(args, project)):
-        return _print_sessions(project, base)
+    ident = (hub_identity(base) or {}) if base else {}
+    if (base and ident.get("mode") == "launcher") or (not base and _home_mode(args, project)):
+        # (`api`: the hub has an API token, docs/SPEC.md §21.1; its line as `serve` prints it)
+        return _print_sessions(project, base, api=ident.get("api") is True)
     if base:
         req = urllib.request.Request(base + "/api/act/swarm_status", data=b"{}", method="POST",
                                      headers={"Content-Type": "application/json"})
@@ -791,26 +796,34 @@ def _hub_json(base: str, path: str, timeout: float = 15.0, *, user_url: str | No
         return json.loads(resp.read().decode("utf-8"))
 
 
+# why a pick the user did not name found nothing although the home has sessions of the HTTP API v1 (`console`, `traces`)
+API_NOT_PICKED = "A session created through the HTTP API is never picked without --session ID."
+
+
 def _pick_session(base: str, sid: str | None, *, user_url: str | None = None) -> dict:
     """The session a command works with: `sid`, else the running one (most recently active), else the only one
-    this version opens."""
+    this version opens; without `sid`, never one created through the HTTP API (instruct.without_api_sessions)."""
     sessions = _hub_json(base, "/api/sessions", user_url=user_url).get("sessions", [])
     if sid:
         for item in sessions:
             if item["id"] == sid:
                 return item
         raise LookupError(f"Unknown session '{sid}'. Sessions: {', '.join(x['id'] for x in sessions) or 'none'}.")
-    running = [x for x in sessions if x.get("status") == "running"]
+    mine = without_api_sessions(sessions)
+    running = [x for x in mine if x.get("status") == "running"]
     if running:
         return running[0]
-    openable = [x for x in sessions if not x.get("earlier_version")]
+    openable = [x for x in mine if not x.get("earlier_version")]
     if len(openable) == 1:
         return openable[0]
     raise LookupError("No running session. Create or start one on the sessions page, or pass --session ID."
-                      + (f" Sessions: {', '.join(x['id'] for x in sessions)}." if sessions else ""))
+                      + (f" Sessions: {', '.join(x['id'] for x in sessions)}." if sessions else "")
+                      + (f" {API_NOT_PICKED}" if len(mine) < len(sessions) else ""))
 
 
-def _print_sessions(home: Path, base: str | None) -> int:
+def _print_sessions(home: Path, base: str | None, *, api: bool = False) -> int:
+    """The sessions of a home (from its hub at `base`, else read from the home), the home and the hub; `api`: the hub
+    serves the HTTP API v1 with an API token of its own (its `/api/hub`), so its address is printed too."""
     from .launcher_mcp import session_line
 
     sessions = None
@@ -833,6 +846,8 @@ def _print_sessions(home: Path, base: str | None) -> int:
     print("\n".join(session_line(s) for s in sessions) if sessions else "No sessions yet.")
     print(f"Home: {home}")
     print(f"Hub: {base}" if base else "Hub: not running (start it with `dreamteam serve`)")
+    if base and api:   # (never the token or its digest: the client has its own DREAMTEAM_API_TOKEN)
+        print(f"API: {base}/api/v1")
     return 0
 
 
@@ -1683,18 +1698,24 @@ async def _mcp_launcher_in_process(home: Path, config: Config, web: bool, stop: 
 
 def _session_db(home: Path, sid: str | None) -> tuple[Path | None, str | None]:
     """The database of a session (or of a single-swarm project) for reading traces without a hub, and the session
-    it belongs to (None for a project)."""
+    it belongs to (None for a project). LookupError (its message) when no `sid` is given and only sessions of the HTTP
+    API could have been picked."""
     if not is_home(home):
         path = home / ".dreamteam" / "swarm.db"
         return (path if path.exists() else None), None
     from .sessions import SessionManager
 
     manager = SessionManager(home)
-    if not sid:  # no hub, nothing runs: the most recently active session this version opens (list() order)
-        items = [s for s in manager.list() if not s.get("error") and not s.get("earlier_version")]
+    if not sid:  # no hub, nothing runs: the most recently active session this version opens (list() order), never
+        # one created through the HTTP API (instruct.without_api_sessions)
+        listed = manager.list()
+        mine = without_api_sessions(listed)
+        items = [s for s in mine if not s.get("error") and not s.get("earlier_version")]
         sid = next((s["id"] for s in items if s.get("last_activity")), None) or next((s["id"] for s in items), None)
         if sid:
             print(f"Session {sid}", file=sys.stderr)
+        elif len(mine) < len(listed):
+            raise LookupError(f"No session to read traces from. {API_NOT_PICKED}")
     if not sid or not manager.exists(sid):
         return None, sid
     try:
@@ -1746,7 +1767,11 @@ def cmd_traces(args) -> int:
 
         from .db import Database, made_by_earlier_version
 
-        db_path, sid = _session_db(home, args.session)
+        try:
+            db_path, sid = _session_db(home, args.session)
+        except LookupError as exc:   # (only sessions of the HTTP API, and no --session)
+            print(str(exc), file=sys.stderr)
+            return 1
         if db_path is None:
             print(f"Unknown session '{args.session}'." if args.session else "No session to read traces from.",
                   file=sys.stderr)

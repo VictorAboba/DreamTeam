@@ -34,6 +34,7 @@ from ..eventtext import (_ANSI, _TASK_SYMBOL, TOOL_CALL_CHARS, TextContext, _clo
                          _deps_word, _echo_target, _first_line, _float, _int, _job_result, _list, _names, _reason,
                          _recipients_text, _review_text, _session_run, _status_label, _via_text, _wake_summary, _who,
                          clean, first_name, fmt_cost, fmt_elapsed, tool_call_text)
+from ..models import API_VIA
 from . import theme
 
 log = logging.getLogger(__name__)
@@ -1537,6 +1538,8 @@ def sessions_table(ctx: RenderContext, sessions: list[dict], current: str | None
         title = Text(clean(s.get("title")) or sid or "?", style="bold")
         if sid and sid != clean(s.get("title")):
             title.append(f"  {sid}", style="dim")
+        if s.get("via") == API_VIA:   # created through the HTTP API v1: its client's job, which -c passes over
+            title.append(f" · {ctx.t('sess_api')}", style="dim")
         goal = _d(s.get("goal"))
         if goal.get("title"):
             title.append("\n" + ctx.short(goal.get("title"), 120), style="dim")

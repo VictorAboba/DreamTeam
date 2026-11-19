@@ -242,6 +242,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_done": "цель достигнута",
         "sess_error": "ошибка конфигурации",
         "sess_earlier": "прежняя версия",
+        "sess_api": "HTTP API",   # a session created through the HTTP API v1 (-c passes over it)
         # a session made by an earlier version (docs/SPEC.md §17.2): the twins of sessions.EARLIER_VERSION_TEXT and
         # MAIN_EARLIER_VERSION_TEXT (and of home.js); earlier_home stands for {home} when nothing names the folder
         "earlier_session": "Сессия {sid} создана более ранней версией DreamTeam, и эта версия ({version}) не может её "
@@ -506,6 +507,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "session_deleting": "Удаляю сессию…",
         "session_deleted": "Сессия «{title}» ({id}) удалена",
         "no_sessions_continue": "Нет сессий, которые можно продолжить",
+        "no_sessions_continue_api": "Нет сессий, которые можно продолжить: сессию, созданную через HTTP API, -c не "
+                                    "выбирает, её открывают через /resume id",
         "continue_earlier": "Последняя сессия, {id}, создана более ранней версией DreamTeam, и эта версия ({version}) "
                             "не может её открыть: начните новую сессию",
         "confirm_new_title": "Цель этой сессии уже достигнута",
@@ -902,6 +905,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "sess_done": "goal achieved",
         "sess_error": "config error",
         "sess_earlier": "earlier version",
+        "sess_api": "HTTP API",   # a session created through the HTTP API v1 (-c passes over it)
         "earlier_session": "Session {sid} was made by an earlier version of DreamTeam and cannot be opened by this one "
                            "({version}). Open it with the version that made it (export it here, then import it into a "
                            "home of that version: once this one saved its settings, that version may not read this "
@@ -1168,6 +1172,8 @@ TEXTS: dict[str, dict[str, str]] = {
         "session_deleting": "Deleting the session…",
         "session_deleted": "Session \"{title}\" ({id}) deleted",
         "no_sessions_continue": "There is no session to continue",
+        "no_sessions_continue_api": "There is no session to continue: -c never picks a session created through the "
+                                    "HTTP API; open one with /resume id",
         "continue_earlier": "The most recent session, {id}, was made by an earlier version of DreamTeam and cannot be "
                             "opened by this one ({version}): start a new session",
         "confirm_new_title": "This session's goal is already achieved",

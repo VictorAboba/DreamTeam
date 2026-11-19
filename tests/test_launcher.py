@@ -1462,3 +1462,68 @@ async def test_launcher_mcp_copy_from(tmp_path):
     assert shown.startswith("a b [2J") and len(shown) == copyfrom.SOURCE_SHOWN_MAX
     assert "copied from" not in session_line({"id": "001-x", "copied_from": {"source": 5}})
     assert "copied from" not in session_line({"id": "001-x", "copied_from": None})
+
+
+async def test_session_line_marks_a_session_of_the_http_api(tmp_path):
+    """A session created through the HTTP API v1 (summary `via` "api", docs/SPEC.md §18.2) has ` | HTTP API` right
+    after the cost, before the marks that follow; a session made anywhere else has none."""
+    manager = _manager(tmp_path)
+    try:
+        job = (await manager.create("Job", "Write a parser", start=False, api={"answers": "auto"}))["id"]
+        mine = (await manager.create("Mine", "Write a lexer", start=False))["id"]
+        first = session_line(manager.summary(job)).splitlines()[0]
+        assert first.endswith(" of $2.00 | HTTP API"), first
+        assert " | HTTP API" not in session_line(manager.summary(mine))
+        line = session_line({**manager.summary(job), "network": "off", "clarify": True}).splitlines()[0]
+        assert line.endswith(" | HTTP API | no network | clarify"), line
+        text, err = await call_launcher_tool(manager, "sessions_list", {})
+        assert not err and text.count(" | HTTP API") == 1
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_session_of_the_http_api_is_never_the_default_one(tmp_path):
+    """The launcher MCP's hub tools without `session` (and `serve`'s console: manager.default_session) never go to a
+    session created through the HTTP API v1 (docs/SPEC.md §17.1, §18.2), not even the only session or the only running
+    one: the error lists the sessions and says why; `session=` reaches it. Another session is the default as before."""
+    manager = _manager(tmp_path)
+    try:
+        job = (await manager.create("Job", "Write a parser", start=False,
+                                    api={"answers": "auto", "stop_when_done": False}))["id"]
+        assert manager.default_session() is None   # the only session
+        await manager.start(job)
+        assert job in manager.running and manager.default_session() is None   # the only running one
+        text, err = await call_launcher_tool(manager, "board", {})
+        assert err and "no single running session" in text and "HTTP API is never the default" in text, text
+        assert f"{job} [running" in text
+        text, err = await call_launcher_tool(manager, "board", {"session": job})
+        assert not err, text
+        mine = (await manager.create("Mine", "Write a lexer", start=False))["id"]
+        assert manager.default_session() == mine   # the only one it may pick, though the job runs
+        text, err = await call_launcher_tool(manager, "board", {})
+        assert err and f"session {mine} is stopped" in text
+        await manager.start(mine)
+        assert manager.default_session() == mine
+        text, err = await call_launcher_tool(manager, "board", {})
+        assert not err, text
+    finally:
+        await manager.shutdown()
+
+
+def test_the_hub_says_whether_it_has_an_api_token(tmp_path, monkeypatch):
+    """/api/hub's `api` (docs/SPEC.md §18.1): the hub has an API token of its own, read when asked, as `serve`'s `API:`
+    line; never the token or its digest. `dreamteam status` prints the API's address from it."""
+    from dreamteam import hubauth
+
+    manager = _manager(tmp_path)
+    with TestClient(create_launcher_app(manager), base_url="http://127.0.0.1:8765") as c:
+        assert c.get("/api/hub").json()["api"] is False
+        token = "api-token-of-the-test-" + "x" * 24
+        monkeypatch.setenv(hubauth.API_TOKEN_ENV, token)
+        info = c.get("/api/hub")
+        assert info.json()["api"] is True
+        assert token not in info.text and hubauth.digest(token) not in info.text
+        monkeypatch.delenv(hubauth.API_TOKEN_ENV)
+        monkeypatch.setenv(hubauth.API_DIGEST_ENV, hubauth.digest(token))   # the sandbox's container: the digest
+        assert c.get("/api/hub").json()["api"] is True
+        c.portal.call(manager.shutdown)

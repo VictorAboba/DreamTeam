@@ -271,6 +271,10 @@ async def test_select_list_and_dialog_results():
 
     sessions = [{"id": "001-a", "title": "A", "status": "running", "goal": {"title": "Goal A", "status": "done"}},
                 {"id": "002-b", "title": "B", "status": "stopped"}]
+    # a session created through the HTTP API v1 (docs/SPEC.md §21.4): marked after its status, the others not
+    text = plain(SessionPicker("en", [*sessions, {"id": "003-c", "title": "C", "status": "stopped", "via": "api",
+                                                  "answers": "auto"}]).fragments(80))
+    assert "003-c · stopped · HTTP API" in text and text.count("HTTP API") == 1
     picker = SessionPicker("en", sessions, current="002-b")
     assert picker.select.selected.value == "002-b" and not picker.pick_number(1)
     text = plain(picker.fragments(80))

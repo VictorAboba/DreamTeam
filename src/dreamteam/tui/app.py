@@ -40,6 +40,7 @@ from ..console import (
 )
 from ..copyfrom import size_text
 from ..hubauth import DIGEST_ENV, browser_url, token_link_needed
+from ..instruct import without_api_sessions
 from ..models import USER
 from . import commands, render, theme
 from .bash import ShellCommand
@@ -2091,8 +2092,8 @@ class TUI:
             await self.handle_input(self.initial_prompt)
 
     async def _open(self) -> bool:
-        """Open the hub and the session asked for; whether one was asked for (-r ID, or -c with sessions, or either
-        when the hub or its session list failed)."""
+        """Open the hub and the session asked for; whether one was asked for (-r ID, or -c with a session it may
+        continue: one not created through the HTTP API, or either when the hub or its session list failed)."""
         missing = None
         # asked for until the session list says otherwise: a list that fails keeps the prompt as well
         wanted = bool(self.session_arg) or self.continue_last
@@ -2102,6 +2103,7 @@ class TUI:
             home = str(self.hub.get("home") or self.hub.get("project") or "")
             self.local = bool(self.conn.owned) or _same_path(home, str(self.home))
             sessions: list[dict] = []
+            continuable: list[dict] = []   # those -c may pick: never a session of the HTTP API (without_api_sessions)
             target: dict | None = None
             earlier: dict | None = None  # -c: the most recent session, made by an earlier version
             refused: dict | None = None  # -r ID: a session made by an earlier version (its message, nothing attached)
@@ -2113,14 +2115,15 @@ class TUI:
                         if lang in LANGS:
                             self.ctx.lang = lang
                 sessions = await self.client.sessions()
-                wanted = bool(self.session_arg) or (self.continue_last and bool(sessions))
+                continuable = without_api_sessions(sessions)
+                wanted = bool(self.session_arg) or (self.continue_last and bool(continuable))
                 if self.session_arg:
                     target = next((s for s in sessions if s.get("id") == self.session_arg), None)
                     missing = None if target else self.session_arg
                     if target is not None and target.get("earlier_version"):   # never opened (SPEC §17.2)
                         refused, target = target, None
-                elif self.continue_last and sessions:
-                    target = max(sessions, key=lambda s: _float(s.get("last_activity") or s.get("created_at")))
+                elif self.continue_last and continuable:
+                    target = max(continuable, key=lambda s: _float(s.get("last_activity") or s.get("created_at")))
                     if target.get("earlier_version"):  # never opened, nor passed over for an older one (SPEC §17.2)
                         earlier, target = target, None
             self.print(render.welcome(self.ctx, version=__version__, home=str(self.home),
@@ -2133,8 +2136,9 @@ class TUI:
                 self._resume_skills = False   # the skills go to a session /new creates, as with no sessions
             elif refused is not None:
                 self._refuse_earlier(refused)
-            elif self.continue_last and not sessions and self.client.mode == "launcher":
-                self.info(self.t("no_sessions_continue"))
+            elif self.continue_last and not continuable and self.client.mode == "launcher":
+                # (with sessions of the API only, it says how to open one)
+                self.info(self.t("no_sessions_continue_api" if sessions else "no_sessions_continue"))
             if self.client.mode != "launcher":
                 await self.attach(None, announce=False)
             elif target is not None:

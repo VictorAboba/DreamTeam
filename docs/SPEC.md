@@ -97,8 +97,8 @@ src/dreamteam/
   uitext.py      the feed's texts (ru/en), moved out of tui/i18n.py, which stays as a shim (§21.6; draft)
   symbols.py     the feed's symbols, moved out of tui/theme.py, which re-exports them (§21.6; draft)
   result.py      the result object of a run, shared by `dreamteam -p` and the API (§21.7; draft)
-  instruct.py    what `dreamteam -p -r` and the API's continue do with a prompt: coordinator, continue_step (§21.2;
-                 draft)
+  instruct.py    what `dreamteam -p -r` and the API's continue do with a prompt: coordinator, continue_step; the
+                 sessions `-c` picks from: without_api_sessions (§21.2, §21.4; draft)
   sessionopts.py team, model and limits of a request -> session overrides, shared with the launcher MCP (§21.4;
                  draft)
   apifolders.py  [api] folders: the roots, their checks, a request's folder (§21.10; draft)
@@ -4534,7 +4534,9 @@ settings; ValueError when they are invalid):
   while the server runs are picked up (mtime/size) before reads and updates; an invalid hand edit is ignored
   with a warning.
 - `default_session()`: the running session (the most recently active one when several run), else the only
-  session, else None; a session made by an earlier version is never it ("Sessions of an earlier version").
+  session, else None; a session made by an earlier version is never it ("Sessions of an earlier version"), nor one
+  created through the HTTP API v1 (`instruct.without_api_sessions`, and `api_sids()` for the fallback: an API
+  client's job never takes the launcher MCP's calls without `session` or `serve`'s console, §21.4).
 - Summary (`list()` sorts running first, then by last activity or creation, newest first; a session that
   cannot be summarized appears as `{"id", "title", "status": "stopped", "error"}`):
   ```json
@@ -4564,11 +4566,16 @@ settings; ValueError when they are invalid):
   `skills_pending`: those members proposed that wait for the user's library decision (from memory when loaded,
   else `read_session_skills` of the session's data dir). `copied_from`: the files copied in at create ("Copying
   files into a new session" below), None for a session made without a copy.
-  `via` and `answers` are there only for a session created through `/api/v1` (§21.4): session.json's `via` (`"api"`)
-  and its `api.answers` (`"auto"` or `"manual"`), so the sessions page marks it "API" and `dreamteam -p` sends no
-  automatic replies of its own to an `auto` one. `last_activity` (the time of the newest journal event) leaves out
-  `session.started` and `session.stopped` (§21.6), and `dreamteam -c` and `-p -c` never pick a session whose `via` is
-  `"api"`.
+  `via` and `answers` are there only for a session created through `/api/v1` (§21.4): session.json's `via`
+  (`models.API_VIA`, `"api"`) and its `api.answers` (`"auto"` or `"manual"`), so the sessions page marks it "API"
+  (§18.4), `session_line` marks it ` | HTTP API` (§18.2), and `dreamteam -p` sends no
+  automatic replies or approvals of its own to an `auto` one (`autoreply.hub_answers(summary)`, §21.5).
+  `last_activity` (the time of the newest journal event) leaves out `session.started` and `session.stopped` (§21.6),
+  and `dreamteam -c` and `-p -c` never pick a session whose `via` is `"api"`, nor do the other picks the user did
+  not name (`console` and `traces` without `--session`, the hub's `default_session()`):
+  `instruct.without_api_sessions(sessions)` drops them first. When nothing is picked only because of that, the
+  message says how to reach one (`-p -c`: printmode `no_sessions_api`; the TUI: `no_sessions_continue_api`;
+  `console` / `traces`: cli `API_NOT_PICKED`). `-r <id>` and `--session` open such a session as any other.
 
 #### Workspace folder
 A session works in `<session dir>/workspace` (`default_workspace(sid)`) unless its `session.json` has
@@ -5032,7 +5039,7 @@ succeeded: either may have changed the library) and everything else to the launc
 |---|---|
 | GET `/` | `static/home.html` (launcher page, `no-store`) |
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
-| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox","container"}` (`container`: `copyfrom.hub_in_container`, §17.2 "Copying files into a new session") |
+| GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox","container","api"}` (`container`: `copyfrom.hub_in_container`, §17.2 "Copying files into a new session"; `api`: the hub has an API token of its own, `hubauth.api_digest() is not None`, §21.1: `dreamteam status` then prints the API's address; never the token or its digest) |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
 | POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`); `copy_from` (an absolute folder or .zip path on the hub's computer) or `copy_from_upload` (a token of POST `/api/uploads`), strings, not both: copied into the new session's folder before its first start (§17.2 "Copying files into a new session"), the answer then also has `"copy"` (`copy_result`); 404 for an unknown or used upload, 409 for a `workspace` with files, 413 over `[workspace] copy_max_mb` / `copy_max_files` |
 | POST `/api/uploads?filename=<name>` | the raw zip as the body (`Content-Type: application/zip`, not base64 JSON; the guard's `raw_posts`) → 201 `{"upload": token, "filename", "bytes", "expires_in": 3600}` (`manager.uploads.receive` with the limits of `manager.global_config()`); 415 JSON when not `application/zip` (the handler checks too), 413 over `copy_max_mb` (Content-Length or streamed), 429 when 8 uploads wait, 400 empty, not a zip, or interrupted (starlette's `ClientDisconnect`: "The upload was interrupted."), 500 for other failures (`_failure`); the token is used once by `POST /api/sessions` within an hour |
@@ -5128,7 +5135,9 @@ succeeded: either may have changed the library) and everything else to the launc
   summary may be a remote hub's JSON), and for a
   running session with background jobs ` | jobs N running` (`session_line`, from `read_stats` "jobs"); a running one
   in the user's wrap-up mode is `[running, wrapping up]`; one paused for a member's question (summary `question`,
-  §3.1) is `[paused (waiting for your answer to Anna Smith, question #12)]`; a session without network ends its first
+  §3.1) is `[paused (waiting for your answer to Anna Smith, question #12)]`; a session created through the HTTP API
+  v1 (summary `via` "api", §21.4) has ` | HTTP API` right after the cost, before the marks that follow; a session
+  without network ends its first
   line with ` | no network` (summary `network`, §7.2), one in clarify mode with ` | clarify` (summary `clarify`,
   after ` | no network`); a session made by an earlier version (summary `earlier_version`, §17.2) is `[stopped]`
   ending its first line with ` | made by an earlier version: cannot be opened` (`session_start`, `session_cd` and
@@ -5142,8 +5151,9 @@ succeeded: either may have changed the library) and everything else to the launc
   entry (the sessions keep their copies). Library changes emit `sessions.changed` (change `skills`). There is no
   `session_delete` tool.
 - Every hub tool (§13) with an extra optional `session` property. Without it the call goes to
-  `manager.default_session()`; when there is none, the error lists the sessions. An unknown or stopped session
-  is an error result (`session_start` is suggested; for a session made by an earlier version, its message).
+  `manager.default_session()` (never a session created through the HTTP API v1, §17.1); when there is none, the
+  error lists the sessions, and adds `A session created through the HTTP API is never the default.` when one is
+  listed. An unknown or stopped session is an error result (`session_start` is suggested; for a session made by an earlier version, its message).
 - Calls run `hub_mcp.hub_call` on the session's swarm (same actor rules: `as_agent`). A call still running when
   its session stops or is deleted ends with `Error: session X was stopped while <tool> was running.` Each call is
   dispatched inside `hub_mcp.serving_client(client_key(ctx, local))` (`local` = `local:<uuid>` per launcher server),
@@ -5393,7 +5403,10 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   stderr, exit 1, and its database is not opened: `db.made_by_earlier_version` runs right after `_session_db`
   returns an existing path, before `Database(...)`, so one check covers the home and the project).
 - Sessions made by an earlier version (§17.2 "Sessions of an earlier version"): `sessions` and `status` list them
-  marked (`session_line`, as in §18.2); `-c` and `-p -c` continue the most recent session, and when that one was
+  marked (`session_line`, as in §18.2); `-c` and `-p -c` continue the most recent session (never one created
+  through the HTTP API v1, which they pass over as if it were not listed: `instruct.without_api_sessions`, §17.2;
+  with only such sessions they say there is no session to continue and that `-r <id>` / `/resume id` opens one),
+  and when that one was
   made by an earlier version they never pass over it for an older session the user did not ask for: they say so
   and that a new session is needed, and create nothing (`-p` exits 1 with the print mode's `continue_earlier` on
   stderr, en `The most recent session, {sid}, was made by an earlier version of DreamTeam and cannot be opened by
@@ -5404,7 +5417,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   {id}, создана более ранней версией DreamTeam, и эта версия ({version}) не может её открыть: начните новую
   сессию», and attaches nothing; a prompt given with `-c`, or with `-r ID` of a session that did not open, is
   never sent (nor when the hub or its session list failed): it is left in the input line, to send on purpose; `{version}` is the hub's); a default picked without the user asking for the last
-  session (`console` and `traces` without `--session`) still skips sessions made by an earlier version; `-r ID` of
+  session (`console` and `traces` without `--session`) still skips sessions made by an earlier version, and those
+  created through the HTTP API v1 too (which the `-r` picker and `/sessions` mark `HTTP API` after the status,
+  uitext `sess_api`, as `session_line`'s ` | HTTP API`); `-r ID` of
   one prints its message (the TUI says it under the welcome box and creates nothing; `-p` exits 1); the `-r`
   picker and `/sessions` show them with the status «прежняя версия» / "earlier version", Enter shows the message
   instead of attaching (the picker closes and the message is printed; `/resume ID` the same; the legacy `main`'s Del
@@ -5412,7 +5427,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   its stopped check; without `--session` it picks, like `traces`, only among the sessions this version opens);
   `sessions rm` deletes them as any session (the legacy `main` stays undeletable there too, and its message names
   the file to remove by hand).
-- `status` of a home lists the sessions (from the hub, or read from the home); of a project, `swarm_status`.
+- `status` of a home lists the sessions (from the hub, or read from the home), then `Home:` and `Hub:`, and `API:
+  <hub>/api/v1` when the running hub's `/api/hub` says `api` (it has an API token, §21.1; the line `serve` prints,
+  never the token); of a project, `swarm_status`. `sessions` prints the same list without the `API:` line.
+- `console` prints the session it opens as `Session <id>: <title>`, the title as one printable line
+  (`copyfrom.printable_line`: one made on the board or over MCP, or a remote hub's, may hold control characters).
 - `sandbox` refuses when a hub runs for the directory; the container runs `serve /swarm` for a home and
   `run /swarm` for a project, on `--host 0.0.0.0` with a hub token of its own (§14.2: printed with the board URL and
   the MCP command, kept on the host outside the mounted folders for the host's `dreamteam` commands; the container gets only its SHA-256). `docker.sandbox_command` starts it with `docker run --rm --init ...`: a tiny init
@@ -5495,7 +5514,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       stays in the paused state, its badge reads «Ждёт вашего ответа» / "Waiting for your answer" with the tooltip
       «{name} ждёт вашего ответа на вопрос #{id}» from the summary's `question`) and, for a running session in the
       user's wrap-up mode (summary `wrap_up`, read
-      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», task progress bar, agents (working), spent/budget, model, last activity (the time of
+      from the session database like `paused`), a warning badge «Завершается» / «Wrapping up», after the «Без
+      интернета» badge (§7.2) a plain badge «API» for a session created through the HTTP API v1 (summary `via`
+      "api", §21.4; `apiBadge`), its tooltip by summary `answers`: `api_hint_auto` (the hub itself answers the agents'
+      questions and reviews) or `api_hint_manual` (the API client answers them, or the user on the board), both
+      saying that `dreamteam -c` does not pick it, task progress bar, agents (working), spent/budget, model, last activity (the time of
       the session's last event, its tooltip «Активность: … · Создана: …»; without an event, the creation time and
       «Создана: …»),
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
@@ -7238,7 +7261,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   `start_error` the last start's failure; `error` {code, text} of a `continue` whose text could not be given after a
   start (21.2), null again from the next text a `continue` gives. The sessions page shows
   such a session like any other, marked "API". `dreamteam -c` and `-p -c` never pick one (a busy client would
-  otherwise make its own sessions the most recent ones); `-r <id>` opens it.
+  otherwise make its own sessions the most recent ones), nor do `console` and `traces` without `--session`, nor is
+  one the hub's `default_session()` (the launcher MCP's calls without `session`, `serve`'s console; §17.1, §17.2);
+  `-r <id>` opens it.
 - **`[api] max_running`** (default 3, 0 = no limit) counts the running and starting sessions created through v1. Only
   v1's starts (create, `continue`) are refused, 429 `too_many_sessions`. A resume when the hub starts and the owner's
   starts from the board, the TUI or MCP are never refused, but they count.
@@ -7385,7 +7410,10 @@ retried answer never lands on a newer one:
   - `mcp` requests stay requests in this mode too. With `[mcp] require_approval = true`, an `auto` session can stay
     `waiting` until the client or the board answers.
   - The texts and the limit move from printmode.py to autoreply.py. `-p` keeps its client-side replies, except for a
-    session whose summary says `answers: "auto"`: there it sends none, so nothing is answered twice.
+    session whose summary says `answers: "auto"` (`autoreply.hub_answers(summary)`, read from the summary `-p -r`
+    starts or attaches; `answers` never changes after the create): there it sends no reply, approval or answer to a
+    question pause, and writes no line that a member waits for the user, so nothing is answered twice; with
+    `--verbose` it says once that the hub answers (printmode `hub_answers`).
 
 ### 21.6 Events
 
@@ -7807,11 +7835,14 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - `autoreply.py`: `SessionAutoReply`, `requests_of`, `requests_from`, `read_requests`, `blocking_requests`,
     `request_key`, `follow_journal`, `journal_head`, `planner_question` and the queries it shares with the swarm
     (`LAST_TO`, `QUESTION_DROPPED`, `PLANS`), `AUTO_REPLY`, `AUTO_REVIEW`, `AUTO_REPLY_MAX` (moved from printmode.py,
-    which imports them). It imports neither dreamteam.tui nor the swarm module (the swarm imports it).
+    which imports them), and `hub_answers(summary)` (21.5: `-p` sends nothing of its own there). It imports neither
+    dreamteam.tui nor the swarm module (the swarm imports it).
   - `eventtext.py`: `event_text`. `uitext.py` and `symbols.py`: the feed's texts and symbols, moved out of
     `tui/i18n.py` and `tui/theme.py` (shims stay there).
   - `result.py`: `build_result`.
-  - `instruct.py`: `coordinator(state)` and `continue_step(state)`: what `-p -r` and v1 `continue` do with a prompt.
+  - `instruct.py`: `coordinator(state)` and `continue_step(state)`: what `-p -r` and v1 `continue` do with a prompt;
+    `without_api_sessions(sessions)`: the sessions `-c` and the CLI's other unnamed picks choose from (21.4).
+  - `models.py`: `API_VIA` ("api"), the `via` the hub writes and the clients read.
   - `sessionopts.py`: `overrides_from(body, config, *, strict)`: team, model and limits → session overrides, shared
     with the launcher MCP's `session_create`.
   - `apifolders.py`: the roots of `[api] folders` (in the sandbox's container, where it mounts them), their checks,
@@ -7892,8 +7923,17 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     `folder`;
   - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
     spelling (one folder), a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, and
-    `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight; `-c` passing over
-    v1 sessions;
+    `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;
+  - the clients (`tests/test_tui_print.py`, `tests/test_tui_app.py`, `tests/test_tui_commands.py`,
+    `tests/test_tui_render.py`, `tests/test_cli_launcher.py`, `tests/test_launcher.py`, `tests/test_ui.py`,
+    `tests/test_instruct.py`): `-p -r` on an `answers: "auto"` session
+    answering nothing itself (one answer per message and review, the hub's), and on a `manual` one as on any session;
+    `-c` of the TUI and of `-p`, the CLI's `console` / `traces` picks and the hub's `default_session()` (the launcher
+    MCP's calls without `session`), passing over v1 sessions (only v1 sessions: no session to continue, and how to
+    open one); `-p --no-auto-reply` on an `auto` session writing no line that a member waits for the user; the
+    sessions page's «API» badge and its tooltips in both languages; `session_line`'s
+    ` | HTTP API` and the TUI picker's `HTTP API`; `/api/hub`'s `api` and `status` printing `API:` only for a hub that says it; the console's title
+    as one printable line;
   - the sandbox (21.10 "Sandbox", in `tests/test_api_v1_folders.py`, no Docker run: the argv and the container's hub):
     the roots mounted as resolved (one through a link), read-only unless `in_place`, and not a missing one, the user's
     home folder, one inside the DreamTeam home, one around the store of hub tokens or the host's skills library, or

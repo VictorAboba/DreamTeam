@@ -71,6 +71,21 @@ class TestPure:
         assert printmode.AUTO_REPLY is autoreply.AUTO_REPLY and printmode.AUTO_REVIEW is autoreply.AUTO_REVIEW
         assert printmode.AUTO_REPLY_MAX == autoreply.AUTO_REPLY_MAX == 50
 
+    @pytest.mark.parametrize("summary, hub", [
+        ({"id": "s", "via": "api", "answers": "auto"}, True),
+        ({"id": "s", "via": "api", "answers": "manual"}, False),   # the API client answers
+        ({"id": "s", "via": "api"}, False),                        # (the hub's summary always has both keys)
+        ({"id": "s", "answers": "auto"}, False),                   # not a session of the API: `answers` alone is not it
+        ({"id": "s", "via": "home", "answers": "auto"}, False),
+        ({"id": "s"}, False),
+        ({}, False),
+        (None, False),
+        ("api", False),
+    ])
+    def test_hub_answers(self, summary, hub):
+        """Which sessions the hub answers for itself (docs/SPEC.md §21.5), so `-p` sends nothing there."""
+        assert autoreply.hub_answers(summary) is hub
+
 
 def test_the_shared_run_modules_import_no_tui():
     """Hub code imports autoreply, result, instruct and the event texts (eventtext, uitext, symbols): none of them may

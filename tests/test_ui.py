@@ -2569,6 +2569,48 @@ def test_home_card_shows_a_question():
     assert 'title="Anna Smith ждёт вашего ответа на вопрос #12">Ждёт вашего ответа</span>' in out["ru"]
 
 
+def test_the_api_badge_is_translated():
+    """The sessions page's «API» badge of a session created through the HTTP API (docs/SPEC.md §18.4): its label and
+    both tooltips exist in ru and en, and the card uses all three."""
+    blocks = home_i18n()
+    keys = {"api_badge", "api_hint_auto", "api_hint_manual"}
+    assert keys <= blocks["ru"] and keys <= blocks["en"]
+    assert keys <= used_keys(HOME_JS)
+
+
+@needs_node
+def test_home_card_marks_a_session_of_the_http_api():
+    """A session created through the HTTP API v1 (summary `via` "api"): a plain «API» badge after the others, its
+    tooltip by `answers` (the hub answers, or the API client does), in the page's language; none for another session,
+    whatever its `answers`."""
+    out = run_js(r"""
+      const home = loadHomeJs();
+      const base = { id: "s1", title: "S", status: "running", network: "off", tasks: { total: 0, done: 0 },
+                     agents: { total: 0, working: 0 } };
+      const card = (extra) => home.sessionCard(Object.assign({}, base, extra));
+      for (const lang of ["en", "ru"]) {
+        home.H.lang = lang;
+        out[lang] = { auto: card({ via: "api", answers: "auto" }), manual: card({ via: "api", answers: "manual" }),
+                      plain: card({}), other: card({ via: "home", answers: "auto" }),
+                      hintAuto: home.esc(home.t("api_hint_auto")), hintManual: home.esc(home.t("api_hint_manual")),
+                      label: home.t("api_badge") };
+      }
+    """)
+    for lang in ("en", "ru"):
+        cards = out[lang]
+        assert cards["label"] == "API" and cards["hintAuto"] != cards["hintManual"]
+        auto = f'<span class="badge plain" title="{cards["hintAuto"]}">API</span>'
+        manual = f'<span class="badge plain" title="{cards["hintManual"]}">API</span>'
+        assert auto in cards["auto"] and manual not in cards["auto"]
+        assert manual in cards["manual"] and auto not in cards["manual"]
+        # after the status and «no internet» badges, in the card's head
+        head = cards["auto"].split('<div class="sc-head">', 1)[1].split("</div>", 1)[0]
+        assert head.index(auto) > head.index("badge warn") > 0
+        assert ">API</span>" not in cards["plain"] and ">API</span>" not in cards["other"]
+    assert "hub itself answers" in out["en"]["hintAuto"] and "API client answers" in out["en"]["hintManual"]
+    assert "dreamteam -c" in out["en"]["hintAuto"] and "dreamteam -c" in out["ru"]["hintManual"]
+
+
 @needs_node
 def test_home_card_of_an_earlier_version_session():
     """A session made by an earlier version (docs/SPEC.md §17.2, §18.4 home card): the «Прежняя версия» badge in place

@@ -617,6 +617,90 @@ async def test_attach_to_session_and_continue_last(launch):
     assert code == 1 and "no-such-session" in err
 
 
+# ---- sessions of the HTTP API v1 (docs/SPEC.md §21.4, §21.5) --------------------------------------------------------
+JOB = {"answers": "auto", "stop_when_done": False}   # the api block of a session created through the HTTP API v1
+
+
+async def test_a_session_the_hub_answers_for_gets_nothing_from_print_mode(launch, monkeypatch):
+    """`-p -r` on a session of the HTTP API with `answers: "auto"`: the hub answers the member's question and approves
+    the review itself (SessionAutoReply), and the run sends no reply or approval of its own, so each is answered once;
+    with --verbose it says so once. The prompt itself still goes in (here: the goal)."""
+    conn = await launch(asking_planner)
+    sid = (await conn.manager.create("Job", "", start=False, api=JOB))["id"]
+    acts: list[str] = []
+    act = conn.client.act
+
+    async def recording(sid_, tool, args=None):
+        acts.append(tool)
+        return await act(sid_, tool, args)
+
+    monkeypatch.setattr(conn.client, "act", recording)
+    code, out, err = await run(conn, f"Plan a {MARK}", session=sid, output_format="json", verbose=True)
+    assert code == 0, err
+    result = json.loads(out)
+    assert result["session"] == sid and result["summary"] == "Planned, reviewed and done."
+    assert acts == ["set_goal"]   # no send_message, no task_review: the hub's answers alone
+    replies = [m for m in await conn.client.messages(sid) if m["sender"] == "user"]
+    assert [m["text"] for m in replies] == [AUTO_REPLY["en"]] and isinstance(replies[0]["reply_to"], int)
+    data = await conn.client.task(sid, 1)
+    assert [p["text"] for p in data["discussion"] if p["author"] == "user"] == [AUTO_REVIEW["en"]]
+    assert err.count(printmode.TEXTS["en"]["hub_answers"]) == 1
+
+
+async def test_a_session_whose_client_answers_still_gets_the_automatic_replies(launch):
+    """`answers: "manual"`: the hub answers nothing, so `-p -r` with automatic replies answers as for any session."""
+    conn = await launch(asking_planner)
+    sid = (await conn.manager.create("Job", "", start=False, api={**JOB, "answers": "manual"}))["id"]
+    code, out, err = await run(conn, f"Plan a {MARK}", session=sid, output_format="json", verbose=True)
+    assert code == 0, err
+    assert json.loads(out)["summary"] == "Planned, reviewed and done."
+    assert [m["text"] for m in await conn.client.messages(sid) if m["sender"] == "user"] == [AUTO_REPLY["en"]]
+    data = await conn.client.task(sid, 1)
+    assert [p["text"] for p in data["discussion"] if p["author"] == "user"] == [AUTO_REVIEW["en"]]
+    assert printmode.TEXTS["en"]["hub_answers"] not in err
+
+
+async def test_without_auto_reply_print_mode_says_nothing_of_what_the_hub_answers(launch):
+    """`-p -r --no-auto-reply` on a clarifying session of the HTTP API with `answers: "auto"`: the member's question is
+    the hub's to answer, so the run writes no "asks you" or "waits for your answer" line (it would for another
+    clarifying session) and ends with the goal; without --verbose it does not say that the hub answers either."""
+    conn = await launch(pausing_asker())
+    sid = (await conn.manager.create("Job", "", start=False, overrides=CLARIFY, api=JOB))["id"]
+    code, out, err = await run(conn, f"A {MARK} in a colour", session=sid, auto_reply=False, timeout=10)
+    assert code == 0 and out.strip() == "The haiku is blue.", err
+    assert (await conn.client.session(sid))["session"]["clarify"]
+    asked = [m for m in await conn.client.messages(sid) if "user" in m["recipients"] and m["sender"] != "user"]
+    replies = [m for m in await conn.client.messages(sid) if m["sender"] == "user"]
+    assert asked and [m["text"] for m in replies] == [AUTO_REPLY["en"]]   # the hub's answer, the only one
+    for key in ("asked", "asked_timeout", "question"):
+        line = printmode.TEXTS["en"][key].format(name=asked[0]["sender"], id=asked[0]["id"], url=board_url(conn, sid))
+        assert line not in err, err
+    assert " asks you (message #" not in err and "The swarm waits for your answer" not in err
+    assert printmode.TEXTS["en"]["hub_answers"] not in err   # (--verbose only)
+
+
+async def test_continue_last_passes_over_the_sessions_of_the_http_api(launch):
+    """`-p -c` never continues a session created through the HTTP API, though it is the most recent one: with only
+    such sessions there is no session to continue (nothing started), and the line says how to reach one (with none
+    at all, the line as before); else the most recent other one goes on."""
+    conn = await launch(finisher("Continued."))
+    code, out, err = await run(conn, f"Write a {MARK}", continue_last=True, lang="en")
+    assert code == 1 and out == "" and err.strip() == printmode.TEXTS["en"]["no_sessions"]
+    first = (await conn.manager.create("Job", "", start=False, api=JOB))["id"]
+    code, out, err = await run(conn, f"Write a {MARK}", continue_last=True, lang="en")
+    assert code == 1 and out == "" and err.strip() == printmode.TEXTS["en"]["no_sessions_api"]
+    assert "-r <id>" in err and not conn.manager.running
+    mine = (await conn.client.create_session("Mine", "", start=False))["id"]
+    await asyncio.sleep(0.05)
+    job = (await conn.manager.create("Job two", "", start=False, api=JOB))["id"]
+    listed = {s["id"]: s for s in await conn.client.sessions()}
+    assert listed[job]["created_at"] > listed[mine]["created_at"] > listed[first]["created_at"]
+    code, out, err = await run(conn, f"Write a {MARK}", continue_last=True, output_format="json")
+    assert code == 0, err
+    assert json.loads(out)["session"] == mine
+    assert sorted(conn.manager.running) == [mine]   # neither session of the API was started
+
+
 class GonePipe(io.StringIO):
     """stdout of `dreamteam -p ... | head -1` after head exited."""
 
