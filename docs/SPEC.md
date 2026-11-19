@@ -7021,13 +7021,18 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   left keeps its place until its call returns (a download or an archive closes its file or its walk only then:
   `api_v1._thread_step`). Never the loop's default executor, which the rest of the hub shares (workspace git, the
   triggers, the forge, v1's reads of the journals and the uploads store) and which `asyncio.run` waits for at exit: a
-  share that stops answering holds at most these threads until its calls return, never the hub's other work, and
-  never its exit. A folder worked in `in_place` (21.10) is not covered: it is the session's workspace, and the
-  manager's work on it runs where the manager runs any session's, in the loop's default executor, as for a folder on
-  a share that the owner gave a board session (§17.2): the create's `_plan` and the folder's set-up (`_carry_out`: the
-  missing folders, `git init` and the first commit), the checks of every start (`_check_workspace_ready`,
-  `_check_server_git`, `_check_adopted_repo`) and the running session's workspace git. An in-place root on a share
-  that stops answering after `resolve_request` touched it may so hold threads of the default executor.
+  share that stops answering holds at most these threads until its calls return, never the hub's other work. The
+  hub's exit still waits, as long as the call lasts, for a call whose caller waits for it through a cancel: a create's
+  copy (so that its staging folder is removed) and a download's or an archive's step (`_thread_step`, so that its file
+  or its walk is closed after it). The shutdown cancels those callers, and `asyncio.run` then waits for them. The
+  other calls (GET files, a result's changed files, a create's `resolve_request`, a redaction) are left to their
+  thread at a cancel, and the exit does not wait for them. A folder worked in `in_place` (21.10) is not covered: it is
+  the session's workspace, and the manager's work on it runs where the manager runs any session's, in the loop's default
+  executor, as for a folder on a share that the owner gave a board session (§17.2): the create's `_plan` and the
+  folder's set-up (`_carry_out`: the missing folders, `git init` and the first commit), the checks of every start
+  (`_check_workspace_ready`, `_check_server_git`, `_check_adopted_repo`) and the running session's workspace git. An
+  in-place root on a share that stops answering after `resolve_request` touched it may so hold threads of the default
+  executor.
 - **Compatibility**: within v1, fields, codes, states and event types are only added, never renamed, removed or given
   another meaning; a client ignores what it does not know. The `text` of events (21.6) and of errors is for people and
   may be reworded. Anything else is `/api/v2`, and v1 then stays for at least one minor release. `GET /api/v1/options`

@@ -819,7 +819,9 @@ class _Threads:
     Never the loop's default executor, which the rest of the hub shares (workspace git, the triggers, the forge, v1's
     journal reads) and which asyncio.run waits for at exit: a folder on a share that stops answering holds at most
     `size` threads of v1's, each until its own call returns (a cancelled caller's thread keeps its place until then),
-    never the hub's other work nor its exit."""
+    never the hub's other work. A caller that waits for its call through a cancel (a create's copy: sessions'
+    _in_thread; a download's or an archive's step: _thread_step) holds the hub's exit until that call returns; one
+    that awaits run() does not."""
 
     def __init__(self, size: int) -> None:
         self._slots = asyncio.Semaphore(size)

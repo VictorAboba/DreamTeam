@@ -2619,7 +2619,8 @@ class SessionManager:
         `file_conflict`) in the SessionError. `folder_threads`: with `sources`, where their copy runs instead of the
         loop's default executor (_in_thread's `threads`): v1 passes its folder threads when a server folder is among
         them (docs/SPEC.md §21.1 "Threads"), so a share that stops answering in the middle of the copy holds none of
-        the threads the rest of the hub shares, nor its exit.
+        the threads the rest of the hub shares. A cancel, the hub's shutdown among them, still waits for the copy to
+        end (_in_thread), so the hub's exit waits for it as long as it lasts.
         `api`: the session is the HTTP API v1's: session.json gets "via": "api" and the "api" block (the keys of
         API_GIVEN: answers, stop_when_done, client_ref, request_digest, folder; the others null) in its first write,
         before any start (see _start_locked for what every start does with it).
