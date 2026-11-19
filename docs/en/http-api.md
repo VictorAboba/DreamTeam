@@ -479,7 +479,10 @@ is resumed as well.
   zip's end, so the client gets an invalid zip, never a valid one that lacks files. A hub sends at most 4 archives at
   once (from the measure until the answer ends, however slowly its client reads): one more is 429
   `too_many_archives`; ask again later, or download the files one by one. A client that leaves during the measure
-  gives its place back at once.
+  gives its place back at once. Each archive keeps open files on the hub while it is sent, so a hub whose limit of
+  open files is below 1024 sends fewer (one at macOS's default of 256). The hub raises that limit to 1024 when it
+  starts, as far as the system allows, and its log says so when it cannot (`ulimit -n 1024` before
+  `dreamteam serve` helps then).
 - Paths are relative to the session's folder, with `/`. An absolute path, `..`, `.`, an empty name, a NUL, a backslash,
   a `.git` component or a Windows short name (`GIT~1`) is 400 `bad_name`; so is a path in `.scratch` without
   `scratch=true`, and one in `.scratch/_skills` ever; on a Windows hub so are `:`, `< > " | ? *`, reserved names
@@ -551,7 +554,7 @@ under a root the owner lists in `[api] folders` can be named, by the root's name
 | `too_large` | 413 | a body, an upload, a copy or an archive over its limit |
 | `too_many_uploads` | 429 | `[api] uploads_pending` uploads already wait (with `Retry-After`; delete the unused ones) |
 | `too_many_sessions` | 429 | `[api] max_running` sessions already run |
-| `too_many_archives` | 429 | the hub already sends 4 archives |
+| `too_many_archives` | 429 | the hub already sends as many archives as it sends at once (4) |
 | `internal` | 500 | the hub failed, or is shutting down; its log says why. Ask again later |
 
 An error text never names a path of the hub's computer for the API token: a server folder reads as `<root>/<path>`,

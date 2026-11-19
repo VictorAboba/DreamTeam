@@ -75,6 +75,11 @@ if TYPE_CHECKING:
     from .sessions import SessionManager
     from .swarm import Swarm
 
+try:
+    import resource   # (POSIX: the limit of open files, open_files_limit)
+except ImportError:   # (Windows: none to read; its C runtime gives a process up to 8192 descriptors)
+    resource = None   # type: ignore[assignment]
+
 log = logging.getLogger(__name__)
 
 API_VERSION = 1
@@ -110,9 +115,14 @@ ARCHIVE_FIELDS = ("path", "scratch")                           # GET .../archive
 FILE_CHUNK = 1 << 20        # bytes of each read of a download or of an archived file
 ZIP_SENT = 256 << 10        # bytes of zip an archive gathers before it sends them
 ZIP_ENTRY_COST = 4 << 10    # what one entry of an archive counts for in a step, as bytes read (_zip_parts)
-# archives a hub measures or sends at once (429 too_many_archives beyond them): each holds the descriptors of its walk,
-# up to nofollow.MAX_DEPTH + 2, for as long as its client takes to read it
+# archives a hub measures or sends at once, at most (429 too_many_archives beyond them): each holds the descriptors of
+# its walk, up to nofollow.MAX_DEPTH + 2, for as long as its client takes to read it; archives_at_once() allows fewer
+# where the process's limit of open files is low
 ARCHIVES_AT_ONCE = 4
+# the soft limit of open files (RLIMIT_NOFILE, POSIX) a hub raises a lower one to at its start, as far as the hard limit
+# allows (raise_open_files_limit; macOS gives a program started from Terminal 256). Never higher: the programs the
+# agents run inherit it, and select() takes no descriptor past 1024 (FD_SETSIZE)
+OPEN_FILES_WANTED = 1024
 # v1's own daemon threads at once for the work that may touch a folder of the hub's computer (_Threads; docs/SPEC.md
 # §21.1 "Threads"): a call past them waits for one to end
 FOLDER_THREADS = 8
@@ -936,6 +946,52 @@ def _number(value: Any) -> bool:
 
 
 # ---- files and archive (docs/SPEC.md §21.8) -------------------------------------------------------------------------
+def open_files_limit() -> int | None:
+    """The process's soft limit of open files (RLIMIT_NOFILE); None where there is none to read (Windows) or it is
+    unlimited."""
+    if resource is None:
+        return None
+    try:
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return None
+    return None if soft == resource.RLIM_INFINITY or soft < 0 else soft
+
+
+def raise_open_files_limit(wanted: int = OPEN_FILES_WANTED) -> int | None:
+    """At a hub's start (launcher.serve_launcher): the process's soft limit of open files raised to `wanted` when it
+    is lower, to the hard limit when that is lower still, never higher, for this process only (the programs it starts
+    inherit it). A refusal (a sandbox) leaves it as it was. Returns the soft limit then (open_files_limit); when it is
+    too low for ARCHIVES_AT_ONCE archives, the log says how many are sent at once (archives_at_once)."""
+    if resource is None:
+        return None
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if soft != resource.RLIM_INFINITY and 0 <= soft < wanted:
+            target = wanted if hard == resource.RLIM_INFINITY or hard < 0 else min(wanted, hard)
+            if target > soft:
+                resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (OSError, ValueError) as exc:
+        log.info("the limit of open files stays as it was: %s", exc)
+    at_once = archives_at_once()
+    if at_once < ARCHIVES_AT_ONCE:
+        log.warning("The limit of open files of this process is %s, so the HTTP API sends at most %d archive(s) at "
+                    "once instead of %d: raise it (ulimit -n %d) before the hub starts.", open_files_limit(), at_once,
+                    ARCHIVES_AT_ONCE, wanted)
+    return open_files_limit()
+
+
+def archives_at_once() -> int:
+    """How many archives the hub measures or sends at once: ARCHIVES_AT_ONCE, fewer when the descriptors their walks
+    may hold together (nofollow.MAX_DEPTH + 2 each, while their clients read) would pass a third of the process's soft
+    limit of open files (open_files_limit: the rest is the hub's own, its sessions' databases, logs and sockets and its
+    agents' pipes); one at the least."""
+    soft = open_files_limit()
+    if soft is None:
+        return ARCHIVES_AT_ONCE
+    return max(1, min(ARCHIVES_AT_ONCE, soft // 3 // (nofollow.MAX_DEPTH + 2)))
+
+
 def served(parts: tuple[str, ...], scratch: bool = False) -> bool:
     """Whether v1 lists, serves and archives the path `parts` of a session's folder (docs/SPEC.md §21.8): exactly the
     paths copyfrom.check_rel takes, which `files/{path}` checks, so the three agree: never `.git` at any depth, never
@@ -2722,18 +2778,21 @@ class ApiV1:
         the folder `path` in it, with what GET files lists at every level, streamed as it is built (_zip_parts). It is
         measured first (_measure: 413 `too_large` past `[api] archive_max_mb` before any byte); an error once the
         answer has started cuts it (the zip then lacks its central directory). Checked in the order of GET files.
-        At most ARCHIVES_AT_ONCE archives are measured or sent at once, from the measure until the answer ends (each
-        holds its walk's descriptors while its client reads): one more is 429 `too_many_archives`. The measure stops at
+        At most archives_at_once() archives (ARCHIVES_AT_ONCE, fewer under a low limit of open files) are measured or
+        sent at once, from the measure until the answer ends (each holds its walk's descriptors while its client
+        reads): one more is 429 `too_many_archives`. The measure stops at
         its next entry, and gives its place back, when its client goes away (_until_gone), the hub shuts down or a
         delete of the session cuts it (_Reading)."""
         query = query_fields(request, ARCHIVE_FIELDS)
         scratch = query_flag(query.get("scratch"), "scratch")
         asked = check_rel(query.get("path"), scratch=scratch)
         sid = self._session(request, caller)
-        if self._archives >= ARCHIVES_AT_ONCE:
-            raise ApiError("too_many_archives", f"{ARCHIVES_AT_ONCE} archives are being sent already, the most the "
-                                                "hub sends at once: ask again once one has ended, or download the "
-                                                "files one by one (files/{path}).")
+        at_once = archives_at_once()
+        if self._archives >= at_once:
+            raise ApiError("too_many_archives", f"The hub sends at most {at_once} "
+                                                f"{'archive' if at_once == 1 else 'archives'} at once, and that many "
+                                                "are being sent already: ask again once one has ended, or download "
+                                                "the files one by one (files/{path}).")
         reading = _Reading(self.manager, sid)
         reading.hold()
         self._archives += 1
@@ -2774,12 +2833,13 @@ __all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVES_AT_ONCE", "ARCHI
            "FOLDER_FIELDS", "FOLDER_GONE_TEXT", "FOLDER_LINKED_TEXT", "FOLDER_REFUSED_TEXT", "FOLDER_THREADS",
            "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX", "LASTING_TEXTS", "MESSAGES_DEFAULT",
            "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT", "NO_BASE_TEXT", "NO_GIT_TEXT",
-           "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS", "PING_SECONDS", "RESULTS_CACHED",
-           "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT", "STATES",
-           "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES", "WAIT_MAX",
-           "ZIP_ENTRY_COST", "ZIP_SENT", "ApiError", "ApiV1", "CreateRequest", "SafeJSONResponse", "answer_of",
-           "attachment", "budget_text", "check_fields", "check_json_type", "claim_uploads", "continue_text",
-           "error_code", "event_view", "fail", "job_view", "library_skills", "message_of", "message_view",
-           "options_view", "query_after", "query_choice", "query_count", "query_fields", "query_flag", "query_wait",
-           "read_json", "request_digest", "required_text", "root_pairs", "safe_json", "served", "session_lang",
-           "skill_refs", "sse_event", "state_of"]
+           "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "OPEN_FILES_WANTED", "PATCH_FIELDS", "PING_SECONDS",
+           "RESULTS_CACHED", "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT",
+           "STATES", "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES",
+           "WAIT_MAX", "ZIP_ENTRY_COST", "ZIP_SENT", "ApiError", "ApiV1", "CreateRequest", "SafeJSONResponse",
+           "answer_of", "archives_at_once", "attachment", "budget_text", "check_fields", "check_json_type",
+           "claim_uploads", "continue_text", "error_code", "event_view", "fail", "job_view", "library_skills",
+           "message_of", "message_view", "open_files_limit", "options_view", "query_after", "query_choice",
+           "query_count", "query_fields", "query_flag", "query_wait", "raise_open_files_limit", "read_json",
+           "request_digest", "required_text", "root_pairs", "safe_json", "served", "session_lang", "skill_refs",
+           "sse_event", "state_of"]

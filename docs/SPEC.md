@@ -7912,13 +7912,21 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   time (clamped to 1980-2107) and a Unix mode of 0o644, 0o755 for a folder and for a file someone may execute (never
   writable by others, never setuid, whatever the hub's computer says: a Windows hub says 0o666 of every file),
   `Content-Type: application/zip`, no `Content-Length`, named `<folder>.zip` (the session's `name` for its whole
-  folder), with the headers of a download. At most `api_v1.ARCHIVES_AT_ONCE` (4) archives are measured or sent at
-  once on a hub, each from its measure until its answer ends (an archive whose client stops reading keeps its walk,
-  and with it up to `MAX_DEPTH` + 2 descriptors, open); one more is 429 `too_many_archives` (the files can still be
-  downloaded one by one). A folder more than `MAX_DEPTH` levels below the folder archived is 409 `conflict` (the
-  first walk cannot read it). Two walks (`nofollow.walk_inside`, the same `skip`, `limit=api_v1.ARCHIVE_MAX_ENTRIES`:
-  100 000 names, the ones left out counted too, since each costs the hub memory while the zip is made, whatever its
-  size; a folder's listing keeps only the names the walk may still reach, and one more raises `nofollow.TooMany`):
+  folder), with the headers of a download. At most `api_v1.archives_at_once()` archives are measured or sent at once
+  on a hub, each from its measure until its answer ends (an archive whose client stops reading keeps its walk, and
+  with it up to `MAX_DEPTH` + 2 descriptors, open); one more is 429 `too_many_archives` (the files can still be
+  downloaded one by one). That is `ARCHIVES_AT_ONCE` (4), fewer when the descriptors their walks may hold together
+  would pass a third of the process's soft limit of open files (`RLIMIT_NOFILE`; the rest is the hub's own), one at
+  the least: 4 at 1024, 2 at 512, 1 at 256. A hub raises a soft limit below `api_v1.OPEN_FILES_WANTED` (1024) to it
+  at its start (`raise_open_files_limit`, from `launcher.serve_launcher`), as far as the hard limit allows: macOS
+  starts a program from Terminal with 256. Never higher, and for its own process only (the programs it starts,
+  the agents' commands among them, inherit it; select() takes no descriptor past 1024); a limit that stays low (a
+  hard limit below 1024, a sandbox that refuses) is logged with the number of archives it allows. Windows has no
+  such limit to read (its C runtime gives a process 8192 descriptors): 4. A folder more than `MAX_DEPTH` levels below
+  the folder archived is 409 `conflict` (the first walk cannot read it). Two walks (`nofollow.walk_inside`, the same
+  `skip`, `limit=api_v1.ARCHIVE_MAX_ENTRIES`: 100 000 names, the ones left out counted too, since each costs the hub
+  memory while the zip is made, whatever its size; a folder's listing keeps only the names the walk may still reach,
+  and one more raises `nofollow.TooMany`):
   - the first measures without opening a file (`ApiV1._measure`, `open_files` False; `scan_tree` would walk by path):
     over `[api] archive_max_mb` (default 1024, read again at each request) or over `ARCHIVE_MAX_ENTRIES` names is 413
     `too_large` before any byte, and an entry it cannot read (a folder it cannot list) is 409 `conflict`, since the
@@ -7944,7 +7952,7 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   claims use the same helper (`claim_uploads`).
 - An archive's measure sends nothing, and the server cancels nothing before an answer starts: while it runs, the
   archive reads the request's `receive` itself (`api_v1._until_gone`), and at `http.disconnect` its walk ends at its
-  next entry and its place among the `ARCHIVES_AT_ONCE` is given back, instead of walking the whole folder for a
+  next entry and its place among the archives sent at once is given back, instead of walking the whole folder for a
   client that left.
 - **A delete.** A download and an archive are among the manager's readers of the session
   (`SessionManager.add_reader` .. `drop_reader`, `api_v1._Reading`) from before they open anything in its folder
@@ -8106,7 +8114,9 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     a client that reads slowly (both cut and closed, the delete done), a download or an archive asked while a delete
     runs (409); at most
     `ARCHIVES_AT_ONCE` archives while their clients do not read (429 `too_many_archives`, every slot given back by an
-    archive that ends, is refused or is left; the descriptors they may hold together stay within a third of 1024); the
+    archive that ends, is refused or is left; the descriptors they may hold together stay within a third of 1024),
+    fewer under a lower soft limit of open files (one at 256), which a hub's start raises to 1024 as far as the hard
+    limit allows, never higher (a stand-in for `resource`); the
     archive a zip of exactly what is listed, with its folders, normalized modes and clamped times, of the whole folder
     and of one inside it; over `archive_max_mb` (413 before any byte); over `ARCHIVE_MAX_ENTRIES` names (413 before
     any byte, a cut zip when it grows past them between the walks; a walk's `limit` and `list_some` keep no more

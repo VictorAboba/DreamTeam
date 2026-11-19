@@ -850,12 +850,37 @@ async def test_an_archive_left_by_its_client_closes_its_walk(tmp_path, api_token
         await hub.close()
 
 
+class _Limits:
+    """Stands for the `resource` module (api_v1.resource): a soft and a hard limit of open files (-1: unlimited), and
+    what setrlimit was given (`refuse`: it raises, as a sandbox may make it)."""
+
+    RLIMIT_NOFILE = 7
+    RLIM_INFINITY = -1
+
+    def __init__(self, soft: int, hard: int = -1, refuse: bool = False):
+        self.soft, self.hard, self.refuse = soft, hard, refuse
+        self.given: list[tuple[int, int]] = []
+
+    def getrlimit(self, which: int) -> tuple[int, int]:
+        assert which == self.RLIMIT_NOFILE
+        return self.soft, self.hard
+
+    def setrlimit(self, which: int, limits: tuple[int, int]) -> None:
+        assert which == self.RLIMIT_NOFILE
+        if self.refuse:
+            raise ValueError("not allowed")
+        self.given.append(limits)
+        self.soft, self.hard = limits
+
+
 async def test_at_most_archives_at_once_are_sent_while_their_clients_do_not_read(tmp_path, api_token, no_start,
                                                                                  monkeypatch):
     """Each archive holds its walk's descriptors (up to MAX_DEPTH + 2) for as long as its client takes to read it, so
-    a hub measures or sends at most ARCHIVES_AT_ONCE at once: one more is 429 `too_many_archives`. Every slot comes
-    back, whether the archive ends, is refused or is left by its client."""
+    a hub measures or sends at most ARCHIVES_AT_ONCE at once (with a soft limit of open files of 1024): one more is
+    429 `too_many_archives`. Every slot comes back, whether the archive ends, is refused or is left by its client."""
     assert api_v1.ARCHIVES_AT_ONCE * (nofollow.MAX_DEPTH + 2) <= 1024 // 3   # (Linux's usual soft limit)
+    monkeypatch.setattr(api_v1, "resource", _Limits(1024))
+    assert api_v1.archives_at_once() == api_v1.ARCHIVES_AT_ONCE
     hub = Hub(_manager(_home(tmp_path, api={"archive_max_mb": 1})))
     no_start(hub.manager)
     monkeypatch.setattr(api_v1, "ZIP_SENT", 1)
@@ -870,7 +895,7 @@ async def test_at_most_archives_at_once_are_sent_while_their_clients_do_not_read
         assert not any(task.done() for task in held)
         got = await archive(hub, uid, {"path": "small"})
         assert got.status == 429 and _json(got)["code"] == "too_many_archives", _json(got)
-        assert _json(got)["error"].startswith(f"{api_v1.ARCHIVES_AT_ONCE} archives are being sent already")
+        assert _json(got)["error"].startswith(f"The hub sends at most {api_v1.ARCHIVES_AT_ONCE} archives at once")
         assert (await listing(hub, uid)).status == 200
         assert (await download(hub, uid, "small/f0.txt")).body == b"x" * 100   # (a download is no archive)
         hold.set()
@@ -882,6 +907,66 @@ async def test_at_most_archives_at_once_are_sent_while_their_clients_do_not_read
         assert (await archive(hub, uid, {"path": "big"})).status == 413 and hub.api._archives == 0
         got = await archive(hub, uid, {"path": "small"}, leave_after=1)
         assert got.status == 200 and not got.ended and hub.api._archives == 0
+    finally:
+        hold.set()
+        await hub.close()
+
+
+async def test_a_low_limit_of_open_files_is_raised_at_the_start_or_allows_fewer_archives(tmp_path, api_token, no_start,
+                                                                                         monkeypatch, caplog):
+    """The descriptors the archives' walks may hold together stay within a third of the soft limit of open files. A
+    hub raises a soft limit below OPEN_FILES_WANTED to it at its start (serve_launcher), as far as the hard limit
+    allows and never higher (macOS starts a program from Terminal with 256); where the limit stays low it sends fewer
+    archives at once (one at 256), and its log says so."""
+    from dreamteam import launcher
+
+    wanted = api_v1.OPEN_FILES_WANTED
+    for soft, hard, then in ((256, -1, wanted), (256, 512, 512), (256, 256, 256), (4096, -1, 4096), (-1, -1, None)):
+        limits = _Limits(soft, hard)
+        monkeypatch.setattr(api_v1, "resource", limits)
+        assert api_v1.raise_open_files_limit() == then, (soft, hard)
+        assert limits.given == ([(then, hard)] if then not in (soft, None) else [])
+    for soft, at_once in ((1024, 4), (4096, 4), (512, 2), (256, 1), (100, 1), (-1, 4)):
+        monkeypatch.setattr(api_v1, "resource", _Limits(soft))
+        assert api_v1.archives_at_once() == at_once, soft
+    monkeypatch.setattr(api_v1, "resource", None)   # (Windows)
+    assert api_v1.open_files_limit() is None and api_v1.raise_open_files_limit() is None
+    assert api_v1.archives_at_once() == api_v1.ARCHIVES_AT_ONCE
+    refused = _Limits(256, refuse=True)   # (a sandbox that refuses: the limit stays, the log says what follows)
+    monkeypatch.setattr(api_v1, "resource", refused)
+    assert api_v1.raise_open_files_limit() == 256 and refused.given == []
+    assert "at most 1 archive(s) at once" in caplog.text and "ulimit -n 1024" in caplog.text
+
+    def no_app(manager, host):   # (the start stops right after the limit is raised: nothing listens)
+        raise RuntimeError("stop here")
+
+    started = _Limits(256)
+    monkeypatch.setattr(api_v1, "resource", started)
+    monkeypatch.setattr(launcher, "create_launcher_app", no_app)
+    (tmp_path / "started").mkdir()
+    manager = _manager(_home(tmp_path / "started"))
+    try:
+        with pytest.raises(RuntimeError, match="stop here"):
+            await launcher.serve_launcher(manager, "127.0.0.1", 1)
+    finally:
+        await manager.shutdown()
+    assert started.given == [(wanted, -1)]
+
+    monkeypatch.setattr(api_v1, "resource", _Limits(256, 256))   # (the hard limit too: one archive at once)
+    monkeypatch.setattr(api_v1, "ZIP_SENT", 1)
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    hold = asyncio.Event()
+    try:
+        uid, _sid, _folder = await session_with(hub, {"small/a.txt": "x" * 100})
+        held = asyncio.create_task(archive(hub, uid, {"path": "small"}, hold=hold))
+        await _until(lambda: hub.api._archives == 1)
+        got = await archive(hub, uid, {"path": "small"})
+        assert got.status == 429 and _json(got)["code"] == "too_many_archives", _json(got)
+        assert _json(got)["error"].startswith("The hub sends at most 1 archive at once")
+        hold.set()
+        assert (await held).status == 200 and hub.api._archives == 0
+        assert (await archive(hub, uid, {"path": "small"})).status == 200
     finally:
         hold.set()
         await hub.close()

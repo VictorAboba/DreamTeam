@@ -26,7 +26,7 @@ from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
 from . import __version__, apifolders, hubauth, netoff, procs, roles
-from .api_v1 import ApiV1
+from .api_v1 import ApiV1, raise_open_files_limit
 from .copyfrom import API_UPLOAD_PATH, UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
@@ -707,8 +707,10 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
     is chosen before the port opens (manager.plan_resume), so a client's first request already sees them as about to
     start (`resume_pending`), never as final. `on_listening` is called as soon as the port is open (write hub.json
     there: other `dreamteam` commands then find this hub during a long resume instead of starting a second one),
-    `on_started` after the resume, so callers see the resumed sessions running."""
+    `on_started` after the resume, so callers see the resumed sessions running. A soft limit of open files below
+    api_v1.OPEN_FILES_WANTED is raised first, as far as the hard limit allows (raise_open_files_limit)."""
     check_hub_token(host, api=True)   # (api: the warning of an API token without a hub token, docs/SPEC.md §21.1)
+    raise_open_files_limit()   # (macOS starts a program from Terminal with 256: docs/SPEC.md §21.8 "archive")
     app = create_launcher_app(manager, host)
     config = hub_server_config(app, host, port, log_level)
     listening = asyncio.Event()

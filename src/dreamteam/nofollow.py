@@ -67,7 +67,7 @@ _ENDS_WALK = frozenset({"link", "outside"})
 
 # walk_inside enters at most this many folder levels below its start folder; a folder deeper is an ERROR entry. A walk
 # holds one descriptor per level (and one for its current file), so this bounds what one walk holds however deep an
-# agent nests a tree; what walks hold together is bounded by their callers (api_v1.ARCHIVES_AT_ONCE for the archives,
+# agent nests a tree; what walks hold together is bounded by their callers (api_v1.archives_at_once() for the archives,
 # which a client may keep open while it reads)
 MAX_DEPTH = 64
 
