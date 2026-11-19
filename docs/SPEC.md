@@ -6930,8 +6930,8 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   that serves a site with a hub token too, or in `dreamteam sandbox`, which the docs recommend anyway (the agents run
   commands, and an uploaded document may carry instructions to them). For another computer the hub listens on a
   non-loopback address, which needs the hub token (§14.2), and the name the client uses goes into
-  `DREAMTEAM_ALLOWED_HOSTS`. No CORS: a page of another origin is refused as today, so a site calls the API from its
-  server, never from its visitors' browsers.
+  `DREAMTEAM_ALLOWED_HOSTS`. No CORS: a page of another origin is refused, as on the board (the guard's Origin check,
+  §14.2), so a site calls the API from its server, never from its visitors' browsers.
 - **Format.** JSON bodies and answers (`httpjson.JSONResponse`), except uploads (the raw body) and file downloads (raw
   bytes). Every POST and PATCH under `/api/v1` sends `Content-Type: application/json`, a body-less one (`/stop`) too,
   except uploads (21.3), which take their own two types and no JSON. The guard's 415 rule covers every POST under
@@ -7141,8 +7141,8 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   otherwise, an empty body too: "The upload is empty."), and its files go into the session folder under the zip
   rules of `copy_from` (§17.2: a zip of one folder gives that folder's files; `.git`, links and the excluded names
   are left out). At its top level, after that unwrap, the names the session owns (`.scratch`, `.gitignore`,
-  `.dreamteam`, `mcp`) are left out too and counted as excluded: today only `.scratch/_skills` is, so a zip could
-  write into the members' folders. Without `unpack` a zip is one file like any other.
+  `.dreamteam`, `mcp`) are left out too and counted as excluded (`copyfrom.SESSION_NAMES`), so a zip never writes
+  into the members' folders. Without `unpack` a zip is one file like any other.
 - **Limits.** `[workspace] copy_max_mb` caps one upload (413 `too_large`, before any byte is read when the
   Content-Length says more) and the sum of what one create copies in; `copy_max_files` caps the files one create
   copies in. An unpacked size is known only by unpacking, so the sum is checked while the create copies, after the
@@ -7459,17 +7459,17 @@ retried answer never lands on a newer one:
     answer to a question pause does not count against the limit; an answer to a message does (a question's message
     among them), as in `-p`.
   - `_start_locked` starts it when the `api` meta says `auto`, on every start path (the board, the TUI, `-r`, a resume
-    when the hub starts, the launcher MCP, v1). There too, `Swarm.hold_auto_reply()` (new) takes the auto-reply lease
+    when the hub starts, the launcher MCP, v1). There too, `Swarm.hold_auto_reply()` takes the auto-reply lease
     for the whole run before `swarm.start()`, which may itself call `set_goal` from the settings: no planning question
     first, `pause_swarm` ignored (§3.1).
   - Past `AUTO_REPLY_MAX`, messages are no longer answered: they stay requests of kind `message`, and the session
-    notifies the user once per run, with a `notification` of the new kind `u_auto_reply_limit` {max} (quiet: no
+    notifies the user once per run, with a `notification` of the kind `u_auto_reply_limit` {max} (quiet: no
     member is woken; a warning line in the terminal's feed, `render._WARN_NOTES`).
   - `_unload` stops it (and waits for its task) before `Swarm.stop`; it ends at its next wait, so no action is cut in
     two.
   - `mcp` requests stay requests in this mode too. With `[mcp] require_approval = true`, an `auto` session can stay
     `waiting` until the client or the board answers.
-  - The texts and the limit move from printmode.py to autoreply.py. `-p` keeps its client-side replies, except for a
+  - The texts and the limit live in autoreply.py. `-p` keeps its client-side replies, except for a
     session whose summary says `answers: "auto"` (`autoreply.hub_answers(summary)`, read from the summary `-p -r`
     starts or attaches; `answers` never changes after the create): there it sends no reply, approval or answer to a
     question pause, and writes no line that a member waits for the user, so nothing is answered twice; with
@@ -7485,7 +7485,7 @@ An event is a journal row (§9) with its id, plus a line for people:
 ```
 
 - `data` is §9's and may gain fields.
-- `text`: one line from `eventtext.event_text(event, lang, me=USER)`, new and outside the `tui` package. It takes its
+- `text`: one line from `eventtext.event_text(event, lang, me=USER)`, outside the `tui` package. It takes its
   words and symbols from `uitext.py` and `symbols.py`, moved out of `tui/i18n.py` and `tui/theme.py`, which keep
   shims. It has the meaning of the TUI's verbose feed line as the user sees it (`render.event`), without its terminal
   parts: no wrapping, panels or colours, no clock (`ts` has the time), no width limit; whitespace is collapsed, and
@@ -7648,8 +7648,8 @@ null, "language", "model", "cost_usd", "max_cost_usd", "max_agents", "created_at
   token.
 
 Result: `result.build_result(*, status, session, goal, summary, tasks, agents, jobs, cost_usd, duration_s,
-error=None)`, a builder moved out of `_PrintRun.report`, which builds the result inline today with a monotonic
-duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
+error=None)`, a builder `_PrintRun.report` shares (it passes a monotonic duration). It takes the raw snapshot lists
+and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
 `session`, `goal`, `summary` (the goal's summary when `status` is `done`, else ""), `tasks`
 (`{id, title, status, assignee}`), `cost_usd`, `duration_s`, `agents` (the names of the members not retired), `jobs`
 (the running ones, `{id, label, owner, command, origin}`), and `error` only when given.
