@@ -337,7 +337,7 @@ async def test_an_mcp_server_waiting_for_approval_is_a_request_with_its_digest(t
         broken = {"id": "s-broken-aaaaaaaaaaaa", "kind": "mcp", "ts": 3.0, "from": ANNA,
                   "server": {"name": "broken", "description": "", "tools": []}}
         assert requests_of(sw) == [request, broken]
-        assert read_stats(sw.db.path, sw.db.conn)["requests"] == 2
+        assert read_stats(sw.db.path, sw.db.conn, requests=True)["requests"] == 2
 
 
 async def test_a_sessions_requests_are_read_the_same_running_and_stopped_and_its_summary_counts_them(tmp_path):
@@ -349,19 +349,52 @@ async def test_a_sessions_requests_are_read_the_same_running_and_stopped_and_its
                                     api={"answers": "manual", "stop_when_done": False}))["id"]
         swarm = manager.swarms[sid]
         member = swarm.members()[0]["name"]
-        assert manager.summary(sid)["requests"] == 0
+        assert manager.summary(sid, requests=True)["requests"] == 0
         swarm.mail.send(member, ["user"], "Started with the lexer.")
         to_review(swarm, "Lexer", assignee=member)
         live = requests_of(swarm)
         assert [r["kind"] for r in live] == ["message", "review"]
-        assert manager.summary(sid)["requests"] == 2
+        assert manager.summary(sid, requests=True)["requests"] == 2
         await manager.stop(sid)
         path = manager.dir_of(sid) / ".dreamteam" / "swarm.db"
-        assert read_requests(path) == live and read_stats(path)["requests"] == 2
-        assert read_stats(path, running=False)["requests"] == 1
+        assert read_requests(path) == live and read_stats(path, requests=True)["requests"] == 2
+        assert read_stats(path, running=False, requests=True)["requests"] == 1
         assert listed_requests(live, running=False) == live[1:] and listed_requests(live, running=True) == live
-        assert manager.summary(sid)["requests"] == 1 and sid not in manager.swarms   # read without loading it
-        assert read_requests(tmp_path / "missing.db") == [] and read_stats(tmp_path / "missing.db")["requests"] == 0
+        assert manager.summary(sid, requests=True)["requests"] == 1 and sid not in manager.swarms   # (not loaded)
+        assert read_requests(tmp_path / "missing.db") == []
+        assert read_stats(tmp_path / "missing.db", requests=True)["requests"] == 0
+    finally:
+        await manager.shutdown()
+
+
+async def test_the_boards_summaries_never_read_the_requests(tmp_path, monkeypatch):
+    """Only the HTTP API v1's summary counts the requests (summary(requests=True)): the board's summaries, which the
+    sessions page polls and default_session reads for every session, never run requests_from, whose queries take longer
+    as the journal grows, nor carry a `requests` of their own."""
+    import dreamteam.sessions as sessions_module
+
+    manager = manager_for(home_for(tmp_path), idler)
+    try:
+        sid = (await manager.create("Parser", "Write a parser", overrides=NO_GIT,
+                                    api={"answers": "manual", "stop_when_done": False}))["id"]
+        other = (await manager.create("Docs", "Write the docs", overrides=NO_GIT, start=False))["id"]
+        swarm = manager.swarms[sid]
+        swarm.mail.send(swarm.members()[0]["name"], ["user"], "Started with the lexer.")
+        read = []
+
+        def counted(conn, *, clarify):
+            read.append(clarify)
+            return autoreply.requests_from(conn, clarify=clarify)
+
+        monkeypatch.setattr(sessions_module, "requests_from", counted)
+        listed = manager.list()
+        assert {s["id"] for s in listed} == {sid, other} and all("requests" not in s for s in listed)
+        assert "requests" not in manager.summary(sid) and "requests" not in manager.summary(other)
+        assert manager.default_session() == other and manager.finished(sid) is False
+        assert read == []
+        assert "requests" not in read_stats(manager.dir_of(sid) / ".dreamteam" / "swarm.db")
+        assert read == []
+        assert manager.summary(sid, requests=True)["requests"] == 1 and len(read) == 1
     finally:
         await manager.shutdown()
 

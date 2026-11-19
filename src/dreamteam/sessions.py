@@ -702,19 +702,23 @@ def external_workspaces(home: str | Path) -> list[tuple[str, str]]:
 
 
 def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify: bool = False,
-               running: bool = True) -> dict[str, Any]:
+               running: bool = True, requests: bool = False) -> dict[str, Any]:
     """Board/agent/budget figures of a session database (read-only; zeros when it does not exist), and whether an
     earlier version made it (`earlier_version`). A file of its own is read through db.reading_file, which writes
     nothing next to it (a plain read-only open of a WAL database would leave a -wal and a -shm in every stopped
-    session at each listing). `requests`: how many requests to the user wait (autoreply.requests_from: the same kinds
-    the HTTP API v1 lists, docs/SPEC.md §21.5), `clarify` being the session's [swarm] clarify; of a session that does
-    not run (`running` False) only those that hold its work (autoreply.listed_requests)."""
+    session at each listing). `requests` True adds "requests": how many requests to the user wait
+    (autoreply.requests_from: the same kinds the HTTP API v1 lists, docs/SPEC.md §21.5), `clarify` being the session's
+    [swarm] clarify; of a session that does not run (`running` False) only those that hold its work
+    (autoreply.listed_requests). Only the HTTP API v1's summary asks for it: those queries take longer as the journal
+    grows, and the board's summaries (the sessions page polls them, default_session reads them all) never show it."""
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
-        "jobs": {"running": 0}, "question": None, "requests": 0, "earlier_version": False,
+        "jobs": {"running": 0}, "question": None, "earlier_version": False,
     }
+    if requests:
+        stats["requests"] = 0
     with contextlib.ExitStack() as stack:
         if conn is None:
             if not db_path.exists():
@@ -723,13 +727,14 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify
                 conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
             except (sqlite3.Error, OSError):
                 return stats
-        _read_stats(conn, db_path, stats, clarify, running)
+        _read_stats(conn, db_path, stats, clarify, running, requests)
     return stats
 
 
 def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], clarify: bool = False,
-                running: bool = True) -> None:
-    """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default."""
+                running: bool = True, requests: bool = False) -> None:
+    """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default. `requests`: count the
+    requests to the user too (read_stats)."""
     try:
         def kv(key: str) -> Any:
             row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
@@ -772,10 +777,11 @@ def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], 
             stats["jobs"]["running"] = int(row[0] or 0)
         except sqlite3.Error as exc:
             log.debug("cannot count the jobs of %s: %s", db_path, exc)
-        try:  # its own try too: a request it cannot read must not hide the figures above
-            stats["requests"] = len(listed_requests(requests_from(conn, clarify=clarify), running=running))
-        except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError) as exc:   # (a damaged row too)
-            log.debug("cannot count the requests of %s: %s", db_path, exc)
+        if requests:
+            try:  # its own try too: a request it cannot read must not hide the figures above
+                stats["requests"] = len(listed_requests(requests_from(conn, clarify=clarify), running=running))
+            except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError) as exc:   # (a damaged row too)
+                log.debug("cannot count the requests of %s: %s", db_path, exc)
     except sqlite3.Error as exc:  # a database of an older version or locked: show what we have
         log.debug("cannot read stats of %s: %s", db_path, exc)
     try:  # its own try: the tables it reads may be all that is left of a damaged file
@@ -1934,10 +1940,12 @@ class SessionManager:
         return clean
 
     # ---- summaries ----------------------------------------------------------------------------
-    def summary(self, sid: str, *, workspace: bool = True) -> dict[str, Any]:
+    def summary(self, sid: str, *, workspace: bool = True, requests: bool = False) -> dict[str, Any]:
         """The session as the board and the clients show it. `workspace`: False leaves its "workspace" None, which
         otherwise looks at the folder the session works in (workspace_of: it may lie on a share that does not answer),
-        for a caller that never shows it, on the event loop (the HTTP API v1's summary, docs/SPEC.md §21.7)."""
+        for a caller that never shows it, on the event loop (the HTTP API v1's summary, docs/SPEC.md §21.7).
+        `requests`: True adds "requests", how many requests to the user wait (read_stats), for the HTTP API v1's
+        summary only; list() and default_session() leave it out, so they never pay for its queries."""
         self._check(sid)
         meta = self.meta(sid)
         try:
@@ -1951,9 +1959,9 @@ class SessionManager:
         running = sid in self.running        # (a session that does not run counts only the requests that block it)
         if swarm is not None:
             with swarm.db._lock:
-                stats = read_stats(db_path, swarm.db.conn, clarify=clarify, running=running)
+                stats = read_stats(db_path, swarm.db.conn, clarify=clarify, running=running, requests=requests)
         else:
-            stats = read_stats(db_path, clarify=clarify, running=running)
+            stats = read_stats(db_path, clarify=clarify, running=running, requests=requests)
         limits = stats.pop("limits") or {}
         pending = pending_goal(meta)
         if stats["goal"] is None and pending:

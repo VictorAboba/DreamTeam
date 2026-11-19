@@ -4198,8 +4198,9 @@ settings; ValueError when they are invalid):
   (`copyfrom.Uploads(<home>/.dreamteam/uploads/api)`, the files of `POST /api/v1/uploads`, §21.3;
   `clean_copy_leftovers` sweeps both).
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
-  `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid, *, workspace=True)`
-  (False: `"workspace": None`, the folder not looked at), `list()`,
+  `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid, *, workspace=True,
+  requests=False)` (`workspace` False: `"workspace": None`, the folder not looked at; `requests` True: its
+  `requests` count, which only v1's summary asks for), `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
   workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None, api=None,
   sources=None, mark=None)`, `validated_overrides(overrides)`,
@@ -4220,8 +4221,8 @@ settings; ValueError when they are invalid):
   `backups(sid)`, `import_overrides(overrides, models)`, `async import_add(staged, meta, workspace, *, sid,
   before_swap=None)`, `async import_rewrite(sid, staged, meta, workspace, *, expect=None, before_swap=None)`,
   `async import_settings(sid, meta, *, expect=None)`, `recover_swaps()` and `interrupted_swaps()`; module functions
-  `read_stats(db_path, conn=None, *, clarify=False)`, `read_lists(db_path, conn=None)`, `slugify(title)`,
-  `external_workspaces(home)`,
+  `read_stats(db_path, conn=None, *, clarify=False, running=True, requests=False)`, `read_lists(db_path, conn=None)`,
+  `slugify(title)`, `external_workspaces(home)`,
   `new_uid()`, `session_uid(meta)`, `api_meta(meta, *, create=False)` and `api_answers(api)`.
 - `listen` callbacks receive `{"type": "sessions.changed", "session": sid | None, "change", "ts"}`. The change is
   one of `created`, `started`, `stopped`, `updated`, `deleted` or `settings` (session None).
@@ -4557,7 +4558,7 @@ settings; ValueError when they are invalid):
    "goal":{"title","description","status":"active|done|pending","summary"}|null,
    "tasks":{"total","done","open","by_status"},"agents":{"total","working","llm","external"},
    "spent_usd","paused","pause_reason","wrap_up","last_activity","jobs":{"running"},
-   "question":{"asker","message_id"}|null,"requests":n,"clarify":bool,
+   "question":{"asker","message_id"}|null,"requests"?:n,"clarify":bool,
    "workspace":{"path","default","adopted","exists"},"skills":[names],"skills_pending":[names],
    "copied_from":{"source","files","bytes","at"}|null,"earlier_version":bool,"via"?,"answers"?}
   ```
@@ -4567,10 +4568,13 @@ settings; ValueError when they are invalid):
   `read_stats` opens its own connection through `db.reading_file`, so listing leaves no `-wal` or `-shm` behind.
   `question` (`read_stats`, from kv `paused`, default None): the member's question that holds the pause, set only
   for a paused slot with reason `question`, a non-empty asker and an integer message_id (the test of
-  `Swarm.pending_question`, §3.1); `requests` (`read_stats`, default 0, in a try of its own): how many requests to
-  the user wait (`autoreply.requests_from` on the same connection, with the session's `clarify`: the kinds the HTTP
-  API v1 lists, §21.5), for every session, and for one that does not run only those that block its work
-  (`read_stats(..., running=False)`, `autoreply.listed_requests`); `clarify`: the session's `[swarm] clarify`
+  `Swarm.pending_question`, §3.1); `requests` (`read_stats(..., requests=True)`, default 0, in a try of its own),
+  present only with `summary(sid, requests=True)`, which only the HTTP API v1's summary passes (§21.7): how
+  many requests to the user wait (`autoreply.requests_from` on the same connection, with the session's `clarify`:
+  the kinds the HTTP API v1 lists, §21.5), and for a session that does not run only those that block its work
+  (`read_stats(..., running=False)`, `autoreply.listed_requests`). The board's summaries (`list()`, which the
+  sessions page polls, `default_session()`, the routes of §18.1) leave it out: its queries take longer as the
+  journal grows (§21.5 "Cost"), and nothing there shows it. `clarify`: the session's `[swarm] clarify`
   setting (its own override, else the global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
@@ -7343,8 +7347,10 @@ retried answer never lands on a newer one:
   `("mcp", name, digest[:12] or "")`, None for anything else, a number of more than 19 digits or above 2^63−1
   (`autoreply.ID_MAX`, SQLite's largest integer) among them: no request has one, and Python's `int()` refuses a text
   of over 4300 digits.
-- **Cost.** Every session summary (the sessions list, polled by the home page) reads the requests, so no query of
-  `requests_from` scans a whole table for each request: the newest round of each review is read back from the newest
+- **Cost.** Only v1's summary counts the requests (`manager.summary(sid, requests=True)`): the board's summaries (the
+  sessions list the home page polls, `default_session()`) never run these queries. v1 builds one for every route,
+  every pass of a poll or a stream and every session GET `/sessions` lists, so no query of `requests_from` scans a
+  whole table for each request: the newest round of each review is read back from the newest
   `task.updated` on the events type index (`ORDER BY id DESC LIMIT 1`), and each member's last message to the user
   (one grouped query on the inbox's recipient index) is checked against the messages written after it only. The time
   grows with what was written since a request was asked, and with the messages to the user, not with the whole
@@ -7900,8 +7906,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     the coroutine closed): `manager.shutdown()` may be running, and nobody would wait for the task.
   - `api_v1.py` also holds the one resolver of `{id}` (`ApiV1.resolve(uid, caller)`: `sid_of_uid`, then for the API
     caller a session whose session.json says `"via": "api"`), the summary (`ApiV1.summary(sid)`, built on the board's
-    `manager.summary` with no path of it, and without its `workspace` entry: `manager.summary(sid, workspace=False)`,
-    as `continue` reads the budget, since `workspace_of` looks at the folder the session works in, which may lie on a
+    `manager.summary` with no path of it, without its `workspace` entry and with its `requests` count:
+    `manager.summary(sid, workspace=False, requests=True)`; `continue` reads the budget with `workspace=False` alone,
+    since `workspace_of` looks at the folder the session works in, which may lie on a
     share that does not answer, and a summary is built on the loop for every route, every pass of a poll or a stream
     and every session listed) and its state (`api_v1.state_of`), and `[api] max_running`'s count
     (`ApiV1.running_count()`: the v1 sessions in `running`, `starting` or `resume_pending`, plus the creates past the
