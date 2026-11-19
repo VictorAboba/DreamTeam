@@ -806,7 +806,7 @@ async def test_a_create_counts_once_in_max_running_while_it_is_made(tmp_path, ap
         await hub.settled()
         assert hub.api.running_count() == 0 and first_writes == [1]
         monkeypatch.setattr(SessionManager, "_commit_skills", held_commit)
-        first =asyncio.ensure_future(hub.create({"goal": "A", "skills": ["demo"], **MANUAL}))
+        first = asyncio.ensure_future(hub.create({"goal": "A", "skills": ["demo"], **MANUAL}))
         await _until(entered.is_set, "the skills commit")
         assert first_writes == [1, 1] and hub.api.running_count() == 1
         status, answer = await hub.create({"goal": "B", **MANUAL})

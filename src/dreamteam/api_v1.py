@@ -1886,7 +1886,7 @@ class ApiV1:
                     self._own_folder(sid, info)
                 except ApiError as exc:
                     return None, exc.text
-        secrets =[profile.api_key_env for profile in config.models.values() if getattr(profile, "api_key_env", None)]
+        secrets = [profile.api_key_env for profile in config.models.values() if getattr(profile, "api_key_env", None)]
         try:
             files = changed_since(folder, base, adopted=config.workspace_adopted, network_off=network_off, git=git,
                                   secret_names=secrets)
