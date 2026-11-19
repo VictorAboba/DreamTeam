@@ -7237,13 +7237,17 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     this run count, so a board start of a done session keeps it running.
 - **`client_ref`**: at most 128 printable characters. A create whose `client_ref` and `request_digest` match a session
   that v1 still has (and the caller sees) answers 200 with that session and creates nothing: a retry after a timeout
-  never makes a second job. The same `client_ref` with another body is 409 `conflict`. `request_digest` is the SHA-256
-  of the body's canonical JSON (keys sorted, no spaces; a field that is `null` left out, as not given, and a whole
-  number with a fraction, `5.0`, written as `5`; `folder` as parsed, `{"root", "path", "mode"}` with `path` `""` and
-  `mode` `"copy"` when not given, 21.10), stored for every v1 create. A create in flight holds an in-memory
-  reservation of its `client_ref`: a retry with the same body waits for it, then answers as a repeat (200), or goes
-  on when that create failed; a retry with another body is 409 at once. The stored sessions are found through the
-  manager's index (`SessionManager.sid_of_client_ref`, §17.2), on the event loop with no await before the
+  never makes a second job. The same `client_ref` with another body is 409 `conflict`; when a session was made with
+  it, the answer's `session` names that session's id (every caller sees it: it was made through v1), so a client
+  that cannot resend the same body finds its session. `request_digest` is the SHA-256 of the body's canonical JSON
+  (keys sorted, no spaces; a field that is `null` left out, as not given, and a whole number with a fraction, `5.0`,
+  written as `5`; `folder` as parsed, `{"root", "path", "mode"}` with `path` `""` and `mode` `"copy"` when not
+  given, 21.10), stored for every v1 create. The upload tokens of `files` are part of the body: a retry resends the
+  same tokens (a token used up by the create is not checked again: the repeat is answered first, "Order" 2), and
+  one that uploaded its files again is another body. A create in flight holds an in-memory reservation of its
+  `client_ref`: a retry with the same body waits for it, then answers as a repeat (200), or goes on when that create
+  failed; a retry with another body is 409 at once (no session to name yet). The stored sessions are found through
+  the manager's index (`SessionManager.sid_of_client_ref`, §17.2), on the event loop with no await before the
   reservation, so a create that finishes meanwhile is never missed.
 - **Order**, so that a refused create costs nothing:
   1. the body: unknown fields; `goal`, `title`, `description`, `answers` with `clarify`, `stop_when_done`,

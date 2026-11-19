@@ -259,7 +259,9 @@ with its `error`.
   again. With false it keeps running like a board session.
 - **`client_ref`** (at most 128 printable characters): a retry after a timeout never makes a second job. A create with
   the same `client_ref` and the same body as a session the API still has answers 200 with that session and creates
-  nothing; one still being created is waited for. The same `client_ref` with another body is 409 `conflict`.
+  nothing; one still being created is waited for. The same `client_ref` with another body is 409 `conflict`, whose
+  `session` names the session made with it. The upload tokens of `files` are part of the body: a retry sends the same
+  tokens again (a token the create used up is fine there), not new uploads of the same files, which are another body.
 - **`[api] max_running`** (default 3, 0 for no limit) counts the running and starting sessions created through the
   API: a create or a `continue` past it is 429 `too_many_sessions`. The owner's own starts (the board, the terminal,
   MCP) and the resume when the hub starts are never refused, but they count.

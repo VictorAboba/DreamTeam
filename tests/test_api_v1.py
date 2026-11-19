@@ -602,6 +602,7 @@ async def test_client_ref_makes_one_session_per_job(tmp_path, api_token, no_star
         assert status == 200 and again["session"]["id"] == first["session"]["id"]
         status, other = await hub.create({**body, "goal": "Another job"})
         assert status == 409 and other["code"] == "conflict"
+        assert other["session"] == first["session"]["id"]   # (the session made with it: every caller sees it)
         assert len(hub.manager.ids()) == 1
         # a field that is null is not given, and 5.0 is 5: the same request spelled another way is a repeat
         status, again = await hub.create({**body, "model": None, "skills": None})
@@ -622,6 +623,28 @@ async def test_client_ref_makes_one_session_per_job(tmp_path, api_token, no_star
         assert hub.manager.sid_of_client_ref("job-7") is None
         status, fresh = await hub.create(body)   # the job is new again once its session is gone
         assert status == 202 and fresh["session"]["id"] != uid
+    finally:
+        await hub.close()
+
+
+async def test_a_retry_that_uploaded_again_is_told_which_session_has_its_client_ref(tmp_path, api_token, no_start):
+    """The upload tokens are part of the request body: a retry with the same token is a repeat (200), one with a new
+    upload of the same file is another body (409), whose `session` names the session made the first time."""
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    try:
+        first = (await hub.upload("brief.md", b"# Brief\n"))[1]["upload"]
+        body = {"goal": "Translate the brief", "files": [first], "client_ref": "job-42"}
+        status, made = await hub.create(body)
+        assert status == 202, made
+        status, again = await hub.create(body)   # (its token used up: the client_ref is looked at first)
+        assert status == 200 and again["session"]["id"] == made["session"]["id"]
+        second = (await hub.upload("brief.md", b"# Brief\n"))[1]["upload"]
+        status, answer = await hub.create({**body, "files": [second]})
+        assert status == 409 and answer["code"] == "conflict" and answer["session"] == made["session"]["id"]
+        assert "upload tokens" in answer["error"] and len(hub.manager.ids()) == 1
+        status, answer = await hub.call("GET", f"/api/v1/sessions/{answer['session']}")
+        assert status == 200 and answer["session"]["client_ref"] == "job-42"
     finally:
         await hub.close()
 

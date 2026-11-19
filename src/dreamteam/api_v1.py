@@ -1462,19 +1462,22 @@ class ApiV1:
             raise ApiError("too_many_sessions", f"{count} sessions of the API run or start already ([api] max_running "
                                                 f"= {limit}): wait for one to end, or stop one.")
 
-    def _stored_ref(self, ref: str) -> tuple[str, Any] | None:
-        """(sid, request_digest) of the v1 session created with client_ref `ref`, else None: the manager's index
+    def _stored_ref(self, ref: str) -> tuple[str, Any, str | None] | None:
+        """(sid, request_digest, uid) of the v1 session created with client_ref `ref`, else None: the manager's index
         (SessionManager.sid_of_client_ref), then that one session.json. Every caller sees such a session (it was made
-        through v1: §21.1 "Scope"). On the loop, with no await: a create in flight cannot finish between this read and
-        the reservation that follows it."""
+        through v1: §21.1 "Scope"), so a 409 may name it. On the loop, with no await: a create in flight cannot finish
+        between this read and the reservation that follows it."""
         sid = self.manager.sid_of_client_ref(ref)
         if sid is None:
             return None
         try:
-            api = api_meta(self.manager.meta(sid))
+            meta = self.manager.meta(sid)
         except SessionError:
             return None
-        return (sid, api.get("request_digest")) if api is not None and api.get("client_ref") == ref else None
+        api = api_meta(meta)
+        if api is None or api.get("client_ref") != ref:
+            return None
+        return sid, api.get("request_digest"), session_uid(meta)
 
     def _never_started(self, sid: str, exc: BaseException) -> None:
         """A created session whose start could not be spawned (the hub stopped: spawn's 503) records it as a failed
@@ -1488,9 +1491,10 @@ class ApiV1:
         """A create's `client_ref` (docs/SPEC.md §21.4): (the summary of the session it already made, None) for a
         repeat, which creates nothing; (None, the reservation this create now holds) otherwise. A create with the
         same client_ref in flight: the same body waits for it, then is a repeat or goes on when it failed; another
-        body is 409 `conflict` at once, and so is a stored session of another body."""
+        body is 409 `conflict` at once, and so is a stored session of another body, whose id the answer's `session`
+        names (a retry that uploaded its files again sends other tokens: it finds its session there)."""
         conflict = (f"client_ref {_shown(ref)} names another job: a session was created with it from another "
-                    "request body.")
+                    "request body (the upload tokens of 'files' are part of it).")
         while True:
             held = self._refs.get(ref)
             if held is not None:
@@ -1502,9 +1506,9 @@ class ApiV1:
             if stored is None:
                 mine = self._refs[ref] = _Ref(digest)
                 return None, mine
-            sid, stored_digest = stored
+            sid, stored_digest, uid = stored
             if stored_digest != digest:
-                raise ApiError("conflict", conflict)
+                raise ApiError("conflict", conflict, **({"session": uid} if uid else {}))
             try:
                 return self.summary(sid), None
             except SessionError as exc:
