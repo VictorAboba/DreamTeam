@@ -287,12 +287,14 @@ class _Posix:
     @staticmethod
     def spelled(parent: _Dir, name: str, rel: str) -> None:
         """`name` is in the parent's listing exactly as given (a case-insensitive or normalizing file system opens
-        an alias too)."""
+        an alias too). The listing is read until that name and keeps none of the others, however many the folder
+        holds (scandir of a duplicate of the descriptor, closed, and the listing's place rewound, by the `with`)."""
         try:
-            names = os.listdir(parent.fd)
+            with os.scandir(parent.fd) as it:
+                found = any(entry.name == name for entry in it)
         except OSError as exc:
             raise _named(exc, rel) from None
-        if name not in names:
+        if not found:
             raise FileNotFoundError(errno.ENOENT, "no such name in the folder (names are compared exactly)", rel)
 
     @staticmethod

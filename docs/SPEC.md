@@ -7823,7 +7823,10 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   - On POSIX the path is opened one component at a time from the workspace's folder, with `O_NOFOLLOW` and directory
     descriptors (`dir_fd`); a link (ELOOP, ENOTDIR) ends the request. A folder already opened is read through its
     descriptor even if it is moved or renamed meanwhile (its own entries, wherever it now lies); nothing is read
-    through a link put in its place.
+    through a link put in its place. A component counts only when its folder's listing holds that name exactly
+    (`_Posix.spelled`); that listing is read through the folder's descriptor until the name and keeps none of the
+    other names, so reaching a file, or a folder to list or walk, below a folder of any size holds no list of its
+    names.
   - On Windows every component is checked for a name-surrogate reparse point (a link or a junction), and the opened
     handle's identity (`fstat`) and final path (`GetFinalPathNameByHandleW`) are compared with the path's and the
     root's.
@@ -8107,7 +8110,8 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     archive a zip of exactly what is listed, with its folders, normalized modes and clamped times, of the whole folder
     and of one inside it; over `archive_max_mb` (413 before any byte); over `ARCHIVE_MAX_ENTRIES` names (413 before
     any byte, a cut zip when it grows past them between the walks; a walk's `limit` and `list_some` keep no more
-    names, `tests/test_nofollow.py`); a listing of the first `FILES_MAX_ENTRIES` names with `truncated`, rendered in
+    names, and on POSIX a path below a large folder keeps none of its names, `tests/test_nofollow.py`); a listing of
+    the first `FILES_MAX_ENTRIES` names with `truncated`, rendered in
     its thread; a folder that cannot be read on POSIX (409); a running session, then the stopped one read without
     loading it; the API token's scope; a missing folder; a session folder swapped for a link (403); a folder
     session.json names that no session may work in (DreamTeam's data with the uploads, another home: 403, nothing

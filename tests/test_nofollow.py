@@ -429,6 +429,41 @@ def test_a_listing_of_some_names_keeps_only_those_while_it_reads(tmp_path, monke
     assert nf.list_some(root, ("b",)) == (list_inside(root, ("b",)), False)
 
 
+@pytest.mark.skipif(WINDOWS, reason="POSIX checks a name against its folder's listing; Windows compares final paths")
+def test_a_name_in_a_large_folder_is_found_without_keeping_its_listing(tmp_path):
+    """On POSIX each name on the way must be one its folder's listing holds exactly: that listing is read until the
+    name and keeps none of the others. Opening a file of a large folder, or listing or walking a folder below one,
+    holds far less memory than the folder's list of names would."""
+    import tracemalloc
+
+    root = tmp_path / "root"
+    _write(root / "big" / "sub" / "y.txt", "Y")
+    for i in range(5000):
+        (root / "big" / f"f{i:05d}.txt").touch()
+
+    def cost(call) -> int:   # (the most memory taken above what was taken before the call)
+        tracemalloc.reset_peak()
+        before = tracemalloc.get_traced_memory()[0]
+        call()
+        return tracemalloc.get_traced_memory()[1] - before
+
+    tracemalloc.start()
+    try:
+        names = cost(lambda: os.listdir(root / "big"))
+        took = [cost(lambda: os.close(open_inside(root, ("big", "f04999.txt")))),
+                cost(lambda: os.close(open_inside(root, ("big", "sub", "y.txt")))),
+                cost(lambda: nf.list_some(root, ("big", "sub"), 10)),
+                cost(lambda: _walk(root, ("big", "sub")))]
+    finally:
+        tracemalloc.stop()
+    assert names > 200_000 and all(n < names // 10 for n in took), (names, took)
+    assert _walk(root, ("big", "sub")) == [(FILE, "y.txt", b"Y")]
+    with pytest.raises(FileNotFoundError):
+        open_inside(root, ("big", "f05000.txt"))
+    with pytest.raises(FileNotFoundError):
+        open_inside(root, ("big", "F00001.txt"))
+
+
 def test_a_folder_swapped_after_its_open_is_listed_through_what_was_opened(tmp_path, monkeypatch):
     """The folder is swapped for a link to outside after it was opened, before it is listed: its listing comes
     from the folder opened (POSIX: its descriptor; Windows: its handle), never from outside; on Windows a name below
