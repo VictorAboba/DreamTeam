@@ -453,9 +453,10 @@ is resumed as well.
 - `changed_files` is null, with `changed_files_error` saying why, when git is off for the session, git is not installed,
   the session has no base commit, that commit is gone, the folder has no repository of its own, the settings cannot be
   read, git fails, or an in-place folder no longer passes its checks.
-- A final result is kept and answered again as it was, unless its `changed_files_error` may pass (git not installed,
-  something that cannot be read, git failing, an in-place folder refused): then it is computed again at the next
-  request.
+- A final result is kept and answered again as it was, with its `error` and `board_url` as the session's summary says
+  them now, unless its `changed_files_error` may pass (git not installed, something that cannot be read, git failing,
+  an in-place folder refused): then it is computed again at the next request. An edit of the hub's settings (such as
+  `[api] folders` or `[workspace] git`) has every kept result computed again.
 
 ## Files
 

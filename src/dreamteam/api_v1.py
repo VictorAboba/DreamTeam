@@ -1258,8 +1258,11 @@ class ApiV1:
         self.threads = _Threads(FOLDER_THREADS)   # the work that may touch a folder of the hub's computer
         self._refs: dict[str, _Ref] = {}   # the client_refs of the creates in flight
         # the results of final sessions (docs/SPEC.md §21.7), newest last, at most RESULTS_CACHED: key (_result_key)
-        # -> the result without its board_url
+        # -> the result as built (its `error` and `board_url` are read again at each answer); all made with the hub's
+        # settings `_results_settings` (manager.config: a hand edit picked up or a save replaces it, and the kept
+        # results go)
         self._results: OrderedDict[tuple[Any, ...], dict[str, Any]] = OrderedDict()
+        self._results_settings: object | None = None
         self._results_lock = threading.Lock()   # (results are built in threads)
         routes = [
             self._route("/api/v1/options", {"GET": self._options}),
@@ -1920,18 +1923,26 @@ class ApiV1:
         stopped session from its file, never loaded) and `duration_s` from `api.started_at` to `api.finished_at` or
         now; then `error` (always, null when none), `final`, `board_url`, `changed_files` (the first CHANGED_FILES_MAX
         by path), `changed_files_error` and `changed_files_truncated` (true when the list stops there), in that order.
-        A final result is kept (RESULTS_CACHED, _result_key) unless its `changed_files_error` may pass (LASTING_TEXTS).
-        SessionError 404 for a session that is gone. Blocking (the database, git): in a thread."""
+        A final result is kept (RESULTS_CACHED, _result_key) unless its `changed_files_error` may pass (LASTING_TEXTS),
+        and answered with the summary's `error` and `board_url` (session.json says them: a `continue` whose text was
+        not delivered changes `error` alone) for as long as the hub's settings are the ones it was made with
+        (manager.config, which the caller read again: a hand edit of `[api] folders` or `[workspace] git` may change
+        `changed_files`, so the kept results go). SessionError 404 for a session that is gone. Blocking (the
+        database, git): in a thread."""
         meta = self.manager.meta(sid)
         api = api_meta(meta) or {}
+        settings = self.manager.config   # (before anything is read with them: a result is kept with these only)
         key = self._result_key(sid, summary, api)
         if key is not None:
             with self._results_lock:
+                if self._results_settings is not settings:
+                    self._results.clear()
+                    self._results_settings = settings
                 cached = self._results.get(key)
                 if cached is not None:
                     self._results.move_to_end(key)
             if cached is not None:
-                return {**cached, "board_url": summary["board_url"]}
+                return {**cached, "error": summary["error"], "board_url": summary["board_url"]}
         tasks, agents = self._read_db(sid, self._lists, read_lists)
         files, files_error = self.changed_files(sid, meta, api)
         started, finished = api.get("started_at"), api.get("finished_at")
@@ -1950,6 +1961,8 @@ class ApiV1:
                       changed_files_error=files_error, changed_files_truncated=truncated)
         if key is not None and files_error in LASTING_TEXTS:
             with self._results_lock:
+                if self._results_settings is not settings:   # (the settings changed while it was made)
+                    return result
                 self._results[key] = result
                 self._results.move_to_end(key)
                 while len(self._results) > RESULTS_CACHED:

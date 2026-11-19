@@ -142,6 +142,49 @@ async def test_a_result_is_kept_per_state_and_head(tmp_path, api_token):
         await hub.close()
 
 
+async def test_a_kept_result_says_the_error_its_summary_says_now(tmp_path, api_token, monkeypatch):
+    """A `continue` whose text never reached the session records `api.error` and nothing else (no event, no
+    finished_at): the kept result answers with that error, as the summary does."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        uid, sid, swarm = await running(hub)
+        assert (await hub.call("POST", f"/api/v1/sessions/{uid}/stop"))[0] == 200
+        first = await result_of(hub, uid)
+        assert first["final"] is True and first["error"] is None and len(hub.api._results) == 1
+        await hub.api._not_delivered(sid, uid)
+        status, answer = await hub.call("GET", f"/api/v1/sessions/{uid}")
+        error = answer["session"]["error"]
+        assert error is not None and api_v1.NOT_DELIVERED_TEXT in str(error), error
+        monkeypatch.setattr(api_v1, "read_lists", lambda *args: pytest.fail("read again"))   # (still kept)
+        second = await result_of(hub, uid)
+        assert second["error"] == error and list(second) == list(first)
+        assert {**second, "error": None} == first and len(hub.api._results) == 1
+    finally:
+        await hub.close()
+
+
+@needs_git
+async def test_a_kept_result_goes_once_workspace_git_is_edited_by_hand(tmp_path, api_token):
+    """`[workspace] git` turned off in dreamteam.toml while a result is kept: the next result says git is off, as one
+    computed afresh does (the settings are read again first)."""
+    hub = Hub(_manager(_home(tmp_path, workspace={"git": True})))
+    manager = hub.manager
+    try:
+        uid, sid = await with_files(hub, {"a.txt": "a\n"})
+        put(manager.swarms[sid].workspace.root, "new.txt", "new\n")
+        assert (await hub.call("POST", f"/api/v1/sessions/{uid}/stop"))[0] == 200
+        first = await result_of(hub, uid)
+        assert first["changed_files"] == [{"path": "new.txt", "change": "added"}] and len(hub.api._results) == 1
+        raw = st.read_raw(manager.home)
+        raw["workspace"]["git"] = False
+        st.write_raw(manager.home, raw)
+        second = await result_of(hub, uid)
+        assert second["changed_files"] is None and second["changed_files_error"] == GIT_OFF_TEXT
+        assert [key[0] for key in hub.api._results] == [uid]   # (kept again, with the settings of now)
+    finally:
+        await hub.close()
+
+
 def test_job_view_names_what_a_result_shows():
     job = SimpleNamespace(id=1, label=None, owner="Ann", command="make", origin="shell", status="running",
                           processes=["make"])
@@ -290,9 +333,12 @@ async def test_an_in_place_folder_whose_git_leads_outside_it_is_not_read(tmp_pat
 
 
 @needs_git
-async def test_a_hand_edit_of_the_folder_roots_counts_at_once(tmp_path, api_token):
-    """[api] folders no longer lists the root of an in-place session: its folder is not read, as no start runs there
-    (the settings are read again first, as a start reads them)."""
+@pytest.mark.parametrize("edit", ["removed", "copy only"])
+@pytest.mark.parametrize("kept", [False, True])
+async def test_a_hand_edit_of_the_folder_roots_counts_at_once(tmp_path, api_token, edit, kept):
+    """[api] folders no longer lists the root of an in-place session, or lists it for copies only: its folder is not
+    read, as no start runs there (the settings are read again first, as a start reads them), also when a result of
+    the session was kept before the edit."""
     hub, _jobs, places = _hub(tmp_path, git_on=True)
     repository(places / "repo", 2)
     try:
@@ -301,13 +347,23 @@ async def test_a_hand_edit_of_the_folder_roots_counts_at_once(tmp_path, api_toke
         assert status == 202, answer
         await hub.settled()
         uid = answer["session"]["id"]
+        put(places / "repo", "new.txt", "new\n")
         assert (await hub.call("POST", f"/api/v1/sessions/{uid}/stop"))[0] == 200
+        if kept:
+            first = await result_of(hub, uid)
+            assert first["changed_files"] == [{"path": "new.txt", "change": "added"}] and len(hub.api._results) == 1
         raw = st.read_raw(hub.manager.home)
-        del raw["api"]["folders"]["places"]
+        if edit == "removed":
+            del raw["api"]["folders"]["places"]
+        else:
+            raw["api"]["folders"]["places"]["in_place"] = False
         st.write_raw(hub.manager.home, raw)
         result = await result_of(hub, uid)
         assert result["changed_files"] is None and "no longer lists" in result["changed_files_error"]
+        assert not hub.api._results   # (a refusal may pass: never kept)
         _no_path(result, tmp_path)
+        status, answer = await hub.call("GET", f"/api/v1/sessions/{uid}/files")
+        assert status == 403 and answer["code"] == "forbidden_folder", answer
     finally:
         await hub.close()
 

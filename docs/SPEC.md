@@ -7689,10 +7689,14 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
 - A final result is cached (`ApiV1._results`, the newest `api_v1.RESULTS_CACHED` = 64), keyed by uid and
   `finished_at`, and also by the state and the journal's head: a PATCH of a stopped session writes no `finished_at` but
   may change its state (a budget pause lifted), and anything changed while the board had it loaded leaves an event. A
-  cached result is answered with its `board_url` read again. Only a result whose `changed_files_error` stays as it is
-  while the session stays final is cached (`api_v1.LASTING_TEXTS`: none, `GIT_OFF_TEXT`, `NO_BASE_TEXT`,
-  `BASE_GONE_TEXT`); git not installed, settings or a repository that cannot be read, git failing (a timeout) and an
-  in-place folder refused may pass, so such a result is computed again at the next request.
+  cached result is answered with its `error` and `board_url` read again from the summary (a `continue` whose text was
+  not delivered records `api.error` `not_running` and changes nothing else, 21.2). The cache holds only results made
+  with the hub's settings of now (`ApiV1._results_settings`, the `manager.config` object, which a hand edit picked up
+  or a save replaces): once they change, every kept result goes, since `[api] folders` and `[workspace] git` decide
+  `changed_files`. Only a result whose `changed_files_error` stays as it is while the session stays final and the
+  settings stay the same is cached (`api_v1.LASTING_TEXTS`: none, `GIT_OFF_TEXT`, `NO_BASE_TEXT`, `BASE_GONE_TEXT`);
+  git not installed, settings or a repository that cannot be read, git failing (a timeout) and an in-place folder
+  refused may pass, so such a result is computed again at the next request.
 - `changed_files` is the working tree against `base_commit`:
   - untracked files are included (files still held back from the autocommit, §7 "Held new files", count); ignored ones
     and `.scratch` are not, so an output the agents put into `.gitignore` is not listed. A path both deleted and
@@ -8063,8 +8067,10 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     deleted, untracked and held files, `.scratch` and ignored ones left out, a path deleted and untracked; a stopped
     session's files; a list cut at `CHANGED_FILES_MAX`; git off, no base commit, one gone, one that is no commit id, a
     repository git cannot open; an in-place folder whose `.git` became a gitfile, one whose git fails (no git output
-    in the text), one whose root a hand edit removed; the result while running, a done one, the cache by state and
-    head, a git failure not cached; `changed_since` without the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
+    in the text), one whose root a hand edit removed, also once its result was kept, and one whose root became copy
+    only; the result while running, a done one, the cache by state and head, a git failure not cached, a kept result
+    gone once `[workspace] git` is edited by hand, and its `error` read again (a `continue` not delivered);
+    `changed_since` without the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
   - settings and import: a settings-page save never writes `[api]` (`public_view`, `apply_update`); an import keeps
     the target's `api.folders` and drops a v1 session's `client_ref`, `request_digest`, `start_error`, `error` and
     `folder`;
