@@ -295,7 +295,7 @@ async def test_a_create_refused_by_its_body_makes_nothing(tmp_path, api_token, b
     try:
         status, answer = await hub.create(body)
         assert status == api_v1.CODES[code] and answer["code"] == code, answer
-        assert hub.manager.ids() == [] and not hub.api._refs and hub.api._reserved == 0
+        assert hub.manager.ids() == [] and not hub.api._refs and not hub.api._reserved
     finally:
         await hub.close()
 
@@ -622,7 +622,7 @@ async def test_a_cancelled_create_gives_its_uploads_back(tmp_path, api_token, no
         with pytest.raises(asyncio.CancelledError):
             await request
         assert [m["token"] for m in hub.manager.api_uploads.peek_many([token], caller="api")] == [token]
-        assert not copyfrom._IN_USE and hub.manager.ids() == [] and hub.api._reserved == 0 and not hub.api._refs
+        assert not copyfrom._IN_USE and hub.manager.ids() == [] and not hub.api._reserved and not hub.api._refs
     finally:
         await hub.close()
 
@@ -775,6 +775,53 @@ async def test_max_running_counts_the_starting_and_running_sessions_of_v1(tmp_pa
         hold.set()
     finally:
         hold.set()
+        await hub.close()
+
+
+async def test_a_create_counts_once_in_max_running_while_it_is_made(tmp_path, api_token, no_start, monkeypatch):
+    """A create counts once from the max_running check on: by its reservation until its session is marked starting
+    with it, then by that session, also before its session.json is written and while its skills are committed (or its
+    in-place folder is made). A second create and a `continue` meanwhile are not refused for it."""
+    make_skill(Path(os.environ["DREAMTEAM_SKILLS_DIR"]) / "demo", "demo", "The library's demo.")
+    hub = Hub(_manager(_home(tmp_path, api={"max_running": 2})))
+    no_start(hub.manager)
+    gate, entered = threading.Event(), threading.Event()
+    first_writes: list[int] = []
+    commit, write = SessionManager._commit_skills, SessionManager._write_meta
+
+    def held_commit(self: SessionManager, *args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        gate.wait(5)
+        return commit(self, *args, **kwargs)
+
+    def counted_write(self: SessionManager, sid: str, meta: dict[str, Any]) -> None:
+        if not (self.dir_of(sid) / sessions_module.SESSION_FILE).exists():   # (a create's first write: marked, not listed)
+            first_writes.append(hub.api.running_count())
+        write(self, sid, meta)
+
+    monkeypatch.setattr(SessionManager, "_write_meta", counted_write)
+    try:
+        status, old = await hub.create({"goal": "Old", **MANUAL})
+        assert status == 202
+        await hub.settled()
+        assert hub.api.running_count() == 0 and first_writes == [1]
+        monkeypatch.setattr(SessionManager, "_commit_skills", held_commit)
+        first =asyncio.ensure_future(hub.create({"goal": "A", "skills": ["demo"], **MANUAL}))
+        await _until(entered.is_set, "the skills commit")
+        assert first_writes == [1, 1] and hub.api.running_count() == 1
+        status, answer = await hub.create({"goal": "B", **MANUAL})
+        assert status == 202, answer
+        await _until(lambda: hub.api.running_count() == 1, "B's start")
+        status, answer = await hub.call("POST", f"/api/v1/sessions/{old['session']['id']}/continue",
+                                        body={"text": "Go on"})
+        assert status == 200, answer
+        gate.set()
+        status, answer = await first
+        assert status == 202, answer
+        await hub.settled()
+        assert hub.api.running_count() == 0 and not hub.api._reserved
+    finally:
+        gate.set()
         await hub.close()
 
 

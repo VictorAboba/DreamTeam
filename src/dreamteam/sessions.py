@@ -1278,6 +1278,10 @@ class SessionManager:
     def _marked(self, sid: str, mark: object) -> bool:
         return mark in self._marks.get(sid, ())
 
+    def marked_session(self, mark: object) -> str | None:
+        """The session the start `mark` is on now (mark_starting), else None (not placed yet, or taken away)."""
+        return next((sid for sid, marks in self._marks.items() if mark in marks), None)
+
     def _drop_marks(self, sid: str, marks: Iterable[object] | None = None) -> None:
         """A delete (`marks` None: every mark) or a stop (`marks`: those placed before it was asked): those starts on
         their way start nothing any more (start(..., marked=...)); the session leaves `starting` with its last mark."""

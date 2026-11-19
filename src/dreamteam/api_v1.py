@@ -1181,7 +1181,9 @@ class ApiV1:
         self._tasks: set[asyncio.Task] = set()
         self.closing = False    # aclose() runs: no new create starts
         self._closed = False    # aclose() ended: nothing more is spawned (manager.shutdown() may run)
-        self._reserved = 0      # creates past the max_running check whose session is not marked starting yet
+        # the start marks of the creates past the max_running check, until manager.create returns: one counts on its
+        # own until its session is marked starting with it, then that session counts (running_count)
+        self._reserved: set[object] = set()
         self._archives = 0      # archives being measured or sent (at most ARCHIVES_AT_ONCE)
         self._refs: dict[str, _Ref] = {}   # the client_refs of the creates in flight
         # the results of final sessions (docs/SPEC.md §21.7), newest last, at most RESULTS_CACHED: key (_result_key)
@@ -1455,9 +1457,19 @@ class ApiV1:
     def running_count(self) -> int:
         """How many sessions created through v1 run or start now (docs/SPEC.md §21.4 `[api] max_running`): running,
         `starting` (a create or a `continue`) or about to be resumed, whoever started them, plus the creates past the
-        check whose session is not marked yet."""
-        busy = self.manager.running | self.manager.starting | self.manager.resume_pending
-        return len(busy & set(self.manager.api_sids())) + self._reserved
+        check whose session is not marked yet. A create counts once: by its mark until its session is marked starting
+        with it, then by its session, also before its session.json lists it as a v1 session."""
+        manager = self.manager
+        busy = manager.running | manager.starting | manager.resume_pending
+        api = set(manager.api_sids())
+        unmarked = 0
+        for mark in self._reserved:
+            sid = manager.marked_session(mark)
+            if sid is None:
+                unmarked += 1
+            else:
+                api.add(sid)
+        return len(busy & api) + unmarked
 
     def _check_running(self, config: "Config") -> None:
         """429 `too_many_sessions` when `[api] max_running` (0: no limit) sessions of v1 run or start already. The
@@ -2126,10 +2138,10 @@ class ApiV1:
             copied = [folder.source()] if folder is not None and folder.mode == "copy" else []
             in_place = folder is not None and folder.mode == "in_place"
             self._check_running(config)
-            self._reserved += 1   # (no await since the check)
+            mark = object()
+            self._reserved.add(mark)   # (no await since the check)
             try:
                 claimed = await claim_uploads(uploads, ask.files, caller) if ask.files else []
-                mark = object()
                 created = False
                 try:
                     made = await manager.create(
@@ -2144,7 +2156,7 @@ class ApiV1:
                 finally:   # (synchronous: any outcome settles every claim, docs/SPEC.md §21.3 "Life")
                     uploads.settle(claimed, used=created)
             finally:
-                self._reserved -= 1   # (the session is `starting` now, with its mark)
+                self._reserved.discard(mark)   # (the session is `starting` now, with its mark, or not made)
             sid = made["id"]
             try:
                 self.spawn(self._start_later(sid, mark), name=f"api-start-{sid}")

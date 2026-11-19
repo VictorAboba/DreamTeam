@@ -7913,9 +7913,11 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     share that does not answer, and a summary is built on the loop for every route, every pass of a poll or a stream
     and every session listed) and its state (`api_v1.state_of`), and `[api] max_running`'s count
     (`ApiV1.running_count()`: the v1 sessions in `running`, `starting` or `resume_pending`, plus the creates past the
-    check that have not marked their session yet). A request of a running session that cannot be read blocks
-    nothing (as the summary's `requests` count skips it), and GET `/sessions` leaves out a session whose summary
-    fails (logged), as the sessions page does.
+    check that have not marked their session yet; a create counts once, by its start mark in `ApiV1._reserved` until
+    `manager.marked_session(mark)` names its session, then by that session, also before its session.json is written
+    and while its skills are committed or its in-place folder is made). A request of a running session that cannot be
+    read blocks nothing (as the summary's `requests` count skips it), and GET `/sessions` leaves out a session whose
+    summary fails (logged), as the sessions page does.
   - `autoreply.py`: `SessionAutoReply`, `requests_of`, `requests_from`, `read_requests`, `blocking_requests`,
     `request_key`, `follow_journal`, `journal_head`, `planner_question` and the queries it shares with the swarm
     (`LAST_TO`, `QUESTION_DROPPED`, `PLANS`), `AUTO_REPLY`, `AUTO_REVIEW`, `AUTO_REPLY_MAX` (moved from printmode.py,
@@ -7980,7 +7982,9 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     with its result, no result while the session is started again meanwhile, `detail=all` with `lang`, pings, a delete
     ending it without a result, its refusals before it starts; `tests/test_api_v1_events.py`); `last_activity`
     unchanged by `session.*` events;
-  - `stop_when_done`; PATCH of a running session and of a stopped one followed by its start; `continue` after a
+  - `stop_when_done`; a create counted once in `max_running` while it is made (before its session.json and while its
+    skills are committed: another create and a `continue` meanwhile are not refused for it); PATCH of a running
+    session and of a stopped one followed by its start; `continue` after a
     budget stop, and while a create's start is in flight (counted once in `max_running`, the texts given after it in
     order, the start tried again when it fails); `continue` on a running session (the coordinator, a pending
     question, a pause by the user or a budget that covers what was spent), on a done job, on a session without a
