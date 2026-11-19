@@ -83,6 +83,11 @@ KEEP_ON_IMPORT = (".venv", "venv", "node_modules")
 _STAMP = re.compile(r"\d{8}-\d{6}(?:-\d+)?")
 RENAME_TRIES = 10  # a rename refused while a file inside is held open for a moment (Windows) is tried again
 RENAME_PAUSE = 0.2
+# session.json replaced while a reader holds it open without sharing delete access (Windows: a thread of the hub's,
+# such as the HTTP API v1's, another process, a scanner) is tried again (_write_meta): it blocks the loop at most
+# META_REPLACE_TRIES * META_REPLACE_PAUSE seconds, and only while the file is held
+META_REPLACE_TRIES = 10
+META_REPLACE_PAUSE = 0.02
 # A session's identity across homes and computers (session.json "uid", see session_uid): the sequence id is not one,
 # two homes both make 017-session. Fixed forever: it derives the uid of sessions made before "uid" was written.
 UID_NAMESPACE = uuid.UUID("545ad73f-3f1d-471d-a6b5-de9395f527da")
@@ -1502,6 +1507,9 @@ class SessionManager:
         return meta
 
     def _write_meta(self, sid: str, meta: dict[str, Any]) -> None:
+        """session.json written whole: a temporary file, then put in its place (os.replace). A replace refused with
+        PermissionError (Windows: a reader holds the file open for a moment, such as a thread of the hub's that reads
+        it) is tried again, META_REPLACE_TRIES times META_REPLACE_PAUSE apart; then the error is raised."""
         if sid == LEGACY_ID:
             path = self.home / ".dreamteam" / SESSION_FILE
             data = {k: meta[k] for k in ("title", "created_at", "autostart") if k in meta}
@@ -1513,7 +1521,14 @@ class SessionManager:
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             tmp.write_bytes(text.encode("utf-8", "replace"))
-            os.replace(tmp, path)
+            for attempt in range(META_REPLACE_TRIES):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == META_REPLACE_TRIES - 1:
+                        raise
+                    time.sleep(META_REPLACE_PAUSE)
         finally:
             if tmp.exists():
                 try:
@@ -2981,7 +2996,9 @@ class SessionManager:
         `api.finished_at` before it raises, and before `session.stopped` is journaled. Once it runs (its pending goal
         set), the hub's automatic answers start with `answers: "auto"` (autoreply.SessionAutoReply), and the
         stop_when_done watcher with `stop_when_done` (_watch_end, from the journal's head before `session.started`:
-        this run's events only, but on a resume the state it was stopped in), until _unload stops them."""
+        this run's events only, but on a resume the state it was stopped in), until _unload stops them. Its last write
+        of session.json (the resume mark, and the `api` block above) is logged when it fails, never raised: the
+        session runs by then."""
         # loaded under the lock: a swarm fetched before waiting could have been unloaded meanwhile
         try:
             swarm = self._load_locked(sid)
@@ -3075,7 +3092,11 @@ class SessionManager:
                     block["base_commit"] = swarm.workspace.head_at_init
                 block["start_error"] = None
                 block["finished_at"] = None   # running: no longer final
-            self._write_meta(sid, meta)
+            try:   # (the swarm runs: a write that fails is no failed start, which would leave it running unseen)
+                self._write_meta(sid, meta)
+            except OSError:
+                log.exception("session %s runs, but its session.json could not be written: its resume mark and "
+                              "the record of this start are missing", sid)
             swarm.session_pending_goal = pending_goal(meta)
         return swarm
 

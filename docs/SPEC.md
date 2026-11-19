@@ -4329,7 +4329,9 @@ settings; ValueError when they are invalid):
   - `_start_locked`, on every start path: with `answers: "auto"` it calls `swarm.hold_auto_reply()` right after
     loading, before `swarm.start()`; at the first start (`started_at` null) it sets `swarm.workspace.record_head`,
     and once the start succeeded it writes `started_at` and `base_commit` (`Workspace.head_at_init`) with the rest of
-    session.json; every start that succeeds clears `start_error` and `finished_at`. A start that fails, because the
+    session.json; every start that succeeds clears `start_error` and `finished_at`. That write comes once the swarm
+    runs, so its failure is logged, never raised (the start is no failed one: its callers would record a start error
+    for a running session). A start that fails, because the
     session cannot be loaded (not a 404, never a session of an earlier version, which is not written to), because
     `_check_workspace_ready` or `_check_adopted_repo` refuse it, or because `swarm.start()` raises, writes
     `start_error` {code, text} and `finished_at` before it raises (and before `session.stopped` is journaled): `code`
@@ -4399,7 +4401,10 @@ settings; ValueError when they are invalid):
   server derive it).
 - **Identity.** The sequence id is not an identity across homes (two homes both make `017-session`). `create`
   writes `"uid": new_uid()` (uuid4, 32 lowercase hex) into session.json; `_write_meta` keeps unknown keys, so
-  `update`, `set_workspace` and `start` keep it. `session_uid(meta)` is the stored uid when it is 32 hex characters
+  `update`, `set_workspace` and `start` keep it. (`_write_meta` writes a temporary file and puts it in place with
+  `os.replace`; a replace refused with PermissionError, as on Windows while a reader holds session.json open for a
+  moment, such as a thread of the HTTP API v1, is tried again, `META_REPLACE_TRIES` = 10 × `META_REPLACE_PAUSE`
+  0.02 s, before the error is raised.) `session_uid(meta)` is the stored uid when it is 32 hex characters
   (lowercased), else `uuid5(UID_NAMESPACE, "created_at:" + repr(float(created_at))).hex`, derived on read and never
   written (so a session made before uids existed, or a folder copied by hand, has the same identity in every home
   it is in); None without a finite numeric `created_at` and for the legacy `main` session (never matched).
@@ -8002,6 +8007,9 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     `client_ref` twice, with another body, and during a slow copy; a failed start; `max_running`; a session listed
     `starting` while its create commits its skills, and a DELETE, a stop or a `continue` sent then waiting for the
     create;
+  - session.json put in place again while a reader holds it (a thread that has it open, on Windows; a refusal past
+    `META_REPLACE_TRIES` raised, no temporary file left), and a start whose last write fails running, logged
+    (`tests/test_api_sessions.py`);
   - auto answers (a question, a review per round, a question pause, past `AUTO_REPLY_MAX`, after a hub restart) and
     manual requests with their answers (`tests/test_api_v1_requests.py`: a question pause, a clarify planner's
     question read from the stopped session's file too, a message, a review answered once per round, an MCP server

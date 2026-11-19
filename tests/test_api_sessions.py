@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -20,6 +21,7 @@ from typing import Any
 import pytest
 
 from dreamteam import prompts
+from dreamteam import sessions as sessions_module
 from dreamteam import settings as st
 from dreamteam import swarm as swarm_module
 from dreamteam.copyfrom import CopyError, CopyLimits
@@ -335,6 +337,90 @@ async def test_finished_at_is_written_when_a_running_session_stops_and_cleared_w
         await manager.shutdown()   # the hub stops: the run ends too
     api = stored(manager, sid)["api"]
     assert isinstance(api["finished_at"], float) and api["started_at"] == started_at
+
+
+async def test_session_json_is_put_in_place_again_while_a_reader_holds_it(tmp_path, monkeypatch):
+    """os.replace refused with PermissionError (Windows: a reader holds session.json open for a moment, such as a
+    thread of the HTTP API v1) is tried again; past META_REPLACE_TRIES the error is raised and no temporary file
+    stays."""
+    manager = _manager(_home(tmp_path))
+    try:
+        sid = (await manager.create("Calc", "Build a calculator", overrides=NO_GIT, start=False, api=AUTO))["id"]
+        monkeypatch.setattr(sessions_module, "META_REPLACE_PAUSE", 0)
+        real, refused, limit = os.replace, [], 3
+
+        def held(src: Any, dst: Any) -> None:
+            if Path(dst).name == "session.json" and len(refused) < limit:
+                refused.append(dst)
+                raise PermissionError(13, "The process cannot access the file", str(dst))
+            real(src, dst)
+
+        monkeypatch.setattr(os, "replace", held)
+        meta = manager.meta(sid)
+        meta["autostart"] = True
+        manager._write_meta(sid, meta)
+        assert len(refused) == 3 and stored(manager, sid)["autostart"] is True
+        refused.clear()
+        limit = sessions_module.META_REPLACE_TRIES
+        meta["autostart"] = False
+        with pytest.raises(PermissionError):
+            manager._write_meta(sid, meta)
+        assert len(refused) == sessions_module.META_REPLACE_TRIES and stored(manager, sid)["autostart"] is True
+        assert [p.name for p in manager.dir_of(sid).iterdir() if p.name.endswith(".tmp")] == []
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="only Windows refuses to replace a file another handle holds open")
+async def test_session_json_is_written_while_a_thread_reads_it(tmp_path):
+    manager = _manager(_home(tmp_path))
+    try:
+        sid = (await manager.create("Calc", "Build a calculator", overrides=NO_GIT, start=False, api=AUTO))["id"]
+        opened, release = threading.Event(), threading.Event()
+
+        def reader() -> None:
+            with open(manager.dir_of(sid) / "session.json", "rb"):   # (Python's open shares no delete access)
+                opened.set()
+                release.wait(2)
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        try:
+            assert opened.wait(2)
+            threading.Timer(0.05, release.set).start()
+            meta = manager.meta(sid)
+            meta["autostart"] = True
+            manager._write_meta(sid, meta)
+        finally:
+            release.set()
+            thread.join(2)
+        assert stored(manager, sid)["autostart"] is True
+    finally:
+        await manager.shutdown()
+
+
+async def test_a_start_whose_last_write_fails_runs_and_says_so(tmp_path, monkeypatch, caplog):
+    """The write of session.json at the end of a start comes once the swarm runs: its failure is logged, and the
+    start succeeds (raising would have the caller record a failed start of a running session)."""
+    manager = _manager(_home(tmp_path))
+    write = SessionManager._write_meta
+
+    def failing(self: SessionManager, sid: str, meta: dict[str, Any]) -> None:
+        if sid in self.running:
+            raise PermissionError(13, "Access is denied", "session.json")
+        write(self, sid, meta)
+
+    try:
+        sid = (await manager.create("Calc", "Build a calculator", overrides=NO_GIT, start=False, api=AUTO))["id"]
+        monkeypatch.setattr(SessionManager, "_write_meta", failing)
+        with caplog.at_level(logging.ERROR, logger="dreamteam.sessions"):
+            swarm = await manager.start(sid)
+        assert swarm is not None and sid in manager.running and manager.swarms[sid] is swarm
+        assert "runs, but its session.json could not be written" in caplog.text
+        assert stored(manager, sid)["api"]["start_error"] is None
+        monkeypatch.setattr(SessionManager, "_write_meta", write)
+    finally:
+        await manager.shutdown()
 
 
 async def test_a_start_cancelled_by_the_hub_stopping_records_finished_at_and_no_start_error(tmp_path, monkeypatch):
