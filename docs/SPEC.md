@@ -8256,8 +8256,10 @@ in_place = false            # true: a session may also work in a folder under it
   resolved path keeps the spelling it was given; the session stores, and a copy reads, the listed names, which the
   no-follow reads of 21.8 require. The names from the first one that is not there on (the folders an in-place create
   makes) stay as given. Each listing is read (`scandir`) until the name and keeps none of the other names; only for a
-  name it does not hold exactly is it read once more, keeping one name at most, so a root of many folders costs a
-  create, and each request for an in-place session's files (21.8), no list of its names.
+  name it does not hold exactly is it read again, keeping one name at most and comparing by device and inode only
+  the names that differ in letter case or Unicode form (once more, the others, only when none of those is the same
+  entry: a short name), so a root of many folders costs a create, and each request for an in-place session's files
+  (21.8), no list of its names and no lstat of each of them.
 - The create works with that resolved folder and checks it again after its own resolution, given the resolved root
   (`within=`): for a copy, `resolve_source(..., within=)` right after `resolve_request` (its location rules for the
   folder itself: another DreamTeam home under the root is 403 `forbidden_folder` too), then the copy itself reads

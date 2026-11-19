@@ -1134,6 +1134,32 @@ def test_a_name_below_a_large_root_is_taken_as_listed_without_keeping_the_listin
     assert apifolders.as_listed(root, ("new", "site")) == ("new", "site")
 
 
+def test_another_spelling_below_a_large_root_compares_only_the_names_of_its_key(tmp_path, monkeypatch):
+    """A name in another letter case (here `ZETA`, which the file system opens as `zeta`, listed after 3000 other
+    names) is found by comparing only the listed names of the same key by device and inode, not each name of the
+    folder; a short name (here `ZET~1`), which has no key in common with its listed name, still finds it among the
+    others."""
+    root = tmp_path / "root"
+    root.mkdir()
+    for i in range(3000):
+        (root / f"f{i:05d}.txt").touch()
+    (root / "zeta").mkdir()
+    lstat = os.lstat
+    calls: list[str] = []
+
+    def aliased(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        head, tail = os.path.split(os.fspath(path))
+        calls.append(tail)
+        return lstat(os.path.join(head, "zeta") if tail in ("ZETA", "ZET~1") else path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", aliased)
+    assert apifolders.as_listed(root, ("ZETA",)) == ("zeta",)
+    assert sorted(calls) == ["ZETA", "zeta"], len(calls)
+    calls.clear()
+    assert apifolders.as_listed(root, ("ZET~1",)) == ("zeta",)
+    assert calls[0] == "ZET~1" and calls[-1] == "zeta"
+
+
 async def test_the_other_sessions_folders_are_compared_by_file_identity_too(tmp_path, monkeypatch):
     """A folder that another session's stored path names by another spelling (here: through a link, which the
     file system resolves to the same folder) is that session's folder: _plan compares by identity, not by text

@@ -299,9 +299,10 @@ def _listed_name(folder: Path, name: str) -> str | None:
     """The name of `folder`'s listing that `name` opens (as_listed); None when `name` names nothing there. The listing
     is read (scandir) until `name` and keeps none of the other names, so a folder of any size (a root of many jobs)
     costs no list of its names (docs/SPEC.md §21.8). Only when it does not hold `name` exactly, and `name` opens
-    something, is it read once more, keeping one name at most: the first of the same entry (lstat: device and inode)
-    with `name`'s key (letter case and Unicode form folded), else the first other one of the same entry (a short
-    name); with no file ids, the one name with that key (None when two have it)."""
+    something, is it read again, keeping one name at most: the first of the same entry (lstat: device and inode)
+    with `name`'s key (letter case and Unicode form folded), looking only at the names with that key; only when none
+    is, once more for the first other name of the same entry (a short name); with no file ids, the one name with that
+    key (None when two have it). So the lstat calls are those of the names with the key, not of the whole folder."""
     where = long_path(folder)
     try:
         with os.scandir(where) as listing:
@@ -311,23 +312,24 @@ def _listed_name(folder: Path, name: str) -> str | None:
     except OSError:
         return None
     key = _name_key(name)
-    ids = bool(given.st_ino)   # (else a file system without file ids)
-    found: str | None = None   # (ids: the first other name of the entry; none: the one name with the key)
     try:
-        with os.scandir(where) as listing:
-            for entry in listing:
-                alike = _name_key(entry.name) == key
-                if not ids:
-                    if alike and found is not None:
-                        return None
-                    found = entry.name if alike else found
-                elif (alike or found is None) and _same_entry(folder / entry.name, given):
-                    if alike:
+        if not given.st_ino:   # (a file system without file ids)
+            found: str | None = None
+            with os.scandir(where) as listing:
+                for entry in listing:
+                    if _name_key(entry.name) == key:
+                        if found is not None:
+                            return None
+                        found = entry.name
+            return found
+        for alike in (True, False):
+            with os.scandir(where) as listing:
+                for entry in listing:
+                    if (_name_key(entry.name) == key) == alike and _same_entry(folder / entry.name, given):
                         return entry.name
-                    found = entry.name
     except OSError:
         return None
-    return found
+    return None
 
 
 def _same_entry(path: Path, given: os.stat_result) -> bool:
