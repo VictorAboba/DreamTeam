@@ -106,12 +106,14 @@ class CopyError(ValueError):
     """A copy that cannot be made; `status` is the HTTP status. `code`: the HTTP API v1's error code where the
     status alone does not say it (docs/SPEC.md §21.1: `bad_name`, `file_conflict`, `too_many_uploads`, and for the
     server folders of §21.10 `unknown_folder`, `forbidden_folder`, `not_found`); None otherwise. The internal routes
-    do not show it."""
+    do not show it. `retry_after`: whole seconds after which the same request may pass (v1 sends it as Retry-After:
+    `too_many_uploads`), else None."""
 
-    def __init__(self, message: str, status: int = 400, code: str | None = None):
+    def __init__(self, message: str, status: int = 400, code: str | None = None, *, retry_after: int | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.retry_after = retry_after
 
 
 class CopyCancelled(Exception):
@@ -1192,6 +1194,29 @@ class Uploads:
                     count += 1
         return count
 
+    def _first_free(self) -> int:
+        """Whole seconds (at least 1) until the first upload that waits or arrives is past UPLOAD_TTL, which the next
+        upload's clean then removes: by its json's "at", else its file's time, as clean reads it (an upload still
+        arriving counts from its last write). UPLOAD_TTL when none can be read. Blocking."""
+        now = time.time()
+        soonest = float(UPLOAD_TTL)
+        try:
+            entries = list(os.scandir(self.root))
+        except OSError:
+            return UPLOAD_TTL
+        for entry in entries:
+            m = PENDING_NAME.match(entry.name)
+            if m is None or m.group(2) not in ("zip", "bin", "part"):
+                continue
+            at = _stamp((_read_meta(self.root / f"{m.group(1)}.json") or {}).get("at"))
+            if at is None:
+                try:
+                    at = entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
+                    continue
+            soonest = min(soonest, at + UPLOAD_TTL - now)
+        return max(1, int(soonest) + 1)   # (clean removes an upload once it is older than UPLOAD_TTL, not at it)
+
     def _finish(self, token: str, part: Path, name: str, total: int, ext: str = "zip",
                 extra: dict[str, Any] | None = None) -> None:
         meta = self.root / f"{token}.json"
@@ -1210,13 +1235,14 @@ class Uploads:
                       max_pending: int = UPLOAD_MAX_PENDING, caller: str | None = None) -> dict[str, Any]:
         """Store an uploaded zip streamed as `chunks` (at most `limits.max_bytes`; `length`: the Content-Length
         header, checked before reading). Returns {"upload": token, "filename", "bytes", "expires_in"}; CopyError
-        413 (too large), 429 `too_many_uploads` (`max_pending` uploads wait), 400 (empty, not a zip). Whatever
-        goes wrong (an exception from `chunks` too, which goes on to the caller), the partial file is removed.
+        413 (too large), 429 `too_many_uploads` (`max_pending` uploads wait; v1's has `retry_after`, _first_free), 400
+        (empty, not a zip). Whatever goes wrong (an exception from `chunks` too, which goes on to the caller), the
+        partial file is removed.
         `kind="file"` (the HTTP API v1, docs/SPEC.md §21.3): any file, an empty one too, kept as <token>.bin under
         the name `filename`, which check_upload_name refuses (400 `bad_name`, before anything is read) rather than
-        cleans up; a zip only with `unpack` (unpacked by the create; empty, 400); its json records `unpack` and `caller` (who
-        uploaded it: UPLOAD_CALLERS). Returns {"upload", "filename", "bytes", "unpack", "expires_in"}. `unpack`
-        is a bool (the route parses the query's text strictly), else ValueError."""
+        cleans up; a zip only with `unpack` (unpacked by the create; empty, 400); its json records `unpack` and
+        `caller` (who uploaded it: UPLOAD_CALLERS). Returns {"upload", "filename", "bytes", "unpack", "expires_in"}.
+        `unpack` is a bool (the route parses the query's text strictly), else ValueError."""
         if kind not in ("zip", "file"):
             raise ValueError(f"unknown upload kind {kind!r}")
         if type(unpack) is not bool:
@@ -1234,9 +1260,15 @@ class Uploads:
             raise CopyError(too_big, 413)
         async with self._admitting:   # (the count, then this upload's .part, which the next count sees)
             pending = await asyncio.to_thread(self._pending)
-            if pending >= max_pending:
+            if pending >= max_pending and kind == "zip":
                 raise CopyError(f"{pending} uploads already wait for a session; each is removed when a session uses "
                                 "it or an hour after its upload. Try again later.", 429, code="too_many_uploads")
+            if pending >= max_pending:
+                wait = await asyncio.to_thread(self._first_free)
+                raise CopyError(f"{pending} uploads already wait for a session; each is removed when a session uses "
+                                f"it, when its client deletes it (DELETE {API_UPLOAD_PATH}/{{token}}) or an hour after "
+                                f"its upload. The first of them is past its hour in {wait} s.", 429,
+                                code="too_many_uploads", retry_after=wait)
             token = secrets.token_urlsafe(18)
             part = self.root / f"{token}.part"
             fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
@@ -1413,6 +1445,24 @@ class Uploads:
                     self.unclaim(source)
                 raise
         return taken
+
+    def discard(self, token: Any, *, caller: str) -> None:
+        """Remove the v1 upload `token` of `caller` that no create has used (DELETE /api/v1/uploads/{token},
+        docs/SPEC.md §21.3 "Life"): its place under the cap is free at once. Under the lock claims are made under, so
+        a create either claimed it first (then it is not here: 404) or never finds it. CopyError 400 for a malformed
+        token, 404 as peek_many's (unknown, used, claimed by a create that runs, past its hour, a link, or of the other
+        kind of caller), 500 when it cannot be removed. Blocking."""
+        token = self._checked(token, f"Not a token of POST {API_UPLOAD_PATH}.")
+        with self._claiming:
+            self._peek_file(token, caller)
+            try:
+                os.unlink(self.root / f"{token}.bin")
+            except FileNotFoundError:
+                raise _gone(token, "file") from None
+            except OSError as exc:
+                raise CopyError(f"Cannot remove the upload {token}: {exc.strerror or exc}", 500) from None
+            with contextlib.suppress(OSError):   # (else the next clean removes it: a json alone counts for nothing)
+                os.unlink(self.root / f"{token}.json")
 
     def unclaim(self, source: Source) -> bool:
         """Give back a claimed v1 upload (the create failed: a 4xx, a 5xx, a cancel): the claim is renamed back to

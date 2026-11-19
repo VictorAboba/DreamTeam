@@ -1191,6 +1191,7 @@ class ApiV1:
         routes = [
             self._route("/api/v1/options", {"GET": self._options}),
             self._route(API_UPLOAD_PATH, {"POST": self._upload}),
+            self._route(API_UPLOAD_PATH + "/{token}", {"DELETE": self._discard_upload}),
             self._route("/api/v1/sessions", {"GET": self._list, "POST": self._create}),
             self._route("/api/v1/sessions/{id}", {"GET": self._get, "PATCH": self._patch, "DELETE": self._delete}),
             self._route("/api/v1/sessions/{id}/continue", {"POST": self._continue}),
@@ -1285,7 +1286,8 @@ class ApiV1:
         traceback unless it is the 503 of a hub shutting down (no fault of anyone's). `sid`: the session the route
         is about (its folders are named by their names). `folder_busy` is v1's own text, whoever calls: the manager's
         names the other session's folder, so its title; the answer's `session` names that session's id when the
-        caller sees it (docs/SPEC.md §21.10 "One folder, one session")."""
+        caller sees it (docs/SPEC.md §21.10 "One folder, one session"). An error's `retry_after` (CopyError's, of
+        `too_many_uploads`) is sent as Retry-After."""
         code = error_code(exc)
         if code == "internal":
             if getattr(exc, "status", None) == 503:
@@ -1297,7 +1299,10 @@ class ApiV1:
             uid = await asyncio.to_thread(self._uid_for, holder, caller) if isinstance(holder, str) else None
             return fail(code, FOLDER_BUSY_TEXT, **({"session": uid} if uid else {}))
         text = str(exc)
-        return fail(code, await asyncio.to_thread(self.redact, text, sid) if caller == "api" else text)
+        wait = getattr(exc, "retry_after", None)   # (CopyError's: `too_many_uploads`)
+        headers = {"Retry-After": str(wait)} if isinstance(wait, int) and not isinstance(wait, bool) else None
+        return fail(code, await asyncio.to_thread(self.redact, text, sid) if caller == "api" else text,
+                    headers=headers)
 
     def _uid_for(self, sid: str, caller: str) -> str | None:
         """The uid of session `sid` when `caller` sees it (resolve's scope), else None. Blocking (session.json)."""
@@ -2041,6 +2046,15 @@ class ApiV1:
         except ClientDisconnect:   # (receive removed the partial file already)
             raise ApiError("bad_request", "The upload was interrupted.") from None
         return JSONResponse(data, status_code=201)
+
+    async def _discard_upload(self, request: Request, caller: str) -> Response:
+        """DELETE /api/v1/uploads/{token} (docs/SPEC.md §21.3 "Life"): this caller's upload that no create has used is
+        removed, and its place under `[api] uploads_pending` is free at once (Uploads.discard: 400 for a malformed
+        token, 404 for one that is unknown, used, past its hour or the other caller's)."""
+        query_fields(request)
+        token = request.path_params.get("token")
+        await asyncio.to_thread(self.manager.api_uploads.discard, token, caller=caller)
+        return JSONResponse({"ok": True})
 
     async def _list(self, request: Request, caller: str) -> Response:
         """GET /api/v1/sessions?state=&limit= (docs/SPEC.md §21.2): the sessions the caller sees, newest first by

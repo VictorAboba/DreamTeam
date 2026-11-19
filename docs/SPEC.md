@@ -6940,9 +6940,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   `bad_request` (`api_v1.read_json`). Times are Unix seconds (float), money is USD (float).
 - **Unknown fields.** A field the server does not know, in a JSON body or in a query that v1 reads, is 400
   `unknown_field`, so a typo never passes silently. One helper checks every route: the create, PATCH, `continue`, the
-  answers of requests, `messages` POST, the uploads query (`filename`, `unpack`) and the queries of the GET routes
-  (`api_v1.check_fields`, `query_fields`; `GET /api/v1/options` reads no query, so any field there is unknown). A
-  query field given twice is 400 `bad_request`.
+  answers of requests, `messages` POST, the uploads query (`filename`, `unpack`) and the queries of the GET and
+  DELETE routes (`api_v1.check_fields`, `query_fields`; `GET /api/v1/options` and `DELETE /api/v1/uploads/{token}`
+  read no query, so any field there is unknown). A query field given twice is 400 `bad_request`.
 - **Errors** are `{"error": text, "code": code}` for every answer under `/api/v1/`, the guard's included; a code may
   add fields of its own, named where it is described. The text is English and for people; programs check `code`.
   - The guard: `token_required` (401), `api_disabled`, `forbidden_host`, `forbidden_origin` (403),
@@ -6951,7 +6951,8 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     `unknown_folder`, `bad_name` (400); `forbidden_folder` (403); `not_found` (404: a session, file, request, upload
     or folder root); `method_not_allowed` (405); `conflict`, `earlier_version`, `file_conflict`, `folder_busy`,
     `folder_not_ready`, `not_running`, `budget_exhausted` (409); `too_large` (413); `too_many_uploads`,
-    `too_many_sessions`, `too_many_archives` (429); `internal` (500, logged).
+    `too_many_sessions`, `too_many_archives` (429; `too_many_uploads` with `Retry-After`, 21.3); `internal` (500,
+    logged).
   - `earlier_version`: the session was made by an earlier tool revision. Since 0.2.0 such a session cannot be loaded,
     started, stopped or changed (§17.2 "Sessions of an earlier version"), so every route that needs it loaded answers
     this code.
@@ -6988,6 +6989,7 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 |---|---|
 | GET `/api/v1/options` | `{"api": 1, "version", "languages": ["ru","en"], "language": the default, "teams": [{name, roles}], "roles": [{key, name, description}], "models": [{name, provider, model}], "default_model", "skills": [{name, description}], "folders": [{name, in_place}], "limits": {"upload_max_mb", "upload_max_files", "files_per_session", "uploads_pending", "max_running", "archive_max_mb"}}`: what a client may choose (below) |
 | POST `/api/v1/uploads?filename=<name>[&unpack=true]` | the file as the raw body, `Content-Type: application/octet-stream` or `application/zip` → 201 `{"upload": token, "filename", "bytes", "unpack", "expires_in": 3600}` (21.3) |
+| DELETE `/api/v1/uploads/{token}` | `{"ok": true}`: the caller's upload that no create used is removed, its place under `[api] uploads_pending` free at once (21.3 "Life") |
 | POST `/api/v1/sessions` | 21.4 → 202 `{"session": summary}`; 200 with the existing one for a repeated `client_ref` |
 | GET `/api/v1/sessions?state=&limit=` | `{"sessions": [summary]}`, newest first by `created_at` (`limit` 1–200, default 50); `state` keeps the sessions in that state (21.7) |
 | GET `/api/v1/sessions/{id}` | `{"session": summary}` |
@@ -7103,8 +7105,11 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   kind finds no such token (404 `not_found`): an API client never uses the owner's uploads, nor the reverse.
 - **The cap.** At most `[api] uploads_pending` (default 32) uploads wait or arrive at once, read at each upload; one
   more is 429 `too_many_uploads`. Uploads sent at the same time are counted one after another (the count and the
-  `.part` of each are made under the store's lock, §17.2 "Uploads"), so the cap holds for them too. The board's 8
-  (`UPLOAD_MAX_PENDING`) is apart.
+  `.part` of each are made under the store's lock, §17.2 "Uploads"), so the cap holds for them too. The 429 carries
+  `Retry-After` (and its text the same number): the whole seconds until the first upload waiting or arriving is past
+  its hour, by its json's `at`, else its file's time, as `clean()` reads it (`Uploads._first_free`; the next upload's
+  `clean()` then removes it; at least 1, at most `UPLOAD_TTL` + 1). A client frees a place at once by deleting an
+  upload it no longer needs ("Life"). The board's 8 (`UPLOAD_MAX_PENDING`) is apart; its 429 has no `Retry-After`.
 - **Content type.** The guard's `raw_posts` maps a path to a set of types (§18.1; a plain string is one type).
   `/api/v1/uploads` takes `application/octet-stream` and `application/zip` (neither is CORS-safelisted: a
   cross-site page cannot send one without a preflight the hub never answers); anything else, JSON included, is 415
@@ -7138,14 +7143,18 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   Content-Length says more) and the sum of what one create copies in; `copy_max_files` caps the files one create
   copies in. An unpacked size is known only by unpacking, so the sum is checked while the create copies, after the
   claim (21.4).
-- **Life.** A token lives an hour (`UPLOAD_TTL`) and is used by one successful create. The create checks every token
-  without claiming it (`peek_many`: 400 for a malformed token, 404 for one that is unknown, expired, used or of the
-  other caller), then claims them all (`claim_many`, under one lock: a failure renames back what it took), then copies
-  them into one staging folder (`copy_sources`: each source into a part of its own, then merged; a top-level name two
-  sources share is 409 `file_conflict`, compared in NFC and case-folded on Windows and macOS, exactly elsewhere).
-  Every outcome settles the claims synchronously in a `finally`: a success releases them (used up); a 4xx unclaims
-  every token (a 413 or a clash found while copying included), so any 4xx leaves every token usable; a 5xx, a cancel,
-  a client's disconnect or a hub shutdown unclaims them too. Nothing stays claimed (`copyfrom._IN_USE`) after the
+- **Life.** A token lives an hour (`UPLOAD_TTL`) and is used by one successful create, unless its caller deletes it
+  first: `DELETE /api/v1/uploads/{token}` (`Uploads.discard`, under the lock claims are made under) removes an upload
+  of the caller's that no create used, and answers `{"ok": true}`; a malformed token is 400 `bad_request`, one that
+  is unknown, used, claimed by a create in flight, past its hour or the other caller's 404 `not_found` (a create that
+  fails gives its tokens back: they can be deleted then). The create checks every token without claiming it
+  (`peek_many`: 400 for a malformed token, 404 for one that is unknown, expired, used or of the other caller), then
+  claims them all (`claim_many`, under one lock: a failure renames back what it took), then copies them into one
+  staging folder (`copy_sources`: each source into a part of its own, then merged; a top-level name two sources
+  share is 409 `file_conflict`, compared in NFC and case-folded on Windows and macOS, exactly elsewhere). Every
+  outcome settles the claims synchronously in a `finally`: a success releases them (used up); a 4xx unclaims every
+  token (a 413 or a clash found while copying included), so any 4xx leaves every token usable; a 5xx, a cancel, a
+  client's disconnect or a hub shutdown unclaims them too. Nothing stays claimed (`copyfrom._IN_USE`) after the
   create.
 
 ### 21.4 Creating a session
@@ -7935,7 +7944,8 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     `unknown_field` on every body and query; a PATCH without a JSON `Content-Type` (415);
   - scope: the API token sees only `via: "api"` sessions, the owner's made through v1 with the hub token among them;
     uid ids after a delete; earlier-version sessions (listed, 409);
-  - uploads: a file, an unpacked zip, every refused name (`.git` among them), a name clash, the limits, the tokens
+  - uploads: a file, an empty file, an unpacked zip, every refused name (`.git` among them), a name clash, the
+    limits, the cap's `Retry-After`, an upload deleted by its caller (not by the other, not once used), the tokens
     kept after a 4xx, a 5xx and a cancel, a token of the other caller, a link or a hard link put in the store;
   - create: an unknown field, team, model, role and skill; a blank goal; a `title` with a line break, over 200
     characters, or equal to the goal's title; `start_agents` 0, over `max_agents`, and with a `team` string;

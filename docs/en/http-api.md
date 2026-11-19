@@ -154,6 +154,7 @@ print(result["status"], result["summary"])
 |---|---|
 | GET `/api/v1/options` | what a client may choose (below) |
 | POST `/api/v1/uploads?filename=<name>[&unpack=true]` | 201 `{"upload", "filename", "bytes", "unpack", "expires_in": 3600}` ([Uploads](#uploads)) |
+| DELETE `/api/v1/uploads/{token}` | `{"ok": true}`: an upload no create used is deleted, its place under the cap free at once |
 | POST `/api/v1/sessions` | 202 `{"session": summary}`; 200 with the existing session for a repeated `client_ref` ([Creating a session](#creating-a-session)) |
 | GET `/api/v1/sessions?state=&limit=` | `{"sessions": [summary]}`, newest first; `limit` 1–200, default 50; `state` keeps one [state](#states) |
 | GET `/api/v1/sessions/{id}` | `{"session": summary}` |
@@ -200,9 +201,13 @@ that name before the first start.
   `.scratch`, `.gitignore`, `.dreamteam` or `mcp`.
 - `[workspace] copy_max_mb` caps one upload (413 `too_large`) and the sum one create copies in; `copy_max_files` caps
   the files one create copies in (an unpacked zip counts its files). At most `[api] uploads_pending` (32) uploads wait
-  at once: one more is 429 `too_many_uploads`.
+  at once, the owner's and the API token's together: one more is 429 `too_many_uploads`, whose `Retry-After` header
+  says in how many seconds the first of them is past its hour.
 - A token lives an hour and is used by one successful create. A create that is refused (any 4xx) leaves every token it
   named usable for the next try, and so does a create that fails on the hub's side or is cancelled.
+- `DELETE /api/v1/uploads/{token}` deletes an upload that no create used (a form left unsent, a create given up), so
+  its place under `uploads_pending` is free at once: `{"ok": true}`. A token that is unknown, used, past its hour or
+  uploaded with the other token is 404 `not_found`.
 - The API's uploads are its own: a token is never usable on the board's "New session" dialog, nor the reverse, and a
   token uploaded with the API token is unknown to the hub token's owner (404), and the reverse.
 
@@ -538,7 +543,7 @@ under a root the owner lists in `[api] folders` can be named, by the root's name
 | `not_running` | 409 | an answer or a message to a stopped session |
 | `budget_exhausted` | 409 | the budget is spent: raise it with PATCH |
 | `too_large` | 413 | a body, an upload, a copy or an archive over its limit |
-| `too_many_uploads` | 429 | `[api] uploads_pending` uploads already wait |
+| `too_many_uploads` | 429 | `[api] uploads_pending` uploads already wait (with `Retry-After`; delete the unused ones) |
 | `too_many_sessions` | 429 | `[api] max_running` sessions already run |
 | `too_many_archives` | 429 | the hub already sends 4 archives |
 | `internal` | 500 | the hub failed, or is shutting down; its log says why. Ask again later |

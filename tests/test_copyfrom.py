@@ -850,6 +850,45 @@ async def test_v1_uploads_have_their_own_cap(tmp_path):
         await _file_upload(uploads, max_pending=11)
 
 
+async def test_the_v1_cap_says_when_its_first_upload_is_past_its_hour(tmp_path):
+    """retry_after (v1's Retry-After): the whole seconds until the oldest upload waiting is older than UPLOAD_TTL, by
+    its json's "at" as clean reads it; the board's cap says nothing of it."""
+    uploads = Uploads(tmp_path / "api")
+    tokens = [(await _file_upload(uploads, filename=f"{n}.txt"))["upload"] for n in range(2)]
+    meta_path = uploads.root / f"{tokens[1]}.json"
+    meta_path.write_text(json.dumps({**json.loads(meta_path.read_text(encoding="utf-8")),
+                                     "at": time.time() - copyfrom.UPLOAD_TTL + 100}), encoding="utf-8")
+    with pytest.raises(CopyError) as err:
+        await _file_upload(uploads, max_pending=2)
+    assert err.value.code == "too_many_uploads" and 95 <= err.value.retry_after <= 101
+    assert f"in {err.value.retry_after} s" in str(err.value) and "DELETE /api/v1/uploads/{token}" in str(err.value)
+    board = Uploads(tmp_path / "uploads")
+    for _ in range(copyfrom.UPLOAD_MAX_PENDING):
+        await board.receive(_chunks(_zip({"a": "1"})), filename="w.zip", length=None, limits=LIMITS)
+    with pytest.raises(CopyError, match="Try again later") as err:
+        await board.receive(_chunks(_zip({"a": "1"})), filename="w.zip", length=None, limits=LIMITS)
+    assert err.value.retry_after is None
+
+
+async def test_a_v1_upload_is_discarded_by_its_caller_unless_a_create_holds_it(tmp_path):
+    uploads = Uploads(tmp_path / "api")
+    token = (await _file_upload(uploads))["upload"]
+    for bad, caller, status in (("not-a-token", "api", 400), (token, "owner", 404), ("A" * 24, "api", 404)):
+        with pytest.raises(CopyError) as err:
+            uploads.discard(bad, caller=caller)
+        assert err.value.status == status, bad
+    claimed = uploads.claim_many([token], caller="api")
+    with pytest.raises(CopyError) as err:   # a create that runs holds it: it is not here to discard
+        uploads.discard(token, caller="api")
+    assert err.value.status == 404
+    uploads.settle(claimed, used=False)   # given back (the create failed): usable, and so discarded now
+    uploads.discard(token, caller="api")
+    assert _names(uploads.root) == [] and not _claims_held([token])
+    with pytest.raises(CopyError) as err:
+        uploads.peek_many([token], caller="api")
+    assert err.value.status == 404
+
+
 async def test_v1_uploads_expire_and_left_over_claims_go(tmp_path):
     uploads = Uploads(tmp_path / "api")
     token = (await _file_upload(uploads))["upload"]

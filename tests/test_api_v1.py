@@ -90,6 +90,7 @@ class Hub:
         self.manager = manager
         self.app = create_launcher_app(manager, host)
         self.api: ApiV1 = self.app.api
+        self.headers: dict[str, str] = {}   # the headers of the last answer of call()
 
     async def call(self, method: str, path: str, *, body: Any = None, raw: bytes | None = None, query: str = "",
                    token: str = API_TOKEN, content_type: str | None = None) -> tuple[int, Any]:
@@ -98,8 +99,8 @@ class Hub:
         kind = "application/json" if content_type is None else content_type   # ("": no Content-Type at all)
         if method in ("POST", "PATCH") and kind:
             headers["content-type"] = kind
-        status, _, answer = await _ask(self.app, path=path, method=method, headers=headers, query=query, body=data,
-                                       client=LOCAL)
+        status, self.headers, answer = await _ask(self.app, path=path, method=method, headers=headers, query=query,
+                                                  body=data, client=LOCAL)   # (the last answer's headers)
         return status, (json.loads(answer.decode("utf-8")) if answer else None)
 
     async def create(self, body: dict[str, Any], **kwargs: Any) -> tuple[int, Any]:
@@ -487,6 +488,42 @@ async def test_the_uploads_cap_and_size_limit(tmp_path, api_token):
         assert (await hub.upload("a.txt", b"a"))[0] == 201 and (await hub.upload("b.txt", b"b"))[0] == 201
         status, answer = await hub.upload("c.txt", b"c")
         assert status == 429 and answer["code"] == "too_many_uploads"
+        wait = int(hub.headers["retry-after"])   # (when the first of them is past its hour)
+        assert copyfrom.UPLOAD_TTL - 60 <= wait <= copyfrom.UPLOAD_TTL + 1 and f"in {wait} s" in answer["error"]
+    finally:
+        await hub.close()
+
+
+async def test_an_unused_upload_is_deleted_by_its_caller_and_frees_its_place(tmp_path, api_token, hub_token,
+                                                                             no_start):
+    hub = Hub(_manager(_home(tmp_path, api={"uploads_pending": 2})))
+    no_start(hub.manager)
+    uploads = hub.manager.api_uploads
+    try:
+        one = (await hub.upload("a.txt", b"a"))[1]["upload"]
+        two = (await hub.upload("b.txt", b"b"))[1]["upload"]
+        assert (await hub.upload("c.txt", b"c"))[0] == 429
+        for call, status, code in (
+                (hub.call("DELETE", f"/api/v1/uploads/{one}", token=TOKEN), 404, "not_found"),   # the other caller's
+                (hub.call("DELETE", "/api/v1/uploads/not-a-token"), 400, "bad_request"),
+                (hub.call("DELETE", f"/api/v1/uploads/{one}", query="now=1"), 400, "unknown_field"),
+                (hub.call("GET", f"/api/v1/uploads/{one}"), 405, "method_not_allowed")):
+            got, answer = await call
+            assert got == status and answer["code"] == code, answer
+        assert [meta["token"] for meta in uploads.peek_many([one, two], caller="api")] == [one, two]
+        status, answer = await hub.call("DELETE", f"/api/v1/uploads/{one}")
+        assert status == 200 and answer == {"ok": True} and not list(uploads.root.glob(f"{one}.*"))
+        status, answer = await hub.call("DELETE", f"/api/v1/uploads/{one}")
+        assert status == 404 and answer["code"] == "not_found"
+        status, answer = await hub.create({"goal": "G", "files": [one]})
+        assert status == 404 and answer["code"] == "not_found"
+        assert (await hub.upload("c.txt", b"c"))[0] == 201   # its place under the cap is free at once
+        status, answer = await hub.create({"goal": "G", "files": [two]})
+        assert status == 202
+        status, answer = await hub.call("DELETE", f"/api/v1/uploads/{two}")   # used up
+        assert status == 404 and answer["code"] == "not_found"
+        mine = (await hub.upload("d.txt", b"d", token=TOKEN))[1]["upload"]   # the owner deletes its own
+        assert (await hub.call("DELETE", f"/api/v1/uploads/{mine}", token=TOKEN))[0] == 200
     finally:
         await hub.close()
 
