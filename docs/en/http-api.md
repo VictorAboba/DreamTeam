@@ -461,9 +461,11 @@ is resumed as well.
 - `GET .../archive?path=` streams a zip of the session's folder, or of one folder in it, named `<folder>.zip`: every
   folder an entry (empty ones too), files deflated with their times, modes 0644 (0755 for folders and executable
   files). It is measured first: over `[api] archive_max_mb` (default 1024) it is 413 `too_large` before any byte, and a
-  folder that cannot be read is 409 `conflict`. Each file is taken at its size when it is opened. A file or folder that
-  goes, is replaced or shrinks while the zip is written cuts the answer before the zip's end, so the client gets an
-  invalid zip, never a valid one that lacks files.
+  folder that cannot be read is 409 `conflict`, as is one more than 64 levels deep. Each file is taken at its size when
+  it is opened. A file or folder that goes, is replaced or shrinks while the zip is written cuts the answer before the
+  zip's end, so the client gets an invalid zip, never a valid one that lacks files. A hub sends at most 4 archives at
+  once (from the measure until the answer ends, however slowly its client reads): one more is 429
+  `too_many_archives`; ask again later, or download the files one by one.
 - Paths are relative to the session's folder, with `/`. An absolute path, `..`, `.`, an empty name, a NUL, a backslash,
   a `.git` component or a Windows short name (`GIT~1`) is 400 `bad_name`; on a Windows hub so are `:`,
   `< > " | ? *`, reserved names (`CON`) and a trailing dot or space.
@@ -533,6 +535,7 @@ under a root the owner lists in `[api] folders` can be named, by the root's name
 | `too_large` | 413 | a body, an upload, a copy or an archive over its limit |
 | `too_many_uploads` | 429 | `[api] uploads_pending` uploads already wait |
 | `too_many_sessions` | 429 | `[api] max_running` sessions already run |
+| `too_many_archives` | 429 | the hub already sends 4 archives |
 | `internal` | 500 | the hub failed, or is shutting down; its log says why. Ask again later |
 
 An error text never names a path of the hub's computer for the API token: a server folder reads as `<root>/<path>`,

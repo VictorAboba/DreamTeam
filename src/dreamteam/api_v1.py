@@ -110,6 +110,9 @@ ARCHIVE_FIELDS = ("path", "scratch")                           # GET .../archive
 FILE_CHUNK = 1 << 20        # bytes of each read of a download or of an archived file
 ZIP_SENT = 256 << 10        # bytes of zip an archive gathers before it sends them
 ZIP_ENTRY_COST = 4 << 10    # what one entry of an archive counts for in a step, as bytes read (_zip_parts)
+# archives a hub measures or sends at once (429 too_many_archives beyond them): each holds the descriptors of its walk,
+# up to nofollow.MAX_DEPTH + 2, for as long as its client takes to read it
+ARCHIVES_AT_ONCE = 4
 # ID_MAX (autoreply's, SQLite's largest integer): the largest id a query's `after`, a message's `reply_to` or a
 # request's id names
 TO_MAX = 100                # names in the `to` of a message the client sends
@@ -173,7 +176,7 @@ CODES: dict[str, int] = {
     "conflict": 409, "earlier_version": 409, "file_conflict": 409, "folder_busy": 409, "folder_not_ready": 409,
     "not_running": 409, "budget_exhausted": 409,
     "too_large": 413,
-    "too_many_uploads": 429, "too_many_sessions": 429,
+    "too_many_uploads": 429, "too_many_sessions": 429, "too_many_archives": 429,
     "internal": 500,
 }
 # the code of an error that has no code of its own, by its status; another 4xx is bad_request, anything else internal
@@ -1169,6 +1172,7 @@ class ApiV1:
         self.closing = False    # aclose() runs: no new create starts
         self._closed = False    # aclose() ended: nothing more is spawned (manager.shutdown() may run)
         self._reserved = 0      # creates past the max_running check whose session is not marked starting yet
+        self._archives = 0      # archives being measured or sent (at most ARCHIVES_AT_ONCE)
         self._refs: dict[str, _Ref] = {}   # the client_refs of the creates in flight
         # the results of final sessions (docs/SPEC.md §21.7), newest last, at most RESULTS_CACHED: key (_result_key)
         # -> the result without its board_url
@@ -2392,27 +2396,53 @@ class ApiV1:
         """GET /api/v1/sessions/{id}/archive?path=&scratch= (docs/SPEC.md §21.8): a zip of the session's folder, or of
         the folder `path` in it, with what GET files lists at every level, streamed as it is built (_zip_parts). It is
         measured first (_measure: 413 `too_large` past `[api] archive_max_mb` before any byte); an error once the
-        answer has started cuts it (the zip then lacks its central directory). Checked in the order of GET files."""
+        answer has started cuts it (the zip then lacks its central directory). Checked in the order of GET files.
+        At most ARCHIVES_AT_ONCE archives are measured or sent at once, from the measure until the answer ends (each
+        holds its walk's descriptors while its client reads): one more is 429 `too_many_archives`."""
         query = query_fields(request, ARCHIVE_FIELDS)
         scratch = query_flag(query.get("scratch"), "scratch")
         asked = check_rel(query.get("path"), scratch=scratch)
         sid = self._session(request, caller)
-        limit_mb = self.manager.global_config().api.archive_max_mb   # (a hand edit is picked up)
-        where, measured = await asyncio.to_thread(self._measure, sid, asked, scratch, limit_mb)
-        parts = _zip_parts(where, asked, scratch, measured, limit_mb << 20)
-        return _Streamed(_zip_bytes(parts, f"{'/'.join(asked) or '.'} of session {sid}"), closing=parts.close,
+        if self._archives >= ARCHIVES_AT_ONCE:
+            raise ApiError("too_many_archives", f"{ARCHIVES_AT_ONCE} archives are being sent already, the most the "
+                                                "hub sends at once: ask again once one has ended, or download the "
+                                                "files one by one (files/{path}).")
+        self._archives += 1
+        held = [True]
+
+        def release() -> None:
+            if held[0]:
+                held[0] = False
+                self._archives -= 1
+
+        try:
+            limit_mb = self.manager.global_config().api.archive_max_mb   # (a hand edit is picked up)
+            # (a cancel waits for the walk's thread to end: the slot is given back once its descriptors are closed)
+            where, measured = await _thread_step(self._measure, sid, asked, scratch, limit_mb)
+            parts = _zip_parts(where, asked, scratch, measured, limit_mb << 20)
+        except BaseException:
+            release()
+            raise
+
+        def closing() -> None:
+            try:
+                parts.close()
+            finally:
+                release()
+
+        return _Streamed(_zip_bytes(parts, f"{'/'.join(asked) or '.'} of session {sid}"), closing=closing,
                          media_type="application/zip", headers=_download_headers(f"{asked[-1] if asked else sid}.zip"))
 
 
-__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVE_FIELDS", "BASE_GONE_TEXT", "CHANGED_FILES_MAX",
-           "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS", "DETAILS", "EVENTS_DEFAULT",
-           "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS", "FILES_PER_SESSION", "FILES_REFUSAL", "FILE_CHUNK",
-           "FILE_FIELDS", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "FOLDER_GONE_TEXT", "FOLDER_LINKED_TEXT",
-           "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX", "LASTING_TEXTS", "MESSAGES_DEFAULT",
-           "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT", "NO_BASE_TEXT", "NO_GIT_TEXT",
-           "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS", "PING_SECONDS", "RESULTS_CACHED",
-           "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT", "STATES",
-           "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES", "WAIT_MAX",
+__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVES_AT_ONCE", "ARCHIVE_FIELDS", "BASE_GONE_TEXT",
+           "CHANGED_FILES_MAX", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS",
+           "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS", "FILES_PER_SESSION",
+           "FILES_REFUSAL", "FILE_CHUNK", "FILE_FIELDS", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "FOLDER_GONE_TEXT",
+           "FOLDER_LINKED_TEXT", "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX", "LASTING_TEXTS",
+           "MESSAGES_DEFAULT", "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT",
+           "NO_BASE_TEXT", "NO_GIT_TEXT", "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS", "PING_SECONDS",
+           "RESULTS_CACHED", "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT",
+           "STATES", "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES", "WAIT_MAX",
            "ZIP_ENTRY_COST", "ZIP_SENT", "ApiError", "ApiV1", "CreateRequest", "SafeJSONResponse", "answer_of",
            "attachment", "budget_text", "check_fields", "check_json_type", "claim_uploads", "continue_text",
            "error_code", "event_view", "fail", "job_view", "library_skills", "message_of", "message_view",

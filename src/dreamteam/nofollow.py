@@ -63,9 +63,11 @@ REASONS = {
 # by another file, folder or a special file, which is not opened) are an ERROR entry of that name
 _ENDS_WALK = frozenset({"link", "outside"})
 
-# walk_inside enters at most this many folder levels below its start folder (it holds one descriptor per level, so
-# a tree an agent nested deeper cannot use up the hub's descriptors); a folder deeper is an ERROR entry
-MAX_DEPTH = 256
+# walk_inside enters at most this many folder levels below its start folder; a folder deeper is an ERROR entry. A walk
+# holds one descriptor per level (and one for its current file), so this bounds what one walk holds however deep an
+# agent nests a tree; what walks hold together is bounded by their callers (api_v1.ARCHIVES_AT_ONCE for the archives,
+# which a client may keep open while it reads)
+MAX_DEPTH = 64
 
 _WINDOWS = sys.platform == "win32"
 _NAME_SURROGATE = 0x20000000   # IsReparseTagNameSurrogate: the reparse point names another file (link, junction)

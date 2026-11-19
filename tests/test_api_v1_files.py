@@ -32,7 +32,7 @@ from dreamteam import settings as st
 from dreamteam.api_v1 import ApiV1, attachment, served
 from dreamteam.copyfrom import CopyError, check_rel
 from dreamteam.sessions import SessionManager
-from test_api_v1 import LOCAL, Hub, _home, _manager, _no_path, no_start  # noqa: F401 - a fixture
+from test_api_v1 import LOCAL, Hub, _home, _manager, _no_path, _until, no_start  # noqa: F401 - a fixture
 from test_api_v1_events import _manager as waiting_manager
 from test_api_v1_events import running
 from test_api_v1_folders import _dir_link, _hub, _outside, _swap_for_link
@@ -62,11 +62,13 @@ def _write(path: Path, data: bytes | str) -> Path:
 
 
 async def fetch(hub: Hub, path: str, query: dict[str, str] | str = "", *, token: str = API_TOKEN,
-                on_body: Any = None, leave_after: int | None = None) -> SimpleNamespace:
+                on_body: Any = None, leave_after: int | None = None,
+                hold: asyncio.Event | None = None) -> SimpleNamespace:
     """GET `path` through the hub's app as the server would call it (ASGI 2.3: Starlette listens for the
     disconnect), read as it comes: status, headers, body, `ended` (the last body message came), `error` (what the
     app raised: an answer cut after it started). `on_body(n)` runs at the n-th body message; `leave_after`: the
-    client goes away after that many."""
+    client goes away after that many; `hold`: after the first body message the client reads nothing more until it
+    is set (the server's send waits)."""
     if isinstance(query, dict):
         query = urllib.parse.urlencode(query)
     sent = [(b"host", b"127.0.0.1:8765"), (b"authorization", f"Bearer {token}".encode())]
@@ -98,6 +100,8 @@ async def fetch(hub: Hub, path: str, query: dict[str, str] | str = "", *, token:
                 gone.set()
             elif leave_after is not None and got.messages >= leave_after:
                 gone.set()
+            elif hold is not None:
+                await hold.wait()
 
     try:
         await hub.app(scope, receive, send)
@@ -705,6 +709,43 @@ async def test_an_archive_left_by_its_client_closes_its_walk(tmp_path, api_token
         assert got.status == 200 and not got.ended
         assert len(made) == 1 and made[0].gi_frame is None   # (closed: its walk with it)
     finally:
+        await hub.close()
+
+
+async def test_at_most_archives_at_once_are_sent_while_their_clients_do_not_read(tmp_path, api_token, no_start,
+                                                                                 monkeypatch):
+    """Each archive holds its walk's descriptors (up to MAX_DEPTH + 2) for as long as its client takes to read it, so
+    a hub measures or sends at most ARCHIVES_AT_ONCE at once: one more is 429 `too_many_archives`. Every slot comes
+    back, whether the archive ends, is refused or is left by its client."""
+    assert api_v1.ARCHIVES_AT_ONCE * (nofollow.MAX_DEPTH + 2) <= 1024 // 3   # (Linux's usual soft limit)
+    hub = Hub(_manager(_home(tmp_path, api={"archive_max_mb": 1})))
+    no_start(hub.manager)
+    monkeypatch.setattr(api_v1, "ZIP_SENT", 1)
+    hold = asyncio.Event()
+    small = {f"small/f{i}.txt": "x" * 100 for i in range(5)}
+    try:
+        uid, _sid, _folder = await session_with(hub, {**small, "big/a.bin": b"x" * (1 << 20) + b"y"})
+        held = [asyncio.create_task(archive(hub, uid, {"path": "small"}, hold=hold))
+                for _ in range(api_v1.ARCHIVES_AT_ONCE)]
+        await _until(lambda: hub.api._archives == api_v1.ARCHIVES_AT_ONCE)
+        await asyncio.sleep(0.05)
+        assert not any(task.done() for task in held)
+        got = await archive(hub, uid, {"path": "small"})
+        assert got.status == 429 and _json(got)["code"] == "too_many_archives", _json(got)
+        assert _json(got)["error"].startswith(f"{api_v1.ARCHIVES_AT_ONCE} archives are being sent already")
+        assert (await listing(hub, uid)).status == 200
+        assert (await download(hub, uid, "small/f0.txt")).body == b"x" * 100   # (a download is no archive)
+        hold.set()
+        for got in await asyncio.gather(*held):
+            assert got.status == 200 and got.ended and got.error is None
+            assert _zip(got)["f0.txt"] == b"x" * 100
+        assert hub.api._archives == 0
+        assert (await archive(hub, uid, {"path": "nowhere"})).status == 404 and hub.api._archives == 0
+        assert (await archive(hub, uid, {"path": "big"})).status == 413 and hub.api._archives == 0
+        got = await archive(hub, uid, {"path": "small"}, leave_after=1)
+        assert got.status == 200 and not got.ended and hub.api._archives == 0
+    finally:
+        hold.set()
         await hub.close()
 
 

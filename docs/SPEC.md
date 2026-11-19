@@ -6935,7 +6935,7 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     `unknown_folder`, `bad_name` (400); `forbidden_folder` (403); `not_found` (404: a session, file, request, upload
     or folder root); `method_not_allowed` (405); `conflict`, `earlier_version`, `file_conflict`, `folder_busy`,
     `folder_not_ready`, `not_running`, `budget_exhausted` (409); `too_large` (413); `too_many_uploads`,
-    `too_many_sessions` (429); `internal` (500, logged).
+    `too_many_sessions`, `too_many_archives` (429); `internal` (500, logged).
   - `earlier_version`: the session was made by an earlier tool revision. Since 0.2.0 such a session cannot be loaded,
     started, stopped or changed (§17.2 "Sessions of an earlier version"), so every route that needs it loaded answers
     this code.
@@ -7746,8 +7746,11 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
       and closed unread). `skip(parts)` leaves an entry out unopened (a folder is never entered). What cannot be
       opened or listed is an `error` entry (FileNotFoundError: gone, or on Windows renamed or moved, meanwhile), and
       so is a name the listing gave that another file, folder or special file took meanwhile (`Refused`
-      `replaced` or `special`: never read). The walk enters at most `nofollow.MAX_DEPTH` (256) folder levels below
-      its start folder, since it holds one descriptor per level; a folder deeper is an `error` entry.
+      `replaced` or `special`: never read). The walk enters at most `nofollow.MAX_DEPTH` (64) folder levels below
+      its start folder, since it holds one descriptor per level (and one for its current file); a folder deeper is
+      an `error` entry. So one walk holds at most 66 descriptors however deep an agent nests a tree; how many walks
+      run at once is up to their callers (`archive?path=` below: an archive's client decides how long its walk
+      stays open).
     - `nofollow.Refused` (an OSError, ELOOP, with `reason` and `rel`) is raised for a link on the way or swapped in,
       a path that now leads out of the root, and, from `open_inside`, a hard-linked or special file or one replaced
       while it was opened. A link or a path out of the root ends a walk.
@@ -7784,7 +7787,11 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   time (clamped to 1980-2107) and a Unix mode of 0o644, 0o755 for a folder and for a file someone may execute (never
   writable by others, never setuid, whatever the hub's computer says: a Windows hub says 0o666 of every file),
   `Content-Type: application/zip`, no `Content-Length`, named `<folder>.zip` (the session's `name` for its whole
-  folder), with the headers of a download. Two walks (`nofollow.walk_inside`, the same `skip`):
+  folder), with the headers of a download. At most `api_v1.ARCHIVES_AT_ONCE` (4) archives are measured or sent at
+  once on a hub, each from its measure until its answer ends (an archive whose client stops reading keeps its walk,
+  and with it up to `MAX_DEPTH` + 2 descriptors, open); one more is 429 `too_many_archives` (the files can still be
+  downloaded one by one). A folder more than `MAX_DEPTH` levels below the folder archived is 409 `conflict` (the
+  first walk cannot read it). Two walks (`nofollow.walk_inside`, the same `skip`):
   - the first measures without opening a file (`ApiV1._measure`, `open_files` False; `scan_tree` would walk by path):
     over `[api] archive_max_mb` (default 1024, read again at each request) is 413 `too_large` before any byte, and an
     entry it cannot read (a folder it cannot list) is 409 `conflict`, since the archive would lack it;
@@ -7924,7 +7931,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     swapped while it is measured (409 before any byte, naming it), a file that shrinks while it is archived (a cut zip)
     and one that grows (taken at its size when opened), a folder that cannot be read (409 for a listing, a download
     and an archive alike) and a session folder that cannot be read (`folder_not_ready`), an archive its client leaves
-    (its walk closed); the archive a zip of exactly what is listed, with its folders, normalized modes and clamped
+    (its walk closed); at most `ARCHIVES_AT_ONCE` archives while their clients do not read (429 `too_many_archives`,
+    every slot given back by an archive that ends, is refused or is left; the descriptors they may hold together stay
+    within a third of 1024); the archive a zip of exactly what is listed, with its folders, normalized modes and clamped
     times, of the whole folder and of one inside it; over `archive_max_mb` (413 before any byte); a folder that
     cannot be read on POSIX (409); a running session, then the stopped one read without loading it; the API token's
     scope; a missing folder; a session folder swapped for a link (403); an in-place folder read below its root, a
