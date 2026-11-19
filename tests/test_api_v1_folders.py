@@ -515,6 +515,60 @@ async def test_git_init_in_place_never_writes_or_removes_through_a_link_swapped_
         await hub.close()
 
 
+@needs_git
+@pytest.mark.parametrize("step", ["init", "gitignore", "add", "commit"])
+async def test_git_init_in_place_takes_each_step_in_the_folder_held(tmp_path, api_token, no_start, monkeypatch,
+                                                                     step):
+    """A link swapped in right after a check passed, just before the step it let through: on POSIX that step still
+    works in the folder held, through its descriptor (git starts in it, its config is read there, the .gitignore is
+    made through it), the next check ends the create (403) and what git made is removed from the folder held. The
+    folder the link leads to gets nothing: no repository, no .gitignore, nothing staged, no commit. On Windows the
+    folder held refuses the swap."""
+    hub, _jobs, places = _hub(tmp_path, git_on=True)
+    no_start(hub.manager)
+    victim = tmp_path / "owner-project"   # outside the root
+    if step == "init":
+        _write(victim / "notes.txt", "the owner's notes\n")   # (no repository yet)
+    else:
+        repository(victim, 1)
+        _write(victim / "untracked.txt", "not staged\n")
+    _write(places / "job" / "owner.txt", "the owner's file\n")
+    # _init_held's checks: 1 before init_repo, then one before each step (init, .gitignore, ls-files, add, commit)
+    swap_after = {"init": 2, "gitignore": 3, "add": 5, "commit": 6}[step]
+    real_check = sessions._check_held
+    checks: list[int] = []
+    blocked: list[bool] = []
+
+    def check_then_swap(*args: Any) -> None:
+        real_check(*args)
+        checks.append(1)
+        if len(checks) == swap_after:
+            try:
+                _swap_for_link(places / "job", victim)
+            except PermissionError:   # (Windows: the folder is held while git init runs)
+                blocked.append(True)
+
+    monkeypatch.setattr(sessions, "_check_held", check_then_swap)
+    try:
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "job",
+                                                                   "mode": "in_place"}})
+        _no_path(answer, tmp_path)
+        if blocked:
+            assert WINDOWS and status == 202, answer
+        else:
+            assert not WINDOWS and len(checks) == swap_after   # (the next check refused the link)
+            assert status == 403 and answer["code"] == "forbidden_folder", answer
+            assert sorted(os.listdir(places / "job.old")) == ["owner.txt"] and hub.manager.ids() == []
+        if step == "init":
+            assert sorted(os.listdir(victim)) == ["notes.txt"]
+        else:
+            assert sorted(os.listdir(victim)) == [".git", "file0.txt", "untracked.txt"]
+            assert git(victim, "rev-list", "--count", "HEAD") == "1"
+            assert git(victim, "status", "--porcelain") == "?? untracked.txt"
+    finally:
+        await hub.close()
+
+
 def test_a_level_made_through_a_link_swapped_in_meanwhile_is_refused_and_removed(tmp_path, monkeypatch):
     """_carry_out makes the missing levels by path: one made through a junction swapped in at that instant is found
     outside the root right after, refused (403), and the undo removes it."""

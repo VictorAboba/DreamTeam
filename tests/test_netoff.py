@@ -485,6 +485,28 @@ def test_prepare_workspace_never_follows_a_symlink_swapped_in_meanwhile(tmp_path
 
 
 @pytest.mark.skipif(WINDOWS, reason="POSIX ownership and modes")
+def test_prepare_workspace_of_a_folder_held_walks_that_folder_wherever_its_path_leads(tmp_path, monkeypatch):
+    """With `dir_fd` (the folder held by an in-place create of the HTTP API) the folder is opened from that
+    descriptor: a link swapped in for its path, or for a folder above it, is never followed to another tree."""
+    held = _workspace(tmp_path / "held")
+    elsewhere = _workspace(tmp_path / "elsewhere")
+    _fake_pwd(monkeypatch, uid=os.getuid())
+    force("docker", ["setpriv", "--"], ids=(os.getuid() + 4242, os.getgid()))
+    fd = os.open(held, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        held.rename(held.with_name("ws.old"))
+        os.symlink(elsewhere, held, target_is_directory=True)
+        assert netoff.prepare_workspace(held, dir_fd=fd) == 0
+    finally:
+        os.close(fd)
+    moved = held.with_name("ws.old")
+    assert _mode(moved / "src") == 0o775 and _mode(moved / "src" / "a.py") == 0o664
+    assert _mode(moved / "mine.txt") == 0o660
+    assert _mode(elsewhere / "src") == 0o755 and _mode(elsewhere / "src" / "a.py") == 0o644
+    assert _mode(elsewhere / "mine.txt") == 0o600
+
+
+@pytest.mark.skipif(WINDOWS, reason="POSIX ownership and modes")
 def test_prepare_workspace_of_a_folder_not_created_yet_has_nothing_to_do(tmp_path, monkeypatch):
     """A new session's start opens its workspace before Workspace.init creates it (DreamTeam's git in init() already
     runs as the offline user): nothing to open yet, and never an error."""

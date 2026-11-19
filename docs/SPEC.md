@@ -2284,6 +2284,13 @@ environment or network.
   with checked-out submodules a call after one that rewrote the index (`add`, `commit`, `status`) costs one
   `git ls-files -s` more.
   `hubgit.forget()` (tests).
+- **A folder held** (`hubgit.in_folder(root, fd)`, POSIX; the HTTP API v1's in-place git init, §21.10): while it is
+  open, every git command the thread runs in `root` or below it starts in the folder open as `fd`, or below it,
+  wherever the folder lies now (`preexec_fn`: `fchdir`, then `chdir` to the path below it, in the child before
+  `exec`; a child that cannot is an OSError), so a link swapped in for `root` is not crossed when git starts; the
+  guard scans that folder's config each time (never reused nor kept: the cache reads its files by path) and looks
+  for checked-out submodules through the descriptor (`hubgit.lexists`, also `workspace.nested_repo_paths`).
+  Windows: nothing changes (the folder held there cannot be renamed).
 - **Defense in depth**: a key a member's command adds while DreamTeam's git is starting is not seen in time, and under
   the "netns" isolation the members can write the user's global config. So in a session without network under
   "docker" or "netns" every git DreamTeam runs for it runs like the members' commands: `hubgit.run(...,
@@ -8145,9 +8152,12 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     refused and never mounted, an error text that never resolves a root (yet names a path below one in its resolved
     spelling), a copy in v1's folder threads (a create cancelled during it waits for it, then leaves no staging
     folder, no session and no place held), a `.git` that is a gitfile or a linked worktree's, a common dir outside the
-    folder, a link swapped in before git init, between its steps, after it and after `_carry_out` (nothing written or
-    removed in the repository it leads to; on Windows the folder held refuses the swap; `tests/test_nofollow.py`:
-    `hold_inside`), and `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;
+    folder, a link swapped in before git init, between its steps, after it and after `_carry_out`, and right after
+    each check before the step it lets through, that step then working in the folder held (nothing written or removed
+    in the repository it leads to; on Windows the folder held refuses the swap; `tests/test_nofollow.py`:
+    `hold_inside`; `tests/test_hub_git.py`: git and its guard in a folder held whatever its path leads to;
+    `tests/test_netoff.py`: `prepare_workspace` of a folder held), and `DREAMTEAM_API_FOLDERS_DIR` ignored outside
+    the container; `aclose()` with a start in flight;
   - the clients (`tests/test_tui_print.py`, `tests/test_tui_app.py`, `tests/test_tui_commands.py`,
     `tests/test_tui_render.py`, `tests/test_cli_launcher.py`, `tests/test_launcher.py`, `tests/test_ui.py`,
     `tests/test_instruct.py`): `-p -r` on an `answers: "auto"` session
@@ -8254,14 +8264,24 @@ in_place = false            # true: a session may also work in a folder under it
   `git init` runs with the folder held (`sessions._init_held`): `nofollow.hold_inside` opens it from the resolved
   root name by name, never through a link. On Windows that handle shares no deleting, so until git is done neither
   the folder nor a folder above it can be renamed, moved or removed, and no link can take a place on its way. POSIX
-  has no such hold: the folder must still resolve to itself inside the root and be the folder held (its identity,
-  `_check_held`) before each step of `init_repo` (`check=`: git init, the `.gitignore`, ls-files, add, commit) and
-  after the last, so a link swapped in ends it at the next step (403). What git init made (`.git`, and the
-  `.gitignore` when there was none) is removed, when a step fails, through the held folder (`_remove_held`: `dir_fd`
-  on POSIX; on Windows by its path, which the hold keeps), never by a path that may lead elsewhere. The undo of a later
-  failure removes them only from that folder, held again with the same identity (`_Undo.held`); a folder no longer
-  reached so keeps them, and the error says so (500, "not removed"). Nothing is written or removed through a link
-  swapped in. A link swapped in meanwhile ends the create, and every start checks again ("Starts").
+  has no such hold, so every step works in the folder held, through its descriptor (`init_repo(held=)`): each git
+  command starts in it (`hubgit.in_folder`: `fchdir` in the child before `exec`; below it for a submodule) and the
+  guard reads its config there, never a scan kept for the path; the `.gitignore` is made through it (`O_EXCL`,
+  `O_NOFOLLOW`); in the Docker sandbox without network the offline user is given it through it
+  (`netoff.prepare_workspace(dir_fd=)`). The folder must also still resolve to itself inside the root and be the
+  folder held (its identity, `_check_held`) before each step of `init_repo` (`check=`: git init, the `.gitignore`,
+  ls-files, add, commit) and after the last, so a link swapped in ends the create at the next step (403), the step
+  in between still working in the folder held. What git init made (`.git`, and the `.gitignore` when there was none)
+  is removed, when a step fails, through the held folder (`_remove_held`: `dir_fd` on POSIX; on Windows by its path,
+  which the hold keeps), never by a path that may lead elsewhere. The undo of a later failure removes them only from
+  that folder, held again with the same identity (`_Undo.held`); a folder no longer reached so keeps them, and the
+  error says so (500, "not removed"). Nothing is removed through a link swapped in, and DreamTeam writes nothing
+  through one. What remains on POSIX is git's own: a git command takes its folder's path when it starts (`getcwd`)
+  and goes on by that path (git init for its new `.git`, every command for its work tree), so when the folder held
+  is renamed back to its own name just as a command starts and a link is swapped in for it before the command
+  writes, that command writes in the folder the link leads to, and the next check ends the create (403). Closing
+  that would take the folder's path itself held, which POSIX offers no unprivileged way to do. A link swapped in
+  meanwhile ends the create, and every start checks again ("Starts").
 - Every rule of `copy_from` and `workspace` (§17.2) applies as well.
 
 **`copy`.**

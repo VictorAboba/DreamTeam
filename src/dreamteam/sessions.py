@@ -460,11 +460,13 @@ def _remove_from_held(folder: Path, within: Path, held: tuple[int, int], names: 
 
 def _init_held(plan: "_Plan", within: Path, undo: "_Undo", names: list[str]) -> None:
     """Git init in a server folder in place (docs/SPEC.md §21.10 "Resolution") with the folder held (_hold): on Windows
-    nothing on its way can then be renamed until git is done; on POSIX, which has no such hold, the folder must still
-    be the one held, inside its root, before each of init_repo's steps and after the last (_check_held), so a link
-    swapped in ends it at the next step. What a step that fails leaves of `names` (.git, and .gitignore when it was not
-    there) is removed through the held folder (_remove_held), never by a path; once it is done, the undo of a later
-    failure removes them from that folder only (`undo.held`). Blocking."""
+    nothing on its way can then be renamed until git is done; on POSIX, which has no such hold, every step works in the
+    folder held, through its descriptor (init_repo's `held`, isolated_git's: git starts in it, the .gitignore is made
+    and the sandbox's offline user given the folder through it), and the folder must still be the one held, inside its
+    root, before each of init_repo's steps and after the last (_check_held), so a link swapped in ends it at the next
+    step (what git itself does by the path it takes when it starts is §21.10's). What a step that fails leaves of
+    `names` (.git, and .gitignore when it was not there) is removed through the held folder (_remove_held), never by a
+    path; once it is done, the undo of a later failure removes them from that folder only (`undo.held`). Blocking."""
     fd = _hold(plan.target, within)
     try:
         held = _identity(os.fstat(fd))
@@ -474,8 +476,8 @@ def _init_held(plan: "_Plan", within: Path, undo: "_Undo", names: list[str]) -> 
 
         try:
             check()
-            error = init_repo(plan.target, adopted=plan.adopted, offline=isolated_git(plan.network_off, plan.target),
-                              check=check)
+            offline = isolated_git(plan.network_off, plan.target, held=fd)
+            error = init_repo(plan.target, adopted=plan.adopted, offline=offline, check=check, held=fd)
             if error:
                 raise OSError(f"git init in {plan.target} failed: {error}")
             check()

@@ -441,15 +441,17 @@ def run_git(root: Path, *args: str, actor: str | None = None, git: str | None = 
                       offline=offline)
 
 
-def isolated_git(network_off: bool, folder: Path | None = None) -> bool:
+def isolated_git(network_off: bool, folder: Path | None = None, *, held: int | None = None) -> bool:
     """Whether DreamTeam's git for a session runs like its members' commands (run_git offline=True): the session has
     no network (`network_off`) and this machine's isolation is "docker" or "netns" (detected here: synchronous, call
     it from a thread). In the Docker sandbox `folder`, where that git is about to write, is first opened to the
-    offline user (netoff.prepare_workspace), as at every start of such a session."""
+    offline user (netoff.prepare_workspace), as at every start of such a session; `held`: `folder` open
+    (sessions._hold), opened through that descriptor, wherever it lies now."""
     if not network_off or netoff.isolation() not in ("docker", "netns"):
         return False
-    if folder is not None and netoff.detected() == "docker" and Path(folder).is_dir():
-        failed = netoff.prepare_workspace(Path(folder))
+    if folder is not None and netoff.detected() == "docker" and (held is not None or Path(folder).is_dir()):
+        failed = (netoff.prepare_workspace(Path(folder)) if held is None
+                  else netoff.prepare_workspace(Path(folder), dir_fd=held))
         if failed:
             log.warning("%d entries of %s stay closed to the offline user", failed, folder)
     return True
@@ -466,45 +468,63 @@ def nested_repo_paths(root: Path, listed: bytes) -> list[str]:
     found: list[str] = []
     for name in listed.decode("utf-8", "replace").split("\0"):
         path = name.rstrip("/")
-        if name.endswith("/") and path and not in_scratch(path) and os.path.lexists(Path(root) / path / ".git"):
+        if name.endswith("/") and path and not in_scratch(path) and hubgit.lexists(Path(root) / path / ".git"):
             found.append(path)
     return found
 
 
 def init_repo(root: Path, git: str | None = None, *, adopted: bool = False, offline: bool = False,
-              check: Callable[[], None] | None = None) -> str | None:
+              check: Callable[[], None] | None = None, held: int | None = None) -> str | None:
     """`git init` in `root` with a `.gitignore` (unless one exists) and an initial commit of what is there,
     as for a new workspace (synchronous). `adopted`: a folder of the user (its files are committed with the user's
     own line-ending settings, as every later commit there is); `offline`: run_git's. `check`: called before each
     step (each git command, the .gitignore), it ends the init by raising (a server folder of the HTTP API v1 must
-    still be the folder it held inside its root: sessions._check_held). Returns None on success, else git's error
-    text."""
+    still be the folder it held inside its root: sessions._check_held). `held` (POSIX): `root` open as a descriptor
+    (sessions._hold); every step then works in that folder wherever it lies now, not through a link swapped in for
+    `root` or a folder above it after a check: each git command starts in it and its config is read there
+    (hubgit.in_folder; git then goes on by the path it finds there, docs/SPEC.md §21.10), and the .gitignore is made
+    through it (O_EXCL, O_NOFOLLOW). Returns None on success, else git's error text."""
     step = check or (lambda: None)
-    step()
-    proc = run_git(root, "-c", "init.defaultBranch=main", "init", "-q", git=git, adopted=adopted, offline=offline)
-    if proc.returncode != 0:
-        return git_output(proc) or f"git init failed with code {proc.returncode}"
-    gitignore = root / ".gitignore"
-    step()
-    if not gitignore.exists():
-        gitignore.write_bytes(DEFAULT_GITIGNORE.encode("utf-8"))
-    # An adopted folder may hold cloned or generated projects: left out like in every autocommit (the next shell
-    # call's autocommit tells the agent about them), not committed as gitlinks without a .gitmodules
-    step()
-    listed = run_git(root, "ls-files", "--others", "--exclude-standard", "-z", git=git, adopted=adopted,
-                     offline=offline)
-    nested = nested_repo_paths(root, listed.stdout) if listed.returncode == 0 else []
-    if nested:
-        log.info("initial commit of %s leaves out nested repositories: %s", root, ", ".join(nested))
-    step()
-    run_git(root, "add", "-A", "--ignore-errors", "--", ".", *(f":(exclude,literal){path}" for path in nested),
-            git=git, adopted=adopted, literal=False, unfiltered=True, offline=offline)
-    step()
-    proc = run_git(root, "commit", "-q", "--no-verify", "--allow-empty", "-m", "Initialize workspace", git=git,
-                   adopted=adopted, offline=offline)
-    if proc.returncode != 0:
-        return git_output(proc) or f"git commit failed with code {proc.returncode}"
-    return None
+    with hubgit.in_folder(root, held):
+        step()
+        proc = run_git(root, "-c", "init.defaultBranch=main", "init", "-q", git=git, adopted=adopted, offline=offline)
+        if proc.returncode != 0:
+            return git_output(proc) or f"git init failed with code {proc.returncode}"
+        gitignore = root / ".gitignore"
+        step()
+        if held is not None and not _WINDOWS:
+            _create_in(held, ".gitignore", DEFAULT_GITIGNORE.encode("utf-8"))
+        elif not gitignore.exists():
+            gitignore.write_bytes(DEFAULT_GITIGNORE.encode("utf-8"))
+        # An adopted folder may hold cloned or generated projects: left out like in every autocommit (the next shell
+        # call's autocommit tells the agent about them), not committed as gitlinks without a .gitmodules
+        step()
+        listed = run_git(root, "ls-files", "--others", "--exclude-standard", "-z", git=git, adopted=adopted,
+                         offline=offline)
+        nested = nested_repo_paths(root, listed.stdout) if listed.returncode == 0 else []
+        if nested:
+            log.info("initial commit of %s leaves out nested repositories: %s", root, ", ".join(nested))
+        step()
+        run_git(root, "add", "-A", "--ignore-errors", "--", ".", *(f":(exclude,literal){path}" for path in nested),
+                git=git, adopted=adopted, literal=False, unfiltered=True, offline=offline)
+        step()
+        proc = run_git(root, "commit", "-q", "--no-verify", "--allow-empty", "-m", "Initialize workspace", git=git,
+                       adopted=adopted, offline=offline)
+        if proc.returncode != 0:
+            return git_output(proc) or f"git commit failed with code {proc.returncode}"
+        return None
+
+
+def _create_in(folder: int, name: str, data: bytes) -> None:
+    """The new file `name` with `data` in the folder open as `folder` (POSIX `dir_fd`), never through a link; nothing
+    when the name is taken (a file, a folder or a link)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(name, flags, 0o666, dir_fd=folder)
+    except FileExistsError:
+        return
+    with open(fd, "wb") as out:
+        out.write(data)
 
 
 # A git operation that stopped halfway (a file or folder in the git dir): the next commit would conclude it.
