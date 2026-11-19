@@ -937,6 +937,47 @@ async def test_a_session_folder_swapped_for_a_link_is_never_read(tmp_path, api_t
         await hub.close()
 
 
+@pytest.mark.parametrize("where", ["uploads", "uploads_in_home", "home_data", "other_home"])
+async def test_a_folder_session_json_names_is_read_only_where_a_session_may_work(tmp_path, api_token, hub_token,
+                                                                                no_start, where):
+    """session.json names the folder a session works in, and in the Docker sandbox the agents of a session without
+    network can write it: files and archives read a folder it names only where a session may work
+    (SessionManager._target_refusal): never DreamTeam's own data folder, with the owner's pending uploads, nor
+    another DreamTeam home (403 `forbidden_folder`, nothing read); a folder of the user's elsewhere is read."""
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    other = tmp_path / "other-home"
+    _write(other / "dreamteam.toml", "")
+    (other / "sessions").mkdir()
+    _write(other / "secret.txt", SECRET)
+    project = tmp_path / "project"
+    _write(project / "mine.txt", "the user's own")
+    try:
+        status, upload = await hub.upload("owner-secret.txt", SECRET, token=TOKEN)
+        assert status == 201, upload
+        token = upload["upload"]
+        uid, sid, _folder = await session_with(hub, {"a.txt": "A"})
+        stored = {"uploads": {"path": str(hub.manager.api_uploads.root), "adopted": True},
+                  "uploads_in_home": {"path": "elsewhere", "in_home": ".dreamteam/uploads/api", "adopted": True},
+                  "home_data": {"path": str(hub.manager.home / ".dreamteam"), "adopted": True},
+                  "other_home": {"path": str(other), "adopted": True}}[where]
+        meta = hub.manager.meta(sid)
+        meta["workspace"] = stored
+        hub.manager._write_meta(sid, meta)
+        name = "secret.txt" if where == "other_home" else f"{token}.bin"
+        for call in (listing(hub, uid), download(hub, uid, name), archive(hub, uid)):
+            got = await call
+            answer = _json(got)
+            assert got.status == 403 and answer["code"] == "forbidden_folder", got.body
+            assert answer["error"] == api_v1.FOLDER_REFUSED_TEXT and SECRET not in got.body
+            _no_path(answer, tmp_path)
+        meta["workspace"] = {"path": str(project), "adopted": True}
+        hub.manager._write_meta(sid, meta)
+        assert (await download(hub, uid, "mine.txt")).body == b"the user's own"
+    finally:
+        await hub.close()
+
+
 # ---------------------------------------------------------------------------------------------- server folders
 async def test_an_in_place_folder_is_read_below_its_root(tmp_path, api_token, no_start):
     hub, _jobs, places = _hub(tmp_path)

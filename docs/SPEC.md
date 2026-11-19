@@ -7713,12 +7713,13 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     that no longer leads to itself inside its root;
   - it is null, with `changed_files_error`, when git is off (or not installed), the session has no `base_commit`
     (`api_v1.NO_BASE_TEXT`; also a value that is no commit id, `workspace.COMMIT_ID`: it never reaches git's command
-    line), that commit is gone, the folder has no repository of its own, git fails, or the in-place checks above
-    refuse. The texts are DreamTeam's own (`api_v1.GIT_OFF_TEXT`, `BASE_GONE_TEXT`, ...), never git's output: when
-    `git_dir_refusal` says git cannot read the folder's repository, it quotes git, so `changed_files_error` names
-    only `apifolders.GIT_UNREADABLE` and the hub's log has the rest. Those that can quote a path (the in-place
-    checks' reasons, a failure to run git) go through `ApiV1.redact` for every caller: a result holds no absolute
-    path.
+    line), that commit is gone, the folder has no repository of its own, git fails, the in-place checks above refuse,
+    or a folder session.json names is one no session may work in (`ApiV1._own_folder`, as for its files, 21.8:
+    `api_v1.FOLDER_REFUSED_TEXT`). The texts are DreamTeam's own (`api_v1.GIT_OFF_TEXT`, `BASE_GONE_TEXT`, ...), never
+    git's output: when `git_dir_refusal` says git cannot read the folder's repository, it quotes git, so
+    `changed_files_error` names only `apifolders.GIT_UNREADABLE` and the hub's log has the rest. Those that can quote
+    a path (the in-place checks' reasons, a failure to run git) go through `ApiV1.redact` for every caller: a result
+    holds no absolute path.
 
 ### 21.8 Files
 
@@ -7755,9 +7756,15 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   `ARCHIVE_FIELDS`; `scratch` is `true` or `false`), the path (`bad_name`), the session (404), then reads in a
   thread, the hub's settings read again first. A stopped session is never loaded.
 - **Where the files are read** (`ApiV1._where`): the session's folder (`workspace_of`), which nofollow opens without
-  following its own name. A session that works in a server folder in place is first checked as a start checks it
-  (`SessionManager._check_server_folder(..., refusal=api_v1.FILES_REFUSAL)`, whose texts then end in "its files are
-  not read", not in a start's words; it gives the resolved root and the resolved folder: 403 `forbidden_folder` when
+  following its own name. A folder other than the session's own default one is the one its session.json names,
+  which in the Docker sandbox the agents of a session without network can write while the hub reads with more
+  rights than theirs: it is read, resolved, only when it is one a session may work in (`ApiV1._own_folder`:
+  `SessionManager._target_refusal`, §17.2: never inside DreamTeam's own data folder, where the uploads wait, nor the
+  hub tokens' folder, another DreamTeam home, the user's home itself, on POSIX `/proc`, `/sys`, `/dev`...), else
+  403 `forbidden_folder` (`FOLDER_REFUSED_TEXT`), nothing read. (What else such agents can do there with that write
+  is the sandbox's, not v1's.) A session that works in a server folder in place is first checked as a start checks
+  it (`SessionManager._check_server_folder(..., refusal=api_v1.FILES_REFUSAL)`, whose texts then end in "its files
+  are not read", not in a start's words; it gives the resolved root and the resolved folder: 403 `forbidden_folder` when
   the root no longer allows it or the folder no longer leads to itself inside it, 409 `folder_not_ready` when it or
   its root is missing), then reached from that root name by name (`_Where.base`: the resolved folder's names below
   the resolved root, each as its folder lists it, `apifolders.as_listed`; on POSIX a resolved path keeps the spelling
@@ -8028,17 +8035,18 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     within a third of 1024); the archive a zip of exactly what is listed, with its folders, normalized modes and clamped
     times, of the whole folder and of one inside it; over `archive_max_mb` (413 before any byte); a folder that
     cannot be read on POSIX (409); a running session, then the stopped one read without loading it; the API token's
-    scope; a missing folder; a session folder swapped for a link (403); an in-place folder read below its root, a
-    link put on the way to it before and after the check, its root taken back by the owner (403, in v1's words), a
-    folder on its way renamed in letter case only and one created or copied with another letter case of its names
-    (still read, on a file system that ignores case, also with a resolution that keeps the given spelling as POSIX
-    does), one inside its root by file identity only (403)); `changed_files` with a hook in `.git/config` that must not
-    run (`tests/test_api_v1_result.py`: added, modified, deleted, untracked and held files, `.scratch` and ignored
-    ones left out, a path deleted and untracked; a stopped session's files; a list cut at `CHANGED_FILES_MAX`; git
-    off, no base commit, one gone, one that is no commit id, a repository git cannot open; an in-place folder whose
-    `.git` became a gitfile, one whose git fails (no git output in the text), one whose root a hand edit removed; the
-    result while running, a done one, the cache by state and head, a git failure not cached; `changed_since` without
-    the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
+    scope; a missing folder; a session folder swapped for a link (403); a folder session.json names that no session
+    may work in (DreamTeam's data with the uploads, another home: 403, nothing read); an in-place folder read below
+    its root, a link put on the way to it before and after the check, its root taken back by the owner (403, in
+    v1's words), a folder on its way renamed in letter case only and one created or copied with another letter
+    case of its names (still read, on a file system that ignores case, also with a resolution that keeps the given
+    spelling as POSIX does), one inside its root by file identity only (403)); `changed_files` with a hook in
+    `.git/config` that must not run (`tests/test_api_v1_result.py`: added, modified, deleted, untracked and held
+    files, `.scratch` and ignored ones left out, a path deleted and untracked; a stopped session's files; a list cut
+    at `CHANGED_FILES_MAX`; git off, no base commit, one gone, one that is no commit id, a repository git cannot open;
+    an in-place folder whose `.git` became a gitfile, one whose git fails (no git output in the text), one whose root
+    a hand edit removed; the result while running, a done one, the cache by state and head, a git failure not cached;
+    `changed_since` without the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
   - settings and import: a settings-page save never writes `[api]` (`public_view`, `apply_update`); an import keeps
     the target's `api.folders` and drops a v1 session's `client_ref`, `request_digest`, `start_error`, `error` and
     `folder`;

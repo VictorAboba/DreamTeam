@@ -160,6 +160,9 @@ LASTING_TEXTS = (None, GIT_OFF_TEXT, NO_BASE_TEXT, BASE_GONE_TEXT)
 FOLDER_GONE_TEXT = "The session's folder is not there (deleted or moved, or on a drive that is not connected)."
 FOLDER_LINKED_TEXT = "The session's folder is reached through a link now: nothing in it is read."
 FOLDER_UNREADABLE_TEXT = "The session's folder cannot be read on the hub's computer (its permissions)."
+# a folder session.json names that no session may work in (ApiV1._own_folder): nothing in it is read
+FOLDER_REFUSED_TEXT = ("The session's folder is one no session may work in (DreamTeam's own data, its hub tokens, "
+                       "another DreamTeam home, the home folder itself, a system folder): nothing in it is read.")
 # the end of a server folder's start-check refusal (SessionManager._check_server_folder) when v1 reads its files
 FILES_REFUSAL = "its files are not read"
 # v1's own text of `folder_busy` (docs/SPEC.md §21.10): the manager's names the other session's folder, so its title
@@ -1868,7 +1871,14 @@ class ApiV1:
                     log.info("API v1: no changed files for session %s: %s", sid, problem)
                     problem = apifolders.GIT_UNREADABLE
                 return None, self.redact(f"Its folder's repository is not read: {problem}.", sid)
-        secrets = [profile.api_key_env for profile in config.models.values() if getattr(profile, "api_key_env", None)]
+        else:   # (a folder session.json names: one a session may work in, as for its files, §21.8)
+            info = manager.workspace_of(sid, meta)
+            if not info["default"] and info["exists"]:
+                try:
+                    self._own_folder(sid, info)
+                except ApiError as exc:
+                    return None, exc.text
+        secrets =[profile.api_key_env for profile in config.models.values() if getattr(profile, "api_key_env", None)]
         try:
             files = changed_since(folder, base, adopted=config.workspace_adopted, network_off=network_off, git=git,
                                   secret_names=secrets)
@@ -2029,7 +2039,26 @@ class ApiV1:
             return _Where(root, apifolders.as_listed(root, below))
         if not info["exists"]:
             raise ApiError("folder_not_ready", FOLDER_GONE_TEXT)
-        return _Where(Path(info["path"]))
+        return _Where(self._own_folder(sid, info))
+
+    def _own_folder(self, sid: str, info: Mapping[str, Any]) -> Path:
+        """The folder of a session that works in no server folder in place (`info`: workspace_of's), when it is one a
+        session may work in: its own default folder as it is; any other (session.json names it) resolved, and 403
+        `forbidden_folder` (FOLDER_REFUSED_TEXT) where SessionManager._target_refusal refuses it (DreamTeam's own data
+        folder, where the uploads wait; the hub tokens' folder; another DreamTeam home; the user's home itself; on
+        POSIX /proc, /sys and /dev...). In the Docker sandbox the agents of a session without network can write its
+        session.json, and the hub reads with more rights than theirs: v1 never reads a folder for them that no
+        session may have (docs/SPEC.md §21.8). 409 `folder_not_ready` for one that cannot be resolved. Blocking."""
+        folder = Path(info["path"])
+        if info["default"]:
+            return folder
+        try:
+            real = folder.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            raise ApiError("folder_not_ready", FOLDER_GONE_TEXT) from None
+        if self.manager._target_refusal(real, sid) is not None:
+            raise ApiError("forbidden_folder", FOLDER_REFUSED_TEXT)
+        return real
 
     def _listing(self, sid: str, asked: tuple[str, ...], scratch: bool) -> list[dict[str, Any]]:
         """GET files: the folders and the regular files with one name of the folder `asked` (nofollow.list_inside: no
@@ -2579,7 +2608,8 @@ __all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVES_AT_ONCE", "ARCHI
            "CHANGED_FILES_MAX", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS",
            "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS", "FILES_PER_SESSION",
            "FILES_REFUSAL", "FILE_CHUNK", "FILE_FIELDS", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "FOLDER_GONE_TEXT",
-           "FOLDER_LINKED_TEXT", "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX", "LASTING_TEXTS",
+           "FOLDER_LINKED_TEXT", "FOLDER_REFUSED_TEXT", "FOLDER_THREADS", "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT",
+           "ID_MAX", "JSON_MAX", "LASTING_TEXTS",
            "MESSAGES_DEFAULT", "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT",
            "NO_BASE_TEXT", "NO_GIT_TEXT", "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS", "PING_SECONDS",
            "RESULTS_CACHED", "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT",

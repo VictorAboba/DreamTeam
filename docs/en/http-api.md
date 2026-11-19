@@ -487,7 +487,8 @@ is resumed as well.
 - Codes: 404 for a missing path (a name longer than a folder can hold too), a link, a hard-linked or special file;
   400 `bad_request` for a folder asked as a file or the reverse; 409 `conflict` for a name replaced while it was
   opened or a file the hub may not read; 409 `folder_not_ready` when the session's folder is gone or cannot be read;
-  403 `forbidden_folder` when it is reached through a link, or an in-place folder's root no longer allows it.
+  403 `forbidden_folder` when it is reached through a link, an in-place folder's root no longer allows it, or it is
+  a folder no session may work in (DreamTeam's own data, another DreamTeam home, a system folder).
 
 ## Folders on the hub's computer
 
