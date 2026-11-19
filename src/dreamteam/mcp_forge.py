@@ -550,8 +550,9 @@ class MCPForge:
         return truncate_middle(text, max_chars or self.config.agents.tool_output_chars), is_error
 
     async def approve(self, actor: str, name: str, approve: bool, comment: str = "", digest: str = "") -> str:
-        """`digest`: the snapshot_digest (or its start) the user was shown by the dialog, the card or mcp_list; an
-        approval is refused when the server's snapshot has another one now (its owner created it again meanwhile)."""
+        """`digest`: the snapshot_digest (or its start) the user was shown by the dialog, the card, mcp_list or a
+        request of the HTTP API v1; an approval, or a rejection given with a digest, is refused when the server's
+        snapshot has another one now (its owner created it again meanwhile): the answer was about other code."""
         if actor != USER:
             raise ToolError("Only the user can approve or reject MCP servers.")
         key = _norm(name)
@@ -564,14 +565,14 @@ class MCPForge:
             if rec["status"] != PENDING:
                 raise ToolError(f"MCP server '{key}' is not waiting for approval (status: {rec['status']}).")
             code = None
+            recorded = rec.get("digest") or ""  # none: a record of an older version (_changed_report)
+            if digest and recorded and not recorded.startswith(digest):
+                raise ToolError(
+                    f"MCP server '{key}' was not {'approved' if approve else 'rejected'}: digest {digest[:12]} does "
+                    f"not match its current digest {recorded[:12]} (the one mcp_list and the MCP card show now; its "
+                    "owner may have created it again since). It still waits for your approval."
+                )
             if approve:
-                recorded = rec.get("digest") or ""  # none: a record of an older version (_changed_report)
-                if digest and recorded and not recorded.startswith(digest):
-                    raise ToolError(
-                        f"MCP server '{key}' was not approved: digest {digest[:12]} does not match its current digest "
-                        f"{recorded[:12]} (the one mcp_list and the MCP card show now; its owner may have created it "
-                        "again since). It still waits for your approval."
-                    )
                 # the user approves the snapshot that passed the smoke test, while the working copy (what /cat and
                 # the Files tab show) is that same code; a changed one is tested again instead (_sync_snapshot)
                 code = await self._sync_snapshot(rec)

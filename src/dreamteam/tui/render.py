@@ -3,13 +3,14 @@
 Inputs are dicts as returned by the hub API plus a RenderContext; outputs are rich renderables (printed
 above the input box through `to_ansi`) or, for the bottom area, prompt_toolkit formatted text. Nothing
 here does I/O, and no event payload, however malformed, makes a renderer raise. `ToolPairs` is the one
-stateful helper: it keeps tool results under their calls in a printed feed."""
+stateful helper: it keeps tool results under their calls in a printed feed. The pure text helpers (clean,
+first_name, fmt_cost, tool_call_text, _who...) and RenderContext's base live in dreamteam/eventtext.py, whose
+one-line event texts the HTTP API sends (docs/SPEC.md §21.6)."""
 
 from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 import unicodedata
 from dataclasses import dataclass
@@ -29,8 +30,12 @@ from rich.table import Table
 from rich.text import Text
 
 from .. import prompts, roles
+from ..eventtext import (_ANSI, _TASK_SYMBOL, TOOL_CALL_CHARS, TextContext, _clock, _crew_size, _d, _deps_reason,
+                         _deps_word, _echo_target, _first_line, _float, _int, _job_result, _list, _names, _reason,
+                         _recipients_text, _review_text, _session_run, _status_label, _via_text, _wake_summary, _who,
+                         clean, first_name, fmt_cost, fmt_elapsed, tool_call_text)
+from ..models import API_VIA
 from . import theme
-from .i18n import t, tn
 
 log = logging.getLogger(__name__)
 
@@ -46,38 +51,30 @@ EVENT_TYPES = (
     "trigger.fired", "trigger.deleted", "mcp.created", "mcp.status", "swarm.paused", "swarm.resumed",
     "swarm.wrap_up", "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
     "job.silent", "skill.attached", "skill.detached", "skill.proposed", "skill.library", "skill.deps",
-    "sessions.changed", "_connection",
+    "session.started", "session.stopped", "sessions.changed", "_connection",
 )
 ACTIVITY_KINDS = ("wake", "thinking", "text", "tool_call", "tool_result", "error", "nudge", "compacted")
 
-TOOL_CALL_CHARS = 80      # "task_claim(task_id=3)" is cut to about this many characters
 HOUSEKEEPING_TOOLS = frozenset({"wait", "wait_for_events"})   # their calls and results show only in verbose
 # Tools whose effect has its own line (the message, the task, the goal panel, the team change): in normal
 # verbosity their successful calls would only repeat it ("⏺ Анна → вам …" + "send_message(…) ⎿ Sent message #2").
 ECHOED_TOOLS = frozenset({"send_message", "task_claim", "task_create", "task_complete", "task_comment",
                           "goal_complete", "hire_agent", "retire_agent"})
 TOOL_HOLD = 1.0           # ToolPairs: a call waits this long for its result before it is printed alone
-ARG_CHARS = 30            # one string argument inside it
 RESULT_LINES = 20         # tool result lines in verbose
 THINKING_LINES = 12
 MAX_FILE_LINES = 2000     # /cat: longer files are cut (the hub caps the size too)
 
-_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[@-_]")
-# Text written by agents must not drive the terminal: drop C0/C1 control characters (keep \n).
-_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
-
-@dataclass
-class RenderContext:
+@dataclass(kw_only=True)
+class RenderContext(TextContext):
+    """eventtext.TextContext (the language, the symbols, the viewer: what the shared helpers read) plus the
+    verbosity and the terminal's width. Keyword arguments only, as its base."""
     lang: str = "ru"
     verbosity: str = "normal"
     width: int = 100
-    unicode: bool = True          # False -> ASCII symbols (theme.SYMBOLS_ASCII)
+    unicode: bool = True          # False -> ASCII symbols (symbols.SYMBOLS_ASCII)
     me: str = "user"
-
-    @property
-    def sym(self) -> dict[str, str]:
-        return theme.symbols(self.unicode)
 
     @property
     def quiet(self) -> bool:
@@ -87,101 +84,8 @@ class RenderContext:
     def verbose(self) -> bool:
         return self.verbosity == "verbose"
 
-    def t(self, key: str, **kw: Any) -> str:
-        return t(self.lang, key, **kw)
 
-    def tn(self, key: str, n: int, **kw: Any) -> str:
-        return tn(self.lang, key, n, **kw)
-
-    def short(self, value: Any, limit: int) -> str:
-        """One line, whitespace collapsed, cut to `limit` characters with an ellipsis."""
-        text = " ".join(clean(value).split())
-        if limit <= 0 or len(text) <= limit:
-            return text
-        ell = self.sym["ellipsis"]
-        return text[: max(0, limit - len(ell))].rstrip() + ell
-
-
-# ---- small helpers -------------------------------------------------------------------------------
-def clean(value: Any) -> str:
-    """Printable text of an API value: control and escape sequences removed, tabs expanded."""
-    if value is None:
-        return ""
-    if not isinstance(value, str):
-        if isinstance(value, (dict, list, tuple)):
-            try:
-                value = json.dumps(value, ensure_ascii=False, default=str)
-            except (TypeError, ValueError):
-                value = str(value)
-        else:
-            value = str(value)
-    if not value.isascii():
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError:  # an unpaired surrogate from model output
-            value = value.encode("utf-8", "replace").decode("utf-8")
-    value = _ANSI.sub("", value.replace("\r\n", "\n").replace("\t", "    "))
-    return _CONTROL.sub("", value)
-
-
-def _d(value: Any) -> dict:
-    return value if isinstance(value, dict) else {}
-
-
-def _list(value: Any) -> list:
-    return list(value) if isinstance(value, (list, tuple)) else []
-
-
-def _int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-
-
-def _float(value: Any, default: float = 0.0) -> float:
-    try:
-        number = float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
-    return number if number == number and abs(number) != float("inf") else default
-
-
-def _names(value: Any) -> list[str]:
-    if isinstance(value, str):
-        return [value] if value else []
-    return [str(v) for v in _list(value) if v]
-
-
-def first_name(name: Any) -> str:
-    words = clean(name).split()
-    return words[0] if words else ""
-
-
-def _first_line(value: Any) -> str:
-    for line in clean(value).splitlines():
-        if line.strip():
-            return line.strip()
-    return ""
-
-
-_WAKE_HEADER = re.compile(r"^=+ .* =+$")   # "=== Wake-up 2026-10-08 19:37 ===" (prompts.wake_header)
-_WAKE_LABELS = frozenset(prompts.t(lang, "reasons") for lang in ("ru", "en"))   # "What happened:"
-
-
-def _wake_summary(value: Any) -> str:
-    """What woke an agent: the first line of its wake-up text after the "=== Wake-up … ===" header and the
-    "What happened:" label; a line ending with ":" (a message header) is joined with the line after it."""
-    lines = [line.strip() for line in clean(value).splitlines() if line.strip()]
-    lines = [line for line in lines if not _WAKE_HEADER.match(line) and line not in _WAKE_LABELS]
-    if not lines:
-        return ""
-    first = lines[0].removeprefix("•").strip()
-    if first.endswith(":") and len(lines) > 1 and not lines[1].startswith(("•", "=")):
-        first = f"{first} {lines[1]}"
-    return first
-
-
+# ---- small helpers (clean, first_name, fmt_cost, _who... come from eventtext) --------------------
 def _clip_lines(ctx: RenderContext, value: Any, max_lines: int) -> tuple[str, int]:
     """The first `max_lines` non-trailing lines of `value` and how many lines were left out."""
     lines = clean(value).strip("\n").splitlines()
@@ -205,16 +109,6 @@ def fmt_tokens(n: Any) -> str:
     return f"{n / 1_000_000:.1f}M"
 
 
-def fmt_elapsed(seconds: Any) -> str:
-    """12s, 3m 05s, 1h 02m."""
-    s = max(0, int(_float(seconds)))
-    if s < 60:
-        return f"{s}s"
-    if s < 3600:
-        return f"{s // 60}m {s % 60:02d}s"
-    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
-
-
 def fmt_ms(ms: Any) -> str:
     ms = max(0, _int(ms))
     if ms < 1000:
@@ -222,24 +116,6 @@ def fmt_ms(ms: Any) -> str:
     if ms < 60_000:
         return f"{ms / 1000:.1f}s"
     return fmt_elapsed(ms / 1000)
-
-
-def fmt_cost(usd: Any, digits: int = 2) -> str:
-    """$0.12; small non-zero amounts keep three decimals ($0.004)."""
-    usd = _float(usd)
-    if digits == 2 and 0 < abs(usd) < 0.01:
-        return f"${usd:.3f}"
-    return f"${usd:.{digits}f}"
-
-
-def _clock(ts: Any, with_date: bool = False) -> str:
-    value = _float(ts)
-    if value <= 0:
-        return "-"
-    try:
-        return time.strftime("%d.%m %H:%M" if with_date else "%H:%M", time.localtime(value))
-    except (OverflowError, OSError, ValueError):
-        return "-"
 
 
 def _ago(ctx: RenderContext, ts: Any) -> str:
@@ -254,22 +130,6 @@ def _ago(ctx: RenderContext, ts: Any) -> str:
     if delta < 86400:
         return ctx.t("h_ago", n=delta // 3600)
     return ctx.t("d_ago", n=delta // 86400)
-
-
-def _who(ctx: RenderContext, name: Any, short: bool = False) -> str:
-    """Display name: "вы" for the user, "система" for no actor, else the (first) name."""
-    if name == ctx.me:
-        return ctx.t("you")
-    if not name:
-        return ctx.t("system")
-    return first_name(name) if short else clean(name)
-
-
-def _status_label(ctx: RenderContext, prefix: str, value: Any) -> str:
-    """Translated label of an enum value (`s_done`, `a_idle`...), the raw value when unknown."""
-    raw = clean(value)
-    label = ctx.t(prefix + raw) if raw else ""
-    return raw if label == prefix + raw else label
 
 
 # ---- ASCII fallback -------------------------------------------------------------------------------
@@ -458,13 +318,6 @@ def user_echo(ctx: RenderContext, text: str, to: str | None) -> RenderableType:
     return _out(ctx, body)
 
 
-def _recipients_text(ctx: RenderContext, recipients: list[str], short: bool = False) -> str:
-    names = [ctx.t("to_you") if r == ctx.me else (first_name(r) if short else clean(r)) for r in recipients]
-    if len(names) > 4:
-        return ", ".join(names[:3]) + f" +{len(names) - 3}"
-    return ", ".join(names) or "?"
-
-
 def _mail_line(ctx: RenderContext, sender: Any, recipients: list[str], text: Any, full: bool) -> RenderableType:
     """`✉ Анна → Борис: text` (dim): one line in normal, the whole text when `full`."""
     head = f"{_who(ctx, sender, short=True)} {ctx.sym['arrow']} {_recipients_text(ctx, recipients, True)}: "
@@ -496,14 +349,6 @@ def agent_message(ctx: RenderContext, msg: dict) -> RenderableType:
     return _out(ctx, Group(head, Padding(_markdown(ctx, msg.get("text")), (0, 0, 0, 2))))
 
 
-def _echo_target(ctx: RenderContext, recipients: list[str]) -> str | None:
-    if not recipients:
-        return None
-    if len(recipients) > 3:
-        return "all"
-    return ", ".join(clean(r) for r in recipients)
-
-
 # ---- goal -----------------------------------------------------------------------------------------
 def goal_panel(ctx: RenderContext, goal: dict | None) -> RenderableType:
     goal = _d(goal)
@@ -528,10 +373,6 @@ def goal_panel(ctx: RenderContext, goal: dict | None) -> RenderableType:
 
 
 # ---- tasks ----------------------------------------------------------------------------------------
-_TASK_SYMBOL = {"todo": "todo", "in_progress": "doing", "waiting": "doing", "review": "review", "done": "done",
-                "failed": "failed", "cancelled": "failed"}
-
-
 def _task_symbol(ctx: RenderContext, status: Any) -> tuple[str, str]:
     key = _TASK_SYMBOL.get(status if isinstance(status, str) else "", "todo")
     style = {"doing": theme.ACCENT, "review": theme.WARN, "done": theme.OK, "failed": theme.ERROR}.get(key, "")
@@ -619,9 +460,7 @@ def _ev_task_updated(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | 
 
 def _review_label(ctx: RenderContext, reviewer: Any) -> tuple[str, str]:
     """The label of a task in review: "in review (Carl)", or "waits for your review" (bold) for the viewer."""
-    if reviewer and reviewer == ctx.me:
-        return ctx.t("task_review_you"), f"bold {theme.WARN}"
-    return ctx.t("task_review") + (f" ({first_name(reviewer)})" if reviewer else ""), theme.WARN
+    return _review_text(ctx, reviewer), (f"bold {theme.WARN}" if reviewer and reviewer == ctx.me else theme.WARN)
 
 
 def _task_result(ctx: RenderContext, result: Any, style: str) -> RenderableType:
@@ -664,10 +503,11 @@ def _ev_message(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 # the goal panel / hire line / the question's pause line (with the spinner and the input box's title) say it
 _QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined", "u_question"})
 # the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user, a model
-# profile whose calls count as $0
+# profile whose calls count as $0, the members' messages no longer answered automatically (u_auto_reply_limit)
 _WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
                          "u_review_handed_over", "u_reviews_waiting", "u_skill_proposed", "u_skill_deps_failed",
-                         "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left", "u_cost_unknown"})
+                         "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left", "u_cost_unknown",
+                         "u_auto_reply_limit"})
 
 
 def _ev_notification(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -743,35 +583,6 @@ def _ev_status(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     body = Text(f"{clean(name) or '?'}: {_status_label(ctx, 'a_', status)}",
                 style=theme.ERROR if status == "error" else "dim")
     return _line(ctx, ctx.sym["dot"], "dim", body)
-
-
-def tool_call_text(ctx: RenderContext, tool: Any, args: Any, limit: int = TOOL_CALL_CHARS) -> str:
-    """`task_claim(task_id=3)`: arguments as k=v, strings quoted and shortened."""
-    if isinstance(args, str):
-        try:
-            args = json.loads(args) if args.strip() else {}
-        except ValueError:
-            pass
-    name = clean(tool) or "?"
-    if isinstance(args, dict):
-        inner = ", ".join(f"{clean(k)}={_arg(ctx, v)}" for k, v in args.items())
-    elif args in (None, ""):
-        inner = ""
-    else:
-        inner = ctx.short(args, limit)
-    return ctx.short(f"{name}({inner})", limit)
-
-
-def _arg(ctx: RenderContext, value: Any) -> str:
-    if isinstance(value, str):
-        return '"' + ctx.short(value, ARG_CHARS) + '"'
-    if value is None or isinstance(value, (bool, int, float)):
-        return json.dumps(value)
-    try:
-        text = json.dumps(value, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        text = str(value)
-    return ctx.short(text, ARG_CHARS)
 
 
 def _ev_activity(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -886,12 +697,6 @@ def _ev_mcp(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     return _line(ctx, ctx.sym["dot"], "dim", body)
 
 
-def _reason(ctx: RenderContext, reason: Any) -> str:
-    raw = clean(reason)
-    key = {"budget": "reason_budget", "paused by the user": "reason_user", "question": "reason_question"}.get(raw)
-    return ctx.t(key) if key else raw
-
-
 def _ev_paused(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     if d.get("reason") == "question" and d.get("asker"):  # a member's question (send_message pause_swarm)
         text = ctx.t("paused_question", name=first_name(d.get("asker")))
@@ -929,20 +734,6 @@ def _ev_limits(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     budget = fmt_cost(cost) if cost > 0 else ctx.t("unlimited")
     text = ctx.t("limits", budget=budget, agents=clean(d.get("max_agents")) or "?")
     return _line(ctx, ctx.sym["dot"], "dim", Text(text, style="dim"))
-
-
-def _job_result(ctx: RenderContext, job: dict) -> str:
-    """How a background job ended: "завершился с кодом 0", "остановлен вами"..."""
-    status = clean(job.get("status"))
-    if status == "lost":
-        return ctx.t("job_lost")
-    if status == "stopped":
-        key = "job_stopped_" + clean(job.get("reason"))
-        label = ctx.t(key)
-        return ctx.t("job_stopped") if label == key else label
-    if job.get("exit_code") is not None:
-        return ctx.t("job_ended_code", code=clean(job.get("exit_code")))
-    return ctx.t("job_ended")
 
 
 def _ev_job(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -996,19 +787,6 @@ def _ev_skill(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     return _bullet(ctx, actor, body)
 
 
-# the user's own surfaces (the pages, the terminal; a role's attach): the feed names only the others (MCP clients)
-_PLAIN_VIA = frozenset({"", "act", "home", "cli", "role", "create"})
-
-
-def _via_text(ctx: RenderContext, via: Any) -> str:
-    """`via MCP` for a change an MCP client made (MCP, the launcher MCP); "" for the user's own surfaces."""
-    via = clean(via)
-    if via in _PLAIN_VIA:
-        return ""
-    label = ctx.t(f"via_{via}")
-    return ctx.t("ev_skill_via", via=via if label == f"via_{via}" else label)
-
-
 def _ev_skill_deps(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     """A skill's packages: ready (a dim line), failed (red; quiet: the u_skill_deps_failed notification says it);
     a build starting and the manual states only in verbose."""
@@ -1032,6 +810,16 @@ def _ev_skill_deps(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | No
     else:
         text = f"{name}: {clean(d.get('ecosystem'))} {_deps_word(ctx, status)} ({_deps_reason(d.get('reason'))})"
     return _line(ctx, ctx.sym["dot"], "dim", Text(text, style="dim"))
+
+
+def _ev_session_run(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """A run's start or end the session manager journaled (session.started / session.stopped): verbose only, the
+    client says it in its own words otherwise (the session's status, a start's error)."""
+    if not ctx.verbose:
+        return None
+    symbol, text = _session_run(ctx, ev, d)
+    style = theme.WARN if symbol == "warn" else "dim"
+    return _line(ctx, ctx.sym[symbol], style, Text(text, style=style))
 
 
 def _ev_session(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -1088,6 +876,8 @@ _HANDLERS: dict[str, Callable[[RenderContext, dict, dict], RenderableType | None
     "skill.proposed": _ev_skill,
     "skill.library": _ev_skill,
     "skill.deps": _ev_skill_deps,
+    "session.started": _ev_session_run,
+    "session.stopped": _ev_session_run,
     "sessions.changed": _ev_session,
     "_connection": _ev_connection,
 }
@@ -1383,12 +1173,6 @@ def board(ctx: RenderContext, tasks: list[dict]) -> RenderableType:
         for card in shown:
             rows.append(_board_row(ctx, card.task, card))
     return _out(ctx, Group(*rows))
-
-
-def _crew_size(task: dict) -> int:
-    """`crew` of a crew task (an integer >= 2), else 0."""
-    crew = task.get("crew")
-    return crew if isinstance(crew, int) and not isinstance(crew, bool) and crew >= 2 else 0
 
 
 def _stack_tail(ctx: RenderContext, card: Card) -> Text:
@@ -1754,6 +1538,8 @@ def sessions_table(ctx: RenderContext, sessions: list[dict], current: str | None
         title = Text(clean(s.get("title")) or sid or "?", style="bold")
         if sid and sid != clean(s.get("title")):
             title.append(f"  {sid}", style="dim")
+        if s.get("via") == API_VIA:   # created through the HTTP API v1: its client's job, which -c passes over
+            title.append(f" · {ctx.t('sess_api')}", style="dim")
         goal = _d(s.get("goal"))
         if goal.get("title"):
             title.append("\n" + ctx.short(goal.get("title"), 120), style="dim")
@@ -1913,21 +1699,6 @@ def role_detail(ctx: RenderContext, role: dict) -> RenderableType:
 # ---- skills (docs/SPEC.md §19) ----------------------------------------------------------------------
 _DEPS_STYLE = {"ready": theme.OK, "installing": theme.WARN, "failed": theme.ERROR}
 SKILL_MD_LINES = 40   # /skills show: the start of SKILL.md
-
-
-def _deps_word(ctx: RenderContext, status: Any) -> str:
-    """ready / installing… / failed / manual (off, unsupported, unavailable: the agents install by hand)."""
-    status = clean(status)
-    return ctx.t("skp_" + status) if status in ("ready", "installing", "failed") else ctx.t("skp_manual")
-
-
-def _deps_reason(value: Any) -> str:
-    """The detail of an off / unsupported / unavailable state: {code, detail | need, have} or a plain string."""
-    if not isinstance(value, dict):
-        return clean(value)
-    if value.get("need"):
-        return f"{clean(value.get('need'))} ({clean(value.get('have'))})" if value.get("have") else clean(value["need"])
-    return clean(value.get("detail") or value.get("code"))
 
 
 def _skill_packages(ctx: RenderContext, deps: Any) -> Text:

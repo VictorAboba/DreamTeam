@@ -238,6 +238,25 @@ def fs_type(path: str | os.PathLike, mountinfo: str | None = None) -> str | None
     return kind
 
 
+def without_posix_bits(path: str | os.PathLike) -> bool:
+    """Whether the folder `path` lies on a Linux file system that holds no POSIX bits (_NO_POSIX_FS: WSL's drvfs,
+    Docker Desktop's 9p, FAT, exFAT, NTFS, SMB), whose files report modes it makes up; False on Windows."""
+    return os.name != "nt" and fs_type(path) in _NO_POSIX_FS
+
+
+def writable_bits(mode: int, head: bytes, no_posix: bool) -> int:
+    """The permission bits of a copy with modes "writable" (see the module docstring) of a file of `mode` whose
+    bytes start with `head`: the owner can read and write it, the group and others never write, no setuid, setgid
+    or sticky bit; a file reported as 0o777, or any from a file system without POSIX bits (`no_posix`:
+    without_posix_bits), becomes 0o644, or 0o755 when it is a script or a program."""
+    bits = stat.S_IMODE(mode) & 0o777
+    if os.name != "nt" and (bits == 0o777 or no_posix):
+        # a file system without POSIX bits (WSL's /mnt/c, FAT, exFAT, SMB) makes them up: only scripts and programs
+        # stay executable, not every file committed as 100755
+        bits = 0o755 if head.startswith(_EXEC_MAGIC) else 0o644
+    return (bits | stat.S_IRUSR | stat.S_IWUSR) & ~0o022
+
+
 def _changed(now: os.stat_result, seen: os.stat_result) -> bool:
     return bool(now.st_ino and seen.st_ino and (now.st_dev, now.st_ino) != (seen.st_dev, seen.st_ino))
 
@@ -443,7 +462,7 @@ def copy_tree(src: str | os.PathLike, dst: str | os.PathLike, *,
     else:
         os.makedirs(long_path(dst))
     out = TreeResult()
-    no_posix = modes == "writable" and os.name != "nt" and fs_type(real_src) in _NO_POSIX_FS
+    no_posix = modes == "writable" and without_posix_bits(real_src)
 
     def on_dir(rel: str) -> None:
         os.mkdir(long_path(dst.joinpath(*rel.split("/"))))
@@ -496,12 +515,7 @@ def copy_tree(src: str | os.PathLike, dst: str | os.PathLike, *,
         elif modes == "writable":
             # the agents can read and edit it (the sandbox hub is root and reads a 000 file); no setuid / setgid /
             # sticky bits, and never writable by the group or others
-            bits = stat.S_IMODE(st.st_mode) & 0o777
-            if os.name != "nt" and (bits == 0o777 or no_posix):
-                # a file system without POSIX bits (WSL's /mnt/c, FAT, exFAT, SMB) makes them up: only scripts and
-                # programs stay executable, not every file committed as 100755
-                bits = 0o755 if head.startswith(_EXEC_MAGIC) else 0o644
-            os.chmod(target, (bits | stat.S_IRUSR | stat.S_IWUSR) & ~0o022)
+            os.chmod(target, writable_bits(st.st_mode, head, no_posix))
         elif modes == "export":
             record = mode_record(st.st_mode)
             if record is not None:

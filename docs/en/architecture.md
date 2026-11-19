@@ -3,7 +3,7 @@
 **English** · [Русский](../ru/architecture.md) · [All docs](README.md)
 
 ```
- Start page ─────────REST+WS─► Launcher (SessionManager, settings, /mcp)
+ Start page ─────────REST+WS─► Launcher (SessionManager, settings, /mcp, HTTP API /api/v1)
                                   │  /s/<id>/…  — board, REST, WS and MCP of one session
  Web board / console ──REST+WS──┐ ▼                       ┌── LLM agents (ReAct, own asyncio task) ── Tracer
  Claude Code ───────────MCP─────┤   Session Swarm         ├── external members via MCP (join_swarm) ── Tracer
@@ -23,6 +23,9 @@
   example, `jobs` and `job_stop`): changing the set breaks nothing then. Until then, background jobs work for it
   too: a command goes to the background on timeout, and `kill j3` in the console stops the job.
 * Every change is written to the event log. Live UI updates, the feed and trigger checks are built from it.
+* A program uses the swarm as a service through the [HTTP API](http-api.md) (`/api/v1`): the hub's own process
+  serves it, works with the session swarms directly, reads a session's events from its event log by id, and passes
+  on the program's answers to the agents' requests to the user (or the hub answers them itself).
 * The module contract is described in [docs/SPEC.md](../SPEC.md).
 
 The ideas come from Claude Code Agent Teams (a shared task list, task claiming, mailboxes), Gas Town / Beads

@@ -41,13 +41,13 @@
   export is complete, every file it wrote, every row of the session databases and the whole history of the exported
   git repositories are searched for the known secrets of this computer: stored keys, the values of key variables
   and of the variables the agents' console treats as secret, `shell.pass_env` and `[skills] install_env`, the `env`
-  values and command credentials of MCP servers, the hub token, as UTF-8 and as UTF-16. Values shorter than 8
-  characters are not searched for, and a command credential that short stays in the copied session database
-  (longer ones are removed from it). When one is found, the export is removed, and the message names the place but
-  not the value. The check does not know other tokens that agents printed into a history or wrote to files, so
-  keep the export folder as private as the home itself. MCP approvals travel with the library: a server approved on
-  one computer is approved on the other, so import only your own exports. An import keeps a stored API key (and
-  the key variable and secret `extra` entries set up here) only while the profile keeps the same provider and
+  values and command credentials of MCP servers, the hub token and the HTTP API's token, as UTF-8 and as UTF-16.
+  Values shorter than 8 characters are not searched for, and a command credential that short stays in the copied
+  session database (longer ones are removed from it). When one is found, the export is removed, and the message
+  names the place but not the value. The check does not know other tokens that agents printed into a history or wrote to
+  files, so keep the export folder as private as the home itself. MCP approvals travel with the library: a server
+  approved on one computer is approved on the other, so import only your own exports. An import keeps a stored API key
+  (and the key variable and secret `extra` entries set up here) only while the profile keeps the same provider and
   `base_url`, and an MCP server's `env` values only for the same command and folder.
 * Agents can change the session's `.git` from their console. So DreamTeam's own git commands (autocommits, the checks of
   your folder) never run what a repository names for git to run: hooks, `core.fsmonitor`, filters, textconv and merge
@@ -87,6 +87,22 @@
   container's loopback), so other containers on the same Docker network reach its port. `dreamteam sandbox` therefore
   gives every container its own token, keeps it on the host outside every folder it mounts (see
   [Docker sandbox](sandbox.md#access-token)) and gives the container only its SHA-256.
+* The [HTTP API](http-api.md) (`/api/v1`) has a token of its own, `DREAMTEAM_API_TOKEN` (or its SHA-256 in
+  `DREAMTEAM_API_TOKEN_SHA256`), sent as `Authorization: Bearer <token>`. It opens `/api/v1` and nothing else: no
+  route of the board, no `/mcp`, no WebSocket, and only the sessions created through the API. The hub token works
+  there too, as the owner. A hub with neither token answers the API 403; a hub whose API token is its hub token does
+  not start; a hub with an API token and no hub token starts with a warning, because the rest of the hub then answers
+  whoever reaches its port (give it a hub token, or run it in `dreamteam sandbox`); a `DREAMTEAM_API_TOKEN_SHA256`
+  that is no SHA-256 lets no API token in (the hub token still works), with a warning in the log. DreamTeam removes both
+  variables from its environment at start, so they reach neither the agents' commands, nor MCP servers, nor DreamTeam's
+  own git, whatever `shell.pass_env` says, and `dreamteam sandbox` gives the container only the digest.
+* The API token limits what a client can name, not what the agents can reach: it is the power to run a goal. The
+  agents run commands with the hub user's rights (in the sandbox, the container's), so they can read the home, its
+  settings and the keys there, and an uploaded document may carry instructions to them. Every root of `[api] folders`
+  is a further grant to whoever holds the token: the agents read what a client names there, and with `in_place` they
+  write there. In `dreamteam sandbox` every root is mounted into the container, so every agent of every session there
+  can read the roots and write the `in_place` ones ([Docker sandbox](sandbox.md#the-http-api-in-the-sandbox)). A hub
+  that serves a site runs in `dreamteam sandbox`, and the site calls the API from its server: there is no CORS.
 * Protection against DNS rebinding and cross-site requests works with any bind address (including `0.0.0.0` in
   Docker): access through `localhost` always works, and by IP when it is the address the connection came to (any IP
   with the token); list other host names in `DREAMTEAM_ALLOWED_HOSTS=board.example.com`. `DREAMTEAM_PUBLIC_URL` sets

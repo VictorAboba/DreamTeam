@@ -13,6 +13,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from ..models import API_VIA
 from .i18n import t
 from .render import RenderContext, _size, cells, cut_cells, skill_md_body, skill_states_preview
 
@@ -415,6 +416,8 @@ class SessionPicker(Dialog):
             sid = str(s.get("id") or "")
             mark = ("▶ " if unicode else "> ") if current and sid == current else "  "
             hint = [sid, session_status(lang, s)]
+            if s.get("via") == API_VIA:   # created through the HTTP API v1: its client's job, which -c passes over
+                hint.append(t(lang, "sess_api"))
             goal = (s.get("goal") or {}).get("title") if isinstance(s.get("goal"), dict) else None
             if goal:
                 hint.append(" ".join(str(goal).split())[:80])

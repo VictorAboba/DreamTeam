@@ -37,17 +37,21 @@ import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Callable, Collection
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Collection, Iterable, Iterator
 
-from . import __version__, netoff
+from . import __version__, apifolders, hubauth, netoff, nofollow
 from . import skills as skill_lib
-from .config import Config
-from .copyfrom import (COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled, CopyError, CopyLimits, Source,
-                       Uploads, check_target, copy_into, done_with, hub_in_container, left_over, printable_line,
-                       resolve_source, staging_name)
+from .autoreply import SessionAutoReply, follow_journal, journal_head, listed_requests, requests_from
+from .config import INT64_LIMIT, Config
+from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled,
+                       CopyError, CopyLimits, Source, Uploads, _other_home, check_target, copy_into, copy_sources,
+                       done_with, hub_in_container, left_over, printable_line, resolve_source, staging_name)
 from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
+from .events import event_data, read_page
+from .eventtext import without_abs_paths
 from .goal_text import shorten_title, split_goal
-from .models import USER, Status, ToolError
+from .instruct import without_api_sessions
+from .models import API_VIA, USER, Status, Task, ToolError
 from .settings import (
     apply_update, deep_merge, ensure_home, profile_renames, public_view, read_raw, settings_path, validate, write_raw,
 )
@@ -79,10 +83,44 @@ KEEP_ON_IMPORT = (".venv", "venv", "node_modules")
 _STAMP = re.compile(r"\d{8}-\d{6}(?:-\d+)?")
 RENAME_TRIES = 10  # a rename refused while a file inside is held open for a moment (Windows) is tried again
 RENAME_PAUSE = 0.2
+# session.json replaced while a reader holds it open without sharing delete access (Windows: a thread of the hub's,
+# such as the HTTP API v1's, another process, a scanner) is tried again (_write_meta): it blocks the loop at most
+# META_REPLACE_TRIES * META_REPLACE_PAUSE seconds, and only while the file is held
+META_REPLACE_TRIES = 10
+META_REPLACE_PAUSE = 0.02
 # A session's identity across homes and computers (session.json "uid", see session_uid): the sequence id is not one,
 # two homes both make 017-session. Fixed forever: it derives the uid of sessions made before "uid" was written.
 UID_NAMESPACE = uuid.UUID("545ad73f-3f1d-471d-a6b5-de9395f527da")
 _UID = re.compile(r"[0-9a-f]{32}")
+# the manager's own journal events: a run's start and end (docs/SPEC.md §21.6). They are not the session's activity:
+# `last_activity` leaves them out, or a hub shutdown would stamp every running session.
+SESSION_EVENTS = ("session.started", "session.stopped")
+# why `session.stopped`: a stop by the user (any surface), a goal or budget end (stop_when_done), the hub stopping, a
+# stop the hub makes to start the session again (a workspace move), a start that failed
+STOP_REASONS = ("user", "done", "budget", "shutdown", "restart", "failed")
+# the reasons a caller of SessionManager.stop may give; the others are the manager's own (shutdown(), a workspace
+# move, a failed start)
+STOP_REQUEST_REASONS = ("user", "done", "budget")
+# the HTTP API v1's codes of SessionError (docs/SPEC.md §21.1, §21.10): a folder another session works in (or is being
+# created in); a folder the session cannot work in now (a missing workspace folder, a repository not ready for the
+# agents' commits, a workspace move that did not finish); a server folder out of its root, or under a root that no
+# longer allows it
+FOLDER_BUSY = "folder_busy"
+FOLDER_NOT_READY = "folder_not_ready"
+FORBIDDEN_FOLDER = "forbidden_folder"
+# session.json "via" of a session created through the HTTP API v1 (models.API_VIA, which the clients read too), and its
+# "api" block (docs/SPEC.md §21.4): what the create gives (API_GIVEN, with their defaults) and what the manager writes
+# later
+API_ANSWERS = ("auto", "manual")
+API_GIVEN = {"answers": "auto", "stop_when_done": True, "client_ref": None, "request_digest": None, "folder": None}
+API_LATER = ("base_commit", "started_at", "finished_at", "start_error", "error")
+# what an import drops from an "api" block (docs/SPEC.md §21.9): the caller's retry key and its body's digest, the
+# errors of runs on the other computer, and the server folder, whose {root, path} names another folder here or none
+API_IMPORT_DROPS = ("client_ref", "request_digest", "start_error", "error", "folder")
+# a SessionError's status as a v1 code, for a start_error without a code of its own
+_STATUS_CODES = {400: "bad_request", 404: "not_found", 409: "conflict", 413: "too_large"}
+# SessionManager.journal's 503 when a stopped session's journal file cannot be read now (docs/SPEC.md §21.6 "Polling")
+JOURNAL_TEXT = "The session's journal cannot be read now (the hub's log says why): ask again later."
 LEGACY_WORKSPACE_TEXT = (
     "The main session lives in the home directory itself, and `dreamteam run` can still open that directory as a "
     "single-swarm project, which would not know about another folder: its workspace cannot be moved. Create a new "
@@ -107,11 +145,21 @@ _TRANSLIT = dict(zip(
 
 class SessionError(ValueError):
     """A session operation that cannot be done; `status` is the matching HTTP status, `extra` goes into the JSON
-    answer (`exists`: skill names that clash, `pending_skills`: the proposals a delete would lose)."""
+    answer (`exists`: skill names that clash, `pending_skills`: the proposals a delete would lose). `code`: the HTTP
+    API v1's error code where the status alone does not say it (docs/SPEC.md §21.1: `folder_busy`,
+    `folder_not_ready`, `conflict`, a CopyError's `bad_name` or `file_conflict`); None otherwise. The internal
+    routes do not show it. v1 answers a code with that code's own status (§21.1), which may differ from `status`:
+    `folder_not_ready` is 409 there, also for the two refusals of a create that are 400 here (a folder inside a
+    repository, a repository's own database). `holder`: the session whose folder it is (`folder_busy`), which v1
+    names, by its uid, only to a caller who sees that session (docs/SPEC.md §21.10); never in the internal answers
+    either."""
 
-    def __init__(self, message: str, status: int = 400, **extra: Any):
+    def __init__(self, message: str, status: int = 400, *, code: str | None = None, holder: str | None = None,
+                 **extra: Any):
         super().__init__(message)
         self.status = status
+        self.code = code
+        self.holder = holder
         self.extra = extra
 
 
@@ -152,6 +200,15 @@ def _number(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _finite(number: int | float) -> bool:
+    """Whether `number` is finite as a float: a whole number too large for one (10**400, which JSON may hold) is not,
+    where math.isfinite would raise OverflowError."""
+    try:
+        return math.isfinite(number)
+    except OverflowError:
+        return False
 
 
 def _copied_from(value: Any) -> dict[str, Any] | None:
@@ -300,6 +357,140 @@ def _move_back(moved: Path, original: Path, copied: bool = False) -> None:
     _remove(moved)  # (a file's original is still whole: it is deleted at once or not at all)
 
 
+def _check_inside(path: Path, within: Path) -> None:
+    """The folder `path` of a plan (resolved when it was planned) still resolves to itself inside the resolved root
+    `within` of a server folder (docs/SPEC.md §21.10 "Resolution"): 403 `forbidden_folder` otherwise, a link or a
+    junction swapped in on its way since (the text names the planned path, never where it leads). Blocking."""
+    try:
+        real: Path | None = path.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        real = None
+    if real is None or not (_same_path(real, path) and is_within(real, within)):
+        raise _left_root(path)
+
+
+def _left_root(path: Path) -> SessionError:
+    return SessionError(f"{path} does not lie inside its folder root any more: a link or a junction on the way leads "
+                        "out of it.", 403, code=FORBIDDEN_FOLDER)
+
+
+def _identity(st: os.stat_result) -> tuple[int, int]:
+    return st.st_dev, st.st_ino
+
+
+def _same_identity(a: tuple[int, int], b: tuple[int, int]) -> bool:
+    """The same file, where the file system gives file ids (st_ino 0 on both sides or either: it does not say)."""
+    return not (a[1] and b[1]) or a == b
+
+
+def _hold(folder: Path, within: Path) -> int:
+    """The folder of a server folder's plan held: nofollow.hold_inside from its resolved root `within`, name by name,
+    never through a link (on Windows nothing on its way can be renamed while the descriptor is open; POSIX has no such
+    hold). A descriptor the caller closes; 403 `forbidden_folder` when the folder is not reached so (a link or a
+    junction on the way, the folder renamed or gone). Blocking."""
+    try:
+        return nofollow.hold_inside(within, folder.relative_to(within).parts)
+    except (ValueError, nofollow.Refused, FileNotFoundError, NotADirectoryError):
+        raise _left_root(folder) from None
+
+
+def _check_held(folder: Path, within: Path, held: tuple[int, int]) -> None:
+    """The folder of a server folder's plan still resolves to itself inside `within` (_check_inside) and is still the
+    folder held (`held`: its identity when _hold opened it), else 403 `forbidden_folder`. Blocking."""
+    _check_inside(folder, within)
+    try:
+        now = _identity(os.stat(folder))
+    except OSError:
+        raise _left_root(folder) from None
+    if not _same_identity(now, held):
+        raise _left_root(folder)
+
+
+def _remove_held(fd: int, folder: Path, names: Iterable[str]) -> list[str]:
+    """Remove the entries `names` of the folder held as `fd` (_hold): on POSIX through the descriptor (`dir_fd`), so
+    in that very folder wherever it lies now and never through a link; on Windows by path, which the hold keeps naming
+    that folder (a link in a name's own place is removed itself, never followed). Returns what could not be removed.
+    Blocking."""
+    problems = []
+    for name in names:
+        try:
+            if os.name == "nt":
+                path = folder / name
+                if is_link(path):
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        os.rmdir(path)
+                elif os.path.lexists(path):
+                    _remove(path)
+                continue
+            try:
+                st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISDIR(st.st_mode):
+                shutil.rmtree(name, dir_fd=fd)
+            else:
+                os.unlink(name, dir_fd=fd)
+        except (OSError, NotImplementedError) as exc:
+            problems.append(f"{folder / name}: {exc}")
+    return problems
+
+
+def _remove_from_held(folder: Path, within: Path, held: tuple[int, int], names: list[str]) -> list[str]:
+    """The undo's removal of what git init made in a server folder (`names` of `folder`): only from the folder held then
+    (`held`, its identity), held again (_hold); a folder that is not reached so any more (renamed, moved, a link or a
+    junction on its way) keeps them, reported, since its path leads elsewhere now. Returns what could not be removed.
+    Blocking."""
+    try:
+        fd = _hold(folder, within)
+    except SessionError:
+        fd = None
+    except OSError as exc:
+        return [f"{folder / name}: not removed: {exc}" for name in names]
+    try:
+        if fd is not None and _same_identity(_identity(os.fstat(fd)), held):
+            return _remove_held(fd, folder, names)
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return [f"{folder / name}: not removed: the folder is no longer there inside its folder root (renamed or moved, or "
+            "a link or a junction on its way)" for name in names]
+
+
+def _init_held(plan: "_Plan", within: Path, undo: "_Undo", names: list[str]) -> None:
+    """Git init in a server folder in place (docs/SPEC.md §21.10 "Resolution") with the folder held (_hold): on Windows
+    nothing on its way can then be renamed until git is done; on POSIX, which has no such hold, every step works in the
+    folder held, through its descriptor (init_repo's `held`, isolated_git's: git starts in it, the .gitignore is made
+    and the sandbox's offline user given the folder through it), and the folder must still be the one held, inside its
+    root, before each of init_repo's steps and after the last (_check_held), so a link swapped in ends it at the next
+    step (what git itself does by the path it takes when it starts is §21.10's). What a step that fails leaves of
+    `names` (.git, and .gitignore when it was not there) is removed through the held folder (_remove_held), never by a
+    path; once it is done, the undo of a later failure removes them from that folder only (`undo.held`). Blocking."""
+    fd = _hold(plan.target, within)
+    try:
+        held = _identity(os.fstat(fd))
+
+        def check() -> None:
+            _check_held(plan.target, within, held)
+
+        try:
+            check()
+            offline = isolated_git(plan.network_off, plan.target, held=fd)
+            error = init_repo(plan.target, adopted=plan.adopted, offline=offline, check=check, held=fd)
+            if error:
+                raise OSError(f"git init in {plan.target} failed: {error}")
+            check()
+        except BaseException:
+            undo.problems += _remove_held(fd, plan.target, names)
+            raise
+        undo.held = (within, held)
+        undo.git_dir = plan.target / ".git"
+        undo.gitignore = plan.target / ".gitignore" if ".gitignore" in names else None
+    finally:
+        os.close(fd)
+
+
 def _check_writable(folder: Path, shown: Path) -> None:
     try:
         fd, probe = tempfile.mkstemp(prefix=".dreamteam-probe-", dir=folder)
@@ -329,6 +520,9 @@ class _Plan:
     old_tracked: list[str] = field(default_factory=list)
     # the session has no network: DreamTeam's git in both folders runs like its members' commands (isolated_git)
     network_off: bool = False
+    # a server folder of the HTTP API v1 (docs/SPEC.md §21.10): its resolved root, which _carry_out finds every level
+    # of the target inside again, right before and after it makes one, and before and after git init (_check_inside)
+    within: Path | None = None
 
     def result(self, git: str | None = None) -> dict[str, Any]:
         # old_kept: the previous folder still holds its files (an adopt, or the user's folder left as it was)
@@ -369,12 +563,21 @@ class _Undo:
         self.removed_old: Path | None = None          # the emptied default folder that was removed
         self.git_dir: Path | None = None              # a repository created by the change
         self.gitignore: Path | None = None            # a .gitignore created with it
+        # a server folder's (docs/SPEC.md §21.10 "Resolution"): its resolved root and the identity of the folder git
+        # init ran in, held (_init_held); .git / .gitignore are then removed only from that folder, held again
+        self.held: tuple[Path, tuple[int, int]] | None = None
+        # a server folder's: the identity of each level made (None: unknown), removed only while its path names it
+        self.made: dict[Path, tuple[int, int] | None] = {}
+        self.problems: list[str] = []                 # what a step that failed could not remove itself
 
     def run(self) -> list[str]:
         """Undo in reverse order; returns what could not be undone (empty: everything is back)."""
-        problems: list[str] = []
-        for path in (self.git_dir, self.gitignore):
-            if path is not None and os.path.lexists(path):
+        problems: list[str] = list(self.problems)
+        made = [path for path in (self.git_dir, self.gitignore) if path is not None]
+        if self.held is not None and made:
+            problems += _remove_from_held(made[0].parent, *self.held, [path.name for path in made])
+        for path in made if self.held is None else ():
+            if os.path.lexists(path):
                 try:
                     _remove(path)
                 except OSError as exc:
@@ -390,6 +593,14 @@ class _Undo:
             except OSError as exc:
                 problems.append(f"{moved} (belongs in {original}): {exc}")
         for folder in reversed(self.created):
+            if folder in self.made:   # (a server folder's level: only while its path still names the folder made)
+                try:
+                    st = os.lstat(folder)
+                except OSError:
+                    continue
+                ident = self.made[folder]
+                if ident is None or not stat.S_ISDIR(st.st_mode) or not _same_identity(_identity(st), ident):
+                    continue
             try:
                 folder.rmdir()
             except OSError:
@@ -399,14 +610,20 @@ class _Undo:
 
 def _repo_refusal(folder: Path, state: dict[str, Any], *, starting: str | None = None) -> SessionError | None:
     """Why the agents cannot work with git in a folder of the user (`repo_state(folder)`), or None. `starting`: the
-    session about to start in a folder it adopted before (else the folder is about to be adopted)."""
+    session about to start in a folder it adopted before (else the folder is about to be adopted). Every refusal
+    carries the v1 code `folder_not_ready` (docs/SPEC.md §21.10). A refusal for changes that line endings alone make
+    (`repo_state(line_endings=True)`) names core.autocrlf in the repository itself."""
     where = f"{folder} (the folder session {starting} works in)" if starting else str(folder)
     first = "before starting the session" if starting else "first"
+
+    def refused(text: str, status: int = 409) -> SessionError:
+        return SessionError(text, status, code=FOLDER_NOT_READY)
+
     if state["error"]:
-        return SessionError(f"Git cannot read the repository in {where}: {state['error'][:500]}", 409)
+        return refused(f"Git cannot read the repository in {where}: {state['error'][:500]}")
     if state["git_dir"]:
-        return SessionError(f"{where} is a git repository's own database (a .git folder or a bare repository), not "
-                            "a folder of files: choose the folder of its work tree.", 409 if starting else 400)
+        return refused(f"{where} is a git repository's own database (a .git folder or a bare repository), not a "
+                       "folder of files: choose the folder of its work tree.", 409 if starting else 400)
     toplevel = state["toplevel"]
     if toplevel is None:
         return None  # no repository: one is created, as for a new workspace
@@ -416,31 +633,41 @@ def _repo_refusal(folder: Path, state: dict[str, Any], *, starting: str | None =
         top = Path(toplevel)
     if not _same_path(top, folder):
         if starting:
-            return SessionError(f"{where} is inside the git repository {top}: with git on, DreamTeam would create a "
-                                f"repository inside it. Move the session to {top} or to a folder outside it (/cd), "
-                                "or turn git off for this session.", 409)
-        return SessionError(f"{folder} is inside the git repository {top}: choose the repository's own folder {top}, "
-                            "or a folder outside it.")
+            return refused(f"{where} is inside the git repository {top}: with git on, DreamTeam would create a "
+                           f"repository inside it. Move the session to {top} or to a folder outside it (/cd), or "
+                           "turn git off for this session.")
+        return refused(f"{folder} is inside the git repository {top}: choose the repository's own folder {top}, or "
+                       "a folder outside it.", 400)
     if state["branch"] is None:
-        return SessionError(f"The git repository in {where} is in a detached HEAD state: check out a branch {first} "
-                            "(the agents' commits go to the current branch).", 409)
+        return refused(f"The git repository in {where} is in a detached HEAD state: check out a branch {first} (the "
+                       "agents' commits go to the current branch).")
     if state["operation"]:
-        return SessionError(f"A {state['operation']} is in progress in the git repository in {where}: finish or abort "
-                            f"it {first} (the agents' next commit would conclude it in their name).", 409)
+        return refused(f"A {state['operation']} is in progress in the git repository in {where}: finish or abort it "
+                       f"{first} (the agents' next commit would conclude it in their name).")
     if state["changes"]:
         shown = "; ".join(state["changes"][:5]) + ("; ..." if len(state["changes"]) > 5 else "")
-        return SessionError(
-            f"The git repository in {where} has uncommitted changes or untracked files ({len(state['changes'])}: "
-            f"{shown}). Commit or stash them {first}: the agents commit with `git add -A`, which would mix your "
-            "changes into their commits.", 409)
+        text = (f"The git repository in {where} has uncommitted changes or untracked files "
+                f"({len(state['changes'])}: {shown}). Commit or stash them {first}: the agents commit with "
+                "`git add -A`, which would mix your changes into their commits.")
+        eol = state.get("line_endings") or []
+        if eol:
+            which = "all" if len(eol) == len(state["changes"]) else str(len(eol))
+            text += (f" In {which} of them only the line endings differ (CRLF in the files, LF in the repository), "
+                     "which git here does not convert: core.autocrlf is not true for this repository here (git in "
+                     "the Docker sandbox does not read the settings of your computer's git). If your git converts "
+                     "line endings, set it in the repository itself: `git config core.autocrlf true` in that folder.")
+        return refused(text)
     return None
 
 
-async def _in_thread(fn: Callable[..., Any], *args: Any, on_cancel: Callable[[], None] | None = None) -> Any:
+async def _in_thread(fn: Callable[..., Any], *args: Any, on_cancel: Callable[[], None] | None = None,
+                     threads: Callable[..., Awaitable[asyncio.Future[Any]]] | None = None) -> Any:
     """Blocking file work in a thread that a cancellation cannot abandon halfway (a move whose undo would run
     while it still moves files): the caller waits for it to end before the CancelledError goes on. `on_cancel()`
-    is called at the first cancellation, before the wait (it tells the work to stop early: a copy)."""
-    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    is called at the first cancellation, before the wait (it tells the work to stop early: a copy). `threads`: where
+    the work runs instead of the loop's default executor, `threads(fn, *args)` awaited for a future of its result
+    (the HTTP API v1's folder threads, api_v1._Threads.start: a cancel while it waits for a place starts nothing)."""
+    work = await threads(fn, *args) if threads is not None else asyncio.ensure_future(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(work)
     except asyncio.CancelledError:
@@ -628,17 +855,24 @@ def external_workspaces(home: str | Path) -> list[tuple[str, str]]:
     return found
 
 
-def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[str, Any]:
+def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify: bool = False,
+               running: bool = True, requests: bool = False) -> dict[str, Any]:
     """Board/agent/budget figures of a session database (read-only; zeros when it does not exist), and whether an
     earlier version made it (`earlier_version`). A file of its own is read through db.reading_file, which writes
     nothing next to it (a plain read-only open of a WAL database would leave a -wal and a -shm in every stopped
-    session at each listing)."""
+    session at each listing). `requests` True adds "requests": how many requests to the user wait
+    (autoreply.requests_from: the same kinds the HTTP API v1 lists, docs/SPEC.md §21.5), `clarify` being the session's
+    [swarm] clarify; of a session that does not run (`running` False) only those that hold its work
+    (autoreply.listed_requests). Only the HTTP API v1's summary asks for it: those queries take longer as the journal
+    grows, and the board's summaries (the sessions page polls them, default_session reads them all) never show it."""
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
         "limits": {}, "paused": False, "pause_reason": "", "wrap_up": False, "last_activity": None,
         "jobs": {"running": 0}, "question": None, "earlier_version": False,
     }
+    if requests:
+        stats["requests"] = 0
     with contextlib.ExitStack() as stack:
         if conn is None:
             if not db_path.exists():
@@ -647,12 +881,14 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None) -> dict[st
                 conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
             except (sqlite3.Error, OSError):
                 return stats
-        _read_stats(conn, db_path, stats)
+        _read_stats(conn, db_path, stats, clarify, running, requests)
     return stats
 
 
-def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any]) -> None:
-    """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default."""
+def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], clarify: bool = False,
+                running: bool = True, requests: bool = False) -> None:
+    """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default. `requests`: count the
+    requests to the user too (read_stats)."""
     try:
         def kv(key: str) -> Any:
             row = conn.execute("SELECT value FROM kv WHERE key = ?", (key,)).fetchone()
@@ -686,19 +922,57 @@ def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any]) 
             stats["question"] = {"asker": paused["asker"], "message_id": paused["message_id"]}
         wrap_up = kv("wrap_up")  # the user's wrap-up mode (Swarm.wrap_up)
         stats["wrap_up"] = bool(wrap_up.get("on")) if isinstance(wrap_up, dict) else False
-        row = conn.execute("SELECT ts FROM events ORDER BY id DESC LIMIT 1").fetchone()
+        # the newest event of the session's own work: a run's start and end (SESSION_EVENTS) are not activity
+        row = conn.execute(f"SELECT ts FROM events WHERE type NOT IN ({', '.join('?' * len(SESSION_EVENTS))}) "
+                           "ORDER BY id DESC LIMIT 1", SESSION_EVENTS).fetchone()
         stats["last_activity"] = row[0] if row else None
         try:  # its own try: a database of a version before background jobs has no jobs table
             row = conn.execute("SELECT COUNT(*) FROM jobs WHERE status = 'running'").fetchone()
             stats["jobs"]["running"] = int(row[0] or 0)
         except sqlite3.Error as exc:
             log.debug("cannot count the jobs of %s: %s", db_path, exc)
+        if requests:
+            try:  # its own try too: a request it cannot read must not hide the figures above
+                stats["requests"] = len(listed_requests(requests_from(conn, clarify=clarify), running=running))
+            except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError) as exc:   # (a damaged row too)
+                log.debug("cannot count the requests of %s: %s", db_path, exc)
     except sqlite3.Error as exc:  # a database of an older version or locked: show what we have
         log.debug("cannot read stats of %s: %s", db_path, exc)
     try:  # its own try: the tables it reads may be all that is left of a damaged file
         stats["earlier_version"] = made_by_earlier_version(conn)
     except sqlite3.Error as exc:
         log.debug("cannot tell whether an earlier version made %s: %s", db_path, exc)
+
+
+def read_lists(db_path: Path, conn: sqlite3.Connection | None = None) -> tuple[list[dict[str, Any]],
+                                                                               list[dict[str, Any]]]:
+    """(tasks, agents) of a session database, read-only, in the shape and order of a loaded swarm's snapshot: every
+    task (closed ones too) as `Task.to_dict()`, by priority then id, without the board's computed fields (blocked_by,
+    comments, crew_working stay empty); every member (retired ones too) as its `agents` row, in hiring order. For a
+    stopped session's result (docs/SPEC.md §21.7) without loading it. A file of its own is read through
+    db.reading_file, as read_stats reads it; `conn`: a connection the caller holds (under the Database's lock).
+    ([], []) without a database; what cannot be read stays empty (logged)."""
+    tasks: list[dict[str, Any]] = []
+    agents: list[dict[str, Any]] = []
+    with contextlib.ExitStack() as stack:
+        if conn is None:
+            if not db_path.exists():
+                return tasks, agents
+            try:
+                conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
+            except (sqlite3.Error, OSError):
+                return tasks, agents
+        cursor = conn.cursor()
+        cursor.row_factory = sqlite3.Row   # (never the connection's own: it may be a loaded swarm's)
+        try:
+            tasks = [Task.from_row(row).to_dict()
+                     for row in cursor.execute("SELECT * FROM tasks ORDER BY priority DESC, id ASC")]
+            agents = [dict(row) for row in cursor.execute("SELECT * FROM agents ORDER BY created_at, rowid")]
+        except sqlite3.Error as exc:   # a database of an older version, or locked: show what we have
+            log.debug("cannot read the tasks and members of %s: %s", db_path, exc)
+        finally:
+            cursor.close()
+    return tasks, agents
 
 
 def rename_member_profiles(db_path: Path, renames: dict[str, str]) -> int:
@@ -762,7 +1036,106 @@ def session_uid(meta: dict[str, Any]) -> str | None:
     return uuid.uuid5(UID_NAMESPACE, "created_at:" + repr(value)).hex
 
 
+def api_meta(meta: Any, *, create: bool = False) -> dict[str, Any] | None:
+    """The "api" block of the session.json `meta` of a session created through the HTTP API v1 ("via": "api",
+    docs/SPEC.md §21.4), None for any other session. A v1 session whose block is not an object (a hand edit) gets an
+    empty one; `create`: put into `meta`, so that a change to it is written with it."""
+    if not isinstance(meta, dict) or meta.get("via") != API_VIA or meta.get("legacy"):
+        return None
+    block = meta.get("api")
+    if not isinstance(block, dict):
+        block = {}
+        if create:
+            meta["api"] = block
+    return block
+
+
+def api_answers(api: dict[str, Any]) -> Any:
+    """The `answers` of a v1 session's "api" block (api_meta), API_GIVEN's default ("auto") when the block has none (a
+    hand edit), as `stop_when_done` falls back to its own: the hold, the automatic answers and the summary agree."""
+    return api.get("answers", API_GIVEN["answers"])
+
+
+def _new_api_block(api: Any) -> dict[str, Any]:
+    """The "api" block a create writes (docs/SPEC.md §21.4): what the caller gives (the keys of API_GIVEN, their
+    defaults for the others) and the keys the manager fills later (API_LATER), null. SessionError 400 for another key
+    or a value of the wrong kind (v1 checks the request before; this guards the session.json it writes)."""
+    if not isinstance(api, dict):
+        raise SessionError("'api' must be an object.")
+    unknown = sorted(str(key) for key in api if key not in API_GIVEN)
+    if unknown:
+        raise SessionError(f"Unknown keys in 'api': {', '.join(unknown)}.")
+    block = {**API_GIVEN, **copy.deepcopy(api)}
+    if block["answers"] not in API_ANSWERS:
+        raise SessionError(f"'answers' must be one of {', '.join(API_ANSWERS)}.")
+    if not isinstance(block["stop_when_done"], bool):
+        raise SessionError("'stop_when_done' must be true or false.")
+    for key in ("client_ref", "request_digest"):
+        if block[key] is not None and not isinstance(block[key], str):
+            raise SessionError(f"'{key}' must be a string.")
+    if block["folder"] is not None and not isinstance(block["folder"], dict):
+        raise SessionError("'folder' must be an object.")
+    block.update(dict.fromkeys(API_LATER))
+    return block
+
+
+def _error_code(exc: BaseException) -> str:
+    """The v1 code of a start's failure (api.start_error.code): the error's own code (SessionError, CopyError), else
+    by its status, else "internal" (docs/SPEC.md §21.1)."""
+    code = exc.code if isinstance(exc, (SessionError, CopyError)) else None
+    if isinstance(code, str) and code:
+        return code
+    if isinstance(exc, SessionError):
+        if exc.extra.get("earlier_version"):
+            return "earlier_version"
+        return _STATUS_CODES.get(exc.status, "internal")
+    return "internal"
+
+
+class _SessionLock(asyncio.Lock):
+    """A session's lock that calls `on_release` each time it is released: the end of an operation that held it (a
+    start, a stop, a workspace move...) wakes the session's waiters (SessionManager.watch), since a held lock keeps
+    the session from being final (is_final) and its release changes no state a waiter could see otherwise."""
+
+    def __init__(self, on_release: Callable[[], None]) -> None:
+        super().__init__()
+        self._on_release = on_release
+
+    def release(self) -> None:
+        super().release()
+        try:
+            self._on_release()
+        except Exception:  # a waiter must never break the operation that held the lock
+            log.exception("could not wake the waiters of a session")
+
+
+@dataclass
+class _RunWatch:
+    """What runs beside one run of a v1 session (docs/SPEC.md §21.4, §21.5), tied to its Swarm object: the hub's
+    automatic answers (`answers: "auto"`) and the stop_when_done watcher."""
+    swarm: "Swarm"
+    auto_reply: SessionAutoReply | None = None
+    watcher: asyncio.Task | None = None
+
+    async def stop(self) -> None:
+        """Cancel both and wait for them to end; never raises (but a cancel of the caller)."""
+        if self.watcher is not None:
+            self.watcher.cancel()
+            await asyncio.wait({self.watcher})
+            if not self.watcher.cancelled() and self.watcher.exception() is not None:
+                log.error("the stop_when_done watcher of session %s ended with an error", self.swarm.session_id,
+                          exc_info=self.watcher.exception())
+        if self.auto_reply is not None:
+            try:
+                await self.auto_reply.stop()
+            except Exception:
+                log.exception("could not stop the automatic answers of session %s", self.swarm.session_id)
+
+
 class SessionManager:
+    # what _public_text writes for a path in another session's folder (whose name is that session's title)
+    OTHER_SESSION = "(a folder of another session)"
+
     def __init__(self, home: str | Path, *, llm_factory: Callable | None = None,
                  language: str = "ru", provider: str = "anthropic"):
         self.home = ensure_home(home, language, provider)
@@ -774,6 +1147,8 @@ class SessionManager:
             raise ValueError(f"Invalid settings in {settings_path(self.home)}: {exc}") from None
         self._stamp = self._settings_stamp()
         self.swarms: dict[str, "Swarm"] = {}   # loaded sessions (running or not)
+        # sessions _unload took out of `swarms` whose database is not closed yet: readers in threads use it (reading)
+        self._unloading: dict[str, "Swarm"] = {}
         self.running: set[str] = set()
         self.hub_url: str | None = None        # base URL of the web server (no trailing /), set by launcher.serve
         self._locks: dict[str, asyncio.Lock] = {}  # kept after a delete: a waiter may still hold the old lock
@@ -785,8 +1160,38 @@ class SessionManager:
         # first and failing at the claim
         self._creating_in: set[Path] = set()
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
+        # the waiters of each session (watch): woken by a journaled event of the session, a change (_changed) and the
+        # end of an operation that held its lock (_SessionLock); each with the loop that waits on it
+        self._wakers: dict[str, dict[asyncio.Event, asyncio.AbstractEventLoop]] = {}
+        # the sessions resume() is about to start (docs/SPEC.md §21.7 `final`): filled before the launcher takes its
+        # first request (plan_resume), emptied one by one as resume() handles them
+        self.resume_pending: set[str] = set()
+        self._resume_planned: list[str] | None = None
+        # the sessions a create or a v1 `continue` is starting (mark_starting .. unmark_starting; is_final reads it),
+        # and the marks of each: one per start on its way, so a start ends its own mark only
+        self.starting: set[str] = set()
+        self._marks: dict[str, set[object]] = {}
+        # the hub's own readers of a session's files while they are sent (the HTTP API v1's downloads and archives,
+        # each with cut(); add_reader .. drop_reader): delete() cuts them before it renames the session's folder away
+        # (Windows renames no folder that holds an open file), and none is added while it runs (`_deleting`)
+        self._readers: dict[str, set[Any]] = {}
+        self._deleting: set[str] = set()
+        # what runs beside a started v1 session, tied to its Swarm (the hub's automatic answers, the stop_when_done
+        # watcher; docs/SPEC.md §21.4, §21.5): started by _start_locked, stopped by _unload before the swarm stops
+        self._run_watch: dict[str, _RunWatch] = {}
+        # the stops stop_when_done scheduled (detached: _unload cancels the watcher that scheduled them); none is
+        # scheduled while shutdown() runs (`_closing`): the resume check at the next start handles those jobs
+        self._stopping: set[asyncio.Task] = set()
+        self._closing = False
+        # uid -> sid of every session, the sids of the v1 sessions and client_ref -> sid of those (sid_of_uid,
+        # api_sids, sid_of_client_ref), with the sessions folder's mtime and the session folders they were read from;
+        # None: read again at the next use
+        self._index: tuple[int | None, frozenset[str], dict[str, str], list[str], dict[str, str]] | None = None
         # zips the sessions page uploads for a new session's copy (POST /api/uploads, copy_from_upload)
         self.uploads = Uploads(self.home / ".dreamteam" / UPLOADS_DIR)
+        # the files of the HTTP API v1 (POST /api/v1/uploads, docs/SPEC.md §21.3): a root of their own, so a token
+        # of one store is never usable in the other
+        self.api_uploads = Uploads(self.home / ".dreamteam" / UPLOADS_DIR / API_UPLOADS_DIR)
 
     # ---- change notifications ------------------------------------------------------------------
     def listen(self, listener: Callable[[dict[str, Any]], None]) -> None:
@@ -797,6 +1202,10 @@ class SessionManager:
             self._listeners.remove(listener)
 
     def _changed(self, sid: str | None, change: str) -> None:
+        if change in ("created", "deleted"):
+            self._index = None   # a session came or went (sid_of_uid, api_sids)
+        if sid is not None:
+            self._poke(sid)
         event = {"type": "sessions.changed", "session": sid, "change": change, "ts": time.time()}
         for listener in list(self._listeners):
             try:
@@ -805,7 +1214,123 @@ class SessionManager:
                 log.exception("session listener failed")
 
     def _lock(self, sid: str) -> asyncio.Lock:
-        return self._locks.setdefault(sid, asyncio.Lock())
+        lock = self._locks.get(sid)
+        if lock is None:
+            lock = self._locks[sid] = _SessionLock(lambda: self._poke(sid))
+        return lock
+
+    # ---- waiting for a session's changes (docs/SPEC.md §21.6) -----------------------------------------
+    @contextlib.contextmanager
+    def watch(self, sid: str) -> Iterator[asyncio.Event]:
+        """A waiter for any change of session `sid`: an asyncio.Event set by a new journaled event of the session
+        (one bus listener per Swarm, installed by _load_locked), a change the manager makes (_changed: created,
+        started, stopped, updated, deleted), the end of an operation that held the session's lock, and resume()
+        handling it. It is keyed by session, never by a bus: it outlives an unload, which replaces the Swarm and its
+        bus. Clear the event before each read, then wait on it:
+
+            with manager.watch(sid) as changed:
+                while ...:
+                    changed.clear()
+                    ... read ...
+                    await asyncio.wait_for(changed.wait(), timeout)
+
+        Call it on the event loop that waits (a poke from another thread is handed to that loop)."""
+        event = asyncio.Event()
+        waiters = self._wakers.setdefault(sid, {})
+        waiters[event] = asyncio.get_running_loop()
+        try:
+            yield event
+        finally:
+            waiters = self._wakers.get(sid)
+            if waiters is not None:
+                waiters.pop(event, None)
+                if not waiters:
+                    self._wakers.pop(sid, None)
+
+    def _poke(self, sid: str) -> None:
+        """Wake every waiter of session `sid` (watch). It only sets events: no database work, no await, no emit."""
+        waiters = self._wakers.get(sid)
+        if not waiters:
+            return
+        try:
+            current = asyncio.get_running_loop()
+        except RuntimeError:
+            current = None
+        for event, loop in list(waiters.items()):
+            if loop is current:
+                event.set()
+            elif not loop.is_closed():
+                with contextlib.suppress(RuntimeError):   # its loop closed meanwhile
+                    loop.call_soon_threadsafe(event.set)
+
+    def is_final(self, sid: str) -> bool:
+        """The session is stopped and will not come back by itself (docs/SPEC.md §21.7): it is not running, not being
+        started (`starting`: a create or a `continue` in flight; `resume_pending`: resume() is about to start it), and
+        no operation holds its lock (_unload takes it out of `running` before it journals `session.stopped`). The
+        autostart mark does not count: resume() skips finished and earlier-version sessions but keeps their mark."""
+        if sid in self.running or sid in self.starting or sid in self.resume_pending:
+            return False
+        lock = self._locks.get(sid)
+        return lock is None or not lock.locked()
+
+    def mark_starting(self, sid: str, mark: object | None = None) -> object:
+        """A start of `sid` is on its way (a create with start=True, a v1 create or `continue` that starts it in the
+        background): the session is `starting` (docs/SPEC.md §21.7), so never seen final, until that start ends.
+        Returns the mark (`mark`, else a new object): `start(sid, marked=mark)` starts the session only while the mark
+        is there and takes it away when it ends; unmark_starting(sid, mark) takes it away without a start. A delete
+        meanwhile takes every mark of the session away, a stop the marks placed before it was asked (_stop), and those
+        starts then start nothing. Each start has its own mark: one that ends never takes away another's (a second
+        caller's, or a new session's that got the folder name of a deleted one)."""
+        mark = object() if mark is None else mark
+        self._marks.setdefault(sid, set()).add(mark)
+        self.starting.add(sid)
+        self._poke(sid)
+        return mark
+
+    def unmark_starting(self, sid: str, mark: object) -> None:
+        """The start `mark` announced (mark_starting) is over, whatever its outcome; nothing when the mark is gone."""
+        marks = self._marks.get(sid)
+        if marks is None or mark not in marks:
+            return
+        marks.discard(mark)
+        if not marks:
+            del self._marks[sid]
+            self.starting.discard(sid)
+        self._poke(sid)
+
+    def _marked(self, sid: str, mark: object) -> bool:
+        return mark in self._marks.get(sid, ())
+
+    def marked_session(self, mark: object) -> str | None:
+        """The session the start `mark` is on now (mark_starting), else None (not placed yet, or taken away)."""
+        return next((sid for sid, marks in self._marks.items() if mark in marks), None)
+
+    def _drop_marks(self, sid: str, marks: Iterable[object] | None = None) -> None:
+        """A delete (`marks` None: every mark) or a stop (`marks`: those placed before it was asked): those starts on
+        their way start nothing any more (start(..., marked=...)); the session leaves `starting` with its last mark."""
+        held = self._marks.get(sid)
+        if held is not None and marks is not None:
+            held.difference_update(marks)
+            if held:
+                return
+        self._marks.pop(sid, None)
+        self.starting.discard(sid)
+
+    def add_reader(self, sid: str, reader: Any) -> None:
+        """`reader` (cut(): it stops and closes what it holds in the session's folder, at once or when its running
+        step ends) reads the session's files until drop_reader: a delete of the session cuts it first. SessionError
+        409 while a delete of the session runs. On the loop."""
+        if sid in self._deleting:
+            raise SessionError(f"Session {sid} is being deleted.", 409)
+        self._readers.setdefault(sid, set()).add(reader)
+
+    def drop_reader(self, sid: str, reader: Any) -> None:
+        """`reader` holds nothing of the session's any more (add_reader)."""
+        readers = self._readers.get(sid)
+        if readers is not None:
+            readers.discard(reader)
+            if not readers:
+                del self._readers[sid]
 
     # ---- global settings ----------------------------------------------------------------------
     def _settings_stamp(self) -> tuple[int, int] | None:
@@ -968,8 +1493,11 @@ class SessionManager:
         path = self.sessions_dir / sid
         return path.is_dir() and (path / SESSION_FILE).exists()
 
-    def _check(self, sid: str) -> None:
-        if not self.exists(sid):
+    def _check(self, sid: str, uid: str | None = None) -> None:
+        """404 for a session that is not there; with `uid`, also when the folder name `sid` holds another session by
+        now: a delete gives its folder number to the next session with the same title slug (_new_id), so a caller
+        that named the session by its uid (the HTTP API v1) checks it again after waiting for the session's lock."""
+        if not self.exists(sid) or (uid is not None and not self._has_uid(sid, uid)):
             raise SessionError(f"Unknown session '{sid}'.", 404)
 
     def dir_of(self, sid: str) -> Path:
@@ -1013,6 +1541,9 @@ class SessionManager:
         return meta
 
     def _write_meta(self, sid: str, meta: dict[str, Any]) -> None:
+        """session.json written whole: a temporary file, then put in its place (os.replace). A replace refused with
+        PermissionError (Windows: a reader holds the file open for a moment, such as a thread of the hub's that reads
+        it) is tried again, META_REPLACE_TRIES times META_REPLACE_PAUSE apart; then the error is raised."""
         if sid == LEGACY_ID:
             path = self.home / ".dreamteam" / SESSION_FILE
             data = {k: meta[k] for k in ("title", "created_at", "autostart") if k in meta}
@@ -1024,7 +1555,14 @@ class SessionManager:
         tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
         try:
             tmp.write_bytes(text.encode("utf-8", "replace"))
-            os.replace(tmp, path)
+            for attempt in range(META_REPLACE_TRIES):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if attempt == META_REPLACE_TRIES - 1:
+                        raise
+                    time.sleep(META_REPLACE_PAUSE)
         finally:
             if tmp.exists():
                 try:
@@ -1124,20 +1662,77 @@ class SessionManager:
         raise SessionError(
             f"Moving the workspace of session {sid} from {info.get('from', '?')} to {info.get('to', '?')} did not "
             f"finish: some of its files may be in one folder and some in the other. The session uses {uses}: put "
-            f"the files together there, then delete {path}.", 409)
+            f"the files together there, then delete {path}.", 409, code=FOLDER_NOT_READY)
 
     def _check_workspace_ready(self, sid: str, meta: dict[str, Any]) -> None:
         """Before a start: a folder outside the session is never created silently (a deleted project, an unplugged
-        drive, a host path inside the Docker sandbox): the agents would work in an empty stand-in."""
+        drive, a host path inside the Docker sandbox): the agents would work in an empty stand-in. A session that
+        works in a server folder of the HTTP API v1 in place (`api.folder`, docs/SPEC.md §21.10 "Starts") is checked
+        again too, whoever starts it (_check_server_folder). Blocking (a folder may lie on a share that does not
+        answer): _start_locked runs it in a thread, with the settings read again just before."""
         self._check_journal(sid, meta)
         info = self.workspace_of(sid, meta)
-        if info["default"] or info["exists"]:
+        if not (info["default"] or info["exists"]):
+            what = "is not a folder" if Path(info["path"]).exists() else "does not exist"
+            raise SessionError(
+                f"The workspace folder of session {sid} {what}: {info['path']}. Bring it back (e.g. reconnect the "
+                f"drive), or move the session to another folder: /cd <folder> (/cd --default for its own folder) in "
+                f"`dreamteam` or `dreamteam console --session {sid}`, session_cd in MCP.", 409, code=FOLDER_NOT_READY)
+        self._check_server_folder(sid, meta)
+
+    def _check_server_folder(self, sid: str, meta: dict[str, Any], *,
+                             refusal: str = "it does not start") -> tuple[Path, Path] | None:
+        """Before a start of a session that works in a server folder in place (api.folder mode "in_place",
+        docs/SPEC.md §21.10 "Starts"; nothing for any other session): its root must still be listed in `[api]
+        folders` with `in_place = true` (the settings as _start_locked read them again: a hand edit counts at once)
+        and must not be refused (apifolders.resolve_root; a missing root is 409 `folder_not_ready`), and the stored
+        folder must still resolve to itself inside that root, by text and by file identity: a component swapped for a
+        link after the create, or a root moved elsewhere, refuses the start (403 `forbidden_folder`). `refusal` ends
+        the texts of its own refusals (what does not happen: v1 reading the files passes its own). The git rules of
+        the folder are checked apart (_check_server_git). (The root resolved, the folder resolved: on Windows its names
+        as the folders on the way spell them, on POSIX as session.json spells them; v1 reads the files below the root
+        by the names as their folders list them, apifolders.as_listed, §21.8), None for any other session. Blocking:
+        in a thread."""
+        folder = apifolders.in_place_folder((api_meta(meta) or {}).get("folder")) if sid != LEGACY_ID else None
+        if folder is None:
+            return None
+        where = apifolders.shown(folder["root"], folder["path"])
+        config = self.config   # (never _refresh_settings here: it writes the manager's settings, off the loop)
+        root = apifolders.roots(config).get(folder["root"])
+        if root is None or not root.in_place:
+            raise SessionError(
+                f"Session {sid} works in {where}, under the folder root '{folder['root']}', which [api] folders no "
+                f"longer lists with in_place = true: {refusal}.", 403, code=FORBIDDEN_FOLDER)
+        try:
+            root_real = apifolders.resolve_root(root, home=self.home, config=config)
+        except CopyError as exc:
+            missing = exc.code == "not_found"
+            raise SessionError(str(exc), 409 if missing else 403,
+                               code=FOLDER_NOT_READY if missing else FORBIDDEN_FOLDER) from None
+        stored = Path(self.workspace_of(sid, meta)["path"])
+        try:
+            real = stored.resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            raise SessionError(f"The folder {where} of session {sid} cannot be read: {refusal}.", 409,
+                               code=FOLDER_NOT_READY) from None
+        if not (_same_path(real, stored) and is_within(real, root_real)):
+            raise SessionError(
+                f"The folder {where} of session {sid} no longer leads to itself inside its root (a link or a junction "
+                f"on the way, or the root moved): {refusal}.", 403, code=FORBIDDEN_FOLDER)
+        return root_real, real
+
+    def _check_server_git(self, sid: str, folder: Path, network_off: bool = False) -> None:
+        """Before a start of a session that works in a server folder in place, with git on (docs/SPEC.md §21.10
+        `in_place`): DreamTeam's git must write inside the folder only (apifolders.git_dir_refusal: a `.git` that is
+        a link or a gitfile, a link or a hard-linked file in its repository's folders, a git dir, common dir or path
+        git writes outside it): 409 `folder_not_ready`. Blocking (git): run it in a thread."""
+        git_exe = shutil.which("git")
+        if git_exe is None:
             return
-        what = "is not a folder" if Path(info["path"]).exists() else "does not exist"
-        raise SessionError(
-            f"The workspace folder of session {sid} {what}: {info['path']}. Bring it back (e.g. reconnect the drive), "
-            f"or move the session to another folder: /cd <folder> (/cd --default for its own folder) in `dreamteam` "
-            f"or `dreamteam console --session {sid}`, session_cd in MCP.", 409)
+        problem = apifolders.git_dir_refusal(folder, git_exe, offline=isolated_git(network_off))
+        if problem is not None:
+            raise SessionError(f"The folder session {sid} works in ({folder}) cannot take DreamTeam's commits: "
+                               f"{problem}.", 409, code=FOLDER_NOT_READY)
 
     def _check_adopted_repo(self, sid: str, folder: Path, mcp: list[str], network_off: bool = False) -> None:
         """Before a start in a folder the session adopted, with git on: the same rules as when it was adopted, since
@@ -1151,7 +1746,7 @@ class SessionManager:
         if git_exe is None:
             return
         state = repo_state(folder, git_exe, exclude=[*(f"mcp/{name}" for name in mcp), SCRATCH_DIR],
-                           offline=isolated_git(network_off))
+                           offline=isolated_git(network_off), line_endings=True)
         refusal = _repo_refusal(folder, state, starting=sid)
         if refusal is not None:
             raise refusal
@@ -1191,8 +1786,9 @@ class SessionManager:
         """Why the folder `target` (resolved) can never be the workspace of session `sid` (None: a session about to
         be created; an id that does not exist yet is fine): a drive root, the user's home or a folder containing it,
         the DreamTeam home or a folder containing it, DreamTeam's own data folder, the sessions folder (except the
-        session's own default folder), a git database, the MCP and skills libraries and the skill environments.
-        None when it can be."""
+        session's own default folder), a git database, another DreamTeam home or a folder inside one, the hub tokens'
+        folder (inside or containing it), on POSIX /proc, /sys and /dev, the MCP and skills libraries and the skill
+        environments. None when it can be."""
         try:
             home = self.home.resolve()
             sessions = self.sessions_dir.resolve()
@@ -1227,6 +1823,21 @@ class SessionManager:
         if any(part.casefold() == ".git" for part in target.parts) or looks_like_git_dir(target):
             return (f"{target} is a git repository's own database (a .git folder or a bare repository), not a folder "
                     "of files: choose the folder of its work tree.")
+        # (this home and its sessions folder: above; the session's own folder is its own whatever its agents built
+        # there, even a home's layout: /cd --default always leads back)
+        other = _other_home(target) if not is_default else None
+        if other is not None and not same(other, home):
+            return (f"{target} is a DreamTeam home ({other}) or inside one: its settings (API keys too) and sessions "
+                    "are never a session's folder; choose another folder.")
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
+            tokens = hubauth.tokens_dir().resolve()
+            if within(target, tokens) or within(tokens, target):
+                return (f"{target} is the folder of DreamTeam's hub tokens {tokens}, or inside it or contains it; "
+                        "choose another folder.")
+        if os.name != "nt":
+            for system in _SYSTEM_ROOTS:
+                if _within(target, Path(system)):
+                    return f"{target} is a system folder ({system}); choose another folder."
         libraries = [self.config.library_dir]
         if sid is not None and os.path.lexists(self.dir_of(sid) / SESSION_FILE):
             with contextlib.suppress(ValueError, SessionError):
@@ -1263,15 +1874,21 @@ class SessionManager:
             if _overlaps(target, folder):
                 how = "" if _fold_key(target) == _fold_key(folder) else f" ({target} is inside it or contains it)"
                 raise SessionError(f"Another session is being created in {folder} right now{how}; when it is done, "
-                                   "that folder is taken.", 409)
+                                   "that folder is taken.", 409, code=FOLDER_BUSY)
 
     def _plan(self, sid: str | None, path: Any, *, git_on: bool, mcp: list[str] | None = None,
-              network_off: bool = False, copying: bool = False) -> _Plan:
+              network_off: bool = False, copying: bool = False, within: Path | None = None) -> _Plan:
         """Check a new workspace folder for a session (sid None: a session about to be created) and decide what
         to do; SessionError (400 bad target, 409 conflict) before anything changes. `network_off`: the session's
         setting, for its git checks here and later (_Plan.network_off; the first check runs while the session's
         members may still run commands). `copying`: files are copied into the new session (create's copy_from),
-        so a folder with files is refused (409). Blocking (git): run it in a thread."""
+        so a folder with files is refused (409). `within`: the resolved root of a server folder of the HTTP API v1
+        (docs/SPEC.md §21.10): the folder, once resolved here, must lie inside it by text and by file identity (403
+        `forbidden_folder`: a link swapped in on the way since the request was resolved), and with git on its
+        repository must keep DreamTeam's git inside it (apifolders.git_dir_refusal: 409 `folder_not_ready`). A
+        folder another session works in, inside it or containing it, is compared by text and by file identity
+        (treecopy.is_within: another letter case or Unicode form of a name is the same folder where the file system
+        says so). Blocking (git): run it in a thread."""
         meta = self.meta(sid) if sid is not None else {}
         if sid is not None:
             old, old_stored, old_adopted = self._workspace_entry(sid, meta)
@@ -1299,6 +1916,10 @@ class SessionManager:
             session_dir = self.dir_of(sid).resolve() if sid is not None else None
         except (OSError, ValueError, RuntimeError) as exc:
             raise SessionError(f"Cannot use the folder {path}: {exc}") from None
+        if within is not None and not is_within(target, within):   # (named as asked: never where it leads)
+            asked = os.fspath(path).strip() if path is not None else target
+            raise SessionError(f"{asked} does not lie inside its folder root any more: a link or a junction on the "
+                               "way leads out of it.", 403, code=FORBIDDEN_FOLDER)
         is_default = default_real is not None and _same_path(target, default_real)
         refusal = self._target_refusal(target, sid)
         if refusal is not None:
@@ -1314,11 +1935,14 @@ class SessionManager:
             raise SessionError(f"{target} contains the session's current folder {old_real}; choose a folder that "
                                "does not.")
         for other, folder in self._other_workspaces(sid):
-            if _within(target, folder) or _within(folder, target):
-                how = "is the folder" if _same_path(target, folder) else \
-                    ("is inside the folder" if _within(target, folder) else "contains the folder")
+            # by file identity too: a file system that ignores case or Unicode form where normcase does not (APFS,
+            # a casefold mount) takes jobs/Acme for jobs/acme
+            inside, holds = is_within(target, folder), is_within(folder, target)
+            if inside or holds:
+                how = "is the folder" if inside and holds else ("is inside the folder" if inside else
+                                                                "contains the folder")
                 raise SessionError(f"{target} {how} of session {other} ({folder}); two sessions cannot share files.",
-                                   409)
+                                   409, code=FOLDER_BUSY, holder=other)
         if target.exists() and not target.is_dir():
             raise SessionError(f"{target} is a file, not a folder.")
         if target.is_dir():
@@ -1341,7 +1965,7 @@ class SessionManager:
         plan = _Plan(target=target, old=old_real if old_real is not None else target, mode="moved",
                      default=is_default, adopted=False, git="none", old_exists=old_exists,
                      old_is_default=old_stored is None and old is not None, old_adopted=old_adopted,
-                     network_off=network_off)
+                     network_off=network_off, within=within)
         carried = [name for name in (mcp or []) if old_exists and (old_real / "mcp" / name).is_dir()]
         if old_adopted and carried and git_exe:  # leaving the user's folder: did the agents commit the servers there?
             plan.old_tracked = tracked(old_real, [f"mcp/{name}" for name in carried], git_exe,
@@ -1376,10 +2000,15 @@ class SessionManager:
         elif empty or is_default:
             plan.git = "existing" if (target / ".git").exists() else "initialized"
         else:
+            if within is not None:   # a server folder: DreamTeam's git stays inside it (checked before git reads it)
+                problem = apifolders.git_dir_refusal(target, git_exe, offline=isolated_git(network_off))
+                if problem is not None:
+                    raise SessionError(f"The repository in {target} cannot take DreamTeam's commits: {problem}.",
+                                       409, code=FOLDER_NOT_READY)
             # the session's own servers (absent there: checked above) are left out, as at every start: a folder it
             # worked in before may track them, and their move brings them back (else it could never return there)
             state = repo_state(target, git_exe, exclude=[f"mcp/{name}" for name in carried],
-                               offline=isolated_git(network_off))
+                               offline=isolated_git(network_off), line_endings=True)
             refusal = _repo_refusal(target, state)
             if refusal is not None:
                 raise refusal
@@ -1388,7 +2017,11 @@ class SessionManager:
 
     def _carry_out(self, sid: str | None, plan: _Plan, undo: _Undo) -> str:
         """Do what the plan says (blocking: run it in a thread). Returns the git outcome; on an exception `undo`
-        knows how to put everything back."""
+        knows how to put everything back. A server folder's plan (`within`, docs/SPEC.md §21.10) finds the deepest
+        level that is there and each level it makes right after making it inside its root again (_check_inside, 403
+        `forbidden_folder`): the levels are made by path, so a link swapped in on the way since the last _plan ends
+        the change, and the undo removes each level it made while its path still names it (its identity). Git init
+        there runs in the folder held (_init_held), and what it made is removed only from that folder."""
         if sid is not None:
             journal = self._journal(sid)
             journal.parent.mkdir(parents=True, exist_ok=True)
@@ -1399,9 +2032,17 @@ class SessionManager:
         while not folder.exists():
             missing.append(folder)
             folder = folder.parent
+        if plan.within is not None:
+            _check_inside(folder, plan.within)
         for folder in reversed(missing):
             folder.mkdir()
             undo.created.append(folder)
+            if plan.within is not None:
+                try:
+                    undo.made[folder] = _identity(os.lstat(folder))
+                except OSError:
+                    undo.made[folder] = None
+                _check_inside(folder, plan.within)
         if plan.old_exists and plan.old_adopted and not plan.move_all:
             # leaving the user's folder: copies of library or Claude Code skills never stay in their project (not
             # undone on a rollback: every start rebuilds the mirror)
@@ -1436,8 +2077,11 @@ class SessionManager:
             if os.path.lexists(plan.target / ".git"):  # not ours: never initialized over, nor removed by the undo
                 raise SessionError(f"A git repository appeared in {plan.target} meanwhile; check the folder and "
                                    "try again.", 409)
-            if not os.path.lexists(plan.target / ".gitignore"):
-                undo.gitignore = plan.target / ".gitignore"
+            names = [".git"] if os.path.lexists(plan.target / ".gitignore") else [".git", ".gitignore"]
+            if plan.within is not None:
+                _init_held(plan, plan.within, undo, names)
+                return plan.git
+            undo.gitignore = plan.target / ".gitignore" if ".gitignore" in names else None
             undo.git_dir = plan.target / ".git"
             error = init_repo(plan.target, adopted=plan.adopted, offline=isolated_git(plan.network_off, plan.target))
             if error:
@@ -1477,7 +2121,10 @@ class SessionManager:
                 result[section] = clean
         return result
 
-    def _validated_overrides(self, overrides: Any) -> dict[str, Any]:
+    def validated_overrides(self, overrides: Any) -> dict[str, Any]:
+        """The overrides a new session would be created with: cleaned (clean_overrides) and checked against the
+        global settings (SessionError 400 "Invalid session settings: ..." otherwise); create's own check, for callers
+        that refuse a request before anything else (the HTTP API v1, docs/SPEC.md §21.4 "Order")."""
         clean = self.clean_overrides(overrides)
         try:
             validate(self.sessions_dir / "new", self._merged(self.raw, clean))
@@ -1486,7 +2133,12 @@ class SessionManager:
         return clean
 
     # ---- summaries ----------------------------------------------------------------------------
-    def summary(self, sid: str) -> dict[str, Any]:
+    def summary(self, sid: str, *, workspace: bool = True, requests: bool = False) -> dict[str, Any]:
+        """The session as the board and the clients show it. `workspace`: False leaves its "workspace" None, which
+        otherwise looks at the folder the session works in (workspace_of: it may lie on a share that does not answer),
+        for a caller that never shows it, on the event loop (the HTTP API v1's summary, docs/SPEC.md §21.7).
+        `requests`: True adds "requests", how many requests to the user wait (read_stats), for the HTTP API v1's
+        summary only; list() and default_session() leave it out, so they never pay for its queries."""
         self._check(sid)
         meta = self.meta(sid)
         try:
@@ -1496,11 +2148,13 @@ class SessionManager:
             cfg, config_error = self.config, str(exc)
         swarm = self.swarms.get(sid)
         db_path = cfg.data_dir / "swarm.db" if config_error is None else self.dir_of(sid) / ".dreamteam" / "swarm.db"
+        clarify = bool(cfg.swarm.clarify)   # (a clarify planner that waits for the user is a request: read_stats)
+        running = sid in self.running        # (a session that does not run counts only the requests that block it)
         if swarm is not None:
             with swarm.db._lock:
-                stats = read_stats(db_path, swarm.db.conn)
+                stats = read_stats(db_path, swarm.db.conn, clarify=clarify, running=running, requests=requests)
         else:
-            stats = read_stats(db_path)
+            stats = read_stats(db_path, clarify=clarify, running=running, requests=requests)
         limits = stats.pop("limits") or {}
         pending = pending_goal(meta)
         if stats["goal"] is None and pending:
@@ -1508,6 +2162,10 @@ class SessionManager:
         profile = cfg.agents.default_model
         model = cfg.models.get(profile)
         attached = self._attached_skills(sid)
+        api = api_meta(meta)
+        # a session of the HTTP API v1 says so (the sessions page marks it, `dreamteam -p` sends no automatic replies
+        # of its own to an `auto` one); other sessions have neither key
+        made_by_api = {} if api is None else {"via": API_VIA, "answers": api_answers(api)}
         return {
             "id": sid, "uid": session_uid(meta), "title": meta.get("title") or sid, "legacy": meta.get("legacy", False),
             "dir": str(self.dir_of(sid)), "created_at": meta.get("created_at"),
@@ -1519,11 +2177,12 @@ class SessionManager:
             "max_cost_usd": _number(limits.get("max_cost_usd", cfg.swarm.max_cost_usd)),
             "max_agents": int(_number(limits.get("max_agents", cfg.swarm.max_agents))),
             "overrides": meta.get("overrides") or {}, "config_error": config_error,
-            "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta),
+            "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta) if workspace else None,
             "copied_from": _copied_from(meta.get("copied_from")),   # files copied in at create (copyfrom.py)
             "skills": [s.name for s in attached],
             "skills_pending": [s.name for s in attached if s.library == "pending"],
             **stats,
+            **made_by_api,
         }
 
     def list(self) -> list[dict[str, Any]]:
@@ -1543,14 +2202,120 @@ class SessionManager:
         return items
 
     def default_session(self) -> str | None:
-        """The session MCP calls without `session` go to: the only running one, else the most recently
-        active running one, else the only session this version opens (one made by an earlier version is never
-        it)."""
-        running = [s for s in self.list() if s.get("status") == "running"]
+        """The session MCP calls without `session` go to (and `serve`'s console): the only running one, else the most
+        recently active running one, else the only session this version opens (one made by an earlier version is
+        never it). Never one created through the HTTP API v1 (instruct.without_api_sessions, as `-c` and the CLI's
+        other unnamed picks): an API client's job would otherwise take the owner's calls; `session=` reaches it."""
+        running = [s for s in without_api_sessions(self.list()) if s.get("status") == "running"]
         if running:
             return running[0]["id"]
-        ids = [sid for sid in self.ids() if not self.earlier_version(sid)]
+        api = set(self.api_sids())
+        ids = [sid for sid in self.ids() if sid not in api and not self.earlier_version(sid)]
         return ids[0] if len(ids) == 1 else None
+
+    # ---- the HTTP API v1's lookups (docs/SPEC.md §21.1 "Scope", §21.2 `{id}`) ----------------------------------
+    def _sessions_stamp(self) -> int | None:
+        try:
+            return self.sessions_dir.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _uid_index(self, *, recount: bool = False) -> tuple[dict[str, str], list[str], dict[str, str]]:
+        """(uid -> sid, the sids of the v1 sessions, client_ref -> sid of those: the first by name when two share
+        one), read from every session.json once and kept until a session comes or goes: here (_changed "created" /
+        "deleted", an import's rewrite) or in another process (the sessions folder's mtime). `recount`: also compare
+        the session folders (ids(): no session.json is read) with those it was read from, for a uid it does not know
+        and for api_sids(): another process makes a session's folder before it writes its session.json, which
+        changes no mtime of the sessions folder. A uid two sessions share (a folder copied by hand) names neither: a
+        v1 id must never reach another job. The legacy main session has no uid; a damaged session.json is left
+        out."""
+        stamp = self._sessions_stamp()
+        index = self._index
+        ids: frozenset[str] | None = None
+        if index is not None and index[0] == stamp:
+            if not recount:
+                return index[2], index[3], index[4]
+            ids = frozenset(self.ids()) - {LEGACY_ID}
+            if ids == index[1]:
+                return index[2], index[3], index[4]
+        if ids is None:
+            ids = frozenset(self.ids()) - {LEGACY_ID}
+        owners: dict[str, list[str]] = {}
+        made_by_api: list[str] = []
+        refs: dict[str, str] = {}
+        for sid in sorted(ids):
+            try:
+                meta = self.meta(sid)
+            except SessionError:
+                continue
+            uid = session_uid(meta)
+            if uid is not None:
+                owners.setdefault(uid, []).append(sid)
+            api = api_meta(meta)
+            if api is not None:
+                made_by_api.append(sid)
+                if isinstance(api.get("client_ref"), str):
+                    refs.setdefault(api["client_ref"], sid)
+        by_uid = {}
+        for uid, sids in owners.items():
+            if len(sids) == 1:
+                by_uid[uid] = sids[0]
+            else:
+                log.warning("sessions %s share the uid %s: the HTTP API reaches neither", ", ".join(sids), uid)
+        self._index = (stamp, ids, by_uid, made_by_api, refs)
+        return by_uid, made_by_api, refs
+
+    def _has_uid(self, sid: str, uid: str) -> bool:
+        try:
+            return self.exists(sid) and session_uid(self.meta(sid)) == uid
+        except SessionError:
+            return False
+
+    def sid_of_uid(self, uid: Any) -> str | None:
+        """The folder name of the session whose uid is `uid` (32 lowercase hex characters, session_uid), else None:
+        an unknown or malformed uid, a deleted session (its folder number may belong to a new one by now), the
+        legacy main session (no uid). A cached answer is checked against the session.json it names; a uid the index
+        does not know is looked up again when the session folders changed since it was read (_uid_index's
+        `recount`)."""
+        if not isinstance(uid, str) or not _UID.fullmatch(uid):
+            return None
+        sid = self._uid_index()[0].get(uid)
+        if sid is not None and self._has_uid(sid, uid):
+            return sid
+        if sid is None:   # a session.json written since (another process): read again when the folders differ
+            sid = self._uid_index(recount=True)[0].get(uid)
+        else:   # changed behind the index: read it again once
+            self._index = None
+            sid = self._uid_index()[0].get(uid)
+        return sid if sid is not None and self._has_uid(sid, uid) else None
+
+    def api_sids(self) -> list[str]:
+        """The folder names of the sessions created through the HTTP API v1 (session.json "via": "api"), by name,
+        read from session.json alone (no summary): the sessions an API-token caller may see. The index is read again
+        when the session folders changed since it was read. One deleted meanwhile by another process may still be
+        named; its summary then says it is unknown (404)."""
+        return list(self._uid_index(recount=True)[1])
+
+    def sid_of_client_ref(self, ref: Any) -> str | None:
+        """The folder name of the v1 session created with client_ref `ref` (docs/SPEC.md §21.4), else None, from the
+        index (_uid_index, read again when the session folders changed since: no session.json read per session at
+        each create), its answer checked against the session.json it names and read again once when that changed
+        behind it. A client_ref never changes after the create."""
+        if not isinstance(ref, str):
+            return None
+        sid = self._uid_index(recount=True)[2].get(ref)
+        if sid is None or self._has_client_ref(sid, ref):
+            return sid
+        self._index = None
+        sid = self._uid_index()[2].get(ref)
+        return sid if sid is not None and self._has_client_ref(sid, ref) else None
+
+    def _has_client_ref(self, sid: str, ref: str) -> bool:
+        try:
+            api = api_meta(self.meta(sid)) if self.exists(sid) else None
+        except SessionError:
+            return False
+        return api is not None and api.get("client_ref") == ref
 
     def earlier_version(self, sid: str) -> bool:
         """The session is not loaded and its database was made by an earlier version of DreamTeam (§17.2): this one
@@ -1571,6 +2336,40 @@ class SessionManager:
         """409 with the message when the session was made by an earlier version: it is not opened or changed."""
         if self.earlier_version(sid):
             raise SessionError(self.earlier_version_text(sid), 409, earlier_version=True)
+
+    def journal(self, sid: str, after: int, limit: int, types: tuple[str, ...] | None = None, *,
+                recipient: str | None = None) -> tuple[list[dict[str, Any]], int, bool]:
+        """One page of the session's journal (events.read_page: (events, last, more); docs/SPEC.md §21.6 "Polling").
+        A loaded session's, or one being unloaded until its database is closed (reading), through its own connection,
+        under its Database's lock (never the session's lock, which a start, a stop or a folder move holds for long);
+        any other's from its file, read-only, opened and closed for this read (db.reading_file), never through load(),
+        which would build and keep a whole Swarm; from the file also when an unload closed the connection meanwhile
+        (sqlite3.ProgrammingError). The rows' data is decoded after the Database's lock is released (the event loop
+        takes it too). A session without a database has no events (head 0). A file that cannot be read is SessionError
+        503 (JOURNAL_TEXT, the cause logged), never an empty page, which would say "nothing more" to a client that has
+        missed events. Blocking: call it in a thread."""
+        swarm = self.reading(sid)
+        page = None
+        if swarm is not None:
+            try:
+                with swarm.db._lock:
+                    page = read_page(swarm.db.conn, after, limit, types, recipient=recipient, decode=False)
+            except sqlite3.ProgrammingError as exc:   # (unloaded meanwhile: its connection is closed)
+                log.debug("session %s was unloaded while its journal was read (%s): read from its file", sid, exc)
+        if page is None:
+            path = self._data_dir(sid) / "swarm.db"
+            if not path.is_file():
+                return [], 0, False
+            try:
+                with reading_file(path, timeout=2.0) as (conn, _immutable):
+                    page = read_page(conn, after, limit, types, recipient=recipient, decode=False)
+            except (sqlite3.Error, OSError) as exc:
+                log.info("cannot read the journal of session %s: %s", sid, exc)
+                raise SessionError(JOURNAL_TEXT, 503) from None
+        events, last, more = page
+        for event in events:
+            event["data"] = event_data(event["data"])
+        return events, last, more
 
     # ---- skills (docs/SPEC.md §19) -------------------------------------------------------------
     def _data_dir(self, sid: str) -> Path:
@@ -1804,7 +2603,10 @@ class SessionManager:
                      overrides: dict[str, Any] | None = None, start: bool = True, actor: str = USER,
                      workspace: str | os.PathLike | None = None, skills: list[str] | None = None,
                      via: str = "home", auto_reply: bool = False, copy_from: str | os.PathLike | None = None,
-                     copy_from_upload: str | None = None) -> dict[str, Any]:
+                     copy_from_upload: str | None = None, api: dict[str, Any] | None = None,
+                     sources: list[Source] | None = None, mark: object | None = None,
+                     within: Path | None = None,
+                     folder_threads: Callable[..., Awaitable[asyncio.Future[Any]]] | None = None) -> dict[str, Any]:
         """Create a session (and start it with the goal unless start=False). Returns its summary.
         `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
         an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
@@ -1818,12 +2620,39 @@ class SessionManager:
         before anything else is created (docs/SPEC.md §17.2 "Copying files into a new session"); `copy_from_upload`:
         the token of a zip uploaded with POST /api/uploads instead, claimed before anything else: a create that
         names it uses it up, whether it succeeds or not. Not both. With `workspace`, that folder must be
-        empty or missing. The summary then has "copy_result" (copyfrom.copy_into's result)."""
+        empty or missing. The summary then has "copy_result" (copyfrom.copy_into's result).
+        `sources`: the HTTP API v1's files instead (docs/SPEC.md §21.4), already claimed by the caller, which also
+        settles the claims (copyfrom.Uploads.settle): copied together by copyfrom.copy_sources (its result is the
+        "copy_result"); not with copy_from or copy_from_upload. A CopyError keeps its code (`bad_name`,
+        `file_conflict`) in the SessionError. `folder_threads`: with `sources`, where their copy runs instead of the
+        loop's default executor (_in_thread's `threads`): v1 passes its folder threads when a server folder is among
+        them (docs/SPEC.md §21.1 "Threads"), so a share that stops answering in the middle of the copy holds none of
+        the threads the rest of the hub shares. A cancel, the hub's shutdown among them, still waits for the copy to
+        end (_in_thread), so the hub's exit waits for it as long as it lasts.
+        `api`: the session is the HTTP API v1's: session.json gets "via": "api" and the "api" block (the keys of
+        API_GIVEN: answers, stop_when_done, client_ref, request_digest, folder; the others null) in its first write,
+        before any start (see _start_locked for what every start does with it).
+        With `start`, the session is `starting` (mark_starting) from its first write of session.json (which lists it)
+        until its start ends. `mark`: a start mark of the caller's (any object): the new session is `starting` with it
+        from its first write of session.json, and with start=False the caller starts it later (in the background:
+        v1's create, docs/SPEC.md §21.4) with `start(sid, marked=mark)`, so nobody sees it final in between; a create
+        that fails after the mark takes it away. The session's lock is held from that first write until the session
+        is made (its skills committed, its folder set), so a stop, a start, a folder change or a delete asked
+        meanwhile waits for the create (a stop or a delete then takes the mark away: the start starts nothing).
+        `within`: with `workspace`, the resolved root of the HTTP API v1's server folder it lies in (docs/SPEC.md
+        §21.10 `in_place`): every check of the folder on the create's way (_plan, the last one under the home's
+        workspace claims just before the missing folders are made) finds it inside that root again, by text and by
+        file identity, or refuses the create (403 `forbidden_folder`)."""
         # the goal split as set_goal splits it: its first line also names the session (cut at a word)
         goal_title, goal_description = split_goal(_text(goal), _text(description))
         title = (_one_line(title) or shorten_title(goal_title, 60) or "Session")[:TITLE_LIMIT].strip()
         self._refresh_settings()
-        copying = copy_from is not None or copy_from_upload is not None
+        if sources is not None and (copy_from is not None or copy_from_upload is not None):
+            # before an upload is claimed: nothing is used up for a call that can never work
+            raise SessionError("Give sources, copy_from or copy_from_upload, not more than one.")
+        api_block = _new_api_block(api) if api is not None else None
+        sources = list(sources) if sources else None
+        copying = copy_from is not None or copy_from_upload is not None or sources is not None
         source: Source | None = None
         prepared: list[_SkillItem] = []
         staging: Path | None = None
@@ -1842,7 +2671,7 @@ class SessionManager:
                         raise SessionError(str(exc), exc.status) from None
             if copy_from is not None and copy_from_upload is not None:
                 raise SessionError("Give copy_from or copy_from_upload, not both.")
-            overrides = self._validated_overrides(overrides)
+            overrides = self.validated_overrides(overrides)
             if copy_from is not None:   # the source is refused early, before any work
                 text = os.fspath(copy_from) if isinstance(copy_from, os.PathLike) else copy_from
                 try:
@@ -1853,7 +2682,7 @@ class SessionManager:
             if workspace is not None:  # checked before anything is created
                 new = validate(self.sessions_dir / "new", self._merged(self.raw, overrides))
                 plan = await asyncio.to_thread(self._plan, None, workspace, git_on=new.workspace.git,
-                                               network_off=netoff.is_off(new), copying=copying)
+                                               network_off=netoff.is_off(new), copying=copying, within=within)
                 if source is not None and copy_from is not None:
                     try:
                         check_target(source, plan.target)
@@ -1870,7 +2699,7 @@ class SessionManager:
                                                    Path(workspace) if workspace is not None else None)
             if copying:
                 try:
-                    if source is None:   # (resolved or claimed above)
+                    if source is None and sources is None:   # (resolved or claimed above)
                         raise SessionError("Nothing to copy.", 500)
                     self.sessions_dir.mkdir(parents=True, exist_ok=True)
                     await asyncio.to_thread(self.clean_copy_leftovers)
@@ -1881,14 +2710,18 @@ class SessionManager:
                         if cancel.is_set():
                             raise CopyCancelled()
 
-                    copied = await _in_thread(copy_into, source, staging, CopyLimits.from_config(self.config), check,
-                                              on_cancel=cancel.set)
+                    limits = CopyLimits.from_config(self.config)
+                    if sources is not None:
+                        copied = await _in_thread(copy_sources, sources, staging, limits, check, on_cancel=cancel.set,
+                                                  threads=folder_threads)
+                    else:
+                        copied = await _in_thread(copy_into, source, staging, limits, check, on_cancel=cancel.set)
                 except CopyError as exc:
-                    raise SessionError(str(exc), exc.status) from None
+                    raise SessionError(str(exc), exc.status, code=exc.code) from None
             summary = await self._create(title, goal_title, goal_description, overrides, start, actor, workspace,
                                          prepared, via, auto_reply=auto_reply,
                                          copied=(staging, copied) if staging is not None and copied is not None
-                                         else None)
+                                         else None, api=api_block, mark=mark, within=within)
         finally:
             if reserved is not None:
                 self._creating_in.discard(reserved)
@@ -1910,6 +2743,7 @@ class SessionManager:
         processes that no longer run (the launcher calls it at its start and hourly, create before a copy). Best
         effort; blocking."""
         self.uploads.clean()
+        self.api_uploads.clean()
         self._clean_copies()
 
     def _clean_copies(self) -> None:
@@ -1933,7 +2767,9 @@ class SessionManager:
     async def _create(self, title: str, goal_title: str, goal_description: str, overrides: dict[str, Any],
                       start: bool, actor: str, workspace: str | os.PathLike | None, prepared: list[_SkillItem],
                       via: str, *, auto_reply: bool = False,
-                      copied: tuple[Path, dict[str, Any]] | None = None) -> dict[str, Any]:
+                      copied: tuple[Path, dict[str, Any]] | None = None,
+                      api: dict[str, Any] | None = None, mark: object | None = None,
+                      within: Path | None = None) -> dict[str, Any]:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         for _attempt in range(100):  # another process (a second launcher, the CLI) may take the same id
             sid = self._new_id(title)
@@ -1964,32 +2800,45 @@ class SessionManager:
         if copied is not None:   # for the user (the session card, the TUI); the agents are never told the source
             r = copied[1]
             meta["copied_from"] = {"source": r["source"], "files": r["files"], "bytes": r["bytes"], "at": time.time()}
-        self._write_meta(sid, meta)
-        if prepared:  # before the folder: a failure leaves nothing in it; the members find them at the first start
-            try:
-                await asyncio.to_thread(self._commit_skills, self.config, prepared, self._data_dir(sid), via=via)
-            except BaseException:
-                await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
-                raise
+        if api is not None:   # in this first write: any later one could race a start (docs/SPEC.md §21.4)
+            meta["via"] = API_VIA
+            meta["api"] = copy.deepcopy(api)
+        # `starting` from the first write of session.json, which lists the session, until its first start: it is never
+        # seen final before; and the session's lock is held until it is made (its skills, its folder), so a stop, a
+        # start, a folder change or a delete asked meanwhile waits for it and never meets it half made
+        token = self.mark_starting(sid, mark) if start or mark is not None else None
         result = None
-        if workspace is not None:
-            try:
-                # with a copy, the folder must still be new or empty: the copied files move there
-                result = await self._set_workspace(sid, workspace, creating=True,
-                                                   expect="moved" if copied is not None else None)
-            except BaseException:
-                await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
-                raise
-            if result["mode"] == "moved":
-                result["mode"] = "created"
-            elif result["old_kept"]:  # adopted: the session's own folder was never used
-                with contextlib.suppress(OSError):
-                    self.default_workspace(sid).rmdir()
-                result["old_kept"] = None
-        self._changed(sid, "created")
-        if start:
-            await self.start(sid, auto_reply=auto_reply)
-        summary = self.summary(sid)
+        try:
+            async with self._lock(sid):
+                self._write_meta(sid, meta)
+                try:
+                    if prepared:  # before the folder: a failure leaves nothing in it; the members find them at the
+                        # first start
+                        await asyncio.to_thread(self._commit_skills, self.config, prepared, self._data_dir(sid),
+                                                via=via)
+                    if workspace is not None:
+                        # with a copy, the folder must still be new or empty: the copied files move there
+                        result = await self._set_workspace_locked(
+                            sid, workspace, creating=True, expect="moved" if copied is not None else None,
+                            within=within)
+                except BaseException:
+                    await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
+                    raise
+            if result is not None:
+                if result["mode"] == "moved":
+                    result["mode"] = "created"
+                elif result["old_kept"]:  # adopted: the session's own folder was never used
+                    with contextlib.suppress(OSError):
+                        self.default_workspace(sid).rmdir()
+                    result["old_kept"] = None
+            self._changed(sid, "created")
+            if start:
+                await self.start(sid, auto_reply=auto_reply, marked=token)
+            summary = self.summary(sid)
+        except BaseException:
+            if token is not None:   # (a start that ended took it away already)
+                self.unmark_starting(sid, token)
+            raise
         if result is not None:
             summary["workspace_result"] = result
         if copied is not None:
@@ -2027,6 +2876,8 @@ class SessionManager:
         swarm.session_pending_goal = pending_goal(meta)
         if self.hub_url:
             swarm.hub_url = f"{self.hub_url}/s/{sid}/mcp"
+        # every journaled event of this Swarm wakes the session's waiters (watch); live-only ones (id None) do not
+        swarm.bus.listen(lambda event: self._poke(sid) if event.get("id") is not None else None)
         self.swarms[sid] = swarm
         return swarm
 
@@ -2040,48 +2891,226 @@ class SessionManager:
             return self._load_locked(sid)
 
     async def start(self, sid: str, *, skills: list[str] | None = None, via: str = "home",
-                    auto_reply: bool = False) -> "Swarm":
+                    auto_reply: bool = False, marked: object | None = None,
+                    then: Callable[["Swarm"], None] | None = None) -> "Swarm | None":
         """Start the session (a no-op when it runs). `skills`: references or sources, as `create` takes them,
         attached first: live to a running session, written into a stopped one before it starts (`via`: the surface,
         recorded in the library for a source). SessionError before anything changes when one of them cannot be.
-        `auto_reply`: as `create` takes it (see _start_locked)."""
-        self._check(sid)
-        async with self._lock(sid):
-            written: list[str] = []
-            if skills:
-                written = await self._skills_at_start(sid, self._load_locked(sid), skills, via)
-            swarm = await self._start_locked(sid, auto_reply=auto_reply)
-            if written:
-                swarm.skills.attached_again(written)
-        self._changed(sid, "started")
-        return swarm
+        `auto_reply`: as `create` takes it (see _start_locked).
+        `marked`: the mark of the start mark_starting announced. It starts nothing (None) when a stop or a delete
+        took the mark away meanwhile, which is checked again under the session's lock (as resume() does): a delete, or
+        a stop asked after the mark was placed, that held the lock while this call waited is never undone (a stop
+        asked before leaves the mark alone: _stop). This mark (and no other) goes when this call ends,
+        whatever its outcome.
+        `then`: called with the running Swarm once the start succeeded (also when the session ran already), still
+        under the session's lock, so nothing that waits for the lock (a stop, the stop of stop_when_done) comes
+        between the start and it: the HTTP API v1's `continue` delivers its text there (docs/SPEC.md §21.2). It is
+        synchronous and should not raise; an error it raises is logged, and the start stands."""
+        try:
+            if marked is not None and not self._marked(sid, marked):
+                return None
+            self._check(sid)
+            async with self._lock(sid):
+                if marked is not None and (not self._marked(sid, marked) or not self.exists(sid)):
+                    return None
+                written: list[str] = []
+                if skills:
+                    written = await self._skills_at_start(sid, self._load_locked(sid), skills, via)
+                swarm = await self._start_locked(sid, auto_reply=auto_reply)
+                if written:
+                    swarm.skills.attached_again(written)
+                if then is not None:
+                    try:
+                        then(swarm)
+                    except Exception:
+                        log.exception("session %s: the step after its start failed", sid)
+            self._changed(sid, "started")
+            return swarm
+        finally:
+            if marked is not None:
+                self.unmark_starting(sid, marked)
 
-    async def _start_locked(self, sid: str, auto_reply: bool = False) -> "Swarm":
+    def _api_write(self, sid: str, **changes: Any) -> None:
+        """Set keys of the "api" block of a v1 session's session.json (read-modify-write; the caller holds the
+        session's lock); nothing for any other session. An error is logged, never raised: the operation that
+        records it goes on (a session.json that cannot be read: its summary says why)."""
+        try:
+            meta = self.meta(sid)
+        except SessionError:
+            return
+        block = api_meta(meta, create=True)
+        if block is None:
+            return
+        block.update(changes)
+        try:
+            self._write_meta(sid, meta)
+        except Exception:
+            log.exception("could not record %s in session %s", ", ".join(changes), sid)
+
+    def _public_text(self, sid: str | None, text: str, *, named: Iterable[tuple[Path, str]] = ()) -> str:
+        """An error of the session's start for a reader outside the hub (api.start_error, the error of
+        `session.stopped`): eventtext.without_abs_paths with the folders of this computer such an error names, which
+        it names unquoted, spaces included ("does not exist: <path>. Bring it back"), and without_abs_paths alone
+        would cut at their first space. Each is replaced by a name: the user's home by "~", also at the start of a
+        path below it (without_abs_paths then names that path by its last component); the session's workspace, the
+        two folders of a workspace move that did not finish, the session's own folder and the home by their last
+        component, also at the start of a path below them (what lies there stays, relative); every folder above
+        those only where the text names that very folder (a path below one may be anyone's). A path in another
+        session's folder (below the home's `sessions`, the session's own aside) is OTHER_SESSION whole: a session's
+        folder name is its title. Each also resolved. Best effort: what cannot be read is left out. `sid` None: an
+        error of no session (the external API's), with the user's home and the home alone. `named`: (absolute folder,
+        name) pairs of the caller's, taken before all of these and named the same way (the external API's roots of
+        `[api] folders` by their names, docs/SPEC.md §21.1 "Paths in answers"); they are not resolved here. A session
+        that works in a server folder in place (api.folder) has its folder named `<root>/<path>` (§21.10 "Answers"),
+        before the generic names."""
+        kept: dict[str, tuple[Path, str]] = {}
+        exact: dict[str, tuple[Path, str]] = {}
+        hidden: dict[str, tuple[Path, str]] = {}
+
+        def add(into: dict[str, tuple[Path, str]], path: Path, name: str) -> None:
+            key = os.path.normcase(str(path))
+            if path.is_absolute() and path.name and key not in kept:
+                into.setdefault(key, (path, name))
+
+        def variants(path: Path) -> list[Path]:
+            found = [path]
+            with contextlib.suppress(OSError, RuntimeError):
+                found.append(path.resolve())
+            return found
+
+        for path, name in named:
+            add(kept, Path(path), name)
+        if sid is not None:   # a server folder the session works in in place: `<root>/<path>` (docs/SPEC.md §21.10)
+            with contextlib.suppress(SessionError, OSError, ValueError, TypeError):
+                folder = apifolders.in_place_folder((api_meta(self.meta(sid)) or {}).get("folder"))
+                if folder is not None:
+                    for path in variants(Path(self.workspace_of(sid)["path"])):   # (below the root: the hub's
+                        add(kept, path, apifolders.shown(folder["root"], folder["path"], os.sep))   # separator)
+        with contextlib.suppress(RuntimeError, KeyError, OSError):
+            for path in variants(Path.home()):
+                add(kept, path, "~")
+        bases = [self.home] if sid is None else [self.dir_of(sid), self.home]
+        if sid is not None:
+            with contextlib.suppress(SessionError, OSError, ValueError, TypeError):
+                bases.insert(0, Path(self.workspace_of(sid)["path"]))
+            with contextlib.suppress(OSError, ValueError):
+                moving = json.loads(self._journal(sid).read_text(encoding="utf-8"))
+                if isinstance(moving, dict):
+                    bases += [Path(moving[key]) for key in ("from", "to") if isinstance(moving.get(key), str)]
+        found = [path for base in bases for path in variants(base)]
+        for path in found:
+            add(kept, path, path.name)
+        for path in found:
+            for folder in path.parents:
+                add(exact, folder, folder.name)
+        for path in variants(self.sessions_dir):   # (the session's own folder is longer: it is named first)
+            add(exact, path, path.name)
+            add(hidden, path, self.OTHER_SESSION)
+        return without_abs_paths(text, list(kept.values()), exact=list(exact.values()), hidden=list(hidden.values()))
+
+    def _public_text_in_home(self, sid: str | None) -> bool:
+        """Whether _public_text(sid, ...) looks at no folder outside the home (the user's home aside): no session, one
+        whose session.json cannot be read, or one that works in its own folder or another folder of the home
+        ("in_home"), with no workspace move left halfway (its journal names folders anywhere). Otherwise it resolves
+        the session's folder outside the home (an in-place server folder of the HTTP API v1, a folder the owner chose),
+        maybe on a share that does not answer. Blocking: the journal's presence and session.json, both in the home."""
+        if sid is None:
+            return True
+        if os.path.lexists(self._journal(sid)):
+            return False
+        try:
+            workspace = self.meta(sid).get("workspace")
+        except SessionError:
+            return True
+        return not isinstance(workspace, dict) or _home_relative(workspace) is not None
+
+    def _start_failed(self, sid: str, exc: BaseException) -> None:
+        """A v1 session's start failed: `api.start_error` {code, text} (the text through _public_text, as in the
+        journal) and `api.finished_at` (docs/SPEC.md §21.4)."""
+        text = str(exc) if isinstance(exc, SessionError) else f"{type(exc).__name__}: {exc}"
+        self._api_write(sid, start_error={"code": _error_code(exc), "text": self._public_text(sid, text)},
+                        finished_at=time.time())
+
+    async def _start_locked(self, sid: str, auto_reply: bool = False, *, resumed: bool = False) -> "Swarm":
         """Start the session (if it is not running). The caller holds the session's lock. `auto_reply`: a
         `dreamteam -p` client with automatic replies asks for it, so the swarm's auto-reply lease holds before its
         start (also of a running session): no question pauses it, and its goal gets the classic planning task
-        (Swarm.clarifying; docs/SPEC.md §3 "Clarify mode")."""
+        (Swarm.clarifying; docs/SPEC.md §3 "Clarify mode"). `resumed`: resume() starts it as the hub starts.
+        The run is journaled (docs/SPEC.md §21.6): `session.started` right before `swarm.start()`, so this run's
+        start events (agent.hired, goal.set...) follow it; a failed `swarm.start()` journals `session.stopped`
+        {reason: "failed", error} before its unload (the session is not in `running` yet: _unload would not), the
+        error with every absolute path named by its last component, the session's folders whole (_public_text; the
+        journal goes to v1 clients and exports; the log has it whole); a start cancelled meanwhile (the hub stops)
+        journals {reason: "shutdown"} (and a v1 session records `api.finished_at`, no start_error). A start refused
+        by the checks before `swarm.start()` journals nothing: the release of the lock wakes the waiters.
+        A session of the HTTP API v1 (api_meta, docs/SPEC.md §21.4), on every start path: with `answers: "auto"` the
+        swarm's auto-reply lease is held for its whole run (Swarm.hold_auto_reply) before `swarm.start()`, which may
+        set a goal from the settings; its first start records `api.started_at` and `api.base_commit` (HEAD at the end
+        of Workspace.init: the first commit of its files, no agent's); a start that succeeds clears
+        `api.start_error` and `api.finished_at`; one that fails (the session cannot be loaded, the checks before
+        `swarm.start()` refuse it, or `swarm.start()` raises) writes `api.start_error` {code, text} and
+        `api.finished_at` before it raises, and before `session.stopped` is journaled. Once it runs (its pending goal
+        set), the hub's automatic answers start with `answers: "auto"` (autoreply.SessionAutoReply), and the
+        stop_when_done watcher with `stop_when_done` (_watch_end, from the journal's head before `session.started`:
+        this run's events only, but on a resume the state it was stopped in), until _unload stops them. Its last write
+        of session.json (the resume mark, and the `api` block above) is logged when it fails, never raised: the
+        session runs by then."""
         # loaded under the lock: a swarm fetched before waiting could have been unloaded meanwhile
-        swarm = self._load_locked(sid)
+        try:
+            swarm = self._load_locked(sid)
+        except SessionError as exc:   # (a session made by an earlier version is never written to; a gone one is gone)
+            if exc.status != 404 and not exc.extra.get("earlier_version"):
+                self._start_failed(sid, exc)
+            raise
+        api = api_meta(self.meta(sid)) if sid != LEGACY_ID else None
         if auto_reply:
             swarm.auto_reply_seen()
+        if api is not None and api_answers(api) == "auto":
+            swarm.hold_auto_reply()
         if sid not in self.running:
-            if sid != LEGACY_ID:
-                self._check_workspace_ready(sid, self.meta(sid))
-                cfg = swarm.config  # what this start will use (the loaded swarm got any new settings)
-                if cfg.workspace_adopted and cfg.workspace.git:
-                    servers = [r["name"] for r in swarm.db.all("SELECT name FROM mcp_servers WHERE origin != 'config'")]
-                    await asyncio.to_thread(self._check_adopted_repo, sid, cfg.workspace_dir, servers,
-                                            netoff.is_off(cfg))
+            first = api is not None and api.get("started_at") is None
             try:
+                if sid != LEGACY_ID:
+                    server_folder = apifolders.in_place_folder((api or {}).get("folder")) is not None
+                    if server_folder:   # `[api] folders` as the owner left it (_check_server_folder), read on the loop
+                        self._refresh_settings()
+                    # in a thread: a folder on a share that does not answer never stalls the hub
+                    await asyncio.to_thread(self._check_workspace_ready, sid, self.meta(sid))
+                    cfg = swarm.config  # what this start will use (the loaded swarm got any new settings)
+                    if cfg.workspace.git and server_folder:
+                        await asyncio.to_thread(self._check_server_git, sid, cfg.workspace_dir, netoff.is_off(cfg))
+                    if cfg.workspace_adopted and cfg.workspace.git:
+                        servers = [r["name"] for r in
+                                   swarm.db.all("SELECT name FROM mcp_servers WHERE origin != 'config'")]
+                        await asyncio.to_thread(self._check_adopted_repo, sid, cfg.workspace_dir, servers,
+                                                netoff.is_off(cfg))
+            except Exception as exc:
+                if api is not None:
+                    self._start_failed(sid, exc)
+                raise
+            swarm.workspace.record_head = first   # (base_commit: HEAD once Workspace.init made the first commit)
+            try:
+                head = journal_head(swarm)   # (stop_when_done counts this run's events: those after it)
+                swarm.bus.emit("session.started", None)
                 await swarm.start()
-            except Exception:
+            except Exception as exc:
                 log.exception("session %s failed to start", sid)
                 try:
                     await swarm.stop()  # whatever started before the failure
                 except Exception:
                     log.exception("cleanup after the failed start of %s", sid)
+                error = str(exc) if isinstance(exc, SessionError) else f"{type(exc).__name__}: {exc}"
+                if api is not None:   # (before the journal: a reader of session.stopped finds the error recorded)
+                    self._start_failed(sid, exc)
+                self._journal_stopped(sid, swarm, "failed", error=self._public_text(sid, error))
                 await self._unload(sid)
+                raise
+            except asyncio.CancelledError:  # the hub stops while the swarm starts (Ctrl+C during resume()): the run
+                # ends here, and shutdown()'s unload of a session that is not running journals nothing (nor records
+                # finished_at; no start_error: the start did not fail)
+                if api is not None:
+                    self._api_write(sid, finished_at=time.time())
+                self._journal_stopped(sid, swarm, "shutdown")
                 raise
             self.running.add(sid)
             meta = self.meta(sid)
@@ -2100,6 +3129,8 @@ class SessionManager:
                     log.exception("could not set the goal of session %s", sid)
             else:
                 meta.pop("pending_goal", None)
+            if api is not None:
+                self._start_run_watch(sid, swarm, api, after=head, resumed=resumed)
             notice = meta.pop("workspace_notice", None)
             if isinstance(notice, dict) and notice.get("key") in ("n_workspace_moved", "n_workspace_changed"):
                 try:  # news for the agents' next wake-up, not a reason to wake everybody; an external member (an
@@ -2110,38 +3141,190 @@ class SessionManager:
                                          path=str(notice.get("path", "")), old=str(notice.get("old", "")))
                 except Exception:
                     log.exception("could not tell the members of session %s about its new folder", sid)
-            self._write_meta(sid, meta)
+            block = api_meta(meta, create=True)
+            if block is not None:   # (one write with the rest: the session's lock is held)
+                if first:
+                    block["started_at"] = time.time()
+                    block["base_commit"] = swarm.workspace.head_at_init
+                block["start_error"] = None
+                block["finished_at"] = None   # running: no longer final
+            try:   # (the swarm runs: a write that fails is no failed start, which would leave it running unseen)
+                self._write_meta(sid, meta)
+            except OSError:
+                log.exception("session %s runs, but its session.json could not be written: its resume mark and "
+                              "the record of this start are missing", sid)
             swarm.session_pending_goal = pending_goal(meta)
         return swarm
 
-    async def stop(self, sid: str, *, remember: bool = False) -> None:
+    async def stop(self, sid: str, *, remember: bool = False, reason: str = "user", uid: str | None = None) -> None:
         """Stop the session's agents and unload it. remember=True keeps it marked for resume() (used at
-        server shutdown); an explicit stop clears the mark. A session made by an earlier version is refused (409):
-        it is never running, and its mark stays."""
+        server shutdown); an explicit stop clears the mark, and resume() no longer starts it. A session made by an
+        earlier version is refused (409): it is never running, and its mark stays. `reason`: the `session.stopped`
+        reason journaled when it was running (STOP_REQUEST_REASONS: "user" for a stop from any surface; "done" and
+        "budget" for stop_when_done); another one is a ValueError (the others are the manager's own). A start announced
+        before this call (mark_starting, resume_pending) that has not taken the lock yet then starts nothing; one
+        announced after it (a v1 `continue` sent after the stop) keeps its mark and starts the session again once
+        this stop is over: the requests keep their order, whenever the stop takes the lock. `uid`: the session's uid
+        as the caller resolved it, checked again once the lock is taken (_check: 404 when the folder name holds another
+        session by then, which is left alone)."""
+        if reason not in STOP_REQUEST_REASONS:
+            raise ValueError(f"unknown stop reason {reason!r}")
+        await self._stop(sid, remember=remember, reason=reason, uid=uid)
+
+    async def _stop(self, sid: str, *, remember: bool = False, reason: str = "user",
+                    still: Callable[[], bool] | None = None, uid: str | None = None) -> bool:
+        """stop(), and, with `still`, only when `still()` holds under the session's lock (stop_when_done: the session
+        still runs the same swarm, and its goal is still completed or its budget pause still holds); False when it did
+        nothing then. Such an automatic stop ends the run it watched and nothing more: a start announced meanwhile
+        (mark_starting, resume_pending; e.g. a `continue` waiting for the lock) keeps its mark and starts the session
+        again."""
         self._check(sid)
         self._refuse_earlier(sid)
+        earlier = set(self._marks.get(sid, ()))   # (read before any await: the starts this stop was asked after)
         async with self._lock(sid):
+            if uid is not None:
+                self._check(sid, uid)   # (another session under the name by now: nothing of it is touched)
+            if still is not None and not still():
+                return False
             try:
-                await self._unload(sid)
+                await self._unload(sid, reason)
             finally:
-                if not remember and self.exists(sid):
-                    meta = self.meta(sid)
-                    meta["autostart"] = False
-                    self._write_meta(sid, meta)
+                if not remember:
+                    if still is None:
+                        self.resume_pending.discard(sid)
+                        self._drop_marks(sid, earlier)
+                    if self.exists(sid):
+                        meta = self.meta(sid)
+                        meta["autostart"] = False
+                        self._write_meta(sid, meta)
             self._check(sid)  # deleted while this call waited for the lock
         self._changed(sid, "stopped")
+        return True
 
-    async def _unload(self, sid: str) -> None:
-        swarm = self.swarms.pop(sid, None)
+    # ---- what runs beside a v1 session (docs/SPEC.md §21.4 stop_when_done, §21.5 answers: "auto") -------------------
+    def _start_run_watch(self, sid: str, swarm: "Swarm", api: dict[str, Any], *, after: int, resumed: bool) -> None:
+        """A v1 session just started (_start_locked, the session's lock held): the hub's automatic answers when its
+        `answers` is "auto", and the stop_when_done watcher when its `stop_when_done` is true (the default), which
+        reads the journal from `after` (the head before `session.started`). An error is logged: the session runs."""
+        watch = _RunWatch(swarm)
+        if api_answers(api) == "auto":
+            try:   # (from `after` too: a member's messages while swarm.start() ran are answered each)
+                watch.auto_reply = SessionAutoReply(swarm)
+                watch.auto_reply.start(after=after)
+            except Exception:
+                log.exception("could not start the automatic answers of session %s", sid)
+        if api.get("stop_when_done", API_GIVEN["stop_when_done"]) is True:
+            watch.watcher = asyncio.create_task(self._watch_end(sid, swarm, after, resumed),
+                                                name=f"stop-when-done-{sid}")
+        if watch.auto_reply is not None or watch.watcher is not None:
+            self._run_watch[sid] = watch
+
+    @staticmethod
+    def _ended(swarm: "Swarm") -> list[str]:
+        """Why a stop_when_done session's job is over now: "done" (its goal is completed), "budget" (the budget paused
+        it); [] while it is not."""
+        reasons = []
+        if (swarm.goal() or {}).get("status") == "done":
+            reasons.append("done")
+        if swarm.paused and swarm.pause_reason == "budget":
+            reasons.append("budget")
+        return reasons
+
+    async def _watch_end(self, sid: str, swarm: "Swarm", after: int, resumed: bool) -> None:
+        """stop_when_done (docs/SPEC.md §21.4): the session is stopped when its goal is completed (`goal.completed`:
+        "done") or the budget pauses it (`swarm.paused` {budget}: "budget"), read from the journal by id after `after`,
+        woken by the bus (autoreply.follow_journal: never the bus's queue, which drops events when it is full). On a
+        resume as the hub starts, a session that is already so is stopped at once: the hub may have stopped between
+        that event and its stop. It never awaits a stop (_unload cancels this task): _stop_soon schedules it, and it
+        goes on watching in case that stop finds the job not over after all (a goal reopened meanwhile)."""
+        if resumed:
+            for reason in self._ended(swarm)[:1]:
+                self._stop_soon(sid, swarm, reason)
+        async with contextlib.aclosing(follow_journal(swarm, after, ("goal.completed", "swarm.paused"))) as events:
+            async for event in events:
+                if event["type"] == "goal.completed":
+                    self._stop_soon(sid, swarm, "done")
+                elif event["data"].get("reason") == "budget":
+                    self._stop_soon(sid, swarm, "budget")
+
+    def _stop_soon(self, sid: str, swarm: "Swarm", reason: str) -> None:
+        """Schedule the stop of a stop_when_done session's run (a task the manager keeps; shutdown() waits for it).
+        Nothing while shutdown() runs: such a task could outlive it, and the next start's resume check stops the
+        session instead (_watch_end)."""
+        if self._closing:
+            log.info("session %s: its stop (%s) is left to the next start (the hub stops)", sid, reason)
+            return
+        task = asyncio.create_task(self._stop_ended(sid, swarm, reason), name=f"stop-{reason}-{sid}")
+        self._stopping.add(task)
+        task.add_done_callback(self._stopping.discard)
+
+    async def _stop_ended(self, sid: str, swarm: "Swarm", reason: str) -> None:
+        """Stop the run of `swarm` with `reason` ("done" | "budget"), if, under the session's lock, the session still
+        runs that swarm and the reason still holds (a stop, a continue that reopened the goal or a raised budget may
+        have come first). An error is logged."""
+        def still() -> bool:
+            return self.swarms.get(sid) is swarm and sid in self.running and reason in self._ended(swarm)
+
+        try:
+            if await self._stop(sid, reason=reason, still=still):
+                log.info("session %s stopped: %s (stop_when_done)", sid, reason)
+        except SessionError as exc:   # deleted meanwhile
+            log.info("session %s was not stopped (%s): %s", sid, reason, exc)
+        except Exception:
+            log.exception("could not stop session %s (%s)", sid, reason)
+
+    async def _unload(self, sid: str, reason: str | None = None) -> None:
+        """Stop (when it runs) and close the session's Swarm. The caller holds the session's lock. `reason`: a running
+        session journals `session.stopped` {reason} after its agents stopped and before its database closes (an emit
+        after the close raises); None journals nothing (nor does a session that is not running). A running v1
+        session records `api.finished_at` first (docs/SPEC.md §21.4), whatever the reason. What runs beside a v1
+        session's run (_RunWatch: the automatic answers, the stop_when_done watcher) stops first, before its agents.
+        Until its database is closed the Swarm stays in `_unloading` (put there before it leaves `swarms`), so a reader
+        in a thread (reading: the journal, v1's reads) goes on through its connection, which the close waits for, and
+        never opens the file next to an open writer: a reader of the file at that moment would keep the close from
+        folding the -wal file back into it."""
+        swarm = self.swarms.get(sid)
+        if swarm is not None:
+            self._unloading[sid] = swarm
+        self.swarms.pop(sid, None)
         was_running = sid in self.running
         self.running.discard(sid)
+        watch = self._run_watch.pop(sid, None)
         if swarm is None:
             return
         try:
+            if watch is not None:
+                await watch.stop()
             if was_running:
                 await swarm.stop()
         finally:
-            swarm.close()
+            try:
+                if was_running:
+                    self._api_write(sid, finished_at=time.time())
+                    if reason is not None:
+                        self._journal_stopped(sid, swarm, reason)
+            finally:
+                try:
+                    swarm.close()
+                finally:
+                    if self._unloading.get(sid) is swarm:
+                        del self._unloading[sid]
+
+    def reading(self, sid: str) -> "Swarm | None":
+        """The Swarm whose connection a reader of session `sid` in a thread uses (docs/SPEC.md §21.6): the loaded one,
+        or one _unload is stopping whose database is not closed yet; None when the session's file is read (no writer
+        is open). Under its Database's lock; a sqlite3.ProgrammingError means it closed meanwhile: read the file."""
+        swarm = self.swarms.get(sid)
+        return swarm if swarm is not None else self._unloading.get(sid)
+
+    @staticmethod
+    def _journal_stopped(sid: str, swarm: "Swarm", reason: str, **data: Any) -> None:
+        """Journal `session.stopped` {reason, **data} into the session's journal; an error is logged, never raised (the
+        stop goes on)."""
+        try:
+            swarm.bus.emit("session.stopped", None, reason=reason, **data)
+        except Exception:
+            log.exception("could not journal the stop of session %s", sid)
 
     async def unload_idle(self, sid: str) -> None:
         """Drop a loaded but not running session (frees its database connection)."""
@@ -2149,6 +3332,63 @@ class SessionManager:
             async with self._lock(sid):
                 if sid not in self.running:
                     await self._unload(sid)
+
+    async def control(self, sid: str, *, max_cost_usd: float | None = None, max_agents: int | None = None,
+                      wrap_up: bool | None = None, uid: str | None = None) -> dict[str, Any]:
+        """What `swarm_control` does with the limits and wrap-up mode, as the user (the HTTP API v1's PATCH,
+        docs/SPEC.md §21.2), under the session's lock: `Swarm.set_limits` (a `max_cost_usd` that covers what was
+        spent lifts a budget pause), then `wrap_up` / `end_wrap_up`. They write the session database's kv `limits`
+        and `wrap_up`, which the swarm reads at every use: a stopped session is loaded to write them (one that never
+        started gets its database now) and unloaded again afterwards, unless something else had it loaded (on Windows
+        an open database blocks a delete or a folder move). None leaves a value as it is; nothing given changes
+        nothing. Returns the summary.
+        SessionError: 400 for a value of the wrong kind or one the swarm refuses (`max_agents` below 1, a negative
+        cost: nothing is written), and for a number a float cannot hold (a whole number of 400 digits) or a
+        `max_agents` of more than 64 bits, as `[swarm] max_agents` (config); 409 code `conflict` for `wrap_up: true`
+        while the session's first start has its goal still to set (set_goal ends wrap-up mode); 409 for a session
+        made by an earlier version; 404, also when `uid` (the session's uid as the caller resolved it) is given and
+        the folder name holds another session once the lock is taken (_check)."""
+        for name, value in (("max_cost_usd", max_cost_usd), ("max_agents", max_agents)):
+            if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
+                                      or not _finite(value)):
+                raise SessionError(f"'{name}' must be a number.")
+        if max_agents is not None and not isinstance(max_agents, int):
+            if not float(max_agents).is_integer():
+                raise SessionError("'max_agents' must be a whole number.")
+            max_agents = int(max_agents)
+        if max_agents is not None and max_agents >= INT64_LIMIT:
+            raise SessionError("'max_agents' must be a 64-bit integer.")
+        if wrap_up is not None and not isinstance(wrap_up, bool):
+            raise SessionError("'wrap_up' must be true or false.")
+        self._check(sid)
+        self._refuse_earlier(sid)
+        if max_cost_usd is None and max_agents is None and wrap_up is None:
+            return self.summary(sid)
+        async with self._lock(sid):
+            self._check(sid, uid)  # deleted while this call waited for the lock (and its name taken, with `uid`)
+            loaded = sid in self.swarms
+            if wrap_up is True and pending_goal(self.meta(sid)) is not None:
+                swarm = self.swarms.get(sid)   # (refused before a database is made for it)
+                goal = swarm.goal() if swarm is not None else read_stats(self._data_dir(sid) / "swarm.db")["goal"]
+                if not goal:
+                    raise SessionError(f"Session {sid} has not started yet: its first start sets its goal, which "
+                                       "ends wrap-up mode. Start it first.", 409, code="conflict")
+            swarm = self._load_locked(sid)
+            try:
+                try:
+                    if max_cost_usd is not None or max_agents is not None:
+                        swarm.set_limits(USER, max_cost_usd, max_agents)
+                    if wrap_up is True:
+                        swarm.wrap_up(USER)
+                    elif wrap_up is False:
+                        swarm.end_wrap_up(USER)
+                except ToolError as exc:
+                    raise SessionError(str(exc), 400) from None
+            finally:
+                if not loaded and sid not in self.running:
+                    await self._unload(sid)
+        self._changed(sid, "updated")
+        return self.summary(sid)
 
     def _patched_overrides(self, stored: Any, settings: Any) -> dict[str, Any]:
         """The stored overrides with a partial update applied: {section: {key: value or None}}; None (or "") removes
@@ -2269,70 +3509,86 @@ class SessionManager:
         raise SessionError(f"The folder {plan.target} {what}. Nothing was changed; check the folder and try again "
                            f"(session {sid}).", 409)
 
-    async def _set_workspace(self, sid: str, path: Any, *, creating: bool = False,
-                             expect: str | None = None) -> dict[str, Any]:
-        notify = not creating
+    async def _set_workspace(self, sid: str, path: Any, *, expect: str | None = None) -> dict[str, Any]:
+        """set_workspace's change under the session's lock (_set_workspace_locked); a session that ran again
+        afterwards is announced "started" once the lock is released."""
         async with self._lock(sid):
-            self._check(sid)  # deleted while this call waited for the lock
-            meta = self.meta(sid)
-            self._check_journal(sid, meta)
-            try:
-                cfg = self.config_for(sid)
-            except SessionError:
-                raise
-            except ValueError as exc:
-                raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
-            git_on, network_off = cfg.workspace.git, netoff.is_off(cfg)
-            first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
-                                            network_off=network_off)
-            if first.mode == "unchanged":
-                return {**first.result(), "restarted": False, "start_error": None}
-            if not creating:   # (a create checked its own folder against the others before it copied)
-                self._check_reserved(first.target)
-            self._check_expected(sid, first, expect)
-            was_loaded, was_running = sid in self.swarms, sid in self.running
-            try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now
-                await self._unload(sid)
-            except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
-                log.exception("error stopping session %s before moving its workspace", sid)
-            if was_loaded and notify:
-                self._changed(sid, "stopped")
-            try:
-                async with self._claims:  # no other session takes a folder until this one's session.json names it
-                    plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating,
-                                                                       network_off)
-            except BaseException:
-                if was_running:
-                    with contextlib.suppress(Exception):
-                        await self._start_locked(sid)
-                    if notify and sid in self.running:
-                        self._changed(sid, "started")
-                raise
-            log.info("session %s now works in %s (%s, git %s)", sid, plan.target, plan.mode, git)
-            if notify:
-                self._changed(sid, "updated")
-            result = {**plan.result(git), "old_changed": old_changed, "restarted": False, "start_error": None}
-            if was_running:
-                try:
-                    await self._start_locked(sid)
-                    result["restarted"] = True
-                except Exception as exc:  # the move stands; the session stays stopped and says why
-                    log.exception("session %s did not start again after moving its workspace", sid)
-                    result["start_error"] = str(exc) if isinstance(exc, SessionError) else \
-                        f"{type(exc).__name__}: {exc}"
-        if was_running and result["restarted"] and notify:
+            result = await self._set_workspace_locked(sid, path, expect=expect)
+        if result["restarted"]:
             self._changed(sid, "started")
         return result
 
+    async def _set_workspace_locked(self, sid: str, path: Any, *, creating: bool = False,
+                                    expect: str | None = None, within: Path | None = None) -> dict[str, Any]:
+        """The folder session `sid` works in changed to `path` (set_workspace's rules); the caller holds the session's
+        lock (_set_workspace; _create, from its first write of session.json). `creating`: the create's own folder
+        (no change announced, the reservation checked by the create). Returns the result, "restarted" True when a
+        running session ran again afterwards (the caller announces it)."""
+        notify = not creating
+        self._check(sid)  # deleted while the caller waited for the lock
+        meta = self.meta(sid)
+        self._check_journal(sid, meta)
+        try:
+            cfg = self.config_for(sid)
+        except SessionError:
+            raise
+        except ValueError as exc:
+            raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
+        git_on, network_off = cfg.workspace.git, netoff.is_off(cfg)
+        first = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
+                                        network_off=network_off, within=within)
+        if first.mode == "unchanged":
+            return {**first.result(), "restarted": False, "start_error": None}
+        if not creating:   # (a create checked its own folder against the others before it copied)
+            self._check_reserved(first.target)
+        self._check_expected(sid, first, expect)
+        was_loaded, was_running = sid in self.swarms, sid in self.running
+        try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now (a running
+            # session starts again afterwards, also after a failure: its stop is a restart)
+            await self._unload(sid, "restart")
+        except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
+            log.exception("error stopping session %s before moving its workspace", sid)
+        if was_loaded and notify:
+            self._changed(sid, "stopped")
+        try:
+            async with self._claims:  # no other session takes a folder until this one's session.json names it
+                plan, git, old_changed = await self._change_folder(sid, path, git_on, first, expect, creating,
+                                                                   network_off, within)
+        except BaseException:
+            if was_running:
+                with contextlib.suppress(Exception):
+                    await self._start_locked(sid)
+                if notify and sid in self.running:
+                    self._changed(sid, "started")
+            raise
+        log.info("session %s now works in %s (%s, git %s)", sid, plan.target, plan.mode, git)
+        if notify:
+            self._changed(sid, "updated")
+        result = {**plan.result(git), "old_changed": old_changed, "restarted": False, "start_error": None}
+        if was_running:
+            try:
+                await self._start_locked(sid)
+                result["restarted"] = True
+            except Exception as exc:  # the move stands; the session stays stopped and says why
+                log.exception("session %s did not start again after moving its workspace", sid)
+                result["start_error"] = str(exc) if isinstance(exc, SessionError) else \
+                    f"{type(exc).__name__}: {exc}"
+        return result
+
     async def _change_folder(self, sid: str, path: Any, git_on: bool, first: _Plan, expect: str | None,
-                             creating: bool, network_off: bool = False) -> tuple[_Plan, str, dict[str, Any] | None]:
+                             creating: bool, network_off: bool = False,
+                             within: Path | None = None) -> tuple[_Plan, str, dict[str, Any] | None]:
         """The change itself, with the session unloaded and the home's workspace claims held: the final check, the
         moves, session.json. Returns (plan, git outcome, what changed in the user's folder it left); raises with
-        everything put back (or, when that failed too, an error that says where the files are)."""
+        everything put back (or, when that failed too, an error that says where the files are). `within`: the root
+        of a create's server folder (_plan). A move by the owner (not `creating`) of a session that works in a server
+        folder in place drops its `api.folder` (docs/SPEC.md §21.10 "Starts"): it then works in a folder the owner
+        chose, and the checks of that folder no longer apply."""
         # checked again with nothing running: an agent may have forged a server, the folder may have changed, and
-        # another session may have taken the folder meanwhile (it is in its session.json now)
+        # another session may have taken the folder meanwhile (it is in its session.json now); for a server folder,
+        # the last containment check before the missing folders are made (a link swapped in meanwhile)
         plan = await asyncio.to_thread(self._plan, sid, path, git_on=git_on, mcp=self._forged_servers(sid),
-                                       network_off=network_off)
+                                       network_off=network_off, within=within)
         if plan.mode == "unchanged":
             raise SessionError(f"The folder of session {sid} changed meanwhile; try again.", 409)
         self._check_expected(sid, plan, expect, first)
@@ -2347,6 +3603,9 @@ class SessionManager:
             if not creating:  # the members hear of it at their next wake-up (the next start delivers it)
                 meta["workspace_notice"] = {"key": "n_workspace_moved" if plan.move_all else "n_workspace_changed",
                                             "path": str(plan.target), "old": str(plan.old)}
+                block = api_meta(meta)
+                if block is not None and apifolders.in_place_folder(block.get("folder")) is not None:
+                    block["folder"] = None
             self._write_meta(sid, meta)
         except BaseException as exc:
             problems = await _in_thread(undo.run)
@@ -2377,6 +3636,10 @@ class SessionManager:
 
     def _move_error(self, sid: str, plan: _Plan, exc: Exception, problems: list[str], *,
                     creating: bool = False) -> SessionError:
+        """The error of a workspace change that failed; the code of a SessionError that caused it (a folder another
+        session took meanwhile: `folder_busy`) is kept, unless files could not be put back (500)."""
+        code = exc.code if isinstance(exc, SessionError) else None
+        holder = exc.holder if isinstance(exc, SessionError) else None
         if isinstance(exc, SessionError):
             reason = str(exc)
         elif isinstance(exc, OSError) and exc.strerror:
@@ -2391,7 +3654,7 @@ class SessionManager:
                     "Remove it by hand.", 500)
             return SessionError(f"Could not create the session in {plan.target} ({reason}); the session was not "
                                 "created and the folder is as it was.",
-                                exc.status if isinstance(exc, SessionError) else 500)
+                                exc.status if isinstance(exc, SessionError) else 500, code=code, holder=holder)
         if problems:
             return SessionError(
                 f"Could not change the folder of session {sid} to {plan.target} ({reason}), and some files could "
@@ -2403,17 +3666,22 @@ class SessionManager:
         return SessionError(
             f"Could not change the folder of session {sid} to {plan.target} ({reason})"
             + ("; a file is in use: close the programs that use it and try again" if in_use else "")
-            + f". Nothing was changed: the session still works in {plan.old}.", status)
+            + f". Nothing was changed: the session still works in {plan.old}.", status, code=code,
+            holder=holder)
 
-    async def delete(self, sid: str, *, skills: str | None = None, via: str = "home") -> str | None:
+    async def delete(self, sid: str, *, skills: str | None = None, via: str = "home",
+                     uid: str | None = None) -> str | None:
         """Stop the session and delete its directory (board, messages, workspace, traces). The directory is
-        first renamed away, so a session whose files are in use stays intact (409) instead of being
-        half-deleted. A workspace folder outside the directory (set_workspace) is never deleted: it is the
+        first renamed away, so a session whose files are in use stays intact (409, the system's reason without its
+        paths) instead of being half-deleted; the hub's own readers of its files (add_reader: the HTTP API v1's
+        downloads and archives) are cut first, and none starts while the delete runs. A workspace folder outside the
+        directory (set_workspace) is never deleted: it is the
         user's folder (the skills mirror in it goes). Returns that folder (read under the session's lock, so a
         workspace change that ran just before is taken into account), else None.
         Skills members proposed that wait for the user's library decision are not lost silently: 409
         (`pending_skills`) unless `skills` is "save" (each saved to the library first, `via`; a clash refuses the
-        delete) or "discard"."""
+        delete) or "discard". `uid`: the session's uid as the caller resolved it, checked again once the lock is taken
+        (_check: 404 when the folder name holds another session by then, which is never deleted)."""
         self._check(sid)
         if sid == LEGACY_ID:
             if self.earlier_version(sid):  # its own message names the file to remove by hand
@@ -2423,7 +3691,7 @@ class SessionManager:
         if skills not in (None, "save", "discard"):
             raise SessionError("skills must be \"save\" or \"discard\".")
         async with self._lock(sid):
-            self._check(sid)  # a concurrent delete finished first
+            self._check(sid, uid)  # a concurrent delete finished first (and, with `uid`, another session took the name)
             pending = [s.name for s in self._attached_skills(sid) if s.library == "pending"]
             if pending and skills is None:
                 raise SessionError(f"Session {sid} has skills waiting for your library decision: "
@@ -2431,35 +3699,55 @@ class SessionManager:
                                    "session.", 409, pending_skills=pending)
             if pending and skills == "save":
                 await self._save_pending(sid, pending, via)
+            self.resume_pending.discard(sid)
+            self._drop_marks(sid)   # (a start on its way starts nothing: start(..., marked=...))
+            self._deleting.add(sid)   # (no reader of its files starts while this runs: add_reader)
             try:
-                await self._unload(sid)
-            except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
-                log.exception("error stopping session %s before deleting it", sid)
-            try:
-                workspace = self.workspace_of(sid)
-                kept = None if workspace["default"] else workspace["path"]
-            except SessionError:  # a damaged session.json: it can still be deleted
-                workspace, kept = {}, None
-            if workspace.get("adopted") and workspace.get("exists"):
-                # the user's folder keeps no copy of the session's skills (Swarm.stop removes it too: this covers a
-                # crashed or never-stopped one)
+                # the hub's own readers of its files (the HTTP API v1's downloads and archives) close what they hold
+                # before the rename, at once or when their running step ends (the retries below wait for that)
+                for reader in list(self._readers.get(sid, ())):
+                    reader.cut()
+                try:  # a user's stop: its journal goes away with the session, unless the rename below fails (files
+                    # in use, 409) and the session stays, stopped
+                    await self._unload(sid, "user")
+                except Exception:  # unloaded and closed anyway (_unload closes in `finally`)
+                    log.exception("error stopping session %s before deleting it", sid)
                 try:
-                    await asyncio.to_thread(_drop_mirror, Path(workspace["path"]))
-                except OSError as exc:
-                    log.warning("could not remove the skills mirror in %s: %s", workspace["path"], exc)
-            path = self.dir_of(sid)
-            trash = self.sessions_dir / f"{TRASH_PREFIX}{sid}-{time.time_ns()}"
-            for attempt in range(10):
-                try:
-                    os.rename(path, trash)
-                    break
-                except FileNotFoundError:
-                    raise SessionError(f"Unknown session '{sid}'.", 404) from None
-                except OSError as exc:  # Windows: a file inside is open (an editor, an antivirus scan...)
-                    if attempt == 9:
-                        raise SessionError(f"Could not delete session {sid}: its files are in use ({exc}). Close "
-                                           "the programs that use them and try again.", 409) from None
-                    await asyncio.sleep(0.2)
+                    workspace = self.workspace_of(sid)
+                    kept = None if workspace["default"] else workspace["path"]
+                except SessionError:  # a damaged session.json: it can still be deleted
+                    workspace, kept = {}, None
+                if workspace.get("adopted") and workspace.get("exists"):
+                    # the user's folder keeps no copy of the session's skills (Swarm.stop removes it too: this covers
+                    # a crashed or never-stopped one)
+                    try:
+                        await asyncio.to_thread(_drop_mirror, Path(workspace["path"]))
+                    except OSError as exc:
+                        log.warning("could not remove the skills mirror in %s: %s", workspace["path"], exc)
+                path = self.dir_of(sid)
+                trash = self.sessions_dir / f"{TRASH_PREFIX}{sid}-{time.time_ns()}"
+                for attempt in range(10):
+                    try:
+                        os.rename(path, trash)
+                        break
+                    except FileNotFoundError:
+                        raise SessionError(f"Unknown session '{sid}'.", 404) from None
+                    except OSError as exc:  # Windows: a file inside is open (an editor, an antivirus scan...)
+                        if attempt == 9:
+                            try:  # it stays, stopped as by the user (session.stopped above): a hub start does not
+                                # resume it
+                                meta = self.meta(sid)
+                                meta["autostart"] = False
+                                self._write_meta(sid, meta)
+                            except Exception:
+                                log.exception("could not clear the resume mark of session %s", sid)
+                            log.info("could not delete session %s: %s", sid, exc)
+                            raise SessionError(f"Could not delete session {sid}: its files are in use "
+                                               f"({exc.strerror or exc}). Close the programs that use them and try "
+                                               "again.", 409) from None
+                        await asyncio.sleep(0.2)
+            finally:
+                self._deleting.discard(sid)
         self._changed(sid, "deleted")
         await asyncio.to_thread(self._purge_trash)
         return kept
@@ -2523,11 +3811,16 @@ class SessionManager:
     def _import_meta(self, sid: str, meta: dict[str, Any], workspace: ImportedWorkspace) -> tuple[dict, str | None]:
         """The session.json an imported session gets as `sid`: its overrides checked against this home's settings
         (an `agents.default_model` naming a profile this home does not have is dropped, as update_settings does; the
-        name is returned), never started by itself (autostart false), its workspace entry built for this home."""
+        name is returned), never started by itself (autostart false), its workspace entry built for this home. A
+        session of the HTTP API v1 keeps "via" and its "api" block without what belongs to the other computer
+        (API_IMPORT_DROPS, set to null; docs/SPEC.md §21.9)."""
         self._refresh_settings()
         data = {k: copy.deepcopy(v) for k, v in meta.items() if k not in ("id", "legacy", "workspace_notice")}
         if not isinstance(data.get("uid"), str) or not _UID.fullmatch(data["uid"]):
             raise SessionError(f"Session {sid} has no valid uid to be imported with.")
+        block = api_meta(data)
+        if block is not None and isinstance(data.get("api"), dict):
+            block.update(dict.fromkeys(API_IMPORT_DROPS))
         overrides, dropped = self.import_overrides(data.get("overrides"), self.config.models)
         try:
             self._config_from(self.raw, sid, overrides)
@@ -2682,6 +3975,7 @@ class SessionManager:
             removed, left = await _to_end(self._drop_old_backups, sid, backup)
             warnings += [f"the older backup {path} could not be removed completely: delete it by hand"
                          for path in left]
+        self._index = None   # another session.json: its uid and "via" may differ (sid_of_uid, api_sids)
         self._changed(sid, "updated")
         return {"id": sid, "backup": str(backup), "kept": kept, "removed_backups": removed, "warnings": warnings,
                 "dropped_model": dropped}
@@ -2710,6 +4004,7 @@ class SessionManager:
             if "workspace" in current:
                 data["workspace"] = copy.deepcopy(current["workspace"])
             self._write_meta(sid, data)
+        self._index = None   # another session.json: its uid and "via" may differ (sid_of_uid, api_sids)
         self._changed(sid, "updated")
         return {"id": sid, "dropped_model": dropped}
 
@@ -2887,38 +4182,108 @@ class SessionManager:
         return ((stats.get("goal") or {}).get("status") == "done"
                 and not any(by_status.get(status) for status in Status.OPEN))
 
-    async def resume(self) -> list[str]:
-        """Start the sessions that were running when the server last stopped, except finished ones (finished()):
-        they stay stopped until started by hand; and except sessions made by an earlier version, which keep their
-        mark (one warning each)."""
-        started = []
+    def _resume_plan(self) -> list[str]:
+        """The sessions resume() will try: those marked for it (autostart), read from their session.json alone. It is
+        cheap and logs nothing, so the launcher can make it before its port opens; whether one is finished or made by
+        an earlier version is resume()'s to tell (and log) at its turn. A session.json that cannot be read is tried
+        too: resume() logs why it does not start that session."""
+        plan = []
         for sid in self.ids():
             try:
-                if self.meta(sid).get("autostart"):
+                marked = bool(self.meta(sid).get("autostart"))
+            except Exception:  # e.g. a damaged session.json: resume() says what to do
+                marked = True
+            if marked:
+                plan.append(sid)
+        return plan
+
+    def plan_resume(self) -> list[str]:
+        """Choose the sessions the next resume() tries and put them into `resume_pending` now: the launcher calls it
+        before it takes its first request, so a session about to be resumed is never seen final (is_final) by a
+        client that comes first. cancel_resume() drops the plan when resume() is not called after all."""
+        self._resume_planned = self._resume_plan()
+        self.resume_pending.update(self._resume_planned)
+        return list(self._resume_planned)
+
+    def cancel_resume(self) -> None:
+        """Forget a plan_resume() whose resume() will not run (the launcher lost the port, or stopped first)."""
+        planned, self._resume_planned = self._resume_planned or [], None
+        for sid in planned:
+            self._resume_done(sid)
+
+    def _resume_done(self, sid: str) -> None:
+        if sid in self.resume_pending:
+            self.resume_pending.discard(sid)
+            self._poke(sid)
+
+    async def resume(self) -> list[str]:
+        """Start the sessions that were running when the server last stopped (the plan of plan_resume(), else chosen
+        now), except finished ones (finished()): they stay stopped until started by hand; and except sessions made by
+        an earlier version, which keep their mark (one warning each). Each one is in `resume_pending` until it is
+        handled. One stopped by the user (out of `resume_pending`, its mark cleared) or deleted meanwhile is skipped,
+        and that is checked again under the session's lock: a stop that held it while this call waited is never
+        undone."""
+        sids, self._resume_planned = self._resume_planned, None
+        if sids is None:
+            sids = self._resume_plan()
+            self.resume_pending.update(sids)
+        started = []
+
+        def still_wanted(sid: str) -> bool:
+            return sid in self.resume_pending and bool(self.meta(sid).get("autostart"))
+
+        try:
+            for sid in sids:
+                try:
+                    if not still_wanted(sid):
+                        continue
                     if self.earlier_version(sid):
                         log.warning("session %s was made by an earlier version of DreamTeam: not resumed", sid)
                         continue
                     if self.finished(sid):
                         log.info("session %s is finished (goal achieved, no open task): not resumed", sid)
                         continue
-                    await self.start(sid)
+                    async with self._lock(sid):
+                        if not still_wanted(sid):  # a stop or a delete held the lock while this call waited
+                            continue
+                        await self._start_locked(sid, resumed=True)
+                    self._changed(sid, "started")
                     started.append(sid)
-            except SessionError as exc:  # e.g. its workspace folder is missing: the message says what to do
-                log.warning("could not resume session %s: %s", sid, exc)
-            except Exception:
-                log.exception("could not resume session %s", sid)
+                except SessionError as exc:  # e.g. its workspace folder is missing: the message says what to do
+                    log.warning("could not resume session %s: %s", sid, exc)
+                except Exception:
+                    log.exception("could not resume session %s", sid)
+                finally:
+                    self._resume_done(sid)
+        finally:  # (cancelled: the rest is not about to start any more)
+            for sid in sids:
+                self._resume_done(sid)
         return started
 
     async def shutdown(self) -> None:
-        """Stop every loaded session, keeping the running ones marked for resume()."""
-        # also sessions in the middle of an operation (a start, a workspace move that starts them again)
-        busy = [sid for sid, lock in self._locks.items() if lock.locked() and sid not in self.swarms]
-        for sid in list(self.swarms) + busy:
-            try:
-                async with self._lock(sid):
-                    await self._unload(sid)
-            except Exception:
-                log.exception("error stopping session %s", sid)
+        """Stop every loaded session, keeping the running ones marked for resume() (they journal `session.stopped`
+        {reason: "shutdown"}). The stops stop_when_done scheduled end first: such a job is over, so it is not resumed
+        at the next start. None is scheduled from here on (`_closing`): a goal completed or a budget pause the watcher
+        has not acted on yet is left to the resume check of the next start (_watch_end)."""
+        self._closing = True
+        try:
+            # (only the stops not done yet are awaited: a task that has just ended leaves _stopping one loop step later,
+            # through its done-callback, and on Python 3.12+ a gather of done tasks completes without yielding to the
+            # loop, so waiting for those would never let that callback run)
+            while self._stopping:
+                self._stopping.difference_update([task for task in self._stopping if task.done()])
+                if self._stopping:
+                    await asyncio.wait(set(self._stopping))
+            # also sessions in the middle of an operation (a start, a workspace move that starts them again)
+            busy = [sid for sid, lock in self._locks.items() if lock.locked() and sid not in self.swarms]
+            for sid in list(self.swarms) + busy:
+                try:
+                    async with self._lock(sid):
+                        await self._unload(sid, "shutdown")
+                except Exception:
+                    log.exception("error stopping session %s", sid)
+        finally:
+            self._closing = False
 
     def copy_overrides(self, sid: str) -> dict[str, Any]:
         return copy.deepcopy(self.meta(sid).get("overrides") or {})

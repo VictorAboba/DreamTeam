@@ -2,7 +2,8 @@
 
 `/` is the sessions page with the global settings. Each session's board UI and API (the per-swarm app of
 web.create_app) is served under `/s/{sid}/`. `/mcp` is the launcher MCP. A stopped session can be
-viewed (its swarm is loaded without starting) but not changed.
+viewed (its swarm is loaded without starting) but not changed. `/api/v1` is the external HTTP API (api_v1.py,
+docs/SPEC.md §21).
 """
 
 from __future__ import annotations
@@ -24,8 +25,9 @@ from starlette.responses import FileResponse, HTMLResponse, PlainTextResponse, R
 from starlette.routing import Mount, Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from . import __version__, netoff, procs, roles
-from .copyfrom import UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
+from . import __version__, apifolders, hubauth, netoff, procs, roles
+from .api_v1 import ApiV1, raise_open_files_limit
+from .copyfrom import API_UPLOAD_PATH, UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyLimits, hub_in_container
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
 from .models import AUTO_REPLY_HEADER
@@ -35,7 +37,7 @@ from .skill_deps import EnvManager
 from .skills import SkillError
 from .web import (
     GRACEFUL_SECONDS, STATIC_DIR, GuardMiddleware, HubServer, UIStaticFiles, check_hub_token, create_app,
-    env_allowed_hosts, hub_server_config, public_base, skill_routes,
+    env_allowed_hosts, hub_server_config, is_api_path, public_base, skill_routes,
 )
 
 if TYPE_CHECKING:
@@ -267,6 +269,22 @@ class SessionRouter:
             await entry.app(child, receive, send)
 
 
+class _ApiFirst:
+    """ASGI dispatcher in front of SessionRouter (docs/SPEC.md §21.1 "Dispatch"): a request whose path web.is_api_path
+    takes goes to the external API's app, every other one (and the lifespan) to `rest`. The guard's v1 branch decides
+    by the same predicate, so no v1 path reaches the internal routes and no other path reaches v1."""
+
+    def __init__(self, api, rest):
+        self.api = api
+        self.rest = rest
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] in ("http", "websocket") and is_api_path(scope.get("path", "")):
+            await self.api(scope, receive, send)
+        else:
+            await self.rest(scope, receive, send)
+
+
 def _error(exc: Exception) -> JSONResponse:
     status = getattr(exc, "status", 400)
     # extra: e.g. "pending_skills" of a refused delete, "exists" of a skill clash
@@ -373,19 +391,33 @@ async def _sweep_copies_hourly(manager: "SessionManager") -> None:
         await asyncio.sleep(UPLOAD_TTL)
 
 
+async def _check_folder_roots(manager: "SessionManager") -> None:
+    """Log the roots of `[api] folders` that the HTTP API v1 cannot use now (docs/SPEC.md §21.10: each is checked
+    again at every use), once at the launcher's start. In a daemon thread: a root on a network share that does not
+    answer never holds the hub's exit."""
+    try:
+        await procs.daemon_call(apifolders.log_refusals, manager.global_config(), manager.home)
+    except Exception:  # noqa: BLE001 - every use checks the roots again
+        log.exception("cannot check the roots of [api] folders")
+
+
 def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> GuardMiddleware:
     extra_hosts = env_allowed_hosts()
     endpoint = LauncherMCPEndpoint(manager, host, extra_hosts=extra_hosts)
+    api = ApiV1(manager, host)   # the external HTTP API (docs/SPEC.md §21)
     holder: dict[str, SessionRouter] = {}
 
     async def home(request: Request):
         return FileResponse(STATIC_DIR / "home.html", headers={"Cache-Control": "no-store"})
 
     async def hub_info(request: Request):
+        # `api`: the hub has an API token of its own (docs/SPEC.md §21.1), so `dreamteam status` prints the API's
+        # address as `serve` does; never the token or its digest
         return JSONResponse({"pid": os.getpid(), "project": str(manager.home), "home": str(manager.home),
                              "name": "DreamTeam", "version": __version__, "mode": "launcher",
                              "sandbox": manager.config.skills_host_library_dir is not None,
-                             "container": hub_in_container(manager.config)})
+                             "container": hub_in_container(manager.config),
+                             "api": hubauth.api_digest() is not None})
 
     async def sessions(request: Request):
         if request.method == "GET":
@@ -612,16 +644,20 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     async def lifespan(app):
         cleaner = asyncio.create_task(_clean_envs_daily(manager), name="skill-envs-cleanup")
         sweeper = asyncio.create_task(_sweep_copies_hourly(manager), name="copy-leftovers-cleanup")
+        roots = asyncio.create_task(_check_folder_roots(manager), name="api-folders-check")
         try:
             async with endpoint.manager.run():
                 try:
                     yield
                 finally:
-                    router = holder.get("router")
-                    if router is not None:
-                        await router.aclose()
+                    try:   # the API's starts in flight first: waited for, never cancelled (docs/SPEC.md §21.9)
+                        await api.aclose()
+                    finally:
+                        router = holder.get("router")
+                        if router is not None:
+                            await router.aclose()
         finally:
-            for task in (cleaner, sweeper):
+            for task in (cleaner, sweeper, roots):
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
@@ -651,10 +687,14 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
     holder["router"] = router
 
     # The router forwards "lifespan" (and every non-session path) to `inner`, whose lifespan runs the
-    # launcher MCP manager and closes the session apps at shutdown.
-    app = GuardMiddleware(router, host=host, extra_hosts=extra_hosts, raw_posts={UPLOAD_PATH: "application/zip"})
+    # launcher MCP manager and closes the API and the session apps at shutdown. /api/v1 goes to the API's own app
+    # (_ApiFirst), behind the guard's v1 branch (api=True: the API token, JSON refusals).
+    app = GuardMiddleware(_ApiFirst(api.app, router), host=host, extra_hosts=extra_hosts, api=True,
+                          raw_posts={UPLOAD_PATH: "application/zip",
+                                     API_UPLOAD_PATH: ("application/octet-stream", "application/zip")})
     app.session_router = router  # type: ignore[attr-defined]
     app.manager = manager  # type: ignore[attr-defined]
+    app.api = api  # type: ignore[attr-defined]
     return app
 
 
@@ -663,11 +703,14 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
                          on_listening: Callable[[], Any] | None = None) -> None:
     """Run the launcher until the task is cancelled, then shut the web server and every session down.
     Sessions that were running when the server last stopped are resumed (server.resume_sessions) once the port
-    is ours: a second launcher that loses the race for the port must not run them too, even for a moment.
-    `on_listening` is called as soon as the port is open (write hub.json there: other `dreamteam` commands then
-    find this hub during a long resume instead of starting a second one), `on_started` after the resume, so
-    callers see the resumed sessions running."""
-    check_hub_token(host)
+    is ours: a second launcher that loses the race for the port must not run them too, even for a moment. Which ones
+    is chosen before the port opens (manager.plan_resume), so a client's first request already sees them as about to
+    start (`resume_pending`), never as final. `on_listening` is called as soon as the port is open (write hub.json
+    there: other `dreamteam` commands then find this hub during a long resume instead of starting a second one),
+    `on_started` after the resume, so callers see the resumed sessions running. A soft limit of open files below
+    api_v1.OPEN_FILES_WANTED is raised first, as far as the hard limit allows (raise_open_files_limit)."""
+    check_hub_token(host, api=True)   # (api: the warning of an API token without a hub token, docs/SPEC.md §21.1)
+    raise_open_files_limit()   # (macOS starts a program from Terminal with 256: docs/SPEC.md §21.8 "archive")
     app = create_launcher_app(manager, host)
     config = hub_server_config(app, host, port, log_level)
     listening = asyncio.Event()
@@ -675,6 +718,9 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
     manager.hub_url = public_base(host, port)
     for sid, swarm in manager.swarms.items():
         swarm.hub_url = f"{manager.hub_url}/s/{sid}/mcp"
+    resuming = manager.config.server.resume_sessions if resume is None else resume
+    if resuming:  # before the first request: a session about to be resumed is not final (docs/SPEC.md §21.7)
+        manager.plan_resume()
     task = asyncio.ensure_future(server.serve())
     try:
         waiter = asyncio.ensure_future(listening.wait())
@@ -685,10 +731,11 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
         if listening.is_set() and not task.done():
             if on_listening is not None:
                 on_listening()
-            if manager.config.server.resume_sessions if resume is None else resume:
+            if resuming:
                 await manager.resume()
             if on_started is not None:
                 on_started()
+        manager.cancel_resume()  # (the port was not ours: nothing is resumed)
         await asyncio.shield(task)
     except BaseException:  # cancelled (Ctrl+C), or on_started failed: the web server must not outlive this call
         if not task.done():
@@ -701,6 +748,7 @@ async def serve_launcher(manager: "SessionManager", host: str, port: int, log_le
                     task.cancel()
         raise
     finally:
+        manager.cancel_resume()
         try:
             await manager.shutdown()
         finally:

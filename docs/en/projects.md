@@ -68,15 +68,22 @@ Safety rules for a folder that is not the session's own:
 - The settings of your repository don't change: DreamTeam does not write `user.name`, `user.email`, `core.autocrlf`
   or other keys into it. The author of each agent commit is set with flags of the git command itself, and your commits
   stay yours. Line endings in the agents' commits follow your settings (`core.autocrlf` and the like), as in your own
-  commits.
+  commits. In the Docker sandbox git reads only the repository's own settings, not your computer's: set
+  `core.autocrlf` in the repository there ([The HTTP API in the sandbox](sandbox.md#the-http-api-in-the-sandbox)).
 - If the folder is not a git repository and git is turned on (`workspace.git`), DreamTeam creates a repository in it:
-  `git init`, `.gitignore` (if there is none) and an initial commit with your files. The reply says so.
+  `git init`, `.gitignore` (if there is none) and an initial commit with your files. The reply says so. On a file
+  system without Linux permissions (a Windows folder seen from WSL or from the Docker sandbox) that repository gets
+  `core.filemode=false`: there every file Windows wrote looks executable.
 - If the folder already has `mcp/<name>/` with the same name as one of the session's MCP servers, the move is refused
   before any change.
 - You can't choose the root of a drive, the user's home folder, the DreamTeam home folder or the folders of other
-  sessions, the git repository database itself (a `.git` folder or a bare repository), the shared library of MCP
-  servers, a file, or a folder inside the current session folder or one that contains it. All checks run before the
-  first change. Two sessions can't work in one folder, even if they are moved there at the same time.
+  sessions, the git repository database itself (a `.git` folder or a bare repository), the shared libraries of MCP
+  servers and skills, another DreamTeam home or a folder inside one (its `dreamteam.toml` can hold API keys), the
+  folder of the hub tokens (`~/.dreamteam/hub-tokens`) or a folder inside or around it, on Linux and macOS a folder
+  under `/proc`, `/sys` or `/dev`, a file, or a folder inside the current session folder or one that contains it. All
+  checks run before the first change. Two sessions can't work in one folder (or in folders inside one another), even
+  if they are moved there at the same time; a folder spelled in another letter case, or in another Unicode form, on a
+  file system that does not tell them apart (macOS) counts as the same folder.
 - If you agreed to a move into an empty folder and files appeared in it in the meantime (or the other way round), the
   move is refused: the session does only what you agreed to.
 - A running session stops, moves and starts again from the same point. If the move fails halfway, the files go back;
@@ -110,6 +117,13 @@ folder: the session stays in it, and the files of the export go to the session's
 
 The `main` session of an old project (`dreamteam run`) can't be moved.
 
+A program that uses the [HTTP API](http-api.md) can have a session work right in a folder under a root you list in
+`[api] folders` with `in_place = true` ([HTTP API settings](configuration.md#http-api-settings)), by the root's name and
+a path inside it. The rules above apply, with stricter git ones: the folder's `.git` must be a folder inside it (not a
+linked worktree's `.git` file or a link), and git must keep everything it writes inside the folder. Every start of
+such a session checks again that the root still allows it and that the folder still lies inside the root. A `/cd` of
+such a session to another folder makes it an ordinary session of yours: the checks of the root no longer apply.
+
 ## Working on a copy of files
 
 When the agents should work with your files but must not change them, give a new session a copy. DreamTeam copies
@@ -133,7 +147,10 @@ Where to give the source:
   goes to `POST /api/uploads?filename=<name>.zip` first (the file itself as the body, `Content-Type:
   application/zip`; the session card shows that name as "upload: <name>.zip"); the `upload` token of the answer
   goes into `copy_from_upload`. An upload waits an hour for its session and is used once: by the
-  create that names it, also when that create is refused (upload the .zip again for the next try).
+  create that names it, also when that create is refused (upload the .zip again for the next try);
+- a program through the [HTTP API](http-api.md): uploaded files and zips (`files` of a create), or a folder or .zip
+  under a root you list in `[api] folders` (`"folder": {"root", "path", "mode": "copy"}`). The same rules of what
+  gets into the copy apply, and files with more than one hard link are left out too.
 
 A folder or .zip path is an absolute path on the computer where DreamTeam (the hub) runs; `dreamteam` makes a
 relative one absolute itself. The reply says how many files were copied, their size and what was left out, and the

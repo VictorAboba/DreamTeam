@@ -57,8 +57,8 @@ def _roster(manager: SessionManager, sid: str) -> list[tuple[str, str]]:
 
 
 def test_the_order_of_the_sections():
-    assert st.SECTIONS == ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "teams",
-                           "roles", "models")
+    assert st.SECTIONS == ("swarm", "agents", "server", "shell", "workspace", "mcp", "skills", "tracing", "api",
+                           "teams", "roles", "models")
 
 
 # ---- loading: the shape, and only the shape ----------------------------------------------------------------

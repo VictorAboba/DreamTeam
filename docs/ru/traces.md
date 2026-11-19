@@ -19,7 +19,9 @@
 
 * REST сессии (пути от `/s/<id>`): `/api/traces`, `/api/traces/<n>`, `/api/spans/<n>`, `/api/spans/<n>/context`,
   `/api/traces/stats`, `/api/traces/<n>/export`, `/api/agents/<имя>/traces.jsonl`.
-* Терминал: `dreamteam traces "Анна Смирнова" --status failed`.
+* Терминал: `dreamteam traces "Анна Смирнова" --status failed`. Без `--session ID` он сам выбирает сессию (работающую
+  или последнюю активную), но никогда не созданную через [HTTP API](http-api.md): такую называйте через
+  `--session ID`.
 * MCP: `agent_traces(agent=..., trace_id=..., span_id=..., context=true)`.
 
 Настройки находятся в секции `[tracing]`: `enabled`, `max_payload_chars` (лимит одного поля) и `retention_days`

@@ -15,6 +15,7 @@ from typing import Any, Callable
 
 from . import __version__, hubauth, netoff, procs, prompts, roles
 from .agent import AgentRuntime
+from .autoreply import LAST_TO, PLANS, planner_question
 from .board import MARK_FREE_DIRECTIONS, Board
 from .config import Config, ModelProfile
 from .db import Database, dumps, loads, made_by_earlier_version, remap_sql, utf8_safe
@@ -50,14 +51,9 @@ QUESTION_CHARS = 4000            # the question and the answer as quoted to the 
 QUESTION_PREVIEW_CHARS = 600     # snapshot swarm.question.text
 AUTO_REPLY_GRACE = 90.0          # s a `dreamteam -p` client with auto-reply still counts after its last sign
                                  # (> printmode.LOST_LIMIT, 60 s: a client that lost the hub gives up first)
-_LAST_TO = ("SELECT MAX(m.id) FROM messages m JOIN inbox i ON i.message_id = m.id "
-            "WHERE m.sender = ? AND i.recipient = ? AND m.ts >= ?")      # (sender, recipient, since)
-# the question (its message id) ended without an answer: the swarm.resumed event that went on without it (a manual
-# resume, clarify switched off, the asker left) or the swarm.paused event of the budget pause it turned into (the
-# events_type index; few such events)
-_DROPPED = ("SELECT 1 FROM events WHERE type IN ('swarm.resumed', 'swarm.paused') "
-            "AND json_extract(data, '$.question.message_id') = ? "
-            "AND json_extract(data, '$.question.outcome') = 'dropped' LIMIT 1")
+# (sender, recipient, since): the newest message from sender that reached recipient (autoreply.py, which also holds
+# the rule of a clarify planner that waits for the user: planner_question)
+_LAST_TO = LAST_TO
 _monotonic = time.monotonic      # the lease's clock; tests patch swarm._monotonic, never time.monotonic itself
 # the refusal of a swarm whose database was made by an earlier version (db.made_by_earlier_version); {dir} is the
 # project (or session) folder, {version} this version
@@ -160,6 +156,9 @@ class Swarm:
         # streams, and the _monotonic() deadline of the grace after its last sign
         self._auto_reply_streams = 0
         self._auto_reply_until = 0.0
+        # the hub answers for the user itself (hold_auto_reply: a v1 session with `answers: auto`), for this object's
+        # whole life
+        self._auto_reply_held = False
         # agent idle (not busy, nothing pending) holding in-progress tasks or with liveness marks -> (that liveness
         # key, idle with it since)
         self._idle_holding: dict[str, tuple[StallKey, float]] = {}
@@ -1057,6 +1056,12 @@ class Swarm:
             return {"asker": p["asker"], "message_id": p["message_id"], "since": p.get("since")}
         return None
 
+    def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None:
+        """The id of the newest message from `sender` that reached `recipient` (named, or through "all": the inbox
+        row), sent at `since` (a timestamp) or later; None when there is none (docs/SPEC.md §21.5 `message`)."""
+        found = self.db.scalar(_LAST_TO, (sender, recipient, since))
+        return int(found) if found is not None else None
+
     def pause_text(self) -> str:
         """The pause reason as readable text (swarm_status, an agent's trace)."""
         q = self.pending_question()
@@ -1139,22 +1144,18 @@ class Swarm:
 
     def _plans(self, name: str, task: Any) -> bool:
         """`name` has created a task since the planning card `task`: it plans already (as _hint_planner's check)."""
-        return bool(self.db.scalar("SELECT 1 FROM tasks WHERE created_by = ? AND id > ? LIMIT 1", (name, task.id)))
+        return bool(self.db.scalar(PLANS, (name, task.id)))
 
     def _awaits_user_answer(self, name: str, task: Any) -> bool:
         """`task` is a clarify planning card, `name` has created no task since it (it plans already: the ordinary nags
         apply again), and `name`'s last message to the user since the card was created is newer than the user's last
         message to it (named or through "all"). Both bounds keep an old message (an earlier goal) or a note to the user
         after planning started from silencing the nags for ever. A question the user went on without (a manual
-        resume, a budget pause in its place: n_question_unanswered told the planner so) waits for nothing."""
+        resume, a budget pause in its place: n_question_unanswered told the planner so) waits for nothing.
+        (autoreply.planner_question: the requests to the user read the same rule from a session's file.)"""
         if "planning" not in task.tags or prompts.CLARIFY_TAG not in task.tags:
             return False
-        if self._plans(name, task):
-            return False
-        asked = self.db.scalar(_LAST_TO, (name, USER, task.created_at))
-        if not asked or asked <= (self.db.scalar(_LAST_TO, (USER, name, task.created_at)) or 0):
-            return False
-        return not self.db.scalar(_DROPPED, (asked,))
+        return planner_question(self.db.scalar, name, task.id, task.created_at) is not None
 
     def asks_user(self, name: str, task: Any) -> bool:
         """The nag guard (docs/SPEC.md §3 "Clarify mode"): the clarify planner waits for the user's answers, so it
@@ -1194,9 +1195,15 @@ class Swarm:
             self._auto_reply_streams = max(0, self._auto_reply_streams - 1)
             self.auto_reply_seen()
 
+    def hold_auto_reply(self) -> None:
+        """The hub itself answers what the members ask the user (HTTP API v1 `answers: "auto"`, docs/SPEC.md §21.5):
+        the lease holds from now until this Swarm is unloaded, with no client sign. SessionManager._start_locked
+        takes it before `swarm.start()`, which may itself set a goal from the settings."""
+        self._auto_reply_held = True
+
     @property
     def auto_reply_active(self) -> bool:
-        return self._auto_reply_streams > 0 or _monotonic() < self._auto_reply_until
+        return self._auto_reply_held or self._auto_reply_streams > 0 or _monotonic() < self._auto_reply_until
 
     @property
     def clarifying(self) -> bool:

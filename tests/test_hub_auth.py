@@ -46,6 +46,8 @@ BASE = "http://127.0.0.1:8765"
 BEARER = {"authorization": f"Bearer {TOKEN}"}
 DIGEST = hubauth.digest(TOKEN)
 COOKIE = hubauth.cookie_name(DIGEST)
+API_TOKEN = "Api-" + "z9Y8x7W6" * 6   # the external API's token (docs/SPEC.md §21.1)
+API_DIGEST = hubauth.digest(API_TOKEN)
 
 
 @pytest.fixture
@@ -560,6 +562,218 @@ def test_an_agents_command_never_sees_the_token(tmp_path, monkeypatch):
     out = subprocess.run([sys.executable, "-c", f"import os; print(os.environ.get('{hubauth.TOKEN_ENV}', 'none'))"],
                          env=env, capture_output=True, text=True, timeout=60)
     assert out.stdout.strip() == "none"
+
+
+# ---------------------------------------------------------------------------------------------- the API token
+def test_dreamteam_takes_the_api_token_out_of_its_environment(tmp_path, monkeypatch):
+    """main() moves DREAMTEAM_API_TOKEN and DREAMTEAM_API_TOKEN_SHA256 out of os.environ with the hub token's names.
+    The agents' shell and DreamTeam's git drop both whatever shell.pass_env says (the digest's name matches no secret
+    pattern), and no client of DreamTeam's ever sends the API token."""
+    monkeypatch.setenv(hubauth.API_TOKEN_ENV, f" {API_TOKEN} ")
+    monkeypatch.setenv(hubauth.API_DIGEST_ENV, API_DIGEST.upper())
+    assert cli.main(["init", str(tmp_path / "p"), "--lang", "en"]) == 0
+    assert hubauth.API_TOKEN_ENV not in os.environ and hubauth.api_env_token() == API_TOKEN
+    assert hubauth.API_DIGEST_ENV not in os.environ and hubauth.api_digest() == API_DIGEST
+    assert hubauth.env_token() is None and hubauth.hub_digest() is None   # the hub has no token of its own
+    monkeypatch.setattr(hubauth, "_taken", TOKEN)   # (with one, its clients send it and their own, never the API's)
+    hubauth.serving(BASE)
+    assert hubauth.client_tokens(BASE) == [TOKEN, hubauth.own_token()]
+    for url in (BASE, "http://localhost:8765", "http://192.168.1.5:8765"):
+        assert API_TOKEN not in hubauth.client_tokens(url, user_url=url)
+        assert API_TOKEN not in hubauth.browser_url(url, user_url=url)
+    names = [hubauth.API_TOKEN_ENV, hubauth.API_DIGEST_ENV]
+    monkeypatch.setenv(hubauth.API_TOKEN_ENV, API_TOKEN)   # (a process that did not go through main())
+    monkeypatch.setenv(hubauth.API_DIGEST_ENV, API_DIGEST)
+    config = Config.from_dict(tmp_path / "q", {"shell": {"pass_env": names}})
+    for env in (shell.scrubbed_env(config), shell.scrubbed_env(config, keep_url_credentials=True),
+                shell.secret_free_env([n.lower() for n in names]), hubgit.environment()):
+        assert not set(names) & set(env)
+        assert not any(API_TOKEN in v or API_DIGEST in v for v in env.values())
+    out = subprocess.run([sys.executable, "-c", "import os; print([n for n in os.environ if 'API_TOKEN' in n])"],
+                         env=shell.scrubbed_env(config), capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip() == "[]"
+
+
+def test_the_api_tokens_digest(monkeypatch, caplog):
+    """api_digest(): the digest variable (any case), else the digest the token taken from the environment has; None
+    without either. A digest variable that is no SHA-256 asks for a token nobody has, never for none, and says so
+    once per value, without it: once the log is set up (a command's early check runs before setup_logging)."""
+    caplog.set_level(logging.WARNING)
+    assert hubauth.api_digest() is None and hubauth.api_env_token() is None
+    monkeypatch.setattr(hubauth, "_api_taken", API_TOKEN)
+    assert hubauth.api_digest() == API_DIGEST
+    monkeypatch.setenv(hubauth.API_TOKEN_ENV, "another-token-of-this-process")
+    assert hubauth.api_digest() == hubauth.digest("another-token-of-this-process")
+    monkeypatch.setattr(hubauth, "_api_taken_digest", API_DIGEST.upper())   # the digest wins over the token
+    assert hubauth.api_digest() == API_DIGEST
+    assert hubauth.hub_digest() is None   # the hub token is another one
+    for bad in ("not-a-digest", API_DIGEST[:-1], API_DIGEST[:-1] + "g"):
+        monkeypatch.setenv(hubauth.API_DIGEST_ENV, bad)
+        first, second = hubauth.api_digest(), hubauth.api_digest()
+        assert first and second and first != second and len(first) == 64 and API_DIGEST not in (first, second)
+        warned = [r.getMessage() for r in caplog.records if hubauth.API_DIGEST_ENV in r.getMessage()]
+        assert len(warned) == 1 and bad not in warned[0], warned
+        caplog.clear()
+
+    def warnings() -> int:
+        return len([r for r in caplog.records if hubauth.API_DIGEST_ENV in r.getMessage()])
+
+    for bad in ("bad-1", "bad-2", "bad-1"):   # once per value, not once per change
+        monkeypatch.setenv(hubauth.API_DIGEST_ENV, bad)
+        hubauth.api_digest()
+    assert warnings() == 2
+    caplog.clear()
+    monkeypatch.setenv(hubauth.API_DIGEST_ENV, "bad-3")
+    with monkeypatch.context() as m:   # no handler yet: Python's last resort says it, the log file would miss it
+        m.setattr(logging.Logger, "hasHandlers", lambda self: False)
+        hubauth.api_digest()
+        hubauth.api_digest()
+    assert warnings() == 2
+    hubauth.api_digest()   # the log is set up: said once more, then no more
+    hubauth.api_digest()
+    assert warnings() == 3
+
+
+def test_a_hub_whose_api_token_is_its_hub_token_does_not_start(tmp_path, monkeypatch, capsys):
+    """The API token opens /api/v1 alone; one that is also the hub token would open every route of the hub. Such a hub
+    does not start, on a loopback address too, whichever form (token or digest) gives either, before a command
+    creates or starts anything."""
+    for hub, api in (((hubauth.TOKEN_ENV, TOKEN), (hubauth.API_TOKEN_ENV, TOKEN)),
+                     ((hubauth.DIGEST_ENV, DIGEST), (hubauth.API_TOKEN_ENV, TOKEN)),
+                     ((hubauth.TOKEN_ENV, TOKEN), (hubauth.API_DIGEST_ENV, DIGEST.upper()))):
+        with monkeypatch.context() as m:
+            m.setenv(*hub)
+            m.setenv(*api)
+            for bind in ("127.0.0.1", "0.0.0.0"):
+                with pytest.raises(web.NoTokenError, match=hubauth.API_TOKEN_ENV):
+                    web.check_hub_token(bind, warn=False)
+            m.setenv(api[0], API_TOKEN if api[0] == hubauth.API_TOKEN_ENV else API_DIGEST)   # a token of its own
+            web.check_hub_token("0.0.0.0", api=True)
+    done = _no_side_effects(monkeypatch)
+    home, project = tmp_path / "home", tmp_path / "project"
+    assert cli.main(["init", str(project), "--lang", "en"]) == 0
+    capsys.readouterr()
+    port = str(_free_port())
+    for argv in (["serve", "--home", str(home), "--port", port, "--goal", "X", "--no-browser", "--no-console"],
+                 ["run", str(project), "--port", port, "--goal", "X", "--no-console"]):
+        monkeypatch.setenv(hubauth.TOKEN_ENV, TOKEN)   # (main() takes both out of the environment again)
+        monkeypatch.setenv(hubauth.API_TOKEN_ENV, TOKEN)
+        assert cli.main(argv) == 1, argv
+        err = capsys.readouterr().err
+        assert "cannot start on 127.0.0.1" in err and hubauth.API_TOKEN_ENV in err and TOKEN not in err, err
+    assert not done["created"] and not done["started"]
+    assert not list((home / "sessions").iterdir()) and not cli.hub_file(home).exists()
+
+
+async def test_serve_launcher_refuses_equal_tokens_and_warns_of_an_api_token_without_a_hub_token(tmp_path, monkeypatch,
+                                                                                                   caplog):
+    """A hub with an API token and no hub token starts, with a warning in its log (which `serve` shows): the internal
+    routes answer whoever reaches the port, a site's own bugs on this computer included. Only a hub that serves the
+    external API says it (serve_launcher, not `run`'s serve()), once (the commands' early check is quiet), and not in
+    the sandbox image, where the hub runs in its container."""
+    from dreamteam import launcher as launcher_module, netoff
+
+    caplog.set_level(logging.WARNING)
+    built: list[str] = []
+
+    def no_app(manager, host):   # (the check comes first: nothing listens)
+        built.append(host)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(launcher_module, "create_launcher_app", no_app)
+    manager = _manager(tmp_path)
+    try:
+        monkeypatch.setattr(hubauth, "_api_taken", API_TOKEN)
+        assert web.api_token_warning() and cli._token_missing("127.0.0.1", 1) is False
+        web.check_hub_token("127.0.0.1")   # (`run`: no external API)
+        assert not caplog.records
+        with pytest.raises(RuntimeError, match="stop here"):
+            await launcher_module.serve_launcher(manager, "127.0.0.1", 1)
+        warned = [r.getMessage() for r in caplog.records]
+        assert len(warned) == 1 and hubauth.TOKEN_ENV in warned[0] and "dreamteam sandbox" in warned[0], warned
+        assert API_TOKEN not in caplog.text
+        caplog.clear()
+        monkeypatch.setenv(netoff.IMAGE_ENV, "1")
+        assert web.api_token_warning() is None
+        monkeypatch.delenv(netoff.IMAGE_ENV)
+        monkeypatch.setattr(hubauth, "_taken", TOKEN)   # a hub token as well: nothing to say
+        assert web.api_token_warning() is None
+        monkeypatch.setattr(hubauth, "_api_taken", TOKEN)   # ...unless it is the API token
+        with pytest.raises(web.NoTokenError, match=hubauth.API_TOKEN_ENV):
+            await launcher_module.serve_launcher(manager, "127.0.0.1", 1)
+        monkeypatch.setattr(hubauth, "_taken", None)
+        monkeypatch.setattr(hubauth, "_api_taken", None)   # no API token: nothing to say either
+        assert web.api_token_warning() is None
+        with pytest.raises(RuntimeError, match="stop here"):
+            await launcher_module.serve_launcher(manager, "127.0.0.1", 1)
+        assert not caplog.records and built == ["127.0.0.1", "127.0.0.1"]
+    finally:
+        await manager.shutdown()
+
+
+def test_serve_says_once_on_its_output_and_in_its_log_that_the_hub_has_no_token(tmp_path, monkeypatch, capsys):
+    """`dreamteam serve` with an API token and no hub token: the warning reaches its output (the log's stderr handler)
+    and its log file, once each, without the token."""
+    from dreamteam import launcher as launcher_module
+
+    def no_app(manager, host):   # (after the check: nothing listens)
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(launcher_module, "create_launcher_app", no_app)
+    monkeypatch.setenv(hubauth.API_TOKEN_ENV, API_TOKEN)   # (main() takes it out of the environment)
+    home = tmp_path / "home"
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    try:
+        assert cli.main(["serve", "--home", str(home), "--port", str(_free_port()), "--no-browser",
+                         "--no-console"]) == 1
+    finally:   # (setup_logging replaced the root's handlers: its log file is closed again)
+        for handler in list(root.handlers):
+            if handler not in handlers:
+                root.removeHandler(handler)
+                handler.close()
+        for handler in handlers:
+            if handler not in root.handlers:
+                root.addHandler(handler)
+        root.setLevel(level)
+    err = capsys.readouterr().err
+    logged = (home / ".dreamteam" / "logs" / "dreamteam.log").read_text(encoding="utf-8")
+    for text in (err, logged):
+        assert text.count("the external API has a token") == 1 and "dreamteam sandbox" in text, text
+        assert API_TOKEN not in text and API_DIGEST not in text
+    assert "stop here" in err and not cli.hub_file(home).exists()
+
+
+def test_the_tuis_launcher_tries_no_other_port_for_a_hub_whose_api_token_is_its_hub_token(tmp_path, monkeypatch):
+    """Without the web UI (or with its port busy) the TUI's launcher has no early check: serve_launcher's refusal of
+    equal tokens ends it at once, with the reason, instead of three more tries on other ports."""
+    from dreamteam import launcher as launcher_module
+
+    home = tmp_path / "home"
+    cli._load_home(home)
+    tries: list[int] = []
+    serve_launcher = launcher_module.serve_launcher
+
+    async def counted(manager, host, port, **kwargs):
+        tries.append(port)
+        return await serve_launcher(manager, host, port, **kwargs)
+
+    monkeypatch.setattr(launcher_module, "serve_launcher", counted)
+    monkeypatch.setattr(hubauth, "_taken", TOKEN)
+    monkeypatch.setattr(hubauth, "_api_taken", TOKEN)
+
+    def factory(profile, agent):
+        return ScriptedLLM(lambda system, messages, tools: "Nothing to do.", profile)
+
+    async def attach():
+        with pytest.raises(tui_client.HubError) as refused:
+            await tui_client.connect(home, web=False, resume=False, llm_factory=factory)
+        return refused.value
+
+    refused = asyncio.run(attach())
+    assert hubauth.API_TOKEN_ENV in refused.message and TOKEN not in refused.message, refused.message
+    assert len(tries) == 1
+    assert not list((home / ".dreamteam").glob("launcher-*.pid")) and not cli.hub_file(home).exists()
 
 
 # ---------------------------------------------------------------------------------------------- the host's clients
@@ -1422,6 +1636,7 @@ def test_compose_gives_the_container_the_tokens_digest_only():
               if line.strip().startswith("- ")}
     assert hubauth.DIGEST_ENV in passed and hubauth.TOKEN_ENV not in passed
     assert "hashlib.sha256(os.environ['DREAMTEAM_HUB_TOKEN']" in compose   # how to compute it on the host
+    assert hubauth.API_DIGEST_ENV in passed and hubauth.API_TOKEN_ENV not in passed   # the API token's likewise
 
 
 def test_run_sandbox_makes_a_token_per_container_and_prints_how_to_use_it(tmp_path, monkeypatch, capsys):
@@ -1470,6 +1685,54 @@ def test_run_sandbox_makes_a_token_per_container_and_prints_how_to_use_it(tmp_pa
     monkeypatch.setattr(docker_module, "container_exists", lambda name: name == "dreamteam-9316")
     calls.clear()
     assert docker_module.run_sandbox(project, 9316) == 1 and not calls
+
+
+def test_the_sandbox_passes_the_api_tokens_digest_by_name_only(tmp_path, monkeypatch):
+    """A home's hub in the sandbox gets the API token's SHA-256 as it gets the hub token's: by name on the command
+    line, the value in the docker command's environment, taken from hubauth (main() has already taken both names out
+    of os.environ). Never the token itself, never the host's variables by name (not even through [shell] pass_env),
+    and nothing for a single-swarm project, whose `run` has no external API."""
+    names = [hubauth.API_TOKEN_ENV, hubauth.API_DIGEST_ENV]
+    project = _sandbox_project(tmp_path)
+    (project / "sessions").mkdir()   # a home
+    monkeypatch.setenv(hubauth.API_TOKEN_ENV, API_TOKEN)   # (as in a process that did not go through main())
+    monkeypatch.setenv(hubauth.API_DIGEST_ENV, API_DIGEST)
+    config = Config.from_dict(project, {"shell": {"pass_env": names}})
+    assert not set(names) & set(docker_module.env_passthrough(config))
+    for home, api_token, passed in ((None, True, True), (True, True, True), (False, True, False),
+                                    (None, False, False)):
+        cmd = docker_module.sandbox_command(project, 9317, config, docker="docker", home=home, api_token=api_token)
+        assert not any(API_TOKEN in part or API_DIGEST in part for part in cmd)
+        assert hubauth.API_TOKEN_ENV not in cmd and cmd.count(hubauth.API_DIGEST_ENV) == int(passed), (home, cmd)
+        if passed:
+            at = cmd.index(hubauth.API_DIGEST_ENV)
+            assert cmd[at - 1] == "-e" and at < cmd.index(docker_module.IMAGE)
+
+    calls: list[tuple[list[str], dict[str, str]]] = []
+    monkeypatch.setattr(docker_module, "_docker", lambda: "docker")
+    monkeypatch.setattr(docker_module, "image_exists", lambda image=docker_module.IMAGE: True)
+    same = docker_module.dockerfile_hash()
+    monkeypatch.setattr(docker_module, "image_dockerfile", lambda image=docker_module.IMAGE: same)
+    monkeypatch.setattr(docker_module, "container_exists", lambda name: False)
+    monkeypatch.setattr(docker_module.subprocess, "call", lambda cmd, env=None: calls.append((cmd, env)) or 0)
+    monkeypatch.setattr(cli, "_stdin_is_terminal", lambda: False)
+    for name in names:
+        monkeypatch.delenv(name)
+    monkeypatch.setattr(hubauth, "_api_taken", API_TOKEN)   # what main() took
+    assert docker_module.run_sandbox(project, 9317) == 0
+    assert docker_module.run_sandbox(project, 9317, home=False) == 0
+    monkeypatch.setattr(hubauth, "_api_taken", None)
+    assert docker_module.run_sandbox(project, 9317) == 0   # no API token
+    monkeypatch.setenv(hubauth.API_TOKEN_ENV, API_TOKEN)   # still in the environment: never inherited as it is
+    assert docker_module.run_sandbox(project, 9317) == 0
+    taken, single, plain, kept = calls
+    for run_cmd, run_env in (taken, kept):
+        assert run_env[hubauth.API_DIGEST_ENV] == API_DIGEST and hubauth.API_DIGEST_ENV in run_cmd
+        assert hubauth.API_TOKEN_ENV not in run_env and not any(API_TOKEN in v for v in run_env.values())
+        assert not any(API_TOKEN in part or API_DIGEST in part for part in run_cmd)
+        assert run_env[hubauth.DIGEST_ENV] != API_DIGEST   # the hub token is the sandbox's own
+    for run_cmd, run_env in (single, plain):
+        assert hubauth.API_DIGEST_ENV not in run_cmd and not set(names) & set(run_env)
 
 
 # ---------------------------------------------------------------------------------------------- real Docker (opt-in)

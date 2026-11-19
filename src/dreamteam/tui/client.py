@@ -532,7 +532,8 @@ async def connect(home: Path | str, *, host: str | None = None, port: int | None
        listens, before the sessions resume, so that another `dreamteam` finds this hub meanwhile. When the
        configured port is busy (or is lost in a race), a hub of this home that shows up within HUB_WAIT is
        used instead (owned=False); else a free ephemeral port on 127.0.0.1. A free configured port on an address
-       other than loopback without a hub token is HubError(0, web.NoTokenError's text) before anything starts.
+       other than loopback without a hub token is HubError(0, web.NoTokenError's text) before anything starts. A hub
+       whose API token is its hub token is that HubError too, at the latest after one try (no other port is tried).
        web=False binds 127.0.0.1 on an ephemeral port and writes no hub.json. `resume` overrides
        server.resume_sessions of the settings.
     3. Else HubError(0, ...); HubError(401, ...) when the home's hub asks for a token this computer lacks."""
@@ -640,6 +641,8 @@ async def _start_launcher(home: Path, *, host: str | None, port: int | None, web
                 break
             chosen = ("127.0.0.1", _free_port())
             server, error = await launch(*chosen)
+            if isinstance(error, NoTokenError):   # (no port helps: a hub whose API token is its hub token)
+                break
         if server is None or chosen is None:
             raise HubError(0, f"The DreamTeam web server could not start: {error}")
     except BaseException:

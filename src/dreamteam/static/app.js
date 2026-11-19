@@ -101,6 +101,10 @@ const I18N = {
     job_log_hint: "Открыть журнал на вкладке «Файлы»", job_took: "проработал {t}", agent_jobs: "фоновых процессов: {n}",
     job_silent: "{t} без вывода", job_silent_hint: "Процесс давно ничего не выводит и, возможно, завис: посмотрите его вывод и остановите, если он застрял.",
     ev_job_started: "{who}: фоновый процесс {id} — {command}", ev_job_ended: "{who}: процесс {id} {result} ({t})",
+    ev_session_started: "сессия запущена", ev_session_stopped: "сессия остановлена", ev_session_stopped_user: "сессия остановлена вами",
+    ev_session_stopped_done: "сессия остановлена: цель достигнута", ev_session_stopped_budget: "сессия остановлена: бюджет исчерпан",
+    ev_session_stopped_shutdown: "сессия остановлена вместе с хабом", ev_session_stopped_restart: "сессия остановлена для перезапуска",
+    ev_session_stopped_failed: "сессия не запустилась",
     dur_s: "{n} с", dur_min: "{n} мин", dur_h: "{h} ч {m} мин",
     sg_jobs: "Фоновые процессы", sf_jobs: "Фоновых процессов на участника", sf_jobs_total: "Фоновых процессов на сессию",
     sf_job_minutes: "Предел жизни фонового процесса, мин (0 — без предела)", sf_cpu: "Потоков вычислений на команду (auto или число)",
@@ -275,6 +279,10 @@ const I18N = {
     job_log_hint: "Open the log in the Files tab", job_took: "ran {t}", agent_jobs: "background jobs: {n}",
     job_silent: "no output for {t}", job_silent_hint: "It has printed nothing for a long time and may hang: look at its output, and stop it if it is stuck.",
     ev_job_started: "{who}: background job {id} — {command}", ev_job_ended: "{who}: job {id} {result} ({t})",
+    ev_session_started: "session started", ev_session_stopped: "session stopped", ev_session_stopped_user: "session stopped by you",
+    ev_session_stopped_done: "session stopped: the goal is achieved", ev_session_stopped_budget: "session stopped: the budget is spent",
+    ev_session_stopped_shutdown: "session stopped with the hub", ev_session_stopped_restart: "session stopped to start again",
+    ev_session_stopped_failed: "session did not start",
     dur_s: "{n} s", dur_min: "{n} min", dur_h: "{h} h {m} min",
     sg_jobs: "Background jobs", sf_jobs: "Background jobs per member", sf_jobs_total: "Background jobs per session",
     sf_job_minutes: "Background job time limit, min (0 = none)", sf_cpu: "Compute threads per command (auto or a number)",
@@ -362,7 +370,7 @@ const CREW_MAX = 8;
 const EMPTY_CARD = Object.freeze({ rows: Object.freeze([]), direct: Object.freeze([]), forced: false, matches: new Set() });
 const ACTIVITY_PROSE = new Set(["text", "thinking", "compacted"]);   // activity kinds the LLM wrote: shown as Markdown
 // the feed asks the server only for these types: agent.activity / agent.usage would crowd everything else out
-const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*", "skill.*"];
+const FEED_TYPES = ["task.*", "message.*", "goal.*", "agent.hired", "agent.retired", "file.*", "trigger.*", "mcp.*", "swarm.*", "job.*", "skill.*", "session.*"];
 const FEED_SKIP = new Set(["agent.activity", "agent.usage", "notification", "agent.status", "agent.compacted"]);
 const DND_TYPE = "application/x-dreamteam-task";
 const MAX_SEEN = 5000;
@@ -2659,6 +2667,13 @@ function describeEvent(ev) {
       if (d.status === "failed") return t("ev_skill_deps_failed", { name: d.name, error: short(d.error, 200) });
       return t("ev_skill_deps_installing", { name: d.name, files });
     }
+    // a run's start and end, journaled by the session manager (SPEC §21.6; no actor)
+    case "session.started": return t("ev_session_started");
+    case "session.stopped": {
+      if (d.reason === "failed") return t("ev_session_stopped_failed") + (d.error ? ": " + short(d.error, 200) : "");
+      const key = "ev_session_stopped_" + String(d.reason ?? "");
+      return I18N.en[key] ? t(key) : t("ev_session_stopped") + (d.reason ? ` (${d.reason})` : "");
+    }
     default: return `${ev.type} ${short(JSON.stringify(d), 120)}`;
   }
 }
@@ -2672,8 +2687,9 @@ function viaText(via) {
 }
 
 function feedLine(ev) {
-  // the swarm's own lines name no task: a number there is a question's message id (swarm.paused, swarm.resumed)
-  const text = ev.type.startsWith("swarm.") ? esc(describeEvent(ev)) : linkify(describeEvent(ev));
+  // the swarm's own lines name no task: a number there is a question's message id (swarm.paused, swarm.resumed);
+  // a session's start and end neither (a failed start's error is DreamTeam's text)
+  const text = /^(swarm|session)\./.test(ev.type) ? esc(describeEvent(ev)) : linkify(describeEvent(ev));
   return `<div class="ev"><time>${esc(fmtTime(ev.ts))}</time><span class="ev-text">${text}</span></div>`;
 }
 

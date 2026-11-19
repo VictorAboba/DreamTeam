@@ -439,13 +439,14 @@ def sandbox_entry() -> None:
                        sys.executable, "-m", "dreamteam", *sys.argv[1:]])
 
 
-def prepare_workspace(root: Path) -> int:
+def prepare_workspace(root: Path, *, dir_fd: int | None = None) -> int:
     """Docker isolation: open to the offline user what root created in the workspace (DreamTeam before, or a run
     with network) or the image's OFFLINE_USER did: such an entry gets the offline group with the owner's bits copied
     to the group (a read-only entry, e.g. the skills mirror, stays read-only). What the offline user owns already
     (the user's own files of a bind mount on Linux, sandbox_ids) and what anyone else owns is left as it is. Walked
-    by file descriptors, never following a symlink: the members' commands may change the tree meanwhile. Returns the
-    number of entries it could not change (logged); 0 when there is nothing to do."""
+    by file descriptors, never following a symlink: the members' commands may change the tree meanwhile. `dir_fd`:
+    `root` open (sessions._hold), walked from that descriptor, wherever the folder lies now, never by its path.
+    Returns the number of entries it could not change (logged); 0 when there is nothing to do."""
     if detected() != "docker" or not _POSIX:
         return 0
     import stat
@@ -488,10 +489,15 @@ def prepare_workspace(root: Path) -> int:
         finally:
             os.close(fd)
 
-    fix(str(root), None)
-    if not os.path.isdir(root):   # not created yet (a new session): Workspace.init makes it with the offline group
-        return failed
-    for _folder, dirs, files, dirfd in os.fwalk(root, follow_symlinks=False):
+    if dir_fd is not None:
+        fix(".", dir_fd)
+        walk = os.fwalk(".", follow_symlinks=False, dir_fd=dir_fd)
+    else:
+        fix(str(root), None)
+        if not os.path.isdir(root):   # not created yet (a new session): Workspace.init makes it with the offline group
+            return failed
+        walk = os.fwalk(root, follow_symlinks=False)
+    for _folder, dirs, files, dirfd in walk:
         for name in dirs + files:
             fix(name, dirfd)
     return failed

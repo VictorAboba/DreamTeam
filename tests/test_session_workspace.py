@@ -723,7 +723,7 @@ def test_repo_state(tmp_path):
     plain = tmp_path / "plain"
     plain.mkdir()
     assert repo_state(plain) == {"toplevel": None, "git_dir": False, "branch": None, "operation": None, "changes": [],
-                                 "error": None}
+                                 "line_endings": [], "error": None}
     # a repository's own database is not a folder of files
     git(tmp_path, "init", "-q", "--bare", "bare.git")
     assert repo_state(tmp_path / "bare.git")["git_dir"] is True and repo_state(project / ".git")["git_dir"] is True
@@ -731,6 +731,34 @@ def test_repo_state(tmp_path):
     _halfway_merge(project)
     state = repo_state(project)
     assert state["changes"] == [] and state["operation"] == "merge"
+
+
+@needs_git
+def test_repo_state_names_the_changes_that_line_endings_alone_make(tmp_path):
+    """CRLF in the files over LF in the repository (a checkout of Git for Windows, whose system config sets
+    core.autocrlf=true), read by a git without that setting (the Docker sandbox's): `line_endings` names those
+    changes, and asking leaves them changed for the next check (the status with core.autocrlf=true stores nothing in
+    the index)."""
+    project = _user_repo(tmp_path / "project")
+    (project / "app.py").write_bytes(b"a = 1\nb = 2\n")
+    (project / "lib.py").write_bytes(b"c = 3\n")
+    _commit(project, "Code")
+    git(project, "config", "--local", "core.autocrlf", "true")   # as Git for Windows' system config has it
+    for name in ("app.py", "lib.py"):
+        (project / name).unlink()
+    git(project, "checkout", "--", ".")   # CRLF in the folder, LF in the repository
+    git(project, "config", "--local", "core.autocrlf", "false")   # a git without that setting, on every system
+    for name in ("app.py", "lib.py"):   # seen from elsewhere (the container): not the stamps the index holds
+        seen = os.stat(project / name)
+        os.utime(project / name, ns=(seen.st_atime_ns, seen.st_mtime_ns - 5_000_000_000))
+    (project / "new.txt").write_text("x", encoding="utf-8")
+    assert repo_state(project)["line_endings"] == []   # only when asked
+    for _ in range(2):
+        state = repo_state(project, line_endings=True)
+        assert state["changes"] == [" M app.py", " M lib.py", "?? new.txt"], state
+        assert state["line_endings"] == [" M app.py", " M lib.py"], state
+    (project / "app.py").write_bytes(b"a = 1\r\nb = 22\r\n")
+    assert repo_state(project, line_endings=True)["line_endings"] == [" M lib.py"]   # app.py: a change of its own
 
 
 async def test_a_stopped_agent_command_is_killed(tmp_path):
@@ -1810,6 +1838,40 @@ async def test_a_create_removes_expired_uploads(tmp_path):
     src = _source(tmp_path / "src")
     await manager.create("C", copy_from=str(src), start=False)   # no new upload: the create's sweep removes it
     assert _upload_files(manager, token) == []
+    await manager.shutdown()
+
+
+async def test_v1_uploads_have_a_root_and_a_cap_of_their_own(tmp_path):
+    """The HTTP API v1's uploads (docs/SPEC.md §21.3) live in .dreamteam/uploads/api: never counted against the
+    board's 8, never usable as its copy_from_upload, and swept with the board's."""
+    manager = _manager(tmp_path)
+    assert manager.api_uploads.root == manager.uploads.root / copyfrom.API_UPLOADS_DIR
+    limits = copyfrom.CopyLimits.from_config(manager.global_config())
+
+    async def chunks():
+        yield b"some text"
+
+    tokens = [(await manager.api_uploads.receive(chunks(), filename="a.txt", length=None, limits=limits,
+                                                  kind="file", caller="api", max_pending=32))["upload"]
+              for _ in range(copyfrom.UPLOAD_MAX_PENDING + 1)]
+    board = await _upload(manager, {"a.txt": "A"})   # the board's count ignores the api folder
+    with pytest.raises(SessionError) as err:   # a v1 token is no board upload
+        await manager.create("C", copy_from_upload=tokens[0], start=False)
+    assert err.value.status == 404 and manager.ids() == []
+    with pytest.raises(copyfrom.CopyError) as err:   # nor a board token a v1 one
+        manager.api_uploads.peek_many([board], caller="owner")
+    assert err.value.status == 404
+    api_root = manager.api_uploads.root
+    old = time.time() - copyfrom.UPLOAD_TTL - 1
+    meta = api_root / f"{tokens[1]}.json"
+    meta.write_text(json.dumps({**json.loads(meta.read_text(encoding="utf-8")), "at": old}), encoding="utf-8")
+    dead = 2 ** 22 + 12345
+    assert not sessions_mod._pid_alive(dead)
+    claim = _put(api_root / f"{'C' * 24}.claimed-{dead}-{copyfrom.RUN}-0123abcd.bin", "x")
+    manager.clean_copy_leftovers()   # (the hub's hourly sweep, or the next create)
+    left = sorted(p.name for p in api_root.iterdir())
+    assert f"{tokens[1]}.bin" not in left and not claim.exists() and f"{tokens[0]}.bin" in left
+    assert _upload_files(manager, board) == [f"{board}.json", f"{board}.zip"]
     await manager.shutdown()
 
 

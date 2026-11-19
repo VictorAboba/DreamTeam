@@ -205,6 +205,41 @@ def test_conversation(swarm, mail):
     assert mail.conversation(USER, CARL) == []
 
 
+def test_user_conversation_is_oldest_first_after_an_id(swarm, mail, tmp_path):
+    """The user's messages and those that reached the user (HTTP API v1, docs/SPEC.md §21.5 "Messages"): after 0 the
+    oldest page, unlike conversation() and history(); a session's file reads the same, an older file (no to_all)
+    too."""
+    import sqlite3
+
+    from dreamteam.mailbox import read_user_conversation
+
+    m1 = mail.send(ANNA, USER, "a report")
+    mail.send(ANNA, BOB, "side chat")   # never the user's
+    m3 = mail.send(USER, "all", "to everyone")
+    m4 = mail.send(BOB, [USER, CARL], "cc carl")
+    m5 = mail.send(USER, [ANNA], "thanks", reply_to=m1["id"])
+    mail.send(CARL, "all", "news")   # "all" never reaches the user
+    expected = [{key: m[key] for key in ("id", "ts", "sender", "recipients", "text", "reply_to")}
+                for m in (m1, m3, m4, m5)]
+    assert mail.user_conversation() == expected
+    assert mail.user_conversation(limit=2) == expected[:2]
+    assert mail.user_conversation(after=m3["id"]) == expected[2:]
+    assert mail.user_conversation(after=m5["id"]) == []
+    assert read_user_conversation(swarm.db.path, after=m1["id"], limit=2) == expected[1:3]
+    assert read_user_conversation(tmp_path / "missing.db") == []
+    old = tmp_path / "old.db"   # (a file of a version before messages.to_all)
+    conn = sqlite3.connect(old)
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, sender TEXT, recipients TEXT,"
+                 " text TEXT, reply_to INTEGER)")
+    conn.execute("CREATE TABLE inbox (message_id INTEGER, recipient TEXT, read_at REAL)")
+    conn.execute("INSERT INTO messages(ts, sender, recipients, text) VALUES (1, 'a', '[\"user\"]', 'old')")
+    conn.execute("INSERT INTO inbox(message_id, recipient) VALUES (1, 'user')")
+    conn.commit()
+    conn.close()
+    assert read_user_conversation(old) == [{"id": 1, "ts": 1.0, "sender": "a", "recipients": [USER], "text": "old",
+                                            "reply_to": None}]
+
+
 def test_recent(mail):
     msgs = [mail.send(ANNA, BOB, f"m{i}") for i in range(5)]
     assert mail.recent() == msgs
