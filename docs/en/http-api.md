@@ -480,9 +480,9 @@ is resumed as well.
   once (from the measure until the answer ends, however slowly its client reads): one more is 429
   `too_many_archives`; ask again later, or download the files one by one. A client that leaves during the measure
   gives its place back at once. Each archive keeps open files on the hub while it is sent, so a hub whose limit of
-  open files is below 1024 sends fewer (one at macOS's default of 256). The hub raises that limit to 1024 when it
-  starts, as far as the system allows, and its log says so when it cannot (`ulimit -n 1024` before
-  `dreamteam serve` helps then).
+  open files stays below 792 sends fewer (two at 512, one at 256). The hub raises a lower limit to 1024 when it
+  starts, as far as the system allows (macOS starts a program from Terminal with 256), and when the limit stays below
+  792 its log says how many archives it sends (`ulimit -n 1024` before `dreamteam serve` helps then).
 - Paths are relative to the session's folder, with `/`. An absolute path, `..`, `.`, an empty name, a NUL, a backslash,
   a `.git` component or a Windows short name (`GIT~1`) is 400 `bad_name`; so is a path in `.scratch` without
   `scratch=true`, and one in `.scratch/_skills` ever; on a Windows hub so are `:`, `< > " | ? *`, reserved names

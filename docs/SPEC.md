@@ -7933,13 +7933,13 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   the least: 4 at 1024, 2 at 512, 1 at 256. A hub raises a soft limit below `api_v1.OPEN_FILES_WANTED` (1024) to it
   at its start (`raise_open_files_limit`, from `launcher.serve_launcher`), as far as the hard limit allows: macOS
   starts a program from Terminal with 256. Never higher, and for its own process only (the programs it starts,
-  the agents' commands among them, inherit it; select() takes no descriptor past 1024); a limit that stays low (a
-  hard limit below 1024, a sandbox that refuses) is logged with the number of archives it allows. Windows has no
-  such limit to read (its C runtime gives a process 8192 descriptors): 4. A folder more than `MAX_DEPTH` levels below
-  the folder archived is 409 `conflict` (the first walk cannot read it). Two walks (`nofollow.walk_inside`, the same
-  `skip`, `limit=api_v1.ARCHIVE_MAX_ENTRIES`: 100 000 names, the ones left out counted too, since each costs the hub
-  memory while the zip is made, whatever its size; a folder's listing keeps only the names the walk may still reach,
-  and one more raises `nofollow.TooMany`):
+  the agents' commands among them, inherit it; select() takes no descriptor past 1024); a limit that stays below 792,
+  where fewer than 4 are sent (a hard limit that low, a sandbox that refuses), is logged with the number of archives
+  it allows. Windows has no such limit to read (its C runtime gives a process 8192 descriptors): 4. A folder more than
+  `MAX_DEPTH` levels below the folder archived is 409 `conflict` (the first walk cannot read it). Two walks
+  (`nofollow.walk_inside`, the same `skip`, `limit=api_v1.ARCHIVE_MAX_ENTRIES`: 100 000 names, the ones left out counted
+  too, since each costs the hub memory while the zip is made, whatever its size; a folder's listing keeps only the names
+  the walk may still reach, and one more raises `nofollow.TooMany`):
   - the first measures without opening a file (`ApiV1._measure`, `open_files` False; `scan_tree` would walk by path):
     over `[api] archive_max_mb` (default 1024, read again at each request) or over `ARCHIVE_MAX_ENTRIES` names is 413
     `too_large` before any byte, and an entry it cannot read (a folder it cannot list) is 409 `conflict`, since the
@@ -8128,7 +8128,7 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     runs (409); at most
     `ARCHIVES_AT_ONCE` archives while their clients do not read (429 `too_many_archives`, every slot given back by an
     archive that ends, is refused or is left; the descriptors they may hold together stay within a third of 1024),
-    fewer under a lower soft limit of open files (one at 256), which a hub's start raises to 1024 as far as the hard
+    fewer under a soft limit of open files below 792 (one at 256), which a hub's start raises to 1024 as far as the hard
     limit allows, never higher (a stand-in for `resource`); the
     archive a zip of exactly what is listed, with its folders, normalized modes and clamped times, of the whole folder
     and of one inside it; over `archive_max_mb` (413 before any byte); over `ARCHIVE_MAX_ENTRIES` names (413 before
