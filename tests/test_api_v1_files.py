@@ -393,6 +393,58 @@ async def test_a_step_cancelled_waits_for_its_thread_then_releases_what_it_gave(
     assert done.is_set() and released == ["opened"]
 
 
+async def test_folder_work_runs_in_v1s_own_threads_never_the_default_executor(tmp_path, api_token, no_start,
+                                                                              monkeypatch):
+    """A listing, a download, an archive, a result and an error's redaction run in v1's own daemon threads
+    (api_v1._Threads), at most FOLDER_THREADS at once: reads that hang (a share that stops answering) hold none of the
+    loop's default executor, which the rest of the hub shares (GET events reads the journal through it), a read past
+    FOLDER_THREADS waits for a place, and a read whose client is gone keeps its place until its thread ends."""
+    monkeypatch.setattr(api_v1, "FOLDER_THREADS", 2)
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    gate = threading.Event()
+    used: list[threading.Thread] = []
+    real_list, real_open, real_walk = nofollow.list_inside, nofollow.open_inside, nofollow.walk_inside
+    real_result, real_redact = ApiV1.result, ApiV1.redact
+
+    def hung_list(*args: Any, **kwargs: Any) -> Any:
+        used.append(threading.current_thread())
+        gate.wait(5)
+        return real_list(*args, **kwargs)
+
+    def seen(real: Any) -> Any:
+        def call(*args: Any, **kwargs: Any) -> Any:
+            used.append(threading.current_thread())
+            return real(*args, **kwargs)
+        return call
+
+    try:
+        uid, _sid, _folder = await session_with(hub, {"a.txt": "A"})
+        monkeypatch.setattr(nofollow, "list_inside", hung_list)
+        reads = [asyncio.ensure_future(listing(hub, uid)) for _ in range(3)]
+        await _until(lambda: len(used) == 2, "two reads in their threads")
+        await asyncio.sleep(0.1)
+        assert len(used) == 2   # (the third waits for a place)
+        status, _answer = await asyncio.wait_for(hub.call("GET", f"/api/v1/sessions/{uid}/events"), 2)
+        assert status == 200
+        assert await asyncio.wait_for(asyncio.to_thread(lambda: "free"), 2) == "free"
+        gate.set()
+        assert [got.status for got in await asyncio.gather(*reads)] == [200, 200, 200]
+        monkeypatch.setattr(nofollow, "open_inside", seen(real_open))
+        monkeypatch.setattr(nofollow, "walk_inside", seen(real_walk))
+        monkeypatch.setattr(ApiV1, "result", seen(real_result))
+        monkeypatch.setattr(ApiV1, "redact", seen(real_redact))
+        assert (await download(hub, uid, "a.txt")).body == b"A"
+        assert (await archive(hub, uid)).status == 200
+        assert (await hub.call("GET", f"/api/v1/sessions/{uid}/result"))[0] == 200
+        assert (await hub.create({"goal": "G", "model": "no-such-model"}))[1]["code"] == "unknown_model"
+        assert len(used) >= 7
+        assert all(thread.name == "dreamteam-api-folder" and thread.daemon for thread in used), used
+    finally:
+        gate.set()
+        await hub.close()
+
+
 async def test_a_client_gone_during_a_long_step_leaves_the_event_loop_idle(tmp_path, api_token, no_start,
                                                                             monkeypatch):
     """Starlette cancels a streamed answer through an anyio cancel scope, which cancels a task still waiting again at

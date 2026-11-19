@@ -113,6 +113,9 @@ ZIP_ENTRY_COST = 4 << 10    # what one entry of an archive counts for in a step,
 # archives a hub measures or sends at once (429 too_many_archives beyond them): each holds the descriptors of its walk,
 # up to nofollow.MAX_DEPTH + 2, for as long as its client takes to read it
 ARCHIVES_AT_ONCE = 4
+# v1's own daemon threads at once for the work that may touch a folder of the hub's computer (_Threads; docs/SPEC.md
+# §21.1 "Threads"): a call past them waits for one to end
+FOLDER_THREADS = 8
 # ID_MAX (autoreply's, SQLite's largest integer): the largest id a query's `after`, a message's `reply_to` or a
 # request's id names
 TO_MAX = 100                # names in the `to` of a message the client sends
@@ -314,18 +317,20 @@ async def read_json(request: Request, *, limit: int = JSON_MAX) -> dict[str, Any
 
 def root_pairs(config: "Config") -> list[tuple[Path, str]]:
     """The roots of `[api] folders` as (folder, name) pairs for the redaction of error texts (docs/SPEC.md §21.1
-    "Paths in answers"): a path below a root then reads `<root>/<path>`. Each as written and resolved; a root that is
-    not absolute on this computer's own system (config.native_absolute) is never resolved, nor named."""
+    "Paths in answers"): a path below a root then reads `<root>/<path>`. Each as written and as it resolved the last
+    time the hub resolved it (apifolders.resolved_root: at the hub's start, then at each use of the root, which comes
+    before any text that names a path below it); a root that is not absolute on this computer's own system
+    (config.native_absolute) is never named. Never touches the file system: an error that has nothing to do with a
+    root never waits on one that lies on a share that does not answer."""
     pairs: list[tuple[Path, str]] = []
     for folder in apifolders.roots(config).values():
         if not native_absolute(folder.path):
             continue
         path = Path(folder.path)
         pairs.append((path, folder.name))
-        with contextlib.suppress(OSError, RuntimeError, ValueError):
-            resolved = path.resolve()
-            if resolved != path:
-                pairs.append((resolved, folder.name))
+        resolved = apifolders.resolved_root(folder.path)
+        if resolved is not None and resolved != path:
+            pairs.append((resolved, folder.name))
     return pairs
 
 
@@ -786,12 +791,65 @@ async def _outlive(work: asyncio.Future[Any]) -> None:
             await asyncio.wait({work})
 
 
-async def _thread_step(fn: Callable[..., Any], *args: Any, release: Callable[[Any], None] | None = None) -> Any:
+class _Threads:
+    """v1's own daemon threads for the work that may touch a folder of the hub's computer (docs/SPEC.md §21.1
+    "Threads"): a session's folder, a server folder or its root (the files and archives, a result's changed files, a
+    create's folder, the redaction of an error text). At most `size` run at once; a call past them waits for one to
+    end, and a cancel while it waits starts nothing. Never the loop's default executor, which the rest of the hub
+    shares (workspace git, the triggers, the forge, v1's journal reads) and which asyncio.run waits for at exit: a
+    folder on a share that stops answering holds at most `size` threads of v1's, each until its own call returns (a
+    cancelled caller's thread keeps its place until then), never the hub's other work nor its exit."""
+
+    def __init__(self, size: int) -> None:
+        self._slots = asyncio.Semaphore(size)
+
+    async def start(self, fn: Callable[..., Any], *args: Any) -> asyncio.Future[Any]:
+        """fn(*args) started in a new daemon thread once a place is free: a future of its result (an exception it
+        raises is the future's), which nothing cancels in the thread."""
+        await self._slots.acquire()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+
+        def settle(ok: bool, value: Any) -> None:
+            self._slots.release()
+            if future.cancelled():
+                return
+            if ok:
+                future.set_result(value)
+            else:
+                future.set_exception(value)
+
+        def work() -> None:
+            try:
+                value, ok = fn(*args), True
+            except BaseException as exc:  # noqa: BLE001 - handed to the future
+                value, ok = exc, False
+            with contextlib.suppress(RuntimeError):   # (the loop is closed: nobody waits any more)
+                loop.call_soon_threadsafe(settle, ok, value)
+
+        try:
+            threading.Thread(target=work, name="dreamteam-api-folder", daemon=True).start()
+        except BaseException:
+            self._slots.release()
+            raise
+        return future
+
+    async def run(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """fn(*args) in one of the threads, its result awaited (a cancel leaves the thread to end by itself)."""
+        return await (await self.start(fn, *args))
+
+
+async def _thread_step(fn: Callable[..., Any], *args: Any, release: Callable[[Any], None] | None = None,
+                       threads: _Threads | None = None) -> Any:
     """fn(*args) in a thread that a cancellation (the client gone) never leaves running behind the caller: a cancel
     waits for it to end (_outlive), hands what it gave to `release` (a file it opened, to close; claims it took, to
     give back), then goes on. So a download or an archive closes its file or its walk only once no thread reads it,
-    and a create holds no claim after it."""
-    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
+    and a create holds no claim after it. `threads`: v1's folder threads (a read of a folder of the hub's computer),
+    else the loop's default executor (the home's own files)."""
+    if threads is not None:
+        work = await threads.start(fn, *args)   # (a cancel while it waits for a place starts nothing)
+    else:
+        work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(work)
     except asyncio.CancelledError:
@@ -1008,14 +1066,15 @@ class _Streamed(StreamingResponse):
                     log.exception("API v1: a download could not close what it read")
 
 
-async def _file_bytes(file: BinaryIO, size: int, label: str) -> AsyncIterator[bytes]:
-    """The bytes of an opened file (`files/{path}`), FILE_CHUNK at a time in a thread, exactly `size` of them (the
-    Content-Length sent): a file that grew meanwhile is cut there; one that shrank, or a read that fails, ends the
-    answer with an error (logged), so the client sees it cut short, never a whole file that is not."""
+async def _file_bytes(file: BinaryIO, size: int, label: str, threads: _Threads | None = None) -> AsyncIterator[bytes]:
+    """The bytes of an opened file (`files/{path}`), FILE_CHUNK at a time in a thread (`threads`: _thread_step's),
+    exactly `size` of them (the Content-Length sent): a file that grew meanwhile is cut there; one that shrank, or a
+    read that fails, ends the answer with an error (logged), so the client sees it cut short, never a whole file that
+    is not."""
     sent = 0
     try:
         while sent < size:
-            chunk = await _thread_step(file.read, min(FILE_CHUNK, size - sent))
+            chunk = await _thread_step(file.read, min(FILE_CHUNK, size - sent), threads=threads)
             if not chunk:
                 raise OSError(errno.EIO, f"the file ended after {sent} of its {size} bytes")
             sent += len(chunk)
@@ -1151,12 +1210,12 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: M
         walk.close()
 
 
-async def _zip_bytes(parts: Iterator[bytes], label: str) -> AsyncIterator[bytes]:
-    """The parts of an archive (_zip_parts), each step in a thread (_thread_step: the walk is closed only once no
-    thread reads it); an error ends the answer (logged), so the client's zip has no central directory."""
+async def _zip_bytes(parts: Iterator[bytes], label: str, threads: _Threads | None = None) -> AsyncIterator[bytes]:
+    """The parts of an archive (_zip_parts), each step in a thread (_thread_step, `threads`: the walk is closed only
+    once no thread reads it); an error ends the answer (logged), so the client's zip has no central directory."""
     try:
         while True:
-            chunk = await _thread_step(next, parts, None)
+            chunk = await _thread_step(next, parts, None, threads=threads)
             if chunk is None:
                 return
             if chunk:
@@ -1185,6 +1244,7 @@ class ApiV1:
         # own until its session is marked starting with it, then that session counts (running_count)
         self._reserved: set[object] = set()
         self._archives = 0      # archives being measured or sent (at most ARCHIVES_AT_ONCE)
+        self.threads = _Threads(FOLDER_THREADS)   # the work that may touch a folder of the hub's computer
         self._refs: dict[str, _Ref] = {}   # the client_refs of the creates in flight
         # the results of final sessions (docs/SPEC.md §21.7), newest last, at most RESULTS_CACHED: key (_result_key)
         # -> the result without its board_url
@@ -1234,7 +1294,7 @@ class ApiV1:
             return await handler(request, caller)
         except ApiError as exc:
             if exc.redact and caller == "api":   # (the swarm's own text: in a thread, as error_response's)
-                text = await asyncio.to_thread(self.redact, exc.text, request.scope.get(API_SID))
+                text = await self.threads.run(self.redact, exc.text, request.scope.get(API_SID))
                 return fail(exc.code, text, headers=exc.headers, **exc.extra)
             return exc.response()
         except CODED_ERRORS as exc:   # (the session the route resolved, if any: its folders are named in the text)
@@ -1264,8 +1324,9 @@ class ApiV1:
         `[api] folders` as `<root>/<path>`, the user's home as "~", the home, and with `sid` that session's folders, by
         their names, a path in another session's folder as SessionManager.OTHER_SESSION (SessionManager._public_text),
         any other absolute path by its last component. A route of v1 the text names (_ROUTE: "GET /api/v1/options")
-        is kept as it is. Blocking (it resolves the roots, which may lie on a network share, and reads the session's
-        files): a route calls it through error_response, in a thread."""
+        is kept as it is. The roots are named as written and as they resolved before (root_pairs), never resolved
+        here. Blocking (it reads the session's files and resolves its folders, an in-place one maybe on a network
+        share): a route calls it through error_response, in one of v1's folder threads."""
         routes: list[str] = []
         marker = "APIROUTE"
         while marker in text:
@@ -1283,8 +1344,9 @@ class ApiV1:
         return re.sub(f"{marker}([0-9]+){marker}", back, public) if routes else public
 
     async def error_response(self, exc: BaseException, caller: str, sid: str | None = None) -> JSONResponse:
-        """One of CODED_ERRORS as `{"error", "code"}` (error_code); for the API caller its text through redact(), in a
-        thread, so that a root on an unplugged share never stalls the hub. An `internal` one is logged, with its
+        """One of CODED_ERRORS as `{"error", "code"}` (error_code); for the API caller its text through redact(), in
+        one of v1's folder threads (_Threads), so that a session's folder on an unplugged share never holds the loop's
+        default executor (redact never resolves a root at all). An `internal` one is logged, with its
         traceback unless it is the 503 of a hub shutting down (no fault of anyone's). `sid`: the session the route
         is about (its folders are named by their names). `folder_busy` is v1's own text, whoever calls: the manager's
         names the other session's folder, so its title; the answer's `session` names that session's id when the
@@ -1303,7 +1365,7 @@ class ApiV1:
         text = str(exc)
         wait = getattr(exc, "retry_after", None)   # (CopyError's: `too_many_uploads`)
         headers = {"Retry-After": str(wait)} if isinstance(wait, int) and not isinstance(wait, bool) else None
-        return fail(code, await asyncio.to_thread(self.redact, text, sid) if caller == "api" else text,
+        return fail(code, await self.threads.run(self.redact, text, sid) if caller == "api" else text,
                     headers=headers)
 
     def _uid_for(self, sid: str, caller: str) -> str | None:
@@ -1924,7 +1986,7 @@ class ApiV1:
                     summary = self._summary_of(sid)
                     if summary is None:
                         return
-                    result = await asyncio.to_thread(self.result, sid, summary, [])
+                    result = await self.threads.run(self.result, sid, summary, [])
                     if (watch.changed.is_set() or not summary["final"] or not self.manager.is_final(sid)
                             or self.resolve(uid, caller) != sid):
                         continue
@@ -2130,8 +2192,9 @@ class ApiV1:
             skills = await asyncio.to_thread(skill_refs, ask.skills, config) if ask.skills else []
             folder: FolderRequest | None = None
             if ask.folder is not None:   # resolved and checked (docs/SPEC.md §21.10), checked again by the create
-                folder = await asyncio.to_thread(apifolders.resolve_request, ask.folder["root"], ask.folder["path"],
-                                                 ask.folder["mode"], config=config, home=manager.home)
+                folder = await self.threads.run(functools.partial(
+                    apifolders.resolve_request, ask.folder["root"], ask.folder["path"], ask.folder["mode"],
+                    config=config, home=manager.home))
             uploads = manager.api_uploads
             if ask.files:   # every token checked, none claimed yet: a refusal here uses nothing up
                 await asyncio.to_thread(uploads.peek_many, ask.files, caller=caller)
@@ -2425,7 +2488,7 @@ class ApiV1:
         swarm = self.manager.swarms.get(sid)
         jobs = ([job_view(job) for job in swarm.jobs.running_of()]
                 if swarm is not None and sid in self.manager.running else [])
-        result = await asyncio.to_thread(self.result, sid, summary, jobs)
+        result = await self.threads.run(self.result, sid, summary, jobs)
         self._still(request, sid)
         return SafeJSONResponse(result)
 
@@ -2439,7 +2502,7 @@ class ApiV1:
         asked = check_rel(query.get("path"), scratch=scratch)
         sid = self._session(request, caller)
         self.manager._refresh_settings()
-        entries = await asyncio.to_thread(self._listing, sid, asked, scratch)
+        entries = await self.threads.run(self._listing, sid, asked, scratch)
         self._still(request, sid)
         return JSONResponse({"path": "/".join(asked), "entries": entries})
 
@@ -2455,14 +2518,16 @@ class ApiV1:
             raise ApiError("bad_request", _is_folder_text("."))
         sid = self._session(request, caller)
         self.manager._refresh_settings()
-        file, size = await _thread_step(self._open_file, sid, asked, release=lambda opened: opened[0].close())
+        file, size = await _thread_step(self._open_file, sid, asked, release=lambda opened: opened[0].close(),
+                                        threads=self.threads)
         try:   # (the file opened is the session's only when its name is still the session's after the open)
             self._still(request, sid)
         except BaseException:
             file.close()
             raise
-        return _Streamed(_file_bytes(file, size, f"{'/'.join(asked)} of session {sid}"), closing=file.close,
-                         media_type="application/octet-stream", headers=_download_headers(asked[-1], size))
+        return _Streamed(_file_bytes(file, size, f"{'/'.join(asked)} of session {sid}", self.threads),
+                         closing=file.close, media_type="application/octet-stream",
+                         headers=_download_headers(asked[-1], size))
 
     async def _archive(self, request: Request, caller: str) -> Response:
         """GET /api/v1/sessions/{id}/archive?path=&scratch= (docs/SPEC.md §21.8): a zip of the session's folder, or of
@@ -2490,7 +2555,7 @@ class ApiV1:
         try:
             limit_mb = self.manager.global_config().api.archive_max_mb   # (a hand edit is picked up)
             # (a cancel waits for the walk's thread to end: the slot is given back once its descriptors are closed)
-            where, measured = await _thread_step(self._measure, sid, asked, scratch, limit_mb)
+            where, measured = await _thread_step(self._measure, sid, asked, scratch, limit_mb, threads=self.threads)
             self._still(request, sid)
             uid = request.path_params.get("id")
             parts = _zip_parts(where, asked, scratch, measured, limit_mb << 20,
@@ -2505,8 +2570,9 @@ class ApiV1:
             finally:
                 release()
 
-        return _Streamed(_zip_bytes(parts, f"{'/'.join(asked) or '.'} of session {sid}"), closing=closing,
-                         media_type="application/zip", headers=_download_headers(f"{asked[-1] if asked else sid}.zip"))
+        return _Streamed(_zip_bytes(parts, f"{'/'.join(asked) or '.'} of session {sid}", self.threads),
+                         closing=closing, media_type="application/zip",
+                         headers=_download_headers(f"{asked[-1] if asked else sid}.zip"))
 
 
 __all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVES_AT_ONCE", "ARCHIVE_FIELDS", "BASE_GONE_TEXT",

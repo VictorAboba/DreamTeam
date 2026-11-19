@@ -65,6 +65,11 @@ GIT_UNREADABLE = "git cannot read its repository"
 # the sandbox. Below RUNTIME_DISKS lie removable disks, not sockets.
 RUNTIME_FOLDERS = ("/run", "/var/run", "/private/var/run")
 RUNTIME_DISKS = "/run/media"
+# what each root path (as written) resolved to the last time resolve_root resolved it in this process (at the hub's
+# start: log_refusals; then at each use), for the redaction of error texts (api_v1.root_pairs), which never resolves a
+# root itself: an error's answer never waits on a root on a share that does not answer. At most RESOLVED_KEPT paths
+_RESOLVED: dict[str, Path] = {}
+RESOLVED_KEPT = 256
 
 
 def roots(config: "Config") -> dict[str, ApiFolder]:
@@ -151,12 +156,21 @@ def resolve_root(folder: ApiFolder, *, home: Path, config: "Config") -> Path:
         why = getattr(exc, "strerror", None) or type(exc).__name__
         raise CopyError(f"The folder root '{name}' cannot be read on the hub's computer ({why}).", 403,
                         code=FORBIDDEN) from None
+    if folder.path not in _RESOLVED and len(_RESOLVED) >= RESOLVED_KEPT:
+        _RESOLVED.clear()
+    _RESOLVED[folder.path] = real
     if not real.is_dir():
         raise CopyError(f"The folder root '{name}' is not a folder on the hub's computer.", 404, code="not_found")
     reason = root_refusal(real, home=home, config=config)
     if reason is not None:
         raise CopyError(f"The folder root '{name}' {reason}: [api] folders cannot grant it.", 403, code=FORBIDDEN)
     return real
+
+
+def resolved_root(path: str) -> Path | None:
+    """What the root path `path` (as written) resolved to the last time resolve_root resolved it in this process, else
+    None. Never touches the file system."""
+    return _RESOLVED.get(path)
 
 
 @dataclass(frozen=True)
@@ -429,4 +443,4 @@ def log_refusals(config: "Config", home: Path) -> None:
 
 __all__ = ["FOLDER_FIELDS", "GIT_UNREADABLE", "GIT_WRITES", "MODES", "ApiFolder", "FolderRequest", "as_listed",
            "folder_meta", "git_dir_refusal", "in_place_folder", "log_refusals", "resolve_request", "resolve_root",
-           "root_refusal", "roots", "shown"]
+           "resolved_root", "root_refusal", "roots", "shown"]

@@ -6975,14 +6975,27 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     session's id, its folders by their names, a path in another session's folder as `(a folder of another session)`
     (`SessionManager.OTHER_SESSION`: a session's folder name is its title), any other absolute path by its last
     component. `ApiV1.redact(text, sid=None)` is `manager._public_text(sid, text, named=<the roots of [api]
-    folders>)` (§17.2), a root not absolute on the hub's own system left out; `ApiV1.error_response` runs it in a
-    thread, since it resolves the roots (a disconnected network share would otherwise stall the hub) and reads the
-    session's files. A route of v1 that a text names (`GET /api/v1/options lists the roles`: `/api/v1` and lowercase
-    words or `{id}`-like placeholders after it, starting a word) is kept as it is, never named by its last component.
-    `folder_busy` is v1's own text (`api_v1.FOLDER_BUSY_TEXT`), for every caller, never a `SessionError` text; its
-    `session` names the other session (`SessionError.holder`) by its uid when the caller sees it (21.10). Summaries
-    (21.7) hold no absolute path, for any caller. Event data (21.6), task results, messages and files carry what the
-    agents wrote, paths included: v1 does not scrub them.
+    folders>)` (§17.2), a root not absolute on the hub's own system left out. The roots are named as written and as
+    they resolved the last time the hub resolved them (`api_v1.root_pairs`, `apifolders.resolved_root`: at the hub's
+    start, then at each use of a root, which comes before any text that names a path below it), never resolved for
+    an error: an error that has nothing to do with a root never waits on one on a share that does not answer.
+    `ApiV1.error_response` runs it in one of v1's folder threads ("Threads"), since it reads the session's files and
+    resolves its folders. A route of v1 that a text names (`GET /api/v1/options lists the roles`: `/api/v1` and
+    lowercase words or `{id}`-like placeholders after it, starting a word) is kept as it is, never named by its last
+    component. `folder_busy` is v1's own text (`api_v1.FOLDER_BUSY_TEXT`), for every caller, never a `SessionError`
+    text; its `session` names the other session (`SessionError.holder`) by its uid when the caller sees it (21.10).
+    Summaries (21.7) hold no absolute path, for any caller. Event data (21.6), task results, messages and files carry
+    what the agents wrote, paths included: v1 does not scrub them.
+- **Threads.** What may touch a folder of the hub's computer runs in v1's own daemon threads (`api_v1._Threads`,
+  `ApiV1.threads`), at most `api_v1.FOLDER_THREADS` (8) at once: a session's folder or a server folder and its root,
+  read by GET files, a download's reads, an archive's measure and steps (21.8), a result's changed files (21.7), a
+  create's `folder` (`apifolders.resolve_request`, 21.10) and the redaction of an error text. A call past them waits
+  for one to end; a cancel while it waits starts nothing, and a thread whose client left keeps its place until its
+  call returns (a download or an archive closes its file or its walk only then: `api_v1._thread_step`). Never the
+  loop's default executor, which the rest of the hub shares (workspace git, the triggers, the forge, v1's reads of
+  the journals and the uploads store) and which `asyncio.run` waits for at exit: a share that stops answering holds
+  at most these threads until its calls return, never the hub's other work, and never its exit. The checks of a
+  start (`_check_workspace_ready`, §17.2) are the manager's.
 - **Compatibility**: within v1, fields, codes, states and event types are only added, never renamed, removed or given
   another meaning; a client ignores what it does not know. The `text` of events (21.6) and of errors is for people and
   may be reworded. Anything else is `/api/v2`, and v1 then stays for at least one minor release. `GET /api/v1/options`
@@ -8000,7 +8013,9 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     attachment's name; a listing in name order without `.git` or `.scratch`, `.scratch` only with `scratch=true` and
     `.scratch/_skills` never; what is asked missing or of the other kind, unknown query fields; a download with its
     headers in chunks, one that shrinks while it is sent (cut), one its client leaves (its file closed), one replaced
-    while it is opened (409); a step cancelled twice waits for its thread, then releases what it gave; a client gone
+    while it is opened (409); a step cancelled twice waits for its thread, then releases what it gave; the folder
+    work in v1's own daemon threads (at most `FOLDER_THREADS`: reads that hang hold none of the default executor,
+    and GET events still answers; a listing, a download, an archive, a result, a redaction); a client gone
     during a long step leaves the event loop idle (its passes counted); path escapes
     and `.git` at any depth as `bad_name`, the NTFS names refused on Windows only, a name with `:` listed and served
     on POSIX, names NTFS reads as others left out on Windows; a link to outside and hard links never listed, served or
@@ -8029,7 +8044,8 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     `folder`;
   - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
     spelling (one folder), each name taken as its folder lists it (`as_listed`), a root under /run or /var/run
-    refused and never mounted, a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, a
+    refused and never mounted, an error text that never resolves a root (yet names a path below one in its resolved
+    spelling), a `.git` that is a gitfile or a linked worktree's, a common dir outside the folder, a
     link swapped in before git init, between its steps, after it and after `_carry_out` (nothing written or removed in
     the repository it leads to; on Windows the folder held refuses the swap; `tests/test_nofollow.py`: `hold_inside`),
     and `DREAMTEAM_API_FOLDERS_DIR` ignored outside the container; `aclose()` with a start in flight;

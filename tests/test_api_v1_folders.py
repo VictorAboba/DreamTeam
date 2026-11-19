@@ -532,6 +532,36 @@ async def test_a_root_is_checked_where_it_lies_at_each_use(tmp_path, api_token, 
         await hub.close()
 
 
+async def test_an_error_text_never_resolves_a_root(tmp_path, api_token, monkeypatch):
+    """The redaction of an error text names each root as written and as it resolved the last time the hub resolved it
+    (apifolders.resolved_root), never resolving one itself: an error that has nothing to do with a root never waits
+    on one on a share that does not answer. A path below a root, in its resolved spelling, still reads
+    `<root>/<path>` once the root was used."""
+    real = tmp_path / "srv" / "real-jobs"
+    (real / "acme").mkdir(parents=True)
+    written = tmp_path / "jobs-link"   # (the root as written leads elsewhere: written != resolved)
+    _dir_link(real, written)
+    hub, _jobs, _places = _hub(tmp_path, folders={"linked": {"path": str(written)}})
+    resolved: list[Path] = []
+    real_resolve = Path.resolve
+
+    def counted(self: Path, *args: Any, **kwargs: Any) -> Path:
+        if self == written:
+            resolved.append(self)
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counted)
+    try:
+        status, answer = await hub.create({"goal": "G", "model": "no-such-model"})
+        assert (status, answer["code"]) == (400, "unknown_model") and resolved == [], answer
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "linked", "path": "none"}})
+        assert (status, answer["code"]) == (404, "not_found") and len(resolved) == 1, answer   # (the root's use)
+        text = await hub.api.threads.run(hub.api.redact, f"{real_resolve(real) / 'acme' / 'x.txt'} is in use")
+        assert text.replace(os.sep, "/") == "linked/acme/x.txt is in use" and len(resolved) == 1, text
+    finally:
+        await hub.close()
+
+
 async def test_the_hub_logs_the_roots_it_cannot_use_at_its_start(tmp_path, caplog):
     jobs = tmp_path / "jobs"
     jobs.mkdir()
