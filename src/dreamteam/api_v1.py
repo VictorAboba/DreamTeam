@@ -1396,11 +1396,12 @@ class ApiV1:
 
     def summary(self, sid: str) -> dict[str, Any]:
         """A session as v1 shows it (docs/SPEC.md §21.7 "Summary"), for any caller: never an absolute path (no `dir`,
-        `workspace` or `copied_from` of the board's summary, whose figures it takes). SessionError 404 for a session
-        that is gone. Blocking (it reads session.json and the database), as the board's summary."""
+        `workspace` or `copied_from` of the board's summary, whose figures it takes; the board's is built without its
+        workspace, so the folder a session works in, maybe on a share, is never looked at here). SessionError 404 for a
+        session that is gone. Blocking (it reads session.json and the database), as the board's summary."""
         manager = self.manager
         meta = manager.meta(sid)
-        board = manager.summary(sid)
+        board = manager.summary(sid, workspace=False)
         api = api_meta(meta)
         running = sid in manager.running
         goal = board.get("goal")
@@ -2198,7 +2199,7 @@ class ApiV1:
         held = sid in manager.starting or sid in manager.resume_pending   # (its place in max_running is held already)
         if api_meta(meta) is not None and not held:
             self._check_running(manager.global_config())
-        board = manager.summary(sid)
+        board = manager.summary(sid, workspace=False)
         limit, spent = float(board.get("max_cost_usd") or 0.0), float(board.get("spent_usd") or 0.0)
         if limit > 0 and spent >= limit:
             raise ApiError("budget_exhausted", budget_text(spent, limit))

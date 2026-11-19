@@ -4198,7 +4198,8 @@ settings; ValueError when they are invalid):
   (`copyfrom.Uploads(<home>/.dreamteam/uploads/api)`, the files of `POST /api/v1/uploads`, §21.3;
   `clean_copy_leftovers` sweeps both).
 - Methods: `listen(fn)` / `unlisten(fn)`, `settings_view()`, `async update_settings(update)`, `ids()`,
-  `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid)`, `list()`,
+  `exists(sid)`, `dir_of(sid)`, `meta(sid)`, `config_for(sid)`, `config_view(sid)`, `summary(sid, *, workspace=True)`
+  (False: `"workspace": None`, the folder not looked at), `list()`,
   `default_session()`, `async create(title, goal="", description="", *, overrides=None, start=True,
   workspace=None, skills=None, via="home", auto_reply=False, copy_from=None, copy_from_upload=None, api=None,
   sources=None, mark=None)`, `validated_overrides(overrides)`,
@@ -7869,7 +7870,10 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     the coroutine closed): `manager.shutdown()` may be running, and nobody would wait for the task.
   - `api_v1.py` also holds the one resolver of `{id}` (`ApiV1.resolve(uid, caller)`: `sid_of_uid`, then for the API
     caller a session whose session.json says `"via": "api"`), the summary (`ApiV1.summary(sid)`, built on the board's
-    `manager.summary` with no path of it) and its state (`api_v1.state_of`), and `[api] max_running`'s count
+    `manager.summary` with no path of it, and without its `workspace` entry: `manager.summary(sid, workspace=False)`,
+    as `continue` reads the budget, since `workspace_of` looks at the folder the session works in, which may lie on a
+    share that does not answer, and a summary is built on the loop for every route, every pass of a poll or a stream
+    and every session listed) and its state (`api_v1.state_of`), and `[api] max_running`'s count
     (`ApiV1.running_count()`: the v1 sessions in `running`, `starting` or `resume_pending`, plus the creates past the
     check that have not marked their session yet). A request of a running session that cannot be read blocks
     nothing (as the summary's `requests` count skips it), and GET `/sessions` leaves out a session whose summary

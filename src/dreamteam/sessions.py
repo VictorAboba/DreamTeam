@@ -1925,7 +1925,10 @@ class SessionManager:
         return clean
 
     # ---- summaries ----------------------------------------------------------------------------
-    def summary(self, sid: str) -> dict[str, Any]:
+    def summary(self, sid: str, *, workspace: bool = True) -> dict[str, Any]:
+        """The session as the board and the clients show it. `workspace`: False leaves its "workspace" None, which
+        otherwise looks at the folder the session works in (workspace_of: it may lie on a share that does not answer),
+        for a caller that never shows it, on the event loop (the HTTP API v1's summary, docs/SPEC.md §21.7)."""
         self._check(sid)
         meta = self.meta(sid)
         try:
@@ -1964,7 +1967,7 @@ class SessionManager:
             "max_cost_usd": _number(limits.get("max_cost_usd", cfg.swarm.max_cost_usd)),
             "max_agents": int(_number(limits.get("max_agents", cfg.swarm.max_agents))),
             "overrides": meta.get("overrides") or {}, "config_error": config_error,
-            "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta),
+            "url": f"/s/{sid}/", "workspace": self.workspace_of(sid, meta) if workspace else None,
             "copied_from": _copied_from(meta.get("copied_from")),   # files copied in at create (copyfrom.py)
             "skills": [s.name for s in attached],
             "skills_pending": [s.name for s in attached if s.library == "pending"],

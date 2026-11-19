@@ -756,6 +756,37 @@ async def test_a_start_checks_the_folder_off_the_event_loop(tmp_path, api_token,
         await hub.close()
 
 
+async def test_a_summary_never_looks_at_the_folder_on_the_event_loop(tmp_path, api_token, no_start, monkeypatch):
+    """v1's summaries (a session, the listing, each pass of a poll) are built on the event loop and never show the
+    folder a session works in, so they never look at it (manager.summary(..., workspace=False)): on a share that does
+    not answer, every session, the board and /mcp would wait."""
+    hub, _jobs, _places = _hub(tmp_path)
+    no_start(hub.manager)
+    loop_thread = threading.get_ident()
+    looked: list[str] = []
+    workspace_of = SessionManager.workspace_of
+
+    def watched(self: SessionManager, sid: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        if threading.get_ident() == loop_thread:
+            looked.append(sid)
+        return workspace_of(self, sid, meta)
+
+    try:
+        status, answer = await hub.create({"goal": "G", "folder": {"root": "places", "path": "a", "mode": "in_place"}})
+        assert status == 202, answer
+        await hub.settled()
+        uid, sid = answer["session"]["id"], answer["session"]["name"]
+        monkeypatch.setattr(SessionManager, "workspace_of", watched)
+        for path, query in ((f"/api/v1/sessions/{uid}", ""), ("/api/v1/sessions", ""),
+                            (f"/api/v1/sessions/{uid}/events", "wait=0.2")):
+            status, answer = await hub.call("GET", path, query=query)
+            assert status == 200, (path, answer)
+        assert looked == []
+        assert hub.manager.summary(sid)["workspace"]["exists"] and looked == [sid]   # (the board's shows it)
+    finally:
+        await hub.close()
+
+
 async def test_a_workspace_move_by_the_owner_drops_the_server_folder(tmp_path, api_token):
     hub, _jobs, _places = _hub(tmp_path)
     try:
