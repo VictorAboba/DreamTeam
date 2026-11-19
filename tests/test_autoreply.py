@@ -813,6 +813,43 @@ async def test_a_hub_that_stops_waits_for_a_scheduled_stop_and_leaves_an_unread_
         await again.shutdown()
 
 
+async def test_a_hub_that_stops_as_a_scheduled_stop_ends_does_not_wait_for_that_task(tmp_path, monkeypatch):
+    """shutdown() entered in the loop step in which a scheduled stop has ended, before the task's done-callback has
+    taken it out of _stopping, returns: only the stops not done yet are awaited. (On Python 3.12+ a gather of done
+    tasks completes without yielding to the loop, so waiting for that task would never let the callback run;
+    `eager_gather` does the same here on every version, and fails the test instead of spinning.)"""
+    manager = manager_for(home_for(tmp_path), idler)
+
+    async def ended(sid: str, swarm: Any, reason: str) -> None:
+        return None
+
+    monkeypatch.setattr(manager, "_stop_ended", ended)
+    manager._stop_soon("001-done", None, "done")
+    (task,) = manager._stopping
+    await asyncio.sleep(0)   # (the task ends in this step; its done-callback runs at the next one)
+    assert task.done() and task in manager._stopping
+    real_gather, spins = asyncio.gather, []
+
+    def eager_gather(*aws: Any, return_exceptions: bool = False) -> Any:
+        if aws and all(isinstance(aw, asyncio.Future) and aw.done() for aw in aws):
+            spins.append(1)
+            if len(spins) > 100:
+                raise AssertionError("shutdown() waits for a done task without yielding to the loop")
+            future = asyncio.get_running_loop().create_future()
+            future.set_result([None] * len(aws))
+            return future
+        return real_gather(*aws, return_exceptions=return_exceptions)
+
+    asyncio.gather = eager_gather
+    try:
+        await manager.shutdown()
+    finally:
+        asyncio.gather = real_gather
+    assert not spins and not manager._closing
+    await asyncio.sleep(0)
+    assert not manager._stopping
+
+
 async def test_a_budget_raised_before_its_stop_keeps_the_session_running(tmp_path):
     manager = manager_for(home_for(tmp_path), idler)
     try:

@@ -71,6 +71,18 @@ def _manager(home: Path) -> SessionManager:
     return SessionManager(home, llm_factory=factory)
 
 
+async def drained(tasks: set[asyncio.Task]) -> None:
+    """Wait until `tasks`, a set its tasks leave through a done-callback, is empty. Only the tasks not done yet are
+    awaited: on Python 3.12+ a gather of done tasks completes without yielding to the loop, so their done-callbacks
+    would never run and a `while tasks: await gather(*tasks)` would spin."""
+    while tasks:
+        pending = [task for task in tasks if not task.done()]
+        if pending:
+            await asyncio.wait(pending)
+        else:
+            await asyncio.sleep(0)   # (the done-callbacks run at the loop's next step)
+
+
 class Hub:
     """The launcher's app of a manager, called on the test's loop as the server would call it."""
 
@@ -101,8 +113,7 @@ class Hub:
 
     async def settled(self) -> None:
         """Every background start has ended."""
-        while self.api._tasks:
-            await asyncio.gather(*list(self.api._tasks), return_exceptions=True)
+        await drained(self.api._tasks)
 
     async def close(self) -> None:
         await self.api.aclose()
@@ -997,8 +1008,7 @@ async def test_continue_reopens_the_goal_of_a_session_stop_when_done_stopped(tmp
         (row,) = swarm.db.all("SELECT data FROM events WHERE type = 'goal.reopened'")
         assert json.loads(row["data"])["comment"] == "Make it rhyme better."
         await asyncio.sleep(0.05)
-        while hub.manager._stopping:   # (none should be scheduled: the new run's watcher saw no completion)
-            await asyncio.gather(*list(hub.manager._stopping), return_exceptions=True)
+        await drained(hub.manager._stopping)   # (none should be scheduled: the new run's watcher saw no completion)
         status, answer = await hub.call("GET", path)
         assert _running(hub, sid) and answer["session"]["state"] == "running", answer
         assert answer["session"]["error"] is None and answer["session"]["finished_at"] is None
@@ -1035,8 +1045,7 @@ async def test_continue_of_a_done_job_the_hub_resumes_keeps_it_running(tmp_path,
             lock.release()
         assert await resuming == [sid]
         await hub.settled()
-        while hub.manager._stopping:
-            await asyncio.gather(*list(hub.manager._stopping), return_exceptions=True)
+        await drained(hub.manager._stopping)
         swarm = hub.manager.swarms[sid]
         assert _running(hub, sid) and swarm.goal()["status"] == "active"
         assert hub.manager.meta(sid)["api"]["error"] is None

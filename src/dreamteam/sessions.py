@@ -3958,8 +3958,13 @@ class SessionManager:
         has not acted on yet is left to the resume check of the next start (_watch_end)."""
         self._closing = True
         try:
+            # (only the stops not done yet are awaited: a task that has just ended leaves _stopping one loop step later,
+            # through its done-callback, and on Python 3.12+ a gather of done tasks completes without yielding to the
+            # loop, so waiting for those would never let that callback run)
             while self._stopping:
-                await asyncio.gather(*list(self._stopping), return_exceptions=True)
+                self._stopping.difference_update([task for task in self._stopping if task.done()])
+                if self._stopping:
+                    await asyncio.wait(set(self._stopping))
             # also sessions in the middle of an operation (a start, a workspace move that starts them again)
             busy = [sid for sid, lock in self._locks.items() if lock.locked() and sid not in self.swarms]
             for sid in list(self.swarms) + busy:
