@@ -278,7 +278,8 @@ def as_listed(root: Path, parts: tuple[str, ...]) -> tuple[str, ...]:
     nofollow takes a name only as its folder lists it. A name the listing does not hold exactly is replaced by the
     listed name of the same entry (lstat: device and inode; with no file ids, the one listed name that differs in
     letter case or Unicode form only). From the first name that is not there (a folder an in-place create makes, or
-    one gone meanwhile) on, the names stay as given. Blocking: a listing of each folder on the way."""
+    one gone meanwhile) on, the names stay as given. Blocking: a listing of each folder on the way, read until the name
+    and keeping none of the other names (_listed_name)."""
     out: list[str] = []
     folder = root
     for i, name in enumerate(parts):
@@ -295,29 +296,46 @@ def _name_key(name: str) -> str:
 
 
 def _listed_name(folder: Path, name: str) -> str | None:
-    """The name of `folder`'s listing that `name` opens (as_listed); None when `name` names nothing there."""
+    """The name of `folder`'s listing that `name` opens (as_listed); None when `name` names nothing there. The listing
+    is read (scandir) until `name` and keeps none of the other names, so a folder of any size (a root of many jobs)
+    costs no list of its names (docs/SPEC.md §21.8). Only when it does not hold `name` exactly, and `name` opens
+    something, is it read once more, keeping one name at most: the first of the same entry (lstat: device and inode)
+    with `name`'s key (letter case and Unicode form folded), else the first other one of the same entry (a short
+    name); with no file ids, the one name with that key (None when two have it)."""
+    where = long_path(folder)
     try:
-        names = os.listdir(long_path(folder))
-    except OSError:
-        return None
-    if name in names:
-        return name
-    try:
+        with os.scandir(where) as listing:
+            if any(entry.name == name for entry in listing):
+                return name
         given = os.lstat(long_path(folder / name))
     except OSError:
         return None
     key = _name_key(name)
-    alike = [other for other in names if _name_key(other) == key]
-    if not given.st_ino:   # (a file system without file ids)
-        return alike[0] if len(alike) == 1 else None
-    for other in alike + [other for other in names if _name_key(other) != key]:
-        try:
-            st = os.lstat(long_path(folder / other))
-        except OSError:
-            continue
-        if (st.st_dev, st.st_ino) == (given.st_dev, given.st_ino):
-            return other
-    return None
+    ids = bool(given.st_ino)   # (else a file system without file ids)
+    found: str | None = None   # (ids: the first other name of the entry; none: the one name with the key)
+    try:
+        with os.scandir(where) as listing:
+            for entry in listing:
+                alike = _name_key(entry.name) == key
+                if not ids:
+                    if alike and found is not None:
+                        return None
+                    found = entry.name if alike else found
+                elif (alike or found is None) and _same_entry(folder / entry.name, given):
+                    if alike:
+                        return entry.name
+                    found = entry.name
+    except OSError:
+        return None
+    return found
+
+
+def _same_entry(path: Path, given: os.stat_result) -> bool:
+    try:
+        st = os.lstat(long_path(path))
+    except OSError:
+        return False
+    return (st.st_dev, st.st_ino) == (given.st_dev, given.st_ino)
 
 
 def git_dir_refusal(folder: Path, git: str | None = None, *, offline: bool = False) -> str | None:

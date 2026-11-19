@@ -1093,6 +1093,47 @@ def test_each_name_below_a_root_is_taken_as_its_folder_lists_it(tmp_path, monkey
         assert apifolders.as_listed(tmp_path, ("dOCS", "Api")) == ("Docs", "api")
 
 
+def test_a_name_below_a_large_root_is_taken_as_listed_without_keeping_the_listing(tmp_path, monkeypatch):
+    """as_listed reads each folder's listing until the name and keeps none of the other names, on every OS: an
+    in-place session's files and archive, and every create, cost far less memory than the list of a root of many jobs
+    would. A name the listing does not hold (another spelling, a short name: here an alias the file system opens as
+    `acme`) is looked for once more, keeping no list either."""
+    import tracemalloc
+
+    root = tmp_path / "root"
+    (root / "acme" / "site").mkdir(parents=True)
+    for i in range(5000):
+        (root / f"f{i:05d}.txt").touch()
+    lstat = os.lstat
+
+    def aliased(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        head, tail = os.path.split(os.fspath(path))
+        return lstat(os.path.join(head, "acme") if tail == "alias" else path, *args, **kwargs)
+
+    def cost(call: Any) -> int:   # (the most memory taken above what was taken before the call)
+        tracemalloc.reset_peak()
+        before = tracemalloc.get_traced_memory()[0]
+        call()
+        return tracemalloc.get_traced_memory()[1] - before
+
+    tracemalloc.start()
+    try:
+        names = cost(lambda: os.listdir(root))
+        took = [cost(lambda: apifolders.as_listed(root, ("acme", "site"))),
+                cost(lambda: apifolders.as_listed(root, ("ACME", "Site"))),
+                cost(lambda: apifolders.as_listed(root, ("new", "site")))]
+        monkeypatch.setattr(os, "lstat", aliased)
+        took.append(cost(lambda: apifolders.as_listed(root, ("alias", "site"))))
+    finally:
+        tracemalloc.stop()
+    assert names > 200_000 and all(n < names // 10 for n in took), (names, took)
+    assert apifolders.as_listed(root, ("alias", "site")) == ("acme", "site")
+    monkeypatch.setattr(os, "lstat", lstat)
+    folds = folds_case(tmp_path)
+    assert apifolders.as_listed(root, ("ACME", "Site")) == (("acme", "site") if folds else ("ACME", "Site"))
+    assert apifolders.as_listed(root, ("new", "site")) == ("new", "site")
+
+
 async def test_the_other_sessions_folders_are_compared_by_file_identity_too(tmp_path, monkeypatch):
     """A folder that another session's stored path names by another spelling (here: through a link, which the
     file system resolves to the same folder) is that session's folder: _plan compares by identity, not by text

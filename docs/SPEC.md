@@ -7806,9 +7806,10 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   the resolved root, each as its folder lists it, `apifolders.as_listed`; on POSIX a resolved path keeps the spelling
   it was given, so on a file system that ignores letter case or Unicode form, such as APFS or a Windows drive seen
   from WSL or a Docker Desktop bind mount, the listing gives the name; a folder on the way renamed in letter case
-  only is still read, on any OS), so a link put on the way after the check is met, never followed. A folder inside
-  its root by file identity only (a bind mount, a path whose resolved form does not name it below the root) is 403
-  `forbidden_folder` (`FOLDER_LINKED_TEXT`): it is never read by its own path after the check. A folder that is not
+  only is still read, on any OS; each listing is read until the name and keeps none of the other names, so a root of
+  many jobs costs no list of its names), so a link put on the way after the check is met, never followed. A folder
+  inside its root by file identity only (a bind mount, a path whose resolved form does not name it below the root) is
+  403 `forbidden_folder` (`FOLDER_LINKED_TEXT`): it is never read by its own path after the check. A folder that is not
   there is 409 `folder_not_ready` (`FOLDER_GONE_TEXT`).
 - **Codes** of what nofollow meets (`api_v1._read_error`), by where it meets it: a name replaced while it was opened
   is 409 `conflict` (try again); the session's folder itself, or a folder above it below a root, gone is 409
@@ -7833,7 +7834,7 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     through a link put in its place. A component counts only when its folder's listing holds that name exactly
     (`_Posix.spelled`); that listing is read through the folder's descriptor until the name and keeps none of the
     other names, so reaching a file, or a folder to list or walk, below a folder of any size holds no list of its
-    names.
+    names (nor do the names above an in-place session's folder, taken by `as_listed` the same way, on any OS).
   - On Windows every component is checked for a name-surrogate reparse point (a link or a junction), and the opened
     handle's identity (`fstat`) and final path (`GetFinalPathNameByHandleW`) are compared with the path's and the
     root's.
@@ -8148,16 +8149,16 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     the target's `api.folders` and drops a v1 session's `client_ref`, `request_digest`, `start_error`, `error` and
     `folder`;
   - the folder cases of 21.10, among them `jobs/Acme` against `jobs/acme` on a file system that folds case and an NFD
-    spelling (one folder), each name taken as its folder lists it (`as_listed`), a root under /run or /var/run
-    refused and never mounted, an error text that never resolves a root (yet names a path below one in its resolved
-    spelling), a copy in v1's folder threads (a create cancelled during it waits for it, then leaves no staging
-    folder, no session and no place held), a `.git` that is a gitfile or a linked worktree's, a common dir outside the
-    folder, a link swapped in before git init, between its steps, after it and after `_carry_out`, and right after
-    each check before the step it lets through, that step then working in the folder held (nothing written or removed
-    in the repository it leads to; on Windows the folder held refuses the swap; `tests/test_nofollow.py`:
-    `hold_inside`; `tests/test_hub_git.py`: git and its guard in a folder held whatever its path leads to;
-    `tests/test_netoff.py`: `prepare_workspace` of a folder held), and `DREAMTEAM_API_FOLDERS_DIR` ignored outside
-    the container; `aclose()` with a start in flight;
+    spelling (one folder), each name taken as its folder lists it (`as_listed`, below a root of 5000 names without
+    keeping its listing), a root under /run or /var/run refused and never mounted, an error text that never resolves a
+    root (yet names a path below one in its resolved spelling), a copy in v1's folder threads (a create cancelled during
+    it waits for it, then leaves no staging folder, no session and no place held), a `.git` that is a gitfile or a
+    linked worktree's, a common dir outside the folder, a link swapped in before git init, between its steps, after it
+    and after `_carry_out`, and right after each check before the step it lets through, that step then working in the
+    folder held (nothing written or removed in the repository it leads to; on Windows the folder held refuses the swap;
+    `tests/test_nofollow.py`: `hold_inside`; `tests/test_hub_git.py`: git and its guard in a folder held whatever its
+    path leads to; `tests/test_netoff.py`: `prepare_workspace` of a folder held), and `DREAMTEAM_API_FOLDERS_DIR`
+    ignored outside the container; `aclose()` with a start in flight;
   - the clients (`tests/test_tui_print.py`, `tests/test_tui_app.py`, `tests/test_tui_commands.py`,
     `tests/test_tui_render.py`, `tests/test_cli_launcher.py`, `tests/test_launcher.py`, `tests/test_ui.py`,
     `tests/test_instruct.py`): `-p -r` on an `answers: "auto"` session
@@ -8249,7 +8250,9 @@ in_place = false            # true: a session may also work in a folder under it
   or a Docker Desktop bind mount) `{"root": "jobs", "path": "Acme"}` names the folder listed as `acme`, and on POSIX a
   resolved path keeps the spelling it was given; the session stores, and a copy reads, the listed names, which the
   no-follow reads of 21.8 require. The names from the first one that is not there on (the folders an in-place create
-  makes) stay as given.
+  makes) stay as given. Each listing is read (`scandir`) until the name and keeps none of the other names; only for a
+  name it does not hold exactly is it read once more, keeping one name at most, so a root of many folders costs a
+  create, and each request for an in-place session's files (21.8), no list of its names.
 - The create works with that resolved folder and checks it again after its own resolution, given the resolved root
   (`within=`): for a copy, `resolve_source(..., within=)` right after `resolve_request` (its location rules for the
   folder itself: another DreamTeam home under the root is 403 `forbidden_folder` too), then the copy itself reads
