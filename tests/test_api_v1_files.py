@@ -266,6 +266,11 @@ async def test_what_a_listing_or_a_download_is_asked_for_must_be_there_and_of_it
             (download(hub, uid, "README.md/x"), 404, "not_found", "No such file"),
             (archive(hub, uid, {"path": "README.md"}), 400, "bad_request", "is a file"),
             (archive(hub, uid, {"path": "nope"}), 404, "not_found", "No such file"),
+            # a name longer than any folder holds is not there either (Windows would answer EINVAL: never a 500)
+            (download(hub, uid, "a" * 300), 404, "not_found", "No such file"),
+            (download(hub, uid, "src/" + "я" * 256), 404, "not_found", "No such file"),
+            (listing(hub, uid, path="\U0001F600" * 128), 404, "not_found", "No such file"),
+            (archive(hub, uid, {"path": "src/" + "b" * 256}), 404, "not_found", "No such file"),
             (listing(hub, uid, paths="x"), 400, "unknown_field", "Unknown field"),
             (download(hub, uid, "README.md", {"path": "x"}), 400, "unknown_field", "Unknown field"),
             (archive(hub, uid, {"scratch": "yes"}), 400, "bad_request", "true or false"),

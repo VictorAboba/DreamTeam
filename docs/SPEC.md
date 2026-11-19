@@ -7707,7 +7707,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
   - The no-follow open (`nofollow.py`) also takes a component only when its exact spelling is in its parent
     folder's listing, which catches short names and case aliases on any file system (FileNotFoundError: the name
     is not there). On Windows the final path of the opened handle shows it: it names each component as the folder
-    holds it, long and in its letter case.
+    holds it, long and in its letter case. A component longer than a folder can hold (over 255 UTF-16 units,
+    `nofollow._WINDOWS_NAME_MAX`, which Windows would answer with EINVAL) is FileNotFoundError on Windows before
+    anything is opened, as on POSIX, where no listing holds it: 404 `not_found` like any missing path.
 - Listings and archives leave out exactly the names `files/{path}` would refuse, so the three agree: one predicate,
   `api_v1.served(parts, scratch)`, is `check_rel` of the path relative to the session's folder (a walk is given it
   as its `skip`, `api_v1._skipped`: such a name is never opened, such a folder never entered).

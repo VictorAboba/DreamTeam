@@ -475,10 +475,10 @@ is resumed as well.
   files) unless `scratch=true`; `.scratch/_skills` ever.
 - Nothing is followed: a link, or a folder swapped for one while it is read, ends the request instead of reading outside
   the session's folder.
-- Codes: 404 for a missing path, a link, a hard-linked or special file; 400 `bad_request` for a folder asked as a file
-  or the reverse; 409 `conflict` for a name replaced while it was opened or a file the hub may not read; 409
-  `folder_not_ready` when the session's folder is gone or cannot be read; 403 `forbidden_folder` when it is reached
-  through a link, or an in-place folder's root no longer allows it.
+- Codes: 404 for a missing path (a name longer than a folder can hold too), a link, a hard-linked or special file;
+  400 `bad_request` for a folder asked as a file or the reverse; 409 `conflict` for a name replaced while it was
+  opened or a file the hub may not read; 409 `folder_not_ready` when the session's folder is gone or cannot be read;
+  403 `forbidden_folder` when it is reached through a link, or an in-place folder's root no longer allows it.
 
 ## Folders on the hub's computer
 

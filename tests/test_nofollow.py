@@ -306,6 +306,17 @@ def test_a_name_counts_only_spelled_as_the_folder_holds_it(tmp_path):
         list_inside(root, ("B",))
 
 
+@pytest.mark.parametrize("name", ["a" * 256, "я" * 300, "\U0001F600" * 128])
+def test_a_name_longer_than_a_folder_holds_is_not_there(tmp_path, name):
+    """On every OS (Windows itself answers EINVAL for over 255 UTF-16 units; a POSIX listing never holds it)."""
+    root, _ = _tree(tmp_path)
+    for call in (lambda: open_inside(root, (name,)), lambda: open_inside(root, ("b", name)),
+                 lambda: list_inside(root, (name,)), lambda: list(walk_inside(root, (name, "x")))):
+        with pytest.raises(FileNotFoundError) as info:
+            call()
+        assert info.value.filename.startswith((name[:10], "b/"))
+
+
 @pytest.mark.skipif(not WINDOWS, reason="Windows short names")
 def test_a_windows_short_name_names_nothing(tmp_path):
     import ctypes

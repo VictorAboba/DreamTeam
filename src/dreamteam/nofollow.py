@@ -70,6 +70,7 @@ _ENDS_WALK = frozenset({"link", "outside"})
 MAX_DEPTH = 64
 
 _WINDOWS = sys.platform == "win32"
+_WINDOWS_NAME_MAX = 255        # UTF-16 units of a name in a folder (NTFS, ReFS, exFAT); a longer one is EINVAL there
 _NAME_SURROGATE = 0x20000000   # IsReparseTagNameSurrogate: the reparse point names another file (link, junction)
 _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
 # (O_NONBLOCK: a FIFO swapped in never blocks the open; cleared again once the file is known to be regular)
@@ -509,7 +510,11 @@ class _Windows:
 
     @staticmethod
     def spelled(parent: _Dir, name: str, rel: str) -> None:
-        """(Windows compares the final path of what it opened instead: see child.)"""
+        """A name longer than a Windows folder can hold (_WINDOWS_NAME_MAX UTF-16 units) is in none: FileNotFoundError,
+        as on POSIX, whose listing never holds it, where Windows itself would answer EINVAL. (Any other spelling is
+        checked by the final path of what is opened: see child.)"""
+        if len(name.encode("utf-16-le")) // 2 > _WINDOWS_NAME_MAX:
+            raise FileNotFoundError(errno.ENOENT, "no such name in the folder (longer than a name can be)", rel)
 
     def child(self, parent: _Dir, name: str, rel: str, *, want_dir: bool,
               data: bool = True) -> tuple[int, os.stat_result, str]:
