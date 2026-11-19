@@ -396,7 +396,7 @@ async def test_a_client_gone_during_a_long_step_leaves_the_event_loop_idle(tmp_p
     no_start(hub.manager)
     stepped = threading.Event()
 
-    def slow_parts(*args: Any) -> Any:
+    def slow_parts(*args: Any, **kwargs: Any) -> Any:
         def parts() -> Any:
             yield b"PK"
             time.sleep(0.3)   # (one long step: a stalled share, a large file being read)
@@ -572,9 +572,9 @@ async def test_a_file_gone_between_the_two_walks_cuts_the_archive(tmp_path, api_
         uid, _sid, folder = await session_with(hub, {"a.txt": "A", "b.txt": "B"})
         real = api_v1._zip_parts
 
-        def parts(*args: Any) -> Any:
+        def parts(*args: Any, **kwargs: Any) -> Any:
             (folder / "b.txt").unlink()
-            return real(*args)
+            return real(*args, **kwargs)
 
         monkeypatch.setattr(api_v1, "_zip_parts", parts)
         got = await archive(hub, uid)
@@ -698,8 +698,8 @@ async def test_an_archive_left_by_its_client_closes_its_walk(tmp_path, api_token
     made: list[Any] = []
     real = api_v1._zip_parts
 
-    def parts(*args: Any) -> Any:
-        made.append(real(*args))
+    def parts(*args: Any, **kwargs: Any) -> Any:
+        made.append(real(*args, **kwargs))
         return made[-1]
 
     monkeypatch.setattr(api_v1, "_zip_parts", parts)

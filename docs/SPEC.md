@@ -4204,11 +4204,13 @@ settings; ValueError when they are invalid):
   sources=None, mark=None)`, `validated_overrides(overrides)`,
   `async load(sid)`, `async start(sid, *, skills=None,
   via="home", auto_reply=False, marked=None, then=None)`, `mark_starting(sid, mark=None)`, `unmark_starting(sid, mark)`,
-  `async stop(sid, *, remember=False, reason="user")`, `async unload_idle(sid)`, `async control(sid, *,
-  max_cost_usd=None, max_agents=None, wrap_up=None)`, `update(sid, *, title=None,
-  overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home")`, `async resume()`,
+  `async stop(sid, *, remember=False, reason="user", uid=None)`, `async unload_idle(sid)`, `async control(sid, *,
+  max_cost_usd=None, max_agents=None, wrap_up=None, uid=None)`, `update(sid, *, title=None,
+  overrides=None, settings=None)`, `async delete(sid, *, skills=None, via="home", uid=None)`, `async resume()`,
   `plan_resume()`, `cancel_resume()`, `watch(sid)`, `is_final(sid)`, `journal(sid, after, limit, types=None, *,
-  recipient=None)`, `sid_of_uid(uid)`, `api_sids()`, `sid_of_client_ref(ref)`, `global_config()`,
+  recipient=None)`, `sid_of_uid(uid)` (`uid=` of `stop`, `control` and `delete`: the uid the caller resolved,
+  checked again once the session's lock is taken, 404 when the folder name holds another session by then),
+  `api_sids()`, `sid_of_client_ref(ref)`, `global_config()`,
   `session_skills(sid, show=None)`, `async decide_skill(sid, name, approve, *, comment="", replace=False,
   via="home")` ("Skills" below),
   `finished(sid)`, `async shutdown()`, `copy_overrides(sid)`, `default_workspace(sid)`, `workspace_of(sid)`,
@@ -7001,7 +7003,15 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   `name`, the folder name the board shows (`/s/<name>/`). One resolver serves every route: the uid → the folder name
   (`sid_of_uid`), the API caller's scope (21.1), the legacy main session never; 404 `not_found` otherwise. A route
   that needs the session loaded answers 409 `earlier_version` for such a session. A long poll and a stream resolve the
-  id again at every pass, since a delete can give the folder number to a new session.
+  id again at every pass, since a delete can give the folder number to a new session. For the same reason a route
+  checks the uid again after every await, before it acts or answers (`ApiV1._still`: the folder name must still hold
+  that uid, else 404 `not_found`): under the session's lock (PATCH, stop and DELETE pass it to `manager.control`,
+  `stop` and `delete` as `uid=`, which `_check(sid, uid)` tests once the lock is taken; `continue`, an answer and
+  a message of a running session test it once they hold the lock), and after a read in a thread (files, a download
+  once its file is open, an archive after its measure and again in its walk, requests, messages, the result; a page
+  of events or of the stream is read again when the name changed hands during the read). So a request that waited
+  behind a delete never deletes, changes, starts or writes to the session that took the folder name meanwhile, and
+  never answers with what it read of it.
 - **PATCH** does what `swarm_control` does (`manager.control`, under the session's lock): `set_limits` and `wrap_up` /
   `end_wrap_up`, as the user. They write the kv keys `limits` and `wrap_up`, which the swarm reads at every use (§3).
   A stopped session is loaded to write them into its own database, not into its overrides (the database outranks
@@ -7917,8 +7927,11 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     goal, during the hub's resume of a done job and before a stop sent after it; a stop, then a `continue` (the
     session runs again with the text, whether the stop is unloading the session, waits for its lock, or waits behind
     a create's start); a `continue` whose session is deleted before its start, the folder name taken by a new one
-    (nothing reaches that one); a text that cannot be given after the start (the summary's `error`, cleared by the
-    next one; `not_running` when a stop sent after it takes the lock first);
+    (nothing reaches that one); DELETE, PATCH, stop, `continue`, an answer and a message that waited for the lock,
+    and files, a download, an archive, requests, messages, the result and events read in a thread, while the session
+    was deleted and its folder name taken by the owner's new session (404, that session untouched); a text that
+    cannot be given after the start (the summary's `error`, cleared by the next one; `not_running` when a stop sent
+    after it takes the lock first);
   - files and archive (`tests/test_api_v1_files.py`: the one rule of `served`, a name that is no UTF-8 text, the
     attachment's name; a listing in name order without `.git` or `.scratch`, `.scratch` only with `scratch=true` and
     `.scratch/_skills` never; what is asked missing or of the other kind, unknown query fields; a download with its

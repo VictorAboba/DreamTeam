@@ -718,6 +718,105 @@ async def test_a_deleted_sessions_id_never_reaches_the_one_that_took_its_number(
         await hub.close()
 
 
+async def _took_the_name(hub: Hub, sid: str, files: dict[str, bytes] | None = None) -> str:
+    """The session `sid` goes away as a delete makes it go (its folder renamed away) and the owner makes a board session
+    with the same title, which gets the same folder name (a delete gives its number to the next one): that session's
+    name, with `files` in its folder."""
+    manager = hub.manager
+    os.rename(manager.dir_of(sid), manager.sessions_dir / f".deleted-{sid}-{time.time_ns()}")
+    other = (await manager.create("Job", "The owner's own job", start=False))["id"]
+    assert other == sid and manager.meta(other).get("via") is None
+    if files:
+        folder = Path(manager.workspace_of(other)["path"])
+        folder.mkdir(parents=True, exist_ok=True)
+        for name, data in files.items():
+            (folder / name).write_bytes(data)
+    return other
+
+
+@pytest.mark.parametrize("route", ["DELETE", "PATCH", "stop", "continue", "answer", "send"])
+async def test_a_route_that_waited_for_the_lock_never_acts_on_the_session_that_took_the_name(tmp_path, api_token,
+                                                                                         no_start, route):
+    """A route resolves `{id}` to a folder name, then waits for the session's lock. If the session was deleted
+    meanwhile and another one took its folder name, the route finds the uid gone once it holds the lock: 404, and the
+    other session is neither deleted, changed, stopped, started nor written to."""
+    hub = Hub(_manager(_home(tmp_path)))
+    running = route in ("continue", "answer", "send")
+    if not running:
+        no_start(hub.manager)
+    try:
+        made = (await hub.create({"goal": "Job", **MANUAL}))[1]["session"]
+        await hub.settled()
+        uid, sid = made["id"], made["name"]
+        assert _running(hub, sid) is running
+        path = f"/api/v1/sessions/{uid}"
+        asked = {"DELETE": ("DELETE", path, None, f"confirm={uid}"),
+                 "PATCH": ("PATCH", path, {"max_cost_usd": 123.0}, ""),
+                 "stop": ("POST", f"{path}/stop", None, ""),
+                 "continue": ("POST", f"{path}/continue", {"text": "THE CLIENT'S TEXT"}, ""),
+                 "answer": ("POST", f"{path}/requests/m1", {"text": "THE CLIENT'S TEXT"}, ""),
+                 "send": ("POST", f"{path}/messages", {"to": ["all"], "text": "THE CLIENT'S TEXT"}, "")}[route]
+        lock = hub.manager._lock(sid)
+        await lock.acquire()
+        try:
+            method, where, body, query = asked
+            task = asyncio.create_task(hub.call(method, where, body=body, query=query))
+            for _ in range(5):
+                await asyncio.sleep(0.01)
+            assert not task.done()   # (it waits for the lock)
+            if running:
+                await hub.manager._unload(sid, "user")   # (a delete holding the lock stops the session first)
+            other = await _took_the_name(hub, sid)
+        finally:
+            lock.release()
+        status, answer = await task
+        assert status == 404 and answer["code"] == "not_found", answer
+        await hub.settled()
+        assert hub.manager.exists(other) and hub.manager.meta(other).get("autostart") is not True
+        assert other not in hub.manager.swarms and other not in hub.manager.starting
+        summary = hub.manager.summary(other)
+        assert summary["max_cost_usd"] != 123.0 and summary["goal"]["status"] == "pending"
+    finally:
+        await hub.close()
+
+
+@pytest.mark.parametrize("route, reader", [
+    ("files", "_listing"), ("files/a.txt", "_open_file"), ("archive", "_measure"), ("requests", "_read_db"),
+    ("messages", "_read_db"), ("result", "result"), ("events", "events_page")])
+async def test_a_route_that_read_in_a_thread_never_answers_with_the_session_that_took_the_name(
+        tmp_path, api_token, no_start, route, reader):
+    """A route resolves `{id}` to a folder name, then reads in a thread. If the session was deleted meanwhile and
+    another one took its folder name, what it read is not the session's: 404, never the other session's files,
+    requests, messages, result or events."""
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    entered, gate = threading.Event(), threading.Event()
+    real = getattr(hub.api, reader)
+
+    def gated(*args: Any, **kwargs: Any) -> Any:
+        entered.set()
+        assert gate.wait(5)
+        return real(*args, **kwargs)
+
+    try:
+        made = (await hub.create({"goal": "Job"}))[1]["session"]
+        await hub.settled()
+        uid, sid = made["id"], made["name"]
+        setattr(hub.api, reader, gated)
+        folder = Path(hub.manager.workspace_of(sid)["path"])
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "a.txt").write_bytes(b"the client's")
+        task = asyncio.create_task(hub.call("GET", f"/api/v1/sessions/{uid}/{route}"))
+        await _until(entered.is_set, "the read in its thread")
+        await _took_the_name(hub, sid, {"a.txt": b"THE OWNER'S", "b.txt": b"THE OWNER'S"})
+        gate.set()
+        status, answer = await task
+        assert status == 404 and answer["code"] == "not_found", answer
+    finally:
+        gate.set()
+        await hub.close()
+
+
 async def test_a_session_of_an_earlier_version_is_listed_stopped_and_refused(tmp_path, api_token):
     hub = Hub(_manager(_home(tmp_path)))
     try:

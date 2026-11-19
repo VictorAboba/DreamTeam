@@ -1075,7 +1075,7 @@ def _zip_info(rel: str, entry: nofollow.Entry, *, folder: bool) -> zipfile.ZipIn
 
 
 def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: Mapping[str, str],
-               limit: int) -> Iterator[bytes]:
+               limit: int, still: Callable[[], bool] | None = None) -> Iterator[bytes]:
     """The zip of the folder `asked` of a session's folder (docs/SPEC.md §21.8 `archive`), in parts: the second walk
     (nofollow, what `served` takes), each file read through the walk's own open file before the walk goes on,
     exactly the size it had when it was opened (more written meanwhile is left for the next archive), deflated, each
@@ -1085,14 +1085,22 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: M
     directory is written, so the client's zip is never a valid one that lacks files or holds a torn one. What came
     meanwhile is taken. Blocking: one step at a time in a thread (_zip_bytes); a step ends (a part, b"" when there
     is no zip to send yet) once ZIP_SENT bytes of zip are ready or about FILE_CHUNK bytes were read (an entry counts
-    as ZIP_ENTRY_COST), so that a client gone waits for one short step only."""
+    as ZIP_ENTRY_COST), so that a client gone waits for one short step only. `still()` says whether the session's
+    folder name still holds the session asked for (ApiV1._still): asked once the walk has opened its folder, before
+    any part, and again before the central directory, so an archive never holds the files of another session that
+    took the name meanwhile (_Cut)."""
     sink = _ZipSink()
     archive = zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
     walk = nofollow.walk_inside(where.root, where.base + asked, skip=_skipped(asked, scratch))
     seen: set[str] = set()
     total = work = 0   # (bytes of files so far; bytes read in this step, an entry counted as ZIP_ENTRY_COST)
+    checked = still is None
     try:
         for entry in walk:
+            if not checked:   # (the walk has opened its folder: is the name still the session's?)
+                checked = True
+                if still is not None and not still():
+                    raise _Cut("the session is gone")
             rel, was = entry.rel, measured.get(entry.rel)
             work += ZIP_ENTRY_COST
             if entry.kind == nofollow.EXCLUDED:
@@ -1135,6 +1143,8 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: M
         missing = sorted(set(measured) - seen)
         if missing:
             raise _Cut(f"{len(missing)} file(s) or folder(s) gone meanwhile, the first {missing[0]}")
+        if still is not None and not still():
+            raise _Cut("the session is gone")
         archive.close()   # (the central directory: only for a whole archive)
         yield sink.take()
     finally:
@@ -1359,12 +1369,21 @@ class ApiV1:
 
     def _session(self, request: Request, caller: str) -> str:
         """The session of a route's `{id}` (resolve), else 404 `not_found`; kept in the scope, so an error text of the
-        route names its folders by their names (error_response)."""
+        route names its folders by their names (error_response). A route that waits after it (for the session's lock,
+        or for a read in a thread) checks it again before it acts or answers (_still)."""
         sid = self.resolve(request.path_params.get("id"), caller)
         if sid is None:
             raise ApiError("not_found", NO_SESSION_TEXT)
         request.scope[API_SID] = sid
         return sid
+
+    def _still(self, request: Request, sid: str) -> None:
+        """After an await of a route (the session's lock waited for, a read in a thread): the folder name `sid` still
+        holds the session `{id}` names, else 404 `not_found`. A delete gives its folder number to the next session
+        with the same title slug, so the route would otherwise act on another session, or answer with what it read
+        of one (docs/SPEC.md §21.2 `{id}`). Blocking (session.json), as resolve."""
+        if not self.manager._has_uid(sid, request.path_params.get("id")):
+            raise ApiError("not_found", NO_SESSION_TEXT)
 
     def board_url(self, sid: str) -> str | None:
         """The board of the session for people (docs/SPEC.md §21.7): the hub's address + /s/<name>/, only when the hub
@@ -1701,12 +1720,14 @@ class ApiV1:
         (current, on the loop), then the journal's head and rows (events_page, in a thread; the lines in `lang`, else
         the session's language). (sid, summary, page: {"events", "last", "more", "state", "final"}); None when the
         id names no session for `caller` any more."""
-        found = self.current(uid, caller)
-        if found is None:
-            return None
-        sid, summary = found
-        page = await asyncio.to_thread(self.events_page, sid, after, limit, detail, lang or session_lang(summary))
-        return sid, summary, {**page, "state": summary["state"], "final": summary["final"]}
+        while True:
+            found = self.current(uid, caller)
+            if found is None:
+                return None
+            sid, summary = found
+            page = await asyncio.to_thread(self.events_page, sid, after, limit, detail, lang or session_lang(summary))
+            if self.resolve(uid, caller) == sid:   # (else the name changed hands during the read: read again)
+                return sid, summary, {**page, "state": summary["state"], "final": summary["final"]}
 
     def _file_head(self, path: Path) -> int | None:
         """The newest event id of a session database file (0 without one), None when it cannot be read."""
@@ -1866,6 +1887,8 @@ class ApiV1:
                     language = session_lang(summary)
                 final = self.manager.is_final(sid)
                 page = await asyncio.to_thread(self.events_page, sid, after, STREAM_PAGE, detail, language)
+                if self.resolve(uid, caller) != sid:   # (the name changed hands during the read: resolve again)
+                    continue
                 after = page["last"]
                 if page["events"]:
                     yield "".join(sse_event(event) for event in page["events"])
@@ -2130,7 +2153,7 @@ class ApiV1:
         check_fields(body, PATCH_FIELDS)
         sid = self._session(request, caller)
         await self.manager.control(sid, max_cost_usd=body.get("max_cost_usd"), max_agents=body.get("max_agents"),
-                                   wrap_up=body.get("wrap_up"))
+                                   wrap_up=body.get("wrap_up"), uid=request.path_params.get("id"))
         return JSONResponse({"session": self.summary(sid)})
 
     async def _continue(self, request: Request, caller: str) -> Response:
@@ -2159,6 +2182,7 @@ class ApiV1:
         if sid in manager.running:
             delivered = False
             async with manager._lock(sid):
+                self._still(request, sid)   # (deleted while this waited, its name another session's: 404)
                 swarm = manager.swarms.get(sid)
                 if sid in manager.running and swarm is not None:   # (else stopped meanwhile: as a stopped one, below)
                     self._deliver(sid, swarm, text)
@@ -2189,7 +2213,7 @@ class ApiV1:
         query_fields(request)
         check_fields(await read_json(request), ())
         sid = self._session(request, caller)
-        await self.manager.stop(sid, reason="user")
+        await self.manager.stop(sid, reason="user", uid=request.path_params.get("id"))
         return JSONResponse({"session": self.summary(sid)})
 
     async def _delete(self, request: Request, caller: str) -> Response:
@@ -2204,7 +2228,7 @@ class ApiV1:
             folder = apifolders.in_place_folder((api_meta(self.manager.meta(sid)) or {}).get("folder"))
         except SessionError:
             folder = None
-        kept = await self.manager.delete(sid, skills="discard", via="api")
+        kept = await self.manager.delete(sid, skills="discard", via="api", uid=request.path_params.get("id"))
         answer: dict[str, Any] = {"ok": True}
         if folder is not None and kept is not None:
             answer["folder_kept"] = {"root": folder["root"], "path": folder["path"]}
@@ -2220,6 +2244,7 @@ class ApiV1:
         sid = self._session(request, caller)
         found = await asyncio.to_thread(self._read_db, sid, requests_of,
                                         lambda path: read_requests(path, clarify=self._clarify(sid)))
+        self._still(request, sid)
         return JSONResponse({"requests": listed_requests(found, running=sid in self.manager.running)})
 
     async def _answer(self, request: Request, caller: str) -> Response:
@@ -2243,6 +2268,7 @@ class ApiV1:
         given: "Swarm | None" = None
         if sid in manager.running:
             async with manager._lock(sid):
+                self._still(request, sid)
                 swarm = manager.swarms.get(sid)
                 if sid in manager.running and swarm is not None:
                     self._give_answer(swarm, rid, key, answer)
@@ -2251,6 +2277,7 @@ class ApiV1:
             raise ApiError("not_running", NOT_RUNNING_TEXT)
         if key[0] == "mcp":   # (no await since the check under the lock)
             await self._approve_server(sid, given, key, answer["approve"])
+            self._still(request, sid)
         return JSONResponse({"ok": True, "session": self.summary(sid)})
 
     async def _messages(self, request: Request, caller: str) -> Response:
@@ -2265,6 +2292,7 @@ class ApiV1:
         sid = self._session(request, caller)
         found = await asyncio.to_thread(self._read_db, sid, lambda swarm: swarm.mail.user_conversation(after, limit),
                                         lambda path: self._stored_conversation(path, after, limit))
+        self._still(request, sid)
         messages = [message_view(item) for item in found]
         return JSONResponse({"messages": messages, "last": messages[-1]["id"] if messages else after})
 
@@ -2281,6 +2309,7 @@ class ApiV1:
         manager._refuse_earlier(sid)
         if sid in manager.running:
             async with manager._lock(sid):
+                self._still(request, sid)
                 swarm = manager.swarms.get(sid)
                 if sid in manager.running and swarm is not None:
                     try:
@@ -2361,7 +2390,9 @@ class ApiV1:
         swarm = self.manager.swarms.get(sid)
         jobs = ([job_view(job) for job in swarm.jobs.running_of()]
                 if swarm is not None and sid in self.manager.running else [])
-        return SafeJSONResponse(await asyncio.to_thread(self.result, sid, summary, jobs))
+        result = await asyncio.to_thread(self.result, sid, summary, jobs)
+        self._still(request, sid)
+        return SafeJSONResponse(result)
 
     async def _files(self, request: Request, caller: str) -> Response:
         """GET /api/v1/sessions/{id}/files?path=&scratch= (docs/SPEC.md §21.8): `{"path", "entries"}` of a folder of
@@ -2374,6 +2405,7 @@ class ApiV1:
         sid = self._session(request, caller)
         self.manager._refresh_settings()
         entries = await asyncio.to_thread(self._listing, sid, asked, scratch)
+        self._still(request, sid)
         return JSONResponse({"path": "/".join(asked), "entries": entries})
 
     async def _file(self, request: Request, caller: str) -> Response:
@@ -2389,6 +2421,11 @@ class ApiV1:
         sid = self._session(request, caller)
         self.manager._refresh_settings()
         file, size = await _thread_step(self._open_file, sid, asked, release=lambda opened: opened[0].close())
+        try:   # (the file opened is the session's only when its name is still the session's after the open)
+            self._still(request, sid)
+        except BaseException:
+            file.close()
+            raise
         return _Streamed(_file_bytes(file, size, f"{'/'.join(asked)} of session {sid}"), closing=file.close,
                          media_type="application/octet-stream", headers=_download_headers(asked[-1], size))
 
@@ -2419,7 +2456,10 @@ class ApiV1:
             limit_mb = self.manager.global_config().api.archive_max_mb   # (a hand edit is picked up)
             # (a cancel waits for the walk's thread to end: the slot is given back once its descriptors are closed)
             where, measured = await _thread_step(self._measure, sid, asked, scratch, limit_mb)
-            parts = _zip_parts(where, asked, scratch, measured, limit_mb << 20)
+            self._still(request, sid)
+            uid = request.path_params.get("id")
+            parts = _zip_parts(where, asked, scratch, measured, limit_mb << 20,
+                               still=lambda: self.manager._has_uid(sid, uid))
         except BaseException:
             release()
             raise

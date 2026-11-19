@@ -1297,8 +1297,11 @@ class SessionManager:
         path = self.sessions_dir / sid
         return path.is_dir() and (path / SESSION_FILE).exists()
 
-    def _check(self, sid: str) -> None:
-        if not self.exists(sid):
+    def _check(self, sid: str, uid: str | None = None) -> None:
+        """404 for a session that is not there; with `uid`, also when the folder name `sid` holds another session by
+        now: a delete gives its folder number to the next session with the same title slug (_new_id), so a caller
+        that named the session by its uid (the HTTP API v1) checks it again after waiting for the session's lock."""
+        if not self.exists(sid) or (uid is not None and not self._has_uid(sid, uid)):
             raise SessionError(f"Unknown session '{sid}'.", 404)
 
     def dir_of(self, sid: str) -> Path:
@@ -2903,7 +2906,7 @@ class SessionManager:
             swarm.session_pending_goal = pending_goal(meta)
         return swarm
 
-    async def stop(self, sid: str, *, remember: bool = False, reason: str = "user") -> None:
+    async def stop(self, sid: str, *, remember: bool = False, reason: str = "user", uid: str | None = None) -> None:
         """Stop the session's agents and unload it. remember=True keeps it marked for resume() (used at
         server shutdown); an explicit stop clears the mark, and resume() no longer starts it. A session made by an
         earlier version is refused (409): it is never running, and its mark stays. `reason`: the `session.stopped`
@@ -2911,13 +2914,15 @@ class SessionManager:
         "budget" for stop_when_done); another one is a ValueError (the others are the manager's own). A start announced
         before this call (mark_starting, resume_pending) that has not taken the lock yet then starts nothing; one
         announced after it (a v1 `continue` sent after the stop) keeps its mark and starts the session again once
-        this stop is over: the requests keep their order, whenever the stop takes the lock."""
+        this stop is over: the requests keep their order, whenever the stop takes the lock. `uid`: the session's uid
+        as the caller resolved it, checked again once the lock is taken (_check: 404 when the folder name holds another
+        session by then, which is left alone)."""
         if reason not in STOP_REQUEST_REASONS:
             raise ValueError(f"unknown stop reason {reason!r}")
-        await self._stop(sid, remember=remember, reason=reason)
+        await self._stop(sid, remember=remember, reason=reason, uid=uid)
 
     async def _stop(self, sid: str, *, remember: bool = False, reason: str = "user",
-                    still: Callable[[], bool] | None = None) -> bool:
+                    still: Callable[[], bool] | None = None, uid: str | None = None) -> bool:
         """stop(), and, with `still`, only when `still()` holds under the session's lock (stop_when_done: the session
         still runs the same swarm, and its goal is still completed or its budget pause still holds); False when it did
         nothing then. Such an automatic stop ends the run it watched and nothing more: a start announced meanwhile
@@ -2927,6 +2932,8 @@ class SessionManager:
         self._refuse_earlier(sid)
         earlier = set(self._marks.get(sid, ()))   # (read before any await: the starts this stop was asked after)
         async with self._lock(sid):
+            if uid is not None:
+                self._check(sid, uid)   # (another session under the name by now: nothing of it is touched)
             if still is not None and not still():
                 return False
             try:
@@ -3059,7 +3066,7 @@ class SessionManager:
                     await self._unload(sid)
 
     async def control(self, sid: str, *, max_cost_usd: float | None = None, max_agents: int | None = None,
-                      wrap_up: bool | None = None) -> dict[str, Any]:
+                      wrap_up: bool | None = None, uid: str | None = None) -> dict[str, Any]:
         """What `swarm_control` does with the limits and wrap-up mode, as the user (the HTTP API v1's PATCH,
         docs/SPEC.md §21.2), under the session's lock: `Swarm.set_limits` (a `max_cost_usd` that covers what was
         spent lifts a budget pause), then `wrap_up` / `end_wrap_up`. They write the session database's kv `limits`
@@ -3069,7 +3076,9 @@ class SessionManager:
         nothing. Returns the summary.
         SessionError: 400 for a value of the wrong kind or one the swarm refuses (`max_agents` below 1, a negative
         cost: nothing is written); 409 code `conflict` for `wrap_up: true` while the session's first start has its
-        goal still to set (set_goal ends wrap-up mode); 409 for a session made by an earlier version; 404."""
+        goal still to set (set_goal ends wrap-up mode); 409 for a session made by an earlier version; 404, also when
+        `uid` (the session's uid as the caller resolved it) is given and the folder name holds another session once
+        the lock is taken (_check)."""
         for name, value in (("max_cost_usd", max_cost_usd), ("max_agents", max_agents)):
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
                                       or not math.isfinite(value)):
@@ -3085,7 +3094,7 @@ class SessionManager:
         if max_cost_usd is None and max_agents is None and wrap_up is None:
             return self.summary(sid)
         async with self._lock(sid):
-            self._check(sid)  # deleted while this call waited for the lock
+            self._check(sid, uid)  # deleted while this call waited for the lock (and its name taken, with `uid`)
             loaded = sid in self.swarms
             if wrap_up is True and pending_goal(self.meta(sid)) is not None:
                 swarm = self.swarms.get(sid)   # (refused before a database is made for it)
@@ -3379,7 +3388,8 @@ class SessionManager:
             + f". Nothing was changed: the session still works in {plan.old}.", status, code=code,
             holder=holder)
 
-    async def delete(self, sid: str, *, skills: str | None = None, via: str = "home") -> str | None:
+    async def delete(self, sid: str, *, skills: str | None = None, via: str = "home",
+                     uid: str | None = None) -> str | None:
         """Stop the session and delete its directory (board, messages, workspace, traces). The directory is
         first renamed away, so a session whose files are in use stays intact (409) instead of being
         half-deleted. A workspace folder outside the directory (set_workspace) is never deleted: it is the
@@ -3387,7 +3397,8 @@ class SessionManager:
         workspace change that ran just before is taken into account), else None.
         Skills members proposed that wait for the user's library decision are not lost silently: 409
         (`pending_skills`) unless `skills` is "save" (each saved to the library first, `via`; a clash refuses the
-        delete) or "discard"."""
+        delete) or "discard". `uid`: the session's uid as the caller resolved it, checked again once the lock is taken
+        (_check: 404 when the folder name holds another session by then, which is never deleted)."""
         self._check(sid)
         if sid == LEGACY_ID:
             if self.earlier_version(sid):  # its own message names the file to remove by hand
@@ -3397,7 +3408,7 @@ class SessionManager:
         if skills not in (None, "save", "discard"):
             raise SessionError("skills must be \"save\" or \"discard\".")
         async with self._lock(sid):
-            self._check(sid)  # a concurrent delete finished first
+            self._check(sid, uid)  # a concurrent delete finished first (and, with `uid`, another session took the name)
             pending = [s.name for s in self._attached_skills(sid) if s.library == "pending"]
             if pending and skills is None:
                 raise SessionError(f"Session {sid} has skills waiting for your library decision: "
