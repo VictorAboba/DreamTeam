@@ -4556,8 +4556,9 @@ settings; ValueError when they are invalid):
   for a paused slot with reason `question`, a non-empty asker and an integer message_id (the test of
   `Swarm.pending_question`, §3.1); `requests` (`read_stats`, default 0, in a try of its own): how many requests to
   the user wait (`autoreply.requests_from` on the same connection, with the session's `clarify`: the kinds the HTTP
-  API v1 lists, §21.5), for every session; `clarify`: the session's `[swarm] clarify` setting (its own override,
-  else the global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
+  API v1 lists, §21.5), for every session, and for one that does not run only those that block its work
+  (`read_stats(..., running=False)`, `autoreply.listed_requests`); `clarify`: the session's `[swarm] clarify`
+  setting (its own override, else the global one: `cfg.swarm.clarify`; the auto-reply lease is not counted here).
   `workspace` (= `workspace_of(sid)`): the folder the session works in; `default` = its own `workspace/` (created
   on demand, so it never counts as missing at start), `adopted` = a folder that held files before (the user's),
   `exists` = it is a folder now. `jobs.running`: the session's running background jobs (`read_stats` counts the
@@ -7285,9 +7286,14 @@ retried answer never lands on a newer one:
 - **One definition.** `autoreply.requests_of(swarm)` lists them, and `autoreply.blocking_requests` says which of them
   block the work. `SessionAutoReply`'s sweep, the summary's `requests` count, the state `waiting` (21.7) and the
   routes all use them. A stopped session's requests are read from its file (`read_requests(db_path, *,
-  clarify=False)`, read-only, the same kinds), and `_read_stats` counts the same kinds for its summary: a question
+  clarify=False)`, read-only, the same kinds), and `_read_stats` reads the same kinds for its summary: a question
   pause (kv `paused`), a clarify planner that waits, reviews for the user, MCP servers that wait, unanswered member
-  messages. All three are `autoreply.requests_from(conn, *, clarify)` on a connection (a loaded swarm's under its
+  messages. A session that does not run lists and counts only those that block its work
+  (`autoreply.listed_requests(requests, running=)`): a `message` can be answered only while the session runs, and a
+  job that stopped with its member's last report unanswered (a done job, which `stop_when_done` stops) would
+  otherwise list a request for good that only a `continue`, which reopens the goal, could reach. The report stays in
+  the user's conversation (GET `messages`), and is listed again if the session runs again with it unanswered.
+  All three are `autoreply.requests_from(conn, *, clarify)` on a connection (a loaded swarm's under its
   Database's lock, or a file's), where `clarify` is the session's `[swarm] clarify` (a planner waits for the user only
   with it on, as `Swarm.asks_user` says). The list is oldest first (`ts`, the time it was asked: the message's, the
   review round's event's, the MCP record's last update). `autoreply.request_key(id)` reads an id back:
@@ -7313,7 +7319,8 @@ retried answer never lands on a newer one:
   member followed (`Swarm.last_message_id(sender, recipient, since)`, a public form of the private `_LAST_TO` query; a
   message the user sends on the board closes it too). One per member at most. A message already listed as a question
   is left out, and so are the messages of retired members, which can never be answered. Answer `{"text"}`. It does not
-  block: reports to the user land here too, and the state stays `running`.
+  block: reports to the user land here too, and the state stays `running`. Listed only while the session runs (see
+  "One definition").
 - `review` (`r<task id>-<event id>`): a task in review whose reviewer is the user. The event is the newest
   `task.updated` in the journal that put the task in review for the user (the event's task is in review with the user
   as its reviewer, and `changes.status[1] == "review"` or `changes.reviewer[1] == "user"`), so a new submission is a
@@ -7339,7 +7346,9 @@ retried answer never lands on a newer one:
   (`api_v1.answer_of`, `ANSWER_FIELDS`): a field of another kind's answer is 400 `unknown_field`, a missing one or a
   value of the wrong kind 400 `bad_request` (null is not given); then the session (404), `earlier_version` (409), and
   it must run (409 `not_running`, `api_v1.NOT_RUNNING_TEXT`, also when it stopped while the answer waited for its
-  lock). Under the session's lock the request must still be current (`requests_of` lists that id; an answered,
+  lock: "The session is not running: POST /api/v1/sessions/{id}/continue starts it again with a text, the answer to
+  a pending question, else a message to its team; a completed goal is reopened with it, and its agents work on it
+  again."). Under the session's lock the request must still be current (`requests_of` lists that id; an answered,
   vanished or older one, a review round handed in again or an MCP server built again, is 404 `not_found`), checked on
   the loop with no await before the action, so the agents, on the same loop, cannot come between. It is given in
   process, as the user (`ApiV1._give_answer`): a question or a message is the user's message to its member with
@@ -7881,9 +7890,10 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     approved through its digest and a stale digest refused, its code changed after the listing (tested again, the
     refusal's text redacted, the old id 404), a server built again while the answer waits for the forge, a stop that
     does not wait for an approval testing the server again; the answers' fields by kind, an answered or unknown
-    request, an id of thousands of digits, a stopped session, a stop that takes the lock first, an earlier-version
-    session; the user's conversation from `after`, a message sent, what the mailbox refuses; a damaged file of a
-    stopped session; the API token's scope);
+    request, an id of thousands of digits, a stopped session (only what blocks its work listed), a done job stopped
+    with its member's report unanswered (no request, the reopen named by `not_running`, the report listed again once
+    it runs), a stop that takes the lock first, an earlier-version session; the user's conversation from `after`, a
+    message sent, what the mailbox refuses; a damaged file of a stopped session; the API token's scope);
   - polling (`after=0` from the oldest, a page the filter emptied answered at once, an `after` past the head, `wait`
     woken by an event, a change of state and a released lock, `final` never before `session.stopped`, the user's
     notifications only in the timeline, a stopped session read without loading it, a `NaN` in an event's data, the

@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator
 
 from . import __version__, apifolders, hubauth, netoff
 from . import skills as skill_lib
-from .autoreply import SessionAutoReply, follow_journal, journal_head, requests_from
+from .autoreply import SessionAutoReply, follow_journal, journal_head, listed_requests, requests_from
 from .config import Config
 from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled,
                        CopyError, CopyLimits, Source, Uploads, _other_home, check_target, copy_into, copy_sources,
@@ -692,12 +692,14 @@ def external_workspaces(home: str | Path) -> list[tuple[str, str]]:
     return found
 
 
-def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify: bool = False) -> dict[str, Any]:
+def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify: bool = False,
+               running: bool = True) -> dict[str, Any]:
     """Board/agent/budget figures of a session database (read-only; zeros when it does not exist), and whether an
     earlier version made it (`earlier_version`). A file of its own is read through db.reading_file, which writes
     nothing next to it (a plain read-only open of a WAL database would leave a -wal and a -shm in every stopped
     session at each listing). `requests`: how many requests to the user wait (autoreply.requests_from: the same kinds
-    the HTTP API v1 lists, docs/SPEC.md §21.5), `clarify` being the session's [swarm] clarify."""
+    the HTTP API v1 lists, docs/SPEC.md §21.5), `clarify` being the session's [swarm] clarify; of a session that does
+    not run (`running` False) only those that hold its work (autoreply.listed_requests)."""
     stats: dict[str, Any] = {
         "goal": None, "tasks": {"total": 0, "done": 0, "open": 0, "by_status": {}},
         "agents": {"total": 0, "working": 0, "llm": 0, "external": 0}, "spent_usd": 0.0,
@@ -712,11 +714,12 @@ def read_stats(db_path: Path, conn: sqlite3.Connection | None = None, *, clarify
                 conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
             except (sqlite3.Error, OSError):
                 return stats
-        _read_stats(conn, db_path, stats, clarify)
+        _read_stats(conn, db_path, stats, clarify, running)
     return stats
 
 
-def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], clarify: bool = False) -> None:
+def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], clarify: bool = False,
+                running: bool = True) -> None:
     """Fill `stats` (read_stats) from an open connection; what cannot be read keeps its default."""
     try:
         def kv(key: str) -> Any:
@@ -761,7 +764,7 @@ def _read_stats(conn: sqlite3.Connection, db_path: Path, stats: dict[str, Any], 
         except sqlite3.Error as exc:
             log.debug("cannot count the jobs of %s: %s", db_path, exc)
         try:  # its own try too: a request it cannot read must not hide the figures above
-            stats["requests"] = len(requests_from(conn, clarify=clarify))
+            stats["requests"] = len(listed_requests(requests_from(conn, clarify=clarify), running=running))
         except (sqlite3.Error, ValueError, TypeError, KeyError, IndexError) as exc:   # (a damaged row too)
             log.debug("cannot count the requests of %s: %s", db_path, exc)
     except sqlite3.Error as exc:  # a database of an older version or locked: show what we have
@@ -1927,11 +1930,12 @@ class SessionManager:
         swarm = self.swarms.get(sid)
         db_path = cfg.data_dir / "swarm.db" if config_error is None else self.dir_of(sid) / ".dreamteam" / "swarm.db"
         clarify = bool(cfg.swarm.clarify)   # (a clarify planner that waits for the user is a request: read_stats)
+        running = sid in self.running        # (a session that does not run counts only the requests that block it)
         if swarm is not None:
             with swarm.db._lock:
-                stats = read_stats(db_path, swarm.db.conn, clarify=clarify)
+                stats = read_stats(db_path, swarm.db.conn, clarify=clarify, running=running)
         else:
-            stats = read_stats(db_path, clarify=clarify)
+            stats = read_stats(db_path, clarify=clarify, running=running)
         limits = stats.pop("limits") or {}
         pending = pending_goal(meta)
         if stats["goal"] is None and pending:

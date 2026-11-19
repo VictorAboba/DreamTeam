@@ -48,7 +48,8 @@ from starlette.types import Receive, Scope, Send
 
 from . import __version__, apifolders, netoff, nofollow, roles
 from .apifolders import FOLDER_FIELDS, MODES, FolderRequest
-from .autoreply import ID_MAX, blocking_requests, journal_head, read_requests, request_key, requests_of
+from .autoreply import (ID_MAX, blocking_requests, journal_head, listed_requests, read_requests, request_key,
+                        requests_of)
 from .board import MAX_POST
 from .config import _joins_text, native_absolute
 from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads, check_rel, printable_line
@@ -130,8 +131,9 @@ SHUTTING_DOWN_TEXT = "DreamTeam is shutting down."
 NO_REQUEST_TEXT = ("No such request: it was answered, or it waits no more. GET /api/v1/sessions/{id}/requests lists "
                    "what waits now.")
 # `not_running` of an answer or a message (docs/SPEC.md §21.2): they need the session running
-NOT_RUNNING_TEXT = ("The session is not running: POST /api/v1/sessions/{id}/continue starts it with a text (the "
-                    "answer to a pending question, else a message to its team).")
+NOT_RUNNING_TEXT = ("The session is not running: POST /api/v1/sessions/{id}/continue starts it again with a text, the "
+                    "answer to a pending question, else a message to its team; a completed goal is reopened with it, "
+                    "and its agents work on it again.")
 # a continue's `api.error` when its start started nothing: a stop sent after it took the session's lock first
 NOT_DELIVERED_TEXT = "The session stopped before the text of a continue reached it: send the text again."
 NO_SESSION_TEXT = "No such session: GET /api/v1/sessions lists the sessions this token sees."
@@ -2207,12 +2209,14 @@ class ApiV1:
     async def _requests(self, request: Request, caller: str) -> Response:
         """GET /api/v1/sessions/{id}/requests (docs/SPEC.md §21.5): what waits for the user now, oldest first; a loaded
         session's from its swarm (requests_of), any other's from its file (read_requests with its [swarm] clarify:
-        nothing from a file it cannot read, as its summary's count). In a thread: the file may be large."""
+        nothing from a file it cannot read, as its summary's count); of a session that does not run only those that
+        hold its work (listed_requests: a member's message can be answered only while it runs). In a thread: the file
+        may be large."""
         query_fields(request)
         sid = self._session(request, caller)
         found = await asyncio.to_thread(self._read_db, sid, requests_of,
                                         lambda path: read_requests(path, clarify=self._clarify(sid)))
-        return JSONResponse({"requests": found})
+        return JSONResponse({"requests": listed_requests(found, running=sid in self.manager.running)})
 
     async def _answer(self, request: Request, caller: str) -> Response:
         """POST /api/v1/sessions/{id}/requests/{rid} (docs/SPEC.md §21.5): the user's answer to one request, `{"text"}`

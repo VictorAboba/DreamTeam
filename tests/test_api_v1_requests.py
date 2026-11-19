@@ -381,7 +381,8 @@ def test_answers_and_messages_as_given():
 
 async def test_an_answer_needs_its_request_and_a_running_session(tmp_path, api_token):
     """Refusals give nothing: a body of the wrong shape (400), an id that names no request, an unknown session (404);
-    the query's fields too. A stopped session (409 `not_running`) lists its requests from its file, unloaded."""
+    the query's fields too. A stopped session (409 `not_running`) lists its requests from its file, unloaded: only
+    those that hold its work (the review, not the member's message)."""
     hub = Hub(_manager(_home(tmp_path)))
     try:
         uid, sid, swarm = await running(hub)
@@ -411,12 +412,44 @@ async def test_an_answer_needs_its_request_and_a_running_session(tmp_path, api_t
         assert (await hub.call("GET", f"{base}/requests", query="all=1"))[1]["code"] == "unknown_field"
         assert swarm.board.get(task_id).status == Status.REVIEW and len(_from_user(swarm)) == given
         assert (await hub.call("POST", f"{base}/stop"))[0] == 200
-        assert await listed(hub, uid) == waiting and sid not in hub.manager.swarms   # (read from its file)
+        blocking = [r for r in waiting if r["id"] == rid]
+        assert await listed(hub, uid) == blocking and sid not in hub.manager.swarms   # (read from its file)
         for path, body in ((f"{base}/requests/{rid}", {"approve": True}), (f"{base}/requests/m{mid}", {"text": "Ok"})):
             status, answer = await hub.call("POST", path, body=body)
             assert status == 409 and answer["code"] == "not_running", path
             assert "/api/v1/sessions/{id}/continue" in answer["error"]
-        assert sid not in hub.manager.swarms and await listed(hub, uid) == waiting
+        assert sid not in hub.manager.swarms and await listed(hub, uid) == blocking
+    finally:
+        await hub.close()
+
+
+async def test_a_job_that_stopped_lists_no_message_and_its_answer_says_continue_reopens_it(tmp_path, api_token):
+    """A member's message to the user can be answered only while the session runs, and holds nothing: a job that
+    stopped once its goal was done, with its member's last report unanswered, lists no request and counts none (the
+    report stays in the user's conversation). An answer to it is `not_running`, whose text says that `continue`
+    reopens a completed goal. Once the session runs again, the report is listed again."""
+    hub = Hub(_manager(_home(tmp_path)))
+    try:
+        uid, sid, swarm = await running(hub, stop_when_done=True)
+        base, member = f"/api/v1/sessions/{uid}", swarm.members()[0]["name"]
+        report = swarm.mail.send(member, [USER], "Report: summary.md is ready.")
+        assert [r["id"] for r in await listed(hub, uid)] == [f"m{report['id']}"]
+        assert (await hub.call("GET", base))[1]["session"]["requests"] == 1
+        swarm.complete_goal(USER, "summary.md is written.")
+        await _until(lambda: hub.manager.is_final(sid), "the stop of the done job")
+        session = (await hub.call("GET", base))[1]["session"]
+        assert (session["state"], session["final"], session["requests"]) == ("done", True, 0), session
+        assert [s["requests"] for s in (await hub.call("GET", "/api/v1/sessions"))[1]["sessions"]] == [0]
+        assert await listed(hub, uid) == []
+        messages = (await hub.call("GET", f"{base}/messages"))[1]["messages"]
+        assert (messages[-1]["id"], messages[-1]["from"]) == (report["id"], member)
+        status, answer = await hub.call("POST", f"{base}/requests/m{report['id']}", body={"text": "Thanks."})
+        assert status == 409 and answer["code"] == "not_running", answer
+        assert "a completed goal is reopened with it" in answer["error"]
+        status, answer = await hub.call("POST", f"{base}/continue", body={"text": "Add a title."})
+        assert status == 200 and answer["session"]["state"] == "starting", answer
+        await hub.settled()
+        assert sid in hub.manager.running and [r["id"] for r in await listed(hub, uid)] == [f"m{report['id']}"]
     finally:
         await hub.close()
 

@@ -275,6 +275,15 @@ def blocking_requests(requests: Iterable[dict[str, Any]]) -> list[dict[str, Any]
     return [r for r in requests if r.get("kind") in BLOCKING_KINDS]
 
 
+def listed_requests(requests: Iterable[dict[str, Any]], *, running: bool) -> list[dict[str, Any]]:
+    """The requests a session lists, and its summary counts (docs/SPEC.md §21.5): every one while it runs; while it
+    does not, only those that hold its work (blocking_requests). A member's message to the user can be answered only
+    while the session runs and holds nothing, so a stopped job's last report to the user is no request then: it stays
+    in the user's conversation, and is listed again if the session runs again with it unanswered."""
+    found = list(requests)
+    return found if running else blocking_requests(found)
+
+
 def request_key(rid: Any) -> tuple[Any, ...] | None:
     """What a request id names: ("question", message id), ("message", message id), ("review", task id, event id) or
     ("mcp", server name, digest[:12] or ""); None for anything else, a number above ID_MAX among them (no request
@@ -497,5 +506,5 @@ class SessionAutoReply:
 
 __all__ = ["AUTO_REPLY", "AUTO_REVIEW", "AUTO_REPLY_MAX", "BLOCKING_KINDS", "ID_MAX", "JOURNAL_BATCH", "LAST_TO",
            "PLANS", "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests", "follow_journal",
-           "hub_answers", "journal_head", "planner_question", "read_requests", "reply_text", "request_key",
-           "requests_from", "requests_of", "review_key", "review_text", "wants_reply"]
+           "hub_answers", "journal_head", "listed_requests", "planner_question", "read_requests", "reply_text",
+           "request_key", "requests_from", "requests_of", "review_key", "review_text", "wants_reply"]

@@ -357,12 +357,15 @@ newer one:
   true|false}`; a server the agent built again since the listing has a new id, and the old one is 404.
 
 `question`, `review` and `mcp` requests block the work: the state is then `waiting`. `GET .../requests` lists what
-waits now, oldest first; the summary's `requests` counts them.
+waits now, oldest first; the summary's `requests` counts them. A session that does not run lists only those that block
+its work: a `message` can be answered only while the session runs, so a job that stopped with its member's last report
+unanswered lists nothing (the report stays in `GET .../messages`), and lists it again if it runs again.
 
 `POST .../requests/{rid}` answers one, as the user, and answers `{"ok": true, "session"}`. A field of another kind's
 answer is 400 `unknown_field`, a missing one or one of the wrong type 400 `bad_request`. A request answered or
 replaced meanwhile is 404 `not_found` (list the requests again). The session must run: a stopped one is 409
-`not_running` (`continue` starts it with a text). A second answer to the same MCP server while the first one is still
+`not_running` (`continue` starts it with a text; a completed goal is reopened with it, and the agents work, and spend,
+again). A second answer to the same MCP server while the first one is still
 being checked is 409 `conflict`; so is anything the swarm refuses, with its text (a path of the hub's computer in it
 rewritten, as in every error, see [Errors](#errors)). A text (of a question's or a
 message's answer, of a message, of `continue`) has its surrounding whitespace dropped and must then hold something,

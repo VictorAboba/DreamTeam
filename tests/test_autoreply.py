@@ -20,8 +20,8 @@ import dreamteam
 from dreamteam import autoreply, prompts
 from dreamteam import settings as st
 from dreamteam.autoreply import (AUTO_REPLY, AUTO_REVIEW, BLOCKING_KINDS, ID_MAX, SessionAutoReply, blocking_requests,
-                                 follow_journal, journal_head, read_requests, reply_text, request_key, requests_of,
-                                 review_key, review_text, wants_reply)
+                                 follow_journal, journal_head, listed_requests, read_requests, reply_text, request_key,
+                                 requests_of, review_key, review_text, wants_reply)
 from dreamteam.config import Config
 from dreamteam.db import Database, dumps
 from dreamteam.llm.scripted import ScriptedLLM
@@ -340,7 +340,9 @@ async def test_an_mcp_server_waiting_for_approval_is_a_request_with_its_digest(t
         assert read_stats(sw.db.path, sw.db.conn)["requests"] == 2
 
 
-async def test_a_sessions_requests_are_the_same_running_and_stopped_and_its_summary_counts_them(tmp_path):
+async def test_a_sessions_requests_are_read_the_same_running_and_stopped_and_its_summary_counts_them(tmp_path):
+    """A stopped session's file holds the same requests; its summary counts only those that hold its work (a member's
+    message can be answered only while the session runs: listed_requests)."""
     manager = manager_for(home_for(tmp_path), idler)
     try:
         sid = (await manager.create("Parser", "Write a parser", overrides=NO_GIT,
@@ -356,7 +358,9 @@ async def test_a_sessions_requests_are_the_same_running_and_stopped_and_its_summ
         await manager.stop(sid)
         path = manager.dir_of(sid) / ".dreamteam" / "swarm.db"
         assert read_requests(path) == live and read_stats(path)["requests"] == 2
-        assert manager.summary(sid)["requests"] == 2 and sid not in manager.swarms   # read without loading it
+        assert read_stats(path, running=False)["requests"] == 1
+        assert listed_requests(live, running=False) == live[1:] and listed_requests(live, running=True) == live
+        assert manager.summary(sid)["requests"] == 1 and sid not in manager.swarms   # read without loading it
         assert read_requests(tmp_path / "missing.db") == [] and read_stats(tmp_path / "missing.db")["requests"] == 0
     finally:
         await manager.shutdown()
