@@ -156,6 +156,12 @@ def _no_path(answer: Any, *paths: Path) -> None:
             assert spelling not in text, spelling
 
 
+def _taken_since(before: set[str]) -> set[str]:
+    """The claims and staging folders in use (copyfrom._IN_USE) that were not before (`before`: the set when the test
+    began; the set is the process's, and a test of another file may leave names of its own there)."""
+    return set(copyfrom._IN_USE) - before
+
+
 async def _until(condition: Callable[[], bool], what: str = "the condition", seconds: float = 5.0) -> None:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + seconds
@@ -546,6 +552,7 @@ async def test_the_uploads_cap_holds_for_uploads_that_arrive_together(tmp_path, 
 async def test_files_land_in_the_session_folder_and_their_tokens_are_used_up(tmp_path, api_token, no_start):
     hub = Hub(_manager(_home(tmp_path)))
     no_start(hub.manager)
+    before = set(copyfrom._IN_USE)
     try:
         brief = (await hub.upload("brief.md", b"# Brief\n"))[1]["upload"]
         data = (await hub.upload("data.zip", _zip({"a.csv": b"1,2\n", "notes/b.txt": b"b\n", ".gitignore": b"*\n"}),
@@ -558,7 +565,7 @@ async def test_files_land_in_the_session_folder_and_their_tokens_are_used_up(tmp
         _no_path(answer, tmp_path)
         status, answer = await hub.create({"goal": "Again", "files": [brief]})
         assert status == 404 and answer["code"] == "not_found"   # used up
-        assert not copyfrom._IN_USE
+        assert not _taken_since(before)
     finally:
         await hub.close()
 
@@ -571,6 +578,7 @@ async def test_a_refused_create_leaves_every_token_usable(tmp_path, api_token, h
     def usable(*tokens: str, caller: str = "api") -> bool:
         return [meta["token"] for meta in uploads.peek_many(list(tokens), caller=caller)] == list(tokens)
 
+    before = set(copyfrom._IN_USE)
     try:
         one = (await hub.upload("report.md", b"one\n"))[1]["upload"]
         two = (await hub.upload("report.md", b"two\n"))[1]["upload"]
@@ -596,7 +604,7 @@ async def test_a_refused_create_leaves_every_token_usable(tmp_path, api_token, h
         status, answer = await hub.create({"goal": "G", "files": [one]})
         assert status == 500 and answer["code"] == "internal" and usable(one)
         assert str(tmp_path) not in answer["error"]   # (redacted for the API caller)
-        assert hub.manager.ids() == [] and not copyfrom._IN_USE
+        assert hub.manager.ids() == [] and not _taken_since(before)
     finally:
         await hub.close()
 
@@ -613,6 +621,7 @@ async def test_a_cancelled_create_gives_its_uploads_back(tmp_path, api_token, no
             threading.Event().wait(0.01)
 
     monkeypatch.setattr(sessions_module, "copy_sources", slow)
+    before = set(copyfrom._IN_USE)
     try:
         token = (await hub.upload("brief.md", b"x"))[1]["upload"]
         request = asyncio.create_task(hub.create({"goal": "G", "files": [token]}))
@@ -622,7 +631,7 @@ async def test_a_cancelled_create_gives_its_uploads_back(tmp_path, api_token, no
         with pytest.raises(asyncio.CancelledError):
             await request
         assert [m["token"] for m in hub.manager.api_uploads.peek_many([token], caller="api")] == [token]
-        assert not copyfrom._IN_USE and hub.manager.ids() == [] and not hub.api._reserved and not hub.api._refs
+        assert not _taken_since(before) and hub.manager.ids() == [] and not hub.api._reserved and not hub.api._refs
     finally:
         await hub.close()
 
@@ -714,6 +723,7 @@ async def test_a_retry_during_a_slow_create_waits_for_it(tmp_path, api_token, no
             await asyncio.sleep(0.01)
         raise AssertionError("never happened")
 
+    before = set(copyfrom._IN_USE)
     try:
         token = (await hub.upload("brief.md", b"x"))[1]["upload"]
         body = {"goal": "G", "files": [token], "client_ref": "job-1"}
@@ -736,7 +746,7 @@ async def test_a_retry_during_a_slow_create_waits_for_it(tmp_path, api_token, no
         assert status == 202, made
         status, repeat = await third
         assert status == 200 and repeat["session"]["id"] == made["session"]["id"]
-        assert len(hub.manager.ids()) == 1 and not hub.api._refs and not copyfrom._IN_USE
+        assert len(hub.manager.ids()) == 1 and not hub.api._refs and not _taken_since(before)
     finally:
         for gate in gates:
             gate.set()

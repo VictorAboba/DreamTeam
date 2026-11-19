@@ -601,13 +601,16 @@ async def test_claim_and_release(tmp_path):
 
 async def test_concurrent_claims_have_one_winner(tmp_path):
     """A rename on Windows is not exclusive (two can both succeed, the second moving the first one's file): the
-    claims are made one at a time, so the loser gets the 404 and the winner keeps its file."""
+    claims are made one at a time, so the loser gets the 404 and the winner keeps its file. Each claim is settled
+    afterwards, the loser's too (release of a claim that took nothing only ends its use), so none stays in use."""
     import threading
 
     uploads = Uploads(tmp_path / "uploads")
     data = _zip({"a": "1"})
+    tokens: list[str] = []
     for _ in range(50):
         token = (await uploads.receive(_chunks(data), filename="w.zip", length=None, limits=LIMITS))["upload"]
+        tokens.append(token)
         paths = [uploads.claim_path(token), uploads.claim_path(token)]
         barrier = threading.Barrier(2)
         outcomes: list = [None, None]
@@ -629,6 +632,8 @@ async def test_concurrent_claims_have_one_winner(tmp_path):
         assert len(won) == 1 and len(lost) == 1 and lost[0].status == 404, outcomes
         assert paths[won[0]].is_file() and not paths[1 - won[0]].exists()
         uploads.release(token, paths[won[0]])
+        uploads.release(token, paths[1 - won[0]])
+    assert _claims_held(tokens) == []
 
 
 def test_a_vanished_upload_is_a_404(tmp_path):
