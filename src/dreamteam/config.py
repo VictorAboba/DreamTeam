@@ -339,7 +339,7 @@ _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "too
                       "install_timeout", "lock_ttl_minutes", "copy_max_mb", "copy_max_files", "uploads_pending",
                       "archive_max_mb"})
 _MAX = {"port": 65535}
-_INT64 = 2 ** 63
+INT64_LIMIT = 2 ** 63   # a whole-number setting is a 64-bit integer (SQLite's); v1's PATCH bounds max_agents so too
 
 
 def _bad(where: str, key: str, expected: str, value: Any) -> ValueError:
@@ -374,7 +374,7 @@ def _checked(where: str, key: str, annotation: str, value: Any) -> Any:
                 if not value.is_integer():
                     raise _bad(where, key, "a whole number", value)
                 value = int(value)
-            if not -_INT64 <= value < _INT64:
+            if not -INT64_LIMIT <= value < INT64_LIMIT:
                 raise _bad(where, key, "a 64-bit integer", value)
         low, high = (1 if key in _MIN_ONE else 0), _MAX.get(key)
         if value < low or (high is not None and value > high):

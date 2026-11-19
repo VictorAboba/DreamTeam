@@ -7034,7 +7034,9 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   that never started is 409 `conflict`, because the
   goal set at the first start ends wrap-up mode. A `continue` that reopens a done goal ends it too. A `max_cost_usd`
   that covers what was spent lifts a budget pause. A value the swarm refuses (`max_agents` below 1, a negative cost)
-  is 400 `bad_request`. Its checks come in this order: the type (415 `unsupported_media_type` unless the
+  is 400 `bad_request`, and so is a number a float cannot hold (a whole number of 400 digits, which JSON may write;
+  `sessions._finite`) or a `max_agents` past 64 bits (`config.INT64_LIMIT`, as the create's `[swarm] max_agents`),
+  with nothing written. Its checks come in this order: the type (415 `unsupported_media_type` unless the
   `Content-Type` is `application/json`, parameters such as a charset aside: `api_v1.check_json_type`), the query and
   the body's fields (`unknown_field`; `api_v1.PATCH_FIELDS`), then the session. A field that is `null` is not given;
   nothing given changes nothing.

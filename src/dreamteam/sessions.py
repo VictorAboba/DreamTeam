@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Any, Callable, Collection, Iterable, Iterator
 from . import __version__, apifolders, hubauth, netoff
 from . import skills as skill_lib
 from .autoreply import SessionAutoReply, follow_journal, journal_head, listed_requests, requests_from
-from .config import Config
+from .config import INT64_LIMIT, Config
 from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled,
                        CopyError, CopyLimits, Source, Uploads, _other_home, check_target, copy_into, copy_sources,
                        done_with, hub_in_container, left_over, printable_line, resolve_source, staging_name)
@@ -195,6 +195,15 @@ def _number(value: Any) -> float:
         return float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _finite(number: int | float) -> bool:
+    """Whether `number` is finite as a float: a whole number too large for one (10**400, which JSON may hold) is not,
+    where math.isfinite would raise OverflowError."""
+    try:
+        return math.isfinite(number)
+    except OverflowError:
+        return False
 
 
 def _copied_from(value: Any) -> dict[str, Any] | None:
@@ -3105,18 +3114,21 @@ class SessionManager:
         an open database blocks a delete or a folder move). None leaves a value as it is; nothing given changes
         nothing. Returns the summary.
         SessionError: 400 for a value of the wrong kind or one the swarm refuses (`max_agents` below 1, a negative
-        cost: nothing is written); 409 code `conflict` for `wrap_up: true` while the session's first start has its
-        goal still to set (set_goal ends wrap-up mode); 409 for a session made by an earlier version; 404, also when
-        `uid` (the session's uid as the caller resolved it) is given and the folder name holds another session once
-        the lock is taken (_check)."""
+        cost: nothing is written), and for a number a float cannot hold (a whole number of 400 digits) or a
+        `max_agents` of more than 64 bits, as `[swarm] max_agents` (config); 409 code `conflict` for `wrap_up: true`
+        while the session's first start has its goal still to set (set_goal ends wrap-up mode); 409 for a session
+        made by an earlier version; 404, also when `uid` (the session's uid as the caller resolved it) is given and
+        the folder name holds another session once the lock is taken (_check)."""
         for name, value in (("max_cost_usd", max_cost_usd), ("max_agents", max_agents)):
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
-                                      or not math.isfinite(value)):
+                                      or not _finite(value)):
                 raise SessionError(f"'{name}' must be a number.")
         if max_agents is not None and not isinstance(max_agents, int):
             if not float(max_agents).is_integer():
                 raise SessionError("'max_agents' must be a whole number.")
             max_agents = int(max_agents)
+        if max_agents is not None and max_agents >= INT64_LIMIT:
+            raise SessionError("'max_agents' must be a 64-bit integer.")
         if wrap_up is not None and not isinstance(wrap_up, bool):
             raise SessionError("'wrap_up' must be true or false.")
         self._check(sid)

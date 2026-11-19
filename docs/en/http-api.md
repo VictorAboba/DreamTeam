@@ -416,8 +416,9 @@ is resumed as well.
 
 - `PATCH /api/v1/sessions/{id}` with `max_cost_usd`, `max_agents` or `wrap_up` changes them as the board's ⚙ does,
   also for a stopped session. A budget that covers what was spent lifts a budget pause. `wrap_up: true` asks the team
-  to finish with what it has (409 `conflict` on a session that never started). PATCH checks its own `Content-Type`
-  (415).
+  to finish with what it has (409 `conflict` on a session that never started). A value that cannot be a limit
+  (`max_agents` below 1 or past 64 bits, a negative budget, a number too large for a float) is 400 `bad_request`, and
+  nothing changes. PATCH checks its own `Content-Type` (415).
 - `POST .../stop` stops the session and its background jobs (reason `user`); `continue` starts it again.
 - `DELETE .../{id}?confirm={id}` deletes the session with its folder. A folder the session worked in in place is kept,
   with its files, and named: `"folder_kept": {"root", "path"}`.

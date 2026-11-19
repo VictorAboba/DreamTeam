@@ -1064,10 +1064,18 @@ async def test_patch_changes_the_limits_and_wrap_up_of_a_running_session(tmp_pat
         for body, code in (({"max_agents": 0}, "bad_request"), ({"max_cost_usd": -1}, "bad_request"),
                            ({"max_cost_usd": "5"}, "bad_request"), ({"max_agents": 2.5}, "bad_request"),
                            ({"max_agents": True}, "bad_request"), ({"wrap_up": "yes"}, "bad_request"),
+                           # a whole number no float holds (JSON may write one), a max_agents past 64 bits, as the
+                           # create's [swarm] max_agents: 400, never a 500 the docs tell a client to retry
+                           ({"max_cost_usd": 10 ** 400}, "bad_request"), ({"max_agents": 10 ** 400}, "bad_request"),
+                           ({"max_agents": 2 ** 63}, "bad_request"), ({"max_agents": 1e300}, "bad_request"),
                            ({"max_agents": 3, "colour": "red"}, "unknown_field")):
             status, answer = await hub.call("PATCH", path, body=body)
-            assert status == 400 and answer["code"] == code, body
+            assert status == 400 and answer["code"] == code, (body, answer)
         assert swarm.limits() == {"max_cost_usd": 2.5, "max_agents": 2}   # nothing written by a refusal
+        status, answer = await hub.call("PATCH", path, body={"max_cost_usd": 10 ** 300})   # (a float holds it)
+        assert status == 200 and answer["session"]["max_cost_usd"] == 1e300
+        status, answer = await hub.call("PATCH", path, body={"max_cost_usd": 2.5})
+        assert status == 200 and swarm.limits() == {"max_cost_usd": 2.5, "max_agents": 2}
         assert (await hub.call("PATCH", path, body={}, query="now=1"))[1]["code"] == "unknown_field"
         for kind in ("text/plain", "", "application/jsonx"):   # (the guard's 415 covers POST only)
             status, answer = await hub.call("PATCH", path, body={"max_agents": 3}, content_type=kind)
