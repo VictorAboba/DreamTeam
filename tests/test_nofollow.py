@@ -406,6 +406,29 @@ def test_a_listing_gives_folders_and_files_in_name_order(tmp_path):
     assert [(e.name, e.size) for e in list_inside(root, ["b", "deeper"])] == [("y.txt", 2)]
 
 
+def test_a_listing_of_some_names_keeps_only_those_while_it_reads(tmp_path, monkeypatch):
+    """list_some lists the first `limit` names in name order (a link among them is left out, as by list_inside) and
+    says whether the folder holds more; the folder's listing itself keeps only limit + 1 names, however many it
+    holds."""
+    root, outside = _tree(tmp_path)
+    for name in ("e.txt", "d.txt"):
+        _write(root / name, "x")
+    _dir_link(outside, root / "0-link")
+    kept: list[int] = []
+    real = nf._FS.listing
+
+    def listing(folder, rel, limit=None):
+        found = real(folder, rel, limit)
+        kept.append(len(found))
+        return found
+    monkeypatch.setattr(nf._FS, "listing", listing)
+    entries, more = nf.list_some(root, (), 3)   # ("0-link", "a.txt", "b"; then "c.txt", "d.txt", "e.txt")
+    assert [e.name for e in entries] == ["a.txt", "b"] and more is True and kept == [4]
+    entries, more = nf.list_some(root, (), 6)
+    assert [e.name for e in entries] == ["a.txt", "b", "c.txt", "d.txt", "e.txt"] and more is False
+    assert nf.list_some(root, ("b",)) == (list_inside(root, ("b",)), False)
+
+
 def test_a_folder_swapped_after_its_open_is_listed_through_what_was_opened(tmp_path, monkeypatch):
     """The folder is swapped for a link to outside after it was opened, before it is listed: its listing comes
     from the folder opened (POSIX: its descriptor; Windows: its handle), never from outside; on Windows a name below
@@ -413,11 +436,11 @@ def test_a_folder_swapped_after_its_open_is_listed_through_what_was_opened(tmp_p
     real = nf._FS.listing
     roots: list[tuple[Path, Path]] = []
 
-    def listing(folder, rel):
+    def listing(folder, rel, limit=None):
         root, outside = roots[-1]
         if rel == "b" and not (root / "b.old").exists():
             _swap_for_link(root / "b", outside)
-        return real(folder, rel)
+        return real(folder, rel, limit)
     monkeypatch.setattr(nf._FS, "listing", listing)
 
     roots.append(_tree(tmp_path / "1"))
@@ -628,6 +651,31 @@ def test_a_walk_enters_at_most_max_depth_folders(tmp_path, monkeypatch):
     assert errors["b/c/d"].filename == "b/c/d" and "deep" in errors["b/c/d"].strerror
     assert [(kind, rel) for kind, rel, _data in _rest(walk_inside(root, ("b",)))[0]] == [
         (DIR, "c"), (DIR, "c/d"), (FILE, "c/d/deep.txt"), (FILE, "x.txt")]
+
+
+def test_a_walk_gives_at_most_its_limit_of_entries_and_keeps_no_more_names(tmp_path, monkeypatch):
+    """walk_inside(limit=n) gives n entries at most (every name counts, a left-out one too) and raises TooMany at the
+    next; each folder's listing keeps only the names the walk may still reach, however many it holds."""
+    root, _ = _tree(tmp_path)   # a.txt, b/, b/x.txt, c.txt
+    for i in range(40):
+        _write(root / "b" / f"many-{i:02d}.txt", "")
+    kept: list[tuple[str, int]] = []
+    real = nf._FS.listing
+
+    def listing(folder, rel, limit=None):
+        found = real(folder, rel, limit)
+        kept.append((rel, len(found)))
+        return found
+    monkeypatch.setattr(nf._FS, "listing", listing)
+    walk = walk_inside(root, skip=lambda parts: parts[-1] == "many-00.txt", open_files=False, limit=5)
+    got = [(next(walk).rel) for _ in range(5)]
+    assert got == ["a.txt", "b", "b/many-00.txt", "b/many-01.txt", "b/many-02.txt"]
+    with pytest.raises(nf.TooMany) as info:
+        next(walk)
+    assert info.value.limit == 5 and kept == [("", 3), ("b", 4)]   # (5 - 2 given + 1 of b's 41 names)
+    assert len(list(walk_inside(root, open_files=False, limit=44))) == 44   # (exactly the limit: no TooMany)
+    with pytest.raises(nf.TooMany):
+        list(walk_inside(root, open_files=False, limit=43))
 
 
 def test_what_is_gone_or_unreadable_meanwhile_is_an_error_entry(tmp_path):

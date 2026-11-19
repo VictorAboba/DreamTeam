@@ -221,6 +221,35 @@ async def test_a_folder_is_listed_in_name_order_without_git_or_scratch(tmp_path,
         assert _json(await listing(hub, uid, path="src/lib"))["entries"][0]["path"] == "src/lib/util.js"
         _no_path(answer, tmp_path)
         assert sid not in hub.manager.swarms   # (never loaded)
+        assert answer["truncated"] is False
+    finally:
+        await hub.close()
+
+
+async def test_a_listing_holds_the_first_names_of_a_folder_and_says_when_there_are_more(tmp_path, api_token,
+                                                                                        no_start, monkeypatch):
+    """GET files reads at most FILES_MAX_ENTRIES names of a folder, the first in name order (what it leaves out among
+    them, as `.git`, counts), and `truncated` says the folder holds more; the answer is rendered in the thread that
+    reads the folder."""
+    monkeypatch.setattr(api_v1, "FILES_MAX_ENTRIES", 3)
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    rendered: list[threading.Thread] = []
+    real_text = api_v1.json_text
+
+    def text(*args: Any, **kwargs: Any) -> str:
+        rendered.append(threading.current_thread())
+        return real_text(*args, **kwargs)
+
+    monkeypatch.setattr(api_v1, "json_text", text)
+    try:
+        uid, _sid, _folder = await session_with(hub, {"b.txt": "", "a.txt": "", ".git/HEAD": "ref", "d/x.txt": "",
+                                                     "c.txt": "", "three/1": "", "three/2": "", "three/3": ""})
+        answer = _json(await listing(hub, uid))
+        assert _names(answer["entries"]) == ["a.txt", "b.txt"] and answer["truncated"] is True   # (.git, a, b)
+        answer = _json(await listing(hub, uid, path="three"))
+        assert _names(answer["entries"]) == ["1", "2", "3"] and answer["truncated"] is False
+        assert rendered and all(thread.name == "dreamteam-api-folder" for thread in rendered)
     finally:
         await hub.close()
 
@@ -404,7 +433,7 @@ async def test_folder_work_runs_in_v1s_own_threads_never_the_default_executor(tm
     no_start(hub.manager)
     gate = threading.Event()
     used: list[threading.Thread] = []
-    real_list, real_open, real_walk = nofollow.list_inside, nofollow.open_inside, nofollow.walk_inside
+    real_list, real_open, real_walk = nofollow.list_some, nofollow.open_inside, nofollow.walk_inside
     real_result, real_redact = ApiV1.result, ApiV1.redact
 
     def hung_list(*args: Any, **kwargs: Any) -> Any:
@@ -420,7 +449,7 @@ async def test_folder_work_runs_in_v1s_own_threads_never_the_default_executor(tm
 
     try:
         uid, _sid, _folder = await session_with(hub, {"a.txt": "A"})
-        monkeypatch.setattr(nofollow, "list_inside", hung_list)
+        monkeypatch.setattr(nofollow, "list_some", hung_list)
         reads = [asyncio.ensure_future(listing(hub, uid)) for _ in range(3)]
         await _until(lambda: len(used) == 2, "two reads in their threads")
         await asyncio.sleep(0.1)
@@ -709,10 +738,10 @@ def _unreadable(monkeypatch, *rels: str) -> None:
     """nofollow lists the folders `rels` (relative to the root) as a folder the hub may not read: PermissionError."""
     real = nofollow._FS.listing
 
-    def listing_(folder, rel):
+    def listing_(folder, rel, limit=None):
         if rel in rels:
             raise OSError(errno.EACCES, "Access is denied.", rel or ".")
-        return real(folder, rel)
+        return real(folder, rel, limit)
 
     monkeypatch.setattr(nofollow._FS, "listing", listing_)
 
@@ -854,6 +883,39 @@ async def test_an_archive_over_its_limit_is_refused_before_any_byte(tmp_path, ap
         answer = _json(got)
         assert answer["code"] == "too_large" and "archive_max_mb (1 MB)" in answer["error"]
         assert _zip(await archive(hub, uid, {"path": "sub"})) == {"b.bin": b"y" * (1 << 19) + b"z"}
+    finally:
+        await hub.close()
+
+
+async def test_an_archive_of_more_entries_than_it_holds_is_refused_before_any_byte(tmp_path, api_token, no_start,
+                                                                                    monkeypatch):
+    """Empty files cost nothing against archive_max_mb, but each costs the hub memory while the zip is made: past
+    ARCHIVE_MAX_ENTRIES names (the ones left out count too) the archive is 413 before any byte, and one that grows
+    past them between its two walks is cut."""
+    monkeypatch.setattr(api_v1, "ARCHIVE_MAX_ENTRIES", 6)
+    hub = Hub(_manager(_home(tmp_path)))
+    no_start(hub.manager)
+    try:
+        uid, _sid, folder = await session_with(hub, {**{f"many/e{i}.txt": "" for i in range(6)}, "few/a.txt": "",
+                                                     "few/.git/HEAD": "ref"})
+        got = await archive(hub, uid)
+        assert got.status == 413 and got.messages == 1 and got.error is None
+        answer = _json(got)
+        assert answer["code"] == "too_large" and "more than 6 files and folders" in answer["error"], answer
+        assert sorted(_zip(await archive(hub, uid, {"path": "many"}))) == [f"e{i}.txt" for i in range(6)]
+        assert sorted(_zip(await archive(hub, uid, {"path": "few"}))) == ["a.txt"]
+
+        real_measure = ApiV1._measure
+
+        def measure_then_grow(self: ApiV1, *args: Any, **kwargs: Any) -> Any:
+            measured = real_measure(self, *args, **kwargs)
+            _write(folder / "many" / "e9.txt", "")   # (after the measure, before the second walk)
+            return measured
+
+        monkeypatch.setattr(ApiV1, "_measure", measure_then_grow)
+        got = await archive(hub, uid, {"path": "many"})
+        assert got.status == 200 and not got.ended and isinstance(got.error, api_v1._Cut), got.error
+        assert "more than 6 files and folders" in str(got.error)
     finally:
         await hub.close()
 

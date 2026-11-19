@@ -32,16 +32,17 @@ thread). Stdlib only, ctypes on Windows.
 from __future__ import annotations
 
 import errno
+import heapq
 import io
 import os
 import stat
 import struct
 import sys
 from dataclasses import dataclass, field
-from typing import Any, BinaryIO, Callable, Iterator
+from typing import Any, BinaryIO, Callable, Iterable, Iterator
 
 __all__ = ["DIR", "FILE", "LINK", "HARD_LINK", "SPECIAL", "EXCLUDED", "ERROR", "REASONS", "MAX_DEPTH", "Entry",
-           "Refused", "open_inside", "hold_inside", "list_inside", "walk_inside"]
+           "Refused", "TooMany", "open_inside", "hold_inside", "list_inside", "list_some", "walk_inside"]
 
 # what an Entry is
 DIR = "dir"                # a folder (walk_inside: entered next)
@@ -91,6 +92,14 @@ class Refused(OSError):
         super().__init__(errno.ELOOP, REASONS[reason], rel or ".")
         self.rel = rel
         self.reason = reason
+
+
+class TooMany(Exception):
+    """A walk that met more entries than its `limit` (walk_inside): it ends there, before it keeps any more."""
+
+    def __init__(self, limit: int):
+        super().__init__(f"more than {limit} entries")
+        self.limit = limit
 
 
 @dataclass(frozen=True)
@@ -317,12 +326,13 @@ class _Posix:
         return fd, st, None
 
     @staticmethod
-    def listing(folder: _Dir, rel: str) -> list[_Listed]:
-        """The folder's names in name order, with what lstat (through its descriptor) says of each."""
+    def listing(folder: _Dir, rel: str, limit: int | None = None) -> list[_Listed]:
+        """The folder's names in name order, with what lstat (through its descriptor) says of each (`limit`: only the
+        first that many, each other one never kept)."""
         out: list[_Listed] = []
         try:
             with os.scandir(folder.fd) as it:
-                found = list(it)
+                found = list(it) if limit is None else heapq.nsmallest(limit, it, key=lambda entry: entry.name)
         except OSError as exc:
             raise _named(exc, rel) from None
         for entry in found:   # (their stat goes through folder.fd, which stays open)
@@ -444,18 +454,18 @@ class _WindowsApi:
                 return buf[:n]
             size = n + 1
 
-    def list_dir(self, fd: int, rel: str) -> list[tuple[str, int, int, int, int]]:
-        """The entries of the open folder: (name, attributes, reparse tag, size, modification time in ns)."""
+    def list_dir(self, fd: int, rel: str) -> Iterator[tuple[str, int, int, int, int]]:
+        """The entries of the open folder, one at a time as the system gives them: (name, attributes, reparse tag,
+        size, modification time in ns)."""
         handle = self.msvcrt.get_osfhandle(fd)
         buf = self.ctypes.create_string_buffer(_LIST_BUFFER)
         kind = _FILE_FULL_DIRECTORY_RESTART_INFO
-        out = []
         while True:
             if not self.information_ex(handle, kind, buf, _LIST_BUFFER):
                 code = self.ctypes.get_last_error()
                 if code == _ERROR_NO_MORE_FILES or (code == _ERROR_FILE_NOT_FOUND
                                                     and kind == _FILE_FULL_DIRECTORY_RESTART_INFO):
-                    return out
+                    return
                 raise self.error(rel, code)
             kind = _FILE_FULL_DIRECTORY_INFO
             raw = buf.raw
@@ -466,7 +476,7 @@ class _WindowsApi:
                 start = offset + _FULL_DIR_INFO.size
                 name = raw[start:start + name_length].decode("utf-16-le", "surrogatepass")
                 if name not in (".", ".."):
-                    out.append((name, attributes, tag, size, (written - _FILETIME_EPOCH) * 100))
+                    yield name, attributes, tag, size, (written - _FILETIME_EPOCH) * 100
                 if not next_offset:
                     break
                 offset += next_offset
@@ -546,10 +556,13 @@ class _Windows:
             raise Refused(rel, "outside")
         return fd, st, final
 
-    def listing(self, folder: _Dir, rel: str) -> list[_Listed]:
-        """The open folder's names in name order, read through its handle."""
+    def listing(self, folder: _Dir, rel: str, limit: int | None = None) -> list[_Listed]:
+        """The open folder's names in name order, read through its handle (`limit`: only the first that many)."""
         out = []
-        for name, attributes, tag, size, mtime_ns in self.api.list_dir(folder.fd, rel):
+        rows: Iterable[tuple[str, int, int, int, int]] = self.api.list_dir(folder.fd, rel)
+        if limit is not None:
+            rows = heapq.nsmallest(limit, rows, key=lambda row: row[0])
+        for name, attributes, tag, size, mtime_ns in rows:
             if attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT and tag & _NAME_SURROGATE:
                 kind = LINK
             elif attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
@@ -623,13 +636,21 @@ def list_inside(root: str | os.PathLike, parts: Any = ()) -> list[Entry]:
     links, files with more than one name (st_nlink > 1) and special files are left out, as is a name gone
     meanwhile. Entry.parts is the one name. Errors as open_inside's for the folder; `Refused` also when a file's
     path now leads out of the root (Windows: a link swapped in above it). Blocking."""
+    return list_some(root, parts)[0]
+
+
+def list_some(root: str | os.PathLike, parts: Any = (), limit: int | None = None) -> tuple[list[Entry], bool]:
+    """list_inside of the first `limit` names of the folder in name order (None: all), and whether it holds more
+    names than that. Only those names are kept while the folder is read, however many it holds. Blocking."""
     parts = _check_parts(parts)
     fs = _FS
     base = "/".join(parts)
     folder = _open_folder(root, parts)
     out: list[Entry] = []
     try:
-        for item in fs.listing(folder, base):
+        items = fs.listing(folder, base, None if limit is None else limit + 1)
+        more = limit is not None and len(items) > limit
+        for item in items[:limit] if more else items:
             if item.kind == DIR:
                 out.append(Entry((item.name,), DIR, 0, item.mtime_ns, item.mode))
             elif item.kind == FILE and item.nlink is not None:   # (POSIX: lstat through the folder's descriptor)
@@ -650,11 +671,11 @@ def list_inside(root: str | os.PathLike, parts: Any = ()) -> list[Entry]:
                     out.append(Entry((item.name,), FILE, st.st_size, st.st_mtime_ns, st.st_mode))
     finally:
         _close(folder.fd)
-    return out
+    return out, more
 
 
-def walk_inside(root: str | os.PathLike, parts: Any = (), *,
-                skip: Callable[[tuple[str, ...]], bool] | None = None, open_files: bool = True) -> Iterator[Entry]:
+def walk_inside(root: str | os.PathLike, parts: Any = (), *, skip: Callable[[tuple[str, ...]], bool] | None = None,
+                open_files: bool = True, limit: int | None = None) -> Iterator[Entry]:
     """Every entry below the folder `parts` of `root`, depth first in name order (a folder's entry, then what it
     holds). Entry.parts is relative to that folder. `skip(parts)`: True leaves the entry out (EXCLUDED: never
     opened, a folder never entered), asked before anything else. A FILE comes open (Entry.reader(), a file object
@@ -667,16 +688,23 @@ def walk_inside(root: str | os.PathLike, parts: Any = (), *,
     another file or folder (Refused "replaced") or a special file (Refused "special"), never opened, and a folder
     more than MAX_DEPTH levels below the start folder, never entered.
     A link swapped in for a folder or a file the listing gave, or a path that now leads out of the root, raises
-    `Refused`: the walk ends. Errors of the start folder (as open_inside's) are raised by the first next().
-    Every descriptor is closed when the walk ends, also when it is left before. Blocking."""
+    `Refused`: the walk ends. `limit`: the walk gives at most that many entries and raises `TooMany` at the next one
+    (every name below the folder counts, the ones left out too); a folder's listing then keeps only the names the walk
+    may still reach, however many it holds. Errors of the start folder (as open_inside's) are raised by the first
+    next(). Every descriptor is closed when the walk ends, also when it is left before. Blocking."""
     parts = _check_parts(parts)
     fs = _FS
     base = "/".join(parts)
     stack: list[tuple[_Dir, tuple[str, ...], Iterator[_Listed]]] = []
+    given = 0   # (entries taken so far: each name taken gives one entry)
+
+    def names(folder: _Dir, rel: str) -> list[_Listed]:   # (one more than the walk may give: TooMany comes then)
+        return fs.listing(folder, rel, None if limit is None else max(limit - given, 0) + 1)
+
     try:
         start = _open_folder(root, parts)
         try:
-            listed = fs.listing(start, base)
+            listed = names(start, base)
         except BaseException:
             _close(start.fd)
             raise
@@ -688,6 +716,9 @@ def walk_inside(root: str | os.PathLike, parts: Any = (), *,
                 stack.pop()
                 _close(folder.fd)
                 continue
+            given += 1
+            if limit is not None and given > limit:
+                raise TooMany(limit)
             sub = here + (item.name,)
             rel = _join(base, sub)
             if skip is not None and skip(sub):
@@ -719,7 +750,7 @@ def walk_inside(root: str | os.PathLike, parts: Any = (), *,
             if want_dir:
                 child = _Dir(fd, final, folder.root_final)
                 try:
-                    listed = fs.listing(child, rel)
+                    listed = names(child, rel)
                 except OSError as exc:
                     _close(fd)
                     yield Entry(sub, ERROR, error=exc)

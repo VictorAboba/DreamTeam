@@ -169,7 +169,7 @@ print(result["status"], result["summary"])
 | GET `/api/v1/sessions/{id}/messages?after=&limit=` | `{"messages": [...], "last"}`: the user's conversation with the members, oldest first |
 | POST `/api/v1/sessions/{id}/messages` | `{"to", "text", "reply_to"?}` → 201 `{"message"}` |
 | GET `/api/v1/sessions/{id}/result` | the [result](#the-result), also while the session runs (`"final": false`) |
-| GET `/api/v1/sessions/{id}/files?path=&scratch=` | `{"path", "entries": [...]}`: one folder of the session's files ([Files](#files)) |
+| GET `/api/v1/sessions/{id}/files?path=&scratch=` | `{"path", "entries": [...], "truncated"}`: one folder of the session's files ([Files](#files)) |
 | GET `/api/v1/sessions/{id}/files/{path}?scratch=` | the file's bytes |
 | GET `/api/v1/sessions/{id}/archive?path=&scratch=` | a zip of the session's folder or of one folder in it |
 
@@ -460,8 +460,9 @@ is resumed as well.
 ## Files
 
 - `GET .../files?path=` lists one folder of the session's files (the session's folder itself without `path`):
-  `{"path", "entries": [{name, path, type: "file" | "dir", size, modified}]}`, in name order. A listing is always
-  whole: there is no paging.
+  `{"path", "entries": [{name, path, type: "file" | "dir", size, modified}], "truncated"}`, in name order. A
+  listing reads at most the first 10 000 names of the folder; `truncated` is true when it holds more (there is no
+  paging: list a folder inside it, or ask for its archive).
 - `GET .../files/{path}` downloads one file: `Content-Type: application/octet-stream` whatever the name (the agents
   wrote it: a site that passes it on must not have it rendered), `Content-Disposition: attachment` with the name,
   `X-Content-Type-Options: nosniff`, `Cache-Control: no-store` and `Content-Length`, the size when it was opened.
@@ -469,7 +470,8 @@ is resumed as well.
   ends the answer early, so a client that compares the bytes with `Content-Length` never takes a short file for whole.
 - `GET .../archive?path=` streams a zip of the session's folder, or of one folder in it, named `<folder>.zip`: every
   folder an entry (empty ones too), files deflated with their times, modes 0644 (0755 for folders and executable
-  files). It is measured first: over `[api] archive_max_mb` (default 1024) it is 413 `too_large` before any byte, and a
+  files). It is measured first: over `[api] archive_max_mb` (default 1024), or over 100 000 files and folders (the
+  names it leaves out count too), it is 413 `too_large` before any byte, and a
   folder that cannot be read is 409 `conflict`, as is one more than 64 levels deep. Each file is taken at its size when
   it is opened. A file or folder that goes, is replaced or shrinks while the zip is written cuts the answer before the
   zip's end, so the client gets an invalid zip, never a valid one that lacks files. A hub sends at most 4 archives at

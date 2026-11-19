@@ -116,6 +116,11 @@ ARCHIVES_AT_ONCE = 4
 # v1's own daemon threads at once for the work that may touch a folder of the hub's computer (_Threads; docs/SPEC.md
 # §21.1 "Threads"): a call past them waits for one to end
 FOLDER_THREADS = 8
+# what one archive walks at most (docs/SPEC.md §21.8): its files and folders, and the names it leaves out too (each
+# costs the hub memory while the zip is made, whatever its size): 413 `too_large` past them, before any byte
+ARCHIVE_MAX_ENTRIES = 100_000
+# the names of one folder GET files lists at most: the first in name order, `truncated` when the folder holds more
+FILES_MAX_ENTRIES = 10_000
 # ID_MAX (autoreply's, SQLite's largest integer): the largest id a query's `after`, a message's `reply_to` or a
 # request's id names
 TO_MAX = 100                # names in the `to` of a message the client sends
@@ -1136,16 +1141,17 @@ def _zip_info(rel: str, entry: nofollow.Entry, *, folder: bool) -> zipfile.ZipIn
     return info
 
 
-def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: Mapping[str, str],
+def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: dict[str, str],
                limit: int, still: Callable[[], bool] | None = None) -> Iterator[bytes]:
     """The zip of the folder `asked` of a session's folder (docs/SPEC.md §21.8 `archive`), in parts: the second walk
     (nofollow, what `served` takes), each file read through the walk's own open file before the walk goes on,
     exactly the size it had when it was opened (more written meanwhile is left for the next archive), deflated, each
-    folder an entry of its own. What the first walk `measured` (rel -> kind) must be there still: a file or a folder
-    gone, one that became a link or another kind, a file that shrank while it was read, an entry that cannot be
-    read, a link swapped in (nofollow.Refused), or more than `limit` bytes, raise (_Cut, OSError) before the central
-    directory is written, so the client's zip is never a valid one that lacks files or holds a torn one. What came
-    meanwhile is taken. Blocking: one step at a time in a thread (_zip_bytes); a step ends (a part, b"" when there
+    folder an entry of its own. What the first walk `measured` (rel -> kind; each is taken out of it as the walk
+    meets it, so nothing else holds every path) must be there still: a file or a folder gone, one that became a link
+    or another kind, a file that shrank while it was read, an entry that cannot be read, a link swapped in
+    (nofollow.Refused), more than `limit` bytes, or more than ARCHIVE_MAX_ENTRIES entries (what came meanwhile
+    counts too: nofollow.TooMany), raise (_Cut, OSError) before the central directory is written, so the client's
+    zip is never a valid one that lacks files or holds a torn one. What came meanwhile is taken. Blocking: one step at a time in a thread (_zip_bytes); a step ends (a part, b"" when there
     is no zip to send yet) once ZIP_SENT bytes of zip are ready or about FILE_CHUNK bytes were read (an entry counts
     as ZIP_ENTRY_COST), so that a client gone waits for one short step only. `still()` says whether the session's
     folder name still holds the session asked for (ApiV1._still): asked once the walk has opened its folder, before
@@ -1153,56 +1159,58 @@ def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: M
     took the name meanwhile (_Cut)."""
     sink = _ZipSink()
     archive = zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
-    walk = nofollow.walk_inside(where.root, where.base + asked, skip=_skipped(asked, scratch))
-    seen: set[str] = set()
+    walk = nofollow.walk_inside(where.root, where.base + asked, skip=_skipped(asked, scratch),
+                                limit=ARCHIVE_MAX_ENTRIES)
     total = work = 0   # (bytes of files so far; bytes read in this step, an entry counted as ZIP_ENTRY_COST)
     checked = still is None
     try:
-        for entry in walk:
-            if not checked:   # (the walk has opened its folder: is the name still the session's?)
-                checked = True
-                if still is not None and not still():
-                    raise _Cut("the session is gone")
-            rel, was = entry.rel, measured.get(entry.rel)
-            work += ZIP_ENTRY_COST
-            if entry.kind == nofollow.EXCLUDED:
-                continue
-            if entry.kind == nofollow.ERROR:
-                if was is None and isinstance(entry.error, FileNotFoundError):
-                    continue   # (came and went between the two walks)
-                raise _Cut(f"{rel} cannot be read any more: {entry.error}")
-            if entry.kind not in (nofollow.DIR, nofollow.FILE):   # (a link, a file with another name, a special file)
-                if was is not None:
+        try:
+            for entry in walk:
+                if not checked:   # (the walk has opened its folder: is the name still the session's?)
+                    checked = True
+                    if still is not None and not still():
+                        raise _Cut("the session is gone")
+                rel, was = entry.rel, measured.pop(entry.rel, None)
+                work += ZIP_ENTRY_COST
+                if entry.kind == nofollow.EXCLUDED:
+                    continue
+                if entry.kind == nofollow.ERROR:
+                    if was is None and isinstance(entry.error, FileNotFoundError):
+                        continue   # (came and went between the two walks)
+                    raise _Cut(f"{rel} cannot be read any more: {entry.error}")
+                if entry.kind not in (nofollow.DIR, nofollow.FILE):   # (a link, a hard-linked or a special file)
+                    if was is not None:
+                        raise _Cut(f"{rel} is no {was} any more")
+                    continue
+                if was not in (None, entry.kind):
                     raise _Cut(f"{rel} is no {was} any more")
-                continue
-            if was not in (None, entry.kind):
-                raise _Cut(f"{rel} is no {was} any more")
-            seen.add(rel)
-            if entry.kind == nofollow.DIR:
-                archive.mkdir(_zip_info(rel, entry, folder=True))
-            else:
-                reader = entry.reader()
-                # (no force_zip64: exactly entry.size bytes are written, so zipfile's own rule from file_size holds)
-                with archive.open(_zip_info(rel, entry, folder=False), "w") as out:
-                    left = entry.size
-                    while left:
-                        chunk = reader.read(min(FILE_CHUNK, left))
-                        if not chunk:
-                            raise _Cut(f"{rel} shrank while it was read ({entry.size - left} of its {entry.size} "
-                                       "bytes)")
-                        left -= len(chunk)
-                        total += len(chunk)
-                        if total > limit:
-                            raise _Cut(f"more than {limit} bytes ([api] archive_max_mb)")
-                        out.write(chunk)
-                        work += len(chunk)
-                        if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
-                            work = 0
-                            yield sink.take()
-            if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
-                work = 0
-                yield sink.take()
-        missing = sorted(set(measured) - seen)
+                if entry.kind == nofollow.DIR:
+                    archive.mkdir(_zip_info(rel, entry, folder=True))
+                else:
+                    reader = entry.reader()
+                    # (no force_zip64: exactly entry.size bytes are written, so zipfile's rule from file_size holds)
+                    with archive.open(_zip_info(rel, entry, folder=False), "w") as out:
+                        left = entry.size
+                        while left:
+                            chunk = reader.read(min(FILE_CHUNK, left))
+                            if not chunk:
+                                raise _Cut(f"{rel} shrank while it was read ({entry.size - left} of its {entry.size} "
+                                           "bytes)")
+                            left -= len(chunk)
+                            total += len(chunk)
+                            if total > limit:
+                                raise _Cut(f"more than {limit} bytes ([api] archive_max_mb)")
+                            out.write(chunk)
+                            work += len(chunk)
+                            if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
+                                work = 0
+                                yield sink.take()
+                if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
+                    work = 0
+                    yield sink.take()
+        except nofollow.TooMany:
+            raise _Cut(f"more than {ARCHIVE_MAX_ENTRIES} files and folders") from None
+        missing = sorted(measured)
         if missing:
             raise _Cut(f"{len(missing)} file(s) or folder(s) gone meanwhile, the first {missing[0]}")
         if still is not None and not still():
@@ -2060,13 +2068,16 @@ class ApiV1:
             raise ApiError("forbidden_folder", FOLDER_REFUSED_TEXT)
         return real
 
-    def _listing(self, sid: str, asked: tuple[str, ...], scratch: bool) -> list[dict[str, Any]]:
-        """GET files: the folders and the regular files with one name of the folder `asked` (nofollow.list_inside: no
-        link, no file with another name, no special file), what `served` takes, in name order, as
-        {name, path, type: "file" | "dir", size (0 for a folder), modified (Unix seconds)}. Blocking: in a thread."""
+    def _listing(self, sid: str, asked: tuple[str, ...], scratch: bool) -> bytes:
+        """GET files' answer, rendered here (in the thread that reads the folder, never on the event loop):
+        `{"path", "entries", "truncated"}`. The entries are the folders and the regular files with one name among the
+        first FILES_MAX_ENTRIES names of the folder `asked` in name order (nofollow.list_some: no link, no file with
+        another name, no special file; only those names are kept while the folder is read), what `served` takes, as
+        {name, path, type: "file" | "dir", size (0 for a folder), modified (Unix seconds)}; `truncated` says the folder
+        holds more names. Blocking: in a thread."""
         where = self._where(sid)
         try:
-            found = nofollow.list_inside(where.root, where.base + asked)
+            found, more = nofollow.list_some(where.root, where.base + asked, FILES_MAX_ENTRIES)
         except OSError as exc:
             raise (_read_error(exc, where, asked) or exc) from None
         entries = []
@@ -2076,7 +2087,7 @@ class ApiV1:
                 folder = entry.kind == nofollow.DIR
                 entries.append({"name": entry.name, "path": "/".join(parts), "type": "dir" if folder else "file",
                                 "size": 0 if folder else entry.size, "modified": entry.mtime_ns / 1e9})
-        return entries
+        return json_text({"path": "/".join(asked), "entries": entries, "truncated": more}).encode("utf-8")
 
     def _open_file(self, sid: str, asked: tuple[str, ...]) -> tuple[BinaryIO, int]:
         """GET files/{path}: the file `asked` opened for reading below the session's folder without following any
@@ -2099,13 +2110,15 @@ class ApiV1:
                  limit_mb: int) -> tuple[_Where, dict[str, str]]:
         """An archive's first walk (docs/SPEC.md §21.8 `archive`), before any byte is sent: what `served` takes below
         the folder `asked`, measured without opening a file (nofollow.walk_inside, open_files False). 413
-        `too_large` past `limit_mb` MiB of files ([api] archive_max_mb); 409 `conflict` for an entry that cannot be
-        read (the archive would lack it). (where it read, {rel: "dir" | "file"} of what the second walk must find
-        again). Blocking: in a thread."""
+        `too_large` past `limit_mb` MiB of files ([api] archive_max_mb) or past ARCHIVE_MAX_ENTRIES entries (each
+        costs memory, not bytes: the walk keeps no more); 409 `conflict` for an entry that cannot be read (the archive
+        would lack it). (where it read, {rel: "dir" | "file"} of what the second walk must find again). Blocking: in a
+        thread."""
         where = self._where(sid)
         measured: dict[str, str] = {}
         total = 0
-        walk = nofollow.walk_inside(where.root, where.base + asked, skip=_skipped(asked, scratch), open_files=False)
+        walk = nofollow.walk_inside(where.root, where.base + asked, skip=_skipped(asked, scratch), open_files=False,
+                                    limit=ARCHIVE_MAX_ENTRIES)
         try:
             for entry in walk:
                 if entry.kind == nofollow.FILE:
@@ -2119,6 +2132,10 @@ class ApiV1:
                 elif entry.kind == nofollow.ERROR and not isinstance(entry.error, FileNotFoundError):
                     raise ApiError("conflict", _unreadable_text(_shown_path(asked + entry.parts), entry.error,
                                                                 "an archive would lack it"))
+        except nofollow.TooMany:
+            raise ApiError("too_large", f"The folder holds more than {ARCHIVE_MAX_ENTRIES} files and folders (with "
+                                        "the names an archive leaves out): ask for a folder inside it (archive?path=), "
+                                        "or for its files one by one (files/{path}).") from None
         except OSError as exc:
             raise (_read_error(exc, where, asked) or exc) from None
         finally:
@@ -2522,18 +2539,18 @@ class ApiV1:
         return SafeJSONResponse(result)
 
     async def _files(self, request: Request, caller: str) -> Response:
-        """GET /api/v1/sessions/{id}/files?path=&scratch= (docs/SPEC.md §21.8): `{"path", "entries"}` of a folder of
-        the session's folder (_listing). In this order: the query, the path (copyfrom.check_rel: 400 `bad_name`), the
-        session (404), then the folder read in a thread, the hub's settings read again first (an in-place folder is
-        checked as a start checks it). A stopped session is never loaded."""
+        """GET /api/v1/sessions/{id}/files?path=&scratch= (docs/SPEC.md §21.8): `{"path", "entries", "truncated"}` of
+        a folder of the session's folder (_listing, rendered in its thread). In this order: the query, the path
+        (copyfrom.check_rel: 400 `bad_name`), the session (404), then the folder read in a thread, the hub's settings
+        read again first (an in-place folder is checked as a start checks it). A stopped session is never loaded."""
         query = query_fields(request, FILES_FIELDS)
         scratch = query_flag(query.get("scratch"), "scratch")
         asked = check_rel(query.get("path"), scratch=scratch)
         sid = self._session(request, caller)
         self.manager._refresh_settings()
-        entries = await self.threads.run(self._listing, sid, asked, scratch)
+        body = await self.threads.run(self._listing, sid, asked, scratch)
         self._still(request, sid)
-        return JSONResponse({"path": "/".join(asked), "entries": entries})
+        return Response(body, media_type="application/json")
 
     async def _file(self, request: Request, caller: str) -> Response:
         """GET /api/v1/sessions/{id}/files/{path}?scratch= (docs/SPEC.md §21.8): the file's bytes, streamed FILE_CHUNK
@@ -2604,16 +2621,16 @@ class ApiV1:
                          headers=_download_headers(f"{asked[-1] if asked else sid}.zip"))
 
 
-__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVES_AT_ONCE", "ARCHIVE_FIELDS", "BASE_GONE_TEXT",
-           "CHANGED_FILES_MAX", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS",
-           "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS", "FILES_PER_SESSION",
-           "FILES_REFUSAL", "FILE_CHUNK", "FILE_FIELDS", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "FOLDER_GONE_TEXT",
-           "FOLDER_LINKED_TEXT", "FOLDER_REFUSED_TEXT", "FOLDER_THREADS", "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT",
-           "ID_MAX", "JSON_MAX", "LASTING_TEXTS",
-           "MESSAGES_DEFAULT", "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT",
-           "NO_BASE_TEXT", "NO_GIT_TEXT", "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS", "PING_SECONDS",
-           "RESULTS_CACHED", "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT",
-           "STATES", "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES", "WAIT_MAX",
+__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVES_AT_ONCE", "ARCHIVE_FIELDS", "ARCHIVE_MAX_ENTRIES",
+           "BASE_GONE_TEXT", "CHANGED_FILES_MAX", "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS",
+           "CREATE_FIELDS", "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS",
+           "FILES_MAX_ENTRIES", "FILES_PER_SESSION", "FILES_REFUSAL", "FILE_CHUNK", "FILE_FIELDS", "FOLDER_BUSY_TEXT",
+           "FOLDER_FIELDS", "FOLDER_GONE_TEXT", "FOLDER_LINKED_TEXT", "FOLDER_REFUSED_TEXT", "FOLDER_THREADS",
+           "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX", "LASTING_TEXTS", "MESSAGES_DEFAULT",
+           "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT", "NO_BASE_TEXT", "NO_GIT_TEXT",
+           "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS", "PING_SECONDS", "RESULTS_CACHED",
+           "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT", "STATES",
+           "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES", "WAIT_MAX",
            "ZIP_ENTRY_COST", "ZIP_SENT", "ApiError", "ApiV1", "CreateRequest", "SafeJSONResponse", "answer_of",
            "attachment", "budget_text", "check_fields", "check_json_type", "claim_uploads", "continue_text",
            "error_code", "event_view", "fail", "job_view", "library_skills", "message_of", "message_view",

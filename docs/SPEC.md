@@ -7022,7 +7022,7 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
 | GET `/api/v1/sessions/{id}/messages?after=&limit=` | `{"messages": [{id, ts, from, to, text, reply_to}], "last"}`: the user's conversation with the members, oldest first (21.5) |
 | POST `/api/v1/sessions/{id}/messages` | `{"to": ["all"] or [names], "text", "reply_to"?}` → 201 `{"message"}` (as `send_message` of the user); 409 `not_running` for a stopped session (use `continue`) |
 | GET `/api/v1/sessions/{id}/result` | the result (21.7), also while it runs (`"final": false`) |
-| GET `/api/v1/sessions/{id}/files?path=&scratch=` | `{"path", "entries": [{name, path, type: file\|dir, size, modified}]}` of a folder of the session's workspace (21.8) |
+| GET `/api/v1/sessions/{id}/files?path=&scratch=` | `{"path", "entries": [{name, path, type: file\|dir, size, modified}], "truncated"}` of a folder of the session's workspace (21.8) |
 | GET `/api/v1/sessions/{id}/files/{path}?scratch=` | the file's bytes (21.8) |
 | GET `/api/v1/sessions/{id}/archive?path=&scratch=` | a zip of the workspace or of one folder in it (21.8) |
 
@@ -7815,22 +7815,30 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   - The module (stdlib, ctypes on Windows; blocking: run in a thread):
     - `open_inside(root, parts, *, want_dir=False) -> fd`: the file (or folder) `parts` names below `root`, open for
       reading; the caller closes it.
+    - `hold_inside(root, parts) -> fd`: the folder `parts` names, reached as `open_inside` reaches it, held where it
+      is: on Windows its handle shares no deleting, so while it is open neither the folder nor a folder above it
+      can be renamed, moved or removed; POSIX has no such hold, and work in that very folder goes through the
+      descriptor (`dir_fd`). Used by an in-place create's git init (21.10 "Resolution").
     - `list_inside(root, parts) -> [Entry]`: the folders and the regular files with one name of that folder, in name
-      order.
-    - `walk_inside(root, parts, *, skip=None, open_files=True)`: every entry below that folder, depth first in name
-      order. Each regular file comes open (`Entry.reader()`: a file object the walk owns) until the walk goes on,
-      when the walk closes it: read later, it is a ValueError, never another file's bytes (`Entry.fd` is its
+      order. `list_some(root, parts, limit) -> ([Entry], more)`: the same of its first `limit` names in name order,
+      and whether it holds more; the listing keeps only `limit` + 1 names while it reads the folder (`heapq.nsmallest`
+      over the system's listing), however many it holds.
+    - `walk_inside(root, parts, *, skip=None, open_files=True, limit=None)`: every entry below that folder, depth
+      first in name order. Each regular file comes open (`Entry.reader()`: a file object the walk owns) until the walk
+      goes on, when the walk closes it: read later, it is a ValueError, never another file's bytes (`Entry.fd` is its
       descriptor meanwhile). With `open_files` False a file comes without one, for a pass that only counts and
       measures (a copy's or an archive's first). Links, hard-linked files and special files are given as such but
-      never read (on Windows only a handle tells how many names a file has, so a hard-linked file is opened there
-      and closed unread). `skip(parts)` leaves an entry out unopened (a folder is never entered). What cannot be
-      opened or listed is an `error` entry (FileNotFoundError: gone, or on Windows renamed or moved, meanwhile), and
-      so is a name the listing gave that another file, folder or special file took meanwhile (`Refused`
-      `replaced` or `special`: never read). The walk enters at most `nofollow.MAX_DEPTH` (64) folder levels below
-      its start folder, since it holds one descriptor per level (and one for its current file); a folder deeper is
-      an `error` entry. So one walk holds at most 66 descriptors however deep an agent nests a tree; how many walks
-      run at once is up to their callers (`archive?path=` below: an archive's client decides how long its walk
-      stays open).
+      never read (on Windows only a handle tells how many names a file has, so a hard-linked file is opened there and
+      closed unread). `skip(parts)` leaves an entry out unopened (a folder is never entered). What cannot be opened or
+      listed is an `error` entry (FileNotFoundError: gone, or on Windows renamed or moved, meanwhile), and so is a
+      name the listing gave that another file, folder or special file took meanwhile (`Refused` `replaced` or
+      `special`: never read). The walk enters at most `nofollow.MAX_DEPTH` (64) folder levels below its start folder,
+      since it holds one descriptor per level (and one for its current file); a folder deeper is an `error` entry. So
+      one walk holds at most 66 descriptors however deep an agent nests a tree; how many walks run at once is up to
+      their callers (`archive?path=` below: an archive's client decides how long its walk stays open). With `limit` it
+      gives at most that many entries (every name counts, a left-out one too) and raises `nofollow.TooMany` at the
+      next one; each folder's listing then keeps only the names the walk may still reach (`limit` minus the entries
+      given, plus one), so what a walk holds is bounded by `limit` too, however many names a folder holds.
     - `nofollow.Refused` (an OSError, ELOOP, with `reason` and `rel`) is raised for a link on the way or swapped in,
       a path that now leads out of the root, and, from `open_inside`, a hard-linked or special file or one replaced
       while it was opened. A link or a path out of the root ends a walk.
@@ -7853,9 +7861,12 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     listed nor archived.
 - A session whose folder is missing (an in-place folder deleted, a drive not connected, its own folder removed by
   hand) is 409 `folder_not_ready`.
-- `files?path=`: `{"path", "entries"}`, the entries of one folder (`nofollow.list_inside`, then `served`) in name
-  order, `{name, path (from the session's folder, '/'), type: file | dir, size (bytes; 0 for a folder), modified
-  (Unix seconds)}`. No `path` is the session's folder itself.
+- `files?path=`: `{"path", "entries", "truncated"}`, the entries of one folder in name order, `{name, path (from
+  the session's folder, '/'), type: file | dir, size (bytes; 0 for a folder), modified (Unix seconds)}`. No `path` is
+  the session's folder itself. Only the first `api_v1.FILES_MAX_ENTRIES` (10 000) names of the folder in name order
+  are read (`nofollow.list_some`: the listing keeps no more, however many the folder holds), then `served`;
+  `truncated` is true when the folder holds more (its archive, or its folders' listings, have the rest). The answer
+  is rendered in the thread that reads the folder, never on the event loop.
 - `files/{path}`: the bytes, streamed in 1 MiB reads (`api_v1.FILE_CHUNK`, each in a thread),
   `Content-Type: application/octet-stream` whatever the name (the agents wrote them, so a site that passes them to its
   visitors must not have them rendered), `Content-Disposition: attachment; filename="<ASCII>"; filename*=UTF-8''<name>`
@@ -7873,17 +7884,22 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
   once on a hub, each from its measure until its answer ends (an archive whose client stops reading keeps its walk,
   and with it up to `MAX_DEPTH` + 2 descriptors, open); one more is 429 `too_many_archives` (the files can still be
   downloaded one by one). A folder more than `MAX_DEPTH` levels below the folder archived is 409 `conflict` (the
-  first walk cannot read it). Two walks (`nofollow.walk_inside`, the same `skip`):
+  first walk cannot read it). Two walks (`nofollow.walk_inside`, the same `skip`, `limit=api_v1.ARCHIVE_MAX_ENTRIES`:
+  100 000 names, the ones left out counted too, since each costs the hub memory while the zip is made, whatever its
+  size; a folder's listing keeps only the names the walk may still reach, and one more raises `nofollow.TooMany`):
   - the first measures without opening a file (`ApiV1._measure`, `open_files` False; `scan_tree` would walk by path):
-    over `[api] archive_max_mb` (default 1024, read again at each request) is 413 `too_large` before any byte, and an
-    entry it cannot read (a folder it cannot list) is 409 `conflict`, since the archive would lack it;
+    over `[api] archive_max_mb` (default 1024, read again at each request) or over `ARCHIVE_MAX_ENTRIES` names is 413
+    `too_large` before any byte, and an entry it cannot read (a folder it cannot list) is 409 `conflict`, since the
+    archive would lack it; what it measured (path -> kind) is all the second walk is given, which takes each path out
+    as it meets it;
   - the second writes the zip (`api_v1._zip_parts`, one step at a time in a thread: a step ends once 256 KiB of zip
     are ready, `ZIP_SENT`, or about one `FILE_CHUNK` was read, an entry counting as `ZIP_ENTRY_COST` = 4 KiB), each
     file read through the walk's own open file before the walk goes on, exactly the size it had when it was opened
     (what was written to it meanwhile is left for the next archive; so zipfile's own zip64 rule from that size
     always holds). What came meanwhile is taken. A file or folder of the first walk that is gone, or became a link,
     a file with another name, a special file or the other kind, a file that shrank while it was read, an entry that
-    cannot be read, a link swapped in (the walk ends), or more than the limit of bytes, cuts it: the error ends the
+    cannot be read, a link swapped in (the walk ends), more than the limit of bytes, or more than
+    `ARCHIVE_MAX_ENTRIES` names (what came meanwhile counts), cuts it: the error ends the
     answer before the central directory is written, so the client's zip is no valid zip (never a valid one that lacks
     files or holds a torn one, as a download is never a whole file that is not); it is logged.
 - A client that goes away ends the read: the file or the walk is closed once no thread reads it any more
@@ -8020,33 +8036,35 @@ and gives `-p`'s fields in `-p`'s order: `type` ("result"), `status`,
     attachment's name; a listing in name order without `.git` or `.scratch`, `.scratch` only with `scratch=true` and
     `.scratch/_skills` never; what is asked missing or of the other kind, unknown query fields; a download with its
     headers in chunks, one that shrinks while it is sent (cut), one its client leaves (its file closed), one replaced
-    while it is opened (409); a step cancelled twice waits for its thread, then releases what it gave; the folder
-    work in v1's own daemon threads (at most `FOLDER_THREADS`: reads that hang hold none of the default executor,
-    and GET events still answers; a listing, a download, an archive, a result, a redaction); a client gone
-    during a long step leaves the event loop idle (its passes counted); path escapes
-    and `.git` at any depth as `bad_name`, the NTFS names refused on Windows only, a name with `:` listed and served
-    on POSIX, names NTFS reads as others left out on Windows; a link to outside and hard links never listed, served or
-    archived; a folder swapped for a link while it is archived and a file gone between the two walks (a cut zip), one
-    swapped while it is measured (409 before any byte, naming it), a file that shrinks while it is archived (a cut zip)
-    and one that grows (taken at its size when opened), a folder that cannot be read (409 for a listing, a download
-    and an archive alike) and a session folder that cannot be read (`folder_not_ready`), an archive its client leaves
-    (its walk closed); at most `ARCHIVES_AT_ONCE` archives while their clients do not read (429 `too_many_archives`,
-    every slot given back by an archive that ends, is refused or is left; the descriptors they may hold together stay
-    within a third of 1024); the archive a zip of exactly what is listed, with its folders, normalized modes and clamped
-    times, of the whole folder and of one inside it; over `archive_max_mb` (413 before any byte); a folder that
-    cannot be read on POSIX (409); a running session, then the stopped one read without loading it; the API token's
-    scope; a missing folder; a session folder swapped for a link (403); a folder session.json names that no session
-    may work in (DreamTeam's data with the uploads, another home: 403, nothing read); an in-place folder read below
-    its root, a link put on the way to it before and after the check, its root taken back by the owner (403, in
-    v1's words), a folder on its way renamed in letter case only and one created or copied with another letter
-    case of its names (still read, on a file system that ignores case, also with a resolution that keeps the given
-    spelling as POSIX does), one inside its root by file identity only (403)); `changed_files` with a hook in
-    `.git/config` that must not run (`tests/test_api_v1_result.py`: added, modified, deleted, untracked and held
-    files, `.scratch` and ignored ones left out, a path deleted and untracked; a stopped session's files; a list cut
-    at `CHANGED_FILES_MAX`; git off, no base commit, one gone, one that is no commit id, a repository git cannot open;
-    an in-place folder whose `.git` became a gitfile, one whose git fails (no git output in the text), one whose root
-    a hand edit removed; the result while running, a done one, the cache by state and head, a git failure not cached;
-    `changed_since` without the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
+    while it is opened (409); a step cancelled twice waits for its thread, then releases what it gave; the folder work
+    in v1's own daemon threads (at most `FOLDER_THREADS`: reads that hang hold none of the default executor, and GET
+    events still answers; a listing, a download, an archive, a result, a redaction); a client gone during a long step
+    leaves the event loop idle (its passes counted); path escapes and `.git` at any depth as `bad_name`, the NTFS
+    names refused on Windows only, a name with `:` listed and served on POSIX, names NTFS reads as others left out on
+    Windows; a link to outside and hard links never listed, served or archived; a folder swapped for a link while it
+    is archived and a file gone between the two walks (a cut zip), one swapped while it is measured (409 before any
+    byte, naming it), a file that shrinks while it is archived (a cut zip) and one that grows (taken at its size when
+    opened), a folder that cannot be read (409 for a listing, a download and an archive alike) and a session folder
+    that cannot be read (`folder_not_ready`), an archive its client leaves (its walk closed); at most
+    `ARCHIVES_AT_ONCE` archives while their clients do not read (429 `too_many_archives`, every slot given back by an
+    archive that ends, is refused or is left; the descriptors they may hold together stay within a third of 1024); the
+    archive a zip of exactly what is listed, with its folders, normalized modes and clamped times, of the whole folder
+    and of one inside it; over `archive_max_mb` (413 before any byte); over `ARCHIVE_MAX_ENTRIES` names (413 before
+    any byte, a cut zip when it grows past them between the walks; a walk's `limit` and `list_some` keep no more
+    names, `tests/test_nofollow.py`); a listing of the first `FILES_MAX_ENTRIES` names with `truncated`, rendered in
+    its thread; a folder that cannot be read on POSIX (409); a running session, then the stopped one read without
+    loading it; the API token's scope; a missing folder; a session folder swapped for a link (403); a folder
+    session.json names that no session may work in (DreamTeam's data with the uploads, another home: 403, nothing
+    read); an in-place folder read below its root, a link put on the way to it before and after the check, its root
+    taken back by the owner (403, in v1's words), a folder on its way renamed in letter case only and one created or
+    copied with another letter case of its names (still read, on a file system that ignores case, also with a
+    resolution that keeps the given spelling as POSIX does), one inside its root by file identity only (403));
+    `changed_files` with a hook in `.git/config` that must not run (`tests/test_api_v1_result.py`: added, modified,
+    deleted, untracked and held files, `.scratch` and ignored ones left out, a path deleted and untracked; a stopped
+    session's files; a list cut at `CHANGED_FILES_MAX`; git off, no base commit, one gone, one that is no commit id, a
+    repository git cannot open; an in-place folder whose `.git` became a gitfile, one whose git fails (no git output
+    in the text), one whose root a hand edit removed; the result while running, a done one, the cache by state and
+    head, a git failure not cached; `changed_since` without the workspace's git lock and with `GIT_OPTIONAL_LOCKS=0`);
   - settings and import: a settings-page save never writes `[api]` (`public_view`, `apply_update`); an import keeps
     the target's `api.folders` and drops a v1 session's `client_ref`, `request_digest`, `start_error`, `error` and
     `folder`;
