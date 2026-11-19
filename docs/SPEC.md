@@ -7601,8 +7601,9 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     folder, adopted or not, its network setting: `isolated_git`, as its other git runs) and keeps its key variables
     out of git's environment;
   - a session that works in a server folder in place (21.10) is checked first as every start checks it
-    (`_check_server_folder`, then `apifolders.git_dir_refusal`): git never reads a repository whose database lies
-    outside the folder, nor a folder that no longer leads to itself inside its root;
+    (`_check_server_folder`, its refusals ending in "its changed files are not listed", then
+    `apifolders.git_dir_refusal`): git never reads a repository whose database lies outside the folder, nor a folder
+    that no longer leads to itself inside its root;
   - it is null, with `changed_files_error`, when git is off (or not installed), the session has no `base_commit`
     (`api_v1.NO_BASE_TEXT`; also a value that is no commit id, `workspace.COMMIT_ID`: it never reaches git's command
     line), that commit is gone, the folder has no repository of its own, git fails, or the in-place checks above
@@ -7628,11 +7629,41 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     name (`CON`, `NUL`, `aux.txt`), a trailing dot or space (`workspace._check_windows_names`, which the workspace
     too applies on Windows only). On Linux and macOS the agents may create such names (`run-10:00.log`,
     `what?.md`), and they are listed and served there.
+  - on every OS, a name that is no UTF-8 text (an unpaired surrogate: a POSIX name whose bytes are not UTF-8, as
+    `os.listdir` gives it), which no URL can name and no JSON answer or zip can hold; the text quotes it with `?`.
   - The no-follow open (`nofollow.py`) also takes a component only when its exact spelling is in its parent
     folder's listing, which catches short names and case aliases on any file system (FileNotFoundError: the name
     is not there). On Windows the final path of the opened handle shows it: it names each component as the folder
     holds it, long and in its letter case.
-- Listings and archives leave out exactly the names `files/{path}` would refuse, so the three agree.
+- Listings and archives leave out exactly the names `files/{path}` would refuse, so the three agree: one predicate,
+  `api_v1.served(parts, scratch)`, is `check_rel` of the path relative to the session's folder (a walk is given it
+  as its `skip`, `api_v1._skipped`: such a name is never opened, such a folder never entered).
+- Each route checks, in this order: its query (`unknown_field`; `api_v1.FILES_FIELDS`, `FILE_FIELDS`,
+  `ARCHIVE_FIELDS`; `scratch` is `true` or `false`), the path (`bad_name`), the session (404), then reads in a
+  thread, the hub's settings read again first. A stopped session is never loaded.
+- **Where the files are read** (`ApiV1._where`): the session's folder (`workspace_of`), which nofollow opens without
+  following its own name. A session that works in a server folder in place is first checked as a start checks it
+  (`SessionManager._check_server_folder(..., refusal=api_v1.FILES_REFUSAL)`, whose texts then end in "its files are
+  not read", not in a start's words; it gives the resolved root and the resolved folder: 403 `forbidden_folder` when
+  the root no longer allows it or the folder no longer leads to itself inside it, 409 `folder_not_ready` when it or
+  its root is missing), then reached from that root name by name (`_Where.base`: the resolved folder's names below
+  the resolved root, as the folders on the way spell them, so a folder on the way renamed in letter case only is
+  still read), so a link put on the way after the check is met, never followed. A folder inside its root by file
+  identity only (a bind mount, another spelling whose resolved path does not name it below the root) is 403
+  `forbidden_folder` (`FOLDER_LINKED_TEXT`): it is never read by its own path after the check. A folder that is not
+  there is 409 `folder_not_ready` (`FOLDER_GONE_TEXT`).
+- **Codes** of what nofollow meets (`api_v1._read_error`), by where it meets it: a name replaced while it was opened
+  is 409 `conflict` (try again); the session's folder itself, or a folder above it below a root, gone is 409
+  `folder_not_ready`, not readable by the hub (its permissions) 409 `folder_not_ready` (`FOLDER_UNREADABLE_TEXT`),
+  reached through a link 403 `forbidden_folder` (`FOLDER_LINKED_TEXT`); a file or folder in it the hub may not read
+  (a PermissionError: what is asked, a folder on its way or one a walk enters) is 409 `conflict` ("cannot be read on
+  the hub's computer", with the system's words for why), in a listing, a download and an archive alike; the path
+  asked or a folder on its way missing is 404 `not_found`, a link, a file with more than one name or a special file
+  404 ("is not served": it is never listed either), one of the other kind 400 `bad_request` (`files/{path}` of a
+  folder, `files` or `archive` of a file); below it (what a walk meets), a link swapped in or a path that now leads
+  out is 409 `conflict`. A conflict quotes the path where it was met, from the session's folder (`'sub' changed
+  while it was read`, also for an archive of the whole folder). Anything else is 500 `internal`, logged. No text
+  names a path of the computer: the path quoted is the client's.
 - A name a client creates follows the Windows rules on every OS: an upload's `filename` (21.3) and a server folder's
   `path` (21.10).
 - Nothing is followed when a file is opened, not only when it is checked (`nofollow.py`), so a link, or a folder
@@ -7693,16 +7724,43 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     Windows (as it does `st_ino`).
   - So an environment installed with hard links in the workspace (uv's `.venv`, pnpm's `node_modules`) is neither
     listed nor archived.
-- A session whose in-place folder is missing is 409 `folder_not_ready`.
-- `files?path=`: the entries of one folder, `{name, path, type: file | dir, size, modified}`.
-- `files/{path}`: the bytes, streamed in 1 MiB reads, `Content-Type: application/octet-stream` whatever the name (the
-  agents wrote them, so a site that passes them to its visitors must not have them rendered),
-  `Content-Disposition: attachment; filename*=UTF-8''<name>`, `X-Content-Type-Options: nosniff`, `Content-Length`,
-  `Cache-Control: no-store`. A folder is 400 `bad_request` (list it instead).
-- `archive?path=`: a zip streamed as it is built, of the workspace or of that folder, with the same rules. It is
-  measured first (`scan_tree`, without hashing): over `[api] archive_max_mb` (default 1024) is 413 `too_large` before
-  any byte. An error once the answer has started (a file vanished or turned into a link) aborts the connection, so the
-  client gets a zip without its central directory, never a valid one that lacks files; it is logged.
+- A session whose folder is missing (an in-place folder deleted, a drive not connected, its own folder removed by
+  hand) is 409 `folder_not_ready`.
+- `files?path=`: `{"path", "entries"}`, the entries of one folder (`nofollow.list_inside`, then `served`) in name
+  order, `{name, path (from the session's folder, '/'), type: file | dir, size (bytes; 0 for a folder), modified
+  (Unix seconds)}`. No `path` is the session's folder itself.
+- `files/{path}`: the bytes, streamed in 1 MiB reads (`api_v1.FILE_CHUNK`, each in a thread),
+  `Content-Type: application/octet-stream` whatever the name (the agents wrote them, so a site that passes them to its
+  visitors must not have them rendered), `Content-Disposition: attachment; filename="<ASCII>"; filename*=UTF-8''<name>`
+  (`api_v1.attachment`: the name in UTF-8, after an ASCII fallback for older clients whose other characters are
+  `_`), `X-Content-Type-Options: nosniff`, `Content-Length` (the size when it was opened), `Cache-Control: no-store`.
+  A folder is 400 `bad_request` (list it instead, or ask for its archive). Exactly `Content-Length` bytes are sent: a
+  file that grew meanwhile is cut there; one that shrank, or a read that fails, ends the answer with an error
+  (logged), so the client sees it cut short, never a whole file that is not.
+- `archive?path=`: a zip streamed as it is built, of the session's folder or of that folder in it, with the same
+  rules, names relative to that folder, every folder an entry of its own (empty ones too), files deflated with their
+  time (clamped to 1980-2107) and a Unix mode of 0o644, 0o755 for a folder and for a file someone may execute (never
+  writable by others, never setuid, whatever the hub's computer says: a Windows hub says 0o666 of every file),
+  `Content-Type: application/zip`, no `Content-Length`, named `<folder>.zip` (the session's `name` for its whole
+  folder), with the headers of a download. Two walks (`nofollow.walk_inside`, the same `skip`):
+  - the first measures without opening a file (`ApiV1._measure`, `open_files` False; `scan_tree` would walk by path):
+    over `[api] archive_max_mb` (default 1024, read again at each request) is 413 `too_large` before any byte, and an
+    entry it cannot read (a folder it cannot list) is 409 `conflict`, since the archive would lack it;
+  - the second writes the zip (`api_v1._zip_parts`, one step at a time in a thread: a step ends once 256 KiB of zip
+    are ready, `ZIP_SENT`, or about one `FILE_CHUNK` was read, an entry counting as `ZIP_ENTRY_COST` = 4 KiB), each
+    file read through the walk's own open file before the walk goes on, exactly the size it had when it was opened
+    (what was written to it meanwhile is left for the next archive; so zipfile's own zip64 rule from that size
+    always holds). What came meanwhile is taken. A file or folder of the first walk that is gone, or became a link,
+    a file with another name, a special file or the other kind, a file that shrank while it was read, an entry that
+    cannot be read, a link swapped in (the walk ends), or more than the limit of bytes, cuts it: the error ends the
+    answer before the central directory is written, so the client's zip is no valid zip (never a valid one that lacks
+    files or holds a torn one, as a download is never a whole file that is not); it is logged.
+- A client that goes away ends the read: the file or the walk is closed once no thread reads it any more
+  (`api_v1._Streamed`, `_thread_step`), also when it goes before the first byte. The wait for that thread is
+  shielded from the anyio cancel scope through which Starlette cancels a streamed answer (`api_v1._outlive`: that
+  scope cancels a task still waiting again at every pass of the event loop, which would keep the loop busy for the
+  whole step); a cancel of the task itself (the hub shutting down) is waited through as well. A create's upload
+  claims use the same helper (`claim_uploads`).
 
 ### 21.9 Settings, modules, tests
 
@@ -7800,8 +7858,25 @@ duration. It takes the raw snapshot lists and gives `-p`'s fields in `-p`'s orde
     a create's start); a `continue` whose session is deleted before its start, the folder name taken by a new one
     (nothing reaches that one); a text that cannot be given after the start (the summary's `error`, cleared by the
     next one; `not_running` when a stop sent after it takes the lock first);
-  - files and archive (path escapes, a link swapped in, `.git` at depth, `.scratch`, hard links, a name with `:`
-    listed and served on POSIX and left out on Windows); `changed_files` with a hook in `.git/config` that must not
+  - files and archive (`tests/test_api_v1_files.py`: the one rule of `served`, a name that is no UTF-8 text, the
+    attachment's name; a listing in name order without `.git` or `.scratch`, `.scratch` only with `scratch=true` and
+    `.scratch/_skills` never; what is asked missing or of the other kind, unknown query fields; a download with its
+    headers in chunks, one that shrinks while it is sent (cut), one its client leaves (its file closed), one replaced
+    while it is opened (409); a step cancelled twice waits for its thread, then releases what it gave; a client gone
+    during a long step leaves the event loop idle (its passes counted); path escapes
+    and `.git` at any depth as `bad_name`, the NTFS names refused on Windows only, a name with `:` listed and served
+    on POSIX, names NTFS reads as others left out on Windows; a link to outside and hard links never listed, served or
+    archived; a folder swapped for a link while it is archived and a file gone between the two walks (a cut zip), one
+    swapped while it is measured (409 before any byte, naming it), a file that shrinks while it is archived (a cut zip)
+    and one that grows (taken at its size when opened), a folder that cannot be read (409 for a listing, a download
+    and an archive alike) and a session folder that cannot be read (`folder_not_ready`), an archive its client leaves
+    (its walk closed); the archive a zip of exactly what is listed, with its folders, normalized modes and clamped
+    times, of the whole folder and of one inside it; over `archive_max_mb` (413 before any byte); a folder that
+    cannot be read on POSIX (409); a running session, then the stopped one read without loading it; the API token's
+    scope; a missing folder; a session folder swapped for a link (403); an in-place folder read below its root, a
+    link put on the way to it before and after the check, its root taken back by the owner (403, in v1's words), a
+    folder on its way renamed in letter case only (Windows: still read), one inside its root by file identity only
+    (403)); `changed_files` with a hook in `.git/config` that must not
     run (`tests/test_api_v1_result.py`: added, modified, deleted, untracked and held files, `.scratch` and ignored
     ones left out, a path deleted and untracked; a stopped session's files; a list cut at `CHANGED_FILES_MAX`; git
     off, no base commit, one gone, one that is no commit id, a repository git cannot open; an in-place folder whose

@@ -1467,24 +1467,28 @@ class SessionManager:
                 f"`dreamteam` or `dreamteam console --session {sid}`, session_cd in MCP.", 409, code=FOLDER_NOT_READY)
         self._check_server_folder(sid, meta)
 
-    def _check_server_folder(self, sid: str, meta: dict[str, Any]) -> None:
+    def _check_server_folder(self, sid: str, meta: dict[str, Any], *,
+                             refusal: str = "it does not start") -> tuple[Path, Path] | None:
         """Before a start of a session that works in a server folder in place (api.folder mode "in_place",
         docs/SPEC.md §21.10 "Starts"; nothing for any other session): its root must still be listed in `[api]
         folders` with `in_place = true` (the settings as _start_locked read them again: a hand edit counts at once)
         and must not be refused (apifolders.resolve_root; a missing root is 409 `folder_not_ready`), and the stored
         folder must still resolve to itself inside that root, by text and by file identity: a component swapped for a
-        link after the create, or a root moved elsewhere, refuses the start (403 `forbidden_folder`). The git rules
-        of the folder are checked apart (_check_server_git). Blocking: in a thread."""
+        link after the create, or a root moved elsewhere, refuses the start (403 `forbidden_folder`). `refusal` ends
+        the texts of its own refusals (what does not happen: v1 reading the files passes its own). The git rules of
+        the folder are checked apart (_check_server_git). (The root resolved, the folder resolved: its names as the
+        folders on the way spell them; v1's files are read below the root by those names, §21.8), None for any other
+        session. Blocking: in a thread."""
         folder = apifolders.in_place_folder((api_meta(meta) or {}).get("folder")) if sid != LEGACY_ID else None
         if folder is None:
-            return
+            return None
         where = apifolders.shown(folder["root"], folder["path"])
         config = self.config   # (never _refresh_settings here: it writes the manager's settings, off the loop)
         root = apifolders.roots(config).get(folder["root"])
         if root is None or not root.in_place:
             raise SessionError(
                 f"Session {sid} works in {where}, under the folder root '{folder['root']}', which [api] folders no "
-                "longer lists with in_place = true: it does not start there.", 403, code=FORBIDDEN_FOLDER)
+                f"longer lists with in_place = true: {refusal}.", 403, code=FORBIDDEN_FOLDER)
         try:
             root_real = apifolders.resolve_root(root, home=self.home, config=config)
         except CopyError as exc:
@@ -1495,12 +1499,13 @@ class SessionManager:
         try:
             real = stored.resolve(strict=True)
         except (OSError, RuntimeError, ValueError):
-            raise SessionError(f"The folder {where} of session {sid} cannot be read: it does not start.", 409,
+            raise SessionError(f"The folder {where} of session {sid} cannot be read: {refusal}.", 409,
                                code=FOLDER_NOT_READY) from None
         if not (_same_path(real, stored) and is_within(real, root_real)):
             raise SessionError(
                 f"The folder {where} of session {sid} no longer leads to itself inside its root (a link or a junction "
-                "on the way, or the root moved): it does not start.", 403, code=FORBIDDEN_FOLDER)
+                f"on the way, or the root moved): {refusal}.", 403, code=FORBIDDEN_FOLDER)
+        return root_real, real
 
     def _check_server_git(self, sid: str, folder: Path, network_off: bool = False) -> None:
         """Before a start of a session that works in a server folder in place, with git on (docs/SPEC.md §21.10

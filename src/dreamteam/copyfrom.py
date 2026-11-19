@@ -266,14 +266,20 @@ def check_rel(path: Any, *, scratch: bool = False, portable: bool = False) -> tu
     Linux hub too (WSL's /mnt/c, a Docker Desktop bind mount of a Windows folder). The other names Windows reads as
     others (< > : " | ? * and control characters: `.git::$INDEX_ALLOCATION` names .git; reserved device names; a
     trailing dot or space) are refused on a Windows hub only, where they would reach another file: on Linux and
-    macOS the agents may make such names. `.scratch` (the members' folders, at the top) only with `scratch`;
-    `.scratch/_skills` never. `portable`: a path a client makes up (a server folder's, §21.10): the Windows rules
-    on every OS, no character that does not print (_UNPRINTABLE), and no `.scratch` at any depth, whatever
-    `scratch` says."""
+    macOS the agents may make such names. An unpaired surrogate is refused everywhere: a POSIX name whose bytes are
+    not UTF-8 (os.listdir's surrogateescape), which no URL can name and no JSON answer or zip can hold. `.scratch`
+    (the members' folders, at the top) only with `scratch`; `.scratch/_skills` never. `portable`: a path a client
+    makes up (a server folder's, §21.10): the Windows rules on every OS, no character that does not print
+    (_UNPRINTABLE), and no `.scratch` at any depth, whatever `scratch` says."""
     if path is None or path == "":
         return ()
     if not isinstance(path, str):
         raise _bad_name("A path must be a text, relative to the folder, with '/'.")
+    try:
+        path.encode("utf-8")
+    except UnicodeEncodeError:
+        raise _bad_name(f"Invalid path '{_shown(path.encode('utf-8', 'replace').decode('utf-8'))}': a name holds "
+                        "bytes that are not UTF-8 text.") from None
     shown = _shown(path)
     if path.startswith("/"):
         raise _bad_name(f"Invalid path '{shown}': give it relative to the folder, with '/'.")

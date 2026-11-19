@@ -7,14 +7,18 @@ handler, so that a wrong path or method is JSON too. Every answer under `/api/v1
 `{"error": text, "code": code}` with the code's status (CODES). This module also holds what every route uses: the JSON
 body read up to JSON_MAX, the check of a body's or a query's fields (`unknown_field`), the mapping of the manager's
 errors to codes with the redaction of paths for the API caller, the one resolver of a session's `{id}`, the summary
-and its state (§21.7), and `aclose()`, which waits for the starts in flight and never cancels them. It uses the
+and its state (§21.7), the files and the archive of a session's folder, read without following a link (§21.8,
+nofollow), and `aclose()`, which waits for the starts in flight and never cancels them. It uses the
 manager in process, never the internal routes over HTTP, and never imports dreamteam.tui."""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
+import functools
 import hashlib
+import io
 import json
 import logging
 import math
@@ -22,26 +26,32 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import threading
 import time
 import unicodedata
+import urllib.parse
+import zipfile
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Mapping
+from typing import (TYPE_CHECKING, Any, AsyncIterator, Awaitable, BinaryIO, Callable, Coroutine, Iterable, Iterator,
+                    Mapping)
 
+import anyio
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
 
-from . import __version__, apifolders, netoff, roles
+from . import __version__, apifolders, netoff, nofollow, roles
 from .apifolders import FOLDER_FIELDS, MODES, FolderRequest
 from .autoreply import ID_MAX, blocking_requests, journal_head, read_requests, request_key, requests_of
 from .board import MAX_POST
 from .config import _joins_text, native_absolute
-from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads
+from .copyfrom import API_UPLOAD_PATH, CopyError, CopyLimits, Source, Uploads, check_rel, printable_line
 from .db import reading_file
 from .eventtext import event_text
 from .goal_text import split_goal
@@ -93,6 +103,12 @@ TIMELINE = ("task.created", "task.updated", "task.comment", "message.sent", "not
             "skill.deps", "file.changed")
 EVENTS_FIELDS = ("after", "wait", "limit", "detail", "lang")   # GET .../events
 STREAM_FIELDS = ("after", "detail", "lang")                    # GET .../events/stream
+FILES_FIELDS = ("path", "scratch")                             # GET .../files (docs/SPEC.md §21.8)
+FILE_FIELDS = ("scratch",)                                     # GET .../files/{path}
+ARCHIVE_FIELDS = ("path", "scratch")                           # GET .../archive
+FILE_CHUNK = 1 << 20        # bytes of each read of a download or of an archived file
+ZIP_SENT = 256 << 10        # bytes of zip an archive gathers before it sends them
+ZIP_ENTRY_COST = 4 << 10    # what one entry of an archive counts for in a step, as bytes read (_zip_parts)
 # ID_MAX (autoreply's, SQLite's largest integer): the largest id a query's `after`, a message's `reply_to` or a
 # request's id names
 TO_MAX = 100                # names in the `to` of a message the client sends
@@ -132,6 +148,12 @@ SETTINGS_TEXT = "The session's settings cannot be read, so its folder is not kno
 # any other (git not installed, settings or a repository that cannot be read, git failing, an in-place folder refused)
 # may pass, so it is computed again at the next request
 LASTING_TEXTS = (None, GIT_OFF_TEXT, NO_BASE_TEXT, BASE_GONE_TEXT)
+# the files of a session (docs/SPEC.md §21.8): its folder gone, or reached through a link now
+FOLDER_GONE_TEXT = "The session's folder is not there (deleted or moved, or on a drive that is not connected)."
+FOLDER_LINKED_TEXT = "The session's folder is reached through a link now: nothing in it is read."
+FOLDER_UNREADABLE_TEXT = "The session's folder cannot be read on the hub's computer (its permissions)."
+# the end of a server folder's start-check refusal (SessionManager._check_server_folder) when v1 reads its files
+FILES_REFUSAL = "its files are not read"
 # v1's own text of `folder_busy` (docs/SPEC.md §21.10): the manager's names the other session's folder, so its title
 FOLDER_BUSY_TEXT = ("Another session works in this folder, in a folder inside it or in one containing it, or is being "
                     "created there: two sessions cannot share files. Send that session's next instruction with "
@@ -749,20 +771,37 @@ def budget_text(spent: float, limit: float) -> str:
             "PATCH /api/v1/sessions/{id} first.")
 
 
-async def claim_uploads(uploads: Uploads, tokens: list[str], caller: str) -> list[Source]:
-    """`uploads.claim_many(tokens, caller=caller)` in a thread that a cancellation never leaves holding claims: a
-    cancel waits for the claims to end and gives back what they took (docs/SPEC.md §21.3 "Life": nothing stays
-    claimed after the create)."""
-    work = asyncio.ensure_future(asyncio.to_thread(uploads.claim_many, tokens, caller=caller))
+async def _outlive(work: asyncio.Future[Any]) -> None:
+    """Wait for `work` (a thread's) to end, once the caller was cancelled, without keeping the event loop busy: an
+    anyio cancel scope (Starlette cancels a streamed answer through one when its client goes away) cancels a task
+    that is still waiting again at every pass of the loop, so the wait is shielded from it; a cancel of the task
+    itself (the hub shutting down) is waited through as well."""
+    while not work.done():
+        with anyio.CancelScope(shield=True), contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait({work})
+
+
+async def _thread_step(fn: Callable[..., Any], *args: Any, release: Callable[[Any], None] | None = None) -> Any:
+    """fn(*args) in a thread that a cancellation (the client gone) never leaves running behind the caller: a cancel
+    waits for it to end (_outlive), hands what it gave to `release` (a file it opened, to close; claims it took, to
+    give back), then goes on. So a download or an archive closes its file or its walk only once no thread reads it,
+    and a create holds no claim after it."""
+    work = asyncio.ensure_future(asyncio.to_thread(fn, *args))
     try:
         return await asyncio.shield(work)
     except asyncio.CancelledError:
-        while not work.done():
-            with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.wait({work})
-        if not work.cancelled() and work.exception() is None:
-            uploads.settle(work.result(), used=False)
+        await _outlive(work)
+        if not work.cancelled() and work.exception() is None and release is not None:
+            release(work.result())
         raise
+
+
+async def claim_uploads(uploads: Uploads, tokens: list[str], caller: str) -> list[Source]:
+    """`uploads.claim_many(tokens, caller=caller)` in a thread that a cancellation never leaves holding claims: a
+    cancel waits for the claims to end and gives back what they took (docs/SPEC.md §21.3 "Life": nothing stays
+    claimed after the create; _thread_step)."""
+    return await _thread_step(functools.partial(uploads.claim_many, tokens, caller=caller),
+                              release=lambda sources: uploads.settle(sources, used=False))
 
 
 @dataclass
@@ -819,6 +858,301 @@ def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
+# ---- files and archive (docs/SPEC.md §21.8) -------------------------------------------------------------------------
+def served(parts: tuple[str, ...], scratch: bool = False) -> bool:
+    """Whether v1 lists, serves and archives the path `parts` of a session's folder (docs/SPEC.md §21.8): exactly the
+    paths copyfrom.check_rel takes, which `files/{path}` checks, so the three agree: never `.git` at any depth, never
+    `.scratch/_skills`, `.scratch` only with `scratch`, never the form of a short name, on a Windows hub never a name
+    NTFS reads as another, never a name that is no UTF-8 text."""
+    try:
+        check_rel("/".join(parts), scratch=scratch)
+    except CopyError:
+        return False
+    return True
+
+
+def _skipped(asked: tuple[str, ...], scratch: bool) -> Callable[[tuple[str, ...]], bool]:
+    """nofollow.walk_inside's `skip` for a walk of the folder `asked`: what `served` leaves out (never opened, a
+    folder never entered)."""
+    return lambda sub: not served(asked + sub, scratch)
+
+
+def attachment(name: str) -> str:
+    """The `Content-Disposition` of a download (docs/SPEC.md §21.8): an attachment, its name as `filename*` (RFC 5987,
+    UTF-8: any name), after an ASCII `filename` for older clients (its other characters as '_')."""
+    fallback = "".join(ch if ch.isascii() and (ch.isalnum() or ch in "-_.") else "_" for ch in name)[-100:]
+    return f"attachment; filename=\"{fallback or 'download'}\"; filename*=UTF-8''{urllib.parse.quote(name, safe='')}"
+
+
+def _download_headers(name: str, size: int | None = None) -> dict[str, str]:
+    """The headers of a download or an archive (docs/SPEC.md §21.8): an attachment the client never renders."""
+    headers = {"Content-Disposition": attachment(name), "X-Content-Type-Options": "nosniff",
+               "Cache-Control": "no-store"}
+    if size is not None:
+        headers["Content-Length"] = str(size)
+    return headers
+
+
+def _shown_path(parts: tuple[str, ...]) -> str:
+    return printable_line("/".join(parts), 200) or "."
+
+
+def _no_file_text(shown: str) -> str:
+    return f"No such file or folder in the session's folder: '{shown}'."
+
+
+def _not_served_text(shown: str) -> str:
+    return (f"'{shown}' is not served: only folders and regular files with one name are (never a link, a file with "
+            "more than one name, or a special file).")
+
+
+def _changed_text(shown: str) -> str:
+    return (f"'{shown}' changed while it was read (a file or a folder replaced, or a link put in its place): try "
+            "again.")
+
+
+def _is_folder_text(shown: str) -> str:
+    return (f"'{shown}' is a folder: GET /api/v1/sessions/{{id}}/files?path=<path> lists it, GET "
+            "/api/v1/sessions/{id}/archive?path=<path> gives it as a zip.")
+
+
+def _is_file_text(shown: str) -> str:
+    return f"'{shown}' is a file: GET /api/v1/sessions/{{id}}/files/{{path}} gives its bytes."
+
+
+@dataclass(frozen=True)
+class _Where:
+    """Where v1 reads a session's files (docs/SPEC.md §21.8): nofollow's root and the names of the session's folder
+    below it (none: the root is the folder; a session that works in a server folder in place: its names below the
+    resolved root of `[api] folders`, so that no link put on the way after the check is followed)."""
+
+    root: Path
+    base: tuple[str, ...] = ()
+
+
+def _unreadable_text(shown: str, error: BaseException | None, then: str = "") -> str:
+    """The text of a path that cannot be read: the system's words for why (never the error's own text, which may
+    name a path)."""
+    why = getattr(error, "strerror", None) or (type(error).__name__ if error is not None else "unknown")
+    return f"'{shown}' cannot be read on the hub's computer ({str(why).rstrip('.')}){f': {then}' if then else ''}."
+
+
+def _read_error(exc: OSError, where: _Where, asked: tuple[str, ...]) -> "ApiError | None":
+    """The answer to an OSError nofollow raised while it read the path `asked` of a session's folder (docs/SPEC.md
+    §21.8), by where it met it (its path relative to nofollow's root, which nofollow's errors name): a name replaced
+    while it was opened, 409 `conflict` (try again); the session's folder itself (or a folder above it, below an
+    `[api] folders` root) gone, 409 `folder_not_ready`, not readable (its permissions), 409 `folder_not_ready`, or
+    reached through a link, 403 `forbidden_folder`; below it, one that cannot be read (its permissions), 409
+    `conflict`; the path asked or a folder on its way missing, 404 `not_found`, a link, a file with another name or a
+    special file, 404 (never served), of the other kind, 400 `bad_request`; below it (what a listing or a walk met), a
+    link put in place of a folder or a file, or a path that now leads out, 409 `conflict`. A conflict quotes the path
+    where it was met, from the session's folder (the client's own names). None for anything else (a 500, logged)."""
+    refused = isinstance(exc, nofollow.Refused)
+    rel = exc.rel if isinstance(exc, nofollow.Refused) else exc.filename
+    if not isinstance(rel, str):
+        return None
+    met = () if rel in ("", ".") else tuple(rel.split("/"))
+    depth, base, full = len(met), len(where.base), len(where.base) + len(asked)
+    shown, here = _shown_path(asked), _shown_path(met[base:])
+    if refused and exc.reason == "replaced":
+        return ApiError("conflict", _changed_text(here))
+    if isinstance(exc, PermissionError):
+        if depth <= base:
+            return ApiError("folder_not_ready", FOLDER_UNREADABLE_TEXT)
+        return ApiError("conflict", _unreadable_text(here, exc))
+    if depth <= base:
+        if refused:
+            return ApiError("forbidden_folder", FOLDER_LINKED_TEXT)
+        if isinstance(exc, (FileNotFoundError, NotADirectoryError)):
+            return ApiError("folder_not_ready", FOLDER_GONE_TEXT)
+        return None
+    if depth <= full:
+        if refused:
+            return ApiError("not_found", _not_served_text(shown))
+        if isinstance(exc, FileNotFoundError) or (isinstance(exc, NotADirectoryError) and depth < full):
+            return ApiError("not_found", _no_file_text(shown))
+        if isinstance(exc, NotADirectoryError):
+            return ApiError("bad_request", _is_file_text(shown))
+        if isinstance(exc, IsADirectoryError):
+            return ApiError("bad_request", _is_folder_text(shown))
+        return None
+    return ApiError("conflict", _changed_text(here)) if refused else None
+
+
+class _Streamed(StreamingResponse):
+    """A download or an archive, streamed as it is read (docs/SPEC.md §21.8): whatever ends the answer (its end, an
+    error, the client gone, before the first byte too), its body is closed and `closing()` called, so no descriptor
+    and no walk stays open until a garbage collection."""
+
+    def __init__(self, content: AsyncIterator[bytes], *, closing: Callable[[], None], **kwargs: Any):
+        super().__init__(content, **kwargs)
+        self.closing = closing
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            body = self.body_iterator
+            try:
+                if hasattr(body, "aclose"):
+                    await body.aclose()
+            finally:
+                try:
+                    self.closing()
+                except Exception:  # noqa: BLE001 - the answer's own outcome goes on
+                    log.exception("API v1: a download could not close what it read")
+
+
+async def _file_bytes(file: BinaryIO, size: int, label: str) -> AsyncIterator[bytes]:
+    """The bytes of an opened file (`files/{path}`), FILE_CHUNK at a time in a thread, exactly `size` of them (the
+    Content-Length sent): a file that grew meanwhile is cut there; one that shrank, or a read that fails, ends the
+    answer with an error (logged), so the client sees it cut short, never a whole file that is not."""
+    sent = 0
+    try:
+        while sent < size:
+            chunk = await _thread_step(file.read, min(FILE_CHUNK, size - sent))
+            if not chunk:
+                raise OSError(errno.EIO, f"the file ended after {sent} of its {size} bytes")
+            sent += len(chunk)
+            yield chunk
+    except Exception as exc:
+        log.warning("API v1: the download of %s was cut: %s", label, exc)
+        raise
+    finally:
+        file.close()
+
+
+class _ZipSink:
+    """Where zipfile writes an archive being streamed: no seek, no tell (zipfile then writes each file's sizes after
+    its data, as a data descriptor); `take()` gives what was written since the last call."""
+
+    def __init__(self) -> None:
+        self._parts: list[bytes] = []
+        self.size = 0
+
+    def write(self, data: bytes) -> int:
+        self._parts.append(bytes(data))
+        self.size += len(data)
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def take(self) -> bytes:
+        data = b"".join(self._parts)
+        self._parts.clear()
+        self.size = 0
+        return data
+
+
+class _Cut(Exception):
+    """An archive that cannot be finished whole once its answer has started (docs/SPEC.md §21.8): it is cut there."""
+
+
+def _zip_info(rel: str, entry: nofollow.Entry, *, folder: bool) -> zipfile.ZipInfo:
+    """The zip entry of a folder or a file of the walk: its name relative to the folder archived ('/'), its time
+    (clamped to what a zip holds, 1980-2107), a Unix mode (0o755 for a folder and for a file someone may execute,
+    else 0o644: never writable by others, never setuid, whatever the hub's computer says; a Windows hub says 0o666),
+    deflated when it is a file."""
+    try:
+        when = tuple(time.localtime(entry.mtime_ns / 1e9)[:6])
+    except (OverflowError, OSError, ValueError):
+        when = (1980, 1, 1, 0, 0, 0)
+    info = zipfile.ZipInfo(f"{rel}/" if folder else rel, min(max(when, (1980, 1, 1, 0, 0, 0)),
+                                                              (2107, 12, 31, 23, 59, 58)))
+    info.create_system = 3   # (Unix: unzip reads the mode below)
+    mode = 0o755 if folder or entry.mode & 0o111 else 0o644
+    info.external_attr = ((stat.S_IFDIR if folder else stat.S_IFREG) | mode) << 16 | (0x10 if folder else 0)
+    info.compress_type = zipfile.ZIP_STORED if folder else zipfile.ZIP_DEFLATED
+    info.file_size = 0 if folder else entry.size
+    info.CRC = 0
+    return info
+
+
+def _zip_parts(where: _Where, asked: tuple[str, ...], scratch: bool, measured: Mapping[str, str],
+               limit: int) -> Iterator[bytes]:
+    """The zip of the folder `asked` of a session's folder (docs/SPEC.md §21.8 `archive`), in parts: the second walk
+    (nofollow, what `served` takes), each file read through the walk's own open file before the walk goes on,
+    exactly the size it had when it was opened (more written meanwhile is left for the next archive), deflated, each
+    folder an entry of its own. What the first walk `measured` (rel -> kind) must be there still: a file or a folder
+    gone, one that became a link or another kind, a file that shrank while it was read, an entry that cannot be
+    read, a link swapped in (nofollow.Refused), or more than `limit` bytes, raise (_Cut, OSError) before the central
+    directory is written, so the client's zip is never a valid one that lacks files or holds a torn one. What came
+    meanwhile is taken. Blocking: one step at a time in a thread (_zip_bytes); a step ends (a part, b"" when there
+    is no zip to send yet) once ZIP_SENT bytes of zip are ready or about FILE_CHUNK bytes were read (an entry counts
+    as ZIP_ENTRY_COST), so that a client gone waits for one short step only."""
+    sink = _ZipSink()
+    archive = zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True)
+    walk = nofollow.walk_inside(where.root, where.base + asked, skip=_skipped(asked, scratch))
+    seen: set[str] = set()
+    total = work = 0   # (bytes of files so far; bytes read in this step, an entry counted as ZIP_ENTRY_COST)
+    try:
+        for entry in walk:
+            rel, was = entry.rel, measured.get(entry.rel)
+            work += ZIP_ENTRY_COST
+            if entry.kind == nofollow.EXCLUDED:
+                continue
+            if entry.kind == nofollow.ERROR:
+                if was is None and isinstance(entry.error, FileNotFoundError):
+                    continue   # (came and went between the two walks)
+                raise _Cut(f"{rel} cannot be read any more: {entry.error}")
+            if entry.kind not in (nofollow.DIR, nofollow.FILE):   # (a link, a file with another name, a special file)
+                if was is not None:
+                    raise _Cut(f"{rel} is no {was} any more")
+                continue
+            if was not in (None, entry.kind):
+                raise _Cut(f"{rel} is no {was} any more")
+            seen.add(rel)
+            if entry.kind == nofollow.DIR:
+                archive.mkdir(_zip_info(rel, entry, folder=True))
+            else:
+                reader = entry.reader()
+                # (no force_zip64: exactly entry.size bytes are written, so zipfile's own rule from file_size holds)
+                with archive.open(_zip_info(rel, entry, folder=False), "w") as out:
+                    left = entry.size
+                    while left:
+                        chunk = reader.read(min(FILE_CHUNK, left))
+                        if not chunk:
+                            raise _Cut(f"{rel} shrank while it was read ({entry.size - left} of its {entry.size} "
+                                       "bytes)")
+                        left -= len(chunk)
+                        total += len(chunk)
+                        if total > limit:
+                            raise _Cut(f"more than {limit} bytes ([api] archive_max_mb)")
+                        out.write(chunk)
+                        work += len(chunk)
+                        if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
+                            work = 0
+                            yield sink.take()
+            if work >= FILE_CHUNK or sink.size >= ZIP_SENT:
+                work = 0
+                yield sink.take()
+        missing = sorted(set(measured) - seen)
+        if missing:
+            raise _Cut(f"{len(missing)} file(s) or folder(s) gone meanwhile, the first {missing[0]}")
+        archive.close()   # (the central directory: only for a whole archive)
+        yield sink.take()
+    finally:
+        walk.close()
+
+
+async def _zip_bytes(parts: Iterator[bytes], label: str) -> AsyncIterator[bytes]:
+    """The parts of an archive (_zip_parts), each step in a thread (_thread_step: the walk is closed only once no
+    thread reads it); an error ends the answer (logged), so the client's zip has no central directory."""
+    try:
+        while True:
+            chunk = await _thread_step(next, parts, None)
+            if chunk is None:
+                return
+            if chunk:
+                yield chunk
+    except Exception as exc:
+        log.warning("API v1: the archive of %s was cut: %s", label, exc)
+        raise
+    finally:
+        parts.close()
+
+
 Handler = Callable[[Request, str], Awaitable[Response]]
 
 
@@ -851,6 +1185,9 @@ class ApiV1:
             self._route("/api/v1/sessions/{id}/events", {"GET": self._events}),
             self._route("/api/v1/sessions/{id}/events/stream", {"GET": self._stream}),
             self._route("/api/v1/sessions/{id}/result", {"GET": self._result}),
+            self._route("/api/v1/sessions/{id}/files", {"GET": self._files}),
+            self._route("/api/v1/sessions/{id}/files/{path:path}", {"GET": self._file}),
+            self._route("/api/v1/sessions/{id}/archive", {"GET": self._archive}),
         ]
         self.app = Starlette(routes=routes, exception_handlers={HTTPException: self._http_error})
         self.app.router.redirect_slashes = False
@@ -1409,7 +1746,7 @@ class ApiV1:
         network_off = netoff.is_off(config)
         if apifolders.in_place_folder(api.get("folder")) is not None:   # (as every start checks it, §21.10)
             try:
-                manager._check_server_folder(sid, meta)
+                manager._check_server_folder(sid, meta, refusal="its changed files are not listed")
             except SessionError as exc:
                 return None, self.redact(str(exc), sid)
             problem = apifolders.git_dir_refusal(folder, git, offline=isolated_git(network_off))
@@ -1551,6 +1888,96 @@ class ApiV1:
             log.exception("API v1: the event stream of session %s failed", sid)
         finally:
             watch.close()
+
+    # ---- files and archive (docs/SPEC.md §21.8) ---------------------------------------------------------------------
+    def _where(self, sid: str) -> _Where:
+        """Where the files of session `sid` are read from (docs/SPEC.md §21.8): its folder, which nofollow opens
+        without following its own name; for a session that works in a server folder in place, the folder checked as
+        a start checks it (SessionManager._check_server_folder, with the settings the caller read again on the loop:
+        403 `forbidden_folder`, 409 `folder_not_ready`; its texts end in FILES_REFUSAL), then reached from its resolved
+        root name by name, the names as the resolved folder spells them (a folder on the way renamed in letter case
+        only is still read), so that a link put on the way after the check is met, never followed. A folder inside
+        its root by file identity only (a bind mount, another spelling) is 403 `forbidden_folder`: it is never read
+        by its own path after the check. 409 `folder_not_ready` for a folder that is not there. Blocking
+        (session.json, the folder): in a thread."""
+        manager = self.manager
+        meta = manager.meta(sid)
+        info = manager.workspace_of(sid, meta)
+        checked = manager._check_server_folder(sid, meta, refusal=FILES_REFUSAL)
+        if checked is not None:
+            root, real = checked
+            try:
+                return _Where(root, real.relative_to(root).parts)
+            except ValueError:
+                raise ApiError("forbidden_folder", FOLDER_LINKED_TEXT) from None
+        if not info["exists"]:
+            raise ApiError("folder_not_ready", FOLDER_GONE_TEXT)
+        return _Where(Path(info["path"]))
+
+    def _listing(self, sid: str, asked: tuple[str, ...], scratch: bool) -> list[dict[str, Any]]:
+        """GET files: the folders and the regular files with one name of the folder `asked` (nofollow.list_inside: no
+        link, no file with another name, no special file), what `served` takes, in name order, as
+        {name, path, type: "file" | "dir", size (0 for a folder), modified (Unix seconds)}. Blocking: in a thread."""
+        where = self._where(sid)
+        try:
+            found = nofollow.list_inside(where.root, where.base + asked)
+        except OSError as exc:
+            raise (_read_error(exc, where, asked) or exc) from None
+        entries = []
+        for entry in found:
+            parts = asked + entry.parts
+            if served(parts, scratch):
+                folder = entry.kind == nofollow.DIR
+                entries.append({"name": entry.name, "path": "/".join(parts), "type": "dir" if folder else "file",
+                                "size": 0 if folder else entry.size, "modified": entry.mtime_ns / 1e9})
+        return entries
+
+    def _open_file(self, sid: str, asked: tuple[str, ...]) -> tuple[BinaryIO, int]:
+        """GET files/{path}: the file `asked` opened for reading below the session's folder without following any
+        link (nofollow.open_inside: never a link, a file with another name or a special file), and its size then.
+        The caller closes it. Blocking: in a thread (_thread_step, which closes it when the request is cancelled)."""
+        where = self._where(sid)
+        try:
+            fd = nofollow.open_inside(where.root, where.base + asked)
+        except OSError as exc:
+            raise (_read_error(exc, where, asked) or exc) from None
+        try:   # (fstat first: a FileIO made is the descriptor's only owner, which closes it)
+            size = os.fstat(fd).st_size
+            file = io.FileIO(fd, "rb", closefd=True)
+        except BaseException:
+            os.close(fd)
+            raise
+        return file, size
+
+    def _measure(self, sid: str, asked: tuple[str, ...], scratch: bool,
+                 limit_mb: int) -> tuple[_Where, dict[str, str]]:
+        """An archive's first walk (docs/SPEC.md §21.8 `archive`), before any byte is sent: what `served` takes below
+        the folder `asked`, measured without opening a file (nofollow.walk_inside, open_files False). 413
+        `too_large` past `limit_mb` MiB of files ([api] archive_max_mb); 409 `conflict` for an entry that cannot be
+        read (the archive would lack it). (where it read, {rel: "dir" | "file"} of what the second walk must find
+        again). Blocking: in a thread."""
+        where = self._where(sid)
+        measured: dict[str, str] = {}
+        total = 0
+        walk = nofollow.walk_inside(where.root, where.base + asked, skip=_skipped(asked, scratch), open_files=False)
+        try:
+            for entry in walk:
+                if entry.kind == nofollow.FILE:
+                    total += entry.size
+                    if total > limit_mb << 20:
+                        raise ApiError("too_large", f"The folder holds more than [api] archive_max_mb "
+                                                    f"({limit_mb} MB) of files: ask for a folder inside it "
+                                                    "(archive?path=), or for its files one by one (files/{path}).")
+                if entry.kind in (nofollow.DIR, nofollow.FILE):
+                    measured[entry.rel] = entry.kind
+                elif entry.kind == nofollow.ERROR and not isinstance(entry.error, FileNotFoundError):
+                    raise ApiError("conflict", _unreadable_text(_shown_path(asked + entry.parts), entry.error,
+                                                                "an archive would lack it"))
+        except OSError as exc:
+            raise (_read_error(exc, where, asked) or exc) from None
+        finally:
+            walk.close()
+        return where, measured
 
     # ---- routes ---------------------------------------------------------------------------------------------------
     async def _options(self, request: Request, caller: str) -> Response:
@@ -1928,16 +2355,63 @@ class ApiV1:
                 if swarm is not None and sid in self.manager.running else [])
         return SafeJSONResponse(await asyncio.to_thread(self.result, sid, summary, jobs))
 
+    async def _files(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/files?path=&scratch= (docs/SPEC.md §21.8): `{"path", "entries"}` of a folder of
+        the session's folder (_listing). In this order: the query, the path (copyfrom.check_rel: 400 `bad_name`), the
+        session (404), then the folder read in a thread, the hub's settings read again first (an in-place folder is
+        checked as a start checks it). A stopped session is never loaded."""
+        query = query_fields(request, FILES_FIELDS)
+        scratch = query_flag(query.get("scratch"), "scratch")
+        asked = check_rel(query.get("path"), scratch=scratch)
+        sid = self._session(request, caller)
+        self.manager._refresh_settings()
+        entries = await asyncio.to_thread(self._listing, sid, asked, scratch)
+        return JSONResponse({"path": "/".join(asked), "entries": entries})
 
-__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "BASE_GONE_TEXT", "CHANGED_FILES_MAX", "CLIENT_REF_MAX",
-           "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS", "DETAILS", "EVENTS_DEFAULT", "EVENTS_FIELDS",
-           "EVENTS_MAX", "FILES_PER_SESSION", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX",
-           "LASTING_TEXTS", "MESSAGES_DEFAULT", "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT",
-           "NOT_RUNNING_TEXT", "NO_BASE_TEXT", "NO_GIT_TEXT", "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS",
-           "PING_SECONDS", "RESULTS_CACHED", "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS",
-           "START_WAIT", "STATES", "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES",
-           "WAIT_MAX", "ApiError", "ApiV1", "CreateRequest", "SafeJSONResponse", "answer_of", "budget_text",
-           "check_fields", "check_json_type", "claim_uploads", "continue_text", "error_code", "event_view", "fail",
-           "job_view", "library_skills", "message_of", "message_view", "options_view", "query_after", "query_choice",
-           "query_count", "query_fields", "query_flag", "query_wait", "read_json", "request_digest", "required_text",
-           "root_pairs", "safe_json", "session_lang", "skill_refs", "sse_event", "state_of"]
+    async def _file(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/files/{path}?scratch= (docs/SPEC.md §21.8): the file's bytes, streamed FILE_CHUNK
+        at a time, as an attachment that is never rendered (`application/octet-stream`, `nosniff`, `no-store`), with
+        its Content-Length; a folder is 400 `bad_request` (list it, or ask for its archive). Checked in the order of
+        GET files."""
+        query = query_fields(request, FILE_FIELDS)
+        scratch = query_flag(query.get("scratch"), "scratch")
+        asked = check_rel(request.path_params.get("path"), scratch=scratch)
+        if not asked:
+            raise ApiError("bad_request", _is_folder_text("."))
+        sid = self._session(request, caller)
+        self.manager._refresh_settings()
+        file, size = await _thread_step(self._open_file, sid, asked, release=lambda opened: opened[0].close())
+        return _Streamed(_file_bytes(file, size, f"{'/'.join(asked)} of session {sid}"), closing=file.close,
+                         media_type="application/octet-stream", headers=_download_headers(asked[-1], size))
+
+    async def _archive(self, request: Request, caller: str) -> Response:
+        """GET /api/v1/sessions/{id}/archive?path=&scratch= (docs/SPEC.md §21.8): a zip of the session's folder, or of
+        the folder `path` in it, with what GET files lists at every level, streamed as it is built (_zip_parts). It is
+        measured first (_measure: 413 `too_large` past `[api] archive_max_mb` before any byte); an error once the
+        answer has started cuts it (the zip then lacks its central directory). Checked in the order of GET files."""
+        query = query_fields(request, ARCHIVE_FIELDS)
+        scratch = query_flag(query.get("scratch"), "scratch")
+        asked = check_rel(query.get("path"), scratch=scratch)
+        sid = self._session(request, caller)
+        limit_mb = self.manager.global_config().api.archive_max_mb   # (a hand edit is picked up)
+        where, measured = await asyncio.to_thread(self._measure, sid, asked, scratch, limit_mb)
+        parts = _zip_parts(where, asked, scratch, measured, limit_mb << 20)
+        return _Streamed(_zip_bytes(parts, f"{'/'.join(asked) or '.'} of session {sid}"), closing=parts.close,
+                         media_type="application/zip", headers=_download_headers(f"{asked[-1] if asked else sid}.zip"))
+
+
+__all__ = ["ANSWER_FIELDS", "API_SID", "API_VERSION", "ARCHIVE_FIELDS", "BASE_GONE_TEXT", "CHANGED_FILES_MAX",
+           "CLIENT_REF_MAX", "CODED_ERRORS", "CODES", "CONTINUE_FIELDS", "CREATE_FIELDS", "DETAILS", "EVENTS_DEFAULT",
+           "EVENTS_FIELDS", "EVENTS_MAX", "FILES_FIELDS", "FILES_PER_SESSION", "FILES_REFUSAL", "FILE_CHUNK",
+           "FILE_FIELDS", "FOLDER_BUSY_TEXT", "FOLDER_FIELDS", "FOLDER_GONE_TEXT", "FOLDER_LINKED_TEXT",
+           "FOLDER_UNREADABLE_TEXT", "GIT_OFF_TEXT", "ID_MAX", "JSON_MAX", "LASTING_TEXTS", "MESSAGES_DEFAULT",
+           "MESSAGES_MAX", "MESSAGE_FIELDS", "NOT_DELIVERED_TEXT", "NOT_RUNNING_TEXT", "NO_BASE_TEXT", "NO_GIT_TEXT",
+           "NO_REPOSITORY_TEXT", "NO_REQUEST_TEXT", "PATCH_FIELDS", "PING_SECONDS", "RESULTS_CACHED",
+           "SESSIONS_DEFAULT", "SESSIONS_MAX", "SETTINGS_TEXT", "SETTLE_SECONDS", "START_WAIT", "STATES",
+           "STATUS_CODES", "STREAM_FIELDS", "STREAM_PAGE", "TIMELINE", "TO_MAX", "UPLOAD_TYPES", "WAIT_MAX",
+           "ZIP_ENTRY_COST", "ZIP_SENT", "ApiError", "ApiV1", "CreateRequest", "SafeJSONResponse", "answer_of",
+           "attachment", "budget_text", "check_fields", "check_json_type", "claim_uploads", "continue_text",
+           "error_code", "event_view", "fail", "job_view", "library_skills", "message_of", "message_view",
+           "options_view", "query_after", "query_choice", "query_count", "query_fields", "query_flag", "query_wait",
+           "read_json", "request_digest", "required_text", "root_pairs", "safe_json", "served", "session_lang",
+           "skill_refs", "sse_event", "state_of"]
