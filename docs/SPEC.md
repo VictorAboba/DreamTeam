@@ -372,8 +372,9 @@ class Swarm:
         # question this resume ends (§3.1); a resume without it while a question is pending drops that question
         # (outcome "dropped", why "resumed"): its asker gets a waking n_question_unanswered instead of n_resumed.
         # A pause is no planning or decision time: the pause's length (`_paused_at`, in memory, so a pause that began
-        # before a restart is not counted) moves on the planning hint's clock (scheduler item 4) and every
+        # before a restart is not counted) moves on the planning hint's clock (scheduler item 4), every
         # `_considering` start (`_nudge_idle`'s decision window; an offer made during the pause counts from the resume)
+        # and every free-place clock (`_crew_gaps`, scheduler item 8: a crew task's state does not age while paused)
     def pending_question(self) -> dict | None            # {asker, message_id, since} of the question holding the
                                                          # pause (kv `paused` with reason "question"), else None
     def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None
@@ -504,7 +505,18 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    (`review` is an open status, so it waits for every review); not while any LLM member works or is busy with a
    job (with no open task only a `timeout` job can make it busy: its command may still change the result);
 7. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
-   (§4.1 "Liveness").
+   (§4.1 "Liveness");
+8. `_tell_crew_gaps` (§4.2 "A free place"; run of 2026-11-13: for hours one member worked on the last direction of
+   a crew task while a place was free and three members idled, its owner among them, and nothing told the owner):
+   the owner of a crew task that has a free place, a direction in `in_progress` or `waiting` and none a member may
+   take now (`Board.crew_gaps()`), while other members are idle with no task of their own to go on with, gets
+   `n_crew_gap` once the crew task has been in that state with the same open and named directions for
+   `CREW_GAP_FACTOR` (10) × `agents.idle_nudge_seconds`, and only while the owner is idle itself; once per such
+   state, at most `CREW_GAP_MAX` (2) times per owner and crew task (counted from the notifications table, so a
+   restart does not reset the count); never while the goal is not active or in wrap-up mode (`wrapping_up`; the
+   clocks start again afterwards; a pause stops them: `resume` moves them on by its length). It runs last, in the
+   code too: it reads the offers item 1 made in the same pass (`_nudged`), and a member that items 1-7 woke has
+   news pending, so it is not idle. It wakes nobody but that owner.
 
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
 agents in ERROR; a changed role catalog (§17.3), `[swarm] independent_review` and `crew_review` apply at once (new
@@ -679,6 +691,12 @@ class Board:
     def contributors_of(self, task: Task) -> set[str]  # the assignees of its subtasks, any status
     def busy_crews(self, name: str) -> set[int]        # crew tasks with a direction name works on (in_progress or
                                                        # waiting): their directions are not offered to it
+    def crew_gaps(self) -> list[tuple[Task, list[Task], list[tuple[int, str, int]]]]
+        # the crew tasks whose owner may be told of a free place (§4.2 "A free place"), each with its open
+        # directions and the held ones to name: (sub, assignee, m), id ascending
+    def crew_gap_parts(self, task: Task, held: list[tuple[int, str, int]], lang: str) -> tuple[str, str]
+        # n_crew_gap's {directions} and {held} in `lang`: the directions but the cancelled ones, the blockers of
+        # the todo ones after them, and one sentence per held direction (§4.2 "A free place")
 
     # independent review (below)
     independent_review: bool                           # property: [swarm] independent_review, read on every call
@@ -1211,9 +1229,11 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     itself, which a hand-in sends to review, and only a done dependency unblocks), and the board says when the claim
     would take it. `n_unblocked` is unchanged: a direction still held back when its dependencies are done gets it
     like any task, and the refusal of its claim says why. A wait that keeps the held direction or a place from ever
-    freeing (a working direction that waits for the held one) gets no text of its own: Liveness counts #8 among its
-    owner's stalled ids only while #8 is `in_progress` and every working direction waits for a held-back one (§3
-    items 2-3). The checks of "Taking a direction" are unchanged.
+    freeing (a working direction that waits for the held one) gets no text of its own here: Liveness counts #8 among
+    its owner's stalled ids only while #8 is `in_progress` and every working direction waits for a held-back one (§3
+    items 2-3), and while #8 has a free place and other members are idle with no task of their own to go on with,
+    "A free place" tells its owner of the held direction and of that wait. The checks of "Taking a direction" are
+    unchanged.
 - **Also assigned.** When a claim or an `update` takes direction #M for the actor, a member (a take of "Taking a
   direction", with its checks), the result adds, after the card instruction and the reviewer sentence, for each
   other `todo` direction of the same crew task assigned to the actor (id ascending), ` #16, also assigned to you,
@@ -1236,6 +1256,109 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   spans lines (a crew draft) starts on a line of its own, its leading space removed, as in `Board.mark_text`. It
   records no liveness key, so the mark still wakes the member later (once per key) if it does not take the
   direction.
+- **A free place.** `crew` is how many members may work on a crew task at once, not how many must; still, a crew
+  task can run below its size for hours while other members have nothing to do, and no text reaches anyone. In the
+  run of 2026-11-13 a direction assigned to a member busy with another one waited while a place was free ("A held
+  direction"), and later one member worked on the last direction of a crew of 3 for about five hours, a place free
+  and three members idle, its owner among them: nothing was free to offer, and the working direction could still
+  move, so Liveness waited. The owner is then told once, to decide (§3 item 8):
+  - *When* (`Board.crew_gaps()`, read at each pass; for each crew task, its open directions and the held ones to
+    name): crew task #8 is `todo`, `in_progress` or `waiting`, not blocked, and owned by a member (not USER); it has
+    a free place (its working set is smaller than `crew`; the owner takes one, so a crew of 2 with an idle owner and
+    one worker is full), at least one direction in `in_progress` or `waiting` (USER's counts), and no `todo`
+    direction a member may take now. One may be taken now when it has no blocker of its own and either no assignee
+    (a free direction, "Offers") or an assignee that is an LLM member, not in error, whose claim would take it
+    (`Board.directions_to_take`, the "direction to take" mark) and that works on no other task: no `in_progress`
+    task outside #8 without an open subtask (`Board.open_parents`; system prompt rule 3, one task in progress at a
+    time, so a crew task it owns while it works on none of its directions does not count). Such a direction keeps
+    #8 out, and so do no directions yet (`crew_owner_none`), all of them finished (`n_subtasks_done`) and none
+    working (all in review, or waiting for their turn). A direction in review neither counts as working nor keeps
+    #8 out, and neither do these `todo` ones: one blocked by its own `depends_on` (a sequence: the list shows its
+    blockers, and the text allows leaving the place free); one assigned to USER, to an external member or to a
+    member in error, not held back (the list shows its assignee); and one without a blocker of its own that is held
+    back ("A held direction"; with a free place only the busy reason holds one back) or whose assignee, an LLM
+    member not in error, works on another task: the **held** directions, which the notice names. A working
+    direction that waits for a held one (§3 items 2-3; `has_live_directions` is not asked) does not keep #8 out
+    either: the notice names the held one and says that neither moves while it stays assigned.
+  - *Free members*: the LLM members outside #8's working set (so never its owner) that are idle
+    (`_idle_llm_members`) and have been for `agents.idle_nudge_seconds` at least (since `last_active`, so one that
+    has just finished is not named while someone may still give it work), wait neither for a job of their own nor
+    for a file (`JobManager.awaited`, `Workspace.waits_for_lock`), have no review waiting for them
+    (`Board.reviews_of`), hold nothing they can go on with, and were offered by item 1 every ready task it would
+    offer them (`ready_unassigned` but the directions of `busy_crews`, each in `_nudged` under its offer key).
+    They have nothing to go on with when they hold no `in_progress` task and no `todo` one that no blocker stops
+    and that is no direction, leaving out a parent with an open subtask (`Board.open_parents`: it waits for its
+    subtasks, as §4.1 "Liveness" counts work, so the owner of another crew task that works on none of its
+    directions is free, as system prompt rule 3 says), and no liveness mark (`Board.stall_marks`: subtasks done, a
+    direction to take, free directions). A task in `waiting` or in review does not count: it waits for something
+    else, and item 1 offers its holder ready tasks too (so the `busy_crews` exception applies to a member whose
+    direction of another crew task is `waiting`). So a member holding a task blocked by #8 counts (the planner of
+    that run), and one with a ready task not offered to it yet does not: item 1 offers it first. External members,
+    USER and members in error never count, nor does an owner told earlier in the same pass (it has news pending now,
+    like a member items 1-7 woke). At least one is needed; one member may be named for several crew tasks.
+  - *To whom*: the owner, and only while it is an LLM member that is idle itself (`_idle_llm_members`, read once
+    per pass). An owner at work, busy with a job, with news pending, in error or paused is told at the first pass
+    that finds it idle, if the state still holds, so the notice never lands in a running activation; one that
+    waits for its own job or for a file is told (an owner that works on the last direction itself and waits for its
+    matches may add a direction meanwhile). An owner that is USER or an external member is told nothing (no `u_`
+    text: the board shows the crew chip; no scheduler item wakes an external member), nor is the crew task's
+    creator in its place (keeping the directions consistent is the owner's part, system prompt rule 3, and a
+    creator that added them would work around that owner), and a crew task without an owner is a ready task
+    itself, which item 1 offers.
+  - *Once.* `_crew_gaps` {task id: (key, since)} is rebuilt at each pass from `crew_gaps()`, like `_idle_holding`:
+    the key is (owner, `crew`, the ids of its open directions, the ids of the held ones); `since` starts again when
+    the key changes or #8 leaves the list. The notice goes out once the key has lasted `CREW_GAP_FACTOR` (10) ×
+    `agents.idle_nudge_seconds` (10 minutes by default) and the owner and a free member are found, and never again
+    for that key (`_crew_gap_told` {task id: key}, set once the notice is sent, in memory and never cleared, like
+    `_stall_woken`: a direction added or finished, a change of the held ones (a direction assigned to a busy member,
+    say), of `crew` or of the owner re-arms it; a claim, a hand-in to review, a place taken and freed again, or
+    other free members do not); at most `CREW_GAP_MAX` (2) times per owner and crew task in all (`recipient`,
+    `kind` and `json_extract(data, '$.id')` in the notifications table, like the planning hint's count; at the cap a
+    key due is recorded as told at once, with no free member looked for, so it costs nothing until it changes; after
+    a restart the same state may be told once more, within that count). A render error leaves the key unrecorded
+    (logged; the next pass tries again). Every crew task due in a pass is told in it, so an owner of two gets both
+    in one wake-up. A pause stops the clocks (`resume` moves each `since` on by its length); while the goal is not
+    active or wrap-up mode is on (`wrapping_up`: the team finishes with what it has), nothing is sent and
+    `_crew_gaps` is emptied, so the clocks start again afterwards.
+  - *The text*, in the owner's language, waking: `#8 "engine", your crew task, has a free place (2 of its 3 places
+    taken: Olga Owner, Anna Smith), but none of its directions can be taken now, and these members are idle, with
+    no task of their own to go on with: Carl Diaz (Tester), Bob Brown (Generalist). Its directions: #14 [done]
+    "search" @Olga Owner; #15 [done] "eval" @Bob Brown; #16 [in_progress] "uci" @Anna Smith. If a part of #8 that no
+    direction covers yet can be done now, add it as a direction (task_update directions). If none of this applies,
+    leave #8 as it is: a free place need not be filled, and no reply is needed.` (`n_crew_gap` {id, title, working,
+    crew, names, idle, directions, held}: `working` and `names` the working set's size and its members in its
+    order, `crew_working`; `idle` the free members as `Name (role)`, the longest idle first (`last_active`), the
+    role as stored, cut like `fmt.trim(role, 60)`, at most 8, then `…`; `directions` the list of the owner sentence
+    ("The owner": every direction but the cancelled ones, `crew_directions` and `crew_directions_more`), each `todo`
+    one with blockers followed by them, ` (blocked by #15)` (`crew_gap_blocked` {ids}); `held` "" or, after the
+    list, one sentence per held direction, id ascending, at most 5, #15 the lowest direction of #8 its assignee
+    works on, else the lowest other task it works on (*When*): ` #16 waits: Bob Brown works on #15 and can take #16
+    only after handing #15 in. If another member can do #16 now, unassign it (task_update assignee='') and a free
+    member is offered it.` (`crew_gap_held` {sub, name, m}); for the owner's own one, also when #15 waits for it,
+    ` #16, also assigned to you, waits: you can take it only after handing #15 in. If another member can do #16
+    now, unassign yourself (task_update assignee='') and a free member is offered it.` (`crew_gap_held_you` {sub,
+    m}, the words of "Also assigned"); when #15 waits for #16 (`Board._wait_for_held`, the case in which "A held
+    direction" leaves its tail out), ` #16 waits: Bob Brown works on #15, which waits for #16, so neither moves
+    while Bob Brown holds #16: unassign #16 (task_update assignee='') and a free member is offered it.`
+    (`crew_gap_held_wait` {sub, name, m}). The board renders both pieces (`Board.crew_gap_parts`), like every crew
+    placeholder.
+  - *What the owner may do*, with the tools it has (no new tool, no tool revision, no change of the system prompt,
+    so the members of a running session get the notice too): add a direction for a part of #8 that no direction
+    covers yet and that can be done now (`task_update directions`, "Marking": with a direction of its own already,
+    the new one is free and item 1 offers it, `n_ready`; with none, the first one is its own part, `note_own_part`);
+    unassign a named held direction if another member can do it now, or at once when a working direction waits for
+    it (`task_update assignee=''`, "Who controls subtasks": the owner may unassign any open direction not in review;
+    with the place free, no blocker of its own and #8 not blocked, it is then a free direction, which item 1 offers;
+    its old assignee gets `n_unassigned` as for any unassignment); or, if none of this applies, leave #8 as it is,
+    in one step (`wait`): no reply is asked for, so no discussion post wakes the crew.
+  - *What stays.* The text never says "reassign" nor "assign it to X" (giving a direction to another member is for
+    its assignee or creator, §4 `update`, while the owner of #8 may always unassign one that is not in review; a
+    free direction reaches the free members through `n_ready`), never "fill the place" (a place may stay free on
+    purpose: in that run the members ran no matches while the worker held the shared CPU cores), never "split" a
+    direction someone works on, nothing about the size of the crew, and nothing about who gets an added direction.
+    The free members are sent nothing. Item 1's offers (`_nudged`, `_considering`), Liveness (`stall_marks`, the
+    liveness key, `has_live_directions`; §3 items 2-3), the in-activation nudge (§6.2), the wake-up text (§6.3)
+    and the checks of "Taking a direction" are unchanged.
 - **Discussion.** The participants of a crew task (§4 `post`) also include the assignees of its open directions (in
   review too): its discussion is the crew's channel, and a post there wakes them (the economy rules of the system
   prompt apply). Taking a direction posts nothing: the board shows it.
@@ -1518,7 +1641,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   offers it to each member once while it stays ready. Neither `n_ready` nor the wake-up's `ready` list names to a
   member the directions of a crew task in which it works on a direction (`in_progress` or `waiting`;
   `Board.busy_crews(name)`): its claim would be refused. Its fallback is the owner: an idle owner working on none
-  of the directions is woken once about a free one ("free directions" mark, "Finishing", Liveness).
+  of the directions is woken once about a free one ("free directions" mark, "Finishing", Liveness). With nothing
+  left to take while a place stays free and other members are idle with no task of their own to go on with, the
+  owner is told once ("A free place").
   A parent without an assignee is ready the whole time its subtasks are worked on, so most members were offered it
   already when they finish. `_nudged` is therefore keyed by the pair (task id, finish state), the finish states of
   the ready tasks read at each pass (`Board.finish_states`, "Finishing"; the kickoff's entry is (card id, None)),
@@ -1546,8 +1671,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `n_direction_freed`: `#{id} "{title}", a direction of your crew task, is free again: {by} left the swarm.`
   `n_crew_owner`: the owner sentence above; `n_crew_review_requested`, the crew endings of `n_subtasks_done` and
   `n_review_rejected`, the draft of #N's result (`crew_draft`, `crew_draft_cut`, `crew_draft_more`,
-  `crew_draft_no_result`), `n_direction_failed`, `n_direction_cancelled`, `n_marks_stalled`: "Finishing". `Task` gains
-  `crew: int` (stored) and `crew_working:
+  `crew_draft_no_result`), `n_direction_failed`, `n_direction_cancelled`, `n_marks_stalled`: "Finishing";
+  `n_crew_gap`, `crew_gap_held`, `crew_gap_held_you`, `crew_gap_held_wait` and `crew_gap_blocked`: "A free place".
+  `Task` gains `crew: int` (stored) and `crew_working:
   list[str]` (filled by `Board`, not stored); both are in `to_dict()`, so in the state API and the events (an
   export copies the column `tasks.crew`). The web and the TUI show a crew task's chip from its `crew_working` in the
   board's snapshot and fetch the snapshot again after changes (the web on every bus event, the TUI for `/board` and
@@ -1569,6 +1695,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   | a direction is taken (a claim, an `update`, a `parent_id` move) | the owner, unless it is the actor or the taker | `n_direction_taken` {by, id, title, parent} | no |
   | a direction's holder left the swarm | the crew task's assignee after the release | `n_direction_freed` {id, title, by} | no |
   | someone else makes or tells a member the holder of a crew task (an assignment, the creator's reopening, `crew` set) | that holder | `n_crew_owner` {id, title, crew, directions, instructions} (in place of `n_assigned`; with all directions finished, `instructions` is the all finished owner form with the draft, and `directions` "") | yes |
+  | a crew task has had a free place, a working direction and none a member may take now for 10 × `agents.idle_nudge_seconds`, while other members are idle with no task of their own to go on with ("A free place", §3 item 8) | its owner, an idle LLM member | `n_crew_gap` {id, title, working, crew, names, idle, directions, held} | yes |
   | the assignee changes the `crew` of a task it did not create | the creator | `n_crew_changed` {by, id, title, crew} | no |
   | the creator or USER changes the `crew` of a task someone else holds, not making it a crew task | the holder | `n_crew_changed` {by, id, title, crew} | no |
   | a parent with open subtasks becomes terminal ("Leaving and closing") | the assignees of its other open subtasks | `n_parent_closed` {id, title, status, sub} | yes |
@@ -1660,7 +1787,24 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   refused by "Who controls subtasks"); tests/test_ui.py (the order of the settings and of the template);
   tests/test_frozen_tools.py (`RELEASED` gains 5); tests/test_db_schema.py (`tasks.crew`); tests/test_prompts.py
   (the identifier tests of the agent texts and the planning card check the revisions from
-  `frozen.OLDEST_OPEN_REVISION` on, §12 R0′).
+  `frozen.OLDEST_OPEN_REVISION` on, §12 R0′). For "A free place": `Board.crew_gaps` in and out (in: the run's two
+  states, a working direction that waits for a held one, a sequence, a `todo` direction assigned to USER, to an
+  external member or to a member in error (not named), one assigned to a member at work on another task (named);
+  out: a free direction just added, a direction to take, a crew of 2 with an idle owner and one worker, USER as the
+  owner, nothing working); `Board.crew_gap_parts` (the blockers in the list; the three forms of a held direction:
+  another member's, the owner's own, one a working direction waits for); the scheduler item in
+  tests/test_crew_swarm.py, with a small `idle_nudge_seconds`: one notice after 10 × it and none before, and one
+  through the scheduler's own loop, not in the pass in which item 1 offers the owner a task (item 8 runs last); an
+  owner at work told only once it is idle, an owner that waits for its own job told, USER and external owners never;
+  the free members (a holder of a blocked task or of a `waiting` one and an idle owner of another crew task that
+  works on none of its directions count; a member with a ready task not offered to it yet, a `todo` subtask of a
+  plain task, a review waiting, a job it waits for or a liveness mark does not, nor an owner told earlier in the
+  same pass); the notice re-armed by a finished direction and by a newly held one, not by a hand-in or a claim; the
+  cap of 2 across a restart (a key due at the cap recorded with no free member looked for); a pause moving the clock
+  on; nothing with the goal done or in wrap-up mode; two crew tasks of one owner in one pass. tests/test_prompts.py:
+  `CREW_KEYS` gains the five keys, the fragments that start with a space gain `crew_gap_`, `n_crew_gap` joins the
+  keys that say «групповая задача» and «направлен», and the examples above are pinned in
+  `test_crew_texts_render_the_spec_wording`.
 
 ## 5. Mailbox (mailbox.py)
 
@@ -4050,6 +4194,12 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   update apply (`clean_overrides` keeps `false`, so a session can switch off a global `true`); switching it off on a
   running swarm lifts a question pause (`reconfigure`). Under the auto-reply lease of `dreamteam -p` it does not
   apply. The template has the line `clarify = false` after `network`, with a Russian comment.
+- `[agents] idle_nudge_seconds = 60` (number ≥ 0): how long the scheduler lets an idle member be before it steps in
+  (§3): the spacing of item 1's offers to one member, the stall wakes and liveness marks of items 2-3 (§4.2
+  "Finishing"), the review reminders (item 5, §4.1 "Liveness") and, ten times over (`CREW_GAP_FACTOR`), the
+  free-place notice of item 8 (§4.2 "A free place"), whose free members must also have been idle this long. Read
+  at each scheduler pass; session overrides apply. The template has no line for it; the settings page's «Агенты»
+  section and the session dialog's «Агенты» group have its field («Напоминание простаивающим, с»).
 - `[agents] planning_hint_steps = 8` (whole number ≥ 0) and `planning_hint_minutes = 10` (number ≥ 0): the planning
   hint of §3 (scheduler item 4; in clarify mode, before the planner has asked, its `n_clarify_hint`), after this
   many LLM steps or minutes of holding the planning task without creating a task, once more at twice the value; 0

@@ -241,6 +241,17 @@ TEXTS: dict[str, dict[str, str]] = {
                                    "goal? Approve it, or return it with what does not fit (task_review).",
         # a holder stalls with liveness marks only: {text} is their mark_* sentences, without the leading space
         "n_marks_stalled": "{text}",
+        # the scheduler (docs/SPEC.md §3 item 8, §4.2 "A free place"): the owner's crew task has a free place, a
+        # working direction and none a member may take now, while other members are idle with no task of their own
+        # to go on with; {names}: the working set; {idle}: "Name (role)"; {directions}: crew_directions (+
+        # crew_directions_more), a blocked todo direction followed by crew_gap_blocked; {held}: crew_gap_held,
+        # crew_gap_held_you or crew_gap_held_wait for each held direction, or ""
+        "n_crew_gap": "#{id} \"{title}\", your crew task, has a free place ({working} of its {crew} places taken: "
+                      "{names}), but none of its directions can be taken now, and these members are idle, with no "
+                      "task of their own to go on with: {idle}.{directions}{held} If a part of #{id} that no "
+                      "direction covers yet can be done now, add it as a direction (task_update directions). If none "
+                      "of this applies, leave #{id} as it is: a free place need not be filled, and no reply is "
+                      "needed.",
         # crew tasks: fragments the board and the scheduler render into the texts above, in the recipient's language
         # the draft of a crew task's result (Board._crew_draft); the board adds the line break before it
         "crew_draft": "Draft for #{id}'s result: its directions in the order they were created, with the results of "
@@ -346,6 +357,21 @@ TEXTS: dict[str, dict[str, str]] = {
                                     "(task_complete), since a member works on one direction of crew task #{id} at a "
                                     "time. If you take other work after that, unassign yourself from #{sub} first "
                                     "(task_update assignee=''), so it does not wait for you.",
+        # n_crew_gap's {held}: a held direction (no blocker of its own; held back, or its assignee works on another
+        # task); #{m}: the lowest direction of the crew task its assignee works on, else that other task
+        "crew_gap_held": " #{sub} waits: {name} works on #{m} and can take #{sub} only after handing #{m} in. If "
+                         "another member can do #{sub} now, unassign it (task_update assignee='') and a free member is "
+                         "offered it.",
+        # the owner's own held direction (the words of note_direction_held_also and note_direction_held_tail_you)
+        "crew_gap_held_you": " #{sub}, also assigned to you, waits: you can take it only after handing #{m} in. If "
+                             "another member can do #{sub} now, unassign yourself (task_update assignee='') and a "
+                             "free member is offered it.",
+        # #{m} waits for #{sub} (Board._wait_for_held): keeping #{sub} for {name} would leave both waiting
+        "crew_gap_held_wait": " #{sub} waits: {name} works on #{m}, which waits for #{sub}, so neither moves while "
+                              "{name} holds #{sub}: unassign #{sub} (task_update assignee='') and a free member is "
+                              "offered it.",
+        # after a todo direction with blockers in n_crew_gap's {directions}; {ids}: "#15, #20"
+        "crew_gap_blocked": " (blocked by {ids})",
         # a task became failed or cancelled while open tasks depend on it; {deps}: "#5, #7"
         "note_dependents_blocked": " {deps} depend on #{id}, which is {status} now: they stay blocked until that "
                                    "dependency is removed (task_update depends_on) or they are cancelled.",
@@ -749,6 +775,12 @@ TEXTS: dict[str, dict[str, str]] = {
                                    "достигает ли результат её цели? Прими её или верни с тем, что не сходится "
                                    "(task_review).",
         "n_marks_stalled": "{text}",
+        "n_crew_gap": "#{id} «{title}», твоя групповая задача: в ней есть свободное место (занято {working} из "
+                      "{crew}: {names}), но ни одно её направление сейчас нельзя взять, а эти участники простаивают и "
+                      "ни одну свою задачу сейчас вести не могут: {idle}.{directions}{held} Если в #{id} есть часть, "
+                      "которую не покрывает ни одно направление и которую можно делать уже сейчас, добавь её как "
+                      "направление (task_update directions). Если ничего из этого не подходит, оставь #{id} как есть: "
+                      "свободное место не обязательно занимать, и отвечать не нужно.",
         "crew_draft": "Черновик итога #{id}: её направления в порядке создания, с итогами выполненных:\n{items}",
         "crew_draft_cut": "(обрезано: больше покажет task_get #{id})",
         "crew_draft_more": "… ещё не показано направлений: {k}; task_get #{id} перечисляет их, а task_get направления "
@@ -843,6 +875,16 @@ TEXTS: dict[str, dict[str, str]] = {
                                     "направление групповой задачи #{id} за раз. Если после сдачи #{m} возьмёшься за "
                                     "другую работу, сначала сними себя с #{sub} (task_update assignee=''), чтобы это "
                                     "направление не ждало тебя.",
+        "crew_gap_held": " #{sub} пока ждёт: {name} ведёт #{m} и сможет взять #{sub} только после сдачи #{m}. Если "
+                         "#{sub} уже сейчас может сделать и другой участник, сними с #{sub} исполнителя (task_update "
+                         "assignee=''), и #{sub} предложат свободному участнику.",
+        "crew_gap_held_you": " Направление #{sub}, тоже назначенное тебе, пока ждёт: взять его ты сможешь только "
+                             "после сдачи #{m}. Если #{sub} уже сейчас может сделать другой участник, сними себя с "
+                             "#{sub} (task_update assignee=''), и #{sub} предложат свободному участнику.",
+        "crew_gap_held_wait": " #{sub} пока ждёт: {name} ведёт #{m}, а #{m} ждёт #{sub}, поэтому ни одно из них не "
+                              "сдвинется, пока #{sub} за {name}: сними с #{sub} исполнителя (task_update "
+                              "assignee=''), и #{sub} предложат свободному участнику.",
+        "crew_gap_blocked": " (ждёт {ids})",
         "note_dependents_blocked": " {deps} зависят от #{id}, которая теперь в статусе {status}: они останутся "
                                    "заблокированными, пока эту зависимость не уберут (task_update depends_on) или их "
                                    "не отменят.",
