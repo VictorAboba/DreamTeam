@@ -1,6 +1,6 @@
 """Tools for the swarm's skills (docs/SPEC.md §19). The user's (`skills`, `skill_attach`, `skill_detach`,
 `skill_approve`, `skill_reinstall`; audience `user`, part of no frozen LLM tool set) reach the web /api/act, the TUI, the console and the
-hub MCP. The members' `skill_propose` is an LLM tool of frozen revision 3 (tools/frozen.py)."""
+hub MCP. The members' `skill_propose` is an LLM tool (part of the frozen tool sets, tools/frozen.py)."""
 
 from __future__ import annotations
 
@@ -181,7 +181,7 @@ async def skill_detach(ctx: ToolContext, args: dict[str, Any]) -> str:
     return f"Skill \"{skill.name}\" detached; members are told."
 
 
-# The members' tool (frozen tool set revision 3, tools/frozen.py): its schema is part of every new agent's prefix.
+# The members' tool (part of the frozen LLM tool sets, tools/frozen.py): its schema is part of every AI agent's prefix.
 @tool(
     "skill_propose",
     en="Propose a skill you made: a folder with a SKILL.md, which starts with front matter between two '---' lines "

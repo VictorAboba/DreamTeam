@@ -65,7 +65,7 @@ src/dreamteam/
   tools/__init__.py  registry: ToolSpec, ToolContext, tool(), tools_for(), schemas_for(), call_tool()
   tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
   tools/skill_tools.py the skills tools: the user's `skills`, `skill_attach`, `skill_detach`, `skill_approve`,
-                 `skill_reinstall`, and the members' `skill_propose` (frozen revision 3; §19)
+                 `skill_reinstall`, and the members' `skill_propose` (§19)
   tools/frozen.py    frozen LLM tool sets: revisions (now 5), the kv record of each agent,
                      `python -m dreamteam.tools.frozen` (§6.1)
   tools/snapshots/   llm_r<N>.json: the shipped LLM tool sets, revision OLDEST_OPEN_REVISION..TOOLSET_REVISION
@@ -1887,24 +1887,18 @@ it:
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
   tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without a usable one
   (`frozen.valid`, below) gets `frozen.current_record(language)`, written at once: a session this version opens
-  has no agent with a history and no usable record (§17.2 "Sessions of an earlier version"), so the baseline
-  branch of `initial_record(language, has_history)` is gone (the function and its `has_history` argument are
-  removed; `member_tool_names` follows the same rule). View-only loads (no runtime) write nothing.
+  has no agent with a history and no usable record (§17.2 "Sessions of an earlier version"), so a missing record
+  means the agent never ran; `member_tool_names` follows the same rule. View-only loads (no runtime) write nothing.
 - `AgentRuntime`: `tools_rev`, `tools` (the record's list, passed unchanged to `llm.complete`), `tool_names`
   (frozenset), `tool_parameters(name) -> dict | None` (None: the agent lacks that tool).
 - **Upgrade at compaction only**: `_replace_with_summary` moves an agent whose `tools_rev != TOOLSET_REVISION` to
   `frozen.current_record(language)` (`!=`: after a code downgrade it realigns too); the record is written in the same
   `db.transaction()` as the history rewrite (`_replace_history(messages, tools=)`), and the new history holds no
-  assistant turn bound to the old array. The compaction request itself still sends the old array. When tools were
-  added, the summary message gets `tools_added` {tools: "`jobs`, `job_stop`"} before `continue` (revision 3 → 4 adds
-  no tool, only the `pause_swarm` property, so no such line). `agent.compacted` data and the compaction span meta
+  assistant turn bound to the old array. The compaction request itself still sends the old array. Downgrading the
+  code below a session's newest revision is unsupported. When the upgrade adds tools, the summary message gets
+  `tools_added` {tools: the added names, each in backticks, joined by ", "} before `continue`; an upgrade that adds
+  no tool (only properties or descriptions) gets no such line. `agent.compacted` data and the compaction span meta
   carry `tools_revision`.
-- Existing agents keep revision 1 until their next compaction: they get timer backgrounding, the adoption of
-  processes a command leaves running, the console intercept, the job notices and the wake line at once (§7.1), and
-  texts that point at a tool are tailored with `ToolContext.has_tool` (§12). Downgrading the code below a session's
-  newest revision is unsupported. This bullet and the other passages on agents of revisions 1-4 (§3.1 `pause_swarm`
-  dropped by `call_tool`, the console intercept of §7.1, §12) describe branches no session this version opens
-  reaches ("Oldest revision opened"): the code and its tests stay until a separate cleanup removes them.
 - **Oldest revision opened**: `OLDEST_OPEN_REVISION = 5`, a fixed constant (the revision of crew tasks, 0.2.0; never
   derived from `TOOLSET_REVISION`, so a later revision still opens sessions of revision 5). A session with a member
   recorded below it, or with an agent that has a history and no record (it ran before tool sets were frozen), was
@@ -1917,7 +1911,7 @@ it:
 - `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions()`, `snapshot(rev, language)` (a fresh copy; unknown
   language → en), `current(language)`, `record(rev, language, tools)`, `current_record(language)`,
   `valid(rec) -> bool` (a dict with an integer, non-bool `rev` and `tools` a list of dicts with a str `name` and a
-  dict `parameters`; today's `_valid`, made public so that `read` and `db.made_by_earlier_version` share it),
+  dict `parameters`; shared by `read` and `db.made_by_earlier_version`),
   `read(db, name) -> dict | None` (a record that is not `valid` is logged and ignored),
   `write(db, name, rec)`, `names(tools)`, `for_span(db, name, language, revision)` (§16), `member_tool_names(swarm,
   member) -> frozenset` (a runtime's names, else the record or the set its first start will freeze, nothing
@@ -2835,8 +2829,8 @@ commit), then notifies the owner when it is still a member:
 Only the owner or the user can stop a job. `{duration}` (`fmt_duration`: "45 s", "12 min", "2 h 05 min"; ru "45 с",
 "12 мин", "2 ч 05 мин") and `{result}` are built in the owner's language; `{tail}` = the last 15 lines, at most 1200
 characters, each indented by two spaces, or `job_no_output`; `{command}` = `short_command(command, 120)`; `{log}` =
-the log as shown above. These texts reach agents of every tool revision, so they name no tool, only the log. A
-paused swarm holds them until `resume` like any notice; an external member gets them through `wait_for_events`.
+the log as shown above. These texts name no tool, only the log. A paused swarm holds them until `resume` like any
+notice; an external member gets them through `wait_for_events`.
 
 **Stop** — `async stop(job_id, by, *, force=False) -> str`, synchronous (a restart on the same port does not race):
 only the owner or USER (else ToolError `Job j3 belongs to Anna Smith; only its owner or the user can stop it (ask them
@@ -3487,7 +3481,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `skill_detach` | name | U (§19) |
 | `skill_approve` | name, approve, comment?, replace? (a member's proposal: saved to the skills library or not) | U (§19) |
 | `skill_reinstall` | name, ecosystem? (`python` or `node`; default both: the skill's packages installed again) | U (§19) |
-| `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (revision 3, §19) |
+| `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (§19) |
 
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
@@ -4669,32 +4663,23 @@ settings; ValueError when they are invalid):
   neither `dreamteam export` nor `dreamteam import`, and 0.1.1 (tool set revision 4 like 0.1.0) opens the sessions of both; the export takes
   only the sessions (`--include sessions`) and goes into a separate home of 0.1.1, for example through
   `uvx --from "git+…@v0.1.1" dreamteam import FOLDER --home NEW_HOME` (a new, empty folder, never the home this version uses). The legacy `main` is never said to be
-  exported: finish it before updating, or remove its database by hand afterwards. Since sessions stop opening, the
-  release that brings crew tasks is 0.2.0, not a patch: the version in pyproject.toml, src/dreamteam/__init__.py and
-  uv.lock.
+  exported: finish it before updating, or remove its database by hand afterwards.
   Tests: a session with a revision-4 record, one with a history and no record, and one with a history and a record
   that is not `frozen.valid` are each listed with `earlier_version`, refused with the message and writing nothing
   through `load`, `start`, `stop`, `resume()`, PATCH, `set_workspace`, the skills routes, `/mcp`, `-c`, `-r`,
   `traces` and
   a single-swarm project's `run` / `status` (no `logs` folder either); each can be deleted (`main`: the 409 and its
   own message) and exported, and `dreamteam import` refuses it before writing anything. A session with no database
-  file, and one whose database holds neither history nor records, open as usual. Tests that change: the fixtures
-  that write a `history` row with no record, tests/test_transfer.py (`_fill_db` and the WAL test's 'bob') and
-  tests/test_cli_transfer.py (`_exported`), and tests/test_runtime.py
-  `test_restart_continues_an_activation_cut_short_without_tasks`, also write `frozen.write(db, name,
-  frozen.current_record("en"))`; tests/test_frozen_tools.py `test_view_only_access_writes_no_tool_record` asserts
-  that the reopen and `dreamteam status` are refused (`EarlierVersionError`, exit 1), and
-  `test_agent_created_before_frozen_tool_sets_keeps_the_baseline` is removed (its rule is gone, §6.1 "Record"). The
-  tests that write a revision 1-4 record into an opened swarm and build its runtime (in tests/test_frozen_tools.py,
-  tests/test_job_tools.py `freeze_revision_1`, tests/test_swarm_skills.py
-  `test_write_tools_name_skill_propose_only_to_who_has_it`) keep working: `AgentRuntime` does not check the
-  revision (§6.1 "Oldest revision opened"). Those that got revision 1 from a history with no record
-  (`seed_history` before the runtime, in tests/test_frozen_tools.py:
-  `test_agents_of_revision_1_keep_it_when_later_revisions_are_released`, `_upgrade_run`,
-  `test_the_upgrade_is_atomic_with_the_history_rewrite`, `test_has_tool_and_member_tool_names`) write the
-  revision-1 record explicitly (`frozen.write(db, name, frozen.record(1, "en", frozen.snapshot(1, "en")))`), and
-  their asserts that such an agent, or `member_tool_names`
-  of an unstarted member with a history, gets the baseline now expect the current revision.
+  file, and one whose database holds neither history nor records, open as usual. The fixtures that write a
+  `history` row, tests/test_transfer.py (`_fill_db` and the WAL test's 'bob') and tests/test_cli_transfer.py
+  (`_exported`), and tests/test_runtime.py `test_restart_continues_an_activation_cut_short_without_tasks`, also
+  write the agent's record (`frozen.write(db, name, frozen.current_record("en"))`), so their sessions open.
+  tests/test_frozen_tools.py `test_view_only_access_writes_no_tool_record` asserts that the reopen and
+  `dreamteam status` are refused (`EarlierVersionError`, exit 1). The tests of an agent on an older revision than
+  the code's write a record of `OLDEST_OPEN_REVISION` into an opened swarm while the code builds a simulated later
+  revision (the `later_revision` fixture of tests/test_frozen_tools.py, or the same monkeypatch of
+  `frozen.TOOLSET_REVISION` and `frozen.current`); `AgentRuntime` does not check the revision (§6.1 "Oldest
+  revision opened").
 - `delete(sid)` renames the directory to `sessions/.deleted-<sid>-<ns>` first (a session whose files are open
   stays intact: 409), then removes it in a thread; leftovers are purged at the next delete. A workspace folder
   outside the session directory is never deleted (it is the user's folder): `delete` returns it (read under the
@@ -6418,9 +6403,9 @@ host library's and Claude Code's skills not attached), `skill_attach` (name or s
 packages (requirements.txt) are being installed; members are told when they are ready." or " Its packages are
 installed already."), `skill_detach`, `skill_reinstall` (§12).
 
-**Proposals** (`skill_propose(path)`, audience llm and external: an LLM tool of frozen revision 3, so new members
-and external members have it at once and older agents after their next compaction, whose `tools_added` names it;
-the system prompt's Skills bullet ends with the proposing sentence, which agents hired before revision 3 never got).
+**Proposals** (`skill_propose(path)`, audience llm and external, so every AI agent and external member has it; the
+system prompt's Skills bullet ends with the proposing sentence (a member hired by a build from before `skill_propose`
+and never started keeps the system prompt it was hired with, which lacks that sentence, §6.1)).
 `SessionSkills.propose(actor, path)`: not the user ("Members propose skills; the user attaches them with
 skill_attach."); `[skills] max_proposals = 0` → "Proposing skills is turned off in this swarm's settings."; the path
 goes through `Workspace.resolve` (inside the workspace, never `.git`), a `SKILL.md` file means its folder, and a
