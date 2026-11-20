@@ -39,7 +39,6 @@ TOOLSET_REVISION = 5
 # a session with a member recorded below it (or an agent with a history and no record) was made by an earlier
 # version and is not opened (docs/SPEC.md §17.2); a fixed literal, never derived from TOOLSET_REVISION
 OLDEST_OPEN_REVISION = 5
-BASELINE_REVISION = 1  # the array agents created before tool sets were frozen last sent (sorted digest e3c5cbc7…)
 KV_PREFIX = "tools:"
 LANGUAGES = ("en", "ru")
 SNAPSHOT_DIR = Path(__file__).resolve().with_name("snapshots")
@@ -126,10 +125,8 @@ def names(tools: list[dict]) -> list[str]:
 
 
 def for_span(db: Any, name: str, language: str | None, revision: Any) -> list[dict]:
-    """The tools an LLM call of agent `name` sent, for traces. A span without a revision was recorded before
-    tool sets were frozen: the agent then sent the baseline."""
-    if revision is None:
-        return snapshot(BASELINE_REVISION, language)
+    """The tools an LLM call of agent `name` sent, for traces: the agent's record when its revision matches, else
+    that revision's shipped snapshot, else the record's tools (the current set when it has none)."""
     rec = read(db, name)
     if rec is not None and rec["rev"] == revision:
         return rec["tools"]

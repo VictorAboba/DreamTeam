@@ -1880,8 +1880,7 @@ to, so every LLM agent sends exactly the array it was given, and the array chang
 it:
 - Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
   [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what
-  `schemas_for("llm", language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were
-  frozen (sorted digest `e3c5cbc7…`).
+  `schemas_for("llm", language)` builds.
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
   tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without a usable one
   (`frozen.valid`, below) gets `frozen.current_record(language)`, written at once: a session this version opens
@@ -1905,12 +1904,12 @@ it:
   reaches ("Oldest revision opened"): the code and its tests stay until a separate cleanup removes them.
 - **Oldest revision opened**: `OLDEST_OPEN_REVISION = 5`, a fixed constant (the revision of crew tasks, 0.2.0; never
   derived from `TOOLSET_REVISION`, so a later revision still opens sessions of revision 5). A session with a member
-  recorded below it, or with an agent that has a history and no record (the baseline revision), was made by an
-  earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version opens builds
-  a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and the upgrade at
-  compaction moves only revisions 5 and later. The snapshots `llm_r1..r4.json` stay (tests/test_frozen_tools.py
-  checks that every released revision stays served, §12 R0′, and `frozen.for_span` reads them for old trace spans;
-  `--check` compares only the current revision's file).
+  recorded below it, or with an agent that has a history and no record (it ran before tool sets were frozen), was
+  made by an earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version
+  opens builds a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and
+  the upgrade at compaction moves only revisions 5 and later. The snapshots `llm_r1..r4.json` stay
+  (tests/test_frozen_tools.py checks that every released revision stays served, §12 R0′, and `frozen.for_span`
+  reads them for old trace spans; `--check` compares only the current revision's file).
 - `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions()`, `snapshot(rev, language)` (a fresh copy; unknown
   language → en), `current(language)`, `record(rev, language, tools)`, `current_record(language)`,
   `valid(rec) -> bool` (a dict with an integer, non-bool `rev` and `tools` a list of dicts with a str `name` and a
@@ -4017,7 +4016,7 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
 | kind | name | input | output | notes |
 |---|---|---|---|---|
 | input | `wake` / `incoming` / `nudge` / `continue` | – | text added to the context | `record()` |
-| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1; absent in spans recorded before tool sets were frozen) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` (+ `max_tokens` when the request's output limit was raised, §6.2) + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
+| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` (+ `max_tokens` when the request's output limit was raised, §6.2) + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
 | tool | tool name | arguments (dict) | full result text (before truncation for the model) | meta `{call_id, chars, shown_chars?}`; status `error` if is_error; task ids in `task_id` / `parent_id` / `depends_on` are added to the trace's `tasks` |
 | compaction | `compaction` | `{"messages","prompt_tokens"}` | summary text | parent of its llm span; meta `{epoch_archived, fallback?, tools_revision}` (the tool set from then on, §6.1); status `error` when the summary call failed |
 | event | `reply_to_user` / `refusal` / `budget_pause` / `step_limit` / `stopped` / `crash` | – | text | `refusal` and `crash` have status `error` |
@@ -4044,8 +4043,8 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
   them). `Tracer.span_context(span_id)` then rebuilds `{span_id, agent, epoch, model, system, tools, messages,
   complete, note}` for any LLM span, reading the live epoch from the table (a second reader such as the CLI
   gets it right too); its `tools` (unless given) are the tools that call sent: `frozen.for_span(db, agent, language,
-  input.tools_rev)` = the agent's record when its revision matches, else that revision's shipped snapshot, and the
-  baseline revision for a span without `tools_rev`. `export()` passes `tools=[]`.
+  input.tools_rev)` = the agent's record when its revision matches, else that revision's shipped snapshot, else the
+  record's tools (the current set when the agent has no record). `export()` passes `tools=[]`.
 - External members: `tracer.external_call(agent, tool, args_without_as_agent, result_text, is_error, started_at)`
   for every hub tool call by an external member except `wait_for_events`. A session trace closes (`done`) at
   its last call after `EXTERNAL_IDLE_SECONDS` (15 min) without calls (scheduler: `close_external(idle_seconds)`),
@@ -4609,8 +4608,8 @@ settings; ValueError when they are invalid):
   (beside `db.max_tools_revision`, read-only through `_reading`, never creating the file) is true when the
   session database has a kv `tools:<name>` record whose `rev` is an integer below `frozen.OLDEST_OPEN_REVISION`
   (5, §6.1; retired members count; valid or not), or `history` rows of an agent with no usable record (missing, not
-  JSON, or not `frozen.valid`, §6.1, the same test `frozen.read` makes: an agent of the baseline revision). False
-  without a database file (a session
+  JSON, or not `frozen.valid`, §6.1, the same test `frozen.read` makes: an agent that ran before tool sets were
+  frozen). False without a database file (a session
   never started) and for a database with neither (no LLM member ever ran: only the user, external members, or
   members hired and never started): nothing in it is frozen, it is opened as usual, and its LLM members get the
   current revision at their first start. The check is the first step of `Swarm.__init__` once its `config` is

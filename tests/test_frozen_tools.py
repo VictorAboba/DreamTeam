@@ -45,8 +45,6 @@ RELEASED = {
     5: {"en": "06d7f3ebc6d94f9e450256633804a57619bae3859d9e4aa9c21a50b7da9d2187",
         "ru": "d0a9bbe1dc690b54ac30474843e8b53ec8c321997ef11afecfbbbfaf194656fa"},
 }
-# the digest tests/test_tools.py pinned for the tool set agents had before tool sets were frozen
-BASELINE_SORTED = "e3c5cbc798e3aafddcd44284bb515d9655e68b953e6ca707f67063dcad7cda85"
 LANGS = ("en", "ru")
 LATER = 99  # the simulated later revision
 
@@ -167,21 +165,14 @@ def fast_scheduler(monkeypatch):
 
 
 # ------------------------------------------------------------------------------ released revisions
-def test_baseline_snapshot_is_the_tool_set_agents_had():
-    en, ru = frozen.snapshot(1, "en"), frozen.snapshot(1, "ru")
-    assert sha(json.dumps([en, ru], ensure_ascii=False, sort_keys=True)) == BASELINE_SORTED
-    assert sha(dumps(en)) == RELEASED[1]["en"] and sha(dumps(ru)) == RELEASED[1]["ru"]
-    assert len(en) == len(ru) == 30 and frozen.names(en) == frozen.names(ru)
-    assert frozen.BASELINE_REVISION == 1
-    # a language without texts gets the English array, like schemas_for
-    assert frozen.snapshot(1, "de") == en and frozen.snapshot(1, None) == en
-
-
 def test_released_tool_sets_never_change():
     assert frozen.revisions() == list(range(1, frozen.TOOLSET_REVISION + 1)) == sorted(RELEASED)
     for rev, digests in RELEASED.items():
         for lang in LANGS:
             assert sha(dumps(frozen.snapshot(rev, lang))) == digests[lang], (rev, lang)
+    # a language without texts gets the English array, like schemas_for
+    old = frozen.OLDEST_OPEN_REVISION
+    assert frozen.snapshot(old, "de") == frozen.snapshot(old, None) == frozen.snapshot(old, "en")
 
 
 def test_the_oldest_revision_opened_is_a_fixed_5(later_revision):
@@ -642,11 +633,6 @@ async def test_traces_show_the_tools_each_call_used(tmp_path, later_revision):
         after = swarm.tracer.span_context(spans[1]["id"])
         assert dumps(before["tools"]) == dumps(rec.calls[agent][0][1]) == dumps(frozen.snapshot(1, "en"))
         assert dumps(after["tools"]) == dumps(rec.calls[agent][1][1])
-        # a span recorded before tool sets were frozen has no revision: the agent then sent the baseline
-        trace = swarm.tracer.begin(agent, "old")
-        old = trace.llm_start(0)
-        assert "tools_rev" not in swarm.tracer.get_span(old.id)["input"]
-        assert dumps(swarm.tracer.span_context(old.id)["tools"]) == dumps(frozen.snapshot(1, "en"))
         # a revision the record no longer holds comes from the shipped snapshot
         frozen.write(swarm.db, agent, frozen.record(LATER + 1, "en", []))
         assert dumps(swarm.tracer.span_context(spans[0]["id"])["tools"]) == dumps(frozen.snapshot(1, "en"))
@@ -678,9 +664,9 @@ async def test_provider_requests_are_byte_identical_across_restarts(tmp_path):
 
 
 async def test_view_only_access_writes_no_tool_record(tmp_path, capsys):
-    """A member with a history and no tool-set record ran under an earlier version (the baseline revision): the
-    project is not opened again, neither to view it nor by `dreamteam status`, and nothing is written into its data
-    folder (no logs folder, no -wal or -shm next to the database)."""
+    """A member with a history and no tool-set record ran under an earlier version (it ran before tool sets were
+    frozen): the project is not opened again, neither to view it nor by `dreamteam status`, and nothing is written
+    into its data folder (no logs folder, no -wal or -shm next to the database)."""
     project = tmp_path / "swarm"
     assert cli.main(["init", str(project), "--lang", "en", "--name", "View only"]) == 0
     text = (project / "dreamteam.toml").read_text(encoding="utf-8")

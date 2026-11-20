@@ -264,7 +264,7 @@ def test_made_by_earlier_version_by_a_history_without_a_usable_record(tmp_path):
         _history(database, "Anna")
         assert made_by_earlier_version(database) is False  # a history with a valid record of this version
         _history(database, "Bob")
-        assert made_by_earlier_version(database) is True  # no record: the baseline revision
+        assert made_by_earlier_version(database) is True  # no record: it ran before tool sets were frozen
         for broken in ({"rev": 5, "tools": "all"}, {"rev": 5, "tools": [{"name": "wait"}]}, {"rev": True, "tools": []},
                        {"rev": "5", "tools": []}, ["rev", 5], "text"):
             database.set(frozen.kv_key("Bob"), broken)
