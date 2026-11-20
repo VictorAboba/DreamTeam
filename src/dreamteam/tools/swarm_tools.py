@@ -301,9 +301,8 @@ async def goal_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
         text += f" Note: {len(still_open)} task(s) are still open ({ids}); finish or cancel them."
     running = swarm.jobs.running_of()
     if running:  # they go on (a dev server may be for the user): the caller may stop the ones nobody needs
-        how = "job_stop" if ctx.has_tool("job_stop") else "the shell command kill jN (as a command of its own)"
         text += (f" Note: background jobs are still running: {_job_list(running)}. Stop the ones nobody needs with "
-                 f"{how}; the rest stop with the session.")
+                 "job_stop; the rest stop with the session.")
     return text
 
 

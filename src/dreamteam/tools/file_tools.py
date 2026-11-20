@@ -134,8 +134,8 @@ async def shell(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
     cfg = swarm.config.shell
     command = args["command"]
-    # `jobs`, `jobs j3` or `kill j3` as the whole command line is answered by the hub (how agents whose tool set
-    # has no `jobs` tool list and stop their jobs): nothing is spawned and nothing is committed
+    # `jobs`, `jobs j3` or `kill j3` as the whole command line is answered by the hub (as typed from shell habit):
+    # nothing is spawned and nothing is committed
     answer = await swarm.jobs.console(ctx.actor, command, max_chars=ctx.output_cap)
     if answer is not None:
         return answer
@@ -159,9 +159,8 @@ async def shell(ctx: ToolContext, args: dict[str, Any]) -> str:
         # command that goes on as a job has not ended yet
         await swarm.workspace.autocommit(ctx.actor, kind="shell", detail=command, skipped=skipped, hold=True,
                                          ended=outcome.serial if outcome.job is None else None)
-    # the footer of a job points at the tools the caller has (`jobs`, `job_stop` or the console commands; `wait`,
-    # or `wait_for_events` for an external member)
-    text = outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=cfg, has_wait=ctx.has_tool("wait"))
+    # the footer of a job names `wait`, or `wait_for_events` for an external member (no `wait`)
+    text = outcome.render(cfg=cfg, has_wait=ctx.has_tool("wait"))
     # nested repositories the commit left out (a generated project with its own `git init`): named once each
     note = swarm.workspace.nested_repos_note(ctx.actor, skipped)
     return f"{text}\n{note}" if note else text

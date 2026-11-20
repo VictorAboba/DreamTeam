@@ -2658,7 +2658,7 @@ outlive its call:
 4. Unless the outcome is `killed` (the session stops or the member leaves: no git work may start then):
    `workspace.autocommit(actor, kind="shell", detail=command, hold=True)`, one commit per call; new files wait
    one more command ("Held new files" above), and the result says nothing about them.
-5. The result is `outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=[shell], has_wait=ctx.has_tool("wait"))`.
+5. The result is `outcome.render(cfg=[shell], has_wait=ctx.has_tool("wait"))`.
 
 An agent's command dies when the agent's task is cancelled (a stopped or retired agent) before the command became a
 job: its command must not go on writing into the workspace after the swarm stopped.
@@ -2696,7 +2696,7 @@ class Job:   # id, owner, command, origin, cmd: RunningCommand, log, log_path, s
              # stopped_by, ended_at, tail; label "j<id>", log_shown, notice_tail(), public(now=None) -> dict
 @dataclass
 class ShellOutcome:  # state, code, output, shell, wait, job=None, note="", names=[], note_args={}, max_output=12000
-    def render(self, *, has_jobs_tool: bool, cfg: ShellSettings, has_wait: bool = True) -> str
+    def render(self, *, cfg: ShellSettings, has_wait: bool = True) -> str
 def parse_job_id(text) -> int | None                     # "j3" "J3" "%3" "#3" "3" -> 3
 def parse_console(command) -> tuple[str, list[int], bool] | None   # ("list"|"show"|"kill", ids, force)
 def short_command(cmd, limit) -> str                     # one line, cut in the middle with "…"
@@ -2709,8 +2709,8 @@ def shown_log(log) -> str                                # a data_dir log with "
 | origin | how a command becomes one | stopped at (from its start) | keeps its owner busy | its end wakes the owner |
 |---|---|---|---|---|
 | `timeout` | its shell still runs when the call's wait ended | `[shell] max_timeout` | always | unless the goal is done |
-| `background` | `background=true` (revision-2 agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
-| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow`, `start /b`; with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
+| `background` | `background=true` (AI agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
+| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`; with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
 
 `wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
 
@@ -2755,15 +2755,14 @@ def shown_log(log) -> str                                # a data_dir log with "
   | `killed` | the session stopped or the member left while the command ran in the foreground | `KILLED: the session is stopping [shell]` / `KILLED: you are leaving the swarm [shell]` |
 
   Then the output (`(no output)`, or `(no output yet)` for a job), and for `leftovers_killed` / `timeout` a
-  `[note]`, for a job a footer. The footer of `background`, `started` and `detached` says where the output goes,
-  that the owner is notified at the end (so: no polling, other work or `wait`; `wait_for_events` for an external
-  member, which has no `wait`: `has_wait`), how to see and stop the job and its lifetime. For a caller with the
-  `jobs` tool (`ToolContext.has_tool`) it names `jobs` with job_id and `job_stop` (and for `background`: "start
-  servers and long runs with background=true instead"); for a revision-1 agent it names the console commands ("run
-  the shell command jobs jN / kill jN (each as a command of its own)") and `&` / `Start-Process -NoNewWindow` (a
-  plain `Start-Process` opens a console window of its own on the user's desktop and its output never reaches the
-  job), never a tool it lacks. `render()` never cuts the first line or the footer: only the output between them is
-  cut to `max_output`.
+  `[note]`, for a job a footer. The footer of `background`, `started` and `detached` says:
+  - where the output goes;
+  - that the owner is notified at the end (so: no polling, other work or `wait`; `wait_for_events` for an external
+    member, which has no `wait`: `has_wait`);
+  - how to see and stop the job (`jobs` with job_id, `job_stop`);
+  - its lifetime (for `background`: "start servers and long runs with background=true instead").
+
+  `render()` never cuts the first line or the footer: only the output between them is cut to `max_output`.
 - A caller cancelled before its command became a job: the tree is killed and awaited (KILL_WAIT), the cancellation
   goes on; any other failure kills it too. After the adoption the caller's cancellation never touches the job.
 
@@ -2879,10 +2878,11 @@ the `listing` line (`…, started in the background, no output for 40 min; log �
 `/jobs`. The monitor publishes a live-only `job.silent` {job} each time a job turns silent or prints again, so the UI
 reloads the state; no notice, no automatic stop: its owner (or the user) decides.
 
-**Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: how revision-1 agents
-list and stop jobs with the `shell` tool they have. The command is stripped and one trailing `;` dropped; the WHOLE
-line must match (case-sensitive), else None and the command goes to the real shell (`kill j3; npm start`, `jobs |
-wc -l`, `echo kill j3` all do):
+**Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: a whole `shell` command
+line `jobs`, `jobs j3` or `kill j3`, as a model types it from shell habit (a fresh shell has no job table), is
+answered from the job manager for every caller of `shell`; no text advertises it. The command is stripped and one
+trailing `;` dropped; the WHOLE line must match (case-sensitive), else None and the command goes to the real shell
+(`kill j3; npm start`, `jobs | wc -l`, `echo kill j3` all do):
 
 | command line | answer |
 |---|---|
@@ -3659,8 +3659,7 @@ Results of the team, wait and job flows:
   `Workspace.awaited_locks`: none once the goal is done, when n_lock_free is quiet; §7 "Lock waiters"); both:
   `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.`
 - `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
-  min). Stop the ones nobody needs with job_stop; the rest stop with the session.` (a caller without `job_stop`: `with
-  the shell command kill jN (as a command of its own)`).
+  min). Stop the ones nobody needs with job_stop; the rest stop with the session.`
 - `shell`, `jobs`, `job_stop`: §7.1.
 - `wait_for_events(progress=true)` also returns when others make board progress: `task.created`, `task.updated` with
   a status change, `goal.set`, `goal.completed`, `goal.reopened`, `agent.hired` (an external member: "joined"),
