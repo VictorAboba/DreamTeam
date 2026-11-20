@@ -1026,17 +1026,20 @@ async def test_an_mcp_client_cannot_save_the_proposal_of_the_member_it_acts_as(t
     assert team.bus.recent(types=("skill.library",), limit=1)[-1]["data"]["via"] == "mcp"
 
 
-async def test_write_tools_name_skill_propose_only_to_who_has_it(team, tmp_path):
-    from dreamteam.tools import frozen
+async def test_the_mirror_refusal_names_skill_propose_to_every_caller(team, tmp_path):
+    from dreamteam.tools import REGISTRY, frozen
 
     add_to_library(team, tmp_path, "demo")
     await team.skills.attach(USER, "demo")
-    new, old = [m["name"] for m in team.members()]
-    frozen.write(team.db, old, frozen.record(1, "en", frozen.snapshot(1, "en")))
-    for name, proposes in ((new, True), (old, False)):
-        ctx = ToolContext(team, name, AgentRuntime(team, name))
+    agent = first(team)
+    text, is_error = await call_tool(ToolContext(team, USER), "join_swarm", {"role": "Reviewer", "name": "Claude Code"})
+    assert not is_error, text
+    for name in ("write_file", "edit_file"):   # whoever can write has skill_propose
+        assert REGISTRY[name].audience <= REGISTRY["skill_propose"].audience
+    for ctx in (ToolContext(team, agent, AgentRuntime(team, agent)), ToolContext(team, "Claude Code")):
+        assert "skill_propose" in frozen.member_tool_names(team, team.member(ctx.actor))
         text, is_error = await call_tool(ctx, "write_file", {"path": f"{SKILLS_MIRROR}/demo/x.md", "content": "x"})
-        assert is_error and ("then call skill_propose." in text) is proposes, text
+        assert is_error and text.endswith("edit it there, then call skill_propose."), text
 
 
 async def test_the_library_gets_only_the_content_that_was_proposed(team, tmp_path):

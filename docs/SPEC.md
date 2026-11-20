@@ -2067,8 +2067,7 @@ class Workspace:
         # both refuse a path under SKILLS_MIRROR (`.scratch/_skills`, a lexical check on the resolved relative path,
         # case-folded on Windows): ToolError "'.scratch/_skills/' holds the swarm's skills and is rebuilt by
         # DreamTeam. To change a skill, copy its folder (without node_modules) into your scratch folder and edit it
-        # there, then call skill_propose." (§19); the last clause only for a caller whose tool set has skill_propose
-        # (frozen.member_tool_names: an agent of revision 1 or 2 gets "... edit it there.")
+        # there, then call skill_propose." (§19)
         # a read-only file elsewhere (a copy of a mirror folder keeps its read-only files) is made writable first
         # (owner write bit), unless it has other hard links; the write is the member's explicit edit
         # old must occur exactly once unless replace_all; ToolError with hints otherwise
