@@ -571,14 +571,13 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
   past the tags is `autoreply.planner_question(scalar, name, task_id, since)` (the id of the question the planner
   waits on, else None), which the requests to the user read from a session's file too (§21.5), so the guard, the
   banner and the requests cannot drift apart.
-- **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm` (toolset revision 4,
-  §6.1). The message is always stored first; then `ask_user(asker, message)` pauses only after these checks, in this
+- **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm`. The message is always
+  stored first; then `ask_user(asker, message)` pauses only after these checks, in this
   order, each giving its outcome and result note (§12): `user` (the sender is the user), `no_user` ("user" is not a
   recipient), `off` (`[swarm] clarify` is off), `auto` (the auto-reply lease), `own` / `pending` (a question is
   pending already: one at a time), `paused` (paused for another reason, which stays), `budget` (spent), else
   `asked`: `pause(asker, "question", asker=, message_id=, since=)`. Every outcome but `asked` leaves an ordinary
-  message. AI agents of revision 4 and later and external MCP members can pause; for an agent of revision 1-3
-  `call_tool` drops the argument (§12) until its next compaction. There is no cap per member.
+  message. AI agents and external MCP members can pause. There is no cap per member.
   - State: the question lives only in kv `paused` (`{"paused": true, "reason": "question", "asker", "message_id",
     "since"}`); `pending_question()` reads it. Every exit rewrites that one slot, so a stale question never captures
     a later message. `swarm.paused` {reason: "question", asker, message_id, since}, actor the asker; USER gets the
@@ -3427,7 +3426,7 @@ async def call_tool(ctx: ToolContext, name: str, args: dict) -> tuple[str, bool]
     # rejects actors that are neither USER nor an active member; an LLM agent (a runtime with
     # tool_parameters) calls only the tools of its frozen set, with their frozen parameters: a tool it lacks is
     # "Unknown tool" with close matches and the list from its own set only (never a newer tool), and arguments
-    # its schema lacks are dropped with the note "[Ignored unknown argument(s): ...; Usage: <its frozen
+    # its schema lacks are dropped with the note "[Ignored unknown argument(s): .... Usage: <its frozen
     # signature>]"; validation still uses the registry spec (hence R0′ below); unknown tool -> close matches + the
     # available tools; audience errors say how to fix the call (join_swarm/as_agent); checks required args
     # (whitespace-only = missing unless allow_empty) and types with coercion ("5"/"#5" -> 5, JSON strings for
@@ -3449,7 +3448,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `task_review` | task_id, approve, comment? | LEU |
 | `task_comment` | task_id, text, reply_to? | LEU |
 | `task_discussion` | task_id, since_id? | LEU |
-| `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean, revision 4 and later: a question to "user" that may pause the swarm, §3.1) | LEU |
+| `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean: a question to "user" that may pause the swarm, §3.1) | LEU |
 | `read_messages` | with?, limit?, include_read? | LEU |
 | `agents` | — (the roster, then the role catalog) | LEU |
 | `hire_agent` | role, instructions ("" for a catalog role), model?, name? | LEU |
@@ -3491,7 +3490,7 @@ Tool results are plain text (compact, line-oriented), language = English for dat
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
 `ctx.runtime.note_sent_to_user()` when USER is a recipient.
 
-`send_message` and `pause_swarm` (§3.1). The description (en and ru, revision 4) keeps "wakes its recipients" and
+`send_message` and `pause_swarm` (§3.1). The description (en and ru) keeps "wakes its recipients" and
 adds that `pause_swarm=true` is only for a question to ["user"] whose answer decides how the team goes on, so that
 work under way would otherwise be redone: the session *may* then pause the whole swarm until the user answers, and
 every member gets the question with the answer; never for what the agent can decide itself, a question about its
@@ -3514,8 +3513,6 @@ usage line is `send_message(to, text, reply_to?, pause_swarm?)`. The result star
 - The user's message that answers a question: ` This answers {asker}'s question #{id}: every member got the question
   and your answer, and the swarm goes on.` (A-ok), or with the budget spent `…, but the budget is exhausted, so the
   swarm stays paused until you raise max_cost_usd.` (A-budget).
-- An agent of revision 1-3 passing `pause_swarm` gets the argument dropped by `call_tool`: `[Ignored unknown
-  argument(s): pause_swarm. Usage: send_message(to, text, reply_to?)]`, and nothing pauses.
 
 **R0′: LLM tool schemas are released as revisions.** Every LLM agent sends its own frozen tools array (§6.1), and
 Anthropic thinking blocks bind to the exact prefix, so a changed name, description, parameter, `required` list, enum
