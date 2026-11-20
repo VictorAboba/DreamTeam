@@ -163,18 +163,19 @@ def test_context_tools_are_the_frozen_tool_set_the_call_sent(store):
     trace = tracer.begin(agent, "wake")
     # no revision (the runtime always passes one): the record's tools, else the current set
     before = trace.llm_start(0)
-    first = trace.llm_start(0, tools_rev=1)
+    old = frozen.OLDEST_OPEN_REVISION
+    first = trace.llm_start(0, tools_rev=old)
     assert "tools_rev" not in tracer.get_span(before.id)["input"]
-    assert tracer.get_span(first.id)["input"]["tools_rev"] == 1
+    assert tracer.get_span(first.id)["input"]["tools_rev"] == old
     assert tracer.span_context(before.id)["tools"] == frozen.current("en")
-    assert tracer.span_context(first.id)["tools"] == frozen.snapshot(1, "en")
+    assert tracer.span_context(first.id)["tools"] == frozen.snapshot(old, "en")
     # a revision only the agent's record holds (e.g. one this code no longer ships) comes from the record
     own = [{"name": "board", "description": "Old.", "parameters": {"type": "object", "properties": {}}}]
     frozen.write(db, agent, frozen.record(7, "en", own))
     upgraded = trace.llm_start(0, tools_rev=7)
     assert tracer.span_context(before.id)["tools"] == own
     assert tracer.span_context(upgraded.id)["tools"] == own
-    assert tracer.span_context(first.id)["tools"] == frozen.snapshot(1, "en")
+    assert tracer.span_context(first.id)["tools"] == frozen.snapshot(old, "en")
     assert tracer.span_context(upgraded.id, tools=[])["tools"] == []  # export passes its own
 
 

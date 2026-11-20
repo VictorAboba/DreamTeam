@@ -7,14 +7,15 @@ and its thinking. So every agent keeps the array it was given at its first runti
 inside a compaction (agent.py `_replace_with_summary`), when its history no longer holds an assistant turn bound
 to the old one.
 
-Every released array is a numbered revision shipped in `snapshots/llm_r<N>.json` and never edited. A change to
-an LLM tool schema (a name, description, parameter, `required`, an enum or the order) is released as a new
-revision (rule R0′):
+Every released array is a numbered revision, never edited, and a number is never reused. The revisions a session
+this version opens can hold (OLDEST_OPEN_REVISION..TOOLSET_REVISION) are shipped in `snapshots/llm_r<N>.json`.
+A change to an LLM tool schema (a name, description, parameter, `required`, an enum or the order) is released as a
+new revision (rule R0′):
 1. change the code;
 2. bump TOOLSET_REVISION;
 3. run `python -m dreamteam.tools.frozen --write`;
 4. pin the new exact-order digests in tests/test_frozen_tools.py (RELEASED).
-The registry must keep serving every released revision (no tool or property removed, enums only grow...):
+The registry must keep serving every shipped revision (no tool or property removed, enums only grow...):
 arguments are still validated against the current registry. tests/test_frozen_tools.py checks all of it.
 """
 
@@ -33,8 +34,8 @@ from ..db import dumps
 
 log = logging.getLogger(__name__)
 
-# what schemas_for("llm", ...) builds; bump it with EVERY LLM schema change (2: background jobs; 3: skill_propose;
-# 4: send_message pause_swarm; 5: crew tasks, task_create and task_update gain crew and directions)
+# what schemas_for("llm", ...) builds; bump it with EVERY LLM schema change (1-4: the tool sets of 0.1.x, whose
+# sessions are not opened; 5: crew tasks, task_create and task_update gain crew and directions)
 TOOLSET_REVISION = 5
 # a session with a member recorded below it (or an agent with a history and no record) was made by an earlier
 # version and is not opened (docs/SPEC.md §17.2); a fixed literal, never derived from TOOLSET_REVISION

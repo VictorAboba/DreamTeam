@@ -68,7 +68,8 @@ src/dreamteam/
                  `skill_reinstall`, and the members' `skill_propose` (frozen revision 3; §19)
   tools/frozen.py    frozen LLM tool sets: revisions (now 5), the kv record of each agent,
                      `python -m dreamteam.tools.frozen` (§6.1)
-  tools/snapshots/   llm_r<N>.json: every released LLM tool set (revision N, en and ru), never edited
+  tools/snapshots/   llm_r<N>.json: the shipped LLM tool sets, revision OLDEST_OPEN_REVISION..TOOLSET_REVISION
+                     (now 5; en and ru), never edited
   agent.py       AgentRuntime   — ReAct loop of one LLM agent
   swarm.py       Swarm          — composition root
   hub_mcp.py     the swarm as an MCP server (stdio / streamable HTTP / stdio->HTTP proxy)
@@ -1878,9 +1879,11 @@ reach existing members through tool results and notifications, and new tools at 
 **Frozen tool sets** (tools/frozen.py). The tools array is part of the prompt prefix that thinking blocks are bound
 to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
 it:
-- Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
-  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what
-  `schemas_for("llm", language)` builds.
+- Every released LLM tool set is a numbered **revision** (`{"revision": N, "en": [...], "ru": [...]}`), never
+  edited, and a number is never reused. The revisions a session this version opens can hold, from
+  `OLDEST_OPEN_REVISION` to `TOOLSET_REVISION`, are shipped as `tools/snapshots/llm_r<N>.json`. `TOOLSET_REVISION`
+  (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what `schemas_for("llm", language)`
+  builds.
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
   tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without a usable one
   (`frozen.valid`, below) gets `frozen.current_record(language)`, written at once: a session this version opens
@@ -1907,9 +1910,10 @@ it:
   recorded below it, or with an agent that has a history and no record (it ran before tool sets were frozen), was
   made by an earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version
   opens builds a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and
-  the upgrade at compaction moves only revisions 5 and later. The snapshots `llm_r1..r4.json` stay
-  (tests/test_frozen_tools.py checks that every released revision stays served, §12 R0′, and `frozen.for_span`
-  reads them for old trace spans; `--check` compares only the current revision's file).
+  the upgrade at compaction moves only revisions 5 and later. Only the revisions from `OLDEST_OPEN_REVISION` on are
+  shipped (tests/test_frozen_tools.py checks that exactly these are, and that each stays served, §12 R0′).
+  `frozen.for_span` reads them for trace spans recorded before an agent's last upgrade. `--check` compares only the
+  current revision's file.
 - `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions()`, `snapshot(rev, language)` (a fresh copy; unknown
   language → en), `current(language)`, `record(rev, language, tools)`, `current_record(language)`,
   `valid(rec) -> bool` (a dict with an integer, non-bool `rev` and `tools` a list of dicts with a str `name` and a
@@ -3522,14 +3526,11 @@ or order of a tool with the `llm` audience is released as a new revision, in one
 4. pin its exact-order digests (`sha256(db.dumps(tools))` per language) in tests/test_frozen_tools.py (`RELEASED`).
 
 Existing agents keep their revision until their next compaction; new agents get the current one. Arguments are
-still validated against the current registry, so the registry must keep serving every released revision
+still validated against the current registry, so the registry must keep serving every shipped revision
 (tests/test_frozen_tools.py checks it): no tool leaves the `llm` audience, no property is removed or retyped
-(`items.type` included), the current `required` is a subset of every released one, enums only grow, a free property
-never gains an enum. Revisions: 1 = the tools before background jobs (sorted digest `e3c5cbc7…`, the baseline of
-agents created before tool sets were frozen), 2 = background jobs (`shell` gains `background`, new `jobs` and
-`job_stop`, new `shell` and `wait` descriptions), 3 = `skill_propose` (appended last; the array of revision 2
-before it is unchanged), 4 = `send_message` gains `pause_swarm` and its new description (the array of revision 3
-otherwise unchanged; §3.1), 5 = crew tasks (§4.2): `task_create` and `task_update` gain `crew` and then
+(`items.type` included), the current `required` is a subset of every shipped one, enums only grow, a free property
+never gains an enum. Revisions 1-4 were the tool sets of 0.1.x (their sessions are not opened, §17.2); 5 = crew
+tasks (§4.2): `task_create` and `task_update` gain `crew` and then
 `directions` (last, after `tags` / `comment`; their descriptions English in both arrays, like the other board
 properties: `task_create` `crew` `Crew task: how many members may work on it at once, its owner included (2..8);
 0 = an ordinary task`, `directions` `With crew: its areas, one title per item; each becomes a draft subtask whose
@@ -3547,10 +3548,10 @@ and directions; you then own it and the first direction is your own part; each d
 and when all of them are finished you write the task's result and complete it (crew 0 makes it an ordinary task
 again).` (ru « Если задача, над которой ты работаешь, оказалась слишком велика для одного участника, передай crew и
 directions: ты станешь её владельцем, а первое направление — твоя часть; каждое направление сдаётся отдельно, а
-когда все они завершены, ты пишешь итог задачи и завершаешь её (crew 0 снова делает её обычной задачей).»; the
-array of revision 4 otherwise unchanged; `task_claim` is unchanged). A session with a member below
+когда все они завершены, ты пишешь итог задачи и завершаешь её (crew 0 снова делает её обычной задачей).»; no
+other tool changed, `task_claim` included). A session with a member below
 `frozen.OLDEST_OPEN_REVISION` (5) is not opened (§6.1, §17.2 "Sessions of an earlier version"), so notifications
-and wake-up texts name only tools and parameters of every released revision from 5 on (tests/test_prompts.py),
+and wake-up texts name only tools and parameters of every shipped revision from 5 on (tests/test_prompts.py),
 crew tasks, `crew` and `directions` included; tool results that point at a newer tool check
 `ToolContext.has_tool`, and a notification the recipient's frozen record (`frozen.member_tool_names`). `allow_empty`
 is validation only, not part of the schema. Tools of the `user`/`external` audiences only (e.g. `set_goal`) are not

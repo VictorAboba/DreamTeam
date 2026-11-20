@@ -1,4 +1,4 @@
-"""Frozen LLM tool sets (tools/frozen.py, docs/SPEC.md §6.1): the released revisions never change and stay
+"""Frozen LLM tool sets (tools/frozen.py, docs/SPEC.md §6.1): the shipped revisions never change and stay
 served by the registry, every agent sends exactly the array it was given, and it moves to the current revision
 only inside a compaction. Agents run on ScriptedLLM; a later revision is simulated by patching
 TOOLSET_REVISION and `frozen.current` and registering a `probe` tool."""
@@ -28,25 +28,15 @@ from dreamteam.models import USER, AgentKind, AgentStatus, Status
 from dreamteam.swarm import Swarm
 from dreamteam.tools import REGISTRY, ToolContext, ToolSpec, call_tool, frozen, schemas_for
 
-# exact-order digests (sha256 of db.dumps) of every released revision: what agents send, byte for byte
+# exact-order digests (sha256 of db.dumps) of every shipped revision: what agents send, byte for byte
 RELEASED = {
-    1: {"en": "f11401bf332caa959f2adf121fbb9808dc339fd9ed07aab22e54b1d4fcbd4561",
-        "ru": "dbf9ca6df4166f761353c267ede532184abda194b1fd7418434bd9950860c270"},
-    # background jobs: shell(background), jobs, job_stop; new shell and wait descriptions
-    2: {"en": "92f7a5df2601bc26eb4d3414afa6117cfda5eddc45624e741d187266075cba70",
-        "ru": "768d9936471b80ec2fec0922e9e853a06d9ef3e689dce186ea3bacba6054b032"},
-    # skills: skill_propose (revision 2's array unchanged before it)
-    3: {"en": "f27151511893a8f72bb26b609ad7cf9ef0cf8eb30f592b27e2d24a590e934863",
-        "ru": "477db524ae479c2e5da88e4bbe233194e8c0ac03381500e1f8747869f7973d45"},
-    # clarify mode: send_message gains pause_swarm (revision 3's array otherwise unchanged)
-    4: {"en": "f20f4105ea7b5e56617f08a51a3bfae09f9c3162ac6eaa2293371403f9d21e0b",
-        "ru": "d44f7431d93b9c59e3b514eac9faec16f6e31b001e5aeaa732ac2642cb55ebb9"},
-    # crew tasks: task_create and task_update gain crew and directions (revision 4's array otherwise unchanged)
+    # crew tasks: task_create and task_update gain crew and directions
     5: {"en": "06d7f3ebc6d94f9e450256633804a57619bae3859d9e4aa9c21a50b7da9d2187",
         "ru": "d0a9bbe1dc690b54ac30474843e8b53ec8c321997ef11afecfbbbfaf194656fa"},
 }
 LANGS = ("en", "ru")
 LATER = 99  # the simulated later revision
+OLD = frozen.OLDEST_OPEN_REVISION  # what a simulated later revision upgrades from
 
 
 def sha(text: str) -> str:
@@ -142,7 +132,7 @@ async def probe_tool(ctx: ToolContext, args: dict) -> str:
 
 @pytest.fixture
 def later_revision(monkeypatch):
-    """The code builds revision 99 = revision 1 + a `probe` tool (as a real revision would add a tool)."""
+    """The code builds revision 99 = revision OLD + a `probe` tool (as a real revision would add a tool)."""
     tools_module._load()
     spec = ToolSpec(name="probe", description={"en": "A tool of a later revision.",
                                                "ru": "Инструмент более поздней ревизии."},
@@ -152,8 +142,8 @@ def later_revision(monkeypatch):
     monkeypatch.setattr(frozen, "TOOLSET_REVISION", LATER)
 
     def current(language):
-        return frozen.snapshot(1, language) + [{"name": "probe", "description": spec.describe(language or "en"),
-                                                "parameters": copy.deepcopy(spec.parameters)}]
+        return frozen.snapshot(OLD, language) + [{"name": "probe", "description": spec.describe(language or "en"),
+                                                  "parameters": copy.deepcopy(spec.parameters)}]
 
     monkeypatch.setattr(frozen, "current", current)
     return spec
@@ -166,13 +156,13 @@ def fast_scheduler(monkeypatch):
 
 # ------------------------------------------------------------------------------ released revisions
 def test_released_tool_sets_never_change():
-    assert frozen.revisions() == list(range(1, frozen.TOOLSET_REVISION + 1)) == sorted(RELEASED)
+    # exactly the revisions a session this version opens can hold: OLD..TOOLSET_REVISION
+    assert frozen.revisions() == list(range(OLD, frozen.TOOLSET_REVISION + 1)) == sorted(RELEASED)
     for rev, digests in RELEASED.items():
         for lang in LANGS:
             assert sha(dumps(frozen.snapshot(rev, lang))) == digests[lang], (rev, lang)
     # a language without texts gets the English array, like schemas_for
-    old = frozen.OLDEST_OPEN_REVISION
-    assert frozen.snapshot(old, "de") == frozen.snapshot(old, None) == frozen.snapshot(old, "en")
+    assert frozen.snapshot(OLD, "de") == frozen.snapshot(OLD, None) == frozen.snapshot(OLD, "en")
 
 
 def test_the_oldest_revision_opened_is_a_fixed_5(later_revision):
@@ -182,7 +172,7 @@ def test_the_oldest_revision_opened_is_a_fixed_5(later_revision):
 
 
 def test_valid_rejects_unusable_records():
-    assert frozen.valid(frozen.record(1, "en", frozen.snapshot(1, "en")))
+    assert frozen.valid(frozen.record(OLD, "en", frozen.snapshot(OLD, "en")))
     assert frozen.valid(frozen.current_record("ru")) and frozen.valid({"rev": 5, "tools": []})
     for bad in ({"rev": "1", "tools": []}, {"rev": True, "tools": []}, {"rev": 1, "tools": [{"name": "board"}]},
                 {"rev": 1, "tools": "board"}, ["board"], None, "(not JSON)"):
@@ -203,7 +193,7 @@ def _types(schema: dict) -> tuple:
 
 
 def test_every_released_tool_set_is_still_served():
-    """Arguments are validated against the current registry, so it must accept everything a released array
+    """Arguments are validated against the current registry, so it must accept everything a shipped array
     allows: no tool or property removed or retyped, no new required argument, enums only grow."""
     for rev in frozen.revisions():
         for lang in LANGS:
@@ -311,9 +301,9 @@ async def test_unknown_tool_lists_only_the_agents_own_tools(tmp_path, later_revi
     await swarm.start(run_agents=False)
     try:
         agent = swarm.members()[0]["name"]
-        frozen.write(swarm.db, agent, frozen.record(1, "en", frozen.snapshot(1, "en")))
+        frozen.write(swarm.db, agent, frozen.record(OLD, "en", frozen.snapshot(OLD, "en")))
         runtime = AgentRuntime(swarm, agent)
-        assert runtime.tools_rev == 1 and "probe" not in runtime.tool_names
+        assert runtime.tools_rev == OLD and "probe" not in runtime.tool_names
         ctx = ToolContext(swarm, agent, runtime)
         for name in ("probe", "prob"):
             text, is_error = await call_tool(ctx, name, {})
@@ -332,8 +322,9 @@ async def test_arguments_outside_the_frozen_schema_are_ignored(tmp_path):
     await swarm.start(run_agents=False)
     try:
         agent = swarm.members()[0]["name"]
-        record = frozen.record(1, "en", frozen.snapshot(1, "en"))
-        for tool in record["tools"]:  # an older revision whose tools lacked these optional parameters
+        record = frozen.record(OLD, "en", frozen.snapshot(OLD, "en"))
+        # a frozen set whose tools lack these optional parameters (as one lacks what a later revision adds)
+        for tool in record["tools"]:
             if tool["name"] in ("board", "read_file"):
                 drop = {"board": "include_closed", "read_file": "limit"}[tool["name"]]
                 del tool["parameters"]["properties"][drop]
@@ -359,7 +350,7 @@ async def test_arguments_outside_the_frozen_schema_are_ignored(tmp_path):
 
 # ------------------------------------------------------------------------------ the compaction upgrade
 async def _upgrade_run(tmp_path: Path, tool: str = "probe") -> tuple[Swarm, Recorder, str]:
-    """An agent frozen at revision 1 compacts while the code builds a later revision; after the compaction it calls
+    """An agent frozen at revision OLD compacts while the code builds a later revision; after the compaction it calls
     `tool` (a tool of that revision), then `wait`."""
 
     def policy(messages, tools):
@@ -373,7 +364,7 @@ async def _upgrade_run(tmp_path: Path, tool: str = "probe") -> tuple[Swarm, Reco
     swarm, rec = make_swarm(tmp_path, policy, agents={"context_tokens": 20000})
     await swarm.start(run_agents=False)
     agent = swarm.members()[0]["name"]
-    frozen.write(swarm.db, agent, frozen.record(1, "en", frozen.snapshot(1, "en")))
+    frozen.write(swarm.db, agent, frozen.record(OLD, "en", frozen.snapshot(OLD, "en")))
     seed_history(swarm, agent, pairs=20, size=4000)
     await swarm.stop()
     await swarm.start()
@@ -387,8 +378,8 @@ async def test_compaction_moves_an_agent_to_the_current_tool_set(tmp_path, later
     try:
         (compaction, old_tools), (after, new_tools) = rec.calls[agent][:2]
         assert is_compaction_request(compaction)
-        assert dumps(old_tools) == dumps(frozen.snapshot(1, "en"))  # the compaction request sends the old array
-        assert frozen.names(new_tools) == frozen.names(frozen.snapshot(1, "en")) + ["probe"]
+        assert dumps(old_tools) == dumps(frozen.snapshot(OLD, "en"))  # the compaction request sends the old array
+        assert frozen.names(new_tools) == frozen.names(frozen.snapshot(OLD, "en")) + ["probe"]
         record = frozen.read(swarm.db, agent)
         assert record["rev"] == LATER and dumps(record["tools"]) == dumps(new_tools)
         assert swarm.runtimes[agent].tools_rev == LATER
@@ -411,17 +402,40 @@ async def test_compaction_moves_an_agent_to_the_current_tool_set(tmp_path, later
         await shutdown(swarm)
 
 
-async def test_agents_of_revision_1_keep_it_when_later_revisions_are_released(tmp_path):
-    """Revisions 2 (background jobs), 3 (skill_propose), 4 (send_message pause_swarm) and 5 (crew tasks) change
-    nothing for an agent that already ran: one frozen at revision 1 with a history and one frozen at revision 1
-    without one send revision 1 byte for byte, run after run; only a new agent gets the current revision."""
+async def test_an_upgrade_that_adds_only_properties_names_no_tool(tmp_path, monkeypatch):
+    """A later revision that only adds a property (here `probe_flag` of `board`) moves the agent at its compaction
+    like one that adds a tool, and the summary message names no new tool."""
+    monkeypatch.setattr(frozen, "TOOLSET_REVISION", LATER)
+
+    def current(language):
+        tools = frozen.snapshot(OLD, language)
+        next(t for t in tools if t["name"] == "board")["parameters"]["properties"]["probe_flag"] = {"type": "boolean"}
+        return tools
+
+    monkeypatch.setattr(frozen, "current", current)
+    swarm, rec, agent = await _upgrade_run(tmp_path, tool="board")
+    try:
+        (compaction, old_tools), (after, new_tools) = rec.calls[agent][:2]
+        assert is_compaction_request(compaction)
+        assert dumps(old_tools) == dumps(frozen.snapshot(OLD, "en"))  # the compaction request sends the old array
+        assert dumps(new_tools) == dumps(frozen.current("en")) and frozen.read(swarm.db, agent)["rev"] == LATER
+        assert prompts.t("en", "tools_added", tools="x").split("x")[0] not in after[0]["content"]
+        assert "probe_flag" in swarm.runtimes[agent].tool_parameters("board")["properties"]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_agents_keep_their_revision_when_a_later_one_is_built(tmp_path, later_revision):
+    """A later revision changes nothing for an agent that already ran: one frozen at revision OLD with a history and
+    one frozen at it without one send revision OLD byte for byte, run after run; only a new agent gets the later
+    revision."""
     swarm, rec = make_swarm(tmp_path, lambda m, t: call("wait"), swarm={"start_agents": 3})
     await swarm.start(run_agents=False)
     names = [m["name"] for m in swarm.members()]
     before, kept, new = names
     seed_history(swarm, before, pairs=1, size=10)
     for name in (before, kept):
-        frozen.write(swarm.db, name, frozen.record(1, "en", frozen.snapshot(1, "en")))
+        frozen.write(swarm.db, name, frozen.record(OLD, "en", frozen.snapshot(OLD, "en")))
     await swarm.stop()
     try:
         counts: dict[str, int] = {}
@@ -432,165 +446,14 @@ async def test_agents_of_revision_1_keep_it_when_later_revisions_are_released(tm
             await run_until(lambda: all(len(rec.tools(n)) > counts.get(n, 0) for n in names))
             counts = {n: len(rec.tools(n)) for n in names}
             await swarm.stop()
-        for name, rev in ((before, 1), (kept, 1), (new, frozen.TOOLSET_REVISION)):
-            assert {dumps(t) for t in rec.tools(name)} == {dumps(frozen.snapshot(rev, "en"))}, name
+        old_tools, later_tools = frozen.snapshot(OLD, "en"), frozen.current("en")
+        for name, rev, tools in ((before, OLD, old_tools), (kept, OLD, old_tools), (new, LATER, later_tools)):
+            assert {dumps(t) for t in rec.tools(name)} == {dumps(tools)}, name
             assert frozen.read(swarm.db, name)["rev"] == rev
-        assert "jobs" not in frozen.names(rec.tools(before)[0]) and "jobs" in frozen.names(rec.tools(new)[0])
-        assert "skill_propose" not in frozen.names(rec.tools(kept)[0])
-        assert frozen.names(rec.tools(new)[0])[-1] == "skill_propose"
+        assert "probe" not in frozen.names(rec.tools(before)[0]) and "probe" not in frozen.names(rec.tools(kept)[0])
+        assert frozen.names(rec.tools(new)[0])[-1] == "probe"
     finally:
         swarm.close()
-
-
-async def test_an_agent_of_revision_2_keeps_it_and_compacts_into_the_current_revision(tmp_path):
-    """Revision 3 adds only skill_propose, at the end, and revisions 4 and 5 only parameters: an agent frozen at
-    revision 2 sends revision 2 byte for byte until its compaction, which moves it to the current revision and names
-    the new tool."""
-
-    def policy(messages, tools):
-        if is_compaction_request(messages):
-            return "SUMMARY of older work"
-        return call("wait")
-
-    swarm, rec = make_swarm(tmp_path, policy, agents={"context_tokens": 20000})
-    await swarm.start(run_agents=False)
-    agent = swarm.members()[0]["name"]
-    frozen.write(swarm.db, agent, frozen.record(2, "en", frozen.snapshot(2, "en")))
-    seed_history(swarm, agent, pairs=20, size=4000)
-    await swarm.stop()
-    await swarm.start()
-    try:
-        swarm.notify(agent, "n_restart")
-        await run_until(lambda: len(rec.calls.get(agent, [])) >= 2)
-        (compaction, old_tools), (after, new_tools) = rec.calls[agent][:2]
-        assert is_compaction_request(compaction) and dumps(old_tools) == dumps(frozen.snapshot(2, "en"))
-        assert dumps(new_tools) == dumps(frozen.snapshot(frozen.TOOLSET_REVISION, "en"))
-        assert frozen.read(swarm.db, agent)["rev"] == frozen.TOOLSET_REVISION
-        assert prompts.t("en", "tools_added", tools="`skill_propose`") in after[0]["content"]
-    finally:
-        await shutdown(swarm)
-
-
-def _send_message(rev: int, lang: str) -> dict:
-    return next(t for t in frozen.snapshot(rev, lang) if t["name"] == "send_message")
-
-
-def test_revision_4_only_adds_pause_swarm():
-    """Revision 4 (clarify mode) changes one tool: send_message gains the optional boolean pause_swarm, last, and
-    a longer description; every other tool, the names and their order are revision 3's."""
-    for lang in LANGS:
-        r3, r4 = frozen.snapshot(3, lang), frozen.snapshot(4, lang)
-        assert frozen.names(r3) == frozen.names(r4)
-        changed = [a["name"] for a, b in zip(r3, r4) if dumps(a) != dumps(b)]
-        assert changed == ["send_message"], (lang, changed)
-        old, new = _send_message(3, lang), _send_message(4, lang)
-        props = new["parameters"]["properties"]
-        assert list(props) == [*old["parameters"]["properties"], "pause_swarm"]
-        assert {k: v for k, v in props.items() if k != "pause_swarm"} == old["parameters"]["properties"]
-        assert props["pause_swarm"]["type"] == "boolean" and "default" not in props["pause_swarm"]
-        assert new["parameters"]["required"] == old["parameters"]["required"] == ["to", "text"]
-        assert len(new["description"]) <= 2000 and new["description"].startswith(old["description"])
-        assert "pause_swarm=true" in new["description"]
-    # one shared English property text in both arrays (tools/__init__.py: the registry keeps one schema)
-    assert _send_message(4, "en")["parameters"] == _send_message(4, "ru")["parameters"]
-
-
-def _tool(rev: int, lang: str, name: str) -> dict:
-    return next(t for t in frozen.snapshot(rev, lang) if t["name"] == name)
-
-
-def test_revision_5_only_adds_crew_and_directions():
-    """Revision 5 (crew tasks) changes two tools: task_create and task_update gain the optional integer crew and
-    the optional array of strings directions, last, and a last sentence of their descriptions; every other tool,
-    the names and their order are revision 4's (task_claim included)."""
-    for lang in LANGS:
-        r4, r5 = frozen.snapshot(4, lang), frozen.snapshot(5, lang)
-        assert frozen.names(r4) == frozen.names(r5)
-        changed = [a["name"] for a, b in zip(r4, r5) if dumps(a) != dumps(b)]
-        assert changed == ["task_create", "task_update"], (lang, changed)
-        for name in changed:
-            old, new = _tool(4, lang, name), _tool(5, lang, name)
-            props, old_props = new["parameters"]["properties"], old["parameters"]["properties"]
-            assert list(props) == [*old_props, "crew", "directions"], (lang, name)
-            assert {k: v for k, v in props.items() if k not in ("crew", "directions")} == old_props
-            assert set(props["crew"]) == {"type", "description"} and props["crew"]["type"] == "integer"
-            assert set(props["directions"]) == {"type", "items", "description"}
-            assert props["directions"]["type"] == "array" and props["directions"]["items"] == {"type": "string"}
-            assert new["parameters"]["required"] == old["parameters"]["required"]
-            assert len(new["description"]) <= 2000 and new["description"].startswith(old["description"])
-            assert "crew" in new["description"][len(old["description"]):]
-            assert "directions" in new["description"][len(old["description"]):]
-    # one shared English property text in both arrays
-    for name in ("task_create", "task_update"):
-        assert _tool(5, "en", name)["parameters"] == _tool(5, "ru", name)["parameters"]
-        assert _tool(5, "en", name)["description"] != _tool(5, "ru", name)["description"]
-
-
-async def test_an_agent_of_revision_3_ignores_pause_swarm_until_it_compacts(tmp_path):
-    """An agent frozen at revision 3 has no pause_swarm: call_tool strips it (the existing note names the r3 usage),
-    so its question is an ordinary message and the swarm keeps working, even in clarify mode. An agent of revision 4
-    pauses the swarm. A compaction moves the r3 agent to the current revision with no tools_added line (revisions 4
-    and 5 add no tool)."""
-
-    def policy(messages, tools):
-        if is_compaction_request(messages):
-            return "SUMMARY of older work"
-        return call("wait")
-
-    swarm, rec = make_swarm(tmp_path, policy, swarm={"start_agents": 2, "clarify": True},
-                            agents={"context_tokens": 20000})
-    await swarm.start(run_agents=False)
-    old, new = [m["name"] for m in swarm.members()]
-    frozen.write(swarm.db, old, frozen.record(3, "en", frozen.snapshot(3, "en")))
-    try:
-        ctx = ToolContext(swarm, old, AgentRuntime(swarm, old))
-        args = {"to": ["user"], "text": "Postgres or SQLite?", "pause_swarm": True}
-        text, is_error = await call_tool(ctx, "send_message", args)
-        assert not is_error, text
-        assert text.startswith("Sent message #1 to user.")
-        assert text.endswith("\n[Ignored unknown argument(s): pause_swarm. Usage: send_message(to, text, reply_to?)]")
-        assert "pause_swarm was ignored" not in text and not swarm.paused
-        # an agent of the current revision pauses the swarm with the same call
-        text, is_error = await call_tool(ToolContext(swarm, new, AgentRuntime(swarm, new)), "send_message", args)
-        assert not is_error and " The swarm is paused until the user answers" in text, text
-        assert swarm.paused and swarm.pending_question()["asker"] == new
-        swarm.resume(USER)
-        assert not swarm.paused
-    finally:
-        await swarm.stop()
-    # the r3 agent compacts: it moves to the current revision, and no tool is named as new (pause_swarm, crew and
-    # directions are parameters)
-    seed_history(swarm, old, pairs=20, size=4000)
-    await swarm.start()
-    try:
-        swarm.notify(old, "n_restart")
-        await run_until(lambda: len(rec.calls.get(old, [])) >= 2)
-        (compaction, old_tools), (after, new_tools) = rec.calls[old][:2]
-        assert is_compaction_request(compaction) and dumps(old_tools) == dumps(frozen.snapshot(3, "en"))
-        rev = frozen.TOOLSET_REVISION
-        assert dumps(new_tools) == dumps(frozen.snapshot(rev, "en")) and frozen.read(swarm.db, old)["rev"] == rev
-        assert prompts.t("en", "tools_added", tools="x").split("x")[0] not in after[0]["content"]
-        assert "pause_swarm" in swarm.runtimes[old].tool_parameters("send_message")["properties"]
-        assert "crew" in swarm.runtimes[old].tool_parameters("task_update")["properties"]
-    finally:
-        await shutdown(swarm)
-
-
-async def test_a_compaction_moves_a_revision_1_agent_to_the_current_revision(tmp_path):
-    swarm, rec, agent = await _upgrade_run(tmp_path, tool="jobs")
-    try:
-        (compaction, old_tools), (after, new_tools) = rec.calls[agent][:2]
-        assert is_compaction_request(compaction)
-        assert dumps(old_tools) == dumps(frozen.snapshot(1, "en"))  # the compaction request: still revision 1
-        assert dumps(new_tools) == dumps(frozen.snapshot(frozen.TOOLSET_REVISION, "en"))
-        assert frozen.read(swarm.db, agent)["rev"] == frozen.TOOLSET_REVISION == swarm.runtimes[agent].tools_rev
-        # it is told about the new tools (those of revisions 2 and 3); `background` (a new parameter of shell) is in
-        # shell's own description
-        assert prompts.t("en", "tools_added", tools="`jobs`, `job_stop`, `skill_propose`") in after[0]["content"]
-        result = next(m for m in rec.calls[agent][2][0] if m.get("role") == "tool" and m.get("name") == "jobs")
-        assert result["content"] == "No background jobs are running." and not result["is_error"]
-    finally:
-        await shutdown(swarm)
 
 
 async def test_the_upgrade_is_atomic_with_the_history_rewrite(tmp_path, later_revision, monkeypatch):
@@ -598,7 +461,7 @@ async def test_the_upgrade_is_atomic_with_the_history_rewrite(tmp_path, later_re
     await swarm.start(run_agents=False)
     try:
         agent = swarm.members()[0]["name"]
-        frozen.write(swarm.db, agent, frozen.record(1, "en", frozen.snapshot(1, "en")))
+        frozen.write(swarm.db, agent, frozen.record(OLD, "en", frozen.snapshot(OLD, "en")))
         seed_history(swarm, agent, pairs=2, size=50)
         runtime = AgentRuntime(swarm, agent)
         runtime._load_history()
@@ -614,7 +477,7 @@ async def test_the_upgrade_is_atomic_with_the_history_rewrite(tmp_path, later_re
             runtime._replace_history([{"role": "user", "content": "summary"}], tools=frozen.current_record("en"))
         after = swarm.db.all("SELECT seq, msg FROM history WHERE agent = ? ORDER BY seq", (agent,))
         assert [tuple(r) for r in after] == [tuple(r) for r in before]
-        assert frozen.read(swarm.db, agent)["rev"] == 1 and runtime.tools_rev == 1
+        assert frozen.read(swarm.db, agent)["rev"] == OLD and runtime.tools_rev == OLD
         assert "probe" not in runtime.tool_names
         monkeypatch.setattr(frozen, "write", real_write)
         runtime._replace_history([{"role": "user", "content": "summary"}], tools=frozen.current_record("en"))
@@ -628,14 +491,14 @@ async def test_traces_show_the_tools_each_call_used(tmp_path, later_revision):
     try:
         spans = [s for t in reversed(swarm.tracer.list_traces(agent)) for s in swarm.tracer.get_trace(t["id"])["spans"]
                  if s["kind"] == "llm"]
-        assert [s["input"]["tools_rev"] for s in spans[:3]] == [1, LATER, LATER]
+        assert [s["input"]["tools_rev"] for s in spans[:3]] == [OLD, LATER, LATER]
         before = swarm.tracer.span_context(spans[0]["id"])
         after = swarm.tracer.span_context(spans[1]["id"])
-        assert dumps(before["tools"]) == dumps(rec.calls[agent][0][1]) == dumps(frozen.snapshot(1, "en"))
+        assert dumps(before["tools"]) == dumps(rec.calls[agent][0][1]) == dumps(frozen.snapshot(OLD, "en"))
         assert dumps(after["tools"]) == dumps(rec.calls[agent][1][1])
         # a revision the record no longer holds comes from the shipped snapshot
         frozen.write(swarm.db, agent, frozen.record(LATER + 1, "en", []))
-        assert dumps(swarm.tracer.span_context(spans[0]["id"])["tools"]) == dumps(frozen.snapshot(1, "en"))
+        assert dumps(swarm.tracer.span_context(spans[0]["id"])["tools"]) == dumps(frozen.snapshot(OLD, "en"))
     finally:
         await shutdown(swarm)
 
@@ -707,10 +570,10 @@ async def test_has_tool_and_member_tool_names(tmp_path, later_revision):
     await swarm.start(run_agents=False)
     try:
         old, new, unstarted = [m["name"] for m in swarm.members()]
-        frozen.write(swarm.db, old, frozen.record(1, "en", frozen.snapshot(1, "en")))
+        frozen.write(swarm.db, old, frozen.record(OLD, "en", frozen.snapshot(OLD, "en")))
         seed_history(swarm, old, pairs=1, size=10)
         old_rt, new_rt = AgentRuntime(swarm, old), AgentRuntime(swarm, new)
-        assert (old_rt.tools_rev, new_rt.tools_rev) == (1, LATER)
+        assert (old_rt.tools_rev, new_rt.tools_rev) == (OLD, LATER)
         assert not ToolContext(swarm, old, old_rt).has_tool("probe")
         assert ToolContext(swarm, old, old_rt).has_tool("board")
         assert ToolContext(swarm, new, new_rt).has_tool("probe")
