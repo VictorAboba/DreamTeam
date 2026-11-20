@@ -26,6 +26,7 @@ MAX_DIRECTIONS = 20        # directions passed in one call
 CREW_DRAFT_CHARS = 8000    # the largest budget of the draft of a crew task's result ("Finishing")
 CREW_DRAFT_MIN = 300       # a cut result keeps at least this many characters, else only its task_get pointer
 OWNER_LIST_MAX = 20        # directions listed in the owner sentence, then crew_directions_more
+CREW_GAP_HELD_MAX = 5      # held directions named in n_crew_gap ("A free place")
 MARK_SUBTASKS_DONE = "subtasks done"      # liveness marks (stall_marks)
 MARK_FREE_DIRECTIONS = "free directions"
 MARK_DIRECTION_TO_TAKE = "direction to take"
@@ -707,6 +708,103 @@ class Board:
         for i, part in enumerate(parts):
             text += "\n" + part.lstrip() if i and "\n" in parts[i - 1] else part
         return text
+
+    # --- reads: a free place (docs/SPEC.md §4.2 "A free place", §3 item 8) -----------------------------------------
+
+    def crew_gaps(self) -> list[tuple[Task, list[Task], list[tuple[int, str, int]]]]:
+        """The crew tasks whose owner may be told of a free place, id ascending, each with its open directions (id
+        ascending, filled) and the held ones to name, (sub, assignee, m) id ascending. Listed: a crew task todo,
+        in_progress or waiting, not blocked, owned by a member (not USER), whose working set is smaller than its
+        crew, with a direction in in_progress or waiting and no todo direction a member may take now (one without a
+        blocker of its own that has no assignee, a free direction, or whose assignee is an LLM member, not in error,
+        whose claim would take it, directions_to_take, and that works on no other task, _works_on_alone).
+        Held, and named: a todo direction without a blocker of its own that is held back (_held_back; with a free
+        place only because its assignee works on another direction of the crew task, the lowest one #m), or whose
+        assignee, an LLM member not in error, works on another task #m. A todo direction with a blocker of its own,
+        or assigned to USER, an external member or a member in error and not held back, neither keeps the crew task
+        out nor is named; a working direction that waits for a held one does not keep it out either
+        (has_live_directions is not asked). It runs at each scheduler pass, so each assignee's tasks and directions
+        to take are read once per call."""
+        tasks = self._query(["crew >= 2", "assignee IS NOT NULL", "assignee != ?",
+                             f"status IN ({_qmarks(len(_TAKEABLE))})"], [USER, *_TAKEABLE])
+        self._fill(tasks)
+        members: dict[str, dict] | None = None
+        works_alone: dict[str, list[tuple[int, int | None]]] = {}  # assignee -> _works_on_alone, read once
+        to_take: dict[str, set[int]] = {}  # assignee -> the ids of its directions_to_take, read once
+        out: list[tuple[Task, list[Task], list[tuple[int, str, int]]]] = []
+        for task in sorted(tasks, key=lambda t: t.id):
+            if task.blocked_by or len(task.crew_working) >= task.crew:
+                continue
+            subs = self.subtasks_of(task.id, open_only=True)
+            if not any(sub.status in _WORKING for sub in subs):
+                continue
+            works_on: dict[str, int] = {}  # assignee -> the lowest direction of the crew task it works on
+            for sub in subs:
+                if sub.status in _WORKING and sub.assignee is not None:
+                    works_on.setdefault(sub.assignee, sub.id)
+            held_back = self._held_back(task, subs)
+            named: list[tuple[int, str, int]] = []
+            takeable = False
+            for sub in subs:
+                if sub.status != Status.TODO or sub.blocked_by:
+                    continue
+                if sub.assignee is None:
+                    takeable = True  # a free direction: item 1 offers it
+                    break
+                if sub.id in held_back and sub.assignee in works_on:
+                    named.append((sub.id, sub.assignee, works_on[sub.assignee]))
+                    continue
+                if members is None:
+                    members = {m["name"]: m for m in self.swarm.members()}
+                info = members.get(sub.assignee)
+                if info is None or info["kind"] != AgentKind.LLM or info["status"] == AgentStatus.ERROR:
+                    continue  # USER, an external member or a member in error: the list shows the assignee
+                if sub.assignee not in works_alone:
+                    works_alone[sub.assignee] = self._works_on_alone(sub.assignee)
+                # the lowest task it works on outside the crew task: neither it nor one of its directions
+                elsewhere = next((tid for tid, parent in works_alone[sub.assignee] if task.id not in (tid, parent)),
+                                 None)
+                if elsewhere is not None:
+                    named.append((sub.id, sub.assignee, elsewhere))
+                    continue
+                if sub.assignee not in to_take:
+                    to_take[sub.assignee] = {d.id for d in self.directions_to_take(sub.assignee)}
+                if sub.id in to_take[sub.assignee]:
+                    takeable = True  # a direction to take: the liveness mark tells its assignee
+                    break
+            if not takeable:
+                out.append((task, subs, named))
+        return out
+
+    def _works_on_alone(self, name: str) -> list[tuple[int, int | None]]:
+        """(id, parent_id) of each in_progress task of `name` without an open subtask, id ascending: the tasks it
+        works on. System prompt rule 3: one task in progress at a time, and a parent that waits for its subtasks (a
+        crew task it owns while it works on none of its directions) does not count."""
+        rows = self.db.all("SELECT id, parent_id FROM tasks WHERE assignee = ? AND status = ? ORDER BY id",
+                           (name, Status.IN_PROGRESS))
+        waiting = self.open_parents(r["id"] for r in rows)
+        return [(r["id"], r["parent_id"]) for r in rows if r["id"] not in waiting]
+
+    def crew_gap_parts(self, task: Task, held: list[tuple[int, str, int]], lang: str) -> tuple[str, str]:
+        """n_crew_gap's {directions} and {held} in `lang` (§4.2 "A free place"). directions: the list of the owner
+        sentence (every direction but the cancelled ones, crew_directions and crew_directions_more), each todo one
+        with blockers of its own followed by them (crew_gap_blocked). held: "" or one sentence per held direction
+        (`held`, from crew_gaps), id ascending, at most CREW_GAP_HELD_MAX: crew_gap_held_you for the owner's own,
+        else crew_gap_held_wait when #m waits for it (_wait_for_held), else crew_gap_held."""
+        listed = [s for s in self.subtasks_of(task.id) if s.status != Status.CANCELLED]
+        directions = self._directions_text(task, listed, lang, blockers=True)
+        rows: dict[int, Any] = {}  # every task's row, read once if a held direction of another member needs it
+        parts: list[str] = []
+        for sub, name, m in sorted(held)[:CREW_GAP_HELD_MAX]:
+            if name == task.assignee:
+                parts.append(prompts.t(lang, "crew_gap_held_you", sub=sub, m=m))
+                continue
+            if not rows:
+                rows.update((r["id"], r) for r in
+                            self.db.all("SELECT id, status, depends_on, parent_id, crew FROM tasks"))
+            key = "crew_gap_held_wait" if self._wait_for_held(rows, [m], {sub}) else "crew_gap_held"
+            parts.append(prompts.t(lang, key, sub=sub, name=name, m=m))
+        return directions, "".join(parts)
 
     @property
     def independent_review(self) -> bool:
@@ -2224,13 +2322,19 @@ class Board:
             instructions = prompts.t(lang, "crew_owner_all_taken", id=task.id, crew=task.crew)
         return instructions, self._directions_text(task, listed, lang)
 
-    def _directions_text(self, task: Task, listed: list[Task], lang: str) -> str:
+    def _directions_text(self, task: Task, listed: list[Task], lang: str, blockers: bool = False) -> str:
         """crew_directions with '#15 [in_progress] "pkce" @Anna Smith; #17 [todo] "oidc"' (at most OWNER_LIST_MAX,
-        then crew_directions_more), or "" with none."""
+        then crew_directions_more), or "" with none. `blockers` (n_crew_gap): each todo one with blockers of its
+        own followed by them, '#17 [todo] "oidc" (blocked by #15)' (crew_gap_blocked; `listed` filled)."""
         if not listed:
             return ""
-        items = "; ".join(self._draft_line(s, lang)[2:] for s in listed[:OWNER_LIST_MAX])
-        text = prompts.t(lang, "crew_directions", items=items)
+        lines = []
+        for sub in listed[:OWNER_LIST_MAX]:
+            line = self._draft_line(sub, lang)[2:]
+            if blockers and sub.status == Status.TODO and sub.blocked_by:
+                line += prompts.t(lang, "crew_gap_blocked", ids=", ".join(f"#{d}" for d in sub.blocked_by))
+            lines.append(line)
+        text = prompts.t(lang, "crew_directions", items="; ".join(lines))
         if len(listed) > OWNER_LIST_MAX:
             text += prompts.t(lang, "crew_directions_more", k=len(listed) - OWNER_LIST_MAX, id=task.id)
         return text
