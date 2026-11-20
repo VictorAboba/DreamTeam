@@ -1294,7 +1294,8 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     else, and item 1 offers its holder ready tasks too (so the `busy_crews` exception applies to a member whose
     direction of another crew task is `waiting`). So a member holding a task blocked by #8 counts (the planner of
     that run), and one with a ready task not offered to it yet does not: item 1 offers it first. External members,
-    USER and members in error never count. At least one is needed; one member may be named for several crew tasks.
+    USER and members in error never count, nor does an owner told earlier in the same pass (it has news pending now,
+    like a member items 1-7 woke). At least one is needed; one member may be named for several crew tasks.
   - *To whom*: the owner, and only while it is an LLM member that is idle itself (`_idle_llm_members`, read once
     per pass). An owner at work, busy with a job, with news pending, in error or paused is told at the first pass
     that finds it idle, if the state still holds, so the notice never lands in a running activation; one that
@@ -1312,12 +1313,13 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     `_stall_woken`: a direction added or finished, a change of the held ones (a direction assigned to a busy member,
     say), of `crew` or of the owner re-arms it; a claim, a hand-in to review, a place taken and freed again, or
     other free members do not); at most `CREW_GAP_MAX` (2) times per owner and crew task in all (`recipient`,
-    `kind` and `json_extract(data, '$.id')` in the notifications table, like the planning hint's count; at the cap
-    the key is recorded as told; after a restart the same state may be told once more, within that count). A
-    render error leaves the key unrecorded (logged; the next pass tries again). Every crew task due in a pass is
-    told in it, so an owner of two gets both in one wake-up. A pause stops the clocks (`resume` moves each `since`
-    on by its length); while the goal is not active or wrap-up mode is on (`wrapping_up`: the team finishes with
-    what it has), nothing is sent and `_crew_gaps` is emptied, so the clocks start again afterwards.
+    `kind` and `json_extract(data, '$.id')` in the notifications table, like the planning hint's count; at the cap a
+    key due is recorded as told at once, with no free member looked for, so it costs nothing until it changes; after
+    a restart the same state may be told once more, within that count). A render error leaves the key unrecorded
+    (logged; the next pass tries again). Every crew task due in a pass is told in it, so an owner of two gets both
+    in one wake-up. A pause stops the clocks (`resume` moves each `since` on by its length); while the goal is not
+    active or wrap-up mode is on (`wrapping_up`: the team finishes with what it has), nothing is sent and
+    `_crew_gaps` is emptied, so the clocks start again afterwards.
   - *The text*, in the owner's language, waking: `#8 "engine", your crew task, has a free place (2 of its 3 places
     taken: Olga Owner, Anna Smith), but none of its directions can be taken now, and these members are idle, with
     no task of their own to go on with: Carl Diaz (Tester), Bob Brown (Generalist). Its directions: #14 [done]
@@ -1791,15 +1793,18 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   out: a free direction just added, a direction to take, a crew of 2 with an idle owner and one worker, USER as the
   owner, nothing working); `Board.crew_gap_parts` (the blockers in the list; the three forms of a held direction:
   another member's, the owner's own, one a working direction waits for); the scheduler item in
-  tests/test_crew_swarm.py, with a small `idle_nudge_seconds`: one notice after 10 × it and none before; an owner
-  at work told only once it is idle, an owner that waits for its own job told, USER and external owners never; the
-  free members (a holder of a blocked task or of a `waiting` one and an idle owner of another crew task that works
-  on none of its directions count; a member with a ready task not offered to it yet, a review waiting, a job it
-  waits for or a liveness mark does not); the notice re-armed by a finished direction and by a newly held one, not
-  by a hand-in or a claim; the cap of 2 across a restart; a pause moving the clock on; nothing with the goal done
-  or in wrap-up mode; two crew tasks of one owner in one pass. tests/test_prompts.py: `CREW_KEYS` gains the five
-  keys, the fragments that start with a space gain `crew_gap_`, `n_crew_gap` joins the keys that say «групповая
-  задача» and «направлен», and the examples above are pinned in `test_crew_texts_render_the_spec_wording`.
+  tests/test_crew_swarm.py, with a small `idle_nudge_seconds`: one notice after 10 × it and none before, and one
+  through the scheduler's own loop, not in the pass in which item 1 offers the owner a task (item 8 runs last); an
+  owner at work told only once it is idle, an owner that waits for its own job told, USER and external owners never;
+  the free members (a holder of a blocked task or of a `waiting` one and an idle owner of another crew task that
+  works on none of its directions count; a member with a ready task not offered to it yet, a `todo` subtask of a
+  plain task, a review waiting, a job it waits for or a liveness mark does not, nor an owner told earlier in the
+  same pass); the notice re-armed by a finished direction and by a newly held one, not by a hand-in or a claim; the
+  cap of 2 across a restart (a key due at the cap recorded with no free member looked for); a pause moving the clock
+  on; nothing with the goal done or in wrap-up mode; two crew tasks of one owner in one pass. tests/test_prompts.py:
+  `CREW_KEYS` gains the five keys, the fragments that start with a space gain `crew_gap_`, `n_crew_gap` joins the
+  keys that say «групповая задача» and «направлен», and the examples above are pinned in
+  `test_crew_texts_render_the_spec_wording`.
 
 ## 5. Mailbox (mailbox.py)
 

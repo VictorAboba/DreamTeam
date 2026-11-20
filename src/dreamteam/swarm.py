@@ -26,11 +26,11 @@ from .llm import create_llm
 from .llm.base import LLMClient, Usage, cost_of, uncounted_fields
 from .mailbox import Mailbox
 from .mcp_forge import MCPForge
-from .models import USER, AgentKind, AgentStatus, Status, ToolError
+from .models import USER, AgentKind, AgentStatus, Status, Task, ToolError
 from .names import generate_name
 from .shell import resolve_shell, truncate_middle
 from .swarm_skills import SessionSkills, role_skill_pairs
-from .tools.fmt import STAMP_SPAN, item_time, stamp_range
+from .tools.fmt import STAMP_SPAN, item_time, stamp_range, trim
 from .tracing import EXTERNAL_IDLE_SECONDS, Tracer
 from .triggers import TriggerEngine
 from .workspace import Workspace, scratch_rel
@@ -45,6 +45,12 @@ TRACE_PRUNE_SECONDS = 6 * 3600
 # this much time passes. No more agents consider offers than there are ready tasks, so one free task
 # does not wake the whole idle team at once.
 NUDGE_DECISION_SECONDS = 300.0
+# A crew task with a free place and nothing a member may take now (docs/SPEC.md §3 item 8, §4.2 "A free place"): its
+# owner is told once its state has lasted this many times agents.idle_nudge_seconds, at most CREW_GAP_MAX times per
+# owner and crew task (counted from the notifications table), naming at most CREW_GAP_IDLE_MAX free members
+CREW_GAP_FACTOR = 10
+CREW_GAP_MAX = 2
+CREW_GAP_IDLE_MAX = 8
 # A member's critical question (send_message pause_swarm; docs/SPEC.md §3 "Clarify mode")
 QUESTION = "question"            # the pause reason of a member's critical question (send_message pause_swarm)
 QUESTION_CHARS = 4000            # the question and the answer as quoted to the other members (n_user_answer)
@@ -62,6 +68,11 @@ PROJECT_EARLIER_VERSION_TEXT = ("The swarm in {dir} was made by an earlier versi
 # the liveness key of a member (docs/SPEC.md §3 items 2-3): (its stalled in_progress task ids, its marks as
 # (task id, kind), Board.stall_marks); the two parts are compared apart, never sorted together
 StallKey = tuple[frozenset[int], frozenset[tuple[int, str]]]
+# the free-place key of a crew task (docs/SPEC.md §3 item 8): (its owner, its crew, the ids of its open directions,
+# the ids of the held ones the notice names)
+CrewGapKey = tuple[str, int, frozenset[int], frozenset[int]]
+# item 1's ready tasks, each with its offer key (task id, finish state) in _nudged (docs/SPEC.md §4.2 "Offers")
+Offers = list[tuple[Task, tuple[int, str | None]]]
 
 
 class EarlierVersionError(ValueError):
@@ -162,6 +173,12 @@ class Swarm:
         # agent idle (not busy, nothing pending) holding in-progress tasks or with liveness marks -> (that liveness
         # key, idle with it since)
         self._idle_holding: dict[str, tuple[StallKey, float]] = {}
+        # crew task id -> (its free-place key, in that state since): _tell_crew_gaps, rebuilt at each pass from
+        # Board.crew_gaps like _idle_holding
+        self._crew_gaps: dict[int, tuple[CrewGapKey, float]] = {}
+        # crew task id -> the free-place key its owner was told about, or that reached the cap (never cleared, like
+        # _stall_woken: a key that comes back is not told again)
+        self._crew_gap_told: dict[int, CrewGapKey] = {}
         # reviewer -> (ids of the reviews it was reminded about, or that waited while it was in error; since when)
         self._review_reminded: dict[str, tuple[frozenset[int], float]] = {}
         self._review_lapsed: dict[int, set[str]] = {}  # task in review -> reviewers it was taken from (hand-over)
@@ -1030,6 +1047,9 @@ class Swarm:
             # during the pause counts from the resume
             for agent, (since, owned, offered) in list(self._considering.items()):
                 self._considering[agent] = (since + now - max(since, self._paused_at), owned, offered)
+            # nor does a crew task's state age while paused (_tell_crew_gaps): every free-place clock moves on
+            for task_id, (key, since) in list(self._crew_gaps.items()):
+                self._crew_gaps[task_id] = (key, since + now - max(since, self._paused_at))
             self._paused_at = None
         self.bus.emit("swarm.resumed", actor, **({"question": question} if question else {}))
         told = None
@@ -1276,6 +1296,7 @@ class Swarm:
                     self._remind_reviewers()
                     self._check_all_done()
                     self._remind_user_reviews()
+                    self._tell_crew_gaps()  # last: it reads item 1's offers of this pass, and whom items 1-7 woke
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1299,14 +1320,19 @@ class Swarm:
                 self._deferred.discard(name)
                 self.signal(name)
 
-    def _nudge_idle(self) -> None:
+    def _offers(self) -> Offers:
+        """The ready tasks (Board.ready_unassigned), each with its offer key: a ready task is offered to each member
+        once while it stays ready with the same finish state (docs/SPEC.md §4.2 "Offers")."""
         ready = self.board.ready_unassigned()
+        states = self.board.finish_states(t.id for t in ready) if ready else {}
+        return [(t, (t.id, states.get(t.id))) for t in ready]
+
+    def _nudge_idle(self) -> None:
+        offers = self._offers()
+        ready = [t for t, _ in offers]
         ready_ids = {t.id for t in ready}
-        # a ready task is offered to each member once while it stays ready with the same finish state (docs/SPEC.md
-        # §4.2 "Offers"): a key no longer among the ready ones is dropped
-        states = self.board.finish_states(ready_ids) if ready else {}
-        offer_key = {t.id: (t.id, states.get(t.id)) for t in ready}
-        live = set(offer_key.values())
+        offer_key = {t.id: key for t, key in offers}
+        live = set(offer_key.values())  # a key no longer among the ready ones is dropped
         self._nudged = {k: v for k, v in self._nudged.items() if k in live}
         goal = self.goal()
         if not ready or not goal or goal.get("status") != "active":
@@ -1649,6 +1675,102 @@ class Swarm:
         self._all_done_key = key
         # wrapping up: the goal is closed with what there is, no new tasks for what is missing
         self.notify(idle[0]["name"], "n_all_done_wrap_up" if self.wrapping_up else "n_all_done")
+
+    def _tell_crew_gaps(self) -> None:
+        """Item 8 (docs/SPEC.md §4.2 "A free place"): the owner of a crew task with a free place, a working direction
+        and none a member may take now (Board.crew_gaps) gets n_crew_gap once the crew task has kept that state (its
+        key: owner, crew, open directions, held ones) for CREW_GAP_FACTOR x agents.idle_nudge_seconds, while the
+        owner is an idle LLM member (one that waits for its own job or a file included) and other members are free
+        (_free_members); once per key (_crew_gap_told), at most CREW_GAP_MAX times per owner and crew task (a key due
+        at the cap is recorded at once, with no free member looked for). While the goal is not active or in wrap-up
+        mode nothing is sent and the clocks are dropped; a pause stops them (resume moves them on). It runs after items
+        1-7: it reads item 1's offers of the pass (_nudged), and a member they woke has news pending, so it is not idle;
+        nor is an owner told earlier in the same pass a free member."""
+        goal = self.goal()
+        if not goal or goal.get("status") != "active" or self.wrapping_up:
+            self._crew_gaps = {}
+            return
+        now, wait = time.time(), self.config.agents.idle_nudge_seconds
+        clocks: dict[int, tuple[CrewGapKey, float]] = {}
+        due: list[tuple[Task, list[tuple[int, str, int]], CrewGapKey]] = []
+        for task, subs, held in self.board.crew_gaps():
+            key = (task.assignee, task.crew, frozenset(s.id for s in subs), frozenset(sub for sub, _, _ in held))
+            seen, since = self._crew_gaps.get(task.id, (None, now))
+            since = since if seen == key else now
+            clocks[task.id] = (key, since)
+            if now - since >= CREW_GAP_FACTOR * wait and self._crew_gap_told.get(task.id) != key:
+                due.append((task, held, key))
+        self._crew_gaps = clocks
+        if not due:
+            return
+        idle = self._idle_llm_members()  # read once: an owner of two crew tasks due is told of both in this pass
+        owners = {m["name"] for m in idle}
+        told: set[str] = set()  # the owners told in this pass: news pending, so no free member of the next crew task
+        offers: Offers | None = None  # item 1's ready tasks, read once a free member is looked for
+        for task, held, key in due:
+            owner = task.assignee
+            if owner not in owners:
+                continue  # USER, an external member, or a member at work, busy, with news, in error or paused
+            sent = self.db.scalar("SELECT COUNT(*) FROM notifications WHERE recipient = ? AND kind = 'n_crew_gap'"
+                                  " AND json_extract(data, '$.id') = ?", (owner, task.id))
+            if int(sent or 0) >= CREW_GAP_MAX:
+                self._crew_gap_told[task.id] = key  # the cap: this key is not counted again, nor free members sought
+                continue
+            if offers is None:
+                offers = self._offers()
+            free = self._free_members(task, [m for m in idle if m["name"] not in told], now, offers)
+            if not free:
+                continue
+            lang = self.language_of(owner)
+            try:
+                directions, held_text = self.board.crew_gap_parts(task, held, lang)
+            except Exception:
+                log.exception("could not render the free place of crew task #%s", task.id)
+                continue  # the key stays unrecorded: the next pass tries again
+            names = [f"{m['name']} ({trim(m.get('role'), 60)})" for m in free[:CREW_GAP_IDLE_MAX]]
+            self.notify(owner, "n_crew_gap", id=task.id, title=task.title, working=len(task.crew_working),
+                        crew=task.crew, names=", ".join(task.crew_working),
+                        idle=", ".join(names + (["…"] if len(free) > CREW_GAP_IDLE_MAX else [])),
+                        directions=directions, held=held_text)
+            self._crew_gap_told[task.id] = key
+            told.add(owner)
+
+    def _free_members(self, task: Task, idle: list[dict], now: float, offers: Offers) -> list[dict]:
+        """The free members of crew task `task` (docs/SPEC.md §4.2 "A free place"), the longest idle first: the
+        `idle` LLM members outside its working set that have been idle for agents.idle_nudge_seconds at least
+        (last_active), wait neither for a job of their own nor for a file, have no review waiting for them, hold
+        nothing they can go on with (no in_progress task and no todo one without blockers that is no direction, a
+        parent with an open subtask left out; no liveness mark), and were offered by item 1 every ready task it would
+        offer them (`offers` but the directions of their busy_crews, each in _nudged under its offer key)."""
+        wait = self.config.agents.idle_nudge_seconds
+        working = set(task.crew_working)
+        crews: dict[int, bool] = {}  # parent id -> a crew task: its todo subtasks are directions
+        free: list[dict] = []
+        for m in sorted(idle, key=lambda m: m.get("last_active") or 0):
+            name = m["name"]
+            if name in working or now - float(m.get("last_active") or 0) < wait:
+                continue
+            if self.jobs.awaited(name) or self.workspace.waits_for_lock(name) or self.board.reviews_of(name):
+                continue
+            work = []
+            for t in self.board.open_tasks_of(name):
+                if t.status == Status.TODO and not t.blocked_by and t.parent_id is not None:
+                    if t.parent_id not in crews:
+                        crews[t.parent_id] = self.board.get(t.parent_id).crew >= 2
+                    if crews[t.parent_id]:
+                        continue  # a direction: its liveness mark says when its claim would take it
+                if t.status == Status.IN_PROGRESS or (t.status == Status.TODO and not t.blocked_by):
+                    work.append(t.id)
+            waits = self.board.open_parents(work)  # a parent with an open subtask waits for it
+            if any(tid not in waits for tid in work):
+                continue
+            busy = self.board.busy_crews(name) if offers else set()
+            if any(name not in self._nudged.get(key, set()) for t, key in offers if t.parent_id not in busy):
+                continue  # item 1 offers it a ready task first
+            if self.board.stall_marks(name):
+                continue
+            free.append(m)
+        return free
 
     # ---- snapshot -----------------------------------------------------------------------------
     def workspace_info(self) -> dict:
