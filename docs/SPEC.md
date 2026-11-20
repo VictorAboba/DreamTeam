@@ -21,7 +21,8 @@ User-visible texts for agents live in `prompts.py` (ru/en). Python >= 3.11, asyn
 * Event loop: everything runs in one asyncio loop; the DB is used synchronously from it.
   Blocking work (git, big file IO) goes through `asyncio.to_thread`. Shell commands never use the loop's default
   executor (git does, and `asyncio.run` waits for its threads at exit): their spawn, output reader and waiter are
-  daemon threads of their own (§7).
+  daemon threads of their own (§7). Every loop is started by `cli.run_loop(main)` (§18.3), never a bare
+  `asyncio.run` (tests/test_loop_start.py checks src).
 
 ## 1. Layout
 
@@ -5402,6 +5403,20 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   is the TUI prompt (`dreamteam "Сделай змейку"`), except a mistyped command name, which argparse reports
   (`_mistyped`: one word of at least 3 letters one edit from a command — a letter inserted, deleted or replaced, or
   two neighbours swapped; a word of 3 letters only with two swapped, `rnu`).
+- Event loop start (`run_loop`, issue #62): the commands, `tui.main_tui` and `tui.main_print` start their loop with
+  `cli.run_loop(main)`. On Windows (`LOOPBACK_SOCKETPAIR`) each asyncio loop first opens a `socket.socketpair()`,
+  which Python makes by connecting to itself over 127.0.0.1 and accepting with no timeout: a program that holds local
+  connections (network filtering of an antivirus or firewall, its unseen "allow?" window, a VPN or proxy client)
+  holds `asyncio.run` there, silently and deaf to Ctrl+C. `run_loop` first opens and closes one pair in a daemon
+  thread, waiting in 0.1 s steps: Ctrl+C works between them (KeyboardInterrupt as from `asyncio.run`, `main` closed
+  unstarted). After `LOOPBACK_WAIT` (5 s) `loopback_text()` goes once to stderr (never stdout) and to the log when one
+  is set up (INFO): the program file of the process (`_python_image`, not a venv launcher or a Store alias), likely
+  causes, fixes (and to start again if it does not go on after them) and docs/en/getting-started.md; once the pair
+  opens, "... DreamTeam goes on." A failed pair (a proxy's "Unexpected peer connection") gets the failure form, then
+  `asyncio.run` runs. Should the loop's own pair be held after the check passed (a program that asks for each
+  connection), a daemon thread writes the same text after `LOOPBACK_WAIT` unless the loop's first step ran by then,
+  saying Ctrl+C cannot stop that wait. `run_loop` closes `main` only when the loop never ran it: a task that a Ctrl+C
+  during `asyncio.run`'s cleanup left pending stays as `asyncio.run` leaves it. Elsewhere `run_loop` is `asyncio.run`.
 - `tui` (docs/TUI.md): `tui.main_tui` (interactive; refuses without a terminal, exit 2) or with `-p`
   `tui.main_print` (text piped into stdin — a pipe or a file, never a terminal or NUL — is appended to the
   prompt; no prompt → exit 2). `-r` without an id opens the session picker (`/sessions`). The flags `--model`,
@@ -5531,7 +5546,7 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     `plan.exit_code`. Otherwise `[y/N]` (`Import? [y/N] `; `y`, `yes`, `д`, `да`) when `_stdin_is_terminal()`,
     else `--yes` is required (`Nothing imported: pass --yes to import without a confirmation.`, exit 1); another
     answer prints `Nothing imported.` (exit 0); Ctrl+C there exits 130. The blockers are checked again after the
-    answer. The import runs in this process (`SessionManager(home)`, `asyncio.run`) with its own launcher marker
+    answer. The import runs in this process (`SessionManager(home)`, `run_loop`) with its own launcher marker
     (`write_launcher_marker`, removed at the end) and a `before_swap` hook that checks the blockers again right
     before each session is renamed in (a process that started meanwhile fails that session). It prints
     `render_import_result` and exits with `result.exit_code` (130 when Ctrl+C stopped it; a second Ctrl+C breaks

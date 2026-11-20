@@ -285,6 +285,153 @@ def _port_free(host: str, port: int) -> bool:
         return False
 
 
+# ---- starting the event loop (run_loop, docs/SPEC.md §18.3, issue #62) ------------------------
+LOOPBACK_WAIT = 5.0  # seconds a start waits for asyncio's local connection before it says what holds it
+# Windows has no socketpair of its own: Python makes one by connecting to itself over 127.0.0.1 and accepting with
+# no timeout, and every asyncio loop opens one first. Elsewhere it is a Unix socket pair, which nothing holds.
+LOOPBACK_SOCKETPAIR = sys.platform == "win32"
+LOOPBACK_HELP = ("https://github.com/VictorAboba/DreamTeam/blob/master/docs/en/getting-started.md"
+                 "#if-dreamteam-hangs-at-start-on-windows")
+
+
+def run_loop(main):
+    """asyncio.run(main): the only way DreamTeam starts an event loop (docs/SPEC.md §18.3). With
+    LOOPBACK_SOCKETPAIR it first opens one socket.socketpair() in a daemon thread and waits for it in 0.1 s steps
+    (Ctrl+C works between them, never inside a blocked accept): after LOOPBACK_WAIT seconds stderr says what holds
+    it, and the start goes on once it opens. A Ctrl+C while waiting closes `main` unstarted and comes out as
+    KeyboardInterrupt, as from asyncio.run. Should the loop's own pair be held after that, a daemon thread says so
+    after LOOPBACK_WAIT seconds as well."""
+    if not LOOPBACK_SOCKETPAIR:
+        return asyncio.run(main)
+    try:
+        _wait_for_loopback()
+    except BaseException:
+        main.close()  # (never started: no "coroutine was never awaited" warning)
+        raise
+    started = threading.Event()
+
+    async def first_step():
+        started.set()
+        return await main
+
+    def watch() -> None:
+        if not started.wait(LOOPBACK_WAIT):
+            _start_notice(loopback_text(deaf=True))
+
+    step = first_step()
+    try:
+        _daemon_thread(watch, "dreamteam-loop-start")
+        return asyncio.run(step)
+    finally:
+        if not started.is_set():  # the loop never ran them (its creation failed): no "never awaited" warning
+            step.close()
+            main.close()
+        # (once it ran them they are done, or left pending by a Ctrl+C that broke off asyncio.run's cleanup:
+        # closing them then would turn that KeyboardInterrupt into "coroutine ignored GeneratorExit")
+        started.set()
+
+
+def _daemon_thread(target, name: str) -> threading.Thread | None:
+    """A started daemon thread; None when no thread can start (the start goes on without the check)."""
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:  # "can't start new thread"
+        return None
+    return thread
+
+
+def _wait_for_loopback() -> None:
+    """One socket.socketpair() opened and closed in a daemon thread, waited for in 0.1 s steps (run_loop). Only
+    KeyboardInterrupt comes out: a check that cannot run lets the start go on as before."""
+    import time
+
+    outcome: list[Exception | None] = []
+
+    def probe() -> None:
+        try:
+            a, b = socket.socketpair()
+        except Exception as exc:  # e.g. ConnectionError "Unexpected peer connection": something took the connection
+            outcome.append(exc)
+        else:
+            a.close()
+            b.close()
+            outcome.append(None)
+
+    start = time.monotonic()
+    thread = _daemon_thread(probe, "dreamteam-loopback")
+    if thread is None:
+        return
+    held = False
+    while thread.is_alive():
+        thread.join(0.1)
+        if not held and thread.is_alive() and time.monotonic() - start >= LOOPBACK_WAIT:
+            _start_notice(loopback_text())
+            held = True
+    error = outcome[0] if outcome else None
+    if error is not None:
+        _start_notice(loopback_text(error))
+    elif held:
+        _start_notice(f"The connection to 127.0.0.1 opened after {time.monotonic() - start:.0f} s: "
+                      "DreamTeam goes on.")
+
+
+def _start_notice(text: str) -> None:
+    """`text` on stderr (never stdout: `mcp` and `-p` answer there) and in the log, when one is set up."""
+    log.info("%s", text)  # (INFO: the stderr log handler of serve and run takes WARNING and up, no second copy)
+    try:
+        if sys.stderr is not None:  # (print(file=None) would write to stdout)
+            print(text, file=sys.stderr, flush=True)
+    except (OSError, ValueError):  # no usable stderr: the log file has it
+        pass
+
+
+def loopback_text(error: Exception | None = None, *, deaf: bool = False) -> str:
+    """What holds the start and what to check (Windows, issue #62): `error` when the connection failed, `deaf`
+    when the event loop's own connection is held after the check passed (Ctrl+C cannot stop that wait)."""
+    exe = _python_image()
+    name = os.path.basename(exe) or "python.exe"
+    if error is None:
+        head = (f"DreamTeam is not starting: for {LOOPBACK_WAIT:g} s Python has been waiting for a connection to "
+                "itself over 127.0.0.1, which asyncio needs on Windows.")
+    else:
+        reason = f"{type(error).__name__}: {error}" if str(error) else type(error).__name__
+        head = ("DreamTeam may not start: Python could not open a connection to itself over 127.0.0.1, which "
+                f"asyncio needs on Windows ({reason}).")
+    text = (f"{head}\nMost likely a program holds or intercepts the local connections of {exe}: an antivirus or "
+            "firewall with network filtering (Kaspersky, ESET, Avast, Dr.Web...), perhaps asking in a window that "
+            f"is easy to miss whether to allow {name}, or a VPN or proxy client.\nAllow {name} there, or turn the "
+            f"filtering or the VPN off for a while, or add that {name} (or 127.0.0.1) to its exclusions.")
+    if deaf:
+        text += ("\nDreamTeam goes on once the connection opens; Ctrl+C cannot stop this wait: close the window "
+                 "(or end the process) to stop it.")
+    elif error is None:
+        text += ("\nDreamTeam keeps waiting and goes on once the connection opens; Ctrl+C stops it (start it again "
+                 "if it does not go on after you change those settings).")
+    return f"{text}\nMore: {LOOPBACK_HELP}"
+
+
+def _python_image() -> str:
+    """The program file of this process, as security software sees and excludes it: in a venv (uv tool install)
+    sys.executable is a launcher that starts the base interpreter, and a Microsoft Store Python runs from its
+    package folder, not from the alias in WindowsApps that sys.executable names."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # (its own: windll.kernel32 keeps its argtypes)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                        ctypes.POINTER(wintypes.DWORD)]
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = wintypes.DWORD(len(buffer))
+        if kernel32.QueryFullProcessImageNameW(kernel32.GetCurrentProcess(), 0, buffer, ctypes.byref(size)):
+            return buffer.value
+    except (ImportError, AttributeError, OSError, ValueError):  # (not Windows)
+        pass
+    return os.path.realpath(getattr(sys, "_base_executable", None) or sys.executable or "python.exe")
+
+
 class _StopSignals:
     """Ctrl+C, Ctrl+Break (Windows) and SIGTERM (`docker stop`, MCP clients) request a graceful stop: the
     web server closes, then `swarm.stop()` stops the agents and their MCP server processes. A second
@@ -558,7 +705,7 @@ def cmd_run(args) -> int:
     setup_logging(project)
     console = not args.no_console and _stdin_is_terminal()
     try:
-        return asyncio.run(_serve_swarm(project, config, host, port, args.goal, console, args.open))
+        return run_loop(_serve_swarm(project, config, host, port, args.goal, console, args.open))
     except KeyboardInterrupt:
         return 0
 
@@ -695,12 +842,12 @@ def cmd_mcp(args) -> int:
         if base:
             from .hub_mcp import serve_stdio_proxy
 
-            asyncio.run(serve_stdio_proxy(base + "/mcp"))
+            run_loop(serve_stdio_proxy(base + "/mcp"))
             return 0
         if home_mode:
-            asyncio.run(_mcp_launcher_in_process(project, config, web=not args.no_web))
+            run_loop(_mcp_launcher_in_process(project, config, web=not args.no_web))
         else:
-            asyncio.run(_mcp_in_process(project, config, web=not args.no_web))
+            run_loop(_mcp_in_process(project, config, web=not args.no_web))
     except KeyboardInterrupt:
         pass
     return 0
@@ -748,7 +895,7 @@ def cmd_status(args) -> int:
     except EarlierVersionError as exc:
         print(exc, file=sys.stderr)
         return 1
-    text, _ = asyncio.run(call_tool(ToolContext(swarm, USER), "swarm_status", {}))
+    text, _ = run_loop(call_tool(ToolContext(swarm, USER), "swarm_status", {}))
     print(text)
     print("Hub: not running")
     swarm.close()
@@ -1048,9 +1195,9 @@ def cmd_serve(args) -> int:
     setup_logging(home)
     console = not args.no_console and _stdin_is_terminal()
     try:
-        return asyncio.run(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
-                                       goal=args.goal, title=args.title, workspace=workspace, skills=skills,
-                                       network=args.network, clarify=args.clarify, copy_from=copy_from))
+        return run_loop(_serve_home(home, host, port, console=console, open_browser=not args.no_browser,
+                                    goal=args.goal, title=args.title, workspace=workspace, skills=skills,
+                                    network=args.network, clarify=args.clarify, copy_from=copy_from))
     except KeyboardInterrupt:
         return 0
 
@@ -1199,7 +1346,7 @@ def _delete_sessions(args, ids: list[str]) -> int:
         return code
 
     try:
-        return asyncio.run(delete_all())
+        return run_loop(delete_all())
     except KeyboardInterrupt:  # the sessions deleted so far are printed
         print("Interrupted.", file=sys.stderr)
         return 130
@@ -1519,7 +1666,7 @@ def _apply_import(manager, plan, home: Path, new_home: bool = False, progress=No
 
     marker = write_launcher_marker(home)
     try:
-        asyncio.run(run())
+        run_loop(run())
         interrupted = False
     except KeyboardInterrupt:
         interrupted = True
