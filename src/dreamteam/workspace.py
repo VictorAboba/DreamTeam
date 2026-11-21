@@ -1066,22 +1066,15 @@ class Workspace:
         return data.decode("utf-8", errors="replace"), size > len(data)
 
     # --- writing ------------------------------------------------------------------------------
-    def _refuse_skills_mirror(self, actor: str, rel: str) -> None:
+    def _refuse_skills_mirror(self, rel: str) -> None:
         """write_file / edit_file never change the swarm's skills: the mirror is rebuilt from the session's copies
-        (a `shell` edit there is undone by the next check, docs/SPEC.md §19). The way to propose the change is named
-        only to a caller whose tool set has skill_propose (an agent of an older revision lacks it)."""
+        (a `shell` edit there is undone by the next check, docs/SPEC.md §19). The refusal names skill_propose, which
+        every caller of write_file / edit_file has (AI agents and external members)."""
         if not _covers(SKILLS_MIRROR, rel.rstrip("/")):
             return
-        text = (f"'{SKILLS_MIRROR}/' holds the swarm's skills and is rebuilt by DreamTeam. To change a skill, copy "
-                "its folder (without node_modules) into your scratch folder and edit it there")
-        try:
-            from .tools import frozen
-
-            member = self.swarm.member(actor)
-            proposes = member is not None and "skill_propose" in frozen.member_tool_names(self.swarm, member)
-        except Exception:  # noqa: BLE001 - only the wording depends on it (test doubles, a view-only swarm)
-            proposes = False
-        raise ToolError(text + (", then call skill_propose." if proposes else "."))
+        raise ToolError(f"'{SKILLS_MIRROR}/' holds the swarm's skills and is rebuilt by DreamTeam. To change a skill, "
+                        "copy its folder (without node_modules) into your scratch folder and edit it there, then call "
+                        "skill_propose.")
 
     @staticmethod
     def _refuse_hardlink(rel: str, p: Path) -> None:
@@ -1098,7 +1091,7 @@ class Workspace:
     async def write(self, actor: str, path: str, content: str) -> str:
         p = self.resolve(path)
         rel = self.rel(p)
-        self._refuse_skills_mirror(actor, rel)
+        self._refuse_skills_mirror(rel)
         self._refuse_hardlink(rel, p)
         if p.is_dir():
             raise ToolError(f"'{rel}' is a directory; give a file path.")
@@ -1121,7 +1114,7 @@ class Workspace:
         _encode(new, "new_text")
         async with self._io_lock:
             p, rel = self._existing_file(path)
-            self._refuse_skills_mirror(actor, rel)
+            self._refuse_skills_mirror(rel)
             self._refuse_hardlink(rel, p)
             self.check_writable(actor, rel)
             updated, replaced = self._apply_edit(rel, self._read_bytes(p, rel), old, new, replace_all)

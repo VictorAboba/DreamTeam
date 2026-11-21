@@ -66,10 +66,11 @@ src/dreamteam/
   tools/__init__.py  registry: ToolSpec, ToolContext, tool(), tools_for(), schemas_for(), call_tool()
   tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
   tools/skill_tools.py the skills tools: the user's `skills`, `skill_attach`, `skill_detach`, `skill_approve`,
-                 `skill_reinstall`, and the members' `skill_propose` (frozen revision 3; §19)
+                 `skill_reinstall`, and the members' `skill_propose` (§19)
   tools/frozen.py    frozen LLM tool sets: revisions (now 5), the kv record of each agent,
                      `python -m dreamteam.tools.frozen` (§6.1)
-  tools/snapshots/   llm_r<N>.json: every released LLM tool set (revision N, en and ru), never edited
+  tools/snapshots/   llm_r<N>.json: the shipped LLM tool sets, revision OLDEST_OPEN_REVISION..TOOLSET_REVISION
+                     (now 5; en and ru), never edited
   agent.py       AgentRuntime   — ReAct loop of one LLM agent
   swarm.py       Swarm          — composition root
   hub_mcp.py     the swarm as an MCP server (stdio / streamable HTTP / stdio->HTTP proxy)
@@ -572,14 +573,13 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
   past the tags is `autoreply.planner_question(scalar, name, task_id, since)` (the id of the question the planner
   waits on, else None), which the requests to the user read from a session's file too (§21.5), so the guard, the
   banner and the requests cannot drift apart.
-- **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm` (toolset revision 4,
-  §6.1). The message is always stored first; then `ask_user(asker, message)` pauses only after these checks, in this
+- **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm`. The message is always
+  stored first; then `ask_user(asker, message)` pauses only after these checks, in this
   order, each giving its outcome and result note (§12): `user` (the sender is the user), `no_user` ("user" is not a
   recipient), `off` (`[swarm] clarify` is off), `auto` (the auto-reply lease), `own` / `pending` (a question is
   pending already: one at a time), `paused` (paused for another reason, which stays), `budget` (spent), else
   `asked`: `pause(asker, "question", asker=, message_id=, since=)`. Every outcome but `asked` leaves an ordinary
-  message. AI agents of revision 4 and later and external MCP members can pause; for an agent of revision 1-3
-  `call_tool` drops the argument (§12) until its next compaction. There is no cap per member.
+  message. AI agents and external MCP members can pause. There is no cap per member.
   - State: the question lives only in kv `paused` (`{"paused": true, "reason": "question", "asker", "message_id",
     "since"}`); `pending_question()` reads it. Every exit rewrites that one slot, so a stale question never captures
     a later message. `swarm.paused` {reason: "question", asker, message_id, since}, actor the asker; USER gets the
@@ -1880,43 +1880,39 @@ reach existing members through tool results and notifications, and new tools at 
 **Frozen tool sets** (tools/frozen.py). The tools array is part of the prompt prefix that thinking blocks are bound
 to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
 it:
-- Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
-  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what
-  `schemas_for("llm", language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were
-  frozen (sorted digest `e3c5cbc7…`).
+- Every released LLM tool set is a numbered **revision** (`{"revision": N, "en": [...], "ru": [...]}`), never
+  edited, and a number is never reused. The revisions a session this version opens can hold, from
+  `OLDEST_OPEN_REVISION` to `TOOLSET_REVISION`, are shipped as `tools/snapshots/llm_r<N>.json`. `TOOLSET_REVISION`
+  (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what `schemas_for("llm", language)`
+  builds.
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
   tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without a usable one
   (`frozen.valid`, below) gets `frozen.current_record(language)`, written at once: a session this version opens
-  has no agent with a history and no usable record (§17.2 "Sessions of an earlier version"), so the baseline
-  branch of `initial_record(language, has_history)` is gone (the function and its `has_history` argument are
-  removed; `member_tool_names` follows the same rule). View-only loads (no runtime) write nothing.
+  has no agent with a history and no usable record (§17.2 "Sessions of an earlier version"), so a missing record
+  means the agent never ran; `member_tool_names` follows the same rule. View-only loads (no runtime) write nothing.
 - `AgentRuntime`: `tools_rev`, `tools` (the record's list, passed unchanged to `llm.complete`), `tool_names`
   (frozenset), `tool_parameters(name) -> dict | None` (None: the agent lacks that tool).
 - **Upgrade at compaction only**: `_replace_with_summary` moves an agent whose `tools_rev != TOOLSET_REVISION` to
   `frozen.current_record(language)` (`!=`: after a code downgrade it realigns too); the record is written in the same
   `db.transaction()` as the history rewrite (`_replace_history(messages, tools=)`), and the new history holds no
-  assistant turn bound to the old array. The compaction request itself still sends the old array. When tools were
-  added, the summary message gets `tools_added` {tools: "`jobs`, `job_stop`"} before `continue` (revision 3 → 4 adds
-  no tool, only the `pause_swarm` property, so no such line). `agent.compacted` data and the compaction span meta
+  assistant turn bound to the old array. The compaction request itself still sends the old array. Downgrading the
+  code below a session's newest revision is unsupported. When the upgrade adds tools, the summary message gets
+  `tools_added` {tools: the added names, each in backticks, joined by ", "} before `continue`; an upgrade that adds
+  no tool (only properties or descriptions) gets no such line. `agent.compacted` data and the compaction span meta
   carry `tools_revision`.
-- Existing agents keep revision 1 until their next compaction: they get timer backgrounding, the adoption of
-  processes a command leaves running, the console intercept, the job notices and the wake line at once (§7.1), and
-  texts that point at a tool are tailored with `ToolContext.has_tool` (§12). Downgrading the code below a session's
-  newest revision is unsupported. This bullet and the other passages on agents of revisions 1-4 (§3.1 `pause_swarm`
-  dropped by `call_tool`, the console intercept of §7.1, §12) describe branches no session this version opens
-  reaches ("Oldest revision opened"): the code and its tests stay until a separate cleanup removes them.
 - **Oldest revision opened**: `OLDEST_OPEN_REVISION = 5`, a fixed constant (the revision of crew tasks, 0.2.0; never
   derived from `TOOLSET_REVISION`, so a later revision still opens sessions of revision 5). A session with a member
-  recorded below it, or with an agent that has a history and no record (the baseline revision), was made by an
-  earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version opens builds
-  a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and the upgrade at
-  compaction moves only revisions 5 and later. The snapshots `llm_r1..r4.json` stay (tests/test_frozen_tools.py
-  checks that every released revision stays served, §12 R0′, and `frozen.for_span` reads them for old trace spans;
-  `--check` compares only the current revision's file).
+  recorded below it, or with an agent that has a history and no record (it ran before tool sets were frozen), was
+  made by an earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version
+  opens builds a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and
+  the upgrade at compaction moves only revisions 5 and later. Only the revisions from `OLDEST_OPEN_REVISION` on are
+  shipped (tests/test_frozen_tools.py checks that exactly these are, and that each stays served, §12 R0′).
+  `frozen.for_span` reads them for trace spans recorded before an agent's last upgrade. `--check` compares only the
+  current revision's file.
 - `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions()`, `snapshot(rev, language)` (a fresh copy; unknown
   language → en), `current(language)`, `record(rev, language, tools)`, `current_record(language)`,
   `valid(rec) -> bool` (a dict with an integer, non-bool `rev` and `tools` a list of dicts with a str `name` and a
-  dict `parameters`; today's `_valid`, made public so that `read` and `db.made_by_earlier_version` share it),
+  dict `parameters`; shared by `read` and `db.made_by_earlier_version`),
   `read(db, name) -> dict | None` (a record that is not `valid` is logged and ignored),
   `write(db, name, rec)`, `names(tools)`, `for_span(db, name, language, revision)` (§16), `member_tool_names(swarm,
   member) -> frozenset` (a runtime's names, else the record or the set its first start will freeze, nothing
@@ -2068,8 +2064,7 @@ class Workspace:
         # both refuse a path under SKILLS_MIRROR (`.scratch/_skills`, a lexical check on the resolved relative path,
         # case-folded on Windows): ToolError "'.scratch/_skills/' holds the swarm's skills and is rebuilt by
         # DreamTeam. To change a skill, copy its folder (without node_modules) into your scratch folder and edit it
-        # there, then call skill_propose." (§19); the last clause only for a caller whose tool set has skill_propose
-        # (frozen.member_tool_names: an agent of revision 1 or 2 gets "... edit it there.")
+        # there, then call skill_propose." (§19)
         # a read-only file elsewhere (a copy of a mirror folder keeps its read-only files) is made writable first
         # (owner write bit), unless it has other hard links; the write is the member's explicit edit
         # old must occur exactly once unless replace_all; ToolError with hints otherwise
@@ -2659,7 +2654,7 @@ outlive its call:
 4. Unless the outcome is `killed` (the session stops or the member leaves: no git work may start then):
    `workspace.autocommit(actor, kind="shell", detail=command, hold=True)`, one commit per call; new files wait
    one more command ("Held new files" above), and the result says nothing about them.
-5. The result is `outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=[shell], has_wait=ctx.has_tool("wait"))`.
+5. The result is `outcome.render(cfg=[shell], has_wait=ctx.has_tool("wait"))`.
 
 An agent's command dies when the agent's task is cancelled (a stopped or retired agent) before the command became a
 job: its command must not go on writing into the workspace after the swarm stopped.
@@ -2697,7 +2692,7 @@ class Job:   # id, owner, command, origin, cmd: RunningCommand, log, log_path, s
              # stopped_by, ended_at, tail; label "j<id>", log_shown, notice_tail(), public(now=None) -> dict
 @dataclass
 class ShellOutcome:  # state, code, output, shell, wait, job=None, note="", names=[], note_args={}, max_output=12000
-    def render(self, *, has_jobs_tool: bool, cfg: ShellSettings, has_wait: bool = True) -> str
+    def render(self, *, cfg: ShellSettings, has_wait: bool = True) -> str
 def parse_job_id(text) -> int | None                     # "j3" "J3" "%3" "#3" "3" -> 3
 def parse_console(command) -> tuple[str, list[int], bool] | None   # ("list"|"show"|"kill", ids, force)
 def short_command(cmd, limit) -> str                     # one line, cut in the middle with "…"
@@ -2710,8 +2705,8 @@ def shown_log(log) -> str                                # a data_dir log with "
 | origin | how a command becomes one | stopped at (from its start) | keeps its owner busy | its end wakes the owner |
 |---|---|---|---|---|
 | `timeout` | its shell still runs when the call's wait ended | `[shell] max_timeout` | always | unless the goal is done |
-| `background` | `background=true` (revision-2 agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
-| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow`, `start /b`; with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
+| `background` | `background=true` (AI agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
+| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`; with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
 
 `wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
 
@@ -2756,15 +2751,14 @@ def shown_log(log) -> str                                # a data_dir log with "
   | `killed` | the session stopped or the member left while the command ran in the foreground | `KILLED: the session is stopping [shell]` / `KILLED: you are leaving the swarm [shell]` |
 
   Then the output (`(no output)`, or `(no output yet)` for a job), and for `leftovers_killed` / `timeout` a
-  `[note]`, for a job a footer. The footer of `background`, `started` and `detached` says where the output goes,
-  that the owner is notified at the end (so: no polling, other work or `wait`; `wait_for_events` for an external
-  member, which has no `wait`: `has_wait`), how to see and stop the job and its lifetime. For a caller with the
-  `jobs` tool (`ToolContext.has_tool`) it names `jobs` with job_id and `job_stop` (and for `background`: "start
-  servers and long runs with background=true instead"); for a revision-1 agent it names the console commands ("run
-  the shell command jobs jN / kill jN (each as a command of its own)") and `&` / `Start-Process -NoNewWindow` (a
-  plain `Start-Process` opens a console window of its own on the user's desktop and its output never reaches the
-  job), never a tool it lacks. `render()` never cuts the first line or the footer: only the output between them is
-  cut to `max_output`.
+  `[note]`, for a job a footer. The footer of `background`, `started` and `detached` says:
+  - where the output goes;
+  - that the owner is notified at the end (so: no polling, other work or `wait`; `wait_for_events` for an external
+    member, which has no `wait`: `has_wait`);
+  - how to see and stop the job (`jobs` with job_id, `job_stop`);
+  - its lifetime (for `background`: "start servers and long runs with background=true instead").
+
+  `render()` never cuts the first line or the footer: only the output between them is cut to `max_output`.
 - A caller cancelled before its command became a job: the tree is killed and awaited (KILL_WAIT), the cancellation
   goes on; any other failure kills it too. After the adoption the caller's cancellation never touches the job.
 
@@ -2836,8 +2830,8 @@ commit), then notifies the owner when it is still a member:
 Only the owner or the user can stop a job. `{duration}` (`fmt_duration`: "45 s", "12 min", "2 h 05 min"; ru "45 с",
 "12 мин", "2 ч 05 мин") and `{result}` are built in the owner's language; `{tail}` = the last 15 lines, at most 1200
 characters, each indented by two spaces, or `job_no_output`; `{command}` = `short_command(command, 120)`; `{log}` =
-the log as shown above. These texts reach agents of every tool revision, so they name no tool, only the log. A
-paused swarm holds them until `resume` like any notice; an external member gets them through `wait_for_events`.
+the log as shown above. These texts name no tool, only the log. A paused swarm holds them until `resume` like any
+notice; an external member gets them through `wait_for_events`.
 
 **Stop** — `async stop(job_id, by, *, force=False) -> str`, synchronous (a restart on the same port does not race):
 only the owner or USER (else ToolError `Job j3 belongs to Anna Smith; only its owner or the user can stop it (ask them
@@ -2880,10 +2874,11 @@ the `listing` line (`…, started in the background, no output for 40 min; log �
 `/jobs`. The monitor publishes a live-only `job.silent` {job} each time a job turns silent or prints again, so the UI
 reloads the state; no notice, no automatic stop: its owner (or the user) decides.
 
-**Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: how revision-1 agents
-list and stop jobs with the `shell` tool they have. The command is stripped and one trailing `;` dropped; the WHOLE
-line must match (case-sensitive), else None and the command goes to the real shell (`kill j3; npm start`, `jobs |
-wc -l`, `echo kill j3` all do):
+**Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: a whole `shell` command
+line `jobs`, `jobs j3` or `kill j3`, as a model types it from shell habit (a fresh shell has no job table), is
+answered from the job manager for every caller of `shell`; no text advertises it. The command is stripped and one
+trailing `;` dropped; the WHOLE line must match (case-sensitive), else None and the command goes to the real shell
+(`kill j3; npm start`, `jobs | wc -l`, `echo kill j3` all do):
 
 | command line | answer |
 |---|---|
@@ -3429,7 +3424,7 @@ async def call_tool(ctx: ToolContext, name: str, args: dict) -> tuple[str, bool]
     # rejects actors that are neither USER nor an active member; an LLM agent (a runtime with
     # tool_parameters) calls only the tools of its frozen set, with their frozen parameters: a tool it lacks is
     # "Unknown tool" with close matches and the list from its own set only (never a newer tool), and arguments
-    # its schema lacks are dropped with the note "[Ignored unknown argument(s): ...; Usage: <its frozen
+    # its schema lacks are dropped with the note "[Ignored unknown argument(s): .... Usage: <its frozen
     # signature>]"; validation still uses the registry spec (hence R0′ below); unknown tool -> close matches + the
     # available tools; audience errors say how to fix the call (join_swarm/as_agent); checks required args
     # (whitespace-only = missing unless allow_empty) and types with coercion ("5"/"#5" -> 5, JSON strings for
@@ -3451,7 +3446,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `task_review` | task_id, approve, comment? | LEU |
 | `task_comment` | task_id, text, reply_to? | LEU |
 | `task_discussion` | task_id, since_id? | LEU |
-| `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean, revision 4 and later: a question to "user" that may pause the swarm, §3.1) | LEU |
+| `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean: a question to "user" that may pause the swarm, §3.1) | LEU |
 | `read_messages` | with?, limit?, include_read? | LEU |
 | `agents` | — (the roster, then the role catalog) | LEU |
 | `hire_agent` | role, instructions ("" for a catalog role), model?, name? | LEU |
@@ -3487,13 +3482,13 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `skill_detach` | name | U (§19) |
 | `skill_approve` | name, approve, comment?, replace? (a member's proposal: saved to the skills library or not) | U (§19) |
 | `skill_reinstall` | name, ecosystem? (`python` or `node`; default both: the skill's packages installed again) | U (§19) |
-| `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (revision 3, §19) |
+| `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (§19) |
 
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
 `ctx.runtime.note_sent_to_user()` when USER is a recipient.
 
-`send_message` and `pause_swarm` (§3.1). The description (en and ru, revision 4) keeps "wakes its recipients" and
+`send_message` and `pause_swarm` (§3.1). The description (en and ru) keeps "wakes its recipients" and
 adds that `pause_swarm=true` is only for a question to ["user"] whose answer decides how the team goes on, so that
 work under way would otherwise be redone: the session *may* then pause the whole swarm until the user answers, and
 every member gets the question with the answer; never for what the agent can decide itself, a question about its
@@ -3516,8 +3511,6 @@ usage line is `send_message(to, text, reply_to?, pause_swarm?)`. The result star
 - The user's message that answers a question: ` This answers {asker}'s question #{id}: every member got the question
   and your answer, and the swarm goes on.` (A-ok), or with the budget spent `…, but the budget is exhausted, so the
   swarm stays paused until you raise max_cost_usd.` (A-budget).
-- An agent of revision 1-3 passing `pause_swarm` gets the argument dropped by `call_tool`: `[Ignored unknown
-  argument(s): pause_swarm. Usage: send_message(to, text, reply_to?)]`, and nothing pauses.
 
 **R0′: LLM tool schemas are released as revisions.** Every LLM agent sends its own frozen tools array (§6.1), and
 Anthropic thinking blocks bind to the exact prefix, so a changed name, description, parameter, `required` list, enum
@@ -3528,14 +3521,11 @@ or order of a tool with the `llm` audience is released as a new revision, in one
 4. pin its exact-order digests (`sha256(db.dumps(tools))` per language) in tests/test_frozen_tools.py (`RELEASED`).
 
 Existing agents keep their revision until their next compaction; new agents get the current one. Arguments are
-still validated against the current registry, so the registry must keep serving every released revision
+still validated against the current registry, so the registry must keep serving every shipped revision
 (tests/test_frozen_tools.py checks it): no tool leaves the `llm` audience, no property is removed or retyped
-(`items.type` included), the current `required` is a subset of every released one, enums only grow, a free property
-never gains an enum. Revisions: 1 = the tools before background jobs (sorted digest `e3c5cbc7…`, the baseline of
-agents created before tool sets were frozen), 2 = background jobs (`shell` gains `background`, new `jobs` and
-`job_stop`, new `shell` and `wait` descriptions), 3 = `skill_propose` (appended last; the array of revision 2
-before it is unchanged), 4 = `send_message` gains `pause_swarm` and its new description (the array of revision 3
-otherwise unchanged; §3.1), 5 = crew tasks (§4.2): `task_create` and `task_update` gain `crew` and then
+(`items.type` included), the current `required` is a subset of every shipped one, enums only grow, a free property
+never gains an enum. Revisions 1-4 were the tool sets of 0.1.x (their sessions are not opened, §17.2); 5 = crew
+tasks (§4.2): `task_create` and `task_update` gain `crew` and then
 `directions` (last, after `tags` / `comment`; their descriptions English in both arrays, like the other board
 properties: `task_create` `crew` `Crew task: how many members may work on it at once, its owner included (2..8);
 0 = an ordinary task`, `directions` `With crew: its areas, one title per item; each becomes a draft subtask whose
@@ -3553,10 +3543,10 @@ and directions; you then own it and the first direction is your own part; each d
 and when all of them are finished you write the task's result and complete it (crew 0 makes it an ordinary task
 again).` (ru « Если задача, над которой ты работаешь, оказалась слишком велика для одного участника, передай crew и
 directions: ты станешь её владельцем, а первое направление — твоя часть; каждое направление сдаётся отдельно, а
-когда все они завершены, ты пишешь итог задачи и завершаешь её (crew 0 снова делает её обычной задачей).»; the
-array of revision 4 otherwise unchanged; `task_claim` is unchanged). A session with a member below
+когда все они завершены, ты пишешь итог задачи и завершаешь её (crew 0 снова делает её обычной задачей).»; no
+other tool changed, `task_claim` included). A session with a member below
 `frozen.OLDEST_OPEN_REVISION` (5) is not opened (§6.1, §17.2 "Sessions of an earlier version"), so notifications
-and wake-up texts name only tools and parameters of every released revision from 5 on (tests/test_prompts.py),
+and wake-up texts name only tools and parameters of every shipped revision from 5 on (tests/test_prompts.py),
 crew tasks, `crew` and `directions` included; tool results that point at a newer tool check
 `ToolContext.has_tool`, and a notification the recipient's frozen record (`frozen.member_tool_names`). `allow_empty`
 is validation only, not part of the schema. Tools of the `user`/`external` audiences only (e.g. `set_goal`) are not
@@ -3660,8 +3650,7 @@ Results of the team, wait and job flows:
   `Workspace.awaited_locks`: none once the goal is done, when n_lock_free is quiet; §7 "Lock waiters"); both:
   `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.`
 - `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
-  min). Stop the ones nobody needs with job_stop; the rest stop with the session.` (a caller without `job_stop`: `with
-  the shell command kill jN (as a command of its own)`).
+  min). Stop the ones nobody needs with job_stop; the rest stop with the session.`
 - `shell`, `jobs`, `job_stop`: §7.1.
 - `wait_for_events(progress=true)` also returns when others make board progress: `task.created`, `task.updated` with
   a status change, `goal.set`, `goal.completed`, `goal.reopened`, `agent.hired` (an external member: "joined"),
@@ -4023,7 +4012,7 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
 | kind | name | input | output | notes |
 |---|---|---|---|---|
 | input | `wake` / `incoming` / `nudge` / `continue` | – | text added to the context | `record()` |
-| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1; absent in spans recorded before tool sets were frozen) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` (+ `max_tokens` when the request's output limit was raised, §6.2) + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
+| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` (+ `max_tokens` when the request's output limit was raised, §6.2) + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
 | tool | tool name | arguments (dict) | full result text (before truncation for the model) | meta `{call_id, chars, shown_chars?}`; status `error` if is_error; task ids in `task_id` / `parent_id` / `depends_on` are added to the trace's `tasks` |
 | compaction | `compaction` | `{"messages","prompt_tokens"}` | summary text | parent of its llm span; meta `{epoch_archived, fallback?, tools_revision}` (the tool set from then on, §6.1); status `error` when the summary call failed |
 | event | `reply_to_user` / `refusal` / `budget_pause` / `step_limit` / `stopped` / `crash` | – | text | `refusal` and `crash` have status `error` |
@@ -4050,8 +4039,8 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
   them). `Tracer.span_context(span_id)` then rebuilds `{span_id, agent, epoch, model, system, tools, messages,
   complete, note}` for any LLM span, reading the live epoch from the table (a second reader such as the CLI
   gets it right too); its `tools` (unless given) are the tools that call sent: `frozen.for_span(db, agent, language,
-  input.tools_rev)` = the agent's record when its revision matches, else that revision's shipped snapshot, and the
-  baseline revision for a span without `tools_rev`. `export()` passes `tools=[]`.
+  input.tools_rev)` = the agent's record when its revision matches, else that revision's shipped snapshot, else the
+  record's tools (the current set when the agent has no record). `export()` passes `tools=[]`.
 - External members: `tracer.external_call(agent, tool, args_without_as_agent, result_text, is_error, started_at)`
   for every hub tool call by an external member except `wait_for_events`. A session trace closes (`done`) at
   its last call after `EXTERNAL_IDLE_SECONDS` (15 min) without calls (scheduler: `close_external(idle_seconds)`),
@@ -4615,8 +4604,8 @@ settings; ValueError when they are invalid):
   (beside `db.max_tools_revision`, read-only through `_reading`, never creating the file) is true when the
   session database has a kv `tools:<name>` record whose `rev` is an integer below `frozen.OLDEST_OPEN_REVISION`
   (5, §6.1; retired members count; valid or not), or `history` rows of an agent with no usable record (missing, not
-  JSON, or not `frozen.valid`, §6.1, the same test `frozen.read` makes: an agent of the baseline revision). False
-  without a database file (a session
+  JSON, or not `frozen.valid`, §6.1, the same test `frozen.read` makes: an agent that ran before tool sets were
+  frozen). False without a database file (a session
   never started) and for a database with neither (no LLM member ever ran: only the user, external members, or
   members hired and never started): nothing in it is frozen, it is opened as usual, and its LLM members get the
   current revision at their first start. The check is the first step of `Swarm.__init__` once its `config` is
@@ -4675,32 +4664,23 @@ settings; ValueError when they are invalid):
   neither `dreamteam export` nor `dreamteam import`, and 0.1.1 (tool set revision 4 like 0.1.0) opens the sessions of both; the export takes
   only the sessions (`--include sessions`) and goes into a separate home of 0.1.1, for example through
   `uvx --from "git+…@v0.1.1" dreamteam import FOLDER --home NEW_HOME` (a new, empty folder, never the home this version uses). The legacy `main` is never said to be
-  exported: finish it before updating, or remove its database by hand afterwards. Since sessions stop opening, the
-  release that brings crew tasks is 0.2.0, not a patch: the version in pyproject.toml, src/dreamteam/__init__.py and
-  uv.lock.
+  exported: finish it before updating, or remove its database by hand afterwards.
   Tests: a session with a revision-4 record, one with a history and no record, and one with a history and a record
   that is not `frozen.valid` are each listed with `earlier_version`, refused with the message and writing nothing
   through `load`, `start`, `stop`, `resume()`, PATCH, `set_workspace`, the skills routes, `/mcp`, `-c`, `-r`,
   `traces` and
   a single-swarm project's `run` / `status` (no `logs` folder either); each can be deleted (`main`: the 409 and its
   own message) and exported, and `dreamteam import` refuses it before writing anything. A session with no database
-  file, and one whose database holds neither history nor records, open as usual. Tests that change: the fixtures
-  that write a `history` row with no record, tests/test_transfer.py (`_fill_db` and the WAL test's 'bob') and
-  tests/test_cli_transfer.py (`_exported`), and tests/test_runtime.py
-  `test_restart_continues_an_activation_cut_short_without_tasks`, also write `frozen.write(db, name,
-  frozen.current_record("en"))`; tests/test_frozen_tools.py `test_view_only_access_writes_no_tool_record` asserts
-  that the reopen and `dreamteam status` are refused (`EarlierVersionError`, exit 1), and
-  `test_agent_created_before_frozen_tool_sets_keeps_the_baseline` is removed (its rule is gone, §6.1 "Record"). The
-  tests that write a revision 1-4 record into an opened swarm and build its runtime (in tests/test_frozen_tools.py,
-  tests/test_job_tools.py `freeze_revision_1`, tests/test_swarm_skills.py
-  `test_write_tools_name_skill_propose_only_to_who_has_it`) keep working: `AgentRuntime` does not check the
-  revision (§6.1 "Oldest revision opened"). Those that got revision 1 from a history with no record
-  (`seed_history` before the runtime, in tests/test_frozen_tools.py:
-  `test_agents_of_revision_1_keep_it_when_later_revisions_are_released`, `_upgrade_run`,
-  `test_the_upgrade_is_atomic_with_the_history_rewrite`, `test_has_tool_and_member_tool_names`) write the
-  revision-1 record explicitly (`frozen.write(db, name, frozen.record(1, "en", frozen.snapshot(1, "en")))`), and
-  their asserts that such an agent, or `member_tool_names`
-  of an unstarted member with a history, gets the baseline now expect the current revision.
+  file, and one whose database holds neither history nor records, open as usual. The fixtures that write a
+  `history` row, tests/test_transfer.py (`_fill_db` and the WAL test's 'bob') and tests/test_cli_transfer.py
+  (`_exported`), and tests/test_runtime.py `test_restart_continues_an_activation_cut_short_without_tasks`, also
+  write the agent's record (`frozen.write(db, name, frozen.current_record("en"))`), so their sessions open.
+  tests/test_frozen_tools.py `test_view_only_access_writes_no_tool_record` asserts that the reopen and
+  `dreamteam status` are refused (`EarlierVersionError`, exit 1). The tests of an agent on an older revision than
+  the code's write a record of `OLDEST_OPEN_REVISION` into an opened swarm while the code builds a simulated later
+  revision (the `later_revision` fixture of tests/test_frozen_tools.py, or the same monkeypatch of
+  `frozen.TOOLSET_REVISION` and `frozen.current`); `AgentRuntime` does not check the revision (§6.1 "Oldest
+  revision opened").
 - `delete(sid)` renames the directory to `sessions/.deleted-<sid>-<ns>` first (a session whose files are open
   stays intact: 409), then removes it in a thread; leftovers are purged at the next delete. A workspace folder
   outside the session directory is never deleted (it is the user's folder): `delete` returns it (read under the
@@ -6438,9 +6418,9 @@ host library's and Claude Code's skills not attached), `skill_attach` (name or s
 packages (requirements.txt) are being installed; members are told when they are ready." or " Its packages are
 installed already."), `skill_detach`, `skill_reinstall` (§12).
 
-**Proposals** (`skill_propose(path)`, audience llm and external: an LLM tool of frozen revision 3, so new members
-and external members have it at once and older agents after their next compaction, whose `tools_added` names it;
-the system prompt's Skills bullet ends with the proposing sentence, which agents hired before revision 3 never got).
+**Proposals** (`skill_propose(path)`, audience llm and external, so every AI agent and external member has it; the
+system prompt's Skills bullet ends with the proposing sentence (a member hired by a build from before `skill_propose`
+and never started keeps the system prompt it was hired with, which lacks that sentence, §6.1)).
 `SessionSkills.propose(actor, path)`: not the user ("Members propose skills; the user attaches them with
 skill_attach."); `[skills] max_proposals = 0` → "Proposing skills is turned off in this swarm's settings."; the path
 goes through `Workspace.resolve` (inside the workspace, never `.git`), a `SKILL.md` file means its folder, and a

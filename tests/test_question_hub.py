@@ -274,9 +274,9 @@ async def test_read_stats_and_session_line_show_a_question(tmp_path):
 # --- the MCP servers ---------------------------------------------------------------------------------------------
 
 def test_hub_tools_offer_pause_swarm():
-    """The hub MCP lists the live registry: send_message has pause_swarm (toolset revision 4), for external members
-    and for the launcher MCP (which adds `session`). The instructions say how the user answers a question pause; the
-    launcher's own part adds only the clarify=true sentence (the answer rule is in the hub's part it ends with)."""
+    """The hub MCP lists the live registry: send_message has pause_swarm, for external members and for the launcher
+    MCP (which adds `session`). The instructions say how the user answers a question pause; the launcher's own
+    part adds only the clarify=true sentence (the answer rule is in the hub's part it ends with)."""
     for tools in (list_hub_tools(SimpleNamespace(language="en")), list_hub_tools(SimpleNamespace(language="ru")),
                   list_launcher_tools(SimpleNamespace(config=SimpleNamespace(swarm=SimpleNamespace(language="en"))))):
         schema = next(t for t in tools if t.name == "send_message").input_schema

@@ -343,8 +343,9 @@ def made_by_earlier_version(source: Source) -> bool:
     """Whether the session database `source` (see columns_of) was made by an earlier DreamTeam, which this version
     does not open: a kv `tools:<member>` record whose "rev" is an integer below frozen.OLDEST_OPEN_REVISION (valid
     or not, retired members included), or `history` rows of an agent with no usable record (missing, not JSON or
-    not frozen.valid: an agent of the baseline revision). False without a database file (it is not created) and
-    for a database with neither (no LLM member ever ran). Read only; sqlite3.Error and OSError reach the caller."""
+    not frozen.valid: an agent that ran before tool sets were frozen). False without a database file (it is not
+    created) and for a database with neither (no LLM member ever ran). Read only; sqlite3.Error and OSError reach
+    the caller."""
     from .tools.frozen import KV_PREFIX, OLDEST_OPEN_REVISION, valid  # the tools package imports this module
 
     if not isinstance(source, (Database, sqlite3.Connection)) and not Path(source).is_file():

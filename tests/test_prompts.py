@@ -220,7 +220,7 @@ def test_texts_reference_only_real_tools():
             assert not code_idents(text) - allowed, (lang, key, code_idents(text) - allowed)
 
 
-def test_agent_texts_name_only_baseline_tools():
+def test_agent_texts_name_only_tools_every_opened_revision_has():
     """Notifications and wake-up texts reach agents of every tool set revision a session this version opens
     (tools/frozen.py: an agent keeps its tools until a compaction; sessions with a member below
     frozen.OLDEST_OPEN_REVISION are not opened), so they may name only the tools and parameters that every shipped
@@ -321,10 +321,10 @@ def test_background_job_texts():
 
 @pytest.mark.parametrize("lang", LANGS)
 def test_system_prompt_teaches_background_jobs(lang):
-    """New members (revision 2 of the tool set) learn the jobs protocol: a command still running at its timeout, or
-    after [shell] foreground_max seconds, goes on as a background job; long runs start with `background`, then
-    `wait`; `jobs` and `job_stop` show and stop a job; the whole output is in the scratch folder. The end of a job
-    is among the events that wake the member (How you work, item 10)."""
+    """New members learn the jobs protocol: a command still running at its timeout, or after [shell] foreground_max
+    seconds, goes on as a background job; long runs start with `background`, then `wait`; `jobs` and `job_stop` show
+    and stop a job; the whole output is in the scratch folder. The end of a job is among the events that wake the
+    member (How you work, item 10)."""
     system = SYSTEMS[lang]
     for snippet in ("`{scratch}jobs/`", "`background`", "`jobs`", "`job_stop`", "`timeout`", "{foreground_max}",
                     "(j1, j2, …)"):
@@ -358,7 +358,7 @@ def test_system_prompt_teaches_skills(lang):
     assert ("the skills attached to the swarm" if lang == "en" else "подключённые к рою скиллы") in item1
     if lang == "ru":
         assert "скилл" in bullet and "навык" not in system.lower()
-    # new members have skill_propose (revision 3): a procedure that worked can be proposed as a skill
+    # new members have skill_propose: a procedure that worked can be proposed as a skill
     assert "`skill_propose`" in bullet and "`name`" in bullet and "`description`" in bullet
     assert ("the user decides whether it is kept" if lang == "en" else "пользователь решит, сохранить ли его") in bullet
 
@@ -380,7 +380,7 @@ def test_skill_texts():
         for key in ("n_skill_added", "n_skill_updated"):
             assert placeholders(texts[key]) == {"name", "description", "path", "deps"} and "`read_file`" in texts[key]
         assert placeholders(texts["n_skill_removed"]) == {"name"}
-        # proposals and the user's decision; agents of every revision get these, so they name no skill_propose
+        # proposals and the user's decision: they name no skill_propose
         assert placeholders(texts["n_skill_shared"]) == {"owner", "name", "description", "path", "deps"}
         assert placeholders(texts["n_skill_saved"]) == {"name"}
         assert placeholders(texts["n_skill_not_saved"]) == {"name", "comment"}

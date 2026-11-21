@@ -83,7 +83,7 @@ def write_earlier(path: Path, kind: str) -> None:
                    "'idle')")
         db.execute("INSERT INTO events(ts, type, actor, data) VALUES (1.0, 'session.started', 'user', '{}')")
         if kind == "record":   # a revision-4 record (its history does not matter)
-            frozen.write(db, "Anna", frozen.record(4, "en", frozen.snapshot(4, "en")))
+            frozen.write(db, "Anna", frozen.record(4, "en", []))
         else:
             db.execute("INSERT INTO history(agent, seq, msg) VALUES ('Anna', 1, ?)",
                        (json.dumps({"role": "user", "content": "hello"}),))
@@ -770,7 +770,7 @@ async def test_a_session_that_ran_and_was_rewritten_to_revision_4_is_refused(tmp
     conn = sqlite3.connect(path)
     try:
         conn.execute("UPDATE kv SET value = ? WHERE key = ?",
-                     (json.dumps(frozen.record(4, "en", frozen.snapshot(4, "en"))), frozen.kv_key(names[0])))
+                     (json.dumps(frozen.record(4, "en", [])), frozen.kv_key(names[0])))
         conn.commit()
     finally:
         conn.close()

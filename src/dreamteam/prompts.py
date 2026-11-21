@@ -494,7 +494,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "job_exit": "exit code {code}",
         "job_gone": "all its processes exited",
         "job_no_output": "(no output)",
-        # they reach agents of every tool set revision: they name no tool (only the log)
+        # they name no tool, only the log
         "n_job_done": "Your background job j{id} has ended ({result}) after running {duration}. Command: {command}\n"
                       "Last lines of its output:\n{tail}\nThe whole output: {log}.",
         # the shell of a job ended while programs it started run on (a build that left a daemon): the job goes on
