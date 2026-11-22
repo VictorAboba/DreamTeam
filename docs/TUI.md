@@ -278,9 +278,10 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     $0: no prices, and the provider reports no cost; SPEC §10), `u_budget_low` (most of the money budget is spent,
     SPEC §3 `record_usage`), `u_team_asleep` (nobody in the team works and nothing is set to wake anyone, SPEC §3
     scheduler item 9) or `u_team_waits` (the same, and every open task is held by the user or an external member,
-    so no member is woken) writes its text to `err` once per text, also without `verbose` (as `on_cost_unknown`
-    does; the verbose feed already shows it as a notice line). The run goes on waiting after `u_team_asleep` or
-    `u_team_waits`, until `--timeout` when one is given. `stream-json` carries the event itself.
+    so no member is woken) writes its text to `err` once per text, also without `verbose` (the kinds are
+    `printmode.STDERR_NOTES`, written by `on_user_notice`; the verbose feed already shows it as a notice line). The
+    run goes on waiting after `u_team_asleep` or `u_team_waits`, until `--timeout` when one is given. `stream-json`
+    carries the event itself.
   - `json`: one object on `out` at the end:
     `{"type":"result","status":"done|budget|timeout|error|interrupted","session":id,"goal":{...},
     "summary":str,"tasks":[{id,title,status,assignee}],"cost_usd":float,"duration_s":float,"agents":[names],

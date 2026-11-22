@@ -624,6 +624,12 @@ class Swarm:
                 lines.append(prompts.t(lang, "goal", title=goal["title"], status=goal.get("status", "active")))
             else:
                 lines.append(prompts.t(lang, "goal_none"))
+            member = self.member(name) or {}
+            limit = self.limits()["max_cost_usd"]
+            if member.get("kind") == AgentKind.LLM and limit > 0:  # what is spent, next to the goal (§6.3)
+                spent = self.spent_usd()
+                lines.append(prompts.t(lang, "money", spent=spent, limit=limit,
+                                       pct=min(round(100 * spent / limit), 99)))
             mine = self.board.open_tasks_of(name)
             lines.append(prompts.t(lang, "my_tasks", tasks="; ".join(t.short() for t in mine))
                          if mine else prompts.t(lang, "my_tasks_none"))
@@ -643,7 +649,6 @@ class Swarm:
             ready = [t for t in self.board.ready_unassigned() if t.parent_id not in busy][:8]
             if ready:
                 lines.append(prompts.t(lang, "ready", tasks="; ".join(f"#{t.id} {t.title}" for t in ready)))
-            member = self.member(name) or {}
             notes_text = (member.get("notes") or "").strip()
             if member.get("kind") == AgentKind.LLM:
                 # The full Skills index (up to ~15 KB) once per agent memory (the first wake-up, after a restart, in
@@ -974,7 +979,38 @@ class Swarm:
         fields = uncounted_fields(profile, usage, model)
         if fields:
             self._cost_unknown(profile, model or profile.model, fields)
+        try:  # the notice must not fail the model call that paid for it
+            self._budget_low()
+        except Exception:
+            log.exception("the money notice failed")
         return cost
+
+    def _budget_low(self) -> None:
+        """Once per money limit and [swarm] budget_notice_at (kv budget_notice): when the share is spent and the
+        limit is not yet, every AI agent gets n_budget_low (waking by resume's rule, else quiet) and USER the quiet
+        u_budget_low. At the limit u_budget covers it; a new limit or share differs from the record and re-arms it
+        (docs/SPEC.md §3 record_usage)."""
+        limit = self.limits()["max_cost_usd"]
+        at = float(self.config.swarm.budget_notice_at or 0)
+        if not (limit > 0 and 0 < at < 1):
+            return
+        spent = self.spent_usd()
+        if spent < at * limit - 1e-9 or spent >= limit:
+            return
+        told = self.db.get("budget_notice") or {}
+        if told.get("limit") == limit and told.get("at") == at:
+            return
+        self.db.set("budget_notice", {"limit": limit, "at": at, "spent": spent, "ts": time.time()})
+        pct = min(round(100 * spent / limit), 99)
+        for m in self.members():
+            if m["kind"] != AgentKind.LLM:
+                continue
+            name = m["name"]
+            runtime = self.runtimes.get(name)
+            busy = (m["status"] == AgentStatus.WORKING or (runtime is not None and runtime.state == AgentStatus.WORKING)
+                    or self.board.open_tasks_of(name) or self.board.reviews_of(name) or self.has_pending(name))
+            self.notify(name, "n_budget_low", spent=spent, limit=limit, pct=pct, wake=bool(busy))
+        self.notify(USER, "u_budget_low", spent=spent, limit=limit, pct=pct, wake=False)
 
     def _cost_unknown(self, profile: ModelProfile, model: str, fields: tuple[str, ...]) -> None:
         """A call of `profile` counted (some of) its tokens as $0: no price and no cost from the provider. The user

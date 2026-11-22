@@ -38,6 +38,9 @@ FINAL_STATE_TIMEOUT = 5.0
 HEAL_AFTER = 2.0         # s after a failed auto-reply before the state is read again (doubling up to HEAL_MAX)
 HEAL_MAX = 30.0
 PROGRESS_SKIP = ("agent.status", "agent.usage", "agent.activity", "trace.")  # fallback feed: too noisy
+# the user notices whose text goes to stderr once also without --verbose (docs/TUI.md §2): a model profile's calls
+# count as $0 (docs/SPEC.md §10), most of the money budget is spent (§3 record_usage)
+STDERR_NOTES = frozenset({"u_cost_unknown", "u_budget_low"})
 
 TEXTS = {
     "ru": {
@@ -264,7 +267,7 @@ class _PrintRun:
         self._heal_delay = HEAL_AFTER
         self.question_told: set[int] = set()  # question pauses announced on stderr (no auto-replies)
         self.asked_told: set[int] = set()     # agents' messages to the user announced on stderr (the same)
-        self.cost_told: set[str] = set()      # u_cost_unknown texts written to stderr
+        self.notice_told: set[str] = set()    # STDERR_NOTES texts written to stderr
         self.clarify = False                  # the session's [swarm] clarify (its summary, then its state)
         self.ui_lang = lang
         self.lang = lang or "ru"            # the session's language once known (auto-replies)
@@ -564,17 +567,16 @@ class _PrintRun:
             raise _Finished("budget", _text(self.text_lang, "budget"))
         elif etype == "swarm.paused" and data.get("reason") == "question":
             await self.on_question(data.get("asker"), data.get("message_id"))
-        elif etype == "notification" and data.get("kind") == "u_cost_unknown" and data.get("recipient") == USER:
-            self.on_cost_unknown(data.get("text"))
+        elif etype == "notification" and data.get("kind") in STDERR_NOTES and data.get("recipient") == USER:
+            self.on_user_notice(data.get("text"))
 
-    def on_cost_unknown(self, text: Any) -> None:
-        """A model profile's calls count as $0 (u_cost_unknown, docs/SPEC.md §10): its text on stderr once, in the
-        `text` and `json` formats also without --verbose (whose feed shows every notice anyway); stream-json carries
-        the event itself."""
+    def on_user_notice(self, text: Any) -> None:
+        """A user notice of STDERR_NOTES: its text on stderr once, in the `text` and `json` formats also without
+        --verbose (whose feed shows every notice anyway); stream-json carries the event itself (docs/TUI.md §2)."""
         text = " ".join(str(text or "").split())
-        if not text or self.verbose or self.format == "stream-json" or text in self.cost_told:
+        if not text or self.verbose or self.format == "stream-json" or text in self.notice_told:
             return
-        self.cost_told.add(text)
+        self.notice_told.add(text)
         self.err.write(text + "\n")
 
     def board_url(self) -> str:
