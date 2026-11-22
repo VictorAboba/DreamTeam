@@ -25,6 +25,7 @@ language = "ru"          # language of the agents' prompts: ru | en
 start_agents = 3         # how many agents start
 max_agents = 8           # max AI agents (they hire new ones themselves; members via MCP do not count)
 max_cost_usd = 5.0       # budget; when it runs out, the swarm pauses
+budget_notice_at = 0.8   # at this share of the budget the agents and you get one notice (0 or 1 means none)
 starting_roles = []      # the starting team in order: ["architect", "developer", "developer", "tester"]
 independent_review = true # another member accepts an agent's task (or you, if there is no one else)
 crew_review = true       # a crew task its owner completed is checked as a whole (see "Reviews"); false: done once the owner completes it
@@ -123,6 +124,18 @@ the size and number of the files copied from a folder or unpacked from a .zip; `
 archive's own size counts against `copy_max_mb`, and every entry (left-out ones and folders included) against a
 limit of twice `copy_max_files`. Both are at least 1. They are global settings: the copy is made before the session
 exists, so a value in a session's own settings has no effect.
+
+## Budget
+
+`max_cost_usd` is the session's money budget (0 means no limit); when it is used up, the swarm pauses. Once the
+agents have spent the share `budget_notice_at` of it (0.8, that is 80 %, by default), every agent and you get one
+notice: the agents are told to finish and hand in what is nearly done and to start nothing large, without waiting for
+you to ask for a wrap-up. 0 or 1 turns this notice off (the pause at the limit still tells you). After the budget is
+raised, or `budget_notice_at` changed, the notice comes again once the new share is spent. While the budget has a
+limit, every wake-up of an agent shows how much is spent. The budget bar on the board and the spending in the
+terminal's status line take the warning colour at 80 %, whatever `budget_notice_at` says. On the "Settings" tab the
+field is under "Defaults for new sessions", after the budget; the new-session dialog and a session's ⚙ dialog do not
+have it.
 
 ## Reviews
 

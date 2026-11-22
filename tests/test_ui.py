@@ -1708,7 +1708,7 @@ def test_feed_tells_how_a_question_pause_ends():
         "Anna Smith покинул(а) рой: рой продолжил работу без ответа на вопрос #12",
         "рой продолжил работу",
         "рой на паузе (исчерпан бюджет — увеличьте его в настройках)",
-        "рой на паузе (остановлен вами)",
+        "рой на паузе (по вашему решению)",
     ]
     # a question's #12 is a message, not a task: no task link (a task's discussion keeps its links)
     assert "data-open-task" not in out["line"] and "question #12" in out["line"]

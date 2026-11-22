@@ -220,8 +220,16 @@ async def hub_call(swarm: "Swarm", name: str, args: dict[str, Any], client: str 
     joining = bool(client) and actor == USER and name == "join_swarm"
     before = _externals(swarm) if joining else set()
     started = time.time()
+    # an external member at work (Swarm.team_asleep): stamped before and after the call, tracing or not (with
+    # background_on_timeout the call waits at most jobs.EXTERNAL_WAIT_MAX, below EXTERNAL_IDLE_SECONDS, so the first
+    # stamp covers it; docs/SPEC.md §13); a client that only listens (wait_for_events) is asleep like the others
+    seen = getattr(swarm, "_external_seen", None) if actor != USER and name not in UNTRACED_TOOLS else None
+    if seen is not None:
+        seen[actor] = started
     with sent_as_seen_by(clients.members_of(client), actor):
         text, is_error = await call_tool(ToolContext(swarm, actor, via=via), name, args)
+    if seen is not None:
+        seen[actor] = time.time()
     if joining and not is_error:
         # the member it became: a new one, or the one it continues as after a reconnect (join_swarm with its name)
         joined = _externals(swarm) - before

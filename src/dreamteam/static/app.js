@@ -83,7 +83,7 @@ const I18N = {
     ws_adopted_hint: "Существующая папка (ваш проект): агенты работают с её файлами и коммитят в текущую ветку её репозитория. При удалении сессии папка остаётся.",
     ws_moved_hint: "Сессия перенесена в эту папку (/cd). При удалении сессии папка остаётся.",
     ws_missing: "Папка сессии не найдена: {path}. Сессия не запустится, пока её не перенесут в другую папку: /cd ПАПКА или /cd --default в dreamteam tui.",
-    "reason_budget": "исчерпан бюджет — увеличьте его в настройках", "reason_paused by the user": "остановлен вами",
+    "reason_budget": "исчерпан бюджет — увеличьте его в настройках", "reason_paused by the user": "по вашему решению",
     // a member's question that pauses the swarm (send_message pause_swarm), a clarify planner waiting for your answers
     reason_question: "ждёт вашего ответа",
     paused_question: "Рой на паузе: {name} ждёт вашего ответа на вопрос #{id} — ответ получат все участники. Нажмите, чтобы ответить; «Продолжить» снимает паузу без ответа",
@@ -692,6 +692,13 @@ function renderAll() {
 }
 
 /* ---------------------------------------------------------------- header */
+/** «Пауза» / «Продолжить» (docs/SPEC.md §18.4): a pause is quiet (the banner says it, and with jobs running the
+ * u_paused_jobs notice comes as a toast; the English result would repeat it), a refusal and a resume are toasted. */
+function togglePause() {
+  const pause = !(S.state && S.state.swarm.paused);
+  return act("swarm_control", { action: pause ? "pause" : "resume" }, pause);
+}
+
 /** The wrap-up toggle: on (the team finishes with what it has, no new background jobs) or back off. */
 function toggleWrapUp() {
   if (!S.state) return undefined;
@@ -3020,7 +3027,7 @@ function init() {
   $("#team-toggle").addEventListener("click", () => { store("dt-team", document.body.classList.contains("team-rail") ? "full" : "rail"); applyTeamLayout(); });
   $("#team-close").addEventListener("click", () => toggleTeamOverlay(false));
   $("#team-btn").addEventListener("click", () => toggleTeamOverlay());
-  $("#pause-btn").addEventListener("click", () => act("swarm_control", { action: S.state && S.state.swarm.paused ? "resume" : "pause" }));
+  $("#pause-btn").addEventListener("click", togglePause);
   $("#wrap-btn").addEventListener("click", toggleWrapUp);
   $("#lang-btn").addEventListener("click", () => setLang(S.lang === "ru" ? "en" : "ru"));
   $("#theme-btn").addEventListener("click", () => {
@@ -3063,7 +3070,7 @@ if (typeof module !== "undefined" && module.exports) {
     reviewerNone, taskReviewHtml, reviewTask, moveTask, findRole, rolePreviewHtml, hireArgs, hireModal, goalModal,
     // used by traces.js (the tests load it on top of these) and by the session-chrome tests
     BASE, $, $$, api, post, act, toast, avatar, agentColor, members, fmtTime, short, openModal, closeModal, setTab, store, setHtml,
-    renderHeader, toggleWrapUp, responseError, errText, startSession, connect,
+    renderHeader, togglePause, toggleWrapUp, responseError, errText, startSession, connect,
     // a member's question that pauses the swarm: the banner, the chat hint, the composer's toast, the feed
     pendingQuestion, sendComposer, openChat, feedLine,
     // the session folder (the Files tab head, the missing-folder banner)

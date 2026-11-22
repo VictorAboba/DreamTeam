@@ -1020,7 +1020,10 @@ async def test_restart_continues_an_activation_cut_short_without_tasks(tmp_path,
 
 
 # ------------------------------------------------------------------------- scheduler / kickoff
-async def test_kickoff_is_staggered_and_not_preceded_by_ready_nudges(tmp_path):
+async def test_kickoff_is_staggered_and_not_preceded_by_ready_nudges(tmp_path, monkeypatch):
+    # the scripted team only waits, so it sleeps with the planning task open: scheduler item 9 would wake its holder
+    # after 5 x idle_nudge_seconds (tests/test_team_asleep.py); this test is about the kickoff alone
+    monkeypatch.setattr(swarm_module, "TEAM_ASLEEP_FACTOR", 10_000)
     swarm, rec = make_swarm(tmp_path, lambda *a: call("wait"), swarm={"start_agents": 3},
                             agents={"stagger_seconds": 0.3, "idle_nudge_seconds": 0.05})
     await swarm.start()

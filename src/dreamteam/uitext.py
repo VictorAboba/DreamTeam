@@ -85,7 +85,7 @@ TEXTS: dict[str, dict[str, str]] = {
                       "фоновых процессов",
         "wrap_up_off": "{who}: режим завершения выключен",
         "reason_budget": "исчерпан бюджет",
-        "reason_user": "остановлен вами",
+        "reason_user": "по вашему решению",
         "reason_question": "ждёт вашего ответа",
         "limits": "Лимиты: бюджет {budget}, агентов не больше {agents}",
         "file_locked": "заблокирован",

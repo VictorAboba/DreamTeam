@@ -61,7 +61,12 @@
   `/board` line carries the same mark; accept or return the subtask by its own number (`/approve 5`).
 - **Agents' background jobs.** While they run, the status line shows `jobs N`, and the agent in `/agents` shows
   `⚙N`. `/jobs` lists them (and the ones that finished in the last hour), `/jobs j3` shows a job's output,
-  `/jobs stop j3` stops it together with everything it started. `Esc` and `/pause` do not stop them.
+  `/jobs stop j3` stops it together with everything it started. `Esc` and `/pause` do not stop them: when jobs run,
+  the pause prints a notice that names them. A process an agent starts with `&` or `nohup` is listed in `/jobs`
+  too: on Windows its command's Job Object holds it, on Linux (the Docker sandbox included) DreamTeam finds it by a
+  token in its environment. A known limit: on macOS a process that leaves its command's process group (`setsid`,
+  GNU `timeout`), and on Linux one that clears its environment (`env -i`), are not tracked, and their end wakes
+  nobody. Agents are told to start long runs with `background=true` instead.
 - **Locked files.** An agent locks a shared file while it edits it; an agent that runs into someone else's lock is
   woken when the file is free. `/unlock path` removes a lock (after `/unlock ` the suggestions list the locked paths
   and their holders; Tab completes one, Enter sends the path as typed), and the agents waiting for that file are
@@ -112,8 +117,10 @@ answers such a pause at once, and `stream-json` may then show a short `swarm.pau
 or in `dreamteam tui`, a critical question pauses the swarm until you answer, and the run waits too (until
 `--timeout`, if you gave one). In the `text` and `json` formats each agent message to you prints a line on stderr,
 and a question that pauses the swarm one more (`stream-json` shows the events instead). The same goes, also without
-`--verbose`, for the notice that a model profile's calls count as $0 (no prices, and the provider does not report
-the cost): one line on stderr.
+`--verbose`, for four notices, one line each on stderr: that a model profile's calls count as $0 (no prices, and
+the provider does not report the cost), that most of the budget is spent, that nobody in the team works while
+nothing is set to wake the team, and that every open task waits for you or a member who joined through MCP (the run
+then still waits, until `--timeout` if you gave one).
 `--clarify` / `--no-clarify` do not work with `-c` / `-r`: change an existing session with `/clarify`.
 A session created through the [HTTP API](http-api.md) with `answers: "auto"` is answered by the hub itself. `-r ID`
 of such a session sends no reply, approval or answer of its own, with or without `--no-auto-reply`, and prints no line

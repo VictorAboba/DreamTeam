@@ -133,6 +133,9 @@ const I18N = {
     default_marker: "основной", none_opt: "—",
     sw_name: "Имя роя", sw_lang: "Язык промптов агентов", sw_max: "Максимум агентов",
     sw_budget: "Бюджет сессии, $", sw_budget_hint: "0 — без лимита",
+    sw_budget_notice: "Предупредить о бюджете при доле",
+    sw_budget_notice_hint: "При этой доле потраченного бюджета агенты и вы получаете одно предупреждение " +
+      "(0.8 — 80 %); 0 или 1 — без него.",
     sw_review: "Независимое ревью задач",
     sw_review_hint: "Задачу агента принимает другой агент, а если больше некому — вы. Выключите для дешёвых прогонов: тогда задача без ревьюера сразу готова.",
     sw_crew_review: "Проверять групповую задачу целиком",
@@ -382,6 +385,9 @@ const I18N = {
     default_marker: "default", none_opt: "—",
     sw_name: "Swarm name", sw_lang: "Agents' prompt language", sw_max: "Max agents",
     sw_budget: "Session budget, $", sw_budget_hint: "0 — no limit",
+    sw_budget_notice: "Budget warning at share",
+    sw_budget_notice_hint: "At this share of the budget spent, the agents and you get one notice " +
+      "(0.8 = 80 %); 0 or 1: none.",
     sw_review: "Independent review of tasks",
     sw_review_hint: "An agent's task is approved by another agent, or by you when there is nobody else. Turn it off for cheap runs: a task without a reviewer is then done at once.",
     sw_crew_review: "Check a crew task as a whole",
@@ -2106,6 +2112,8 @@ function renderSettings(fromServer) {
       field("sw_lang", "swarm.language", "select", { options: [["ru", "Русский"], ["en", "English"]] }),
       field("sw_max", "swarm.max_agents", "int", { min: 1 }),
       field("sw_budget", "swarm.max_cost_usd", "float", { min: 0, step: 0.5, hint: "sw_budget_hint" }),
+      field("sw_budget_notice", "swarm.budget_notice_at", "float",
+            { min: 0, max: 1, step: 0.05, hint: "sw_budget_notice_hint" }),
       teamComposer("defaults"),
       field("sw_review", "swarm.independent_review", "bool", { full: true, hint: "sw_review_hint" }),
       field("sw_crew_review", "swarm.crew_review", "bool", { full: true, hint: "sw_crew_review_hint" }),

@@ -306,7 +306,7 @@ def test_background_job_texts():
         assert "{log}" in texts["n_job_done"] and "{log}" in texts["n_job_gone"]
         assert "{log}" in texts["n_job_command_done"]
         for key in ("my_jobs", "my_job", "job_exit", "job_gone", "job_no_output", "n_job_done", "n_job_command_done",
-                    "n_job_stopped", "n_job_limit", "n_job_gone", "u_jobs_running"):
+                    "n_job_stopped", "n_job_limit", "n_job_gone", "u_jobs_running", "u_paused_jobs"):
             assert not code_idents(texts[key]) and "job_stop" not in texts[key], (lang, key)
             # a job is shown as j3 (#3 is a task); in Russian it is a «фоновый процесс», «задача» is a board task
             assert "#{id}" not in texts[key], (lang, key)

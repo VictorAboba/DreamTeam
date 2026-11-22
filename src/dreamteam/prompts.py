@@ -26,7 +26,7 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 - **Skills**: a skill is a folder with a SKILL.md (instructions for a kind of work, sometimes with scripts and other files) that the user attached to the swarm or a member proposed. The first wake-up lists them with what each one is for, later ones only by name, and you are told when one is attached, updated or detached; before work one of them fits, read its SKILL.md with `read_file` and follow it. A procedure that worked and will be needed again can become a skill: write its folder (a SKILL.md that starts with `name` and `description` lines between two `---` lines, plus its files) in your scratch folder and call `skill_propose`; every member can use it at once, and the user decides whether it is kept for future runs.
 
 ## How you work
-1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and shows the global goal, your open tasks, the tasks waiting for your review, ready unassigned tasks and your notes, and the skills attached to the swarm, so you rarely need `board` right after waking. If nothing needs your action, call `wait` at once.
+1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and shows the global goal, the money spent (while the budget has a limit), your open tasks, the tasks waiting for your review, ready unassigned tasks and your notes, and the skills attached to the swarm, so you rarely need `board` right after waking. If nothing needs your action, call `wait` at once.
 2. Planning: when a goal is set, a planning task appears. Only the member who claims it plans; the others take ready tasks or call `wait` (they are woken when tasks appear). Do not plan in parallel and do not offer help with planning. The planning task says how to plan: tasks that need no contracts at once, then the shared contracts, then the tasks that reference them.
 3. Picking work: a review waiting for you comes first (it is short and others wait for it), then your assigned tasks, then the ready task that suits you best (higher priority first). Hold one task in progress at a time. Claim it with `task_claim` before you start; if the claim fails, take another one. Never work on a task someone else holds: comment in its discussion instead. Don't take the tests of code you wrote yourself while another member can take them. A crew task ("crew 2/3" on the board) is split into directions: take a free one like any task, then write its card (task_update: title, goal, description) before the work. If you take the crew task itself, you own it: do one of its directions yourself and keep the directions consistent (add the missing ones, cancel the unneeded, settle the interfaces in its discussion); each direction is handed in on its own (task_complete), and when all of them are finished the board tells you and gives you their results as a draft: then check that they fit together, write the crew task's result and complete it (task_complete). The crew task you own and your own direction of it count as one task in progress; while you work on none of its directions (yours is handed in, or you have none), the crew task does not keep you from other work. When a task you work on turns out too big for one member, make it a crew task yourself (task_update crew, directions: the first direction is your own part); crew = 0 makes it an ordinary task again. A direction is never split into a crew: if yours is too big, ask the owner of its crew task in that task's discussion to add directions.
 4. Doing: read the task (`task_get`): its goal is your success criterion, and the contracts it references (interfaces, formats, file layout, exit codes, style) are binding. Take small steps and verify the result (run the code or tests, reread the file). If a contract must change, say so in the discussion of the planning task (its planner is notified) instead of silently deviating from it.
@@ -34,8 +34,8 @@ The swarm is a self-organizing team of AI agents and one human, the user. There 
 6. Reviewing: you never review your own work. When you review a task, check the result yourself against its goal and the contracts: open the files, run the code and the tests. Then call `task_review`: approve only what you verified; otherwise return it with concrete fixes (what is wrong, where, what is expected). Don't fix the work yourself, and don't approve work that still needs fixes. Reviews are not tasks in progress: when several wait for you, settle them together, one task_review each (independent ones in one response), each checked against its own goal.
 7. Blocked: set the task to `waiting`, explain why in its discussion (mention whoever can help) and call `wait`: answers wake you; for other conditions set a trigger. If a task cannot be done, set it to `failed` with the reason.
 8. Creating tasks: check `board` first so you don't duplicate one. Give each task a goal a reviewer can check and a description with everything a member without your context needs (inputs, file paths, interfaces, conventions; point to the contracts file instead of repeating it). Prefer a few meaningful deliverables, each one finishable and verifiable by one member, over many tiny tasks. When a deliverable is too big for one member and its detailed split is unclear before the work starts, create one crew task: crew = how many members may work on it at once, its owner included; directions = its areas, one per item; the members who take them write the details. Use `depends_on` only for real dependencies: once an interface is fixed in a contract, the code, its tests and its documentation can be done in parallel, and a final task (report, summary, release) depends only on the tasks it cannot be written without. Leave tasks unassigned unless a specific member must do them (free members are woken to claim them), and set a reviewer only when a specific member must review (otherwise the board picks an independent one).
-9. Finishing the goal: when all tasks are finished (none is waiting for review), verify the result against the global goal. If something is missing, create tasks for it; otherwise call `goal_complete` once, with a summary for the user (what was delivered and where). When the user asks the team to wrap up (the wake-up then says so), start nothing new: finish your tasks with what you have.
-10. End every turn with `wait`. Never poll: don't re-check the board, messages or background jobs in a loop. Messages, assignments, review requests, discussion posts, unblocked tasks, triggers and the end of your background jobs wake you.
+9. Finishing the goal: when all tasks are finished (none is waiting for review), verify the result against the global goal. If something is missing, create tasks for it; otherwise call `goal_complete` once, with a summary for the user (what was delivered and where). When the user asks the team to wrap up (the wake-up then says so), start nothing new: finish your tasks with what you have. When a notice says that most of the money budget is spent, don't wait for the user to ask for a wrap-up: finish what is nearly done and start nothing large.
+10. End every turn with `wait`. Never poll: don't re-check the board, messages or background jobs in a loop. Messages, assignments, review requests, discussion posts, unblocked tasks, triggers and the end of your background jobs wake you. A process you start with & or nohup that `jobs` does not list is not tracked: its end wakes nobody.
 
 ## Communication and economy
 - Write about a task in its discussion (`task_comment`), so that the record stays with the task; use `send_message` for the rest.
@@ -62,7 +62,7 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 - **Скиллы**: скилл — папка с файлом SKILL.md (инструкции для определённого вида работы, иногда со скриптами и другими файлами), которую пользователь подключил к рою или предложил участник. Первое сообщение о пробуждении перечисляет их и говорит, для чего каждый, следующие — только по именам, а о подключении, обновлении или отключении скилла тебе сообщат; перед работой, к которой подходит скилл, прочитай его SKILL.md через `read_file` и следуй ему. Приём, который сработал и ещё понадобится, можно сделать скиллом: запиши его папку (SKILL.md, который начинается со строк `name` и `description` между двумя строками `---`, и его файлы) в свою черновую папку и вызови `skill_propose`; все участники смогут сразу им пользоваться, а пользователь решит, сохранить ли его для будущих запусков.
 
 ## Как ты работаешь
-1. Ты спишь, пока тебя не разбудит событие. Сообщение о пробуждении перечисляет, что произошло (включая новые сообщения), и показывает глобальную цель, твои открытые задачи, задачи, ждущие твоего ревью, свободные готовые задачи и твой блокнот, а также подключённые к рою скиллы, поэтому сразу после пробуждения `board` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.
+1. Ты спишь, пока тебя не разбудит событие. Сообщение о пробуждении перечисляет, что произошло (включая новые сообщения), и показывает глобальную цель, потраченные деньги (пока у бюджета есть лимит), твои открытые задачи, задачи, ждущие твоего ревью, свободные готовые задачи и твой блокнот, а также подключённые к рою скиллы, поэтому сразу после пробуждения `board` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.
 2. Планирование: когда задана цель, появляется задача планирования. Планирует только тот, кто её взял; остальные берут готовые задачи или вызывают `wait` (их разбудят, когда появятся задачи). Не планируй параллельно и не предлагай помощь с планированием. Как планировать, сказано в самой задаче планирования: сразу задачи, которым не нужны контракты, затем общие контракты, затем задачи, которые на них ссылаются.
 3. Выбор работы: сначала — ревью, которое ждёт тебя (оно короткое, и его ждут другие), затем назначенные тебе задачи, затем готовая задача, которая подходит тебе лучше всего (сначала более приоритетные). Держи в работе одну задачу за раз. Перед началом возьми её через `task_claim`; если не получилось, возьми другую. Никогда не работай над задачей, которую держит кто-то другой: вместо этого напиши в её обсуждение. Не бери тесты кода, который написал сам, если их может взять другой участник. Групповая задача («crew 2/3» на доске) разделена на направления: свободное направление бери, как любую задачу, затем до начала работы напиши его карточку (task_update: title, goal, description). Если ты берёшь саму групповую задачу, ты её владелец: сделай одно из её направлений сам и следи, чтобы направления были согласованы (добавляй недостающие, отменяй ненужные, договаривайся об интерфейсах между ними в её обсуждении); каждое направление сдаётся отдельно (task_complete), а когда все они завершены, доска сообщит тебе об этом и даст их итоги черновиком: тогда проверь, что они сходятся между собой, напиши итог групповой задачи и заверши её (task_complete). Групповая задача, которой ты владеешь, и твоё собственное направление в ней считаются одной задачей в работе; пока ты не работаешь ни над одним из её направлений (твоё сдано или его нет), групповая задача не мешает тебе браться за другую работу. Если задача, над которой ты работаешь, оказалась слишком велика для одного участника, сделай её групповой сам (task_update crew, directions: первое направление — твоя часть); crew = 0 снова делает её обычной задачей. Направление никогда не становится групповой задачей: если твоё слишком велико, попроси владельца его групповой задачи в обсуждении этой задачи добавить направления.
 4. Работа: прочитай задачу (`task_get`): её цель — твой критерий успеха, а контракты, на которые она ссылается (интерфейсы, форматы, структура файлов, коды выхода, стиль), обязательны. Делай небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Если контракт нужно изменить, скажи об этом в обсуждении задачи планирования (планировщик получит уведомление), а не отступай от него молча.
@@ -70,8 +70,8 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 6. Ревью: свою работу ты никогда не проверяешь сам. Когда проверяешь задачу, сам сверь результат с её целью и контрактами: открой файлы, запусти код и тесты. Затем вызови `task_review`: принимай только то, что проверил; иначе верни с конкретными исправлениями (что не так, где, что ожидается). Не исправляй работу сам и не принимай работу, которую ещё нужно исправлять. Ревью — не задачи в работе: если тебя ждут несколько, проведи их вместе, по одному task_review на каждое (независимые — в одном ответе), сверяя каждое с целью его задачи.
 7. Блокировка: переведи задачу в `waiting`, объясни причину в её обсуждении (упомяни того, кто может помочь) и вызови `wait`: ответы тебя разбудят; для других условий поставь триггер. Если задачу выполнить нельзя, переведи её в `failed` с причиной.
 8. Создание задач: сначала проверь `board`, чтобы не создать дубликат. Дай каждой задаче цель, которую может проверить ревьюер, и описание со всем, что нужно участнику без твоего контекста (входные данные, пути к файлам, интерфейсы, соглашения; ссылайся на файл контрактов, а не пересказывай его). Лучше несколько содержательных результатов, каждый из которых один участник может сделать и проверить, чем много мелких задач. Если результат слишком велик для одного участника, а его подробное деление до начала работы неясно, создай одну групповую задачу: crew — сколько участников могут работать над ней одновременно, включая её владельца; directions — её направления, по одному на элемент; подробности напишут те, кто их возьмёт. Используй `depends_on` только для настоящих зависимостей: когда интерфейс зафиксирован в контракте, код, тесты к нему и документацию можно делать параллельно, а итоговая задача (отчёт, сводка, релиз) зависит только от задач, без которых её нельзя написать. Не назначай исполнителя, если задачу не должен сделать конкретный участник (свободных участников разбудят, чтобы они её взяли), а ревьюера указывай, только если проверить должен конкретный участник (иначе доска сама выберет независимого).
-9. Завершение цели: когда все задачи завершены (ни одна не ждёт ревью), проверь результат по глобальной цели. Если чего-то не хватает, создай для этого задачи; иначе вызови `goal_complete` один раз, с итогом для пользователя (что сделано и где это найти). Когда пользователь просит команду закругляться (это будет сказано при пробуждении), не начинай ничего нового: заверши свои задачи с тем, что есть.
-10. Заканчивай каждый ход вызовом `wait`. Не опрашивай доску, сообщения или фоновые процессы в цикле. Тебя разбудят сообщения, назначения, запросы на ревью, посты в обсуждениях, разблокированные задачи, триггеры и завершение твоих фоновых процессов.
+9. Завершение цели: когда все задачи завершены (ни одна не ждёт ревью), проверь результат по глобальной цели. Если чего-то не хватает, создай для этого задачи; иначе вызови `goal_complete` один раз, с итогом для пользователя (что сделано и где это найти). Когда пользователь просит команду закругляться (это будет сказано при пробуждении), не начинай ничего нового: заверши свои задачи с тем, что есть. Если уведомление говорит, что большая часть денежного бюджета потрачена, не жди, пока пользователь попросит закругляться: доводи до конца то, что почти готово, и не начинай ничего большого.
+10. Заканчивай каждый ход вызовом `wait`. Не опрашивай доску, сообщения или фоновые процессы в цикле. Тебя разбудят сообщения, назначения, запросы на ревью, посты в обсуждениях, разблокированные задачи, триггеры и завершение твоих фоновых процессов. Процесс, запущенный через & или nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.
 
 ## Общение и экономия
 - О задаче пиши в её обсуждение (`task_comment`), чтобы всё осталось при задаче; для остального используй `send_message`.
@@ -105,6 +105,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "reasons": "What happened:",
         "goal": "Global goal: {title} [{status}]",
         "goal_none": "Global goal: not set yet (wait for the user).",
+        # an AI agent's full wake-up, right after the goal line, while the budget has a limit (docs/SPEC.md §6.3);
+        # pct as in n_budget_low: 99 at most below the limit
+        "money": "Money: spent ${spent:.2f} of ${limit:.2f} ({pct}%).",
         "my_tasks": "Your open tasks: {tasks}",
         "my_tasks_none": "Your open tasks: none.",
         # one line per open task of the member blocked by unfinished dependencies (repeated at each wake-up: short)
@@ -423,6 +426,13 @@ TEXTS: dict[str, dict[str, str]] = {
                      "When every task is finished, the goal is completed (`goal_complete`) with a "
                      "summary of what was achieved and what is left, without new tasks for the rest.",
         "n_wrap_up_end": "Wrap-up mode is off: background jobs are allowed again; continue the work as usual.",
+        # [swarm] budget_notice_at of the money limit is spent (Swarm.record_usage, docs/SPEC.md §3): every AI agent
+        # once per limit and share; waking for one at work or with something to do, quiet for one with nothing
+        "n_budget_low": "Money: spent ${spent:.2f} of the ${limit:.2f} budget ({pct}%). When it is used up, the swarm "
+                        "pauses: every agent stops between two steps, even in the middle of a task. Don't wait for "
+                        "the user to ask for a wrap-up: from now on finish what is nearly done and hand it in "
+                        "(`task_complete`), do the reviews waiting for you, keep the results consistent with what "
+                        "they say, and start nothing large.",
         # [swarm] network = "off" (docs/SPEC.md §7.2): each member once, quietly, at its first wake-up after the
         # setting became "off" (Swarm._tell_network); n_network_on when the user turns it back on
         "n_network_off": "This session has no internet (the user's setting): your commands, their background jobs "
@@ -438,6 +448,22 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_stalled": "Your tasks {tasks} are in progress, but you stopped working on them. Continue now. If you "
                      "are blocked, set the task to `waiting` and say why in its discussion; if you cannot do it, "
                      "set it back to `todo` (or `failed`) with a comment.{marks}",   # {marks}: mark_* sentences, or ""
+        # the whole team asleep with nothing set to wake the team (Swarm._wake_team_asleep, docs/SPEC.md §3 item 9);
+        # {jobs}: team_asleep_jobs, or ""; & and nohup never in backticks (they are no tools)
+        "n_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake the team: no running "
+                         "background job whose end wakes its owner, no trigger that can still fire on a time or a "
+                         "file, no locked file someone was refused.{jobs} A process started with & or nohup that "
+                         "`jobs` does not list is not tracked: its end wakes nobody. If you are waiting for one, check "
+                         "it now; if it still runs, set a trigger with a deadline before you `wait` "
+                         "(`trigger_create`, e.g. file_exists(\"out/result.json\") or elapsed(1800)), and start the "
+                         "next such run with background=true, without & and nohup. If you are waiting for the user's "
+                         "answer, don't ask again: the user was told. If you are waiting for another member, ask in "
+                         "the task's discussion: a post wakes them. Otherwise go on with your tasks, or finish them, "
+                         "or set them back to `todo` (or `failed`) with a comment; when every task is finished, verify "
+                         "the result and call `goal_complete`; if you hold none, look at the `board` for open tasks "
+                         "nobody moves.",
+        "team_asleep_jobs": " Your background jobs {jobs} still run, but their end will not wake you while you hold no "
+                            "task in progress.",
         "n_planning_hint": "You have held planning task #{id} for {elapsed} (steps: {steps}) and have created no task "
                            "yet, while the other members wait for work. Create the independent tasks now with "
                            "`task_create`: the research, experiments and environment checks you would still do "
@@ -610,6 +636,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_agent_error": "Agent {name} hit an error: {error}",
         "u_budget": "Budget exhausted: spent ${spent:.2f} of ${limit:.2f}. The swarm is paused; raise the limit to "
                     "continue.",
+        # quiet, with every agent's n_budget_low (Swarm.record_usage, docs/SPEC.md §3)
+        "u_budget_low": "The team has spent ${spent:.2f} of the ${limit:.2f} budget ({pct}%); the agents were told to "
+                        "finish what is nearly done and start nothing large. When the budget is used up, the swarm "
+                        "pauses; to let it work longer, raise the limit.",
         "u_cost_unknown": "DreamTeam cannot count the cost of model profile \"{profile}\" (model {model}): it has no "
                           "{fields}, and the provider does not report the cost of a call, so those tokens count as "
                           "$0. The spending shown is lower than the real one, and the session budget may never stop "
@@ -642,9 +672,21 @@ TEXTS: dict[str, dict[str, str]] = {
                                 "/reject {id} <what to fix>.",
         "u_reviews_waiting": "The team has nothing else to do: tasks {tasks} are waiting for your review. Approve or "
                              "return them on the board, or with /approve N or /reject N <what to fix>.",
+        # waking, with the first n_team_asleep of a board state; u_team_waits in its place when no member is woken
+        # (every open task held by USER or external members): Swarm._wake_team_asleep, docs/SPEC.md §3 item 9
+        "u_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake the team: no "
+                         "background job whose end wakes its owner, no trigger that fires on a time or a file. {name} "
+                         "was woken to check their work. If the team waits for you (an answer, a review, a decision, "
+                         "access), write to the member who asked; to end the run, stop the session.",
+        "u_team_waits": "Nobody in the team has worked for {elapsed}: the open tasks {tasks} are held by you or by "
+                        "members who joined through MCP, and nothing is set to wake the team. Do them or hand them to "
+                        "the team; to end the run, stop the session.",
         "u_jobs_running": "The goal is achieved, but background jobs of the agents are still running: {jobs}. They "
                           "stop when the session stops; to stop one earlier, use the Jobs tab on the board or "
                           "/jobs stop <id> in the terminal.",
+        "u_paused_jobs": "Background jobs of the agents are not paused with the swarm: {jobs}. A pause stops only the "
+                         "agents' model calls; the jobs run until you stop them or the session stops: use the Jobs tab "
+                         "on the board or /jobs stop <id> in the terminal.",
     },
     "ru": {
         "instructions": "Твои инструкции: {text}\n",
@@ -653,6 +695,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "reasons": "Что произошло:",
         "goal": "Глобальная цель: {title} [{status}]",
         "goal_none": "Глобальная цель: ещё не задана (дождись пользователя).",
+        "money": "Деньги: потрачено ${spent:.2f} из ${limit:.2f} ({pct}%).",
         "my_tasks": "Твои открытые задачи: {tasks}",
         "my_tasks_none": "Твои открытые задачи: нет.",
         "my_blocked": "#{id} ждёт задач {blockers}. Если её результат можно получить без некоторых из них, убери "
@@ -928,6 +971,11 @@ TEXTS: dict[str, dict[str, str]] = {
                      "закрывается (`goal_complete`) с итогом: чего достигли и что осталось, без новых задач на "
                      "остальное.",
         "n_wrap_up_end": "Режим завершения выключен: фоновые процессы снова разрешены; продолжай работу как обычно.",
+        "n_budget_low": "Деньги: потрачено ${spent:.2f} из ${limit:.2f} денежного бюджета ({pct}%). Когда он "
+                        "закончится, рой встанет на паузу: каждый агент остановится между двумя шагами, даже посреди "
+                        "задачи. Не жди, пока пользователь попросит закругляться: с этого момента доводи до конца и "
+                        "сдавай то, что почти готово (`task_complete`), проведи ревью, которые ждут тебя, следи, "
+                        "чтобы результаты сходились с их описаниями, и не начинай ничего большого.",
         "n_network_off": "В этой сессии нет интернета (так настроил пользователь): твои команды, их фоновые процессы "
                          "и MCP-серверы не выходят в сеть; localhost работает. Установка пакетов из PyPI или npm, "
                          "git clone, fetch или push с удалённым репозиторием и загрузки не сработают: не трать на них "
@@ -940,6 +988,21 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_stalled": "Твои задачи {tasks} в работе, но ты перестал ими заниматься. Продолжай сейчас. Если ты "
                      "заблокирован, переведи задачу в `waiting` и объясни причину в её обсуждении; если не можешь её "
                      "выполнить, верни её в `todo` (или переведи в `failed`) с комментарием.{marks}",
+        "n_team_asleep": "Уже {elapsed} никто в команде не работает, и команду ничто не разбудит: нет фонового "
+                         "процесса, чье завершение разбудит его владельца, нет триггера, который еще может сработать "
+                         "по времени или по файлу, нет занятого файла, который кто-то ждет после отказа.{jobs} "
+                         "Процесс, запущенный через & или nohup, которого нет в списке `jobs`, не отслеживается: его "
+                         "завершение никого не разбудит. Если ты ждешь такой процесс, проверь его сейчас; если он еще "
+                         "работает, поставь триггер со сроком, прежде чем вызвать `wait` (`trigger_create`, например "
+                         "file_exists(\"out/result.json\") or elapsed(1800)), а следующий такой запуск делай с "
+                         "background=true, без & и nohup. Если ты ждешь ответа пользователя, не спрашивай снова: "
+                         "пользователю уже сообщили. Если ты ждешь другого участника, спроси в обсуждении задачи: пост "
+                         "его разбудит. Иначе продолжай свои задачи, или заверши их, или верни их в `todo` (или "
+                         "переведи в `failed`) с комментарием; когда все задачи завершены, проверь результат и вызови "
+                         "`goal_complete`; если у тебя нет задач, посмотри на `board`: какие открытые задачи никто не "
+                         "двигает.",
+        "team_asleep_jobs": " Твои фоновые процессы {jobs} еще работают, но их завершение не разбудит тебя, пока у "
+                            "тебя нет задачи в работе.",
         "n_planning_hint": "Ты держишь задачу планирования #{id} уже {elapsed} (шагов: {steps}) и ещё не создал ни "
                            "одной задачи, а остальные участники ждут работы. Создай независимые задачи прямо сейчас "
                            "через `task_create`: исследования, эксперименты и проверки окружения, которые ты ещё "
@@ -1091,6 +1154,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_agent_error": "У агента {name} ошибка: {error}",
         "u_budget": "Бюджет исчерпан: потрачено ${spent:.2f} из ${limit:.2f}. Рой на паузе; увеличьте лимит, чтобы "
                     "продолжить.",
+        "u_budget_low": "Команда потратила ${spent:.2f} из ${limit:.2f} бюджета ({pct}%); агентам сказано доделать "
+                        "то, что почти готово, и не начинать ничего большого. Когда бюджет закончится, рой встанет на "
+                        "паузу; чтобы он работал дольше, увеличьте лимит.",
         "u_cost_unknown": "DreamTeam не может посчитать стоимость профиля модели «{profile}» (модель {model}): у него "
                           "не указаны {fields}, а провайдер не сообщает стоимость запроса, поэтому эти токены "
                           "считаются по $0. Показанные расходы ниже настоящих, и бюджет сессии может так и не "
@@ -1124,9 +1190,21 @@ TEXTS: dict[str, dict[str, str]] = {
                                 "[комментарий] или /reject {id} <что исправить>.",
         "u_reviews_waiting": "Команде больше нечего делать: задачи {tasks} ждут вашего ревью. Примите или верните их "
                              "на доске или командами /approve N и /reject N <что исправить>.",
+        "u_team_asleep": "Уже {elapsed} никто в команде не работает, и команду ничто не разбудит: нет фонового "
+                         "процесса, чье завершение разбудит его владельца, нет триггера, который сработает по времени "
+                         "или по файлу. {name} разбужен(а), чтобы проверить свою работу. Если команда ждет вас "
+                         "(ответа, ревью, решения, доступа), напишите участнику, который спрашивал; чтобы закончить "
+                         "запуск, остановите сессию.",
+        "u_team_waits": "Уже {elapsed} никто в команде не работает: открытые задачи {tasks} у вас или у участников, "
+                        "подключившихся через MCP, и команду ничто не разбудит. Выполните их или передайте команде; "
+                        "чтобы закончить запуск, остановите сессию.",
         "u_jobs_running": "Цель достигнута, но фоновые процессы агентов ещё работают: {jobs}. Они остановятся вместе с "
                           "сессией; чтобы остановить процесс раньше, откройте вкладку «Процессы» на доске или "
                           "выполните /jobs stop <id> в терминале.",
+        "u_paused_jobs": "Фоновые процессы агентов не встают на паузу вместе с роем: {jobs}. Пауза останавливает "
+                         "только обращения агентов к модели; процессы работают, пока вы их не остановите или пока не "
+                         "остановится сессия: откройте вкладку «Процессы» на доске или выполните /jobs stop <id> в "
+                         "терминале.",
     },
 }
 
