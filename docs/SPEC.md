@@ -191,7 +191,8 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 * kv keys: `goal` → `{"title","description","status":"active"|"done","summary","set_by","updated_at"}`,
   `limits` → `{"max_cost_usd": float, "max_agents": int}` (overrides config), `paused` → `{"paused": bool,
   "reason": str}` (a member's question, §3.1: `{"paused": true, "reason": "question", "asker": str, "message_id":
-  int, "since": float}`),
+  int, "since": float}`), `budget_notice` → `{"limit": float, "at": float, "spent": float, "ts": float}` (the money
+  notice sent for that limit and fraction, §3 `record_usage`; a new limit or fraction re-arms it),
   `tools:<agent name>` → `{"rev": int, "language": "en"|"ru", "tools": [{"name","description","parameters"}]}` (the
   agent's frozen tool set, §6.1; kept for retired agents, traces read it), `wait_progress:<actor>` → the last events
   id whose board progress `wait_for_events(progress=true)` returned to that actor (§12).
@@ -279,6 +280,25 @@ class Swarm:
         # (JobManager.busy) and whose end will wake it (JobManager.awaited): a member's broadcast reaches it without a
         # wake (§5 "Quiet broadcasts")
     def defer_wake(self, name: str) -> None              # such news reached `name` unwoken (_wake_deferred, below)
+    def team_asleep(self, caller: str | None = None) -> bool
+        # nobody in the team can act or be woken by something already set (scheduler item 9 below, `wait`'s result,
+        # §12). `caller`, when given, is the member calling `wait` (still working): it counts as idle with nothing
+        # pending. True when all of these hold: every LLM member with a runtime is idle as `_idle_llm_members` counts
+        # it (status idle, nothing pending, not `jobs.busy`) or in error with no recovery scheduled
+        # (`runtime._recovery` None: one with a recovery timer will be retried, so it counts as awake), and at least
+        # one is idle (or is `caller`); none of them waits for something of its own: a job whose end wakes it
+        # (`jobs.awaited`) or a file it was refused (`workspace.waits_for_lock`), counted however long either lasts
+        # (the job's end or `n_lock_free` will come: a forgotten `background` server keeps it false until `[shell]
+        # job_max_minutes`); no delayed notification is pending (`_timers` empty: staggered kickoffs not delivered
+        # yet); `triggers.unattended(now)` is false (§8 "Unattended triggers"); no external member made a hub call in
+        # the last `EXTERNAL_IDLE_SECONDS` (15 min, tracing.py): `_external_seen` {member: time.time()}, in memory,
+        # stamped by `hub_call` (§13) for every call but `wait_for_events`, whether tracing is on or not (a client
+        # that only listens is asleep like the others)
+    def stall_ids(self, name: str) -> frozenset[int]
+        # the public form of `_stall_ids` (scheduler items 2-3, `wait`'s result): the in_progress task ids of `name`
+        # that count as stalled, not a clarify planning card whose holder waits for the user's answers (`asks_user`,
+        # §3.1) nor a crew task with a direction that can still move (`Board.has_live_directions`); a `waiting` task
+        # never counts (answers wake its holder, system prompt rule 7)
     def render_wake(self, name: str, incoming: bool = False, stamps: bool = False,
                     since: float | None = None) -> str | None
         # drains (marks read/delivered) and renders the wake-up text (§6.3); None if nothing pending
@@ -358,7 +378,18 @@ class Swarm:
     def record_usage(self, agent: str, usage: Usage, profile: ModelProfile, model: str | None = None) -> float
         # adds cost_of(...) to the agent; a call that counted tokens as $0 (uncounted_fields, §10) gives USER the quiet
         # u_cost_unknown {profile, model, fields} once per start() for each (profile, provider, base_url, model,
-        # fields), plus a log warning (the set `_cost_warned` lives in memory and start() clears it)
+        # fields), plus a log warning (the set `_cost_warned` lives in memory and start() clears it).
+        # Then the money notice: limit = limits()["max_cost_usd"], at = `float(config.swarm.budget_notice_at or 0)`
+        # (read at each call, §17.1), spent = `spent_usd()`; when limit > 0, 0 < at < 1, spent >= at × limit − 1e-9,
+        # spent < limit and kv `budget_notice` does not hold this {limit, at} (only those two fields are compared):
+        # kv `budget_notice` {limit, at, spent, ts} is written, then every LLM member (not retired, not external)
+        # gets `n_budget_low` {spent, limit, pct}, waking (`wake=True`) for a member that works or has open tasks,
+        # reviews waiting for it or news pending, quiet for an idle one with none of those, and USER gets the quiet
+        # `u_budget_low` {spent, limit, pct}; pct = min(round(100 × spent / limit), 99) (no format spec in the texts,
+        # §17.1). At or past the limit nothing is recorded: `u_budget` covers it, so a call that jumps past the limit
+        # gives no low notice, and a raised limit gives it at the next call that finds spent past the new threshold.
+        # A new limit (set_limits, a settings change, reconfigure) or a new fraction differs from the kv record and
+        # so re-arms the notice, with no hook; the same limit set again does not
     def budget_exceeded(self) -> bool
     paused: bool; pause_reason: str
     def pause(self, actor: str, reason: str, **details) -> bool
@@ -366,7 +397,15 @@ class Swarm:
         # "question": asker, message_id, since; §3.1)
     def _set_pause(self, actor: str, reason: str, *, outcome: dict | None = None, **details) -> None
         # writes the pause slot even while paused (a question pause turned into a budget pause: `outcome` is then the
-        # event's `question` data); USER gets the quiet u_budget (reason "budget") or u_question (reason "question")
+        # event's `question` data); USER gets the quiet u_budget (reason "budget") or u_question (reason "question");
+        # a fresh pause (not paused before) with the user's reason, "paused by the user" (a swarm.py constant beside
+        # QUESTION, which `swarm_control` passes, §12), while jobs run (`jobs.running_of()`) gives USER the quiet
+        # u_paused_jobs {jobs: "j3 (Anna Smith: npm run dev, 25 min); ...", built like u_jobs_running}: "Background
+        # jobs of the agents are not paused with the swarm: {jobs}. A pause stops only the agents' model calls; the
+        # jobs run until you stop them or the session stops: use the Jobs tab on the board or /jobs stop <id> in the
+        # terminal." (ru alike: «Процессы», no identifier in backticks, test_background_job_texts). None for a
+        # budget or question pause (u_budget / u_question cover them, and a `stop_when_done` session stops its jobs
+        # right after a budget pause, §21.4), nor for a question pause turned into a budget pause
     def resume(self, actor: str, *, question: dict | None = None) -> None
         # n_resumed to LLM agents with open tasks, reviews waiting for them, pending events or an activation the
         # pause cut short (runtime.interrupted); a reply owed to the user by that activation is still forwarded.
@@ -376,7 +415,8 @@ class Swarm:
         # A pause is no planning or decision time: the pause's length (`_paused_at`, in memory, so a pause that began
         # before a restart is not counted) moves on the planning hint's clock (scheduler item 4), every
         # `_considering` start (`_nudge_idle`'s decision window; an offer made during the pause counts from the resume)
-        # and every free-place clock (`_crew_gaps`, scheduler item 8: a crew task's state does not age while paused)
+        # and every free-place clock (`_crew_gaps`, scheduler item 8: a crew task's state does not age while paused);
+        # it drops the team-asleep clock (`_team_asleep` = None, scheduler item 9: its `n_resumed` wakes the holders)
     def pending_question(self) -> dict | None            # {asker, message_id, since} of the question holding the
                                                          # pause (kv `paused` with reason "question"), else None
     def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None
@@ -427,7 +467,8 @@ resolve_member is the real `resolve_member_in`; set_goal / complete_goal validat
 like the real ones (the planning task is created when a real Board is wired: `prompts.planning_task(language,
 config.swarm.clarify)` with its tags, §3.1). It has no `pending_question`, `ask_user`, `asks_user` or `pause_text`:
 their callers (Mailbox.send, send_message, the in-activation nudge, `_stop_reason`) look them up with getattr, so
-with FakeSwarm a message never answers or pauses anything.
+with FakeSwarm a message never answers or pauses anything. Nor has it `team_asleep` or `stall_ids` (and its
+`triggers` is None): `wait` (§12) looks them up with getattr and gives the plain result.
 
 Scheduler (every 3 s): expires file locks, then settles the lock waiters (`workspace.settle_waiters()`, §7 "Lock
 waiters": a member refused a path that is free now is woken, a long holder told; also while paused, the
@@ -505,7 +546,8 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
 5. `_remind_reviewers` (independent review only): review reminder and hand-over (§4.1 "Liveness");
 6. `_check_all_done`: sends `n_all_done` to one idle agent when every task is finished but the goal is open
    (`review` is an open status, so it waits for every review); not while any LLM member works or is busy with a
-   job (with no open task only a `timeout` job can make it busy: its command may still change the result);
+   job (with no open task only a `timeout` job can make it busy: its command may still change the result); once
+   per board state, the key `(task count, MAX(tasks.updated_at))` kept in `_all_done_key` (item 9 reads it);
 7. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
    (§4.1 "Liveness");
 8. `_tell_crew_gaps` (§4.2 "A free place"; run of 2026-11-13: for hours one member worked on the last direction of
@@ -516,14 +558,88 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    `CREW_GAP_FACTOR` (10) × `agents.idle_nudge_seconds`, and only while the owner is idle itself; once per such
    state, at most `CREW_GAP_MAX` (2) times per owner and crew task (counted from the notifications table, so a
    restart does not reset the count); never while the goal is not active or in wrap-up mode (`wrapping_up`; the
-   clocks start again afterwards; a pause stops them: `resume` moves them on by its length). It runs last, in the
-   code too: it reads the offers item 1 made in the same pass (`_nudged`), and a member that items 1-7 woke has
-   news pending, so it is not idle. It wakes nobody but that owner.
+   clocks start again afterwards; a pause stops them: `resume` moves them on by its length). It runs after items
+   1-7, in the code too: it reads the offers item 1 made in the same pass (`_nudged`), and a member that items 1-7
+   woke has news pending, so it is not idle. It wakes nobody but that owner;
+9. `_wake_team_asleep` (§4.2 "Notifications": `n_team_asleep`, `u_team_asleep`, `u_team_waits`): the whole team
+   sleeps while work is open and nothing set will wake anyone: a member waits, after item 3's one wake, for a
+   process the hub does not track (`jobs` does not list it: on macOS one that left its command's process group, on
+   Linux one that also cleared its environment, §7 "Process layer"), members wait for each other, or a member waits
+   for the user's answer to a plain message. It runs last, after item 8, in the code too: a member that items 1-8
+   or `_wake_deferred` woke in the same pass has news pending, so it is not idle.
+   - *When* (in item 9 an open task is one in `todo`, `in_progress` or `waiting`, not `Status.OPEN`: `review` is
+     apart, the review condition below handles it; *Whom* and `u_team_waits` read "open" the same way): in a pass,
+     all of these hold: the goal is active (wrap-up mode included); the board has an open task, or no open task,
+     every task terminal, and item 6 has already spoken for this board state (`_all_done_key` equals the key
+     below); an empty board gives nothing; no task is in review whose review item 5 still works on (independent
+     review on and the reviewer an LLM member: item 5 reminds it and hands it over); a review held by USER or an
+     external member, or any review while independent review is off, does not count, but item 7's state stands
+     item 9 down (USER's reviews wait, `not self._has_task_in_progress() and not self._has_actionable_todo()`: item
+     7 tells the user, nothing else is left); no clarify planner waits for the user's answers (`asks_user` on an
+     open planning card of an LLM member, §3.1); and `team_asleep()` (above: every LLM member idle or in error with
+     no recovery, nothing of theirs awaited, no delayed notice, no unattended trigger, no recent external call).
+   - *Clock*: the key is item 6's, `(task count, MAX(tasks.updated_at))` (a claim or a status change makes a new
+     one, a comment does not). `_team_asleep` (key, since), in memory: `since` is when a pass first saw the
+     conditions hold with that key, raised to the latest `last_active` of the idle LLM members (not of those in
+     error: a failing retry does not restart it); a pass where the conditions fail, or the goal is not active,
+     drops it; a changed key starts a new clock; `resume()` drops it (§3 `resume`).
+   - *Due* when `now - since >= TEAM_ASLEEP_FACTOR * 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) * idle_nudge_seconds`
+     (`agents.idle_nudge_seconds`) and `per_key < TEAM_ASLEEP_MAX`. `sent` = the `n_team_asleep` notifications under
+     the current goal (`SELECT COUNT(*) FROM notifications WHERE kind = 'n_team_asleep' AND ts >=
+     goal.updated_at`: a restart keeps it, a new or reopened goal starts again); `per_key` = those sent since the
+     key was first seen (`_team_asleep_woken` (key, count), in memory). Module constants, monkeypatchable:
+     `TEAM_ASLEEP_FACTOR` = 5, `TEAM_ASLEEP_DOUBLINGS` = 5, `TEAM_ASLEEP_MAX` = 2; with the default 60 s the wakes
+     come after 5, 10, 20, 40, 80, 160, 160… minutes, at most 2 per board state, so a member that changes a task's
+     status at every wake still waits twice as long each time. With `idle_nudge_seconds` = 0 the delay is 0 and
+     the doubling does nothing (as items 2-3 and 8 have no delay then): item 9 is due at the first pass that finds
+     the team asleep, still at most 2 per board state, so a member that changes a task's status at every wake is
+     woken again at almost every pass (3 s) for as long as it does so, or until the budget pauses the swarm.
+   - *Whom*: among the idle LLM members (not those in error), the one active last (`last_active`) of the first
+     group that has one: 1. holding an `in_progress` or `waiting` task; 2. holding a `todo` task; 3. any idle
+     member, when an open task has no assignee, or no open task is left (item 6's state). It gets the waking
+     `n_team_asleep` {elapsed, jobs}; `per_key` is recorded right after that notify succeeds. Then, in its own
+     try/except with a log line, USER gets `u_team_asleep` {elapsed, name} with the first wake of each key, waking
+     (`wake=True`, as `u_reviews_waiting`: a user MCP client in `wait_for_events` is told). When no LLM member
+     holds an open task and every open task has an assignee (USER or an external member), no member is woken: USER
+     gets the waking `u_team_waits` {elapsed, tasks: "#3, #5"} once for that board state (`per_key` is set to the
+     cap at once; `sent` is not touched). `elapsed` = `fmt_duration(now - since)` in the recipient's language;
+     `jobs` = "" or `team_asleep_jobs` {jobs} naming the member's running jobs whose end is quiet
+     (`jobs.running_of(name)` minus `jobs.awaited(name)`, labels `j3, j5`).
+   - *Texts* (en; ru alike, the same placeholders and backticked identifiers; in ru such an untracked process is
+     «процесс, запущенный через & или nohup, которого нет в списке `jobs`», never «фоновый процесс», which is a
+     job; no text puts & or nohup in backticks, which the identifier tests would refuse): `n_team_asleep`
+     ``Nobody in the team has worked for {elapsed}, and nothing is set to wake anyone: no running background job
+     whose end wakes its owner, no trigger that can still fire on a time or a file, no locked file someone was
+     refused.{jobs} A process started with & or nohup that `jobs` does not list is not tracked: its end wakes
+     nobody. If you are waiting for one, check it now; if it still runs, set a trigger with a deadline before you
+     `wait` (`trigger_create`, e.g. file_exists("out/result.json") or elapsed(1800)), and start the next such run
+     with background=true, without & and nohup. If you are waiting for the user's answer, don't ask again: the
+     user was told. If you are waiting for another member, ask in the task's discussion: a post wakes them.
+     Otherwise go on with your tasks, or finish them, or set them back to `todo` (or `failed`) with a comment; when
+     every task is finished, verify the result and call `goal_complete`; if you hold none, look at the `board` for
+     open tasks nobody moves.``; `team_asleep_jobs` ` Your background jobs {jobs} still run, but their end will not
+     wake you while you hold no task in progress.` (ru «фоновые процессы»); `u_team_asleep` `Nobody in the team
+     has worked for {elapsed}, and nothing is set to wake anyone: no background job whose end wakes its owner, no
+     trigger that fires on a time or a file. {name} was woken to check their work. If the team waits for you (an
+     answer, a review, a decision, access), write to the member who asked; to end the run, stop the session.`;
+     `u_team_waits` `Nobody in the team has worked for {elapsed}: the open tasks {tasks} are held by you or by
+     members who joined through MCP, and nothing is set to wake anyone. Do them or hand them to the team; to end
+     the run, stop the session.` The member's texts name only tools every open revision has (§12 R0′).
+   - *Limits accepted*: a job whose end wakes its owner (`JobManager.awaited`: a `background` server past its busy
+     window counts until `[shell] job_max_minutes`, 480 min by default; 0: as long as it runs) and a wait for a
+     refused file (until the lock ends: unlock, expiry after `[workspace] lock_ttl_minutes`, at most 24 h, or
+     retire) keep item 9 silent however long they last; a trigger that reads only files counts for
+     `UNATTENDED_FILE_SECONDS` (§8). Open tasks held only by LLM members in error with no recovery scheduled, none
+     without an assignee, wake nobody and send no `u_team_waits`: USER was told of the error (`u_agent_error`). No
+     external member is ever woken (no scheduler item wakes one), and a `dreamteam -p` run still waits, until its
+     `--timeout` when one is given, with the user's notice on stderr (docs/TUI.md §2).
 
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
 agents in ERROR; a changed role catalog (§17.3), `[swarm] independent_review` and `crew_review` apply at once (new
 hires use the new catalog; existing members keep their frozen prompts); `[swarm] clarify` switched off lifts a
-question pause and tells a clarify planner that waits for the user (§3.1).
+question pause and tells a clarify planner that waits for the user (§3.1). The money notice needs no hook: a new
+`max_cost_usd` or `[swarm] budget_notice_at` no longer matches kv `budget_notice`, so the next `record_usage` past the
+new threshold sends it again (§3 `record_usage`); `agents.idle_nudge_seconds` reaches item 9's delay at the next pass.
 
 ### 3.1 Clarify mode and questions that pause the swarm
 
@@ -586,7 +702,8 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
     quiet `u_question` {name, id}.
   - It pauses like any pause (§6.2): an LLM call in flight and all tool calls of its response finish, the next step
     breaks, a woken agent goes to `paused`, the scheduler skips its passes; jobs, triggers and external members go
-    on. The asker reads its result only after the resume, together with the answer.
+    on (unlike the user's own pause, it sends USER no `u_paused_jobs`: `u_question` covers it, §3 `_set_pause`). The
+    asker reads its result only after the resume, together with the answer.
 - **The answer rule.** While `pending_question()` is {asker A, message_id Q}, the **first** message from USER (any
   surface: the board's chat, the TUI, the console, MCP) whose resolved recipients include A (named, or through
   "all") is the answer; `reply_to` alone does not count. `Mailbox.send` (§5) fills `reply_to = Q` when it has none (A
@@ -934,6 +1051,11 @@ notifications explain it.
     tasks (the tests of an implementation that waits for the user), the directions of a crew task that is blocked,
     full, in review or terminal, and an owner's own part waiting for its blocked crew task do not suppress it. The
     user never answering only leaves the session idle (no cost).
+  - Scheduler item 9 (§3, the whole team asleep) leaves to `_remind_reviewers` only a review it still works on:
+    with the switch on, a task in review whose reviewer is an LLM member keeps item 9 silent; a review held by USER
+    (the usual one in a one-agent team) or by an external member, or any review with the switch off, does not, so
+    a holder of other open work that sleeps with nothing set to wake it is still woken. Item 7's state (only USER's
+    reviews left, nothing in progress, no actionable `todo`) stands item 9 down: `u_reviews_waiting` tells the user.
   - Goal completion: `review` is an open status, so `n_all_done` waits for every review, and `goal_complete`
     (§12) is refused while any task is in review (switch on).
   - The planning task is reviewed like any task; in a one-agent team that asks the user to approve the plan, which
@@ -1578,11 +1700,11 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   sent and the key is not recorded, so the next pass reads the marks again. `_stall_woken` is set only
   after the text is built: a render that raises is logged, nothing is recorded, and the scheduler pass goes on to
   its next items (the next pass tries again). Tests: a parent holder whose subtasks are all terminal stalls three
-  times in a row and
-  gets one wake for that key; a `waiting` task without subtasks is never woken. A trigger `all_done(parent=N)` (§8)
-  needs every subtask `done`, so for a crew task it fires when all its directions are done, before its owner has
-  written #N's result (and never once a direction is cancelled): wait on `done(N)` or `finished(N)` for the crew
-  task itself instead.
+  times in a row and gets one wake for that key; a `waiting` task without subtasks is never woken by items 2-3
+  (item 9, §3, may still wake its holder when the whole team sleeps). A trigger `all_done(parent=N)` (§8) needs
+  every subtask `done`, so for a crew task it fires when all its directions are done, before its owner has written
+  #N's result (and never once a direction is cancelled): wait on `done(N)` or `finished(N)` for the crew task
+  itself instead.
 - **Reviews.** A direction is reviewed by the ordinary rules (§4.1), independently of the others: its own reviewer
   if one was set and is valid, else `pick_reviewer` at its completion (any member but its executor; the owner too,
   though for the directions it added it is their creator and comes after the others, like any creator); with
@@ -1682,9 +1804,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `n_crew_changed`: `{by} set the crew of #{id} "{title}" to {crew}
   (0 = an ordinary task).` `n_subtask_cancelled`: `{by} cancelled #{id} "{title}", your part of #{parent}: stop the
   work on it; if what you have done is still needed, say so in #{parent}'s discussion.`
-- **Notifications** of subtasks and crew tasks (texts in prompts.py, ru/en; never to the actor, who reads the same
-  text in its call's result where this section says so, through the board's `notes`, §4; one per member and
-  change, "Finishing"; "quiet" = `wake=False`):
+- **Notifications** of subtasks and crew tasks, and the liveness wakes of §3 items 2, 3 and 9 (texts in prompts.py,
+  ru/en; never to the actor, who reads the same text in its call's result where this section says so, through the
+  board's `notes`, §4; one per member and change, "Finishing"; "quiet" = `wake=False`):
 
   | when | to | key {placeholders} | wakes |
   |---|---|---|---|
@@ -1704,6 +1826,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   | a crew task is returned | its owner | `n_review_rejected` with the crew `ending` (§4.1 table) | yes |
   | a holder stalls with marks and no unmarked ids (Liveness) | the holder | `n_marks_stalled` {text} (a "subtasks done" mark of a crew task with all directions finished carries the draft of #N's result, in `n_stalled` too) | yes |
   | a holder stalls with unmarked ids (Liveness, §3 items 2 and 3) | the holder | `n_stalled` {tasks, marks} (`marks`: the mark sentences, "" without marks) | yes |
+  | the whole team asleep (§3 item 9) | one idle LLM member | `n_team_asleep` {elapsed, jobs} | yes |
+  | same, the first wake of a board state (§3 item 9) | USER | `u_team_asleep` {elapsed, name} | yes |
+  | same, every open task held by USER or external members | USER, no member | `u_team_waits` {elapsed, tasks} | yes |
 
 - **System prompt** (en and ru; frozen per agent, so for members created from then on). Rule 3 (which says to hold
   one task in progress at a time) adds at its end `A crew task ("crew 2/3" on the board) is split into directions:
@@ -1795,7 +1920,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   owner, nothing working); `Board.crew_gap_parts` (the blockers in the list; the three forms of a held direction:
   another member's, the owner's own, one a working direction waits for); the scheduler item in
   tests/test_crew_swarm.py, with a small `idle_nudge_seconds`: one notice after 10 × it and none before, and one
-  through the scheduler's own loop, not in the pass in which item 1 offers the owner a task (item 8 runs last); an
+  through the scheduler's own loop, not in the pass in which item 1 offers the owner a task (item 8 follows it); an
   owner at work told only once it is idle, an owner that waits for its own job told, USER and external owners never;
   the free members (a holder of a blocked task or of a `waiting` one and an idle owner of another crew task that
   works on none of its directions count; a member with a ready task not offered to it yet, a `todo` subtask of a
@@ -1806,6 +1931,38 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `CREW_KEYS` gains the five keys, the fragments that start with a space gain `crew_gap_`, `n_crew_gap` joins the
   keys that say «групповая задача» and «направлен», and the examples above are pinned in
   `test_crew_texts_render_the_spec_wording`.
+- **Tests** of the team-asleep wake, the money notice, the pause notice and the token liveness (new files, e.g.
+  tests/test_team_asleep.py; ScriptedLLM, aged clocks and direct item calls allowed). Item 9 (§3): a lone member
+  with an `in_progress` task that calls `wait` with nothing awaited gets exactly one `n_team_asleep` at 5 ×
+  `idle_nudge_seconds` and none before, USER one `u_team_asleep`; the second only after the doubled delay, never a
+  third for one board state; a task change re-arms it while the goal-wide doubling holds (5, 10, 20… for a member
+  that changes its status at every wake). It still fires with a task in USER's review and independent review on,
+  after `n_all_done` answered with `wait`, with only a `status(...)` / `done(...)` trigger, with `elapsed(1) and
+  done(99)` past its moment, with a `file_exists` trigger older than `UNATTENDED_FILE_SECONDS` and with a USER-owned
+  `every(60)` that only wakes USER. It stays silent with an awaited job, a refused file, a fresh `elapsed(600)` or
+  `file_exists(...)` trigger, staggered kickoffs pending, a pause, an empty board, an LLM reviewer's review with
+  independent review on, item 7's state, another member at work, an external member's recent call and a clarify
+  planner waiting. Two members asleep: one `n_team_asleep`, to the `in_progress` holder, and one `u_team_asleep`;
+  every open task held by USER: only `u_team_waits`, no member woken; `resume` drops the clock.
+  `TriggerEngine.unattended` has unit tests of its own (each "reaches" and "may fire" case of §8). The `wait` clause
+  (§12): present with an `in_progress` task, nothing awaited and the team asleep; absent with a job, a refused
+  file, a trigger of its own, only a `waiting` task, no task held, a done goal, a clarify planner waiting, another
+  member at work. The money notice (§3 `record_usage`): crossing 0.8 with float sums (8 × 0.1) gives exactly one
+  `n_budget_low` per LLM member (waking or quiet by the rule) and one `u_budget_low`, nothing more at 0.9,
+  `u_budget` at the limit unchanged; `set_limits(2.0)` and `reconfigure` re-arm it; 0, 1 or no limit give none; a
+  call that jumps past the limit gives none; pct never shows 100 below the limit; the setting's default, range
+  error, template line, settings view, home.js field and i18n (§17.1, §18.4). The `money` line (§6.3): present
+  with a limit, absent without one, in incoming renders and for external members, after the goal line; the system
+  prompt sentences in both languages. The pause notice (§3 `_set_pause`, §12): the user's pause with a running job
+  names its id in the result and gives USER one `u_paused_jobs`; without jobs `Done: paused.` and no notice; a
+  budget or question pause gives none; the Russian pause reason (tests/test_tui_render.py, tests/test_ui.py).
+  tests/test_prompts.py `test_background_job_texts` gains `u_paused_jobs`. The token liveness (§7 "Process
+  layer"; Linux only, skipped elsewhere): `nohup timeout 5 sleep 3 &` and `setsid sleep 3 &` keep `alive()` true
+  after the shell exited, `pids()` / `processes()` list `sleep`, and it turns false when that ends; `JobManager.run`
+  makes them a `detached` job (with `background=true` a `background` one) whose end sends its end notice;
+  `kill()` and `terminate()` leave no token process; a command that does not escape is unchanged; the uid rule
+  has a unit test of its own. Existing tests that meet item 9 (an active goal, a sleeping team, a small
+  `idle_nudge_seconds`) raise `TEAM_ASLEEP_FACTOR` or assert only the kinds they are about.
 
 ## 5. Mailbox (mailbox.py)
 
@@ -2004,7 +2161,10 @@ you have."), `reasons:` then one bullet per undelivered notification text and
 per unread message (`msg` template, recipients list with the agent shown as `you`), then, only when one of those
 messages was sent to "all" (`to_all`, from the user or a member; incoming too), the one-line `all_hint` ("Before
 creating a task for a message to all, check the board: one member creates it, the others take it or comment."), then
-(not for incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, one `my_blocked` {id,
+(not for incoming) goal line (one line: the goal is stored split, §3 `set_goal`; `goal_none` without a goal), for an
+LLM member while the budget has a limit (`limits()["max_cost_usd"]` > 0) the line `money` {spent, limit, pct}
+(spent = `spent_usd()`; "Money: spent $1.20 of $5.00 (24%)." / «Деньги: потрачено $1.20 из $5.00 (24%).»; pct as
+in `n_budget_low`, §3 `record_usage`, so it shows 99 at most), `my_tasks`, one `my_blocked` {id,
 blockers: "#3, #4"} per open task of the agent with unfinished dependencies, except one in review whose result is
 already produced (it may remove those it can do without, §4), `my_reviews` (only when
 tasks wait for its review: `#id title (assignee or -)`), `my_jobs` (only while it has running background jobs,
@@ -2014,7 +2174,19 @@ for 40 min)`), `ready` (up to 8; free directions of crew tasks included, §4.2),
 (below), notes: in full only when they
 changed
 since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
-otherwise the one-line `notes_unchanged`, since the history is append-only.
+otherwise the one-line `notes_unchanged`, since the history is append-only. The `money` line is never in an
+incoming render nor for an external member, and never between the header and `wrap_up_line` or before the news.
+
+**System prompt** (en and ru; frozen per member at hire, so for members hired from then on; no new placeholder and
+no new numbered rule, every pinned substring kept): rule 1's list of what a wake-up shows names `the money spent
+(while the budget has a limit)` next to the global goal (ru «потраченные деньги (пока у бюджета есть лимит)»);
+rule 9 ends with `When a notice says that most of the money budget is spent, don't wait for the user to ask for a
+wrap-up: finish what is nearly done and start nothing large.` (it echoes `n_budget_low`; ru «Если уведомление
+говорит, что большая часть денежного бюджета потрачена, не жди, пока пользователь попросит закругляться: доводи до
+конца то, что почти готово, и не начинай ничего большого.»); rule 10 ends with ``A process you start with & or
+nohup that `jobs` does not list is not tracked: its end wakes nobody.`` (ru «Процесс, запущенный через & или
+nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.»; `jobs` in both, so the
+backticked identifiers still match).
 
 The **Skills index** (§19 "Delivery to agents"; never for external members, never in an incoming render): with skills
 attached, the full `skills_index` (or `skills_index_own` when the member's role lists one of them) once per agent
@@ -2588,15 +2760,20 @@ def kill_tree(proc) -> None   # tui/bash.py's `!` commands: POSIX os.killpg(proc
 
 # procs.py (standard library only; kernel32 through ctypes, loaded lazily)
 TOKEN_ENV = "DREAMTEAM_PROCESS_TOKEN"
+TOKEN_SCAN_SECONDS = 2.0  # Linux: how long a tree keeps the result of its token scan (an end is seen that late)
 class ProcessTree:      # proc, pid, pgid (POSIX: the shell's pid, stored), contained, token; released, watchdog
     @classmethod
     def spawn(cls, argv: list[str] | str, *, cwd, env, token=None,
               breakaway=True) -> "ProcessTree"         # blocking: via daemon_call
     def alive(self) -> bool; def pids(self) -> list[int]; def processes(self) -> list[str]
+        # Linux: the group's processes plus the token's outside it ("Process layer" below)
     def terminate(self) -> None; def kill(self) -> None; def release(self) -> None; def mark_eof(self) -> None
 def live_groups(pgids) -> set[int]                     # Linux: one /proc pass, zombies ignored; other POSIX: killpg 0
-def sweep_token(token: str) -> int                     # Linux: SIGKILL every own-user process carrying the token
-def alive_all(trees) -> list[bool]                     # alive() of many trees (one /proc pass on Linux)
+def token_pids(tokens) -> dict[str, list[int]]         # Linux: one /proc pass over /proc/<pid>/environ for several
+                                                       # tokens (the hub's own pid skipped; the uid rule below)
+def sweep_token(token: str) -> int                     # Linux: SIGKILL every process carrying the token (uid rule)
+def alive_all(trees) -> list[bool]                     # alive() of many trees (one /proc pass on Linux for the
+                                                       # groups, one token scan for the trees whose group is gone)
 async def daemon_call(fn, *args, on_orphan=None)       # fn in a new daemon thread; on_orphan(result) when the
                                                        # caller was cancelled meanwhile (kills the new tree)
 ```
@@ -2621,9 +2798,20 @@ outlive its call:
   (an agent running `dreamteam run`, this project's tests run as a job) carries that outer token, and the outer
   job's token sweep must kill the inner hub but leave its watchdogs, which then kill the groups they guard.
   Liveness after the shell was reaped: Linux counts the group's live processes in /proc (zombies ignored, so
-  init-less containers stay correct), other systems `killpg(pgid, 0)`. terminate = SIGTERM to the group; kill =
-  SIGKILL to the group plus, on Linux, the token sweep (it also ends `setsid` escapes). Names from
-  `/proc/<pid>/comm` (Linux), else none ("processes").
+  init-less containers stay correct), other systems `killpg(pgid, 0)`. On Linux, once the shell and the group are
+  both gone, a tree with a token is still alive while a process carries its `DREAMTEAM_PROCESS_TOKEN`
+  (`token_pids`, from `/proc/<pid>/environ`): GNU `timeout` without `--foreground` and `setsid` start a new group,
+  so `nohup timeout N cmd &` or `setsid cmd &` would otherwise leave an empty group while their processes run. The
+  scan runs only for such trees, its result is kept per tree for `TOKEN_SCAN_SECONDS` (2 s; an end is seen at most
+  that late), and `alive_all` scans once for all of them. `pids()` and `processes()` list the group's members plus
+  the token's processes outside it (a tree whose group is gone lists its token's processes). The uid rule, shared
+  by `token_pids` and `sweep_token`: processes of the hub's own uid; when the hub runs as root (the Docker sandbox,
+  whose commands run under `setpriv --reuid=<offline uid>`, §7.2), any uid, since the random token
+  (`secrets.token_hex(8)`) identifies the command's processes. terminate = SIGTERM to the group plus, on Linux,
+  SIGTERM to the token's processes outside it; kill = SIGKILL to the group plus, on Linux, the token sweep (it also
+  ends `setsid` escapes). A process that clears its environment (`env -i`, a daemon that rebuilds it) carries no
+  token and still escapes; macOS has no /proc, so there the group alone decides. Names from `/proc/<pid>/comm`
+  (Linux), else none ("processes").
 - After `release()` nothing is ever signalled again (idempotent); a tree dropped without it is released by a
   `weakref.finalize`.
 - A command ends when its shell has exited and its tree is empty; the pipe's EOF is waited for at most
@@ -2706,7 +2894,7 @@ def shown_log(log) -> str                                # a data_dir log with "
 |---|---|---|---|---|
 | `timeout` | its shell still runs when the call's wait ended | `[shell] max_timeout` | always | unless the goal is done |
 | `background` | `background=true` (AI agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
-| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`; with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
+| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`, on Linux also `nohup timeout N cmd &` and `setsid cmd &`, which leave the group but keep the token (§7 "Process layer"); with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
 
 `wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
 
@@ -2901,7 +3089,8 @@ them).`; a blank job_id lists. The user lists and stops every member's jobs thro
 | `Swarm.stop` (session stop, delete, `/cd` move, launcher shutdown, `dreamteam run` end, stdio `mcp` end, the end of print mode with an owned launcher, a failed start) | `stop_all()`: no new command or job (`closing`), the monitor cancelled; every job tree and every foreground tree terminated, after `STOP_ALL_TERM` (3 s) the survivors killed and awaited up to `STOP_ALL_KILL` (2 s); every job finished as `stopped`/`session` (quiet `n_job_gone`, no commit of its own), every finish, stop and foreground call in flight awaited; then one autocommit per owner of its stopped jobs and of its jobs that ended by themselves since the session began to stop (`Swarm.stop` sets `stopping` first and stops the runtimes before `stop_all`: such an end makes no commit of its own), kind `job j3` or `jobs j3, j4, j5`, detail `Stopped with the session:\nj3: <command>…` and `Ended while the session stopped:\nj4: <command> (<how it ended>)…`; every tree released, every log closed. About 5 s plus git; idempotent; nothing touches git or the database after it returned (`hub_call` also skips its trace while the swarm stops, §13). `Swarm.stop` runs it in `finally`, also after a failed step |
 | `Swarm.retire` | §3 `retire`: `forbid`, then the runtime, then `stop_owner(name, "retired")` |
 | `Swarm.start` | `recover()` (below) |
-| pause | nothing: a pause (a question pause too, §3.1) stops LLM spending only |
+| a budget or question pause (§3.1) | nothing: a pause stops LLM spending only |
+| the user's pause | nothing either; USER also gets the quiet `u_paused_jobs` naming them (§3 `_set_pause`, §12) |
 | `complete_goal` | the jobs go on; USER gets `u_jobs_running`; their later ends are quiet |
 | `reopen_goal` | nothing (the goal is active again, so ends wake again) |
 | `reconfigure` | nothing: the limits are read at each use; turning `background_on_timeout` off kills no job |
@@ -2912,9 +3101,10 @@ them).`; a blank job_id lists. The user lists and stops every member's jobs thro
 **Crash recovery**: when the hub dies, Windows closes its job handles (KILL_ON_JOB_CLOSE kills every tree), POSIX
 watchdogs see EOF and kill their groups, a container stops. At the next `Swarm.start`, `recover()` turns every row
 still `running` into `lost`/`crash` (ended_at = now); on Linux, when the row's `hub_pid` is dead or is this process,
-every own-user process carrying its token is killed (identity from a random token, never from a bare pid); each owner
-still a member gets a quiet `n_job_gone`. View-only loads (`Swarm(...)` without `start`, `cli status`, the launcher
-viewing a stopped session) change nothing. Sessions never started again are cleaned by the OS containment alone.
+every process carrying its token is killed (`sweep_token`, the uid rule of §7 "Process layer"; identity from a
+random token, never from a bare pid); each owner still a member gets a quiet `n_job_gone`. View-only loads
+(`Swarm(...)` without `start`, `cli status`, the launcher viewing a stopped session) change nothing. Sessions never
+started again are cleaned by the OS containment alone.
 
 **Liveness**: `busy(name)` is true while the member has a running `timeout` job, or a `background` job younger than
 `max_timeout` while it holds an in_progress task or a review (the board is queried only then); `detached` jobs never
@@ -2923,7 +3113,12 @@ hand-over (its reminder time is renewed while busy), it holds `n_all_done` back 
 `u_reviews_waiting`; `AgentRuntime` skips its in-activation nudge (§6.2). A free member with a server started with
 `background=true` is still offered ready tasks. A member that is not busy but whose running job's end will wake it
 (`awaited`: a detached job while it holds an in_progress task, a server past its busy window) waits for that job:
-the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone meanwhile.
+the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone meanwhile, and so does the team-asleep
+wake (§3 item 9, `Swarm.team_asleep`), however long the job runs. On Linux a process that left its command's
+process group but kept its environment is found by its token, so its command is a job as `cmd &` is (§7 "Process
+layer"). A process the hub does not track (`jobs` does not list it: on macOS one that left its command's process
+group, on Linux one that also cleared its environment, `env -i` or a daemon that rebuilds it) is no job: its end
+wakes nobody (system prompt rule 10, §6.3); item 9 is what wakes a team that sleeps waiting for one.
 
 **Git**: the caller's `shell` autocommit at every return, also when the command went on as a job (not for
 `killed`); the job's own commits under its owner when its shell exits with processes left, at its end and at the
@@ -3085,6 +3280,9 @@ class TriggerEngine:
     def pending(self, trigger_id: int) -> list[tuple[str, int, float | None]]   # file_changed() changes not fired
                                                              # yet: (path, changes, seconds since the latest)
     def create_notes(self, trigger: dict) -> list[str]       # the trigger_create result's notes (§12)
+    def unattended(self, now: float) -> bool                 # an active trigger may still fire while nobody acts
+                                                             # and its fire reaches an LLM member ("Unattended
+                                                             # triggers" below; Swarm.team_asleep, §3)
 ```
 `create` resolves member names in the condition (`sender=` of message/comment, `assignee=` of count,
 `agent_status(name)`) with `swarm.resolve_member(allow_retired=True)` (a unique first name, `@Name`, any
@@ -3186,6 +3384,29 @@ untold (`wake_at` None). No new event type: every fire still emits `trigger.fire
 `held` / `wake_at`; a release emits only its `notification`. The limit is per trigger and only for triggers:
 lock (`n_lock_free`) and job wake-ups are not limited, and a trigger's message action still wakes its recipients at
 every fire (the flood guard limits those).
+
+**Unattended triggers.** `unattended(now)` (for `Swarm.team_asleep`, §3 scheduler item 9) is true when an active
+trigger both reaches an LLM member and may still fire while nobody acts:
+- *Reaches an LLM member*: its owner is an LLM member and its actions include `wake` (the default when there are
+  none), or its actions include `message` to a member or "all", `set_status` or `create_task`. A trigger of USER or
+  of an external member that only wakes its owner does not count (an hourly `every(3600)` reminder of the user's
+  keeps no LLM member awake).
+- *May fire unattended*: it holds fires (`held` > 0: the end of the wake limit's interval releases them with a wake,
+  "Wake limit"); or its condition uses a time function and the next moment it can come true has not passed by more
+  than `UNATTENDED_GRACE` (10 s): `elapsed(s)` → created_at + s, `after(t)` → t, `every(p)` → (last_fired or
+  created_at) + p, with several of them the latest (read from their literal arguments). A moment that passed
+  without a fire means another part of the condition holds it back (`elapsed(60) and done(3)`): it waits for someone
+  to act. Or its functions are only `file_exists` / `file_changed` (no time function): it counts for
+  `UNATTENDED_FILE_SECONDS` (30 min) from its creation or last fire, then no longer (a process that died never
+  writes the file); a condition that mixes files with board state counts like board state. So
+  `file_exists("out/result.json") or elapsed(1800)`, which the team-asleep texts suggest, counts until its deadline.
+- It does not count either when it is a repeating trigger that is not periodic and whose condition is true now
+  (`last_value` = 1: it fires again only after the condition turns false), or when its condition reads board,
+  message or agent state only (`status`, `done`, `count`, `message`, `comment`, `agent_status`, `goal_done`, …): it
+  waits for someone to act.
+One query over the active triggers (owner, condition, actions, once, created_at, last_fired, last_value, held), the
+conditions compiled through the engine's cache; `UNATTENDED_GRACE` and `UNATTENDED_FILE_SECONDS` are module constants
+of triggers.py. The check never fires, evaluates or changes a trigger.
 
 ## 9. Event types (bus)
 
@@ -3638,7 +3859,12 @@ Results of the team, wait and job flows:
   (waiting for the user's answer to Anna Smith's question #12).` during a question pause; `Done: ...` lists what was
   done: `wrap-up mode on: every agent was told to finish its tasks with what it has, and no
   new background jobs start` / `wrap-up mode was already on` / `wrap-up mode off` / `wrap-up mode was not on`. Nothing
-  to do: `Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.`
+  to do: `Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.` A `pause` that paused
+  (reason "paused by the user", §3 `_set_pause`) while jobs run (`jobs.running_of()`) adds, after the joined parts,
+  a sentence of its own with the ids only (USER's `u_paused_jobs` has the details): `Done: paused; wrap-up mode off.
+  Background jobs keep running (j3, j5): a pause stops only the agents' model calls; job_stop stops a job.`; without
+  jobs the result is unchanged (`Done: paused.`), and a pause while already paused never adds the sentence
+  (`Done: already paused (…).`).
 - `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run (a
   silent one, §7.1: `j5 Bob: pytest, 50 min, no output for 40 min`),
   and for a member caller `Your background jobs: j3, j5.` after its open tasks. `brief=true` shows the goal as one
@@ -3648,7 +3874,18 @@ Results of the team, wait and job flows:
   for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet), and/or
   `, also when docs/AUDIT.md, which you were refused, is free.` (`… are free` for several, at most 10 named;
   `Workspace.awaited_locks`: none once the goal is done, when n_lock_free is quiet; §7 "Lock waiters"); both:
-  `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.`
+  `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.` With neither,
+  the plain text gets one more clause when all of these hold: the goal is active; `swarm.stall_ids(caller)` is not
+  empty (an `in_progress` task, not a clarify card waiting for the user's answers, not a crew task with live
+  directions; a `waiting` task alone does not count: answers wake it, system prompt rule 7); the caller has no
+  active trigger of its own (any trigger: it set it on purpose); and `swarm.team_asleep(caller)` (nobody else can
+  act or be woken by something set, §3). Then: ``OK, waiting. You will be woken up by new events, but nothing of
+  yours is set to wake you and nobody else in the team is at work. A process started with & or nohup that `jobs`
+  does not list is not tracked: its end will not wake you. If you are waiting for one, the next time set a trigger
+  with a deadline before you wait (trigger_create, e.g. file_exists("out/result.json") or elapsed(1800)), and start
+  such runs with background=true, without & and nohup.`` (English like every result; `wait` ends the activation,
+  so the agent reads it only after its next wake-up, hence "the next time"; scheduler item 9 wakes such a team
+  later). `team_asleep`, `stall_ids` and `triggers` are looked up with getattr (FakeSwarm, §3: the plain text).
 - `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
   min). Stop the ones nobody needs with job_stop; the rest stop with the session.`
 - `shell`, `jobs`, `job_stop`: §7.1.
@@ -3687,7 +3924,10 @@ async def hub_call(swarm, name: str, args: dict, client: str | None = None, *, v
     # one MCP tool call with the actor rules above (also used by the launcher MCP, §18.2); calls of external
     # members are traced (tracer.external_call), except UNTRACED_TOOLS = {"wait_for_events"} and except while the
     # swarm stops (a call that returns then, e.g. a shell command killed by the session stop, must not write into
-    # the database that Swarm.stop's caller closes next). `client` (default: serving_client's) names the MCP
+    # the database that Swarm.stop's caller closes next). A call of an external member (actor not USER and
+    # swarm.is_member(actor)), except UNTRACED_TOOLS, stamps `swarm._external_seen[actor] = time.time()` before and
+    # after it, whether tracing is on or not (Swarm.team_asleep, §3: a long shell call counts from its start to its
+    # end, a client that only waits in wait_for_events does not). `client` (default: serving_client's) names the MCP
     # client: a message it sends (as the call's actor) reaches the external members it acts as already read
     # (mailbox.sent_as_seen_by(members, actor)), so it never comes back to it as news; messages others send, e.g.
     # an agent this call hires, reach them as news. `via` becomes ToolContext.via (the launcher MCP: "launcher-mcp").
@@ -4089,7 +4329,8 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
     use: `[shell]` limits at the next command or job check, `agents.max_steps_per_turn` at the agent's next
     wake-up, `context_tokens` (when the model profile has none of its own) and `tool_output_chars` at the next
     call, `idle_nudge_seconds` at the next scheduler pass, `planning_hint_steps` / `planning_hint_minutes` at the
-    planner's next step or scheduler pass.
+    planner's next step or scheduler pass, `[swarm] budget_notice_at` at the next `record_usage` (a new fraction or
+    limit re-arms the money notice through kv `budget_notice`, §3).
 - `AgentRuntime`:
   - `self.trace` is the current `Trace`, or None (`_tr` is a disabled writer outside an activation).
   - `_activate` finishes a trace left open (`interrupted`), begins the trace after a non-empty wake text and
@@ -4158,6 +4399,24 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   `dump_toml(data)` (a top-level non-empty list of tables is written as `[[name]]` blocks after every table,
   None values skipped; a leaf `env` or `extra` table is written inline, except a root of that name under
   `[api.folders]`); `deep_merge(base, override)`.
+- `[swarm] budget_notice_at` (a number from 0 to 1, default 0.8; a field of `SwarmSettings` right after
+  `max_cost_usd`; out of range is a ValueError through `config._MAX["budget_notice_at"] = 1`, `[swarm]
+  budget_notice_at must be between 0 and 1, got 1.5`; a whole number in the file stays one, so it is read as
+  `float(config.swarm.budget_notice_at or 0)`): the share of the session's money limit at which every AI agent gets
+  one `n_budget_low` and USER one `u_budget_low` (§3 `record_usage`: once per limit and fraction, kv
+  `budget_notice`); 0 or 1: no such notice (`u_budget` at the limit covers it). Read at each `record_usage`; session
+  overrides and `reconfigure` apply, and a new fraction or limit re-arms the notice. Texts ({pct} without a format
+  spec): `n_budget_low` ``Money: spent ${spent:.2f} of the ${limit:.2f} budget ({pct}%). When it is used up, the
+  swarm pauses: every agent stops between two steps, even in the middle of a task. Don't wait for the user to ask
+  for a wrap-up: from now on finish what is nearly done and hand it in (`task_complete`), do the reviews waiting
+  for you, keep the results consistent with what they say, and start nothing large.`` (ru «Деньги: потрачено
+  ${spent:.2f} из ${limit:.2f} денежного бюджета ({pct}%). …»); `u_budget_low` `The team has spent ${spent:.2f} of
+  the ${limit:.2f} budget ({pct}%); the agents were told to finish what is nearly done and start nothing large.
+  When the budget is used up, the swarm pauses; to let it work longer, raise the limit.` The warning colour of the
+  budget bar stays at 80 % of the limit whatever the fraction (the board's `#budget-bar`, the TUI's status line).
+  The template has the line `budget_notice_at = 0.8` after `max_cost_usd`, with a Russian comment; the settings
+  page's «Новые сессии по умолчанию» section has its field (§18.4), and only there, like `crew_review`: not the ⚙
+  dialog, the new-session modal, the API's create fields or a CLI flag.
 - `[swarm] independent_review` (bool, default true; a non-bool is a ValueError naming `[swarm]
   independent_review`): an agent's finished task is approved by another member, or by the user when nobody else
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
@@ -4186,9 +4445,12 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   apply. The template has the line `clarify = false` after `network`, with a Russian comment.
 - `[agents] idle_nudge_seconds = 60` (number ≥ 0): how long the scheduler lets an idle member be before it steps in
   (§3): the spacing of item 1's offers to one member, the stall wakes and liveness marks of items 2-3 (§4.2
-  "Finishing"), the review reminders (item 5, §4.1 "Liveness") and, ten times over (`CREW_GAP_FACTOR`), the
-  free-place notice of item 8 (§4.2 "A free place"), whose free members must also have been idle this long. Read
-  at each scheduler pass; session overrides apply. The template has no line for it; the settings page's «Агенты»
+  "Finishing"), the review reminders (item 5, §4.1 "Liveness"), ten times over (`CREW_GAP_FACTOR`) the free-place
+  notice of item 8 (§4.2 "A free place"), whose free members must also have been idle this long, and five times
+  over (`TEAM_ASLEEP_FACTOR`), doubled with each such wake under the goal, the team-asleep wake of item 9 (0
+  removes every such delay: item 9 then still wakes at most twice per board state, but a member that changes a
+  task's status at every wake is woken again at almost every pass, §3 item 9 *Due*). Read at each scheduler pass;
+  session overrides apply. The template has no line for it; the settings page's «Агенты»
   section and the session dialog's «Агенты» group have its field («Напоминание простаивающим, с»).
 - `[agents] planning_hint_steps = 8` (whole number ≥ 0) and `planning_hint_minutes = 10` (number ≥ 0): the planning
   hint of §3 (scheduler item 4; in clarify mode, before the planner has asked, its `n_clarify_hint`), after this
@@ -5825,7 +6087,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     row marked in the error colour (`.team-gone`), with the hint «Этой роли больше нет в каталоге: выберите другую или
     уберите строку.»; a hidden role shows as elsewhere: selected, marked «(скрыта)», and not offered to other rows.
   - Settings tab: sections «Модели и эндпоинты», «Роли», «Команда», «Новые сессии по умолчанию» (with the team
-    composer and
+    composer, the budget «Бюджет сессии, $», `swarm.max_cost_usd`, followed by «Предупредить о бюджете при доле»
+    (en "Budget warning at share"), `swarm.budget_notice_at`, a number field (min 0, max 1, step 0.05) whose hint
+    reads «При этой доле потраченного бюджета агенты и вы получаете одно предупреждение (0.8 — 80 %); 0 или 1 — без
+    него.» (en "At this share of the budget spent, the agents and you get one notice (0.8 = 80 %); 0 or 1: none.";
+    only here, §17.1; the server refuses a value out of range), and
     the switches «Независимое ревью задач», `swarm.independent_review`, «Проверять групповую задачу целиком» (en
     "Check a crew task as a whole"), `swarm.crew_review`, whose hint reads «Завершённую владельцем групповую задачу
     проверяет, по возможности, агент вне её направлений: сочетаются ли они; будет ли ревью вообще, решает
@@ -5942,7 +6208,12 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     pressed (class `on`, `aria-pressed`, the warning colour, tooltip: click to switch it off) and a banner under the
     header says what it means (`#wrapup-banner`). The feed shows `swarm.wrap_up` («… включил(а) режим завершения:
     агенты завершают задачи с тем, что есть» / «… выключил(а) режим завершения»).
-  - Pause and questions (§3.1): «Пауза» / «Продолжить» calls `swarm_control`; the banner `#paused-banner` names the
+  - Pause and questions (§3.1): «Пауза» / «Продолжить» calls `swarm_control`; a pause goes through `act(tool, args,
+    quiet)` with quiet set, so its English result is not toasted: the banner says it, and with jobs running the
+    `u_paused_jobs` notice comes as a toast like every user notice (a refusal is still toasted; a resume toasts its
+    result as before). The user's own pause reads «Рой на паузе: по вашему решению» in the banner (`"reason_paused
+    by the user"`, en "paused by you"; the TUI's `reason_user` alike, «Рой на паузе (по вашему решению)»; a job's
+    «остановлен вами» is another key and stays). The banner `#paused-banner` names the
     reason. A question pause (snapshot `swarm.question`) reads «Рой на паузе: {name} ждёт вашего ответа на вопрос #{id}
     — ответ получат все участники. Нажмите, чтобы ответить; «Продолжить» снимает паузу без ответа» (class `question`,
     `data-asker`; a click, or Enter / Space on the focused banner (`role="button"`, `tabindex` 0), opens the chat with
