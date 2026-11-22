@@ -10,6 +10,7 @@ from .. import netoff, prompts, roles
 from ..db import loads
 from ..jobs import fmt_duration, short_command
 from ..models import USER, AgentKind, Status, ToolError
+from ..swarm import USER_PAUSE
 from ..workspace import shown_list
 from . import ToolContext, tool
 from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
@@ -656,9 +657,13 @@ async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
         swarm.reopen_goal(ctx.actor, args["reopen_goal_comment"])
         done.append("goal reopened")
     action = args.get("action")
+    kept: list = []   # the jobs a pause that paused leaves running (their own sentence after the joined parts, §12)
     if action == "pause":
-        done.append("paused" if swarm.pause(ctx.actor, "paused by the user")
-                    else f"already paused ({swarm.pause_text()})")
+        if swarm.pause(ctx.actor, USER_PAUSE):
+            done.append("paused")
+            kept = swarm.jobs.running_of()
+        else:
+            done.append(f"already paused ({swarm.pause_text()})")
     elif action == "resume":
         swarm.resume(ctx.actor)
         done.append("resumed")
@@ -670,4 +675,8 @@ async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
         done.append("wrap-up mode off" if swarm.end_wrap_up(ctx.actor) else "wrap-up mode was not on")
     if not done:
         raise ToolError("Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.")
-    return "Done: " + "; ".join(done) + "."
+    text = "Done: " + "; ".join(done) + "."
+    if kept:  # ids only: USER's u_paused_jobs (Swarm._set_pause) has the details
+        text += (f" Background jobs keep running ({', '.join(j.label for j in kept)}): a pause stops only the agents' "
+                 "model calls; job_stop stops a job.")
+    return text

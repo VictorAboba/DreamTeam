@@ -596,7 +596,9 @@ def test_team_pause_and_notification_lines():
     assert plain(render.event(c, retired)) == "− Анна Смирнова больше не в команде"
     assert plain(render.event(c, ev("swarm.paused", None, reason="budget"))) == "⏸ Рой на паузе (исчерпан бюджет)"
     assert plain(render.event(c, ev("swarm.paused", "user", reason="paused by the user"))) == \
-        "⏸ Рой на паузе (остановлен вами)"
+        "⏸ Рой на паузе (по вашему решению)"   # not a job's «остановлен вами» (job_stopped_user)
+    assert plain(render.event(ctx(lang="en"), ev("swarm.paused", "user", reason="paused by the user"))) == \
+        "⏸ The swarm is paused (paused by you)"
     assert plain(render.event(c, ev("swarm.resumed", "user"))) == "▶ Рой продолжает работу"
     assert plain(render.event(c, ev("swarm.limits", "user", max_cost_usd=5, max_agents=6))) == \
         "· Лимиты: бюджет $5.00, агентов не больше 6"

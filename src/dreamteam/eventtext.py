@@ -283,6 +283,7 @@ def _arg(ctx: TextContext, value: Any) -> str:
 
 
 def _reason(ctx: TextContext, reason: Any) -> str:
+    # "paused by the user" is swarm.USER_PAUSE, written out: this module never imports the hub (module docstring)
     raw = clean(reason)
     key = {"budget": "reason_budget", "paused by the user": "reason_user", "question": "reason_question"}.get(raw)
     return ctx.t(key) if key else raw

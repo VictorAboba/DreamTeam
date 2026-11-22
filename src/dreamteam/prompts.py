@@ -659,6 +659,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_jobs_running": "The goal is achieved, but background jobs of the agents are still running: {jobs}. They "
                           "stop when the session stops; to stop one earlier, use the Jobs tab on the board or "
                           "/jobs stop <id> in the terminal.",
+        "u_paused_jobs": "Background jobs of the agents are not paused with the swarm: {jobs}. A pause stops only the "
+                         "agents' model calls; the jobs run until you stop them or the session stops: use the Jobs tab "
+                         "on the board or /jobs stop <id> in the terminal.",
     },
     "ru": {
         "instructions": "Твои инструкции: {text}\n",
@@ -1150,6 +1153,10 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_jobs_running": "Цель достигнута, но фоновые процессы агентов ещё работают: {jobs}. Они остановятся вместе с "
                           "сессией; чтобы остановить процесс раньше, откройте вкладку «Процессы» на доске или "
                           "выполните /jobs stop <id> в терминале.",
+        "u_paused_jobs": "Фоновые процессы агентов не встают на паузу вместе с роем: {jobs}. Пауза останавливает "
+                         "только обращения агентов к модели; процессы работают, пока вы их не остановите или пока не "
+                         "остановится сессия: откройте вкладку «Процессы» на доске или выполните /jobs stop <id> в "
+                         "терминале.",
     },
 }
 

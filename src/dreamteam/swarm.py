@@ -53,6 +53,9 @@ CREW_GAP_MAX = 2
 CREW_GAP_IDLE_MAX = 8
 # A member's critical question (send_message pause_swarm; docs/SPEC.md §3 "Clarify mode")
 QUESTION = "question"            # the pause reason of a member's critical question (send_message pause_swarm)
+# the pause reason of the user's own pause (swarm_control action=pause, docs/SPEC.md §3 `_set_pause`, §12); the
+# readable texts key it by this string (eventtext._reason, static/app.js "reason_paused by the user")
+USER_PAUSE = "paused by the user"
 QUESTION_CHARS = 4000            # the question and the answer as quoted to the other members (n_user_answer)
 QUESTION_PREVIEW_CHARS = 600     # snapshot swarm.question.text
 AUTO_REPLY_GRACE = 90.0          # s a `dreamteam -p` client with auto-reply still counts after its last sign
@@ -771,11 +774,15 @@ class Swarm:
         self.notify(USER, "u_goal_done", by=actor, summary=summary.strip())
         running = self.jobs.running_of()
         if running:  # they go on (a dev server may be for the user); their later ends wake nobody
-            now = time.time()
-            listed = (f"{j.label} ({j.owner}: {short_command(j.command, 60)}, "
-                      f"{fmt_duration(now - j.started_at, self.language)})" for j in running)
-            self.notify(USER, "u_jobs_running", wake=False, jobs="; ".join(listed))
+            self.notify(USER, "u_jobs_running", wake=False, jobs=self._user_job_list(running))
         return goal
+
+    def _user_job_list(self, running: list) -> str:
+        """Running jobs for a user notice in the swarm language (u_jobs_running, u_paused_jobs): "j3 (Anna Smith: npm
+        run dev, 25 min); j5 (...)"."""
+        now = time.time()
+        return "; ".join(f"{j.label} ({j.owner}: {short_command(j.command, 60)}, "
+                         f"{fmt_duration(now - j.started_at, self.language)})" for j in running)
 
     def reopen_goal(self, actor: str, comment: str = "") -> dict:
         goal = self.goal()
@@ -1050,7 +1057,9 @@ class Swarm:
 
     def _set_pause(self, actor: str, reason: str, *, outcome: dict | None = None, **details: Any) -> None:
         """Write the pause slot even while paused (a question turned into a budget pause). `outcome`: the event's
-        `question` data of a question that ends with this pause."""
+        `question` data of a question that ends with this pause. A fresh user pause (USER_PAUSE) while jobs run tells
+        USER that they go on (quiet u_paused_jobs); a budget or question pause does not (u_budget / u_question cover
+        it, and a stop_when_done session stops its jobs right after a budget pause), docs/SPEC.md §3 `_set_pause`."""
         was_paused = self.paused
         self.db.set("paused", {"paused": True, "reason": reason, **details})
         if not was_paused or self._paused_at is None:
@@ -1060,6 +1069,8 @@ class Swarm:
             self.notify(USER, "u_budget", spent=self.spent_usd(), limit=self.limits()["max_cost_usd"], wake=False)
         elif reason == QUESTION:
             self.notify(USER, "u_question", name=details["asker"], id=details["message_id"], wake=False)
+        elif reason == USER_PAUSE and not was_paused and (running := self.jobs.running_of()):
+            self.notify(USER, "u_paused_jobs", wake=False, jobs=self._user_job_list(running))
 
     def resume(self, actor: str, *, question: dict | None = None) -> None:
         """`question`: the event's data of the question this resume ends (answered, or dropped by its caller); a
