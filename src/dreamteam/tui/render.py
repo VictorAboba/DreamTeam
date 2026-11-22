@@ -505,7 +505,7 @@ _QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined", "u_question"})
 # the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user, a model
 # profile whose calls count as $0, the members' messages no longer answered automatically (u_auto_reply_limit), most
 # of the money budget spent (u_budget_low), the whole team asleep with nothing set to wake anyone (u_team_asleep,
-# u_team_waits: docs/SPEC.md §3 scheduler item 9; a kind listed here before its text exists matches nothing)
+# u_team_waits: docs/SPEC.md §3 scheduler item 9)
 _WARN_NOTES = frozenset({"u_budget", "u_mcp_pending", "u_review_requested", "u_review_fallback",
                          "u_review_handed_over", "u_reviews_waiting", "u_skill_proposed", "u_skill_deps_failed",
                          "u_role_skills_missing", "u_role_skills_over_cap", "u_question_left", "u_cost_unknown",

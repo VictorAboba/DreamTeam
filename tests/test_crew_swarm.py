@@ -1102,9 +1102,9 @@ async def test_an_owner_told_earlier_in_the_pass_is_no_free_member_of_the_next_c
 
 
 async def test_the_scheduler_loop_tells_the_owner_after_item_1_in_its_pass(tmp_path, monkeypatch):
-    """Item 8 runs in the scheduler's loop, last: in the pass in which item 1 offers the idle owner a ready task (a
-    free direction of a crew task in which Carl, the one free member, works on a `waiting` one, so it is not offered
-    to him), the owner has news pending and is not told; a later pass that finds it idle tells it."""
+    """Item 8 runs in the scheduler's loop after items 1-7: in the pass in which item 1 offers the idle owner a ready
+    task (a free direction of a crew task in which Carl, the one free member, works on a `waiting` one, so it is not
+    offered to him), the owner has news pending and is not told; a later pass that finds it idle tells it."""
     monkeypatch.setattr(swarm_module, "SCHEDULER_SECONDS", 0.05)
     monkeypatch.setattr(swarm_module, "CREW_GAP_FACTOR", 0)
     swarm = await gap_team(tmp_path)

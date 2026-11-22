@@ -18,6 +18,13 @@ from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
 MAX_NOTES = 20000
 WAIT_DEFAULT = 50
 WAIT_MAX = 600
+# `wait` with an in_progress task, nothing of the caller's set to wake it and the rest of the team asleep (docs/SPEC.md
+# §12 `wait`): read after the next wake-up (wait ends the activation), hence "the next time"
+WAIT_UNWATCHED = ("OK, waiting. You will be woken up by new events, but nothing of yours is set to wake you and "
+                  "nobody else in the team is at work. A process started with & or nohup that `jobs` does not list "
+                  "is not tracked: its end will not wake you. If you are waiting for one, the next time set a trigger "
+                  "with a deadline before you wait (trigger_create, e.g. file_exists(\"out/result.json\") or "
+                  "elapsed(1800)), and start such runs with background=true, without & and nohup.")
 # wait_for_events(progress=true): the journal events that are board progress, the lines shown per result (the rest
 # is counted) and the events read per result
 PROGRESS_TYPES = ("task.created", "task.updated", "goal.set", "goal.completed", "goal.reopened", "agent.hired",
@@ -268,7 +275,24 @@ async def wait(ctx: ToolContext, args: dict[str, Any]) -> str:
         also.append(f"{shown_list(refused)}, which you were refused, {'is' if len(refused) == 1 else 'are'} free")
     if also:
         return "OK, waiting. You will be woken up by new events, also when " + " and when ".join(also) + "."
+    if _unwatched(ctx):
+        return WAIT_UNWATCHED
     return "OK, waiting. You will be woken up by new events."
+
+
+def _unwatched(ctx: ToolContext) -> bool:
+    """The caller holds a stalled in_progress task (Swarm.stall_ids: not a clarify card waiting for the user, not a
+    crew task with live directions; a `waiting` task alone does not count: answers wake it), has no active trigger of
+    its own, and nobody else can act or be woken by something set (Swarm.team_asleep); the goal is active. The job
+    and refused-file waits are ruled out by the caller. A test double without these gives False."""
+    swarm = ctx.swarm
+    stall_ids, team_asleep = getattr(swarm, "stall_ids", None), getattr(swarm, "team_asleep", None)
+    triggers = getattr(swarm, "triggers", None)
+    if stall_ids is None or team_asleep is None or triggers is None:
+        return False
+    goal = swarm.goal() or {}
+    return (goal.get("status") == "active" and bool(stall_ids(ctx.actor))
+            and not triggers.list(owner=ctx.actor) and team_asleep(ctx.actor))
 
 
 @tool(

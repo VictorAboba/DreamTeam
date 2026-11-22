@@ -448,6 +448,22 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_stalled": "Your tasks {tasks} are in progress, but you stopped working on them. Continue now. If you "
                      "are blocked, set the task to `waiting` and say why in its discussion; if you cannot do it, "
                      "set it back to `todo` (or `failed`) with a comment.{marks}",   # {marks}: mark_* sentences, or ""
+        # the whole team asleep with nothing set to wake anyone (Swarm._wake_team_asleep, docs/SPEC.md §3 item 9);
+        # {jobs}: team_asleep_jobs, or ""; & and nohup never in backticks (they are no tools)
+        "n_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake anyone: no running "
+                         "background job whose end wakes its owner, no trigger that can still fire on a time or a "
+                         "file, no locked file someone was refused.{jobs} A process started with & or nohup that "
+                         "`jobs` does not list is not tracked: its end wakes nobody. If you are waiting for one, check "
+                         "it now; if it still runs, set a trigger with a deadline before you `wait` "
+                         "(`trigger_create`, e.g. file_exists(\"out/result.json\") or elapsed(1800)), and start the "
+                         "next such run with background=true, without & and nohup. If you are waiting for the user's "
+                         "answer, don't ask again: the user was told. If you are waiting for another member, ask in "
+                         "the task's discussion: a post wakes them. Otherwise go on with your tasks, or finish them, "
+                         "or set them back to `todo` (or `failed`) with a comment; when every task is finished, verify "
+                         "the result and call `goal_complete`; if you hold none, look at the `board` for open tasks "
+                         "nobody moves.",
+        "team_asleep_jobs": " Your background jobs {jobs} still run, but their end will not wake you while you hold no "
+                            "task in progress.",
         "n_planning_hint": "You have held planning task #{id} for {elapsed} (steps: {steps}) and have created no task "
                            "yet, while the other members wait for work. Create the independent tasks now with "
                            "`task_create`: the research, experiments and environment checks you would still do "
@@ -656,6 +672,15 @@ TEXTS: dict[str, dict[str, str]] = {
                                 "/reject {id} <what to fix>.",
         "u_reviews_waiting": "The team has nothing else to do: tasks {tasks} are waiting for your review. Approve or "
                              "return them on the board, or with /approve N or /reject N <what to fix>.",
+        # waking, with the first n_team_asleep of a board state; u_team_waits in its place when no member is woken
+        # (every open task held by USER or external members): Swarm._wake_team_asleep, docs/SPEC.md §3 item 9
+        "u_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake anyone: no "
+                         "background job whose end wakes its owner, no trigger that fires on a time or a file. {name} "
+                         "was woken to check their work. If the team waits for you (an answer, a review, a decision, "
+                         "access), write to the member who asked; to end the run, stop the session.",
+        "u_team_waits": "Nobody in the team has worked for {elapsed}: the open tasks {tasks} are held by you or by "
+                        "members who joined through MCP, and nothing is set to wake anyone. Do them or hand them to "
+                        "the team; to end the run, stop the session.",
         "u_jobs_running": "The goal is achieved, but background jobs of the agents are still running: {jobs}. They "
                           "stop when the session stops; to stop one earlier, use the Jobs tab on the board or "
                           "/jobs stop <id> in the terminal.",
@@ -963,6 +988,21 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_stalled": "Твои задачи {tasks} в работе, но ты перестал ими заниматься. Продолжай сейчас. Если ты "
                      "заблокирован, переведи задачу в `waiting` и объясни причину в её обсуждении; если не можешь её "
                      "выполнить, верни её в `todo` (или переведи в `failed`) с комментарием.{marks}",
+        "n_team_asleep": "Уже {elapsed} никто в команде не работает, и ничто никого не разбудит: нет фонового "
+                         "процесса, чье завершение разбудит его владельца, нет триггера, который еще может сработать "
+                         "по времени или по файлу, нет занятого файла, который кто-то ждет после отказа.{jobs} "
+                         "Процесс, запущенный через & или nohup, которого нет в списке `jobs`, не отслеживается: его "
+                         "завершение никого не разбудит. Если ты ждешь такой процесс, проверь его сейчас; если он еще "
+                         "работает, поставь триггер со сроком, прежде чем вызвать `wait` (`trigger_create`, например "
+                         "file_exists(\"out/result.json\") or elapsed(1800)), а следующий такой запуск делай с "
+                         "background=true, без & и nohup. Если ты ждешь ответа пользователя, не спрашивай снова: "
+                         "пользователю уже сообщили. Если ты ждешь другого участника, спроси в обсуждении задачи: пост "
+                         "его разбудит. Иначе продолжай свои задачи, или заверши их, или верни их в `todo` (или "
+                         "переведи в `failed`) с комментарием; когда все задачи завершены, проверь результат и вызови "
+                         "`goal_complete`; если у тебя нет задач, посмотри на `board`: какие открытые задачи никто не "
+                         "двигает.",
+        "team_asleep_jobs": " Твои фоновые процессы {jobs} еще работают, но их завершение не разбудит тебя, пока у "
+                            "тебя нет задачи в работе.",
         "n_planning_hint": "Ты держишь задачу планирования #{id} уже {elapsed} (шагов: {steps}) и ещё не создал ни "
                            "одной задачи, а остальные участники ждут работы. Создай независимые задачи прямо сейчас "
                            "через `task_create`: исследования, эксперименты и проверки окружения, которые ты ещё "
@@ -1150,6 +1190,14 @@ TEXTS: dict[str, dict[str, str]] = {
                                 "[комментарий] или /reject {id} <что исправить>.",
         "u_reviews_waiting": "Команде больше нечего делать: задачи {tasks} ждут вашего ревью. Примите или верните их "
                              "на доске или командами /approve N и /reject N <что исправить>.",
+        "u_team_asleep": "Уже {elapsed} никто в команде не работает, и ничто никого не разбудит: нет фонового "
+                         "процесса, чье завершение разбудит его владельца, нет триггера, который сработает по времени "
+                         "или по файлу. {name} разбужен(а), чтобы проверить свою работу. Если команда ждет вас "
+                         "(ответа, ревью, решения, доступа), напишите участнику, который спрашивал; чтобы закончить "
+                         "запуск, остановите сессию.",
+        "u_team_waits": "Уже {elapsed} никто в команде не работает: открытые задачи {tasks} у вас или у участников, "
+                        "подключившихся через MCP, и ничто никого не разбудит. Выполните их или передайте команде; "
+                        "чтобы закончить запуск, остановите сессию.",
         "u_jobs_running": "Цель достигнута, но фоновые процессы агентов ещё работают: {jobs}. Они остановятся вместе с "
                           "сессией; чтобы остановить процесс раньше, откройте вкладку «Процессы» на доске или "
                           "выполните /jobs stop <id> в терминале.",

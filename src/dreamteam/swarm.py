@@ -51,6 +51,13 @@ NUDGE_DECISION_SECONDS = 300.0
 CREW_GAP_FACTOR = 10
 CREW_GAP_MAX = 2
 CREW_GAP_IDLE_MAX = 8
+# The whole team asleep with work open and nothing set to wake anyone (docs/SPEC.md §3 item 9): one idle member is
+# woken once the state has lasted TEAM_ASLEEP_FACTOR x 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) x
+# agents.idle_nudge_seconds (sent: the n_team_asleep notices under the current goal, from the notifications table), at
+# most TEAM_ASLEEP_MAX times per board state
+TEAM_ASLEEP_FACTOR = 5
+TEAM_ASLEEP_DOUBLINGS = 5
+TEAM_ASLEEP_MAX = 2
 # A member's critical question (send_message pause_swarm; docs/SPEC.md §3 "Clarify mode")
 QUESTION = "question"            # the pause reason of a member's critical question (send_message pause_swarm)
 # the pause reason of the user's own pause (swarm_control action=pause, docs/SPEC.md §3 `_set_pause`, §12); the
@@ -182,6 +189,13 @@ class Swarm:
         # crew task id -> the free-place key its owner was told about, or that reached the cap (never cleared, like
         # _stall_woken: a key that comes back is not told again)
         self._crew_gap_told: dict[int, CrewGapKey] = {}
+        # the whole team asleep (_wake_team_asleep): (the board key, asleep with it since), dropped by a pass that does
+        # not find the team asleep and by resume; (the board key, the n_team_asleep sent since it was first seen)
+        self._team_asleep: tuple[tuple, float] | None = None
+        self._team_asleep_woken: tuple[tuple, int] | None = None
+        # external member -> time.time() of its last hub call but wait_for_events, stamped by hub_mcp.hub_call before
+        # and after the call (team_asleep: one that called in the last EXTERNAL_IDLE_SECONDS may still act)
+        self._external_seen: dict[str, float] = {}
         # reviewer -> (ids of the reviews it was reminded about, or that waited while it was in error; since when)
         self._review_reminded: dict[str, tuple[frozenset[int], float]] = {}
         self._review_lapsed: dict[int, set[str]] = {}  # task in review -> reviewers it was taken from (hand-over)
@@ -565,6 +579,42 @@ class Swarm:
         """`name` got news without a wake (waits_for_job): its job's end shows it; should that wait end otherwise,
         the scheduler wakes it (_wake_deferred)."""
         self._deferred.add(name)
+
+    def team_asleep(self, caller: str | None = None) -> bool:
+        """Nobody in the team can act or be woken by something already set (docs/SPEC.md §3 `team_asleep`; scheduler
+        item 9, `wait`'s result): every LLM member with a runtime is idle (_idle_llm_members: nothing pending, not
+        busy) or in error with no recovery scheduled, at least one idle; none waits for a job whose end wakes it or for
+        a file it was refused; no delayed notification is pending; no trigger may fire unattended
+        (TriggerEngine.unattended); no external member called the hub in the last EXTERNAL_IDLE_SECONDS. `caller`: the
+        member calling `wait`, still working, counts as idle with nothing pending."""
+        if self._timers:  # staggered kickoffs not delivered yet
+            return False
+        members = self.members()
+        idle = False
+        for m in members:
+            name = m["name"]
+            if m["kind"] != AgentKind.LLM or name not in self.runtimes:
+                continue
+            if name == caller or (m["status"] == AgentStatus.IDLE and not self.has_pending(name)
+                                  and not self.jobs.busy(name)):
+                idle = True
+            elif m["status"] != AgentStatus.ERROR or getattr(self.runtimes[name], "_recovery", None) is not None:
+                return False  # at work, with news, busy, paused, or in error with a retry on its way
+            if self.jobs.awaited(name) or self.workspace.waits_for_lock(name):
+                return False
+        if not idle:
+            return False
+        if self.triggers.unattended(self.triggers.clock()):  # the clock the engine stamps its triggers with
+            return False
+        now = time.time()  # hub_call's stamps
+        externals = {m["name"] for m in members if m["kind"] == AgentKind.EXTERNAL}
+        return not any(now - seen < EXTERNAL_IDLE_SECONDS for name, seen in self._external_seen.items()
+                       if name in externals)
+
+    def stall_ids(self, name: str) -> frozenset[int]:
+        """The in_progress task ids of `name` that count as stalled (_stall_ids: scheduler items 2-3, `wait`'s result,
+        docs/SPEC.md §3)."""
+        return self._stall_ids(name)
 
     def has_pending(self, name: str) -> bool:
         if self.db.scalar("SELECT 1 FROM inbox WHERE recipient = ? AND read_at IS NULL LIMIT 1", (name,)):
@@ -1098,6 +1148,7 @@ class Swarm:
             for task_id, (key, since) in list(self._crew_gaps.items()):
                 self._crew_gaps[task_id] = (key, since + now - max(since, self._paused_at))
             self._paused_at = None
+        self._team_asleep = None  # the team-asleep clock starts again: n_resumed below wakes the holders
         self.bus.emit("swarm.resumed", actor, **({"question": question} if question else {}))
         told = None
         if (question and question["outcome"] == "dropped" and question.get("why") != "left"
@@ -1343,7 +1394,8 @@ class Swarm:
                     self._remind_reviewers()
                     self._check_all_done()
                     self._remind_user_reviews()
-                    self._tell_crew_gaps()  # last: it reads item 1's offers of this pass, and whom items 1-7 woke
+                    self._tell_crew_gaps()  # after items 1-7: it reads item 1's offers of this pass, and whom they woke
+                    self._wake_team_asleep()  # last: a member that items 1-8 woke has news pending, so it is not idle
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1713,7 +1765,7 @@ class Swarm:
         # a command that went on as a job may still change the result (with no open task only timeout jobs count)
         if any(m["kind"] == AgentKind.LLM and self.jobs.busy(m["name"]) for m in members):
             return
-        key = (total, self.db.scalar("SELECT MAX(updated_at) FROM tasks"))
+        key = self._board_key()
         if key == self._all_done_key:
             return
         idle = sorted(self._idle_llm_members(), key=lambda m: m.get("last_active") or 0, reverse=True)
@@ -1818,6 +1870,104 @@ class Swarm:
                 continue
             free.append(m)
         return free
+
+    def _wake_team_asleep(self) -> None:
+        """Item 9 (docs/SPEC.md §3): the whole team sleeps while work is open and nothing set will wake anyone
+        (_team_may_sleep, team_asleep), e.g. a member waits for a process `jobs` does not list. Once that has lasted
+        TEAM_ASLEEP_FACTOR x 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) x agents.idle_nudge_seconds (sent: the n_team_asleep
+        notices under the current goal) with one board key (item 6's), one idle LLM member is woken (n_team_asleep), at
+        most TEAM_ASLEEP_MAX times per key, and USER is told with the first (u_team_asleep); with every open task held
+        by USER or external members, only USER (u_team_waits, once per key). The clock is dropped by a pass that does
+        not find the team asleep and by resume. It runs last: a member that items 1-8 woke has news pending."""
+        goal = self.goal()
+        if not goal or goal.get("status") != "active" or not self._team_may_sleep():
+            self._team_asleep = None
+            return
+        now, wait = time.time(), self.config.agents.idle_nudge_seconds
+        key = self._board_key()
+        idle = self._idle_llm_members()
+        seen = self._team_asleep
+        since = seen[1] if seen is not None and seen[0] == key else now
+        # a member's activation between two passes restarts the clock (not a failing retry: those in error are left out)
+        since = max([since] + [float(m.get("last_active") or 0) for m in idle])
+        self._team_asleep = (key, since)
+        per_key = self._team_asleep_woken[1] if self._team_asleep_woken and self._team_asleep_woken[0] == key else 0
+        if per_key >= TEAM_ASLEEP_MAX:
+            return
+        sent = int(self.db.scalar("SELECT COUNT(*) FROM notifications WHERE kind = 'n_team_asleep' AND ts >= ?",
+                                  (float(goal.get("updated_at") or 0),)) or 0)
+        if now - since < TEAM_ASLEEP_FACTOR * 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) * wait:
+            return
+        open_tasks = self.board.list(status=[Status.TODO, Status.IN_PROGRESS, Status.WAITING])
+        name = self._team_asleep_whom(idle, open_tasks)
+        if name is None:
+            if open_tasks and all(t.assignee is not None and self.kind_of(t.assignee) != AgentKind.LLM
+                                  for t in open_tasks):
+                # nothing a member could take: only USER (or an external member) can move the run
+                self._team_asleep_woken = (key, TEAM_ASLEEP_MAX)
+                self.notify(USER, "u_team_waits", elapsed=fmt_duration(now - since, self.language_of(USER)),
+                            tasks=", ".join(f"#{t.id}" for t in open_tasks))
+            return  # else open tasks held only by members in error: USER was told of the error (u_agent_error)
+        awaited = {j.id for j in self.jobs.awaited(name)}
+        quiet = [j.label for j in self.jobs.running_of(name) if j.id not in awaited]
+        lang = self.language_of(name)
+        self.notify(name, "n_team_asleep", elapsed=fmt_duration(now - since, lang),
+                    jobs=prompts.t(lang, "team_asleep_jobs", jobs=", ".join(quiet)) if quiet else "")
+        self._team_asleep_woken = (key, per_key + 1)
+        if per_key == 0:
+            try:
+                self.notify(USER, "u_team_asleep", elapsed=fmt_duration(now - since, self.language_of(USER)), name=name)
+            except Exception:
+                log.exception("could not tell the user that the team is asleep")
+
+    def _team_may_sleep(self) -> bool:
+        """Item 9's conditions besides the active goal (docs/SPEC.md §3 item 9 *When*): an open task (todo,
+        in_progress, waiting), or every task terminal after item 6 spoke for this board state; no review that item 5
+        still works on (independent review and an LLM reviewer) and not item 7's state (USER's reviews wait with
+        nothing in progress or actionable); no clarify planner waiting for the user's answers; team_asleep()."""
+        counts = self.board.counts()
+        total = sum(counts.values())
+        if total == 0:
+            return False
+        if not any(counts.get(s, 0) for s in (Status.TODO, Status.IN_PROGRESS, Status.WAITING)):
+            if any(counts.get(s, 0) for s in Status.OPEN) or self._all_done_key != self._board_key():
+                return False
+        if not self.team_asleep():  # first among the rest: false at once while anyone works
+            return False
+        reviews = self.board.list(status=Status.REVIEW) if counts.get(Status.REVIEW, 0) else []
+        if self.board.independent_review and any(
+                t.reviewer and self.kind_of(t.reviewer) == AgentKind.LLM and self.is_member(t.reviewer)
+                for t in reviews):
+            return False
+        if (any(t.reviewer == USER for t in reviews) and not self._has_task_in_progress()
+                and not self._has_actionable_todo()):
+            return False
+        if self.config.swarm.clarify:
+            for t in self.board.list(tag="planning"):
+                if t.assignee and self.kind_of(t.assignee) == AgentKind.LLM and self.asks_user(t.assignee, t):
+                    return False
+        return True
+
+    def _board_key(self) -> tuple:
+        """Items 6 and 9's board key: (task count, MAX(tasks.updated_at)); a claim or a status change makes a new one,
+        a comment does not."""
+        return (self.db.scalar("SELECT COUNT(*) FROM tasks"), self.db.scalar("SELECT MAX(updated_at) FROM tasks"))
+
+    def _team_asleep_whom(self, idle: list[dict], open_tasks: list[Task]) -> str | None:
+        """The idle LLM member item 9 wakes, the one active last of the first group that has one: holding an
+        in_progress or waiting task; holding a todo one; any, when an open task has no assignee or none is left."""
+        held: dict[str, set[str]] = {}
+        for t in open_tasks:
+            if t.assignee:
+                held.setdefault(t.assignee, set()).add(t.status)
+        groups = [[m for m in idle if held.get(m["name"], set()) & {Status.IN_PROGRESS, Status.WAITING}],
+                  [m for m in idle if Status.TODO in held.get(m["name"], set())]]
+        if not open_tasks or any(t.assignee is None for t in open_tasks):
+            groups.append(idle)
+        for group in groups:
+            if group:
+                return max(group, key=lambda m: float(m.get("last_active") or 0))["name"]
+        return None
 
     # ---- snapshot -----------------------------------------------------------------------------
     def workspace_info(self) -> dict:

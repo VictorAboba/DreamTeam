@@ -290,10 +290,11 @@ class Swarm:
         # (`jobs.awaited`) or a file it was refused (`workspace.waits_for_lock`), counted however long either lasts
         # (the job's end or `n_lock_free` will come: a forgotten `background` server keeps it false until `[shell]
         # job_max_minutes`); no delayed notification is pending (`_timers` empty: staggered kickoffs not delivered
-        # yet); `triggers.unattended(now)` is false (§8 "Unattended triggers"); no external member made a hub call in
-        # the last `EXTERNAL_IDLE_SECONDS` (15 min, tracing.py): `_external_seen` {member: time.time()}, in memory,
-        # stamped by `hub_call` (§13) for every call but `wait_for_events`, whether tracing is on or not (a client
-        # that only listens is asleep like the others)
+        # yet); `triggers.unattended(now)` is false (§8 "Unattended triggers"; `now` from the engine's `clock`, which
+        # stamps the triggers' times); no external member made a hub call in the last `EXTERNAL_IDLE_SECONDS` (15
+        # min, tracing.py): `_external_seen` {member: time.time()}, in memory, stamped by `hub_call` (§13) for every
+        # call but `wait_for_events`, whether tracing is on or not (a client that only listens is asleep like the
+        # others)
     def stall_ids(self, name: str) -> frozenset[int]
         # the public form of `_stall_ids` (scheduler items 2-3, `wait`'s result): the in_progress task ids of `name`
         # that count as stalled, not a clarify planning card whose holder waits for the user's answers (`asks_user`,
@@ -3403,9 +3404,9 @@ every fire (the flood guard limits those).
 **Unattended triggers.** `unattended(now)` (for `Swarm.team_asleep`, §3 scheduler item 9) is true when an active
 trigger both reaches an LLM member and may still fire while nobody acts:
 - *Reaches an LLM member*: its owner is an LLM member and its actions include `wake` (the default when there are
-  none), or its actions include `message` to a member or "all", `set_status` or `create_task`. A trigger of USER or
-  of an external member that only wakes its owner does not count (an hourly `every(3600)` reminder of the user's
-  keeps no LLM member awake).
+  none), or its actions include `message` to "all" or to a name that resolves to an LLM member (not to "user" or
+  only to external members), `set_status` or `create_task`. A trigger of USER or of an external member that only
+  wakes its owner does not count (an hourly `every(3600)` reminder of the user's keeps no LLM member awake).
 - *May fire unattended*: it holds fires (`held` > 0: the end of the wake limit's interval releases them with a wake,
   "Wake limit"); or its condition uses a time function and the next moment it can come true has not passed by more
   than `UNATTENDED_GRACE` (10 s): `elapsed(s)` → created_at + s, `after(t)` → t, `every(p)` → (last_fired or
@@ -3420,7 +3421,8 @@ trigger both reaches an LLM member and may still fire while nobody acts:
   message or agent state only (`status`, `done`, `count`, `message`, `comment`, `agent_status`, `goal_done`, …): it
   waits for someone to act.
 One query over the active triggers (owner, condition, actions, once, created_at, last_fired, last_value, held), the
-conditions compiled through the engine's cache; `UNATTENDED_GRACE` and `UNATTENDED_FILE_SECONDS` are module constants
+conditions compiled through the engine's cache (`CompiledCondition.elapsed` and `.after` keep the literal seconds and
+moments, as `.every` keeps the periods); `UNATTENDED_GRACE` and `UNATTENDED_FILE_SECONDS` are module constants
 of triggers.py. The check never fires, evaluates or changes a trigger.
 
 ## 9. Event types (bus)
@@ -3942,7 +3944,10 @@ async def hub_call(swarm, name: str, args: dict, client: str | None = None, *, v
     # the database that Swarm.stop's caller closes next). A call of an external member (actor not USER and
     # swarm.is_member(actor)), except UNTRACED_TOOLS, stamps `swarm._external_seen[actor] = time.time()` before and
     # after it, whether tracing is on or not (Swarm.team_asleep, §3: a long shell call counts from its start to its
-    # end, a client that only waits in wait_for_events does not). `client` (default: serving_client's) names the MCP
+    # end: with `[shell] background_on_timeout`, the default, an external member's call waits at most
+    # `EXTERNAL_WAIT_MAX`, 600 s, below `EXTERNAL_IDLE_SECONDS`, so the stamp before it covers the whole call; with
+    # it off, a call longer than `EXTERNAL_IDLE_SECONDS` counts for that long from its start; a client that only
+    # waits in wait_for_events does not count). `client` (default: serving_client's) names the MCP
     # client: a message it sends (as the call's actor) reaches the external members it acts as already read
     # (mailbox.sent_as_seen_by(members, actor)), so it never comes back to it as news; messages others send, e.g.
     # an agent this call hires, reach them as news. `via` becomes ToolContext.via (the launcher MCP: "launcher-mcp").
