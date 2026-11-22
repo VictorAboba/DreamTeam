@@ -40,7 +40,7 @@ HEAL_MAX = 30.0
 PROGRESS_SKIP = ("agent.status", "agent.usage", "agent.activity", "trace.")  # fallback feed: too noisy
 # the user notices whose text goes to stderr once also without --verbose (docs/TUI.md §2): a model profile's calls
 # count as $0 (docs/SPEC.md §10), most of the money budget is spent (§3 record_usage), the whole team asleep with
-# nothing set to wake anyone (§3 scheduler item 9: u_team_asleep, u_team_waits; the run goes on waiting)
+# nothing set to wake the team (§3 scheduler item 9: u_team_asleep, u_team_waits; the run goes on waiting)
 STDERR_NOTES = frozenset({"u_cost_unknown", "u_budget_low", "u_team_asleep", "u_team_waits"})
 
 TEXTS = {

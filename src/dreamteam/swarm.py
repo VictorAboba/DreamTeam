@@ -51,7 +51,7 @@ NUDGE_DECISION_SECONDS = 300.0
 CREW_GAP_FACTOR = 10
 CREW_GAP_MAX = 2
 CREW_GAP_IDLE_MAX = 8
-# The whole team asleep with work open and nothing set to wake anyone (docs/SPEC.md §3 item 9): one idle member is
+# The whole team asleep with work open and nothing set to wake the team (docs/SPEC.md §3 item 9): one idle member is
 # woken once the state has lasted TEAM_ASLEEP_FACTOR x 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) x
 # agents.idle_nudge_seconds (sent: the n_team_asleep notices under the current goal, from the notifications table), at
 # most TEAM_ASLEEP_MAX times per board state
@@ -1872,7 +1872,7 @@ class Swarm:
         return free
 
     def _wake_team_asleep(self) -> None:
-        """Item 9 (docs/SPEC.md §3): the whole team sleeps while work is open and nothing set will wake anyone
+        """Item 9 (docs/SPEC.md §3): the whole team sleeps while work is open and nothing set will wake the team
         (_team_may_sleep, team_asleep), e.g. a member waits for a process `jobs` does not list. Once that has lasted
         TEAM_ASLEEP_FACTOR x 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) x agents.idle_nudge_seconds (sent: the n_team_asleep
         notices under the current goal) with one board key (item 6's), one idle LLM member is woken (n_team_asleep), at

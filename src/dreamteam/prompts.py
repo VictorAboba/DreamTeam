@@ -448,9 +448,9 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_stalled": "Your tasks {tasks} are in progress, but you stopped working on them. Continue now. If you "
                      "are blocked, set the task to `waiting` and say why in its discussion; if you cannot do it, "
                      "set it back to `todo` (or `failed`) with a comment.{marks}",   # {marks}: mark_* sentences, or ""
-        # the whole team asleep with nothing set to wake anyone (Swarm._wake_team_asleep, docs/SPEC.md §3 item 9);
+        # the whole team asleep with nothing set to wake the team (Swarm._wake_team_asleep, docs/SPEC.md §3 item 9);
         # {jobs}: team_asleep_jobs, or ""; & and nohup never in backticks (they are no tools)
-        "n_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake anyone: no running "
+        "n_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake the team: no running "
                          "background job whose end wakes its owner, no trigger that can still fire on a time or a "
                          "file, no locked file someone was refused.{jobs} A process started with & or nohup that "
                          "`jobs` does not list is not tracked: its end wakes nobody. If you are waiting for one, check "
@@ -674,12 +674,12 @@ TEXTS: dict[str, dict[str, str]] = {
                              "return them on the board, or with /approve N or /reject N <what to fix>.",
         # waking, with the first n_team_asleep of a board state; u_team_waits in its place when no member is woken
         # (every open task held by USER or external members): Swarm._wake_team_asleep, docs/SPEC.md §3 item 9
-        "u_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake anyone: no "
+        "u_team_asleep": "Nobody in the team has worked for {elapsed}, and nothing is set to wake the team: no "
                          "background job whose end wakes its owner, no trigger that fires on a time or a file. {name} "
                          "was woken to check their work. If the team waits for you (an answer, a review, a decision, "
                          "access), write to the member who asked; to end the run, stop the session.",
         "u_team_waits": "Nobody in the team has worked for {elapsed}: the open tasks {tasks} are held by you or by "
-                        "members who joined through MCP, and nothing is set to wake anyone. Do them or hand them to "
+                        "members who joined through MCP, and nothing is set to wake the team. Do them or hand them to "
                         "the team; to end the run, stop the session.",
         "u_jobs_running": "The goal is achieved, but background jobs of the agents are still running: {jobs}. They "
                           "stop when the session stops; to stop one earlier, use the Jobs tab on the board or "
@@ -988,7 +988,7 @@ TEXTS: dict[str, dict[str, str]] = {
         "n_stalled": "Твои задачи {tasks} в работе, но ты перестал ими заниматься. Продолжай сейчас. Если ты "
                      "заблокирован, переведи задачу в `waiting` и объясни причину в её обсуждении; если не можешь её "
                      "выполнить, верни её в `todo` (или переведи в `failed`) с комментарием.{marks}",
-        "n_team_asleep": "Уже {elapsed} никто в команде не работает, и ничто никого не разбудит: нет фонового "
+        "n_team_asleep": "Уже {elapsed} никто в команде не работает, и команду ничто не разбудит: нет фонового "
                          "процесса, чье завершение разбудит его владельца, нет триггера, который еще может сработать "
                          "по времени или по файлу, нет занятого файла, который кто-то ждет после отказа.{jobs} "
                          "Процесс, запущенный через & или nohup, которого нет в списке `jobs`, не отслеживается: его "
@@ -1190,13 +1190,13 @@ TEXTS: dict[str, dict[str, str]] = {
                                 "[комментарий] или /reject {id} <что исправить>.",
         "u_reviews_waiting": "Команде больше нечего делать: задачи {tasks} ждут вашего ревью. Примите или верните их "
                              "на доске или командами /approve N и /reject N <что исправить>.",
-        "u_team_asleep": "Уже {elapsed} никто в команде не работает, и ничто никого не разбудит: нет фонового "
+        "u_team_asleep": "Уже {elapsed} никто в команде не работает, и команду ничто не разбудит: нет фонового "
                          "процесса, чье завершение разбудит его владельца, нет триггера, который сработает по времени "
                          "или по файлу. {name} разбужен(а), чтобы проверить свою работу. Если команда ждет вас "
                          "(ответа, ревью, решения, доступа), напишите участнику, который спрашивал; чтобы закончить "
                          "запуск, остановите сессию.",
         "u_team_waits": "Уже {elapsed} никто в команде не работает: открытые задачи {tasks} у вас или у участников, "
-                        "подключившихся через MCP, и ничто никого не разбудит. Выполните их или передайте команде; "
+                        "подключившихся через MCP, и команду ничто не разбудит. Выполните их или передайте команде; "
                         "чтобы закончить запуск, остановите сессию.",
         "u_jobs_running": "Цель достигнута, но фоновые процессы агентов ещё работают: {jobs}. Они остановятся вместе с "
                           "сессией; чтобы остановить процесс раньше, откройте вкладку «Процессы» на доске или "

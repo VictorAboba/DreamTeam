@@ -1,6 +1,6 @@
 """The whole team asleep (docs/SPEC.md §3 scheduler item 9 `_wake_team_asleep`, `team_asleep`, `stall_ids`; §8
 "Unattended triggers"; §12 `wait`; §13 hub_call's external stamp): one idle member woken with `n_team_asleep` once the
-team has slept TEAM_ASLEEP_FACTOR x 2 ** sent x idle_nudge_seconds with work open and nothing set to wake anyone, USER
+team has slept TEAM_ASLEEP_FACTOR x 2 ** sent x idle_nudge_seconds with work open and nothing set to wake the team, USER
 told with the first (`u_team_asleep`) or alone (`u_team_waits`); `TriggerEngine.unattended`; the honest clause of
 `wait`'s result. The item is called directly with aged clocks; the runtimes are stand-ins that never activate, so
 nothing but the test changes the board (one test runs real agents through the scheduler loop)."""
@@ -140,7 +140,7 @@ async def test_a_lone_member_is_woken_once_at_the_due_time_and_the_user_is_told(
         assert woken(swarm) == [anna] and signalled == [anna, USER]  # both waking
         (member,) = rows(swarm, "n_team_asleep")
         assert member["elapsed"] == "5 min" and member["jobs"] == ""
-        assert member["text"].startswith("Nobody in the team has worked for 5 min, and nothing is set to wake anyone")
+        assert member["text"].startswith("Nobody in the team has worked for 5 min, and nothing is set to wake the team")
         assert "A process started with & or nohup that `jobs` does not list is not tracked" in member["text"]
         assert "file_exists(\"out/result.json\") or elapsed(1800)" in member["text"]
         assert "call `goal_complete`" in member["text"]
