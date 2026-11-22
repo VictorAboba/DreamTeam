@@ -276,7 +276,7 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     `render.event()` lines at verbosity "normal".
   - `text` and `json`: a `notification` to the user of kind `u_cost_unknown` (a model profile's calls count as
     $0: no prices, and the provider reports no cost; SPEC §10), `u_budget_low` (most of the money budget is spent,
-    SPEC §3 `record_usage`), `u_team_asleep` (nobody in the team works and nothing is set to wake anyone, SPEC §3
+    SPEC §3 `record_usage`), `u_team_asleep` (nobody in the team works and nothing is set to wake the team, SPEC §3
     scheduler item 9) or `u_team_waits` (the same, and every open task is held by the user or an external member,
     so no member is woken) writes its text to `err` once per text, also without `verbose` (the kinds are
     `printmode.STDERR_NOTES`, written by `on_user_notice`; the verbose feed already shows it as a notice line). The
@@ -376,7 +376,7 @@ class RenderContext:
   `u_role_skills_missing`, `u_role_skills_over_cap`), `u_cost_unknown` (a model profile's calls count as $0),
   `u_auto_reply_limit` (the hub no longer answers the members' messages of an `answers: "auto"` session in this run,
   SPEC §21.5), `u_budget_low` (most of the money budget is spent, SPEC §3 `record_usage`), `u_team_asleep` (the
-  whole team asleep with nothing set to wake anyone, SPEC §3 scheduler item 9) and `u_team_waits` (the same, with
+  whole team asleep with nothing set to wake the team, SPEC §3 scheduler item 9) and `u_team_waits` (the same, with
   every open task held by the user or an external member: only the user can unblock the run), all in
   `render._WARN_NOTES`.
   `u_paused_jobs` (the user's pause while jobs run) is a plain bell line, like `u_jobs_running`.

@@ -563,12 +563,11 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    1-7, in the code too: it reads the offers item 1 made in the same pass (`_nudged`), and a member that items 1-7
    woke has news pending, so it is not idle. It wakes nobody but that owner;
 9. `_wake_team_asleep` (§4.2 "Notifications": `n_team_asleep`, `u_team_asleep`, `u_team_waits`): the whole team
-   sleeps while work is open and nothing set will wake anyone: a member waits, after item 3's one wake, for a
-   process the hub does not track (`jobs` does not list it: on macOS, and in the Docker sandbox's sessions without
-   network, one that left its command's process group, on Linux one that also cleared its environment, §7 "Process
-   layer"), members wait for each other, or a member waits for the user's answer to a plain message. It runs last,
-   after item 8, in the code too: a member that items 1-8 or `_wake_deferred` woke in the same pass has news
-   pending, so it is not idle.
+   sleeps while work is open and nothing set will wake the team: a member waits, after item 3's one wake, for a
+   process the hub does not track (`jobs` does not list it: on macOS one that left its command's process group, on
+   Linux one that also cleared its environment, §7 "Process layer"), members wait for each other, or a member
+   waits for the user's answer to a plain message. It runs last, after item 8, in the code too: a member that
+   items 1-8 or `_wake_deferred` woke in the same pass has news pending, so it is not idle.
    - *When* (in item 9 an open task is one in `todo`, `in_progress` or `waiting`, not `Status.OPEN`: `review` is
      apart, the review condition below handles it; *Whom* and `u_team_waits` read "open" the same way): in a pass,
      all of these hold: the goal is active (wrap-up mode included); the board has an open task, or no open task,
@@ -610,7 +609,7 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    - *Texts* (en; ru alike, the same placeholders and backticked identifiers; in ru such an untracked process is
      «процесс, запущенный через & или nohup, которого нет в списке `jobs`», never «фоновый процесс», which is a
      job; no text puts & or nohup in backticks, which the identifier tests would refuse): `n_team_asleep`
-     ``Nobody in the team has worked for {elapsed}, and nothing is set to wake anyone: no running background job
+     ``Nobody in the team has worked for {elapsed}, and nothing is set to wake the team: no running background job
      whose end wakes its owner, no trigger that can still fire on a time or a file, no locked file someone was
      refused.{jobs} A process started with & or nohup that `jobs` does not list is not tracked: its end wakes
      nobody. If you are waiting for one, check it now; if it still runs, set a trigger with a deadline before you
@@ -621,11 +620,11 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
      every task is finished, verify the result and call `goal_complete`; if you hold none, look at the `board` for
      open tasks nobody moves.``; `team_asleep_jobs` ` Your background jobs {jobs} still run, but their end will not
      wake you while you hold no task in progress.` (ru «фоновые процессы»); `u_team_asleep` `Nobody in the team
-     has worked for {elapsed}, and nothing is set to wake anyone: no background job whose end wakes its owner, no
+     has worked for {elapsed}, and nothing is set to wake the team: no background job whose end wakes its owner, no
      trigger that fires on a time or a file. {name} was woken to check their work. If the team waits for you (an
      answer, a review, a decision, access), write to the member who asked; to end the run, stop the session.`;
      `u_team_waits` `Nobody in the team has worked for {elapsed}: the open tasks {tasks} are held by you or by
-     members who joined through MCP, and nothing is set to wake anyone. Do them or hand them to the team; to end
+     members who joined through MCP, and nothing is set to wake the team. Do them or hand them to the team; to end
      the run, stop the session.` The member's texts name only tools every open revision has (§12 R0′).
    - *Limits accepted*: a job whose end wakes its owner (`JobManager.awaited`: a `background` server past its busy
      window counts until `[shell] job_max_minutes`, 480 min by default; 0: as long as it runs) and a wait for a
@@ -2817,15 +2816,22 @@ outlive its call:
   runs, and never kept: a kept list would miss a child started outside the group since. terminate() and kill()
   drop the kept list and signal what a new scan finds, never a kept pid. The uid rule, shared by `token_pids` and
   `sweep_token`: processes of the hub's own uid; when the hub runs as root, any uid, since the random token
-  (`secrets.token_hex(8)`) identifies the command's processes. Reading another uid's `/proc/<pid>/environ` must
-  pass the kernel's ptrace read check (proc(5)), which root with Docker's default capability set fails (no
-  `CAP_SYS_PTRACE`): in the Docker sandbox the commands of a session without network, which run under
-  `setpriv --reuid=<offline uid>` (§7.2), are unreadable, skipped by the scan and the sweep, and seen by their group
-  alone, as on macOS. terminate = SIGTERM to the group plus, on Linux, SIGTERM to the token's
-  processes outside it; kill = SIGKILL to the group plus, on Linux, the token sweep (it also ends `setsid`
-  escapes). A process that clears its environment (`env -i`, a daemon that rebuilds it) carries no
-  token and still escapes; macOS has no /proc, so there the group alone decides. Names from `/proc/<pid>/comm`
-  (Linux), else none ("processes").
+  (`secrets.token_hex(8)`) identifies the command's processes. Opening another uid's `/proc/<pid>/environ` must
+  pass the kernel's ptrace read check (proc(5)), made with the opener's file-system ids, which root with Docker's
+  default capability set fails (no `CAP_SYS_PTRACE`): there, in the Docker sandbox the commands of a session without
+  network run under `setpriv --reuid=<offline uid>` (§7.2). A hub running as root that is refused such a file
+  (`PermissionError`) opens it once more under the process's own ids: the calling thread's file-system gid and uid
+  (`setfsgid`, `setfsuid`, through ctypes; they belong to that thread alone) are set to the process's gid and uid
+  for that open only and set back to the hub's at once, also when the open fails; the check then passes as for a
+  process of the same user. Only a process whose real, effective and saved uids are one value, and its gids too
+  (`/proc/<pid>/status`), not uid 0, is opened so; it must still be dumpable, as every command started without a
+  set-user-ID program is. Where the ids cannot be set (no `CAP_SETUID` or `CAP_SETGID`: the switch is checked, a
+  call that leaves the old ids counts as refused), the process stays unread: skipped by the scan and the sweep,
+  seen by its group alone. No capability is added to the container and none is given to the commands.
+  terminate = SIGTERM to the group plus, on Linux, SIGTERM to the token's processes outside it; kill = SIGKILL to
+  the group plus, on Linux, the token sweep (it also ends `setsid` escapes). A process that clears its environment
+  (`env -i`, a daemon that rebuilds it) carries no token and still escapes; macOS has no /proc, so there the group
+  alone decides. Names from `/proc/<pid>/comm` (Linux), else none ("processes").
 - After `release()` nothing is ever signalled again (idempotent); a tree dropped without it is released by a
   `weakref.finalize`.
 - A command ends when its shell has exited and its tree is empty; the pipe's EOF is waited for at most
@@ -2908,7 +2914,7 @@ def shown_log(log) -> str                                # a data_dir log with "
 |---|---|---|---|---|
 | `timeout` | its shell still runs when the call's wait ended | `[shell] max_timeout` | always | unless the goal is done |
 | `background` | `background=true` (AI agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
-| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`, on Linux also `nohup timeout N cmd &`, `setsid cmd &` and a daemon that keeps its environment, which leave the group but keep the token (§7 "Process layer"; not in the Docker sandbox's sessions without network, whose processes the hub cannot read); with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
+| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`, on Linux also `nohup timeout N cmd &`, `setsid cmd &` and a daemon that keeps its environment, which leave the group but keep the token (§7 "Process layer"); with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
 
 `wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
 
@@ -3130,11 +3136,10 @@ hand-over (its reminder time is renewed while busy), it holds `n_all_done` back 
 the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone meanwhile, and so does the team-asleep
 wake (§3 item 9, `Swarm.team_asleep`), however long the job runs. On Linux a process that left its command's
 process group but kept its environment is found by its token, so its command is a job as `cmd &` is (§7 "Process
-layer"), except in the Docker sandbox's sessions without network, whose processes the hub cannot read. A process
-the hub does not track (`jobs` does not list it: on macOS, and in the Docker sandbox's sessions without network,
-one that left its command's process group, on Linux one that also cleared its environment, `env -i` or a daemon
-that rebuilds it) is no job: its end wakes nobody (system prompt rule 10, §6.3); item 9 is what wakes a team that
-sleeps waiting for one.
+layer"), also in the Docker sandbox's sessions without network. A process the hub does not track (`jobs` does not
+list it: on macOS one that left its command's process group, on Linux one that also cleared its environment,
+`env -i` or a daemon that rebuilds it) is no job: its end wakes nobody (system prompt rule 10, §6.3); item 9 is
+what wakes a team that sleeps waiting for one.
 
 **Git**: the caller's `shell` autocommit at every return, also when the command went on as a job (not for
 `killed`); the job's own commits under its owner when its shell exits with processes left, at its end and at the
