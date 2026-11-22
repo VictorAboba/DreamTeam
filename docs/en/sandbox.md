@@ -181,6 +181,9 @@ interface says so plainly:
   session with network (and in one switched off without the firewall): with a rootful Docker daemon on Linux, what
   they create in the mounted folder belongs to root on the host. For an untrusted goal start the sandbox with the
   network off, or use rootless Docker, Docker Desktop or `userns-remap`.
+  The hub finds the background processes of the commands without network by a token in their environment,
+  which it opens for a moment under their user's file-system ids (`setfsuid`): a process monitor (Falco,
+  auditd) sees this as the hub changing its uid.
 * **Linux**: commands run in a separate network namespace that has only its own localhost, as your own user, as
   before. There is one namespace per DreamTeam process: a server that one command started in the background is
   reachable from the next commands, tests and MCP servers, but the machine's own localhost (the board, your local

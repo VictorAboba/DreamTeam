@@ -2820,14 +2820,23 @@ outlive its call:
   pass the kernel's ptrace read check (proc(5)), made with the opener's file-system ids, which root with Docker's
   default capability set fails (no `CAP_SYS_PTRACE`): there, in the Docker sandbox the commands of a session without
   network run under `setpriv --reuid=<offline uid>` (§7.2). A hub running as root that is refused such a file
-  (`PermissionError`) opens it once more under the process's own ids: the calling thread's file-system gid and uid
-  (`setfsgid`, `setfsuid`, through ctypes; they belong to that thread alone) are set to the process's gid and uid
-  for that open only and set back to the hub's at once, also when the open fails; the check then passes as for a
-  process of the same user. Only a process whose real, effective and saved uids are one value, and its gids too
+  (`PermissionError`) opens it once more under the process's own ids, in a short-lived thread of its own that does
+  nothing else and is joined at once (Python runs signal handlers in the main thread alone, so none can raise while
+  the ids are switched, and no other thread's parent-death signal is cleared): that thread's file-system gid and uid
+  (`setfsgid`, `setfsuid`, through ctypes; they belong to that thread alone) are set to the process's gid and uid for
+  that open only and set back at once, also when the open fails, and the file is read after that; the check then
+  passes as for a process of the same user. Each change of the ids makes the whole hub not dumpable
+  (`fs.suid_dumpable`, 0 by default), so the flag is set back after the ids (`PR_SET_DUMPABLE`); a command that joins
+  the network namespace through the hub's `/proc/<pid>/fd` in that moment is refused, and `netns_helper` tries the
+  open 3 times, 50 ms apart. Only a process whose real, effective and saved uids are one value, and its gids too
   (`/proc/<pid>/status`), not uid 0, is opened so; it must still be dumpable, as every command started without a
-  set-user-ID program is. Where the ids cannot be set (no `CAP_SETUID` or `CAP_SETGID`: the switch is checked, a
-  call that leaves the old ids counts as refused), the process stays unread: skipped by the scan and the sweep,
-  seen by its group alone. No capability is added to the container and none is given to the commands.
+  set-user-ID program is. Where the ids cannot be set (no `CAP_SETUID` or `CAP_SETGID`: the switch is checked, a call
+  that leaves the old ids counts as refused), the process stays unread: skipped by the scan and the sweep, seen by its
+  group alone. Ids that do not come back (the kernel always allows root's own) stay with that thread, which reads
+  nothing more and ends; the hub logs it as critical and makes no switch again. Warnings are logged by the calling
+  thread, never under switched ids. Each switch is a uid change the kernel reports (proc connector, audit): a process
+  monitor sees the hub take the command's uid for a moment. No capability is added to the container and none is given
+  to the commands.
   terminate = SIGTERM to the group plus, on Linux, SIGTERM to the token's processes outside it; kill = SIGKILL to
   the group plus, on Linux, the token sweep (it also ends `setsid` escapes). A process that clears its environment
   (`env -i`, a daemon that rebuilds it) carries no token and still escapes; macOS has no /proc, so there the group

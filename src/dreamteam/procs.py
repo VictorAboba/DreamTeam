@@ -9,7 +9,9 @@ POSIX: a new session, whose process group id (the shell's pid) is stored: getpgi
 A `sh` lifeline watchdog per command reads a pipe the hub holds; when the hub dies the pipe reaches EOF and the
 watchdog kills the group. On Linux, processes are also found by a random environment token
 (DREAMTEAM_PROCESS_TOKEN), which catches the processes that left the group (`setsid`, GNU `timeout`): they keep the
-tree alive and listed, and they are signalled with it.
+tree alive and listed, and they are signalled with it. A hub running as root that the kernel refuses another user's
+environment (the Docker sandbox's commands without network, Docker's default capabilities) opens it under that
+user's file-system ids, switched for that open in a short-lived thread of its own.
 
 Only the standard library is used: a test helper runs this module in a bare interpreter."""
 
@@ -359,19 +361,212 @@ def live_groups(pgids: Iterable[int]) -> set[int]:
 
 def _uid_ok(owner: int, hub: int) -> bool:
     """The uid rule of the token scan (docs/SPEC.md §7 "Process layer"): the hub's own processes; a hub running as
-    root looks at every uid, since the random token alone identifies a command's processes. It reaches another uid
-    only where the kernel lets root read that process's environment: not in the Docker sandbox with Docker's default
-    capabilities, whose offline commands (`setpriv --reuid`, netoff.py) are unreadable and so skipped."""
+    root looks at every uid, since the random token alone identifies a command's processes. Where the kernel refuses
+    root another uid's environment (the Docker sandbox with Docker's default capabilities: no CAP_SYS_PTRACE, and
+    the offline commands run under `setpriv --reuid`, netoff.py), _environ opens it under that process's own ids."""
     return hub == 0 or owner == hub
 
 
 def _environ(pid: str) -> bytes | None:
-    """/proc/<pid>/environ, None when it cannot be read."""
+    """/proc/<pid>/environ, None when it cannot be read. A hub running as root (Linux) that is refused the file
+    (PermissionError: the kernel's ptrace read check, which root fails without CAP_SYS_PTRACE for another uid)
+    opens it once more under the process's own file-system ids (_read_as_owner); refused again, or where the ids
+    cannot be set, the process stays unread (None)."""
+    path = f"/proc/{pid}/environ"
     try:
-        with open(f"/proc/{pid}/environ", "rb") as f:
+        with open(path, "rb") as f:
             return f.read()
+    except PermissionError:
+        return _read_as_owner(pid, path) if _LINUX and os.geteuid() == 0 else None
     except OSError:
         return None
+
+
+# --- Linux, a hub running as root: another uid's environment under that uid's file-system ids ---------------------
+#
+# setfsuid/setfsgid change the file-system ids of the calling thread alone (no other thread of the hub sees them:
+# glibc makes them a plain system call, unlike setuid), and the kernel's check for opening /proc/<pid>/environ uses
+# the opener's file-system ids: equal to the process's real, effective and saved uid and gid, the check passes as
+# for a process of the same user (it must still be dumpable). The ids are switched for that one open only, in a
+# short-lived thread of its own, and set back before the file is read; the file-system capabilities root loses with
+# fsuid 0 come back with it. Each change of the ids makes the whole hub not dumpable (the kernel sets the flag to
+# fs.suid_dumpable, 0 by default, and keeps it so): the flag is set back after the ids, or root's children could no
+# longer open the hub's /proc/<pid>/fd (netoff's network namespace), and debuggers could not attach.
+
+_LIBC: Any = None          # the libc with setfsuid/setfsgid and prctl; False once loading it failed
+_LIBC_LOCK = threading.Lock()
+_ID_QUERY = 0xFFFFFFFF     # (uid_t) -1: setfsuid/setfsgid change nothing and return the current id
+_PR_GET_DUMPABLE, _PR_SET_DUMPABLE = 3, 4
+_fsids_stuck = False       # a thread's ids could not be set back once: no switch is made again
+
+
+def _libc() -> Any | None:
+    """libc's setfsuid and setfsgid (argument and result c_uint) and prctl through ctypes, loaded on first use; None
+    where it cannot be loaded (logged once)."""
+    global _LIBC
+    if _LIBC is None:
+        with _LIBC_LOCK:
+            if _LIBC is None:
+                try:
+                    import ctypes
+                    libc = ctypes.CDLL(None, use_errno=True)
+                    for name in ("setfsuid", "setfsgid"):
+                        function = getattr(libc, name)
+                        function.argtypes = [ctypes.c_uint]
+                        function.restype = ctypes.c_uint
+                    libc.prctl.argtypes = [ctypes.c_int] + [ctypes.c_ulong] * 4
+                    libc.prctl.restype = ctypes.c_int
+                    _LIBC = libc
+                except (ImportError, OSError, AttributeError) as exc:
+                    _LIBC = False
+                    _warn_once("fsids-libc", "cannot load setfsuid from libc (%s): the environment of commands "
+                               "running as another user is not read", exc)
+    return _LIBC or None
+
+
+def _owner_ids(pid: str) -> tuple[int, int] | None:
+    """(uid, gid) of `pid` from /proc/<pid>/status when its real, effective and saved uids are one value, its gids
+    too, and the uid is not 0; else None (a process in a set-user-ID program, root's own, or gone)."""
+    try:
+        with open(f"/proc/{pid}/status", "rb") as f:
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    ids: dict[str, list[int]] = {}
+    for line in lines:
+        key, _, rest = line.partition(":")
+        if key in ("Uid", "Gid"):
+            try:
+                ids[key] = [int(value) for value in rest.split()]
+            except ValueError:
+                return None
+    uids, gids = ids.get("Uid", []), ids.get("Gid", [])
+    if len(uids) < 3 or len(gids) < 3 or len(set(uids[:3])) != 1 or len(set(gids[:3])) != 1 or uids[0] == 0:
+        return None
+    return uids[0], gids[0]
+
+
+def _set_fsid(function: Any, value: int) -> bool:
+    """setfsuid/setfsgid(`value`), checked: the call returns the old id even when it refuses, so the id is asked
+    again; one that is not `value` now counts as refused."""
+    function(value)
+    return function(_ID_QUERY) == value
+
+
+def _open_fd(path: str) -> int:
+    return os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+
+
+def _read_as_owner(pid: str, path: str) -> bytes | None:
+    """`path` (/proc/<pid>/environ) read under the process's own file-system ids (_owner_read), in a short-lived
+    thread of its own that does nothing else, joined at once. So no Python signal handler runs while the ids are
+    switched (Python runs them in the main thread alone, and an exception one raises could skip setting the ids
+    back), no other thread's parent-death signal is cleared (a change of the ids clears the changing thread's), and
+    should the ids not come back, only that thread has them, and it ends. What happened is logged here, by the
+    calling thread, never under switched ids."""
+    global _fsids_stuck
+    if _fsids_stuck:
+        return None
+    outcome: dict[str, Any] = {}
+
+    def work() -> None:
+        try:
+            outcome["data"], outcome["notes"] = _owner_read(pid, path)
+        except Exception as exc:   # logged by the calling thread
+            outcome["error"] = exc
+
+    try:
+        worker = threading.Thread(target=work, name="dreamteam-fsids", daemon=True)
+        worker.start()
+    except RuntimeError as exc:   # no thread can be started now
+        _warn_once("fsids-thread", "cannot start a thread to read the environment of a command running as another "
+                   "user (%s): it is not read", exc)
+        return None
+    worker.join()
+    notes = outcome.get("notes", ())
+    if "stuck" in notes:
+        _fsids_stuck = True
+        log.critical("the file-system ids of a thread did not come back from another user's: that thread ended, "
+                     "and the environment of commands running as another user is no longer read")
+    if "refused" in notes:
+        _warn_once("fsids-refused", "cannot set the file-system ids to another user's (no CAP_SETUID or "
+                   "CAP_SETGID?): the environment of commands running as another user is not read")
+    if "dumpable" in notes:
+        _warn_once("fsids-dumpable", "cannot set the hub's dumpable flag back after reading another user's process "
+                   "environment: root's children may not open the hub's /proc files")
+    if "error" in outcome:
+        _warn_once("fsids-error", "cannot read the environment of a command running as another user: %s",
+                   outcome["error"])
+    return outcome.get("data")
+
+
+def _owner_read(pid: str, path: str) -> tuple[bytes | None, tuple[str, ...]]:
+    """In _read_as_owner's thread: `path` opened under the process's ids (_open_as_owner), read once they are set
+    back (the kernel checks at the open alone), and closed; with the ids stuck nothing is read."""
+    fd, notes = _open_as_owner(pid, path)
+    if fd is None:
+        return None, notes
+    try:
+        if "stuck" in notes:
+            return None, notes
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(), notes
+    except OSError:
+        return None, notes
+    finally:
+        os.close(fd)
+
+
+def _open_as_owner(pid: str, path: str) -> tuple[int | None, tuple[str, ...]]:
+    """Open `path` (/proc/<pid>/environ) with the calling thread's file-system gid and uid set to those of `pid`
+    (gid first), and set back to the thread's previous ids at once (uid first), also when the open fails; then the
+    hub's dumpable flag as it was. The fd, None when the process's ids do not qualify (_owner_ids), libc is missing,
+    a switch is refused or the open fails; and notes for the calling thread: "refused" (no CAP_SETUID or
+    CAP_SETGID), "stuck" (the ids did not come back, _restore_fsids), "dumpable" (the flag did not come back)."""
+    ids = _owner_ids(pid)
+    libc = _libc() if ids else None
+    if ids is None or libc is None:
+        return None, ()
+    uid, gid = ids
+    old_uid, old_gid = libc.setfsuid(_ID_QUERY), libc.setfsgid(_ID_QUERY)
+    dumpable = libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0)
+    notes: list[str] = []
+    fd = None
+    try:
+        if _set_fsid(libc.setfsgid, gid) and _set_fsid(libc.setfsuid, uid):
+            fd = _open_fd(path)
+        else:
+            notes.append("refused")
+    except OSError:
+        pass
+    finally:
+        if not _restore_fsids(libc, old_uid, old_gid):
+            notes.append("stuck")
+        if not _restore_dumpable(libc, dumpable):
+            notes.append("dumpable")
+    return fd, tuple(notes)
+
+
+def _restore_fsids(libc: Any, uid: int, gid: int) -> bool:
+    """Set the thread's file-system uid, then gid, back to `uid` and `gid`, checked, with one more try; False when
+    they did not come back. By the kernel's rules that cannot happen: the thread's real, effective and saved ids are
+    still root's, and setting a file-system id to one of them is always allowed. Should it happen all the same,
+    _read_as_owner's thread reads nothing more and ends (no other thread ever had the ids), the hub logs it as
+    critical and makes no switch again."""
+    for _attempt in range(2):
+        uid_back = _set_fsid(libc.setfsuid, uid)
+        gid_back = _set_fsid(libc.setfsgid, gid)
+        if uid_back and gid_back:
+            return True
+    return False
+
+
+def _restore_dumpable(libc: Any, dumpable: int) -> bool:
+    """Set the hub's dumpable flag (PR_SET_DUMPABLE) back to `dumpable` (0 or 1, read before the switch) where the
+    change of the ids moved it; False when that was refused. A value prctl cannot set (2, or an error) is left."""
+    if dumpable not in (0, 1) or libc.prctl(_PR_GET_DUMPABLE, 0, 0, 0, 0) == dumpable:
+        return True
+    return libc.prctl(_PR_SET_DUMPABLE, dumpable, 0, 0, 0) == 0
 
 
 def _may_exec(pid: str) -> bool:
