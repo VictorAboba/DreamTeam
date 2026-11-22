@@ -8,7 +8,8 @@ active processes; closing the job's handle (release(), or the hub's death) kills
 POSIX: a new session, whose process group id (the shell's pid) is stored: getpgid fails once the leader was reaped.
 A `sh` lifeline watchdog per command reads a pipe the hub holds; when the hub dies the pipe reaches EOF and the
 watchdog kills the group. On Linux, processes are also found by a random environment token
-(DREAMTEAM_PROCESS_TOKEN), which catches `setsid` escapes.
+(DREAMTEAM_PROCESS_TOKEN), which catches the processes that left the group (`setsid`, GNU `timeout`): they keep the
+tree alive and listed, and they are signalled with it.
 
 Only the standard library is used: a test helper runs this module in a bare interpreter."""
 
@@ -22,6 +23,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import weakref
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -29,6 +31,12 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 TOKEN_ENV = "DREAMTEAM_PROCESS_TOKEN"
+# Linux: how long a tree keeps the list of its token scan; within it, only the processes found are looked at again
+TOKEN_SCAN_SECONDS = 2.0
+# Linux: a process in execve reads an empty /proc/<pid>/environ until its new image's environment is set up; such a
+# read is tried once more after this pause. PF_KTHREAD (the flags of /proc/<pid>/stat): a kernel thread, never in it
+_EXEC_RETRY_SECONDS = 0.005
+_PF_KTHREAD = 0x00200000
 _WINDOWS = sys.platform == "win32"
 _LINUX = sys.platform.startswith("linux")
 # the watchdog: a line from the hub (release) ends it quietly; EOF (the hub died) kills the group, TERM first.
@@ -291,16 +299,22 @@ def _taskkill(proc: subprocess.Popen) -> None:
 
 # --- POSIX: process groups through /proc (Linux) or killpg ----------------------------------------------------
 
-def _proc_stat(pid: str) -> tuple[str, int] | None:
-    """(state, pgrp) of /proc/<pid>/stat. The fields are read after the LAST ")": comm may hold spaces and ")"."""
+def _stat_fields(pid: str) -> list[str] | None:
+    """The fields of /proc/<pid>/stat after comm (state first). They are read after the LAST ")": comm may hold
+    spaces and ")"."""
     try:
         with open(f"/proc/{pid}/stat", "rb") as f:
             data = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    rest = data[data.rfind(")") + 2:].split()
+    return data[data.rfind(")") + 2:].split()
+
+
+def _proc_stat(pid: str) -> tuple[str, int] | None:
+    """(state, pgrp) of /proc/<pid>/stat."""
+    rest = _stat_fields(pid)
     try:
-        return rest[0], int(rest[2])
+        return (rest[0], int(rest[2])) if rest else None
     except (IndexError, ValueError):
         return None
 
@@ -343,29 +357,114 @@ def live_groups(pgids: Iterable[int]) -> set[int]:
     return alive
 
 
-def sweep_token(token: str) -> int:
-    """Linux: SIGKILL every own-user process whose environment holds DREAMTEAM_PROCESS_TOKEN=`token`; this also ends
-    processes that left the group (`setsid`). Returns how many were signalled (0 elsewhere)."""
-    if not token or not _LINUX or not os.path.isdir("/proc"):
-        return 0
-    needle = f"{TOKEN_ENV}={token}".encode()
+def _uid_ok(owner: int, hub: int) -> bool:
+    """The uid rule of the token scan (docs/SPEC.md §7 "Process layer"): the hub's own processes; a hub running as
+    root looks at every uid, since the random token alone identifies a command's processes. It reaches another uid
+    only where the kernel lets root read that process's environment: not in the Docker sandbox with Docker's default
+    capabilities, whose offline commands (`setpriv --reuid`, netoff.py) are unreadable and so skipped."""
+    return hub == 0 or owner == hub
+
+
+def _environ(pid: str) -> bytes | None:
+    """/proc/<pid>/environ, None when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def _may_exec(pid: str) -> bool:
+    """Whether an empty environment read of `pid` may be a process in execve: it lives and is no kernel thread."""
+    rest = _stat_fields(pid)
+    try:
+        return bool(rest) and rest[0] not in ("Z", "X") and not int(rest[6]) & _PF_KTHREAD
+    except (IndexError, ValueError):
+        return False
+
+
+def _token_scan(tokens: Iterable[str]) -> dict[str, dict[int, int]]:
+    """Linux: {token: {pid: pgrp}} of the live (not zombie) processes whose environment holds
+    DREAMTEAM_PROCESS_TOKEN=<token>, for several tokens in one pass over /proc/<pid>/environ. The hub's own pid is
+    skipped; a process the uid rule leaves out, or whose environment cannot be read, is not seen. An empty read of a
+    live process (one in execve) is read again once, after _EXEC_RETRY_SECONDS, for all such processes together."""
+    wanted = {t for t in tokens if t}
+    if not wanted or not _LINUX or not os.path.isdir("/proc"):
+        return {}
+    prefix = f"{TOKEN_ENV}=".encode()
     me, uid = os.getpid(), os.getuid()
-    killed = 0
+    found: dict[str, dict[int, int]] = {}
+
+    def match(pid: str, data: bytes) -> None:
+        if prefix not in data:
+            return
+        hits = {entry[len(prefix):].decode("utf-8", "replace") for entry in data.split(b"\0")
+                if entry.startswith(prefix)} & wanted
+        stat = _proc_stat(pid) if hits else None
+        if stat is None or stat[0] in ("Z", "X"):
+            return
+        for token in hits:
+            found.setdefault(token, {})[int(pid)] = stat[1]
+
+    empty: list[str] = []
     for pid in _proc_pids():
         if int(pid) == me:
             continue
         try:
-            if os.stat(f"/proc/{pid}").st_uid != uid:
+            if not _uid_ok(os.stat(f"/proc/{pid}").st_uid, uid):
                 continue
-            with open(f"/proc/{pid}/environ", "rb") as f:
-                entries = f.read().split(b"\0")
         except OSError:
             continue
-        if needle in entries:
-            with contextlib.suppress(OSError):
-                os.kill(int(pid), signal.SIGKILL)
-                killed += 1
-    return killed
+        data = _environ(pid)
+        if data:
+            match(pid, data)
+        elif data is not None and _may_exec(pid):
+            empty.append(pid)
+    if empty:
+        time.sleep(_EXEC_RETRY_SECONDS)
+        for pid in empty:
+            match(pid, _environ(pid) or b"")
+    return found
+
+
+def token_pids(tokens: Iterable[str]) -> dict[str, list[int]]:
+    """Linux: the live processes carrying each of `tokens` (DREAMTEAM_PROCESS_TOKEN), from one /proc pass; a token
+    no process carries is left out. Empty elsewhere."""
+    return {token: sorted(pids) for token, pids in _token_scan(tokens).items()}
+
+
+def _carries(pid: int, entry: bytes) -> bool:
+    """Linux: whether `pid` is a live process whose environment still holds `entry` (a pid freed and given to a
+    process of another command does not). An empty read of a process in execve is read again once."""
+    if not _may_exec(str(pid)):
+        return False
+    data = _environ(str(pid))
+    if data == b"":
+        time.sleep(_EXEC_RETRY_SECONDS)
+        data = _environ(str(pid))
+    return entry in (data or b"").split(b"\0")
+
+
+def _signal_token(token: str, sig: int, *, skip_group: int | None = None) -> int:
+    """Send `sig` to every process carrying `token` (found afresh, never from a kept list: a bare pid may name
+    another process by now), except the members of `skip_group`. Returns how many were signalled."""
+    sent = 0
+    for pid, pgrp in _token_scan([token]).get(token, {}).items():
+        if skip_group is not None and pgrp == skip_group:
+            continue
+        with contextlib.suppress(OSError):
+            os.kill(pid, sig)
+            sent += 1
+    return sent
+
+
+def sweep_token(token: str) -> int:
+    """Linux: SIGKILL every process whose environment holds DREAMTEAM_PROCESS_TOKEN=`token` (the uid rule of
+    `_uid_ok`); this also ends processes that left the group (`setsid`, GNU `timeout`). Returns how many were
+    signalled (0 elsewhere)."""
+    if not token:
+        return 0
+    return _signal_token(token, signal.SIGKILL)
 
 
 # --- the tree ---------------------------------------------------------------------------------------------------
@@ -417,6 +516,9 @@ class ProcessTree:
         self.token = token
         self._handles = _Handles()
         self._eof = False
+        # Linux: (time.monotonic() of alive()'s token scan, made with the group gone, the pids it found); dropped by
+        # terminate() and kill()
+        self._token_seen: tuple[float, list[int]] | None = None
         self._finalizer = weakref.finalize(self, self._handles.release)
         # at the hub's exit a tree still referenced is not released: the job's close or the lifeline's EOF must
         # then end what still runs
@@ -503,9 +605,39 @@ class ProcessTree:
             return self.proc.poll() is None
         return False
 
+    def _token_scanned(self) -> bool:
+        return bool(_LINUX and self.token)
+
+    def _token_kept(self, now: float) -> list[int] | None:
+        """The live processes of the last token scan while it is younger than TOKEN_SCAN_SECONDS, or None when a new
+        scan must decide: the scan is older, or every process it found has ended since (one of them may have
+        started another before it ended). An empty scan is kept: it was made with the group gone (only alive() and
+        alive_all keep a scan), so no process of the tree was left to start one."""
+        seen = self._token_seen
+        if seen is None or now - seen[0] >= TOKEN_SCAN_SECONDS:
+            return None
+        entry = f"{TOKEN_ENV}={self.token}".encode()
+        live = [pid for pid in seen[1] if _carries(pid, entry)]
+        return live if live or not seen[1] else None
+
+    def _token_found(self) -> list[int]:
+        """Linux: the live processes carrying the tree's token (the kept scan, or a new one); [] without a token
+        or elsewhere."""
+        if not self._token_scanned():
+            return []
+        now = time.monotonic()
+        kept = self._token_kept(now)
+        if kept is not None:
+            return kept
+        token = self.token or ""
+        found = token_pids([token]).get(token, [])
+        self._token_seen = (now, found)
+        return found
+
     def alive(self) -> bool:
         """True while any process of the tree runs (the shell included). The pipe's EOF never decides: a process
-        may close or redirect its output and go on running."""
+        may close or redirect its output and go on running. Linux: once the shell and the group are gone, while a
+        process carries the tree's token (it left the group: `setsid`, GNU `timeout`)."""
         if self._handles.released:
             return self._shell_running()
         if _WINDOWS:
@@ -515,10 +647,14 @@ class ProcessTree:
             return _job_active(job) > 0
         if self._shell_running():
             return True
-        return bool(self.pgid and live_groups([self.pgid]))
+        if self.pgid and live_groups([self.pgid]):
+            return True
+        return bool(self._token_found())
 
     def pids(self) -> list[int]:
-        """The tree's process ids, as far as the system tells (Windows: the job; Linux: the group)."""
+        """The tree's process ids, as far as the system tells (Windows: the job; Linux: the group and the token's
+        processes outside it, from a new token scan: a kept one would miss a child started outside the group since;
+        it is not kept, an empty one made while the group runs proves nothing for alive())."""
         if self._handles.released:
             return [self.pid] if self._shell_running() else []
         if _WINDOWS:
@@ -527,7 +663,11 @@ class ProcessTree:
                 return [self.pid] if self._shell_running() else []
             return _job_pids(job)
         if _LINUX and self.pgid:
-            return sorted(_group_members({self.pgid}).get(self.pgid, []))
+            members = set(_group_members({self.pgid}).get(self.pgid, []))
+            if self._token_scanned():
+                token = self.token or ""
+                members |= set(token_pids([token]).get(token, []))
+            return sorted(members)
         return [self.pid] if self._shell_running() else []
 
     def processes(self) -> list[str]:
@@ -541,21 +681,26 @@ class ProcessTree:
                 if name and name.lower() != "conhost.exe":
                     names.append(name)
         elif _LINUX and self.pgid:
-            for pid in sorted(_group_members({self.pgid}).get(self.pgid, [])):
+            for pid in self.pids():
                 with contextlib.suppress(OSError):
                     with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as f:
                         names.append(f.read().strip())
         return names
 
     def terminate(self) -> None:
-        """Ask the tree to end: SIGTERM to the group. Windows has no graceful stop: the job is terminated."""
+        """Ask the tree to end: SIGTERM to the group plus (Linux) to the token's processes outside it. Windows has
+        no graceful stop: the job is terminated."""
         if self._handles.released:
             return
+        self._token_seen = None
         try:
             if _WINDOWS:
                 self._kill_windows()
             elif self.pgid:
-                os.killpg(self.pgid, signal.SIGTERM)
+                with contextlib.suppress(OSError):  # the group may be gone (or not ours), the token's processes not
+                    os.killpg(self.pgid, signal.SIGTERM)
+                if self.token:
+                    _signal_token(self.token, signal.SIGTERM, skip_group=self.pgid)
         except Exception as exc:  # noqa: BLE001 - the group may be gone already
             log.debug("terminate of %s: %s", self.pid, exc)
 
@@ -564,12 +709,13 @@ class ProcessTree:
         (degraded mode: taskkill /T in a daemon thread)."""
         if self._handles.released:
             return
+        self._token_seen = None
         try:
             if _WINDOWS:
                 self._kill_windows()
             else:
                 if self.pgid:
-                    with contextlib.suppress(ProcessLookupError):
+                    with contextlib.suppress(OSError):  # the sweep runs all the same
                         os.killpg(self.pgid, signal.SIGKILL)
                 if self.token:
                     sweep_token(self.token)
@@ -596,7 +742,8 @@ def _last_error() -> int:
 
 
 def alive_all(trees: Iterable[ProcessTree]) -> list[bool]:
-    """alive() of many trees with one /proc pass on Linux (the job monitor checks every job each second)."""
+    """alive() of many trees with one /proc pass on Linux for their groups and one token scan for the trees whose
+    group is gone and whose kept scan does not decide (the job monitor checks every job each second)."""
     trees = list(trees)
     if not _LINUX:
         return [t.alive() for t in trees]
@@ -609,7 +756,27 @@ def alive_all(trees: Iterable[ProcessTree]) -> list[bool]:
             result.append(None)
             groups.add(tree.pgid)
     live = live_groups(groups) if groups else set()
-    return [r if r is not None else (t.pgid in live) for r, t in zip(result, trees)]
+    now = time.monotonic()
+    scan: list[int] = []  # indexes of the trees a new token scan decides
+    for i, tree in enumerate(trees):
+        if result[i] is not None:
+            continue
+        if tree.pgid in live:
+            result[i] = True
+        elif not tree._token_scanned():
+            result[i] = False
+        elif (kept := tree._token_kept(now)) is not None:
+            result[i] = bool(kept)
+        else:
+            scan.append(i)
+    if scan:
+        found = token_pids(trees[i].token or "" for i in scan)
+        for i in scan:
+            tree = trees[i]
+            pids = found.get(tree.token or "", [])
+            tree._token_seen = (now, pids)
+            result[i] = bool(pids)
+    return [bool(r) for r in result]
 
 
 async def daemon_call(fn: Callable[..., Any], *args: Any,
@@ -646,4 +813,5 @@ async def daemon_call(fn: Callable[..., Any], *args: Any,
     return await future
 
 
-__all__ = ["ProcessTree", "TOKEN_ENV", "alive_all", "daemon_call", "live_groups", "sweep_token"]
+__all__ = ["ProcessTree", "TOKEN_ENV", "TOKEN_SCAN_SECONDS", "alive_all", "daemon_call", "live_groups", "sweep_token",
+           "token_pids"]

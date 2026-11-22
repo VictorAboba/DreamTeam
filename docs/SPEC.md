@@ -563,10 +563,11 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
    woke has news pending, so it is not idle. It wakes nobody but that owner;
 9. `_wake_team_asleep` (§4.2 "Notifications": `n_team_asleep`, `u_team_asleep`, `u_team_waits`): the whole team
    sleeps while work is open and nothing set will wake anyone: a member waits, after item 3's one wake, for a
-   process the hub does not track (`jobs` does not list it: on macOS one that left its command's process group, on
-   Linux one that also cleared its environment, §7 "Process layer"), members wait for each other, or a member waits
-   for the user's answer to a plain message. It runs last, after item 8, in the code too: a member that items 1-8
-   or `_wake_deferred` woke in the same pass has news pending, so it is not idle.
+   process the hub does not track (`jobs` does not list it: on macOS, and in the Docker sandbox's sessions without
+   network, one that left its command's process group, on Linux one that also cleared its environment, §7 "Process
+   layer"), members wait for each other, or a member waits for the user's answer to a plain message. It runs last,
+   after item 8, in the code too: a member that items 1-8 or `_wake_deferred` woke in the same pass has news
+   pending, so it is not idle.
    - *When* (in item 9 an open task is one in `todo`, `in_progress` or `waiting`, not `Status.OPEN`: `review` is
      apart, the review condition below handles it; *Whom* and `u_team_waits` read "open" the same way): in a pass,
      all of these hold: the goal is active (wrap-up mode included); the board has an open task, or no open task,
@@ -2760,7 +2761,7 @@ def kill_tree(proc) -> None   # tui/bash.py's `!` commands: POSIX os.killpg(proc
 
 # procs.py (standard library only; kernel32 through ctypes, loaded lazily)
 TOKEN_ENV = "DREAMTEAM_PROCESS_TOKEN"
-TOKEN_SCAN_SECONDS = 2.0  # Linux: how long a tree keeps the result of its token scan (an end is seen that late)
+TOKEN_SCAN_SECONDS = 2.0  # Linux: how long alive() keeps the list of its token scan (only those pids rechecked)
 class ProcessTree:      # proc, pid, pgid (POSIX: the shell's pid, stored), contained, token; released, watchdog
     @classmethod
     def spawn(cls, argv: list[str] | str, *, cwd, env, token=None,
@@ -2801,15 +2802,27 @@ outlive its call:
   init-less containers stay correct), other systems `killpg(pgid, 0)`. On Linux, once the shell and the group are
   both gone, a tree with a token is still alive while a process carries its `DREAMTEAM_PROCESS_TOKEN`
   (`token_pids`, from `/proc/<pid>/environ`): GNU `timeout` without `--foreground` and `setsid` start a new group,
-  so `nohup timeout N cmd &` or `setsid cmd &` would otherwise leave an empty group while their processes run. The
-  scan runs only for such trees, its result is kept per tree for `TOKEN_SCAN_SECONDS` (2 s; an end is seen at most
-  that late), and `alive_all` scans once for all of them. `pids()` and `processes()` list the group's members plus
-  the token's processes outside it (a tree whose group is gone lists its token's processes). The uid rule, shared
-  by `token_pids` and `sweep_token`: processes of the hub's own uid; when the hub runs as root (the Docker sandbox,
-  whose commands run under `setpriv --reuid=<offline uid>`, §7.2), any uid, since the random token
-  (`secrets.token_hex(8)`) identifies the command's processes. terminate = SIGTERM to the group plus, on Linux,
-  SIGTERM to the token's processes outside it; kill = SIGKILL to the group plus, on Linux, the token sweep (it also
-  ends `setsid` escapes). A process that clears its environment (`env -i`, a daemon that rebuilds it) carries no
+  so `nohup timeout N cmd &` or `setsid cmd &` would otherwise leave an empty group while their processes run; so
+  does any daemon that keeps its environment (`tmux new -d`, a build tool's server): its command becomes a job, as
+  on Windows (its Job Object), and with no free job slot or in wrap-up it is killed with the rest (§7.1).
+  `alive()` scans only for such trees; the scan's list is kept per tree for `TOKEN_SCAN_SECONDS` (2 s), within
+  which only the processes it found are looked at again (`/proc/<pid>/stat` not a zombie and the environment still
+  holding the token, so a reused pid does not count, and an end is seen at once); a new scan comes when the list is
+  older or every process on it has ended (one may have started another first), and `alive_all` scans once for all
+  the trees it needs. An empty environment read of a live process that is no kernel thread is read again once
+  after 5 ms, all such processes of a scan together: a process in execve reads as empty until its new image's
+  environment is set up. `pids()` and `processes()` list the group's members plus the token's processes outside it
+  (a tree whose group is gone lists its token's processes), from a new scan at each call, also while the group
+  runs, and never kept: a kept list would miss a child started outside the group since. terminate() and kill()
+  drop the kept list and signal what a new scan finds, never a kept pid. The uid rule, shared by `token_pids` and
+  `sweep_token`: processes of the hub's own uid; when the hub runs as root, any uid, since the random token
+  (`secrets.token_hex(8)`) identifies the command's processes. Reading another uid's `/proc/<pid>/environ` must
+  pass the kernel's ptrace read check (proc(5)), which root with Docker's default capability set fails (no
+  `CAP_SYS_PTRACE`): in the Docker sandbox the commands of a session without network, which run under
+  `setpriv --reuid=<offline uid>` (§7.2), are unreadable, skipped by the scan and the sweep, and seen by their group
+  alone, as on macOS. terminate = SIGTERM to the group plus, on Linux, SIGTERM to the token's
+  processes outside it; kill = SIGKILL to the group plus, on Linux, the token sweep (it also ends `setsid`
+  escapes). A process that clears its environment (`env -i`, a daemon that rebuilds it) carries no
   token and still escapes; macOS has no /proc, so there the group alone decides. Names from `/proc/<pid>/comm`
   (Linux), else none ("processes").
 - After `release()` nothing is ever signalled again (idempotent); a tree dropped without it is released by a
@@ -2894,7 +2907,7 @@ def shown_log(log) -> str                                # a data_dir log with "
 |---|---|---|---|---|
 | `timeout` | its shell still runs when the call's wait ended | `[shell] max_timeout` | always | unless the goal is done |
 | `background` | `background=true` (AI agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
-| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`, on Linux also `nohup timeout N cmd &` and `setsid cmd &`, which leave the group but keep the token (§7 "Process layer"); with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
+| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`, on Linux also `nohup timeout N cmd &`, `setsid cmd &` and a daemon that keeps its environment, which leave the group but keep the token (§7 "Process layer"; not in the Docker sandbox's sessions without network, whose processes the hub cannot read); with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
 
 `wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
 
@@ -3116,9 +3129,11 @@ hand-over (its reminder time is renewed while busy), it holds `n_all_done` back 
 the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone meanwhile, and so does the team-asleep
 wake (§3 item 9, `Swarm.team_asleep`), however long the job runs. On Linux a process that left its command's
 process group but kept its environment is found by its token, so its command is a job as `cmd &` is (§7 "Process
-layer"). A process the hub does not track (`jobs` does not list it: on macOS one that left its command's process
-group, on Linux one that also cleared its environment, `env -i` or a daemon that rebuilds it) is no job: its end
-wakes nobody (system prompt rule 10, §6.3); item 9 is what wakes a team that sleeps waiting for one.
+layer"), except in the Docker sandbox's sessions without network, whose processes the hub cannot read. A process
+the hub does not track (`jobs` does not list it: on macOS, and in the Docker sandbox's sessions without network,
+one that left its command's process group, on Linux one that also cleared its environment, `env -i` or a daemon
+that rebuilds it) is no job: its end wakes nobody (system prompt rule 10, §6.3); item 9 is what wakes a team that
+sleeps waiting for one.
 
 **Git**: the caller's `shell` autocommit at every return, also when the command went on as a job (not for
 `killed`); the job's own commits under its owner when its shell exits with processes left, at its end and at the
