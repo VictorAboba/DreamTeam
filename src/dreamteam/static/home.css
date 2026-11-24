@@ -57,7 +57,8 @@ a.sc-title:hover { color: var(--accent); }
 .sc-meta b { color: var(--text); font: 600 12px var(--mono); }
 .sc-error { font: 11.5px/1.5 var(--mono); color: var(--err); white-space: pre-wrap; overflow-wrap: anywhere; }
 .sc-folder { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--faint); min-width: 0; }
-.sc-folder > .ic { color: var(--accent); }
+.sc-folder > .ic, .sc-where > .ic { color: var(--accent); }
+.sc-where { display: flex; align-items: center; gap: 7px; min-width: 0; }   /* the path and its badge */
 /* a path too long for the card loses its start, not its end (the end tells folders apart): rtl box, ltr text */
 .sc-folder code { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); direction: rtl; text-align: left; font-size: 11.5px; }
 .sc-folder .badge { flex: none; }
@@ -186,9 +187,21 @@ textarea.mono { font-family: var(--mono); font-size: 12px; }
 .ns-skills .sk-picker { display: flex; flex-direction: column; gap: 6px; max-height: 200px; overflow: auto; padding: 8px 10px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg); }
 .sk-roles { margin-top: 6px; display: flex; gap: 5px; flex-wrap: wrap; align-items: center; }
 .sk-add-more { margin-top: 8px; }
-/* the new-session dialog's "Files to work on": a folder path or a .zip, one under the other */
-.ns-files { display: flex; flex-direction: column; gap: 8px; font-size: 12px; color: var(--muted); }
-.ns-files > span:first-child { font-weight: 500; display: inline-flex; align-items: center; gap: 5px; }
+/* the new-session dialog's «Рабочая папка»: three choices, only the chosen one's fields shown */
+.ns-ws {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px 12px; margin: 0; display: flex;
+  flex-direction: column; gap: 8px; min-width: 0;
+}
+.ns-ws > legend {
+  padding: 0 6px; font-size: 12px; font-weight: 500; color: var(--muted); display: inline-flex; align-items: center;
+  gap: 5px;
+}
+.ns-ws-box {
+  display: flex; flex-direction: column; gap: 6px; margin-left: 24px; font-size: 12px; color: var(--muted);
+  min-width: 0;
+}
+.ns-ws-box[hidden] { display: none; }
+.ns-ws-box > label.field { margin-top: 2px; }
 .sc-copied > span { flex: none; }
 .session-card .sc-warn.link { background: none; border: none; padding: 0; cursor: pointer; text-align: left; }
 

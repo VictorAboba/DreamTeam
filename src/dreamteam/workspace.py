@@ -553,7 +553,7 @@ def looks_like_git_dir(folder: Path) -> bool:
 
 
 def repo_state(root: Path, git: str | None = None, exclude: tuple[str, ...] | list[str] = (), *,
-               offline: bool = False, line_endings: bool = False) -> dict[str, Any]:
+               offline: bool = False, line_endings: bool = False, optional_locks: bool = True) -> dict[str, Any]:
     """What an existing folder is to git, before it is adopted as a workspace or before a session starts in a
     folder it adopted (synchronous): {"toplevel": the root of the work tree that contains it (None: not in a
     repository), "git_dir": True when it is a repository database (a bare repository or a .git folder), "branch":
@@ -569,14 +569,17 @@ def repo_state(root: Path, git: str | None = None, exclude: tuple[str, ...] | li
     `line_endings`: when a tracked file looks changed, the status runs again with core.autocrlf=true, and the
     changes it no longer lists (CRLF in the file, LF in the repository) are "line_endings": a checkout made by Git
     for Windows, whose system config sets core.autocrlf=true, read by a git that does not read that config (the
-    Docker sandbox's)."""
+    Docker sandbox's).
+    `optional_locks` False: every git call runs with GIT_OPTIONAL_LOCKS=0, so a status never refreshes the stat data
+    of the repository's index (a write): the web UI's check of a folder (docs/SPEC.md §17.2) leaves it as it was."""
     state: dict[str, Any] = {"toplevel": None, "git_dir": False, "branch": None, "operation": None, "changes": [],
                              "line_endings": [], "error": None}
+    no_locks = {} if optional_locks else {"GIT_OPTIONAL_LOCKS": "0"}
 
     def run(*args: str, unfiltered: bool = False, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         # safe.directory=*: only reading here, and a repository created by another account must not look like none
         return run_git(root, *args, git=git, safe_directory="*", adopted=True, literal=False, unfiltered=unfiltered,
-                       offline=offline, env=env)
+                       offline=offline, env={**no_locks, **(env or {})} or None)
 
     probe = run("rev-parse", "--is-inside-git-dir", "--is-bare-repository", "--absolute-git-dir")
     if probe.returncode != 0:

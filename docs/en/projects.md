@@ -17,13 +17,18 @@ How to connect a session to your project:
    dreamteam --workspace ~/code/my-app "Cover the billing module with tests"
    ```
 
+   On the sessions page: "New session" → "Working folder" → "Directly in a project folder", then type the path or
+   pick the folder with "Browse…". Under the path the page says what will happen before you create the session
+   (see [Choosing the folder in the web interface](#choosing-the-folder-in-the-web-interface)).
+
    Or move a running one: in the terminal interface, run `/cd ~/code/my-app` and answer "Yes" to the question
-   "The folder is not empty: the agents will work with its files and commit to its current branch…".
+   "The folder is not empty: the agents will work with its files and commit to its current branch…"; on the web,
+   "Change folder…" on the session's card or on the board's "Files" tab does the same.
 3. The agents work right with the project files, and their commits (under the agents' names) show up in `git log`.
    While the session runs, don't edit the project files yourself: stop it (`/stop`), commit your changes and start it
    again.
-4. To disconnect the session from the project, run `/cd --default`: the project files and history stay where they
-   are, and the session goes back to its own folder.
+4. To disconnect the session from the project, run `/cd --default` (on the web: "Change folder…" → "Back to its
+   own folder"): the project files and history stay where they are, and the session goes back to its own folder.
 
 The `/cd` command in the terminal interface:
 
@@ -33,9 +38,10 @@ The `/cd` command in the terminal interface:
   is local). Before the move, the interface asks for confirmation;
 - `/cd --default` returns the session to its own folder.
 
-The same can be done with `/cd` in `dreamteam console`, the MCP tool `session_cd(session, path)` and
-`POST /api/sessions/<id>/workspace` (`{"path": "<absolute path>"}` or `{"default": true}`). You can create a new
-session in the right folder at once: `--workspace DIR` for `dreamteam`, `dreamteam -p` and `dreamteam serve --goal`,
+The same can be done with "Change folder…" in the web interface, `/cd` in `dreamteam console`, the MCP tool
+`session_cd(session, path)` and `POST /api/sessions/<id>/workspace` (`{"path": "<absolute path>"}` or
+`{"default": true}`). You can create a new session in the right folder at once: "Working folder" in the web
+interface's "New session" dialog, `--workspace DIR` for `dreamteam`, `dreamteam -p` and `dreamteam serve --goal`,
 `session_create(..., workspace=...)` in MCP, or the `workspace` key in `POST /api/sessions`.
 
 What happens depends on the target folder:
@@ -96,14 +102,13 @@ Safety rules for a folder that is not the session's own:
 
 Deleting a session never deletes a folder outside the session: it stays where it is, and the delete dialog,
 `dreamteam sessions rm` and `/delete` say so. If the folder is gone (it was deleted, a drive was disconnected), the
-session does not start and tells you what to do: bring the folder back or run `/cd` to another one (`/cd --default`
-to its own folder).
+session does not start and tells you what to do: bring the folder back, or choose another one with "Change
+folder…" on the web or `/cd` in the terminal (`/cd --default` to its own folder).
 `dreamteam console --session ID` works for this too: the console connects to a stopped session without a folder so
 that you can move it.
 On the home page, each session shows its folder with the label "own folder", "project folder" or "moved", and a
-warning if the folder is missing; on the session board, the path is shown on the "Files" tab. You can't change the
-folder from the web interface, only with the `/cd` command, through MCP or REST, but the "New session" dialog can
-fill a new session's folder with a copy of files ("More" → "Files to work on").
+warning with the "Change folder…" button if the folder is missing; on the session board, the path and the same
+button are on the "Files" tab.
 
 A session that worked in a folder outside the home on another computer arrives after an [import](transfer.md)
 without the files of that folder: only the path travels. When a folder with files exists at that path here, the
@@ -124,6 +129,45 @@ linked worktree's `.git` file or a link), and git must keep everything it writes
 such a session checks again that the root still allows it and that the folder still lies inside the root. A `/cd` of
 such a session to another folder makes it an ordinary session of yours: the checks of the root no longer apply.
 
+## Choosing the folder in the web interface
+
+The "New session" dialog has the "Working folder" block, with three choices:
+
+- **New session folder** (the default): the session starts with an empty folder of its own in the DreamTeam home.
+- **Copy of a folder or a zip**: the files are copied into the session's own folder, and the original is never
+  changed ([Working on a copy of files](#working-on-a-copy-of-files)). Give a folder path (or pick it with
+  "Browse…"), or upload a .zip from your browser.
+- **Directly in a project folder**: the agents work right in that folder: they change, create and delete its files
+  and commit to its current branch (a folder without git becomes a repository), under the rules above. A folder
+  that does not exist is created, and an empty one is used. Don't edit its files yourself while the session runs.
+
+Paths are those of the computer the hub runs on. Under the path the page checks the folder as you type and says
+what will happen: "The folder does not exist: it will be created…", "A folder with files: the agents will work with
+them and commit to its current branch "main"…", or why the folder can't be used (the same text the hub would
+answer, e.g. that the repository has uncommitted changes). The check only reads: it writes nothing into your
+folder. When you click the button before the check has answered, the page checks first and asks you to click
+again, so the session is created only in a folder whose fate you have seen; if the folder changes in between (files
+appear in a folder that was empty), the hub refuses and nothing is created. For a folder with files the page also
+asks you to confirm before it creates the session. With "Directly in a project folder", the skills of that folder's
+`.claude/skills` appear in the dialog's skills list too (`claude-project:` ones).
+
+"Browse…" opens a list of folders on the hub's computer: your home folder, the drives (or `/`), the parents of the
+folders your other sessions work in ("Recent folders"), and the roots of `[api] folders`. It shows folder names
+only, never files, marks a folder that is a git repository, that is empty, or that another session already works
+in, and greys out folders that can't be chosen (with the reason). "New folder…" adds a name to the shown path: the
+folder is created when the session starts working in it. Keys: arrows move, Enter opens a folder, Backspace goes
+up, Escape closes the list. A network path (`\\server\share`) is typed in the field: "Browse…" does not open those.
+
+In the [Docker sandbox](sandbox.md) the hub sees only what is mounted into its container: "Browse…" lists the
+folders inside the DreamTeam home and the roots of `[api] folders` with `in_place = true`, and the hub refuses any
+other folder for a session (a folder made inside the container would be lost with it). A copy there comes from a
+.zip you upload, or from a root of `[api] folders`.
+
+"Change folder…" (on a session's card, on the board's "Files" tab and in the warning about a missing folder) moves an
+existing session: choose another folder (with the same check and "Browse…") or "Back to its own folder". The dialog
+asks before the move, as `/cd` does; a running session stops for the move and then carries on. The legacy `main`
+session and sessions of an earlier version have no such button.
+
 ## Working on a copy of files
 
 When the agents should work with your files but must not change them, give a new session a copy. DreamTeam copies
@@ -141,8 +185,8 @@ Where to give the source:
 - `/copy-from DIR|ZIP` in the terminal interface: the next new session gets the copy, with or without a current
   session. `/copy-from` alone shows the choice, `/copy-from --none` clears it. A relative path and `~` are expanded
   from the terminal's current folder if the server is local;
-- in the web interface, the "New session" dialog: "More" → "Files to work on", either a folder path or a .zip
-  uploaded from the browser;
+- in the web interface, the "New session" dialog: "Working folder" → "Copy of a folder or a zip", either a folder
+  path (typed, or picked with "Browse…"; the page checks it as you type) or a .zip uploaded from the browser;
 - `session_create(..., copy_from=...)` in MCP, or `copy_from` in `POST /api/sessions`. A .zip from another computer
   goes to `POST /api/uploads?filename=<name>.zip` first (the file itself as the body, `Content-Type:
   application/zip`; the session card shows that name as "upload: <name>.zip"); the `upload` token of the answer
@@ -213,8 +257,9 @@ Limits and refusals:
   `/proc`, `/sys` or `/dev`. A source inside the target folder, or one that contains it,
   is refused too. All checks run before anything is copied, and a failed or cancelled copy leaves no session behind.
 - In the [Docker sandbox](sandbox.md) (and with `docker compose` or `docker run` of the image) the hub sees only the
-  DreamTeam home folder of your computer, which is never copied: upload the folder as a .zip in the "New session"
-  dialog. A path the container can't see gets an answer that says so.
+  DreamTeam home folder of your computer, which is never copied (and the roots of `[api] folders`, which can be):
+  upload the folder as a .zip in the "New session" dialog. A path the container can't see gets an answer that says
+  so, in the dialog right under the path.
 
 A large copy may take longer than the client waits:
 

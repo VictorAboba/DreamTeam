@@ -667,3 +667,101 @@ pre.skill-md { white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.55 v
   .msg { max-width: 92%; }
   .ev { flex-direction: column; gap: 0; }
 }
+/* folders (folders.js, both pages): a path field with «Обзор…», its check line, the folder browser above the modal */
+.fo-row { display: flex; gap: 6px; align-items: stretch; min-width: 0; }
+.fo-row > input { flex: 1; min-width: 0; }
+.fo-row > .btn { flex: none; }
+.fo-line { font-size: 12px; line-height: 1.45; color: var(--muted); overflow-wrap: anywhere; white-space: pre-wrap; }
+.fo-line.ok { color: var(--ok); }
+.fo-line.warn { color: var(--warn); }
+.fo-line.err { color: var(--err); }
+.fp-backdrop {
+  position: fixed; inset: 0; background: var(--backdrop); display: flex; align-items: flex-start;
+  justify-content: center; padding: 8vh 16px; z-index: 35; overflow-y: auto;
+}
+.modal.fp { width: min(820px, 100%); display: flex; flex-direction: column; gap: 10px; }
+.modal.fp:focus { outline: none; }
+.modal.fp .modal-head { margin-bottom: 0; }
+.fp-body { display: grid; grid-template-columns: 190px minmax(0, 1fr); gap: 12px; min-height: 0; }
+.fp-places, .fp-recent { display: flex; flex-direction: column; gap: 1px; }
+.fp-places { max-height: 52vh; overflow: auto; }
+.fp-place {
+  display: flex; align-items: center; gap: 7px; text-align: left; padding: 6px 9px;
+  border-radius: var(--radius-sm); background: none; border: none; color: var(--muted); font-size: 13px;
+  cursor: pointer; min-width: 0;
+}
+.fp-place > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fp-place:hover { background: var(--hover); color: var(--text); }
+.fp-place.active {
+  color: var(--text); background: var(--panel-2, var(--hover)); box-shadow: inset 2px 0 0 var(--accent-fill);
+}
+.fp-group {
+  margin: 8px 9px 2px; font: 600 11px var(--mono); color: var(--muted); text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.fp-recent + .fp-place { margin-top: 8px; }
+.fp-places-select { display: none; }
+.fp-main { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
+.fp-crumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 6px; font-size: 12.5px; min-width: 0; }
+.fp-trail { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 2px 4px; min-width: 0; }
+.fp-crumb { font-family: var(--mono); overflow-wrap: anywhere; text-align: left; }
+.fp-crumb[aria-current="page"] { color: var(--text); font-weight: 600; }
+.fp-sep { color: var(--faint); }
+.fp-up-ic { transform: rotate(180deg); }
+.fp-list {
+  list-style: none; margin: 0; padding: 4px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg); height: 44vh; min-height: 160px; overflow: auto;
+}
+.fp-entry {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: var(--radius-sm);
+  cursor: pointer; font-size: 13px; min-width: 0;
+}
+.fp-entry > .ic { color: var(--accent); flex: none; }
+.fp-entry:hover { background: var(--hover); }
+.fp-entry:focus { outline: none; }
+.fp-entry:focus-visible, .fp-entry[aria-selected="true"]:focus {
+  background: var(--accent-soft); box-shadow: inset 0 0 0 1px var(--accent-line);
+}
+.fp-entry.refused .fp-name { color: var(--muted); }
+.fp-entry.refused > .ic { opacity: .55; }
+.fp-entry.closed { cursor: default; }
+.fp-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.fp-marks {
+  display: inline-flex; gap: 4px; flex-wrap: wrap; margin-left: auto; flex: none; max-width: 60%;
+  justify-content: flex-end;
+}
+.fp-mark {
+  font: 11px var(--mono); color: var(--muted); padding: 0 6px; border-radius: 999px;
+  box-shadow: inset 0 0 0 1px var(--border); white-space: nowrap;
+}
+.fp-mark.warn { color: var(--warn); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 45%, transparent); }
+.fp-mark.accent { color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-line); }
+.fp-mark.muted { color: var(--muted); }
+.fp-status { font-size: 12px; color: var(--muted); min-height: 1.4em; overflow-wrap: anywhere; }
+.fp-foot { display: flex; flex-direction: column; gap: 6px; border-top: 1px solid var(--border); padding-top: 10px; }
+.fp-foot .modal-actions { margin-top: 4px; align-items: center; }
+.fp-foot .modal-actions .spacer { flex: 1; }
+.fp-path { font: 12px var(--mono); color: var(--muted); overflow-wrap: anywhere; }
+.fp-cannot { font-size: 12px; color: var(--warn); overflow-wrap: anywhere; }
+.fp-new { display: flex; flex-direction: column; gap: 4px; }
+.fp-new[hidden], .fp-cannot[hidden] { display: none; }   /* (an author's display wins over [hidden] otherwise) */
+.fp-new-error:empty { display: none; }
+/* the hints and the change dialog's radios: home.css has these rules for the sessions page, the board has none */
+.fp .field-hint, .cf-hint { font-weight: 400; font-size: 11px; color: var(--muted); }
+.cf-choices label.check { display: flex; align-items: center; gap: 9px; font-size: 13px; cursor: pointer; }
+.cf-choices label.check input { width: auto; margin: 0; }
+.cf-now { font-size: 13px; color: var(--muted); margin: 0 0 12px; overflow-wrap: anywhere; }
+.cf-choices { display: flex; flex-direction: column; gap: 8px; }
+.cf-other-row { margin-left: 24px; }
+#cf-check { margin-left: 24px; }
+.ws-cd, .sc-cd { font-size: 12px; white-space: nowrap; }
+#workspace-banner .link { color: inherit; text-decoration: underline; text-underline-offset: 2px; font-weight: 600; }
+@media (max-width: 640px) {
+  .fp-body { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr); flex: 1; }
+  .fp-places { display: none; }
+  .fp-places-select { display: block; width: 100%; }
+  .fp-backdrop { padding: 0; }
+  /* the whole screen, the list taking what the title, the places, the path and the foot leave */
+  .modal.fp { border-radius: 0; height: 100vh; height: 100dvh; padding: 14px 16px; }
+  .fp-list { flex: 1; height: auto; min-height: 120px; }
+}
