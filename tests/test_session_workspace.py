@@ -1959,3 +1959,762 @@ async def test_copy_from_outside_a_container_names_the_missing_path(tmp_path, mo
         await manager.create("C", copy_from=str(tmp_path / "missing"), start=False)
     assert err.value.status == 400 and "Docker" not in str(err.value)
     await manager.shutdown()
+
+
+# ---- the web UI's folder check and folder browser (docs/SPEC.md §17.2 "Choosing a folder from the web UI") ----------
+REFUSAL_KEYS = {"use", "path", "error", "status"}
+
+
+def _in_sandbox(monkeypatch) -> None:
+    """The hub runs in the image's container (docker compose / docker run: only DREAMTEAM_IMAGE says so)."""
+    monkeypatch.delenv("DREAMTEAM_HOST_SKILLS_DIR", raising=False)
+    monkeypatch.setenv("DREAMTEAM_IMAGE", "1")
+
+
+def _api_roots(manager: SessionManager, **roots: tuple[Path, bool]) -> None:
+    raw = st.read_raw(manager.home)
+    raw.setdefault("api", {})["folders"] = {name: {"path": str(path), "in_place": in_place}
+                                            for name, (path, in_place) in roots.items()}
+    st.write_raw(manager.home, raw)
+    later = time.time() + 5
+    os.utime(st.settings_path(manager.home), (later, later))
+
+
+def _mounted(monkeypatch, *paths: Path) -> None:
+    """os.path.ismount says yes for `paths` (the sandbox mounts the roots of [api] folders there)."""
+    real = os.path.ismount
+    keys = {os.path.normcase(str(p)) for p in paths}
+    monkeypatch.setattr(os.path, "ismount", lambda p: os.path.normcase(os.fspath(p)) in keys or real(p))
+
+
+async def test_check_folder_for_a_new_session_says_what_the_create_will_do(tmp_path):
+    manager = _manager(tmp_path)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    plain = _put(tmp_path / "plain" / "notes.txt", "x").parent
+    cases = [(tmp_path / "new" / "folder", "missing", "created"), (empty, "empty", "created"),
+             (plain, "files", "adopted")]
+    for folder, state, mode in cases:
+        answer = await manager.check_folder(str(folder))
+        assert answer["state"] == state and answer["mode"] == mode and answer["expect"] == mode, answer
+        assert answer["target"] == str(folder) and answer["path"] == str(folder)
+        assert answer["fresh"] is answer["back"] is answer["lost"] is answer["running"] is False
+        assert answer["mcp"] == [] and answer["api_folder"] is None and answer["branch"] is None
+    if HAS_GIT:
+        assert (await manager.check_folder(str(plain)))["git"] == "initialized"
+        project = _user_repo(tmp_path / "project", branch="feature")
+        answer = await manager.check_folder(f'"{project}"')   # one pair of quotes dropped ("Copy as path")
+        assert answer["mode"] == "adopted" and answer["git"] == "existing" and answer["branch"] == "feature"
+        assert answer["path"] == f'"{project}"' and answer["target"] == str(project)
+    # `target` is the path as given, never resolved: the UI sends it with the create
+    link = tmp_path / "link"
+    _link(link, empty)
+    answer = await manager.check_folder(str(link))
+    assert answer["target"] == str(link) and answer["state"] == "empty"
+    # a relative path: the web text; `~` is the hub user's home
+    answer = await manager.check_folder("work/project")
+    assert set(answer) == REFUSAL_KEYS and answer["status"] == 400
+    assert answer["error"].startswith("work/project is not a full path. Give the full path of a folder on the hub's")
+    answer = await manager.check_folder("~/dreamteam-check-x/y")
+    assert answer["target"] == os.path.expanduser("~/dreamteam-check-x/y") and answer["state"] == "missing"
+    assert not Path(answer["target"]).parent.exists()
+    # the call itself is wrong: raised
+    for kwargs, words in (({"use": "elsewhere", "path": str(empty)}, "'use' must be"),
+                          ({"path": str(empty), "default": True}, "'default' needs 'session'"),
+                          ({}, "Give 'path' or 'default'."), ({"path": "  "}, "Give 'path' or 'default'."),
+                          ({"path": 5}, "'path' must be a string")):
+        with pytest.raises(SessionError, match=words) as err:
+            await manager.check_folder(**kwargs)
+        assert err.value.status == 400
+    await manager.shutdown()
+
+
+async def test_a_refused_folder_is_the_answer_without_its_code_or_holder(tmp_path):
+    manager = _manager(tmp_path)
+    taken = tmp_path / "taken"
+    sid = (await manager.create("Holder", start=False, workspace=str(taken)))["id"]
+    for path, status, words in ((manager.home, 400, "DreamTeam home"), (taken, 409, sid),
+                                (taken / "inner", 409, "two sessions cannot share files"),
+                                (_put(tmp_path / "file.txt", "x"), 400, "is a file")):
+        answer = await manager.check_folder(str(path))
+        assert set(answer) == REFUSAL_KEYS and answer["use"] == "workspace" and answer["path"] == str(path)
+        assert answer["status"] == status and words in answer["error"], answer
+    # a create in progress there: the reservation, as the create would meet it
+    manager._creating_in.add((tmp_path / "busy").resolve())
+    answer = await manager.check_folder(str(tmp_path / "busy" / "x"))
+    assert answer["status"] == 409 and "being created" in answer["error"]
+    await manager.shutdown()
+
+
+async def test_check_folder_for_a_move_of_a_session(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    sid = (await manager.create("Mover", start=False))["id"]
+    swarm = await manager.load(sid)
+    _fake_forged(swarm, "calc")
+    await manager._unload(sid)
+    answer = await manager.check_folder(default=True, sid=sid)   # its own folder: nothing to do
+    assert answer["mode"] == "unchanged" and answer["state"] is None and answer["expect"] is None
+    assert answer["target"] == str(manager.default_workspace(sid)) and answer["mcp"] == []
+    answer = await manager.check_folder(str(tmp_path / "new"), sid=sid)
+    assert answer["mode"] == "moved" == answer["expect"] and answer["state"] == "missing"
+    assert answer["mcp"] == ["calc"] and answer["fresh"] is answer["lost"] is answer["back"] is False
+    manager.running.add(sid)   # (as a started session is listed)
+    try:
+        assert (await manager.check_folder(str(tmp_path / "new"), sid=sid))["running"] is True
+    finally:
+        manager.running.discard(sid)
+    # a project of the user: adopted, then the way back to its own folder, which still holds its files
+    project = _put(tmp_path / "project" / "a.txt", "a").parent
+    _put(manager.default_workspace(sid) / "notes.md", "n")
+    _set_global(manager, "workspace", git=False)
+    assert (await manager.set_workspace(sid, str(project)))["mode"] == "adopted"
+    answer = await manager.check_folder(default=True, sid=sid)
+    assert answer["mode"] == "adopted" and answer["state"] == "files" and answer["back"] is True
+    answer = await manager.check_folder(str(tmp_path / "fresh"), sid=sid)   # leaving the user's folder: afresh
+    assert answer["fresh"] is True and answer["lost"] is False and answer["git"] == "disabled"
+    # the current folder is gone: nothing moves
+    meta = manager.meta(sid)
+    meta["workspace"] = {"path": str(tmp_path / "gone"), "adopted": False}
+    manager._write_meta(sid, meta)
+    answer = await manager.check_folder(str(tmp_path / "fresh"), sid=sid)
+    assert answer["lost"] is True and answer["fresh"] is False
+    # a session that works in place in a server folder of the HTTP API v1: the move drops that
+    assert answer["api_folder"] is None
+    meta["api"] = {"folder": {"root": "jobs", "path": "acme", "mode": "in_place"}}
+    manager._write_meta(sid, meta)
+    answer = await manager.check_folder(str(tmp_path / "fresh"), sid=sid)
+    assert answer["api_folder"] == {"root": "jobs", "path": "acme"}
+    # an unfinished earlier move: its 409 is the answer
+    journal = manager._journal(sid)
+    journal.parent.mkdir(parents=True, exist_ok=True)
+    journal.write_text(json.dumps({"from": "a", "to": "b"}), encoding="utf-8")
+    answer = await manager.check_folder(str(tmp_path / "fresh"), sid=sid)
+    assert set(answer) == REFUSAL_KEYS and answer["status"] == 409 and "did not finish" in answer["error"]
+    journal.unlink()
+    # invalid settings of the session, an unknown session, `main`: the call fails
+    meta["overrides"] = {"swarm": {"max_agents": "many"}}
+    manager._write_meta(sid, meta)
+    with pytest.raises(SessionError, match="invalid settings") as err:
+        await manager.check_folder(str(tmp_path / "fresh"), sid=sid)
+    assert err.value.status == 400
+    with pytest.raises(SessionError) as err:
+        await manager.check_folder(str(tmp_path / "fresh"), sid="nope")
+    assert err.value.status == 404
+    with pytest.raises(SessionError, match="not both"):
+        await manager.check_folder(str(tmp_path / "fresh"), sid=sid, default=True)
+    await manager.shutdown()
+
+
+async def test_a_new_session_is_checked_with_the_homes_settings_and_no_servers(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    seen = []
+    real = manager._plan
+
+    def spy(sid, path, **kwargs):
+        seen.append((sid, path, kwargs))
+        return real(sid, path, **kwargs)
+
+    monkeypatch.setattr(manager, "_plan", spy)
+    _set_global(manager, "workspace", git=False)
+    answer = await manager.check_folder(str(tmp_path / "x"))
+    assert answer["git"] == "disabled"
+    assert seen == [(None, str(tmp_path / "x"), {"git_on": False, "mcp": None, "network_off": False, "dry": True})]
+    await manager.shutdown()
+
+
+@needs_git
+async def test_the_check_writes_nothing_in_the_folder_or_its_repository(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    project = _user_repo(tmp_path / "project")
+    readme = project / "README.md"
+    later = time.time() + 120   # touched: a plain `git status` would store its new stamp in the index
+    os.utime(readme, (later, later))
+    index = project / ".git" / "index"
+    before = (index.read_bytes(), index.stat().st_mtime_ns)
+    real_mkstemp = sessions_mod.tempfile.mkstemp
+    probes = []
+
+    def no_probe(*args, **kwargs):
+        probes.append(kwargs.get("dir"))
+        return real_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(sessions_mod.tempfile, "mkstemp", no_probe)
+    answer = await manager.check_folder(str(project))
+    assert answer["mode"] == "adopted" and answer["git"] == "existing", answer
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    await manager.check_folder(str(empty))
+    await manager.check_folder(str(tmp_path / "missing" / "deeper"))
+    assert probes == [] and not list(tmp_path.rglob(".dreamteam-probe-*"))
+    assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+    await manager.shutdown()
+
+
+@pytest.mark.skipif(sys.platform == "win32" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                    reason="os.access sees no folder as read-only on Windows, nor as root")
+async def test_a_folder_that_cannot_be_written_is_refused_by_the_check(tmp_path):
+    manager = _manager(tmp_path)
+    locked = tmp_path / "locked"
+    _put(locked / "a.txt", "a")
+    locked.chmod(0o555)
+    try:
+        answer = await manager.check_folder(str(locked))
+        assert answer["status"] == 400 and answer["error"] == (f"Cannot write to {locked}: permission denied. Choose a "
+                                                               "folder you can write to.")
+        answer = await manager.check_folder(str(locked / "new"))
+        assert answer["status"] == 400 and "Cannot write to" in answer["error"]
+    finally:
+        locked.chmod(0o755)
+    await manager.shutdown()
+
+
+async def test_a_folder_that_does_not_answer_holds_its_thread_not_the_hub(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    monkeypatch.setattr(sessions_mod, "FOLDER_TIMEOUT", 0.3)
+    monkeypatch.setattr(sessions_mod, "FOLDER_OPS_MAX", 2)
+    release = threading.Event()
+    calls = []
+    real = manager._plan
+
+    def stuck(sid, path, **kwargs):
+        calls.append(path)
+        if "share" in str(path):
+            release.wait(30)
+        return real(sid, path, **kwargs)
+
+    monkeypatch.setattr(manager, "_plan", stuck)
+    share = tmp_path / "share"
+    answer = await manager.check_folder(str(share / "a"))
+    assert answer["status"] == 504 and set(answer) == REFUSAL_KEYS
+    assert answer["error"] == (f"{share / 'a'} did not answer within 0.3 s (a network folder, or a drive that "
+                               "sleeps?). Try again, or choose another folder.")
+    assert manager._folder_ops == 1   # its place is held until the thread ends
+    started = time.monotonic()   # the same path and one inside it: at once, with no thread
+    assert (await manager.check_folder(str(share / "a")))["status"] == 504
+    assert (await manager.check_folder(str(share / "a" / "b")))["status"] == 504
+    assert time.monotonic() - started < 0.25 and len(calls) == 1
+    with pytest.raises(SessionError) as err:   # the listing waits for the same folder too
+        await manager.list_folders(str(share / "a"))
+    assert err.value.status == 504
+    assert (await manager.check_folder(str(tmp_path / "other")))["mode"] == "created"   # another folder works
+    assert (await manager.check_folder(str(share / "c")))["status"] == 504   # a second hung thread
+    assert manager._folder_ops == 2
+    with pytest.raises(SessionError) as err:   # every place is held by a folder that did not answer
+        await manager.check_folder(str(tmp_path / "third"))
+    assert err.value.status == 429 and err.value.args[0] == (
+        f"Folders that did not answer still hold the hub's folder checks ({share / 'a'}, {share / 'c'}): try again "
+        "when they answer, or restart the hub.")
+    release.set()
+    await until(lambda: manager._folder_ops == 0 and not manager._folders_hung, 10)
+    assert (await manager.check_folder(str(share / "a")))["mode"] == "created"
+    manager._folder_ops = 2   # two checks of others run now
+    with pytest.raises(SessionError) as err:
+        await manager.check_folder(str(tmp_path / "third"))
+    assert err.value.status == 429 and str(err.value) == "Too many folder checks at once; try again in a moment."
+    manager._folder_ops = 0
+    await manager.shutdown()
+
+
+async def test_check_folder_of_a_copy_source(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    src = _source(tmp_path / "src")
+    answer = await manager.check_folder(str(src), use="source")
+    assert answer == {"use": "source", "path": str(src), "target": str(src.resolve()), "state": "folder"}
+    archive = _put(tmp_path / "files.zip", b"PK\x05\x06" + b"\0" * 18)
+    assert (await manager.check_folder(f'"{archive}"', use="source"))["state"] == "zip"
+    answer = await manager.check_folder(str(tmp_path / "missing"), use="source")
+    assert set(answer) == REFUSAL_KEYS and answer["status"] == 400 and "Nothing to copy" in answer["error"]
+    answer = await manager.check_folder(str(manager.home), use="source")
+    assert answer["status"] == 400 and "DreamTeam's own files" in answer["error"]
+    for kwargs in ({"sid": "x"}, {"default": True}):
+        with pytest.raises(SessionError, match="are for use") as err:
+            await manager.check_folder(str(src), use="source", **kwargs)
+        assert err.value.status == 400
+    _in_sandbox(monkeypatch)
+    answer = await manager.check_folder(str(tmp_path / "missing"), use="source")
+    assert answer["status"] == 400 and ".zip" in answer["error"]
+    assert answer["error"].startswith("The hub runs in the Docker sandbox and sees only its home")
+    await manager.shutdown()
+
+
+async def test_create_with_expect_holds_the_mode_the_user_agreed_to(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    full = _put(tmp_path / "full" / "a.txt", "a").parent
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    src = _source(tmp_path / "src")
+    for kwargs, words in (({"expect": "created"}, "\"expect\" needs \"workspace\"."),
+                          ({"expect": "moved", "workspace": str(empty)}, "must be \"created\" or \"adopted\""),
+                          ({"expect": "adopted", "workspace": str(empty), "copy_from": str(src)},
+                           "cannot go with a copy")):
+        with pytest.raises(SessionError) as err:
+            await manager.create("E", start=False, **kwargs)
+        assert err.value.status == 400 and words in str(err.value), str(err.value)
+    with pytest.raises(SessionError) as err:
+        await manager.create("E", start=False, workspace=str(full), expect="created")
+    assert err.value.status == 409 and str(err.value) == (
+        f"The folder {full.resolve()} now holds files: the new session would work with them instead of starting afresh "
+        "there. Nothing was created; check the folder and try again.")
+    with pytest.raises(SessionError) as err:
+        await manager.create("E", start=False, workspace=str(empty), expect="adopted")
+    assert err.value.status == 409 and "is now empty or missing: the new session would start afresh" in str(err.value)
+    assert manager.ids() == []
+    # the second check, under the home's workspace claims: files appeared after the first two checks
+    real = manager._plan
+    checks = []
+
+    def files_appear(sid, path, **kwargs):
+        checks.append(sid)
+        if len(checks) == 3:   # the create's own, the first of the new session's, then this one
+            _put(Path(path) / "late.txt", "x")
+        return real(sid, path, **kwargs)
+
+    monkeypatch.setattr(manager, "_plan", files_appear)
+    with pytest.raises(SessionError) as err:
+        await manager.create("E", start=False, workspace=str(empty), expect="created")
+    assert len(checks) == 3 and checks[0] is None and checks[1] == checks[2] is not None
+    assert err.value.status == 409 and str(err.value) == (
+        f"The folder {empty.resolve()} now holds files: the new session would work with them instead of starting "
+        "afresh there. Nothing was created; check the folder and try again.")
+    assert manager.ids() == [] and _left_in_sessions(manager) == []
+    monkeypatch.setattr(manager, "_plan", real)
+    (empty / "late.txt").unlink()
+    made = await manager.create("E", start=False, workspace=str(full), expect="adopted")
+    assert made["workspace_result"]["mode"] == "adopted"
+    made = await manager.create("F", start=False, workspace=str(tmp_path / "new"), expect="created")
+    assert made["workspace_result"]["mode"] == "created"
+    await manager.shutdown()
+
+
+async def test_the_hub_in_the_container_keeps_sessions_in_what_is_mounted(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    sid = (await manager.create("Boxed", start=False))["id"]
+    _in_sandbox(monkeypatch)
+    outside = tmp_path / "outside" / "work"
+    with pytest.raises(SessionError) as err:
+        await manager.set_workspace(sid, str(outside))
+    home = manager.home
+    assert err.value.status == 400 and str(err.value) == (
+        f"The hub runs in the Docker sandbox and sees only its home ({home}) and the [api] folders roots that work in "
+        f"place: {outside.resolve()} is not there, and a folder made there would be lost with the container. Choose a "
+        f"folder inside {home}, e.g. {home}/projects/<name>. To work in a folder of your computer, mount it inside the "
+        "home (docker compose), or add it to [api] folders with in_place = true (which lets every HTTP API client work "
+        "in it too) and start the sandbox again (docker compose: also mount it as docker-compose.yml's comment "
+        "shows).")
+    assert not outside.exists()
+    with pytest.raises(SessionError, match="Docker sandbox"):   # the create too, before anything is made
+        await manager.create("Out", start=False, workspace=str(outside))
+    assert (await manager.check_folder(str(outside)))["error"] == str(err.value)
+    # inside the home, back to its own folder
+    assert (await manager.set_workspace(sid, str(home / "projects" / "p")))["mode"] == "moved"
+    assert (await manager.set_workspace(sid, None))["mode"] == "moved"
+    # the roots of [api] folders: an in_place one that is mounted, one that is not, a copy one
+    jobs, loose, copies = tmp_path / "jobs", tmp_path / "loose", tmp_path / "copies"
+    for root in (jobs, loose, copies):
+        root.mkdir()
+    _api_roots(manager, jobs=(jobs, True), loose=(loose, True), copies=(copies, False))
+    _mounted(monkeypatch, jobs, copies)
+    assert (await manager.check_folder(str(jobs / "acme")))["mode"] == "created"
+    for path in (loose / "acme", copies / "acme"):
+        answer = await manager.check_folder(str(path))
+        assert answer["status"] == 400 and "Docker sandbox" in answer["error"], answer
+    # a server folder of the HTTP API v1 (its own root checks): passes
+    plan = await asyncio.to_thread(manager._plan, None, str(loose / "acme"), git_on=False, within=loose.resolve())
+    assert plan.mode == "moved"
+    if sys.platform != "win32":   # a Windows path, read in the container: the same text, at the absolute-path check
+        with pytest.raises(SessionError) as err:
+            await manager.set_workspace(sid, "C:\\work\\app")
+        assert err.value.status == 400 and "C:\\work\\app is not there" in str(err.value)
+        answer = await manager.check_folder("C:\\work\\app")
+        assert answer["status"] == 400 and answer["error"].startswith("The hub runs in the Docker sandbox")
+    await manager.shutdown()
+
+
+# ---- the folder browser ------------------------------------------------------------------------------------------
+def _kinds(answer: dict) -> list[tuple[str, str]]:
+    return [(root["kind"], root["path"]) for root in answer["roots"]]
+
+
+def _names(answer: dict) -> list[str]:
+    return [entry["name"] for entry in answer["entries"]]
+
+
+def _entry(answer: dict, name: str) -> dict:
+    return next(entry for entry in answer["entries"] if entry["name"] == name)
+
+
+def _where(meta_path: Path, adopted: bool = True) -> dict:
+    return {"path": str(meta_path), "adopted": adopted}
+
+
+async def test_the_browsers_roots_on_the_host(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    monkeypatch.setattr(sessions_mod.folderlist, "logical_drives", lambda: ["C:", "D:"])
+    places = [tmp_path / "ext" / "a", tmp_path / "ext" / "b", Path.home() / "dreamteam-x", tmp_path / "other" / "c"]
+    if sys.platform == "win32":
+        places.append(Path("\\\\server\\share\\jobs\\x"))   # a network path: never a root
+    places.append(Path(os.path.abspath(os.sep)) / "dt-x")   # its parent is a drive or /: never a `recent` root
+    ids = [(await manager.create(f"S{i}", start=False))["id"] for i in range(len(places))]
+    for sid, place in zip(ids, places):
+        meta = manager.meta(sid)
+        meta["workspace"] = _where(place)
+        manager._write_meta(sid, meta)
+    jobs, copies = tmp_path / "jobs", tmp_path / "copies"
+    _api_roots(manager, jobs=(jobs, True), copies=(copies, False))
+    touched = []
+    real_stat, real_scandir, real_ismount = os.stat, os.scandir, os.path.ismount
+
+    def spy(real):
+        def call(path, *args, **kwargs):
+            touched.append(os.fspath(path) if not isinstance(path, int) else "")
+            return real(path, *args, **kwargs)
+        return call
+
+    monkeypatch.setattr(os, "stat", spy(real_stat))
+    monkeypatch.setattr(os, "scandir", spy(real_scandir))
+    monkeypatch.setattr(os.path, "ismount", spy(real_ismount))
+    answer = await manager.list_folders()
+    monkeypatch.setattr(os, "stat", real_stat)
+    monkeypatch.setattr(os, "scandir", real_scandir)
+    monkeypatch.setattr(os.path, "ismount", real_ismount)
+    home_key = os.path.normcase(str(manager.home))
+    assert [p for p in touched if p and not os.path.normcase(p).startswith(home_key)] == []   # only session.json
+    navigation = [("drive", "C:\\"), ("drive", "D:\\")] if os.name == "nt" else [("system", "/")]
+    assert _kinds(answer) == [("home", str(Path.home())), *navigation, ("recent", str(tmp_path / "other")),
+                              ("recent", str(tmp_path / "ext")), ("api", str(jobs))]
+    assert [r["selectable"] for r in answer["roots"]] == [False] * (1 + len(navigation)) + [True] * 3
+    assert answer["path"] is None and answer["entries"] == [] and answer["sep"] == os.sep
+    assert _kinds(await manager.list_folders(use="source"))[-2:] == [("api", str(copies)), ("api", str(jobs))]
+    await manager.shutdown()
+
+
+async def test_the_browsers_roots_in_the_container(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _in_sandbox(monkeypatch)
+    jobs, loose, copies = tmp_path / "jobs", tmp_path / "loose", tmp_path / "copies"
+    _api_roots(manager, jobs=(jobs, True), loose=(loose, True), copies=(copies, False))
+    _mounted(monkeypatch, jobs, copies)
+    assert _kinds(await manager.list_folders()) == [("dreamteam", str(manager.home)), ("api", str(jobs))]
+    assert _kinds(await manager.list_folders(use="source")) == [("api", str(copies)), ("api", str(jobs))]
+    # outside the places: refused by text alone, nothing touched
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: pytest.fail("resolved"))
+    with pytest.raises(SessionError) as err:
+        await manager.list_folders(str(tmp_path / "elsewhere"))
+    assert err.value.status == 403 and str(err.value) == (f"{tmp_path / 'elsewhere'} is outside the places this hub "
+                                                          "lets you browse.")
+    with pytest.raises(SessionError) as err:   # `..` folded by text
+        await manager.list_folders(str(jobs / ".." / "loose"))
+    assert err.value.status == 403
+    await manager.shutdown()
+
+
+def test_network_paths_by_their_text():
+    for text in ("\\\\server\\share\\x", "//server/share", "\\\\?\\C:\\x", "\\\\.\\pipe\\x", "\\\\server\\share"):
+        assert sessions_mod.folderlist.network_path(text, windows=True), text
+        assert not sessions_mod.folderlist.network_path(text, windows=False), text
+    for text in ("C:\\x", "Z:\\", "/home/me", "C:/x"):
+        assert not sessions_mod.folderlist.network_path(text, windows=True), text
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="network paths are Windows paths")
+async def test_a_network_path_is_refused_before_any_file_system_call(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    for name, owner in (("scandir", os), ("stat", os), ("lstat", os)):
+        monkeypatch.setattr(owner, name, lambda *a, **k: pytest.fail("touched"))
+    monkeypatch.setattr(Path, "resolve", lambda self, strict=False: pytest.fail("resolved"))
+    for path in ("\\\\attacker\\share\\x", "//attacker/share", "\\\\?\\UNC\\attacker\\share"):
+        with pytest.raises(SessionError) as err:
+            await manager.list_folders(path)
+        assert err.value.status == 403 and str(err.value) == (f"{path} is a network or device path: the folder browser "
+                                                              "does not open those. Type the folder's path in the "
+                                                              "field instead.")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="drive letters")
+async def test_windows_drives_and_a_mapped_drive(tmp_path, monkeypatch):
+    import ctypes
+
+    monkeypatch.setattr(ctypes.windll.kernel32, "GetLogicalDrives", lambda: 0b101)   # A: and C:
+    assert sessions_mod.folderlist.logical_drives() == ["A:", "C:"]
+    manager = _manager(tmp_path)
+    # a drive mapped to a share resolves to it, and so does every path on it: the root resolves alike
+    mapped = tmp_path / "mapped"
+    _put(mapped / "proj" / "a.txt", "a")
+    _api_roots(manager, z=(mapped, True))
+    unc = "\\\\?\\" + str(tmp_path / "mapped")   # (a local folder in a device path's spelling: nothing remote)
+    real = Path.resolve
+
+    def resolve(self, strict=False):
+        text = str(self)
+        if os.path.normcase(text).startswith(os.path.normcase(str(mapped))):
+            return Path(unc + text[len(str(mapped)):])
+        return real(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    answer = await manager.list_folders(str(mapped))
+    assert answer["path"] == str(mapped) and _names(answer) == ["proj"] and answer["root"] == str(mapped)
+    await manager.shutdown()
+
+
+async def test_the_listing_of_a_folder(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _in_sandbox(monkeypatch)   # the home is the one root: the listing stays in tmp_path
+    home = manager.home
+    work = home / "projects"
+    for name in ("beta", "Alpha", "alpine", ".hidden", "_under", "Zed"):
+        (work / name).mkdir(parents=True)
+    hidden = []
+    if sys.platform == "win32":   # the hidden attribute sorts a folder with the dot-folders
+        import ctypes
+
+        (work / "Shy").mkdir()
+        assert ctypes.windll.kernel32.SetFileAttributesW(str(work / "Shy"), 0x2)
+        hidden = ["Shy"]
+    (home / ".dreamteam").mkdir(exist_ok=True)
+    (home / "sessions").mkdir(exist_ok=True)
+    _put(work / "file.txt", "never listed")
+    _put(work / "Zed" / "x.txt", "x")
+    (work / "repo" / ".git").mkdir(parents=True)
+    answer = await manager.list_folders(str(work))
+    assert _names(answer) == ["_under", "Alpha", "alpine", "beta", "repo", "Zed", ".hidden", *hidden]
+    assert answer["path"] == str(work) and answer["parent"] == str(home) and answer["root"] == str(home)
+    assert answer["truncated"] is answer["partial"] is answer["fallback"] is False and answer["error"] is None
+    assert answer["selectable"] is True and answer["refused"] is None and answer["sep"] == os.sep
+    zed = _entry(answer, "Zed")
+    assert zed == {"name": "Zed", "path": str(work / "Zed"), "link": False, "open": True, "refused": None,
+                   "busy": None, "current": False, "repo": False, "files": True, "noaccess": False}
+    assert _entry(answer, "beta")["files"] is False and _entry(answer, "repo")["repo"] is True
+    # the caps: entries read (files too) and folders shown
+    monkeypatch.setattr(sessions_mod.folderlist, "FOLDER_LIST_MAX", 3)
+    answer = await manager.list_folders(str(work))
+    assert _names(answer) == ["_under", "Alpha", "alpine"] and answer["truncated"] is True
+    monkeypatch.setattr(sessions_mod.folderlist, "FOLDER_LIST_MAX", 500)
+    monkeypatch.setattr(sessions_mod.folderlist, "FOLDER_SCAN_MAX", 2)
+    answer = await manager.list_folders(str(work))
+    assert len(answer["entries"]) <= 2 and answer["truncated"] is True
+    monkeypatch.setattr(sessions_mod.folderlist, "FOLDER_SCAN_MAX", 10_000)
+    # a missing path lists its nearest existing ancestor; a file too
+    answer = await manager.list_folders(str(work / "new" / "deeper"))
+    assert answer["path"] == str(work) and answer["fallback"] is True
+    assert (await manager.list_folders(str(work / "file.txt")))["path"] == str(work)
+    # the home: its own data and the sessions are closed, the home itself is never selectable
+    answer = await manager.list_folders(str(home))
+    assert answer["selectable"] is False and "DreamTeam home" in answer["refused"] and answer["parent"] is None
+    for name in (".dreamteam", "sessions"):
+        assert _entry(answer, name)["open"] is False and _entry(answer, name)["refused"], name
+    with pytest.raises(SessionError) as err:
+        await manager.list_folders(str(home / ".dreamteam"))
+    assert err.value.status == 403 and "data folder" in str(err.value)
+    git_dir = await manager.list_folders(str(work / "repo"))
+    dot_git = _entry(git_dir, ".git")
+    assert dot_git["open"] is False and "repository's own database" in dot_git["refused"]
+    # a folder that cannot be read: its error, the breadcrumb still works
+    def unreadable(*folders):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(sessions_mod.folderlist, "scan", unreadable)
+    answer = await manager.list_folders(str(work))
+    assert answer["entries"] == [] and answer["error"] == f"Cannot read the folder {work}: Permission denied."
+    assert answer["parent"] == str(home)
+    with pytest.raises(SessionError) as err:
+        await manager.list_folders("relative/path")
+    assert err.value.status == 400 and str(err.value) == "'path' must be an absolute folder path."
+    with pytest.raises(SessionError) as err:
+        await manager.list_folders(str(work), use="nothing")
+    assert err.value.status == 400
+    await manager.shutdown()
+
+
+async def test_links_are_followed_only_into_the_places_shown(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _in_sandbox(monkeypatch)
+    home = manager.home
+    work = home / "projects"
+    (work / "real").mkdir(parents=True)
+    (tmp_path / "secret" / "inside").mkdir(parents=True)
+    _link(work / "inner", work / "real")
+    _link(work / "out", tmp_path / "secret")
+    answer = await manager.list_folders(str(work))
+    inner, out = _entry(answer, "inner"), _entry(answer, "out")
+    assert inner["link"] is True and inner["open"] is True and inner["path"] == str(work / "inner")
+    assert out["link"] is True and out["open"] is False and out["files"] is None
+    assert out["refused"] == f"out leads to {(tmp_path / 'secret').resolve()}, outside the places this hub shows."
+    followed = await manager.list_folders(str(work / "inner"))
+    assert followed["path"] == str(work / "inner") and followed["parent"] == str(work)   # the link's own path
+    with pytest.raises(SessionError) as err:
+        await manager.list_folders(str(work / "out"))
+    assert err.value.status == 403 and "outside the places this hub shows" in str(err.value)
+    await manager.shutdown()
+
+
+def _readlinks(monkeypatch, links: dict[str, str]) -> None:
+    """os.readlink reads `links` (path -> its target as Windows gives it); any other path is no link."""
+    def readlink(path, *args, **kwargs):
+        target = links.get(os.path.normcase(os.fspath(path)))
+        if target is None:
+            raise OSError(errno.EINVAL, "not a reparse point", None, 4390)   # ERROR_NOT_A_REPARSE_POINT
+        return target
+
+    monkeypatch.setattr(os, "readlink", readlink)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="network paths are Windows paths")
+def test_the_way_of_a_path_to_a_share_is_read_never_followed(tmp_path, monkeypatch):
+    network_target = sessions_mod.folderlist.network_target
+    links: dict[str, str] = {}
+    _readlinks(monkeypatch, links)
+    a, local = tmp_path / "a", tmp_path / "local"
+    assert network_target(str(a / "b" / "c")) is None and network_target("C:\\") is None
+    links[os.path.normcase(str(a))] = "\\\\?\\" + str(local)   # a junction's target in its device spelling: local
+    assert network_target(str(a / "b" / "c")) is None
+    links[os.path.normcase(str(local / "b"))] = "..\\..\\hop"   # a relative symlink on the way, to a link to a share
+    links[os.path.normcase(str(tmp_path.parent / "hop"))] = "\\\\?\\UNC\\attacker\\share"
+    assert network_target(str(a / "b" / "c")) == "\\\\attacker\\share\\c"
+    assert network_target(str(tmp_path.parent / "hop"), link=True) == "\\\\attacker\\share"
+    assert network_target(str(local), link=True) is None   # (no link)
+    links[os.path.normcase(str(tmp_path / "x"))] = str(tmp_path / "y")   # a loop: shut
+    links[os.path.normcase(str(tmp_path / "y"))] = str(tmp_path / "x")
+    assert network_target(str(tmp_path / "x" / "z")) is not None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="network paths are Windows paths")
+async def test_a_link_to_a_share_is_shut_and_never_followed(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _in_sandbox(monkeypatch)
+    work = manager.home / "projects"
+    (work / "decoy").mkdir(parents=True)
+    _link(work / "evil", work / "decoy")   # a junction, read below as leading to a share
+    _link(work / "plain", work / "decoy")   # one read as it is: `\\?\C:\...`, a local folder
+    share = "\\\\attacker\\share"
+    evil = os.path.normcase(str(work / "evil"))
+    real_readlink = os.readlink
+    monkeypatch.setattr(os, "readlink", lambda path, *a, **k: share if os.path.normcase(os.fspath(path)) == evil
+                        else real_readlink(path, *a, **k))
+    followed = []
+    real_resolve, real_peek, real_isdir = Path.resolve, sessions_mod.folderlist.peek, os.path.isdir
+
+    def watch(real):
+        def call(path, *args, **kwargs):
+            if os.path.normcase(os.fspath(path)).startswith(evil):
+                followed.append(os.fspath(path))
+            return real(path, *args, **kwargs)
+        return call
+
+    monkeypatch.setattr(Path, "resolve", watch(real_resolve))
+    monkeypatch.setattr(sessions_mod.folderlist, "peek", watch(real_peek))
+    monkeypatch.setattr(os.path, "isdir", watch(real_isdir))
+    answer = await manager.list_folders(str(work))
+    assert _entry(answer, "evil") == {
+        "name": "evil", "path": str(work / "evil"), "link": True, "open": False,
+        "refused": f"evil leads to {share}, outside the places this hub shows.", "busy": None, "current": False,
+        "repo": None, "files": None, "noaccess": False}
+    assert _entry(answer, "plain")["open"] is True and _entry(answer, "plain")["link"] is True
+    with pytest.raises(SessionError) as err:   # a typed path through it: refused before anything is followed
+        await manager.list_folders(str(work / "evil" / "sub"))
+    assert err.value.status == 403 and str(err.value) == (f"{work / 'evil' / 'sub'} leads to {share}\\sub, outside "
+                                                          "the places this hub shows.")
+    assert followed == []
+    await manager.shutdown()
+
+
+async def test_the_marks_per_use(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _in_sandbox(monkeypatch)
+    home = manager.home
+    work = home / "projects"
+    taken = work / "taken"
+    sid = (await manager.create("Holder", start=False, workspace=str(taken)))["id"]
+    mover = (await manager.create("Mover", start=False))["id"]
+    (work / "free").mkdir()
+    answer = await manager.list_folders(str(work), sid=mover)
+    assert _entry(answer, "taken")["busy"] == {"sid": sid, "title": "Holder"}
+    assert _entry(answer, "free")["busy"] is None and _entry(answer, "free")["current"] is False
+    listed = await manager.list_folders(str(taken), sid=mover)
+    assert listed["busy"] == {"sid": sid, "title": "Holder"} and listed["selectable"] is False
+    assert (await manager.list_folders(str(taken), sid=sid))["current"] is True
+    copies = tmp_path / "copies"
+    _put(copies / "acme" / "a.txt", "a")
+    _api_roots(manager, copies=(copies, False))
+    _mounted(monkeypatch, copies)
+    source = await manager.list_folders(str(copies), use="source")   # a read-only root: a valid source
+    assert _entry(source, "acme")["refused"] is None and (await manager.list_folders(
+        str(copies / "acme"), use="source"))["selectable"] is True
+    with pytest.raises(SessionError) as err:   # never a place for a session's folder
+        await manager.list_folders(str(copies), use="workspace")
+    assert err.value.status == 403
+    with pytest.raises(SessionError) as err:   # the home is no root of a source
+        await manager.list_folders(str(work), use="source")
+    assert err.value.status == 403
+    await manager.shutdown()
+
+
+async def test_the_marks_on_the_host_per_use(tmp_path):
+    manager = _manager(tmp_path)
+    taken = tmp_path / "ext" / "taken"
+    sid = (await manager.create("Holder", start=False, workspace=str(taken)))["id"]
+    answer = await manager.list_folders(str(tmp_path), use="source")
+    home = _entry(answer, "home")   # the DreamTeam home: never a source, nor anything in it
+    assert "DreamTeam home" in home["refused"] and home["open"] is False
+    workspace = await manager.list_folders(str(tmp_path))
+    assert _entry(workspace, "home")["open"] is True   # (a session may work in a folder of the home)
+    with pytest.raises(SessionError) as err:
+        await manager.list_folders(str(manager.home), use="source")
+    assert err.value.status == 403 and "DreamTeam's own files" in str(err.value)
+    # a busy folder: shown, and a valid source (copying another session's folder is allowed)
+    source = await manager.list_folders(str(tmp_path / "ext"), use="source")
+    assert _entry(source, "taken")["busy"] == {"sid": sid, "title": "Holder"}
+    assert (await manager.list_folders(str(taken), use="source"))["selectable"] is True
+    assert (await manager.list_folders(str(taken)))["selectable"] is False
+    await manager.shutdown()
+
+
+async def test_the_marks_stop_at_their_budget(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    _in_sandbox(monkeypatch)
+    work = manager.home / "projects"
+    for i in range(8):
+        _put(work / f"f{i}" / "a.txt", "a")
+    real_peek = sessions_mod.folderlist.peek
+
+    def slow_peek(folder):
+        time.sleep(0.05)
+        return real_peek(folder)
+
+    monkeypatch.setattr(sessions_mod.folderlist, "peek", slow_peek)
+    monkeypatch.setattr(sessions_mod.folderlist, "FOLDER_MARKS_BUDGET", 0.12)
+    answer = await manager.list_folders(str(work))
+    assert answer["partial"] is True and len(answer["entries"]) == 8
+    marked = [e for e in answer["entries"] if e["files"] is not None]
+    rest = [e for e in answer["entries"] if e["files"] is None]
+    assert marked and rest and all(e["open"] is True and e["refused"] is None and e["repo"] is None for e in rest)
+    await manager.shutdown()
+
+
+async def test_the_macos_private_folders_are_never_peeked(tmp_path, monkeypatch):
+    manager = _manager(tmp_path)
+    user = tmp_path / "user"
+    for name in ("Desktop", "Documents", "code"):
+        _put(user / name / "a.txt", "a")
+    touched = []
+
+    def spy(real):
+        def call(path, *args, **kwargs):
+            touched.append(os.path.normcase(os.fspath(path)) if not isinstance(path, int) else "")
+            return real(path, *args, **kwargs)
+        return call
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: user))
+    for name in ("stat", "lstat", "scandir", "readlink"):
+        monkeypatch.setattr(os, name, spy(getattr(os, name)))
+    monkeypatch.setattr(sessions_mod.folderlist.sys, "platform", "darwin")
+    try:
+        answer = await manager.list_folders(str(user))
+    finally:
+        monkeypatch.undo()
+    for name in ("Desktop", "Documents"):
+        private = os.path.normcase(str(user / name))
+        assert [p for p in touched if p == private or p.startswith(private + os.sep)] == [], name
+        entry = _entry(answer, name)
+        assert entry["files"] is entry["repo"] is entry["refused"] is None and entry["open"] is True, entry
+    assert _entry(answer, "code")["files"] is True and _entry(answer, "code")["refused"] is None
+    await manager.shutdown()

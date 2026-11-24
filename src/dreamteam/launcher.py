@@ -31,7 +31,7 @@ from .copyfrom import API_UPLOAD_PATH, UPLOAD_PATH, UPLOAD_TTL, CopyError, CopyL
 from .httpjson import JSONResponse, json_text
 from .launcher_mcp import LauncherMCPEndpoint
 from .models import AUTO_REPLY_HEADER
-from .sessions import SessionError
+from .sessions import SessionError, network_path
 from .settings import PROVIDER_CHOICES, check_profile, profile_from_view, settings_path
 from .skill_deps import EnvManager
 from .skills import SkillError
@@ -356,6 +356,8 @@ def _workspace_query(request: Request) -> Path | None:
     value = (request.query_params.get("workspace") or "").strip()
     if not value:
         return None
+    if network_path(value):   # by its text, before anything reads it (docs/SPEC.md §17.2): no SMB to any host
+        raise SkillError("'workspace' must be a folder of this computer, not a network path.")
     if not Path(value).is_absolute():
         raise SkillError("'workspace' must be an absolute folder path.")
     return Path(value)
@@ -424,7 +426,7 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
             return JSONResponse({"sessions": manager.list()})
         body = await _json_body(request)
         problem = _body_error(body, strings=("title", "goal", "description", "workspace", "via", "copy_from",
-                                             "copy_from_upload"),
+                                             "copy_from_upload", "expect"),
                               objects=("overrides",), flags=("start",), lists=("skills",))
         if problem:
             return JSONResponse({"error": problem}, status_code=400)
@@ -436,7 +438,8 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
                                            workspace=body.get("workspace") or None, skills=body.get("skills") or None,
                                            via=_via(body.get("via")), auto_reply=_auto_reply(request),
                                            copy_from=body.get("copy_from") or None,
-                                           copy_from_upload=body.get("copy_from_upload") or None)
+                                           copy_from_upload=body.get("copy_from_upload") or None,
+                                           expect=body.get("expect") or None)
         except (SessionError, ValueError) as exc:
             return _error(exc)
         except Exception as exc:  # e.g. the swarm failed to start: show it in the UI
@@ -517,6 +520,27 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
             return _error(exc)
         except Exception as exc:
             return _failure(f"session {sid} workspace", exc)
+
+    async def folders(request: Request):
+        """POST /api/folders/check and /api/folders/list (docs/SPEC.md §17.2 "Choosing a folder from the web UI"): JSON
+        POSTs only, never GETs, so no page of another site can make the hub touch a path."""
+        body = await _json_body(request)
+        check = request.url.path.endswith("/check")
+        problem = _body_error(body, strings=("path", "use", "session"), flags=("default",) if check else ())
+        if problem:
+            return JSONResponse({"error": problem}, status_code=400)
+        use = "workspace" if body.get("use") is None else body["use"]
+        try:
+            if check:
+                answer = await manager.check_folder(body.get("path"), use=use, sid=body.get("session") or None,
+                                                    default=body.get("default") is True)
+            else:
+                answer = await manager.list_folders(body.get("path"), use=use, sid=body.get("session") or None)
+        except (SessionError, ValueError) as exc:
+            return _error(exc)
+        except Exception as exc:
+            return _failure("folder check" if check else "folder listing", exc)
+        return JSONResponse(answer)
 
     async def session_action(request: Request):
         sid, action = request.path_params["sid"], request.path_params["action"]
@@ -672,6 +696,8 @@ def create_launcher_app(manager: "SessionManager", host: str = "127.0.0.1") -> G
         Route("/api/sessions/{sid}/skills", session_skills),
         Route("/api/sessions/{sid}/skills/{name}/decide", session_skill_decide, methods=["POST"]),
         Route("/api/sessions/{sid}/{action}", session_action, methods=["POST"]),
+        Route("/api/folders/check", folders, methods=["POST"]),
+        Route("/api/folders/list", folders, methods=["POST"]),
         *skill_routes(manager.global_config, _workspace_query, via="home",
                       changed=lambda: manager._changed(None, "skills")),
         Route("/api/skill-envs/cleanup", skill_envs_cleanup, methods=["POST"]),

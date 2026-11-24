@@ -5221,16 +5221,19 @@ imported by sessions.py alone); the manager's methods below hold the rules.
   exists. A JSON POST needs a CORS preflight that the hub never answers, so only the hub's own pages and local
   programs (which can do all of this anyway) send one.
 - **Network paths by their text** (`folderlist.network_path(text)`: on Windows a path whose
-  `PureWindowsPath(text).drive` starts with `\\` or `//`: `\\server\share\x`, `//server/share`, `\\?\...`,
-  `\\.\...`; never on POSIX): the listing refuses one before any file system call (403 "<path> is a network or
-  device path: the folder browser does not open those. Type the folder's path in the field instead."), leaves out
-  a root of that shape (a `recent` parent or an api root on a share) and never follows a link there (a link out of
-  the roots is shut anyway, below). The check runs them: a project on a share is a valid folder, and the check's
-  POST comes from the hub's own page. The existing `GET /api/skills?workspace=` (launcher `_workspace_query`, a GET
-  that reads `<folder>/.claude/skills`) had the same hole and refuses such a path by its text too: 400
-  "'workspace' must be a folder of this computer, not a network path." (so the new-session dialog offers no
-  `claude-project` rows for a project on a share). A drive letter mapped to a share (`Z:`) is the user's own
-  mapping and is opened like any drive.
+  `PureWindowsPath(text).drive` starts with `\\` or `//`: `\\server\share\x`, `//server/share`, `\\?\...`, `\\.\...`;
+  never on POSIX): the listing refuses one before any file system call (403 "<path> is a network or device path: the
+  folder browser does not open those. Type the folder's path in the field instead."), leaves out a root of that shape (a
+  `recent` parent or an api root on a share) and never follows a link there: on Windows (`folderlist.network_target`)
+  each link on the way of the listed path, of a root before it is resolved and of a link entry is read with
+  `os.readlink` (the link itself, never its target; a junction's `\\?\` spelling of a local path is local), at most
+  `LINK_HOPS_MAX` (32) links per path, and a way that reaches a network or device path (or a longer chain) is shut
+  before any `stat`, `resolve` or `scandir` follows it (the listed path 403 "<path> leads to <target>, outside the
+  places this hub shows.", an entry below). The check runs them: a project on a share is a valid folder, and the check's
+  POST comes from the hub's own page. The existing `GET /api/skills?workspace=` (launcher `_workspace_query`, a GET that
+  reads `<folder>/.claude/skills`) had the same hole and refuses such a path by its text too: 400 "'workspace' must be a
+  folder of this computer, not a network path." (so the new-session dialog offers no `claude-project` rows for a project
+  on a share). A drive letter mapped to a share (`Z:`) is the user's own mapping and is opened like any drive.
 - **`async check_folder(path=None, *, use="workspace", sid=None, default=False)`** → a dict. It never raises for a
   refusal of the folder (that is its answer); it raises SessionError for the call itself.
   - `use` `"workspace"`: `sid` None checks a new session's `workspace` (`default` then 400 "'default' needs
@@ -5270,13 +5273,12 @@ imported by sessions.py alone); the manager's methods below hold the rules.
     mark is its own). The UI shows `error` verbatim (the texts already say what to do, e.g. "Commit or stash them
     first").
   - `use` `"source"` (a copy into the session's own folder): `copyfrom.resolve_source(path, home=, config=,
-    sandbox=hub_in_container(config))` (it unquotes and expands `~` itself); `sid` or `default` there is 400
-    "'session' and 'default' are for use \"workspace\".". Answer `{"use": "source", "path", "target":
-    str(source.path), "state": "folder" | "zip"}`; a CopyError is the refusal above (in the sandbox a missing or
-    Windows-shaped path gets its text: "The hub runs in the Docker sandbox and sees only its home (<home>): X is not
-    there. Upload the folder as a .zip in the New session dialog of the sessions page instead."). No pre-scan:
-    counting a large folder takes as long as the create's own pre-scan, which refuses it (413) before a byte is
-    copied.
+    sandbox=hub_in_container(config))` (it unquotes and expands `~` itself); `sid` or `default` there is 400 "'session'
+    and 'default' are for use \"workspace\".", no `path` (or an empty one) 400 "Give 'path'.". Answer `{"use": "source",
+    "path", "target": str(source.path), "state": "folder" | "zip"}`; a CopyError is the refusal above (in the sandbox a
+    missing or Windows-shaped path gets its text: "The hub runs in the Docker sandbox and sees only its home (<home>): X
+    is not there. Upload the folder as a .zip in the New session dialog of the sessions page instead."). No pre-scan:
+    counting a large folder takes as long as the create's own pre-scan, which refuses it (413) before a byte is copied.
   - `use` anything else: 400 "'use' must be \"workspace\" or \"source\".".
   - **No side effects** (`dry=True`): `_check_writable` (the probe file) becomes `_can_write(folder, shown)`,
     `os.access(folder, os.W_OK | os.X_OK)` with the same text ("Cannot write to <shown>: permission denied. Choose
@@ -5303,8 +5305,9 @@ imported by sessions.py alone); the manager's methods below hold the rules.
 - **`async list_folders(path=None, *, use="workspace", sid=None)`** → one folder's subfolders for the browser.
   Folder names only: never a file's name, never a content.
   - **Roots** (`folder_roots(use, sid)`, computed per call from text alone, so a disconnected share among them never
-    slows a listing; each `{"path", "kind", "name", "selectable"}`, `selectable` by kind; whether a root exists and
-    its own marks are learnt when it is opened):
+    slows a listing; each `{"path", "kind", "name", "selectable"}`, `selectable` by kind; whether a root exists and its
+    own marks are learnt when it is opened; `name`: the last part of the path for `home` and `recent`, the home folder's
+    name for `dreamteam`, the letter for a `drive` ("C:", path "C:\"), "/" for `system`, the root's name for `api`):
     - on the host: `home` (`Path.home()`; not selectable: the home itself is refused, the folders in it are not); the
       navigation roots, never selectable (a drive or file system root): on Windows one `drive` per letter of
       `GetLogicalDrives()` (ctypes: a bitmask, so no drive is touched and an empty card reader or a sleeping network
@@ -5321,19 +5324,21 @@ imported by sessions.py alone); the manager's methods below hold the rules.
       for "source" every mounted api root (a `copy` root is mounted read-only, which a copy needs) and no `dreamteam`
       root (the home is never a copy source, `resolve_source`). No drive, `/`, `home` or `recent` root there.
     - `use` "source" on the host: the roots of "workspace", with every api root.
-  - **The folder**, in this order: `path` absent answers the roots alone (`"path": null`, `"entries": []`). Else,
-    by text: not a string, empty or not absolute (after `copyfrom.unquote`; no `~` here) 400 "'path' must be an
-    absolute folder path."; a network path 403 (above); `os.path.abspath` (`..` folded by text) must lie inside a
-    root by text (`folderlist.inside_text`: `os.path.normcase` and `commonpath`, no file system call), else 403
-    "<path> is outside the places this hub lets you browse.". Then, in the thread: the path and that root are
-    resolved, and the resolved path must lie inside the resolved root or inside another root resolved alike
-    (`treecopy.is_within`), else 403 "<path> leads to <real>, outside the places this hub shows."; a mapped drive
-    (`Z:\` resolves to `\\server\share\`, and so does every path on it) still compares, since its root is resolved
-    the same way. A closed folder is 403 with its refusal; a path that is missing or a file lists its nearest
-    existing ancestor inside the same root, with `"fallback": true` (a typed new folder opens at its parent). A
-    folder that cannot be read (`os.scandir` raises: no permission, an empty card reader "device not ready", an I/O
-    error), the root itself missing included, is 200 with `"entries": []` and `"error"` "Cannot read the folder
-    <path>: <strerror>." (the status line shows it; the breadcrumb and Up still work).
+    - The roots are built in a daemon thread (`procs.daemon_call`, never the default executor git uses).
+  - **The folder**, in this order: `path` absent answers the roots alone (`"path": null`, `"entries": []`). Else, by
+    text: not a string, empty or not absolute (after `copyfrom.unquote`; no `~` here) 400 "'path' must be an absolute
+    folder path."; a network path 403 (above); `os.path.abspath` (`..` folded by text) must lie inside a root by text
+    (`folderlist.inside_text`: `os.path.normcase` and `commonpath`, no file system call), else 403 "<path> is outside
+    the places this hub lets you browse.". Then, in the thread: the path and that root are resolved, and the resolved
+    path must lie inside the resolved root or inside another root resolved alike (`treecopy.is_within`; the roots that
+    hold it by text first, the others only when none of those does), else 403 "<path> leads to <real>, outside the
+    places this hub shows."; a mapped drive (`Z:\` resolves to `\\server\share\`, and so does every path on it) still
+    compares, since its root is resolved the same way. A closed folder is 403 with its refusal; a path that is missing
+    or a file lists its nearest existing ancestor inside the same root, with `"fallback": true` (a typed new folder
+    opens at its parent). The resolved folder is the one scanned, its entries' paths joined to the listed text. A folder
+    that cannot be read (`os.scandir` raises: no permission, an empty card reader "device not ready", an I/O error), the
+    root itself missing included, is 200 with `"entries": []` and `"error"` "Cannot read the folder <path>: <strerror>."
+    (the status line shows it; the breadcrumb and Up still work).
   - **Entries**: `os.scandir` of the folder, at most `FOLDER_SCAN_MAX` (10 000) entries read, files included (a
     folder of a million files never stalls a listing); kept: folders and links to folders (`is_dir()` follows the
     link; a link to a file and a broken one are left out); sorted with names starting with `.` and, on Windows,
@@ -5341,19 +5346,22 @@ imported by sessions.py alone); the manager's methods below hold the rules.
     after the others, each group by `name.casefold()`, then the name; at most `FOLDER_LIST_MAX` (500) after the
     sort; `truncated` true when either cap cut. Each entry `{"name", "path", "link", "open", "refused", "busy",
     "current", "repo", "files", "noaccess"}`:
-    - `link`: `workspace.is_link` (a symlink or a junction; a cloud placeholder is an ordinary folder); followed
-      only when its resolved target lies inside a root of this listing, else `open` false and `refused` "<name>
-      leads to <target>, outside the places this hub shows." (in the sandbox a link in the home to /etc stays shut);
-      `path` is the entry's own path, never its target, and so is the answer's `path` once it is opened (the
-      breadcrumb never jumps to where a link leads);
-    - `refused`: the static reason the folder cannot be chosen, by `use`: for "workspace" `_target_refusal(entry,
-      sid)` and `_container_refusal`; for "source" `copyfrom.source_refusal(entry, home=, config=)` (the location
-      rules of `resolve_source` without its existence and kind checks, extracted from it: a drive or file system
-      root, the user's home or a folder containing it, inside or containing the DreamTeam home or one of DreamTeam's
-      own folders, another DreamTeam home, /proc, /sys, /dev; no `_container_refusal`: a read-only `copy` root is a
-      valid source). One context per listing: the homes, libraries, environments and tokens folders resolved once,
-      `_other_home` asked of the entry alone (the listed folder's ancestors were checked with it). Else null; the
-      full check of the chosen folder still decides (git state, writability, a file in place);
+    - `link`: `workspace.is_link` (a symlink or a junction; a cloud placeholder is an ordinary folder); followed only
+      when its resolved target lies inside a root of this listing, else `open` false and `refused` "<name> leads to
+      <target>, outside the places this hub shows." (in the sandbox a link in the home to /etc stays shut); a link whose
+      way reaches a network path (above) is that shut entry with no file system call through it (kept when the link
+      itself is a directory link or a junction, its own attributes; never resolved, peeked or tested); `path` is the
+      entry's own path, never its target, and so is the answer's `path` once it is opened (the breadcrumb never jumps to
+      where a link leads);
+    - `refused`: the static reason the folder cannot be chosen, by `use`: for "workspace" `_target_refusal(entry, sid)`
+      and `_container_refusal`; for "source" `copyfrom.source_refusal(entry, home=, config=)` (the location rules of
+      `resolve_source` without its existence and kind checks, extracted from it: a drive or file system root, the user's
+      home or a folder containing it, inside or containing the DreamTeam home or one of DreamTeam's own folders, another
+      DreamTeam home, /proc, /sys, /dev; no `_container_refusal`: a read-only `copy` root is a valid source). One
+      context per listing: the homes, libraries, environments and tokens folders (and in the container the mounted
+      places of `_container_refusal`) resolved once, `_other_home` asked of the entry alone (the listed folder's
+      ancestors were checked with it). Else null; the full check of the chosen folder still decides (git state,
+      writability, a file in place);
     - `open`: false for a closed folder, one whose every descendant is refused too by the same `use`'s rules (for
       "workspace" `_target_refusal` refuses `<entry>/x`: a `.git`, `<home>/.dreamteam`, `<home>/sessions`, the
       tokens folder, the libraries, the skill environments, another DreamTeam home, /proc, /sys, /dev; for "source"
@@ -5371,15 +5379,17 @@ imported by sessions.py alone); the manager's methods below hold the rules.
       `_other_home`'s stats), which on a slow share can outlast `FOLDER_TIMEOUT` for 500 entries; so they stop after
       `FOLDER_MARKS_BUDGET` (5 s) of the listing, and the remaining entries get `refused`, `repo` and `files` null,
       `open` true and the answer `"partial": true` (the full check of a chosen folder still decides). On macOS the
-      entries `Desktop`, `Documents`, `Downloads`, `Pictures`, `Movies`, `Music` and `Library` of the user's home
-      get no peek and no `.git` test (`repo`, `files` null): each would pop a privacy (TCC) prompt for the hub's
-      terminal app at every listing of the home; opening one is the user's own act, and macOS may then ask once.
+      entries `Desktop`, `Documents`, `Downloads`, `Pictures`, `Movies`, `Music` and `Library` of the user's home get no
+      look inside at all (no peek, no `.git` test, no refusal checks, which stat names inside them): the marks past the
+      budget (`refused`, `repo`, `files` null, `open` true; `busy` and `current` by text): each look would pop a privacy
+      (TCC) prompt for the hub's terminal app at every listing of the home; opening one is the user's own act, and macOS
+      may then ask once.
   - Answer: `{"path" (the folder listed, in its text form: the given path normalized, or the `fallback` ancestor),
-    "parent" (null at a root), "root" (the innermost root it lies in, by text), "roots", "entries", "truncated",
-    "partial", "fallback", "error" (null, or the text of a folder that cannot be read), "refused", "selectable" (not
-    refused, not the home or a navigation root, for "workspace" not busy), "busy", "current", "sep" (`os.sep`: the
-    browser joins a new folder's name with it)}`, the listed folder's own marks computed as an entry's. The same
-    daemon thread, `FOLDER_TIMEOUT` (504 "<path> did not answer within 20 s ...") and slots as the check.
+    "parent" (null at a root), "root" (the path of the innermost root it lies in, by text), "roots", "entries",
+    "truncated", "partial", "fallback", "error" (null, or the text of a folder that cannot be read), "refused",
+    "selectable" (not refused, not the home or a navigation root, for "workspace" not busy), "busy", "current", "sep"
+    (`os.sep`: the browser joins a new folder's name with it)}`, the listed folder's own marks computed as an entry's.
+    The same daemon thread, `FOLDER_TIMEOUT` (504 "<path> did not answer within 20 s ...") and slots as the check.
 - **Who reaches them**: the launcher's hub-token holders only, who can already point a session at any folder these
   rules allow and whose agents run commands with the hub user's rights; the listing shows them folder names under
   the same refusals. Never on a session app (`/s/{sid}/api/folders/list` is that app's 404), never under `/api/v1`
@@ -7943,12 +7953,12 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     this code.
   - `CopyError` and `SessionError` carry a `code` where v1 maps them (`bad_name`, `file_conflict`, `folder_busy`,
     `folder_not_ready`, `too_many_uploads`, ...). The internal REST answers do not show it. `api_v1.error_code` takes
-    that code when v1 knows it, `earlier_version` for such a session, else the error's `status` (400 `bad_request`,
-    404 `not_found`, 409 `conflict`, 413 `too_large`, 500 `internal`; another 4xx `bad_request`, anything else
-    `internal`); the code decides the answer's status (`api_v1.CODES`). So every 429 a v1 route can meet names its
-    code (`too_many_uploads`, `too_many_sessions`; a test reads the raises of sessions.py, copyfrom.py and skills.py),
-    or it would read `bad_request`. An `internal` error is logged with its traceback, except the 503 of a hub
-    shutting down, logged as information.
+    that code when v1 knows it, `earlier_version` for such a session, else the error's `status` (400 `bad_request`, 404
+    `not_found`, 409 `conflict`, 413 `too_large`, 500 `internal`; another 4xx `bad_request`, anything else `internal`);
+    the code decides the answer's status (`api_v1.CODES`). So every 429 a v1 route can meet names its code
+    (`too_many_uploads`, `too_many_sessions`; a test reads the raises of sessions.py, copyfrom.py and skills.py, the web
+    UI's folder threads `_folder_call` left out: no v1 route reaches them), or it would read `bad_request`. An
+    `internal` error is logged with its traceback, except the 503 of a hub shutting down, logged as information.
   - **Paths in answers.** For an API-token caller, an error text that would name a path of the hub's computer is
     rewritten (`SessionError` and `CopyError` texts name the home, the user's home and folders): a server folder as
     `<root>/<path>` (21.10; below the root, the hub's own separator: the text is for people), the home and, with the
