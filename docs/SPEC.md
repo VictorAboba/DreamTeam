@@ -6367,7 +6367,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     marks; the full check runs on the chosen folder, in its field. The copy field's browser lists folders only: a
     .zip on the hub's computer is typed (its check says `fo_src_zip`).
     Keyboard, while the focus is in the list or the breadcrumb: ↑ / ↓ move between the entries, Home / End to the
-    first / the last, Enter or Space opens the focused entry, Backspace or Alt+↑ goes up. The list is one tab stop
+    first / the last, Enter or Space opens the focused entry. Backspace or Alt+↑ goes up wherever the focus is in
+    the browser outside the «Новая папка…» input (an empty folder puts the focus on «Выбрать эту папку», and the way
+    up still works from there; the places select keeps its own keys). The list is one tab stop
     (a roving `tabindex`: the focused entry 0, the others -1). In the «Новая папка…» input those keys are the
     input's own, Enter is its «Выбрать», and the first Escape closes the input (the focus back on «Новая папка…»).
     Escape elsewhere closes the browser only and gives the focus back to «Обзор…»; Tab and Shift+Tab cycle inside it

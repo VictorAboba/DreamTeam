@@ -2029,7 +2029,7 @@ async function submitNewSession(e) {
     if (answer && answer.error) { error(String(answer.error)); return; }
     if (answer) {
       const ask = () => confirm(t("f_ws_confirm", { path: answer.target, text: res.words.text }));
-      if (answer.mode === "adopted" && !ask()) return;
+      if (answer.mode === "adopted" && !ask()) { error(""); return; }   // (no earlier error stays under it)
       workspace = answer.target;
       expect = answer.expect;
     } else {

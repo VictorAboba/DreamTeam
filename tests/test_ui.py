@@ -5762,10 +5762,15 @@ def test_folders_browser_lists_marks_and_keys():
       pending[4].resolve(listing("/home", [], { parent: "/", root: "/", fallback: false })); await settle();
       out.none = box().querySelector(".fp-status").textContent;
       out.noEntryFocus = fakeDoc.activeElement === fpBtn("choose");
+      // an empty folder: the way up works from «Выбрать эту папку», where the focus is
+      const upEv = key(fpBtn("choose"), "Backspace");
+      out.upFromChoose = [upEv.defaultPrevented, pending[5].body.path];
+      pending[5].resolve(listing("/", [entry("home")], { parent: null, root: "/", path: "/", fallback: false }));
+      await settle();
       // a place: the recent folder; a listing that cut and marked partly, a fallback
       fire(box().querySelectorAll(".fp-place")[2], "click");
-      out.place = pending[5].body;
-      pending[5].resolve(listing("/work/new", [entry("a")], { root: "/work", parent: "/work", path: "/work",
+      out.place = pending[6].body;
+      pending[6].resolve(listing("/work/new", [entry("a")], { root: "/work", parent: "/work", path: "/work",
                                                               fallback: true, truncated: true, partial: true }));
       await settle();
       out.status = box().querySelector(".fp-status").textContent;
@@ -5797,6 +5802,7 @@ def test_folders_browser_lists_marks_and_keys():
     assert out["backspace"] == "/home/u" and out["backFocus"] is True
     assert out["altUp"] == "/home"
     assert out["none"] == "No folders here." and out["noEntryFocus"] is True
+    assert out["upFromChoose"] == [True, "/"]
     assert out["place"] == {"use": "workspace", "path": "/work"}
     assert out["status"] == ("/work does not exist: the nearest existing folder is open. 1 folders are shown; open the "
                              "others by typing the path. Not every folder is marked: the folder answers slowly.")

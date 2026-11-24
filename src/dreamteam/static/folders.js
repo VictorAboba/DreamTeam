@@ -624,15 +624,20 @@ const Folders = (() => {
       return;
     }
     if (e.key === "Tab") { trap(e); return; }
+    // the way up works from anywhere in the browser (an empty folder leaves the focus on «Выбрать эту папку»),
+    // but the places select keeps its own keys
+    if (((e.key === "ArrowUp" && e.altKey) || e.key === "Backspace") && target !== r.placesSelect) {
+      e.preventDefault();
+      goUp();
+      return;
+    }
     const inList = r.list.contains(target), inCrumbs = r.crumbs.contains(target);
     if (!inList && !inCrumbs) return;
     const items = entryEls();
     const current = inList ? fpOf(target) : null;
     const i = current ? items.indexOf(current) : -1;
     let handled = true;
-    if (e.key === "ArrowUp" && e.altKey) goUp();
-    else if (e.key === "Backspace") goUp();
-    else if (e.key === "ArrowDown") focusEntry(inList ? i + 1 : 0);
+    if (e.key === "ArrowDown") focusEntry(inList ? i + 1 : 0);
     else if (e.key === "ArrowUp") { if (inList) focusEntry(i - 1); }
     else if (e.key === "Home") focusEntry(0);
     else if (e.key === "End") focusEntry(items.length - 1);
