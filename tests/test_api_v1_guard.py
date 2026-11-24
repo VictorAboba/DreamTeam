@@ -555,11 +555,16 @@ def test_unknown_fields_of_a_body_or_a_query():
 
 def test_every_429_the_api_can_meet_names_its_code():
     """A 429 without a code would read `bad_request` (error_code: another 4xx), which tells a client not to retry:
-    every SessionError, CopyError or SkillError raised with 429 in the modules v1 calls carries its code."""
+    every SessionError, CopyError or SkillError raised with 429 in the modules v1 calls carries its code. The web UI's
+    folder threads (SessionManager._folder_call: the launcher's /api/folders routes alone, never v1) are left out."""
     found = 0
     for module in (sessions_module, copyfrom, skills_module):
         tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        internal = {id(node) for fn in ast.walk(tree)
+                    if isinstance(fn, ast.AsyncFunctionDef) and fn.name == "_folder_call" for node in ast.walk(fn)}
         for node in ast.walk(tree):
+            if id(node) in internal:
+                continue
             if not isinstance(node, ast.Call):
                 continue
             name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)

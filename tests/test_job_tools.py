@@ -1,8 +1,7 @@
-"""The agent API of background jobs (docs/SPEC.md §7.1, tools/job_tools.py): the `shell` tool's results for callers
-that have the `jobs` tool (revision 2 of the frozen tool sets, external members) and for revision-1 agents (the
-console intercept and the footers that teach it), `jobs` and `job_stop`, the `wait` result, the job lines of
-`goal_complete`, `agents` and `swarm_status`, the hub's instructions and its stop-time tracing, and scripted agents
-that use all of it through their runtimes.
+"""The agent API of background jobs (docs/SPEC.md §7.1, tools/job_tools.py): the `shell` tool's results for AI agents
+and external members, the console intercept (`jobs`, `kill j3` typed as shell commands), `jobs` and `job_stop`, the
+`wait` result, the job lines of `goal_complete`, `agents` and `swarm_status`, the hub's instructions and its stop-time
+tracing, and scripted agents that use all of it through their runtimes.
 
 Child processes are a Python script outside the workspace; each writes its pid, and the `kids` fixture checks that
 none is left running."""
@@ -22,7 +21,6 @@ import pytest
 from dreamteam import jobs as jobs_module
 from dreamteam import swarm as swarm_module
 from dreamteam.agent import AgentRuntime
-from dreamteam.db import dumps
 from dreamteam.hub_mcp import INSTRUCTIONS, hub_call
 from dreamteam.models import USER, AgentKind
 from dreamteam.tools import ToolContext, call_tool, frozen
@@ -102,16 +100,8 @@ async def team(tmp_path: Path, policy: Any = None, *, run_agents: bool = False, 
     return swarm, rec
 
 
-def freeze_revision_1(swarm, name: str) -> None:
-    """`name` keeps the tool set of revision 1 (no `jobs`, `job_stop` or `background`), as an agent whose last
-    compaction came before revision 2 does."""
-    frozen.write(swarm.db, name, frozen.record(1, "en", frozen.snapshot(1, "en")))
-
-
-def agent_ctx(swarm, name: str, revision: int | None = None) -> ToolContext:
+def agent_ctx(swarm, name: str) -> ToolContext:
     """The tool context of `name` with a runtime of its own (and so its own frozen tool set)."""
-    if revision == 1:
-        freeze_revision_1(swarm, name)
     return ToolContext(swarm, name, AgentRuntime(swarm, name))
 
 
@@ -158,13 +148,12 @@ def commit_spy(swarm, monkeypatch) -> list[tuple[str, str]]:
 # --- the shell tool's results ------------------------------------------------------------------------------------
 
 async def test_shell_results_point_at_the_tools_the_caller_has(tmp_path, fast, kids):
-    """A revision-2 agent is pointed at `jobs` and `job_stop`; a revision-1 agent, whose tool set lacks both (and
-    `background`), at the console commands `jobs jN` and `kill jN`, never at a tool it does not have."""
+    """An AI agent is pointed at `jobs`, `job_stop` and `wait`; an external member, which has no `wait`, at
+    `wait_for_events`."""
     swarm, _ = await team(tmp_path)
     try:
-        new, old = agent_ctx(swarm, ANNA), agent_ctx(swarm, BORIS, revision=1)
-        assert (new.runtime.tools_rev, old.runtime.tools_rev) == (frozen.TOOLSET_REVISION, 1)
-        assert new.has_tool("jobs") and new.has_tool("job_stop") and not old.has_tool("jobs")
+        new = agent_ctx(swarm, ANNA)
+        assert new.has_tool("jobs") and new.has_tool("job_stop")
         # the timer path (footer T)
         text = await ok(new, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "timeout": 1})
         assert text.startswith(f"STILL RUNNING after 1s: continues in the background as job j1 [{PROGRAM}]\n"), text
@@ -173,54 +162,36 @@ async def test_shell_results_point_at_the_tools_the_caller_has(tmp_path, fast, k
         assert ('jobs with job_id "j1" shows its latest output; job_stop stops it. It is stopped if it still runs '
                 "30 min after it started; start servers and long runs with background=true instead") in text
         assert "do other work, or call wait if nothing else is left." in text
-        text = await ok(old, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "timeout": 1})
-        assert text.startswith(f"STILL RUNNING after 1s: continues in the background as job j2 [{PROGRAM}]\n"), text
-        assert ("To see its latest output, run the shell command jobs j2; to stop it, run the shell command kill j2 "
-                "(each as a command of its own)") in text
-        assert "(end the command with &, in PowerShell use Start-Process -NoNewWindow)" in text
-        # background=true (footer S); a revision-1 agent's schema has no such parameter: it is ignored
+        # background=true (footer S)
         text = await ok(new, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "background": True})
-        assert text.startswith(f"STARTED in the background as job j3 [{PROGRAM}]\n"), text
+        assert text.startswith(f"STARTED in the background as job j2 [{PROGRAM}]\n"), text
         assert "It may run up to 8 h 00 min and stops when the session stops.]" in text
-        text = await ok(old, "shell", {"command": "echo hi", "background": True})
-        assert text.startswith(f"exit code: 0 [{PROGRAM}]\nhi"), text
-        assert text.endswith("[Ignored unknown argument(s): background. Usage: shell(command, timeout?)]"), text
         text = await ok(new, "shell", {"command": "echo hi", "background": "true"})
         assert text.startswith(f"exit code: 0 [{PROGRAM}] (it ended within 0.5 s, so it did not stay in the "
                                "background)\nhi"), text
         # processes a command left running (footer D)
         text = await ok(new, "shell", {"command": leave(kids.script, "30", kids.pidfile())})
         assert text.startswith(f"exit code: 0 [{PROGRAM}]; processes it started keep running as background job "
-                               "j4\n"), text
-        assert 'jobs with job_id "j4" shows their latest output; job_stop stops them.]' in text
-        text = await ok(old, "shell", {"command": leave(kids.script, "30", kids.pidfile())})
-        assert text.startswith(f"exit code: 0 [{PROGRAM}]; processes it started keep running as background job "
-                               "j5\n"), text
-        assert "to stop them, run the shell command kill j5 (each as a command of its own).]" in text
-        for job_id, owner, origin in ((1, ANNA, "timeout"), (2, BORIS, "timeout"), (3, ANNA, "background"),
-                                      (4, ANNA, "detached"), (5, BORIS, "detached")):
+                               "j3\n"), text
+        assert 'jobs with job_id "j3" shows their latest output; job_stop stops them.]' in text
+        for job_id, owner, origin in ((1, ANNA, "timeout"), (2, ANNA, "background"), (3, ANNA, "detached")):
             found = job_row(swarm, job_id)
             assert (found["owner"], found["origin"], found["status"]) == (owner, origin, "running"), job_id
-        # an old agent is never pointed at the tools it lacks, and cannot call them
-        for text in (*jobs_module.FOOTERS_OLD.values(), *(how[1] for how in jobs_module.NOTE_HOW.values())):
-            assert "job_stop" not in text and "jobs with" not in text and "background=" not in text, text
-        text = await err(old, "jobs", {})
-        assert text.startswith("Unknown tool 'jobs'.") and "job_stop" not in text
         # a limit reached: background=true is refused before anything starts
         swarm.config.shell.max_jobs_per_member = 3
         text = await err(new, "shell", {"command": "echo never", "background": True})
-        assert text == ("Error: You already have 3 background jobs (j1, j3, j4), the most allowed: stop one with "
+        assert text == ("Error: You already have 3 background jobs (j1, j2, j3), the most allowed: stop one with "
                         "job_stop, or run this command without background.")
-        assert jobs_count(swarm) == 5
+        assert jobs_count(swarm) == 3
         # an external member has no `wait`: it sleeps with wait_for_events, and its footers say so
         await swarm.hire(USER, "Assistant", name=EXT, kind=AgentKind.EXTERNAL)
         ext = ToolContext(swarm, EXT)
         assert ext.has_tool("jobs") and ext.has_tool("wait_for_events") and not ext.has_tool("wait")
         text = await ok(ext, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "timeout": 1})
-        assert text.startswith(f"STILL RUNNING after 1s: continues in the background as job j6 [{PROGRAM}]\n"), text
+        assert text.startswith(f"STILL RUNNING after 1s: continues in the background as job j4 [{PROGRAM}]\n"), text
         assert "do other work, or call wait_for_events if nothing else is left." in text and "call wait " not in text
         text = await ok(ext, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "background": True})
-        assert text.startswith(f"STARTED in the background as job j7 [{PROGRAM}]\n"), text
+        assert text.startswith(f"STARTED in the background as job j5 [{PROGRAM}]\n"), text
         assert "do other work, or call wait_for_events if nothing else is left." in text and "call wait " not in text
     finally:
         await shutdown(swarm)
@@ -285,12 +256,12 @@ async def test_jobs_and_job_stop(tmp_path, fast, kids):
 
 
 async def test_console_intercept_through_the_shell_tool(tmp_path, fast, kids, monkeypatch):
-    """A revision-1 agent lists, shows and stops its jobs with whole command lines in `shell` (`jobs`, `jobs j1`,
-    `kill j1`): DreamTeam answers them (" [dreamteam]" on the first line), nothing is spawned or committed. A line
-    with anything else goes to the real shell."""
+    """An agent lists, shows and stops its jobs with whole command lines in `shell` (`jobs`, `jobs j1`, `kill j1`), as
+    typed from shell habit: DreamTeam answers them (" [dreamteam]" on the first line), nothing is spawned or
+    committed. A line with anything else goes to the real shell."""
     swarm, _ = await team(tmp_path)
     try:
-        old, new = agent_ctx(swarm, BORIS, revision=1), agent_ctx(swarm, ANNA)
+        old, new = agent_ctx(swarm, BORIS), agent_ctx(swarm, ANNA)
         commits = commit_spy(swarm, monkeypatch)
         await ok(old, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "timeout": 1})
         pid = await apid(kids)
@@ -304,7 +275,7 @@ async def test_console_intercept_through_the_shell_tool(tmp_path, fast, kids, mo
             assert text.startswith(f"Job j1 of {BORIS}: ") and text.split("\n")[0].endswith(" [dreamteam]"), line
         text = await err(old, "shell", {"command": "kill j7"})
         assert text == "Error: There is no job j7. Running jobs: j1. [dreamteam]"
-        # a revision-2 agent is answered too (the intercept is never advertised to it)
+        # another member is answered too, and cannot stop a job it does not own
         assert (await ok(new, "shell", {"command": "jobs"})).startswith("Running background jobs (1): [dreamteam]")
         text = await err(new, "shell", {"command": "kill j1"})
         assert f"Job j1 belongs to {BORIS}; only its owner or the user can stop it" in text
@@ -353,7 +324,7 @@ async def test_goal_complete_agents_and_swarm_status_show_the_jobs(tmp_path, fas
     swarm, _ = await team(tmp_path)
     await swarm.hire(USER, "Assistant", name=EXT, kind=AgentKind.EXTERNAL)
     try:
-        anna, boris = agent_ctx(swarm, ANNA), agent_ctx(swarm, BORIS, revision=1)
+        anna, boris = agent_ctx(swarm, ANNA), agent_ctx(swarm, BORIS)
         ext, user = ToolContext(swarm, EXT), ToolContext(swarm, USER)
         await ok(anna, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "timeout": 1})
         await ok(ext, "shell", {"command": py_cmd(kids.script, "30", kids.pidfile()), "background": True})
@@ -372,8 +343,8 @@ async def test_goal_complete_agents_and_swarm_status_show_the_jobs(tmp_path, fas
         swarm.set_goal(USER, "Ship it")
         jobs_line = rf"Note: background jobs are still running: j1 \({ANNA}: .+, \d+ s\); j2 \({EXT}: .+, \d+ s\)\. "
         text = await ok(boris, "goal_complete", {"summary": "done"})
-        assert re.search(jobs_line + r"Stop the ones nobody needs with the shell command kill jN \(as a command of "
-                                     r"its own\); the rest stop with the session\.$", text), text
+        assert re.search(jobs_line + r"Stop the ones nobody needs with job_stop; the rest stop with the session\.$",
+                         text), text
         swarm.reopen_goal(USER, "more")
         text = await ok(ext, "goal_complete", {"summary": "done"})
         assert re.search(jobs_line + r"Stop the ones nobody needs with job_stop; the rest stop with the session\.$",
@@ -453,10 +424,10 @@ def test_a_job_whose_output_ended_is_not_silent():
 # --- scripted agents ---------------------------------------------------------------------------------------------
 
 async def test_scripted_agents_use_background_jobs_through_their_runtimes(tmp_path, fast, kids):
-    """Anna (revision 2): a test run goes on as a job at its timeout, she calls `wait` and its end wakes her; then she
-    starts a server with background=true, reads its output with `jobs` and stops it with `job_stop`. Boris
-    (revision 1, frozen before): a command leaves a process running (`&`, `start /b`), which becomes his job; he
-    lists and stops it with the console commands `jobs` and `kill jN`. Each keeps sending its own tool set."""
+    """Anna: a test run goes on as a job at its timeout, she calls `wait` and its end wakes her; then she starts a
+    server with background=true, reads its output with `jobs` and stops it with `job_stop`. Boris: a command leaves a
+    process running (`&`, `start /b`), which becomes his job; he lists and stops it by typing `jobs` and then `kill`
+    with its job id as shell commands, which the console intercept answers."""
     state: dict[str, Any] = {}
 
     def policy(swarm, name, system, messages, tools):
@@ -488,15 +459,13 @@ async def test_scripted_agents_use_background_jobs_through_their_runtimes(tmp_pa
         return call("wait")
 
     swarm, rec = await team(tmp_path, policy)
-    freeze_revision_1(swarm, BORIS)
     await swarm.stop()
-    await swarm.start()  # the runtimes start (Anna freezes revision 2) and their hiring notices wake them
+    await swarm.start()  # the runtimes start and their hiring notices wake them
     try:
         await until(lambda: [t for t, _ in tool_results(swarm, ANNA)] == ["shell", "wait", "shell", "jobs",
                                                                           "job_stop", "wait"]
                     and [t for t, _ in tool_results(swarm, BORIS)] == ["shell", "shell", "shell", "wait"], 30)
-        assert swarm.runtimes[ANNA].tools_rev == frozen.TOOLSET_REVISION and swarm.runtimes[BORIS].tools_rev == 1
-        assert dumps(swarm.runtimes[BORIS].tools) == dumps(frozen.snapshot(1, "en"))
+        assert swarm.runtimes[ANNA].tools_rev == swarm.runtimes[BORIS].tools_rev == frozen.TOOLSET_REVISION
         (_, timer), (_, waited), (_, server), (_, shown), (_, stopped), _ = tool_results(swarm, ANNA)
         timer_id = re.search(r"as job (j\d+) ", timer).group(1)
         server_id = re.search(r"as job (j\d+) ", server).group(1)
@@ -514,7 +483,7 @@ async def test_scripted_agents_use_background_jobs_through_their_runtimes(tmp_pa
         boris_id = state["boris_job"]
         assert kept.startswith(f"exit code: 0 [{PROGRAM}]; processes it started keep running as background job "
                                f"{boris_id}\n")
-        assert f"run the shell command kill {boris_id}" in kept and "job_stop" not in kept
+        assert f'jobs with job_id "{boris_id}" shows their latest output; job_stop stops them.]' in kept
         assert listed.split("\n")[0].endswith(" [dreamteam]") and f"\n- {boris_id} " in listed
         assert killed.startswith(f"Stopped job {boris_id} (") and killed.split("\n")[0].endswith(" [dreamteam]")
         statuses = {job_row(swarm, int(i[1:]))["reason"] for i in (server_id, boris_id)}

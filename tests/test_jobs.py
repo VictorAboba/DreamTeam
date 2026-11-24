@@ -217,39 +217,30 @@ def test_render_texts(make_fake_swarm):
         log = log_shown = ".scratch/anna.smith/jobs/j3.log"
 
     timeout = ShellOutcome("background", None, "so far", "bash", 120, job=FakeJob())
-    new, old = timeout.render(has_jobs_tool=True, cfg=cfg), timeout.render(has_jobs_tool=False, cfg=cfg)
+    new = timeout.render(cfg=cfg)
     assert new.startswith("STILL RUNNING after 120s: continues in the background as job j3 [bash]\nso far\n\n[Job j3")
     assert "jobs with job_id \"j3\"" in new and "30 min after it started" in new and "8 h 00 min" in new
-    assert "run the shell command kill j3" in old
-    # an old agent backgrounds a server itself: in PowerShell only Start-Process -NoNewWindow keeps its output in the
-    # job (without it the program writes into a window of its own on the user's desktop)
-    assert "(end the command with &, in PowerShell use Start-Process -NoNewWindow)" in old
-    no_time = ShellOutcome("timeout", None, "", "cmd", 1800, note="no_time").render(has_jobs_tool=False, cfg=cfg)
-    assert no_time.endswith("(end it with &, in PowerShell use Start-Process -NoNewWindow).]")
     # the tool that sleeps until the end is announced: `wait`, or `wait_for_events` for an external member
     assert "or call wait if nothing else is left" in new
-    external = timeout.render(has_jobs_tool=True, cfg=cfg, has_wait=False)
+    external = timeout.render(cfg=cfg, has_wait=False)
     assert "or call wait_for_events if nothing else is left" in external and "call wait " not in external
     detached = ShellOutcome("detached", 0, "", "bash", 120, job=FakeJob(), names=["node", "node"])
-    old = detached.render(has_jobs_tool=False, cfg=cfg)
-    assert old.startswith("exit code: 0 [bash]; processes it started keep running as background job j3\n(no output)")
-    assert "Still running: node ×2." in old
-    for state in ("background", "detached"):  # old agents are never pointed at tools they lack
-        text = ShellOutcome(state, 0, "x", "bash", 1, job=FakeJob()).render(has_jobs_tool=False, cfg=cfg)
-        assert "job_stop" not in text and "jobs with" not in text
+    text = detached.render(cfg=cfg)
+    assert text.startswith("exit code: 0 [bash]; processes it started keep running as background job j3\n(no output)")
+    assert "Still running: node ×2." in text
+    assert 'jobs with job_id "j3" shows their latest output; job_stop stops them.]' in text
     cfg.job_max_minutes = 0
-    started = ShellOutcome("started", None, "", "bash", 2, job=FakeJob()).render(has_jobs_tool=True, cfg=cfg)
+    started = ShellOutcome("started", None, "", "bash", 2, job=FakeJob()).render(cfg=cfg)
     assert "(no output yet)" in started and "may run up to the end of the session" in started
-    plain = ShellOutcome("timeout", None, "out\n", "cmd", 1).render(has_jobs_tool=True, cfg=cfg)
+    plain = ShellOutcome("timeout", None, "out\n", "cmd", 1).render(cfg=cfg)
     assert plain == "TIMEOUT after 1s (process tree killed) [cmd]\nout\n"
     limited = ShellOutcome("timeout", None, "", "cmd", 1, note="limit_member",
-                           note_args={"n": 2, "ids": "j1, j2"}).render(has_jobs_tool=False, cfg=cfg)
+                           note_args={"n": 2, "ids": "j1, j2"}).render(cfg=cfg)
     assert limited.endswith("[It was not moved to the background: you already have 2 background jobs (j1, j2), the "
-                            "most allowed. Stop one you no longer need (run the shell command kill jN on its own) or "
-                            "wait for one to end.]")
+                            "most allowed. Stop one you no longer need (job_stop) or wait for one to end.]")
     # the head line and the footer survive any cut: only the output in between is cut
     long = ShellOutcome("background", None, "x" * 50000, "bash", 1, job=FakeJob(), max_output=2000)
-    text = long.render(has_jobs_tool=True, cfg=cfg)
+    text = long.render(cfg=cfg)
     assert len(text) <= 2000 and text.startswith("STILL RUNNING") and text.endswith(".]")
 
 
@@ -261,7 +252,7 @@ async def test_timer_moves_to_background(setup, kids):
     pid = kids.pid()
     assert out.state == "background" and out.job is not None and out.job.label == "j1"
     assert "child up" in out.output
-    text = out.render(has_jobs_tool=True, cfg=swarm.config.shell)
+    text = out.render(cfg=swarm.config.shell)
     assert text.startswith(f"STILL RUNNING after 1s: continues in the background as job j1 [{PROGRAM}]\nchild up")
     record = row(swarm, 1)
     assert record["status"] == "running" and record["origin"] == "timeout" and record["owner"] == ANNA
@@ -284,11 +275,11 @@ async def test_background_request(setup, kids):
     out = await run(manager, ANNA, py(kids.script, "20", kids.pidfile()), timeout=120, background=True)
     assert out.state == "started" and time.monotonic() - started < jobs_module.BACKGROUND_GRACE + 3
     assert out.job.origin == "background" and row(swarm, 1)["origin"] == "background"
-    assert out.render(has_jobs_tool=True, cfg=swarm.config.shell).startswith(
+    assert out.render(cfg=swarm.config.shell).startswith(
         f"STARTED in the background as job j1 [{PROGRAM}]")
     quick = await run(manager, ANNA, "echo hi", background=True)
     assert quick.state == "quick" and quick.job is None and quick.output.strip() == "hi"
-    assert quick.render(has_jobs_tool=True, cfg=swarm.config.shell).startswith(
+    assert quick.render(cfg=swarm.config.shell).startswith(
         f"exit code: 0 [{PROGRAM}] (it ended within 0.5 s, so it did not stay in the background)")
     assert swarm.db.scalar("SELECT COUNT(*) FROM jobs") == 1
 
@@ -304,8 +295,7 @@ async def test_log_falls_back_when_scratch_is_not_a_folder(setup, kids):
     assert out.state == "background"
     expected = Path(swarm.config.data_dir) / "jobs" / "j1.log"
     assert out.job.log == str(expected) and expected.is_file()
-    assert f"{expected} (outside the workspace: read it with shell)" in out.render(has_jobs_tool=True,
-                                                                                   cfg=swarm.config.shell)
+    assert f"{expected} (outside the workspace: read it with shell)" in out.render(cfg=swarm.config.shell)
     assert out.job.notice_tail() == "  child up"
 
 
@@ -318,7 +308,7 @@ async def test_leftovers_become_a_detached_job(setup, kids):
     assert job.origin == "detached" and job.command_done and job.exit_code == 0
     assert row(swarm, job.id)["exit_code"] == 0 and row(swarm, job.id)["origin"] == "detached"
     assert any(name.lower().startswith("python") for name in out.names) or not (WINDOWS or LINUX)
-    text = out.render(has_jobs_tool=True, cfg=swarm.config.shell)
+    text = out.render(cfg=swarm.config.shell)
     assert text.startswith(f"exit code: 0 [{PROGRAM}]; processes it started keep running as background job j1")
     assert not manager.busy(ANNA)  # detached jobs never keep their owner busy
     assert pid_alive(pid)
@@ -363,13 +353,13 @@ async def test_limits(setup, kids):
     second = await run(manager, ANNA, py(kids.script, "20", kids.pidfile()))
     assert second.state == "timeout" and second.note == "limit_member" and second.job is None
     assert dead_if_started(kids)
-    assert "you already have 1 background jobs (j1)" in second.render(has_jobs_tool=True, cfg=swarm.config.shell)
+    assert "you already have 1 background jobs (j1)" in second.render(cfg=swarm.config.shell)
     with pytest.raises(ToolError, match=r"You already have 1 background jobs \(j1\), the most allowed"):
         await run(manager, ANNA, "echo never", background=True)
     third = await run(manager, ANNA, leave(kids.script, "20", kids.pidfile()), timeout=30)
     assert third.state == "leftovers_killed" and third.code == 0
     assert dead_if_started(kids)
-    assert third.render(has_jobs_tool=True, cfg=swarm.config.shell).startswith(
+    assert third.render(cfg=swarm.config.shell).startswith(
         f"exit code: 0 [{PROGRAM}]; the processes it left running were stopped")
     other = await run(manager, BORIS, py(kids.script, "20", kids.pidfile()))  # the limit is per member
     assert other.state == "background"
@@ -383,12 +373,12 @@ async def test_limits(setup, kids):
         await run(manager, BORIS, "echo never", background=True)
     shell_set(swarm, max_jobs=16, background_on_timeout=False)
     plain = await run(manager, BORIS, py(kids.script, "20", kids.pidfile()))
-    assert plain.render(has_jobs_tool=True, cfg=swarm.config.shell) == (
+    assert plain.render(cfg=swarm.config.shell) == (
         f"TIMEOUT after 1s (process tree killed) [{PROGRAM}]\nchild up\n")
     shell_set(swarm, background_on_timeout=True, max_timeout=1)
     no_time = await run(manager, BORIS, py(kids.script, "20", kids.pidfile()))
     assert no_time.state == "timeout" and no_time.note == "no_time"
-    assert no_time.render(has_jobs_tool=True, cfg=swarm.config.shell).endswith(
+    assert no_time.render(cfg=swarm.config.shell).endswith(
         "[1 s is the longest a command may run unless it was started in the background on purpose "
         "(background=true).]")
     for index in (1, 2, 4, 5, 6, 7):  # every child but the two jobs' was killed
@@ -513,7 +503,7 @@ async def test_stop_all_kills_and_closes(setup, kids, tmp_path):
     assert time.monotonic() - started < 10
     assert foreground.done()  # stop_all waited for the foreground call
     result = foreground.result()
-    assert result.state == "killed" and result.render(has_jobs_tool=True, cfg=swarm.config.shell).startswith(
+    assert result.state == "killed" and result.render(cfg=swarm.config.shell).startswith(
         f"KILLED: the session is stopping [{PROGRAM}]")
     for pid in pids:
         assert not pid_alive(pid)
@@ -544,7 +534,7 @@ async def test_stop_owner_kills_only_that_member(setup, kids):
     ext = await apid(kids)
     assert await manager.stop_owner(EXT) == []
     assert call.done() and call.result().state == "killed"  # awaited by stop_owner
-    assert call.result().render(has_jobs_tool=True, cfg=swarm.config.shell).startswith("KILLED: you are leaving")
+    assert call.result().render(cfg=swarm.config.shell).startswith("KILLED: you are leaving")
     assert not pid_alive(ext) and swarm.db.scalar("SELECT COUNT(*) FROM jobs") == 2
 
 
@@ -899,7 +889,7 @@ async def test_an_ai_agents_call_waits_at_most_foreground_max(setup, kids):
     out = await run(manager, ANNA, py(kids.script, "30", kids.pidfile()), timeout=30)
     assert time.monotonic() - started < 5
     assert out.state == "background" and out.wait == 1 and out.job.origin == "timeout" and manager.busy(ANNA)
-    assert out.render(has_jobs_tool=True, cfg=swarm.config.shell).startswith(
+    assert out.render(cfg=swarm.config.shell).startswith(
         f"STILL RUNNING after 1s: continues in the background as job j1 [{PROGRAM}]")
     assert manager._deadline(out.job) == out.job.started_at + swarm.config.shell.max_timeout
     await manager.stop(out.job.id, ANNA, force=True)
@@ -923,7 +913,7 @@ async def test_a_command_that_cannot_become_a_job_gets_its_own_timeout(setup, ki
     assert out.state == "exited" and out.code == 0 and "child end" in out.output
     killed = await run(manager, ANNA, py(kids.script, "30", kids.pidfile()), timeout=3)
     assert killed.state == "timeout" and killed.note == "disabled" and killed.wait == pytest.approx(3)
-    assert killed.render(has_jobs_tool=True, cfg=swarm.config.shell).startswith(
+    assert killed.render(cfg=swarm.config.shell).startswith(
         f"TIMEOUT after 3s (process tree killed) [{PROGRAM}]")
     assert dead_if_started(kids)
     shell_set(swarm, max_jobs_per_member=1)

@@ -105,3 +105,36 @@ To give these commands (except `init` and `run`) another home folder, pass `--ho
 
 You don't have to store API keys in the settings: if `api_key_env` is set, the key is read from the environment
 variable. For Claude, the `ant auth login` profile works too.
+
+## If dreamteam hangs at start on Windows
+
+On Windows, asyncio, which DreamTeam runs on, opens a connection from Python to itself over 127.0.0.1 before anything
+else starts. When a program holds local connections, the start stops there. After 5 seconds DreamTeam says what is
+wrong and names the Python program file whose connections are held: in the terminal, or for `dreamteam mcp` in the
+MCP client's log. The terminal interface (also `-p`), `serve`, `mcp` and `import` also write it to
+`.dreamteam/logs/dreamteam.log` of the home (`run`, and `mcp` of a project: of the project). DreamTeam keeps waiting
+and goes on as soon as the connection opens; Ctrl+C stops it (when the message says that Ctrl+C cannot, close the
+window).
+
+Check it:
+
+```
+python -c "import socket; socket.setdefaulttimeout(10); a, b = socket.socketpair(); print('ok')"
+```
+
+If `python` is another Python or is not found, with the program file from the message, in PowerShell (in cmd the same
+without the `&`):
+
+```
+& "<program file>" -c "import socket; socket.setdefaulttimeout(10); a, b = socket.socketpair(); print('ok')"
+```
+
+It should print `ok` at once. A `TimeoutError` after 10 seconds or a `ConnectionError` means that a program holds or
+intercepts the connection. The usual causes:
+
+- an antivirus or firewall with network filtering (Kaspersky, ESET, Avast, Dr.Web...); it may be waiting for you to
+  allow Python in a window that is easy to miss;
+- a VPN or proxy client that intercepts local connections too.
+
+Turn the filtering or the VPN off for a while to confirm, then add the program file from the message (or 127.0.0.1)
+to the exclusions of that program and start dreamteam again.

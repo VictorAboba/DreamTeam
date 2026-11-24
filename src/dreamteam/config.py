@@ -152,6 +152,10 @@ class SwarmSettings:
     start_agents: int = 3
     max_agents: int = 8
     max_cost_usd: float = 5.0
+    # the share of max_cost_usd at which every AI agent gets one n_budget_low and the user one u_budget_low (once
+    # per limit and share, kv budget_notice); 0 or 1: none (u_budget at the limit covers it); read at each
+    # record_usage as float(... or 0) (docs/SPEC.md §3 record_usage, §17.1)
+    budget_notice_at: float = 0.8
     goal: str = ""
     goal_description: str = ""
     starting_roles: list[str] = field(default_factory=list)
@@ -338,7 +342,7 @@ _MIN_ONE = frozenset({"max_agents", "max_steps_per_turn", "context_tokens", "too
                       "foreground_max", "job_log_mb", "max_files", "max_attached", "max_mb", "max_archive_mb",
                       "install_timeout", "lock_ttl_minutes", "copy_max_mb", "copy_max_files", "uploads_pending",
                       "archive_max_mb"})
-_MAX = {"port": 65535}
+_MAX = {"port": 65535, "budget_notice_at": 1}
 INT64_LIMIT = 2 ** 63   # a whole-number setting is a 64-bit integer (SQLite's); v1's PATCH bounds max_agents so too
 
 
@@ -780,6 +784,7 @@ language = "{language}"        # язык промптов агентов: ru | 
 start_agents = 3              # сколько агентов стартует
 max_agents = 8                # максимум ИИ-агентов (агенты могут нанимать новых; участники, подключившиеся через MCP, не считаются)
 max_cost_usd = 5.0            # бюджет роя в долларах; при исчерпании рой встаёт на паузу
+budget_notice_at = 0.8        # при этой доле бюджета агенты и вы получаете одно предупреждение (0 или 1 — без него)
 goal = {toml_string(goal)}          # глобальная задача (можно задать позже в веб-интерфейсе)
 starting_roles = []           # стартовая команда по порядку, например ["architect", "developer", "developer", "tester"]; недостающим до start_agents — «Универсал»
 independent_review = true     # задачу агента принимает другой агент (или вы, если больше некому); false — без ревьюера задача сразу готова

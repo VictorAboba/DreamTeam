@@ -220,7 +220,7 @@ def test_texts_reference_only_real_tools():
             assert not code_idents(text) - allowed, (lang, key, code_idents(text) - allowed)
 
 
-def test_agent_texts_name_only_baseline_tools():
+def test_agent_texts_name_only_tools_every_opened_revision_has():
     """Notifications and wake-up texts reach agents of every tool set revision a session this version opens
     (tools/frozen.py: an agent keeps its tools until a compaction; sessions with a member below
     frozen.OLDEST_OPEN_REVISION are not opened), so they may name only the tools and parameters that every shipped
@@ -306,7 +306,7 @@ def test_background_job_texts():
         assert "{log}" in texts["n_job_done"] and "{log}" in texts["n_job_gone"]
         assert "{log}" in texts["n_job_command_done"]
         for key in ("my_jobs", "my_job", "job_exit", "job_gone", "job_no_output", "n_job_done", "n_job_command_done",
-                    "n_job_stopped", "n_job_limit", "n_job_gone", "u_jobs_running"):
+                    "n_job_stopped", "n_job_limit", "n_job_gone", "u_jobs_running", "u_paused_jobs"):
             assert not code_idents(texts[key]) and "job_stop" not in texts[key], (lang, key)
             # a job is shown as j3 (#3 is a task); in Russian it is a «фоновый процесс», «задача» is a board task
             assert "#{id}" not in texts[key], (lang, key)
@@ -321,10 +321,10 @@ def test_background_job_texts():
 
 @pytest.mark.parametrize("lang", LANGS)
 def test_system_prompt_teaches_background_jobs(lang):
-    """New members (revision 2 of the tool set) learn the jobs protocol: a command still running at its timeout, or
-    after [shell] foreground_max seconds, goes on as a background job; long runs start with `background`, then
-    `wait`; `jobs` and `job_stop` show and stop a job; the whole output is in the scratch folder. The end of a job
-    is among the events that wake the member (How you work, item 10)."""
+    """New members learn the jobs protocol: a command still running at its timeout, or after [shell] foreground_max
+    seconds, goes on as a background job; long runs start with `background`, then `wait`; `jobs` and `job_stop` show
+    and stop a job; the whole output is in the scratch folder. The end of a job is among the events that wake the
+    member (How you work, item 10)."""
     system = SYSTEMS[lang]
     for snippet in ("`{scratch}jobs/`", "`background`", "`jobs`", "`job_stop`", "`timeout`", "{foreground_max}",
                     "(j1, j2, …)"):
@@ -358,7 +358,7 @@ def test_system_prompt_teaches_skills(lang):
     assert ("the skills attached to the swarm" if lang == "en" else "подключённые к рою скиллы") in item1
     if lang == "ru":
         assert "скилл" in bullet and "навык" not in system.lower()
-    # new members have skill_propose (revision 3): a procedure that worked can be proposed as a skill
+    # new members have skill_propose: a procedure that worked can be proposed as a skill
     assert "`skill_propose`" in bullet and "`name`" in bullet and "`description`" in bullet
     assert ("the user decides whether it is kept" if lang == "en" else "пользователь решит, сохранить ли его") in bullet
 
@@ -380,7 +380,7 @@ def test_skill_texts():
         for key in ("n_skill_added", "n_skill_updated"):
             assert placeholders(texts[key]) == {"name", "description", "path", "deps"} and "`read_file`" in texts[key]
         assert placeholders(texts["n_skill_removed"]) == {"name"}
-        # proposals and the user's decision; agents of every revision get these, so they name no skill_propose
+        # proposals and the user's decision: they name no skill_propose
         assert placeholders(texts["n_skill_shared"]) == {"owner", "name", "description", "path", "deps"}
         assert placeholders(texts["n_skill_saved"]) == {"name"}
         assert placeholders(texts["n_skill_not_saved"]) == {"name", "comment"}
@@ -470,6 +470,10 @@ CREW_KEYS = {
     "note_direction_held_full_you": {"sub", "id", "working", "crew", "names"},
     "note_direction_held_tail": {"sub", "id", "name"}, "note_direction_held_tail_you": {"sub"},
     "note_direction_held_also": {"sub", "id", "m"},
+    # a free place (docs/SPEC.md §4.2 "A free place"): the owner's notice and the board's fragments in it
+    "n_crew_gap": {"id", "title", "working", "crew", "names", "idle", "directions", "held"},
+    "crew_gap_held": {"sub", "name", "m"}, "crew_gap_held_you": {"sub", "m"},
+    "crew_gap_held_wait": {"sub", "name", "m"}, "crew_gap_blocked": {"ids"},
 }
 # changed keys of existing texts
 CHANGED_KEYS = {"n_review_rejected": {"by", "id", "title", "comment", "ending"}, "n_stalled": {"tasks", "marks"}}
@@ -482,7 +486,7 @@ def test_crew_texts_have_their_placeholders():
             assert placeholders(texts[key]) == fields, (lang, key)
         # fragments appended as they are start with a space; the ones after "...: " do not
         for key in CREW_KEYS:
-            spaced = key.startswith(("crew_owner_", "crew_directions", "note_", "mark_"))
+            spaced = key.startswith(("crew_owner_", "crew_directions", "note_", "mark_", "crew_gap_"))
             assert texts[key].startswith(" ") == spaced, (lang, key)
         for key in ("n_stalled", "n_review_rejected"):
             assert texts[key].endswith(("{marks}", "\n{ending}")), (lang, key)
@@ -502,7 +506,7 @@ def test_crew_texts_say_crew_task_and_direction_in_russian():
     for key in ("n_direction_failed", "n_direction_cancelled", "n_direction_taken", "n_direction_freed",
                 "n_crew_review_requested", "crew_owner_take", "mark_free_directions", "note_direction_card",
                 "mark_direction_to_take", "n_direction_held_busy", "n_direction_held_full", "note_direction_held_busy",
-                "note_direction_held_busy_you", "note_direction_held_also"):
+                "note_direction_held_busy_you", "note_direction_held_also", "n_crew_gap"):
         assert "групповой задачи" in ru[key] or "групповая задача" in ru[key], key
         assert "направлен" in ru[key], key
     for key in ("note_direction_held_full", "note_direction_held_full_you"):  # the places of a crew task
@@ -620,6 +624,27 @@ def test_crew_texts_render_the_spec_wording():
     assert t("en", "mark_direction_to_take", sub=16, title="title", id=8) == (
         ' #16 "title", your direction of crew task #8, can be taken now: claim it (task_claim) and do it, or unassign '
         "yourself if you will not (task_update assignee='').")
+    # "A free place": the owner's notice in the run's second state, and the forms of a held direction
+    items = '#14 [done] "search" @Olga Owner; #15 [done] "eval" @Bob Brown; #16 [in_progress] "uci" @Anna Smith'
+    assert t("en", "n_crew_gap", id=8, title="engine", working=2, crew=3, names="Olga Owner, Anna Smith",
+             idle="Carl Diaz (Tester), Bob Brown (Generalist)", directions=t("en", "crew_directions", items=items),
+             held="") == (
+        '#8 "engine", your crew task, has a free place (2 of its 3 places taken: Olga Owner, Anna Smith), but none of '
+        "its directions can be taken now, and these members are idle, with no task of their own to go on with: Carl "
+        'Diaz (Tester), Bob Brown (Generalist). Its directions: #14 [done] "search" @Olga Owner; #15 [done] "eval" '
+        '@Bob Brown; #16 [in_progress] "uci" @Anna Smith. If a part of #8 that no direction covers yet can be done '
+        "now, add it as a direction (task_update directions). If none of this applies, leave #8 as it is: a free "
+        "place need not be filled, and no reply is needed.")
+    assert t("en", "crew_gap_held", sub=16, name="Bob Brown", m=15) == (
+        " #16 waits: Bob Brown works on #15 and can take #16 only after handing #15 in. If another member can do #16 "
+        "now, unassign it (task_update assignee='') and a free member is offered it.")
+    assert t("en", "crew_gap_held_you", sub=16, m=15) == (
+        " #16, also assigned to you, waits: you can take it only after handing #15 in. If another member can do #16 "
+        "now, unassign yourself (task_update assignee='') and a free member is offered it.")
+    assert t("en", "crew_gap_held_wait", sub=16, name="Bob Brown", m=15) == (
+        " #16 waits: Bob Brown works on #15, which waits for #16, so neither moves while Bob Brown holds #16: unassign "
+        "#16 (task_update assignee='') and a free member is offered it.")
+    assert '#16 [todo] "uci"' + t("en", "crew_gap_blocked", ids="#15") == '#16 [todo] "uci" (blocked by #15)'
 
 
 def test_russian_subtasks_done_needs_no_plural_forms():

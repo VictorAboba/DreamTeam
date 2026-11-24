@@ -10,12 +10,11 @@ from typing import Any
 import pytest
 
 from dreamteam import prompts
-from dreamteam.agent import AgentRuntime
 from dreamteam.config import Config
 from dreamteam.llm.scripted import ScriptedLLM
 from dreamteam.models import USER, AgentKind, Status
 from dreamteam.swarm import Swarm
-from dreamteam.tools import ToolContext, call_tool, frozen, schemas_for
+from dreamteam.tools import ToolContext, call_tool, schemas_for
 from helpers.crew import finish_raw, set_raw
 
 pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
@@ -50,8 +49,8 @@ def members(sw: Swarm) -> list[str]:
     return [m["name"] for m in sw.members() if m["kind"] == AgentKind.LLM]
 
 
-async def ok(sw: Swarm, actor: str, tool: str, args: Any = None, runtime: Any = None) -> str:
-    text, is_error = await call_tool(ToolContext(sw, actor, runtime), tool, args)
+async def ok(sw: Swarm, actor: str, tool: str, args: Any = None) -> str:
+    text, is_error = await call_tool(ToolContext(sw, actor), tool, args)
     assert not is_error, text
     return text
 
@@ -492,7 +491,7 @@ async def test_the_board_shows_the_crew_of_a_crew_task(swarm):
     assert lines[1:] == ["    goal: log in", f"  ↳ #2 [in_progress] oauth2 @{a} parent #1", "  ↳ #3 [todo] pkce parent #1"]
 
 
-# --- audiences and revisions ------------------------------------------------------------------------------------
+# --- audiences --------------------------------------------------------------------------------------------------
 
 async def test_an_external_member_sees_and_uses_crew_and_directions(swarm):
     for name in ("task_create", "task_update"):
@@ -503,20 +502,6 @@ async def test_an_external_member_sees_and_uses_crew_and_directions(swarm):
     text = await ok(swarm, "Ext Member", "task_create", {"title": "Auth", "goal": "log in", "assignee": "me",
                                                          "crew": 2, "directions": ["parser", "cli"]})
     assert 'Directions: #2 "parser", #3 "cli".\n#2 "parser" is your own part' in text  # a member: its own part
-
-
-async def test_an_agent_frozen_at_revision_4_has_its_crew_arguments_ignored(swarm):
-    a, b, *_ = members(swarm)
-    frozen.write(swarm.db, a, frozen.record(4, "en", frozen.snapshot(4, "en")))
-    runtime = AgentRuntime(swarm, a)
-    text = await ok(swarm, a, "task_create", {"title": "Auth", "goal": "log in", "crew": 3,
-                                              "directions": ["parser"]}, runtime=runtime)
-    assert text.startswith("Created task #1 [todo] Auth\n[Ignored unknown argument(s): crew, directions. Usage: "
-                           "task_create(title, goal, description?")
-    assert swarm.board.get(1).crew == 0 and swarm.board.subtasks_of(1) == []
-    text = await ok(swarm, b, "task_create", {"title": "Auth 2", "goal": "log in", "crew": 2},
-                    runtime=AgentRuntime(swarm, b))
-    assert text == "Created task #2 [todo] Auth 2 crew 0/2"
 
 
 async def test_the_wake_up_offers_free_directions(swarm):

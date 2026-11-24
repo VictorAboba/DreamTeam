@@ -29,8 +29,87 @@ const I18N = {
     ws_label: "Папка сессии", ws_default: "своя папка", ws_adopted: "папка проекта", ws_moved: "перенесена", ws_missing_badge: "папки нет",
     ws_default_hint: "Собственная папка сессии в домашней папке DreamTeam; удаляется вместе с сессией.",
     ws_adopted_hint: "Существующая папка (ваш проект): агенты работают с её файлами и коммитят в текущую ветку её репозитория. При удалении сессии папка остаётся.",
-    ws_moved_hint: "Сессия перенесена в эту папку (/cd). При удалении сессии папка остаётся.",
-    ws_missing: "Папка не найдена — сессия не запустится. Перенесите её в другую папку: /cd ПАПКА или /cd --default в dreamteam tui.",
+    // the session folder from the web UI (folders.js, docs/SPEC.md §18.4 "Folders on both pages")
+    ws_moved_hint: "Сессия перенесена в эту папку («Сменить папку…» или /cd). При удалении сессии папка остается.",
+    ws_missing: "Папка не найдена — сессия не запустится. Верните ее на место или выберите другую:",
+    fo_browse: "Обзор…",
+    fo_checking: "Проверяю папку…",
+    fo_check_failed: "Не удалось проверить папку: {error}. Хаб проверит ее при создании или переносе.",
+    fo_src_folder: "Папка найдена: ее файлы скопируются в папку новой сессии.",
+    fo_src_zip: "Архив .zip найден: его содержимое скопируется в папку новой сессии.",
+    fo_new_missing: "Папки нет: она будет создана, и сессия начнет в ней с чистого листа.",
+    fo_new_empty: "Папка пустая: сессия начнет в ней с чистого листа.",
+    fo_new_files: "Папка с файлами: агенты будут работать с ними и коммитить в текущую ветку «{branch}».",
+    fo_new_files_plain: "Папка с файлами: агенты будут работать с ними.",
+    fo_git_init: "В ней нет git-репозитория: он будет создан (git init и первый коммит ее файлов).",
+    fo_unchanged: "Сессия уже работает в этой папке.",
+    fo_branch: "Текущая ветка: «{branch}».",
+    fo_mcp: "Вместе с сессией переедут ее MCP-серверы: {names}.",
+    fp_title: "Папка на компьютере хаба",
+    fp_root_home: "Домашняя папка",
+    fp_root_drive: "Диск {name}",
+    fp_root_system: "Корень (/)",
+    fp_recent: "Недавние папки",
+    fp_root_api: "Папка API: {name}",
+    fp_root_api_hint: "из [api] folders в настройках",
+    fp_root_dreamteam: "Домашняя папка DreamTeam",
+    fp_up: "Наверх",
+    fp_repo: "git",
+    fp_empty: "пустая",
+    fp_noaccess: "нет доступа",
+    fp_link: "ссылка",
+    fp_busy: "занята сессией «{title}»",
+    fp_creating: "создается сессия",
+    fp_current: "папка этой сессии",
+    fp_refused: "нельзя выбрать",
+    fp_loading: "Загрузка…",
+    fp_none: "Здесь нет папок.",
+    fp_truncated: "Показаны {n} папок; остальные откройте, введя путь.",
+    fp_partial: "Отметки есть не у всех папок: папка отвечает медленно.",
+    fp_fallback: "Папки {path} нет: открыта ближайшая существующая.",
+    fp_choose: "Выбрать эту папку",
+    fp_cannot: "Эту папку выбрать нельзя: {why}",
+    fp_busy_why: "в ней работает сессия «{title}»",
+    fp_nav_why: "это корень диска или файловой системы",
+    fp_new: "Новая папка…",
+    fp_new_ok: "Выбрать",
+    fp_new_hint: "Папка будет создана, когда сессия начнет в ней работать.",
+    fp_new_bad: "Нужно только имя новой папки, а такое имя для папки на компьютере хаба не подходит.",
+    cf_button: "Сменить папку…",
+    cf_title: "Папка сессии «{title}»",
+    cf_now: "Сейчас: {path} ({kind})",
+    cf_other: "Другая папка",
+    cf_default: "Вернуть в свою папку",
+    cf_hint: "Пустая или новая папка: файлы сессии и история git переедут туда. Папка с файлами: агенты будут работать с ее файлами и коммитить в текущую ветку; прежняя папка останется как есть.",
+    cf_go: "Сменить папку",
+    cf_moving: "Переношу…",
+    cf_api: "Сессию создал клиент HTTP API, и она работает прямо в папке «{root}» из [api] folders: после смены папки это обычная ваша сессия, и проверки той папки к ней больше не относятся.",
+    ws_missing_back: "Папка сессии не найдена: {path}. Сессия не запустится, пока папку не вернут на место.",
+    cd_ask: "Перенести сессию «{title}» в {path}? {text}",
+    cd_ask_default: "Вернуть сессию «{title}» в ее собственную папку {path}? {text}",
+    cd_text_missing: "Папки нет — она будет создана; файлы и история git переедут.",
+    cd_text_empty: "Папка пустая: файлы и история git переедут.",
+    cd_text_files: "Папка не пустая: агенты будут работать с ее файлами и коммитить в текущую ветку (прежняя папка {old} останется как есть).",
+    cd_text_fresh: "Папка пустая: сессия начнет в ней с чистого листа (новый git-репозиторий); ваша папка {old} останется как есть, переедут только MCP-серверы сессии.",
+    cd_text_lost: "Прежней папки {old} нет — переносить нечего: сессия продолжит в новой папке.",
+    cd_text_back: "В папке остались прежние файлы сессии: агенты вернутся к ним; папка {old} останется как есть.",
+    cd_text_running: "Сессия запущена: агенты остановятся на время переноса и продолжат работу.",
+    cd_unchanged: "Сессия «{title}» уже работает в {path}.",
+    cd_moved: "Сессия «{title}» теперь работает в {path}: файлы перенесены.",
+    cd_now: "Сессия «{title}» теперь работает в {path}.",
+    cd_adopted: "Сессия «{title}» теперь работает с файлами папки {path}.",
+    cd_created: "Сессия «{title}» работает в новой папке {path}.",
+    cd_git_moved: "git: история перенесена вместе с файлами.",
+    cd_git_existing: "git: коммиты агентов пойдут в текущую ветку репозитория этой папки.",
+    cd_git_initialized: "git: в папке создан новый репозиторий (git init).",
+    cd_git_disabled: "git выключен в настройках — коммитов не будет.",
+    cd_git_none: "git не установлен — коммитов не будет.",
+    cd_mcp_moved: "MCP-серверы сессии перенесены: {names}.",
+    cd_old_kept: "Прежняя папка {path} осталась на месте.",
+    cd_old_mcp_committed: "Прежняя папка {path} осталась на месте; MCP-серверы сессии ({paths}) убраны из нее, удаление закоммичено там ({commit}).",
+    cd_old_mcp_uncommitted: "Прежняя папка {path} осталась на месте, но MCP-серверы сессии ({paths}) убраны из нее, и это удаление там не закоммичено ({error}): закоммитьте его или верните файлы (git checkout -- {paths}).",
+    cd_old_missing: "Прежней папки {path} не было — переносить было нечего.",
+    cd_start_error: "Сессия не запустилась снова: {error}",
     cancel: "Отмена", create_open: "Создать и открыть", create: "Создать",
     ns_title: "Новая сессия", ns_lead: "Рой получит цель, сам создаст план (задачу планирования) и распределит работу между агентами.",
     f_title: "Название", f_title_ph: "Например: Игра «Змейка». По умолчанию — первая строка цели", f_goal: "Цель",
@@ -60,7 +139,21 @@ const I18N = {
     net_hint_container: "Песочница запущена без файрвола, поэтому здесь это не строгая изоляция: только прокси и офлайн-настройки pip, uv, npm и git. Перезапустите dreamteam sandbox: если есть сессия без интернета, контейнер запустится с файрволом.",
     net_hint_unknown: "Команды агентов, их фоновые процессы и MCP-серверы без интернета, LLM работает: строго — в Docker (dreamteam sandbox) и на Linux, на Windows и macOS — только прокси и офлайн-настройки.",
     goal_required: "Укажите цель сессии.", creating: "Создаю сессию…",
-    f_files: "Файлы для работы", f_copy_from: "Скопировать из папки",
+    // the working folder of a new session (docs/SPEC.md §18.4 "Working folder")
+    f_ws: "Рабочая папка", f_ws_own: "Новая папка сессии",
+    f_ws_own_hint: "Сессия начнет с пустой папки внутри домашней папки DreamTeam; эта папка удаляется вместе с сессией.",
+    f_ws_copy: "Копия папки или zip", f_ws_project: "Прямо в папке проекта", f_ws_folder: "Папка",
+    f_ws_project_hint: "Агенты меняют, создают и удаляют файлы этой папки и коммитят в текущую ветку ее репозитория " +
+      "(папку без git DreamTeam сделает репозиторием). Пока сессия работает, не правьте эти файлы сами. При удалении " +
+      "сессии папка остается.",
+    f_ws_sandbox: "Хаб работает в песочнице Docker: здесь доступны только папки внутри его домашней папки и папки " +
+      "[api] folders с in_place.",
+    f_ws_none: "Укажите папку проекта.",
+    f_ws_checked: "Папка проверена: прочитайте под ней, что произойдет, и нажмите кнопку еще раз.",
+    f_ws_confirm: "Сессия будет работать прямо в папке {path} с ее файлами: {text} Продолжить?",
+    f_copy_none: "Укажите папку или выберите .zip.",
+    f_skills_project: "из .claude/skills этой папки: агенты могут менять эти файлы",
+    f_copy_from: "Скопировать из папки",
     f_copy_from_ph: "Полный путь на компьютере, где работает хаб, например C:\\work\\project",
     f_copy_zip: "или загрузить .zip",
     f_copy_hint: "Файлы копируются в папку новой сессии до её первого запуска: агенты работают с копией, " +
@@ -133,6 +226,9 @@ const I18N = {
     default_marker: "основной", none_opt: "—",
     sw_name: "Имя роя", sw_lang: "Язык промптов агентов", sw_max: "Максимум агентов",
     sw_budget: "Бюджет сессии, $", sw_budget_hint: "0 — без лимита",
+    sw_budget_notice: "Предупредить о бюджете при доле",
+    sw_budget_notice_hint: "При этой доле потраченного бюджета агенты и вы получаете одно предупреждение " +
+      "(0.8 — 80 %); 0 или 1 — без него.",
     sw_review: "Независимое ревью задач",
     sw_review_hint: "Задачу агента принимает другой агент, а если больше некому — вы. Выключите для дешёвых прогонов: тогда задача без ревьюера сразу готова.",
     sw_crew_review: "Проверять групповую задачу целиком",
@@ -174,7 +270,7 @@ const I18N = {
     ws_lock_wanted: "Напомнить держателю блокировки через, мин",
     ws_lock_wanted_hint: "напомнит держателю, когда он держит файл, который ждут, столько минут; 0 — сразу",
     ws_copy_mb: "Копия в новую сессию, МБ",
-    ws_copy_mb_hint: "--copy-from и «Файлы для работы»: предел копии и загружаемого .zip",
+    ws_copy_mb_hint: "--copy-from и «Копия папки или zip»: предел копии и загружаемого .zip",
     ws_copy_files: "Файлов в такой копии",
     mcp_approval: "Подтверждать новые MCP-серверы агентов", mcp_library: "Папка библиотеки MCP", mcp_startup: "Таймаут запуска, с",
     mcp_call: "Таймаут вызова, с", mcp_external: "Внешние MCP-серверы (JSON)",
@@ -276,8 +372,87 @@ const I18N = {
     ws_label: "Session folder", ws_default: "own folder", ws_adopted: "project folder", ws_moved: "moved", ws_missing_badge: "missing",
     ws_default_hint: "The session's own folder in the DreamTeam home; deleted with the session.",
     ws_adopted_hint: "An existing folder (your project): the agents work with its files and commit to the current branch of its repository. Deleting the session keeps the folder.",
-    ws_moved_hint: "The session was moved to this folder (/cd). Deleting the session keeps the folder.",
-    ws_missing: "The folder is missing: the session cannot start. Move it to another folder: /cd FOLDER or /cd --default in dreamteam tui.",
+    // the session folder from the web UI (folders.js, docs/SPEC.md §18.4 "Folders on both pages")
+    ws_moved_hint: "The session was moved to this folder (Change folder… or /cd). Deleting the session keeps the folder.",
+    ws_missing: "The folder is missing: the session cannot start. Bring it back, or choose another one:",
+    fo_browse: "Browse…",
+    fo_checking: "Checking the folder…",
+    fo_check_failed: "Could not check the folder: {error}. The hub checks it when the session is created or moved.",
+    fo_src_folder: "Folder found: its files are copied into the new session's folder.",
+    fo_src_zip: "A .zip found: its contents are copied into the new session's folder.",
+    fo_new_missing: "The folder does not exist: it will be created, and the session starts there afresh.",
+    fo_new_empty: "The folder is empty: the session starts there afresh.",
+    fo_new_files: "A folder with files: the agents will work with them and commit to its current branch “{branch}”.",
+    fo_new_files_plain: "A folder with files: the agents will work with them.",
+    fo_git_init: "It has no git repository: one will be created (git init and a first commit of its files).",
+    fo_unchanged: "The session already works in this folder.",
+    fo_branch: "Current branch: “{branch}”.",
+    fo_mcp: "The session's MCP servers move along: {names}.",
+    fp_title: "A folder on the hub's computer",
+    fp_root_home: "Home folder",
+    fp_root_drive: "Drive {name}",
+    fp_root_system: "Root (/)",
+    fp_recent: "Recent folders",
+    fp_root_api: "API folder: {name}",
+    fp_root_api_hint: "from [api] folders in the settings",
+    fp_root_dreamteam: "DreamTeam home",
+    fp_up: "Up",
+    fp_repo: "git",
+    fp_empty: "empty",
+    fp_noaccess: "no access",
+    fp_link: "link",
+    fp_busy: "taken by session “{title}”",
+    fp_creating: "a session is being created",
+    fp_current: "this session's folder",
+    fp_refused: "cannot be chosen",
+    fp_loading: "Loading…",
+    fp_none: "No folders here.",
+    fp_truncated: "{n} folders are shown; open the others by typing the path.",
+    fp_partial: "Not every folder is marked: the folder answers slowly.",
+    fp_fallback: "{path} does not exist: the nearest existing folder is open.",
+    fp_choose: "Choose this folder",
+    fp_cannot: "This folder cannot be chosen: {why}",
+    fp_busy_why: "session “{title}” works in it",
+    fp_nav_why: "it is a drive or file system root",
+    fp_new: "New folder…",
+    fp_new_ok: "Choose",
+    fp_new_hint: "The folder is made when the session starts working in it.",
+    fp_new_bad: "Give just the new folder's name; this one cannot name a folder on the hub's computer.",
+    cf_button: "Change folder…",
+    cf_title: "Folder of session “{title}”",
+    cf_now: "Now: {path} ({kind})",
+    cf_other: "Another folder",
+    cf_default: "Back to its own folder",
+    cf_hint: "An empty or new folder: the session's files and git history move there. A folder with files: the agents work with its files and commit to its current branch; the previous folder stays as it is.",
+    cf_go: "Change folder",
+    cf_moving: "Moving…",
+    cf_api: "An HTTP API client created this session, and it works right in the folder “{root}” of [api] folders: after the change it is an ordinary session of yours, and that folder's checks no longer apply.",
+    ws_missing_back: "The session folder is missing: {path}. The session cannot start until the folder is back.",
+    cd_ask: "Move session \"{title}\" to {path}? {text}",
+    cd_ask_default: "Move session \"{title}\" back to its own folder {path}? {text}",
+    cd_text_missing: "The folder does not exist — it will be created; the files and the git history move there.",
+    cd_text_empty: "The folder is empty: the files and the git history move there.",
+    cd_text_files: "The folder is not empty: the agents will work with its files and commit to its current branch (the previous folder {old} stays as it is).",
+    cd_text_fresh: "The folder is empty: the session starts afresh there (a new git repository); your folder {old} stays as it is, only the session's MCP servers move.",
+    cd_text_lost: "The current folder {old} does not exist, so nothing moves: the session carries on in the new folder.",
+    cd_text_back: "The session's previous files are still there: the agents go back to them; {old} stays as it is.",
+    cd_text_running: "The session is running: its agents stop during the move and then carry on.",
+    cd_unchanged: "Session \"{title}\" already works in {path}.",
+    cd_moved: "Session \"{title}\" now works in {path}: its files moved there.",
+    cd_now: "Session \"{title}\" now works in {path}.",
+    cd_adopted: "Session \"{title}\" now works with the files of {path}.",
+    cd_created: "Session \"{title}\" works in the new folder {path}.",
+    cd_git_moved: "git: the history moved along with the files.",
+    cd_git_existing: "git: the agents commit to the current branch of this folder's repository.",
+    cd_git_initialized: "git: a new repository was created in the folder (git init).",
+    cd_git_disabled: "git is off in the settings: no commits.",
+    cd_git_none: "git is not installed: no commits.",
+    cd_mcp_moved: "The session's MCP servers moved along: {names}.",
+    cd_old_kept: "The previous folder {path} stays where it is.",
+    cd_old_mcp_committed: "The previous folder {path} stays where it is; the session's MCP servers ({paths}) left it, and their removal is committed there ({commit}).",
+    cd_old_mcp_uncommitted: "The previous folder {path} stays where it is, but the session's MCP servers ({paths}) left it and their removal is not committed there ({error}): commit it, or restore them with git checkout -- {paths}.",
+    cd_old_missing: "The previous folder {path} did not exist: nothing was moved.",
+    cd_start_error: "The session did not start again: {error}",
     cancel: "Cancel", create_open: "Create and open", create: "Create",
     ns_title: "New session", ns_lead: "The swarm gets the goal, makes a plan (a planning task) and shares the work between agents.",
     f_title: "Title", f_title_ph: "e.g. Snake game. Default: the goal's first line", f_goal: "Goal",
@@ -307,7 +482,21 @@ const I18N = {
     net_hint_container: "The sandbox was started without its firewall, so this is not strict isolation here: only proxies and offline settings of pip, uv, npm and git. Restart dreamteam sandbox: with a session without network, the container starts with the firewall.",
     net_hint_unknown: "The agents' commands, their background jobs and MCP servers get no internet, the LLM keeps it: strictly in Docker (dreamteam sandbox) and on Linux; on Windows and macOS only proxies and offline settings.",
     goal_required: "Enter the session goal.", creating: "Creating the session…",
-    f_files: "Files to work on", f_copy_from: "Copy from a folder",
+    // the working folder of a new session (docs/SPEC.md §18.4 "Working folder")
+    f_ws: "Working folder", f_ws_own: "New session folder",
+    f_ws_own_hint: "The session starts with an empty folder of its own inside the DreamTeam home; that folder is deleted with the session.",
+    f_ws_copy: "Copy of a folder or a zip", f_ws_project: "Directly in a project folder", f_ws_folder: "Folder",
+    f_ws_project_hint: "The agents change, create and delete files in this folder and commit to the current branch of " +
+      "its repository (DreamTeam makes a folder without git a repository). Don't edit these files yourself while the " +
+      "session runs. Deleting the session keeps the folder.",
+    f_ws_sandbox: "The hub runs in the Docker sandbox: only the folders inside its home and the [api] folders with " +
+      "in_place are available here.",
+    f_ws_none: "Give the project folder.",
+    f_ws_checked: "The folder was checked: read below it what will happen, and click the button again.",
+    f_ws_confirm: "The session will work right in the folder {path}, with its files: {text} Go on?",
+    f_copy_none: "Give a folder or choose a .zip.",
+    f_skills_project: "from this folder's .claude/skills: agents can change these files",
+    f_copy_from: "Copy from a folder",
     f_copy_from_ph: "Full path on the computer the hub runs on, e.g. /home/me/project",
     f_copy_zip: "or upload a .zip",
     f_copy_hint: "The files are copied into the new session's folder before its first start: the agents work on " +
@@ -382,6 +571,9 @@ const I18N = {
     default_marker: "default", none_opt: "—",
     sw_name: "Swarm name", sw_lang: "Agents' prompt language", sw_max: "Max agents",
     sw_budget: "Session budget, $", sw_budget_hint: "0 — no limit",
+    sw_budget_notice: "Budget warning at share",
+    sw_budget_notice_hint: "At this share of the budget spent, the agents and you get one notice " +
+      "(0.8 = 80 %); 0 or 1: none.",
     sw_review: "Independent review of tasks",
     sw_review_hint: "An agent's task is approved by another agent, or by you when there is nobody else. Turn it off for cheap runs: a task without a reviewer is then done at once.",
     sw_crew_review: "Check a crew task as a whole",
@@ -423,7 +615,7 @@ const I18N = {
     ws_lock_wanted: "Remind the lock holder after, min",
     ws_lock_wanted_hint: "reminds the holder once it has held a file others wait for this long; 0 = at once",
     ws_copy_mb: "Copy into a new session, MB",
-    ws_copy_mb_hint: "--copy-from and “Files to work on”: the largest copy and uploaded .zip",
+    ws_copy_mb_hint: "--copy-from and “Copy of a folder or a zip”: the largest copy and uploaded .zip",
     ws_copy_files: "Files in such a copy",
     mcp_approval: "Require approval of new agent MCP servers", mcp_library: "MCP library folder", mcp_startup: "Startup timeout, s",
     mcp_call: "Call timeout, s", mcp_external: "External MCP servers (JSON)",
@@ -515,6 +707,10 @@ const H = {
 };
 // skills.js: a global of the page (loaded before this script), a module in the Node tests
 const SK = typeof Skills !== "undefined" ? Skills : require("./skills.js");
+// folders.js (the folder field's check line, the folder browser, «Сменить папку…»), the same way
+const FO = typeof Folders !== "undefined" ? Folders : require("./folders.js");
+FO.setup({ t, esc, request: (path, body) => api("POST", path, body), toast: (text, isErr) => toast(text, isErr),
+           openModal, closeModal });
 const SKILL_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;   // skills.NAME_RE (at most 64 characters)
 // profile names the settings accept (settings.apply_update)
 const PROFILE_NAME = /^[A-Za-z0-9_-]+$/;
@@ -714,15 +910,26 @@ function shortPath(path, max = 52) {
 }
 
 /** The card's folder line; `quiet` (a session that cannot start anyway: made by an earlier version) keeps the
- * «папки нет» badge but drops the warning that the session will not start until it is moved. */
-function workspaceLine(ws, quiet = false) {
+ * «папки нет» badge but drops the warning that the session will not start until it is moved and «Сменить папку…».
+ * `cd`: the session whose folder «Сменить папку…» changes (null: no button, as for the legacy main); `busy` disables
+ * it while the card's start or stop request runs. A missing folder has the button inside its warning instead. */
+function workspaceLine(ws, quiet = false, cd = null, busy = false) {
   const kind = workspaceKind(ws);
   if (!kind) return "";
   const missing = workspaceMissing(ws);
   const label = missing ? t("ws_missing_badge") : t("ws_" + kind);
   const badge = `<span class="badge ${missing ? "err" : kind === "default" ? "plain" : ""}">${esc(label)}</span>`;
-  return `<div class="sc-folder" title="${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}"><i class="ic ic-folder"></i><code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</div>
-    ${missing && !quiet ? `<div class="sc-warn"><i class="ic ic-alert"></i>${esc(t("ws_missing"))}</div>` : ""}`;
+  const button = !cd || quiet ? ""
+    : `<button class="link sc-cd" type="button" data-cd="${esc(cd)}"${busy ? " disabled" : ""}>`
+      + `${esc(t("cf_button"))}</button>`;
+  const warnBox = (html) => `<div class="sc-warn"><i class="ic ic-alert"></i><span>${html}</span></div>`;
+  const warn = !missing || quiet ? ""
+    : button ? warnBox(`${esc(t("ws_missing"))} ${button}`) : warnBox(esc(t("ws_missing_back", { path: ws.path })));
+  // the folder's tooltip on its path and badge, not on «Сменить папку…»
+  const tip = `${esc(t("ws_label"))}: ${esc(ws.path)}\n${esc(t("ws_" + kind + "_hint"))}`;
+  return `<div class="sc-folder"><span class="sc-where" title="${tip}"><i class="ic ic-folder"></i>`
+    + `<code><bdi dir="ltr">${esc(shortPath(ws.path))}</bdi></code>${badge}</span>${missing ? "" : button}</div>
+    ${warn}`;
 }
 
 /** The card line of a session whose files were copied in when it was created (summary "copied_from": the folder or
@@ -806,7 +1013,7 @@ function sessionCard(s) {
       <span title="${esc(time.title)}"><i class="ic ic-clock"></i>${esc(time.text)}</span>
       ${skills.count}
     </div>
-    ${workspaceLine(s.workspace, earlier)}
+    ${workspaceLine(s.workspace, earlier, s.legacy || s.id === "main" ? null : s.id, !!busy)}
     ${copiedLine(s.copied_from)}
     ${earlier ? "" : skills.warn}
     ${error ? `<div class="sc-error">${esc(error)}</div>` : ""}
@@ -823,6 +1030,13 @@ function sessionCard(s) {
 }
 
 function findSession(sid) { return (H.sessions || []).find((s) => s.id === sid) || { id: sid, title: sid }; }
+
+/** «Сменить папку…» of a card (folders.js changeDialog): the list reloads after a move. */
+function changeFolderModal(sid) {
+  const s = findSession(sid);
+  return FO.changeDialog({ sid, title: s.title, workspace: s.workspace, running: s.status === "running",
+                           onDone: () => loadSessions() });
+}
 
 /** Start or stop a session. Its button stays disabled until the request ends, also across the re-renders of
  * the polled list (starting a swarm can take a few seconds). */
@@ -1453,6 +1667,7 @@ async function newSessionModal() {
         <label class="field full"><span><i class="ic ic-goal"></i>${esc(t("f_goal"))} * <span class="hint">${esc(t("f_goal_hint"))}</span></span><textarea id="ns-goal" rows="4" placeholder="${esc(t("f_goal_ph"))}"></textarea></label>
         <label class="field full"><span>${esc(t("f_desc"))}</span><textarea id="ns-desc" rows="3" placeholder="${esc(t("f_desc_ph"))}"></textarea></label>
         <label class="check full"><input type="checkbox" id="ns-clarify"${sw.clarify ? " checked" : ""}> <span>${esc(t("f_clarify"))} <span class="hint">${esc(t("f_clarify_hint"))}</span></span></label>
+        ${nsWorkingFolderHtml()}
         <label class="field two"><span>${esc(t("f_model"))} <span class="hint">${esc(t("f_model_hint"))}</span></span><select id="ns-model">${modelOpts}</select></label>
         <label class="field"><span>${esc(t("f_lang"))}</span><select id="ns-lang">
           <option value="ru"${sw.language === "ru" ? " selected" : ""}>Русский</option>
@@ -1472,15 +1687,6 @@ async function newSessionModal() {
           <label class="field"><span>${esc(t("f_steps"))}</span><input id="ns-steps" type="number" min="1" max="500" value="${esc((v.agents || {}).max_steps_per_turn ?? 40)}"></label>
           <label class="check full"><input type="checkbox" id="ns-approval"${(v.mcp || {}).require_approval ? " checked" : ""}> ${esc(t("f_approval"))}</label>
           <label class="check full"><input type="checkbox" id="ns-offline"${sw.network === "off" ? " checked" : ""}> <span>${esc(t("f_network"))} <span class="hint">${esc(networkHint(H.isolation))}</span></span></label>
-          <div class="field full ns-files"><span><i class="ic ic-folder"></i>${esc(t("f_files"))}</span>
-            <label class="field full"><span>${esc(t("f_copy_from"))}</span>
-              <input id="ns-copy-from" spellcheck="false" autocomplete="off"
-                placeholder="${esc(t("f_copy_from_ph"))}"></label>
-            <label class="field full"><span>${esc(t("f_copy_zip"))}</span>
-              <input id="ns-copy-zip" type="file" accept=".zip,application/zip"></label>
-            <span class="field-hint">${esc(t("f_copy_hint", { mb: copyMaxMb() }))}</span>
-            <span class="field-hint" id="ns-copy-sandbox" hidden>${esc(t("f_copy_sandbox"))}</span>
-          </div>
         </div>
       </details>
       <div class="err-text" id="ns-error"></div>
@@ -1500,7 +1706,98 @@ async function newSessionModal() {
   loadSkills();
   $("#ns-run").addEventListener("change", (e) => { $("#ns-submit").textContent = t(e.target.checked ? "create_open" : "create"); });
   $("#ns-form").addEventListener("submit", submitNewSession);
+  nsWorkingFolderWire();
   nsCopySandbox();
+}
+
+/** The block «Рабочая папка» of the new-session dialog (docs/SPEC.md §18.4 "Working folder"): one choice of three,
+ * where the agents work (a new folder of the session's own, or a project folder in place) and what they start with
+ * (a copy of a folder or a zip). Only the chosen choice's fields show. */
+function nsWorkingFolderHtml() {
+  const radio = (value, label, checked = false) => `<label class="check"><input type="radio" name="ns-ws" `
+    + `id="ns-ws-${value}" value="${value}"${checked ? " checked" : ""}> <span>${esc(t(label))}</span></label>`;
+  const browse = `class="btn" type="button" aria-haspopup="dialog">${esc(t("fo_browse"))}</button>`;
+  return `<fieldset class="full ns-ws" id="ns-ws"><legend><i class="ic ic-folder"></i>${esc(t("f_ws"))}</legend>
+    ${radio("own", "f_ws_own", true)}
+    <div class="ns-ws-box" id="ns-ws-own-box"><span class="field-hint">${esc(t("f_ws_own_hint"))}</span></div>
+    ${radio("copy", "f_ws_copy")}
+    <div class="ns-ws-box" id="ns-ws-copy-box" hidden>
+      <label class="field full" for="ns-copy-from"><span>${esc(t("f_copy_from"))}</span></label>
+      <div class="fo-row"><input id="ns-copy-from" spellcheck="false" autocomplete="off"
+        aria-describedby="ns-copy-check" placeholder="${esc(t("f_copy_from_ph"))}">
+        <button id="ns-copy-browse" ${browse}</div>
+      <div class="fo-line" id="ns-copy-check" role="status" aria-live="polite"></div>
+      <label class="field full"><span>${esc(t("f_copy_zip"))}</span>
+        <input id="ns-copy-zip" type="file" accept=".zip,application/zip"></label>
+      <span class="field-hint">${esc(t("f_copy_hint", { mb: copyMaxMb() }))}</span>
+      <span class="field-hint" id="ns-copy-sandbox" hidden>${esc(t("f_copy_sandbox"))}</span>
+    </div>
+    ${radio("project", "f_ws_project")}
+    <div class="ns-ws-box" id="ns-ws-project-box" hidden>
+      <label class="field full" for="ns-ws-path"><span>${esc(t("f_ws_folder"))}</span></label>
+      <div class="fo-row"><input id="ns-ws-path" spellcheck="false" autocomplete="off" aria-describedby="ns-ws-check"
+        placeholder="${esc(t("f_copy_from_ph"))}"><button id="ns-ws-browse" ${browse}</div>
+      <div class="fo-line" id="ns-ws-check" role="status" aria-live="polite"></div>
+      <span class="field-hint">${esc(t("f_ws_project_hint"))}</span>
+      <span class="field-hint" id="ns-ws-sandbox" hidden>${esc(t("f_ws_sandbox"))}</span>
+    </div>
+  </fieldset>`;
+}
+
+/** The chosen working folder: "own", "copy" or "project". */
+function nsWsChoice() {
+  for (const value of ["copy", "project"]) if (($(`#ns-ws-${value}`) || {}).checked === true) return value;
+  return "own";
+}
+
+/** The block's listeners and the two check lines (folders.js checker). */
+function nsWorkingFolderWire() {
+  H.nsProject = null;
+  H.nsCopyRoots = null;
+  H.nsDialog = (H.nsDialog || 0) + 1;   // a late answer of the copy's roots never reaches another dialog
+  H.nsCopyCheck = FO.checker($("#ns-copy-from"), $("#ns-copy-check"), { use: "source" });
+  H.nsWsCheck = FO.checker($("#ns-ws-path"), $("#ns-ws-check"), { use: "workspace", onChange: nsProjectSync });
+  for (const value of ["own", "copy", "project"]) $(`#ns-ws-${value}`)?.addEventListener("change", nsWsShow);
+  const browse = (button, input, use, checker) => button?.addEventListener("click", () => FO.browse({
+    use, start: input.value, opener: button,
+    onChoose: (path) => { input.value = path; input.focus(); checker.run(true); },
+  }));
+  browse($("#ns-copy-browse"), $("#ns-copy-from"), "source", H.nsCopyCheck);
+  browse($("#ns-ws-browse"), $("#ns-ws-path"), "workspace", H.nsWsCheck);
+}
+
+/** Shows the chosen choice's fields (the others keep their values while the dialog is open). */
+function nsWsShow() {
+  const choice = nsWsChoice();
+  for (const value of ["own", "copy", "project"]) {
+    const box = $(`#ns-ws-${value}-box`);
+    if (box) box.hidden = value !== choice;
+  }
+  $("#ns-error").textContent = "";
+  nsProjectSync();
+}
+
+/** The skills of the project folder (`.claude/skills`, origin claude-project): asked for a checked folder with files,
+ * dropped (rows and ticks) for another folder, another choice or a check with an error. */
+function nsProjectSync() {
+  const res = nsWsChoice() === "project" && H.nsWsCheck ? H.nsWsCheck.result : null;
+  const answer = res && res.answer;
+  const want = answer && !answer.error && answer.state === "files" ? answer.target : null;
+  const have = H.nsProject ? H.nsProject.path : null;
+  if (want === have) return;
+  for (const ref of [...(H.nsSkills || [])]) if (ref.startsWith("claude-project:")) H.nsSkills.delete(ref);
+  H.nsProject = want ? { path: want, items: [] } : null;
+  renderNsSkills();
+  if (want) loadNsProjectSkills(want);
+}
+async function loadNsProjectSkills(path) {
+  let data;
+  try {
+    data = await api("GET", `/api/skills?workspace=${encodeURIComponent(path)}`);
+  } catch (e) { return; }   // (400: a network path)
+  if (!H.nsProject || H.nsProject.path !== path) return;   // another folder meanwhile
+  H.nsProject.items = ((data && data.claude) || []).filter((e) => e.origin === "claude-project" && !e.error);
+  renderNsSkills();
 }
 
 /** [workspace] copy_max_mb of the saved settings: the largest copy and uploaded .zip (1024 when not loaded). */
@@ -1509,9 +1806,36 @@ function copyMaxMb() { return Number((savedDefaults().workspace || {}).copy_max_
 /** The "upload it as a .zip" hint of the new-session dialog: shown when the hub runs in a Docker container (the
  * sandbox, docker compose, docker run), which sees only its home (GET /api/skills "container"). */
 function nsCopySandbox() {
+  const container = !!(H.skills && (H.skills.container || H.skills.sandbox));
   const el = $("#modal #ns-copy-sandbox");
-  if (el) el.hidden = !(H.skills && (H.skills.container || H.skills.sandbox));
+  if (el) el.hidden = !container;
+  const ws = $("#modal #ns-ws-sandbox");
+  if (ws) ws.hidden = !container;
+  if (container && H.nsCopyRoots === null) nsCopyRoots();
 }
+/** In a container the copy's browser lists only the mounted [api] folders roots (the home is never a copy source):
+ * asked once per dialog; without any, «Обзор…» is disabled with the sandbox hint as its tooltip. A request that
+ * failed (429, no connection) leaves the button as it is, to be asked again; an answer for a dialog that is gone is
+ * dropped. */
+async function nsCopyRoots() {
+  const dialog = H.nsDialog;
+  H.nsCopyRoots = "asking";
+  let roots;
+  try {
+    roots = (await api("POST", "/api/folders/list", { use: "source" })).roots || [];
+  } catch (e) {
+    if (H.nsDialog === dialog) H.nsCopyRoots = null;
+    return;
+  }
+  if (H.nsDialog !== dialog) return;
+  H.nsCopyRoots = roots;
+  const button = $("#modal #ns-copy-browse");
+  if (!button) return;
+  button.disabled = nsCopyBrowseOff();
+  button.title = roots.length ? "" : t("f_copy_sandbox");
+}
+/** The copy's «Обзор…» is off in a container without a mounted [api] folder (nsCopyRoots). */
+function nsCopyBrowseOff() { return Array.isArray(H.nsCopyRoots) && !H.nsCopyRoots.length; }
 
 /** The toasts of a copy made for a new session (POST /api/sessions "copy"): what was copied and, when something
  * was, what was left out (links, folders by name, special files). */
@@ -1532,9 +1856,16 @@ function copyToasts(copy) {
   return out;
 }
 
-/** Disables (or enables again) the dialog's folder field and .zip input while the session is created. */
+/** Disables (or enables again) the block «Рабочая папка» while the session is created: its choices, the folder
+ * fields, the .zip input and both «Обзор…» (the copy's stays off in a container without [api] folders). */
 function nsFilesDisabled(on) {
-  for (const sel of ["#ns-copy-from", "#ns-copy-zip"]) { const el = $(sel); if (el) el.disabled = on; }
+  for (const sel of ["#ns-copy-from", "#ns-copy-zip", "#ns-ws-path", "#ns-ws-browse", "#ns-ws-own", "#ns-ws-copy",
+                     "#ns-ws-project"]) {
+    const el = $(sel);
+    if (el) el.disabled = on;
+  }
+  const copyBrowse = $("#ns-copy-browse");
+  if (copyBrowse) copyBrowse.disabled = on || nsCopyBrowseOff();
 }
 
 /** "3 KB" / "1.5 MB": a copy's size for the toast and the session card's tooltip. */
@@ -1666,34 +1997,72 @@ async function submitNewSession(e) {
   const run = $("#ns-run").checked;
   const btn = $("#ns-submit");
   if (btn.disabled) return;
-  // files to work on (docs/SPEC.md §17.2): a folder on the hub's computer, or a .zip uploaded first
-  const copyFrom = String($("#ns-copy-from").value || "").trim();
-  const zip = Array.from($("#ns-copy-zip").files || [])[0] || null;
-  const maxMb = copyMaxMb();
-  if (copyFrom && zip) { $("#ns-error").textContent = t("f_copy_both"); return; }
-  if (zip && !/\.zip$/i.test(String(zip.name || ""))) { $("#ns-error").textContent = t("f_copy_zip_only"); return; }
-  if (zip && zip.size > maxMb * 2 ** 20) { $("#ns-error").textContent = t("f_copy_zip_big", { mb: maxMb }); return; }
+  const error = (text) => { $("#ns-error").textContent = text; };
+  // the working folder (docs/SPEC.md §18.4 "Working folder"): never a copy and a folder of the user's together
+  const choice = nsWsChoice();
+  let copyFrom = "", zip = null, workspace = null, expect = null;
+  if (choice === "copy") {   // a folder on the hub's computer, or a .zip uploaded first
+    copyFrom = FO.unquote($("#ns-copy-from").value);
+    zip = Array.from($("#ns-copy-zip").files || [])[0] || null;
+    const maxMb = copyMaxMb();
+    if (!copyFrom && !zip) { error(t("f_copy_none")); return; }
+    if (copyFrom && zip) { error(t("f_copy_both")); return; }
+    if (zip && !/\.zip$/i.test(String(zip.name || ""))) { error(t("f_copy_zip_only")); return; }
+    if (zip && zip.size > maxMb * 2 ** 20) { error(t("f_copy_zip_big", { mb: maxMb })); return; }
+    const res = copyFrom && H.nsCopyCheck ? H.nsCopyCheck.result : null;
+    if (res && res.answer && res.answer.error) { error(String(res.answer.error)); return; }
+  } else if (choice === "project") {
+    const path = FO.unquote($("#ns-ws-path").value);
+    if (!path) { error(t("f_ws_none")); $("#ns-ws-path").focus(); return; }
+    const check = H.nsWsCheck;
+    // the create goes with the check the user has seen: none yet (the 400 ms not over, the answer not in) runs it
+    // and creates nothing; once its answer is in, #ns-error says to read it (or the refusal), the line says the rest
+    if (check && !check.ready()) {
+      error("");
+      const shown = await check.run(true);
+      const seen = shown && shown.answer;
+      if (seen) error(seen.error ? String(seen.error) : t("f_ws_checked"));
+      return;
+    }
+    const res = check ? check.result : null;
+    const answer = res && res.answer;
+    if (answer && answer.error) { error(String(answer.error)); return; }
+    if (answer) {
+      const ask = () => confirm(t("f_ws_confirm", { path: answer.target, text: res.words.text }));
+      if (answer.mode === "adopted" && !ask()) { error(""); return; }   // (no earlier error stays under it)
+      workspace = answer.target;
+      expect = answer.expect;
+    } else {
+      workspace = path;   // a check that could not run blocks nothing: the hub decides and says
+    }
+  }
   btn.disabled = true; nsFilesDisabled(true);
-  $("#ns-error").textContent = zip ? t("uploading", { mb: (zip.size / 2 ** 20).toFixed(1) })
-                                   : copyFrom ? t("copying") : t("creating");
+  error(zip ? t("uploading", { mb: (zip.size / 2 ** 20).toFixed(1) }) : copyFrom ? t("copying") : t("creating"));
   try {
     const body = { title: $("#ns-title").value.trim(), goal, description: $("#ns-desc").value.trim(), overrides, start: run };
-    if (H.nsSkills.size) body.skills = [...H.nsSkills];   // references: "x" from the library, "claude-user:x"…
+    // references: "x" from the library, "claude-user:x"…, "claude-project:x" only with the project's folder
+    const skills = [...H.nsSkills].filter((ref) => choice === "project" || !ref.startsWith("claude-project:"));
+    if (skills.length) body.skills = skills;
     // a new upload on every submit: a create that failed may already have used the token
-    if (zip) { body.copy_from_upload = (await uploadZip(zip)).upload; $("#ns-error").textContent = t("copying"); }
+    if (zip) { body.copy_from_upload = (await uploadZip(zip)).upload; error(t("copying")); }
     else if (copyFrom) body.copy_from = copyFrom;
+    if (workspace) { body.workspace = workspace; if (expect) body.expect = expect; }
     const data = await api("POST", "/api/sessions", body);
     const copy = (data && data.copy) || {};
-    const lines = copyToasts(data && data.copy);
+    const lines = choice === "project"
+      ? FO.resultTexts(t, data && data.result, (data && data.session && data.session.title) || body.title || goal)
+      : copyToasts(data && data.copy).map((text) => ({ text, err: false }));
     // started: the board opens at once, unless the copy left out links or special files (the folders left out
     // by name are expected): that is shown here first, and a click on it opens the board
     if (run && !(Number(copy.links_count) || Number(copy.special_count))) { location.href = data.session.url; return; }
     const open = () => { location.href = data.session.url; };
-    lines.forEach((line, i) => (run && i === lines.length - 1 ? toast(`${line}\n${t("copied_open")}`, false, open)
-                                                                : toast(line)));
+    lines.forEach((line, i) => (run && i === lines.length - 1 ? toast(`${line.text}\n${t("copied_open")}`, false, open)
+                                                                : toast(line.text, line.err)));
     closeModal(true); loadSessions();
   } catch (err) {
-    btn.disabled = false; nsFilesDisabled(false); $("#ns-error").textContent = err.message;
+    btn.disabled = false; nsFilesDisabled(false); error(err.message);
+    // the folder changed since its check (409): say what it is now
+    if (choice === "project" && err.status === 409 && H.nsWsCheck) H.nsWsCheck.run(true);
   }
 }
 
@@ -1901,12 +2270,16 @@ function onSkillsPaneClick(e) {
 /** The new-session picker: a checkbox per skill of every source (a name in two sources shows twice, each row with
  * its own reference), then the skills the composed team's roles bring ("not in the library" when one resolves
  * nowhere: the role would not get it). */
-function nsSkillsHtml(data, checked) {
+function nsSkillsHtml(data, checked, project = null) {
   const rows = skillSources(data).filter((s) => !s.entry.error && s.origin !== "claude-project");
+  // with «Прямо в папке проекта»: that folder's .claude/skills after the other rows (GET /api/skills?workspace=)
+  for (const e of (project && project.items) || []) {
+    rows.push({ entry: e, origin: "claude-project", ref: `claude-project:${e.name}`, project: true });
+  }
   if (!rows.length) return `<div class="sk-empty muted">${esc(t("f_skills_none"))}</div>`;
   return `<div class="sk-picker">${rows.map((s) => `<label class="check" title="${esc(s.entry.description || "")}">
     <input type="checkbox" data-ns-skill="${esc(s.ref)}"${checked.has(s.ref) ? " checked" : ""}>
-    <span><b>${esc(s.entry.name)}</b> <span class="badge plain">${esc(s.origin)}</span>${s.entry.changed_outside ? ` <span class="badge warn" title="${esc(t("sk_changed_hint"))}"><i class="ic ic-alert"></i>${esc(t("sk_changed_outside"))}</span>` : ""} <span class="hint">${esc(roleSummary(s.entry.description || "", 90))}</span></span></label>`).join("")}</div>`;
+    <span><b>${esc(s.entry.name)}</b> <span class="badge plain">${esc(s.origin)}</span>${s.entry.changed_outside ? ` <span class="badge warn" title="${esc(t("sk_changed_hint"))}"><i class="ic ic-alert"></i>${esc(t("sk_changed_outside"))}</span>` : ""} <span class="hint">${esc(s.project ? t("f_skills_project") : roleSummary(s.entry.description || "", 90))}</span></span></label>`).join("")}</div>`;
 }
 /** The skills the roles of `rows` (a composer's) list, by the saved catalog: [{name, resolves}]. */
 function teamSkills(rows, catalog) {
@@ -1936,7 +2309,7 @@ function onNsSkillChange(e) {
 }
 function renderNsSkills() {
   const box = $("#ns-skills-list");
-  if (box && H.skills) box.innerHTML = nsSkillsHtml(H.skills, H.nsSkills);
+  if (box && H.skills) box.innerHTML = nsSkillsHtml(H.skills, H.nsSkills, H.nsProject);
   renderNsRoleSkills();
 }
 function renderNsRoleSkills() {
@@ -2045,16 +2418,29 @@ async function onPendingClick(e) {
 }
 
 // ---- modal -----------------------------------------------------------------------------------------
+/** Escape and a click on the backdrop close the modal, never while the folder browser is open above it: Escape
+ * then closes the browser alone (its own listener takes it while the focus is inside it; this one when the focus has
+ * fallen out of it), and its own backdrop closes it. */
+function onModalEscape(e) {
+  if (e.key !== "Escape") return;
+  if (FO.isOpen()) FO.closeBrowser(true);
+  else if (!$("#modal-backdrop").classList.contains("hidden")) closeModal();
+}
+function onModalBackdrop(e) { if (!FO.isOpen() && e.target.id === "modal-backdrop") closeModal(); }
 function openModal(html) {
+  if (FO.isOpen()) FO.closeBrowser(false);   // (the browser belongs to the dialog it was opened from)
   $("#modal").innerHTML = html;
   $("#modal-backdrop").classList.remove("hidden");
 }
-/** Closes the modal; a new-session form with typed text asks first (a stray click must not lose a long goal). */
+/** Closes the modal; a new-session form with typed text asks first (a stray click must not lose a long goal). The
+ * change dialog never closes while its move runs (folders.js busy()). */
 function closeModal(force = false) {
-  const typed = ["#ns-goal", "#ns-desc", "#ns-copy-from"].some((sel) => {
+  if (FO.busy()) return false;
+  const typed = ["#ns-goal", "#ns-desc", "#ns-copy-from", "#ns-ws-path"].some((sel) => {
     const el = $("#modal " + sel); return el && el.value.trim();
   }) || !!(($("#modal #ns-copy-zip") || {}).files || []).length;   // a chosen .zip counts as typed too
   if (!force && typed && !confirm(t("discard_new"))) return false;
+  if (FO.isOpen()) FO.closeBrowser(false);
   $("#modal-backdrop").classList.add("hidden");
   $("#modal").innerHTML = "";
   return true;
@@ -2106,6 +2492,8 @@ function renderSettings(fromServer) {
       field("sw_lang", "swarm.language", "select", { options: [["ru", "Русский"], ["en", "English"]] }),
       field("sw_max", "swarm.max_agents", "int", { min: 1 }),
       field("sw_budget", "swarm.max_cost_usd", "float", { min: 0, step: 0.5, hint: "sw_budget_hint" }),
+      field("sw_budget_notice", "swarm.budget_notice_at", "float",
+            { min: 0, max: 1, step: 0.05, hint: "sw_budget_notice_hint" }),
       teamComposer("defaults"),
       field("sw_review", "swarm.independent_review", "bool", { full: true, hint: "sw_review_hint" }),
       field("sw_crew_review", "swarm.crew_review", "bool", { full: true, hint: "sw_crew_review_hint" }),
@@ -2669,7 +3057,8 @@ function init() {
     renderSessions();
   }));
   document.addEventListener("click", (e) => {
-    const el = e.target.closest("[data-start],[data-stop],[data-delete],[data-close],[data-new-session],[data-skills-pending]");
+    const el = e.target.closest("[data-start],[data-stop],[data-delete],[data-close],[data-new-session],"
+                                + "[data-skills-pending],[data-cd]");
     if (!el) return;
     const ds = el.dataset;
     if ("start" in ds) startSession(ds.start, el);
@@ -2678,9 +3067,10 @@ function init() {
     else if ("delete" in ds) deleteModal(ds.delete);
     else if ("close" in ds) closeModal();
     else if ("newSession" in ds) newSessionModal();
+    else if ("cd" in ds) { if (!el.disabled) changeFolderModal(ds.cd); }
   });
-  $("#modal-backdrop").addEventListener("mousedown", (e) => { if (e.target.id === "modal-backdrop") closeModal(); });
-  document.addEventListener("keydown", (e) => { if (e.key === "Escape" && !$("#modal-backdrop").classList.contains("hidden")) closeModal(); });
+  $("#modal-backdrop").addEventListener("mousedown", onModalBackdrop);
+  document.addEventListener("keydown", onModalEscape);
   const form = $("#settings-form");
   form.addEventListener("input", onSettingsInput);
   form.addEventListener("change", onSettingsChange);
@@ -2725,6 +3115,9 @@ if (typeof module !== "undefined" && module.exports) {
     networkHint,
     // files to work on: the new-session dialog's copy block, the zip upload, the card's "copy of" line
     uploadZip, copiedLine, sizeText, nsCopySandbox, copyMaxMb, copyToasts,
+    // the working folder of a new session, «Сменить папку…» (folders.js)
+    FO, nsWorkingFolderHtml, nsWsChoice, nsWsShow, nsProjectSync, nsCopyRoots, changeFolderModal, onModalEscape,
+    onModalBackdrop, findSession,
   };
 } else if (typeof document !== "undefined") {
   init();

@@ -1618,6 +1618,7 @@ async def test_background_jobs_in_the_status_line_and_the_jobs_command(tmp_path,
         await h.run("/jobs j1", "child up")
         assert f"Job j1 of {agent}: " in h.out[-1]
         await h.run("/pause", "The swarm is paused")   # a pause does not stop the background jobs
+        await h.see(f"Background jobs of the agents are not paused with the swarm: j1 ({agent}: ")  # u_paused_jobs
         await asyncio.sleep(0.5)
         assert pid_alive(pid) and h.tui.jobs == ["j1"]
         await h.run("/jobs stop j1", "Stopped job j1 (")

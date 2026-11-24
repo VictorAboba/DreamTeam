@@ -18,11 +18,18 @@ the version ranges of `pyproject.toml`.
 `dreamteam sandbox --build` rebuilds an image built earlier.
 Local models (Ollama, vLLM) are reachable from the container at `http://host.docker.internal:<port>`.
 Only the home folder is mounted into the container (and the host's skills library read-only, and the roots of
-`[api] folders` for the [HTTP API](#the-http-api-in-the-sandbox)), so sessions that `/cd` moved to a folder outside it
+`[api] folders` for the [HTTP API](#the-http-api-in-the-sandbox)), so sessions that were moved to a folder outside it
 don't start in the sandbox: `dreamteam sandbox` lists them at startup. Before the start, return such sessions to the
-home folder (`/cd --default` or `/cd` to a folder inside it: such folders are found in the container too).
-Files from your computer reach a new session through the .zip upload of the "New session" dialog ("More" → "Files
-to work on"): a folder path from the host is not there in the container (see
+home folder ("Change folder…" on the sessions page, `/cd --default` or `/cd` to a folder inside it: such folders are
+found in the container too). Inside the sandbox the hub refuses a folder outside the home and outside the roots of
+`[api] folders` with `in_place = true` for a new or moved session, since a folder made inside the container would be
+lost with it; the web interface's "Browse…" lists only those folders
+([Choosing the folder in the web interface](projects.md#choosing-the-folder-in-the-web-interface)). With
+`docker compose`, mount the folders the sessions should work in inside the home (e.g. at `/swarm/projects/<name>`);
+a folder mounted elsewhere must be a root of `[api] folders` with `in_place = true`, mounted where the comment in
+`docker-compose.yml` shows, and that also lets every HTTP API client work in it.
+Files from your computer reach a new session through the .zip upload of the "New session" dialog ("Working folder"
+→ "Copy of a folder or a zip"): a folder path from the host is not there in the container (see
 [Working on a copy of files](projects.md#working-on-a-copy-of-files)).
 
 Git in the image trusts no repository that belongs to another user (git's `safe.directory` check is on). The agents'
@@ -181,6 +188,9 @@ interface says so plainly:
   session with network (and in one switched off without the firewall): with a rootful Docker daemon on Linux, what
   they create in the mounted folder belongs to root on the host. For an untrusted goal start the sandbox with the
   network off, or use rootless Docker, Docker Desktop or `userns-remap`.
+  The hub finds the background processes of the commands without network by a token in their environment,
+  which it opens for a moment under their user's file-system ids (`setfsuid`): a process monitor (Falco,
+  auditd) sees this as the hub changing its uid.
 * **Linux**: commands run in a separate network namespace that has only its own localhost, as your own user, as
   before. There is one namespace per DreamTeam process: a server that one command started in the background is
   reachable from the next commands, tests and MCP servers, but the machine's own localhost (the board, your local

@@ -128,7 +128,7 @@ def make_earlier(manager: SessionManager, sid: str) -> None:
     try:
         db.execute("INSERT INTO agents(name, kind, role, model, status) VALUES ('Anna', 'llm', 'Tester', 'default', "
                    "'idle')")
-        frozen.write(db, "Anna", frozen.record(4, "en", frozen.snapshot(4, "en")))
+        frozen.write(db, "Anna", frozen.record(4, "en", []))
     finally:
         db.close()
 

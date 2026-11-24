@@ -5,8 +5,8 @@ runs on in the background (origin "timeout"). A caller may also ask for the back
 origin "background"), and processes a command leaves running after its shell exited are kept as a job too
 (origin "detached"). The JobManager owns every running job: its row in the `jobs` table, its log
 (`.scratch/<member>/jobs/j<N>.log`), its lifetime, its end (one finisher per job), the autocommit under its owner
-and the cleanup at retire and session stop. Old agents (whose frozen tool set has no `jobs` tool) list and stop
-jobs through a console intercept: the whole command line `jobs`, `jobs j3` or `kill j3`.
+and the cleanup at retire and session stop. A whole `shell` command line `jobs`, `jobs j3` or `kill j3`, typed from
+shell habit, is answered by the console intercept instead of a shell.
 
 The owner's notices (n_job_*, in the owner's language) and the journaled job.started / job.ended events go
 through the `_announce_*` hooks, which never raise."""
@@ -94,24 +94,19 @@ WRAP_UP_ERROR = ("The user asked the team to wrap up, so no new background jobs 
                  "have (task_complete with the result so far and what is left).")
 NOTES = {
     "limit_member": "It was not moved to the background: you already have {n} background jobs ({ids}), the most "
-                    "allowed. Stop one you no longer need ({how}) or wait for one to end.",
+                    "allowed. Stop one you no longer need (job_stop) or wait for one to end.",
     "limit_session": "It was not moved to the background: the session already runs {n} background jobs, the most "
                      "allowed.",
     "disabled": "Background jobs are turned off in the settings ([shell] max_jobs_per_member or max_jobs is 0).",
-    "no_time": "{max} is the longest a command may run unless it was started in the background on purpose ({how}).",
+    "no_time": "{max} is the longest a command may run unless it was started in the background on purpose "
+               "(background=true).",
     "wrap_up": "It was not moved to the background: the user asked the team to wrap up, so no new background jobs "
                "are started. Finish your task with the results you have and say what is left.",
     "wrap_up_left": "They were not kept as a background job: the user asked the team to wrap up, so no new "
                     "background jobs are started.",
 }
-# (new callers, old agents). PowerShell: Start-Process only with -NoNewWindow keeps the output in the job (without it
-# the program writes into a console window of its own on the user's desktop, and the job's log stays empty)
-NOTE_HOW = {
-    "limit_member": ("job_stop", "run the shell command kill jN on its own"),
-    "no_time": ("background=true", "end it with &, in PowerShell use Start-Process -NoNewWindow"),
-}
 # {wait}: the tool that sleeps until the end is announced: `wait` (AI agents), `wait_for_events` (external members)
-FOOTERS_NEW = {
+FOOTERS = {
     "background": "[Job j{id} keeps running in the background; its output goes on into {log}. You will be notified "
                   "when it ends, so don't poll it: do other work, or call {wait} if nothing else is left. jobs with "
                   "job_id \"j{id}\" shows its latest output; job_stop stops it. It is stopped if it still runs {max} "
@@ -125,19 +120,6 @@ FOOTERS_NEW = {
                 "when the session stops or after {job_max}, and you are told when they have all ended (only at your "
                 "next wake-up unless you hold a task in progress). jobs with job_id \"j{id}\" shows their latest "
                 "output; job_stop stops them.]",
-}
-FOOTERS_OLD = {
-    "background": "[Job j{id} keeps running in the background; its output goes on into {log}. You will be notified "
-                  "when it ends, so don't poll it: do other work, or call {wait} if nothing else is left. To see its "
-                  "latest output, run the shell command jobs j{id}; to stop it, run the shell command kill j{id} "
-                  "(each as a command of its own); the command jobs lists all jobs. It is stopped if it still runs "
-                  "{max} after it started; start servers yourself in the background instead (end the command with "
-                  "&, in PowerShell use Start-Process -NoNewWindow), then they may run up to {job_max}.]",
-    "detached": "[Still running: {names}. They are kept as job j{id}: their output goes on into {log}, they stop "
-                "when the session stops or after {job_max}, and you are told when they have all ended (only at your "
-                "next wake-up unless you hold a task in progress). To see their latest output, run the shell "
-                "command jobs j{id}; to stop them, run the shell command kill j{id} (each as a command of its "
-                "own).]",
 }
 CONSOLE_MARK = " [dreamteam]"
 
@@ -165,7 +147,7 @@ _CONSOLE_KILL = re.compile(r"kill(?:\s+(-9|-KILL|-SIGKILL|-s\s+KILL|-s\s+SIGKILL
 
 
 def parse_console(command: str) -> tuple[str, list[int], bool] | None:
-    """The console intercept (old agents' way to list and stop jobs from `shell`): ("list" | "show" | "kill", ids,
+    """The console intercept (a whole `shell` line typed from shell habit): ("list" | "show" | "kill", ids,
     force) when the WHOLE line (stripped, one trailing ";" dropped) is `jobs`, `jobs j3` or `kill [-9|-TERM|…] j3
     [%4 …]`, else None and the command goes to the real shell. Case-sensitive; `kill` never takes a bare number
     (that is a PID)."""
@@ -362,17 +344,15 @@ class ShellOutcome:
     max_output: int = 12000
     serial: int | None = None  # the command's (RunningCommand.serial)
 
-    def _note_text(self, has_jobs_tool: bool, cfg: Any) -> str:
+    def _note_text(self, cfg: Any) -> str:
         if self.note not in NOTES:
             return ""
-        how = NOTE_HOW.get(self.note, ("", ""))[0 if has_jobs_tool else 1]
-        return NOTES[self.note].format(how=how, max=fmt_duration(cfg.max_timeout, "en"), **self.note_args)
+        return NOTES[self.note].format(max=fmt_duration(cfg.max_timeout, "en"), **self.note_args)
 
-    def render(self, *, has_jobs_tool: bool, cfg: Any, has_wait: bool = True) -> str:
+    def render(self, *, cfg: Any, has_wait: bool = True) -> str:
         """The result text (docs/SPEC.md §7.1). The head line and the footer are never cut: when the whole text
-        would pass max_output, only the output in between is cut in the middle. The footer of a job names the tools
-        the caller has: `jobs`/`job_stop` or the console commands (`has_jobs_tool`), `wait` or, for an external
-        member, `wait_for_events` (`has_wait`)."""
+        would pass max_output, only the output in between is cut in the middle. The footer of a job names `jobs`
+        with job_id and `job_stop`, and `wait`, or `wait_for_events` for an external member (`has_wait`)."""
         shell, output = self.shell, self.output
         job_id = self.job.id if self.job else 0
         no_output, footer = "(no output)", ""
@@ -392,8 +372,7 @@ class ShellOutcome:
             else:
                 head = (f"exit code: {self.code} [{shell}]; processes it started keep running as background job "
                         f"j{job_id}")
-            footers = FOOTERS_NEW if has_jobs_tool else FOOTERS_OLD
-            template = footers.get(self.state, FOOTERS_NEW[self.state])
+            template = FOOTERS[self.state]
             minutes = int(getattr(cfg, "job_max_minutes", _SETTING_DEFAULTS["job_max_minutes"]) or 0)
             footer = template.format(id=job_id, log=self.job.log_shown if self.job else "",
                                      max=fmt_duration(cfg.max_timeout, "en"),
@@ -402,11 +381,11 @@ class ShellOutcome:
                                      names=format_names(self.names), wait="wait" if has_wait else "wait_for_events")
         elif self.state == "leftovers_killed":
             head = f"exit code: {self.code} [{shell}]; the processes it left running were stopped"
-            note = self._note_text(has_jobs_tool, cfg)
+            note = self._note_text(cfg)
             footer = f"[{note}]" if note else ""
         elif self.state == "timeout":
             head = f"TIMEOUT after {_secs(self.wait)}s (process tree killed) [{shell}]"
-            note = self._note_text(has_jobs_tool, cfg)
+            note = self._note_text(cfg)
             footer = f"[{note}]" if note else ""
         else:  # killed
             why = "you are leaving the swarm" if self.note == "retired" else "the session is stopping"

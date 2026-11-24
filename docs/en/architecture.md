@@ -19,9 +19,8 @@
 * The agent history is append-only: Claude's thinking blocks are tied to the exact prefix of the dialog, and
   the prompt cache works for the same reason. The system prompt is fixed at hiring, the agent's tool set is
   constant, and MCP tools are called through `mcp_call`. When the context overflows, the history is compacted into
-  a summary. Only at that moment does an agent of an already running session get new DreamTeam tools (for
-  example, `jobs` and `job_stop`): changing the set breaks nothing then. Until then, background jobs work for it
-  too: a command goes to the background on timeout, and `kill j3` in the console stops the job.
+  a summary. Only at that moment does an agent of an already running session get new DreamTeam tools: changing the
+  set breaks nothing then.
 * Every change is written to the event log. Live UI updates, the feed and trigger checks are built from it.
 * A program uses the swarm as a service through the [HTTP API](http-api.md) (`/api/v1`): the hub's own process
   serves it, works with the session swarms directly, reads a session's events from its event log by id, and passes

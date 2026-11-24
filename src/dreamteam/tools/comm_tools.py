@@ -63,7 +63,6 @@ ANSWER_NOTES = {
         "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient names, \"all\" or \"user\""},
         "text": {"type": "string"},
         "reply_to": {"type": "integer", "description": "Number of the message you answer"},
-        # toolset revision 4 (tools/frozen.py): agents of r1-r3 never pass it (call_tool strips it)
         "pause_swarm": {"type": "boolean", "description":
                         "true: this question to \"user\" decides how the whole team goes on (work under way would "
                         "otherwise be redone). The session may then pause every member until the user answers and "
@@ -86,7 +85,7 @@ async def send_message(ctx: ToolContext, args: dict[str, Any]) -> str:
     text = f"Sent message #{msg['id']} to {', '.join(msg['recipients'])}."
     if asked is not None and asked["asker"] in msg["recipients"]:
         text += _answer_note(swarm, asked)
-    if args.get("pause_swarm"):  # agents of r1-r3 never get here with it (stripped, tools/__init__.py call_tool)
+    if args.get("pause_swarm"):
         text += _pause_note(ctx, msg)
     return text
 

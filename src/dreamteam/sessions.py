@@ -39,13 +39,15 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Collection, Iterable, Iterator
 
-from . import __version__, apifolders, hubauth, netoff, nofollow
+from . import __version__, apifolders, folderlist, hubauth, netoff, nofollow, procs
 from . import skills as skill_lib
 from .autoreply import SessionAutoReply, follow_journal, journal_head, listed_requests, requests_from
-from .config import INT64_LIMIT, Config
+from .config import CONFIG_FILE, INT64_LIMIT, Config
 from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOWN_MAX, UPLOADS_DIR, CopyCancelled,
-                       CopyError, CopyLimits, Source, Uploads, _other_home, check_target, copy_into, copy_sources,
-                       done_with, hub_in_container, left_over, printable_line, resolve_source, staging_name)
+                       CopyError, CopyLimits, Source, SourceRules, Uploads, _other_home, check_target, copy_into,
+                       copy_sources, done_with, hub_in_container, left_over, printable_line, resolve_source,
+                       source_refusal, source_rules, staging_name, unquote)
+from .folderlist import network_path
 from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
 from .events import event_data, read_page
 from .eventtext import without_abs_paths
@@ -108,6 +110,15 @@ STOP_REQUEST_REASONS = ("user", "done", "budget")
 FOLDER_BUSY = "folder_busy"
 FOLDER_NOT_READY = "folder_not_ready"
 FORBIDDEN_FOLDER = "forbidden_folder"
+# the web UI's folder check and folder browser (docs/SPEC.md §17.2 "Choosing a folder from the web UI"): each runs in a
+# daemon thread awaited at most FOLDER_TIMEOUT seconds; at most FOLDER_OPS_MAX such threads per hub, checks and
+# listings together, each holding its place until it really ends
+FOLDER_TIMEOUT = 20.0
+FOLDER_OPS_MAX = 4
+FOLDER_USES = ("workspace", "source")
+FOLDER_USE_TEXT = "'use' must be \"workspace\" or \"source\"."
+FOLDER_BUSY_TEXT = "Too many folder checks at once; try again in a moment."
+FOLDER_PATH_TEXT = "'path' must be an absolute folder path."
 # session.json "via" of a session created through the HTTP API v1 (models.API_VIA, which the clients read too), and its
 # "api" block (docs/SPEC.md §21.4): what the create gives (API_GIVEN, with their defaults) and what the manager writes
 # later
@@ -501,6 +512,14 @@ def _check_writable(folder: Path, shown: Path) -> None:
             from None
 
 
+def _can_write(folder: Path, shown: Path) -> None:
+    """_check_writable without its probe file, for the web UI's check of a folder, which writes nothing (docs/SPEC.md
+    §17.2): os.access. On Windows it ignores a folder's read-only attribute and sees no ACL, so it passes every folder
+    there: the create's or the move's real probe refuses one that cannot be written."""
+    if not os.access(folder, os.W_OK | os.X_OK):
+        raise SessionError(f"Cannot write to {shown}: permission denied. Choose a folder you can write to.")
+
+
 @dataclass
 class _Plan:
     """What changing a session's workspace will do, decided (and checked) before anything changes."""
@@ -523,6 +542,10 @@ class _Plan:
     # a server folder of the HTTP API v1 (docs/SPEC.md §21.10): its resolved root, which _carry_out finds every level
     # of the target inside again, right before and after it makes one, and before and after git init (_check_inside)
     within: Path | None = None
+    # what _plan found at the target: "missing" | "empty" | "files"; None for "unchanged" (it returns before it looks)
+    state: str | None = None
+    # the current branch of a folder with files in a repository (repo_state's), with git on; else None
+    branch: str | None = None
 
     def result(self, git: str | None = None) -> dict[str, Any]:
         # old_kept: the previous folder still holds its files (an adopt, or the user's folder left as it was)
@@ -530,6 +553,144 @@ class _Plan:
         return {"mode": self.mode, "from": str(self.old), "to": str(self.target), "git": git or self.git,
                 "mcp_moved": list(self.mcp) if self.mode != "unchanged" else [], "old_kept": kept,
                 "old_missing": not self.old_exists, "old_changed": None}
+
+
+@dataclass(frozen=True)
+class _Rules:
+    """The resolved folders SessionManager._target_refusal compares a folder with (_refusal_rules)."""
+    home: Path
+    sessions: Path
+    user_home: Path
+    default_real: Path | None
+    session_dir: Path | None
+    tokens: Path | None
+    libraries: tuple[Path, ...]
+    skills_library: Path | None
+    envs: Path | None
+
+
+class _FolderMarks:
+    """The marks of one folder listing's entries (SessionManager.list_folders, docs/SPEC.md §17.2 "Entries"), with one
+    context per listing: the folders the rules compare with resolved once, the other sessions' folders read once,
+    another DreamTeam home looked for above the listed folder once (an entry then asks of itself alone)."""
+
+    def __init__(self, manager: "SessionManager", use: str, sid: str | None, folder_real: Path) -> None:
+        self.manager, self.use, self.sid = manager, use, sid
+        self.rules: _Rules | None = None
+        self.source: SourceRules | None = None
+        self.rules_error: str | None = None
+        if use == "workspace":
+            try:
+                self.rules = manager._refusal_rules(sid)
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.rules_error = str(exc)
+        else:
+            self.source = source_rules(manager.home, manager.config)
+        self.sandbox = hub_in_container(manager.config)
+        # in the Docker sandbox's container: what is mounted there, resolved once (_container_refusal)
+        self.mounted = manager._container_places() if self.sandbox and use == "workspace" else None
+        self.above = _other_home(folder_real)   # the listed folder and its parents
+        self.others = manager._other_workspaces(sid)
+        self.titles: dict[str, Any] = {}
+        self.creating = tuple(manager._creating_in)
+        self.current: Path | None = None
+        if sid is not None:
+            with contextlib.suppress(SessionError, OSError, ValueError, RuntimeError):
+                self.current = manager._workspace_entry(sid, manager.meta(sid))[0].resolve()
+        self.user_home = str(Path.home())
+
+    def home_below(self, real: Path, *, entry: bool = True) -> Callable[[Path], Path | None]:
+        """copyfrom._other_home for `real` and a folder inside it: `real` itself (an entry of the listed folder) asked
+        alone, the listed folder and its parents as found once."""
+        if not entry:
+            return lambda _path: self.above
+        found: list[Path | None] = []
+
+        def other_home(_path: Path) -> Path | None:
+            if not found:
+                try:
+                    here = (real / "sessions").is_dir() and (real / CONFIG_FILE).is_file()
+                except OSError:
+                    here = False
+                found.append(real if here else self.above)
+            return found[0]
+
+        return other_home
+
+    def refusal(self, real: Path, other_home: Callable[[Path], Path | None] | None, *,
+                child: bool = False) -> str | None:
+        if self.use == "workspace":
+            if self.rules is None:
+                return f"Cannot use the folder {real}: {self.rules_error}"
+            refusal = self.manager._target_refusal(real, self.sid, self.rules, other_home)
+            if refusal is None and not child:
+                refusal = self.manager._container_refusal(real, places=self.mounted)
+            return refusal
+        return source_refusal(real, home=self.manager.home, config=self.manager.config, sandbox=self.sandbox,
+                              rules=self.source, other_home=other_home)
+
+    def title(self, sid: str) -> Any:
+        if sid not in self.titles:
+            try:
+                self.titles[sid] = self.manager.meta(sid).get("title")
+            except SessionError:
+                self.titles[sid] = None
+        return self.titles[sid]
+
+    def busy(self, real: Path, *, cheap: bool = False) -> dict[str, Any] | None:
+        for other, folder in self.others:
+            if _overlaps(real, folder) if cheap else (is_within(real, folder) or is_within(folder, real)):
+                return {"sid": other, "title": self.title(other)}
+        for folder in self.creating:
+            if _overlaps(real, folder):
+                return {"sid": None, "title": None}
+        return None
+
+    def is_current(self, real: Path, *, cheap: bool = False) -> bool:
+        if self.current is None:
+            return False
+        if cheap:
+            return _fold_key(real) == _fold_key(self.current)
+        return _same_path(real, self.current) or (is_within(real, self.current) and is_within(self.current, real))
+
+    def of(self, path: str, real: Path, other_home: Callable[[Path], Path | None] | None) -> dict[str, Any]:
+        """The marks of the folder `path` (as listed), resolved `real`."""
+        refused = self.refusal(real, other_home)
+        closed = self.refusal(real / "x", other_home, child=True)   # every folder inside it is refused too
+        repo = os.path.lexists(os.path.join(path, ".git"))
+        files, noaccess = folderlist.peek(path)
+        return {"open": closed is None, "refused": refused, "closed": closed, "busy": self.busy(real),
+                "current": self.is_current(real), "repo": repo, "files": files, "noaccess": noaccess}
+
+    def entry(self, item: folderlist.Scanned, folder_real: Path, in_roots: Callable[[Path], bool]) -> dict[str, Any]:
+        out: dict[str, Any] = {"name": item.name, "path": item.path, "link": item.link}
+        if folderlist.macos_private(item.path, self.user_home):   # never looked inside: the marks of past the budget
+            return self.cheap(item, folder_real)
+        if item.leads is not None:   # a link to a network or device path: never followed
+            return {**out, "open": False, "refused": f"{item.name} leads to {item.leads}, outside the places this hub "
+                    "shows.", "busy": None, "current": False, "repo": None, "files": None, "noaccess": False}
+        if item.link:   # followed only into the places of this listing
+            try:
+                real: Path | None = Path(item.path).resolve()
+            except (OSError, ValueError, RuntimeError):
+                real = None
+            if real is None or not in_roots(real):
+                return {**out, "open": False, "refused": f"{item.name} leads to {real or '?'}, outside the places this "
+                        "hub shows.", "busy": None, "current": False, "repo": None, "files": None, "noaccess": False}
+            marks = self.of(item.path, real, None)
+        else:
+            real = folder_real / item.name
+            marks = self.of(item.path, real, self.home_below(real))
+        marks.pop("closed")
+        return {**out, **marks}
+
+    def cheap(self, item: folderlist.Scanned, folder_real: Path) -> dict[str, Any]:
+        """An entry past the marks' budget (or one of the macOS private folders): no file system call (the full check
+        of a chosen folder still decides)."""
+        real = Path(item.path) if item.link else folder_real / item.name
+        return {"name": item.name, "path": item.path, "link": item.link, "open": True, "refused": None,
+                "busy": self.busy(real, cheap=True), "current": self.is_current(real, cheap=True), "repo": None,
+                "files": None, "noaccess": False}
 
 
 @dataclass
@@ -1159,6 +1320,12 @@ class SessionManager:
         # change, into the same folder (inside it, containing it) is refused at once instead of copying everything
         # first and failing at the claim
         self._creating_in: set[Path] = set()
+        # the web UI's folder threads (check_folder, list_folders; docs/SPEC.md §17.2): how many run, and the paths of
+        # those past FOLDER_TIMEOUT that still run (`_fold_key` -> the paths as given, one per thread); the threads
+        # themselves change both, under the lock
+        self._folder_lock = threading.Lock()
+        self._folder_ops = 0
+        self._folders_hung: dict[str, list[str]] = {}
         self._listeners: list[Callable[[dict[str, Any]], None]] = []
         # the waiters of each session (watch): woken by a journaled event of the session, a change (_changed) and the
         # end of an operation that held its lock (_SessionLock); each with the loop that waits on it
@@ -1676,8 +1843,9 @@ class SessionManager:
             what = "is not a folder" if Path(info["path"]).exists() else "does not exist"
             raise SessionError(
                 f"The workspace folder of session {sid} {what}: {info['path']}. Bring it back (e.g. reconnect the "
-                f"drive), or move the session to another folder: /cd <folder> (/cd --default for its own folder) in "
-                f"`dreamteam` or `dreamteam console --session {sid}`, session_cd in MCP.", 409, code=FOLDER_NOT_READY)
+                f"drive), or move the session to another folder: Change folder… on its card on the sessions page, "
+                f"/cd <folder> (/cd --default for its own folder) in `dreamteam` or `dreamteam console --session "
+                f"{sid}`, session_cd in MCP.", 409, code=FOLDER_NOT_READY)
         self._check_server_folder(sid, meta)
 
     def _check_server_folder(self, sid: str, meta: dict[str, Any], *,
@@ -1782,21 +1950,53 @@ class SessionManager:
                 continue  # a damaged session: its own summary shows the error
         return found
 
-    def _target_refusal(self, target: Path, sid: str | None) -> str | None:
+    def _refusal_rules(self, sid: str | None) -> _Rules:
+        """The folders _target_refusal compares a target with, resolved once (a folder listing checks every entry
+        against one such context). OSError, ValueError or RuntimeError when the home, the sessions folder, the user's
+        home or the session's own folders cannot be resolved; a library, the skill environments or the tokens folder
+        that cannot be resolved is left out."""
+        home = self.home.resolve()
+        sessions = self.sessions_dir.resolve()
+        user_home = Path.home().resolve()
+        default_real = self.default_workspace(sid).resolve() if sid is not None else None
+        session_dir = self.dir_of(sid).resolve() if sid is not None else None
+        tokens = None
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
+            tokens = hubauth.tokens_dir().resolve()
+        candidates = [self.config.library_dir]
+        if sid is not None and os.path.lexists(self.dir_of(sid) / SESSION_FILE):
+            with contextlib.suppress(ValueError, SessionError):
+                candidates.append(self._config_from(self.raw, sid).library_dir)
+        libraries = []
+        for library in candidates:
+            with contextlib.suppress(OSError, ValueError, RuntimeError):
+                libraries.append(library.resolve())
+        skills_library = envs = None
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
+            skills_library = self.config.skills_library_dir.resolve()
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
+            envs = self.config.skill_envs_dir.resolve()
+        return _Rules(home, sessions, user_home, default_real, session_dir, tokens, tuple(libraries), skills_library,
+                      envs)
+
+    def _target_refusal(self, target: Path, sid: str | None, rules: _Rules | None = None,
+                        other_home: Callable[[Path], Path | None] | None = None) -> str | None:
         """Why the folder `target` (resolved) can never be the workspace of session `sid` (None: a session about to
         be created; an id that does not exist yet is fine): a drive root, the user's home or a folder containing it,
         the DreamTeam home or a folder containing it, DreamTeam's own data folder, the sessions folder (except the
         session's own default folder), a git database, another DreamTeam home or a folder inside one, the hub tokens'
         folder (inside or containing it), on POSIX /proc, /sys and /dev, the MCP and skills libraries and the skill
-        environments. None when it can be."""
-        try:
-            home = self.home.resolve()
-            sessions = self.sessions_dir.resolve()
-            user_home = Path.home().resolve()
-            default_real = self.default_workspace(sid).resolve() if sid is not None else None
-            session_dir = self.dir_of(sid).resolve() if sid is not None else None
-        except (OSError, ValueError, RuntimeError) as exc:
-            return f"Cannot use the folder {target}: {exc}"
+        environments. None when it can be. `rules`: the folders compared with (_refusal_rules), resolved once by a
+        caller that checks many folders; `other_home`: how another DreamTeam home is found (copyfrom._other_home:
+        the folder and its parents; a folder listing asks of an entry alone, its folder's parents checked once)."""
+        if rules is None:
+            try:
+                rules = self._refusal_rules(sid)
+            except (OSError, ValueError, RuntimeError) as exc:
+                return f"Cannot use the folder {target}: {exc}"
+        home, sessions, user_home = rules.home, rules.sessions, rules.user_home
+        default_real, session_dir = rules.default_real, rules.session_dir
+
         # compared as text and by file identity: a file system that ignores case where normcase does not (macOS)
         def within(path: Path, parent: Path) -> bool:
             return _within(path, parent) or is_within(path, parent)
@@ -1825,46 +2025,79 @@ class SessionManager:
                     "of files: choose the folder of its work tree.")
         # (this home and its sessions folder: above; the session's own folder is its own whatever its agents built
         # there, even a home's layout: /cd --default always leads back)
-        other = _other_home(target) if not is_default else None
+        other = (other_home or _other_home)(target) if not is_default else None
         if other is not None and not same(other, home):
             return (f"{target} is a DreamTeam home ({other}) or inside one: its settings (API keys too) and sessions "
                     "are never a session's folder; choose another folder.")
-        with contextlib.suppress(OSError, ValueError, RuntimeError):
-            tokens = hubauth.tokens_dir().resolve()
-            if within(target, tokens) or within(tokens, target):
-                return (f"{target} is the folder of DreamTeam's hub tokens {tokens}, or inside it or contains it; "
-                        "choose another folder.")
+        tokens = rules.tokens
+        if tokens is not None and (within(target, tokens) or within(tokens, target)):
+            return (f"{target} is the folder of DreamTeam's hub tokens {tokens}, or inside it or contains it; "
+                    "choose another folder.")
         if os.name != "nt":
             for system in _SYSTEM_ROOTS:
                 if _within(target, Path(system)):
                     return f"{target} is a system folder ({system}); choose another folder."
-        libraries = [self.config.library_dir]
-        if sid is not None and os.path.lexists(self.dir_of(sid) / SESSION_FILE):
-            with contextlib.suppress(ValueError, SessionError):
-                libraries.append(self._config_from(self.raw, sid).library_dir)
-        for library in libraries:
-            try:
-                library = library.resolve()
-            except (OSError, ValueError, RuntimeError):
-                continue
+        for library in rules.libraries:
             if _within(target, library) or _within(library, target):
                 return (f"{target} is DreamTeam's shared MCP library {library}, or inside it or contains it (every "
                         "session imports its servers from there); choose another folder.")
-        try:  # the skills library: agents would write into the skills every session attaches from
-            skills_library = self.config.skills_library_dir.resolve()
-        except (OSError, ValueError, RuntimeError):
-            skills_library = None
+        skills_library = rules.skills_library   # agents would write into the skills every session attaches from
         if skills_library is not None and (_within(target, skills_library) or _within(skills_library, target)):
             return (f"{target} is DreamTeam's shared skills library {skills_library}, or inside it or contains it "
                     "(sessions attach their skills from there); choose another folder.")
-        try:  # the skills' environments: agents' files and autocommit's `git add -A` would reach every session's
-            envs = self.config.skill_envs_dir.resolve()
-        except (OSError, ValueError, RuntimeError):
-            envs = None
+        envs = rules.envs   # the skills' environments: agents' files and autocommit's `git add -A` would reach them
         if envs is not None and (_within(target, envs) or _within(envs, target)):
             return (f"{target} is DreamTeam's skill environments folder {envs}, or inside it or contains it (every "
                     "session runs its skills' packages from there); choose another folder.")
         return None
+
+    def _container_text(self, path: Any) -> str:
+        home = str(self.home)
+        return (f"The hub runs in the Docker sandbox and sees only its home ({home}) and the [api] folders roots that "
+                f"work in place: {path} is not there, and a folder made there would be lost with the container. Choose "
+                f"a folder inside {home}, e.g. {home.rstrip('/')}/projects/<name>. To work in a folder of your "
+                "computer, mount it inside the home (docker compose), or add it to [api] folders with in_place = true "
+                "(which lets every HTTP API client work in it too) and start the sandbox again (docker compose: also "
+                "mount it as docker-compose.yml's comment shows).")
+
+    def _mounted_roots(self, *, in_place: bool) -> list[tuple[str, str]]:
+        """In the Docker sandbox's container: (name, path) of the roots of `[api] folders` mounted there (their folder
+        a mount point: os.path.ismount, a local call), only the `in_place` ones with `in_place`."""
+        found = []
+        for name, folder in sorted(apifolders.roots(self.config).items()):
+            if (in_place and not folder.in_place) or not os.path.isabs(folder.path):
+                continue
+            with contextlib.suppress(OSError, ValueError):
+                if os.path.ismount(folder.path):
+                    found.append((name, folder.path))
+        return found
+
+    def _container_places(self) -> list[Path]:
+        """The resolved folders mounted in the Docker sandbox's container where a session may work: the DreamTeam
+        home and the `in_place` roots of `[api] folders` that are mounted there (_mounted_roots)."""
+        try:
+            places = [self.home.resolve()]
+        except (OSError, ValueError, RuntimeError):
+            places = [self.home]
+        for _name, path in self._mounted_roots(in_place=True):
+            with contextlib.suppress(OSError, ValueError, RuntimeError):
+                places.append(Path(path).resolve())
+        return places
+
+    def _container_refusal(self, target: Path, *, within: Path | None = None,
+                           places: list[Path] | None = None) -> str | None:
+        """When the hub runs in the Docker sandbox's container (copyfrom.hub_in_container): why the resolved `target`
+        is outside what is mounted there (docs/SPEC.md §17.2 "Workspace folder"), where a folder made would be lost
+        with the container. Mounted: the DreamTeam home, and the `in_place` roots of `[api] folders` whose folder is a
+        mount point there. None elsewhere, for a folder that is mounted, and for a server folder of the HTTP API v1
+        (`within`: its root, checked by v1). `places`: _container_places, found once by a caller that checks many
+        folders (a folder listing)."""
+        if within is not None or not hub_in_container(self.config):
+            return None
+        for place in self._container_places() if places is None else places:
+            if is_within(target, place):
+                return None
+        return self._container_text(target)
 
     def _check_reserved(self, target: Path) -> None:
         """409 when a session is being created right now (create with `workspace`) in the resolved folder `target`,
@@ -1877,7 +2110,8 @@ class SessionManager:
                                    "that folder is taken.", 409, code=FOLDER_BUSY)
 
     def _plan(self, sid: str | None, path: Any, *, git_on: bool, mcp: list[str] | None = None,
-              network_off: bool = False, copying: bool = False, within: Path | None = None) -> _Plan:
+              network_off: bool = False, copying: bool = False, within: Path | None = None,
+              dry: bool = False) -> _Plan:
         """Check a new workspace folder for a session (sid None: a session about to be created) and decide what
         to do; SessionError (400 bad target, 409 conflict) before anything changes. `network_off`: the session's
         setting, for its git checks here and later (_Plan.network_off; the first check runs while the session's
@@ -1888,7 +2122,9 @@ class SessionManager:
         repository must keep DreamTeam's git inside it (apifolders.git_dir_refusal: 409 `folder_not_ready`). A
         folder another session works in, inside it or containing it, is compared by text and by file identity
         (treecopy.is_within: another letter case or Unicode form of a name is the same folder where the file system
-        says so). Blocking (git): run it in a thread."""
+        says so). In the Docker sandbox's container a folder outside what is mounted there is refused
+        (_container_refusal). `dry`: the web UI's check (check_folder), which writes nothing: _can_write in place of
+        the probe file, git without optional locks. Blocking (git): run it in a thread."""
         meta = self.meta(sid) if sid is not None else {}
         if sid is not None:
             old, old_stored, old_adopted = self._workspace_entry(sid, meta)
@@ -1907,6 +2143,8 @@ class SessionManager:
                 raise SessionError("Give a folder path.")
             target = Path(text.strip())
             if not target.is_absolute():
+                if hub_in_container(self.config) and PureWindowsPath(text.strip()).is_absolute():
+                    raise SessionError(self._container_text(text.strip()))
                 raise SessionError(f"The folder must be an absolute path, got '{text.strip()}' (clients resolve "
                                    "relative paths against their own current directory).")
         try:
@@ -1921,7 +2159,7 @@ class SessionManager:
             raise SessionError(f"{asked} does not lie inside its folder root any more: a link or a junction on the "
                                "way leads out of it.", 403, code=FORBIDDEN_FOLDER)
         is_default = default_real is not None and _same_path(target, default_real)
-        refusal = self._target_refusal(target, sid)
+        refusal = self._target_refusal(target, sid) or self._container_refusal(target, within=within)
         if refusal is not None:
             raise SessionError(refusal)
         if old_real is not None and _same_path(target, old_real):
@@ -1945,13 +2183,16 @@ class SessionManager:
                                    409, code=FOLDER_BUSY, holder=other)
         if target.exists() and not target.is_dir():
             raise SessionError(f"{target} is a file, not a folder.")
+        writable = _can_write if dry else _check_writable
         if target.is_dir():
             try:
                 empty = next(target.iterdir(), None) is None
             except OSError as exc:
                 raise SessionError(f"Cannot read the folder {target}: {exc.strerror or exc}.") from None
-            _check_writable(target, target)
+            writable(target, target)
+            found = "empty" if empty else "files"
         else:
+            found = "missing"
             empty = True
             parent = target.parent
             while not parent.exists() and parent.parent != parent:
@@ -1959,13 +2200,13 @@ class SessionManager:
             if not parent.is_dir():
                 why = "is not a folder" if parent.exists() else "does not exist"
                 raise SessionError(f"{target} cannot be created: {parent} {why}.")
-            _check_writable(parent, target)
+            writable(parent, target)
         old_exists = old_real is not None and old_real.is_dir()
         git_exe = shutil.which("git")
         plan = _Plan(target=target, old=old_real if old_real is not None else target, mode="moved",
                      default=is_default, adopted=False, git="none", old_exists=old_exists,
                      old_is_default=old_stored is None and old is not None, old_adopted=old_adopted,
-                     network_off=network_off, within=within)
+                     network_off=network_off, within=within, state=found)
         carried = [name for name in (mcp or []) if old_exists and (old_real / "mcp" / name).is_dir()]
         if old_adopted and carried and git_exe:  # leaving the user's folder: did the agents commit the servers there?
             plan.old_tracked = tracked(old_real, [f"mcp/{name}" for name in carried], git_exe,
@@ -2008,11 +2249,12 @@ class SessionManager:
             # the session's own servers (absent there: checked above) are left out, as at every start: a folder it
             # worked in before may track them, and their move brings them back (else it could never return there)
             state = repo_state(target, git_exe, exclude=[f"mcp/{name}" for name in carried],
-                               offline=isolated_git(network_off), line_endings=True)
+                               offline=isolated_git(network_off), line_endings=True, optional_locks=not dry)
             refusal = _repo_refusal(target, state)
             if refusal is not None:
                 raise refusal
             plan.git = "initialized" if state["toplevel"] is None else "existing"
+            plan.branch = state["branch"] if state["toplevel"] is not None else None
         return plan
 
     def _carry_out(self, sid: str | None, plan: _Plan, undo: _Undo) -> str:
@@ -2606,7 +2848,8 @@ class SessionManager:
                      copy_from_upload: str | None = None, api: dict[str, Any] | None = None,
                      sources: list[Source] | None = None, mark: object | None = None,
                      within: Path | None = None,
-                     folder_threads: Callable[..., Awaitable[asyncio.Future[Any]]] | None = None) -> dict[str, Any]:
+                     folder_threads: Callable[..., Awaitable[asyncio.Future[Any]]] | None = None,
+                     expect: str | None = None) -> dict[str, Any]:
         """Create a session (and start it with the goal unless start=False). Returns its summary.
         `workspace`: an absolute folder to work in instead of the session's own one (the rules of set_workspace:
         an empty or missing folder is used as a new workspace, one with files is adopted); the summary then has
@@ -2642,7 +2885,11 @@ class SessionManager:
         `within`: with `workspace`, the resolved root of the HTTP API v1's server folder it lies in (docs/SPEC.md
         §21.10 `in_place`): every check of the folder on the create's way (_plan, the last one under the home's
         workspace claims just before the missing folders are made) finds it inside that root again, by text and by
-        file identity, or refuses the create (403 `forbidden_folder`)."""
+        file identity, or refuses the create (403 `forbidden_folder`).
+        `expect`: with `workspace`, the mode the user agreed to ("created" or "adopted", from the web UI's check,
+        docs/SPEC.md §17.2): 409 when the folder turns out otherwise, at the first check or at the second under the
+        home's workspace claims; nothing is created (400 without `workspace`, for another value, and "adopted" with a
+        copy)."""
         # the goal split as set_goal splits it: its first line also names the session (cut at a word)
         goal_title, goal_description = split_goal(_text(goal), _text(description))
         title = (_one_line(title) or shorten_title(goal_title, 60) or "Session")[:TITLE_LIMIT].strip()
@@ -2653,6 +2900,15 @@ class SessionManager:
         api_block = _new_api_block(api) if api is not None else None
         sources = list(sources) if sources else None
         copying = copy_from is not None or copy_from_upload is not None or sources is not None
+        if expect is not None:   # (before an upload is claimed, as above)
+            if workspace is None:
+                raise SessionError("\"expect\" needs \"workspace\".")
+            if expect not in ("created", "adopted"):
+                raise SessionError("\"expect\" must be \"created\" or \"adopted\".")
+            if expect == "adopted" and copying:
+                raise SessionError("\"expect\": \"adopted\" cannot go with a copy: a copy goes into a new or empty "
+                                   "folder.")
+        wanted = {"created": "moved", "adopted": "adopted"}.get(expect or "")
         source: Source | None = None
         prepared: list[_SkillItem] = []
         staging: Path | None = None
@@ -2683,6 +2939,7 @@ class SessionManager:
                 new = validate(self.sessions_dir / "new", self._merged(self.raw, overrides))
                 plan = await asyncio.to_thread(self._plan, None, workspace, git_on=new.workspace.git,
                                                network_off=netoff.is_off(new), copying=copying, within=within)
+                self._check_expected(None, plan, wanted, creating=True)
                 if source is not None and copy_from is not None:
                     try:
                         check_target(source, plan.target)
@@ -2721,7 +2978,7 @@ class SessionManager:
             summary = await self._create(title, goal_title, goal_description, overrides, start, actor, workspace,
                                          prepared, via, auto_reply=auto_reply,
                                          copied=(staging, copied) if staging is not None and copied is not None
-                                         else None, api=api_block, mark=mark, within=within)
+                                         else None, api=api_block, mark=mark, within=within, expect=wanted)
         finally:
             if reserved is not None:
                 self._creating_in.discard(reserved)
@@ -2769,7 +3026,7 @@ class SessionManager:
                       via: str, *, auto_reply: bool = False,
                       copied: tuple[Path, dict[str, Any]] | None = None,
                       api: dict[str, Any] | None = None, mark: object | None = None,
-                      within: Path | None = None) -> dict[str, Any]:
+                      within: Path | None = None, expect: str | None = None) -> dict[str, Any]:
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         for _attempt in range(100):  # another process (a second launcher, the CLI) may take the same id
             sid = self._new_id(title)
@@ -2819,7 +3076,7 @@ class SessionManager:
                     if workspace is not None:
                         # with a copy, the folder must still be new or empty: the copied files move there
                         result = await self._set_workspace_locked(
-                            sid, workspace, creating=True, expect="moved" if copied is not None else None,
+                            sid, workspace, creating=True, expect="moved" if copied is not None else expect,
                             within=within)
                 except BaseException:
                     await asyncio.to_thread(_rmtree, path)  # nothing half-created stays behind
@@ -3458,6 +3715,343 @@ class SessionManager:
         self._changed(sid, "updated")
         return self.summary(sid)
 
+    # ---- the web UI's folder check and folder browser (docs/SPEC.md §17.2 "Choosing a folder from the web UI") ----
+    @staticmethod
+    def _folder_timeout_text(path: str) -> str:
+        return (f"{path} did not answer within {FOLDER_TIMEOUT:g} s (a network folder, or a drive that sleeps?). Try "
+                "again, or choose another folder.")
+
+    def _unhang(self, key: str, path: str) -> None:
+        """A thread past its timeout ended (the caller holds `_folder_lock`)."""
+        paths = self._folders_hung.get(key, [])
+        with contextlib.suppress(ValueError):
+            paths.remove(path)
+        if not paths:
+            self._folders_hung.pop(key, None)
+
+    async def _folder_call(self, path: str, fn: Callable[..., Any], *args: Any) -> Any:
+        """fn(*args) in a daemon thread of the web UI's folder threads (procs.daemon_call: a folder on a share that
+        does not answer never holds the hub's exit), awaited at most FOLDER_TIMEOUT seconds: past it a 504
+        SessionError, and the thread is left to finish, keeping its place until it ends and its `path` (as given) in
+        `_folders_hung`, so a request for that path or one inside it gets the 504 at once, with no thread. A place is
+        taken without waiting: 429 when FOLDER_OPS_MAX threads run (its own text when every one of them is past its
+        timeout)."""
+        key = _fold_key(Path(path))
+        with self._folder_lock:
+            if any(key == hung or key.startswith(hung.rstrip(os.sep) + os.sep) for hung in self._folders_hung):
+                raise SessionError(self._folder_timeout_text(path), 504)
+            if self._folder_ops >= FOLDER_OPS_MAX:
+                held = [shown for paths in self._folders_hung.values() for shown in paths]
+                if len(held) >= self._folder_ops:
+                    raise SessionError(f"Folders that did not answer still hold the hub's folder checks "
+                                       f"({', '.join(dict.fromkeys(held))}): try again when they answer, or restart "
+                                       "the hub.", 429)
+                raise SessionError(FOLDER_BUSY_TEXT, 429)
+            self._folder_ops += 1
+        state = {"started": False, "ended": False, "hung": False}
+
+        def run() -> Any:
+            with self._folder_lock:   # (`settled` gave the place back already: the call was cancelled meanwhile)
+                if state["ended"]:
+                    return None
+                state["started"] = True
+            try:
+                return fn(*args)
+            finally:
+                with self._folder_lock:   # the place is given back when the thread ends, not at its 504
+                    self._folder_ops -= 1
+                    state["ended"] = True
+                    if state["hung"]:
+                        self._unhang(key, path)
+
+        def settled(task: asyncio.Future) -> None:
+            failed = task.cancelled() or task.exception() is not None   # (retrieved: nobody may await it any more)
+            with self._folder_lock:
+                if failed and not state["started"] and not state["ended"]:   # the thread never started
+                    state["ended"] = True
+                    self._folder_ops -= 1
+
+        work = asyncio.ensure_future(procs.daemon_call(run))
+        work.add_done_callback(settled)
+        try:
+            return await asyncio.wait_for(asyncio.shield(work), FOLDER_TIMEOUT)
+        except TimeoutError:
+            with self._folder_lock:
+                if not state["ended"]:
+                    state["hung"] = True
+                    self._folders_hung.setdefault(key, []).append(path)
+            raise SessionError(self._folder_timeout_text(path), 504) from None
+
+    def folder_roots(self, use: str, sid: str | None = None) -> list[dict[str, Any]]:
+        """The places the folder browser starts from (docs/SPEC.md §17.2 "Roots"), each {"path", "kind", "name",
+        "selectable"}, computed from text alone (the sessions' session.json files and the settings; in the Docker
+        sandbox's container, os.path.ismount of each root of `[api] folders`, a local call): whether a root exists is
+        learnt when it is opened. On the host: `home` (the user's home), the navigation roots (on Windows a `drive` per
+        letter of GetLogicalDrives, elsewhere `system` "/"), `recent` (the parents of the folders sessions work in
+        outside their own folder, newest session first, at most FOLDER_RECENT_MAX, without the home, a navigation
+        root, a network path or a duplicate) and `api` (the roots of `[api] folders`; for "workspace" the `in_place`
+        ones; network paths left out). In the container: for "workspace" `dreamteam` (the DreamTeam home) and the
+        mounted `in_place` api roots, for "source" every mounted api root."""
+        roots: list[dict[str, Any]] = []
+
+        def add(path: str, kind: str, name: str, selectable: bool) -> None:
+            roots.append({"path": path, "kind": kind, "name": name, "selectable": selectable})
+
+        if hub_in_container(self.config):
+            if use == "workspace":
+                add(str(self.home), "dreamteam", self.home.name or str(self.home), False)
+            for name, path in self._mounted_roots(in_place=use == "workspace"):
+                add(path, "api", name, True)
+            return roots
+        user_home = Path.home()
+        add(str(user_home), "home", user_home.name or str(user_home), False)
+        if os.name == "nt":
+            for letter in folderlist.logical_drives():
+                add(letter + "\\", "drive", letter, False)
+        else:
+            add("/", "system", "/", False)
+        seen = {_fold_key(Path(root["path"])) for root in roots}
+        recent = 0
+        for other in reversed(self.ids()):   # (ids sort by creation: the newest first)
+            if recent >= folderlist.FOLDER_RECENT_MAX:
+                break
+            if other == LEGACY_ID:
+                continue
+            try:
+                workspace = self.meta(other).get("workspace")
+            except SessionError:
+                continue
+            if not isinstance(workspace, dict):
+                continue   # its own folder
+            relative = _home_relative(workspace)
+            folder = str(self.home / relative) if relative is not None else workspace.get("path")
+            if not isinstance(folder, str) or not os.path.isabs(folder):
+                continue   # (a damaged session.json: its own summary shows the error)
+            parent = os.path.dirname(os.path.normpath(folder))
+            key = _fold_key(Path(parent))
+            if not parent or parent == folder or network_path(parent) or key in seen:
+                continue
+            seen.add(key)
+            add(parent, "recent", os.path.basename(parent) or parent, True)
+            recent += 1
+        for name, root in sorted(apifolders.roots(self.config).items()):
+            if (use == "workspace" and not root.in_place) or not os.path.isabs(root.path) or network_path(root.path):
+                continue
+            add(root.path, "api", name, True)
+        return roots
+
+    async def check_folder(self, path: Any = None, *, use: str = "workspace", sid: str | None = None,
+                           default: bool = False) -> dict[str, Any]:
+        """What choosing the folder `path` would do (docs/SPEC.md §17.2 "Choosing a folder from the web UI"): for `use`
+        "workspace" the folder of a new session (`sid` None) or a move of session `sid` (`default`: to its own
+        folder), by _plan itself with nothing written (dry); for "source" the folder or .zip a new session's files
+        are copied from (resolve_source). A refusal of the folder is the answer {"use", "path", "error", "status"} (504
+        when the folder did not answer within FOLDER_TIMEOUT); a SessionError is raised for the call itself (400 a bad
+        call or invalid session settings, 404, 409 `main` or a session of an earlier version, 429). Nothing is
+        reserved and no lock is taken: the create or the move checks again (`expect`)."""
+        if use not in FOLDER_USES:
+            raise SessionError(FOLDER_USE_TEXT)
+        if path is not None and not isinstance(path, str):
+            raise SessionError("'path' must be a string.")
+        self._refresh_settings()
+        if use == "source":
+            if sid is not None or default:
+                raise SessionError("'session' and 'default' are for use \"workspace\".")
+            if path is None or not unquote(path):
+                raise SessionError("Give 'path'.")
+            return await self._check_source(path)
+        given = path is not None and bool(unquote(path))
+        if default and sid is None:
+            raise SessionError("'default' needs 'session'.")
+        if default and given:
+            raise SessionError("Give 'path' or 'default', not both.")
+        if not default and not given:
+            raise SessionError("Give 'path' or 'default'.")
+        if sid is not None:
+            self._check(sid)
+            self._refuse_earlier(sid)
+            if sid == LEGACY_ID:
+                raise SessionError(LEGACY_WORKSPACE_TEXT, 409)
+        if default:
+            target = str(self.default_workspace(sid))
+        else:
+            target = unquote(path)
+            if target.startswith("~"):   # the hub user's home: the field names a folder of the hub's computer
+                target = os.path.expanduser(target)
+            if not os.path.isabs(target):
+                if hub_in_container(self.config) and PureWindowsPath(target).is_absolute():
+                    text = self._container_text(target)
+                else:
+                    example = "C:\\work\\project" if os.name == "nt" else "/home/me/project"
+                    text = (f"{target} is not a full path. Give the full path of a folder on the hub's computer, e.g. "
+                            f"{example}.")
+                return {"use": "workspace", "path": path, "error": text, "status": 400}
+        try:
+            return await self._folder_call(target, self._check_workspace, path, target, sid, default)
+        except SessionError as exc:
+            if exc.status != 504:
+                raise
+            return {"use": "workspace", "path": path, "error": str(exc), "status": exc.status}
+
+    async def _check_source(self, path: str) -> dict[str, Any]:
+        sandbox = hub_in_container(self.config)
+
+        def resolve() -> Source:
+            return resolve_source(path, home=self.home, config=self.config, sandbox=sandbox)
+
+        try:
+            source = await self._folder_call(os.path.expanduser(unquote(path)), resolve)
+        except CopyError as exc:
+            return {"use": "source", "path": path, "error": str(exc), "status": exc.status}
+        except SessionError as exc:
+            if exc.status != 504:
+                raise
+            return {"use": "source", "path": path, "error": str(exc), "status": exc.status}
+        return {"use": "source", "path": path, "target": str(source.path), "state": source.kind}
+
+    def _check_workspace(self, path: str | None, target: str, sid: str | None, default: bool) -> dict[str, Any]:
+        """check_folder's work for `use` "workspace" (blocking: its folder thread)."""
+        def refused(exc: SessionError) -> dict[str, Any]:   # (never its code or holder)
+            return {"use": "workspace", "path": path, "error": str(exc), "status": exc.status}
+
+        meta = self.meta(sid) if sid is not None else {}
+        if sid is not None:
+            try:   # an unfinished earlier move: the move would refuse it
+                self._check_journal(sid, meta)
+            except SessionError as exc:
+                return refused(exc)
+            try:
+                cfg = self.config_for(sid)
+            except SessionError:
+                raise
+            except ValueError as exc:
+                raise SessionError(f"Session {sid} has invalid settings: {exc}") from None
+            mcp: list[str] | None = self._forged_servers(sid)
+        else:   # the home's settings, as a create without overrides
+            cfg, mcp = self.config, None
+        try:
+            plan = self._plan(sid, None if default else target, git_on=cfg.workspace.git, mcp=mcp,
+                              network_off=netoff.is_off(cfg), dry=True)
+            if plan.mode != "unchanged":
+                self._check_reserved(plan.target)
+        except SessionError as exc:
+            return refused(exc)
+        unchanged = plan.mode == "unchanged"
+        moving = sid is not None and not unchanged
+        afresh = plan.state in ("missing", "empty")
+        mode = "created" if sid is None and plan.mode == "moved" else plan.mode
+        api_folder = None
+        if sid is not None:
+            block = meta.get("api")
+            folder = apifolders.in_place_folder(block.get("folder") if isinstance(block, dict) else None)
+            if folder is not None:
+                api_folder = {"root": folder["root"], "path": folder["path"]}
+        return {"use": "workspace", "path": path, "target": target, "state": plan.state, "mode": mode,
+                "expect": None if unchanged else mode,
+                "fresh": moving and afresh and plan.old_adopted,
+                "back": moving and plan.state == "files" and plan.default,
+                "lost": moving and afresh and not plan.old_adopted and not plan.old_exists,
+                "git": plan.git, "branch": plan.branch, "mcp": [] if unchanged else list(plan.mcp),
+                "running": sid is not None and sid in self.running, "api_folder": api_folder}
+
+    async def list_folders(self, path: Any = None, *, use: str = "workspace",
+                           sid: str | None = None) -> dict[str, Any]:
+        """One folder's subfolders for the web UI's folder browser (docs/SPEC.md §17.2 "Choosing a folder from the web
+        UI"): folder names only, never a file's name or a content, with the marks of `use` ("workspace": a session's
+        folder, `sid` the session that moves or None; "source": a copy's source). `path` None: the roots alone. 400 a
+        path that is not absolute, 403 a network path (by its text, before any file system call), a path outside the
+        roots (by text, then resolved) or a closed folder; a folder that cannot be read is an answer with `error`;
+        504 / 429 as check_folder's threads."""
+        if use not in FOLDER_USES:
+            raise SessionError(FOLDER_USE_TEXT)
+        text = None
+        if path is not None:
+            text = unquote(path) if isinstance(path, str) else ""
+            if not text or not os.path.isabs(text):
+                raise SessionError(FOLDER_PATH_TEXT)
+            if network_path(text):
+                raise SessionError(f"{text} is a network or device path: the folder browser does not open those. "
+                                   "Type the folder's path in the field instead.", 403)
+        if sid is not None:
+            self._check(sid)
+        self._refresh_settings()
+        roots = await procs.daemon_call(self.folder_roots, use, sid)   # (never the default executor: git's)
+        if text is None:
+            return {"path": None, "parent": None, "root": None, "roots": roots, "entries": [], "truncated": False,
+                    "partial": False, "fallback": False, "error": None, "refused": None, "selectable": False,
+                    "busy": None, "current": False, "sep": os.sep}
+        given = os.path.abspath(text)   # (`..` folded by text)
+        root = folderlist.innermost(given, roots)
+        if root is None:
+            raise SessionError(f"{text} is outside the places this hub lets you browse.", 403)
+        answer = await self._folder_call(given, self._list_folder, given, use, sid, roots, root)
+        return {**answer, "roots": roots}
+
+    def _list_folder(self, given: str, use: str, sid: str | None, roots: list[dict[str, Any]],
+                     root: dict[str, Any]) -> dict[str, Any]:
+        """list_folders' work (blocking: its folder thread)."""
+        budget = folderlist.Budget(folderlist.FOLDER_MARKS_BUDGET)
+        resolved: dict[str, Path | None] = {}
+
+        def root_real(entry: dict[str, Any]) -> Path | None:
+            if entry["path"] not in resolved:
+                resolved[entry["path"]] = None
+                if folderlist.network_target(entry["path"]) is None:   # (a root never followed to a share)
+                    with contextlib.suppress(OSError, ValueError, RuntimeError):
+                        resolved[entry["path"]] = Path(entry["path"]).resolve()
+            return resolved[entry["path"]]
+
+        def in_roots(real: Path) -> bool:
+            # the listing's root, then the roots `real` lies in by text, then the others, resolved only when none of
+            # those holds it (a mapped drive resolves to its share, and so does every path on it)
+            text = str(real)
+            for entry in (root, *sorted(roots, key=lambda r: not folderlist.inside_text(text, r["path"]))):
+                found = root_real(entry)
+                if found is not None and is_within(real, found):
+                    return True
+            return False
+
+        leads = folderlist.network_target(given)   # a link on the way to a share: never followed
+        if leads is not None:
+            raise SessionError(f"{given} leads to {leads}, outside the places this hub shows.", 403)
+        listed, fallback = given, False   # a missing path (or a file): its nearest existing ancestor in the root
+        while not os.path.isdir(listed):
+            up = os.path.dirname(listed)
+            if up == listed or not folderlist.inside_text(up, root["path"]):
+                break
+            listed, fallback = up, True
+        try:
+            real = Path(listed).resolve()
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise SessionError(f"Cannot use the folder {listed}: {exc}") from None
+        if not in_roots(real):
+            raise SessionError(f"{listed} leads to {real}, outside the places this hub shows.", 403)
+        marks = _FolderMarks(self, use, sid, real)
+        own = marks.of(listed, real, marks.home_below(real, entry=False))
+        if not own["open"]:
+            raise SessionError(own["refused"] or own["closed"] or f"{listed} cannot be opened.", 403)
+        entries: list[dict[str, Any]] = []
+        error, truncated, partial = None, False, False
+        try:   # (the resolved folder that was checked, its entries shown under the listed path)
+            scanned, truncated = folderlist.scan(str(real), listed)
+        except OSError as exc:
+            scanned, error = [], f"Cannot read the folder {listed}: {exc.strerror or exc}."
+        for item in scanned:
+            if budget.left():
+                entries.append(marks.entry(item, real, in_roots))
+            else:
+                partial = True
+                entries.append(marks.cheap(item, real))
+        here = folderlist.innermost(listed, roots) or root
+        at_root = folderlist.text_key(listed) == folderlist.text_key(here["path"])
+        navigation = any(folderlist.text_key(listed) == folderlist.text_key(r["path"]) and not r["selectable"]
+                         for r in roots)
+        return {"path": listed, "parent": None if at_root else os.path.dirname(listed), "root": here["path"],
+                "entries": entries, "truncated": truncated, "partial": partial, "fallback": fallback, "error": error,
+                "refused": own["refused"],
+                "selectable": own["refused"] is None and not navigation and not (use == "workspace" and own["busy"]),
+                "busy": own["busy"], "current": own["current"], "sep": os.sep}
+
     async def set_workspace(self, sid: str, path: str | os.PathLike | None, *,
                             expect: str | None = None) -> dict[str, Any]:
         """Make the session work in another folder (`path` absolute; None: its own default `workspace/`).
@@ -3495,11 +4089,20 @@ class SessionManager:
         return await self._set_workspace(sid, path, expect=expect)
 
     @staticmethod
-    def _check_expected(sid: str, plan: _Plan, expect: str | None, first: _Plan | None = None) -> None:
-        """The folder must still be what the caller (the user) agreed to, and what the first check found."""
+    def _check_expected(sid: str | None, plan: _Plan, expect: str | None, first: _Plan | None = None, *,
+                        creating: bool = False) -> None:
+        """The folder must still be what the caller (the user) agreed to, and what the first check found.
+        `creating`: the folder of a session being created (its texts speak of the new session; it is removed)."""
         wanted = expect or (first.mode if first is not None else None)
         if wanted is None or plan.mode == wanted:
             return
+        if creating and plan.mode in ("adopted", "moved"):
+            what = ("now holds files: the new session would work with them instead of starting afresh there"
+                    if plan.mode == "adopted" else
+                    "is now empty or missing: the new session would start afresh there instead of working with its "
+                    "files")
+            raise SessionError(f"The folder {plan.target} {what}. Nothing was created; check the folder and try "
+                               "again.", 409)
         if plan.mode == "adopted":
             what = "now holds files: the session would work with them instead of moving its own files there"
         elif plan.mode == "moved":
@@ -3541,7 +4144,7 @@ class SessionManager:
             return {**first.result(), "restarted": False, "start_error": None}
         if not creating:   # (a create checked its own folder against the others before it copied)
             self._check_reserved(first.target)
-        self._check_expected(sid, first, expect)
+        self._check_expected(sid, first, expect, creating=creating)
         was_loaded, was_running = sid in self.swarms, sid in self.running
         try:  # agents, MCP server processes and triggers stop: nothing may write into the folder now (a running
             # session starts again afterwards, also after a failure: its stop is a restart)
@@ -3591,7 +4194,7 @@ class SessionManager:
                                        network_off=network_off, within=within)
         if plan.mode == "unchanged":
             raise SessionError(f"The folder of session {sid} changed meanwhile; try again.", 409)
-        self._check_expected(sid, plan, expect, first)
+        self._check_expected(sid, plan, expect, first, creating=creating)
         undo = _Undo()
         try:
             git = await _in_thread(self._carry_out, sid, plan, undo)

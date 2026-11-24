@@ -8,7 +8,6 @@ Entry points for cli.py:
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import sys
 from pathlib import Path
@@ -66,8 +65,10 @@ def main_tui(home: str | Path, *, lang: str | None = None, session: str | None =
         finally:
             await conn.close()
 
+    from ..cli import run_loop
+
     try:
-        return asyncio.run(run())
+        return run_loop(run())
     except KeyboardInterrupt:
         return 130
     except HubError as exc:
@@ -105,8 +106,10 @@ def main_print(home: str | Path, prompt: str, **options: Any) -> int:
             finally:
                 await conn.close()
 
+    from ..cli import run_loop
+
     try:
-        return asyncio.run(run())
+        return run_loop(run())
     except KeyboardInterrupt:
         return 130
 

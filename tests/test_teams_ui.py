@@ -1215,3 +1215,241 @@ def test_section_texts():
       out.en = home.I18N.en.s_teams;
     """)
     assert out["ru"] == "Команда" and out["en"] == "Teams"
+
+
+# ------------------------------------------------------------------------------------------------ the working folder
+WS = r"""
+  const asked = [];
+  globalThis.confirm = (text) => { asked.push(text); return answers.confirm; };
+  /** The real submit with the dialog's fields: `choice` of «Рабочая папка», a copy path, a project path. */
+  const create = async (choice, props = {}) => {
+    for (const [id, p] of Object.entries({
+      "ns-goal": { value: "Goal", focus() {} }, "ns-title": {}, "ns-desc": {}, "ns-lang": { value: "en" },
+      "ns-budget": { value: "5" }, "ns-model": { value: "default" }, "ns-steps": {}, "ns-approval": { checked: false },
+      "ns-offline": { checked: false }, "ns-clarify": { checked: false }, "ns-run": { checked: false }, "ns-submit": {},
+      "ns-max": { value: "8" }, "ns-error": {}, "ns-copy-from": { value: props.copy || "" },
+      "ns-copy-zip": { files: [] },
+      "ns-ws-path": { value: props.path || "", focus() {} },
+    })) el(id, p);
+    for (const value of ["own", "copy", "project"]) el("ns-ws-" + value, { checked: value === choice });
+    calls.length = 0;
+    await home.submitNewSession({ preventDefault() {} });
+    await new Promise((r) => setImmediate(r));
+    const post = calls.find((c) => c.url === "/api/sessions");
+    return { body: post ? post.body : null, error: elements["ns-error"].textContent };
+  };
+  /** A check line whose state the test sets: ready(), the shown result, run() counted. */
+  const fakeCheck = (result, ready = true) => {
+    const check = { runs: 0, ready: () => ready, result, run: async () => { check.runs++; return result; } };
+    return check;
+  };
+  const answer = (extra) => ({ use: "workspace", path: "/proj", target: "/proj", state: "missing", mode: "created",
+                               expect: "created", git: "initialized", mcp: [], ...extra });
+  const words = { cls: "ok", text: "The folder is empty: the session starts there afresh." };
+"""
+
+
+def run_ws(body: str, lang: str = "en") -> dict:
+    return run_dialog(WS + body, lang=lang)
+
+
+def test_the_working_folder_block_sits_in_the_main_grid():
+    out = run_ws(r"""
+      out.html = await open(base);
+      out.keys = Object.keys(home.I18N.en);
+      home.H.lang = "ru";
+      out.ru = await open(base);
+    """)
+    html = out["html"]
+    fieldset = '<fieldset class="full ns-ws" id="ns-ws"><legend><i class="ic ic-folder"></i>Working folder</legend>'
+    assert fieldset in html
+    # right after «Сначала уточнить цель», before the team is chosen, never under «Дополнительно»
+    assert html.index('id="ns-clarify"') < html.index(fieldset) < html.index('id="ns-model"') \
+        < html.index('id="team-ns"')
+    assert html.index('id="ns-ws-project-box"') < html.index('<details class="more"><summary>More</summary>')
+    assert '<input type="radio" name="ns-ws" id="ns-ws-own" value="own" checked>' in html
+    assert '<input type="radio" name="ns-ws" id="ns-ws-copy" value="copy">' in html
+    assert '<input type="radio" name="ns-ws" id="ns-ws-project" value="project">' in html
+    assert 'id="ns-ws-own-box">' in html and 'id="ns-ws-copy-box" hidden>' in html
+    assert 'id="ns-ws-project-box" hidden>' in html
+    assert "New session folder" in html and "Copy of a folder or a zip" in html
+    assert "Directly in a project folder" in html
+    assert "that folder is deleted with the session." in html and "Don&#39;t edit these files yourself" in html
+    assert '<button id="ns-copy-browse" class="btn" type="button" aria-haspopup="dialog">Browse…</button>' in html
+    assert '<button id="ns-ws-browse" class="btn" type="button" aria-haspopup="dialog">Browse…</button>' in html
+    assert '<div class="fo-line" id="ns-ws-check" role="status" aria-live="polite"></div>' in html
+    assert 'id="ns-ws-sandbox" hidden>The hub runs in the Docker sandbox: only the folders inside its home' in html
+    assert "f_files" not in out["keys"] and "Files to work on" not in html
+    ru = out["ru"]
+    assert "Рабочая папка" in ru and "Новая папка сессии" in ru and "Копия папки или zip" in ru
+    assert "Прямо в папке проекта" in ru and "Обзор…" in ru
+
+
+def test_the_bodies_of_each_choice():
+    out = run_ws(r"""
+      await open(base);
+      out.own = await create("own", { copy: "/data/p", path: "/proj" });   // other choices' values stay unsent
+      out.copy = await create("copy", { copy: ' "/data/my p" ', path: "/proj" });
+      home.H.nsWsCheck = fakeCheck({ key: "/proj", answer: answer(), failed: null, words });
+      out.project = await create("project", { copy: "/data/p", path: "/proj" });
+      // a check that could not run blocks nothing: the field's value, no expect, the hub decides
+      home.H.nsWsCheck = fakeCheck({ key: "/proj", answer: null, failed: "No connection to the server", words });
+      out.failed = await create("project", { path: "'/proj'" });
+      // nothing typed
+      out.none = await create("project", {});
+    """)
+    assert "workspace" not in out["own"]["body"] and "copy_from" not in out["own"]["body"]
+    assert "expect" not in out["own"]["body"] and "copy_from_upload" not in out["own"]["body"]
+    copy = out["copy"]["body"]
+    assert copy["copy_from"] == "/data/my p" and "workspace" not in copy and "expect" not in copy
+    project = out["project"]["body"]
+    assert project["workspace"] == "/proj" and project["expect"] == "created"
+    assert "copy_from" not in project and "copy_from_upload" not in project
+    assert out["failed"]["body"]["workspace"] == "/proj" and "expect" not in out["failed"]["body"]
+    assert out["none"] == {"body": None, "error": "Give the project folder."}
+
+
+def test_a_submit_before_the_check_runs_it_and_creates_nothing():
+    out = run_ws(r"""
+      await open(base);
+      const check = fakeCheck({ key: "/proj", answer: answer(), failed: null, words }, false);
+      home.H.nsWsCheck = check;
+      out.first = await create("project", { path: "/proj" });
+      out.runs = check.runs;
+      // its answer a refusal: that text; a check that could not run: only its line; superseded: nothing
+      const refusal = { use: "workspace", path: "/proj", status: 400, error: "/proj is your home folder." };
+      home.H.nsWsCheck = fakeCheck({ key: "/proj", answer: refusal, failed: null, words }, false);
+      out.firstRefused = await create("project", { path: "/proj" });
+      home.H.nsWsCheck = fakeCheck({ key: "/proj", answer: null, failed: "x", words }, false);
+      out.firstFailed = await create("project", { path: "/proj" });
+      home.H.nsWsCheck = fakeCheck(null, false);
+      out.firstGone = await create("project", { path: "/proj" });
+      // a check that refused the folder: its text, nothing created
+      home.H.nsWsCheck = fakeCheck({ key: "/proj", failed: null,
+                                     answer: { use: "workspace", path: "/proj", status: 409,
+                                               error: "/proj is the folder of session x." },
+                                     words: { cls: "err", text: "/proj is the folder of session x." } });
+      out.refused = await create("project", { path: "/proj" });
+    """)
+    assert out["first"] == {"body": None, "error": "The folder was checked: read below it what will happen, and click "
+                                                   "the button again."}
+    assert out["runs"] == 1
+    assert out["firstRefused"] == {"body": None, "error": "/proj is your home folder."}
+    assert out["firstFailed"] == {"body": None, "error": ""} and out["firstGone"] == {"body": None, "error": ""}
+    assert out["refused"] == {"body": None, "error": "/proj is the folder of session x."}
+
+
+def test_an_adopted_folder_asks_first():
+    out = run_ws(r"""
+      await open(base);
+      const text = "A folder with files: the agents will work with them and commit to its current branch “main”.";
+      home.H.nsWsCheck = fakeCheck({ key: "/proj", failed: null, words: { cls: "warn", text },
+                                     answer: answer({ state: "files", mode: "adopted", expect: "adopted",
+                                                      git: "existing", branch: "main" }) });
+      answers.confirm = false;
+      out.no = await create("project", { path: "/proj" });
+      answers.confirm = true;
+      out.yes = await create("project", { path: "/proj" });
+      out.asked = asked;
+    """)
+    assert out["no"]["body"] is None
+    assert out["yes"]["body"]["workspace"] == "/proj" and out["yes"]["body"]["expect"] == "adopted"
+    assert out["asked"] == ["The session will work right in the folder /proj, with its files: A folder with files: the "
+                            "agents will work with them and commit to its current branch “main”. Go on?"] * 2
+
+
+def test_the_skills_of_a_project_folder():
+    """`?workspace=` is asked only for «Прямо в папке проекта» with a check of a folder with files; its claude-project
+    rows are offered and sent, and dropped (with their ticks) when the folder or the choice changes."""
+    out = run_ws(r"""
+      const skillAsks = [];
+      let hold = null;
+      const checks = { "/proj": answer({ state: "files", mode: "adopted", expect: "adopted", git: "existing",
+                                         branch: "main" }),
+                       "/other": answer({ path: "/other", target: "/other", state: "files", mode: "adopted",
+                                          expect: "adopted", git: "existing", branch: "main" }),
+                       "/empty": answer({ path: "/empty", target: "/empty", state: "empty" }) };
+      globalThis.fetch = async (url, opts) => {
+        const body = opts && opts.body ? JSON.parse(opts.body) : null;
+        calls.push({ url, body });
+        let data = { ok: true, result: "done" };
+        if (url === "/api/folders/check") data = checks[body.path];
+        else if (url.startsWith("/api/skills?workspace=")) {
+          skillAsks.push(url);
+          data = { library: [], claude: [{ name: "proj-skill", origin: "claude-project", description: "d" },
+                                         { name: "notes", origin: "claude-user" }] };
+          if (url.endsWith("%2Fother")) await new Promise((r) => { hold = r; });   // a slow answer
+        } else if (url === "/api/skills") data = { library: [{ name: "pdf", description: "PDF" }], claude: [] };
+        return { ok: true, status: 200, json: async () => data };
+      };
+      el("ns-ws-path", { value: "/proj", focus() {} }); el("ns-ws-check"); el("ns-skills-list");
+      for (const value of ["own", "copy", "project"]) el("ns-ws-" + value, { checked: value === "project" });
+      await open(base);
+      const wsInput = elements["ns-ws-path"];   // the field the check line reads
+      await new Promise((r) => setImmediate(r));
+      await home.H.nsWsCheck.run(true);
+      await new Promise((r) => setImmediate(r));
+      out.asks = skillAsks.slice();
+      out.rows = elements["ns-skills-list"].innerHTML;
+      home.H.nsSkills.add("claude-project:proj-skill");
+      answers.confirm = true;
+      out.sent = (await create("project", { path: "/proj" })).body.skills;
+      elements["ns-ws-path"] = wsInput;
+      // another folder: the rows and their ticks go; a slow answer for it comes after a third folder: dropped
+      wsInput.value = "/other";
+      home.H.nsWsCheck.run(true);
+      await new Promise((r) => setImmediate(r)); await new Promise((r) => setImmediate(r));
+      out.droppedTicks = [...home.H.nsSkills];
+      wsInput.value = "/empty";
+      await home.H.nsWsCheck.run(true);
+      hold();
+      await new Promise((r) => setImmediate(r));
+      out.afterEmpty = [home.H.nsProject, elements["ns-skills-list"].innerHTML.includes("proj-skill")];
+      out.asks2 = skillAsks.length;
+      // another choice drops them too
+      wsInput.value = "/proj";
+      await home.H.nsWsCheck.run(true);
+      await new Promise((r) => setImmediate(r));
+      out.back = elements["ns-skills-list"].innerHTML.includes("proj-skill");
+      for (const value of ["own", "copy", "project"]) el("ns-ws-" + value, { checked: value === "copy" });
+      home.nsWsShow();
+      out.copyChoice = [home.H.nsProject, elements["ns-skills-list"].innerHTML.includes("proj-skill")];
+    """)
+    assert out["asks"] == ["/api/skills?workspace=%2Fproj"]
+    rows = out["rows"]
+    assert 'data-ns-skill="claude-project:proj-skill"' in rows and 'data-ns-skill="pdf"' in rows
+    assert rows.index('data-ns-skill="pdf"') < rows.index('data-ns-skill="claude-project:proj-skill"')
+    assert "from this folder&#39;s .claude/skills: agents can change these files" in rows
+    assert "notes" not in rows   # only the folder's own skills
+    assert out["sent"] == ["claude-project:proj-skill"]
+    assert out["droppedTicks"] == []
+    assert out["afterEmpty"] == [None, False] and out["asks2"] == 2
+    assert out["back"] is True and out["copyChoice"] == [None, False]
+
+
+@pytest.mark.parametrize("roots, disabled", [([], True), ([{"path": "/dreamteam/api-folders/data", "kind": "api",
+                                                            "name": "data", "selectable": True}], False)])
+def test_the_copy_browser_in_a_container(roots, disabled):
+    out = run_ws(r"""
+      const lists = [];
+      globalThis.fetch = async (url, opts) => {
+        const body = opts && opts.body ? JSON.parse(opts.body) : null;
+        if (url === "/api/folders/list") lists.push(body);
+        const data = url === "/api/skills" ? { container: true, library: [], claude: [] }
+          : url === "/api/folders/list" ? { path: null, roots: JSON.parse(process.env.ROOTS), entries: [] }
+            : { ok: true };
+        return { ok: true, status: 200, json: async () => data };
+      };
+      const button = el("modal #ns-copy-browse", { disabled: false, title: "" });
+      el("modal #ns-copy-sandbox", { hidden: true }); el("modal #ns-ws-sandbox", { hidden: true });
+      await open(base);
+      for (let i = 0; i < 4; i++) await new Promise((r) => setImmediate(r));
+      out.lists = lists;
+      out.button = [button.disabled, button.title];
+      out.hints = [elements["modal #ns-copy-sandbox"].hidden, elements["modal #ns-ws-sandbox"].hidden];
+    """.replace("process.env.ROOTS", json.dumps(json.dumps(roots))))
+    assert out["lists"] == [{"use": "source"}]   # once, the roots alone
+    hint = ("The hub runs in the Docker sandbox and sees only its home folder: upload a folder from your computer as "
+            "a .zip.")
+    assert out["button"] == ([True, hint] if disabled else [False, ""])
+    assert out["hints"] == [False, False]

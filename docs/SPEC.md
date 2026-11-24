@@ -21,7 +21,8 @@ User-visible texts for agents live in `prompts.py` (ru/en). Python >= 3.11, asyn
 * Event loop: everything runs in one asyncio loop; the DB is used synchronously from it.
   Blocking work (git, big file IO) goes through `asyncio.to_thread`. Shell commands never use the loop's default
   executor (git does, and `asyncio.run` waits for its threads at exit): their spawn, output reader and waiter are
-  daemon threads of their own (§7).
+  daemon threads of their own (§7). Every loop is started by `cli.run_loop(main)` (§18.3), never a bare
+  `asyncio.run` (tests/test_loop_start.py checks src).
 
 ## 1. Layout
 
@@ -65,10 +66,11 @@ src/dreamteam/
   tools/__init__.py  registry: ToolSpec, ToolContext, tool(), tools_for(), schemas_for(), call_tool()
   tools/board_tools.py comm_tools.py file_tools.py job_tools.py swarm_tools.py trigger_tools.py mcp_tools.py
   tools/skill_tools.py the skills tools: the user's `skills`, `skill_attach`, `skill_detach`, `skill_approve`,
-                 `skill_reinstall`, and the members' `skill_propose` (frozen revision 3; §19)
+                 `skill_reinstall`, and the members' `skill_propose` (§19)
   tools/frozen.py    frozen LLM tool sets: revisions (now 5), the kv record of each agent,
                      `python -m dreamteam.tools.frozen` (§6.1)
-  tools/snapshots/   llm_r<N>.json: every released LLM tool set (revision N, en and ru), never edited
+  tools/snapshots/   llm_r<N>.json: the shipped LLM tool sets, revision OLDEST_OPEN_REVISION..TOOLSET_REVISION
+                     (now 5; en and ru), never edited
   agent.py       AgentRuntime   — ReAct loop of one LLM agent
   swarm.py       Swarm          — composition root
   hub_mcp.py     the swarm as an MCP server (stdio / streamable HTTP / stdio->HTTP proxy)
@@ -189,7 +191,8 @@ Project (one swarm of `dreamteam run`; a session directory has the same layout w
 * kv keys: `goal` → `{"title","description","status":"active"|"done","summary","set_by","updated_at"}`,
   `limits` → `{"max_cost_usd": float, "max_agents": int}` (overrides config), `paused` → `{"paused": bool,
   "reason": str}` (a member's question, §3.1: `{"paused": true, "reason": "question", "asker": str, "message_id":
-  int, "since": float}`),
+  int, "since": float}`), `budget_notice` → `{"limit": float, "at": float, "spent": float, "ts": float}` (the money
+  notice sent for that limit and fraction, §3 `record_usage`; a new limit or fraction re-arms it),
   `tools:<agent name>` → `{"rev": int, "language": "en"|"ru", "tools": [{"name","description","parameters"}]}` (the
   agent's frozen tool set, §6.1; kept for retired agents, traces read it), `wait_progress:<actor>` → the last events
   id whose board progress `wait_for_events(progress=true)` returned to that actor (§12).
@@ -277,6 +280,26 @@ class Swarm:
         # (JobManager.busy) and whose end will wake it (JobManager.awaited): a member's broadcast reaches it without a
         # wake (§5 "Quiet broadcasts")
     def defer_wake(self, name: str) -> None              # such news reached `name` unwoken (_wake_deferred, below)
+    def team_asleep(self, caller: str | None = None) -> bool
+        # nobody in the team can act or be woken by something already set (scheduler item 9 below, `wait`'s result,
+        # §12). `caller`, when given, is the member calling `wait` (still working): it counts as idle with nothing
+        # pending. True when all of these hold: every LLM member with a runtime is idle as `_idle_llm_members` counts
+        # it (status idle, nothing pending, not `jobs.busy`) or in error with no recovery scheduled
+        # (`runtime._recovery` None: one with a recovery timer will be retried, so it counts as awake), and at least
+        # one is idle (or is `caller`); none of them waits for something of its own: a job whose end wakes it
+        # (`jobs.awaited`) or a file it was refused (`workspace.waits_for_lock`), counted however long either lasts
+        # (the job's end or `n_lock_free` will come: a forgotten `background` server keeps it false until `[shell]
+        # job_max_minutes`); no delayed notification is pending (`_timers` empty: staggered kickoffs not delivered
+        # yet); `triggers.unattended(now)` is false (§8 "Unattended triggers"; `now` from the engine's `clock`, which
+        # stamps the triggers' times); no external member made a hub call in the last `EXTERNAL_IDLE_SECONDS` (15
+        # min, tracing.py): `_external_seen` {member: time.time()}, in memory, stamped by `hub_call` (§13) for every
+        # call but `wait_for_events`, whether tracing is on or not (a client that only listens is asleep like the
+        # others)
+    def stall_ids(self, name: str) -> frozenset[int]
+        # the public form of `_stall_ids` (scheduler items 2-3, `wait`'s result): the in_progress task ids of `name`
+        # that count as stalled, not a clarify planning card whose holder waits for the user's answers (`asks_user`,
+        # §3.1) nor a crew task with a direction that can still move (`Board.has_live_directions`); a `waiting` task
+        # never counts (answers wake its holder, system prompt rule 7)
     def render_wake(self, name: str, incoming: bool = False, stamps: bool = False,
                     since: float | None = None) -> str | None
         # drains (marks read/delivered) and renders the wake-up text (§6.3); None if nothing pending
@@ -356,7 +379,18 @@ class Swarm:
     def record_usage(self, agent: str, usage: Usage, profile: ModelProfile, model: str | None = None) -> float
         # adds cost_of(...) to the agent; a call that counted tokens as $0 (uncounted_fields, §10) gives USER the quiet
         # u_cost_unknown {profile, model, fields} once per start() for each (profile, provider, base_url, model,
-        # fields), plus a log warning (the set `_cost_warned` lives in memory and start() clears it)
+        # fields), plus a log warning (the set `_cost_warned` lives in memory and start() clears it).
+        # Then the money notice: limit = limits()["max_cost_usd"], at = `float(config.swarm.budget_notice_at or 0)`
+        # (read at each call, §17.1), spent = `spent_usd()`; when limit > 0, 0 < at < 1, spent >= at × limit − 1e-9,
+        # spent < limit and kv `budget_notice` does not hold this {limit, at} (only those two fields are compared):
+        # kv `budget_notice` {limit, at, spent, ts} is written, then every LLM member (not retired, not external)
+        # gets `n_budget_low` {spent, limit, pct}, waking (`wake=True`) for a member that works or has open tasks,
+        # reviews waiting for it or news pending, quiet for an idle one with none of those, and USER gets the quiet
+        # `u_budget_low` {spent, limit, pct}; pct = min(round(100 × spent / limit), 99) (no format spec in the texts,
+        # §17.1). At or past the limit nothing is recorded: `u_budget` covers it, so a call that jumps past the limit
+        # gives no low notice, and a raised limit gives it at the next call that finds spent past the new threshold.
+        # A new limit (set_limits, a settings change, reconfigure) or a new fraction differs from the kv record and
+        # so re-arms the notice, with no hook; the same limit set again does not
     def budget_exceeded(self) -> bool
     paused: bool; pause_reason: str
     def pause(self, actor: str, reason: str, **details) -> bool
@@ -364,7 +398,15 @@ class Swarm:
         # "question": asker, message_id, since; §3.1)
     def _set_pause(self, actor: str, reason: str, *, outcome: dict | None = None, **details) -> None
         # writes the pause slot even while paused (a question pause turned into a budget pause: `outcome` is then the
-        # event's `question` data); USER gets the quiet u_budget (reason "budget") or u_question (reason "question")
+        # event's `question` data); USER gets the quiet u_budget (reason "budget") or u_question (reason "question");
+        # a fresh pause (not paused before) with the user's reason, "paused by the user" (a swarm.py constant beside
+        # QUESTION, which `swarm_control` passes, §12), while jobs run (`jobs.running_of()`) gives USER the quiet
+        # u_paused_jobs {jobs: "j3 (Anna Smith: npm run dev, 25 min); ...", built like u_jobs_running}: "Background
+        # jobs of the agents are not paused with the swarm: {jobs}. A pause stops only the agents' model calls; the
+        # jobs run until you stop them or the session stops: use the Jobs tab on the board or /jobs stop <id> in the
+        # terminal." (ru alike: «Процессы», no identifier in backticks, test_background_job_texts). None for a
+        # budget or question pause (u_budget / u_question cover them, and a `stop_when_done` session stops its jobs
+        # right after a budget pause, §21.4), nor for a question pause turned into a budget pause
     def resume(self, actor: str, *, question: dict | None = None) -> None
         # n_resumed to LLM agents with open tasks, reviews waiting for them, pending events or an activation the
         # pause cut short (runtime.interrupted); a reply owed to the user by that activation is still forwarded.
@@ -372,8 +414,10 @@ class Swarm:
         # question this resume ends (§3.1); a resume without it while a question is pending drops that question
         # (outcome "dropped", why "resumed"): its asker gets a waking n_question_unanswered instead of n_resumed.
         # A pause is no planning or decision time: the pause's length (`_paused_at`, in memory, so a pause that began
-        # before a restart is not counted) moves on the planning hint's clock (scheduler item 4) and every
+        # before a restart is not counted) moves on the planning hint's clock (scheduler item 4), every
         # `_considering` start (`_nudge_idle`'s decision window; an offer made during the pause counts from the resume)
+        # and every free-place clock (`_crew_gaps`, scheduler item 8: a crew task's state does not age while paused);
+        # it drops the team-asleep clock (`_team_asleep` = None, scheduler item 9: its `n_resumed` wakes the holders)
     def pending_question(self) -> dict | None            # {asker, message_id, since} of the question holding the
                                                          # pause (kv `paused` with reason "question"), else None
     def last_message_id(self, sender: str, recipient: str, since: float = 0.0) -> int | None
@@ -424,7 +468,8 @@ resolve_member is the real `resolve_member_in`; set_goal / complete_goal validat
 like the real ones (the planning task is created when a real Board is wired: `prompts.planning_task(language,
 config.swarm.clarify)` with its tags, §3.1). It has no `pending_question`, `ask_user`, `asks_user` or `pause_text`:
 their callers (Mailbox.send, send_message, the in-activation nudge, `_stop_reason`) look them up with getattr, so
-with FakeSwarm a message never answers or pauses anything.
+with FakeSwarm a message never answers or pauses anything. Nor has it `team_asleep` or `stall_ids` (and its
+`triggers` is None): `wait` (§12) looks them up with getattr and gives the plain result.
 
 Scheduler (every 3 s): expires file locks, then settles the lock waiters (`workspace.settle_waiters()`, §7 "Lock
 waiters": a member refused a path that is free now is woken, a long holder told; also while paused, the
@@ -502,14 +547,100 @@ runtime, nothing pending and not busy with a job (`JobManager.busy`, §7.1 "Live
 5. `_remind_reviewers` (independent review only): review reminder and hand-over (§4.1 "Liveness");
 6. `_check_all_done`: sends `n_all_done` to one idle agent when every task is finished but the goal is open
    (`review` is an open status, so it waits for every review); not while any LLM member works or is busy with a
-   job (with no open task only a `timeout` job can make it busy: its command may still change the result);
+   job (with no open task only a `timeout` job can make it busy: its command may still change the result); once
+   per board state, the key `(task count, MAX(tasks.updated_at))` kept in `_all_done_key` (item 9 reads it);
 7. `_remind_user_reviews` (both modes): `u_reviews_waiting` when only the user's reviews keep the swarm going
-   (§4.1 "Liveness").
+   (§4.1 "Liveness");
+8. `_tell_crew_gaps` (§4.2 "A free place"; run of 2026-11-13: for hours one member worked on the last direction of
+   a crew task while a place was free and three members idled, its owner among them, and nothing told the owner):
+   the owner of a crew task that has a free place, a direction in `in_progress` or `waiting` and none a member may
+   take now (`Board.crew_gaps()`), while other members are idle with no task of their own to go on with, gets
+   `n_crew_gap` once the crew task has been in that state with the same open and named directions for
+   `CREW_GAP_FACTOR` (10) × `agents.idle_nudge_seconds`, and only while the owner is idle itself; once per such
+   state, at most `CREW_GAP_MAX` (2) times per owner and crew task (counted from the notifications table, so a
+   restart does not reset the count); never while the goal is not active or in wrap-up mode (`wrapping_up`; the
+   clocks start again afterwards; a pause stops them: `resume` moves them on by its length). It runs after items
+   1-7, in the code too: it reads the offers item 1 made in the same pass (`_nudged`), and a member that items 1-7
+   woke has news pending, so it is not idle. It wakes nobody but that owner;
+9. `_wake_team_asleep` (§4.2 "Notifications": `n_team_asleep`, `u_team_asleep`, `u_team_waits`): the whole team
+   sleeps while work is open and nothing set will wake the team: a member waits, after item 3's one wake, for a
+   process the hub does not track (`jobs` does not list it: on macOS one that left its command's process group, on
+   Linux one that also cleared its environment, §7 "Process layer"), members wait for each other, or a member
+   waits for the user's answer to a plain message. It runs last, after item 8, in the code too: a member that
+   items 1-8 or `_wake_deferred` woke in the same pass has news pending, so it is not idle.
+   - *When* (in item 9 an open task is one in `todo`, `in_progress` or `waiting`, not `Status.OPEN`: `review` is
+     apart, the review condition below handles it; *Whom* and `u_team_waits` read "open" the same way): in a pass,
+     all of these hold: the goal is active (wrap-up mode included); the board has an open task, or no open task,
+     every task terminal, and item 6 has already spoken for this board state (`_all_done_key` equals the key
+     below); an empty board gives nothing; no task is in review whose review item 5 still works on (independent
+     review on and the reviewer an LLM member: item 5 reminds it and hands it over); a review held by USER or an
+     external member, or any review while independent review is off, does not count, but item 7's state stands
+     item 9 down (USER's reviews wait, `not self._has_task_in_progress() and not self._has_actionable_todo()`: item
+     7 tells the user, nothing else is left); no clarify planner waits for the user's answers (`asks_user` on an
+     open planning card of an LLM member, §3.1); and `team_asleep()` (above: every LLM member idle or in error with
+     no recovery, nothing of theirs awaited, no delayed notice, no unattended trigger, no recent external call).
+   - *Clock*: the key is item 6's, `(task count, MAX(tasks.updated_at))` (a claim or a status change makes a new
+     one, a comment does not). `_team_asleep` (key, since), in memory: `since` is when a pass first saw the
+     conditions hold with that key, raised to the latest `last_active` of the idle LLM members (not of those in
+     error: a failing retry does not restart it); a pass where the conditions fail, or the goal is not active,
+     drops it; a changed key starts a new clock; `resume()` drops it (§3 `resume`).
+   - *Due* when `now - since >= TEAM_ASLEEP_FACTOR * 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) * idle_nudge_seconds`
+     (`agents.idle_nudge_seconds`) and `per_key < TEAM_ASLEEP_MAX`. `sent` = the `n_team_asleep` notifications under
+     the current goal (`SELECT COUNT(*) FROM notifications WHERE kind = 'n_team_asleep' AND ts >=
+     goal.updated_at`: a restart keeps it, a new or reopened goal starts again); `per_key` = those sent since the
+     key was first seen (`_team_asleep_woken` (key, count), in memory). Module constants, monkeypatchable:
+     `TEAM_ASLEEP_FACTOR` = 5, `TEAM_ASLEEP_DOUBLINGS` = 5, `TEAM_ASLEEP_MAX` = 2; with the default 60 s the wakes
+     come after 5, 10, 20, 40, 80, 160, 160… minutes, at most 2 per board state, so a member that changes a task's
+     status at every wake still waits twice as long each time. With `idle_nudge_seconds` = 0 the delay is 0 and
+     the doubling does nothing (as items 2-3 and 8 have no delay then): item 9 is due at the first pass that finds
+     the team asleep, still at most 2 per board state, so a member that changes a task's status at every wake is
+     woken again at almost every pass (3 s) for as long as it does so, or until the budget pauses the swarm.
+   - *Whom*: among the idle LLM members (not those in error), the one active last (`last_active`) of the first
+     group that has one: 1. holding an `in_progress` or `waiting` task; 2. holding a `todo` task; 3. any idle
+     member, when an open task has no assignee, or no open task is left (item 6's state). It gets the waking
+     `n_team_asleep` {elapsed, jobs}; `per_key` is recorded right after that notify succeeds. Then, in its own
+     try/except with a log line, USER gets `u_team_asleep` {elapsed, name} with the first wake of each key, waking
+     (`wake=True`, as `u_reviews_waiting`: a user MCP client in `wait_for_events` is told). When no LLM member
+     holds an open task and every open task has an assignee (USER or an external member), no member is woken: USER
+     gets the waking `u_team_waits` {elapsed, tasks: "#3, #5"} once for that board state (`per_key` is set to the
+     cap at once; `sent` is not touched). `elapsed` = `fmt_duration(now - since)` in the recipient's language;
+     `jobs` = "" or `team_asleep_jobs` {jobs} naming the member's running jobs whose end is quiet
+     (`jobs.running_of(name)` minus `jobs.awaited(name)`, labels `j3, j5`).
+   - *Texts* (en; ru alike, the same placeholders and backticked identifiers; in ru such an untracked process is
+     «процесс, запущенный через & или nohup, которого нет в списке `jobs`», never «фоновый процесс», which is a
+     job; no text puts & or nohup in backticks, which the identifier tests would refuse): `n_team_asleep`
+     ``Nobody in the team has worked for {elapsed}, and nothing is set to wake the team: no running background job
+     whose end wakes its owner, no trigger that can still fire on a time or a file, no locked file someone was
+     refused.{jobs} A process started with & or nohup that `jobs` does not list is not tracked: its end wakes
+     nobody. If you are waiting for one, check it now; if it still runs, set a trigger with a deadline before you
+     `wait` (`trigger_create`, e.g. file_exists("out/result.json") or elapsed(1800)), and start the next such run
+     with background=true, without & and nohup. If you are waiting for the user's answer, don't ask again: the
+     user was told. If you are waiting for another member, ask in the task's discussion: a post wakes them.
+     Otherwise go on with your tasks, or finish them, or set them back to `todo` (or `failed`) with a comment; when
+     every task is finished, verify the result and call `goal_complete`; if you hold none, look at the `board` for
+     open tasks nobody moves.``; `team_asleep_jobs` ` Your background jobs {jobs} still run, but their end will not
+     wake you while you hold no task in progress.` (ru «фоновые процессы»); `u_team_asleep` `Nobody in the team
+     has worked for {elapsed}, and nothing is set to wake the team: no background job whose end wakes its owner, no
+     trigger that fires on a time or a file. {name} was woken to check their work. If the team waits for you (an
+     answer, a review, a decision, access), write to the member who asked; to end the run, stop the session.`;
+     `u_team_waits` `Nobody in the team has worked for {elapsed}: the open tasks {tasks} are held by you or by
+     members who joined through MCP, and nothing is set to wake the team. Do them or hand them to the team; to end
+     the run, stop the session.` The member's texts name only tools every open revision has (§12 R0′).
+   - *Limits accepted*: a job whose end wakes its owner (`JobManager.awaited`: a `background` server past its busy
+     window counts until `[shell] job_max_minutes`, 480 min by default; 0: as long as it runs) and a wait for a
+     refused file (until the lock ends: unlock, expiry after `[workspace] lock_ttl_minutes`, at most 24 h, or
+     retire) keep item 9 silent however long they last; a trigger that reads only files counts for
+     `UNATTENDED_FILE_SECONDS` (§8). Open tasks held only by LLM members in error with no recovery scheduled, none
+     without an assignee, wake nobody and send no `u_team_waits`: USER was told of the error (`u_agent_error`). No
+     external member is ever woken (no scheduler item wakes one), and a `dreamteam -p` run still waits, until its
+     `--timeout` when one is given, with the user's notice on stderr (docs/TUI.md §2).
 
 `reconfigure()` applies new settings to a running swarm, lifts a budget pause the new budget allows and retries
 agents in ERROR; a changed role catalog (§17.3), `[swarm] independent_review` and `crew_review` apply at once (new
 hires use the new catalog; existing members keep their frozen prompts); `[swarm] clarify` switched off lifts a
-question pause and tells a clarify planner that waits for the user (§3.1).
+question pause and tells a clarify planner that waits for the user (§3.1). The money notice needs no hook: a new
+`max_cost_usd` or `[swarm] budget_notice_at` no longer matches kv `budget_notice`, so the next `record_usage` past the
+new threshold sends it again (§3 `record_usage`); `agents.idle_nudge_seconds` reaches item 9's delay at the next pass.
 
 ### 3.1 Clarify mode and questions that pause the swarm
 
@@ -559,21 +690,21 @@ replies works as before); `set_goal`, `ask_user` (its own outcome `auto`) and th
   past the tags is `autoreply.planner_question(scalar, name, task_id, since)` (the id of the question the planner
   waits on, else None), which the requests to the user read from a session's file too (§21.5), so the guard, the
   banner and the requests cannot drift apart.
-- **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm` (toolset revision 4,
-  §6.1). The message is always stored first; then `ask_user(asker, message)` pauses only after these checks, in this
+- **A question that pauses the swarm.** `send_message` has the optional boolean `pause_swarm`. The message is always
+  stored first; then `ask_user(asker, message)` pauses only after these checks, in this
   order, each giving its outcome and result note (§12): `user` (the sender is the user), `no_user` ("user" is not a
   recipient), `off` (`[swarm] clarify` is off), `auto` (the auto-reply lease), `own` / `pending` (a question is
   pending already: one at a time), `paused` (paused for another reason, which stays), `budget` (spent), else
   `asked`: `pause(asker, "question", asker=, message_id=, since=)`. Every outcome but `asked` leaves an ordinary
-  message. AI agents of revision 4 and later and external MCP members can pause; for an agent of revision 1-3
-  `call_tool` drops the argument (§12) until its next compaction. There is no cap per member.
+  message. AI agents and external MCP members can pause. There is no cap per member.
   - State: the question lives only in kv `paused` (`{"paused": true, "reason": "question", "asker", "message_id",
     "since"}`); `pending_question()` reads it. Every exit rewrites that one slot, so a stale question never captures
     a later message. `swarm.paused` {reason: "question", asker, message_id, since}, actor the asker; USER gets the
     quiet `u_question` {name, id}.
   - It pauses like any pause (§6.2): an LLM call in flight and all tool calls of its response finish, the next step
     breaks, a woken agent goes to `paused`, the scheduler skips its passes; jobs, triggers and external members go
-    on. The asker reads its result only after the resume, together with the answer.
+    on (unlike the user's own pause, it sends USER no `u_paused_jobs`: `u_question` covers it, §3 `_set_pause`). The
+    asker reads its result only after the resume, together with the answer.
 - **The answer rule.** While `pending_question()` is {asker A, message_id Q}, the **first** message from USER (any
   surface: the board's chat, the TUI, the console, MCP) whose resolved recipients include A (named, or through
   "all") is the answer; `reply_to` alone does not count. `Mailbox.send` (§5) fills `reply_to = Q` when it has none (A
@@ -679,6 +810,12 @@ class Board:
     def contributors_of(self, task: Task) -> set[str]  # the assignees of its subtasks, any status
     def busy_crews(self, name: str) -> set[int]        # crew tasks with a direction name works on (in_progress or
                                                        # waiting): their directions are not offered to it
+    def crew_gaps(self) -> list[tuple[Task, list[Task], list[tuple[int, str, int]]]]
+        # the crew tasks whose owner may be told of a free place (§4.2 "A free place"), each with its open
+        # directions and the held ones to name: (sub, assignee, m), id ascending
+    def crew_gap_parts(self, task: Task, held: list[tuple[int, str, int]], lang: str) -> tuple[str, str]
+        # n_crew_gap's {directions} and {held} in `lang`: the directions but the cancelled ones, the blockers of
+        # the todo ones after them, and one sentence per held direction (§4.2 "A free place")
 
     # independent review (below)
     independent_review: bool                           # property: [swarm] independent_review, read on every call
@@ -915,6 +1052,11 @@ notifications explain it.
     tasks (the tests of an implementation that waits for the user), the directions of a crew task that is blocked,
     full, in review or terminal, and an owner's own part waiting for its blocked crew task do not suppress it. The
     user never answering only leaves the session idle (no cost).
+  - Scheduler item 9 (§3, the whole team asleep) leaves to `_remind_reviewers` only a review it still works on:
+    with the switch on, a task in review whose reviewer is an LLM member keeps item 9 silent; a review held by USER
+    (the usual one in a one-agent team) or by an external member, or any review with the switch off, does not, so
+    a holder of other open work that sleeps with nothing set to wake it is still woken. Item 7's state (only USER's
+    reviews left, nothing in progress, no actionable `todo`) stands item 9 down: `u_reviews_waiting` tells the user.
   - Goal completion: `review` is an open status, so `n_all_done` waits for every review, and `goal_complete`
     (§12) is refused while any task is in review (switch on).
   - The planning task is reviewed like any task; in a one-agent team that asks the user to approve the plan, which
@@ -1211,9 +1353,11 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
     itself, which a hand-in sends to review, and only a done dependency unblocks), and the board says when the claim
     would take it. `n_unblocked` is unchanged: a direction still held back when its dependencies are done gets it
     like any task, and the refusal of its claim says why. A wait that keeps the held direction or a place from ever
-    freeing (a working direction that waits for the held one) gets no text of its own: Liveness counts #8 among its
-    owner's stalled ids only while #8 is `in_progress` and every working direction waits for a held-back one (§3
-    items 2-3). The checks of "Taking a direction" are unchanged.
+    freeing (a working direction that waits for the held one) gets no text of its own here: Liveness counts #8 among
+    its owner's stalled ids only while #8 is `in_progress` and every working direction waits for a held-back one (§3
+    items 2-3), and while #8 has a free place and other members are idle with no task of their own to go on with,
+    "A free place" tells its owner of the held direction and of that wait. The checks of "Taking a direction" are
+    unchanged.
 - **Also assigned.** When a claim or an `update` takes direction #M for the actor, a member (a take of "Taking a
   direction", with its checks), the result adds, after the card instruction and the reviewer sentence, for each
   other `todo` direction of the same crew task assigned to the actor (id ascending), ` #16, also assigned to you,
@@ -1236,6 +1380,109 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   spans lines (a crew draft) starts on a line of its own, its leading space removed, as in `Board.mark_text`. It
   records no liveness key, so the mark still wakes the member later (once per key) if it does not take the
   direction.
+- **A free place.** `crew` is how many members may work on a crew task at once, not how many must; still, a crew
+  task can run below its size for hours while other members have nothing to do, and no text reaches anyone. In the
+  run of 2026-11-13 a direction assigned to a member busy with another one waited while a place was free ("A held
+  direction"), and later one member worked on the last direction of a crew of 3 for about five hours, a place free
+  and three members idle, its owner among them: nothing was free to offer, and the working direction could still
+  move, so Liveness waited. The owner is then told once, to decide (§3 item 8):
+  - *When* (`Board.crew_gaps()`, read at each pass; for each crew task, its open directions and the held ones to
+    name): crew task #8 is `todo`, `in_progress` or `waiting`, not blocked, and owned by a member (not USER); it has
+    a free place (its working set is smaller than `crew`; the owner takes one, so a crew of 2 with an idle owner and
+    one worker is full), at least one direction in `in_progress` or `waiting` (USER's counts), and no `todo`
+    direction a member may take now. One may be taken now when it has no blocker of its own and either no assignee
+    (a free direction, "Offers") or an assignee that is an LLM member, not in error, whose claim would take it
+    (`Board.directions_to_take`, the "direction to take" mark) and that works on no other task: no `in_progress`
+    task outside #8 without an open subtask (`Board.open_parents`; system prompt rule 3, one task in progress at a
+    time, so a crew task it owns while it works on none of its directions does not count). Such a direction keeps
+    #8 out, and so do no directions yet (`crew_owner_none`), all of them finished (`n_subtasks_done`) and none
+    working (all in review, or waiting for their turn). A direction in review neither counts as working nor keeps
+    #8 out, and neither do these `todo` ones: one blocked by its own `depends_on` (a sequence: the list shows its
+    blockers, and the text allows leaving the place free); one assigned to USER, to an external member or to a
+    member in error, not held back (the list shows its assignee); and one without a blocker of its own that is held
+    back ("A held direction"; with a free place only the busy reason holds one back) or whose assignee, an LLM
+    member not in error, works on another task: the **held** directions, which the notice names. A working
+    direction that waits for a held one (§3 items 2-3; `has_live_directions` is not asked) does not keep #8 out
+    either: the notice names the held one and says that neither moves while it stays assigned.
+  - *Free members*: the LLM members outside #8's working set (so never its owner) that are idle
+    (`_idle_llm_members`) and have been for `agents.idle_nudge_seconds` at least (since `last_active`, so one that
+    has just finished is not named while someone may still give it work), wait neither for a job of their own nor
+    for a file (`JobManager.awaited`, `Workspace.waits_for_lock`), have no review waiting for them
+    (`Board.reviews_of`), hold nothing they can go on with, and were offered by item 1 every ready task it would
+    offer them (`ready_unassigned` but the directions of `busy_crews`, each in `_nudged` under its offer key).
+    They have nothing to go on with when they hold no `in_progress` task and no `todo` one that no blocker stops
+    and that is no direction, leaving out a parent with an open subtask (`Board.open_parents`: it waits for its
+    subtasks, as §4.1 "Liveness" counts work, so the owner of another crew task that works on none of its
+    directions is free, as system prompt rule 3 says), and no liveness mark (`Board.stall_marks`: subtasks done, a
+    direction to take, free directions). A task in `waiting` or in review does not count: it waits for something
+    else, and item 1 offers its holder ready tasks too (so the `busy_crews` exception applies to a member whose
+    direction of another crew task is `waiting`). So a member holding a task blocked by #8 counts (the planner of
+    that run), and one with a ready task not offered to it yet does not: item 1 offers it first. External members,
+    USER and members in error never count, nor does an owner told earlier in the same pass (it has news pending now,
+    like a member items 1-7 woke). At least one is needed; one member may be named for several crew tasks.
+  - *To whom*: the owner, and only while it is an LLM member that is idle itself (`_idle_llm_members`, read once
+    per pass). An owner at work, busy with a job, with news pending, in error or paused is told at the first pass
+    that finds it idle, if the state still holds, so the notice never lands in a running activation; one that
+    waits for its own job or for a file is told (an owner that works on the last direction itself and waits for its
+    matches may add a direction meanwhile). An owner that is USER or an external member is told nothing (no `u_`
+    text: the board shows the crew chip; no scheduler item wakes an external member), nor is the crew task's
+    creator in its place (keeping the directions consistent is the owner's part, system prompt rule 3, and a
+    creator that added them would work around that owner), and a crew task without an owner is a ready task
+    itself, which item 1 offers.
+  - *Once.* `_crew_gaps` {task id: (key, since)} is rebuilt at each pass from `crew_gaps()`, like `_idle_holding`:
+    the key is (owner, `crew`, the ids of its open directions, the ids of the held ones); `since` starts again when
+    the key changes or #8 leaves the list. The notice goes out once the key has lasted `CREW_GAP_FACTOR` (10) ×
+    `agents.idle_nudge_seconds` (10 minutes by default) and the owner and a free member are found, and never again
+    for that key (`_crew_gap_told` {task id: key}, set once the notice is sent, in memory and never cleared, like
+    `_stall_woken`: a direction added or finished, a change of the held ones (a direction assigned to a busy member,
+    say), of `crew` or of the owner re-arms it; a claim, a hand-in to review, a place taken and freed again, or
+    other free members do not); at most `CREW_GAP_MAX` (2) times per owner and crew task in all (`recipient`,
+    `kind` and `json_extract(data, '$.id')` in the notifications table, like the planning hint's count; at the cap a
+    key due is recorded as told at once, with no free member looked for, so it costs nothing until it changes; after
+    a restart the same state may be told once more, within that count). A render error leaves the key unrecorded
+    (logged; the next pass tries again). Every crew task due in a pass is told in it, so an owner of two gets both
+    in one wake-up. A pause stops the clocks (`resume` moves each `since` on by its length); while the goal is not
+    active or wrap-up mode is on (`wrapping_up`: the team finishes with what it has), nothing is sent and
+    `_crew_gaps` is emptied, so the clocks start again afterwards.
+  - *The text*, in the owner's language, waking: `#8 "engine", your crew task, has a free place (2 of its 3 places
+    taken: Olga Owner, Anna Smith), but none of its directions can be taken now, and these members are idle, with
+    no task of their own to go on with: Carl Diaz (Tester), Bob Brown (Generalist). Its directions: #14 [done]
+    "search" @Olga Owner; #15 [done] "eval" @Bob Brown; #16 [in_progress] "uci" @Anna Smith. If a part of #8 that no
+    direction covers yet can be done now, add it as a direction (task_update directions). If none of this applies,
+    leave #8 as it is: a free place need not be filled, and no reply is needed.` (`n_crew_gap` {id, title, working,
+    crew, names, idle, directions, held}: `working` and `names` the working set's size and its members in its
+    order, `crew_working`; `idle` the free members as `Name (role)`, the longest idle first (`last_active`), the
+    role as stored, cut like `fmt.trim(role, 60)`, at most 8, then `…`; `directions` the list of the owner sentence
+    ("The owner": every direction but the cancelled ones, `crew_directions` and `crew_directions_more`), each `todo`
+    one with blockers followed by them, ` (blocked by #15)` (`crew_gap_blocked` {ids}); `held` "" or, after the
+    list, one sentence per held direction, id ascending, at most 5, #15 the lowest direction of #8 its assignee
+    works on, else the lowest other task it works on (*When*): ` #16 waits: Bob Brown works on #15 and can take #16
+    only after handing #15 in. If another member can do #16 now, unassign it (task_update assignee='') and a free
+    member is offered it.` (`crew_gap_held` {sub, name, m}); for the owner's own one, also when #15 waits for it,
+    ` #16, also assigned to you, waits: you can take it only after handing #15 in. If another member can do #16
+    now, unassign yourself (task_update assignee='') and a free member is offered it.` (`crew_gap_held_you` {sub,
+    m}, the words of "Also assigned"); when #15 waits for #16 (`Board._wait_for_held`, the case in which "A held
+    direction" leaves its tail out), ` #16 waits: Bob Brown works on #15, which waits for #16, so neither moves
+    while Bob Brown holds #16: unassign #16 (task_update assignee='') and a free member is offered it.`
+    (`crew_gap_held_wait` {sub, name, m}). The board renders both pieces (`Board.crew_gap_parts`), like every crew
+    placeholder.
+  - *What the owner may do*, with the tools it has (no new tool, no tool revision, no change of the system prompt,
+    so the members of a running session get the notice too): add a direction for a part of #8 that no direction
+    covers yet and that can be done now (`task_update directions`, "Marking": with a direction of its own already,
+    the new one is free and item 1 offers it, `n_ready`; with none, the first one is its own part, `note_own_part`);
+    unassign a named held direction if another member can do it now, or at once when a working direction waits for
+    it (`task_update assignee=''`, "Who controls subtasks": the owner may unassign any open direction not in review;
+    with the place free, no blocker of its own and #8 not blocked, it is then a free direction, which item 1 offers;
+    its old assignee gets `n_unassigned` as for any unassignment); or, if none of this applies, leave #8 as it is,
+    in one step (`wait`): no reply is asked for, so no discussion post wakes the crew.
+  - *What stays.* The text never says "reassign" nor "assign it to X" (giving a direction to another member is for
+    its assignee or creator, §4 `update`, while the owner of #8 may always unassign one that is not in review; a
+    free direction reaches the free members through `n_ready`), never "fill the place" (a place may stay free on
+    purpose: in that run the members ran no matches while the worker held the shared CPU cores), never "split" a
+    direction someone works on, nothing about the size of the crew, and nothing about who gets an added direction.
+    The free members are sent nothing. Item 1's offers (`_nudged`, `_considering`), Liveness (`stall_marks`, the
+    liveness key, `has_live_directions`; §3 items 2-3), the in-activation nudge (§6.2), the wake-up text (§6.3)
+    and the checks of "Taking a direction" are unchanged.
 - **Discussion.** The participants of a crew task (§4 `post`) also include the assignees of its open directions (in
   review too): its discussion is the crew's channel, and a post there wakes them (the economy rules of the system
   prompt apply). Taking a direction posts nothing: the board shows it.
@@ -1454,11 +1701,11 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   sent and the key is not recorded, so the next pass reads the marks again. `_stall_woken` is set only
   after the text is built: a render that raises is logged, nothing is recorded, and the scheduler pass goes on to
   its next items (the next pass tries again). Tests: a parent holder whose subtasks are all terminal stalls three
-  times in a row and
-  gets one wake for that key; a `waiting` task without subtasks is never woken. A trigger `all_done(parent=N)` (§8)
-  needs every subtask `done`, so for a crew task it fires when all its directions are done, before its owner has
-  written #N's result (and never once a direction is cancelled): wait on `done(N)` or `finished(N)` for the crew
-  task itself instead.
+  times in a row and gets one wake for that key; a `waiting` task without subtasks is never woken by items 2-3
+  (item 9, §3, may still wake its holder when the whole team sleeps). A trigger `all_done(parent=N)` (§8) needs
+  every subtask `done`, so for a crew task it fires when all its directions are done, before its owner has written
+  #N's result (and never once a direction is cancelled): wait on `done(N)` or `finished(N)` for the crew task
+  itself instead.
 - **Reviews.** A direction is reviewed by the ordinary rules (§4.1), independently of the others: its own reviewer
   if one was set and is valid, else `pick_reviewer` at its completion (any member but its executor; the owner too,
   though for the directions it added it is their creator and comes after the others, like any creator); with
@@ -1518,7 +1765,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   offers it to each member once while it stays ready. Neither `n_ready` nor the wake-up's `ready` list names to a
   member the directions of a crew task in which it works on a direction (`in_progress` or `waiting`;
   `Board.busy_crews(name)`): its claim would be refused. Its fallback is the owner: an idle owner working on none
-  of the directions is woken once about a free one ("free directions" mark, "Finishing", Liveness).
+  of the directions is woken once about a free one ("free directions" mark, "Finishing", Liveness). With nothing
+  left to take while a place stays free and other members are idle with no task of their own to go on with, the
+  owner is told once ("A free place").
   A parent without an assignee is ready the whole time its subtasks are worked on, so most members were offered it
   already when they finish. `_nudged` is therefore keyed by the pair (task id, finish state), the finish states of
   the ready tasks read at each pass (`Board.finish_states`, "Finishing"; the kickoff's entry is (card id, None)),
@@ -1546,8 +1795,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `n_direction_freed`: `#{id} "{title}", a direction of your crew task, is free again: {by} left the swarm.`
   `n_crew_owner`: the owner sentence above; `n_crew_review_requested`, the crew endings of `n_subtasks_done` and
   `n_review_rejected`, the draft of #N's result (`crew_draft`, `crew_draft_cut`, `crew_draft_more`,
-  `crew_draft_no_result`), `n_direction_failed`, `n_direction_cancelled`, `n_marks_stalled`: "Finishing". `Task` gains
-  `crew: int` (stored) and `crew_working:
+  `crew_draft_no_result`), `n_direction_failed`, `n_direction_cancelled`, `n_marks_stalled`: "Finishing";
+  `n_crew_gap`, `crew_gap_held`, `crew_gap_held_you`, `crew_gap_held_wait` and `crew_gap_blocked`: "A free place".
+  `Task` gains `crew: int` (stored) and `crew_working:
   list[str]` (filled by `Board`, not stored); both are in `to_dict()`, so in the state API and the events (an
   export copies the column `tasks.crew`). The web and the TUI show a crew task's chip from its `crew_working` in the
   board's snapshot and fetch the snapshot again after changes (the web on every bus event, the TUI for `/board` and
@@ -1555,9 +1805,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   `n_crew_changed`: `{by} set the crew of #{id} "{title}" to {crew}
   (0 = an ordinary task).` `n_subtask_cancelled`: `{by} cancelled #{id} "{title}", your part of #{parent}: stop the
   work on it; if what you have done is still needed, say so in #{parent}'s discussion.`
-- **Notifications** of subtasks and crew tasks (texts in prompts.py, ru/en; never to the actor, who reads the same
-  text in its call's result where this section says so, through the board's `notes`, §4; one per member and
-  change, "Finishing"; "quiet" = `wake=False`):
+- **Notifications** of subtasks and crew tasks, and the liveness wakes of §3 items 2, 3 and 9 (texts in prompts.py,
+  ru/en; never to the actor, who reads the same text in its call's result where this section says so, through the
+  board's `notes`, §4; one per member and change, "Finishing"; "quiet" = `wake=False`):
 
   | when | to | key {placeholders} | wakes |
   |---|---|---|---|
@@ -1569,6 +1819,7 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   | a direction is taken (a claim, an `update`, a `parent_id` move) | the owner, unless it is the actor or the taker | `n_direction_taken` {by, id, title, parent} | no |
   | a direction's holder left the swarm | the crew task's assignee after the release | `n_direction_freed` {id, title, by} | no |
   | someone else makes or tells a member the holder of a crew task (an assignment, the creator's reopening, `crew` set) | that holder | `n_crew_owner` {id, title, crew, directions, instructions} (in place of `n_assigned`; with all directions finished, `instructions` is the all finished owner form with the draft, and `directions` "") | yes |
+  | a crew task has had a free place, a working direction and none a member may take now for 10 × `agents.idle_nudge_seconds`, while other members are idle with no task of their own to go on with ("A free place", §3 item 8) | its owner, an idle LLM member | `n_crew_gap` {id, title, working, crew, names, idle, directions, held} | yes |
   | the assignee changes the `crew` of a task it did not create | the creator | `n_crew_changed` {by, id, title, crew} | no |
   | the creator or USER changes the `crew` of a task someone else holds, not making it a crew task | the holder | `n_crew_changed` {by, id, title, crew} | no |
   | a parent with open subtasks becomes terminal ("Leaving and closing") | the assignees of its other open subtasks | `n_parent_closed` {id, title, status, sub} | yes |
@@ -1576,6 +1827,9 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   | a crew task is returned | its owner | `n_review_rejected` with the crew `ending` (§4.1 table) | yes |
   | a holder stalls with marks and no unmarked ids (Liveness) | the holder | `n_marks_stalled` {text} (a "subtasks done" mark of a crew task with all directions finished carries the draft of #N's result, in `n_stalled` too) | yes |
   | a holder stalls with unmarked ids (Liveness, §3 items 2 and 3) | the holder | `n_stalled` {tasks, marks} (`marks`: the mark sentences, "" without marks) | yes |
+  | the whole team asleep (§3 item 9) | one idle LLM member | `n_team_asleep` {elapsed, jobs} | yes |
+  | same, the first wake of a board state (§3 item 9) | USER | `u_team_asleep` {elapsed, name} | yes |
+  | same, every open task held by USER or external members | USER, no member | `u_team_waits` {elapsed, tasks} | yes |
 
 - **System prompt** (en and ru; frozen per agent, so for members created from then on). Rule 3 (which says to hold
   one task in progress at a time) adds at its end `A crew task ("crew 2/3" on the board) is split into directions:
@@ -1660,7 +1914,56 @@ issue #41, is a «команда»). English texts keep "crew task" and "directi
   refused by "Who controls subtasks"); tests/test_ui.py (the order of the settings and of the template);
   tests/test_frozen_tools.py (`RELEASED` gains 5); tests/test_db_schema.py (`tasks.crew`); tests/test_prompts.py
   (the identifier tests of the agent texts and the planning card check the revisions from
-  `frozen.OLDEST_OPEN_REVISION` on, §12 R0′).
+  `frozen.OLDEST_OPEN_REVISION` on, §12 R0′). For "A free place": `Board.crew_gaps` in and out (in: the run's two
+  states, a working direction that waits for a held one, a sequence, a `todo` direction assigned to USER, to an
+  external member or to a member in error (not named), one assigned to a member at work on another task (named);
+  out: a free direction just added, a direction to take, a crew of 2 with an idle owner and one worker, USER as the
+  owner, nothing working); `Board.crew_gap_parts` (the blockers in the list; the three forms of a held direction:
+  another member's, the owner's own, one a working direction waits for); the scheduler item in
+  tests/test_crew_swarm.py, with a small `idle_nudge_seconds`: one notice after 10 × it and none before, and one
+  through the scheduler's own loop, not in the pass in which item 1 offers the owner a task (item 8 follows it); an
+  owner at work told only once it is idle, an owner that waits for its own job told, USER and external owners never;
+  the free members (a holder of a blocked task or of a `waiting` one and an idle owner of another crew task that
+  works on none of its directions count; a member with a ready task not offered to it yet, a `todo` subtask of a
+  plain task, a review waiting, a job it waits for or a liveness mark does not, nor an owner told earlier in the
+  same pass); the notice re-armed by a finished direction and by a newly held one, not by a hand-in or a claim; the
+  cap of 2 across a restart (a key due at the cap recorded with no free member looked for); a pause moving the clock
+  on; nothing with the goal done or in wrap-up mode; two crew tasks of one owner in one pass. tests/test_prompts.py:
+  `CREW_KEYS` gains the five keys, the fragments that start with a space gain `crew_gap_`, `n_crew_gap` joins the
+  keys that say «групповая задача» and «направлен», and the examples above are pinned in
+  `test_crew_texts_render_the_spec_wording`.
+- **Tests** of the team-asleep wake, the money notice, the pause notice and the token liveness (new files, e.g.
+  tests/test_team_asleep.py; ScriptedLLM, aged clocks and direct item calls allowed). Item 9 (§3): a lone member
+  with an `in_progress` task that calls `wait` with nothing awaited gets exactly one `n_team_asleep` at 5 ×
+  `idle_nudge_seconds` and none before, USER one `u_team_asleep`; the second only after the doubled delay, never a
+  third for one board state; a task change re-arms it while the goal-wide doubling holds (5, 10, 20… for a member
+  that changes its status at every wake). It still fires with a task in USER's review and independent review on,
+  after `n_all_done` answered with `wait`, with only a `status(...)` / `done(...)` trigger, with `elapsed(1) and
+  done(99)` past its moment, with a `file_exists` trigger older than `UNATTENDED_FILE_SECONDS` and with a USER-owned
+  `every(60)` that only wakes USER. It stays silent with an awaited job, a refused file, a fresh `elapsed(600)` or
+  `file_exists(...)` trigger, staggered kickoffs pending, a pause, an empty board, an LLM reviewer's review with
+  independent review on, item 7's state, another member at work, an external member's recent call and a clarify
+  planner waiting. Two members asleep: one `n_team_asleep`, to the `in_progress` holder, and one `u_team_asleep`;
+  every open task held by USER: only `u_team_waits`, no member woken; `resume` drops the clock.
+  `TriggerEngine.unattended` has unit tests of its own (each "reaches" and "may fire" case of §8). The `wait` clause
+  (§12): present with an `in_progress` task, nothing awaited and the team asleep; absent with a job, a refused
+  file, a trigger of its own, only a `waiting` task, no task held, a done goal, a clarify planner waiting, another
+  member at work. The money notice (§3 `record_usage`): crossing 0.8 with float sums (8 × 0.1) gives exactly one
+  `n_budget_low` per LLM member (waking or quiet by the rule) and one `u_budget_low`, nothing more at 0.9,
+  `u_budget` at the limit unchanged; `set_limits(2.0)` and `reconfigure` re-arm it; 0, 1 or no limit give none; a
+  call that jumps past the limit gives none; pct never shows 100 below the limit; the setting's default, range
+  error, template line, settings view, home.js field and i18n (§17.1, §18.4). The `money` line (§6.3): present
+  with a limit, absent without one, in incoming renders and for external members, after the goal line; the system
+  prompt sentences in both languages. The pause notice (§3 `_set_pause`, §12): the user's pause with a running job
+  names its id in the result and gives USER one `u_paused_jobs`; without jobs `Done: paused.` and no notice; a
+  budget or question pause gives none; the Russian pause reason (tests/test_tui_render.py, tests/test_ui.py).
+  tests/test_prompts.py `test_background_job_texts` gains `u_paused_jobs`. The token liveness (§7 "Process
+  layer"; Linux only, skipped elsewhere): `nohup timeout 5 sleep 3 &` and `setsid sleep 3 &` keep `alive()` true
+  after the shell exited, `pids()` / `processes()` list `sleep`, and it turns false when that ends; `JobManager.run`
+  makes them a `detached` job (with `background=true` a `background` one) whose end sends its end notice;
+  `kill()` and `terminate()` leave no token process; a command that does not escape is unchanged; the uid rule
+  has a unit test of its own. Existing tests that meet item 9 (an active goal, a sleeping team, a small
+  `idle_nudge_seconds`) raise `TEAM_ASLEEP_FACTOR` or assert only the kinds they are about.
 
 ## 5. Mailbox (mailbox.py)
 
@@ -1735,43 +2038,39 @@ reach existing members through tool results and notifications, and new tools at 
 **Frozen tool sets** (tools/frozen.py). The tools array is part of the prompt prefix that thinking blocks are bound
 to, so every LLM agent sends exactly the array it was given, and the array changes only where nothing is bound to
 it:
-- Every released LLM tool set is a **revision** shipped as `tools/snapshots/llm_r<N>.json` (`{"revision": N, "en":
-  [...], "ru": [...]}`), never edited. `TOOLSET_REVISION` (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what
-  `schemas_for("llm", language)` builds; `BASELINE_REVISION = 1` is the array agents sent before tool sets were
-  frozen (sorted digest `e3c5cbc7…`).
+- Every released LLM tool set is a numbered **revision** (`{"revision": N, "en": [...], "ru": [...]}`), never
+  edited, and a number is never reused. The revisions a session this version opens can hold, from
+  `OLDEST_OPEN_REVISION` to `TOOLSET_REVISION`, are shipped as `tools/snapshots/llm_r<N>.json`. `TOOLSET_REVISION`
+  (now 5: `task_create` and `task_update` gain `crew` and `directions`, §4.2) is what `schemas_for("llm", language)`
+  builds.
 - Record: kv `tools:<name>` = `{"rev", "language", "tools"}` (§2), stored through `db.set` (`db.dumps`: key and
   tool order round-trip exactly). `AgentRuntime.__init__` (`_load_tools`) reads it; an agent without a usable one
   (`frozen.valid`, below) gets `frozen.current_record(language)`, written at once: a session this version opens
-  has no agent with a history and no usable record (§17.2 "Sessions of an earlier version"), so the baseline
-  branch of `initial_record(language, has_history)` is gone (the function and its `has_history` argument are
-  removed; `member_tool_names` follows the same rule). View-only loads (no runtime) write nothing.
+  has no agent with a history and no usable record (§17.2 "Sessions of an earlier version"), so a missing record
+  means the agent never ran; `member_tool_names` follows the same rule. View-only loads (no runtime) write nothing.
 - `AgentRuntime`: `tools_rev`, `tools` (the record's list, passed unchanged to `llm.complete`), `tool_names`
   (frozenset), `tool_parameters(name) -> dict | None` (None: the agent lacks that tool).
 - **Upgrade at compaction only**: `_replace_with_summary` moves an agent whose `tools_rev != TOOLSET_REVISION` to
   `frozen.current_record(language)` (`!=`: after a code downgrade it realigns too); the record is written in the same
   `db.transaction()` as the history rewrite (`_replace_history(messages, tools=)`), and the new history holds no
-  assistant turn bound to the old array. The compaction request itself still sends the old array. When tools were
-  added, the summary message gets `tools_added` {tools: "`jobs`, `job_stop`"} before `continue` (revision 3 → 4 adds
-  no tool, only the `pause_swarm` property, so no such line). `agent.compacted` data and the compaction span meta
+  assistant turn bound to the old array. The compaction request itself still sends the old array. Downgrading the
+  code below a session's newest revision is unsupported. When the upgrade adds tools, the summary message gets
+  `tools_added` {tools: the added names, each in backticks, joined by ", "} before `continue`; an upgrade that adds
+  no tool (only properties or descriptions) gets no such line. `agent.compacted` data and the compaction span meta
   carry `tools_revision`.
-- Existing agents keep revision 1 until their next compaction: they get timer backgrounding, the adoption of
-  processes a command leaves running, the console intercept, the job notices and the wake line at once (§7.1), and
-  texts that point at a tool are tailored with `ToolContext.has_tool` (§12). Downgrading the code below a session's
-  newest revision is unsupported. This bullet and the other passages on agents of revisions 1-4 (§3.1 `pause_swarm`
-  dropped by `call_tool`, the console intercept of §7.1, §12) describe branches no session this version opens
-  reaches ("Oldest revision opened"): the code and its tests stay until a separate cleanup removes them.
 - **Oldest revision opened**: `OLDEST_OPEN_REVISION = 5`, a fixed constant (the revision of crew tasks, 0.2.0; never
   derived from `TOOLSET_REVISION`, so a later revision still opens sessions of revision 5). A session with a member
-  recorded below it, or with an agent that has a history and no record (the baseline revision), was made by an
-  earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version opens builds
-  a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and the upgrade at
-  compaction moves only revisions 5 and later. The snapshots `llm_r1..r4.json` stay (tests/test_frozen_tools.py
-  checks that every released revision stays served, §12 R0′, and `frozen.for_span` reads them for old trace spans;
-  `--check` compares only the current revision's file).
+  recorded below it, or with an agent that has a history and no record (it ran before tool sets were frozen), was
+  made by an earlier version and is not opened (§17.2 "Sessions of an earlier version"): no session this version
+  opens builds a runtime below revision 5 (`AgentRuntime` itself does not check: the check is the session's), and
+  the upgrade at compaction moves only revisions 5 and later. Only the revisions from `OLDEST_OPEN_REVISION` on are
+  shipped (tests/test_frozen_tools.py checks that exactly these are, and that each stays served, §12 R0′).
+  `frozen.for_span` reads them for trace spans recorded before an agent's last upgrade. `--check` compares only the
+  current revision's file.
 - `frozen` API: `kv_key(name)`, `normalize(tools)`, `revisions()`, `snapshot(rev, language)` (a fresh copy; unknown
   language → en), `current(language)`, `record(rev, language, tools)`, `current_record(language)`,
   `valid(rec) -> bool` (a dict with an integer, non-bool `rev` and `tools` a list of dicts with a str `name` and a
-  dict `parameters`; today's `_valid`, made public so that `read` and `db.made_by_earlier_version` share it),
+  dict `parameters`; shared by `read` and `db.made_by_earlier_version`),
   `read(db, name) -> dict | None` (a record that is not `valid` is logged and ignored),
   `write(db, name, rec)`, `names(tools)`, `for_span(db, name, language, revision)` (§16), `member_tool_names(swarm,
   member) -> frozenset` (a runtime's names, else the record or the set its first start will freeze, nothing
@@ -1863,7 +2162,10 @@ you have."), `reasons:` then one bullet per undelivered notification text and
 per unread message (`msg` template, recipients list with the agent shown as `you`), then, only when one of those
 messages was sent to "all" (`to_all`, from the user or a member; incoming too), the one-line `all_hint` ("Before
 creating a task for a message to all, check the board: one member creates it, the others take it or comment."), then
-(not for incoming) goal line (one line: the goal is stored split, §3 `set_goal`), `my_tasks`, one `my_blocked` {id,
+(not for incoming) goal line (one line: the goal is stored split, §3 `set_goal`; `goal_none` without a goal), for an
+LLM member while the budget has a limit (`limits()["max_cost_usd"]` > 0) the line `money` {spent, limit, pct}
+(spent = `spent_usd()`; "Money: spent $1.20 of $5.00 (24%)." / «Деньги: потрачено $1.20 из $5.00 (24%).»; pct as
+in `n_budget_low`, §3 `record_usage`, so it shows 99 at most), `my_tasks`, one `my_blocked` {id,
 blockers: "#3, #4"} per open task of the agent with unfinished dependencies, except one in review whose result is
 already produced (it may remove those it can do without, §4), `my_reviews` (only when
 tasks wait for its review: `#id title (assignee or -)`), `my_jobs` (only while it has running background jobs,
@@ -1873,7 +2175,19 @@ for 40 min)`), `ready` (up to 8; free directions of crew tasks included, §4.2),
 (below), notes: in full only when they
 changed
 since they were last put into the agent's context (a wake-up or a compaction; once more after a restart),
-otherwise the one-line `notes_unchanged`, since the history is append-only.
+otherwise the one-line `notes_unchanged`, since the history is append-only. The `money` line is never in an
+incoming render nor for an external member, and never between the header and `wrap_up_line` or before the news.
+
+**System prompt** (en and ru; frozen per member at hire, so for members hired from then on; no new placeholder and
+no new numbered rule, every pinned substring kept): rule 1's list of what a wake-up shows names `the money spent
+(while the budget has a limit)` next to the global goal (ru «потраченные деньги (пока у бюджета есть лимит)»);
+rule 9 ends with `When a notice says that most of the money budget is spent, don't wait for the user to ask for a
+wrap-up: finish what is nearly done and start nothing large.` (it echoes `n_budget_low`; ru «Если уведомление
+говорит, что большая часть денежного бюджета потрачена, не жди, пока пользователь попросит закругляться: доводи до
+конца то, что почти готово, и не начинай ничего большого.»); rule 10 ends with ``A process you start with & or
+nohup that `jobs` does not list is not tracked: its end wakes nobody.`` (ru «Процесс, запущенный через & или
+nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.»; `jobs` in both, so the
+backticked identifiers still match).
 
 The **Skills index** (§19 "Delivery to agents"; never for external members, never in an incoming render): with skills
 attached, the full `skills_index` (or `skills_index_own` when the member's role lists one of them) once per agent
@@ -1923,8 +2237,7 @@ class Workspace:
         # both refuse a path under SKILLS_MIRROR (`.scratch/_skills`, a lexical check on the resolved relative path,
         # case-folded on Windows): ToolError "'.scratch/_skills/' holds the swarm's skills and is rebuilt by
         # DreamTeam. To change a skill, copy its folder (without node_modules) into your scratch folder and edit it
-        # there, then call skill_propose." (§19); the last clause only for a caller whose tool set has skill_propose
-        # (frozen.member_tool_names: an agent of revision 1 or 2 gets "... edit it there.")
+        # there, then call skill_propose." (§19)
         # a read-only file elsewhere (a copy of a mirror folder keeps its read-only files) is made writable first
         # (owner write bit), unless it has other hard links; the write is the member's explicit edit
         # old must occur exactly once unless replace_all; ToolError with hints otherwise
@@ -2448,15 +2761,20 @@ def kill_tree(proc) -> None   # tui/bash.py's `!` commands: POSIX os.killpg(proc
 
 # procs.py (standard library only; kernel32 through ctypes, loaded lazily)
 TOKEN_ENV = "DREAMTEAM_PROCESS_TOKEN"
+TOKEN_SCAN_SECONDS = 2.0  # Linux: how long alive() keeps the list of its token scan (only those pids rechecked)
 class ProcessTree:      # proc, pid, pgid (POSIX: the shell's pid, stored), contained, token; released, watchdog
     @classmethod
     def spawn(cls, argv: list[str] | str, *, cwd, env, token=None,
               breakaway=True) -> "ProcessTree"         # blocking: via daemon_call
     def alive(self) -> bool; def pids(self) -> list[int]; def processes(self) -> list[str]
+        # Linux: the group's processes plus the token's outside it ("Process layer" below)
     def terminate(self) -> None; def kill(self) -> None; def release(self) -> None; def mark_eof(self) -> None
 def live_groups(pgids) -> set[int]                     # Linux: one /proc pass, zombies ignored; other POSIX: killpg 0
-def sweep_token(token: str) -> int                     # Linux: SIGKILL every own-user process carrying the token
-def alive_all(trees) -> list[bool]                     # alive() of many trees (one /proc pass on Linux)
+def token_pids(tokens) -> dict[str, list[int]]         # Linux: one /proc pass over /proc/<pid>/environ for several
+                                                       # tokens (the hub's own pid skipped; the uid rule below)
+def sweep_token(token: str) -> int                     # Linux: SIGKILL every process carrying the token (uid rule)
+def alive_all(trees) -> list[bool]                     # alive() of many trees (one /proc pass on Linux for the
+                                                       # groups, one token scan for the trees whose group is gone)
 async def daemon_call(fn, *args, on_orphan=None)       # fn in a new daemon thread; on_orphan(result) when the
                                                        # caller was cancelled meanwhile (kills the new tree)
 ```
@@ -2481,9 +2799,48 @@ outlive its call:
   (an agent running `dreamteam run`, this project's tests run as a job) carries that outer token, and the outer
   job's token sweep must kill the inner hub but leave its watchdogs, which then kill the groups they guard.
   Liveness after the shell was reaped: Linux counts the group's live processes in /proc (zombies ignored, so
-  init-less containers stay correct), other systems `killpg(pgid, 0)`. terminate = SIGTERM to the group; kill =
-  SIGKILL to the group plus, on Linux, the token sweep (it also ends `setsid` escapes). Names from
-  `/proc/<pid>/comm` (Linux), else none ("processes").
+  init-less containers stay correct), other systems `killpg(pgid, 0)`. On Linux, once the shell and the group are
+  both gone, a tree with a token is still alive while a process carries its `DREAMTEAM_PROCESS_TOKEN`
+  (`token_pids`, from `/proc/<pid>/environ`): GNU `timeout` without `--foreground` and `setsid` start a new group,
+  so `nohup timeout N cmd &` or `setsid cmd &` would otherwise leave an empty group while their processes run; so
+  does any daemon that keeps its environment (`tmux new -d`, a build tool's server): its command becomes a job, as
+  on Windows (its Job Object), and with no free job slot or in wrap-up it is killed with the rest (§7.1).
+  `alive()` scans only for such trees; the scan's list is kept per tree for `TOKEN_SCAN_SECONDS` (2 s), within
+  which only the processes it found are looked at again (`/proc/<pid>/stat` not a zombie and the environment still
+  holding the token, so a reused pid does not count, and an end is seen at once); a new scan comes when the list is
+  older or every process on it has ended (one may have started another first), and `alive_all` scans once for all
+  the trees it needs. An empty environment read of a live process that is no kernel thread is read again once
+  after 5 ms, all such processes of a scan together: a process in execve reads as empty until its new image's
+  environment is set up. `pids()` and `processes()` list the group's members plus the token's processes outside it
+  (a tree whose group is gone lists its token's processes), from a new scan at each call, also while the group
+  runs, and never kept: a kept list would miss a child started outside the group since. terminate() and kill()
+  drop the kept list and signal what a new scan finds, never a kept pid. The uid rule, shared by `token_pids` and
+  `sweep_token`: processes of the hub's own uid; when the hub runs as root, any uid, since the random token
+  (`secrets.token_hex(8)`) identifies the command's processes. Opening another uid's `/proc/<pid>/environ` must
+  pass the kernel's ptrace read check (proc(5)), made with the opener's file-system ids, which root with Docker's
+  default capability set fails (no `CAP_SYS_PTRACE`): there, in the Docker sandbox the commands of a session without
+  network run under `setpriv --reuid=<offline uid>` (§7.2). A hub running as root that is refused such a file
+  (`PermissionError`) opens it once more under the process's own ids, in a short-lived thread of its own that does
+  nothing else and is joined at once (Python runs signal handlers in the main thread alone, so none can raise while
+  the ids are switched, and no other thread's parent-death signal is cleared): that thread's file-system gid and uid
+  (`setfsgid`, `setfsuid`, through ctypes; they belong to that thread alone) are set to the process's gid and uid for
+  that open only and set back at once, also when the open fails, and the file is read after that; the check then
+  passes as for a process of the same user. Each change of the ids makes the whole hub not dumpable
+  (`fs.suid_dumpable`, 0 by default), so the flag is set back after the ids (`PR_SET_DUMPABLE`); a command that joins
+  the network namespace through the hub's `/proc/<pid>/fd` in that moment is refused, and `netns_helper` tries the
+  open 3 times, 50 ms apart. Only a process whose real, effective and saved uids are one value, and its gids too
+  (`/proc/<pid>/status`), not uid 0, is opened so; it must still be dumpable, as every command started without a
+  set-user-ID program is. Where the ids cannot be set (no `CAP_SETUID` or `CAP_SETGID`: the switch is checked, a call
+  that leaves the old ids counts as refused), the process stays unread: skipped by the scan and the sweep, seen by its
+  group alone. Ids that do not come back (the kernel always allows root's own) stay with that thread, which reads
+  nothing more and ends; the hub logs it as critical and makes no switch again. Warnings are logged by the calling
+  thread, never under switched ids. Each switch is a uid change the kernel reports (proc connector, audit): a process
+  monitor sees the hub take the command's uid for a moment. No capability is added to the container and none is given
+  to the commands.
+  terminate = SIGTERM to the group plus, on Linux, SIGTERM to the token's processes outside it; kill = SIGKILL to
+  the group plus, on Linux, the token sweep (it also ends `setsid` escapes). A process that clears its environment
+  (`env -i`, a daemon that rebuilds it) carries no token and still escapes; macOS has no /proc, so there the group
+  alone decides. Names from `/proc/<pid>/comm` (Linux), else none ("processes").
 - After `release()` nothing is ever signalled again (idempotent); a tree dropped without it is released by a
   `weakref.finalize`.
 - A command ends when its shell has exited and its tree is empty; the pipe's EOF is waited for at most
@@ -2514,7 +2871,7 @@ outlive its call:
 4. Unless the outcome is `killed` (the session stops or the member leaves: no git work may start then):
    `workspace.autocommit(actor, kind="shell", detail=command, hold=True)`, one commit per call; new files wait
    one more command ("Held new files" above), and the result says nothing about them.
-5. The result is `outcome.render(has_jobs_tool=ctx.has_tool("jobs"), cfg=[shell], has_wait=ctx.has_tool("wait"))`.
+5. The result is `outcome.render(cfg=[shell], has_wait=ctx.has_tool("wait"))`.
 
 An agent's command dies when the agent's task is cancelled (a stopped or retired agent) before the command became a
 job: its command must not go on writing into the workspace after the swarm stopped.
@@ -2552,7 +2909,7 @@ class Job:   # id, owner, command, origin, cmd: RunningCommand, log, log_path, s
              # stopped_by, ended_at, tail; label "j<id>", log_shown, notice_tail(), public(now=None) -> dict
 @dataclass
 class ShellOutcome:  # state, code, output, shell, wait, job=None, note="", names=[], note_args={}, max_output=12000
-    def render(self, *, has_jobs_tool: bool, cfg: ShellSettings, has_wait: bool = True) -> str
+    def render(self, *, cfg: ShellSettings, has_wait: bool = True) -> str
 def parse_job_id(text) -> int | None                     # "j3" "J3" "%3" "#3" "3" -> 3
 def parse_console(command) -> tuple[str, list[int], bool] | None   # ("list"|"show"|"kill", ids, force)
 def short_command(cmd, limit) -> str                     # one line, cut in the middle with "…"
@@ -2565,8 +2922,8 @@ def shown_log(log) -> str                                # a data_dir log with "
 | origin | how a command becomes one | stopped at (from its start) | keeps its owner busy | its end wakes the owner |
 |---|---|---|---|---|
 | `timeout` | its shell still runs when the call's wait ended | `[shell] max_timeout` | always | unless the goal is done |
-| `background` | `background=true` (revision-2 agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
-| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow`, `start /b`; with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
+| `background` | `background=true` (AI agents, external members; the user runs no `shell`) | `job_max_minutes` (0 = never) | while younger than `max_timeout` and the owner holds an in_progress task or a review | unless the goal is done |
+| `detached` | the shell exited within the wait and processes it started run on (`cmd &`, `nohup`, `Start-Process -NoNewWindow` (a plain `Start-Process` opens a console window of its own on the user's desktop, and its output never reaches the job), `start /b`, on Linux also `nohup timeout N cmd &`, `setsid cmd &` and a daemon that keeps its environment, which leave the group but keep the token (§7 "Process layer"); with `background=true` such a job is a `background` one); also a timeout/background job whose shell exited later | `job_max_minutes` | never | only under an active goal while the owner holds an in_progress task (else quiet: shown at its next wake-up) |
 
 `wakes(job)` is that last column; `awaited(owner)` = the owner's running jobs with `wakes(job)`.
 
@@ -2611,15 +2968,14 @@ def shown_log(log) -> str                                # a data_dir log with "
   | `killed` | the session stopped or the member left while the command ran in the foreground | `KILLED: the session is stopping [shell]` / `KILLED: you are leaving the swarm [shell]` |
 
   Then the output (`(no output)`, or `(no output yet)` for a job), and for `leftovers_killed` / `timeout` a
-  `[note]`, for a job a footer. The footer of `background`, `started` and `detached` says where the output goes,
-  that the owner is notified at the end (so: no polling, other work or `wait`; `wait_for_events` for an external
-  member, which has no `wait`: `has_wait`), how to see and stop the job and its lifetime. For a caller with the
-  `jobs` tool (`ToolContext.has_tool`) it names `jobs` with job_id and `job_stop` (and for `background`: "start
-  servers and long runs with background=true instead"); for a revision-1 agent it names the console commands ("run
-  the shell command jobs jN / kill jN (each as a command of its own)") and `&` / `Start-Process -NoNewWindow` (a
-  plain `Start-Process` opens a console window of its own on the user's desktop and its output never reaches the
-  job), never a tool it lacks. `render()` never cuts the first line or the footer: only the output between them is
-  cut to `max_output`.
+  `[note]`, for a job a footer. The footer of `background`, `started` and `detached` says:
+  - where the output goes;
+  - that the owner is notified at the end (so: no polling, other work or `wait`; `wait_for_events` for an external
+    member, which has no `wait`: `has_wait`);
+  - how to see and stop the job (`jobs` with job_id, `job_stop`);
+  - its lifetime (for `background`: "start servers and long runs with background=true instead").
+
+  `render()` never cuts the first line or the footer: only the output between them is cut to `max_output`.
 - A caller cancelled before its command became a job: the tree is killed and awaited (KILL_WAIT), the cancellation
   goes on; any other failure kills it too. After the adoption the caller's cancellation never touches the job.
 
@@ -2691,8 +3047,8 @@ commit), then notifies the owner when it is still a member:
 Only the owner or the user can stop a job. `{duration}` (`fmt_duration`: "45 s", "12 min", "2 h 05 min"; ru "45 с",
 "12 мин", "2 ч 05 мин") and `{result}` are built in the owner's language; `{tail}` = the last 15 lines, at most 1200
 characters, each indented by two spaces, or `job_no_output`; `{command}` = `short_command(command, 120)`; `{log}` =
-the log as shown above. These texts reach agents of every tool revision, so they name no tool, only the log. A
-paused swarm holds them until `resume` like any notice; an external member gets them through `wait_for_events`.
+the log as shown above. These texts name no tool, only the log. A paused swarm holds them until `resume` like any
+notice; an external member gets them through `wait_for_events`.
 
 **Stop** — `async stop(job_id, by, *, force=False) -> str`, synchronous (a restart on the same port does not race):
 only the owner or USER (else ToolError `Job j3 belongs to Anna Smith; only its owner or the user can stop it (ask them
@@ -2735,10 +3091,11 @@ the `listing` line (`…, started in the background, no output for 40 min; log �
 `/jobs`. The monitor publishes a live-only `job.silent` {job} each time a job turns silent or prints again, so the UI
 reloads the state; no notice, no automatic stop: its owner (or the user) decides.
 
-**Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: how revision-1 agents
-list and stop jobs with the `shell` tool they have. The command is stripped and one trailing `;` dropped; the WHOLE
-line must match (case-sensitive), else None and the command goes to the real shell (`kill j3; npm start`, `jobs |
-wc -l`, `echo kill j3` all do):
+**Console intercept** — `async console(actor, command, *, max_chars=12000) -> str | None`: a whole `shell` command
+line `jobs`, `jobs j3` or `kill j3`, as a model types it from shell habit (a fresh shell has no job table), is
+answered from the job manager for every caller of `shell`; no text advertises it. The command is stripped and one
+trailing `;` dropped; the WHOLE line must match (case-sensitive), else None and the command goes to the real shell
+(`kill j3; npm start`, `jobs | wc -l`, `echo kill j3` all do):
 
 | command line | answer |
 |---|---|
@@ -2761,7 +3118,8 @@ them).`; a blank job_id lists. The user lists and stops every member's jobs thro
 | `Swarm.stop` (session stop, delete, `/cd` move, launcher shutdown, `dreamteam run` end, stdio `mcp` end, the end of print mode with an owned launcher, a failed start) | `stop_all()`: no new command or job (`closing`), the monitor cancelled; every job tree and every foreground tree terminated, after `STOP_ALL_TERM` (3 s) the survivors killed and awaited up to `STOP_ALL_KILL` (2 s); every job finished as `stopped`/`session` (quiet `n_job_gone`, no commit of its own), every finish, stop and foreground call in flight awaited; then one autocommit per owner of its stopped jobs and of its jobs that ended by themselves since the session began to stop (`Swarm.stop` sets `stopping` first and stops the runtimes before `stop_all`: such an end makes no commit of its own), kind `job j3` or `jobs j3, j4, j5`, detail `Stopped with the session:\nj3: <command>…` and `Ended while the session stopped:\nj4: <command> (<how it ended>)…`; every tree released, every log closed. About 5 s plus git; idempotent; nothing touches git or the database after it returned (`hub_call` also skips its trace while the swarm stops, §13). `Swarm.stop` runs it in `finally`, also after a failed step |
 | `Swarm.retire` | §3 `retire`: `forbid`, then the runtime, then `stop_owner(name, "retired")` |
 | `Swarm.start` | `recover()` (below) |
-| pause | nothing: a pause (a question pause too, §3.1) stops LLM spending only |
+| a budget or question pause (§3.1) | nothing: a pause stops LLM spending only |
+| the user's pause | nothing either; USER also gets the quiet `u_paused_jobs` naming them (§3 `_set_pause`, §12) |
 | `complete_goal` | the jobs go on; USER gets `u_jobs_running`; their later ends are quiet |
 | `reopen_goal` | nothing (the goal is active again, so ends wake again) |
 | `reconfigure` | nothing: the limits are read at each use; turning `background_on_timeout` off kills no job |
@@ -2772,9 +3130,10 @@ them).`; a blank job_id lists. The user lists and stops every member's jobs thro
 **Crash recovery**: when the hub dies, Windows closes its job handles (KILL_ON_JOB_CLOSE kills every tree), POSIX
 watchdogs see EOF and kill their groups, a container stops. At the next `Swarm.start`, `recover()` turns every row
 still `running` into `lost`/`crash` (ended_at = now); on Linux, when the row's `hub_pid` is dead or is this process,
-every own-user process carrying its token is killed (identity from a random token, never from a bare pid); each owner
-still a member gets a quiet `n_job_gone`. View-only loads (`Swarm(...)` without `start`, `cli status`, the launcher
-viewing a stopped session) change nothing. Sessions never started again are cleaned by the OS containment alone.
+every process carrying its token is killed (`sweep_token`, the uid rule of §7 "Process layer"; identity from a
+random token, never from a bare pid); each owner still a member gets a quiet `n_job_gone`. View-only loads
+(`Swarm(...)` without `start`, `cli status`, the launcher viewing a stopped session) change nothing. Sessions never
+started again are cleaned by the OS containment alone.
 
 **Liveness**: `busy(name)` is true while the member has a running `timeout` job, or a `background` job younger than
 `max_timeout` while it holds an in_progress task or a review (the board is queried only then); `detached` jobs never
@@ -2783,7 +3142,13 @@ hand-over (its reminder time is renewed while busy), it holds `n_all_done` back 
 `u_reviews_waiting`; `AgentRuntime` skips its in-activation nudge (§6.2). A free member with a server started with
 `background=true` is still offered ready tasks. A member that is not busy but whose running job's end will wake it
 (`awaited`: a detached job while it holds an in_progress task, a server past its busy window) waits for that job:
-the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone meanwhile.
+the stalled wakes (`_wake_stalled`, `_wake_idle_holders`, §3) leave it alone meanwhile, and so does the team-asleep
+wake (§3 item 9, `Swarm.team_asleep`), however long the job runs. On Linux a process that left its command's
+process group but kept its environment is found by its token, so its command is a job as `cmd &` is (§7 "Process
+layer"), also in the Docker sandbox's sessions without network. A process the hub does not track (`jobs` does not
+list it: on macOS one that left its command's process group, on Linux one that also cleared its environment,
+`env -i` or a daemon that rebuilds it) is no job: its end wakes nobody (system prompt rule 10, §6.3); item 9 is
+what wakes a team that sleeps waiting for one.
 
 **Git**: the caller's `shell` autocommit at every return, also when the command went on as a job (not for
 `killed`); the job's own commits under its owner when its shell exits with processes left, at its end and at the
@@ -2945,6 +3310,9 @@ class TriggerEngine:
     def pending(self, trigger_id: int) -> list[tuple[str, int, float | None]]   # file_changed() changes not fired
                                                              # yet: (path, changes, seconds since the latest)
     def create_notes(self, trigger: dict) -> list[str]       # the trigger_create result's notes (§12)
+    def unattended(self, now: float) -> bool                 # an active trigger may still fire while nobody acts
+                                                             # and its fire reaches an LLM member ("Unattended
+                                                             # triggers" below; Swarm.team_asleep, §3)
 ```
 `create` resolves member names in the condition (`sender=` of message/comment, `assignee=` of count,
 `agent_status(name)`) with `swarm.resolve_member(allow_retired=True)` (a unique first name, `@Name`, any
@@ -3046,6 +3414,30 @@ untold (`wake_at` None). No new event type: every fire still emits `trigger.fire
 `held` / `wake_at`; a release emits only its `notification`. The limit is per trigger and only for triggers:
 lock (`n_lock_free`) and job wake-ups are not limited, and a trigger's message action still wakes its recipients at
 every fire (the flood guard limits those).
+
+**Unattended triggers.** `unattended(now)` (for `Swarm.team_asleep`, §3 scheduler item 9) is true when an active
+trigger both reaches an LLM member and may still fire while nobody acts:
+- *Reaches an LLM member*: its owner is an LLM member and its actions include `wake` (the default when there are
+  none), or its actions include `message` to "all" or to a name that resolves to an LLM member (not to "user" or
+  only to external members), `set_status` or `create_task`. A trigger of USER or of an external member that only
+  wakes its owner does not count (an hourly `every(3600)` reminder of the user's keeps no LLM member awake).
+- *May fire unattended*: it holds fires (`held` > 0: the end of the wake limit's interval releases them with a wake,
+  "Wake limit"); or its condition uses a time function and the next moment it can come true has not passed by more
+  than `UNATTENDED_GRACE` (10 s): `elapsed(s)` → created_at + s, `after(t)` → t, `every(p)` → (last_fired or
+  created_at) + p, with several of them the latest (read from their literal arguments). A moment that passed
+  without a fire means another part of the condition holds it back (`elapsed(60) and done(3)`): it waits for someone
+  to act. Or its functions are only `file_exists` / `file_changed` (no time function): it counts for
+  `UNATTENDED_FILE_SECONDS` (30 min) from its creation or last fire, then no longer (a process that died never
+  writes the file); a condition that mixes files with board state counts like board state. So
+  `file_exists("out/result.json") or elapsed(1800)`, which the team-asleep texts suggest, counts until its deadline.
+- It does not count either when it is a repeating trigger that is not periodic and whose condition is true now
+  (`last_value` = 1: it fires again only after the condition turns false), or when its condition reads board,
+  message or agent state only (`status`, `done`, `count`, `message`, `comment`, `agent_status`, `goal_done`, …): it
+  waits for someone to act.
+One query over the active triggers (owner, condition, actions, once, created_at, last_fired, last_value, held), the
+conditions compiled through the engine's cache (`CompiledCondition.elapsed` and `.after` keep the literal seconds and
+moments, as `.every` keeps the periods); `UNATTENDED_GRACE` and `UNATTENDED_FILE_SECONDS` are module constants
+of triggers.py. The check never fires, evaluates or changes a trigger.
 
 ## 9. Event types (bus)
 
@@ -3284,7 +3676,7 @@ async def call_tool(ctx: ToolContext, name: str, args: dict) -> tuple[str, bool]
     # rejects actors that are neither USER nor an active member; an LLM agent (a runtime with
     # tool_parameters) calls only the tools of its frozen set, with their frozen parameters: a tool it lacks is
     # "Unknown tool" with close matches and the list from its own set only (never a newer tool), and arguments
-    # its schema lacks are dropped with the note "[Ignored unknown argument(s): ...; Usage: <its frozen
+    # its schema lacks are dropped with the note "[Ignored unknown argument(s): .... Usage: <its frozen
     # signature>]"; validation still uses the registry spec (hence R0′ below); unknown tool -> close matches + the
     # available tools; audience errors say how to fix the call (join_swarm/as_agent); checks required args
     # (whitespace-only = missing unless allow_empty) and types with coercion ("5"/"#5" -> 5, JSON strings for
@@ -3306,7 +3698,7 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `task_review` | task_id, approve, comment? | LEU |
 | `task_comment` | task_id, text, reply_to? | LEU |
 | `task_discussion` | task_id, since_id? | LEU |
-| `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean, revision 4 and later: a question to "user" that may pause the swarm, §3.1) | LEU |
+| `send_message` | to (string or array), text, reply_to?, pause_swarm? (boolean: a question to "user" that may pause the swarm, §3.1) | LEU |
 | `read_messages` | with?, limit?, include_read? | LEU |
 | `agents` | — (the roster, then the role catalog) | LEU |
 | `hire_agent` | role, instructions ("" for a catalog role), model?, name? | LEU |
@@ -3342,13 +3734,13 @@ Tool catalogue (audience: L = llm agents, E = external MCP agents, U = user via 
 | `skill_detach` | name | U (§19) |
 | `skill_approve` | name, approve, comment?, replace? (a member's proposal: saved to the skills library or not) | U (§19) |
 | `skill_reinstall` | name, ecosystem? (`python` or `node`; default both: the skill's packages installed again) | U (§19) |
-| `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (revision 3, §19) |
+| `skill_propose` | path (the skill's folder, or its SKILL.md, in the workspace) | LE (§19) |
 
 Tool results are plain text (compact, line-oriented), language = English for data, ToolError texts in
 English. The `wait` tool calls `ctx.runtime.end_turn()`. `send_message` calls
 `ctx.runtime.note_sent_to_user()` when USER is a recipient.
 
-`send_message` and `pause_swarm` (§3.1). The description (en and ru, revision 4) keeps "wakes its recipients" and
+`send_message` and `pause_swarm` (§3.1). The description (en and ru) keeps "wakes its recipients" and
 adds that `pause_swarm=true` is only for a question to ["user"] whose answer decides how the team goes on, so that
 work under way would otherwise be redone: the session *may* then pause the whole swarm until the user answers, and
 every member gets the question with the answer; never for what the agent can decide itself, a question about its
@@ -3371,8 +3763,6 @@ usage line is `send_message(to, text, reply_to?, pause_swarm?)`. The result star
 - The user's message that answers a question: ` This answers {asker}'s question #{id}: every member got the question
   and your answer, and the swarm goes on.` (A-ok), or with the budget spent `…, but the budget is exhausted, so the
   swarm stays paused until you raise max_cost_usd.` (A-budget).
-- An agent of revision 1-3 passing `pause_swarm` gets the argument dropped by `call_tool`: `[Ignored unknown
-  argument(s): pause_swarm. Usage: send_message(to, text, reply_to?)]`, and nothing pauses.
 
 **R0′: LLM tool schemas are released as revisions.** Every LLM agent sends its own frozen tools array (§6.1), and
 Anthropic thinking blocks bind to the exact prefix, so a changed name, description, parameter, `required` list, enum
@@ -3383,14 +3773,11 @@ or order of a tool with the `llm` audience is released as a new revision, in one
 4. pin its exact-order digests (`sha256(db.dumps(tools))` per language) in tests/test_frozen_tools.py (`RELEASED`).
 
 Existing agents keep their revision until their next compaction; new agents get the current one. Arguments are
-still validated against the current registry, so the registry must keep serving every released revision
+still validated against the current registry, so the registry must keep serving every shipped revision
 (tests/test_frozen_tools.py checks it): no tool leaves the `llm` audience, no property is removed or retyped
-(`items.type` included), the current `required` is a subset of every released one, enums only grow, a free property
-never gains an enum. Revisions: 1 = the tools before background jobs (sorted digest `e3c5cbc7…`, the baseline of
-agents created before tool sets were frozen), 2 = background jobs (`shell` gains `background`, new `jobs` and
-`job_stop`, new `shell` and `wait` descriptions), 3 = `skill_propose` (appended last; the array of revision 2
-before it is unchanged), 4 = `send_message` gains `pause_swarm` and its new description (the array of revision 3
-otherwise unchanged; §3.1), 5 = crew tasks (§4.2): `task_create` and `task_update` gain `crew` and then
+(`items.type` included), the current `required` is a subset of every shipped one, enums only grow, a free property
+never gains an enum. Revisions 1-4 were the tool sets of 0.1.x (their sessions are not opened, §17.2); 5 = crew
+tasks (§4.2): `task_create` and `task_update` gain `crew` and then
 `directions` (last, after `tags` / `comment`; their descriptions English in both arrays, like the other board
 properties: `task_create` `crew` `Crew task: how many members may work on it at once, its owner included (2..8);
 0 = an ordinary task`, `directions` `With crew: its areas, one title per item; each becomes a draft subtask whose
@@ -3408,10 +3795,10 @@ and directions; you then own it and the first direction is your own part; each d
 and when all of them are finished you write the task's result and complete it (crew 0 makes it an ordinary task
 again).` (ru « Если задача, над которой ты работаешь, оказалась слишком велика для одного участника, передай crew и
 directions: ты станешь её владельцем, а первое направление — твоя часть; каждое направление сдаётся отдельно, а
-когда все они завершены, ты пишешь итог задачи и завершаешь её (crew 0 снова делает её обычной задачей).»; the
-array of revision 4 otherwise unchanged; `task_claim` is unchanged). A session with a member below
+когда все они завершены, ты пишешь итог задачи и завершаешь её (crew 0 снова делает её обычной задачей).»; no
+other tool changed, `task_claim` included). A session with a member below
 `frozen.OLDEST_OPEN_REVISION` (5) is not opened (§6.1, §17.2 "Sessions of an earlier version"), so notifications
-and wake-up texts name only tools and parameters of every released revision from 5 on (tests/test_prompts.py),
+and wake-up texts name only tools and parameters of every shipped revision from 5 on (tests/test_prompts.py),
 crew tasks, `crew` and `directions` included; tool results that point at a newer tool check
 `ToolContext.has_tool`, and a notification the recipient's frozen record (`frozen.member_tool_names`). `allow_empty`
 is validation only, not part of the schema. Tools of the `user`/`external` audiences only (e.g. `set_goal`) are not
@@ -3503,7 +3890,12 @@ Results of the team, wait and job flows:
   (waiting for the user's answer to Anna Smith's question #12).` during a question pause; `Done: ...` lists what was
   done: `wrap-up mode on: every agent was told to finish its tasks with what it has, and no
   new background jobs start` / `wrap-up mode was already on` / `wrap-up mode off` / `wrap-up mode was not on`. Nothing
-  to do: `Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.`
+  to do: `Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.` A `pause` that paused
+  (reason "paused by the user", §3 `_set_pause`) while jobs run (`jobs.running_of()`) adds, after the joined parts,
+  a sentence of its own with the ids only (USER's `u_paused_jobs` has the details): `Done: paused; wrap-up mode off.
+  Background jobs keep running (j3, j5): a pause stops only the agents' model calls; job_stop stops a job.`; without
+  jobs the result is unchanged (`Done: paused.`), and a pause while already paused never adds the sentence
+  (`Done: already paused (…).`).
 - `swarm_status` adds `Background jobs: 2 running (j3 Anna Smith: npm run dev, 25 min; j5 ...).` while jobs run (a
   silent one, §7.1: `j5 Bob: pytest, 50 min, no output for 40 min`),
   and for a member caller `Your background jobs: j3, j5.` after its open tasks. `brief=true` shows the goal as one
@@ -3513,10 +3905,20 @@ Results of the team, wait and job flows:
   for the caller's jobs whose end will wake it (`JobManager.awaited`: never one a done goal makes quiet), and/or
   `, also when docs/AUDIT.md, which you were refused, is free.` (`… are free` for several, at most 10 named;
   `Workspace.awaited_locks`: none once the goal is done, when n_lock_free is quiet; §7 "Lock waiters"); both:
-  `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.`
+  `…, also when your background job j3 ends and when docs/AUDIT.md, which you were refused, is free.` With neither,
+  the plain text gets one more clause when all of these hold: the goal is active; `swarm.stall_ids(caller)` is not
+  empty (an `in_progress` task, not a clarify card waiting for the user's answers, not a crew task with live
+  directions; a `waiting` task alone does not count: answers wake it, system prompt rule 7); the caller has no
+  active trigger of its own (any trigger: it set it on purpose); and `swarm.team_asleep(caller)` (nobody else can
+  act or be woken by something set, §3). Then: ``OK, waiting. You will be woken up by new events, but nothing of
+  yours is set to wake you and nobody else in the team is at work. A process started with & or nohup that `jobs`
+  does not list is not tracked: its end will not wake you. If you are waiting for one, the next time set a trigger
+  with a deadline before you wait (trigger_create, e.g. file_exists("out/result.json") or elapsed(1800)), and start
+  such runs with background=true, without & and nohup.`` (English like every result; `wait` ends the activation,
+  so the agent reads it only after its next wake-up, hence "the next time"; scheduler item 9 wakes such a team
+  later). `team_asleep`, `stall_ids` and `triggers` are looked up with getattr (FakeSwarm, §3: the plain text).
 - `goal_complete` appends, while jobs run, `Note: background jobs are still running: j3 (Anna Smith: npm run dev, 25
-  min). Stop the ones nobody needs with job_stop; the rest stop with the session.` (a caller without `job_stop`: `with
-  the shell command kill jN (as a command of its own)`).
+  min). Stop the ones nobody needs with job_stop; the rest stop with the session.`
 - `shell`, `jobs`, `job_stop`: §7.1.
 - `wait_for_events(progress=true)` also returns when others make board progress: `task.created`, `task.updated` with
   a status change, `goal.set`, `goal.completed`, `goal.reopened`, `agent.hired` (an external member: "joined"),
@@ -3553,7 +3955,13 @@ async def hub_call(swarm, name: str, args: dict, client: str | None = None, *, v
     # one MCP tool call with the actor rules above (also used by the launcher MCP, §18.2); calls of external
     # members are traced (tracer.external_call), except UNTRACED_TOOLS = {"wait_for_events"} and except while the
     # swarm stops (a call that returns then, e.g. a shell command killed by the session stop, must not write into
-    # the database that Swarm.stop's caller closes next). `client` (default: serving_client's) names the MCP
+    # the database that Swarm.stop's caller closes next). A call of an external member (actor not USER and
+    # swarm.is_member(actor)), except UNTRACED_TOOLS, stamps `swarm._external_seen[actor] = time.time()` before and
+    # after it, whether tracing is on or not (Swarm.team_asleep, §3: a long shell call counts from its start to its
+    # end: with `[shell] background_on_timeout`, the default, an external member's call waits at most
+    # `EXTERNAL_WAIT_MAX`, 600 s, below `EXTERNAL_IDLE_SECONDS`, so the stamp before it covers the whole call; with
+    # it off, a call longer than `EXTERNAL_IDLE_SECONDS` counts for that long from its start; a client that only
+    # waits in wait_for_events does not count). `client` (default: serving_client's) names the MCP
     # client: a message it sends (as the call's actor) reaches the external members it acts as already read
     # (mailbox.sent_as_seen_by(members, actor)), so it never comes back to it as news; messages others send, e.g.
     # an agent this call hires, reach them as news. `via` becomes ToolContext.via (the launcher MCP: "launcher-mcp").
@@ -3878,7 +4286,7 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
 | kind | name | input | output | notes |
 |---|---|---|---|---|
 | input | `wake` / `incoming` / `nudge` / `continue` | – | text added to the context | `record()` |
-| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1; absent in spans recorded before tool sets were frozen) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` (+ `max_tokens` when the request's output limit was raised, §6.2) + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
+| llm | `step` / `compaction` (the purpose) while running; the model id when finished | `{"epoch","upto","messages","extra","tools_rev"}` (`tools_rev`: the revision of the frozen tool set the call sent, §6.1) | `{"stop_reason","thinking","text","tool_calls":[{id,name,arguments,parse_error?}]}` | usage, cost; meta `{purpose, attempt}` (+ `max_tokens` when the request's output limit was raised, §6.2) + `{stop_reason}`; a refusal ends the span with status `error`; every failed attempt is its own span with status `error`, `error` text and meta `{error_kind, retry_in?}`, named after the configured model; a call cut off by a stop is `interrupted` (error_kind `cancelled`, not counted as an error) |
 | tool | tool name | arguments (dict) | full result text (before truncation for the model) | meta `{call_id, chars, shown_chars?}`; status `error` if is_error; task ids in `task_id` / `parent_id` / `depends_on` are added to the trace's `tasks` |
 | compaction | `compaction` | `{"messages","prompt_tokens"}` | summary text | parent of its llm span; meta `{epoch_archived, fallback?, tools_revision}` (the tool set from then on, §6.1); status `error` when the summary call failed |
 | event | `reply_to_user` / `refusal` / `budget_pause` / `step_limit` / `stopped` / `crash` | – | text | `refusal` and `crash` have status `error` |
@@ -3905,8 +4313,8 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
   them). `Tracer.span_context(span_id)` then rebuilds `{span_id, agent, epoch, model, system, tools, messages,
   complete, note}` for any LLM span, reading the live epoch from the table (a second reader such as the CLI
   gets it right too); its `tools` (unless given) are the tools that call sent: `frozen.for_span(db, agent, language,
-  input.tools_rev)` = the agent's record when its revision matches, else that revision's shipped snapshot, and the
-  baseline revision for a span without `tools_rev`. `export()` passes `tools=[]`.
+  input.tools_rev)` = the agent's record when its revision matches, else that revision's shipped snapshot, else the
+  record's tools (the current set when the agent has no record). `export()` passes `tools=[]`.
 - External members: `tracer.external_call(agent, tool, args_without_as_agent, result_text, is_error, started_at)`
   for every hub tool call by an external member except `wait_for_events`. A session trace closes (`done`) at
   its last call after `EXTERNAL_IDLE_SECONDS` (15 min) without calls (scheduler: `close_external(idle_seconds)`),
@@ -3955,7 +4363,8 @@ Each activation (wake-up) of an LLM agent is one **trace** (`kind = "llm"`). An 
     use: `[shell]` limits at the next command or job check, `agents.max_steps_per_turn` at the agent's next
     wake-up, `context_tokens` (when the model profile has none of its own) and `tool_output_chars` at the next
     call, `idle_nudge_seconds` at the next scheduler pass, `planning_hint_steps` / `planning_hint_minutes` at the
-    planner's next step or scheduler pass.
+    planner's next step or scheduler pass, `[swarm] budget_notice_at` at the next `record_usage` (a new fraction or
+    limit re-arms the money notice through kv `budget_notice`, §3).
 - `AgentRuntime`:
   - `self.trace` is the current `Trace`, or None (`_tr` is a disabled writer outside an activation).
   - `_activate` finishes a trace left open (`interrupted`), begins the trace after a non-empty wake text and
@@ -4024,6 +4433,24 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   `dump_toml(data)` (a top-level non-empty list of tables is written as `[[name]]` blocks after every table,
   None values skipped; a leaf `env` or `extra` table is written inline, except a root of that name under
   `[api.folders]`); `deep_merge(base, override)`.
+- `[swarm] budget_notice_at` (a number from 0 to 1, default 0.8; a field of `SwarmSettings` right after
+  `max_cost_usd`; out of range is a ValueError through `config._MAX["budget_notice_at"] = 1`, `[swarm]
+  budget_notice_at must be between 0 and 1, got 1.5`; a whole number in the file stays one, so it is read as
+  `float(config.swarm.budget_notice_at or 0)`): the share of the session's money limit at which every AI agent gets
+  one `n_budget_low` and USER one `u_budget_low` (§3 `record_usage`: once per limit and fraction, kv
+  `budget_notice`); 0 or 1: no such notice (`u_budget` at the limit covers it). Read at each `record_usage`; session
+  overrides and `reconfigure` apply, and a new fraction or limit re-arms the notice. Texts ({pct} without a format
+  spec): `n_budget_low` ``Money: spent ${spent:.2f} of the ${limit:.2f} budget ({pct}%). When it is used up, the
+  swarm pauses: every agent stops between two steps, even in the middle of a task. Don't wait for the user to ask
+  for a wrap-up: from now on finish what is nearly done and hand it in (`task_complete`), do the reviews waiting
+  for you, keep the results consistent with what they say, and start nothing large.`` (ru «Деньги: потрачено
+  ${spent:.2f} из ${limit:.2f} денежного бюджета ({pct}%). …»); `u_budget_low` `The team has spent ${spent:.2f} of
+  the ${limit:.2f} budget ({pct}%); the agents were told to finish what is nearly done and start nothing large.
+  When the budget is used up, the swarm pauses; to let it work longer, raise the limit.` The warning colour of the
+  budget bar stays at 80 % of the limit whatever the fraction (the board's `#budget-bar`, the TUI's status line).
+  The template has the line `budget_notice_at = 0.8` after `max_cost_usd`, with a Russian comment; the settings
+  page's «Новые сессии по умолчанию» section has its field (§18.4), and only there, like `crew_review`: not the ⚙
+  dialog, the new-session modal, the API's create fields or a CLI flag.
 - `[swarm] independent_review` (bool, default true; a non-bool is a ValueError naming `[swarm]
   independent_review`): an agent's finished task is approved by another member, or by the user when nobody else
   can (§4.1); false: a task without a reviewer is done at once. The template has the line `independent_review =
@@ -4050,6 +4477,15 @@ Attachment names with characters outside `[A-Za-z0-9-_.]` (e.g. Cyrillic member 
   update apply (`clean_overrides` keeps `false`, so a session can switch off a global `true`); switching it off on a
   running swarm lifts a question pause (`reconfigure`). Under the auto-reply lease of `dreamteam -p` it does not
   apply. The template has the line `clarify = false` after `network`, with a Russian comment.
+- `[agents] idle_nudge_seconds = 60` (number ≥ 0): how long the scheduler lets an idle member be before it steps in
+  (§3): the spacing of item 1's offers to one member, the stall wakes and liveness marks of items 2-3 (§4.2
+  "Finishing"), the review reminders (item 5, §4.1 "Liveness"), ten times over (`CREW_GAP_FACTOR`) the free-place
+  notice of item 8 (§4.2 "A free place"), whose free members must also have been idle this long, and five times
+  over (`TEAM_ASLEEP_FACTOR`), doubled with each such wake under the goal, the team-asleep wake of item 9 (0
+  removes every such delay: item 9 then still wakes at most twice per board state, but a member that changes a
+  task's status at every wake is woken again at almost every pass, §3 item 9 *Due*). Read at each scheduler pass;
+  session overrides apply. The template has no line for it; the settings page's «Агенты»
+  section and the session dialog's «Агенты» group have its field («Напоминание простаивающим, с»).
 - `[agents] planning_hint_steps = 8` (whole number ≥ 0) and `planning_hint_minutes = 10` (number ≥ 0): the planning
   hint of §3 (scheduler item 4; in clarify mode, before the planner has asked, its `n_clarify_hint`), after this
   many LLM steps or minutes of holding the planning task without creating a task, once more at twice the value; 0
@@ -4464,8 +4900,8 @@ settings; ValueError when they are invalid):
   (beside `db.max_tools_revision`, read-only through `_reading`, never creating the file) is true when the
   session database has a kv `tools:<name>` record whose `rev` is an integer below `frozen.OLDEST_OPEN_REVISION`
   (5, §6.1; retired members count; valid or not), or `history` rows of an agent with no usable record (missing, not
-  JSON, or not `frozen.valid`, §6.1, the same test `frozen.read` makes: an agent of the baseline revision). False
-  without a database file (a session
+  JSON, or not `frozen.valid`, §6.1, the same test `frozen.read` makes: an agent that ran before tool sets were
+  frozen). False without a database file (a session
   never started) and for a database with neither (no LLM member ever ran: only the user, external members, or
   members hired and never started): nothing in it is frozen, it is opened as usual, and its LLM members get the
   current revision at their first start. The check is the first step of `Swarm.__init__` once its `config` is
@@ -4524,32 +4960,23 @@ settings; ValueError when they are invalid):
   neither `dreamteam export` nor `dreamteam import`, and 0.1.1 (tool set revision 4 like 0.1.0) opens the sessions of both; the export takes
   only the sessions (`--include sessions`) and goes into a separate home of 0.1.1, for example through
   `uvx --from "git+…@v0.1.1" dreamteam import FOLDER --home NEW_HOME` (a new, empty folder, never the home this version uses). The legacy `main` is never said to be
-  exported: finish it before updating, or remove its database by hand afterwards. Since sessions stop opening, the
-  release that brings crew tasks is 0.2.0, not a patch: the version in pyproject.toml, src/dreamteam/__init__.py and
-  uv.lock.
+  exported: finish it before updating, or remove its database by hand afterwards.
   Tests: a session with a revision-4 record, one with a history and no record, and one with a history and a record
   that is not `frozen.valid` are each listed with `earlier_version`, refused with the message and writing nothing
   through `load`, `start`, `stop`, `resume()`, PATCH, `set_workspace`, the skills routes, `/mcp`, `-c`, `-r`,
   `traces` and
   a single-swarm project's `run` / `status` (no `logs` folder either); each can be deleted (`main`: the 409 and its
   own message) and exported, and `dreamteam import` refuses it before writing anything. A session with no database
-  file, and one whose database holds neither history nor records, open as usual. Tests that change: the fixtures
-  that write a `history` row with no record, tests/test_transfer.py (`_fill_db` and the WAL test's 'bob') and
-  tests/test_cli_transfer.py (`_exported`), and tests/test_runtime.py
-  `test_restart_continues_an_activation_cut_short_without_tasks`, also write `frozen.write(db, name,
-  frozen.current_record("en"))`; tests/test_frozen_tools.py `test_view_only_access_writes_no_tool_record` asserts
-  that the reopen and `dreamteam status` are refused (`EarlierVersionError`, exit 1), and
-  `test_agent_created_before_frozen_tool_sets_keeps_the_baseline` is removed (its rule is gone, §6.1 "Record"). The
-  tests that write a revision 1-4 record into an opened swarm and build its runtime (in tests/test_frozen_tools.py,
-  tests/test_job_tools.py `freeze_revision_1`, tests/test_swarm_skills.py
-  `test_write_tools_name_skill_propose_only_to_who_has_it`) keep working: `AgentRuntime` does not check the
-  revision (§6.1 "Oldest revision opened"). Those that got revision 1 from a history with no record
-  (`seed_history` before the runtime, in tests/test_frozen_tools.py:
-  `test_agents_of_revision_1_keep_it_when_later_revisions_are_released`, `_upgrade_run`,
-  `test_the_upgrade_is_atomic_with_the_history_rewrite`, `test_has_tool_and_member_tool_names`) write the
-  revision-1 record explicitly (`frozen.write(db, name, frozen.record(1, "en", frozen.snapshot(1, "en")))`), and
-  their asserts that such an agent, or `member_tool_names`
-  of an unstarted member with a history, gets the baseline now expect the current revision.
+  file, and one whose database holds neither history nor records, open as usual. The fixtures that write a
+  `history` row, tests/test_transfer.py (`_fill_db` and the WAL test's 'bob') and tests/test_cli_transfer.py
+  (`_exported`), and tests/test_runtime.py `test_restart_continues_an_activation_cut_short_without_tasks`, also
+  write the agent's record (`frozen.write(db, name, frozen.current_record("en"))`), so their sessions open.
+  tests/test_frozen_tools.py `test_view_only_access_writes_no_tool_record` asserts that the reopen and
+  `dreamteam status` are refused (`EarlierVersionError`, exit 1). The tests of an agent on an older revision than
+  the code's write a record of `OLDEST_OPEN_REVISION` into an opened swarm while the code builds a simulated later
+  revision (the `later_revision` fixture of tests/test_frozen_tools.py, or the same monkeypatch of
+  `frozen.TOOLSET_REVISION` and `frozen.current`); `AgentRuntime` does not check the revision (§6.1 "Oldest
+  revision opened").
 - `delete(sid)` renames the directory to `sessions/.deleted-<sid>-<ns>` first (a session whose files are open
   stays intact: 409), then removes it in a thread; leftovers are purged at the next delete. A workspace folder
   outside the session directory is never deleted (it is the user's folder): `delete` returns it (read under the
@@ -4644,10 +5071,31 @@ next start, which checks the folder).
   DreamTeam's skill environments folder ..., or inside it or contains it (every session runs its skills' packages
   from there)") or a folder inside or containing it, a folder inside the current workspace or containing it (or
   containing the session directory), an existing file, a folder that cannot be created or written (a temporary
-  probe file), another DreamTeam home (a folder with `sessions/` and `dreamteam.toml`; never the session's own
+  probe file `.dreamteam-probe-*`, created and removed at once, in the folder or its nearest existing parent:
+  `_check_writable`; the web check of a folder never writes it, "Choosing a folder from the web UI" below),
+  another DreamTeam home (a folder with `sessions/` and `dreamteam.toml`; never the session's own
   folder, whatever its agents built there, so `--default` always leads back) or a folder inside one, the
-  hub tokens' folder (`hubauth.tokens_dir()`) or a folder inside or containing it, and on POSIX a folder under
-  /proc, /sys or /dev (as `copyfrom.resolve_source` refuses them to a copy). 409: a folder another session works
+  hub tokens' folder (`hubauth.tokens_dir()`) or a folder inside or containing it, on POSIX a folder under
+  /proc, /sys or /dev (as `copyfrom.resolve_source` refuses them to a copy), and, when the hub runs in the Docker
+  sandbox's container (`copyfrom.hub_in_container`), a folder outside what is mounted there (`_container_refusal`,
+  right after `_target_refusal`, also by the create; a path of Windows shape, `PureWindowsPath(text).is_absolute()`,
+  is decided earlier, at the absolute-path check before `resolve()`, with this text in place of "not absolute"):
+  "The hub runs in the Docker sandbox and sees only its home (<home>) and the [api] folders roots that work in
+  place: <path> is not there, and a folder made there would be lost with the container. Choose a folder inside
+  <home>, e.g. <home>/projects/<name>. To work in a folder of your computer, mount it inside the home (docker
+  compose), or add it to [api] folders with in_place = true (which lets every HTTP API client work in it too) and
+  start the sandbox again (docker compose: also mount it as docker-compose.yml's comment shows)." Mounted means
+  inside the DreamTeam home (its refused parts are refused above) or inside a root of `apifolders.roots(config)`
+  whose `in_place` is true and whose folder in the container is a mount point (`os.path.ismount`: the sandbox
+  mounts it writable at `/dreamteam/api-folders/<name>`, §21.10 "Sandbox", but `docker.api_folder_mounts` skips a
+  root that is missing or refused on the host or that `-v` cannot name, and a target under such a root's path would
+  again be made in the container), compared by `treecopy.is_within`; the session's own default folder is in the
+  home. Before this rule a missing POSIX path was created in the container's own file system, which nothing outside
+  the container sees and which `docker run --rm` throws away. Other mounts of a compose setup are not guessed from
+  `/proc/self/mountinfo` (a tmpfs `/tmp` or a named volume would pass and still be lost or out of the user's
+  sight): a folder mounted inside the home is in the home, and one mounted elsewhere is named as an `in_place` root,
+  which is a grant to the HTTP API's clients as well (§21.10); the comment above docker-compose.yml's volumes says
+  both (§18.4 "Working folder" says what the user sees). 409: a folder another session works
   in, or inside / containing one (the legacy `main` works in `<home>/workspace`), compared by text and by file
   identity (`treecopy.is_within`: on a file system that ignores letter case or Unicode form where `normcase` does
   not, APFS or a casefold mount, `jobs/Acme` is `jobs/acme`). The current folder itself: `"unchanged"`, nothing
@@ -4720,8 +5168,11 @@ next start, which checks the folder).
   after an adopt or a fresh start (session.json `workspace_notice` until then); quietly for LLM members (their
   next wake-up), with a wake-up for external members (an MCP client's `wait_for_events` returns it).
 - **Start** (and `resume()`, which logs the error and goes on): a session whose (non-default) folder does not
-  exist or is not a folder does not start: SessionError 409 naming the path and how to fix it (`/cd <folder>` or
-  `/cd --default` in `dreamteam` or `dreamteam console --session <id>`, `session_cd` in MCP); `Workspace.init`
+  exist or is not a folder does not start: SessionError 409 naming the path and how to fix it: "The workspace folder
+  of session <id> does not exist: <path>. Bring it back (e.g. reconnect the drive), or move the session to another
+  folder: Change folder… on its card on the sessions page, /cd <folder> (/cd --default for its own folder) in
+  `dreamteam` or `dreamteam console --session <id>`, session_cd in MCP." ("is not a folder" alike; an HTTP API
+  client reads it through `_public_text`, whose surfaces are the owner's); `Workspace.init`
   never creates it. Viewing it (`load`) still works. An adopted folder with git on is checked again before every
   start (the user may have worked there while the session was stopped, or git was off at the adopt): 409 for
   uncommitted changes or untracked files (the session's own `mcp/<name>` folders and `.scratch/` are left out), a
@@ -4738,10 +5189,236 @@ next start, which checks the folder).
   session. The returned summary then has `"workspace_result"`: the result with mode `"created"` for an
   empty/missing folder or `"adopted"` (`old_kept` null: the unused default folder is removed). With a copy
   (`copy_from` / `copy_from_upload`) the folder must be empty or missing, and the copied files move there ("Copying
-  files into a new session" below).
+  files into a new session" below). `create(..., expect=)` (`"created"` | `"adopted"`, only with `workspace`, else
+  400 "\"expect\" needs \"workspace\"."; anything else 400 "\"expect\" must be \"created\" or \"adopted\"." in the
+  style of the move's route; "adopted" with a copy 400 "\"expect\": \"adopted\" cannot go with a copy: a copy goes
+  into a new or empty folder.", which `_plan(copying=True)` would refuse with a 409 anyway): the mode the
+  user agreed to, from the web check (POST `/api/sessions` `expect`, §18.1); "created" is the plan's `"moved"`. It
+  is checked against the create's first `_plan` and passed on to `_set_workspace_locked(creating=True, expect=)`
+  (`"moved"` for "created"; a copy keeps its own `"moved"`), so the second check under the home-wide lock holds it
+  too: 409 "The folder <target> now holds files: the new session would work with them instead of starting afresh
+  there. Nothing was created; check the folder and try again." or "The folder <target> is now empty or missing: the
+  new session would start afresh there instead of working with its files. Nothing was created; check the folder and
+  try again." (the new session removed as for any failure). Without `expect` nothing changes (the CLI, the TUI, the
+  MCP: their folder is the one the user typed, and they report what happened).
 - `external_workspaces(home)` → `[(sid, stored path)]` of the sessions whose folder is outside the home (no
   `in_home`; read from the `session.json` files, nothing opened): `dreamteam sandbox` warns about them (only the
   home is mounted).
+
+#### Choosing a folder from the web UI
+The launcher's two folder routes (§18.1 `POST /api/folders/check`, `POST /api/folders/list`) let the web UI choose a
+folder of the hub's computer and say beforehand what will happen there (its fields and dialogs: §18.4 "Working
+folder", "Folder browser", "Change folder"). They are the server's: the paths are the hub's, a browser's own
+directory picker (`webkitdirectory`, `showDirectoryPicker`) gives files or a handle but never a path of the hub's
+computer, and a remote browser cannot look at that disk. The check is `_plan` itself (and `resolve_source` for a
+copy), so its rules have one source; no JS copy of them exists. The plain helpers (the text rules of a path, drive
+letters, the scan, the sort, the marks' budget) are in `folderlist.py` (stdlib, `treecopy` and `workspace.is_link`;
+imported by sessions.py alone); the manager's methods below hold the rules.
+- **POSTs, never GETs**: both routes take a JSON body. A page of another site can make a browser send a GET to a
+  loopback hub without a token with no Origin header at all (`<img src="http://127.0.0.1:8765/...">`; the guard
+  checks Origin only when one is sent, §14), and a listing of `\\host\share` would make the hub's Windows open an SMB
+  connection to that host with the hub user's credentials, or wake a drive, or tell by its timing whether a path
+  exists. A JSON POST needs a CORS preflight that the hub never answers, so only the hub's own pages and local
+  programs (which can do all of this anyway) send one.
+- **Network paths by their text** (`folderlist.network_path(text)`: on Windows a path whose
+  `PureWindowsPath(text).drive` starts with `\\` or `//`: `\\server\share\x`, `//server/share`, `\\?\...`, `\\.\...`;
+  never on POSIX): the listing refuses one before any file system call (403 "<path> is a network or device path: the
+  folder browser does not open those. Type the folder's path in the field instead."), leaves out a root of that shape (a
+  `recent` parent or an api root on a share) and never follows a link there: on Windows (`folderlist.network_target`)
+  each link on the way of the listed path, of a root before it is resolved and of a link entry is read with
+  `os.readlink` (the link itself, never its target; a junction's `\\?\` spelling of a local path is local), at most
+  `LINK_HOPS_MAX` (32) links per path, and a way that reaches a network or device path (or a longer chain) is shut
+  before any `stat`, `resolve` or `scandir` follows it (the listed path 403 "<path> leads to <target>, outside the
+  places this hub shows.", an entry below). The check runs them: a project on a share is a valid folder, and the check's
+  POST comes from the hub's own page. The existing `GET /api/skills?workspace=` (launcher `_workspace_query`, a GET that
+  reads `<folder>/.claude/skills`) had the same hole and refuses such a path by its text too: 400 "'workspace' must be a
+  folder of this computer, not a network path." (so the new-session dialog offers no `claude-project` rows for a project
+  on a share). A drive letter mapped to a share (`Z:`) is the user's own mapping and is opened like any drive.
+- **`async check_folder(path=None, *, use="workspace", sid=None, default=False)`** → a dict. It never raises for a
+  refusal of the folder (that is its answer); it raises SessionError for the call itself.
+  - `use` `"workspace"`: `sid` None checks a new session's `workspace` (`default` then 400 "'default' needs
+    'session'."); with `sid` it checks a move of that session (`_check`, `_refuse_earlier`, the legacy `main` 409
+    `LEGACY_WORKSPACE_TEXT`, as `set_workspace`), `default` true for its own folder (`path` then absent: 400 "Give
+    'path' or 'default', not both."; neither: 400 "Give 'path' or 'default'."). The path is trimmed, one pair of
+    quotes is dropped (`copyfrom.unquote`) and a leading `~` is the hub user's home (`os.path.expanduser`, as
+    `resolve_source` does: the field names a folder of the hub's computer, so its `~` is the hub's); a path still not
+    absolute is the refusal "<path> is not a full path. Give the full path of a folder on the hub's computer, e.g.
+    C:\work\project." (`/home/me/project` on a POSIX hub), in place of `_plan`'s text about the clients' current
+    folders, which means nothing on a web page. With `sid`, then `_check_journal(sid, meta)` (an unfinished earlier
+    move: its 409 text is the answer, since the move would refuse it) and `config_for(sid)` (a ValueError of invalid
+    settings is 400, as in `_set_workspace_locked`). Then `_plan(sid, target, git_on=, mcp=, network_off=,
+    dry=True)` with the session's config and `mcp=self._forged_servers(sid)`, or for a new session the home's
+    settings (`workspace.git`, `swarm.network`: the dialog has no git field, and the network only makes git offline)
+    and `mcp=None`, as `create` passes; then `_container_refusal` and `_check_reserved(plan.target)`. Nothing is
+    reserved and no lock is taken: the answer is a forecast; the create or the move checks again, and the `expect`
+    the UI sends from this answer catches a folder that changed meanwhile (409, nothing changes).
+  - Its answer: `{"use": "workspace", "path": <the value as sent>, "target": <the folder the create or the move
+    gets: the path unquoted, `~` expanded, not resolved; the session's own folder for `default`>, "state":
+    plan.state, "mode": "created" | "moved" | "adopted" | "unchanged" ("created" is a new session's "moved"),
+    "expect": the value to send (`"created"` / `"adopted"` for a new session, `"moved"` / `"adopted"` for a move,
+    null for "unchanged"), "fresh": the move leaves an adopted folder for an empty one (the user's files stay, the
+    session starts afresh; `cd_preview`'s `text_fresh`), "back": the target is the session's own folder, which still
+    holds its earlier files (`text_back`), "lost": the current folder does not exist (nothing moves, `text_lost`),
+    "git": plan.git, "branch": plan.branch, "mcp": plan.mcp (the session's servers that move along), "running": the
+    session runs (its agents stop for the move), "api_folder": {"root", "path"} of a session that works in place in
+    a server folder of the HTTP API v1 (`apifolders.in_place_folder((meta.get("api") or {}).get("folder"))`: the
+    move drops it, §21.10 "Starts"), else null}`. `_Plan` gains `state` (`"missing"` | `"empty"` | `"files"`: what
+    `_plan` found at the target; None for "unchanged", where `_plan` returns before it looks) and `branch`
+    (`repo_state`'s branch of a folder with files in a repository, with git on; else None); `set_workspace`'s result
+    is unchanged.
+  - A refusal of the folder (a SessionError of `_plan`, `_check_journal`, `_container_refusal` or
+    `_check_reserved`) is the answer `{"use", "path", "error": <its text>, "status": <its status>}` with HTTP 200:
+    the check worked, the folder cannot be used. Never its `code` or `holder`: those stay out of the internal
+    answers (SessionError above), and the UI needs neither (the text names the other session; the browser's `busy`
+    mark is its own). The UI shows `error` verbatim (the texts already say what to do, e.g. "Commit or stash them
+    first").
+  - `use` `"source"` (a copy into the session's own folder): `copyfrom.resolve_source(path, home=, config=,
+    sandbox=hub_in_container(config))` (it unquotes and expands `~` itself); `sid` or `default` there is 400 "'session'
+    and 'default' are for use \"workspace\".", no `path` (or an empty one) 400 "Give 'path'.". Answer `{"use": "source",
+    "path", "target": str(source.path), "state": "folder" | "zip"}`; a CopyError is the refusal above (in the sandbox a
+    missing or Windows-shaped path gets its text: "The hub runs in the Docker sandbox and sees only its home (<home>): X
+    is not there. Upload the folder as a .zip in the New session dialog of the sessions page instead."). No pre-scan:
+    counting a large folder takes as long as the create's own pre-scan, which refuses it (413) before a byte is copied.
+  - `use` anything else: 400 "'use' must be \"workspace\" or \"source\".".
+  - **No side effects** (`dry=True`): `_check_writable` (the probe file) becomes `_can_write(folder, shown)`,
+    `os.access(folder, os.W_OK | os.X_OK)` with the same text ("Cannot write to <shown>: permission denied. Choose
+    a folder you can write to."). On Windows `os.access` ignores the read-only attribute of a folder (CPython looks
+    at it for files only) and sees no ACL, so `_can_write` is true for every folder there: the create's or the
+    move's real probe refuses one that cannot be written, as that request's error. git reads with
+    `GIT_OPTIONAL_LOCKS=0` (`repo_state(..., optional_locks=False)`, every git call of it): a plain `git status`
+    would refresh the stat data of the user's `.git/index`, a write; `hubgit.run_git` already disarms fsmonitor,
+    hooks and filters, so a check runs no code of the user's repository. Nothing else in `_plan` writes;
+    `resolve_source` only reads. The create and the move keep the real probe: a folder that cannot be written must
+    be refused before anything moves.
+  - **Off the loop**: the work runs in a daemon thread (`procs.daemon_call`: a folder on a share that does not answer
+    never holds the hub's exit), awaited at most `FOLDER_TIMEOUT` (20 s); past it the answer is the refusal "<path>
+    did not answer within 20 s (a network folder, or a drive that sleeps?). Try again, or choose another folder."
+    with status 504, and the thread is left to finish. **Slots**: at most `FOLDER_OPS_MAX` (4) folder threads per
+    hub, checks and listings together; a slot is taken without waiting before the thread starts and given back when
+    the thread itself ends, not at its 504, so folders that never answer hold at most 4 threads. While a thread
+    that passed its timeout still runs, its path is kept (`_folders_hung`, by `_fold_key` of the path as given): a
+    request for that path or one inside it gets the 504 refusal at once, with no thread. No free slot: 429 "Too many
+    folder checks at once; try again in a moment.", or, when every slot is held by a thread past its timeout, 429
+    "Folders that did not answer still hold the hub's folder checks (<paths>): try again when they answer, or
+    restart the hub.". The UI counts a 429 as a check that could not run (`fo_check_failed`, which blocks nothing,
+    §18.4) and asks one check at a time per field.
+- **`async list_folders(path=None, *, use="workspace", sid=None)`** → one folder's subfolders for the browser.
+  Folder names only: never a file's name, never a content.
+  - **Roots** (`folder_roots(use, sid)`, computed per call from text alone, so a disconnected share among them never
+    slows a listing; each `{"path", "kind", "name", "selectable"}`, `selectable` by kind; whether a root exists and its
+    own marks are learnt when it is opened; `name`: the last part of the path for `home` and `recent`, the home folder's
+    name for `dreamteam`, the letter for a `drive` ("C:", path "C:\"), "/" for `system`, the root's name for `api`):
+    - on the host: `home` (`Path.home()`; not selectable: the home itself is refused, the folders in it are not); the
+      navigation roots, never selectable (a drive or file system root): on Windows one `drive` per letter of
+      `GetLogicalDrives()` (ctypes: a bitmask, so no drive is touched and an empty card reader or a sleeping network
+      drive costs nothing until it is opened; `name` "C:"), elsewhere `system` "/"; `recent`: the parents of the
+      folders the sessions work in outside their own default folder (adopted or moved, the session `sid` too;
+      `_workspace_entry`, read from the `session.json` files), deduplicated by `_fold_key`, without a parent that is
+      the home, a navigation root or a network path, newest session first (ids sort by creation), at most
+      `FOLDER_RECENT_MAX` (8), selectable (the listing says when one is refused); `api`: the roots of
+      `apifolders.roots(config)` (`name` the root's; for `use` "workspace" only those with `in_place`; network paths
+      left out), selectable.
+    - in the container (`hub_in_container`) only what is mounted: for "workspace" `dreamteam` (the DreamTeam home,
+      not selectable: refused, its `.dreamteam` and `sessions` closed) and the `in_place` api roots that are mounted
+      (`os.path.ismount`, as `_container_refusal` counts them: the one file system call of the roots, a local one);
+      for "source" every mounted api root (a `copy` root is mounted read-only, which a copy needs) and no `dreamteam`
+      root (the home is never a copy source, `resolve_source`). No drive, `/`, `home` or `recent` root there.
+    - `use` "source" on the host: the roots of "workspace", with every api root.
+    - The roots are built in a daemon thread (`procs.daemon_call`, never the default executor git uses).
+  - **The folder**, in this order: `path` absent answers the roots alone (`"path": null`, `"entries": []`). Else, by
+    text: not a string, empty or not absolute (after `copyfrom.unquote`; no `~` here) 400 "'path' must be an absolute
+    folder path."; a network path 403 (above); `os.path.abspath` (`..` folded by text) must lie inside a root by text
+    (`folderlist.inside_text`: `os.path.normcase` and `commonpath`, no file system call), else 403 "<path> is outside
+    the places this hub lets you browse.". Then, in the thread: the path and that root are resolved, and the resolved
+    path must lie inside the resolved root or inside another root resolved alike (`treecopy.is_within`; the roots that
+    hold it by text first, the others only when none of those does), else 403 "<path> leads to <real>, outside the
+    places this hub shows."; a mapped drive (`Z:\` resolves to `\\server\share\`, and so does every path on it) still
+    compares, since its root is resolved the same way. A closed folder is 403 with its refusal; a path that is missing
+    or a file lists its nearest existing ancestor inside the same root, with `"fallback": true` (a typed new folder
+    opens at its parent). The resolved folder is the one scanned, its entries' paths joined to the listed text. A folder
+    that cannot be read (`os.scandir` raises: no permission, an empty card reader "device not ready", an I/O error), the
+    root itself missing included, is 200 with `"entries": []` and `"error"` "Cannot read the folder <path>: <strerror>."
+    (the status line shows it; the breadcrumb and Up still work).
+  - **Entries**: `os.scandir` of the folder, at most `FOLDER_SCAN_MAX` (10 000) entries read, files included (a
+    folder of a million files never stalls a listing); kept: folders and links to folders (`is_dir()` follows the
+    link; a link to a file and a broken one are left out); sorted with names starting with `.` and, on Windows,
+    folders with the hidden or system attribute (`st_file_attributes`: `$Recycle.Bin`, `System Volume Information`)
+    after the others, each group by `name.casefold()`, then the name; at most `FOLDER_LIST_MAX` (500) after the
+    sort; `truncated` true when either cap cut. Each entry `{"name", "path", "link", "open", "refused", "busy",
+    "current", "repo", "files", "noaccess"}`:
+    - `link`: `workspace.is_link` (a symlink or a junction; a cloud placeholder is an ordinary folder); followed only
+      when its resolved target lies inside a root of this listing, else `open` false and `refused` "<name> leads to
+      <target>, outside the places this hub shows." (in the sandbox a link in the home to /etc stays shut); a link whose
+      way reaches a network path (above) is that shut entry with no file system call through it (kept when the link
+      itself is a directory link or a junction, its own attributes; never resolved, peeked or tested); `path` is the
+      entry's own path, never its target, and so is the answer's `path` once it is opened (the breadcrumb never jumps to
+      where a link leads);
+    - `refused`: the static reason the folder cannot be chosen, by `use`: for "workspace" `_target_refusal(entry, sid)`
+      and `_container_refusal`; for "source" `copyfrom.source_refusal(entry, home=, config=)` (the location rules of
+      `resolve_source` without its existence and kind checks, extracted from it: a drive or file system root, the user's
+      home or a folder containing it, inside or containing the DreamTeam home or one of DreamTeam's own folders, another
+      DreamTeam home, /proc, /sys, /dev; no `_container_refusal`: a read-only `copy` root is a valid source). One
+      context per listing: the homes, libraries, environments and tokens folders (and in the container the mounted
+      places of `_container_refusal`) resolved once, `_other_home` asked of the entry alone (the listed folder's
+      ancestors were checked with it). Else null; the full check of the chosen folder still decides (git state,
+      writability, a file in place);
+    - `open`: false for a closed folder, one whose every descendant is refused too by the same `use`'s rules (for
+      "workspace" `_target_refusal` refuses `<entry>/x`: a `.git`, `<home>/.dreamteam`, `<home>/sessions`, the
+      tokens folder, the libraries, the skill environments, another DreamTeam home, /proc, /sys, /dev; for "source"
+      the DreamTeam home and its own folders, another DreamTeam home, /proc, /sys, /dev), and for a link out of the
+      roots; a refused folder that is not closed (a drive root, the user's home, a folder that contains the DreamTeam
+      home) opens, to reach the folders inside it;
+    - `busy`: `{"sid", "title"}` of another session whose folder it is, lies inside or contains
+      (`_other_workspaces(sid)` once per listing, `is_within` both ways; the title from its `session.json`),
+      `{"sid": null, "title": null}` for a create in progress there (`_creating_in`), else null; for "workspace" a
+      busy folder cannot be chosen, for "source" it is shown only (copying another session's folder is allowed);
+      `current`: the session `sid` works in it;
+    - `repo`: `os.path.lexists(<entry>/.git)`; `files`: it holds any entry (one `scandir` peek), null when not
+      looked at; `noaccess`: the peek raised PermissionError.
+    - **Budget**: the marks cost a few file system calls per entry (a stat through a link, `lexists`, the peek,
+      `_other_home`'s stats), which on a slow share can outlast `FOLDER_TIMEOUT` for 500 entries; so they stop after
+      `FOLDER_MARKS_BUDGET` (5 s) of the listing, and the remaining entries get `refused`, `repo` and `files` null,
+      `open` true and the answer `"partial": true` (the full check of a chosen folder still decides). On macOS the
+      entries `Desktop`, `Documents`, `Downloads`, `Pictures`, `Movies`, `Music` and `Library` of the user's home get no
+      look inside at all (no peek, no `.git` test, no refusal checks, which stat names inside them): the marks past the
+      budget (`refused`, `repo`, `files` null, `open` true; `busy` and `current` by text): each look would pop a privacy
+      (TCC) prompt for the hub's terminal app at every listing of the home; opening one is the user's own act, and macOS
+      may then ask once.
+  - Answer: `{"path" (the folder listed, in its text form: the given path normalized, or the `fallback` ancestor),
+    "parent" (null at a root), "root" (the path of the innermost root it lies in, by text), "roots", "entries",
+    "truncated", "partial", "fallback", "error" (null, or the text of a folder that cannot be read), "refused",
+    "selectable" (not refused, not the home or a navigation root, for "workspace" not busy), "busy", "current", "sep"
+    (`os.sep`: the browser joins a new folder's name with it)}`, the listed folder's own marks computed as an entry's.
+    The same daemon thread, `FOLDER_TIMEOUT` (504 "<path> did not answer within 20 s ...") and slots as the check.
+- **Who reaches them**: the launcher's hub-token holders only, who can already point a session at any folder these
+  rules allow and whose agents run commands with the hub user's rights; the listing shows them folder names under
+  the same refusals. Never on a session app (`/s/{sid}/api/folders/list` is that app's 404), never under `/api/v1`
+  (the API token opens no internal route, §21.1 "What the API token reaches"), no MCP tool. A loopback hub without a
+  hub token serves them to every local program, as it serves every internal route (§21.1 "The rest of the hub"),
+  and docs/en|ru/security.md says so; pages of other sites never reach them (POSTs, above).
+- **Tests**: tests/test_session_workspace.py — `check_folder` (each `state` / `mode` / `expect`, `state` None for
+  "unchanged", `fresh`, `back`, `lost`, `branch`, `mcp`, `running`, `api_folder` with and without `meta["api"]`; a
+  refusal as the answer with its status and without `code` or `holder`; an unfinished move's journal refused as an
+  answer; invalid session settings 400; a new session checked with `mcp=None`; `~` expanded and a relative path
+  given the web text; `target` unresolved; no `.dreamteam-probe-*` ever created and `.git/index` unchanged (bytes
+  and mtime) after a check of a repository with a touched file; a read-only folder refused by `_can_write`, skipped
+  on Windows and as root; the 504 with a `_plan` that blocks, its slot held until the thread ends, a second
+  request for that path 504 at once, the 429 texts; `use` "source" and the sandbox text), `create(expect=)` (400
+  without `workspace`, 400 "adopted" with a copy, 409 both ways, the session removed; the second check under the
+  lock), `_container_refusal` (`hub_in_container` patched: outside the home and the `in_place` roots refused, a
+  Windows path given its text at the absolute-path check, inside the home, a mounted `in_place` root, the default
+  folder and v1's `within` pass, a `copy` root and an `in_place` root that is not a mount point refused) and
+  `list_folders` (roots per place and `use`, no file system call while the roots are built, `recent` without
+  duplicates of the home and the drives, Windows drives with `GetLogicalDrives` patched, a mapped drive with
+  `resolve` patched to a UNC path, a network path refused with no file system call (`os.scandir`, `os.stat` and
+  `Path.resolve` patched to fail), a path outside the roots refused by text alone, the sort, both caps and
+  `truncated`, files never listed, a link out of the roots shut and one inside followed with the link's own path in
+  the answer, `fallback`, an unreadable folder's `error`, each mark per `use` (a `copy` root's folder selectable as a
+  source in the container, a busy folder selectable as a source, a folder in the DreamTeam home refused as a
+  source), closed folders, the marks' budget with a slow `scandir` giving `partial`, the macOS entries not peeked);
+  tests/test_launcher.py — the two routes over HTTP (bodies, statuses, 429 with held slots, the guard's token, a GET
+  of either route 405, 404 for `/s/{sid}/api/folders/list` and v1's `not_found` for `/api/v1/folders/list`),
+  `POST /api/sessions` with `expect`, `GET /api/skills?workspace=\\host\share` 400 with nothing read.
 
 #### Copying files into a new session
 `copyfrom.py` (it imports treecopy, skills, workspace and hubauth, never sessions.py) copies a folder or a zip into
@@ -4751,8 +5428,8 @@ copy_from_upload, not both."); the HTTP API v1 passes `sources` instead ("Sessio
 same order with `copy_sources` in place of `copy_into` and no claim of its own. The surfaces: REST `copy_from` /
 `copy_from_upload` (§18.1), the launcher MCP's
 `session_create(copy_from=)` (§18.2), the CLI's `--copy-from` (§18.3), the TUI's `/copy-from` (docs/TUI.md) and the
-home page's «Файлы для работы» (§18.4). The source is only read and nothing is copied back. The members are never
-told where the files came from: no source path goes into `pending_goal` or any prompt.
+home page's «Рабочая папка» → «Копия папки или zip» (§18.4). The source is only read and nothing is copied back.
+The members are never told where the files came from: no source path goes into `pending_goal` or any prompt.
 - **Order** (the cheap checks first, the copy last):
   1. an upload is claimed first (`uploads.claim`, its claimed name computed first by `claim_path`; an unknown or
      used token is the 404 here): from now on a create that names an upload uses it up, whatever refuses it later
@@ -4903,7 +5580,10 @@ told where the files came from: no source path goes into `pending_goal` or any p
   `/api/skills`): a missing path or a Windows-shaped one is 400 "The hub runs in the Docker sandbox and sees only
   its home (<home>): X is not there. Upload the folder as a .zip in the New session dialog of the sessions page
   instead."; the refusal of a path in the home adds " In the Docker sandbox, upload the folder as a .zip
-  instead.". Other paths of the container work, as for `workspace`; uploads land in `/swarm/.dreamteam/uploads`.
+  instead.". Other paths of the container are not refused here (a copy only reads them: the mounted roots of `[api]
+  folders` are where such a source is found); a `workspace` outside the mounts is ("Workspace folder" above,
+  `_container_refusal`); uploads land in `/swarm/.dreamteam/uploads`. The web UI's check of a source gives these
+  texts before the create (`check_folder(use="source")`, "Choosing a folder from the web UI" above).
 - **Uploads** (`copyfrom.Uploads(root)`, the manager's `uploads`): `receive(chunks, *, filename, length, limits)`
   (`POST /api/uploads`, §18.1): the file name cut to its last part (`\` read as `/`) and to one printable line of
   at most 200 characters ("upload.zip" when empty); a Content-Length of ASCII digits above `copy_max_mb` is 413
@@ -5097,16 +5777,18 @@ succeeded: either may have changed the library) and everything else to the launc
 | GET `/static/{file}` | static files (`UIStaticFiles`, `no-cache`) |
 | GET `/api/hub` | `{"pid","project": str(home),"home","name":"DreamTeam","version","mode":"launcher","sandbox","container","api"}` (`container`: `copyfrom.hub_in_container`, §17.2 "Copying files into a new session"; `api`: the hub has an API token of its own, `hubauth.api_digest() is not None`, §21.1: `dreamteam status` then prints the API's address; never the token or its digest) |
 | GET `/api/sessions` | `{"sessions": [summary...]}` |
-| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`); `copy_from` (an absolute folder or .zip path on the hub's computer) or `copy_from_upload` (a token of POST `/api/uploads`), strings, not both: copied into the new session's folder before its first start (§17.2 "Copying files into a new session"), the answer then also has `"copy"` (`copy_result`); 404 for an unknown or used upload, 409 for a `workspace` with files, 413 over `[workspace] copy_max_mb` / `copy_max_files` |
+| POST `/api/sessions` | body `{title?, goal?, description?, overrides?, start?=true, workspace?, skills?: [ref or source], via?}` → `{"session": summary}` (201); the header `X-DreamTeam-Auto-Reply: 1` (§14) is passed as `create(..., auto_reply=True)`; `overrides.swarm.clarify` (bool) is clarify mode (§3.1); `skills` attached before the first start (§17.2 "Skills"; `via` the surface recorded for them: `home` when absent, `cli` from the terminal's client, anything else 400); `goal` may be multi-line and `title` "" (the server splits the goal and derives the title, §17.2); with `workspace` (an absolute folder, §17.2 "Workspace folder") also `"result"` (mode `created` or `adopted`), and `expect?: "created"\|"adopted"` the mode the user agreed to (the web check's `expect`; 409 when the folder turned out otherwise, nothing created; 400 without `workspace`, or `adopted` with a copy); `copy_from` (an absolute folder or .zip path on the hub's computer) or `copy_from_upload` (a token of POST `/api/uploads`), strings, not both: copied into the new session's folder before its first start (§17.2 "Copying files into a new session"), the answer then also has `"copy"` (`copy_result`); 404 for an unknown or used upload, 409 for a `workspace` with files, 413 over `[workspace] copy_max_mb` / `copy_max_files` |
 | POST `/api/uploads?filename=<name>` | the raw zip as the body (`Content-Type: application/zip`, not base64 JSON; the guard's `raw_posts`) → 201 `{"upload": token, "filename", "bytes", "expires_in": 3600}` (`manager.uploads.receive` with the limits of `manager.global_config()`); 415 JSON when not `application/zip` (the handler checks too), 413 over `copy_max_mb` (Content-Length or streamed), 429 when 8 uploads wait, 400 empty, not a zip, or interrupted (starlette's `ClientDisconnect`: "The upload was interrupted."), 500 for other failures (`_failure`); the token is used once by `POST /api/sessions` within an hour |
 | GET `/api/sessions/{sid}` | `{"session": summary, "config": manager.config_view(sid)}` |
 | PATCH `/api/sessions/{sid}` | body `{title?, overrides?, settings?}` → `{"session": summary, "config": config_view(sid)}`; `overrides` replaces all of them, `settings` `{section: {key: value \| null}}` changes only those keys (null: the global value again; §17.2 "Partial update"; `{"swarm": {"clarify": true \| false \| null}}` is the ⚙ field and the TUI's `/clarify`, §3.1); both at once, a bad value or `main` → 400 and nothing changes |
 | DELETE `/api/sessions/{sid}?confirm={sid}&skills=save\|discard&via=` | `{"ok": true}` (+ `"workspace_kept": path` when the session worked in a folder outside it, which is never deleted); 400 without a matching confirm; 409 `{"error", "pending_skills"}` when members' proposals wait for the user's decision and `skills` is not given (§17.2) |
 | POST `/api/sessions/{sid}/workspace` | body `{"path": "<absolute>"}` or `{"default": true}`, optionally `"expect": "moved"\|"adopted"` (the mode the user agreed to, §17.2) → `{"session": summary, "result": set_workspace result}`; 400 bad body or target, 404 unknown session, 409 dirty repository, MCP name conflict, a folder of another session, a folder that is not what `expect` says, a file in use, `main` |
+| POST `/api/folders/check` | body `{"path"?: str, "use"?: "workspace"\|"source" (default "workspace"), "session"?: sid, "default"?: true}` → 200 `check_folder` answer (§17.2 "Choosing a folder from the web UI"): `{use, path, target, state, mode, expect, fresh, back, lost, git, branch, mcp, running, api_folder}` for a folder that can be used, `{use, path, target, state}` for a copy source, or `{use, path, error, status}` for a refused one (also status 504 when the folder did not answer within 20 s, at once while an earlier thread for it still runs); 400 a bad body or invalid session settings, 404 an unknown session, 409 `main` or a session made by an earlier version, 429 when the 4 folder threads are busy (its own text when folders that did not answer hold them); a GET 405 |
+| POST `/api/folders/list` | body `{"path"?: str, "use"?: "workspace"\|"source" (default "workspace"), "session"?: sid}` → `list_folders` (§17.2): `{path, parent, root, roots: [{path, kind: home\|drive\|system\|recent\|api\|dreamteam, name, selectable}], entries: [{name, path, link, open, refused, busy: null\|{sid, title}, current, repo, files, noaccess}], truncated, partial, fallback, error, refused, selectable, busy, current, sep}`, subfolders only (never a file), at most 500 of the first 10 000 entries; without `path` the roots alone; a folder that cannot be read 200 with `error`; 400 a bad body, a relative path or a bad `use`, 403 a network path, a path outside the roots (by its text, then resolved) or a closed folder, 404 an unknown session, 429, 504; a GET 405 (a POST, so that no page of another site can make the hub touch a path, §17.2) |
 | POST `/api/sessions/{sid}/start` / `/stop` | `{"session"}`; another action → 404; start takes an optional body `{"skills": [...], "via"?}` (attached first; live when it is running; `via` as for create; the delete's `?via=` too); start with the auto-reply header → `start(..., auto_reply=True)`, also for a running session |
 | GET `/api/sessions/{sid}/skills?show=` | `manager.session_skills(sid, show)`: the attached skills (snapshot items, §14.1), also of a stopped session |
 | POST `/api/sessions/{sid}/skills/{name}/decide` | body `{"approve": bool, "comment"?, "replace"?}` → `{"text", "session"}` (`decide_skill`, via home) |
-| GET / POST `/api/skills`, GET / DELETE `/api/skills/{name}` | the library routes of §14 (`skill_routes` with `manager.global_config`, via `home`, no swarm: no `attached`, no `attach`, no `from=session`, no `deps-log`); `?workspace=<absolute>` names the folder whose `.claude/skills` is offered (a relative one 400); a change emits `sessions.changed` (session None, change `skills`) |
+| GET / POST `/api/skills`, GET / DELETE `/api/skills/{name}` | the library routes of §14 (`skill_routes` with `manager.global_config`, via `home`, no swarm: no `attached`, no `attach`, no `from=session`, no `deps-log`); `?workspace=<absolute>` names the folder whose `.claude/skills` is offered (a relative one 400; on Windows a network path 400 by its text, nothing read, §17.2 "Choosing a folder from the web UI"); a change emits `sessions.changed` (session None, change `skills`) |
 | POST `/api/skill-envs/cleanup` | `EnvManager.cleanup(env_retention_days, every_unused=True)` now (a daemon thread: every env no session uses, whatever its age) → `{"removed", "kept"}`; emits change `skill-envs` |
 | GET `/api/settings` | `{"settings": public view, "providers": PROVIDER_CHOICES, "role_presets": roles.presets_view(), "role_catalog": roles.catalog_view(config.roles), "path": str(settings file), "home", "network_isolation": netoff.shown(netoff.isolation()) (§7.2)}` (a hand edit of the file is picked up first); `settings.teams` holds the saved teams, `[{name, roles}]` (§17.3): a REST client starts one by posting its roles as `overrides.swarm.starting_roles` and `start_agents` |
 | PUT `/api/settings` | body `{"settings": {...sections}}` (`settings.roles`: the complete list of `[[roles]]` entries, `[]` removes every customization; `settings.teams`: the complete list of `[[teams]]` entries, `[]` removes the key, shape checked only: a team may name a role the catalog lacks) → `{"settings","applied_to","role_presets","role_catalog"}`; 400 with the `[roles.N] ...` or `[teams.N] ...` text for a bad role or team (nothing saved) |
@@ -5121,6 +5803,11 @@ succeeded: either may have changed the library) and everything else to the launc
 - Errors are `{"error": text}` with SessionError.status; a body that is not JSON, not an object or has fields of
   the wrong type is 400; unexpected failures (e.g. the swarm failed to start, a locked file) are JSON 500s.
 - `POST /s/{sid}/api/*` without `Content-Type: application/json` is 415 (the guard only knows `/api/...`).
+- The folder routes (`POST /api/folders/list`, `POST /api/folders/check`) are routes of the launcher app alone,
+  behind the guard with the hub token like the other internal routes, JSON POSTs only (the guard's JSON type rule
+  then keeps other sites' pages out, §17.2): a session app has none (its `/api/files` stays confined to the
+  session's folder), the v1 branch none (the API token never opens them), the launcher MCP none; neither clashes
+  with `/api/sessions/{sid}/{action}`.
 - The app's lifespan runs `_clean_envs_daily(manager)`: unused skill environments are removed
   `ENV_CLEANUP_DELAY` (60 s) after the start and then every `ENV_CLEANUP_EVERY` (24 h), with the settings read
   each time (`env_retention_days = 0`: none); a failure is logged; the task is cancelled at exit.
@@ -5252,6 +5939,20 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   is the TUI prompt (`dreamteam "Сделай змейку"`), except a mistyped command name, which argparse reports
   (`_mistyped`: one word of at least 3 letters one edit from a command — a letter inserted, deleted or replaced, or
   two neighbours swapped; a word of 3 letters only with two swapped, `rnu`).
+- Event loop start (`run_loop`, issue #62): the commands, `tui.main_tui` and `tui.main_print` start their loop with
+  `cli.run_loop(main)`. On Windows (`LOOPBACK_SOCKETPAIR`) each asyncio loop first opens a `socket.socketpair()`,
+  which Python makes by connecting to itself over 127.0.0.1 and accepting with no timeout: a program that holds local
+  connections (network filtering of an antivirus or firewall, its unseen "allow?" window, a VPN or proxy client)
+  holds `asyncio.run` there, silently and deaf to Ctrl+C. `run_loop` first opens and closes one pair in a daemon
+  thread, waiting in 0.1 s steps: Ctrl+C works between them (KeyboardInterrupt as from `asyncio.run`, `main` closed
+  unstarted). After `LOOPBACK_WAIT` (5 s) `loopback_text()` goes once to stderr (never stdout) and to the log when one
+  is set up (INFO): the program file of the process (`_python_image`, not a venv launcher or a Store alias), likely
+  causes, fixes (and to start again if it does not go on after them) and docs/en/getting-started.md; once the pair
+  opens, "... DreamTeam goes on." A failed pair (a proxy's "Unexpected peer connection") gets the failure form, then
+  `asyncio.run` runs. Should the loop's own pair be held after the check passed (a program that asks for each
+  connection), a daemon thread writes the same text after `LOOPBACK_WAIT` unless the loop's first step ran by then,
+  saying Ctrl+C cannot stop that wait. `run_loop` closes `main` only when the loop never ran it: a task that a Ctrl+C
+  during `asyncio.run`'s cleanup left pending stays as `asyncio.run` leaves it. Elsewhere `run_loop` is `asyncio.run`.
 - `tui` (docs/TUI.md): `tui.main_tui` (interactive; refuses without a terminal, exit 2) or with `-p`
   `tui.main_print` (text piped into stdin — a pipe or a file, never a terminal or NUL — is appended to the
   prompt; no prompt → exit 2). `-r` without an id opens the session picker (`/sessions`). The flags `--model`,
@@ -5381,7 +6082,7 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     `plan.exit_code`. Otherwise `[y/N]` (`Import? [y/N] `; `y`, `yes`, `д`, `да`) when `_stdin_is_terminal()`,
     else `--yes` is required (`Nothing imported: pass --yes to import without a confirmation.`, exit 1); another
     answer prints `Nothing imported.` (exit 0); Ctrl+C there exits 130. The blockers are checked again after the
-    answer. The import runs in this process (`SessionManager(home)`, `asyncio.run`) with its own launcher marker
+    answer. The import runs in this process (`SessionManager(home)`, `run_loop`) with its own launcher marker
     (`write_launcher_marker`, removed at the end) and a `before_swap` hook that checks the blockers again right
     before each session is renamed in (a process that started meanwhile fails that session). It prints
     `render_import_result` and exits with `result.exit_code` (130 when Ctrl+C stopped it; a second Ctrl+C breaks
@@ -5502,7 +6203,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   whose workspace folder is outside it (`external_workspaces`), but for those under a writable mounted root's mount
   point:
   they cannot start in the container (their start reports the missing folder). A folder
-  inside the home is found in the container (session.json `in_home`, §17.2). The host's skills library is mounted
+  inside the home is found in the container (session.json `in_home`, §17.2). The hub there refuses a new folder for a
+  session outside what is mounted (`_container_refusal`, §17.2 "Workspace folder"), and the web UI's folder browser
+  offers only the mounted folders (§17.2 "Choosing a folder from the web UI"). The host's skills library is mounted
   read-only at `/dreamteam/host-skills` with `DREAMTEAM_HOST_SKILLS_DIR` pointing there and `DREAMTEAM_SKILLS_DIR=
   /swarm/.dreamteam/skills-library` (the sandbox's own library inside the mounted home; not `.dreamteam/skills`,
   the default library's name: a home that is the user's home folder would make the host's library writable);
@@ -5559,6 +6262,204 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
   and a `claude-project` skill). A skill's SKILL.md is shown as Markdown on the session page (`md()`, its YAML front
   matter left out: `bodyOf`; the card shows the name and description) and escaped as preformatted text on the home
   page (it has no Markdown renderer); every other skill text is escaped. The icon is `ic-skill` (a book).
+- **Folders on both pages** (§17.2 "Choosing a folder from the web UI"): `folders.js` (loaded before home.js and
+  app.js, after skills.js; `Folders`, also a Node module for the tests) holds the folder field's check line, the
+  folder browser and the «Сменить папку…» dialog. Each page passes its `t`, `esc`, request function (the board its
+  `launcherApi`: the routes are the launcher's, at the root, never `/s/{sid}/...`; a failure carries its HTTP
+  `status`), `toast` and modal functions (`Folders.setup`, at the page script's load); the texts (`fo_*`, `fp_*`,
+  `cf_*`, `cd_*`) live in both pages' dictionaries, ru and en.
+  - **Check line** (`Folders.checker(input, line, {use, session, isDefault, old, onChange})` → `{run(now), ready(),
+    result}`; `old()` the session's current folder, the `{old}` of the `cd_text_*` texts; `onChange(result)` after
+    every change of what the line shows or of `ready()`, as the change dialog's button and the new-session dialog's
+    project skills follow it): every
+    `input` or `change` of the field restarts a 400 ms timer (`CHECK_DELAY`; a paste is an `input`; a `change` of a
+    value whose answer is shown, as when the field is left for the dialog's button, keeps it, but not a check that
+    could not run: that one is tried again); a choice in the browser and `run(true)` check at once. A field no
+    longer in the page (its dialog closed) sends nothing more, and a late answer for it changes nothing. The value
+    sent is `Folders.unquote(field.value)`: trimmed, with one pair
+    of matching quotes dropped (the twin of `console.unquote`: Explorer's "Copy as path" adds them); an empty value
+    sends nothing and empties the line. Each request carries a number (`seq`): an answer whose number is not the
+    latest, or whose `path` (the value sent) is no longer `Folders.unquote(field.value)`, is dropped, so a slow
+    answer for an earlier value never shows over a newer one (the request itself is not aborted: the hub's slots
+    bound them). «Проверяю папку…» / "Checking the folder…" (`fo_checking`) shows only after 300 ms (no flicker for
+    a quick answer). `ready()` is true only while the shown result is the answer for the current
+    `Folders.unquote(field.value)`: false while the 400 ms timer runs and while a request is out, so a path typed and
+    submitted at once never goes with the `expect` of an earlier value. The line is `role="status"` with
+    `aria-live="polite"`; the field gets `aria-describedby` to it and `aria-invalid="true"` while it shows an error.
+  - **Words of the line** (class `ok`; `warn` for an adopt, for a move of a running session and for `api_folder`;
+    `err` for an error): an `error` verbatim (English, as every hub error), status 504 included, and so the text of
+    another 4xx of the call itself (a bad body, an unknown session: an error, it blocks as one); a request that failed
+    (no connection, 429, 5xx) `fo_check_failed` «Не удалось проверить папку: {error}. Хаб проверит ее при создании
+    или переносе.» / "Could not check the folder: {error}. The hub checks it when the session is created or
+    moved." ({error} without its own final full stop). `use` "source": `fo_src_folder` «Папка найдена: ее файлы
+    скопируются в папку новой сессии.» / "Folder found: its files are copied into the new session's folder." or
+    `fo_src_zip` «Архив .zip найден: его содержимое скопируется в папку новой сессии.» / "A .zip found: its contents
+    are copied into the new session's folder.". `use`
+    "workspace" for a new session: `fo_new_missing` «Папки нет: она будет создана, и сессия начнет в ней с чистого
+    листа.» / "The folder does not exist: it will be created, and the session starts there afresh."; `fo_new_empty`
+    «Папка пустая: сессия начнет в ней с чистого листа.» / "The folder is empty: the session starts there afresh.";
+    with files `fo_new_files` «Папка с файлами: агенты будут работать с ними и коммитить в текущую ветку
+    «{branch}».» / "A folder with files: the agents will work with them and commit to its current branch
+    “{branch}”." (git `existing`), else `fo_new_files_plain` «Папка с файлами: агенты будут работать с ними.» / "A
+    folder with files: the agents will work with them." followed by `fo_git_init` «В ней нет git-репозитория: он
+    будет создан (git init и первый коммит ее файлов).» / "It has no git repository: one will be created (git init
+    and a first commit of its files)." (`initialized`), `cd_git_disabled` (`disabled`) or `cd_git_none` (`none`).
+    `use` "workspace" for a move, by the key `console.cd_preview` would give: `fo_unchanged` «Сессия уже работает
+    в этой папке.» / "The session already works in this folder." (`unchanged`), else `cd_text_fresh` (`fresh`),
+    `cd_text_lost` (`lost`), `cd_text_back` (`back`), `cd_text_missing` / `cd_text_empty` (`state`), `cd_text_files`
+    (with files; then `fo_branch` «Текущая ветка: «{branch}».» / "Current branch: “{branch}”." when known), `{old}`
+    the session's current folder; then the git line for `initialized` with files (`fo_git_init`), `disabled`,
+    `none`; `fo_mcp` «Вместе с сессией переедут ее MCP-серверы: {names}.» / "The session's MCP servers move along:
+    {names}." when `mcp` is not empty; `cd_text_running` when `running`; `cf_api` «Сессию создал клиент HTTP API, и
+    она работает прямо в папке «{root}» из [api] folders: после смены папки это обычная ваша сессия, и проверки той
+    папки к ней больше не относятся.» / "An HTTP API client created this session, and it works right in the folder
+    “{root}” of [api] folders: after the change it is an ordinary session of yours, and that folder's checks no
+    longer apply." when `api_folder`. The `cd_*` keys this picks are listed by name in `Folders.LINE_KEYS` (a
+    `t("cd_" + key)` would escape the used-keys test).
+  - **Folder browser** (`Folders.browse({use, session, start, onChoose, opener})`; `opener` the «Обзор…» button the
+    focus goes back to), behind «Обзор…» / "Browse…" (`fo_browse`,
+    a `button type="button"` after each path field, `aria-haspopup="dialog"`): a layer of its own above the page's
+    modal (`#folder-picker` with its own backdrop, `role="dialog"`, `aria-modal="true"`, `aria-labelledby` its title
+    `fp_title` «Папка на компьютере хаба» / "A folder on the hub's computer"), so the dialog under it keeps what was
+    typed. Its requests are `POST /api/folders/list` `{path?, use, session?}`. It shows:
+    - the places (`roots`) as a column of buttons (under 640 px a `select` above the list): `fp_root_home`
+      «Домашняя папка» / "Home folder", `fp_root_drive` «Диск {name}» / "Drive {name}", `fp_root_system` «Корень
+      (/)» / "Root (/)", the `recent` ones in a group of their own (`role="group"`; in the `select` an `optgroup`)
+      under the heading `fp_recent` «Недавние папки» / "Recent folders"
+      with the folder's last part as the label (the whole path as the tooltip), `fp_root_api` «Папка API: {name}» /
+      "API folder: {name}" (the tooltip the path and `fp_root_api_hint` «из [api] folders в настройках» / "from [api]
+      folders in the settings"), `fp_root_dreamteam` «Домашняя папка DreamTeam» / "DreamTeam home";
+    - the path as a breadcrumb of buttons inside its root, after `fp_up` «Наверх» / "Up" (disabled at a root);
+    - the subfolders (`ul role="listbox"` with `aria-label` the path, one `li role="option"` per entry), each with its
+      name (`<bdi dir="ltr">`) and marks: `fp_repo` «git», `fp_empty` «пустая» / "empty" (`files` false),
+      `fp_noaccess` «нет доступа» / "no access" (`noaccess`), `fp_link` «ссылка» / "link", `fp_busy` «занята
+      сессией «{title}»» / "taken by session “{title}”" (`fp_creating` «создается сессия» / "a session is being
+      created" for a `busy` without `sid`), `fp_current` «папка этой сессии» / "this session's folder"; a `refused`
+      one muted with `fp_refused` «нельзя выбрать» / "cannot be chosen" and the reason as its tooltip and as a
+      hidden text the entry points to with `aria-describedby`; a closed one (`open` false) `aria-disabled="true"`,
+      still focusable (a screen reader hears why), never opened;
+    - the status line (`role="status"`): `fp_loading` «Загрузка…» / "Loading…", `fp_none` «Здесь нет папок.» / "No
+      folders here.", `fp_truncated` «Показаны {n} папок; остальные откройте, введя путь.» / "{n} folders are shown;
+      open the others by typing the path.", `fp_partial` «Отметки есть не у всех папок: папка отвечает медленно.» /
+      "Not every folder is marked: the folder answers slowly.", `fp_fallback` «Папки {path} нет: открыта ближайшая
+      существующая.» / "{path} does not exist: the nearest existing folder is open.", or the answer's `error` or an
+      error answer verbatim;
+    - the foot: the shown folder's path, `fp_choose` «Выбрать эту папку» / "Choose this folder" (disabled when the
+      answer's `selectable` is false, with `fp_cannot` «Эту папку выбрать нельзя: {why}» / "This folder cannot be
+      chosen: {why}" under it, {why} the `refused` text, `fp_busy_why` «в ней работает сессия «{title}»» / "session
+      “{title}” works in it", or `fp_nav_why` «это корень диска или файловой системы» / "it is a drive or file system
+      root"), `fp_new` «Новая папка…» / "New folder…" (a name input with its own `fp_new_ok` «Выбрать» / "Choose":
+      it fills the field with `path + sep + name` and closes; the folder is made by the create or the move, never by
+      the browser, as `fp_new_hint` «Папка будет создана, когда сессия начнет в ней работать.» / "The folder is made
+      when the session starts working in it." says; refused in the form: an empty name, `.` or `..`, a name with `/`,
+      on a Windows hub (`sep` "\\") also with `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, a control character, a
+      trailing dot or space, or a device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`…`COM9`, `LPT1`…`LPT9`, with any
+      extension, any case): `fp_new_bad` «Нужно только имя новой папки, а такое имя для папки на компьютере хаба не
+      подходит.» / "Give just the new folder's name; this one cannot name a folder on the hub's computer."),
+      `cancel`.
+    It opens at the folder of its field when one is typed (`Folders.unquote` of the value; a missing one falls back
+    to its nearest existing ancestor: `fallback`), else at the first root (the home on the host; the DreamTeam home,
+    or the first api root, in a container); a 403 (outside the places, a network path) opens the first root with the
+    error in the status line. One listing request at a time: a click while one runs supersedes it (`seq`, the stale
+    answer dropped). «Выбрать эту папку», or a double click on an entry (the entry of its first click, which has
+    started opening it: by the second click its subfolders may be under the pointer), puts the path into the field,
+    closes the browser, gives the focus back to the field and checks it at once. The browser shows only the cheap
+    marks; the full check runs on the chosen folder, in its field. The copy field's browser lists folders only: a
+    .zip on the hub's computer is typed (its check says `fo_src_zip`).
+    Keyboard, while the focus is in the list or the breadcrumb: ↑ / ↓ move between the entries, Home / End to the
+    first / the last, Enter or Space opens the focused entry. Backspace or Alt+↑ goes up wherever the focus is in
+    the browser outside the «Новая папка…» input (an empty folder puts the focus on «Выбрать эту папку», and the way
+    up still works from there; the places select keeps its own keys). The list is one tab stop
+    (a roving `tabindex`: the focused entry 0, the others -1). In the «Новая папка…» input those keys are the
+    input's own, Enter is its «Выбрать», and the first Escape closes the input (the focus back on «Новая папка…»).
+    Escape elsewhere closes the browser only and gives the focus back to «Обзор…»; Tab and Shift+Tab cycle inside it
+    (a focus trap); at open (and after each listing: on the folder it came up from, if listed) the focus is on the
+    first entry, else on «Выбрать эту папку» (on `cancel` while that is disabled). A click on an entry opens it (a
+    closed one only takes the focus); the narrow screen's `select` of places is named by the title
+    (`aria-labelledby`), and a folder outside the places shows "—" there. A click on the browser's
+    own backdrop closes the browser only. The dialog under it never sees these: a keydown listener on
+    `#folder-picker` stops Escape there (`stopPropagation`; home.js's Escape handler and app.js's `onKeydown` are
+    bubble-phase listeners on `document`), and while `Folders.isOpen()` both pages' backdrop handlers return at once
+    and their Escape handlers close the browser alone (`Folders.closeBrowser`: an Escape while the focus has fallen
+    out of the browser never discards the new-session dialog). `#folder-picker` takes the focus of a click on its
+    text (`tabindex="-1"`), and the page's modal under it is `inert` while it is open. The page's `openModal` and
+    `closeModal` close an open browser (it belongs to the dialog it was opened from).
+  - **Change folder** (`Folders.changeDialog({sid, title, workspace, running, onDone})`): «Сменить папку…» / "Change
+    folder…" (`cf_button`) opens the page's modal: the title `cf_title` «Папка сессии «{title}»» / "Folder of session
+    “{title}”", `cf_now` «Сейчас: {path} ({kind})» / "Now: {path} ({kind})" ({kind} the card's badge text, «папки
+    нет» for a missing one), the radios `cf_other` «Другая папка» / "Another folder" (checked at open: the path field
+    `#cf-path` with «Обзор…», `use` "workspace" with `session`, and its check line) and `cf_default` «Вернуть в свою
+    папку» / "Back to its own folder" (disabled while the session works in its own folder; chosen, it checks
+    `{"default": true, "session"}` at once), the hint `cf_hint` «Пустая или новая папка: файлы сессии и история
+    git переедут туда. Папка с файлами: агенты будут работать с ее файлами и коммитить в текущую ветку; прежняя
+    папка останется как есть.» / "An empty or new folder: the session's files and git history move there. A folder
+    with files: the agents work with its files and commit to its current branch; the previous folder stays as it
+    is.", `cancel` and `cf_go` «Сменить папку» / "Change folder" (enabled by a `ready()` check without `error` and
+    not "unchanged"). The click asks `confirm()` with the TUI's question, `cd_ask` or `cd_ask_default` ({title},
+    {path} the check's `target`, {text} the check line's text, which holds `cd_text_running` for a running session:
+    its agents stop for the move and go on afterwards); yes → `POST /api/sessions/{sid}/workspace` with `{"path":
+    <the check's target>, "expect": <its expect>}` or `{"default": true, "expect": <its expect>}`. A check of a
+    typed folder that could not run (`fo_check_failed`) blocks nothing, as for a create: the question's {path} is
+    `Folders.unquote` of the field and the body `{"path": <it>}` without `expect` (the hub decides and says);
+    «Вернуть в свою папку» needs an answer (its folder's path is the hub's). During the request the button, the ×
+    and `cancel` are
+    disabled, and `cf_moving` «Переношу…» / "Moving…" shown (no time limit of the page's own: a move across drives
+    copies). While that request runs the dialog cannot close (`Folders.busy()`): Escape, its backdrop and `cancel`
+    do nothing (`cancel` disabled), so its result or error is never lost and no second move starts. The answer's
+    `result` is worded by `Folders.resultLines(result, title)`, the twin of `console.cd_result_lines` (keys
+    `cd_unchanged`, `cd_moved`, `cd_now`, `cd_adopted`, `cd_created`, `cd_git_*`, `cd_mcp_moved`, `cd_old_kept`,
+    `cd_old_mcp_committed`, `cd_old_mcp_uncommitted`, `cd_old_missing`, `cd_start_error`, listed by name), one toast
+    per line (the `start_error` one an error toast); the modal closes; the sessions page reloads its list, the board
+    waits for its socket (a running session restarts: its sockets close with 1012) and re-lists «Файлы»
+    (`syncWorkspace`). An error (409: the folder changed since its check, a dirty repository, another session took
+    it, a file in use, an unfinished earlier move; 500 with the undo's report) stays in the dialog (`#cf-error`), the
+    dialog can close again, and the folder is checked again. Cancelling sends nothing; before the click Escape and a
+    stray click close it like any modal of the page.
+    Where: the card's folder line and its missing warning (sessions page), the head of «Файлы» (`#workspace-info`,
+    after the path) and the missing-folder banner (`#workspace-banner`) on the board. Hidden for the legacy `main`
+    (summary `legacy`; on the board the sid "main"), a session made by an earlier version (summary
+    `earlier_version`; the board's `S.earlier`) and a standalone `dreamteam run` board (`sessionSid()` is "": no
+    launcher). The board takes `title`, `workspace` and `running` from its snapshot (`swarm.session`,
+    `swarm.workspace`).
+  - **Texts shared with the terminal**: these keys of `console.CD_TEXTS` are copied under `cd_<key>`: `ask`,
+    `ask_default`, `text_missing`, `text_empty`, `text_files`, `text_fresh`, `text_lost`, `text_back`,
+    `text_running`, `unchanged`, `moved`, `now`, `adopted`, `created`, `git_moved`, `git_existing`,
+    `git_initialized`, `git_disabled`, `git_none`, `mcp_moved`, `old_kept`, `old_mcp_committed`,
+    `old_mcp_uncommitted`, `old_missing`, `start_error`; en as there, ru as there with е for ё, `ask` / `ask_default`
+    without " [y/N] " (a `confirm()` has its own buttons). The terminal-only keys (`launcher_only`,
+    `remote_relative`, `hint`, `missing`, `current`, `kind_*`, `file`, `text_unknown`, `continue`, `cancelled`) are
+    not copied. A test compares the copied ones, so the web and the terminal word a move alike.
+  - **Texts of the session folder** (both pages): `ws_moved_hint` «Сессия перенесена в эту папку («Сменить папку…»
+    или /cd). При удалении сессии папка остается.» / "The session was moved to this folder (Change folder… or /cd).
+    Deleting the session keeps the folder."; home's `ws_missing` «Папка не найдена — сессия не запустится. Верните ее
+    на место или выберите другую:» / "The folder is missing: the session cannot start. Bring it back, or choose
+    another one:" followed by the «Сменить папку…» button; the board's `ws_missing` «Папка сессии не найдена: {path}.
+    Сессия не запустится, пока папку не вернут на место или не выберут другую:» / "The session folder is missing:
+    {path}. The session cannot start until the folder is back or another one is chosen:" followed by the button;
+    where the button is hidden (above), `ws_missing_back` «Папка сессии не найдена: {path}. Сессия не запустится,
+    пока папку не вернут на место.» / "The session folder is missing: {path}. The session cannot start until the
+    folder is back." (no `/cd`: it is refused for `main` and an earlier version's session, and a standalone `run`
+    board has no launcher session to move; the former `/cd` text goes away).
+  - **Tests**: tests/test_ui.py — the new keys in both dictionaries of both pages; a used-keys check of
+    `folders.js` itself (`used_keys(FOLDERS_JS)`, with `Folders.LINE_KEYS` and the result keys, against both pages'
+    dictionaries, both languages, as for skills.js); the copied `cd_*` subset equal to `console.CD_TEXTS` (ё read as
+    е, " [y/N] " dropped) and no terminal-only key copied; no ё in any new ru text; `ws_missing` / `ws_moved_hint`
+    naming «Сменить папку…» and not `dreamteam tui`, `ws_missing_back` naming no `/cd`; in Node with the DOM stub:
+    `Folders.unquote`, the checker (debounce, `seq`: a slower earlier answer dropped, an answer for another value
+    dropped, `ready()` false while the timer runs and while a request is out), the line's words for each answer
+    shape, `Folders.resultLines` equal to `console.cd_result_lines` for a table of results, the browser's keys
+    (↑/↓, Home/End, Backspace in the list; Backspace, Home/End and Enter inside the name input acting on the input;
+    the input's first Escape; Escape that leaves the dialog under it open and refocuses «Обзор…»; the roving
+    `tabindex`; a closed entry `aria-disabled` and focusable), its backdrop closing only itself, the pages' Escape
+    handlers doing nothing while `Folders.isOpen()`, the new-folder name rules (POSIX and Windows), the change
+    dialog that cannot close while its request runs, and the change button hidden for `legacy`, `earlier_version`
+    and a board with `sessionSid()` "". tests/test_teams_ui.py — `newSessionModal`: the «Рабочая папка» fieldset in
+    the main grid, not inside `details.more`; `own` checked at open; no `f_files` key left; the bodies of
+    `submitNewSession` per choice (`own`: neither key; `copy`: `copy_from` or `copy_from_upload` only; `project`:
+    `workspace` (the check's `target`) and `expect` only, never with a copy key); a submit before the check runs it
+    and creates nothing; the `confirm()` for an "adopted" check, a "no" creating nothing; `?workspace=` asked only
+    for `project` with a "files" check, the `claude-project:x` rows sent and dropped when the folder changes; the
+    copy's «Обзор…» disabled in a container without api roots; `closeModal` asking for a typed `#ns-ws-path`.
 - **home.html + home.js + home.css** (launcher page, `/`): header (DreamTeam, tabs «Сессии» / «Скиллы» /
   «Настройки», RU/EN, theme, connection state; the tab is kept in the URL hash, `#skills`); live updates from `/ws`
   plus a 5 s poll (a `sessions.changed` event with change "skills" or "skill-envs" reloads the skills); texts in ru
@@ -5578,30 +6479,34 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       the session's last event, its tooltip «Активность: … · Создана: …»; without an event, the creation time and
       «Создана: …»),
       the session folder (summary `workspace`: the path, cut at the front when long and whole in the tooltip,
-      and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved with /cd); a folder
-      outside the session that does not exist gets the badge «папки нет» and a warning that the session cannot
-      start until it is moved with `/cd`), right after it for a session made with a copy (summary `copied_from`,
-      `copiedLine`) the line «Копия:» / "Copy of:" with the source (cut at the front when long, whole in the
-      tooltip with «Файлы скопированы при создании сессии (when), файлов: N, size. Оригиналы не менялись.»; nothing
-      for a missing or malformed value), the error of a damaged session. The search also matches the path and the
+      and a badge «своя папка» (default) / «папка проекта» (adopted) / «перенесена» (moved), then the link button
+      «Сменить папку…» / "Change folder…" (`data-cd="<sid>"`, "Folders on both pages" above; disabled while the
+      card's start or stop request runs); a folder outside the session that does not exist gets the badge «папки
+      нет» and the warning `ws_missing` with that button inside it instead), right after it for a session made with
+      a copy (summary `copied_from`, `copiedLine`) the line «Копия:» / "Copy of:" with the source (cut at the front
+      when long, whole in the tooltip with «Файлы скопированы при создании сессии (when), файлов: N, size.
+      Оригиналы не менялись.»; nothing for a missing or malformed value), the error of a damaged session. The search
+      also matches the path and the
       copy's source. A session made by an earlier version (summary `earlier_version`, §17.2) gets the badge
       «Прежняя версия» / "Earlier version" in place of its status and the message of §17.2 in its twin (ru / en);
       its title is no link, its goal has no «ждёт запуска» (it never starts here), and it has no «Открыть» or
       «Запустить», only delete (none for the legacy `main`: its
       message names the file to remove). Such a card has the state `earlier` (`sessionState`): the top stripe and the
       dot of a stopped one, the badge in the warning colour, the message as a warning line under the error line; the
-      folder line keeps its path and «папки нет» badge but not the warning that the session cannot start, and there
-      is no proposals button (its dialog's request would be refused; the delete dialog still names the proposals).
+      folder line keeps its path and «папки нет» badge but not the warning that the session cannot start nor
+      «Сменить папку…» (its move is refused, 409), and there is no proposals button (its dialog's request would be
+      refused; the delete dialog still names the proposals).
       The filters list it under «Остановлены», never «Работают». The message's `{version}` is the hub's
       (`GET /api/hub`, asked once and only when a listed session is such a one; «?» until it answers or when it
       fails), and the `{home}` of `main` is its summary's `dir` (the home), else the hub's `home`.
     - Card buttons: «Открыть», «Запустить» / «Остановить» (disabled while the request runs), delete (not for
       the legacy `main`) with a confirmation dialog naming the session; for a folder outside the session the
-      dialog says the folder stays, and the toast names it (`workspace_kept` of the DELETE answer). The web UI
-      never changes the folder (`/cd`, MCP `session_cd` or REST do). When members' skill proposals wait for the
-      user (summary `skills_pending`, or a 409 with `pending_skills` for one proposed since), the dialog names them
-      and offers «Сохранить в библиотеку и удалить» (`?skills=save`; a library clash refuses, shown in the dialog)
-      and «Удалить вместе с ними» (`?skills=discard`) instead of a plain «Удалить».
+      dialog says the folder stays, and the toast names it (`workspace_kept` of the DELETE answer). The folder
+      changes with «Сменить папку…» on the card's folder line ("Folders on both pages" above), as with `/cd`, MCP
+      `session_cd` or REST; the legacy `main` has no such button (`LEGACY_WORKSPACE_TEXT`). When members' skill
+      proposals wait for the user (summary `skills_pending`, or a 409 with `pending_skills` for one proposed since),
+      the dialog names them and offers «Сохранить в библиотеку и удалить» (`?skills=save`; a library clash
+      refuses, shown in the dialog) and «Удалить вместе с ними» (`?skills=discard`) instead of a plain «Удалить».
     - Skills on the card: «скиллов: N» (summary `skills`) and, while proposals wait, a warning button «Скиллы ждут
       вашего решения: N» that opens a dialog with one row per proposal (owner, description, files): «Сохранить в
       библиотеку» / «Не сохранять» with an optional reason (`POST /api/sessions/{sid}/skills/{name}/decide`, also on
@@ -5619,40 +6524,15 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     one changed outside DreamTeam carries the warn badge «изменён вне DreamTeam» and ticking it asks «подключить всё
     равно?», as the board's attach dialog does), the skills the chosen team's roles bring (from the catalog's
     `skills`; one not in the library or ~/.claude/skills gets a warning chip «нет в библиотеке») and «Добавить новый:
-    папка, zip или Git» (the shared form; what it imports is ticked); the ticked ones go as `skills`. Deviation from
-    the skills design (§7.4): the modal still has no workspace folder field (a new session works in its own folder;
-    «Файлы для работы» below only fills that folder with a copy), so it offers no `claude-project:x` rows and loads
-    `/api/skills` without `?workspace=`; a project's `.claude/skills`
-    skill is attached at create through the CLI (`--workspace` with `--skill claude-project:x`) or the launcher MCP,
-    or later on the board; under «Дополнительно» steps per wake-up, MCP
+    папка, zip или Git» (the shared form; what it imports is ticked); the ticked ones go as `skills`, with «Прямо в
+    папке проекта» chosen also the rows of that folder's `.claude/skills` ("Working folder" below); under
+    «Дополнительно» steps per wake-up, MCP
     approval and «Без интернета для агентов» (`swarm.network = "off"`, §7.2; sent only when it differs from the saved
     default; its hint is `networkHint(network_isolation of GET /api/settings)`: strict only for "docker" / "netns",
     the "env" and "container" texts say plainly that it is not isolation, "container" that a restart of the sandbox
-    adds the firewall), then the block «Файлы для работы» / "Files to work on" (§17.2 "Copying files into a new
-    session"): «Скопировать из папки» (`#ns-copy-from`, an absolute path on the hub's computer), «или загрузить .zip»
-    (`#ns-copy-zip`, a file input, `accept=".zip,application/zip"`), the hint that the files are copied before the
-    first start, the originals are never changed and `.git`, `node_modules`, `.venv`, `venv`, `__pycache__` and
-    links are left out, with the limit (`copyMaxMb()`: the saved `workspace.copy_max_mb`, 1024 when missing), and a
-    second hint (`#ns-copy-sandbox`, shown only when `GET /api/skills` reports `container` (or `sandbox`):
-    `nsCopySandbox()`, at the dialog's start and again in `loadSkills()` while it is open) that the hub in a Docker
-    container sees only its home, so a folder from the user's computer goes as a .zip; «Запустить сразу» with
-    «Создать и открыть» (or
-    «Создать»). The submit refuses a path together with a zip, a file that is not `.zip` and a zip over the limit
-    before any request (the message in `#ns-error`), then disables the button and both file fields and shows
-    «Загрузка архива (N МБ)…» or «Копирование файлов…». With a zip it first calls `uploadZip(file)`: `POST
-    /api/uploads?filename=<encodeURIComponent(name)>` with `Content-Type: application/zip` and the File itself as
-    the body (a raw-body upload, unlike the skills form's base64 JSON; same-origin `fetch` sends the hub cookie),
-    which throws with the hub's `error`, `<status> <statusText>` for the guard's plain-text answers, `conn_lost`, or
-    when a 2xx answer has no `upload` token; the create then carries only `copy_from_upload`. A path goes as the
-    trimmed `copy_from`. Every submit uploads again (the create may have claimed the token). Without «Запустить
-    сразу» a success shows the toasts of `copyToasts(copy)` from the answer's `copy`: «Скопировано файлов: N (size)»
-    (`sizeText`: KB, MB) and, when something was left out, «Не скопированы: ссылки (N: a, b, c, …); папки по имени
-    (N: …); особые файлы (N)». With «Запустить сразу» the browser goes to the board, unless `links_count` or
-    `special_count` is above 0 (folders left out by name are expected): then the dialog closes on the sessions page
-    with the same toasts, the last one clickable («Сессия запущена. Нажмите, чтобы открыть её доску.», 9 s) and a
-    click opens the board. An error re-enables the fields. A stray click or Escape also asks before discarding a
-    typed path or a chosen
-    zip. Only values that differ
+    adds the firewall); «Запустить сразу» with «Создать и открыть» (or «Создать»). The block «Рабочая папка» /
+    "Working folder" sits in the main grid (not under «Дополнительно»), right after «Сначала уточнить цель» (below:
+    the folder decides what the team works on, so it is seen before the team is chosen). Only values that differ
     from the saved defaults are sent as overrides (the team as `swarm.starting_roles` / `start_agents`). With teams
     saved, the select `#ns-team` («Команда», first option «Роли ниже», right before the composer) fills the composer's
     rows with a chosen team and sets the max to the larger of the typed value (else the saved `max_agents`) and the
@@ -5664,6 +6544,92 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     click or Escape asks before discarding a typed goal. Independent review and the check of a crew task as a
     whole are not fields of the modal (the settings page has them; sessions can still override them through the
     API).
+  - Working folder (new-session modal, `#ns-ws`: a `fieldset` with the legend «Рабочая папка» / "Working folder",
+    `f_ws`; one choice of three, radios `name="ns-ws"`; the folder is kept apart from the copy because the two answer
+    different questions: where the agents work, and what they start with):
+    - `own` «Новая папка сессии» / "New session folder" (`f_ws_own`; checked at open, the behaviour of a dialog
+      without the block), its hint `f_ws_own_hint` «Сессия начнет с пустой папки внутри домашней папки DreamTeam;
+      эта папка удаляется вместе с сессией.» / "The session starts with an empty folder of its own inside the
+      DreamTeam home; that folder is deleted with the session.";
+    - `copy` «Копия папки или zip» / "Copy of a folder or a zip" (`f_ws_copy`; §17.2 "Copying files into a new
+      session"; the former «Дополнительно» → «Файлы для работы» block, moved here, its heading key `f_files` gone):
+      «Скопировать из папки» (`#ns-copy-from`, `f_copy_from`, the placeholder `f_copy_from_ph`) with «Обзор…» (`use`
+      "source") and its check line `#ns-copy-check` (`use` "source"), «или загрузить .zip» (`#ns-copy-zip`, a file
+      input, `accept=".zip,application/zip"`), the hint `f_copy_hint` (the files are copied before the first start,
+      the originals are never changed, `.git`, `node_modules`, `.venv`, `venv`, `__pycache__` and links are left out,
+      the limit `copyMaxMb()`: the saved `workspace.copy_max_mb`, 1024 when missing) and the hint `#ns-copy-sandbox`
+      (`f_copy_sandbox`, shown only when `GET /api/skills` reports `container` (or `sandbox`): `nsCopySandbox()`, at
+      the dialog's start and again in `loadSkills()` while it is open) that the hub in a Docker container sees only
+      its home, so a folder from the user's computer goes as a .zip;
+    - `project` «Прямо в папке проекта» / "Directly in a project folder" (`f_ws_project`): «Папка» / "Folder"
+      (`#ns-ws-path`, `f_ws_folder`, the placeholder `f_copy_from_ph`) with «Обзор…» (`use` "workspace") and its check
+      line `#ns-ws-check` (`use` "workspace", no session), the hint `f_ws_project_hint` «Агенты меняют, создают и
+      удаляют файлы этой папки и коммитят в текущую ветку ее репозитория (папку без git DreamTeam сделает
+      репозиторием). Пока сессия работает, не правьте эти файлы сами. При удалении сессии папка остается.» / "The
+      agents change, create and delete files in this folder and commit to the current branch of its repository
+      (DreamTeam makes a folder without git a repository). Don't edit these files yourself while the session runs.
+      Deleting the session keeps the folder.", and in a container (as `#ns-copy-sandbox` decides) `#ns-ws-sandbox`,
+      `f_ws_sandbox` «Хаб работает в песочнице Docker: здесь доступны только папки внутри его домашней папки и папки
+      [api] folders с in_place.» / "The hub runs in the Docker sandbox: only the folders inside its home and the [api]
+      folders with in_place are available here.".
+    Only the chosen choice's fields show (the others `hidden`; their values stay while the dialog is open, so going
+    back loses nothing); a stray click or Escape asks before discarding a typed path of either or a chosen zip
+    (`closeModal` reads `#ns-copy-from`, `#ns-ws-path`, `#ns-copy-zip`).
+    - **Never both**: the dialog sends `workspace` (with `expect`) for `project` and `copy_from` / `copy_from_upload`
+      for `copy`, never the two together; a copy into a folder of the user's stays with the CLI, the MCP and REST
+      (target empty or missing, §17.2). So the 409 "already has files ...: a copy goes into a new or empty folder"
+      never comes from this dialog, and neither choice has to be checked against the other.
+    - **Submit** (`submitNewSession`): `own` sends neither. `copy` as the former block: nothing given is refused
+      (`f_copy_none` «Укажите папку или выберите .zip.» / "Give a folder or choose a .zip."), a path together with a
+      zip (`f_copy_both`), a file that is not `.zip` (`f_copy_zip_only`) and a zip over the limit (`f_copy_zip_big`)
+      before any request (the message in `#ns-error`); a path whose current check has an `error` is refused with
+      that text; then the button and the fields of the block are disabled and «Загрузка архива (N МБ)…» or
+      «Копирование файлов…» shown. With a zip it first calls `uploadZip(file)`: `POST
+      /api/uploads?filename=<encodeURIComponent(name)>` with `Content-Type: application/zip` and the File itself as
+      the body (a raw-body upload, unlike the skills form's base64 JSON; same-origin `fetch` sends the hub cookie),
+      which throws with the hub's `error`, `<status> <statusText>` for the guard's plain-text answers, `conn_lost`,
+      or when a 2xx answer has no `upload` token; the create then carries only `copy_from_upload`. A path goes as
+      `copy_from`, the value the check sent (`Folders.unquote`). Every submit uploads again (the create may have
+      claimed the token). `project`: no path is `f_ws_none` «Укажите папку проекта.» / "Give the project folder.";
+      the create needs a check of exactly the field's value that the user has seen (`checker.ready()`, "Folders on
+      both pages" above): when there is none yet (the 400 ms not over, or the answer not in), the submit runs the
+      check at once, shows its line and creates nothing, with `f_ws_checked` «Папка проверена: прочитайте под ней,
+      что произойдет, и нажмите кнопку еще раз.» / "The folder was checked: read below it what will happen, and
+      click the button again." in `#ns-error` once its answer is in (an answer with an `error` puts that text
+      there instead; a check that could not run, only its line); a check with an `error` refuses with that text; a
+      check whose mode is
+      "adopted" asks `confirm()` first, `f_ws_confirm` «Сессия будет работать прямо в папке {path} с ее файлами:
+      {text} Продолжить?» / "The session will work right in the folder {path}, with its files: {text} Go on?"
+      ({path} the check's `target`, {text} the check line's text; as every move of the change dialog asks, so does a
+      create that hands the user's files to the agents; "no" creates nothing); else the body gets `workspace` = the
+      check's `target` and `expect` = its `expect` (`created` or `adopted`). A check that could not run
+      (`fo_check_failed`: no connection, 429, 5xx) does not block: the create is sent with `workspace` =
+      `Folders.unquote` of the field and without `expect`, and the hub decides and says. A 409 of the create (the
+      folder changed since its check) shows its text and checks the folder again.
+    - **After the create**: without «Запустить сразу» a success shows the toasts of `copyToasts(copy)` from the
+      answer's `copy`: «Скопировано файлов: N (size)» (`sizeText`: KB, MB) and, when something was left out, «Не
+      скопированы: ссылки (N: a, b, c, …); папки по имени (N: …); особые файлы (N)»; for `project` the lines of
+      `Folders.resultLines(result, title)` (`cd_created` / `cd_adopted`, then the git line). With «Запустить сразу»
+      the browser goes to the board, unless `links_count` or `special_count` is above 0 (folders left out by name are
+      expected): then the dialog closes on the sessions page with the same toasts, the last one clickable («Сессия
+      запущена. Нажмите, чтобы открыть её доску.», 9 s) and a click opens the board. An error re-enables the fields.
+    - **Skills of the folder**: with `project`, a check without `error` whose `state` is "files" makes the modal ask
+      `GET /api/skills?workspace=<encodeURIComponent(target)>` itself (`H.nsProject = {path, items}`; `H.skills` and
+      the Skills tab stay as they are) and list the `claude` items of origin `claude-project` after the other rows,
+      sent as `claude-project:<name>`, with the badge `claude-project` and the hint `f_skills_project` «из
+      .claude/skills этой папки: агенты могут менять эти файлы» / "from this folder's .claude/skills: agents can
+      change these files"; another folder, another choice or a check with an error drops those rows and their
+      ticks; an answer for a folder that is no longer the checked one is dropped; a 400 for a network path (§17.2)
+      just offers no rows. (This ends the earlier deviation from §7.4: the dialog had no folder, so it offered no
+      `claude-project:x` rows.)
+    - **In the Docker sandbox**: `own` and the zip work as on the host. `project`'s browser lists only the mounted
+      folders and the check refuses any other with `_container_refusal`'s text (§17.2). `copy`'s browser lists only
+      the mounted roots of `[api] folders` (the home is never a copy source): when `nsCopySandbox()` first finds the
+      hub in a container, the dialog asks `POST /api/folders/list` `{"use": "source"}` (no path: the roots alone)
+      once, and without any root «Обзор…» is disabled with `f_copy_sandbox` as its tooltip (a request that failed
+      leaves the button as it is and is asked again; an answer for a closed dialog is dropped); a typed path of the
+      user's computer gets the sandbox text of `resolve_source` in the check line ("... Upload the folder as a .zip in
+      the New session dialog ..."), which the zip field next to it answers.
   - Team composer (new-session modal, settings' defaults, saved teams): one row per group of the starting team (§17.3
     `team_rows`; JS twins `teamRows` / `teamValue`): a role select over the visible catalog plus «Своя роль…» (a
     name not in the catalog), −/+ count (1..50; a row a saved team already holds above 50 keeps that count as its limit,
@@ -5680,7 +6646,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     row marked in the error colour (`.team-gone`), with the hint «Этой роли больше нет в каталоге: выберите другую или
     уберите строку.»; a hidden role shows as elsewhere: selected, marked «(скрыта)», and not offered to other rows.
   - Settings tab: sections «Модели и эндпоинты», «Роли», «Команда», «Новые сессии по умолчанию» (with the team
-    composer and
+    composer, the budget «Бюджет сессии, $», `swarm.max_cost_usd`, followed by «Предупредить о бюджете при доле»
+    (en "Budget warning at share"), `swarm.budget_notice_at`, a number field (min 0, max 1, step 0.05) whose hint
+    reads «При этой доле потраченного бюджета агенты и вы получаете одно предупреждение (0.8 — 80 %); 0 или 1 — без
+    него.» (en "At this share of the budget spent, the agents and you get one notice (0.8 = 80 %); 0 or 1: none.";
+    only here, §17.1; the server refuses a value out of range), and
     the switches «Независимое ревью задач», `swarm.independent_review`, «Проверять групповую задачу целиком» (en
     "Check a crew task as a whole"), `swarm.crew_review`, whose hint reads «Завершённую владельцем групповую задачу
     проверяет, по возможности, агент вне её направлений: сочетаются ли они; будет ли ревью вообще, решает
@@ -5696,7 +6666,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     `agents.planning_hint_steps` / `planning_hint_minutes` and their hints, and the triggers' `file_settle_seconds`,
     `file_max_wait_seconds`, `trigger_wake_seconds` with theirs, §8), «Консоль», «Workspace» (`workspace.git`,
     `lock_ttl_minutes` ≥ 1 and `lock_wanted_minutes` ≥ 0 with its hint, §7 "Lock waiters"; then «Копия в новую сессию,
-    МБ», `workspace.copy_max_mb`, whose hint names `--copy-from` and «Файлы для работы», and «Файлов в такой копии»,
+    МБ», `workspace.copy_max_mb`, whose hint names `--copy-from` and the dialog's copy (`ws_copy_mb_hint`
+    «--copy-from и «Копия папки или zip»: предел копии и загружаемого .zip» / "--copy-from and “Copy of a folder or a
+    zip”: the largest copy and uploaded .zip"), and «Файлов в такой копии»,
     `workspace.copy_max_files`, both at least 1), «MCP»,
     «Скиллы», «Трейсы», «Сервер», with a section navigation.
     - Roles: a card per catalog role (from `role_presets` and `settings.roles`). A built-in role: its name in
@@ -5791,13 +6763,19 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     accepted before that close, so the refresh's 409 may come before the close or after it; either order ends the
     same. Any other close reconnects as before.
     A folder outside the session that does not exist (snapshot `swarm.workspace`) adds a banner naming the
-    path and the fix (`/cd FOLDER` or `/cd --default`).
+    path and the fix (`ws_missing` with the «Сменить папку…» button, "Folders on both pages"; `ws_missing_back`,
+    bring the folder back, where the button is hidden).
   - Wrap-up (§3): a toggle button «Завершать» / «Wrap up» (`ic-check`, label hidden on phones) right after «Пауза»
     calls `swarm_control` {wrap_up: !snapshot swarm.wrap_up} (`toggleWrapUp`); while the mode is on the button is
     pressed (class `on`, `aria-pressed`, the warning colour, tooltip: click to switch it off) and a banner under the
     header says what it means (`#wrapup-banner`). The feed shows `swarm.wrap_up` («… включил(а) режим завершения:
     агенты завершают задачи с тем, что есть» / «… выключил(а) режим завершения»).
-  - Pause and questions (§3.1): «Пауза» / «Продолжить» calls `swarm_control`; the banner `#paused-banner` names the
+  - Pause and questions (§3.1): «Пауза» / «Продолжить» calls `swarm_control`; a pause goes through `act(tool, args,
+    quiet)` with quiet set, so its English result is not toasted: the banner says it, and with jobs running the
+    `u_paused_jobs` notice comes as a toast like every user notice (a refusal is still toasted; a resume toasts its
+    result as before). The user's own pause reads «Рой на паузе: по вашему решению» in the banner (`"reason_paused
+    by the user"`, en "paused by you"; the TUI's `reason_user` alike, «Рой на паузе (по вашему решению)»; a job's
+    «остановлен вами» is another key and stays). The banner `#paused-banner` names the
     reason. A question pause (snapshot `swarm.question`) reads «Рой на паузе: {name} ждёт вашего ответа на вопрос #{id}
     — ответ получат все участники. Нажмите, чтобы ответить; «Продолжить» снимает паузу без ответа» (class `question`,
     `data-asker`; a click, or Enter / Space on the focused banner (`role="button"`, `tabindex` 0), opens the chat with
@@ -5944,9 +6922,11 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     and, while its fires are held by the wake limit, «отложено: 2 до 18:48» / "held: 2 until 18:48" from `held` and
     `wake_at`, §8; note, actions, last error; «Удалить» asks first).
   - Tab «Файлы»: above the tree, the session folder (`swarm.workspace`): its absolute path (click to copy) and
-    the badge «своя папка» / «папка проекта» / «перенесена» / «папки нет»; the tab button's tooltip is the
-    path. A missing folder is not listed (no `/api/files` call). When the path (or its existence) changes
-    after a `/cd`, the tab starts again from the root of the new folder. A locked entry (its path is the path of a
+    the badge «своя папка» / «папка проекта» / «перенесена» / «папки нет», then «Сменить папку…» ("Folders on both
+    pages": hidden on a standalone `dreamteam run` board, for `main` and for a session of an earlier version); the
+    tab button's tooltip is the path. A missing folder is not listed (no `/api/files` call). When the path (or its
+    existence) changes after a move (this dialog, `/cd` or another client), the tab starts again from the root of
+    the new folder. A locked entry (its path is the path of a
     lock in the snapshot's `locks`) shows the lock icon («Заблокирован: {owner}» as its tooltip) and the link «Снять
     блокировку» / "Unlock" (`.file-unlock`): after a `confirm()` («Снять блокировку, которую поставил(а) {owner}, с
     {path}? Участников, которые ждут этот файл, разбудят.») it calls `act('file_unlock', {path})` (§7 "Lock
@@ -6273,9 +7253,9 @@ host library's and Claude Code's skills not attached), `skill_attach` (name or s
 packages (requirements.txt) are being installed; members are told when they are ready." or " Its packages are
 installed already."), `skill_detach`, `skill_reinstall` (§12).
 
-**Proposals** (`skill_propose(path)`, audience llm and external: an LLM tool of frozen revision 3, so new members
-and external members have it at once and older agents after their next compaction, whose `tools_added` names it;
-the system prompt's Skills bullet ends with the proposing sentence, which agents hired before revision 3 never got).
+**Proposals** (`skill_propose(path)`, audience llm and external, so every AI agent and external member has it; the
+system prompt's Skills bullet ends with the proposing sentence (a member hired by a build from before `skill_propose`
+and never started keeps the system prompt it was hired with, which lacks that sentence, §6.1)).
 `SessionSkills.propose(actor, path)`: not the user ("Members propose skills; the user attaches them with
 skill_attach."); `[skills] max_proposals = 0` → "Proposing skills is turned off in this swarm's settings."; the path
 goes through `Workspace.resolve` (inside the workspace, never `.git`), a `SKILL.md` file means its folder, and a
@@ -7000,12 +7980,12 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
     this code.
   - `CopyError` and `SessionError` carry a `code` where v1 maps them (`bad_name`, `file_conflict`, `folder_busy`,
     `folder_not_ready`, `too_many_uploads`, ...). The internal REST answers do not show it. `api_v1.error_code` takes
-    that code when v1 knows it, `earlier_version` for such a session, else the error's `status` (400 `bad_request`,
-    404 `not_found`, 409 `conflict`, 413 `too_large`, 500 `internal`; another 4xx `bad_request`, anything else
-    `internal`); the code decides the answer's status (`api_v1.CODES`). So every 429 a v1 route can meet names its
-    code (`too_many_uploads`, `too_many_sessions`; a test reads the raises of sessions.py, copyfrom.py and skills.py),
-    or it would read `bad_request`. An `internal` error is logged with its traceback, except the 503 of a hub
-    shutting down, logged as information.
+    that code when v1 knows it, `earlier_version` for such a session, else the error's `status` (400 `bad_request`, 404
+    `not_found`, 409 `conflict`, 413 `too_large`, 500 `internal`; another 4xx `bad_request`, anything else `internal`);
+    the code decides the answer's status (`api_v1.CODES`). So every 429 a v1 route can meet names its code
+    (`too_many_uploads`, `too_many_sessions`; a test reads the raises of sessions.py, copyfrom.py and skills.py, the web
+    UI's folder threads `_folder_call` left out: no v1 route reaches them), or it would read `bad_request`. An
+    `internal` error is logged with its traceback, except the 503 of a hub shutting down, logged as information.
   - **Paths in answers.** For an API-token caller, an error text that would name a path of the hub's computer is
     rewritten (`SessionError` and `CopyError` texts name the home, the user's home and folders): a server folder as
     `<root>/<path>` (21.10; below the root, the hub's own separator: the text is for people), the home and, with the
@@ -8434,6 +9414,12 @@ drops it as well (21.9).
   no check runs on the host.
 - An in-place session made there stores the container path. A hub outside the container finds that folder missing (409
   `folder_not_ready` at the session's start).
+- The roots mounted writable (`in_place`, a mount point in the container) are, with the home, the folders where the
+  hub in the container lets any session work (`_container_refusal`, §17.2 "Workspace folder"): `/cd`, `session_cd`
+  and the web UI's «Сменить папку…» there may name a folder inside one, which the folder browser lists as a root of
+  its own; a `copy` root is read-only there and offered only as a source of a copy. So an `in_place` root is how a
+  compose setup lets sessions work in a folder mounted outside the home, and every API client with them; a folder
+  mounted inside the home needs no root.
 - Git in the container reads a repository's own config and the image's, never the host's system or global git
   config. On a Windows host a repository checked out with Git for Windows' defaults (`core.autocrlf=true` in its
   system config: CRLF in the files, LF in the repository) is therefore changed for it: an `in_place` create, and a

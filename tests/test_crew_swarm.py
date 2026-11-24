@@ -1,9 +1,9 @@
-"""Crew tasks at the swarm level (docs/SPEC.md §3 items 1-3, §4.2 "Offers" and Liveness, §6.2): offers keyed by the
-pair (task id, finish state), the liveness key (stalled ids, marks) of the scheduler's items 2 and 3, the
-in-activation nudge of a crew task's owner, the user's review reminder, and the seams other parts read (snapshot,
-events, settings, session statistics, export). Crew tasks are built with tests/helpers/crew.py, straight into the
-rows; the members are `IdleRuntime`s of a real Swarm (test_review.py), except for the nudge, which runs a scripted
-agent."""
+"""Crew tasks at the swarm level (docs/SPEC.md §3 items 1-3 and 8, §4.2 "Offers", Liveness and "A free place", §6.2):
+offers keyed by the pair (task id, finish state), the liveness key (stalled ids, marks) of the scheduler's items 2 and
+3, the owner's notice of a free place nobody can fill (item 8), the in-activation nudge of a crew task's owner, the
+user's review reminder, and the seams other parts read (snapshot, events, settings, session statistics, export). Crew
+tasks are built with tests/helpers/crew.py, straight into the rows; the members are `IdleRuntime`s of a real Swarm
+(test_review.py), except for the nudge, which runs a scripted agent."""
 
 from __future__ import annotations
 
@@ -15,10 +15,13 @@ import pytest
 
 from dreamteam import prompts
 from dreamteam import settings as st
-from dreamteam.db import Database
+from dreamteam import swarm as swarm_module
+from dreamteam.db import Database, loads
 from dreamteam.models import USER, AgentStatus, Status
 from dreamteam.sessions import read_stats
+from dreamteam.swarm import CREW_GAP_FACTOR
 from dreamteam.tools import frozen
+from dreamteam.tools.fmt import trim
 from dreamteam.transfer import export_home
 from helpers.crew import finish_raw, make_crew_raw, set_raw
 from test_review import WAIT, IdleRuntime, deliver, live_team
@@ -667,6 +670,511 @@ async def test_a_member_refused_a_direction_of_a_full_crew_task_is_woken_once_a_
         idle_for_a_while(swarm)
         assert texts_for(swarm, CARL, "n_marks_stalled") == [
             prompts.t("en", "mark_direction_to_take", sub=cli.id, title="cli", id=crew.id).lstrip()]
+    finally:
+        await shutdown(swarm)
+
+
+# ================================================================== a free place (§3 item 8, §4.2 "A free place")
+
+OLGA, DINA, EXT = "Olga Owner", "Dina Dale", "Ext Agent"
+ROLES = {OLGA: "Generalist", ANNA: "Developer", BOB: "Generalist", CARL: "Tester", DINA: "Analyst"}
+DUE = CREW_GAP_FACTOR * WAIT    # how long a crew task keeps its state before its owner is told
+
+
+async def gap_team(tmp_path):
+    """A live team of the members of ROLES, hired in that order (Olga owns the crew tasks), with room for more."""
+    swarm = await live_team(tmp_path, max_agents=12)
+    for name, role in ROLES.items():
+        await swarm.hire(USER, role, name=name)
+        swarm.runtimes[name] = IdleRuntime()
+    deliver(swarm)
+    return swarm
+
+
+def engine(swarm, crew: int = 3, owner: str = OLGA, creator: str = USER):
+    """Crew task "engine" (crew `crew`, created by `creator`, held in progress by `owner`) with the todo directions
+    "search", "eval" and "uci"; the goal is set and the members have read their news."""
+    board = swarm.board
+    task, subs = make_crew_raw(board, creator, crew, ["search", "eval", "uci"], title="engine", goal="g")
+    set_raw(board, task.id, status=Status.IN_PROGRESS, assignee=owner)
+    if not swarm.goal():
+        swarm.set_goal(USER, "Ship it")
+    deliver(swarm)
+    return board.get(task.id), subs
+
+
+def last_direction(swarm, owner: str = OLGA, **kw):
+    """The run's second state (§4.2 "A free place"): the owner's "search" and Bob's "eval" are done, Anna works on
+    "uci", one place of three is free; Bob, Carl and Dina have nothing to go on with."""
+    task, (search, evalu, uci) = engine(swarm, owner=owner, **kw)
+    finish_raw(swarm.board, search.id, Status.DONE, "r", assignee=owner)
+    finish_raw(swarm.board, evalu.id, Status.DONE, "r", assignee=BOB)
+    set_raw(swarm.board, uci.id, status=Status.IN_PROGRESS, assignee=ANNA)
+    return swarm.board.get(task.id), (search, evalu, uci)
+
+
+def rested(swarm, *first: str) -> None:
+    """Every member has been idle for a while (the free members' own wait); `first` the longest, in this order."""
+    now = time.time()
+    swarm.db.execute("UPDATE agents SET last_active = ?", (now - 10 * WAIT,))
+    for i, name in enumerate(first):
+        swarm.db.execute("UPDATE agents SET last_active = ? WHERE name = ?", (now - 20 * WAIT + i * 0.1, name))
+
+
+def later(swarm, seconds: float) -> None:
+    """Item 8's clocks: each crew task has kept its state `seconds` longer."""
+    swarm._crew_gaps = {tid: (key, since - seconds) for tid, (key, since) in swarm._crew_gaps.items()}
+
+
+def tell_when_due(swarm) -> None:
+    """Item 8 sees the states (a clock starts for a new one), and again once they are due."""
+    swarm._tell_crew_gaps()
+    later(swarm, DUE)
+    swarm._tell_crew_gaps()
+
+
+def gap_notices(swarm, name: str = OLGA) -> list[dict]:
+    """The placeholders of each n_crew_gap `name` got, oldest first."""
+    return [loads(r["data"]) for r in swarm.db.all("SELECT data FROM notifications WHERE recipient = ? AND kind = ?"
+                                                   " ORDER BY id", (name, "n_crew_gap"))]
+
+
+def free_names(swarm, task) -> list[str]:
+    """The free members of `task` now (Swarm._free_members), by name."""
+    free = swarm._free_members(swarm.board.get(task.id), swarm._idle_llm_members(), time.time(), swarm._offers())
+    return [m["name"] for m in free]
+
+
+async def test_the_owner_is_told_once_after_ten_times_the_wait_and_not_before(tmp_path):
+    """The run's second state: nothing before CREW_GAP_FACTOR x agents.idle_nudge_seconds, then one n_crew_gap to the
+    owner naming the free members, the longest idle first, and never again for that state; nobody else is told."""
+    swarm = await gap_team(tmp_path)
+    try:
+        task, (search, evalu, uci) = last_direction(swarm)
+        rested(swarm, CARL, BOB)
+        swarm._tell_crew_gaps()                                         # the clock starts
+        later(swarm, DUE - WAIT / 2)
+        swarm._tell_crew_gaps()
+        assert gap_notices(swarm) == []
+        later(swarm, WAIT / 2)
+        swarm._tell_crew_gaps()
+        directions, held = swarm.board.crew_gap_parts(task, [], "en")
+        assert directions == (f' Its directions: #{search.id} [done] "search" @{OLGA}; #{evalu.id} [done] "eval" '
+                              f'@{BOB}; #{uci.id} [in_progress] "uci" @{ANNA}.') and held == ""
+        assert texts_for(swarm, OLGA, "n_crew_gap") == [prompts.t(
+            "en", "n_crew_gap", id=task.id, title="engine", working=2, crew=3, names=f"{OLGA}, {ANNA}",
+            idle=f"{CARL} (Tester), {BOB} (Generalist), {DINA} (Analyst)", directions=directions, held="")]
+        assert swarm._crew_gap_told == {task.id: (OLGA, 3, frozenset({uci.id}), frozenset())}
+        assert swarm.db.scalar("SELECT COUNT(*) FROM notifications WHERE kind = 'n_crew_gap'") == 1
+        deliver(swarm)
+        for _ in range(3):
+            later(swarm, DUE)
+            swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 1
+    finally:
+        await shutdown(swarm)
+
+
+async def test_an_owner_at_work_is_told_at_the_first_pass_that_finds_it_idle(tmp_path, monkeypatch):
+    """Working, busy with a job or with news pending, the owner is not told (the notice never lands in a running
+    activation); the first pass that finds it idle tells it, the state still holding."""
+    swarm = await gap_team(tmp_path)
+    try:
+        last_direction(swarm)
+        rested(swarm)
+        swarm.db.execute("UPDATE agents SET status = ? WHERE name = ?", (AgentStatus.WORKING, OLGA))
+        tell_when_due(swarm)
+        assert gap_notices(swarm) == []
+        swarm.db.execute("UPDATE agents SET status = ? WHERE name = ?", (AgentStatus.IDLE, OLGA))
+        busy = swarm.jobs.busy
+        monkeypatch.setattr(swarm.jobs, "busy", lambda name: name == OLGA)     # its command went on as a job
+        swarm._tell_crew_gaps()
+        assert gap_notices(swarm) == []
+        monkeypatch.setattr(swarm.jobs, "busy", busy)
+        swarm.mail.send(USER, OLGA, "status?")
+        swarm._tell_crew_gaps()
+        assert gap_notices(swarm) == []
+        deliver(swarm, OLGA)
+        swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 1
+    finally:
+        await shutdown(swarm)
+
+
+async def test_an_owner_waiting_for_its_own_job_is_told_but_a_member_waiting_for_one_is_not_free(tmp_path,
+                                                                                               monkeypatch):
+    swarm = await gap_team(tmp_path)
+    try:
+        last_direction(swarm)
+        rested(swarm, CARL, BOB, DINA)
+        monkeypatch.setattr(swarm.jobs, "awaited", lambda name: ["j1"] if name in (OLGA, BOB) else [])
+        tell_when_due(swarm)
+        assert [d["idle"] for d in gap_notices(swarm)] == [f"{CARL} (Tester), {DINA} (Analyst)"]
+    finally:
+        await shutdown(swarm)
+
+
+@pytest.mark.parametrize("owner", [USER, EXT])
+async def test_the_user_or_an_external_owner_is_never_told_nor_the_creator_in_its_place(tmp_path, owner):
+    swarm = await gap_team(tmp_path)
+    try:
+        await swarm.hire(USER, "Developer", name=EXT, kind="external")
+        task, _ = last_direction(swarm, owner=owner, creator=DINA)
+        rested(swarm)
+        for _ in range(3):
+            tell_when_due(swarm)
+        assert [t.id for t, _, _ in swarm.board.crew_gaps()] == ([] if owner == USER else [task.id])
+        assert swarm.db.scalar("SELECT COUNT(*) FROM notifications WHERE kind = 'n_crew_gap'") == 0
+    finally:
+        await shutdown(swarm)
+
+
+async def test_members_whose_tasks_wait_are_free(tmp_path):
+    """Bob holds a task blocked by the crew task (the planner of that run) and a direction of another crew task, held
+    back since that one is full; Carl holds a task in `waiting`; Dina owns the other crew task while working on none
+    of its directions: all three are free. The owner and Anna, the crew task's working set, never are."""
+    swarm = await gap_team(tmp_path)
+    try:
+        board = swarm.board
+        task, _ = last_direction(swarm)
+        report = board.create(USER, "report", goal="g", depends_on=[task.id])
+        set_raw(board, report.id, assignee=BOB)
+        docs = board.create(USER, "docs", goal="g")
+        set_raw(board, docs.id, status=Status.WAITING, assignee=CARL)
+        other, (part, more) = make_crew_raw(board, USER, 2, ["part", "more"], title="other", goal="g")
+        set_raw(board, other.id, status=Status.IN_PROGRESS, assignee=DINA)
+        set_raw(board, part.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        set_raw(board, more.id, assignee=BOB)
+        assert board.stall_marks(BOB) == board.stall_marks(DINA) == frozenset()
+        rested(swarm, BOB, CARL, DINA)
+        assert free_names(swarm, task) == [BOB, CARL, DINA]
+        tell_when_due(swarm)
+        assert [d["idle"] for d in gap_notices(swarm)] == [f"{BOB} (Generalist), {CARL} (Tester), {DINA} (Analyst)"]
+    finally:
+        await shutdown(swarm)
+
+
+@pytest.mark.parametrize("case", ["in progress", "todo", "todo subtask", "review", "mark", "file", "just idle"])
+async def test_a_member_with_something_to_go_on_with_is_not_free(tmp_path, case):
+    """Bob works on a task, holds a todo one no blocker stops (no direction: a top-level one, or a subtask of Dina's
+    plain task, which leaves Dina free), has a review waiting for him, has a liveness mark (a direction of another crew
+    task his claim would take now), waits for a file, or has just gone idle (someone may still give him work): not
+    free."""
+    swarm = await gap_team(tmp_path)
+    try:
+        board = swarm.board
+        task, _ = last_direction(swarm)
+        side = board.create(USER, "side", goal="g")
+        if case == "in progress":
+            set_raw(board, side.id, status=Status.IN_PROGRESS, assignee=BOB)
+        elif case == "todo":
+            set_raw(board, side.id, assignee=BOB)
+        elif case == "todo subtask":
+            set_raw(board, side.id, status=Status.IN_PROGRESS, assignee=DINA)
+            part = board.create(USER, "part", goal="g", parent_id=side.id)
+            set_raw(board, part.id, assignee=BOB)
+        elif case == "review":
+            finish_raw(board, side.id, Status.REVIEW, "r", assignee=ANNA, reviewer=BOB)
+        elif case == "mark":
+            set_raw(board, side.id, status=Status.CANCELLED)
+            other, (part,) = make_crew_raw(board, USER, 2, ["part"], title="other", goal="g")
+            set_raw(board, other.id, status=Status.IN_PROGRESS, assignee=DINA)
+            set_raw(board, part.id, assignee=BOB)
+            assert board.stall_marks(BOB) == frozenset({(part.id, "direction to take")})
+        else:
+            set_raw(board, side.id, status=Status.CANCELLED)
+            if case == "file":
+                swarm.db.execute("INSERT INTO lock_waiters(agent, path, since) VALUES (?, ?, ?)",
+                                 (BOB, "x.md", time.time()))
+        rested(swarm)
+        if case == "just idle":
+            swarm.db.execute("UPDATE agents SET last_active = ? WHERE name = ?", (time.time(), BOB))
+        assert free_names(swarm, task) == [CARL, DINA]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_member_is_free_once_item_1_offered_it_every_ready_task_it_would_offer(tmp_path):
+    """A ready task not offered to a member yet keeps it out (item 1 offers it first; once offered and not taken, it
+    is free). A free direction of a crew task in which the member works on a `waiting` direction is never offered to
+    it (busy_crews), so it keeps that member out of nothing."""
+    swarm = await gap_team(tmp_path)
+    try:
+        board = swarm.board
+        task, _ = last_direction(swarm)
+        other, (mine, spare) = make_crew_raw(board, USER, 3, ["mine", "spare"], title="other", goal="g")
+        set_raw(board, other.id, status=Status.IN_PROGRESS, assignee=USER)
+        set_raw(board, mine.id, status=Status.WAITING, assignee=CARL)
+        side = board.create(USER, "side", goal="g")
+        rested(swarm)
+        assert [t.id for t in board.ready_unassigned()] == [spare.id, side.id]
+        assert free_names(swarm, task) == []
+        offer_rounds(swarm, 6)
+        deliver(swarm)
+        assert [offered(swarm, n, spare) for n in (BOB, CARL, DINA)] == [1, 0, 1]
+        assert free_names(swarm, task) == [BOB, CARL, DINA]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_finished_direction_rearms_the_notice_and_a_hand_in_or_a_claim_does_not(tmp_path):
+    swarm = await gap_team(tmp_path)
+    try:
+        board = swarm.board
+        task, (search, evalu, uci) = engine(swarm, crew=4)
+        finish_raw(board, search.id, Status.DONE, "r", assignee=OLGA)
+        set_raw(board, evalu.id, status=Status.IN_PROGRESS, assignee=BOB)
+        set_raw(board, uci.id, status=Status.IN_PROGRESS, assignee=ANNA)
+        rested(swarm)
+        tell_when_due(swarm)
+        assert len(gap_notices(swarm)) == 1
+        assert swarm._crew_gap_told[task.id] == (OLGA, 4, frozenset({evalu.id, uci.id}), frozenset())
+        deliver(swarm)
+        set_raw(board, evalu.id, status=Status.REVIEW, reviewer=USER)          # Bob hands "eval" in: the same key
+        tell_when_due(swarm)
+        set_raw(board, uci.id, status=Status.TODO, assignee=None)              # Anna lets "uci" go: a free direction
+        swarm._tell_crew_gaps()
+        assert task.id not in swarm._crew_gaps
+        board.claim(CARL, uci.id)                                              # Carl takes the place: the same key
+        deliver(swarm)
+        tell_when_due(swarm)
+        assert len(gap_notices(swarm)) == 1
+        finish_raw(board, evalu.id, Status.DONE, "r", assignee=BOB)            # "eval" finished: a new key
+        swarm._tell_crew_gaps()
+        later(swarm, DUE - 1)
+        swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 1                                    # its clock started again
+        later(swarm, 1)
+        swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 2
+        assert swarm._crew_gap_told[task.id] == (OLGA, 4, frozenset({uci.id}), frozenset())
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_direction_newly_held_for_a_busy_member_rearms_the_notice(tmp_path):
+    """"uci" is first an external member's (neither held nor named), then assigned to Bob, who works on "eval": it is
+    held, a new key, and the second notice names it."""
+    swarm = await gap_team(tmp_path)
+    try:
+        await swarm.hire(USER, "Developer", name=EXT, kind="external")
+        board = swarm.board
+        task, (search, evalu, uci) = engine(swarm)
+        set_raw(board, search.id, status=Status.IN_PROGRESS, assignee=OLGA)
+        set_raw(board, evalu.id, status=Status.IN_PROGRESS, assignee=BOB)
+        set_raw(board, uci.id, assignee=EXT)
+        rested(swarm)
+        tell_when_due(swarm)
+        [first] = gap_notices(swarm)
+        assert first["held"] == ""
+        deliver(swarm)
+        set_raw(board, uci.id, assignee=BOB)
+        swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 1                                    # the new key's clock first
+        later(swarm, DUE)
+        swarm._tell_crew_gaps()
+        second = gap_notices(swarm)[1]
+        assert second["held"] == prompts.t("en", "crew_gap_held", sub=uci.id, name=BOB, m=evalu.id)
+        assert swarm._crew_gap_told[task.id][3] == frozenset({uci.id})
+    finally:
+        await shutdown(swarm)
+
+
+async def test_at_most_two_notices_per_owner_and_crew_task_across_a_restart(tmp_path, monkeypatch):
+    """A restart loses the clocks and the keys told (in memory): the same state may be told once more, but the count
+    is read from the notifications table, so never a third time, nor for a new key. At the cap a key due is recorded
+    as told at once, with no free member looked for (here none is free: a ready task nobody was offered yet), so
+    the pass after it costs nothing."""
+    swarm = await gap_team(tmp_path)
+    try:
+        task, (_, _, uci) = last_direction(swarm)
+        rested(swarm)
+        for told in (1, 2, 2):
+            swarm._crew_gaps, swarm._crew_gap_told = {}, {}                    # a restart
+            tell_when_due(swarm)
+            deliver(swarm)
+            assert len(gap_notices(swarm)) == told
+        assert swarm._crew_gap_told == {task.id: (OLGA, 3, frozenset({uci.id}), frozenset())}  # at the cap
+        swarm.board.create(USER, "side", goal="g")
+        set_raw(swarm.board, task.id, crew=4)
+        deliver(swarm)
+        looked = []
+        free_members = swarm._free_members
+        monkeypatch.setattr(swarm, "_free_members", lambda *a: looked.append(a[0].id) or free_members(*a))
+        tell_when_due(swarm)
+        assert len(gap_notices(swarm)) == 2 and swarm._crew_gap_told[task.id][1] == 4 and looked == []
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_pause_moves_the_clock_on_by_its_length(tmp_path):
+    swarm = await gap_team(tmp_path)
+    try:
+        last_direction(swarm)
+        rested(swarm)
+        swarm._tell_crew_gaps()
+        later(swarm, DUE + 1)                       # due by the wall clock, but the last 3 s of it were a pause
+        swarm.pause(USER, "user")
+        swarm._paused_at -= 3
+        swarm.resume(USER)
+        deliver(swarm)
+        swarm._tell_crew_gaps()
+        assert gap_notices(swarm) == []
+        later(swarm, 2)
+        swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 1
+    finally:
+        await shutdown(swarm)
+
+
+async def test_nothing_is_told_with_the_goal_done_or_in_wrap_up_and_the_clock_starts_again(tmp_path):
+    swarm = await gap_team(tmp_path)
+    try:
+        last_direction(swarm)
+        rested(swarm)
+        swarm._tell_crew_gaps()
+        later(swarm, DUE)
+        swarm.complete_goal(USER, "enough")
+        swarm._tell_crew_gaps()
+        assert gap_notices(swarm) == [] and swarm._crew_gaps == {}
+        swarm.reopen_goal(USER)
+        deliver(swarm)
+        swarm._tell_crew_gaps()                     # a new clock
+        assert gap_notices(swarm) == []
+        later(swarm, DUE)
+        swarm.wrap_up(USER)
+        deliver(swarm)
+        swarm._tell_crew_gaps()
+        assert gap_notices(swarm) == [] and swarm._crew_gaps == {}
+        swarm.end_wrap_up(USER)
+        swarm._tell_crew_gaps()
+        assert gap_notices(swarm) == []
+        later(swarm, DUE)
+        swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 1
+    finally:
+        await shutdown(swarm)
+
+
+async def test_an_owner_of_two_crew_tasks_due_is_told_of_both_in_one_pass(tmp_path):
+    swarm = await gap_team(tmp_path)
+    try:
+        board = swarm.board
+        crews = []
+        for title, worker in (("alpha", ANNA), ("beta", BOB)):
+            crew, (part,) = make_crew_raw(board, USER, 3, ["part"], title=title, goal="g")
+            set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=OLGA)
+            set_raw(board, part.id, status=Status.IN_PROGRESS, assignee=worker)
+            crews.append(crew)
+        swarm.set_goal(USER, "Ship it")
+        deliver(swarm)
+        rested(swarm)
+        swarm._tell_crew_gaps()
+        later(swarm, DUE)
+        swarm._tell_crew_gaps()                     # one pass
+        notices = gap_notices(swarm)
+        assert [d["id"] for d in notices] == [c.id for c in crews]
+        assert [d["idle"] for d in notices] == [f"{CARL} (Tester), {DINA} (Analyst)"] * 2
+    finally:
+        await shutdown(swarm)
+
+
+async def test_an_owner_told_earlier_in_the_pass_is_no_free_member_of_the_next_crew_task(tmp_path):
+    """Dina owns "alpha" (Anna works on it), Olga "beta" (Bob works on it), both due in one pass. Dina, told of alpha
+    first, has news pending, so beta's notice does not name her; Olga, told only after, is named in alpha's."""
+    swarm = await gap_team(tmp_path)
+    try:
+        board = swarm.board
+        for title, owner, worker in (("alpha", DINA, ANNA), ("beta", OLGA, BOB)):
+            crew, (part,) = make_crew_raw(board, USER, 3, ["part"], title=title, goal="g")
+            set_raw(board, crew.id, status=Status.IN_PROGRESS, assignee=owner)
+            set_raw(board, part.id, status=Status.IN_PROGRESS, assignee=worker)
+        swarm.set_goal(USER, "Ship it")
+        deliver(swarm)
+        rested(swarm)
+        swarm._tell_crew_gaps()
+        later(swarm, DUE)
+        swarm._tell_crew_gaps()                     # one pass
+        assert [d["idle"] for d in gap_notices(swarm, DINA)] == [f"{OLGA} (Generalist), {CARL} (Tester)"]
+        assert [d["idle"] for d in gap_notices(swarm, OLGA)] == [f"{CARL} (Tester)"]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_the_scheduler_loop_tells_the_owner_after_item_1_in_its_pass(tmp_path, monkeypatch):
+    """Item 8 runs in the scheduler's loop after items 1-7: in the pass in which item 1 offers the idle owner a ready
+    task (a free direction of a crew task in which Carl, the one free member, works on a `waiting` one, so it is not
+    offered to him), the owner has news pending and is not told; a later pass that finds it idle tells it."""
+    monkeypatch.setattr(swarm_module, "SCHEDULER_SECONDS", 0.05)
+    monkeypatch.setattr(swarm_module, "CREW_GAP_FACTOR", 0)
+    swarm = await gap_team(tmp_path)
+    try:
+        board = swarm.board
+        last_direction(swarm)
+        other, (mine, spare) = make_crew_raw(board, USER, 3, ["mine", "spare"], title="other", goal="g")
+        set_raw(board, other.id, status=Status.IN_PROGRESS, assignee=USER)
+        set_raw(board, mine.id, status=Status.WAITING, assignee=CARL)
+        rested(swarm, OLGA)                         # the longest idle: item 1 offers "spare" to Olga first
+        ready = "SELECT recipient FROM notifications WHERE kind = 'n_ready'"
+        await run_until(lambda: swarm.db.all(ready), timeout=5)
+        assert [r["recipient"] for r in swarm.db.all(ready)] == [OLGA] and gap_notices(swarm) == []
+        deliver(swarm, OLGA)
+        await run_until(lambda: gap_notices(swarm), timeout=5)
+        assert [d["idle"] for d in gap_notices(swarm)] == [f"{CARL} (Tester)"]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_an_owner_in_russian_gets_the_notice_and_its_parts_in_russian(tmp_path):
+    swarm = await gap_team(tmp_path)
+    try:
+        owner = "Дарья Петрова"
+        await swarm.hire(USER, "Developer", name=owner, language="ru")
+        swarm.runtimes[owner] = IdleRuntime()
+        task, _ = last_direction(swarm, owner=owner)
+        rested(swarm)
+        tell_when_due(swarm)
+        [text] = texts_for(swarm, owner, "n_crew_gap")
+        directions, _ = swarm.board.crew_gap_parts(task, [], "ru")
+        assert text.startswith(f"#{task.id} «engine», твоя групповая задача") and directions in text
+        assert directions.startswith(" Её направления: ")
+    finally:
+        await shutdown(swarm)
+
+
+async def test_the_notice_names_at_most_eight_free_members_with_their_roles_cut(tmp_path):
+    swarm = await gap_team(tmp_path)
+    try:
+        extra = [await swarm.hire(USER, "Specialist " * 8) for _ in range(6)]
+        for name in extra:
+            swarm.runtimes[name] = IdleRuntime()
+        last_direction(swarm)
+        rested(swarm, BOB, CARL, DINA, *extra)
+        tell_when_due(swarm)
+        cut = trim(swarm.member(extra[0])["role"], 60)
+        assert len(cut) == 60 and cut.endswith("…")
+        named = [f"{BOB} (Generalist)", f"{CARL} (Tester)", f"{DINA} (Analyst)", *(f"{n} ({cut})" for n in extra[:5])]
+        assert [d["idle"] for d in gap_notices(swarm)] == [", ".join([*named, "…"])]
+    finally:
+        await shutdown(swarm)
+
+
+async def test_a_failed_render_leaves_the_free_place_for_the_next_pass(tmp_path, monkeypatch):
+    swarm = await gap_team(tmp_path)
+    try:
+        task, _ = last_direction(swarm)
+        rested(swarm)
+        real = swarm.board.crew_gap_parts
+
+        def broken(*args):
+            raise RuntimeError("render failed")
+
+        monkeypatch.setattr(swarm.board, "crew_gap_parts", broken)
+        tell_when_due(swarm)
+        assert gap_notices(swarm) == [] and task.id not in swarm._crew_gap_told
+        monkeypatch.setattr(swarm.board, "crew_gap_parts", real)
+        swarm._tell_crew_gaps()
+        assert len(gap_notices(swarm)) == 1
     finally:
         await shutdown(swarm)
 

@@ -1313,7 +1313,7 @@ async def test_a_session_of_an_earlier_dreamteam_is_exported_and_its_import_is_r
     for sid in (earlier, both):   # the member's record of tool set 4: made by an earlier version
         db = _db(home_a, sid)
         try:
-            frozen.write(db, "alice", frozen.record(4, "en", frozen.snapshot(4, "en")))
+            frozen.write(db, "alice", frozen.record(4, "en", []))
         finally:
             db.close()
     source = _paths(home_a / "sessions" / earlier), _all_bytes(home_a / "sessions" / earlier)

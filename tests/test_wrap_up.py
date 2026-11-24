@@ -173,7 +173,7 @@ async def test_jobs_in_wrap_up_mode(tmp_path, fast, kids):
         out = await srun(ANNA, py_cmd(kids.script, "30", kids.pidfile()), timeout=3)
         assert out.state == "timeout" and out.note == "wrap_up" and out.job is None
         assert out.wait == pytest.approx(3) and time.monotonic() - started >= 2.9 and gone(kids)
-        text = out.render(has_jobs_tool=True, cfg=swarm.config.shell)
+        text = out.render(cfg=swarm.config.shell)
         assert text.startswith("TIMEOUT after 3s (process tree killed)")
         assert text.endswith("[It was not moved to the background: the user asked the team to wrap up, so no new "
                              "background jobs are started. Finish your task with the results you have and say what "
@@ -184,7 +184,7 @@ async def test_jobs_in_wrap_up_mode(tmp_path, fast, kids):
         # processes a command leaves running: killed at its end instead of becoming a detached job
         out = await srun(ANNA, leave(kids.script, "30", kids.pidfile()), timeout=10)
         assert out.state == "leftovers_killed" and out.note == "wrap_up_left" and out.code == 0 and gone(kids)
-        assert out.render(has_jobs_tool=True, cfg=swarm.config.shell).endswith(
+        assert out.render(cfg=swarm.config.shell).endswith(
             "[They were not kept as a background job: the user asked the team to wrap up, so no new background jobs "
             "are started.]")
         # an external member: the same rule (its MCP cap stays)

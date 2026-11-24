@@ -400,6 +400,66 @@ def _disk_mount(path: Path) -> bool:
     return root is None or root == "/"
 
 
+@dataclass(frozen=True)
+class SourceRules:
+    """The folders source_refusal compares with, resolved once (one context per folder listing, docs/SPEC.md §17.2
+    "Choosing a folder from the web UI"): the user's home (None when it cannot be resolved), the DreamTeam home and
+    DreamTeam's own folders outside it (_own_folders)."""
+    user_home: Path | None
+    home: Path
+    own: tuple[Path, ...]
+
+
+def source_rules(home: Path, config: "Config") -> SourceRules:
+    try:
+        user_home: Path | None = Path.home().resolve()
+    except (OSError, RuntimeError, ValueError):
+        user_home = None
+    try:
+        home = Path(home).resolve()
+    except (OSError, RuntimeError, ValueError):
+        home = Path(home)
+    return SourceRules(user_home, home, tuple(_own_folders(config)))
+
+
+def source_refusal(path: Path, *, home: Path, config: "Config", sandbox: bool = False, kind: str = "folder",
+                   rules: SourceRules | None = None,
+                   other_home: Callable[[Path], Path | None] | None = None) -> str | None:
+    """Why the resolved `path` can never be copied into a session: the location rules of resolve_source without its
+    existence and kind checks (a folder, or with `kind` "zip" a .zip file): a drive or file system root, the user's
+    home folder or one containing it (a folder only), inside or containing the DreamTeam home or one of DreamTeam's own
+    folders, another DreamTeam home, a system folder (/proc, /sys, /dev). None when it can be. `rules`: the folders
+    resolved once (source_rules); `other_home`: how another DreamTeam home is found (_other_home: `path` and its
+    parents; a folder listing asks of an entry alone). Blocking."""
+    rules = rules if rules is not None else source_rules(home, config)
+    if kind == "folder":
+        if path.parent == path or (os.name != "nt" and _disk_mount(path)):
+            return f"{path} is the root of a drive or of the file system; give the folder to copy."
+        if rules.user_home is not None and _same(path, rules.user_home):
+            return f"{path} is your home folder itself; give the folder to copy, e.g. {path / 'my-project'}."
+        if rules.user_home is not None and _within(rules.user_home, path):
+            return f"{path} contains your home folder {rules.user_home}; give the folder to copy."
+    if _within(path, rules.home) or _within(rules.home, path):
+        text_home = (f"{path} is inside the DreamTeam home {rules.home} or contains it: DreamTeam's own files are "
+                     "never copied into a session.")
+        if sandbox:
+            text_home += " In the Docker sandbox, upload the folder as a .zip instead."
+        return text_home
+    for folder in rules.own:
+        if _within(path, folder) or _within(folder, path):
+            return (f"{path} is DreamTeam's own folder {folder}, or inside it or contains it: DreamTeam's own files "
+                    "are never copied into a session.")
+    other = (other_home or _other_home)(path)
+    if other is not None:
+        return (f"{path} is a DreamTeam home ({other}) or inside one: its settings (API keys too) and sessions are "
+                "never copied into a session.")
+    if os.name != "nt":
+        for root in _SYSTEM_ROOTS:
+            if _within(path, Path(root)):
+                return f"{path} is a system folder ({root}) and is never copied into a session."
+    return None
+
+
 def resolve_source(text: Any, *, home: Path, config: "Config", sandbox: bool, within: Path | None = None) -> Source:
     """The folder or .zip file `text` names, checked: CopyError (400) for a path that is not absolute, missing, a
     file that is not a .zip, a drive or file system root, the user's home folder or one containing it, inside or
@@ -441,40 +501,9 @@ def resolve_source(text: Any, *, home: Path, config: "Config", sandbox: bool, wi
         kind = "folder"
     else:
         raise CopyError(f"{path} is neither a folder nor a .zip file.")
-    if kind == "folder":
-        if path.parent == path or (os.name != "nt" and _disk_mount(path)):
-            raise CopyError(f"{path} is the root of a drive or of the file system; give the folder to copy.")
-        try:
-            user_home: Path | None = Path.home().resolve()
-        except (OSError, RuntimeError, ValueError):
-            user_home = None
-        if user_home is not None and _same(path, user_home):
-            raise CopyError(f"{path} is your home folder itself; give the folder to copy, e.g. "
-                            f"{path / 'my-project'}.")
-        if user_home is not None and _within(user_home, path):
-            raise CopyError(f"{path} contains your home folder {user_home}; give the folder to copy.")
-    try:
-        home = Path(home).resolve()
-    except (OSError, RuntimeError, ValueError):
-        home = Path(home)
-    if _within(path, home) or _within(home, path):
-        text_home = (f"{path} is inside the DreamTeam home {home} or contains it: DreamTeam's own files are never "
-                     "copied into a session.")
-        if sandbox:
-            text_home += " In the Docker sandbox, upload the folder as a .zip instead."
-        raise CopyError(text_home)
-    for folder in _own_folders(config):
-        if _within(path, folder) or _within(folder, path):
-            raise CopyError(f"{path} is DreamTeam's own folder {folder}, or inside it or contains it: DreamTeam's "
-                            "own files are never copied into a session.")
-    other = _other_home(path)
-    if other is not None:
-        raise CopyError(f"{path} is a DreamTeam home ({other}) or inside one: its settings (API keys too) and "
-                        "sessions are never copied into a session.")
-    if os.name != "nt":
-        for root in _SYSTEM_ROOTS:
-            if _within(path, Path(root)):
-                raise CopyError(f"{path} is a system folder ({root}) and is never copied into a session.")
+    refusal = source_refusal(path, home=Path(home), config=config, sandbox=sandbox, kind=kind)
+    if refusal is not None:
+        raise CopyError(refusal)
     return Source(kind, path, str(path))
 
 

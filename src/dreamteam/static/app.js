@@ -81,9 +81,90 @@ const I18N = {
     ws_folder: "Папка сессии", ws_default: "своя папка", ws_adopted: "папка проекта", ws_moved: "перенесена", ws_missing_badge: "папки нет",
     ws_default_hint: "Собственная папка workspace сессии; удаляется вместе с сессией.",
     ws_adopted_hint: "Существующая папка (ваш проект): агенты работают с её файлами и коммитят в текущую ветку её репозитория. При удалении сессии папка остаётся.",
-    ws_moved_hint: "Сессия перенесена в эту папку (/cd). При удалении сессии папка остаётся.",
-    ws_missing: "Папка сессии не найдена: {path}. Сессия не запустится, пока её не перенесут в другую папку: /cd ПАПКА или /cd --default в dreamteam tui.",
-    "reason_budget": "исчерпан бюджет — увеличьте его в настройках", "reason_paused by the user": "остановлен вами",
+    // the session folder from the web UI (folders.js, docs/SPEC.md §18.4 "Folders on both pages")
+    // (the cd_* texts: console.CD_TEXTS, a test compares them)
+    ws_moved_hint: "Сессия перенесена в эту папку («Сменить папку…» или /cd). При удалении сессии папка остается.",
+    ws_missing: "Папка сессии не найдена: {path}. Сессия не запустится, пока папку не вернут на место или не выберут другую:",
+    fo_browse: "Обзор…",
+    fo_checking: "Проверяю папку…",
+    fo_check_failed: "Не удалось проверить папку: {error}. Хаб проверит ее при создании или переносе.",
+    conn_lost: "Нет связи с хабом",
+    fo_src_folder: "Папка найдена: ее файлы скопируются в папку новой сессии.",
+    fo_src_zip: "Архив .zip найден: его содержимое скопируется в папку новой сессии.",
+    fo_new_missing: "Папки нет: она будет создана, и сессия начнет в ней с чистого листа.",
+    fo_new_empty: "Папка пустая: сессия начнет в ней с чистого листа.",
+    fo_new_files: "Папка с файлами: агенты будут работать с ними и коммитить в текущую ветку «{branch}».",
+    fo_new_files_plain: "Папка с файлами: агенты будут работать с ними.",
+    fo_git_init: "В ней нет git-репозитория: он будет создан (git init и первый коммит ее файлов).",
+    fo_unchanged: "Сессия уже работает в этой папке.",
+    fo_branch: "Текущая ветка: «{branch}».",
+    fo_mcp: "Вместе с сессией переедут ее MCP-серверы: {names}.",
+    fp_title: "Папка на компьютере хаба",
+    fp_root_home: "Домашняя папка",
+    fp_root_drive: "Диск {name}",
+    fp_root_system: "Корень (/)",
+    fp_recent: "Недавние папки",
+    fp_root_api: "Папка API: {name}",
+    fp_root_api_hint: "из [api] folders в настройках",
+    fp_root_dreamteam: "Домашняя папка DreamTeam",
+    fp_up: "Наверх",
+    fp_repo: "git",
+    fp_empty: "пустая",
+    fp_noaccess: "нет доступа",
+    fp_link: "ссылка",
+    fp_busy: "занята сессией «{title}»",
+    fp_creating: "создается сессия",
+    fp_current: "папка этой сессии",
+    fp_refused: "нельзя выбрать",
+    fp_loading: "Загрузка…",
+    fp_none: "Здесь нет папок.",
+    fp_truncated: "Показаны {n} папок; остальные откройте, введя путь.",
+    fp_partial: "Отметки есть не у всех папок: папка отвечает медленно.",
+    fp_fallback: "Папки {path} нет: открыта ближайшая существующая.",
+    fp_choose: "Выбрать эту папку",
+    fp_cannot: "Эту папку выбрать нельзя: {why}",
+    fp_busy_why: "в ней работает сессия «{title}»",
+    fp_nav_why: "это корень диска или файловой системы",
+    fp_new: "Новая папка…",
+    fp_new_ok: "Выбрать",
+    fp_new_hint: "Папка будет создана, когда сессия начнет в ней работать.",
+    fp_new_bad: "Нужно только имя новой папки, а такое имя для папки на компьютере хаба не подходит.",
+    cf_button: "Сменить папку…",
+    cf_title: "Папка сессии «{title}»",
+    cf_now: "Сейчас: {path} ({kind})",
+    cf_other: "Другая папка",
+    cf_default: "Вернуть в свою папку",
+    cf_hint: "Пустая или новая папка: файлы сессии и история git переедут туда. Папка с файлами: агенты будут работать с ее файлами и коммитить в текущую ветку; прежняя папка останется как есть.",
+    cf_go: "Сменить папку",
+    cf_moving: "Переношу…",
+    cf_api: "Сессию создал клиент HTTP API, и она работает прямо в папке «{root}» из [api] folders: после смены папки это обычная ваша сессия, и проверки той папки к ней больше не относятся.",
+    ws_missing_back: "Папка сессии не найдена: {path}. Сессия не запустится, пока папку не вернут на место.",
+    cd_ask: "Перенести сессию «{title}» в {path}? {text}",
+    cd_ask_default: "Вернуть сессию «{title}» в ее собственную папку {path}? {text}",
+    cd_text_missing: "Папки нет — она будет создана; файлы и история git переедут.",
+    cd_text_empty: "Папка пустая: файлы и история git переедут.",
+    cd_text_files: "Папка не пустая: агенты будут работать с ее файлами и коммитить в текущую ветку (прежняя папка {old} останется как есть).",
+    cd_text_fresh: "Папка пустая: сессия начнет в ней с чистого листа (новый git-репозиторий); ваша папка {old} останется как есть, переедут только MCP-серверы сессии.",
+    cd_text_lost: "Прежней папки {old} нет — переносить нечего: сессия продолжит в новой папке.",
+    cd_text_back: "В папке остались прежние файлы сессии: агенты вернутся к ним; папка {old} останется как есть.",
+    cd_text_running: "Сессия запущена: агенты остановятся на время переноса и продолжат работу.",
+    cd_unchanged: "Сессия «{title}» уже работает в {path}.",
+    cd_moved: "Сессия «{title}» теперь работает в {path}: файлы перенесены.",
+    cd_now: "Сессия «{title}» теперь работает в {path}.",
+    cd_adopted: "Сессия «{title}» теперь работает с файлами папки {path}.",
+    cd_created: "Сессия «{title}» работает в новой папке {path}.",
+    cd_git_moved: "git: история перенесена вместе с файлами.",
+    cd_git_existing: "git: коммиты агентов пойдут в текущую ветку репозитория этой папки.",
+    cd_git_initialized: "git: в папке создан новый репозиторий (git init).",
+    cd_git_disabled: "git выключен в настройках — коммитов не будет.",
+    cd_git_none: "git не установлен — коммитов не будет.",
+    cd_mcp_moved: "MCP-серверы сессии перенесены: {names}.",
+    cd_old_kept: "Прежняя папка {path} осталась на месте.",
+    cd_old_mcp_committed: "Прежняя папка {path} осталась на месте; MCP-серверы сессии ({paths}) убраны из нее, удаление закоммичено там ({commit}).",
+    cd_old_mcp_uncommitted: "Прежняя папка {path} осталась на месте, но MCP-серверы сессии ({paths}) убраны из нее, и это удаление там не закоммичено ({error}): закоммитьте его или верните файлы (git checkout -- {paths}).",
+    cd_old_missing: "Прежней папки {path} не было — переносить было нечего.",
+    cd_start_error: "Сессия не запустилась снова: {error}",
+    "reason_budget": "исчерпан бюджет — увеличьте его в настройках", "reason_paused by the user": "по вашему решению",
     // a member's question that pauses the swarm (send_message pause_swarm), a clarify planner waiting for your answers
     reason_question: "ждёт вашего ответа",
     paused_question: "Рой на паузе: {name} ждёт вашего ответа на вопрос #{id} — ответ получат все участники. Нажмите, чтобы ответить; «Продолжить» снимает паузу без ответа",
@@ -260,8 +341,89 @@ const I18N = {
     ws_folder: "Session folder", ws_default: "own folder", ws_adopted: "project folder", ws_moved: "moved", ws_missing_badge: "missing",
     ws_default_hint: "The session's own workspace folder; deleted with the session.",
     ws_adopted_hint: "An existing folder (your project): the agents work with its files and commit to the current branch of its repository. Deleting the session keeps the folder.",
-    ws_moved_hint: "The session was moved to this folder (/cd). Deleting the session keeps the folder.",
-    ws_missing: "The session folder is missing: {path}. The session cannot start until it is moved to another folder: /cd FOLDER or /cd --default in dreamteam tui.",
+    // the session folder from the web UI (folders.js, docs/SPEC.md §18.4 "Folders on both pages")
+    // (the cd_* texts: console.CD_TEXTS, a test compares them)
+    ws_moved_hint: "The session was moved to this folder (Change folder… or /cd). Deleting the session keeps the folder.",
+    ws_missing: "The session folder is missing: {path}. The session cannot start until the folder is back or another one is chosen:",
+    fo_browse: "Browse…",
+    fo_checking: "Checking the folder…",
+    fo_check_failed: "Could not check the folder: {error}. The hub checks it when the session is created or moved.",
+    conn_lost: "No connection to the hub",
+    fo_src_folder: "Folder found: its files are copied into the new session's folder.",
+    fo_src_zip: "A .zip found: its contents are copied into the new session's folder.",
+    fo_new_missing: "The folder does not exist: it will be created, and the session starts there afresh.",
+    fo_new_empty: "The folder is empty: the session starts there afresh.",
+    fo_new_files: "A folder with files: the agents will work with them and commit to its current branch “{branch}”.",
+    fo_new_files_plain: "A folder with files: the agents will work with them.",
+    fo_git_init: "It has no git repository: one will be created (git init and a first commit of its files).",
+    fo_unchanged: "The session already works in this folder.",
+    fo_branch: "Current branch: “{branch}”.",
+    fo_mcp: "The session's MCP servers move along: {names}.",
+    fp_title: "A folder on the hub's computer",
+    fp_root_home: "Home folder",
+    fp_root_drive: "Drive {name}",
+    fp_root_system: "Root (/)",
+    fp_recent: "Recent folders",
+    fp_root_api: "API folder: {name}",
+    fp_root_api_hint: "from [api] folders in the settings",
+    fp_root_dreamteam: "DreamTeam home",
+    fp_up: "Up",
+    fp_repo: "git",
+    fp_empty: "empty",
+    fp_noaccess: "no access",
+    fp_link: "link",
+    fp_busy: "taken by session “{title}”",
+    fp_creating: "a session is being created",
+    fp_current: "this session's folder",
+    fp_refused: "cannot be chosen",
+    fp_loading: "Loading…",
+    fp_none: "No folders here.",
+    fp_truncated: "{n} folders are shown; open the others by typing the path.",
+    fp_partial: "Not every folder is marked: the folder answers slowly.",
+    fp_fallback: "{path} does not exist: the nearest existing folder is open.",
+    fp_choose: "Choose this folder",
+    fp_cannot: "This folder cannot be chosen: {why}",
+    fp_busy_why: "session “{title}” works in it",
+    fp_nav_why: "it is a drive or file system root",
+    fp_new: "New folder…",
+    fp_new_ok: "Choose",
+    fp_new_hint: "The folder is made when the session starts working in it.",
+    fp_new_bad: "Give just the new folder's name; this one cannot name a folder on the hub's computer.",
+    cf_button: "Change folder…",
+    cf_title: "Folder of session “{title}”",
+    cf_now: "Now: {path} ({kind})",
+    cf_other: "Another folder",
+    cf_default: "Back to its own folder",
+    cf_hint: "An empty or new folder: the session's files and git history move there. A folder with files: the agents work with its files and commit to its current branch; the previous folder stays as it is.",
+    cf_go: "Change folder",
+    cf_moving: "Moving…",
+    cf_api: "An HTTP API client created this session, and it works right in the folder “{root}” of [api] folders: after the change it is an ordinary session of yours, and that folder's checks no longer apply.",
+    ws_missing_back: "The session folder is missing: {path}. The session cannot start until the folder is back.",
+    cd_ask: "Move session \"{title}\" to {path}? {text}",
+    cd_ask_default: "Move session \"{title}\" back to its own folder {path}? {text}",
+    cd_text_missing: "The folder does not exist — it will be created; the files and the git history move there.",
+    cd_text_empty: "The folder is empty: the files and the git history move there.",
+    cd_text_files: "The folder is not empty: the agents will work with its files and commit to its current branch (the previous folder {old} stays as it is).",
+    cd_text_fresh: "The folder is empty: the session starts afresh there (a new git repository); your folder {old} stays as it is, only the session's MCP servers move.",
+    cd_text_lost: "The current folder {old} does not exist, so nothing moves: the session carries on in the new folder.",
+    cd_text_back: "The session's previous files are still there: the agents go back to them; {old} stays as it is.",
+    cd_text_running: "The session is running: its agents stop during the move and then carry on.",
+    cd_unchanged: "Session \"{title}\" already works in {path}.",
+    cd_moved: "Session \"{title}\" now works in {path}: its files moved there.",
+    cd_now: "Session \"{title}\" now works in {path}.",
+    cd_adopted: "Session \"{title}\" now works with the files of {path}.",
+    cd_created: "Session \"{title}\" works in the new folder {path}.",
+    cd_git_moved: "git: the history moved along with the files.",
+    cd_git_existing: "git: the agents commit to the current branch of this folder's repository.",
+    cd_git_initialized: "git: a new repository was created in the folder (git init).",
+    cd_git_disabled: "git is off in the settings: no commits.",
+    cd_git_none: "git is not installed: no commits.",
+    cd_mcp_moved: "The session's MCP servers moved along: {names}.",
+    cd_old_kept: "The previous folder {path} stays where it is.",
+    cd_old_mcp_committed: "The previous folder {path} stays where it is; the session's MCP servers ({paths}) left it, and their removal is committed there ({commit}).",
+    cd_old_mcp_uncommitted: "The previous folder {path} stays where it is, but the session's MCP servers ({paths}) left it and their removal is not committed there ({error}): commit it, or restore them with git checkout -- {paths}.",
+    cd_old_missing: "The previous folder {path} did not exist: nothing was moved.",
+    cd_start_error: "The session did not start again: {error}",
     "reason_budget": "the budget is spent — raise it in the settings", "reason_paused by the user": "paused by you",
     reason_question: "waiting for your answer",
     paused_question: "The swarm is paused: {name} waits for your answer to question #{id}; every member will get it. Click to answer; Resume goes on without an answer",
@@ -469,6 +631,21 @@ function linkify(text, names) { return decorate(esc(text), names); }
 const MARKDOWN = typeof Markdown !== "undefined" ? Markdown : require("./markdown.js");
 const HIGHLIGHT = typeof Highlight !== "undefined" ? Highlight : require("./highlight.js");   // highlight.js, the same way
 const SK = typeof Skills !== "undefined" ? Skills : require("./skills.js");   // skills.js: the add form, the previews
+// folders.js (the folder field's check line, the folder browser, «Сменить папку…»), the same way: its routes are the
+// launcher's, at the root
+const FO = typeof Folders !== "undefined" ? Folders : require("./folders.js");
+FO.setup({
+  t, esc, openModal, closeModal, toast: (text, isErr) => toast(text, isErr ? "err" : ""),
+  request: async (path, body) => {
+    try {
+      return await launcherApi(path, { method: "POST", headers: { "Content-Type": "application/json" },
+                                       body: JSON.stringify(body || {}) });
+    } catch (e) {
+      if (e && e.status) throw e;
+      throw new Error(t("conn_lost"));   // (fetch's own "Failed to fetch": no answer at all)
+    }
+  },
+});
 const MD_CACHE = new Map();
 const MD_CACHE_MAX = 400;      // rendered texts kept (the chat alone re-renders up to 300 messages on a refresh)
 const MD_CACHE_CHARS = 50000;  // longer texts (a big .md file) are rendered every time instead of being kept
@@ -518,6 +695,7 @@ function responseFailure(status, body) {
   const data = responseData(body);
   const err = new Error(responseError(status, body));
   err.earlierVersion = !!(data && data.earlier_version);
+  err.status = status;
   return err;
 }
 function errText(e) { return (e && e.message) || String(e); }
@@ -692,6 +870,13 @@ function renderAll() {
 }
 
 /* ---------------------------------------------------------------- header */
+/** «Пауза» / «Продолжить» (docs/SPEC.md §18.4): a pause is quiet (the banner says it, and with jobs running the
+ * u_paused_jobs notice comes as a toast; the English result would repeat it), a refusal and a resume are toasted. */
+function togglePause() {
+  const pause = !(S.state && S.state.swarm.paused);
+  return act("swarm_control", { action: pause ? "pause" : "resume" }, pause);
+}
+
 /** The wrap-up toggle: on (the team finishes with what it has, no new background jobs) or back off. */
 function toggleWrapUp() {
   if (!S.state) return undefined;
@@ -806,7 +991,9 @@ function renderHeader() {
   const missing = workspaceMissing(ws);
   const wsBanner = $("#workspace-banner");
   wsBanner.classList.toggle("hidden", !missing);
-  wsBanner.textContent = missing ? t("ws_missing", { path: ws.path }) : "";
+  setHtml(wsBanner, !missing ? ""
+    : canChangeFolder() ? `${esc(t("ws_missing", { path: ws.path }))} ${changeFolderButton()}`
+      : esc(t("ws_missing_back", { path: ws.path })));
   const filesTab = $('#tabs > button[data-tab="files"]');
   if (filesTab) filesTab.title = ws && ws.path ? `${t("ws_folder")}: ${ws.path}` : "";
   setHtml($("#workspace-info"), workspaceHtml(ws));
@@ -821,8 +1008,8 @@ function workspaceKind(ws) {
 }
 /** A folder outside the session that does not exist (its own folder is created on demand: never missing). */
 function workspaceMissing(ws) { return !!(workspaceKind(ws) && !ws.default && !ws.exists); }
-/** The head of the Files tab: the absolute path of the session folder (click to copy) and what kind it is
- * (a missing folder is explained by the banner above the tabs). */
+/** The head of the Files tab: the absolute path of the session folder (click to copy), what kind it is and
+ * «Сменить папку…» (a missing folder is explained by the banner above the tabs). */
 function workspaceHtml(ws) {
   const kind = workspaceKind(ws);
   if (!kind) return "";
@@ -830,7 +1017,26 @@ function workspaceHtml(ws) {
   const label = missing ? t("ws_missing_badge") : t("ws_" + kind);
   return `<span class="ws-label"><i class="ic ic-folder"></i>${esc(t("ws_folder"))}</span>`
     + `<span class="badge${missing ? " err" : kind === "default" ? " plain" : ""}" title="${esc(t("ws_" + kind + "_hint"))}">${esc(label)}</span>`
-    + `<code class="ws-path" id="ws-path" title="${esc(t("copy_hint"))}">${esc(ws.path)}</code>`;
+    + `<code class="ws-path" id="ws-path" title="${esc(t("copy_hint"))}">${esc(ws.path)}</code>`
+    + (canChangeFolder() ? changeFolderButton() : "");
+}
+/** «Сменить папку…» is the launcher's: not on a standalone `dreamteam run` board (no launcher session), not for the
+ * legacy main (its folder never changes) nor a session made by an earlier version (its move is refused). */
+function canChangeFolder() {
+  const sid = sessionSid();
+  return !!sid && sid !== "main" && !S.earlier;
+}
+function changeFolderButton() {
+  return `<button class="link ws-cd" type="button" data-cd="${esc(sessionSid())}">${esc(t("cf_button"))}</button>`;
+}
+/** The change dialog (folders.js) of this board's session; after a move the board refreshes (a running session
+ * restarts: its socket reconnects), and the Files tab starts again from the new folder (syncWorkspace). */
+function changeFolderModal() {
+  const sw = (S.state && S.state.swarm) || {};
+  const session = sw.session || {};
+  if (!canChangeFolder()) return null;
+  return FO.changeDialog({ sid: sessionSid(), title: session.title || sessionSid(), workspace: sw.workspace,
+                           running: session.status === "running", onDone: () => scheduleRefresh() });
 }
 /** After /cd (or the folder coming back) the Files tab starts again from the root of the new folder. */
 function syncWorkspace() {
@@ -1376,6 +1582,7 @@ async function sendComposer() {
 
 /* ---------------------------------------------------------------- modal helpers */
 function openModal(html, { focus = true } = {}) {
+  if (FO.isOpen()) FO.closeBrowser(false);
   S.openTaskId = null;
   S.taskBase = null;
   S.replyTo = null;
@@ -1404,7 +1611,9 @@ function modalHasUnsaved() {
     && !(el.id === "n-dirs" && dirsHidden("n")));
 }
 function closeModal(force = false) {
+  if (FO.busy()) return false;   // the change dialog's move runs: its answer must not be lost
   if (!force && modalHasUnsaved() && !confirm(t("discard_changes"))) return false;
+  if (FO.isOpen()) FO.closeBrowser(false);   // (the browser belongs to the dialog it was opened from)
   $("#modal-backdrop").classList.add("hidden");
   $("#modal").innerHTML = "";
   $("#modal").classList.remove("wide");
@@ -2939,7 +3148,7 @@ function onDocumentClick(e) {
   const target = e.target.closest("[data-open-task],[data-close],[data-unlock],[data-dir],[data-file],[data-reply],[data-goto-post],[data-mcp-approve],[data-mcp-reject],[data-trigger-del],[data-job-out],[data-job-stop],[data-job-log],[data-md-edit],[data-retire],[data-traces],[data-agent],#mcp-cmd,#ws-path,"
     + "[data-skill-show],[data-skill-save],[data-skill-nosave],[data-skill-update],[data-skill-detach],[data-skill-log],[data-skill-reinstall],"
     + "[data-skill-preview],[data-skill-attach],[data-skill-libshow],[data-skill-libdel],[data-copy],"
-    + "#paused-banner[data-asker]");
+    + "#paused-banner[data-asker],[data-cd]");
   if (!target) {
     if (document.body.classList.contains("team-open") && !e.target.closest(".sidebar, #team-btn")) toggleTeamOverlay(false);
     return;
@@ -2947,6 +3156,7 @@ function onDocumentClick(e) {
   const ds = target.dataset;
   if ("openTask" in ds) openTask(Number(ds.openTask));
   else if ("close" in ds) closeModal();
+  else if ("cd" in ds) changeFolderModal();
   else if ("unlock" in ds) unlockFile(ds.unlock, ds.owner);
   else if ("dir" in ds) openDir(ds.dir);
   else if ("file" in ds) openFile(ds.file);
@@ -2982,6 +3192,9 @@ function onDocumentClick(e) {
 }
 
 function onKeydown(e) {
+  // the folder browser above the modal has its own keys; an Escape that reaches the page (the focus has fallen out
+  // of the browser) closes the browser alone
+  if (FO.isOpen()) { if (e.key === "Escape") FO.closeBrowser(true); return; }
   if (e.key === "Escape") {
     if (modalOpen()) closeModal();
     else if (document.body.classList.contains("team-open")) toggleTeamOverlay(false);
@@ -2992,6 +3205,13 @@ function onKeydown(e) {
   if ((e.key === "Enter" || e.key === " ") && e.target.matches && e.target.matches(pressable)) {
     e.preventDefault(); e.target.click();
   }
+}
+
+/** A click on the modal's backdrop closes it, never while the folder browser is open above it. */
+function onModalBackdropClick(e) {
+  const backdrop = $("#modal-backdrop");
+  if (e.target === backdrop && S.downOnBackdrop && !FO.isOpen()) closeModal();
+  S.downOnBackdrop = false;
 }
 
 function init() {
@@ -3020,7 +3240,7 @@ function init() {
   $("#team-toggle").addEventListener("click", () => { store("dt-team", document.body.classList.contains("team-rail") ? "full" : "rail"); applyTeamLayout(); });
   $("#team-close").addEventListener("click", () => toggleTeamOverlay(false));
   $("#team-btn").addEventListener("click", () => toggleTeamOverlay());
-  $("#pause-btn").addEventListener("click", () => act("swarm_control", { action: S.state && S.state.swarm.paused ? "resume" : "pause" }));
+  $("#pause-btn").addEventListener("click", togglePause);
   $("#wrap-btn").addEventListener("click", toggleWrapUp);
   $("#lang-btn").addEventListener("click", () => setLang(S.lang === "ru" ? "en" : "ru"));
   $("#theme-btn").addEventListener("click", () => {
@@ -3039,9 +3259,9 @@ function init() {
   $("#composer-text").addEventListener("keydown", (e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); sendComposer(); } });
   $("#search").addEventListener("input", onSearchInput);
   const backdrop = $("#modal-backdrop");
-  let downOnBackdrop = false; // a text selection that starts in the modal and ends outside must not close it
-  backdrop.addEventListener("mousedown", (e) => { downOnBackdrop = e.target === backdrop; });
-  backdrop.addEventListener("click", (e) => { if (e.target === backdrop && downOnBackdrop) closeModal(); downOnBackdrop = false; });
+  S.downOnBackdrop = false; // a text selection that starts in the modal and ends outside must not close it
+  backdrop.addEventListener("mousedown", (e) => { S.downOnBackdrop = e.target === backdrop; });
+  backdrop.addEventListener("click", onModalBackdropClick);
   document.addEventListener("keydown", onKeydown);
   document.addEventListener("click", onDocumentClick);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) autoMarkRead(); });
@@ -3063,11 +3283,12 @@ if (typeof module !== "undefined" && module.exports) {
     reviewerNone, taskReviewHtml, reviewTask, moveTask, findRole, rolePreviewHtml, hireArgs, hireModal, goalModal,
     // used by traces.js (the tests load it on top of these) and by the session-chrome tests
     BASE, $, $$, api, post, act, toast, avatar, agentColor, members, fmtTime, short, openModal, closeModal, setTab, store, setHtml,
-    renderHeader, toggleWrapUp, responseError, errText, startSession, connect,
+    renderHeader, togglePause, toggleWrapUp, responseError, errText, startSession, connect,
     // a member's question that pauses the swarm: the banner, the chat hint, the composer's toast, the feed
     pendingQuestion, sendComposer, openChat, feedLine,
-    // the session folder (the Files tab head, the missing-folder banner)
-    workspaceKind, workspaceMissing, workspaceHtml, syncWorkspace, openDir, renderAll,
+    // the session folder (the Files tab head, the missing-folder banner, «Сменить папку…»)
+    workspaceKind, workspaceMissing, workspaceHtml, syncWorkspace, openDir, renderAll, FO, canChangeFolder,
+    changeFolderModal, onKeydown, onModalBackdropClick, modalOpen,
     // background jobs: the Jobs tab, the agent marker and the drawer, live events
     fmtDur, jobState, jobCardHtml, renderJobs, loadJobOutput, toggleJobOutput, stopJob, openJobLog, tickJobs,
     processNames, runningJobs, renderAgents, renderDrawerHead, handleEvent, onDocumentClick,

@@ -23,6 +23,7 @@ import os
 import socket
 import struct
 import sys
+import time
 
 SIOCGIFFLAGS = 0x8913
 SIOCSIFFLAGS = 0x8914
@@ -31,6 +32,8 @@ IFF_RUNNING = 0x40
 CLONE_NEWUSER = 0x10000000
 CLONE_NEWNET = 0x40000000
 _IFREQ = "16sH14x"
+OPEN_TRIES = 3
+OPEN_PAUSE_SECONDS = 0.05
 
 
 def _libc():
@@ -48,14 +51,27 @@ def _write(path: str, text: str) -> None:
         f.write(text)
 
 
+def _open_held(path: str) -> int:
+    """One of DreamTeam's namespace fds (/proc/<pid>/fd/N). A DreamTeam running as root is not dumpable for a moment
+    while it reads another user's process environment (procs.py), and the open is refused then: it is tried again
+    after a short pause, OPEN_TRIES times in all."""
+    for attempt in range(OPEN_TRIES):
+        try:
+            return os.open(path, os.O_RDONLY | os.O_CLOEXEC)
+        except PermissionError:
+            if attempt == OPEN_TRIES - 1:
+                raise
+            time.sleep(OPEN_PAUSE_SECONDS)
+    raise AssertionError("unreachable")
+
+
 def join(userns: str, netns: str) -> None:
     """Enter the holder's user namespace (its owner, this user, has every capability there), then its network
     namespace (which needs CAP_SYS_ADMIN in it). The user namespace first: setns into the network one checks the
     capability in the caller's own user namespace too."""
     libc = _libc()
     # both opened first: inside the user namespace, DreamTeam's /proc/<pid>/fd is no longer this process's to open
-    fds = [(os.open(path, os.O_RDONLY | os.O_CLOEXEC), path, kind)
-           for path, kind in ((userns, CLONE_NEWUSER), (netns, CLONE_NEWNET))]
+    fds = [(_open_held(path), path, kind) for path, kind in ((userns, CLONE_NEWUSER), (netns, CLONE_NEWNET))]
     try:
         for fd, path, kind in fds:
             if libc.setns(fd, kind) != 0:

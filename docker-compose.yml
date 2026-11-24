@@ -14,6 +14,11 @@ services:
     security_opt: ["no-new-privileges:true"]
     ports:
       - "127.0.0.1:${PORT:-8765}:8765"
+    # sessions' folders: the hub in here lets a session work only inside its home (/swarm) and inside the roots of
+    # [api] folders with in_place = true mounted below (a folder anywhere else would be made in the container and lost
+    # with it). To let sessions work in a folder of your computer, mount it inside the home (a volume such as
+    # "/home/me/projects/app:/swarm/projects/app", then choose /swarm/projects/app), or mount it as an in_place root of
+    # [api] folders as shown below, which also lets every HTTP API client work in it.
     volumes:
       - "${SWARM_DIR:-./myswarm}:/swarm"
       # skills: the host's library, read-only (`dreamteam sandbox` adds this itself; the folder must exist)

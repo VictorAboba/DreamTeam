@@ -1708,7 +1708,7 @@ def test_feed_tells_how_a_question_pause_ends():
         "Anna Smith покинул(а) рой: рой продолжил работу без ответа на вопрос #12",
         "рой продолжил работу",
         "рой на паузе (исчерпан бюджет — увеличьте его в настройках)",
-        "рой на паузе (остановлен вами)",
+        "рой на паузе (по вашему решению)",
     ]
     # a question's #12 is a message, not a task: no task link (a task's discussion keeps its links)
     assert "data-open-task" not in out["line"] and "question #12" in out["line"]
@@ -3011,6 +3011,16 @@ def test_home_card_shows_the_session_folder_and_delete_keeps_an_outside_one():
       out.missing = card("gone", { path: "/media/usb/app", default: false, adopted: true, exists: false });
       out.evil = card("evil", { path: E, default: false, adopted: true, exists: false });
       out.none = card("old", undefined);
+      // «Сменить папку…»: not for the legacy main (its missing folder is to be brought back) nor an earlier version's
+      out.legacy = home.sessionCard({ id: "main", title: "M", status: "stopped", legacy: true, tasks: {}, agents: {},
+                                      workspace: { path: "/h/workspace", default: false, adopted: false,
+                                                   exists: false } });
+      out.earlier = home.sessionCard({ id: "e", title: "E", status: "stopped", earlier_version: true, tasks: {},
+                                       agents: {},
+                                       workspace: { path: "/gone", default: false, adopted: true, exists: false } });
+      home.H.busy.add("proj");   // its start or stop request runs: the button waits too
+      out.busy = card("proj", { path: "/home/u/code/my-app", default: false, adopted: true, exists: true });
+      home.H.busy.delete("proj");
       out.long = card("long", { path: "C:\\Users\\someone\\DreamTeam\\sessions\\001-a-very-long-session-title\\workspace",
                                default: true, adopted: false, exists: true });
       out.short = [home.shortPath("C:\\Users\\kuzmi\\DreamTeam\\sessions\\001-snake-game\\workspace", 40),
@@ -3051,10 +3061,22 @@ def test_home_card_shows_the_session_folder_and_delete_keeps_an_outside_one():
     assert "The session&#39;s own folder in the DreamTeam home" in own  # the tooltip explains the kind
     assert '<span class="badge ">project folder</span>' in out["project"] and "sc-warn" not in out["project"]
     assert "Deleting the session keeps the folder" in out["project"]
+    button = '<button class="link sc-cd" type="button" data-cd="proj">Change folder…</button></div>'
+    assert '<span class="badge ">project folder</span></span>' + button in out["project"]   # on the folder line
+    # the folder's tooltip is on the path and its badge, not on the button
+    assert '<div class="sc-folder"><span class="sc-where" title="' in out["project"]
+    assert 'data-cd="proj" disabled>' in out["busy"]
     assert '<bdi dir="ltr">D:\\work\\snake</bdi>' in out["moved"] and '<span class="badge ">moved</span>' in out["moved"]
     missing = out["missing"]
     assert '<span class="badge err">missing</span>' in missing and '<div class="sc-warn">' in missing
-    assert "/cd FOLDER or /cd --default" in missing
+    # a missing folder: the button inside the warning instead of on the folder line
+    assert ("<span>The folder is missing: the session cannot start. Bring it back, or choose another one: "
+            '<button class="link sc-cd" type="button" data-cd="gone">Change folder…</button></span>') in missing
+    assert missing.count("data-cd=") == 1 and "/cd" not in missing and "dreamteam tui" not in missing
+    assert "data-cd" not in out["legacy"] and "data-cd" not in out["earlier"]
+    assert ("The session folder is missing: /h/workspace. The session cannot start until the folder is back."
+            in out["legacy"])
+    assert "sc-warn\"><i class=\"ic ic-alert\"></i><span>The" not in out["earlier"]   # (it cannot start anyway)
     assert_escaped(out["evil"], at_least=2)  # the shown path and the tooltip
     assert "sc-folder" not in out["none"]  # an old hub without "workspace": no folder line
     # a long path is cut at the front (on a separator) and shown whole in the tooltip
@@ -3081,6 +3103,9 @@ NS_FORM = r"""
     el("ns-submit", { disabled: false }); el("ns-error");
     el("ns-copy-from", { value: (props && props.path) || "", disabled: false });
     el("ns-copy-zip", { files: (props && props.zip) ? [props.zip] : [], disabled: false });
+    // «Рабочая папка»: the copy is chosen unless `choice` says otherwise
+    const choice = (props && props.choice) || "copy";
+    for (const value of ["own", "copy", "project"]) el("ns-ws-" + value, { checked: value === choice });
     el("modal"); el("modal-backdrop");
   };
   const seen = [];
@@ -3145,13 +3170,15 @@ def test_home_new_session_files_block():
       // a chosen .zip or a typed folder path counts as typed text: closing the dialog asks first
       answers.confirm = false;
       el("modal #ns-goal", { value: "" }); el("modal #ns-desc", { value: "" });
-      el("modal #ns-copy-from", { value: "  " });
+      el("modal #ns-copy-from", { value: "  " }); el("modal #ns-ws-path", { value: " " });
       el("modal #ns-copy-zip", { files: [{ name: "w.zip", size: 1 }] });
       out.closeZip = home.closeModal();
       el("modal #ns-copy-zip", { files: [] });
       out.closeBlank = home.closeModal();
       el("modal #ns-copy-from", { value: "/data/p" });
       out.closePath = home.closeModal();
+      el("modal #ns-copy-from", { value: "" }); el("modal #ns-ws-path", { value: "D:\\work\\app" });
+      out.closeProject = home.closeModal();   // a typed project folder counts too
       el("settings-form"); el("settings-nav"); el("profiles"); el("save-bar"); el("save-msg"); el("add-profile");
       const v = { swarm: { name: "S", language: "en" }, agents: {}, shell: {}, server: {}, tracing: {},
                   mcp: { external: {} }, models: {},
@@ -3162,21 +3189,24 @@ def test_home_new_session_files_block():
     """)
     html = out["html"]
     assert 'id="ns-copy-from" spellcheck="false" autocomplete="off"' in html
+    assert 'aria-describedby="ns-copy-check" placeholder=' in html
     assert 'placeholder="Full path on the computer the hub runs on, e.g. /home/me/project"' in html
     assert '<input id="ns-copy-zip" type="file" accept=".zip,application/zip">' in html
-    assert "<summary>More</summary>" in html  # (the skills picker's own "more" comes earlier)
-    assert html.index("<summary>More</summary>") < html.index('id="ns-offline"') < html.index('id="ns-copy-from"')
-    assert html.index('id="ns-copy-from"') < html.index('id="ns-copy-zip"') < html.index('id="ns-error"')
-    assert "Files to work on" in html and "Copy from a folder" in html and "or upload a .zip" in html
+    # the copy is a choice of «Рабочая папка», in the main grid now, no longer under «Дополнительно»
+    assert "<summary>More</summary>" in html
+    assert html.index('id="ns-ws"') < html.index('id="ns-copy-from"') < html.index('id="ns-copy-zip"') \
+        < html.index("<summary>More</summary>") < html.index('id="ns-offline"') < html.index('id="ns-error"')
+    assert "Files to work on" not in html and "Copy from a folder" in html and "or upload a .zip" in html
     assert "the originals are never changed" in html and "__pycache__ and links are left out; up to 50 MB." in html
     assert '<span class="field-hint" id="ns-copy-sandbox" hidden>The hub runs in the Docker sandbox' in html
     assert out["defaultMb"] == 1024
     assert out["sandboxShown"] is True and out["sandboxHidden"] is True and out["noSkills"] is True
     assert out["containerShown"] is True
     ru = out["ru"]
-    assert "Файлы для работы" in ru and "Скопировать из папки" in ru and "или загрузить .zip" in ru
+    assert "Копия папки или zip" in ru and "Скопировать из папки" in ru and "или загрузить .zip" in ru
     assert "оригиналы не меняются" in ru and "например C:\\work\\project" in ru
     assert out["closeZip"] is False and out["closeBlank"] is True and out["closePath"] is False
+    assert out["closeProject"] is False
     settings = out["settings"]
     assert 'data-path="workspace.copy_max_mb"' in settings and 'data-path="workspace.copy_max_files"' in settings
     assert "Copy into a new session, MB" in settings and "the largest copy and uploaded .zip" in settings
@@ -3282,6 +3312,16 @@ def test_home_submit_copy_errors():
                           workspace: { copy_max_mb: 1 } };
       home.H.teams.ns = home.teamRows([], 3); home.H.nsSkills = new Set();
       const err = () => elements["ns-error"].textContent;
+      nsForm({});   // the copy chosen with nothing given
+      await submit();
+      out.none = [err(), seen.length];
+      // a path whose check refused it: that text, nothing sent
+      home.H.nsCopyCheck = { result: { answer: { use: "source", path: "/x", error: "/x does not exist.",
+                                                 status: 400 } } };
+      nsForm({ path: "/x" });
+      await submit();
+      out.refusedCheck = [err(), seen.length];
+      home.H.nsCopyCheck = null;
       nsForm({ path: "/data/p", zip: { name: "w.zip", size: 10 } });
       await submit();
       out.both = [err(), seen.length, elements["ns-submit"].disabled];
@@ -3309,6 +3349,8 @@ def test_home_submit_copy_errors():
       await submit();
       out.conflict = [err(), elements["ns-submit"].disabled, elements["ns-copy-from"].disabled, posts()];
     """, pre=NS_FORM)
+    assert out["none"] == ["Give a folder or choose a .zip.", 0]
+    assert out["refusedCheck"] == ["/x does not exist.", 0]
     assert out["both"] == ["Give a folder or a .zip, not both.", 0, False]
     assert out["notZip"] == ["Choose a .zip file.", 0]
     assert out["big"] == ["The archive is larger than 1 MB ([workspace] copy_max_mb).", 0]
@@ -3371,7 +3413,7 @@ def test_board_shows_the_session_folder_and_a_missing_one():
       app.S.state = state({ path: E, default: false, adopted: true, exists: false });
       app.renderHeader();
       out.bannerShown = !elements["workspace-banner"].classList.contains("hidden");
-      out.banner = elements["workspace-banner"].textContent;
+      out.banner = elements["workspace-banner"].innerHTML;
       out.info = elements["workspace-info"].innerHTML;
       calls.length = 0;
       await app.openDir("src");
@@ -3401,11 +3443,13 @@ def test_board_shows_the_session_folder_and_a_missing_one():
       out.third = calls.length;
     """, env={"EVIL": EVIL})
     assert out["bannerShown"] is True
-    assert out["banner"].startswith("The session folder is missing: " + EVIL)  # textContent: shown as text
-    assert "/cd FOLDER or /cd --default" in out["banner"]
+    # a standalone board (no launcher session): no «Сменить папку…», the folder is to be brought back
+    assert out["banner"] == ("The session folder is missing: " + EVIL_ESC
+                             + ". The session cannot start until the folder is back.")
     info = out["info"]
     assert_escaped(info)
     assert '<span class="badge err"' in info and ">missing</span>" in info and "/cd" not in info  # the banner says it
+    assert "data-cd" not in info
     assert out["missingCalls"] == 0 and out["missingDir"] == "."
     assert out["bannerHidden"] is True
     project = out["project"]
@@ -5238,3 +5282,923 @@ def test_home_skills_tab_new_session_picker_cards_and_delete():
     assert [(e["name"], e["skills"]) for e in out["entries"]] == [("tester", ["pdf"]), ("Scout", ["web"])]
     assert out["added"] == [True, ["pdf", "csv-tools"]] and out["bad"] is False
     assert 'data-rc-skill-del="ghost"' in out["roleHtml"] and "not in the library" in out["roleHtml"]
+
+
+# ------------------------------------------------------------------------------------------------ folders (§18.4)
+FOLDERS_JS = (STATIC / "folders.js").read_text(encoding="utf-8")
+# the console.CD_TEXTS keys both pages copy under cd_<key> (docs/SPEC.md §18.4 "Texts shared with the terminal")
+CD_COPIED = ["ask", "ask_default", "text_missing", "text_empty", "text_files", "text_fresh", "text_lost", "text_back",
+             "text_running", "unchanged", "moved", "now", "adopted", "created", "git_moved", "git_existing",
+             "git_initialized", "git_disabled", "git_none", "mcp_moved", "old_kept", "old_mcp_committed",
+             "old_mcp_uncommitted", "old_missing", "start_error"]
+CD_TERMINAL_ONLY = ["launcher_only", "remote_relative", "hint", "missing", "current", "kind_default", "kind_moved",
+                    "kind_adopted", "file", "text_unknown", "continue", "cancelled"]
+
+
+def folders_keys(name: str) -> list[str]:
+    return json.loads(re.search(rf"const {name} = (\[.*?\]);", FOLDERS_JS, re.S).group(1))
+
+
+def test_folders_texts_exist_on_both_pages():
+    """folders.js takes each page's t(): every key it uses (with the cd_* keys of LINE_KEYS and RESULT_KEYS, which it
+    builds as t("cd_" + key)) is in both pages' dictionaries, in both languages; the script comes between skills.js and
+    the page's script, and both pages have the browser's layer."""
+    used = used_keys(FOLDERS_JS)
+    line_keys, result_keys = folders_keys("LINE_KEYS"), folders_keys("RESULT_KEYS")
+    assert set(line_keys) | set(result_keys) <= set(CD_COPIED)
+    used |= {"cd_" + key for key in line_keys + result_keys}
+    assert {"fo_check_failed", "fp_busy", "fp_truncated", "fp_new_bad", "cf_now", "cd_ask", "cd_ask_default", "cf_api",
+            "ws_missing_badge", "cd_text_fresh", "cd_start_error"} <= used
+    for name, blocks in (("home", home_i18n()), ("board", i18n_blocks())):
+        for lang in ("ru", "en"):
+            missing = sorted(used - blocks[lang])
+            assert not missing, (name, lang, missing)
+            assert not {"cd_" + key for key in CD_TERMINAL_ONLY} & blocks[lang], (name, lang)
+            assert "ws_missing_back" in blocks[lang] and "f_files" not in blocks[lang]
+    for page, script in ((HOME_HTML, "/static/home.js"), (INDEX, "/static/app.js")):
+        assert page.index("/static/skills.js") < page.index("/static/folders.js") < page.index(script)
+        assert ('<div class="modal fp" id="folder-picker" role="dialog" aria-modal="true" aria-labelledby="fp-title"\n'
+                '      tabindex="-1">' in page)
+        assert 'class="fp-backdrop hidden" id="folder-picker-backdrop"' in page
+
+
+@needs_node
+def test_folders_texts_shared_with_the_terminal_and_without_yo():
+    """The copied cd_* texts are console.CD_TEXTS (ё read as е, a confirm() without " [y/N] "), on both pages; no new
+    Russian text has ё; the folder texts name «Сменить папку…», never `dreamteam tui`, and ws_missing_back no /cd."""
+    from dreamteam.console import CD_TEXTS
+
+    out = run_js(r"""
+      const home = loadHomeJs();
+      out.home = home.I18N; out.board = app.I18N;
+    """)
+    new = re.compile(r"^(fo_|fp_|cf_|cd_|f_ws|ws_missing|ws_moved_hint$|f_copy_none$|f_skills_project$)")
+    for page in ("home", "board"):
+        for lang in ("ru", "en"):
+            texts = out[page][lang]
+            for key in CD_COPIED:
+                want = CD_TEXTS[lang][key].replace("ё", "е")
+                if key in ("ask", "ask_default"):
+                    want = want.replace(" [y/N] ", "")
+                assert texts["cd_" + key] == want, (page, lang, key)
+            for key, text in texts.items():
+                if new.match(key):
+                    assert "ё" not in text and "Ё" not in text, (page, key)
+                    assert "dreamteam tui" not in text, (page, key)
+            assert "/cd" not in texts["ws_missing_back"] and "{path}" in texts["ws_missing_back"]
+        assert "«Сменить папку…»" in out[page]["ru"]["ws_moved_hint"]
+        assert "Change folder…" in out[page]["en"]["ws_moved_hint"]
+        assert out[page]["ru"]["cf_button"] == "Сменить папку…" and out[page]["en"]["cf_button"] == "Change folder…"
+    assert out["board"]["en"]["ws_missing"].endswith("another one is chosen:")
+    assert out["home"]["en"]["ws_missing"].endswith("choose another one:")
+
+
+UNQUOTE_CASES = ['"C:\\My Projects\\app"', "'/srv/a b'", "  /plain  ", '"', "''", '" spaced "', '"a\'', "\"x\" ",
+                 "", "   ", "'C:\\x'  "]
+
+
+@needs_node
+def test_folders_unquote_is_the_twin_of_the_console():
+    from dreamteam.console import unquote
+
+    out = run_js(r"""
+      const FO = require(staticDir + "/folders.js");
+      out.got = JSON.parse(process.env.CASES).map(FO.unquote);
+    """, env={"CASES": json.dumps(UNQUOTE_CASES)})
+    assert out["got"] == [unquote(case) for case in UNQUOTE_CASES]
+
+
+RESULTS = [
+    {"mode": "unchanged", "to": "/p"},
+    {"mode": "moved", "from": "/a", "to": "/b", "git": "moved", "mcp_moved": ["calc", "csv"], "old_kept": None},
+    {"mode": "adopted", "from": "/a", "to": "/repo", "git": "existing", "mcp_moved": [], "old_kept": "/a"},
+    {"mode": "moved", "from": "/gone", "to": "/b", "git": "disabled", "old_kept": None, "old_missing": True},
+    {"mode": "created", "to": "/n", "git": "initialized", "old_missing": True},
+    {"mode": "moved", "from": "/u", "to": "/v", "git": "none", "old_kept": "/u",
+     "old_changed": {"paths": ["mcp/calc", "mcp/x"], "commit": "0123456789abcdef", "error": None}},
+    {"mode": "moved", "from": "/u", "to": "/v", "old_kept": None,
+     "old_changed": {"paths": ["mcp/calc"], "commit": None, "error": None}},
+    {"mode": "moved", "from": "/u", "to": "/v", "old_kept": "/u",
+     "old_changed": {"paths": [], "commit": None, "error": "x"}, "start_error": "boom"},
+    {"mode": "adopted", "to": "/r", "git": "weird", "mcp_moved": None, "old_changed": "bad"},
+    {},
+]
+
+
+@needs_node
+def test_folders_result_lines_are_the_twin_of_the_console():
+    from dreamteam.console import cd_result_lines
+
+    out = run_js(r"""
+      const FO = require(staticDir + "/folders.js");
+      out.got = JSON.parse(process.env.RESULTS).map((r) => FO.resultLines(r, "Calc"));
+      app.S.lang = "en";
+      out.texts = FO.resultTexts(app.t, JSON.parse(process.env.RESULTS)[7], "Calc");
+    """, env={"RESULTS": json.dumps(RESULTS)})
+    want = [[[key, fields] for key, fields in cd_result_lines(result, "Calc")] for result in RESULTS]
+    assert out["got"] == json.loads(json.dumps(want))
+    assert out["texts"][-1] == {"text": "The session did not start again: boom", "err": True}
+    assert not any(line["err"] for line in out["texts"][:-1])
+
+
+ANSWERS = {
+    "srcFolder": {"use": "source", "path": "/p", "target": "/p", "state": "folder"},
+    "srcZip": {"use": "source", "path": "/p.zip", "target": "/p.zip", "state": "zip"},
+    "error": {"use": "workspace", "path": "/x", "error": "Commit or stash them first.", "status": 409},
+    "newMissing": {"use": "workspace", "state": "missing", "mode": "created", "git": "initialized"},
+    "newEmpty": {"use": "workspace", "state": "empty", "mode": "created", "git": "initialized"},
+    "newRepo": {"use": "workspace", "state": "files", "mode": "adopted", "git": "existing", "branch": "main"},
+    "newInit": {"use": "workspace", "state": "files", "mode": "adopted", "git": "initialized"},
+    "newOff": {"use": "workspace", "state": "files", "mode": "adopted", "git": "disabled"},
+    "newNoGit": {"use": "workspace", "state": "files", "mode": "adopted", "git": "none"},
+    "same": {"use": "workspace", "state": None, "mode": "unchanged", "running": True, "mcp": []},
+    "fresh": {"use": "workspace", "state": "empty", "mode": "moved", "fresh": True, "git": "initialized",
+              "mcp": ["calc"]},
+    "lost": {"use": "workspace", "state": "missing", "mode": "moved", "lost": True, "git": "initialized"},
+    "back": {"use": "workspace", "state": "files", "mode": "adopted", "back": True, "git": "existing", "branch": "dev"},
+    "moveMissing": {"use": "workspace", "state": "missing", "mode": "moved", "git": "moved", "running": True},
+    "moveEmpty": {"use": "workspace", "state": "empty", "mode": "moved", "git": "disabled"},
+    "moveFiles": {"use": "workspace", "state": "files", "mode": "adopted", "git": "existing", "branch": "main",
+                  "mcp": ["a", "b"]},
+    "moveInit": {"use": "workspace", "state": "files", "mode": "adopted", "git": "initialized"},
+    "api": {"use": "workspace", "state": "empty", "mode": "moved", "git": "moved",
+            "api_folder": {"root": "jobs", "path": "/j/x"}},
+}
+MOVES = {"same", "fresh", "lost", "back", "moveMissing", "moveEmpty", "moveFiles", "moveInit", "api"}
+
+
+@needs_node
+def test_folders_check_line_words():
+    out = run_js(r"""
+      const FO = require(staticDir + "/folders.js");
+      app.S.lang = "en";
+      const moves = new Set(JSON.parse(process.env.MOVES));
+      out.words = {};
+      for (const [name, answer] of Object.entries(JSON.parse(process.env.ANSWERS)))
+        out.words[name] = FO.lineWords(app.t, answer, { session: moves.has(name), old: "/old" });
+      app.S.lang = "ru";
+      out.ru = FO.lineWords(app.t, JSON.parse(process.env.ANSWERS).newRepo, {});
+    """, env={"ANSWERS": json.dumps(ANSWERS), "MOVES": json.dumps(sorted(MOVES))})
+    w = out["words"]
+    assert w["srcFolder"] == {"cls": "ok", "text": "Folder found: its files are copied into the new session's folder."}
+    assert w["srcZip"]["text"].startswith("A .zip found")
+    assert w["error"] == {"cls": "err", "text": "Commit or stash them first."}
+    assert w["newMissing"] == {"cls": "ok", "text": "The folder does not exist: it will be created, and the session "
+                                                    "starts there afresh."}
+    assert w["newEmpty"]["text"] == "The folder is empty: the session starts there afresh."
+    assert w["newRepo"] == {"cls": "warn", "text": "A folder with files: the agents will work with them and commit to "
+                                                   "its current branch “main”."}
+    assert w["newInit"]["text"] == ("A folder with files: the agents will work with them. It has no git "
+                                    "repository: one will be created (git init and a first commit of its files).")
+    assert w["newOff"]["text"].endswith("work with them. git is off in the settings: no commits.")
+    assert w["newNoGit"]["text"].endswith("work with them. git is not installed: no commits.")
+    assert w["same"] == {"cls": "ok", "text": "The session already works in this folder."}
+    assert w["fresh"]["text"].startswith("The folder is empty: the session starts afresh there (a new git repository); "
+                                         "your folder /old stays as it is")
+    assert w["fresh"]["text"].endswith("The session's MCP servers move along: calc.")
+    assert w["lost"]["text"].startswith("The current folder /old does not exist, so nothing moves")
+    assert w["back"]["text"] == ("The session's previous files are still there: the agents go back to them; /old stays "
+                                 "as it is.")
+    assert w["moveMissing"] == {"cls": "warn", "text": "The folder does not exist — it will be created; the files and "
+                                                       "the git history move there. The session is running: its agents "
+                                                       "stop during the move and then carry on."}
+    assert w["moveEmpty"] == {"cls": "ok", "text": "The folder is empty: the files and the git history move there. git "
+                                                   "is off in the settings: no commits."}
+    assert w["moveFiles"]["cls"] == "warn" and w["moveFiles"]["text"] == (
+        "The folder is not empty: the agents will work with its files and commit to its current branch (the previous "
+        "folder /old stays as it is). Current branch: “main”. The session's MCP servers move along: a, b.")
+    assert w["moveInit"]["text"].endswith("It has no git repository: one will be created (git init and a first "
+                                          "commit of its files).")
+    assert w["api"]["cls"] == "warn" and "in the folder “jobs” of [api] folders" in w["api"]["text"]
+    assert out["ru"]["text"] == "Папка с файлами: агенты будут работать с ними и коммитить в текущую ветку «main»."
+
+
+# a small DOM for folders.js (elements, attributes, focus, events that bubble to the document)
+FAKE_DOM = r"""
+  const registry = new Map();
+  const docListeners = {};
+  function classListOf(el) {
+    const get = () => new Set(String(el.className || "").split(/\s+/).filter(Boolean));
+    const put = (s) => { el.className = [...s].join(" "); };
+    return { add: (...c) => { const s = get(); c.forEach((x) => s.add(x)); put(s); },
+             remove: (...c) => { const s = get(); c.forEach((x) => s.delete(x)); put(s); },
+             contains: (c) => get().has(c),
+             toggle: (c, on) => {
+               const s = get(); const v = on === undefined ? !s.has(c) : !!on;
+               if (v) s.add(c); else s.delete(c);
+               put(s); return v;
+             } };
+  }
+  class FakeText { constructor(text) { this.nodeType = 3; this.text = String(text); this.parentNode = null; }
+                   get textContent() { return this.text; } }
+  class FakeEl {
+    constructor(tag) {
+      Object.assign(this, { nodeType: 1, tagName: String(tag).toUpperCase(), children: [], childNodes: [],
+                            parentNode: null, attrs: {}, listeners: {}, hidden: false, disabled: false, value: "",
+                            className: "", checked: false, dataset: {}, _html: null });
+      this.classList = classListOf(this);
+    }
+    setAttribute(k, v) { this.attrs[k] = String(v); if (k === "id") registry.set(String(v), this); }
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; }
+    hasAttribute(k) { return k in this.attrs; }
+    removeAttribute(k) { delete this.attrs[k]; }
+    get id() { return this.attrs.id || ""; }
+    appendChild(c) {
+      c.parentNode = this; this.childNodes.push(c);
+      if (c.nodeType === 1) this.children.push(c);
+      return c;
+    }
+    get textContent() { return this.childNodes.map((c) => c.textContent).join(""); }
+    set textContent(v) {
+      for (const c of this.childNodes) c.parentNode = null;
+      this.childNodes = []; this.children = []; this._html = null;
+      if (v !== "" && v !== null && v !== undefined) this.appendChild(new FakeText(v));
+    }
+    get innerHTML() { return this._html ?? ""; }
+    set innerHTML(html) {   // the elements with an id, flat: what the dialogs look up
+      this.textContent = "";
+      this._html = String(html);
+      for (const m of this._html.matchAll(/<(\w+)([^>]*?)\bid="([\w-]+)"([^>]*)>/g)) {
+        const attrs = m[2] + m[4];
+        const el = new FakeEl(m[1]);
+        el.setAttribute("id", m[3]);
+        if (/\schecked\b/.test(attrs)) el.checked = true;
+        if (/\sdisabled\b/.test(attrs)) el.disabled = true;
+        this.appendChild(el);
+      }
+    }
+    contains(o) { for (let x = o; x; x = x.parentNode) if (x === this) return true; return false; }
+    focus() { fakeDoc.activeElement = this; }
+    addEventListener(type, fn) { (this.listeners[type] = this.listeners[type] || []).push(fn); }
+    matches(sel) { return sel.split(",").some((s) => matchOne(this, s.trim())); }
+    closest(sel) {
+      for (let x = this; x && x.nodeType === 1; x = x.parentNode) if (x.matches(sel)) return x;
+      return null;
+    }
+    querySelectorAll(sel) {
+      const out = [];
+      const walk = (n) => { for (const c of n.children) { if (c.matches(sel)) out.push(c); walk(c); } };
+      walk(this);
+      return out;
+    }
+    querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
+  }
+  function matchOne(el, s) {
+    if (s.startsWith("#")) return el.id === s.slice(1);
+    if (s.startsWith(".")) return el.classList.contains(s.slice(1));
+    const m = s.match(/^\[([\w-]+)(?:="([^"]*)")?\]$/);
+    if (m) return m[2] === undefined ? el.hasAttribute(m[1]) : el.getAttribute(m[1]) === m[2];
+    return el.tagName === s.toUpperCase();
+  }
+  /** Dispatches an event at `target`, bubbling up to the document; → the event. */
+  function fire(target, type, props = {}) {
+    const ev = Object.assign({ type, target, stopped: false, defaultPrevented: false,
+                               stopPropagation() { this.stopped = true; },
+                               preventDefault() { this.defaultPrevented = true; } }, props);
+    for (let x = target; x && !ev.stopped; x = x.parentNode) {
+      for (const fn of (x.listeners && x.listeners[type]) || []) fn(ev);
+    }
+    if (!ev.stopped) for (const fn of docListeners[type] || []) fn(ev);
+    return ev;
+  }
+  const fakeBody = new FakeEl("body");
+  const fakeDoc = {
+    body: fakeBody, activeElement: null, hidden: false, documentElement: { dataset: {} },
+    createElement: (tag) => new FakeEl(tag), createTextNode: (text) => new FakeText(text),
+    querySelector: (sel) => (sel.startsWith("#") && registry.has(sel.slice(1)) ? registry.get(sel.slice(1))
+                                                                                : fakeBody.querySelector(sel)),
+    querySelectorAll: (sel) => fakeBody.querySelectorAll(sel),
+    addEventListener: (type, fn) => { (docListeners[type] = docListeners[type] || []).push(fn); },
+  };
+  globalThis.document = fakeDoc;
+  // timers run when the test says (tick), requests answer when the test says (pending[i].resolve / reject)
+  let timers = [], timerId = 0;
+  globalThis.setTimeout = (fn, ms) => { const id = ++timerId; timers.push({ id, fn, ms: ms || 0 }); return id; };
+  globalThis.clearTimeout = (id) => { timers = timers.filter((x) => x.id !== id); };
+  const tick = (ms) => {
+    const due = timers.filter((x) => x.ms <= ms);
+    timers = timers.filter((x) => x.ms > ms);
+    due.forEach((x) => x.fn());
+  };
+  const settle = () => new Promise((r) => setImmediate(r));
+  const pending = [];
+  const toasts = [];
+  const fail = (status, message) => Object.assign(new Error(message), { status });
+  const FOLDERS_PAGE = (t, esc) => ({
+    t, esc, toast: (text, err) => toasts.push([text, !!err]),
+    request: (path, body) => new Promise((resolve, reject) => pending.push({ path, body, resolve, reject })),
+    openModal: (html) => { fakeDoc.querySelector("#modal").innerHTML = html; },
+    closeModal: () => { if (FO.busy()) return false; fakeDoc.querySelector("#modal").innerHTML = ""; return true; },
+  });
+  const modalEl = new FakeEl("div"); modalEl.setAttribute("id", "modal"); fakeBody.appendChild(modalEl);
+  const backdropEl = new FakeEl("div");
+  backdropEl.setAttribute("id", "modal-backdrop"); fakeBody.appendChild(backdropEl);
+  const FO = require(staticDir + "/folders.js");
+"""
+
+
+@needs_node
+def test_folders_checker_debounce_seq_and_ready():
+    out = run_js(r"""
+      app.S.lang = "en";
+      FO.setup(FOLDERS_PAGE(app.t, app.esc));
+      const input = new FakeEl("input"); const line = new FakeEl("div"); line.setAttribute("id", "f-check");
+      const changes = [];
+      const ck = FO.checker(input, line, { use: "workspace", onChange: (r) => changes.push(r ? r.key : null) });
+      out.describedby = input.getAttribute("aria-describedby");
+      input.value = "/a"; fire(input, "input");
+      out.typing = [ck.ready(), pending.length, ck.result];      // the 400 ms timer runs: nothing sent, not ready
+      tick(399 - 99); out.early = pending.length;                // (only the 400 ms timer is pending)
+      tick(400);
+      out.sentA = pending.map((p) => [p.path, p.body]);
+      out.out = ck.ready();                                      // a request is out
+      out.lineBefore = line.textContent;                         // no "Checking…" before 300 ms
+      tick(300); out.checking = line.textContent;
+      // a second value before the first answer: its answer first, the slower earlier one then dropped
+      input.value = ' "/b" '; fire(input, "input"); tick(400);
+      out.sentB = pending[1].body;
+      pending[1].resolve({ use: "workspace", path: "/b", target: "/b", state: "empty", mode: "created",
+                           expect: "created", git: "initialized", mcp: [] });
+      await settle();
+      out.afterB = [line.textContent, line.className, ck.ready(), ck.result.answer.expect,
+                    input.getAttribute("aria-invalid")];
+      fire(input, "change");                                     // the field left unchanged: the answer stays
+      out.changeSame = [ck.ready(), pending.length, timers.length];
+      pending[0].resolve({ use: "workspace", path: "/a", target: "/a", state: "missing", mode: "created",
+                           expect: "created" });
+      await settle();
+      out.lateA = [line.textContent, ck.ready(), ck.result.key];
+      // an answer for a value the field no longer holds is dropped (the field changed while it was out)
+      input.value = "/c"; fire(input, "input"); tick(400);
+      input.value = "/c2"; fire(input, "input");
+      pending[2].resolve({ use: "workspace", path: "/c", target: "/c", state: "empty", mode: "created",
+                           expect: "created" });
+      await settle();
+      out.otherValue = [line.textContent, ck.ready(), ck.result];
+      tick(400);
+      pending[3].resolve({ use: "workspace", path: "/elsewhere", state: "empty", mode: "created" });   // not its path
+      await settle();
+      out.otherPath = [ck.ready(), ck.result];
+      // a refusal: the line in the error colour, the field aria-invalid
+      ck.run(true);
+      pending[4].resolve({ use: "workspace", path: "/c2", error: "/c2 is DreamTeam's own folder.", status: 400 });
+      await settle();
+      out.refusal = [line.textContent, line.className, input.getAttribute("aria-invalid"), ck.ready()];
+      // a check that could not run (429, no connection): said, blocks nothing
+      ck.run(true); pending[5].reject(fail(429, "Too many folder checks at once; try again in a moment."));
+      await settle();
+      out.failed = [line.textContent, line.className, ck.ready(), ck.result.failed, ck.result.answer];
+      fire(input, "change");                                     // the same value: a failed check is tried again
+      out.retry = [timers.filter((x) => x.ms === 400).length, ck.ready()];
+      ck.run(true); pending[6].reject(fail(404, "Unknown session x."));   // the call itself refused: said as an error
+      await settle();
+      out.callError = [line.className, ck.result.answer.error];
+      // an empty field sends nothing and empties the line
+      input.value = "  "; fire(input, "input");
+      out.empty = [line.textContent, pending.length, ck.ready(), timers.length];
+      out.changes = changes.filter((c) => c !== null).length > 0;
+      // its dialog closed (the field out of the page): nothing is sent any more
+      input.isConnected = false;
+      input.value = "/z"; fire(input, "input"); tick(400);
+      out.gone = [await ck.run(true), pending.length, line.textContent];
+    """, pre=FAKE_DOM)
+    assert out["describedby"] == "f-check"
+    assert out["typing"] == [False, 0, None] and out["early"] == 0
+    assert out["sentA"] == [["/api/folders/check", {"use": "workspace", "path": "/a"}]]
+    assert out["out"] is False and out["lineBefore"] == "" and out["checking"] == "Checking the folder…"
+    assert out["sentB"] == {"use": "workspace", "path": "/b"}   # unquoted, trimmed
+    assert out["afterB"] == ["The folder is empty: the session starts there afresh.", "fo-line ok", True, "created",
+                             None]
+    assert out["changeSame"] == [True, 2, 0]
+    assert out["lateA"] == [out["afterB"][0], True, "/b"]
+    assert out["otherValue"] == [out["afterB"][0], False, None]
+    assert out["otherPath"] == [False, None]
+    assert out["refusal"] == ["/c2 is DreamTeam's own folder.", "fo-line err", "true", True]
+    assert out["failed"] == ["Could not check the folder: Too many folder checks at once; try again in a moment. "
+                             "The hub checks it when the session is created or moved.", "fo-line warn", True,
+                             "Too many folder checks at once; try again in a moment.", None]
+    assert out["callError"] == ["fo-line err", "Unknown session x."]
+    assert out["retry"] == [1, False]
+    assert out["empty"] == ["", 7, False, 0] and out["changes"] is True
+    assert out["gone"] == [None, 7, ""]
+
+
+LISTING = r"""
+  const ROOTS = [{ path: "/home/u", kind: "home", name: "u", selectable: false },
+                 { path: "/", kind: "system", name: "/", selectable: false },
+                 { path: "/work", kind: "recent", name: "work", selectable: true },
+                 { path: "/srv/jobs", kind: "api", name: "jobs", selectable: true }];
+  const entry = (name, extra) => Object.assign({ name, path: "/home/u/" + name, link: false, open: true,
+                                                 refused: null, busy: null, current: false, repo: false, files: true,
+                                                 noaccess: false }, extra || {});
+  const listing = (path, entries, extra) => Object.assign({ path, parent: "/home", root: "/home/u", roots: ROOTS,
+    entries, truncated: false, partial: false, fallback: false, error: null, refused: null, selectable: true,
+    busy: null, current: false, sep: "/" }, extra || {});
+  const HOME_ENTRIES = [entry("app", { repo: true }), entry("empty", { files: false }),
+                        entry("sys", { open: false, refused: "/home/u/sys is DreamTeam's own folder." }),
+                        entry("taken", { busy: { sid: "s2", title: "Snake" } }),
+                        entry("me", { current: true, link: true })];
+  const listEl = () => fakeDoc.querySelector("#fp-list");
+  const items = () => listEl().children;
+  const box = () => fakeDoc.querySelector("#folder-picker");
+  const key = (target, k, extra) => fire(target, "keydown", Object.assign({ key: k }, extra || {}));
+  const fpBtn = (act) => box().querySelectorAll("button").find((b) => b._fp && b._fp.act === act);
+"""
+
+
+@needs_node
+def test_folders_browser_lists_marks_and_keys():
+    out = run_js(r"""
+      app.S.lang = "en";
+      FO.setup(FOLDERS_PAGE(app.t, app.esc));
+      const docKeys = [];
+      fakeDoc.addEventListener("keydown", (e) => docKeys.push(e.key));
+      const opener = new FakeEl("button"); fakeBody.appendChild(opener);
+      const chosen = [];
+      FO.browse({ use: "workspace", start: "", opener, onChoose: (p) => chosen.push(p) });
+      out.first = pending[0].body;                               // no path: the roots alone, then the first root
+      pending[0].resolve({ path: null, roots: ROOTS, entries: [] }); await settle();
+      out.second = pending[1].body;
+      out.loading = box().querySelector(".fp-status").textContent;
+      pending[1].resolve(listing("/home/u", HOME_ENTRIES,
+                                 { selectable: false, refused: "/home/u is your home folder." }));
+      await settle();
+      out.open = FO.isOpen();
+      out.places = box().querySelector(".fp-places").textContent;
+      out.placeTips = box().querySelectorAll(".fp-place").map((b) => b.getAttribute("title"));
+      out.active = box().querySelectorAll(".fp-place").map((b) => b.getAttribute("aria-current"));
+      out.crumbs = box().querySelector(".fp-trail").textContent;
+      out.up = fpBtn("up").disabled;
+      out.list = [listEl().getAttribute("role"), listEl().getAttribute("aria-label")];
+      out.rows = items().map((li) => [li.getAttribute("role"), li.textContent, li.getAttribute("tabindex"),
+                                      li.getAttribute("aria-disabled"), li.getAttribute("aria-describedby")]);
+      out.why = fakeDoc.querySelector("#fp-why-2").textContent;
+      out.foot = [box().querySelector(".fp-path").textContent, fpBtn("choose").disabled,
+                  box().querySelector(".fp-cannot").textContent, box().querySelector(".fp-cannot").hidden];
+      out.focus0 = fakeDoc.activeElement === items()[0];
+      // ↑ / ↓, Home / End move between the entries: a roving tabindex, the closed one focusable
+      key(items()[0], "ArrowDown"); key(items()[1], "ArrowDown");
+      out.onClosed = [fakeDoc.activeElement === items()[2], items().map((li) => li.getAttribute("tabindex")).join("")];
+      key(items()[2], "Enter");                                   // a closed entry never opens
+      out.closedOpened = pending.length;
+      key(items()[2], "End"); out.end = fakeDoc.activeElement === items()[4];
+      key(items()[4], "ArrowDown"); out.stays = fakeDoc.activeElement === items()[4];
+      key(items()[4], "Home"); out.home = fakeDoc.activeElement === items()[0];
+      key(items()[0], "ArrowUp"); out.top = fakeDoc.activeElement === items()[0];
+      out.docKeys = docKeys.slice();                              // (only Escape stays in the browser)
+      // Enter opens the focused entry; Backspace goes up, focusing the folder it came from
+      const ev = key(items()[0], "Enter");
+      out.enter = [ev.defaultPrevented, pending[2].body];
+      pending[2].resolve(listing("/home/u/app", [entry("src")], { parent: "/home/u", fallback: false }));
+      await settle();
+      out.inApp = [box().querySelector(".fp-trail").textContent, fpBtn("choose").disabled,
+                   box().querySelector(".fp-cannot").hidden];
+      key(items()[0], "Backspace");
+      out.backspace = pending[3].body.path;
+      pending[3].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      out.backFocus = fakeDoc.activeElement === items()[0];
+      key(items()[0], "ArrowUp", { altKey: true });               // Alt+↑ goes up too
+      out.altUp = pending[4].body.path;
+      pending[4].resolve(listing("/home", [], { parent: "/", root: "/", fallback: false })); await settle();
+      out.none = box().querySelector(".fp-status").textContent;
+      out.noEntryFocus = fakeDoc.activeElement === fpBtn("choose");
+      // an empty folder: the way up works from «Выбрать эту папку», where the focus is
+      const upEv = key(fpBtn("choose"), "Backspace");
+      out.upFromChoose = [upEv.defaultPrevented, pending[5].body.path];
+      pending[5].resolve(listing("/", [entry("home")], { parent: null, root: "/", path: "/", fallback: false }));
+      await settle();
+      // a place: the recent folder; a listing that cut and marked partly, a fallback
+      fire(box().querySelectorAll(".fp-place")[2], "click");
+      out.place = pending[6].body;
+      pending[6].resolve(listing("/work/new", [entry("a")], { root: "/work", parent: "/work", path: "/work",
+                                                              fallback: true, truncated: true, partial: true }));
+      await settle();
+      out.status = box().querySelector(".fp-status").textContent;
+      // a double click on an entry chooses it: the field gets its path, the browser closes, no refocus of «Обзор…»
+      fire(items()[0].children[1], "dblclick");
+      out.dbl = [chosen.slice(), FO.isOpen(),
+                 fakeDoc.querySelector("#folder-picker-backdrop").classList.contains("hidden")];
+    """, pre=FAKE_DOM + LISTING)
+    assert out["first"] == {"use": "workspace"} and out["second"] == {"use": "workspace", "path": "/home/u"}
+    assert out["loading"] == "Loading…" and out["open"] is True
+    assert out["places"] == "Home folderRoot (/)Recent foldersworkAPI folder: jobs"
+    assert out["placeTips"] == ["/home/u", "/", "/work", "/srv/jobs\nfrom [api] folders in the settings"]
+    assert out["active"] == ["true", None, None, None]
+    assert out["crumbs"] == "Home folder" and out["up"] is False
+    assert out["list"] == ["listbox", "/home/u"]
+    assert out["rows"] == [
+        ["option", "appgit", "0", None, None], ["option", "emptyempty", "-1", None, None],
+        ["option", "syscannot be chosen/home/u/sys is DreamTeam's own folder.", "-1", "true", "fp-why-2"],
+        ["option", "takentaken by session “Snake”", "-1", None, None],
+        ["option", "melinkthis session's folder", "-1", None, None]]
+    assert out["why"] == "/home/u/sys is DreamTeam's own folder."
+    assert out["foot"] == ["/home/u", True, "This folder cannot be chosen: /home/u is your home folder.", False]
+    assert out["focus0"] is True
+    assert out["onClosed"] == [True, "-1-10-1-1"] and out["closedOpened"] == 2
+    assert out["end"] and out["stays"] and out["home"] and out["top"]
+    assert out["docKeys"] == ["ArrowDown", "ArrowDown", "Enter", "End", "ArrowDown", "Home", "ArrowUp"]
+    assert out["enter"] == [True, {"use": "workspace", "path": "/home/u/app"}]
+    assert out["inApp"] == ["Home folder›app", False, True]
+    assert out["backspace"] == "/home/u" and out["backFocus"] is True
+    assert out["altUp"] == "/home"
+    assert out["none"] == "No folders here." and out["noEntryFocus"] is True
+    assert out["upFromChoose"] == [True, "/"]
+    assert out["place"] == {"use": "workspace", "path": "/work"}
+    assert out["status"] == ("/work does not exist: the nearest existing folder is open. 1 folders are shown; open the "
+                             "others by typing the path. Not every folder is marked: the folder answers slowly.")
+    assert out["dbl"] == [["/home/u/a"], False, True]
+
+
+@needs_node
+def test_folders_browser_escape_backdrop_new_folder_and_the_pages():
+    out = run_js(r"""
+      app.S.lang = "en";
+      const home = loadHomeJs();
+      FO.setup(FOLDERS_PAGE(app.t, app.esc));
+      const docKeys = [];
+      fakeDoc.addEventListener("keydown", (e) => docKeys.push(e.key));
+      const opener = new FakeEl("button"); fakeBody.appendChild(opener);
+      const chosen = [];
+      const open = async (start, use = "workspace") => {
+        pending.length = 0;
+        FO.browse({ use, start, opener, onChoose: (p) => chosen.push(p) });
+        await settle();
+      };
+      // the page's modal is open under the browser
+      modalEl.innerHTML = '<input id="ns-goal">';
+      await open("'/home/u'");                                    // the field's folder, unquoted
+      out.start = pending[0].body;
+      pending[0].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      // the pages' backdrop handlers do nothing while the browser is open, the modal under it is inert, and an
+      // Escape that reaches the page (the focus fallen out of the browser) closes the browser alone
+      home.onModalBackdrop({ target: backdropEl });
+      app.S.downOnBackdrop = true; app.onModalBackdropClick({ target: backdropEl });
+      out.modalKept = [modalEl.innerHTML !== "", !backdropEl.classList.contains("hidden"), FO.isOpen(),
+                       backdropEl.hasAttribute("inert")];
+      home.onModalEscape({ key: "Escape" });
+      out.homeEscape = [FO.isOpen(), modalEl.innerHTML !== "", fakeDoc.activeElement === opener,
+                        backdropEl.hasAttribute("inert")];
+      await open("'/home/u'");
+      pending[0].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      app.onKeydown({ key: "Escape", target: fakeBody });
+      out.appEscape = [FO.isOpen(), modalEl.innerHTML !== ""];
+      await open("'/home/u'");
+      pending[0].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      out.newExpanded = fpBtn("new").getAttribute("aria-expanded");
+      // «Новая папка…»: the input's keys are its own, its first Escape closes it only
+      fire(fpBtn("new"), "click");
+      const name = box().querySelector(".fp-new-name");
+      out.newFocus = fakeDoc.activeElement === name;
+      for (const k of ["Backspace", "Home", "End", "ArrowDown"]) out["new" + k] = key(name, k).defaultPrevented;
+      out.newReq = pending.length;
+      key(name, "Escape");
+      out.newClosed = [box().querySelector(".fp-new").hidden, fakeDoc.activeElement === fpBtn("new"), FO.isOpen(),
+                       fpBtn("new").getAttribute("aria-expanded")];
+      fire(fpBtn("new"), "click");
+      name.value = "a/b";
+      const enter = key(name, "Enter");
+      out.bad = [enter.defaultPrevented, box().querySelector(".fp-new-error").textContent, FO.isOpen()];
+      name.value = "fresh one";
+      key(name, "Enter");
+      out.made = [chosen.slice(), FO.isOpen()];
+      // Escape closes the browser only, refocuses «Обзор…», and never reaches the page's listener
+      await open("");
+      pending[0].resolve({ path: null, roots: ROOTS, entries: [] }); await settle();
+      pending[1].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      docKeys.length = 0;
+      const esc = key(items()[1], "Escape");
+      out.escape = [FO.isOpen(), fakeDoc.activeElement === opener, esc.stopped, docKeys.slice(),
+                    modalEl.innerHTML !== ""];
+      // a click on the browser's own backdrop closes it alone (a press that began inside does not)
+      await open("");
+      pending[0].resolve({ path: null, roots: ROOTS, entries: [] }); await settle();
+      pending[1].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      const back = fakeDoc.querySelector("#folder-picker-backdrop");
+      fire(items()[0], "mousedown"); fire(back, "click");
+      out.dragOut = FO.isOpen();
+      fire(back, "mousedown"); const click = fire(back, "click");
+      out.backdrop = [FO.isOpen(), click.stopped, modalEl.innerHTML !== "", fakeDoc.activeElement === opener];
+      // Tab cycles inside the browser
+      await open("");
+      pending[0].resolve({ path: null, roots: ROOTS, entries: [] }); await settle();
+      pending[1].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      fpBtn("choose").focus();
+      key(fpBtn("choose"), "Tab");
+      out.tabWraps = fakeDoc.activeElement === box().querySelectorAll("button")[0];
+      key(fakeDoc.activeElement, "Tab", { shiftKey: true });
+      out.shiftTabWraps = fakeDoc.activeElement === fpBtn("choose");
+      // a typed path outside the places (403): the first root opens, the refusal in the status line
+      FO.closeBrowser(false);
+      await open("\\\\host\\share");
+      pending[0].reject(fail(403,
+                             "\\\\host\\share is a network or device path: the folder browser does not open those."));
+      await settle();
+      out.after403 = pending.slice(1).map((p) => p.body);
+      pending[1].resolve({ path: null, roots: ROOTS, entries: [] }); await settle();
+      pending[2].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      out.status403 = box().querySelector(".fp-status").textContent;
+      // a listing that fails later (504) keeps what is shown and says why
+      fire(items()[0], "click");
+      pending[3].reject(fail(504, "/home/u/app did not answer within 20 s."));
+      await settle();
+      out.after504 = [box().querySelector(".fp-status").textContent, items().length];
+      // the copy's browser: a busy folder can be chosen as a source
+      FO.closeBrowser(false);
+      chosen.length = 0;
+      await open("/home/u", "source");
+      pending[0].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      fire(items()[2], "dblclick"); fire(items()[3], "dblclick");
+      out.sourceBusy = chosen.slice();
+      // the page's modal closing closes the browser above it
+      await open("/home/u");
+      home.closeModal(true);
+      out.closedWithModal = FO.isOpen();
+    """, pre=FAKE_DOM + LISTING)
+    assert out["start"] == {"use": "workspace", "path": "/home/u"}
+    assert out["modalKept"] == [True, True, True, True]
+    assert out["homeEscape"] == [False, True, True, False] and out["appEscape"] == [False, True]
+    assert out["newExpanded"] == "false"
+    assert out["newFocus"] is True
+    assert [out["new" + k] for k in ("Backspace", "Home", "End", "ArrowDown")] == [False] * 4 and out["newReq"] == 1
+    assert out["newClosed"] == [True, True, True, "false"]
+    assert out["bad"] == [True, "Give just the new folder's name; this one cannot name a folder on the hub's computer.",
+                          True]
+    assert out["made"] == [["/home/u/fresh one"], False]
+    assert out["escape"] == [False, True, True, [], True]
+    assert out["dragOut"] is True and out["backdrop"] == [False, True, True, True]
+    assert out["tabWraps"] is True and out["shiftTabWraps"] is True
+    assert out["after403"] == [{"use": "workspace"}]
+    assert out["status403"] == "\\\\host\\share is a network or device path: the folder browser does not open those."
+    assert out["after504"] == ["/home/u/app did not answer within 20 s.", 5]
+    assert out["sourceBusy"] == ["/home/u/taken"]   # a refused one is never chosen
+    assert out["closedWithModal"] is False
+
+
+@needs_node
+def test_folders_double_click_chooses_its_first_clicks_entry():
+    """The first click of a double click opens the entry; when its listing is in before the second click, the row
+    under the pointer is a subfolder, and the double click still chooses the entry of the first click."""
+    out = run_js(r"""
+      app.S.lang = "en";
+      FO.setup(FOLDERS_PAGE(app.t, app.esc));
+      const opener = new FakeEl("button"); fakeBody.appendChild(opener);
+      const chosen = [];
+      const open = async () => {
+        pending.length = 0;
+        FO.browse({ use: "workspace", start: "/home/u", opener, onChoose: (p) => chosen.push(p) });
+        await settle();
+        pending[0].resolve(listing("/home/u", HOME_ENTRIES)); await settle();
+      };
+      await open();
+      fire(items()[0], "click", { detail: 1 });                    // opens «app»
+      out.opening = pending[1].body.path;
+      pending[1].resolve(listing("/home/u/app", [entry("src", { path: "/home/u/app/src" })], { parent: "/home/u" }));
+      await settle();
+      out.rows = items().map((li) => li.textContent);
+      fire(items()[0], "click", { detail: 2 });                    // the second click lands on «src»: opens nothing
+      out.second = pending.length;
+      fire(items()[0], "dblclick", { detail: 2 });
+      out.chosen = [chosen.slice(), FO.isOpen()];
+      // a click on something else forgets the entry: a double click on the empty list then chooses nothing
+      await open();
+      fire(items()[1], "click", { detail: 1 });                    // opens «empty»
+      pending[1].resolve(listing("/home/u/empty", [], { parent: "/home/u" })); await settle();
+      fire(fpBtn("up"), "click", { detail: 1 });
+      fire(listEl(), "dblclick", { detail: 2 });
+      out.forgot = [chosen.length, FO.isOpen()];
+      // the places: the recent ones in their own group, the api root after it; a folder outside the places shows "—"
+      pending[2].resolve(listing("/home", [], { root: "/srv", parent: "/" })); await settle();
+      out.recent = box().querySelector(".fp-recent").textContent;
+      out.apiOutside = box().querySelector(".fp-recent").querySelectorAll(".fp-place").length;
+      const select = box().querySelector(".fp-places-select");
+      const options = select.querySelectorAll("option");
+      out.none = [options[options.length - 1].value, options[options.length - 1].selected];
+      select.value = ""; fire(select, "change");
+      out.noneRequest = pending.length;
+      select.value = "2"; fire(select, "change");
+      out.place = pending[3] && pending[3].body.path;
+    """, pre=FAKE_DOM + LISTING)
+    assert out["opening"] == "/home/u/app" and out["rows"] == ["src"]
+    assert out["second"] == 2
+    assert out["chosen"] == [["/home/u/app"], False]
+    assert out["forgot"] == [1, True]
+    assert out["recent"] == "Recent folderswork" and out["apiOutside"] == 1
+    assert out["none"] == ["", True] and out["noneRequest"] == 3 and out["place"] == "/work"
+
+
+@needs_node
+def test_folders_crumbs_stay_inside_their_root():
+    out = run_js(r"""
+      const FO = require(staticDir + "/folders.js");
+      out.inside = FO.crumbs("/home/u/a/b", "/home/u", "/");
+      out.prefix = FO.crumbs("/home/user2", "/home/u", "/");
+      out.slashRoot = FO.crumbs("/srv/x", "/", "/");
+      out.windows = FO.crumbs("c:\\Users\\U\\p", "C:\\Users\\u", "\\");
+    """)
+    assert out["inside"] == [{"path": "/home/u", "label": None}, {"path": "/home/u/a", "label": "a"},
+                             {"path": "/home/u/a/b", "label": "b"}]
+    assert out["prefix"] == [{"path": "/home/user2", "label": "/home/user2"}]   # /home/u is no root of /home/user2
+    assert out["slashRoot"] == [{"path": "/", "label": None}, {"path": "/srv", "label": "srv"},
+                                {"path": "/srv/x", "label": "x"}]
+    assert out["windows"] == [{"path": "C:\\Users\\u", "label": None}, {"path": "C:\\Users\\u\\p", "label": "p"}]
+
+
+@needs_node
+def test_folders_on_the_board_say_a_lost_connection_in_words():
+    """The board's request function (launcherApi) turns fetch's own "Failed to fetch" into conn_lost."""
+    out = run_js(r"""
+      app.S.lang = "en";
+      globalThis.fetch = async () => { throw new TypeError("Failed to fetch"); };
+      const input = new FakeEl("input"); const line = new FakeEl("div");
+      const ck = FO.checker(input, line, { use: "workspace" });
+      input.value = "/a";
+      await ck.run(true);
+      out.line = line.textContent;
+    """, pre=FAKE_DOM)
+    assert out["line"] == ("Could not check the folder: No connection to the hub. The hub checks it when the session "
+                           "is created or moved.")
+
+
+NAMES_POSIX = {"app": True, "my project": True, "": False, "  ": False, ".": False, "..": False, "a/b": False,
+               "a\\b": True, "CON": True, "x.": True, "ünï": True, "a:b": True}
+NAMES_WINDOWS = {"app": True, "my project": True, "a\\b": False, "a/b": False, "a:b": False, "a*": False, "a?": False,
+                 'a"': False, "<a>": False, "a|b": False, "a\tb": False, "x.": False, "x ": False, "CON": False,
+                 "con.txt": False, "Lpt9": False, "COM1.tar.gz": False, "COM10": True, "console": True, ".git2": True,
+                 "..": False, "ünï": True}
+
+
+@needs_node
+def test_folders_new_folder_name_rules():
+    out = run_js(r"""
+      const FO = require(staticDir + "/folders.js");
+      out.posix = Object.fromEntries(Object.keys(JSON.parse(process.env.P)).map((n) => [n, FO.newNameOk(n, "/")]));
+      out.windows = Object.fromEntries(Object.keys(JSON.parse(process.env.W)).map((n) => [n, FO.newNameOk(n, "\\")]));
+    """, env={"P": json.dumps(NAMES_POSIX), "W": json.dumps(NAMES_WINDOWS)})
+    assert out["posix"] == NAMES_POSIX
+    assert out["windows"] == NAMES_WINDOWS
+
+
+@needs_node
+def test_folders_change_dialog_cannot_close_while_it_moves():
+    out = run_js(r"""
+      app.S.lang = "en";
+      FO.setup(FOLDERS_PAGE(app.t, app.esc));
+      const asked = [];
+      globalThis.confirm = (text) => { asked.push(text); return answers.confirm; };
+      const $id = (id) => fakeDoc.querySelector("#" + id);
+      const done = [];
+      const ws = { path: "/old", default: false, adopted: false, exists: true };
+      FO.changeDialog({ sid: "s1", title: "Calc", workspace: ws, running: true, onDone: (d) => done.push(d) });
+      out.html = modalEl.innerHTML;
+      out.go0 = $id("cf-go").disabled;
+      $id("cf-path").value = "/new"; fire($id("cf-path"), "input");
+      out.goTyping = $id("cf-go").disabled;
+      tick(400);
+      out.check = pending[0].body;
+      pending[0].resolve({ use: "workspace", path: "/new", target: "/new", state: "empty", mode: "moved",
+                           expect: "moved", git: "moved", mcp: ["calc"], running: true, fresh: false, back: false,
+                           lost: false });
+      await settle();
+      out.goReady = $id("cf-go").disabled;
+      out.line = $id("cf-check").textContent;
+      answers.confirm = false;                                   // «no»: nothing sent
+      fire($id("cf-go"), "click");
+      out.no = [pending.length, asked.slice()];
+      answers.confirm = true;
+      fire($id("cf-go"), "click");
+      out.move = [pending[1].path, pending[1].body];
+      out.busy = [FO.busy(), $id("cf-go").textContent, $id("cf-cancel").disabled, $id("cf-path").disabled];
+      out.closeWhileBusy = [fakeDoc.querySelector("#modal").innerHTML !== "",
+                            FOLDERS_PAGE(app.t, app.esc).closeModal()];
+      pending[1].resolve({ session: {}, result: { mode: "moved", from: "/old", to: "/new", git: "moved",
+                                                  mcp_moved: ["calc"], old_kept: null, old_missing: false,
+                                                  old_changed: null, start_error: "boom" } });
+      await settle();
+      out.after = [FO.busy(), modalEl.innerHTML, toasts.slice(), done.length];
+      // an error stays in the dialog, which can close again, and the folder is checked again
+      toasts.length = 0; pending.length = 0;
+      FO.changeDialog({ sid: "s1", title: "Calc", workspace: ws, running: false, onDone: (d) => done.push(d) });
+      $id("cf-path").value = "/new"; fire($id("cf-path"), "input"); tick(400);
+      pending[0].resolve({ use: "workspace", path: "/new", target: "/new", state: "files", mode: "adopted",
+                           expect: "adopted", git: "existing", branch: "main", mcp: [], running: false });
+      await settle();
+      fire($id("cf-go"), "click");
+      out.asked = asked[asked.length - 1];
+      out.adoptBody = pending[1].body;
+      pending[1].reject(fail(409, "The folder /new changed since it was checked."));
+      await settle();
+      out.error = [FO.busy(), $id("cf-error").textContent, $id("cf-cancel").disabled, pending[2] && pending[2].body,
+                   done.length];
+      // «Вернуть в свою папку»: the session's own folder, checked at once
+      pending.length = 0;
+      $id("cf-default").checked = true; $id("cf-other").checked = false; fire($id("cf-default"), "change");
+      out.defaultCheck = [pending[0].body, $id("cf-path").disabled];
+      // a session already in its own folder: the choice is disabled
+      FO.changeDialog({ sid: "s1", title: "Calc", workspace: { path: "/d", default: true, exists: true },
+                        running: false });
+      out.ownDisabled = $id("cf-default").disabled;
+      // a check of a typed folder that could not run: the move goes as typed, without expect
+      pending.length = 0; asked.length = 0;
+      FO.changeDialog({ sid: "s1", title: "Calc", workspace: ws, running: false });
+      $id("cf-path").value = ' "/typed" '; fire($id("cf-path"), "input"); tick(400);
+      pending[0].reject(fail(429, "Too many folder checks at once; try again in a moment."));
+      await settle();
+      out.failedGo = $id("cf-go").disabled;
+      answers.confirm = true;
+      fire($id("cf-go"), "click");
+      out.failedMove = [asked[0], pending[1] && pending[1].path, pending[1] && pending[1].body, $id("cf-x").disabled,
+                        $id("cf-cancel").disabled];
+      pending[1].reject(fail(409, "The folder /typed changed since it was checked."));
+      await settle();
+      out.xBack = $id("cf-x").disabled;
+      // «Вернуть в свою папку» needs an answer
+      pending.length = 0;
+      $id("cf-default").checked = true; $id("cf-other").checked = false; fire($id("cf-default"), "change");
+      pending[0].reject(fail(503, "Service Unavailable")); await settle();
+      out.failedDefault = $id("cf-go").disabled;
+    """, pre=FAKE_DOM)
+    html = out["html"]
+    assert "Folder of session “Calc”" in html and "Now: /old (moved)" in html and "Another folder" in html
+    assert "Back to its own folder" in html and 'id="cf-browse" aria-haspopup="dialog">Browse…' in html
+    assert "the previous folder stays as it is." in html
+    assert out["go0"] is True and out["goTyping"] is True and out["goReady"] is False
+    assert out["check"] == {"use": "workspace", "session": "s1", "path": "/new"}
+    assert out["line"] == ("The folder is empty: the files and the git history move there. The session's MCP "
+                           "servers move along: calc. The session is running: its agents stop during the move and "
+                           "then carry on.")
+    assert out["no"] == [1, [f"Move session \"Calc\" to /new? {out['line']}"]]
+    assert out["move"] == ["/api/sessions/s1/workspace", {"path": "/new", "expect": "moved"}]
+    assert out["busy"] == [True, "Moving…", True, True]
+    assert out["closeWhileBusy"] == [True, False]
+    assert out["after"][0] is False and out["after"][1] == "" and out["after"][3] == 1
+    assert out["after"][2] == [["Session \"Calc\" now works in /new: its files moved there.", False],
+                               ["git: the history moved along with the files.", False],
+                               ["The session's MCP servers moved along: calc.", False],
+                               ["The session did not start again: boom", True]]
+    assert out["asked"].startswith("Move session \"Calc\" to /new? The folder is not empty: the agents will work")
+    assert out["adoptBody"] == {"path": "/new", "expect": "adopted"}
+    assert out["error"] == [False, "The folder /new changed since it was checked.", False,
+                            {"use": "workspace", "session": "s1", "path": "/new"}, 1]
+    assert out["defaultCheck"] == [{"use": "workspace", "session": "s1", "default": True}, True]
+    assert out["ownDisabled"] is True
+    assert out["failedGo"] is False
+    line = ("Could not check the folder: Too many folder checks at once; try again in a moment. The hub checks it "
+            "when the session is created or moved.")
+    assert out["failedMove"] == [f'Move session "Calc" to /typed? {line}', "/api/sessions/s1/workspace",
+                                 {"path": "/typed"}, True, True]
+    assert out["xBack"] is False and out["failedDefault"] is True
+
+
+BOARD_FOLDER = r"""
+  for (const id of ["back-link", "stopped-banner", "paused-banner", "workspace-banner", "goal-status", "mcp-badge",
+                    "triggers-badge", "team-unread"])
+    el(id, { classList: classList(["hidden"]) });
+  for (const id of ["swarm-name", "mcp-hint", "pause-btn", "budget-bar", "goal-btn", "workspace-info", "file-list",
+                    "crumbs", "file-path", "file-content", 'tabs > button[data-tab="files"]'])
+    el(id);
+  app.S.lang = "en";
+  const show = (workspace) => {
+    app.S.state = { swarm: { name: "S", goal: null, limits: { max_cost_usd: 0, max_agents: 3 }, spent_usd: 0,
+                             mcp_url: "http://h/mcp", session: { id: "x", title: "Calc", status: "running" },
+                             workspace },
+                    agents: [], mcp: [], triggers: [] };
+    app.renderHeader();
+    return { banner: elements["workspace-banner"].innerHTML, info: elements["workspace-info"].innerHTML };
+  };
+  const gone = { path: "/gone", default: false, adopted: true, exists: false };
+  const here = { path: "/here", default: false, adopted: true, exists: true };
+"""
+
+
+@pytest.mark.parametrize("pathname, shown", [("/s/001-calc/", True), ("/s/main/", False), ("/", False)])
+@needs_node
+def test_board_change_folder_button(pathname: str, shown: bool):
+    """«Сменить папку…» on the board: in the Files tab head and in the missing-folder banner of a launcher session,
+    hidden for the legacy main, a session of an earlier version and a standalone `dreamteam run` board."""
+    out = run_js(BOARD_FOLDER + r"""
+      out.sid = app.sessionSid();
+      out.gone = show(gone); out.here = show(here);
+      app.S.earlier = true;
+      out.earlier = show(gone);
+      app.S.earlier = false;
+      // the click opens the change dialog of this session with the snapshot's title, folder and state
+      const seen = [];
+      app.FO.changeDialog = (opts) => seen.push(opts);
+      show(here);
+      app.onDocumentClick({ target: { closest: () => ({ dataset: { cd: out.sid } }) } });
+      out.opened = seen.map((o) => [o.sid, o.title, o.workspace.path, o.running]);
+    """, pre=f"globalThis.location = {{ pathname: {json.dumps(pathname)} }};")
+    button = f'<button class="link ws-cd" type="button" data-cd="{out["sid"]}">Change folder…</button>'
+    if shown:
+        assert out["sid"] == "001-calc"
+        assert out["gone"]["banner"] == ("The session folder is missing: /gone. The session cannot start until the "
+                                         "folder is back or another one is chosen: " + button)
+        code = '<code class="ws-path" id="ws-path" title="Click to copy">/here</code>'
+        assert out["here"]["info"].endswith(code + button)
+        assert out["opened"] == [["001-calc", "Calc", "/here", True]]
+    else:
+        assert out["gone"]["banner"] == ("The session folder is missing: /gone. The session cannot start until the "
+                                         "folder is back.")
+        assert "data-cd" not in out["here"]["info"] and out["opened"] == []
+    assert "data-cd" not in out["earlier"]["banner"] + out["earlier"]["info"]
+    assert out["earlier"]["banner"].endswith("until the folder is back.")

@@ -1527,3 +1527,111 @@ def test_the_hub_says_whether_it_has_an_api_token(tmp_path, monkeypatch):
         monkeypatch.setenv(hubauth.API_DIGEST_ENV, hubauth.digest(token))   # the sandbox's container: the digest
         assert c.get("/api/hub").json()["api"] is True
         c.portal.call(manager.shutdown)
+
+
+# ---- the web UI's folder routes (docs/SPEC.md §17.2 "Choosing a folder from the web UI", §18.1) -----------------
+def test_the_folder_routes(client, tmp_path):
+    c = client
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    answer = _post(c, "/api/folders/check", {"path": str(empty)})
+    assert answer.status_code == 200, answer.text
+    assert answer.json()["mode"] == "created" and answer.json()["state"] == "empty"
+    assert answer.json()["target"] == str(empty) and answer.json()["use"] == "workspace"
+    refused = _post(c, "/api/folders/check", {"path": str(tmp_path / "home")}).json()   # a refusal: an answer
+    assert set(refused) == {"use", "path", "error", "status"} and refused["status"] == 400
+    source = _post(c, "/api/folders/check", {"path": str(empty), "use": "source"}).json()
+    assert source == {"use": "source", "path": str(empty), "target": str(empty.resolve()), "state": "folder"}
+    sid = _post(c, "/api/sessions", {"title": "Mover", "start": False}).json()["session"]["id"]
+    moved = _post(c, "/api/folders/check", {"session": sid, "path": str(empty)}).json()
+    assert moved["mode"] == "moved" == moved["expect"] and moved["running"] is False
+    assert _post(c, "/api/folders/check", {"session": sid, "default": True}).json()["mode"] == "unchanged"
+    for body, status in (({"path": 5}, 400), ({"path": str(empty), "use": "other"}, 400), ({}, 400),
+                         ({"path": str(empty), "default": "yes"}, 400), ({"session": "nope", "path": str(empty)}, 404),
+                         ({"path": str(empty), "use": "source", "session": sid}, 400)):
+        resp = _post(c, "/api/folders/check", body)
+        assert resp.status_code == status and resp.json()["error"], (body, resp.text)
+    roots = _post(c, "/api/folders/list", {})
+    assert roots.status_code == 200 and roots.json()["path"] is None
+    assert roots.json()["roots"][0]["kind"] == "home" and roots.json()["sep"] == os.sep
+    (empty / "inner").mkdir()
+    listed = _post(c, "/api/folders/list", {"path": str(empty), "session": sid}).json()
+    assert [e["name"] for e in listed["entries"]] == ["inner"] and listed["path"] == str(empty)
+    for body, status in (({"path": "relative"}, 400), ({"path": str(empty), "use": 3}, 400),
+                         ({"path": str(empty), "use": "other"}, 400), ({"path": str(empty), "session": "nope"}, 404)):
+        resp = _post(c, "/api/folders/list", body)
+        assert resp.status_code == status and resp.json()["error"], (body, resp.text)
+    if os.name == "nt":
+        resp = _post(c, "/api/folders/list", {"path": "\\\\host\\share"})
+        assert resp.status_code == 403 and "network or device path" in resp.json()["error"]
+    # never a GET, never a form; never under a session or the external API
+    for path in ("/api/folders/check", "/api/folders/list"):
+        assert c.get(path).status_code == 405
+        assert c.post(path, content="path=x", headers={"content-type": "application/x-www-form-urlencoded"}
+                      ).status_code == 415
+    assert _post(c, f"/s/{sid}/api/folders/list", {"path": str(empty)}).status_code == 404
+    # every folder thread busy: 429
+    c.manager._folder_ops = 4
+    try:
+        for path, body in (("/api/folders/check", {"path": str(empty)}), ("/api/folders/list", {"path": str(empty)})):
+            resp = _post(c, path, body)
+            assert resp.status_code == 429 and resp.json() == {"error": "Too many folder checks at once; try again in "
+                                                                        "a moment."}
+    finally:
+        c.manager._folder_ops = 0
+
+
+def test_the_folder_routes_ask_for_the_hub_token(tmp_path, monkeypatch):
+    from dreamteam import hubauth
+
+    token, api_token = "Tk-" + "a1B2c3D4" * 6, "Api-" + "z9Y8x7W6" * 6
+    monkeypatch.setattr(hubauth, "_taken", token)
+    monkeypatch.setattr(hubauth, "_api_taken", api_token)
+    manager = _manager(tmp_path)
+    with TestClient(create_launcher_app(manager, "0.0.0.0"), base_url="http://127.0.0.1:8765",
+                    client=("172.17.0.1", 40000)) as c:
+        try:
+            for path in ("/api/folders/check", "/api/folders/list"):
+                assert _post(c, path, {"path": str(tmp_path)}).status_code == 401
+                for bearer, status in ((api_token, 401), (token, 200)):   # the API token opens no internal route
+                    answer = c.post(path, content=json.dumps({"path": str(tmp_path)}),
+                                    headers={"content-type": "application/json", "authorization": f"Bearer {bearer}"})
+                    assert answer.status_code == status, answer.text
+            answer = c.post("/api/v1/folders/list", content=json.dumps({"path": str(tmp_path)}),
+                            headers={"content-type": "application/json", "authorization": f"Bearer {api_token}"})
+            assert answer.status_code == 404 and answer.json()["code"] == "not_found"   # v1 has no such route
+        finally:
+            c.portal.call(manager.shutdown)
+
+
+def test_create_with_the_mode_the_user_agreed_to(client, tmp_path):
+    c = client
+    full = tmp_path / "full"
+    full.mkdir()
+    (full / "a.txt").write_text("a", encoding="utf-8")
+    resp = _post(c, "/api/sessions", {"title": "E", "start": False, "workspace": str(full), "expect": "created"})
+    assert resp.status_code == 409 and "Nothing was created" in resp.json()["error"]
+    resp = _post(c, "/api/sessions", {"title": "E", "start": False, "expect": "created"})
+    assert resp.status_code == 400 and resp.json()["error"] == "\"expect\" needs \"workspace\"."
+    resp = _post(c, "/api/sessions", {"title": "E", "start": False, "workspace": str(full), "expect": 1})
+    assert resp.status_code == 400
+    resp = _post(c, "/api/sessions", {"title": "E", "start": False, "workspace": str(tmp_path / "new"),
+                                      "expect": "adopted", "copy_from": str(full)})
+    assert resp.status_code == 400 and "cannot go with a copy" in resp.json()["error"]
+    assert c.get("/api/sessions").json() == {"sessions": []}
+    resp = _post(c, "/api/sessions", {"title": "E", "start": False, "workspace": str(full), "expect": "adopted"})
+    assert resp.status_code == 201 and resp.json()["result"]["mode"] == "adopted"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="network paths are Windows paths")
+def test_skills_of_a_project_on_a_share_are_never_read(client, monkeypatch):
+    from dreamteam import skills as skills_module
+
+    def never(*args, **kwargs):
+        raise AssertionError("read")
+
+    monkeypatch.setattr(skills_module, "claude_skills", never)
+    for value in ("\\\\host\\share", "//host/share/project"):
+        resp = client.get("/api/skills", params={"workspace": value})
+        assert resp.status_code == 400 and resp.json()["error"] == ("'workspace' must be a folder of this computer, "
+                                                                    "not a network path.")

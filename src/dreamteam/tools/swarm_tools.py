@@ -10,6 +10,7 @@ from .. import netoff, prompts, roles
 from ..db import loads
 from ..jobs import fmt_duration, short_command
 from ..models import USER, AgentKind, Status, ToolError
+from ..swarm import USER_PAUSE
 from ..workspace import shown_list
 from . import ToolContext, tool
 from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
@@ -17,6 +18,13 @@ from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
 MAX_NOTES = 20000
 WAIT_DEFAULT = 50
 WAIT_MAX = 600
+# `wait` with an in_progress task, nothing of the caller's set to wake it and the rest of the team asleep (docs/SPEC.md
+# §12 `wait`): read after the next wake-up (wait ends the activation), hence "the next time"
+WAIT_UNWATCHED = ("OK, waiting. You will be woken up by new events, but nothing of yours is set to wake you and "
+                  "nobody else in the team is at work. A process started with & or nohup that `jobs` does not list "
+                  "is not tracked: its end will not wake you. If you are waiting for one, the next time set a trigger "
+                  "with a deadline before you wait (trigger_create, e.g. file_exists(\"out/result.json\") or "
+                  "elapsed(1800)), and start such runs with background=true, without & and nohup.")
 # wait_for_events(progress=true): the journal events that are board progress, the lines shown per result (the rest
 # is counted) and the events read per result
 PROGRESS_TYPES = ("task.created", "task.updated", "goal.set", "goal.completed", "goal.reopened", "agent.hired",
@@ -267,7 +275,24 @@ async def wait(ctx: ToolContext, args: dict[str, Any]) -> str:
         also.append(f"{shown_list(refused)}, which you were refused, {'is' if len(refused) == 1 else 'are'} free")
     if also:
         return "OK, waiting. You will be woken up by new events, also when " + " and when ".join(also) + "."
+    if _unwatched(ctx):
+        return WAIT_UNWATCHED
     return "OK, waiting. You will be woken up by new events."
+
+
+def _unwatched(ctx: ToolContext) -> bool:
+    """The caller holds a stalled in_progress task (Swarm.stall_ids: not a clarify card waiting for the user, not a
+    crew task with live directions; a `waiting` task alone does not count: answers wake it), has no active trigger of
+    its own, and nobody else can act or be woken by something set (Swarm.team_asleep); the goal is active. The job
+    and refused-file waits are ruled out by the caller. A test double without these gives False."""
+    swarm = ctx.swarm
+    stall_ids, team_asleep = getattr(swarm, "stall_ids", None), getattr(swarm, "team_asleep", None)
+    triggers = getattr(swarm, "triggers", None)
+    if stall_ids is None or team_asleep is None or triggers is None:
+        return False
+    goal = swarm.goal() or {}
+    return (goal.get("status") == "active" and bool(stall_ids(ctx.actor))
+            and not triggers.list(owner=ctx.actor) and team_asleep(ctx.actor))
 
 
 @tool(
@@ -301,9 +326,8 @@ async def goal_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
         text += f" Note: {len(still_open)} task(s) are still open ({ids}); finish or cancel them."
     running = swarm.jobs.running_of()
     if running:  # they go on (a dev server may be for the user): the caller may stop the ones nobody needs
-        how = "job_stop" if ctx.has_tool("job_stop") else "the shell command kill jN (as a command of its own)"
         text += (f" Note: background jobs are still running: {_job_list(running)}. Stop the ones nobody needs with "
-                 f"{how}; the rest stop with the session.")
+                 "job_stop; the rest stop with the session.")
     return text
 
 
@@ -657,9 +681,13 @@ async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
         swarm.reopen_goal(ctx.actor, args["reopen_goal_comment"])
         done.append("goal reopened")
     action = args.get("action")
+    kept: list = []   # the jobs a pause that paused leaves running (their own sentence after the joined parts, §12)
     if action == "pause":
-        done.append("paused" if swarm.pause(ctx.actor, "paused by the user")
-                    else f"already paused ({swarm.pause_text()})")
+        if swarm.pause(ctx.actor, USER_PAUSE):
+            done.append("paused")
+            kept = swarm.jobs.running_of()
+        else:
+            done.append(f"already paused ({swarm.pause_text()})")
     elif action == "resume":
         swarm.resume(ctx.actor)
         done.append("resumed")
@@ -671,4 +699,8 @@ async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
         done.append("wrap-up mode off" if swarm.end_wrap_up(ctx.actor) else "wrap-up mode was not on")
     if not done:
         raise ToolError("Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.")
-    return "Done: " + "; ".join(done) + "."
+    text = "Done: " + "; ".join(done) + "."
+    if kept:  # ids only: USER's u_paused_jobs (Swarm._set_pause) has the details
+        text += (f" Background jobs keep running ({', '.join(j.label for j in kept)}): a pause stops only the agents' "
+                 "model calls; job_stop stops a job.")
+    return text

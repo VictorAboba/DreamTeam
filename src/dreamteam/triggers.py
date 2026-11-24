@@ -45,6 +45,13 @@ BURST_SECONDS = 10.0
 RESET_FUNCTIONS = frozenset({"message", "comment", "file_changed", "every"})
 # the parameter of these functions that names a member (resolved like every tool does at creation)
 NAME_PARAMS = {"message": "sender", "comment": "sender", "count": "assignee", "agent_status": "name"}
+# TriggerEngine.unattended (docs/SPEC.md §8 "Unattended triggers"): the functions that come true with time alone, those
+# that read files only; a time moment that passed by more than UNATTENDED_GRACE without a fire is held back by another
+# part of the condition, and a files-only trigger counts for UNATTENDED_FILE_SECONDS from its creation or last fire
+TIME_FUNCTIONS = frozenset({"elapsed", "after", "every"})
+FILE_FUNCTIONS = frozenset({"file_exists", "file_changed"})
+UNATTENDED_GRACE = 10.0
+UNATTENDED_FILE_SECONDS = 30 * 60.0
 
 GRAMMAR = (
     "Condition syntax: a Python-like expression with and/or/not, comparisons (== != < <= > >= in, not in), "
@@ -449,6 +456,8 @@ class CompiledCondition:
     functions: frozenset[str]
     files: tuple[str, ...] = ()       # paths watched by file_changed()
     probes: tuple[str, ...] = ()      # workspace paths probed by file_exists()/file_changed()
+    elapsed: tuple[float, ...] = ()   # the seconds of elapsed() calls (TriggerEngine.unattended)
+    after: tuple[float, ...] = ()     # the moments (timestamps) of after() calls (the same)
 
     @property
     def periodic(self) -> bool:
@@ -466,6 +475,8 @@ class _Compiler:
         self.every: list[float] = []
         self.files: list[str] = []
         self.probes: list[str] = []
+        self.elapsed: list[float] = []
+        self.after: list[float] = []
         self.functions: set[str] = set()
 
     def compile(self, source: str) -> CompiledCondition:
@@ -491,7 +502,8 @@ class _Compiler:
         if not self.functions:
             raise _fail("it calls no function, so it never changes; use e.g. done(3) or every(600)")
         return CompiledCondition(source, fn, tuple(self.every), frozenset(self.functions),
-                                 tuple(dict.fromkeys(self.files)), tuple(dict.fromkeys(self.probes)))
+                                 tuple(dict.fromkeys(self.files)), tuple(dict.fromkeys(self.probes)),
+                                 tuple(self.elapsed), tuple(self.after))
 
     # --- expressions --------------------------------------------------------------------------
     def expr(self, node: ast.expr) -> Evaluator:
@@ -570,6 +582,10 @@ class _Compiler:
         pos, named = self.bind(spec, args, kwargs)
         if name == "every":
             self.every.append(float(named["seconds"]))
+        elif name == "elapsed":
+            self.elapsed.append(float(named["seconds"]))
+        elif name == "after":
+            self.after.append(parse_when(named["when"]))
         elif name == "file_changed":
             self.files.append(named["path"])
         if name in ("file_exists", "file_changed"):
@@ -928,6 +944,70 @@ class TriggerEngine:
             rows = [r for r in rows if _norm(r["owner"]) == _norm(owner)]
         interval = self._wake_interval()
         return [_to_dict(r, interval) for r in rows]
+
+    # --- the whole team asleep (Swarm.team_asleep, docs/SPEC.md §3 scheduler item 9) ----------------------------
+    def unattended(self, now: float) -> bool:
+        """An active trigger reaches an LLM member and may still fire while nobody acts (docs/SPEC.md §8
+        "Unattended triggers"): it holds fires (their release wakes the owner); or its condition uses a time function
+        whose next moment (the latest of them) has not passed by more than UNATTENDED_GRACE (one that passed without a
+        fire is held back by board state); or it reads files only and was created or last fired less than
+        UNATTENDED_FILE_SECONDS ago. A repeating trigger that is not periodic and is true now does not count (it fires
+        again only after it turns false), nor one on board, message or agent state only. Never fires, evaluates or
+        changes a trigger."""
+        kinds: dict[str, str | None] = {}
+        for row in self.swarm.db.all("SELECT owner, condition, actions, once, created_at, last_fired, last_value, held"
+                                     " FROM triggers WHERE active = 1"):
+            if not self._reaches_llm(row, kinds):
+                continue
+            if (row["held"] or 0) > 0:
+                return True
+            try:
+                compiled = self.compile(row["condition"])
+            except ToolError:
+                continue
+            if not row["once"] and not compiled.periodic and row["last_value"]:
+                continue
+            created = float(row["created_at"] or 0)
+            if compiled.functions & TIME_FUNCTIONS:
+                every = float(row["last_fired"] if row["last_fired"] is not None else created)
+                moments = ([created + s for s in compiled.elapsed] + list(compiled.after)
+                           + [every + p for p in compiled.every])
+                if moments and now <= max(moments) + UNATTENDED_GRACE:
+                    return True
+            elif compiled.functions <= FILE_FUNCTIONS:
+                since = float(row["last_fired"] if row["last_fired"] is not None else created)
+                if now - since < UNATTENDED_FILE_SECONDS:
+                    return True
+        return False
+
+    def _reaches_llm(self, row: Any, kinds: dict[str, str | None]) -> bool:
+        """A fire of this trigger reaches an LLM member: a wake of an LLM owner (the default actions wake), a message
+        to an LLM member or to "all", or a board change (set_status, create_task: their notices and item 1's offers
+        reach the members). `kinds`: the members' kinds read in this call."""
+        def kind(name: str) -> str | None:
+            if name not in kinds:
+                kinds[name] = self.swarm.kind_of(name)
+            return kinds[name]
+
+        for action in loads(row["actions"], []) or DEFAULT_ACTIONS:
+            kind_of_action = action.get("type")
+            if kind_of_action in ("set_status", "create_task"):
+                return True
+            if kind_of_action == "wake" and row["owner"] != USER and kind(row["owner"]) == AgentKind.LLM:
+                return True
+            if kind_of_action == "message":
+                to = action.get("to")
+                items = to.split(",") if isinstance(to, str) else [str(x) for x in to or []]
+                for item in (" ".join(i.split()) for i in items):
+                    if item.lower() == "all":
+                        return True
+                    try:
+                        name = self.swarm.resolve_member(item, allow_user=True)
+                    except ToolError:
+                        continue
+                    if name != USER and kind(name) == AgentKind.LLM:
+                        return True
+        return False
 
     # --- evaluation ---------------------------------------------------------------------------
     def mark_dirty(self) -> None:

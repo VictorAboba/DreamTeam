@@ -275,9 +275,13 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     to `err`. With `verbose`, a compact progress feed goes to `err`: the plain-text rendering of the
     `render.event()` lines at verbosity "normal".
   - `text` and `json`: a `notification` to the user of kind `u_cost_unknown` (a model profile's calls count as
-    $0: no prices, and the provider reports no cost; SPEC §10) writes its text to `err` once, also without
-    `verbose` (`on_cost_unknown`; the verbose feed already shows it as a notice line). `stream-json` carries the
-    event itself.
+    $0: no prices, and the provider reports no cost; SPEC §10), `u_budget_low` (most of the money budget is spent,
+    SPEC §3 `record_usage`), `u_team_asleep` (nobody in the team works and nothing is set to wake the team, SPEC §3
+    scheduler item 9) or `u_team_waits` (the same, and every open task is held by the user or an external member,
+    so no member is woken) writes its text to `err` once per text, also without `verbose` (the kinds are
+    `printmode.STDERR_NOTES`, written by `on_user_notice`; the verbose feed already shows it as a notice line). The
+    run goes on waiting after `u_team_asleep` or `u_team_waits`, until `--timeout` when one is given. `stream-json`
+    carries the event itself.
   - `json`: one object on `out` at the end:
     `{"type":"result","status":"done|budget|timeout|error|interrupted","session":id,"goal":{...},
     "summary":str,"tasks":[{id,title,status,assignee}],"cost_usd":float,"duration_s":float,"agents":[names],
@@ -369,9 +373,13 @@ class RenderContext:
 - Notifications to the user: `🔔 text`. MCP pending → handled by the approval dialog (plus an info line). The
   review notices (`u_review_requested`, `u_review_fallback`, `u_review_handed_over`, `u_reviews_waiting`) are one
   warning line, like `u_budget`; so are the skill notices (`u_skill_proposed`, `u_skill_deps_failed`,
-  `u_role_skills_missing`, `u_role_skills_over_cap`), `u_cost_unknown` (a model profile's calls count as $0) and
+  `u_role_skills_missing`, `u_role_skills_over_cap`), `u_cost_unknown` (a model profile's calls count as $0),
   `u_auto_reply_limit` (the hub no longer answers the members' messages of an `answers: "auto"` session in this run,
-  SPEC §21.5).
+  SPEC §21.5), `u_budget_low` (most of the money budget is spent, SPEC §3 `record_usage`), `u_team_asleep` (the
+  whole team asleep with nothing set to wake the team, SPEC §3 scheduler item 9) and `u_team_waits` (the same, with
+  every open task held by the user or an external member: only the user can unblock the run), all in
+  `render._WARN_NOTES`.
+  `u_paused_jobs` (the user's pause while jobs run) is a plain bell line, like `u_jobs_running`.
 - Skills (normal and verbose; quiet has the notices): `⏺ вы · подключил(а) скилл pdf · library` (обновил(а) for a
   replace, отключил(а)), `⏺ Анна · предлагает скилл x` (warn), `⏺ вы · сохранил(а) скилл x в библиотеку` / «не
   стал(а) сохранять … · <the reason>». Packages (`skill.deps`): `✓ скилл pdf: пакеты установлены
@@ -379,7 +387,10 @@ class RenderContext:
   <error>`; a build starting and the manual states (off, unsupported, unavailable) only in verbose.
 - Hires: `+ Анна Смирнова (Аналитик) присоединилась` (gendered verb not required: use «в команде»).
   Retire: `− Анна покинула рой`.
-- Pause/resume renders as `⏸ Рой на паузе (причина)` / `▶ Рой продолжает работу`. A pause for a member's question
+- Pause/resume renders as `⏸ Рой на паузе (причина)` / `▶ Рой продолжает работу`; the user's own pause reads
+  `⏸ Рой на паузе (по вашему решению)` / "The swarm is paused (paused by you)" (uitext `reason_user`; a job's
+  «остановлен вами», `job_stopped_user`, is another key). With background jobs running, the `u_paused_jobs` bell line
+  that follows names them (a pause stops only the agents' model calls). A pause for a member's question
   (reason `question`, SPEC §3.1) is a warning line at every verbosity, `⏸ Рой ждёт вашего ответа агенту Анна` / "The
   swarm waits for your answer to Anna" (the first name); a resume that ends one says how: «Рой продолжает работу: ваш
   ответ на вопрос #12 получили все участники» (answered), «Рой продолжает работу без ответа на вопрос #12» (resumed by
@@ -610,7 +621,7 @@ async def run_tui(conn: Connection, *, lang: str | None = None, session: str | N
 | `/cost` | spending per agent |
 | `/status` | setup and session status (with the session folder) |
 | `/model [профиль]` | list model profiles (✓ default; columns profile, model, provider, prices, key); with an argument set the default profile in the settings (new sessions and new hires), and for a profile whose tokens count as $0 (`price_source` none / partial) a warning line: «У профиля «{name}» не указаны {fields}: эти токены считаются по $0, и бюджет их не видит (если провайдер не сообщает стоимость сам). Цены — в /settings» / "Profile "{name}" has no {fields}: …" (i18n `model_no_prices`) |
-| `/pause` | pause / resume the swarm (toggle, `swarm_control`); during a question pause it resumes without the answer (the asker takes its own defaults) |
+| `/pause` | pause / resume the swarm (toggle, `swarm_control`; a successful result is not printed (a refusal is): the `⏸` line and, with jobs running, the `u_paused_jobs` line say it); during a question pause it resumes without the answer (the asker takes its own defaults) |
 | `/wrapup [off]` | wrap-up mode on (`on`/`вкл` or nothing) or off (`off`/`выкл`): the agents finish their tasks with what they have, start no new computations, and no new background jobs start (`swarm_control` wrap_up; the `swarm.wrap_up` event prints the change, a no-op prints the tool's answer) |
 | `/clarify [on\|off]` | clarify mode, `[swarm] clarify` (SPEC §3.1): questions before the plan, and an agent's critical question pauses the swarm (`on`/`вкл`, `off`/`выкл`; anything else: the usage line). In a session: that session's setting (`update_session` {"swarm": {"clarify": bool}}; «В этой сессии цель уточняется: …» / «…не уточняется: …»; the planning task already on the board stays as it is), without an argument its state («Уточнение цели в этой сессии: вкл (своя настройка сессии)», or «как в общих настройках»); `main` has no settings of its own: without an argument it shows the general setting as its state («Уточнение цели в этой сессии: вкл (как в общих настройках)»: main has no overrides), and `on` / `off` change nothing and send no PATCH («У сессии main нет своих настроек: уточнение цели задаётся в общих настройках»). Without a session: the window's new sessions (§4.5), without an argument their state (source «настройка этого окна» or «как в общих настройках»). Launcher only |
 | `/budget N`, `/max N` | limits |
@@ -634,7 +645,7 @@ Unknown command: `⚠ Неизвестная команда /x. /help — спи
 | Alt+Enter, Ctrl+J, `\`+Enter | newline |
 | Tab | complete the selected suggestion |
 | ↑/↓ | move in suggestions, else history |
-| Esc | close suggestions or a dialog; else interrupt a running `!command`; else, while agents work: pause the swarm (prints `⏸ …`). Neither Esc nor `/pause` stops the agents' background jobs (`/jobs stop jN` does); `/pause` during a question pause goes on without the answer |
+| Esc | close suggestions or a dialog; else interrupt a running `!command`; else, while agents work: pause the swarm (prints `⏸ …`). Neither Esc nor `/pause` stops the agents' background jobs (`/jobs stop jN` does): with jobs running, a `u_paused_jobs` line names them; `/pause` during a question pause goes on without the answer |
 | Shift+Tab | cycle verbosity quiet → normal → verbose (shown in the status line) |
 | Ctrl+O | toggle verbose |
 | Ctrl+C | clear the input; else interrupt a running `!command`; on an empty input "Нажмите Ctrl+C ещё раз для выхода" (2 s), twice → exit |
