@@ -83,6 +83,11 @@
   token either. The hub never takes `X-Forwarded-For` or `Forwarded` into account (whatever `FORWARDED_ALLOW_IPS`
   says). A hub without a token (by default `dreamteam serve` on `127.0.0.1`) asks nothing of anyone: every program on
   its computer, the agents' commands outside Docker among them, can use its API.
+* The sessions page shows the names of folders on the hub's computer (never files or their contents): the home
+  folder, the drives and the other places its "Browse…" offers. Whoever can use the hub's API sees them (on a hub
+  without a token, every program on its computer), and can already point a session at any folder the hub allows.
+  Pages of other sites cannot: the folder routes take only JSON POSTs, which a browser does not send across sites
+  without the hub's consent, and the folder browser never opens a network path (`\\server\share`).
 * In the Docker sandbox the hub listens on `0.0.0.0` inside the container (a published port does not reach the
   container's loopback), so other containers on the same Docker network reach its port. `dreamteam sandbox` therefore
   gives every container its own token, keeps it on the host outside every folder it mounts (see
