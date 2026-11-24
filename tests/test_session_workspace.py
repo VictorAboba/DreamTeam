@@ -2189,14 +2189,17 @@ async def test_a_folder_that_does_not_answer_holds_its_thread_not_the_hub(tmp_pa
     assert answer["error"] == (f"{share / 'a'} did not answer within 0.3 s (a network folder, or a drive that "
                                "sleeps?). Try again, or choose another folder.")
     assert manager._folder_ops == 1   # its place is held until the thread ends
-    started = time.monotonic()   # the same path and one inside it: at once, with no thread
+    # the same path and one inside it: answered at once, with no thread (no new call of _plan, no place taken)
     assert (await manager.check_folder(str(share / "a")))["status"] == 504
     assert (await manager.check_folder(str(share / "a" / "b")))["status"] == 504
-    assert time.monotonic() - started < 0.25 and len(calls) == 1
+    assert len(calls) == 1 and manager._folder_ops == 1
     with pytest.raises(SessionError) as err:   # the listing waits for the same folder too
         await manager.list_folders(str(share / "a"))
     assert err.value.status == 504
+    # a folder that answers has all the time a slow machine needs (the timeout is read at each call)
+    monkeypatch.setattr(sessions_mod, "FOLDER_TIMEOUT", 30.0)
     assert (await manager.check_folder(str(tmp_path / "other")))["mode"] == "created"   # another folder works
+    monkeypatch.setattr(sessions_mod, "FOLDER_TIMEOUT", 0.3)
     assert (await manager.check_folder(str(share / "c")))["status"] == 504   # a second hung thread
     assert manager._folder_ops == 2
     with pytest.raises(SessionError) as err:   # every place is held by a folder that did not answer
@@ -2206,6 +2209,7 @@ async def test_a_folder_that_does_not_answer_holds_its_thread_not_the_hub(tmp_pa
         "when they answer, or restart the hub.")
     release.set()
     await until(lambda: manager._folder_ops == 0 and not manager._folders_hung, 10)
+    monkeypatch.setattr(sessions_mod, "FOLDER_TIMEOUT", 30.0)
     assert (await manager.check_folder(str(share / "a")))["mode"] == "created"
     manager._folder_ops = 2   # two checks of others run now
     with pytest.raises(SessionError) as err:
@@ -2674,19 +2678,27 @@ async def test_the_marks_stop_at_their_budget(tmp_path, monkeypatch):
     work = manager.home / "projects"
     for i in range(8):
         _put(work / f"f{i}" / "a.txt", "a")
-    real_peek = sessions_mod.folderlist.peek
+    made = []
 
-    def slow_peek(folder):
-        time.sleep(0.05)
-        return real_peek(folder)
+    class CountedBudget:
+        """The marks' time ends after three entries, however fast or slow the machine is."""
 
-    monkeypatch.setattr(sessions_mod.folderlist, "peek", slow_peek)
-    monkeypatch.setattr(sessions_mod.folderlist, "FOLDER_MARKS_BUDGET", 0.12)
+        def __init__(self, seconds):
+            made.append(seconds)
+            self.asked = 0
+
+        def left(self):
+            self.asked += 1
+            return self.asked <= 3
+
+    monkeypatch.setattr(sessions_mod.folderlist, "Budget", CountedBudget)
     answer = await manager.list_folders(str(work))
+    assert made == [sessions_mod.folderlist.FOLDER_MARKS_BUDGET]   # one budget per listing, of the set seconds
     assert answer["partial"] is True and len(answer["entries"]) == 8
     marked = [e for e in answer["entries"] if e["files"] is not None]
     rest = [e for e in answer["entries"] if e["files"] is None]
-    assert marked and rest and all(e["open"] is True and e["refused"] is None and e["repo"] is None for e in rest)
+    assert len(marked) == 3 and len(rest) == 5
+    assert all(e["open"] is True and e["refused"] is None and e["repo"] is None for e in rest)
     await manager.shutdown()
 
 
