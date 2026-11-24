@@ -6265,11 +6265,18 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
 - **Folders on both pages** (§17.2 "Choosing a folder from the web UI"): `folders.js` (loaded before home.js and
   app.js, after skills.js; `Folders`, also a Node module for the tests) holds the folder field's check line, the
   folder browser and the «Сменить папку…» dialog. Each page passes its `t`, `esc`, request function (the board its
-  `launcherApi`: the routes are the launcher's, at the root, never `/s/{sid}/...`), `toast` and modal functions; the
-  texts (`fo_*`, `fp_*`, `cf_*`, `cd_*`) live in both pages' dictionaries, ru and en.
-  - **Check line** (`Folders.checker(input, line, {use, session, isDefault})` → `{run(now), ready(), result}`): every
-    `input` or `change` of the field restarts a 400 ms timer (`CHECK_DELAY`; a paste is an `input`); a choice in the
-    browser and `run(true)` check at once. The value sent is `Folders.unquote(field.value)`: trimmed, with one pair
+  `launcherApi`: the routes are the launcher's, at the root, never `/s/{sid}/...`; a failure carries its HTTP
+  `status`), `toast` and modal functions (`Folders.setup`, at the page script's load); the texts (`fo_*`, `fp_*`,
+  `cf_*`, `cd_*`) live in both pages' dictionaries, ru and en.
+  - **Check line** (`Folders.checker(input, line, {use, session, isDefault, old, onChange})` → `{run(now), ready(),
+    result}`; `old()` the session's current folder, the `{old}` of the `cd_text_*` texts; `onChange(result)` after
+    every change of what the line shows or of `ready()`, as the change dialog's button and the new-session dialog's
+    project skills follow it): every
+    `input` or `change` of the field restarts a 400 ms timer (`CHECK_DELAY`; a paste is an `input`; a `change` of a
+    value whose answer is shown, as when the field is left for the dialog's button, keeps it, but not a check that
+    could not run: that one is tried again); a choice in the browser and `run(true)` check at once. A field no
+    longer in the page (its dialog closed) sends nothing more, and a late answer for it changes nothing. The value
+    sent is `Folders.unquote(field.value)`: trimmed, with one pair
     of matching quotes dropped (the twin of `console.unquote`: Explorer's "Copy as path" adds them); an empty value
     sends nothing and empties the line. Each request carries a number (`seq`): an answer whose number is not the
     latest, or whose `path` (the value sent) is no longer `Folders.unquote(field.value)`, is dropped, so a slow
@@ -6280,12 +6287,14 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     submitted at once never goes with the `expect` of an earlier value. The line is `role="status"` with
     `aria-live="polite"`; the field gets `aria-describedby` to it and `aria-invalid="true"` while it shows an error.
   - **Words of the line** (class `ok`; `warn` for an adopt, for a move of a running session and for `api_folder`;
-    `err` for an error): an `error` verbatim (English, as every hub error), status 504 included; a request that failed
+    `err` for an error): an `error` verbatim (English, as every hub error), status 504 included, and so the text of
+    another 4xx of the call itself (a bad body, an unknown session: an error, it blocks as one); a request that failed
     (no connection, 429, 5xx) `fo_check_failed` «Не удалось проверить папку: {error}. Хаб проверит ее при создании
     или переносе.» / "Could not check the folder: {error}. The hub checks it when the session is created or
-    moved.". `use` "source": `fo_src_folder` «Папка найдена: ее файлы скопируются в папку новой сессии.» / "Folder
-    found: its files are copied into the new session's folder." or `fo_src_zip` «Архив .zip найден: его содержимое
-    скопируется в папку новой сессии.» / "A .zip found: its contents are copied into the new session's folder.". `use`
+    moved." ({error} without its own final full stop). `use` "source": `fo_src_folder` «Папка найдена: ее файлы
+    скопируются в папку новой сессии.» / "Folder found: its files are copied into the new session's folder." or
+    `fo_src_zip` «Архив .zip найден: его содержимое скопируется в папку новой сессии.» / "A .zip found: its contents
+    are copied into the new session's folder.". `use`
     "workspace" for a new session: `fo_new_missing` «Папки нет: она будет создана, и сессия начнет в ней с чистого
     листа.» / "The folder does not exist: it will be created, and the session starts there afresh."; `fo_new_empty`
     «Папка пустая: сессия начнет в ней с чистого листа.» / "The folder is empty: the session starts there afresh.";
@@ -6307,14 +6316,16 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     “{root}” of [api] folders: after the change it is an ordinary session of yours, and that folder's checks no
     longer apply." when `api_folder`. The `cd_*` keys this picks are listed by name in `Folders.LINE_KEYS` (a
     `t("cd_" + key)` would escape the used-keys test).
-  - **Folder browser** (`Folders.browse({use, session, start, onChoose})`), behind «Обзор…» / "Browse…" (`fo_browse`,
+  - **Folder browser** (`Folders.browse({use, session, start, onChoose, opener})`; `opener` the «Обзор…» button the
+    focus goes back to), behind «Обзор…» / "Browse…" (`fo_browse`,
     a `button type="button"` after each path field, `aria-haspopup="dialog"`): a layer of its own above the page's
     modal (`#folder-picker` with its own backdrop, `role="dialog"`, `aria-modal="true"`, `aria-labelledby` its title
     `fp_title` «Папка на компьютере хаба» / "A folder on the hub's computer"), so the dialog under it keeps what was
     typed. Its requests are `POST /api/folders/list` `{path?, use, session?}`. It shows:
     - the places (`roots`) as a column of buttons (under 640 px a `select` above the list): `fp_root_home`
       «Домашняя папка» / "Home folder", `fp_root_drive` «Диск {name}» / "Drive {name}", `fp_root_system` «Корень
-      (/)» / "Root (/)", the `recent` ones under the group heading `fp_recent` «Недавние папки» / "Recent folders"
+      (/)» / "Root (/)", the `recent` ones in a group of their own (`role="group"`; in the `select` an `optgroup`)
+      under the heading `fp_recent` «Недавние папки» / "Recent folders"
       with the folder's last part as the label (the whole path as the tooltip), `fp_root_api` «Папка API: {name}» /
       "API folder: {name}" (the tooltip the path and `fp_root_api_hint` «из [api] folders в настройках» / "from [api]
       folders in the settings"), `fp_root_dreamteam` «Домашняя папка DreamTeam» / "DreamTeam home";
@@ -6350,7 +6361,8 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     to its nearest existing ancestor: `fallback`), else at the first root (the home on the host; the DreamTeam home,
     or the first api root, in a container); a 403 (outside the places, a network path) opens the first root with the
     error in the status line. One listing request at a time: a click while one runs supersedes it (`seq`, the stale
-    answer dropped). «Выбрать эту папку», or a double click on an entry (that entry), puts the path into the field,
+    answer dropped). «Выбрать эту папку», or a double click on an entry (the entry of its first click, which has
+    started opening it: by the second click its subfolders may be under the pointer), puts the path into the field,
     closes the browser, gives the focus back to the field and checks it at once. The browser shows only the cheap
     marks; the full check runs on the chosen folder, in its field. The copy field's browser lists folders only: a
     .zip on the hub's computer is typed (its check says `fo_src_zip`).
@@ -6359,11 +6371,17 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     (a roving `tabindex`: the focused entry 0, the others -1). In the «Новая папка…» input those keys are the
     input's own, Enter is its «Выбрать», and the first Escape closes the input (the focus back on «Новая папка…»).
     Escape elsewhere closes the browser only and gives the focus back to «Обзор…»; Tab and Shift+Tab cycle inside it
-    (a focus trap); at open the focus is on the first entry, else on «Выбрать эту папку». A click on the browser's
+    (a focus trap); at open (and after each listing: on the folder it came up from, if listed) the focus is on the
+    first entry, else on «Выбрать эту папку» (on `cancel` while that is disabled). A click on an entry opens it (a
+    closed one only takes the focus); the narrow screen's `select` of places is named by the title
+    (`aria-labelledby`), and a folder outside the places shows "—" there. A click on the browser's
     own backdrop closes the browser only. The dialog under it never sees these: a keydown listener on
     `#folder-picker` stops Escape there (`stopPropagation`; home.js's Escape handler and app.js's `onKeydown` are
-    bubble-phase listeners on `document`), and both pages' Escape and backdrop handlers also return at once while
-    `Folders.isOpen()` (so an Escape while the focus has fallen to `body` does not discard the new-session dialog).
+    bubble-phase listeners on `document`), and while `Folders.isOpen()` both pages' backdrop handlers return at once
+    and their Escape handlers close the browser alone (`Folders.closeBrowser`: an Escape while the focus has fallen
+    out of the browser never discards the new-session dialog). `#folder-picker` takes the focus of a click on its
+    text (`tabindex="-1"`), and the page's modal under it is `inert` while it is open. The page's `openModal` and
+    `closeModal` close an open browser (it belongs to the dialog it was opened from).
   - **Change folder** (`Folders.changeDialog({sid, title, workspace, running, onDone})`): «Сменить папку…» / "Change
     folder…" (`cf_button`) opens the page's modal: the title `cf_title` «Папка сессии «{title}»» / "Folder of session
     “{title}”", `cf_now` «Сейчас: {path} ({kind})» / "Now: {path} ({kind})" ({kind} the card's badge text, «папки
@@ -6378,8 +6396,12 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
     not "unchanged"). The click asks `confirm()` with the TUI's question, `cd_ask` or `cd_ask_default` ({title},
     {path} the check's `target`, {text} the check line's text, which holds `cd_text_running` for a running session:
     its agents stop for the move and go on afterwards); yes → `POST /api/sessions/{sid}/workspace` with `{"path":
-    <the check's target>, "expect": <its expect>}` or `{"default": true, "expect": <its expect>}`, the button
-    disabled and `cf_moving` «Переношу…» / "Moving…" shown (no time limit of the page's own: a move across drives
+    <the check's target>, "expect": <its expect>}` or `{"default": true, "expect": <its expect>}`. A check of a
+    typed folder that could not run (`fo_check_failed`) blocks nothing, as for a create: the question's {path} is
+    `Folders.unquote` of the field and the body `{"path": <it>}` without `expect` (the hub decides and says);
+    «Вернуть в свою папку» needs an answer (its folder's path is the hub's). During the request the button, the ×
+    and `cancel` are
+    disabled, and `cf_moving` «Переношу…» / "Moving…" shown (no time limit of the page's own: a move across drives
     copies). While that request runs the dialog cannot close (`Folders.busy()`): Escape, its backdrop and `cancel`
     do nothing (`cancel` disabled), so its result or error is never lost and no second move starts. The answer's
     `result` is worded by `Folders.resultLines(result, title)`, the twin of `console.cd_result_lines` (keys
@@ -6571,7 +6593,9 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       both pages" above): when there is none yet (the 400 ms not over, or the answer not in), the submit runs the
       check at once, shows its line and creates nothing, with `f_ws_checked` «Папка проверена: прочитайте под ней,
       что произойдет, и нажмите кнопку еще раз.» / "The folder was checked: read below it what will happen, and
-      click the button again." in `#ns-error`; a check with an `error` refuses with that text; a check whose mode is
+      click the button again." in `#ns-error` once its answer is in (an answer with an `error` puts that text
+      there instead; a check that could not run, only its line); a check with an `error` refuses with that text; a
+      check whose mode is
       "adopted" asks `confirm()` first, `f_ws_confirm` «Сессия будет работать прямо в папке {path} с ее файлами:
       {text} Продолжить?» / "The session will work right in the folder {path}, with its files: {text} Go on?"
       ({path} the check's `target`, {text} the check line's text; as every move of the change dialog asks, so does a
@@ -6600,7 +6624,8 @@ dreamteam import FOLDER [--include CATEGORIES]... [--session ID|UID]... [--dry-r
       folders and the check refuses any other with `_container_refusal`'s text (§17.2). `copy`'s browser lists only
       the mounted roots of `[api] folders` (the home is never a copy source): when `nsCopySandbox()` first finds the
       hub in a container, the dialog asks `POST /api/folders/list` `{"use": "source"}` (no path: the roots alone)
-      once, and without any root «Обзор…» is disabled with `f_copy_sandbox` as its tooltip; a typed path of the
+      once, and without any root «Обзор…» is disabled with `f_copy_sandbox` as its tooltip (a request that failed
+      leaves the button as it is and is asked again; an answer for a closed dialog is dropped); a typed path of the
       user's computer gets the sandbox text of `resolve_source` in the check line ("... Upload the folder as a .zip in
       the New session dialog ..."), which the zip field next to it answers.
   - Team composer (new-session modal, settings' defaults, saved teams): one row per group of the starting team (§17.3
