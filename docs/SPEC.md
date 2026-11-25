@@ -5593,7 +5593,8 @@ The members are never told where the files came from: no source path goes into `
   are made one upload at a time per store, under an `asyncio.Lock`, so uploads that arrive together each count the
   ones before them; the count is the tokens of the store's `.zip`, `.bin` and `.part` files joined with the uploads
   this store let in that have not ended yet, kept in memory and read before the folder, because a listing of a
-  folder may miss a file renamed while it is read, an upload's `.part` becoming its `.zip` or `.bin`);
+  folder may miss a file renamed while it is read, an upload's `.part` becoming its `.zip` or `.bin`; one whose
+  `.part` `clean()` removed, past its hour, no longer counts, as it can no longer be stored);
   `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
   400 "The upload is empty.", a file that is not a zip 400 "The file is not a zip archive."; then `<token>.json`
   `{"filename",
