@@ -855,6 +855,85 @@ async def test_v1_uploads_have_their_own_cap(tmp_path):
         await _file_upload(uploads, max_pending=11)
 
 
+async def test_uploads_still_arriving_count_whatever_the_folder_shows(tmp_path, monkeypatch):
+    """A listing of a folder may miss a file renamed while it is read (an upload's .part becoming its .bin): the
+    uploads let in that have not ended count whatever the folder shows, and one that ends, finished or failed, no
+    longer counts as arriving."""
+    uploads = Uploads(tmp_path / "api")
+    gate = asyncio.Event()
+    real_scandir = os.scandir
+
+    class MissingParts:   # a listing that misses every .part (each as if renamed while it is read)
+        def __init__(self, path):
+            self._it = real_scandir(path)
+
+        def __iter__(self):
+            return (entry for entry in self._it if not entry.name.endswith(".part"))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._it.close()
+
+    async def held(data: bytes):
+        await gate.wait()
+        yield data
+
+    arriving = [asyncio.create_task(uploads.receive(held(b"x"), filename=f"{n}.txt", length=None, limits=LIMITS,
+                                                    kind="file", caller="api", max_pending=2)) for n in range(2)]
+    while len([n for n in _names(uploads.root) if n.endswith(".part")]) < 2:
+        await asyncio.sleep(0)
+    monkeypatch.setattr(os, "scandir", MissingParts)
+    with pytest.raises(CopyError) as err:
+        await _file_upload(uploads, max_pending=2)
+    assert (err.value.status, err.value.code) == (429, "too_many_uploads")
+    gate.set()
+    done = await asyncio.gather(*arriving)   # (they end while the listing still misses .part files)
+    assert sorted(n for n in _names(uploads.root) if n.endswith(".bin")) == sorted(f"{d['upload']}.bin" for d in done)
+    with pytest.raises(CopyError, match="not a zip"):   # (a failed one)
+        await _file_upload(uploads, b"plain", unpack=True, max_pending=3)
+    monkeypatch.undo()
+    assert not [n for n in _names(uploads.root) if n.endswith(".part")]
+    for answer in done:   # once their .bin are gone, the ended ones (finished or failed) take no place
+        uploads.discard(answer["upload"], caller="api")
+    await _file_upload(uploads, max_pending=2)
+    await _file_upload(uploads, max_pending=2)
+    with pytest.raises(CopyError):
+        await _file_upload(uploads, max_pending=2)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot remove a file that is open")
+async def test_an_upload_arriving_past_its_hour_frees_its_place_when_clean_removes_it(tmp_path):
+    """An upload that sends too little to be written for UPLOAD_TTL keeps its .part's first time: clean() removes the
+    .part, the upload can no longer be stored, and its place under the cap is free."""
+    uploads = Uploads(tmp_path / "api")
+    gate = asyncio.Event()
+
+    async def stalled():
+        yield b"x"
+        await gate.wait()
+
+    first = asyncio.create_task(uploads.receive(stalled(), filename="slow.txt", length=None, limits=LIMITS,
+                                                kind="file", caller="api", max_pending=1))
+    while not [n for n in _names(uploads.root) if n.endswith(".part")]:
+        await asyncio.sleep(0)
+    with pytest.raises(CopyError) as err:
+        await _file_upload(uploads, max_pending=1)
+    assert err.value.code == "too_many_uploads"
+    part = next(uploads.root.glob("*.part"))
+    old = time.time() - copyfrom.UPLOAD_TTL - 10
+    os.utime(part, (old, old))
+    await _file_upload(uploads, max_pending=1)   # its clean() removes the .part, and the place is free
+    assert not part.exists()
+    gate.set()
+    with pytest.raises(OSError):   # (the stalled one has no .part left to store)
+        await first
+    with pytest.raises(CopyError):   # the one stored waits; the stalled one left nothing behind
+        await _file_upload(uploads, max_pending=1)
+    await _file_upload(uploads, max_pending=2)
+
+
 async def test_the_v1_cap_says_when_its_first_upload_is_past_its_hour(tmp_path):
     """retry_after (v1's Retry-After): the whole seconds until the oldest upload waiting is older than UPLOAD_TTL, by
     its json's "at" as clean reads it; the board's cap says nothing of it."""

@@ -1199,6 +1199,12 @@ class Uploads:
         # an upload's count of the uploads waiting or arriving and the create of its .part are made one upload at a
         # time (receive): uploads that arrive together each count the ones before them, so the cap holds
         self._admitting = asyncio.Lock()
+        # the tokens of the uploads receive let in that have not ended yet: the count joins them with the folder's,
+        # since a listing may miss a file renamed while it is read (an upload's .part becoming its .zip or .bin);
+        # one whose .part clean() removed (past its hour) is dropped, as it can no longer be stored. Under
+        # _arrivals: receive changes it on the event loop, clean() in a thread
+        self._arriving: set[str] = set()
+        self._arrivals = threading.Lock()
 
     def _make_root(self) -> None:
         """Make the store's folder (and the board's uploads folder it lies in, for v1's) the hub's alone, 0o700 on
@@ -1212,16 +1218,18 @@ class Uploads:
             with contextlib.suppress(OSError):
                 os.chmod(folder, 0o700)
 
-    def _pending(self) -> int:
+    def _pending(self) -> tuple[set[str], set[str]]:
+        """The tokens of the uploads the folder shows waiting or arriving (<token>.zip, .bin or .part) after
+        clean(), and the tokens whose .part that clean() removed. Blocking."""
         self._make_root()
-        self.clean()
-        count = 0
+        removed = self.clean()
+        tokens: set[str] = set()
         with os.scandir(self.root) as it:
             for entry in it:
                 m = PENDING_NAME.match(entry.name)
                 if m and m.group(2) in ("zip", "bin", "part"):
-                    count += 1
-        return count
+                    tokens.add(m.group(1))
+        return tokens, removed
 
     def _first_free(self) -> int:
         """Whole seconds (at least 1) until the first upload that waits or arrives is past UPLOAD_TTL, which the next
@@ -1288,7 +1296,12 @@ class Uploads:
         if isinstance(length, str) and length.isascii() and length.isdigit() and int(length) > limits.max_bytes:
             raise CopyError(too_big, 413)
         async with self._admitting:   # (the count, then this upload's .part, which the next count sees)
-            pending = await asyncio.to_thread(self._pending)
+            # (the ones arriving are read before the folder: an upload not among them has its file under its last
+            # name already, which the listing sees)
+            with self._arrivals:
+                arriving = set(self._arriving)
+            shown, removed = await asyncio.to_thread(self._pending)
+            pending = len((arriving - removed) | shown)
             if pending >= max_pending and kind == "zip":
                 raise CopyError(f"{pending} uploads already wait for a session; each is removed when a session uses "
                                 "it or an hour after its upload. Try again later.", 429, code="too_many_uploads")
@@ -1301,10 +1314,13 @@ class Uploads:
             token = secrets.token_urlsafe(18)
             part = self.root / f"{token}.part"
             fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-        f = os.fdopen(fd, "wb")
+            with self._arrivals:   # (until it ends, whatever way: the finally below; or clean() removes its .part)
+                self._arriving.add(token)
+        f = None
         total = 0
         done = False
         try:
+            f = os.fdopen(fd, "wb")
             buf = bytearray()
             async for chunk in chunks:
                 if not chunk:
@@ -1336,9 +1352,14 @@ class Uploads:
         finally:
             if not done:
                 with contextlib.suppress(OSError, ValueError):
-                    f.close()
+                    if f is None:
+                        os.close(fd)
+                    else:
+                        f.close()
                 with contextlib.suppress(OSError):
                     os.unlink(part)
+            with self._arrivals:
+                self._arriving.discard(token)
         if kind == "file":
             return {"upload": token, "filename": name, "bytes": total, "unpack": bool(unpack),
                     "expires_in": UPLOAD_TTL}
@@ -1529,16 +1550,17 @@ class Uploads:
                 log.exception("could not settle the upload %s", source.token)
                 done_with(source.path)
 
-    def clean(self) -> None:
+    def clean(self) -> set[str]:
         """Remove (best effort) the uploads older than UPLOAD_TTL (by their json's "at", else the file's time) and
         the claims left over (left_over: by processes that no longer run, or this run's no longer in use); a claim
         a create of this run uses or one of another live process is never touched, and names of neither kind are
-        left alone. Blocking."""
+        left alone. Returns the tokens whose <token>.part it removed, which no longer count as arriving. Blocking."""
         now = time.time()
+        removed: set[str] = set()
         try:
             entries = list(os.scandir(self.root))
         except OSError:
-            return
+            return removed
         ages: dict[str, float | None] = {}
         for entry in entries:
             pending = PENDING_NAME.match(entry.name)
@@ -1553,6 +1575,8 @@ class Uploads:
                         at = entry.stat(follow_symlinks=False).st_mtime
                     if now - at > UPLOAD_TTL:
                         os.unlink(entry.path)
+                        if pending.group(2) == "part":
+                            removed.add(token)
                 elif claimed:
                     if left_over(int(claimed.group(2)), claimed.group(3), entry.name):
                         os.unlink(entry.path)
@@ -1560,3 +1584,7 @@ class Uploads:
                             os.unlink(self.root / f"{claimed.group(1)}.json")
             except OSError:
                 continue
+        if removed:
+            with self._arrivals:
+                self._arriving -= removed
+        return removed
