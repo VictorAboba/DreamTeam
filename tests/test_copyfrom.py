@@ -891,13 +891,47 @@ async def test_uploads_still_arriving_count_whatever_the_folder_shows(tmp_path, 
     gate.set()
     done = await asyncio.gather(*arriving)   # (they end while the listing still misses .part files)
     assert sorted(n for n in _names(uploads.root) if n.endswith(".bin")) == sorted(f"{d['upload']}.bin" for d in done)
-    with pytest.raises(CopyError, match="not a zip"):   # a failed one leaves no place taken
+    with pytest.raises(CopyError, match="not a zip"):   # (a failed one)
         await _file_upload(uploads, b"plain", unpack=True, max_pending=3)
     monkeypatch.undo()
     assert not [n for n in _names(uploads.root) if n.endswith(".part")]
-    await _file_upload(uploads, max_pending=3)   # the two ended ones count by their .bin alone
+    for answer in done:   # once their .bin are gone, the ended ones (finished or failed) take no place
+        uploads.discard(answer["upload"], caller="api")
+    await _file_upload(uploads, max_pending=2)
+    await _file_upload(uploads, max_pending=2)
     with pytest.raises(CopyError):
-        await _file_upload(uploads, max_pending=3)
+        await _file_upload(uploads, max_pending=2)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot remove a file that is open")
+async def test_an_upload_arriving_past_its_hour_frees_its_place_when_clean_removes_it(tmp_path):
+    """An upload that sends too little to be written for UPLOAD_TTL keeps its .part's first time: clean() removes the
+    .part, the upload can no longer be stored, and its place under the cap is free."""
+    uploads = Uploads(tmp_path / "api")
+    gate = asyncio.Event()
+
+    async def stalled():
+        yield b"x"
+        await gate.wait()
+
+    first = asyncio.create_task(uploads.receive(stalled(), filename="slow.txt", length=None, limits=LIMITS,
+                                                kind="file", caller="api", max_pending=1))
+    while not [n for n in _names(uploads.root) if n.endswith(".part")]:
+        await asyncio.sleep(0)
+    with pytest.raises(CopyError) as err:
+        await _file_upload(uploads, max_pending=1)
+    assert err.value.code == "too_many_uploads"
+    part = next(uploads.root.glob("*.part"))
+    old = time.time() - copyfrom.UPLOAD_TTL - 10
+    os.utime(part, (old, old))
+    await _file_upload(uploads, max_pending=1)   # its clean() removes the .part, and the place is free
+    assert not part.exists()
+    gate.set()
+    with pytest.raises(OSError):   # (the stalled one has no .part left to store)
+        await first
+    with pytest.raises(CopyError):   # the one stored waits; the stalled one left nothing behind
+        await _file_upload(uploads, max_pending=1)
+    await _file_upload(uploads, max_pending=2)
 
 
 async def test_the_v1_cap_says_when_its_first_upload_is_past_its_hour(tmp_path):
