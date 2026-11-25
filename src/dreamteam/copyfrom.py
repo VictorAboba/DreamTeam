@@ -1199,6 +1199,9 @@ class Uploads:
         # an upload's count of the uploads waiting or arriving and the create of its .part are made one upload at a
         # time (receive): uploads that arrive together each count the ones before them, so the cap holds
         self._admitting = asyncio.Lock()
+        # the tokens of the uploads receive let in that have not ended yet: the count joins them with the folder's,
+        # since a listing may miss a file renamed while it is read (an upload's .part becoming its .zip or .bin)
+        self._arriving: set[str] = set()
 
     def _make_root(self) -> None:
         """Make the store's folder (and the board's uploads folder it lies in, for v1's) the hub's alone, 0o700 on
@@ -1212,16 +1215,18 @@ class Uploads:
             with contextlib.suppress(OSError):
                 os.chmod(folder, 0o700)
 
-    def _pending(self) -> int:
+    def _pending(self) -> set[str]:
+        """The tokens of the uploads the folder shows waiting or arriving (<token>.zip, .bin or .part), after
+        clean(). Blocking."""
         self._make_root()
         self.clean()
-        count = 0
+        tokens: set[str] = set()
         with os.scandir(self.root) as it:
             for entry in it:
                 m = PENDING_NAME.match(entry.name)
                 if m and m.group(2) in ("zip", "bin", "part"):
-                    count += 1
-        return count
+                    tokens.add(m.group(1))
+        return tokens
 
     def _first_free(self) -> int:
         """Whole seconds (at least 1) until the first upload that waits or arrives is past UPLOAD_TTL, which the next
@@ -1288,7 +1293,10 @@ class Uploads:
         if isinstance(length, str) and length.isascii() and length.isdigit() and int(length) > limits.max_bytes:
             raise CopyError(too_big, 413)
         async with self._admitting:   # (the count, then this upload's .part, which the next count sees)
-            pending = await asyncio.to_thread(self._pending)
+            # (the ones arriving are read before the folder: an upload not among them has its file under its last
+            # name already, which the listing sees)
+            arriving = set(self._arriving)
+            pending = len(arriving | await asyncio.to_thread(self._pending))
             if pending >= max_pending and kind == "zip":
                 raise CopyError(f"{pending} uploads already wait for a session; each is removed when a session uses "
                                 "it or an hour after its upload. Try again later.", 429, code="too_many_uploads")
@@ -1301,10 +1309,12 @@ class Uploads:
             token = secrets.token_urlsafe(18)
             part = self.root / f"{token}.part"
             fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
-        f = os.fdopen(fd, "wb")
+            self._arriving.add(token)   # (until it ends, whatever way: the finally below)
+        f = None
         total = 0
         done = False
         try:
+            f = os.fdopen(fd, "wb")
             buf = bytearray()
             async for chunk in chunks:
                 if not chunk:
@@ -1336,9 +1346,13 @@ class Uploads:
         finally:
             if not done:
                 with contextlib.suppress(OSError, ValueError):
-                    f.close()
+                    if f is None:
+                        os.close(fd)
+                    else:
+                        f.close()
                 with contextlib.suppress(OSError):
                     os.unlink(part)
+            self._arriving.discard(token)
         if kind == "file":
             return {"upload": token, "filename": name, "bytes": total, "unpack": bool(unpack),
                     "expires_in": UPLOAD_TTL}
