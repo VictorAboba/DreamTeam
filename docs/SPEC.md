@@ -5591,7 +5591,10 @@ The members are never told where the files came from: no source path goes into `
   or arriving (`UPLOAD_MAX_PENDING`, else 429 "N uploads already wait for a session; each is removed when a session
   uses it or an hour after its upload. Try again later."; the count and the create of the upload's `<token>.part`
   are made one upload at a time per store, under an `asyncio.Lock`, so uploads that arrive together each count the
-  ones before them); `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
+  ones before them; the count is the tokens of the store's `.zip`, `.bin` and `.part` files joined with the uploads
+  this store let in that have not ended yet, kept in memory and read before the folder, because a listing of a
+  folder may miss a file renamed while it is read, an upload's `.part` becoming its `.zip` or `.bin`);
+  `<token>.part` (O_EXCL, 0o600) streamed against the same 413; an empty body is
   400 "The upload is empty.", a file that is not a zip 400 "The file is not a zip archive."; then `<token>.json`
   `{"filename",
   "bytes", "at"}` and the rename to `<token>.zip`. Any failure (an exception from `chunks`, a disconnect included,
@@ -8157,7 +8160,8 @@ stay as they are and may change; `/api/v1` changes only as 21.1 says.
   kind finds no such token (404 `not_found`): an API client never uses the owner's uploads, nor the reverse.
 - **The cap.** At most `[api] uploads_pending` (default 32) uploads wait or arrive at once, read at each upload; one
   more is 429 `too_many_uploads`. Uploads sent at the same time are counted one after another (the count and the
-  `.part` of each are made under the store's lock, §17.2 "Uploads"), so the cap holds for them too. The 429 carries
+  `.part` of each are made under the store's lock, and the count includes the uploads still arriving whatever the
+  folder shows, §17.2 "Uploads"), so the cap holds for them too. The 429 carries
   `Retry-After` (and its text the same number): the whole seconds until the first upload waiting or arriving is past
   its hour, by its json's `at`, else its file's time, as `clean()` reads it (`Uploads._first_free`; the next upload's
   `clean()` then removes it; at least 1, at most `UPLOAD_TTL` + 1). A client frees a place at once by deleting an
