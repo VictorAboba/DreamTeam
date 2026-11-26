@@ -291,14 +291,15 @@ class Swarm:
     def language_of(self, name: str) -> str             # member language, else swarm language
 
     # notifications / waking
-    def notify(self, recipient: str, key: str, *, wake: bool = True, digest: bool = False, defer: bool = False,
+    def notify(self, recipient: str, key: str, *, wake: bool = True, batch: bool = False, defer: bool = False,
                **kw) -> None
         # text = prompts.t(language_of(recipient), key, **kw); insert notifications row (kind=key,
         # data=kw); emit "notification" {recipient, kind, text}; if wake: signal(recipient).
         # wake=False for a member: data also gets "_quiet": true; such a row is news for the member's
         # next wake-up (render_wake delivers it) but does not count in has_pending
-        # digest (thread sessions, only with wake=False, never for USER): data also gets "_digest": true (DIGEST_KEY),
-        # a digest item of the forum's delivery (§22.3); defer (only with wake=True, never for USER): the row is
+        # batch (thread sessions, only with wake=False, never for USER): data also gets "_digest": true (DIGEST_KEY),
+        # a digest item of the forum's delivery (§22.3; `digest` stays an ordinary data key: u_mcp_pending passes
+        # `digest=` for its `{digest}` placeholder); defer (only with wake=True, never for USER): the row is
         # waking but not signalled, then defer_wake(recipient) (§22.3 "Quiet new posts"). A quiet row becomes news
         # that wakes only when the thread scheduler drops its "_quiet" (a due digest, a settled file item, §22.7):
         # a bare signal never activates a member with nothing pending (§6.2)
@@ -503,9 +504,10 @@ class Swarm:
         # sends `n_all_done_wrap_up` (goal_complete, no new tasks) instead of `n_all_done`. Nothing is paused; the
         # user's own actions are not restricted. A thread session (§22.4, §22.7): `n_wrap_up_thread` and
         # `wrap_up_line_thread`; a like on #1 then means "finish with what we have"; no `_check_all_done`
-    def end_wrap_up(self, actor: str) -> bool
+    def end_wrap_up(self, actor: str, clear_votes: bool = True) -> bool
         # off (False when it was not on): `swarm.wrap_up` {on: false} and a quiet `n_wrap_up_end` to every LLM member
         # (shown at its next wake-up); called by the user (swarm_control wrap_up=false), set_goal and reopen_goal
+        # (these two pass clear_votes=False: they reset the votes on #1 themselves); a thread session: §22.4
     def make_llm(self, profile_name: str | None, agent: str) -> LLMClient
         # a member's profile (agents.model) that no longer exists in the settings (deleted, or renamed by a hand edit
         # of dreamteam.toml) falls back to the default profile with a warning, instead of crashing that agent at every
@@ -5879,7 +5881,7 @@ of a home or a project, never a session override (§17.2).
   languages): they go into a new member's system prompt right after "Your role: <name>.". The architect and the
   developer name the contracts file `CONTRACTS.md`, the one the planning task asks for.
   In a thread session the presets' names and descriptions come from `ROLE_PRESETS_THREAD` (§22.6): `reviewer` is
-  «Критик» / Critic there.
+  «Критик» / Critic there unless a `[[roles]]` entry has that name (§22.6).
 - **`[[roles]]` entries** (`RoleSettings`): `name` (required: a built-in role's id or its name in either language
   customizes that role, only with the fields given; any other name is a role of the user's own), `description`
   (a non-empty one replaces a built-in description in both languages; required for an own role unless it is
@@ -5912,9 +5914,10 @@ of a home or a project, never a session override (§17.2).
   output (§12), a new member's system prompt names it, and the kickoff lists the team (`Team: Name — Role; ...`).
 - **Modes** (§22.6): `catalog(..., mode="board")` and `find_role(..., mode="board")` take the session's mode; in a
   thread session `find_role`, `close_roles` and `missing_roles` also match the thread names («Критик» / Critic →
-  `reviewer`) unless a `[[roles]]` entry has that name; `preset_id` and `role_key` do not change. A `[[roles]]`
-  description (a built-in one's replacement or an own role's) and the instructions go into prompts verbatim in both
-  modes, so word them for the mode the role is used in: a thread session has no tasks, reviews or planning task.
+  `reviewer`) unless a `[[roles]]` entry has that name (the reviewer then keeps its board name in the thread
+  catalog, §22.6); `preset_id` and `role_key` do not change. A `[[roles]]` description (a built-in one's replacement
+  or an own role's) and the instructions go into prompts verbatim in both modes, so word them for the mode the role
+  is used in: a thread session has no tasks, reviews or planning task.
 - **Starting team** (no field of its own): `swarm.starting_roles` (ordered; a name repeated per agent; preset ids,
   built-in names in either language or own role names) and `swarm.start_agents`.
   `starting_team(starting_roles, start_agents)`: member i gets `starting_roles[i]`; members beyond the list and
@@ -9912,7 +9915,8 @@ class Forum:                                         # swarm.forum in a thread s
     def recheck_goal(self, actor: str | None) -> bool   # completes the goal when the vote meets the rule (§22.4)
     def ensure_system_posts(self, goal: dict) -> bool   # True: created #1/#2; False: rewrote them (§22.4)
     def rewrite_goal_rule(self) -> bool             # #1's text for Swarm.goal_rule; True when it changed (§22.4)
-    def reset_goal_votes(self, actor: str | None, reason: str) -> None   # reason "new_goal" | "reopened"
+    def reset_goal_votes(self, actor: str | None, reason: str) -> None
+        # reason "new_goal" | "reopened" | "wrap_up_end"
     def reopen(self, actor: str, comment: str) -> None  # the thread part of reopen_goal (§22.4)
     def similar_open(self, post: dict) -> list[dict]
 
@@ -9992,8 +9996,8 @@ def goal_tally(conn, rule: str) -> dict             # pure: the one vote rule (�
   language, whole, with no length check) when the forum has none, else rewrites their texts for the new goal;
   `rewrite_goal_rule()` rewrites only `#1`'s text for the current `Swarm.goal_rule` (§22.4);
   `reset_goal_votes(actor, reason)` deletes every vote on `p1` and emits `post.updated` of `#1` with `["votes"]`, for
-  "new_goal" only when it deleted a row, for "reopened" always; `reopen(actor, comment)` resets the votes and posts the
-  user's comment on `#1` (unless "" or "-"). Their texts, `#2`'s `data` and the notices: §22.4.
+  "new_goal" and "wrap_up_end" only when it deleted a row, for "reopened" always; `reopen(actor, comment)` resets the
+  votes and posts the user's comment on `#1` (unless "" or "-"). Their texts, `#2`'s `data` and the notices: §22.4.
 - **Mentions.** `@Full Name` (and `@user` / `@пользователь` for USER) in a post's title or text, in a comment, and in
   what an edit adds, found with `board.find_mentions(text, [m["name"] for m in swarm.members(include_retired=True)])`
   as the board does (§4 `post`): retired names take part in the matching, so "@Old Timer" never reaches an active
@@ -10114,7 +10118,8 @@ the only case where the fan-out runs inside the file event's dispatch.
    `Mailbox.send` uses it in place of its inline read of `_SEEN_BY`, with the same behaviour. `Forum._deliver` reads
    it while the event's actor call runs: `create`, `comment`, `update` and `vote` run their fan-out inline. For a file
    event, `call_soon` copies the current context, and the fan-out runs inline when there is no loop, so the rule
-   holds there too. A is the event's actor and never one of a file event's suspects.
+   holds there too. A is the event's actor. A `files.committed` is the one exception: A stays a candidate unless it
+   is the commit's sole suspect (File subscriptions, "Own changes"); the other suspects are candidates as usual.
 2. **Mentions** come first (found as §22.2 "Mentions" says, `@user` / `@пользователь` reaching USER): a mentioned
    recipient gets one waking `f_mention` and nothing else for that event, whatever its subscriptions: a mention is
    no subscription and cannot be turned off.
@@ -10125,8 +10130,9 @@ the only case where the fan-out runs inside the file event's dispatch.
 4. The item **wakes** when any matching subscription is in `wake`, else it is a **digest** item; the exceptions are
    below (votes, quiet new posts, settling file items, the user's posts and comments). A member thus asks to be
    woken by narrower subscriptions: e.g. the feed in `digest`, and `post` `7` or `feed` by="Anna Smith" in `wake`.
-- The actor never gets its own events. One event gives a recipient at most one notification, whatever number of its
-  subscriptions match.
+- The actor never gets its own events, except a `files.committed` whose suspects include other members (File
+  subscriptions, "Own changes"): then it gets `f_file` like any matching member, with the suspects as `{by}`. One
+  event gives a recipient at most one notification, whatever number of its subscriptions match.
 - No fan-out for the system's own changes: the creation of `#1` and `#2` and the swarm's rewrites of them (actor None;
   the kickoff and `n_goal_updated_thread` carry them, §22.4) and a reset of the votes on `#1` (`post.updated` with
   `["votes"]`). The comment `Forum.reopen` posts on `#1` gives the LLM members no `f_*` item, an `@mention` in it
@@ -10139,7 +10145,7 @@ the only case where the fan-out runs inside the file event's dispatch.
 - **The user's posts and comments** reach every member as a waking item, whatever its subscriptions and the
   mode of its feed: `f_post` for a post, `f_comment` / `f_reply` for a comment (`f_mention` when it names the
   member). They are never deferred, like every message of the user (§5).
-- **Votes never wake anyone.** `f_vote` is always written with `notify(..., wake=False, digest=True)`, whatever the mode
+- **Votes never wake anyone.** `f_vote` is always written with `notify(..., wake=False, batch=True)`, whatever the mode
   of the `reactions` row, and never counts for the digest clock (below): a digest of votes alone never wakes its member;
   it comes with the member's next wake-up, incoming render or `wait_for_events` result. A `reactions` row in `wake`
   wakes for comments, replies and edits only; every `subscribe` result for a `reactions` row in `wake` says so (`s2
@@ -10201,10 +10207,10 @@ turns waking keeps its 200 characters. `{by}` is the actor's name (`user` for US
 
 **Digest items**
 - A digest item is a member notification whose data has both `_quiet` and `_digest` (`swarm.DIGEST_KEY`, next to
-  `QUIET_KEY`). Only the forum's delivery writes one, through `notify(..., wake=False, digest=True)`. Every other
+  `QUIET_KEY`). Only the forum's delivery writes one, through `notify(..., wake=False, batch=True)`. Every other
   quiet notice (`n_goal_decided`, `n_network_*`, `n_job_gone`, the skills notices, `n_trigger_held`,
-  `n_wrap_up_end`, `n_user_answer_thread`...) keeps its §3 meaning: news for the next wake-up that never starts a
-  digest wake-up and is rendered under `reasons`.
+  `n_wrap_up_end`, `n_wrap_up_votes_cleared`, `n_user_answer_thread`...) keeps its §3 meaning: news for the next
+  wake-up that never starts a digest wake-up and is rendered under `reasons`.
 - `has_pending` is unchanged: digest rows are quiet and do not count. A due digest wakes a member only by becoming
   waking news: the scheduler drops `_quiet` from the member's undelivered `_digest` rows in one UPDATE
   (`json_remove`), then calls `signal(name)`. A bare signal would not do it (§6.2: an activation is skipped when
@@ -10215,18 +10221,19 @@ turns waking keeps its 200 characters. `{by}` is the actor's name (`user` for US
   or `resume()`: time spent stopped or paused does not age a digest. One rule for both kinds of member:
   - **AI agents**: `_deliver_digests` (§22.7 T1), unless paused and only while the goal is active, wakes each member
     of `_idle_llm_members` (idle, a runtime, nothing pending, not `jobs.busy`) whose `digest_deadline` has passed,
-    once, with all it has gathered. A working member gets its digest items in the incoming render between its steps
-    (§6.2), a member waiting for its own job with that job's end, one with other news with that wake-up: those rows
-    are delivered and never fall due. So a member that keeps the feed in `digest` still takes part, in rounds of
-    about `digest_seconds` instead of at every comment.
+    while `_timers` is empty (§22.7 T1), once, with all it has gathered. A working member gets its digest items in
+    the incoming render between its steps (§6.2), a member waiting for its own job with that job's end, one with
+    other news with that wake-up: those rows are delivered and never fall due. So a member that keeps the feed in
+    `digest` still takes part, in rounds of about `digest_seconds` instead of at every comment.
   - **External members**: `wait_for_events` (§12) also caps each sleep at the caller's `digest_deadline` and returns
     once it has passed. Waking items return at once, as now; when the timeout comes first, the result still holds
     the digest items gathered so far (an incoming render delivers every undelivered row). With `progress=true` the
     progress lines come on top (§22.5): they never replace the digest.
 - While there is no goal or the goal is done, nothing is batched: digest rows wait for the member's next wake-up,
   incoming render or `wait_for_events` result, so a decided goal costs no wake-up for the comments that follow it.
-  Mentions, `wake` rows and messages still wake (the member's own choice). After `reopen_goal` the old rows are past
-  due: the next pass wakes each AI agent holding them once.
+  Mentions, the user's posts and comments, `wake` rows and messages still wake. After `reopen_goal` or a new goal the
+  old rows are past due; each AI agent gets them with its staggered notice (T1 waits while `_timers` holds one,
+  §22.7).
 - After a start or a resume a member whose only news is digest items gets no `n_restart` / `n_resumed` (§3): the
   batch wakes it at most `digest_seconds` later. While the goal is active and an idle AI agent holds an undelivered
   digest row other than votes, the team is not asleep (§22.7 `team_asleep`), so `n_thread_quiet` never comes ahead
@@ -10383,8 +10390,9 @@ only tools of the thread tool set (§22.5, R0′).
   - Every active LLM member gets the quiet `n_goal_decided` {rule, for, against} (names, "—" when none; §22.6);
     `{rule}` here may also be `rule_user` «решение пользователя» / "the user's decision". External members read
     `goal.completed` from their events.
-  - After the decision nothing wakes a member for the forum but mentions, wake-mode subscriptions and messages: digest
-    batching and the quiet check run only while the goal is active (§22.7), so a done goal costs no rounds.
+  - After the decision nothing wakes a member for the forum but mentions, the user's posts and comments, wake-mode
+    subscriptions and messages: digest batching and the quiet check run only while the goal is active (§22.7), so a
+    done goal costs no rounds.
 - **The user completes the goal.** The user is the only one who completes a thread goal directly (no surface did
   before; agents and MCP-joined members complete it only through the vote; `goal_complete` is board-only, §22.5).
   `Swarm.complete_goal_by_user(summary: str = "") -> dict`: a board session raises `In a board session the members
@@ -10427,8 +10435,8 @@ only tools of the thread tool set (§22.5, R0′).
     `i`-th as `i`, gets the waking `n_goal_reopened_thread` {title, comment} (comment "-" when none, §22.6), through
     `notify_later` after `i × agents.stagger_seconds`, as the kickoff does. `completed_by`
     chooses nobody in a thread session: it is only the last voter. There is no scheduler offer (board item 1).
-  - The digest rows left from before the decision are old enough at once: the next scheduler pass delivers them
-    (§22.7); no re-arm step is needed.
+  - The digest rows left from before the decision come with each member's `n_goal_reopened_thread` wake-up (T1 runs
+    no batch while the staggered notices are pending, §22.7); no re-arm step is needed.
 - **The rule is frozen per session.** `SessionManager.create` writes the effective `swarm.goal_rule` into a thread
   session's overrides next to `swarm.mode` = "thread", also when it equals the default (§22.8), so `[swarm] goal_rule`
   of the settings is only the default for new thread sessions and a global save never changes a session's rule (nor
@@ -10449,8 +10457,18 @@ only tools of the thread tool set (§22.5, R0′).
     texts, the jobs' refusal and the quiet check in wrap-up are §22.7's.
   - Votes cast before the wrap-up are kept (no reset; `n_wrap_up_thread` asks to vote again); a decision met during
     it has `wrap_up` true and the summary `goal_decided_wrap_up`. In wrap-up `u_thread_quiet` comes with the first
-    quiet nudge, not the second (§22.7). `end_wrap_up` (the user, a new goal, a reopen) gives the quiet
-    `n_wrap_up_end` as on the board.
+    quiet nudge, not the second (§22.7).
+  - `end_wrap_up(actor, clear_votes=True)` (§3): `set_goal` and `reopen_goal` pass `clear_votes=False`, since they
+    reset the votes themselves; the user's switch-off (`swarm_control` wrap_up=false, as the TUI's `/wrapup off` and
+    v1 PATCH call it) keeps the default. In a thread session, when `clear_votes` is true and the goal is active, it
+    also calls `forum.reset_goal_votes(actor, "wrap_up_end")` (one `post.updated` of #1 with ["votes"], only when it
+    deleted a row), so the likes cast to mean "finish with what we have" are never counted as "the goal is reached",
+    and every LLM member gets the quiet `n_wrap_up_votes_cleared` in place of `n_wrap_up_end`: `Wrap-up mode is off:
+    background jobs are allowed again. The votes on #1 were cleared: a like there means "the goal is reached" again;
+    like it only after checking the result yourself.` / `Режим завершения выключен: фоновые процессы снова
+    разрешены. Голоса на #1 сброшены: «нравится» там снова значит «цель достигнута»; ставь его, только проверив
+    результат сам.` Otherwise (a new goal, a reopen, or a switch-off with no goal or a done goal, whose votes stay
+    frozen until a reopen) it sends the quiet `n_wrap_up_end` as on the board.
 - **Clarify** (§3.1) in a thread session: no card; the decision is `#2`'s data, written whenever `ensure_system_posts`
   creates or rewrites them: `{"clarify": Swarm.clarifying, "asker": the first LLM member or null}` (null while the
   session has no member yet: `_kickoff_thread` then writes the first LLM member into it). Never rewritten when the
@@ -10540,7 +10558,11 @@ only tools of the thread tool set (§22.5, R0′).
   - `reopen_goal` pops `decision`, deletes the votes on `p1`, posts the comment on `#1` as USER unless it is empty or
     exactly "-" (cut to 20 000 characters when longer), gives the LLM members no `f_*` item for it and an external
     member the waking `f_comment`, and wakes every LLM member with `n_goal_reopened_thread`, staggered (in the
-    seeded shuffle of §22.4, checked as above).
+    seeded shuffle of §22.4, checked as above);
+  - under democracy with 5 counted agents, 2 like `#1` in wrap-up mode and the user switches wrap-up off: `#1` then
+    has no votes, every LLM member has a quiet `n_wrap_up_votes_cleared`, and a single later like does not complete
+    the goal; `set_goal` and `reopen_goal` in wrap-up mode each emit exactly one `post.updated` of `#1` for votes;
+    switching wrap-up off after a decision leaves the done goal's votes in place and sends `n_wrap_up_end`.
 
 ### 22.5 Tools: the thread tool set (revision 6)
 A thread session has its own LLM tool set: the 23 tools of board revision 5 that are not about tasks, six of them in
@@ -11018,10 +11040,10 @@ thread mode use е, never its dotted form, also where they repeat a board senten
   key (a test checks it, below).
   - `THREAD_KEYS`: the forum items `f_post`, `f_comment`, `f_reply`, `f_edit`, `f_vote`, `f_file`, `f_mention`
     (§22.3); every `*_thread` key (the list below); `n_kickoff_thread_clarify`, `n_goal_decided`, `n_thread_quiet`,
-    `n_thread_quiet_wrap_up`, `thread_quiet_jobs`; the wake-up's `digest`, `digest_more` and the compaction's
-    `my_goal_vote`; the vote and decision texts `goal_vote_line`, `goal_vote_line_veto`, `rule_democracy`,
-    `rule_veto`, `rule_user`, `goal_decided`, `goal_decided_wrap_up`, `goal_completed_by_user` (§22.4); `f_vote`'s
-    values `vote_like`, `vote_dislike` (§22.3); the system posts' texts
+    `n_thread_quiet_wrap_up`, `thread_quiet_jobs`, `n_wrap_up_votes_cleared` (§22.4); the wake-up's `digest`,
+    `digest_more` and the compaction's `my_goal_vote`; the vote and decision texts `goal_vote_line`,
+    `goal_vote_line_veto`, `rule_democracy`, `rule_veto`, `rule_user`, `goal_decided`, `goal_decided_wrap_up`,
+    `goal_completed_by_user` (§22.4); `f_vote`'s values `vote_like`, `vote_dislike` (§22.3); the system posts' texts
     `post_goal_title`, `post_goal_text`, `post_plan_title`, `post_plan_text`, `post_plan_clarify` (§22.4); the
     `post_create` result's `similar_posts` (§22.5).
   - `BOARD_KEYS`: every key whose text names a board-only tool (§22.5), a task, the board, a review, a crew or the
@@ -11050,8 +11072,8 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     `AgentRuntime._compact`, `_compaction_budget` (its token estimate of the request) and `_replace_with_summary`
     (`compaction_request`, `compacted`). The other thread texts are sent only by thread code paths, never through
     `mode_key`: `n_kickoff_thread` / `n_kickoff_thread_clarify` (`_kickoff_thread`, §22.4), `n_goal_updated_thread`,
-    `n_goal_reopened_thread`, `n_goal_decided` (§22.4), `n_thread_quiet*` in place of `n_team_asleep` (§22.7) and
-    `f_mention` in place of `n_mention` (§22.3).
+    `n_goal_reopened_thread`, `n_goal_decided`, `n_wrap_up_votes_cleared` (§22.4), `n_thread_quiet*` in place of
+    `n_team_asleep` (§22.7) and `f_mention` in place of `n_mention` (§22.3).
   - The `u_*` keys belong to no set: the user's texts are the same in both modes; the thread mode adds
     `u_goal_decided` (§22.4) and `u_thread_quiet` (§22.7) and sends no `u_team_asleep`, `u_team_waits`,
     `u_reviews_waiting` or review requests (their board items do not run, §22.7).
@@ -11166,7 +11188,7 @@ thread mode use е, never its dotted form, also where they repeat a board senten
   for are kept). `_tell_network` and `triggers.release_held` run first for every member but the user, as in §6.3.
   The undelivered notifications are split by `DIGEST_KEY` (`data._digest`, §22.3): the **digest rows**, and the
   rest (waking rows and every other quiet notice: jobs, network, skills, MCP, triggers, `n_goal_decided`, the quiet
-  kickoff, `n_wrap_up_end`). In order:
+  kickoff, `n_wrap_up_end`, `n_wrap_up_votes_cleared`). In order:
   1. `wake_header`, or `incoming_header` for an incoming render;
   2. `wrap_up_line_thread`, only in wrap-up mode, never in an incoming render;
   3. `reasons:` with one bullet per non-digest notification (id order) and per unread message, as in §6.3; the
@@ -11278,6 +11300,12 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     (§22.5).
 - **Role presets** (roles.py; §17.3). `ROLE_PRESETS_THREAD: {language: {id: (name, description)}}` has the same ids in
   the same order as `ROLE_PRESETS`; the names are the same, except `reviewer`, «Критик» / "Critic" in a thread session.
+  The thread name applies only while no `[[roles]]` entry is named «Критик» or "Critic" (any case and spacing).
+  Otherwise the built-in keeps its board name «Ревьюер» / "Reviewer" in a thread session too, and only its
+  description is the critic's; GET /api/roles `names` then leave out the thread name that entry holds (the other
+  language's thread name still resolves to `reviewer`, as `find_role` matches each name on its own). So the catalog
+  never holds two roles of one name, and a member's stored `agents.role` always resolves back to its own entry
+  (`find_role`, `role_skills`, `_ensure_role_skills`, `listed_by_roles`, `missing_roles`).
   `catalog(entries, language, *, include_hidden=False, mode="board")` and `find_role(entries, name, language,
   mode="board")` take a built-in role's name and description from `ROLE_PRESETS_THREAD` when `mode == "thread"`;
   `Swarm._create_member` (`hire` and the first start's starting team; the role's canonical name stored in `agents.role`,
@@ -11319,9 +11347,9 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     say in a comment on #1 what is missing.`
   - Analyst: writes the requirements to a file in the workspace and announces it in a post; records its assumptions
     there and in #2; the user's questions go to the user in one message.
-  - Architect: proposes the contracts (interfaces, formats, file layout) in #2 and, once they are agreed there, writes
+  - Architect: proposes the contracts (interfaces, formats, file layout) in #2 and, when they are agreed there, writes
     them to CONTRACTS.md; when one has to change, proposes the change in a comment where it was agreed, mentioning
-    the members whose work depends on it, and updates the file once the change is agreed. (ru «предлагаешь контракты
+    the members whose work depends on it, and updates the file after the change is agreed. (ru «предлагаешь контракты
     (интерфейсы, форматы, структуру файлов) в #2 и, когда о них договорились, записываешь их в CONTRACTS.md; если
     контракт нужно изменить, предлагаешь изменение в комментарии там, где о нем договорились, упоминая участников,
     чья работа от него зависит, и обновляешь файл, когда изменение согласовано»; the Developer's «следуешь
@@ -11351,10 +11379,13 @@ thread mode use е, never its dotted form, also where they repeat a board senten
     none is a `BOARD_KEYS` key and none names a board-only tool; its wake-ups have no `my_tasks` line and show the
     digest group and the vote line;
   - `ROLE_PRESETS_THREAD` has the ids of `ROLE_PRESETS`, en/ru with the same code identifiers, and no thread text names
-    a board-only tool; a thread hire of "reviewer" stores «Критик» / "Critic" and puts the critic's text into the
-    prompt; a customized description is used in both modes; a home with an own `[[roles]] name = "Critic"` next to a
-    `reviewer` entry loads, and the own role wins in both modes; "Critic" with no such entry resolves to `reviewer` only
-    in a thread session;
+    a board-only tool; a thread hire of "reviewer" stores «Критик» / "Critic" (with no own role of that name) and puts
+    the critic's text into the prompt; a customized description is used in both modes; a home with an own
+    `[[roles]] name = "Critic"` next to a `reviewer` entry loads, and the own role wins in both modes; in that home a
+    thread hire of `reviewer` stores "Reviewer" / «Ревьюер», gets the critic's text and the `reviewer` entry's skills
+    marked as its role's (`role_skills`, `_ensure_role_skills`, `listed_by_roles`), not the own role's, and the
+    thread catalog and GET /api/roles hold exactly one "Critic" (the own role); "Critic" with no such entry resolves
+    to `reviewer` only in a thread session;
   - a thread critic whose `[[roles]] reviewer` entry lists a skill gets it attached at hire and marked as its role's,
     and GET /api/roles of a thread session lists «Критик» / "Critic" with "Critic" among its `names`; `--team Critic`
     with a saved team, and a saved team holding "Critic", resolve in a thread create and are refused as unknown or
@@ -11385,17 +11416,21 @@ sessions.
     (`getattr(swarm, "mode", "board") == "thread"`), and `stall_ids(name)` is always empty: there is no task to name.
     Both are inert without tasks anyway; the explicit checks keep it that way if that code changes.
 - **T1 Digest batching** (`_deliver_digests`, §22.3):
-  - *When*: in a pass, the goal exists and its status is `active` (wrap-up mode included). With no goal or a done
-    goal no batch runs (the guard of `_nudge_idle` and `_wake_team_asleep`; the settle release below has no goal
-    guard: `_deliver_digests` runs it before its goal check): the digest rows stay quiet news that the
-    member's next wake-up or `incoming` shows (§6.2, §22.6). A decided goal then wakes nobody for what the members
-    or the user keep commenting; a mention, a `wake` subscription, a post or comment by USER, a message and the other
-    shared wake reasons still wake (§22.3). `reopen_goal` needs no re-arm: the next pass finds the old rows older than
-    `digest_seconds` and wakes each member that has them, once, in the usual way.
+  - *When*: in a pass, the goal exists and its status is `active` (wrap-up mode included) and `_timers` is empty:
+    while a staggered `_kickoff_thread` or `n_goal_reopened_thread` notice is still to come, no batch runs, because
+    that notice wakes its member and the wake-up delivers the member's digest rows with it (`render_wake` marks every
+    undelivered row delivered, §22.3). With no goal or a done goal no batch runs (the guard of `_nudge_idle` and
+    `_wake_team_asleep`; the settle release below has no goal or `_timers` guard: `_deliver_digests` runs it before
+    these checks): the digest rows stay quiet news that the member's next wake-up or `incoming` shows (§6.2, §22.6).
+    A decided goal then wakes nobody for what the members or the user keep commenting; a mention, a `wake`
+    subscription, a post or comment by USER, a message and the other shared wake reasons still wake (§22.3).
+    `reopen_goal` and a new goal need no re-arm: each LLM member's staggered notice (`n_goal_reopened_thread`,
+    `n_goal_updated_thread`, `n_kickoff_thread`) wakes it and delivers its old rows; a member whose notice is quiet
+    (clarify) and any row left after the last timer fired are delivered by the next pass in the usual way, once.
   - *Whom*: each idle LLM member (`_idle_llm_members`: status idle, a runtime, nothing pending, not `jobs.busy`)
     whose oldest undelivered digest row other than an `f_vote` one is at least `[agents] digest_seconds` old (read at
     each pass, so a ⚙ change or a session override reaches the next pass; at least 10). A digest row is a
-    notification whose data carries `_digest` (`DIGEST_KEY`, set with `_quiet` by `notify(..., digest=True)`); only
+    notification whose data carries `_digest` (`DIGEST_KEY`, set with `_quiet` by `notify(..., batch=True)`); only
     the forum's `f_*` deliveries to a `digest` subscription pass it (§22.3). The age is
     `now - max(ts, _digest_floor)`. One query finds them for the whole team: `SELECT recipient, MIN(ts) FROM
     notifications WHERE delivered_at IS NULL AND json_extract(data, '$._digest') IS NOT NULL AND kind != 'f_vote'
@@ -11407,10 +11442,11 @@ sessions.
     nothing is pending (§6.2). Dropping `_quiet` this way is the only path by which a digest row wakes a member.
   - *Never*: an `f_vote` row starts a batch (votes never wake, §22.3). No other quiet notification starts one either:
     a quiet kickoff, `n_goal_decided`, `n_user_answer_thread`, `n_network_*`, `n_job_gone`, skill and trigger
-    notices, `n_wrap_up_end`, MCP notices. They ride along with any wake-up, as now. A working, busy or erroring
-    member gets its digest with its next wake-up or as `incoming` (§6.2): those rows are delivered and never become
-    due. No scheduler item wakes an external member; its digest ends its `wait_for_events` at `digest_deadline(name)`,
-    the same age rule (§22.3, §22.5).
+    notices, `n_wrap_up_end`, `n_wrap_up_votes_cleared`, MCP notices. They ride along with any wake-up, as now. A
+    working, busy or erroring member gets its digest with its next wake-up or as `incoming` (§6.2): those rows are
+    delivered and never become due. No digest batch wakes an external member: its digest ends its `wait_for_events` at
+    `digest_deadline(name)`, the same age rule (§22.3, §22.5). The settle release below is the only scheduler step
+    that signals an external member.
   - *Settled file items*: in the same step, unless paused and whatever the goal's state (a `wake` subscription is the
     member's own choice), every undelivered `_settle` row (a waking `f_file` waiting for its run of changes, §22.3)
     whose changes have settled loses `_quiet` and `_settle`, and its member, an AI agent or an external one, is
@@ -11525,7 +11561,7 @@ sessions.
     lock_ttl_minutes`, retire). A trigger that reads only files counts for `UNATTENDED_FILE_SECONDS` (§8). A team
     whose LLM members are all in error with no recovery scheduled wakes nobody: USER was told of the error
     (`u_agent_error`). A session with no LLM member, or with an external member that called the hub in the last
-    `EXTERNAL_IDLE_SECONDS`, is not asleep. No external member is ever woken. A `dreamteam -p` run still waits, until
+    `EXTERNAL_IDLE_SECONDS`, is not asleep. T2 never wakes an external member. A `dreamteam -p` run still waits, until
     its `--timeout` when one is given, with `u_thread_quiet` on stderr (docs/TUI.md §2).
 - **`wait`'s unwatched clause** (§12 `wait`): in a thread session the `WAIT_UNWATCHED` text replaces the plain result
   when all of these hold: the goal is active (wrap-up mode included); none of the caller's jobs or refused files is
@@ -11542,10 +11578,11 @@ sessions.
   `_wake_deferred` work unchanged on top of it. The shell result's texts follow the same reading.
   `jobs.FOOTERS_THREAD["detached"]` is `FOOTERS["detached"]` with `(only at your next wake-up unless you hold a task
   in progress)` replaced by `(at once while the goal is active, else at your next wake-up)`. Its other parts
-  (`started`, `background`) name no task and are shared. `ShellOutcome` gains `mode: str = "board"`.
-  `JobManager.run` sets it from `getattr(self.swarm, "mode", "board")`, or `run_shell` passes it to
-  `render(cfg=..., has_wait=..., mode=getattr(swarm, "mode", "board"))`. `render` picks
-  `FOOTERS_THREAD.get(state, FOOTERS[state])` in a thread session. `_note_text` picks the thread note the same way.
+  (`started`, `background`) name no task and are shared. `ShellOutcome` gains `mode: str = "board"`, which
+  `JobManager.run` sets from `getattr(self.swarm, "mode", "board")` in its `outcome()` helper, so every outcome of the
+  call carries it. `render(cfg=..., has_wait=...)` keeps its signature, and the `shell` tool handler
+  (tools/file_tools.py) calls it unchanged. With `self.mode == "thread"`, `render` picks
+  `FOOTERS_THREAD.get(state, FOOTERS[state])` and `_note_text` picks the thread note the same way.
 - **Clarify** (§22.4 "Clarify"): a question pause is a pause, so T1 and T2 do not run while the user is asked; T2
   also stands down while `asks_user` holds for the asker, and wakes the asker first while it is idle in its clarify
   phase (above). The clarify hint is the agent's own per-step `hint_planner(name)` call (§22.4), never a scheduler
@@ -11563,7 +11600,9 @@ sessions.
     `_check_all_done` and its `n_all_done_wrap_up` do not run: the
     vote on `#1` under the session's rule ends a thread wrap-up. Votes given before wrap-up are kept;
     `n_wrap_up_thread` asks to vote again. T2 sends `n_thread_quiet_wrap_up` and tells USER with the first nudge of a
-    key. The clarify hint stops, as item 4 does in wrap-up. `end_wrap_up()` and its quiet `n_wrap_up_end` are shared.
+    key. The clarify hint stops, as item 4 does in wrap-up. `end_wrap_up()` sends the shared quiet `n_wrap_up_end`,
+    except for the user's switch-off under an active goal: it then clears the votes on #1 and sends the quiet
+    `n_wrap_up_votes_cleared` (§22.4).
   - `n_wrap_up_thread`: ``The user asked the team to wrap up: start no new computations or background jobs, not even
     one more quick pass. Post what you have now: the results so far and what is left (a post of your own, or a comment
     on it), and where they are in the workspace. Stop the background jobs nobody needs. Then like #1 (`vote`): in
@@ -11640,8 +11679,10 @@ sessions.
     with waking news, and one `u_budget_low`;
   - the clarify asker gets `n_clarify_hint_thread` and never `n_planning_hint`; T2 wakes the asker first while it has
     not asked;
-  - `ShellOutcome(state="timeout", note="wrap_up")` and `ShellOutcome(state="detached")` rendered with mode "thread"
-    contain no "task", and with mode "board" give today's texts byte for byte.
+  - `ShellOutcome(state="timeout", note="wrap_up", mode="thread")` and `ShellOutcome(state="detached", mode="thread")`
+    render with no "task", and the same outcomes with the default `mode` ("board") render today's texts byte for byte;
+  - T1 wakes no member while `_timers` is not empty: a reopen with old digest rows on every member gives each LLM
+    member exactly one wake-up, in the shuffled stagger order, with the reopen notice and its digest rows together.
 
 ### 22.8 Surfaces
 - **Settings keys** (config.py, §17.1). All three are validated in `Config.load`, next to the `network` check, and
@@ -12037,7 +12078,9 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
     every kind, so `join_swarm` gives a new external member the feed, #1, #2 and its reactions, all `digest`. A
     welcome-back (`join_swarm(name=<an existing external member>)`) keeps the member's subscriptions and makes none; a
     retire drops them all (`forum.drop_subscriptions`). The subscription tools are theirs as for any member (LE).
-  - Digests: an external member has no scheduler wake. In a thread session its `wait_for_events` also ends at
+  - Digests: an external member has no scheduler digest wake (the settle release of a waking `f_file`, §22.3 /
+    §22.7 T1, is the one scheduler signal it gets, and it ends a pending `wait_for_events` at once). In a thread
+    session its `wait_for_events` also ends at
     `Swarm.digest_deadline(actor)` (§22.3: its oldest undelivered digest row other than an `f_vote`, older than
     `[agents] digest_seconds`), a deadline inside the loop of today, so `has_pending` and `team_asleep` keep their
     meaning. The result renders the `digest` group (§22.6) and marks its rows delivered; waking rows (a `wake`
@@ -12057,10 +12100,12 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
   - no goal → `set_goal` (which writes #1 and #2, §22.4); a completed goal → `reopen_goal` with the text as the
     comment (USER's comment on #1, the votes on #1 cleared); a pending question → a message to the asker, as now;
   - otherwise the new action `"post"` (`ContinueStep.action` gains it; `to` None): the text becomes a post of kind
-    `post` by USER, its title the first line cut to 200 characters, its text the rest, or the whole text when it has
-    one line (or when the rest is blank); `instruct.post_parts(text) -> (title, text)` splits it, so `-p` and v1 cannot
-    drift apart. A post or a comment by USER wakes every member whatever the mode of its feed subscription (§22.3),
-    so the instruction is read at once, by everyone, in the shared feed;
+    `post` by USER, its title the first line, shortened as a goal's title is when it is longer than 200 characters
+    (`goal_text.shorten_title`, §3), its text the rest; the text is the whole instruction instead when it has one
+    line, when the rest is blank, or when the first line is longer than 200 characters (as `goal_text.split_goal`
+    keeps a long first line), so nothing of the instruction is lost; `instruct.post_parts(text) -> (title, text)`
+    splits it, so `-p` and v1 cannot drift apart. A post or a comment by USER wakes every member whatever the mode of
+    its feed subscription (§22.3), so the instruction is read at once, by everyone, in the shared feed;
   - a session paused by the user is resumed after it, as now.
   - v1: `ApiV1._deliver` calls `swarm.forum.create(USER, title, text)` for `"post"`. A text the forum refuses (a post's
     text holds at most 20 000 characters, while `continue` takes 50 000) is a ToolError: 409 `conflict` with its
@@ -12091,7 +12136,8 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
       #2.
   - **Options (§21.2).** `GET /api/v1/options` gains `"modes": ["board", "thread"]`, `"mode"` (the global default),
     `"goal_rules": ["democracy", "veto"]` and `"goal_rule"` (the global default). `roles` lists the catalog in the
-    default mode's texts (§22.6: the reviewer is "Critic" in a thread one); a role's `key` is the same in both modes.
+    default mode's texts (§22.6: the reviewer is "Critic" in a thread one unless an own role has that name); a
+    role's `key` is the same in both modes.
   - **PATCH (§21.2).** `api_v1.PATCH_FIELDS` gains `goal_rule` ("democracy" | "veto"), `complete_goal` (bool) and
     `goal_summary` (string). They apply to a thread session only: in a board session each is 400 `bad_request`
     ("goal_rule applies to a thread session", "complete_goal applies to a thread session: in a board session the
@@ -12176,7 +12222,9 @@ Every outside surface serves both modes. The mode is read from the session (`Swa
     `post.vote`; PATCH `goal_rule` live (the vote re-evaluated, a completion with actor None, `stop_when_done` stopping
     it) and on a stopped session (overrides only); PATCH `complete_goal` (done, `u_goal_done` not sent, `decision.rule`
     `user`; 409 with no goal, after done and on a stopped session; 400 in a board session and for `goal_summary` alone);
-    `continue` in a thread session (a post by USER that wakes every member; no goal; a done goal reopened with the votes
+    `continue` in a thread session (a post by USER that wakes every member; a first line of 300 characters and a
+    second line give a post whose title has at most 200 characters and whose text is the whole instruction; no goal;
+    a done goal reopened with the votes
     on #1 cleared, an over-long reopen comment cut to 20 000 on #1; a pending question answered; a text past 20 000
     characters 409); `answers: "auto"` with `[swarm] clarify` on: #2 without the clarify line; a clarify asker's
     `question` request.
