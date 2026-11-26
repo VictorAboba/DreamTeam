@@ -10027,8 +10027,9 @@ def goal_tally(conn, rule: str) -> dict             # pure: the one vote rule (ย
   - `post.vote` {target, voter, value: `like` | `dislike` | `none`, likes, dislikes}: the voter.
   - `subscription.changed` {member, subscription, op: `created` | `changed` | `removed`, count?}: the member; None for
     the automatic rows and for a retire (which carries `count` and no `subscription`).
-  - `files.committed` {kind: `shell` | `job j<N>` | `held`, commit, files: [{path, change: `A` | `M` | `D` | `R`}],
-    more?, suspects: [names]}: the autocommit's actor (the command's member, the job's owner, the held file's owner).
+  - `files.committed` {kind: `shell` | `job j<N>` | `jobs j<N>, j<M>` (a session's stop, one owner's jobs, ยง7) |
+    `held`, commit, files: [{path, change: `A` | `M` | `D` | `R`}], more?, suspects: [names]}: the autocommit's actor
+    (the command's member, the job's owner, the held file's owner).
   - `post` is always the post dict with its current counts, so a client updates a post from any of its events; a
     vote reset has no type of its own: a `post.updated` whose `changes` holds `"votes"` (counts 0/0 on `#1`) tells
     clients to reset `#1`'s counts. A goal decided by the vote is `goal.completed` (its name unchanged; its `goal`
