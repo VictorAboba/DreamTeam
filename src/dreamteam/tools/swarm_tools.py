@@ -19,8 +19,9 @@ from .fmt import STAMP_SPAN, ago, budget_line, goal_line, item_time, stamp_range
 MAX_NOTES = 20000
 WAIT_DEFAULT = 50
 WAIT_MAX = 600
-# `wait` with an in_progress task, nothing of the caller's set to wake it and the rest of the team asleep (docs/SPEC.md
-# §12 `wait`): read after the next wake-up (wait ends the activation), hence "the next time"
+# `wait` with an in_progress task (a thread session: under an active goal, §22.7), nothing of the caller's set to wake
+# it and the rest of the team asleep (docs/SPEC.md §12 `wait`): read after the next wake-up (wait ends the activation),
+# hence "the next time"
 WAIT_UNWATCHED = ("OK, waiting. You will be woken up by new events, but nothing of yours is set to wake you and "
                   "nobody else in the team is at work. A process started with & or nohup that `jobs` does not list "
                   "is not tracked: its end will not wake you. If you are waiting for one, the next time set a trigger "
@@ -335,14 +336,17 @@ def _unwatched(ctx: ToolContext) -> bool:
     """The caller holds a stalled in_progress task (Swarm.stall_ids: not a clarify card waiting for the user, not a
     crew task with live directions; a `waiting` task alone does not count: answers wake it), has no active trigger of
     its own, and nobody else can act or be woken by something set (Swarm.team_asleep); the goal is active. The job
-    and refused-file waits are ruled out by the caller. A test double without these gives False."""
+    and refused-file waits are ruled out by the caller. A thread session has no tasks: the stall_ids condition is
+    dropped there, and team_asleep has its digest clause (docs/SPEC.md §22.7). A test double without these gives
+    False."""
     swarm = ctx.swarm
     stall_ids, team_asleep = getattr(swarm, "stall_ids", None), getattr(swarm, "team_asleep", None)
     triggers = getattr(swarm, "triggers", None)
     if stall_ids is None or team_asleep is None or triggers is None:
         return False
     goal = swarm.goal() or {}
-    return (goal.get("status") == "active" and bool(stall_ids(ctx.actor))
+    stalled = getattr(swarm, "mode", "board") != "board" or bool(stall_ids(ctx.actor))
+    return (goal.get("status") == "active" and stalled
             and not triggers.list(owner=ctx.actor) and team_asleep(ctx.actor))
 
 
@@ -664,6 +668,7 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
     deadline = loop.time() + timeout
     queue = swarm.bus.subscribe() if progress else None  # progress wakes the wait too
     voted_any = False   # a vote on #1 by someone else (thread): one goal vote line, never one per vote
+    digest_deadline = getattr(swarm, "digest_deadline", None)  # (the test double has none)
     try:
         cursor = _progress_cursor(swarm, ctx.actor) if progress and not _stopping(swarm) else 0
         # a signal can be left over from an event that was already consumed (e.g. by read_messages):
@@ -678,6 +683,12 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 break
+            # a thread session: the caller's digest returns once it is due (docs/SPEC.md §22.3), each sleep capped
+            due = digest_deadline(ctx.actor) if digest_deadline is not None else None
+            if due is not None:
+                if time.time() >= due:
+                    break
+                remaining = min(remaining, due - time.time())
             if queue is None:
                 await swarm.wait_signal(ctx.actor, remaining)
             else:

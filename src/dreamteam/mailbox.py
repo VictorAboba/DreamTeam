@@ -35,6 +35,13 @@ def sent_as_seen_by(members: Iterable[str], sender: str) -> Iterator[None]:
         _SEEN_BY.reset(token)
 
 
+def seen_as(sender: str) -> frozenset[str]:
+    """The members of the current sent_as_seen_by block when its sender is `sender`, else frozenset(): what `sender`
+    does now is no news for them (messages, and the forum's delivery, docs/SPEC.md §22.3)."""
+    context = _SEEN_BY.get()
+    return context[1] if context is not None and context[0] == sender else frozenset()
+
+
 def _message_dict(row: Any) -> dict[str, Any]:
     return {"id": row["id"], "ts": row["ts"], "sender": row["sender"],
             "recipients": loads(row["recipients"], []), "text": row["text"], "reply_to": row["reply_to"],
@@ -125,8 +132,7 @@ class Mailbox:
                 answering = q
                 if reply is None:
                     reply = q["message_id"]
-        context = _SEEN_BY.get()  # the sender's own other identities (sent_as_seen_by)
-        seen = context[1] if context is not None and context[0] == sender else frozenset()
+        seen = seen_as(sender)  # the sender's own other identities (sent_as_seen_by)
         with self.db.transaction():
             ts = time.time()
             message_id = self.db.insert(

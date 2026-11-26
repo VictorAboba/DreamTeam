@@ -1,10 +1,12 @@
 """The thread mode's posts, comments, votes and subscriptions (docs/SPEC.md §22.2): swarm.forum.
 
-Every write runs in one db transaction and emits its event after it. Who is told of an event (§22.3) is
-`Forum._deliver`, a hook of the next stage."""
+Every write runs in one db transaction and emits its event after it; who is told of it (§22.3) is
+`Forum._deliver`, and of a file change `Forum._on_event`."""
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import re
 import sqlite3
 import time
@@ -12,9 +14,14 @@ import types
 from typing import Any, Iterable
 
 from . import prompts
-from .board import MAX_POST, MAX_TITLE, SIMILAR_MAX, _as_int, _clip, find_mentions, similar_items
-from .db import Database, dumps, loads
+from .board import (MAX_POST, MAX_TITLE, NOTIFY_TEXT_LIMIT, SIMILAR_MAX, _as_int, _clip, find_mentions,
+                    similar_items)
+from .db import Database, dumps, loads, utf8_safe
+from .mailbox import seen_as
 from .models import USER, AgentKind, AgentStatus, ToolError
+from .workspace import _covers, in_scratch, path_key, shown_list
+
+log = logging.getLogger(__name__)
 
 GOAL_POST = 1                 # the system posts' reserved ids (docs/SPEC.md §22.1)
 PLAN_POST = 2
@@ -30,6 +37,13 @@ COMMENTS_LIMIT = 200
 SIMILAR_CANDIDATES = 200      # similar_open: the most recently active posts compared
 SIMILAR_GOAL_CHARS = 300      # ... a post's "goal": its first paragraph, cut to this
 GOAL_TARGET = f"p{GOAL_POST}"
+# the delivery (docs/SPEC.md §22.3): a digest item's {text} cut; f_file's named paths and its paths cap
+DIGEST_TEXT_LIMIT = 200
+FILE_NAMED = 5
+FILE_PATHS_MAX = 200
+FILE_EVENTS = ("file.changed", "files.committed")
+# notifications.data of a waking f_file waiting for its run of changes to settle: {first, last}
+SETTLE_KEY = "_settle"
 
 _TARGET = re.compile(r"(?:#|p)(\d+)|c(\d+)", re.IGNORECASE)
 _POST_ID = re.compile(r"[#p]?(\d+)", re.IGNORECASE)
@@ -678,12 +692,238 @@ class Forum:
 
     def _deliver(self, event: dict, mentioned: list[str] | tuple[str, ...] = (), *, llm_quiet: bool = False) -> None:
         """The fan-out of a forum event to the members and USER (docs/SPEC.md §22.3): a mentioned recipient's
-        f_mention first, then the subscriptions' f_* items. `llm_quiet`: the LLM members get nothing (reopen's
-        comment).
-        TODO(stage 2): the delivery of §22.3; until then nobody is told."""
-        return None
+        f_mention first, then the subscriptions' f_* items, at most one row per recipient. `llm_quiet`: the LLM
+        members get nothing (reopen's comment)."""
+        actor, kind, data = event.get("actor"), event.get("type"), event.get("data") or {}
+        if actor is None:  # the system's own changes: the kickoff and the goal notices carry them
+            return
+        if kind == "post.updated" and not {"title", "text"} & set(data.get("changes") or ()):
+            return  # a reset of the votes on #1
+        if kind == "post.vote" and data.get("value") not in ("like", "dislike"):
+            return  # a withdrawn vote tells nobody
+        item = self._item_of(kind, data)
+        if item is None:
+            return
+        seen = seen_as(actor)  # the members the same MCP client acts as know it already
+        members = {m["name"]: m for m in self.swarm.members()}
+        told: set[str] = set()
+        for name in dict.fromkeys(mentioned):
+            if name == actor or name in seen or (name != USER and name not in members):
+                continue
+            told.add(name)  # a mention is the recipient's one item for the event, never turned off
+            if name == USER or not (llm_quiet and members[name]["kind"] == AgentKind.LLM):
+                self._send_item(name, "f_mention", actor, item, wake=True)
+        user_wakes = actor == USER and kind in ("post.created", "post.comment")
+        subs = self._subscriptions_of(("feed", "post", "reactions"))
+        for name, member in members.items():
+            if name == actor or name in seen or name in told:
+                continue
+            if llm_quiet and member["kind"] == AgentKind.LLM:
+                continue
+            key = self._key_for(kind, item, name)
+            if user_wakes:  # the user's posts and comments wake every member, whatever it follows
+                self._send_item(name, key, actor, item, wake=True)
+                continue
+            rows = [r for r in subs.get(name, ()) if r["by_member"] in ("", actor)
+                    and self._matches(r, kind, item, name)]
+            if not rows:
+                continue
+            if kind == "post.vote":  # votes never wake anyone, whatever the reactions row's mode
+                self._send_item(name, key, actor, item, wake=False)
+                continue
+            wake = any(r["mode"] == "wake" for r in rows)
+            # a member's new post reaching X only through its feed in wake waits for X's own job (§5)
+            defer = wake and kind == "post.created" and self.swarm.waits_for_job(name)
+            self._send_item(name, key, actor, item, wake=wake, defer=defer)
+        if actor != USER and USER not in told and USER not in seen and kind == "post.comment":
+            # USER has no subscriptions: comments on its posts and replies to its comments (docs/SPEC.md §22.3)
+            if USER in (item["post"]["author"], item["reply_author"]):
+                self._send_item(USER, self._key_for(kind, item, USER), actor, item, wake=True)
+
+    def _item_of(self, kind: str, data: dict) -> dict | None:
+        """What the f_* items of a forum event name: the post, the comment, the authors the reactions follow."""
+        item: dict[str, Any] = {"comment": None, "reply_author": None, "target": "", "target_author": None}
+        if kind in ("post.created", "post.updated"):
+            item["post"] = data["post"]
+        elif kind == "post.comment":
+            comment = item["comment"] = data["comment"]
+            item["post"] = self.get(data["post_id"])
+            if comment.get("reply_to"):
+                row = self.db.one("SELECT author FROM post_comments WHERE id = ?", (comment["reply_to"],))
+                item["reply_author"] = row["author"] if row else None
+        elif kind == "post.vote":
+            target, number = parse_target(data["target"])
+            item["value"] = data["value"]
+            if target == "p":
+                item["post"] = self.get(number)
+                item["target"], item["target_author"] = f"#{number}", item["post"]["author"]
+            else:
+                comment = self.comment_get(number)
+                item["post"] = self.get(comment["post_id"])
+                item["target"] = f"c{number} (#{comment['post_id']})"
+                item["target_author"] = comment["author"]
+        else:
+            return None
+        return item
+
+    @staticmethod
+    def _key_for(kind: str, item: dict, name: str) -> str:
+        if kind == "post.comment":
+            return "f_reply" if item["reply_author"] == name else "f_comment"
+        return {"post.created": "f_post", "post.updated": "f_edit", "post.vote": "f_vote"}[kind]
+
+    @staticmethod
+    def _matches(row: Any, kind: str, item: dict, name: str) -> bool:
+        """A subscription row against a forum event (the table of docs/SPEC.md §22.3; `by` is checked apart)."""
+        post = item["post"]
+        if row["kind"] == "feed":
+            return kind == "post.created"
+        if row["kind"] == "post":
+            return kind in ("post.comment", "post.updated") and row["target"] == str(post["id"])
+        if row["kind"] == "reactions":
+            if kind == "post.comment":
+                return name in (post["author"], item["reply_author"])
+            if kind == "post.updated":
+                return post["author"] == name
+            if kind == "post.vote":
+                return item["target_author"] == name
+        return False
+
+    def _subscriptions_of(self, kinds: tuple[str, ...]) -> dict[str, list]:
+        """member -> its subscription rows of these kinds, by id."""
+        out: dict[str, list] = {}
+        rows = self.db.all(f"SELECT * FROM subscriptions WHERE kind IN ({', '.join('?' * len(kinds))}) ORDER BY id",
+                           kinds)
+        for row in rows:
+            out.setdefault(row["member"], []).append(row)
+        return out
+
+    def _send_item(self, name: str, key: str, actor: str, item: dict, *, wake: bool, defer: bool = False) -> None:
+        """One f_* item: waking (its text cut to NOTIFY_TEXT_LIMIT), or a digest item (cut to DIGEST_TEXT_LIMIT)."""
+        post, comment = item["post"], item["comment"]
+        limit = NOTIFY_TEXT_LIMIT if wake else DIGEST_TEXT_LIMIT
+        kw: dict[str, Any] = {"by": actor, "post": post["id"], "title": post["title"]}
+        if key == "f_vote":
+            kw = {"by": actor, "target": item["target"], "title": post["title"],
+                  "value": t(self.swarm.language_of(name), f"vote_{item['value']}")}
+        elif key == "f_mention":
+            kw["comment"] = f" (c{comment['id']})" if comment else ""
+            kw["text"] = _clip(comment["text"] if comment else post["text"], limit)
+        elif key in ("f_comment", "f_reply"):
+            kw.update(comment=f"c{comment['id']}", text=_clip(comment["text"], limit))
+            if key == "f_reply":
+                kw["reply_to"] = f"c{comment['reply_to']}"
+        elif key == "f_post":
+            kw["text"] = _clip(post["text"], limit)
+        if name == USER:
+            self.swarm.notify(USER, key, **kw)
+        elif wake:
+            self.swarm.notify(name, key, defer=defer, **kw)
+        else:
+            self.swarm.notify(name, key, wake=False, batch=True, **kw)
+
+    # --- file subscriptions (docs/SPEC.md §22.3 "File subscriptions") -------------------------------------------
 
     def _on_event(self, event: dict) -> None:
-        """The bus listener for file.changed / files.committed (docs/SPEC.md §22.3).
-        TODO(stage 2): registered by the swarm with the file subscriptions' delivery."""
-        return None
+        """The bus listener (Swarm._init: swarm.bus.listen) for file.changed and files.committed: the fan-out is
+        scheduled with call_soon on the running loop (no notification inside another event's dispatch; the context,
+        so seen_as, is copied), inline without a loop."""
+        if event.get("type") not in FILE_EVENTS:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._deliver_files(event)
+            return
+        loop.call_soon(self._deliver_files, event)
+
+    def _deliver_files(self, event: dict) -> None:
+        """The f_file items of a file event; never raises (a late write's event may come after the session closed)."""
+        try:
+            self._fan_out_files(event)
+        except sqlite3.ProgrammingError:
+            log.debug("the f_file items of %s were not delivered: the database is closed", event.get("type"))
+        except Exception:  # noqa: BLE001 - a file change must never fail for its notifications
+            log.exception("the f_file items of %s failed", event.get("type"))
+
+    def _fan_out_files(self, event: dict) -> None:
+        actor, data = event.get("actor"), event.get("data") or {}
+        if actor is None:
+            return
+        if event["type"] == "file.changed":
+            paths, editors, extra = [str(data.get("path") or "")], [actor], 0
+        else:
+            paths = [str(f.get("path") or "") for f in data.get("files") or ()]
+            editors = list(dict.fromkeys([actor, *(data.get("suspects") or ())]))
+            extra = max(0, int(data.get("more") or 0))
+        paths = [p for p in dict.fromkeys(paths) if p]
+        if not paths:
+            return
+        seen = seen_as(actor)
+        subs = self._subscriptions_of(("file",))
+        when = float(event.get("ts") or time.time())
+        for member in self.swarm.members():
+            name = member["name"]
+            if name in seen or editors == [name]:
+                # own changes: a commit only when the member is its sole suspect; a file.changed always has its
+                # actor as sole editor
+                continue
+            rows = [r for r in subs.get(name, ()) if r["by_member"] in ("", *editors)]
+            hits = [r for r in rows if any(_path_matches(r["target"], p) for p in paths)]
+            if not hits:
+                continue
+            matched = [p for p in paths if any(_path_matches(r["target"], p) for r in hits)]
+            wake = any(r["mode"] == "wake" for r in hits)
+            # the commit's unlisted paths are known to match only a whole-workspace subscription
+            member_extra = extra if any(r["target"] == "" for r in rows) else 0
+            self._file_item(name, matched, editors, member_extra, wake, when)
+
+    def _file_item(self, name: str, paths: list[str], editors: list[str], extra: int, wake: bool,
+                   when: float) -> None:
+        """An f_file item, merged into the member's undelivered f_file row of the same delivery when there is one
+        (coalescing: its ts and _settle.first kept); a waking one is stored quiet with _settle until it settles."""
+        from .swarm import DIGEST_KEY  # the swarm imports this module
+
+        same = "IS NULL" if wake else "IS NOT NULL"
+        row = self.db.one(f"SELECT id, data FROM notifications WHERE recipient = ? AND kind = 'f_file' AND "
+                          f"delivered_at IS NULL AND json_extract(data, '$.{DIGEST_KEY}') {same} ORDER BY id DESC "
+                          "LIMIT 1", (name,))
+        if row is None:
+            kw = _file_kw(paths, editors, extra)
+            if not wake:
+                self.swarm.notify(name, "f_file", wake=False, batch=True, **kw)
+            else:
+                self.swarm.notify(name, "f_file", wake=False, **kw, **{SETTLE_KEY: {"first": when, "last": when}})
+            return
+        old = loads(row["data"]) or {}
+        old_paths = list(old.get("paths") or ())
+        overflow = max(0, int(old.get("more") or 0) - max(0, len(old_paths) - FILE_NAMED))
+        known = {path_key(p) for p in old_paths}
+        added = [p for p in paths if path_key(p) not in known]
+        kw = _file_kw(old_paths + added, list(dict.fromkeys([*(old.get("editors") or ()), *editors])),
+                      overflow + extra)
+        data = {**old, **kw}
+        if isinstance(old.get(SETTLE_KEY), dict):
+            data[SETTLE_KEY] = {**old[SETTLE_KEY], "last": when}
+        text = utf8_safe(prompts.t(self.swarm.language_of(name), "f_file", **kw))
+        self.db.execute("UPDATE notifications SET text = ?, data = ? WHERE id = ?", (text, dumps(data), row["id"]))
+
+
+def _path_matches(target: str, rel: str) -> bool:
+    """A file subscription's target against a changed path: '' is the whole workspace (.scratch/ aside), else the
+    path itself or one under it, compared by workspace.path_key; .scratch/ paths only for a target inside it."""
+    if in_scratch(rel) and not (target and in_scratch(target)):
+        return False
+    if not target:
+        return True
+    return _covers(target, rel)
+
+
+def _file_kw(paths: list[str], editors: list[str], extra: int) -> dict[str, Any]:
+    """f_file's placeholders and data: paths capped at FILE_PATHS_MAX (the rest counted in `more`, with the ones
+    past FILE_NAMED), editors, and the shown lists."""
+    kept = paths[:FILE_PATHS_MAX]
+    more = max(0, len(kept) - FILE_NAMED) + len(paths) - len(kept) + extra
+    files = shown_list(kept, FILE_NAMED)
+    return {"by": shown_list(editors, FILE_NAMED), "files": files, "more": more, "paths": kept,
+            "editors": editors}

@@ -21,7 +21,8 @@ from .board import MARK_FREE_DIRECTIONS, Board
 from .config import Config, ModelProfile
 from .db import MODE_KEY, MODES, Database, dumps, loads, made_by_earlier_version, remap_sql, utf8_safe
 from .events import EventBus
-from .forum import PLAN_POST, Forum, decision_of, goal_tally, names_or_dash, rule_name, user_summary, vote_line
+from .forum import (PLAN_POST, SETTLE_KEY, Forum, decision_of, goal_tally, names_or_dash, rule_name, user_summary,
+                    vote_line)
 from .goal_text import split_goal
 from .jobs import JobManager, fmt_duration, short_command
 from .llm import create_llm
@@ -41,6 +42,9 @@ log = logging.getLogger(__name__)
 
 USER_ALIASES = {"user", "пользователь", "the user", "human", "человек"}
 QUIET_KEY = "_quiet"  # notifications.data flag of a member notification sent with wake=False
+# ... and of a digest item of the forum's delivery (notify(..., batch=True), thread sessions; docs/SPEC.md §22.3)
+DIGEST_KEY = "_digest"
+DIGEST_SHOWN = 30  # the wake-up's digest group shows at most this many rows (§22.6)
 SCHEDULER_SECONDS = 3.0
 TRACE_PRUNE_SECONDS = 6 * 3600
 # An agent nudged about ready tasks is "considering" them until it claims a task, goes idle again or
@@ -241,6 +245,10 @@ class Swarm:
         # not find the team asleep and by resume; (the board key, the n_team_asleep sent since it was first seen)
         self._team_asleep: tuple[tuple, float] | None = None
         self._team_asleep_woken: tuple[tuple, int] | None = None
+        # a thread session's quiet check (_check_quiet, docs/SPEC.md §22.7): (the thread key, quiet with it since),
+        # dropped like _team_asleep; (the thread key, the nudges sent since it was first seen, USER told for it)
+        self._thread_quiet: tuple[tuple, float] | None = None
+        self._thread_quiet_woken: tuple[tuple, int, bool] | None = None
         # external member -> time.time() of its last hub call but wait_for_events, stamped by hub_mcp.hub_call before
         # and after the call (team_asleep: one that called in the last EXTERNAL_IDLE_SECONDS may still act)
         self._external_seen: dict[str, float] = {}
@@ -254,6 +262,8 @@ class Swarm:
         # agents a broadcast reached without a wake while they wait for their own job (Mailbox.send): woken by the
         # scheduler if that wait ends without the job's end waking them (_wake_deferred)
         self._deferred: set[str] = set()
+        # the time of the last start() or resume(): a digest item ages from it at the earliest (digest_deadline)
+        self._digest_floor = 0.0
         self._missing_profiles: set[str] = set()  # members' profiles gone from the settings (warned once)
         # (profile, provider, base_url, model, missing prices) whose $0 calls the user was told about since the start
         self._cost_warned: set[tuple[str, str, str, str, tuple[str, ...]]] = set()
@@ -262,6 +272,8 @@ class Swarm:
         self.board = Board(self)
         # the thread mode's posts, votes and subscriptions (docs/SPEC.md §22.2); None in a board session
         self.forum: Forum | None = Forum(self) if self.is_thread else None
+        if self.forum is not None:
+            self.bus.listen(self.forum._on_event)  # the file subscriptions' delivery (docs/SPEC.md §22.3)
         self.mail = Mailbox(self)
         self.workspace = Workspace(self)
         self.workspace.commit_events = self.is_thread  # files.committed (docs/SPEC.md §22.2)
@@ -295,6 +307,14 @@ class Swarm:
         await self.skills.ensure_role_skills(announce=False)
         self._started = True
         self._run_agents = run_agents
+        self._digest_floor = time.time()  # time spent stopped does not age a digest item (docs/SPEC.md §22.3)
+        self._thread_quiet = self._thread_quiet_woken = None  # a restart ends the quiet period (§22.7)
+        if self.forum is not None:
+            # digest rows a batch released before the stop and nobody read are digest news again: a member whose
+            # only news they are gets no n_restart, the next batch wakes it (docs/SPEC.md §22.3)
+            self.db.execute(f"UPDATE notifications SET data = json_set(data, '$.{QUIET_KEY}', json('true')) "
+                            f"WHERE delivered_at IS NULL AND json_extract(data, '$.{DIGEST_KEY}') IS NOT NULL "
+                            f"AND json_extract(data, '$.{QUIET_KEY}') IS NULL")
         if run_agents:
             for m in self.members():
                 if m["kind"] == AgentKind.LLM:
@@ -582,18 +602,27 @@ class Swarm:
         return (m and m.get("language")) or self.language
 
     # ---- notifications & waking ---------------------------------------------------------------
-    def notify(self, recipient: str, key: str, *, wake: bool = True, **kw: Any) -> None:
+    def notify(self, recipient: str, key: str, *, wake: bool = True, batch: bool = False, defer: bool = False,
+               **kw: Any) -> None:
         """wake=False for a member: news for its next wake-up, which does not count as pending (has_pending)
-        and so neither wakes it nor keeps the scheduler from offering it tasks."""
+        and so neither wakes it nor keeps the scheduler from offering it tasks. batch (with wake=False, never for
+        USER): also a digest item (DIGEST_KEY) of the forum's delivery; defer (with wake=True, never for USER):
+        waking but not signalled, defer_wake(recipient) instead (docs/SPEC.md §22.3)."""
         text = utf8_safe(prompts.t(self.language_of(recipient), key, **kw))  # may quote model output
-        data = kw if wake or recipient == USER else {**kw, QUIET_KEY: True}
+        quiet = not wake and recipient != USER
+        data = {**kw, QUIET_KEY: True, **({DIGEST_KEY: True} if batch else {})} if quiet else kw
         self.db.insert(
             "INSERT INTO notifications(ts, recipient, kind, text, data) VALUES (?, ?, ?, ?, ?)",
             (time.time(), recipient, key, text, dumps(data)),
         )
         self.bus.emit("notification", None, recipient=recipient, kind=key, text=text)
-        if wake:
+        if wake and defer and recipient != USER:
+            self.defer_wake(recipient)  # its job's end shows it, else the scheduler's _wake_deferred
+        elif wake:
             self.signal(recipient)
+        elif quiet and batch and recipient not in self.runtimes:
+            # an external member's wait_for_events caps its sleep at its digest_deadline: it computes it again
+            self._signals.setdefault(recipient, asyncio.Event()).set()
 
     def notify_later(self, delay: float, recipient: str, key: str, **kw: Any) -> None:
         if delay <= 0:
@@ -651,17 +680,89 @@ class Swarm:
         the scheduler wakes it (_wake_deferred)."""
         self._deferred.add(name)
 
+    def digest_deadline(self, name: str) -> float | None:
+        """When the oldest undelivered digest item of `name` other than a vote falls due: max(ts, _digest_floor) +
+        [agents] digest_seconds; None while the goal is not active or there is none (docs/SPEC.md §22.3)."""
+        if not self.is_thread:
+            return None
+        goal = self.goal()
+        if not goal or goal.get("status") != "active":
+            return None
+        first = self.db.scalar(f"SELECT MIN(ts) FROM notifications WHERE recipient = ? AND delivered_at IS NULL AND "
+                               f"json_extract(data, '$.{DIGEST_KEY}') IS NOT NULL AND kind != 'f_vote'", (name,))
+        return None if first is None else max(float(first), self._digest_floor) + self._digest_seconds()
+
+    def _digest_seconds(self) -> float:
+        """[agents] digest_seconds, read at each use (at least 10)."""
+        return max(10.0, float(self.config.agents.digest_seconds))
+
+    def _due_digests(self, now: float) -> list[str]:
+        """The members whose digest_deadline has passed (one query for the team; the caller checks the goal)."""
+        rows = self.db.all(f"SELECT recipient, MIN(ts) AS first FROM notifications WHERE delivered_at IS NULL AND "
+                           f"json_extract(data, '$.{DIGEST_KEY}') IS NOT NULL AND kind != 'f_vote' GROUP BY recipient")
+        seconds = self._digest_seconds()
+        return [r["recipient"] for r in rows if now >= max(float(r["first"]), self._digest_floor) + seconds]
+
+    def _release_digest(self, name: str) -> None:
+        """A due digest becomes waking news: `_quiet` dropped from every undelivered digest row of `name` (its votes
+        ride along; `_digest` stays, so render_wake shows them in the digest group), then signal(name)."""
+        self.db.execute(f"UPDATE notifications SET data = json_remove(data, '$.{QUIET_KEY}') WHERE recipient = ? AND "
+                        f"delivered_at IS NULL AND json_extract(data, '$.{DIGEST_KEY}') IS NOT NULL", (name,))
+        self.signal(name)
+
+    def _release_settled(self, now: float) -> list[str]:
+        """Every undelivered waking f_file whose run of changes has settled (no new change for [agents]
+        file_settle_seconds, or file_max_wait_seconds (0: no cap) since the first) loses `_quiet` and `_settle`,
+        and its member is signalled (docs/SPEC.md §22.3 "Settling"); returns those members."""
+        rows = self.db.all(f"SELECT n.id, n.recipient, json_extract(n.data, '$.{SETTLE_KEY}.first') AS first, "
+                           f"json_extract(n.data, '$.{SETTLE_KEY}.last') AS last FROM notifications n "
+                           f"JOIN agents a ON a.name = n.recipient AND a.status != 'retired' "
+                           f"WHERE n.delivered_at IS NULL AND json_extract(n.data, '$.{SETTLE_KEY}') IS NOT NULL")
+        if not rows:
+            return []
+        quiet = max(0.0, float(self.config.agents.file_settle_seconds))
+        cap = max(0.0, float(self.config.agents.file_max_wait_seconds))
+        settled = [r for r in rows if now - float(r["last"] or 0) >= quiet
+                   or (cap > 0 and now - float(r["first"] or 0) >= cap)]
+        for row in settled:
+            self.db.execute(f"UPDATE notifications SET data = json_remove(data, '$.{QUIET_KEY}', '$.{SETTLE_KEY}') "
+                            "WHERE id = ?", (row["id"],))
+        names = list(dict.fromkeys(r["recipient"] for r in settled))
+        for name in names:
+            self.signal(name)
+        return names
+
+    def _deliver_digests(self) -> None:
+        """T1 of a thread session's pass (docs/SPEC.md §22.7): the settled file items released, whatever the goal's
+        state; then, while the goal is active and no staggered notice is due (_timers empty), each idle AI agent
+        (_idle_llm_members) whose digest is due woken once with all it has gathered. The scheduler calls it unless
+        paused."""
+        now = time.time()
+        self._release_settled(now)
+        goal = self.goal()
+        if not goal or goal.get("status") != "active" or self._timers:
+            return
+        due = set(self._due_digests(now))
+        if not due:
+            return
+        for m in self._idle_llm_members():
+            if m["name"] in due:
+                self._release_digest(m["name"])
+
     def team_asleep(self, caller: str | None = None) -> bool:
         """Nobody in the team can act or be woken by something already set (docs/SPEC.md §3 `team_asleep`; scheduler
         item 9, `wait`'s result): every LLM member with a runtime is idle (_idle_llm_members: nothing pending, not
         busy) or in error with no recovery scheduled, at least one idle; none waits for a job whose end wakes it or for
         a file it was refused; no delayed notification is pending; no trigger may fire unattended
         (TriggerEngine.unattended); no external member called the hub in the last EXTERNAL_IDLE_SECONDS. `caller`: the
-        member calling `wait`, still working, counts as idle with nothing pending."""
+        member calling `wait`, still working, counts as idle with nothing pending. A thread session (§22.7): also not
+        while the goal is active and an idle LLM member other than `caller` holds an undelivered digest row other than
+        a vote (a batch is about to wake it), nor while any member holds an undelivered `_settle` row."""
         if self._timers:  # staggered kickoffs not delivered yet
             return False
         members = self.members()
         idle = False
+        idle_names: list[str] = []
         for m in members:
             name = m["name"]
             if m["kind"] != AgentKind.LLM or name not in self.runtimes:
@@ -669,11 +770,15 @@ class Swarm:
             if name == caller or (m["status"] == AgentStatus.IDLE and not self.has_pending(name)
                                   and not self.jobs.busy(name)):
                 idle = True
+                if name != caller:
+                    idle_names.append(name)
             elif m["status"] != AgentStatus.ERROR or getattr(self.runtimes[name], "_recovery", None) is not None:
                 return False  # at work, with news, busy, paused, or in error with a retry on its way
             if self.jobs.awaited(name) or self.workspace.waits_for_lock(name):
                 return False
         if not idle:
+            return False
+        if self.is_thread and self._thread_news(idle_names):
             return False
         if self.triggers.unattended(self.triggers.clock()):  # the clock the engine stamps its triggers with
             return False
@@ -681,6 +786,21 @@ class Swarm:
         externals = {m["name"] for m in members if m["kind"] == AgentKind.EXTERNAL}
         return not any(now - seen < EXTERNAL_IDLE_SECONDS for name, seen in self._external_seen.items()
                        if name in externals)
+
+    def _thread_news(self, idle: list[str]) -> bool:
+        """team_asleep's thread clauses (docs/SPEC.md §22.7): a member of `idle` holds an undelivered digest row other
+        than a vote while the goal is active (T1 wakes it), or any member holds an undelivered `_settle` row (T1
+        releases it once its changes settle). Members in error are not in `idle`: their digest keeps nobody awake."""
+        if self.db.scalar(f"SELECT 1 FROM notifications n JOIN agents a ON a.name = n.recipient AND a.status != "
+                          f"'retired' WHERE n.delivered_at IS NULL AND json_extract(n.data, '$.{SETTLE_KEY}') IS NOT "
+                          f"NULL LIMIT 1"):
+            return True
+        goal = self.goal()
+        if not idle or not goal or goal.get("status") != "active":
+            return False
+        return bool(self.db.scalar(
+            f"SELECT 1 FROM notifications WHERE delivered_at IS NULL AND json_extract(data, '$.{DIGEST_KEY}') IS NOT "
+            f"NULL AND kind != 'f_vote' AND recipient IN ({','.join('?' * len(idle))}) LIMIT 1", tuple(idle)))
 
     def stall_ids(self, name: str) -> frozenset[int]:
         """The in_progress task ids of `name` that count as stalled (_stall_ids: scheduler items 2-3, `wait`'s result,
@@ -707,20 +827,26 @@ class Swarm:
             self._tell_network(name)  # once per change of the session's network setting (docs/SPEC.md §7.2)
             # the fires its repeating triggers held back ([agents] trigger_wake_seconds), quietly: it reads its news now
             self.triggers.release_held(name)
-        notes = self.db.all(
-            "SELECT id, ts, text FROM notifications WHERE recipient = ? AND delivered_at IS NULL ORDER BY id", (name,))
+        rows = self.db.all("SELECT id, ts, kind, text, data FROM notifications WHERE recipient = ? AND "
+                           "delivered_at IS NULL ORDER BY id", (name,))
         messages = self.mail.unread(name, mark_read=True)
-        if incoming and not notes and not messages:
+        if incoming and not rows and not messages:
             return None
         now = time.time()
-        if notes:
+        if rows:
             self.db.execute(
-                f"UPDATE notifications SET delivered_at = ? WHERE id IN ({','.join('?' * len(notes))})",
-                [now] + [n["id"] for n in notes],
+                f"UPDATE notifications SET delivered_at = ? WHERE id IN ({','.join('?' * len(rows))})",
+                [now] + [n["id"] for n in rows],
             )
+        # the digest rows form their own group (a thread session's, docs/SPEC.md §22.6 item 5): other rows first,
+        # votes last, each part in (ts, id) order; every one is marked delivered above, the ones not shown too
+        digest = sorted((n for n in rows if (loads(n["data"]) or {}).get(DIGEST_KEY)),
+                        key=lambda n: (n["kind"] == "f_vote", n["ts"], n["id"]))
+        in_digest = {n["id"] for n in digest}
+        notes = [n for n in rows if n["id"] not in in_digest]
         first = None
         if stamps:
-            times = [t for t in [*(n["ts"] for n in notes), *(m["ts"] for m in messages), since] if t]
+            times = [t for t in [*(n["ts"] for n in rows), *(m["ts"] for m in messages), since] if t]
             if times and now - min(times) > STAMP_SPAN:
                 first = min(times)
 
@@ -745,7 +871,11 @@ class Swarm:
             # every member reads a message to all at once: only with one, not at every wake-up
             if any(m.get("to_all") for m in messages):
                 lines.append(prompts.t(lang, prompts.mode_key("all_hint", self.mode)))
-        # TODO(stage 2): a thread session's digest group (docs/SPEC.md §22.6 wake-up item 5, §22.3)
+        if digest:  # incoming renders too: a working member gets its digest with its next news
+            lines.append(prompts.t(lang, "digest"))
+            lines.extend(f"• {at(n['ts'])}{n['text']}" for n in digest[:DIGEST_SHOWN])
+            if len(digest) > DIGEST_SHOWN:
+                lines.append(prompts.t(lang, "digest_more", n=len(digest) - DIGEST_SHOWN))
         if not incoming:
             goal = self.goal()
             if goal:
@@ -1324,6 +1454,9 @@ class Swarm:
                 self._crew_gaps[task_id] = (key, since + now - max(since, self._paused_at))
             self._paused_at = None
         self._team_asleep = None  # the team-asleep clock starts again: n_resumed below wakes the holders
+        # a pause ends a thread session's quiet period: USER never gets u_thread_quiet because of it (§22.7)
+        self._thread_quiet = self._thread_quiet_woken = None
+        self._digest_floor = time.time()  # nor does time spent paused age a digest item (docs/SPEC.md §22.3)
         self.bus.emit("swarm.resumed", actor, **({"question": question} if question else {}))
         told = None
         if (question and question["outcome"] == "dropped" and question.get("why") != "left"
@@ -1605,9 +1738,11 @@ class Swarm:
                 # an external member that stopped calling: its session trace ends at its last call
                 self.tracer.close_external(idle_seconds=EXTERNAL_IDLE_SECONDS)
                 if not self.paused and self.mode == "thread":
-                    # no board item runs in a thread session (docs/SPEC.md §22.7)
+                    # no board item runs in a thread session (docs/SPEC.md §22.7): digest batching, then the quiet
+                    # check, last as item 9 (a member that the steps before woke has news pending, so it is not idle)
                     self._wake_deferred()
-                    # TODO(stage 2): T1 _deliver_digests(), then T2 _check_quiet()
+                    self._deliver_digests()
+                    self._check_quiet()
                 elif not self.paused:
                     self._wake_deferred()
                     self._nudge_idle()
@@ -2240,6 +2375,73 @@ class Swarm:
             if group:
                 return max(group, key=lambda m: float(m.get("last_active") or 0))["name"]
         return None
+
+    def _check_quiet(self) -> None:
+        """T2 of a thread session's pass, the counterpart of item 9 (docs/SPEC.md §22.7): the goal is active, the team
+        asleep (team_asleep with its thread clauses) and the clarify asker does not wait for the user's answers. Once
+        that has lasted 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) x agents.idle_nudge_seconds (sent: the n_thread_quiet*
+        notices under the current goal) with one thread key, one idle LLM member gets n_thread_quiet (its wrap-up
+        form in wrap-up mode), at most TEAM_ASLEEP_MAX times per key; USER gets u_thread_quiet once per key with a
+        nudge that follows an earlier one of this goal, or with the first in wrap-up mode. The clock is dropped by a
+        pass that does not find the team quiet, by start() and by resume()."""
+        goal = self.goal()
+        asker = self._clarify_asker()
+        idle = self._idle_llm_members()
+        if (not goal or goal.get("status") != "active" or not idle or not self.team_asleep()
+                or (asker is not None and self.asks_user(asker))):
+            self._thread_quiet = None
+            return
+        now, wait = time.time(), max(0.0, float(self.config.agents.idle_nudge_seconds))
+        key = self._thread_key()
+        seen = self._thread_quiet
+        since = seen[1] if seen is not None and seen[0] == key else now
+        # a member's activation between two passes restarts the clock (not a failing retry: those in error are left out)
+        since = max([since] + [float(m.get("last_active") or 0) for m in idle])
+        self._thread_quiet = (key, since)
+        woken = self._thread_quiet_woken
+        per_key, told = (woken[1], woken[2]) if woken is not None and woken[0] == key else (0, False)
+        if per_key >= TEAM_ASLEEP_MAX:
+            return
+        sent = int(self.db.scalar("SELECT COUNT(*) FROM notifications WHERE kind IN ('n_thread_quiet', "
+                                  "'n_thread_quiet_wrap_up') AND ts >= ?", (float(goal.get("updated_at") or 0),)) or 0)
+        if now - since < 2 ** min(sent, TEAM_ASLEEP_DOUBLINGS) * wait:
+            return
+        name = self._quiet_whom(idle, asker)
+        awaited = {j.id for j in self.jobs.awaited(name)}
+        quiet = [j.label for j in self.jobs.running_of(name) if j.id not in awaited]
+        lang = self.language_of(name)
+        wrapping_up = self.wrapping_up
+        self.notify(name, "n_thread_quiet_wrap_up" if wrapping_up else "n_thread_quiet", vote=self._vote_text(lang),
+                    jobs=prompts.t(lang, "thread_quiet_jobs", jobs=", ".join(quiet)) if quiet else "")
+        tell = (sent >= 1 or wrapping_up) and not told
+        self._thread_quiet_woken = (key, per_key + 1, told or tell)
+        if tell:
+            try:
+                lang = self.language_of(USER)
+                self.notify(USER, "u_thread_quiet", vote=self._vote_text(lang), elapsed=fmt_duration(now - since, lang))
+            except Exception:
+                log.exception("could not tell the user that the thread is quiet")
+
+    def _thread_key(self) -> tuple:
+        """T2's thread key: (MAX(posts.active_at), the comments, the votes, the newest file.changed or files.committed
+        event, the newest message); a post, an edit, a comment, a new vote, a workspace change or a message makes a new
+        one, a vote turned from like to dislike does not."""
+        one = self.db.scalar
+        return (one("SELECT MAX(active_at) FROM posts"), one("SELECT COUNT(*) FROM post_comments"),
+                one("SELECT COUNT(*) FROM votes"),
+                one("SELECT MAX(id) FROM events WHERE type IN ('file.changed', 'files.committed')"),
+                one("SELECT MAX(id) FROM messages"))
+
+    def _quiet_whom(self, idle: list[dict], asker: str | None) -> str:
+        """The idle LLM member T2 wakes: the clarify asker while it is idle in its clarify phase, else the one least
+        recently active (never active counts as oldest), so successive nudges go round the team."""
+        if asker is not None and any(m["name"] == asker for m in idle) and self._in_clarify_phase(asker):
+            return asker
+        return min(idle, key=lambda m: float(m.get("last_active") or 0))["name"]
+
+    def _vote_text(self, language: str) -> str:
+        """The vote line on #1 under the session's rule in `language` (goal_vote_line or its veto form)."""
+        return vote_line(language, goal_tally(self.db, self.goal_rule))
 
     # ---- snapshot -----------------------------------------------------------------------------
     def workspace_info(self) -> dict:
