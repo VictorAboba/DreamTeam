@@ -58,6 +58,7 @@ HELD_NOTE = ("New files first seen after this command of {owner}{others}, commit
              "it outlives one more command, so leftovers that the next command deletes (of a test run, say) never "
              "enter the history.")
 HELD_OTHERS = " ({names} also had a command running then; git cannot tell who wrote a file)"
+COMMITTED_FILES_MAX = 200  # the files a files.committed event lists; the rest is its `more` (docs/SPEC.md §22.2)
 HARD_LINK_REFUSED = ("'{rel}' has another hard link, which may be a file outside the workspace or inside .git: "
                      "write_file and edit_file do not change it. Write the content to a new path instead.")
 # Directories shown but never expanded in listings (dependency caches, virtualenvs).
@@ -368,6 +369,23 @@ def agent_git_env(env: dict[str, str], actor: str) -> dict[str, str]:
     out = {k: v for k, v in env.items() if k.upper() not in GIT_LOCATION_VARS}
     name, email = git_identity(actor)
     out.update(GIT_AUTHOR_NAME=name, GIT_AUTHOR_EMAIL=email, GIT_COMMITTER_NAME=name, GIT_COMMITTER_EMAIL=email)
+    return out
+
+
+def committed_files(data: bytes) -> list[dict[str, str]]:
+    """[{path, change: A | M | D | R}] from `git diff-tree --name-status -z` output: a rename names its new path, a
+    type change is M; nothing under `.scratch/` (never committed) is listed."""
+    parts = data.decode("utf-8", "replace").split("\0")
+    out: list[dict[str, str]] = []
+    i = 0
+    while i < len(parts) and parts[i]:
+        status = parts[i][:1]
+        two = status in ("R", "C")  # <old> <new>
+        path = parts[i + 2] if two and i + 2 < len(parts) else parts[i + 1] if i + 1 < len(parts) else ""
+        i += 3 if two else 2
+        if path and not in_scratch(path):
+            out.append({"path": path, "change": status if status in ("A", "M", "D", "R") else
+                        "A" if status == "C" else "M"})
     return out
 
 
@@ -830,6 +848,9 @@ class Workspace:
         # `base_commit`); None with git off, without git, or when there is no commit
         self.record_head = False
         self.head_at_init: str | None = None
+        # a thread session's swarm sets it: whole-tree autocommits and held-file commits emit files.committed
+        # (docs/SPEC.md §22.2)
+        self.commit_events = False
 
     # --- setup -----------------------------------------------------------------------------
     @property
@@ -1624,7 +1645,8 @@ class Workspace:
 
             lang = self.swarm.language_of(owner)
             # (lock_wanted_minutes = 0 tells at a refusal right after the lock: never "held for 0 s")
-            self.swarm.notify(owner, "n_lock_wanted", path=lock["path"], held=fmt_duration(max(1.0, held), lang),
+            key = prompts.mode_key("n_lock_wanted", getattr(self.swarm, "mode", "board"))  # docs/SPEC.md §22.6
+            self.swarm.notify(owner, key, path=lock["path"], held=fmt_duration(max(1.0, held), lang),
                               waiters=", ".join(self._waiter_text(name, lang) for name in names))
             mark(lock["path"])
             for other in locks:  # its locks nested with this one count as told too
@@ -1869,7 +1891,7 @@ class Workspace:
                 groups.setdefault((held.owner, held.kind, held.detail, held.others), []).append(path)
         head: str | None = None
         done: set[str] = set()
-        for (owner, kind, detail, _others), files in groups.items():
+        for (owner, kind, detail, others), files in groups.items():
             note = _held_note(self._held[files[0]], when)
             spec = _collapse(files, units)
             message = commit_message(f"{kind} (new files)", sorted(files),
@@ -1887,8 +1909,36 @@ class Workspace:
                 self._held.pop(path, None)
             done.update(files)
             rev = await self._git(owner, "rev-parse", "HEAD")
-            head = rev.stdout.decode("ascii", "replace").strip() or head
+            made = rev.stdout.decode("ascii", "replace").strip()
+            head = made or head
+            await self._emit_committed(owner, "held", made, [owner, *(m for m in others if m != owner)])
         return head, done
+
+    def _suspects(self, actor: str) -> list[str]:
+        """Who may have written what a whole-tree commit of `actor` takes: `actor`, then the other members with a
+        command running or an autocommit queued (HELD_OTHERS's set: git cannot tell who wrote a file)."""
+        running, _last = self._commands()
+        others = ({*running.values()} | {m for m in self._queued if self._queued_besides(m, actor) > 0}) - {actor}
+        return [actor, *sorted(others)]
+
+    async def _emit_committed(self, actor: str, kind: str, sha: str, suspects: list[str]) -> None:
+        """files.committed {kind, commit, files: [{path, change}], more?, suspects} of commit `sha` (docs/SPEC.md
+        §22.2), only when `commit_events` is set (a thread session). The files come from the commit itself (a rename
+        names its new path), at most COMMITTED_FILES_MAX, then `more`. Caller holds the git lock; never raises."""
+        if not self.commit_events or not sha:
+            return
+        try:
+            diff = await self._git(actor, "diff-tree", "--root", "--no-commit-id", "--name-status", "-r", "-M", "-z",
+                                   "--no-ext-diff", "--no-textconv", sha)
+            if diff.returncode != 0:
+                log.info("git diff-tree failed: %s", self._output(diff))
+                return
+            files = committed_files(diff.stdout)
+            more = len(files) - COMMITTED_FILES_MAX
+            self.swarm.bus.emit("files.committed", actor, kind=kind, commit=sha, files=files[:COMMITTED_FILES_MAX],
+                                **({"more": more} if more > 0 else {}), suspects=list(dict.fromkeys(suspects)))
+        except Exception:  # noqa: BLE001 - an event must never fail a commit
+            log.exception("files.committed of %s failed", sha)
 
     async def _git_paths(self, actor: str | None, args: tuple[str, ...], spec: list[str], *,
                          literal: bool = True, unfiltered: bool = False) -> subprocess.CompletedProcess:
@@ -1990,7 +2040,10 @@ class Workspace:
                 log.info("git commit skipped: %s", self._output(commit))
                 return made
             head = await self._git(actor, "rev-parse", "HEAD")
-            return head.stdout.decode("ascii", "replace").strip() or None
+            sha = head.stdout.decode("ascii", "replace").strip() or None
+            if rel is None and sha:  # a single-path commit has its file.changed (docs/SPEC.md §22.2)
+                await self._emit_committed(actor, kind or "shell", sha, self._suspects(actor))
+            return sha
         except (OSError, subprocess.SubprocessError) as exc:
             log.warning("git autocommit failed: %s", exc)
             return made

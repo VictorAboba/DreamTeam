@@ -8,6 +8,7 @@ from typing import Any
 
 from .. import netoff, prompts, roles
 from ..db import loads
+from ..forum import rule_name, vote_line
 from ..jobs import fmt_duration, short_command
 from ..models import USER, AgentKind, Status, ToolError
 from ..swarm import USER_PAUSE
@@ -25,10 +26,14 @@ WAIT_UNWATCHED = ("OK, waiting. You will be woken up by new events, but nothing 
                   "is not tracked: its end will not wake you. If you are waiting for one, the next time set a trigger "
                   "with a deadline before you wait (trigger_create, e.g. file_exists(\"out/result.json\") or "
                   "elapsed(1800)), and start such runs with background=true, without & and nohup.")
-# wait_for_events(progress=true): the journal events that are board progress, the lines shown per result (the rest
-# is counted) and the events read per result
-PROGRESS_TYPES = ("task.created", "task.updated", "goal.set", "goal.completed", "goal.reopened", "agent.hired",
-                  "agent.retired", "swarm.wrap_up")
+# wait_for_events(progress=true): the journal events that are progress, by the session's mode (docs/SPEC.md §22.5),
+# the lines shown per result (the rest is counted) and the events read per result
+PROGRESS_TYPES = {
+    "board": ("task.created", "task.updated", "goal.set", "goal.completed", "goal.reopened", "agent.hired",
+              "agent.retired", "swarm.wrap_up"),
+    "thread": ("post.created", "post.comment", "goal.set", "goal.completed", "goal.reopened", "agent.hired",
+               "agent.retired", "swarm.wrap_up"),
+}
 PROGRESS_MAX = 20
 PROGRESS_SCAN = 1000
 PROGRESS_TITLE = 80
@@ -48,6 +53,16 @@ _PROGRESS = {
                       "jobs",
         "wrap_up_off": "wrap-up mode off ({by})",
         "more": "… and {n} more: see `board`",
+        # a thread session's lines (with goal_set, hired, joined, retired and wrap_up_off above)
+        "posted": "#{id} \"{title}\": posted by {by}",
+        "commented": "c{cid} on #{id} \"{title}\" by {by}: {text}",
+        "goal_done_vote": "goal reached by the vote ({rule})",
+        "goal_done_user": "goal completed by the user",
+        "goal_reopened_thread": "goal reopened by {by}: the votes on #1 were cleared",
+        "wrap_up_on_thread": "wrap-up mode on ({by}): post your results and what is left, stop jobs nobody needs, "
+                             "start nothing new, then like #1",
+        "header_thread": "Feed:",
+        "more_thread": "… and {n} more: see `feed`",
     },
     "ru": {
         "header": "Прогресс на доске:",
@@ -64,6 +79,15 @@ _PROGRESS = {
                       "фоновых процессов",
         "wrap_up_off": "режим завершения выключен ({by})",
         "more": "… и ещё {n}: смотри `board`",
+        "posted": "#{id} «{title}»: опубликовал(а) {by}",
+        "commented": "c{cid} к #{id} «{title}» от {by}: {text}",
+        "goal_done_vote": "цель достигнута голосованием ({rule})",
+        "goal_done_user": "цель завершена пользователем",
+        "goal_reopened_thread": "цель возвращена в работу ({by}): голоса на #1 сброшены",
+        "wrap_up_on_thread": "режим завершения включен ({by}): опубликуй результаты и то, что осталось, останови "
+                             "ненужные фоновые процессы, не начинай нового, затем поставь like на #1",
+        "header_thread": "Лента:",
+        "more_thread": "… и еще {n}: смотри `feed`",
     },
 }
 
@@ -76,6 +100,12 @@ def _job_list(jobs: list, *, parens: bool = True) -> str:
     items = [(j.label, f"{j.owner}: {short_command(j.command, 60)}, {fmt_duration(now - j.started_at)}"
               + (f", {silent}" if (silent := j.silent_phrase("en", now)) else "")) for j in jobs]
     return "; ".join(f"{label} ({text})" if parens else f"{label} {text}" for label, text in items)
+
+
+def _mode_kw(mode: str) -> dict[str, str]:
+    """The `mode` argument of the roles functions in a thread session (docs/SPEC.md §22.6); none for a board one,
+    whose calls stay as they were."""
+    return {"mode": mode} if mode != "board" else {}
 
 
 def _team_size(members: list[dict], limits: dict) -> str:
@@ -93,26 +123,31 @@ def _team_size(members: list[dict], limits: dict) -> str:
     "agents",
     en="Show the swarm roster: every member's name, role, status, model, open tasks and spending.",
     ru="Показать состав роя: имя, роль, статус, модель, открытые задачи и расходы каждого участника.",
+    thread={"en": "Show the swarm roster: every member's name, role, status, model and spending.",
+            "ru": "Показать состав роя: имя, роль, статус, модель и расходы каждого участника."},
 )
 async def agents(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
+    thread = ctx.mode == "thread"
     limits = swarm.limits()
     members = swarm.members()
     lines = [_team_size(members, limits) + " " + budget_line(swarm.spent_usd(), limits["max_cost_usd"])]
     for m in members:
-        open_ids = [t.id for t in swarm.board.open_tasks_of(m["name"])]
         you = " (you)" if m["name"] == ctx.actor else ""
         kind = "" if m["kind"] == AgentKind.LLM else f", {m['kind']}"
         model = f", model {m['model']}" if m.get("model") else ""
         running = swarm.jobs.running_of(m["name"])
         jobs = f", background jobs: {', '.join(j.label for j in running)}" if running else ""
+        tasks = ""
+        if not thread:  # a thread session has no tasks
+            open_ids = [t.id for t in swarm.board.open_tasks_of(m["name"])]
+            tasks = f"tasks: {', '.join('#' + str(i) for i in open_ids) or 'none'}, "
         lines.append(
             f"- {m['name']}{you}: {m['role']} [{m['status']}{kind}]{model}, "
-            f"tasks: {', '.join('#' + str(i) for i in open_ids) or 'none'}, ${m.get('cost_usd') or 0:.2f}, "
-            f"active {ago(m.get('last_active'))}{jobs}"
+            f"{tasks}${m.get('cost_usd') or 0:.2f}, active {ago(m.get('last_active'))}{jobs}"
         )
-    # the role catalog (docs/SPEC.md §17.3), in the caller's language: what hire_agent offers
-    catalog = roles.catalog(swarm.config.roles, swarm.language_of(ctx.actor))
+    # the role catalog (docs/SPEC.md §17.3) of the session's mode, in the caller's language: what hire_agent offers
+    catalog = roles.catalog(swarm.config.roles, swarm.language_of(ctx.actor), **_mode_kw(ctx.mode))
     if catalog:
         lines.append("Role catalog (hire_agent role=<name>; a catalog role brings its description and model profile, "
                      "and instructions may then be empty; any other name is a new role you describe in "
@@ -178,8 +213,9 @@ async def hire_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
     instructions = (args.get("instructions") or "").strip()
     # a catalog role brings its description and model profile; any other name is a new role, which only the
     # instructions describe (the guard is here, not in Swarm.hire: the starting team needs no instructions)
-    entry = roles.find_role(swarm.config.roles, role, swarm.language)
-    close = [] if entry else roles.close_roles(swarm.config.roles, role, swarm.language)
+    mode = _mode_kw(ctx.mode)
+    entry = roles.find_role(swarm.config.roles, role, swarm.language, **mode)
+    close = [] if entry else roles.close_roles(swarm.config.roles, role, swarm.language, **mode)
     similar = f" Similar catalog roles: {', '.join(close)}." if close else ""
     if entry is None and not instructions:
         if ctx.is_user:  # the board's hire form, the TUI or the console: the user's tools and views
@@ -203,6 +239,9 @@ async def hire_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
     else:
         source = (f" \"{shown}\" is a new role (not in the role catalog): your instructions are all they know about "
                   f"it.{similar}")
+    if ctx.mode == "thread":
+        return (f"Hired {name} as \"{shown}\".{source} They are woken now: they will read the feed and #2; no welcome "
+                "message is needed.")
     return (f"Hired {name} as \"{shown}\".{source} They are woken now: assign them a task (task_update assignee) "
             "or leave ready tasks for them to claim; no welcome message is needed.")
 
@@ -213,6 +252,8 @@ async def hire_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
        "back to todo.",
     ru="Вывести участника из роя (по умолчанию себя или нанятого тобой). Его открытые задачи вернутся в todo.",
     properties={"name": {"type": "string"}, "reason": {"type": "string"}},
+    thread={"en": "Remove a member from the swarm (yourself by default, or a member you hired).",
+            "ru": "Вывести участника из роя (по умолчанию себя или нанятого тобой)."},
 )
 async def retire_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
     if args.get("name"):
@@ -257,6 +298,16 @@ async def update_notes(ctx: ToolContext, args: dict[str, Any]) -> str:
        "события тебя разбудят.",
     properties={"reason": {"type": "string", "description": "What you are waiting for"}},
     audience=("llm",),
+    thread={
+        "en": "End your turn and sleep until something happens (a message, an @mention of you, what your subscriptions "
+              "catch, a trigger or the end of one of your background jobs). Call it when there is nothing useful left "
+              "for you to do now. End every turn with it. Never poll the feed, messages or jobs in a loop instead: "
+              "these events wake you.",
+        "ru": "Завершить ход и спать, пока что-нибудь не произойдет (сообщение, @упоминание тебя, то, что ловят твои "
+              "подписки, триггер или завершение твоего фонового процесса). Вызывай, когда полезных дел для тебя сейчас "
+              "нет. Заканчивай им каждый ход. Не опрашивай ленту, сообщения и фоновые процессы в цикле: эти события "
+              "тебя разбудят.",
+    },
 )
 async def wait(ctx: ToolContext, args: dict[str, Any]) -> str:
     if ctx.runtime is not None:
@@ -304,6 +355,7 @@ def _unwatched(ctx: ToolContext) -> bool:
     properties={"summary": {"type": "string"}},
     required=["summary"],
     audience=("llm", "external"),
+    modes=("board",),   # a thread goal is decided by the votes on #1 or by the user (docs/SPEC.md §22.4)
 )
 async def goal_complete(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
@@ -369,14 +421,27 @@ async def join_swarm(ctx: ToolContext, args: dict[str, Any]) -> str:
     role = member.get("role") or args["role"].strip()
     if getattr(swarm, "skills", None) is not None:
         swarm.skills.hire_report(name)  # its role's skills are marked in the list below
-    text = (
-        f"You joined the swarm as {name} (role: {role}). Pass as_agent=\"{name}\" in every call. "
-        "Look at `board`, claim tasks with `task_claim`, talk with `send_message`, and call `wait_for_events` "
-        "to receive messages, assignments and trigger notifications (progress=true: board progress too). "
-        "You do not count toward the agent limit (max_agents)."
-    )
+    if ctx.mode == "thread":
+        digest = fmt_duration(swarm.config.agents.digest_seconds)
+        text = (
+            f"You joined the swarm as {name} (role: {role}). Pass as_agent=\"{name}\" in every call. Read the feed "
+            "(`feed`, `post_read`), post with `post_create`, comment, like or dislike (`vote`; on #1 your vote is "
+            "shown, only the swarm's AI agents' votes count), choose what wakes you with `subscriptions` / "
+            "`subscribe`, talk with `send_message`, and call `wait_for_events` to receive @mentions, what your "
+            "subscriptions catch, messages and trigger notifications (progress=true: new posts and comments and the "
+            "goal vote too). You already follow the whole feed, #1, #2 and the reactions to your posts and comments "
+            f"as a digest: it comes with your next wait_for_events result, at the latest about {digest} after its "
+            "oldest item; votes never end the wait. You do not count toward the agent limit (max_agents)."
+        )
+    else:
+        text = (
+            f"You joined the swarm as {name} (role: {role}). Pass as_agent=\"{name}\" in every call. "
+            "Look at `board`, claim tasks with `task_claim`, talk with `send_message`, and call `wait_for_events` "
+            "to receive messages, assignments and trigger notifications (progress=true: board progress too). "
+            "You do not count toward the agent limit (max_agents)."
+        )
     # an external member has no system prompt: a catalog role's description reaches it here
-    entry = roles.find_role(swarm.config.roles, role, member.get("language") or swarm.language)
+    entry = roles.find_role(swarm.config.roles, role, member.get("language") or swarm.language, **_mode_kw(ctx.mode))
     if entry is not None and entry.description:
         text += f"\nYour role ({role}): {entry.description}"
     return text + _skills_block(swarm, name)
@@ -415,13 +480,47 @@ def _clip(text: Any, limit: int = PROGRESS_TITLE) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
-def _progress_line(texts: dict[str, str], event: dict, actor: str) -> str | None:
-    """One line about a journal event that is board progress made by someone else than `actor`; None otherwise."""
+def _thread_line(texts: dict[str, str], event: dict, by: str, lang: str, titles: dict[int, str]) -> str | None:
+    """A thread session's line about a forum or goal event (None: not one of them, or no line for it)."""
+    kind, data = event["type"], event["data"]
+    if kind == "post.created":
+        post = data.get("post") or {}
+        if event["actor"] is None or not post.get("author"):
+            return None  # a system post: goal.set covers it
+        title = titles.get(post.get("id"), post.get("title"))
+        return texts["posted"].format(id=post.get("id"), title=_clip(title), by=by)
+    if kind == "post.comment":
+        comment = data.get("comment") or {}
+        post_id = data.get("post_id") or comment.get("post_id")
+        return texts["commented"].format(cid=comment.get("id"), id=post_id, title=_clip(titles.get(post_id, "")),
+                                         by=by, text=_clip(comment.get("text")))
+    if kind == "goal.completed":
+        decision = (data.get("goal") or {}).get("decision")
+        if isinstance(decision, dict):
+            if decision.get("rule") == "user":
+                return texts["goal_done_user"]
+            return texts["goal_done_vote"].format(rule=rule_name(lang, decision.get("rule")))
+        return texts["goal_done"].format(by=by)
+    if kind == "goal.reopened":
+        return texts["goal_reopened_thread"].format(by=by)
+    if kind == "swarm.wrap_up" and data.get("on"):
+        return texts["wrap_up_on_thread"].format(by=by)
+    return None
+
+
+def _progress_line(texts: dict[str, str], event: dict, actor: str, mode: str = "board", lang: str = "en",
+                   titles: dict[int, str] | None = None) -> str | None:
+    """One line about a journal event that is progress made by someone else than `actor`; None otherwise."""
     by, data = event["actor"], event["data"]
     if by == actor:
         return None  # what the caller did itself is no news to it
     by = by or "DreamTeam"
     kind = event["type"]
+    if mode == "thread" and kind in ("post.created", "post.comment", "goal.completed", "goal.reopened",
+                                     "swarm.wrap_up"):
+        line = _thread_line(texts, event, by, lang, titles or {})
+        if line is not None or kind != "swarm.wrap_up":
+            return line
     if kind in ("task.created", "task.updated"):
         task = data.get("task") or {}
         fields = {"id": task.get("id"), "title": _clip(task.get("title")), "by": by}
@@ -451,26 +550,55 @@ def _progress_line(texts: dict[str, str], event: dict, actor: str) -> str | None
     return None
 
 
-def _progress(swarm, actor: str, cursor: int) -> tuple[list[tuple[float, str]], int]:
-    """Board progress after journal event `cursor`, as (event time, line in `actor`'s language), and the last event
-    read."""
+def _post_titles(swarm, events: list[dict]) -> dict[int, str]:
+    """The current titles of the posts these events are about, read once per result."""
+    ids = set()
+    for event in events:
+        data = event["data"]
+        if event["type"] == "post.created":
+            ids.add((data.get("post") or {}).get("id"))
+        elif event["type"] == "post.comment":
+            ids.add(data.get("post_id") or (data.get("comment") or {}).get("post_id"))
+    ids = sorted(i for i in ids if isinstance(i, int))
+    if not ids:
+        return {}
+    rows = swarm.db.all(f"SELECT id, title FROM posts WHERE id IN ({', '.join('?' * len(ids))})", tuple(ids))
+    return {r["id"]: r["title"] for r in rows}
+
+
+def _progress(swarm, actor: str, cursor: int) -> tuple[list[tuple[float, str]], int, bool]:
+    """Progress after journal event `cursor`, as (event time, line in `actor`'s language), the last event read, and
+    whether someone else voted on #1 in between (a thread session reads the votes too, which never make a line; on
+    the board it is always False)."""
+    mode = getattr(swarm, "mode", "board")
+    types = PROGRESS_TYPES[mode] + (("post.vote",) if mode == "thread" else ())
     rows = swarm.db.all(f"SELECT id, ts, type, actor, data FROM events WHERE id > ? AND type IN "
-                        f"({', '.join('?' * len(PROGRESS_TYPES))}) ORDER BY id LIMIT ?",
-                        (cursor, *PROGRESS_TYPES, PROGRESS_SCAN))
-    texts = _PROGRESS.get(swarm.language_of(actor)) or _PROGRESS["en"]
-    lines = []
-    for row in rows:
-        event = {"type": row["type"], "actor": row["actor"], "data": loads(row["data"], {})}
-        line = _progress_line(texts, event, actor) if isinstance(event["data"], dict) else None
+                        f"({', '.join('?' * len(types))}) ORDER BY id LIMIT ?",
+                        (cursor, *types, PROGRESS_SCAN))
+    lang = swarm.language_of(actor)
+    texts = _PROGRESS.get(lang) or _PROGRESS["en"]
+    events = [{"ts": row["ts"], "type": row["type"], "actor": row["actor"], "data": loads(row["data"], {})}
+              for row in rows]
+    events = [e for e in events if isinstance(e["data"], dict)]
+    titles = _post_titles(swarm, events) if mode == "thread" else {}
+    lines, voted = [], False
+    for event in events:
+        if event["type"] == "post.vote":
+            voted = voted or (event["data"].get("target") == "p1" and event["actor"] != actor)
+            continue
+        line = _progress_line(texts, event, actor, mode, lang, titles)
         if line:
-            lines.append((row["ts"] or 0.0, line))
-    return lines, (rows[-1]["id"] if rows else cursor)
+            lines.append((event["ts"] or 0.0, line))
+    return lines, (rows[-1]["id"] if rows else cursor), voted
 
 
 async def _signal_or_progress(swarm, actor: str, queue: asyncio.Queue, timeout: float) -> None:
-    """Wait until `actor` is signalled, a board progress event arrives on the bus `queue` or `timeout` passes."""
+    """Wait until `actor` is signalled, a progress event of the session's mode arrives on the bus `queue` (never a
+    vote) or `timeout` passes."""
+    types = PROGRESS_TYPES[getattr(swarm, "mode", "board")]
+
     async def progress_event() -> None:
-        while (await queue.get()).get("type") not in PROGRESS_TYPES:
+        while (await queue.get()).get("type") not in types:
             pass
 
     waiters = {asyncio.ensure_future(swarm.wait_signal(actor, timeout)), asyncio.ensure_future(progress_event())}
@@ -500,6 +628,27 @@ async def _signal_or_progress(swarm, actor: str, queue: asyncio.Queue, timeout: 
                              "description": "Also return on board progress (default false: only what is addressed "
                                             "to you)"}},
     audience=("external", "user"),
+    thread={
+        "en": f"Wait (up to timeout seconds, default {WAIT_DEFAULT}, max {WAIT_MAX}) for new messages, notifications, "
+              "@mentions, what your subscriptions catch or triggers addressed to you, and return them. Returns "
+              "immediately if something is already pending. With progress=true it also returns when the feed moves "
+              "on (new posts and comments by others, the goal set, reached or reopened, members hired, joined or "
+              "leaving, wrap-up mode switched on or off), as short lines with their time (HH:MM), with the goal vote "
+              "on #1 when it changed (votes alone never end the wait). When the news spans more than a minute, every "
+              "item has its time and the header the range.",
+        "ru": f"Подождать (до timeout секунд, по умолчанию {WAIT_DEFAULT}, максимум {WAIT_MAX}) новых сообщений, "
+              "уведомлений, @упоминаний, того, что ловят твои подписки, или срабатываний триггеров, адресованных "
+              "тебе, и вернуть их. Сразу возвращается, если что-то уже есть. С progress=true возвращается и когда "
+              "лента движется (новые объявления и комментарии других, цель задана, достигнута или возвращена в "
+              "работу, участники наняты, вступили или ушли, режим завершения включен или выключен), короткими "
+              "строками со временем (ЧЧ:ММ), с голосованием о цели на #1, если оно изменилось (одни голоса ожидание не "
+              "завершают). Если новости охватывают больше минуты, время есть у каждой из них, а в заголовке — "
+              "диапазон.",
+        "properties": {"timeout": {"type": "integer", "description": f"Seconds, 0-{WAIT_MAX}"},
+                       "progress": {"type": "boolean",
+                                    "description": "Also return when the feed moves on (default false: only what is "
+                                                   "addressed to you)"}},
+    },
 )
 async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
@@ -513,16 +662,18 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
         await workspace.commit_held(ctx.actor, f"at the end of {ctx.actor}'s turn")
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
-    queue = swarm.bus.subscribe() if progress else None  # board progress wakes the wait too
+    queue = swarm.bus.subscribe() if progress else None  # progress wakes the wait too
+    voted_any = False   # a vote on #1 by someone else (thread): one goal vote line, never one per vote
     try:
         cursor = _progress_cursor(swarm, ctx.actor) if progress and not _stopping(swarm) else 0
         # a signal can be left over from an event that was already consumed (e.g. by read_messages):
         # keep waiting until something is really pending or the time is up
         while not _stopping(swarm) and not swarm.has_pending(ctx.actor):
             if progress:
-                lines, last = _progress(swarm, ctx.actor, cursor)
+                lines, last, voted = _progress(swarm, ctx.actor, cursor)
                 if lines:
                     break
+                voted_any |= voted  # the cursor moves over these votes: keep that they came
                 cursor = last  # only the caller's own changes or edits so far: nothing to show for them
             remaining = deadline - loop.time()
             if remaining <= 0:
@@ -538,22 +689,29 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
         raise ToolError("The swarm was stopped while waiting; call wait_for_events again once it runs again.")
     lines: list[tuple[float, str]] = []
     if progress:
-        lines, last = _progress(swarm, ctx.actor, cursor)
+        lines, last, voted = _progress(swarm, ctx.actor, cursor)
+        voted_any |= voted
         swarm.db.set(_progress_key(ctx.actor), last)
+    thread = ctx.mode == "thread"
+    tally = swarm.forum.goal_vote() if thread and voted_any and getattr(swarm, "forum", None) is not None else None
     # one result may hold hours of news (progress collected since the last progress call, notifications queued
     # while the client was away): every progress line has its time, the rest too when the batch spans minutes
     since = min((ts for ts, _ in lines if ts), default=None)
     text = swarm.render_wake(ctx.actor, incoming=True, stamps=True, since=since)
-    if lines:
+    if lines or tally is not None:
         now = time.time()
-        texts = _PROGRESS.get(swarm.language_of(ctx.actor)) or _PROGRESS["en"]
+        lang = swarm.language_of(ctx.actor)
+        texts = _PROGRESS.get(lang) or _PROGRESS["en"]
         shown = [f"• {item_time(ts, now)} {line}" if ts else f"• {line}" for ts, line in lines[:PROGRESS_MAX]]
         if len(lines) > PROGRESS_MAX:
-            shown.append(f"• {texts['more'].format(n=len(lines) - PROGRESS_MAX)}")
+            more = texts["more_thread" if thread else "more"]
+            shown.append(f"• {more.format(n=len(lines) - PROGRESS_MAX)}")
+        if tally is not None:  # no time and no count toward PROGRESS_MAX: the vote as it stands now
+            shown.append(f"• {vote_line(lang, tally)}")
         if not text:
             first = since if since is not None and now - since > STAMP_SPAN else None
-            text = prompts.t(swarm.language_of(ctx.actor), "incoming_header", time=stamp_range(first, now))
-        text += "\n" + "\n".join([texts["header"], *shown])
+            text = prompts.t(lang, "incoming_header", time=stamp_range(first, now))
+        text += "\n" + "\n".join([texts["header_thread" if thread else "header"], *shown])
     return text or f"No new events in {timeout}s. Call wait_for_events again to keep listening."
 
 
@@ -572,7 +730,10 @@ async def wait_for_events(ctx: ToolContext, args: dict[str, Any]) -> str:
 )
 async def set_goal(ctx: ToolContext, args: dict[str, Any]) -> str:
     goal = ctx.swarm.set_goal(ctx.actor, args["title"], args.get("description") or "")
-    return "Goal set. " + goal_line(goal)
+    text = "Goal set. " + goal_line(goal)
+    if ctx.mode == "thread":
+        text += " The feed has #1 \"Goal reached?\" (the vote) and #2 \"Let's plan the work\"."
+    return text
 
 
 @tool(
@@ -584,12 +745,19 @@ async def set_goal(ctx: ToolContext, args: dict[str, Any]) -> str:
     properties={"brief": {"type": "boolean",
                           "description": "The goal as one line, without its description and summary (default false)"}},
     audience=("external", "user"),
+    thread={
+        "en": "Overview of the swarm: goal and its vote on #1, budget, pause and wrap-up state, members, the feed's "
+              "counts and your unread items. brief=true shows the goal as one line (title and status, without its "
+              "description and summary).",
+        "ru": "Обзор роя: цель и голосование на #1, бюджет, пауза и режим завершения, участники, счетчики ленты и твои "
+              "непрочитанные. brief=true показывает цель одной строкой (заголовок и статус, без описания и итога).",
+    },
 )
 async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
+    thread = ctx.mode == "thread"
     limits = swarm.limits()
     members = swarm.members()
-    counts = swarm.board.counts()
     goal = swarm.goal()
     if args.get("brief") and goal:  # a client that checks often needs no repeat of a long goal text
         goal = {"title": goal.get("title"), "status": goal.get("status", "active")}
@@ -598,10 +766,17 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     if question is not None:  # the user's next message to the asker answers it (Mailbox.send)
         state += (f" (your next send_message to {question['asker']} or to all is the answer: every member gets it with "
                   "the question; swarm_control action=resume goes on without it)")
-    if getattr(swarm, "clarifying", False):  # docs/SPEC.md §3 "Clarify mode"
+    if getattr(swarm, "clarifying", False) and thread:  # docs/SPEC.md §22.4 "Clarify"
+        state += ("; CLARIFY MODE: at a new goal the first AI agent asks the user the goal's forks and comments the "
+                  "answers on #2, and a member's question to the user with pause_swarm=true pauses the swarm until "
+                  "the user answers")
+    elif getattr(swarm, "clarifying", False):  # docs/SPEC.md §3 "Clarify mode"
         state += ("; CLARIFY MODE: the planning task first asks the user, and a member's question to the user with "
                   "pause_swarm=true pauses the swarm until the user answers")
-    if swarm.wrapping_up:
+    if swarm.wrapping_up and thread:
+        state += ("; WRAP-UP MODE: the agents post their results and what is left, start nothing new, and a like on #1 "
+                  "now means \"finish with what we have\"")
+    elif swarm.wrapping_up:
         state += ("; WRAP-UP MODE: the agents finish their tasks with what they have, no new computations or "
                   "background jobs")
     if netoff.is_off(swarm.config):  # docs/SPEC.md §7.2
@@ -610,13 +785,22 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
             "env": " (best effort: proxy and offline variables only)",
             "container": " (best effort: proxy and offline variables only; the sandbox was started without its "
                          "firewall)"}.get(netoff.shown(netoff.detected()) or "", "")
-    lines = [
-        f"Swarm \"{swarm.config.swarm.name}\" — {state}",
-        goal_line(goal),
+    lines = [f"Swarm \"{swarm.config.swarm.name}\" — {state}", goal_line(goal)]
+    tally = swarm.forum.goal_vote() if thread else None
+    if tally is not None:
+        lines.append(vote_line(ctx.lang, tally))
+    lines += [
         f"{budget_line(swarm.spent_usd(), limits['max_cost_usd'])} {_team_size(members, limits)}",
         "Members: " + (", ".join(f"{m['name']} ({m['role']}, {m['status']})" for m in members) or "none"),
-        "Tasks: " + (", ".join(f"{k}={v}" for k, v in counts.items() if v) or "none"),
     ]
+    if thread:
+        counts = swarm.forum.counts()
+        posts, comments = counts["posts"], counts["comments"]
+        lines.append(f"Feed: {posts} post{'s' if posts != 1 else ''}, "
+                     f"{comments} comment{'s' if comments != 1 else ''}.")
+    else:
+        counts = swarm.board.counts()
+        lines.append("Tasks: " + (", ".join(f"{k}={v}" for k, v in counts.items() if v) or "none"))
     running = swarm.jobs.running_of()
     if running:
         lines.append(f"Background jobs: {len(running)} running ({_job_list(running, parens=False)}).")
@@ -632,7 +816,9 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
         # an external member reads them by these paths; a client that checks often (brief) has them from join_swarm
         if not ctx.is_user and not args.get("brief"):
             lines.extend(swarm.skills.item_lines(ctx.actor, "en"))
-    if not ctx.is_user:
+    if not ctx.is_user and thread:
+        lines.append(f"You are {ctx.actor}. Your posts: {_own_posts(swarm, ctx.actor)}.")
+    elif not ctx.is_user:
         mine = swarm.board.open_tasks_of(ctx.actor)
         lines.append(f"You are {ctx.actor}. Your open tasks: "
                      + ("; ".join(t.short() for t in mine) if mine else "none"))
@@ -642,6 +828,26 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
     pending = " New events are pending: call wait_for_events." if swarm.has_pending(ctx.actor) else ""
     lines.append(f"Your unread messages: {swarm.mail.unread_count(ctx.actor)}.{pending}")
     return "\n".join(lines)
+
+
+def _own_posts(swarm, actor: str, limit: int = 5) -> str:
+    """The member's most recently active posts with their counts: "#9 (likes 4, dislikes 0, comments 3), #12 (...)"."""
+    ids = [r["id"] for r in swarm.db.all("SELECT id FROM posts WHERE author = ? ORDER BY active_at DESC, id DESC "
+                                         "LIMIT ?", (actor, limit))]
+    posts = [swarm.forum.get(i) for i in ids]
+    return ", ".join(f"#{p['id']} (likes {p.get('likes', 0)}, dislikes {p.get('dislikes', 0)}, comments "
+                     f"{p.get('comments', 0)})" for p in posts) or "none"
+
+
+_CONTROL_PROPS = {
+    "action": {"type": "string", "enum": ["pause", "resume"]},
+    "wrap_up": {"type": "boolean",
+                "description": "true: switch wrap-up mode on (each agent is told once); false: switch it off"},
+    "max_cost_usd": {"type": "number", "description": "Budget in USD, 0 = no limit"},
+    "max_agents": {"type": "integer",
+                   "description": "Maximum number of AI agents (members who joined through MCP do not count)"},
+    "reopen_goal_comment": {"type": "string", "description": "Reopen the completed goal with this comment"},
+}
 
 
 @tool(
@@ -654,32 +860,59 @@ async def swarm_status(ctx: ToolContext, args: dict[str, Any]) -> str:
        "тем, что есть, не начинают новых вычислений, и новые фоновые процессы не запускаются; новая или "
        "возвращённая в работу цель его выключает), изменение лимитов (max_cost_usd, 0 — без лимита; max_agents) "
        "или возврат завершённой цели в работу через reopen_goal_comment.",
-    properties={
-        "action": {"type": "string", "enum": ["pause", "resume"]},
-        "wrap_up": {"type": "boolean",
-                    "description": "true: switch wrap-up mode on (each agent is told once); false: switch it off"},
-        "max_cost_usd": {"type": "number", "description": "Budget in USD, 0 = no limit"},
-        "max_agents": {"type": "integer",
-                       "description": "Maximum number of AI agents (members who joined through MCP do not count)"},
-        "reopen_goal_comment": {"type": "string", "description": "Reopen the completed goal with this comment"},
-    },
+    properties=_CONTROL_PROPS,
     audience=("user",),
+    # the user completes a thread goal directly (docs/SPEC.md §22.4); live texts: no frozen set has the tool
+    thread={
+        "en": "Control the swarm: action=pause|resume, wrap_up=true|false (wrap-up mode: the agents post their results "
+              "and what is left, start no new computations, and no new background jobs start; a like on #1 then means "
+              "\"finish with what we have\"; a new or reopened goal ends it), change limits (max_cost_usd, 0 = no "
+              "limit; max_agents), reopen a completed goal with reopen_goal_comment (the votes on #1 are cleared), or "
+              "complete the active goal yourself with complete_goal (optional goal_summary).",
+        "ru": "Управление роем: action=pause|resume, wrap_up=true|false (режим завершения: агенты публикуют свои "
+              "результаты и то, что осталось, не начинают новых вычислений, и новые фоновые процессы не запускаются; "
+              "like на #1 тогда значит «завершить с тем, что есть»; новая или возвращенная в работу цель его "
+              "выключает), изменение лимитов (max_cost_usd, 0 — без лимита; max_agents), возврат завершенной цели в "
+              "работу через reopen_goal_comment (голоса на #1 сбрасываются) или завершение активной цели самим "
+              "пользователем через complete_goal (goal_summary — по желанию).",
+        "properties": {
+            **_CONTROL_PROPS,
+            "complete_goal": {"type": "boolean",
+                              "description": "Thread sessions only: complete the active goal yourself, whatever the "
+                                             "vote on #1"},
+            "goal_summary": {"type": "string",
+                             "description": "With complete_goal: the goal's summary (default: a generated one with "
+                                            "the vote on #1)"},
+        },
+    },
 )
 async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
     swarm = ctx.swarm
+    thread = ctx.mode == "thread"
+    complete = thread and bool(args.get("complete_goal"))
+    if complete and args.get("reopen_goal_comment"):  # checked first: nothing is applied
+        raise ToolError("Pass either complete_goal or reopen_goal_comment, not both.")
+    if thread and args.get("goal_summary") and not complete:
+        raise ToolError("goal_summary goes with complete_goal.")
     done = []
     wrap = args.get("wrap_up")
     if args.get("max_cost_usd") is not None or args.get("max_agents") is not None:
         limits = swarm.set_limits(ctx.actor, args.get("max_cost_usd"), args.get("max_agents"))
         budget = f"${limits['max_cost_usd']:.2f}" if limits["max_cost_usd"] > 0 else "no budget limit"
         done.append(f"limits: {budget}, at most {limits['max_agents']} AI agents")
+    applied = f" ({'; '.join(done)} applied)." if done else "."
+    if complete:
+        try:
+            swarm.complete_goal_by_user(args.get("goal_summary") or "")
+        except ToolError as exc:
+            raise ToolError(str(exc).rstrip(".") + applied) from None
+        done.append("goal marked reached")
     if args.get("reopen_goal_comment"):
         goal = swarm.goal()
         if goal and goal.get("status") != "done":
-            raise ToolError("The global goal is not completed, so there is nothing to reopen" +
-                            (f" ({'; '.join(done)} applied)." if done else "."))
+            raise ToolError("The global goal is not completed, so there is nothing to reopen" + applied)
         swarm.reopen_goal(ctx.actor, args["reopen_goal_comment"])
-        done.append("goal reopened")
+        done.append("goal reopened: the votes on #1 were cleared" if thread else "goal reopened")
     action = args.get("action")
     kept: list = []   # the jobs a pause that paused leaves running (their own sentence after the joined parts, §12)
     if action == "pause":
@@ -693,10 +926,15 @@ async def swarm_control(ctx: ToolContext, args: dict[str, Any]) -> str:
         done.append("resumed")
     # after reopen_goal_comment, which ends wrap-up mode: both in one call means "reopen, then wrap up"
     if wrap is True:
-        done.append("wrap-up mode on: every agent was told to finish its tasks with what it has, and no new background "
-                    "jobs start" if swarm.wrap_up(ctx.actor) else "wrap-up mode was already on")
+        told = ("every agent was told to post what it has and what is left, start nothing new and like #1 to finish "
+                "with it" if thread else "every agent was told to finish its tasks with what it has")
+        done.append(f"wrap-up mode on: {told}, and no new background jobs start" if swarm.wrap_up(ctx.actor)
+                    else "wrap-up mode was already on")
     elif wrap is False:
         done.append("wrap-up mode off" if swarm.end_wrap_up(ctx.actor) else "wrap-up mode was not on")
+    if not done and thread:
+        raise ToolError("Nothing to do: pass action (pause/resume), wrap_up, a limit, reopen_goal_comment or "
+                        "complete_goal.")
     if not done:
         raise ToolError("Nothing to do: pass action (pause/resume), wrap_up, a limit or reopen_goal_comment.")
     text = "Done: " + "; ".join(done) + "."

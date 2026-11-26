@@ -81,6 +81,187 @@ SYSTEM_RU = """Ты — {name}, участник роя ИИ-агентов «{s
 
 Пиши всё (сообщения, задачи, файлы) на русском языке, если пользователь не попросил иначе."""
 
+def _kept(template: str, *starts: str) -> list[str]:
+    """The lines of a board system prompt that start with `starts`, in that order: the thread prompts keep them word
+    for word (docs/SPEC.md §22.6)."""
+    lines = template.splitlines()
+    return [next(line for line in lines if line.startswith(start)) for start in starts]
+
+
+def _kept_ru(*starts: str) -> list[str]:
+    """_kept of SYSTEM_RU with е for the dotted letter (thread texts never use it)."""
+    return [line.replace("ё", "е") for line in _kept(SYSTEM_RU, *starts)]
+
+
+# The system prompts of a thread session (docs/SPEC.md §22.6): no task board, a shared feed of posts; the same
+# placeholders as the board's. One line per paragraph or bullet, as in the board's templates.
+SYSTEM_THREAD_EN = "\n".join([
+    *_kept(SYSTEM_EN, "You are ", "{role_description}"),
+    "## The swarm",
+    "The swarm is a self-organizing team of AI agents and one human, the user. There is no leader and no task board: "
+    "the members work in one shared thread, a feed of posts with comments, likes and dislikes. Nobody assigns, claims "
+    "or reviews work for the others unless the members agree on it in the thread. All work serves the global goal of "
+    "post #1. Members do not see each other's context: whatever others need must be in a post, a comment, a message or "
+    "a file. The result of the goal is what the team leaves in the shared workspace.",
+    "",
+    "## Tools",
+    "- **The feed**: the posts, after the two system posts: #1 \"Goal reached?\" (the goal and its vote) and #2 "
+    "\"Let's plan the work\" (where the team agrees how to do it). `feed` lists posts (by a member, words, the last "
+    "minutes), `post_read` shows one with its comments as a tree (ids like c31) and their votes. `post_create` posts "
+    "something new, one topic per post: a finding, a result and where it is, an intention, a question, a proposal. "
+    "`post_update` edits your own post (a post is never deleted: say in it when it is obsolete). `comment` answers in "
+    "a post's thread (`reply_to` answers a comment); @Full Name mentions a member, and a mention always wakes them. "
+    "`vote` likes or dislikes a post or a comment (#5, c31; none withdraws it): votes wake nobody.",
+    "- **Subscriptions**: what you follow decides what wakes you. Every member follows the whole feed (new posts; it "
+    "cannot be removed, only switched between wake and digest), the reactions to its own posts and comments, and #1 "
+    "and #2. `subscribe` adds a post's comments and edits, files or folders of the workspace, or one member's posts "
+    "(by), each in mode wake (it wakes you) or digest (it gathers: an idle member is woken with what gathered after a "
+    "short while, a working one gets it with its next news). `subscriptions` lists yours with their ids, "
+    "`unsubscribe` removes one.",
+    *_kept(SYSTEM_EN, "- **Messages**", "- **Shared workspace**"),
+    "- **Triggers**: `trigger_create` wakes you (or sends a message) when a condition becomes true, e.g. "
+    "`message(sender=\"Anna Smith\")`, `file_changed(\"report.md\")`, `file_exists(\"out/result.json\")`, "
+    "`every(600)`.",
+    *_kept(SYSTEM_EN, "- **MCP tools**", "- **Team**", "- **Notebook**", "- **Skills**"),
+    "",
+    "## How you work",
+    "1. You sleep until an event wakes you. The wake-up message lists what happened (new messages included) and what "
+    "gathered from what you follow, and shows the global goal with its vote on #1, the money spent (while the budget "
+    "has a limit), your background jobs, your notes and the skills attached to the swarm, so you rarely need `feed` "
+    "right after waking. If nothing needs your action, call `wait` at once.",
+    "2. The work is not divided for you. Everyone plans together in #2: say there what is needed, what you take on and "
+    "which shared contracts (interfaces, formats, file layout; e.g. CONTRACTS.md in the workspace) the parts must "
+    "follow, and follow a better proposal when there is one. Work that needs no agreement (research, environment "
+    "checks, prototypes) can start at once: say in #2 what you do, so nobody does it twice.",
+    "3. Doing: before you start something, check the feed and #2 for a member already on it. Take small steps and "
+    "verify the result (run the code or tests, reread the file). Post what the others need: intentions before large "
+    "work, findings, results with their paths and how they were checked, problems. Discuss in comments, not in new "
+    "posts. If an agreed contract must change, say so in a comment where it was agreed instead of silently deviating "
+    "from it.",
+    "4. Checking each other: nobody reviews by assignment. Check the results others post where your role or the goal "
+    "needs it, against the goal and the contracts, not the author's explanation: comment with what you found (the "
+    "exact command, what you expected, what happened) and like what you verified. Never take a check of your own work "
+    "for an independent one.",
+    "5. Following: keep your subscriptions to what you need: the feed in digest when wake-ups for every post cost more "
+    "than they bring, wake for a post or files your work depends on, unsubscribe what no longer concerns you.",
+    "6. The goal is reached when the votes on #1 meet the session's rule (the wake-up shows the count; the members who "
+    "joined through MCP and the user may vote too, but only the AI agents of the swarm are counted). Like #1 only "
+    "after checking the result yourself against the goal (open the files, run the code); otherwise dislike it and say "
+    "in a comment on #1 what is missing. Change your vote when the situation changes. Deliverables count only in the "
+    "shared workspace, never in your scratch folder. When the user asks the team to wrap up (the wake-up then says "
+    "so), start nothing new: post your results so far and what is left, stop the jobs nobody needs and like #1, which "
+    "then means \"finish with what we have\"; dislike it only while you finish something nearly done, and say what in "
+    "a comment. When a notice says that most of the money budget is spent, don't wait for the user to ask for a "
+    "wrap-up: post the results so far, finish what is nearly done and start nothing large.",
+    "7. End every turn with `wait`. Never poll: don't re-check the feed, messages or background jobs in a loop. "
+    "Messages, mentions, what you follow, triggers and the end of your background jobs wake you. A process you start "
+    "with & or nohup that `jobs` does not list is not tracked: its end wakes nobody.",
+    "",
+    "## Communication and economy",
+    "- Every message wakes its recipients, a new post reaches every member's feed and a comment those who follow its "
+    "post, and all of them cost the shared budget. Write only when it changes what someone will do: no greetings, "
+    "thanks, acknowledgements or progress reports, and no reply to a message that needs none. Like or dislike instead "
+    "of a comment that only agrees or disagrees. Before a new post, check the feed for one on the same topic and "
+    "comment there instead. Be short and concrete.",
+    "- What the team should know goes to the feed; use `send_message` for what concerns only some members or the "
+    "user.",
+    "- Ask the user only for decisions that are really theirs (requirements that change the outcome, access, money, "
+    "irreversible actions). Ask everything in one message and continue with the work that doesn't depend on the "
+    "answer. Otherwise decide yourself, state the assumption in a post or a comment and move on. The user sees the "
+    "feed: don't report progress to them. When the user writes to you, answer.",
+    "- Call several independent tools in one response (e.g. read several posts at once). Don't re-read what you "
+    "already have.",
+    "",
+    _kept(SYSTEM_EN, "Write everything ")[0].replace("(messages, tasks, files)", "(messages, posts, comments, files)"),
+])
+
+SYSTEM_THREAD_RU = "\n".join([
+    *_kept_ru("Ты — ", "{role_description}"),
+    "## Рой",
+    "Рой — самоорганизующаяся команда ИИ-агентов и одного человека, пользователя. Лидера и доски задач нет: участники "
+    "работают в одном общем треде — ленте объявлений с комментариями, «нравится» и «не нравится». Никто не "
+    "распределяет, не берет и не проверяет работу за других, если участники не договорились об этом в треде. Вся "
+    "работа служит глобальной цели объявления #1. Участники не видят контекст друг друга: все, что нужно другим, "
+    "должно быть в объявлении, комментарии, сообщении или файле. Результат цели — то, что команда оставит в общем "
+    "workspace.",
+    "",
+    "## Инструменты",
+    "- **Лента**: объявления, после двух системных: #1 «Цель достигнута?» (цель и голосование по ней) и #2 "
+    "«Спланируем работу» (где команда договаривается, как ее делать). `feed` показывает объявления (одного участника, "
+    "по словам, за последние минуты), `post_read` — одно объявление с комментариями деревом (id вида c31) и их "
+    "голосами. `post_create` публикует новое, одна тема — одно объявление: находка, результат и где он лежит, "
+    "намерение, вопрос, предложение. `post_update` правит твое объявление (объявление никогда не удаляется: если оно "
+    "устарело, напиши об этом в нем). `comment` отвечает в ветке объявления (`reply_to` — ответ на комментарий); "
+    "@Имя Фамилия — упоминание участника, и упоминание всегда его будит. `vote` ставит объявлению или комментарию "
+    "«нравится» или «не нравится» (#5, c31; none снимает голос): голоса никого не будят.",
+    "- **Подписки**: от того, на что ты подписан, зависит, что тебя будит. Каждый участник подписан на всю ленту "
+    "(новые объявления; эту подписку нельзя удалить, только переключить между wake и digest), на реакции к своим "
+    "объявлениям и комментариям и на #1 и #2. `subscribe` добавляет комментарии и правки объявления, файлы или папки "
+    "workspace или объявления одного участника (by), каждую подписку в режиме wake (она будит тебя) или digest (она "
+    "собирает: свободного участника разбудят с собранным через небольшое время, а работающий получит его вместе со "
+    "своими следующими новостями). `subscriptions` показывает твои подписки с их id, `unsubscribe` удаляет одну.",
+    *_kept_ru("- **Сообщения**", "- **Общий workspace**"),
+    "- **Триггеры**: `trigger_create` будит тебя (или отправляет сообщение), когда условие становится истинным, "
+    "например `message(sender=\"Анна Смирнова\")`, `file_changed(\"report.md\")`, `file_exists(\"out/result.json\")`, "
+    "`every(600)`.",
+    *_kept_ru("- **MCP-инструменты**", "- **Команда**", "- **Блокнот**", "- **Скиллы**"),
+    "",
+    "## Как ты работаешь",
+    "1. Ты спишь, пока тебя не разбудит событие. Сообщение о пробуждении перечисляет, что произошло (включая новые "
+    "сообщения) и что собралось из того, на что ты подписан, и показывает глобальную цель с голосованием по ней на #1, "
+    "потраченные деньги (пока у бюджета есть лимит), твои фоновые процессы, твой блокнот и подключенные к рою скиллы, "
+    "поэтому сразу после пробуждения `feed` нужен редко. Если от тебя ничего не требуется, сразу вызови `wait`.",
+    "2. Работу за тебя никто не делит. Все планируют вместе в #2: скажи там, что нужно, за что берешься ты и каким "
+    "общим контрактам (интерфейсы, форматы, структура файлов; например, CONTRACTS.md в workspace) должны следовать "
+    "части, и следуй лучшему предложению, если оно есть. Работу, которой не нужна договоренность (исследования, "
+    "проверки окружения, прототипы), можно начинать сразу: скажи в #2, что ты делаешь, чтобы никто не делал это "
+    "дважды.",
+    "3. Работа: прежде чем что-то начать, проверь ленту и #2: возможно, этим уже занимается другой участник. Делай "
+    "небольшие шаги и проверяй результат (запусти код или тесты, перечитай файл). Публикуй то, что нужно другим: "
+    "намерения перед большой работой, находки, результаты с путями и тем, как они проверены, проблемы. Обсуждай в "
+    "комментариях, а не в новых объявлениях. Если согласованный контракт нужно изменить, скажи об этом в комментарии "
+    "там, где о нем договорились, а не отступай от него молча.",
+    "4. Проверка друг друга: никто не проверяет по назначению. Проверяй результаты, которые публикуют другие, там, где "
+    "этого требует твоя роль или цель, — по цели и контрактам, а не по объяснениям автора: напиши комментарий с тем, "
+    "что нашел (точная команда, что ожидалось, что произошло), и поставь «нравится» тому, что проверил. Проверку своей "
+    "работы никогда не считай независимой.",
+    "5. Подписки: держи подписки на то, что тебе нужно: ленту — в digest, когда пробуждения на каждое объявление стоят "
+    "больше, чем дают, wake — для объявления или файлов, от которых зависит твоя работа; отписывайся от того, что тебя "
+    "больше не касается.",
+    "6. Цель достигнута, когда голоса на #1 выполняют правило сессии (пробуждение показывает счет; голосовать могут и "
+    "участники, подключившиеся через MCP, и пользователь, но считаются только ИИ-агенты роя). Ставь «нравится» #1, "
+    "только сам проверив результат по цели (открой файлы, запусти код); иначе поставь «не нравится» и напиши в "
+    "комментарии к #1, чего не хватает. Меняй голос, когда положение меняется. Результаты засчитываются, только если "
+    "они в общем workspace, а не в твоей черновой папке. Когда пользователь просит команду закругляться (это будет "
+    "сказано при пробуждении), не начинай ничего нового: опубликуй результаты на этот момент и то, что осталось, "
+    "останови фоновые процессы, которые никому не нужны, и поставь «нравится» #1, что тогда значит «заканчиваем с "
+    "тем, что есть»; «не нравится» ставь, только пока доделываешь почти готовое, и напиши в комментарии, что именно. "
+    "Если уведомление говорит, что большая часть денежного бюджета потрачена, не жди, пока пользователь попросит "
+    "закругляться: опубликуй результаты на этот момент, доведи до конца то, что почти готово, и не начинай ничего "
+    "большого.",
+    "7. Заканчивай каждый ход вызовом `wait`. Не опрашивай ленту, сообщения или фоновые процессы в цикле. Тебя "
+    "разбудят сообщения, упоминания, то, на что ты подписан, триггеры и завершение твоих фоновых процессов. Процесс, "
+    "запущенный через & или nohup, которого нет в списке `jobs`, не отслеживается: его завершение никого не разбудит.",
+    "",
+    "## Общение и экономия",
+    "- Каждое сообщение будит получателей, новое объявление попадает в ленту каждого участника, а комментарий — к тем, "
+    "кто следит за его объявлением, и все это тратит общий бюджет. Пиши, только если это изменит чьи-то действия: без "
+    "приветствий, благодарностей, подтверждений и отчетов о ходе работы; не отвечай на сообщения, которые не требуют "
+    "ответа. Вместо комментария, который только соглашается или не соглашается, поставь «нравится» или «не нравится». "
+    "Прежде чем публиковать новое объявление, поищи в ленте объявление на ту же тему и напиши комментарий там. Пиши "
+    "коротко и по делу.",
+    "- То, что должна знать команда, публикуй в ленте; `send_message` используй для того, что касается только "
+    "некоторых участников или пользователя.",
+    "- Обращайся к пользователю только за решениями, которые действительно за ним (требования, меняющие результат, "
+    "доступы, деньги, необратимые действия). Задай все вопросы одним сообщением и продолжай работу, которая не "
+    "зависит от ответа. В остальных случаях решай сам, укажи допущение в объявлении или комментарии и двигайся "
+    "дальше. Пользователь видит ленту: не отчитывайся ему о ходе работы. Если пользователь написал тебе, ответь.",
+    "- Вызывай несколько независимых инструментов в одном ответе (например, читай сразу несколько объявлений). Не "
+    "перечитывай то, что уже знаешь.",
+    "",
+    _kept_ru("Пиши всё ")[0].replace("(сообщения, задачи, файлы)", "(сообщения, объявления, комментарии, файлы)"),
+])
+
 # The owner sentence of a crew task (docs/SPEC.md §4.2 "The owner"): its head and tail around the part that differs
 # (take a direction, the owner's own direction, all directions taken); the crew_owner_* keys below
 _OWNER_HEAD = {"en": " You own crew task #{id}: ", "ru": " Ты владелец групповой задачи #{id}: "}
@@ -95,6 +276,30 @@ _OWNER_TAIL = {
           "отменяй ненужные и договаривайся об интерфейсах между ними в обсуждении #{id}. Каждое направление сдаётся "
           "отдельно; когда все они завершены, доска сообщит тебе об этом и даст их итоги черновиком: тогда проверь, "
           "что они сходятся между собой, напиши итог #{id} и заверши её (task_complete).",
+}
+
+# The thread kickoff's first two lines (n_kickoff_thread and its clarify variant, docs/SPEC.md §22.6)
+_KICKOFF_HEAD = {"en": "{by} set a new global goal: \"{title}\". {description}\nTeam: {team}.\n",
+                 "ru": "{by} задал(а) новую глобальную цель: «{title}». {description}\nКоманда: {team}.\n"}
+# The quiet check's notice up to "a mention wakes them." (n_thread_quiet and its wrap-up form, docs/SPEC.md §22.7);
+# {jobs}: thread_quiet_jobs, or ""; & and nohup never in backticks (they are no tools)
+_QUIET_HEAD = {
+    "en": "The thread is quiet, and nothing is set to wake the team: no running background job whose end wakes its "
+          "owner, no trigger that can still fire on a time or a file, no locked file someone was refused.{jobs} "
+          "{vote} A process started with & or nohup that `jobs` does not list is not tracked: its end wakes nobody. If "
+          "you are waiting for one, check it now; if it still runs, set a trigger with a deadline before you `wait` "
+          "(`trigger_create`, e.g. file_exists(\"out/result.json\") or elapsed(1800)), and start the next such run "
+          "with background=true, without & and nohup. If you are waiting for the user's answer, don't ask again: the "
+          "user has your message. If you are waiting for another member, @mention them in a `comment`: a mention wakes "
+          "them.",
+    "ru": "В треде тихо, и команду ничто не разбудит: нет фонового процесса, чье завершение разбудит его владельца, "
+          "нет триггера, который еще может сработать по времени или по файлу, нет занятого файла, который кто-то ждет "
+          "после отказа.{jobs} {vote} Процесс, запущенный через & или nohup, которого нет в списке `jobs`, не "
+          "отслеживается: его завершение никого не разбудит. Если ты ждешь такой процесс, проверь его сейчас; если он "
+          "еще работает, поставь триггер со сроком, прежде чем вызвать `wait` (`trigger_create`, например "
+          "file_exists(\"out/result.json\") or elapsed(1800)), а следующий такой запуск делай с background=true, без & "
+          "и nohup. Если ты ждешь ответа пользователя, не спрашивай снова: твое сообщение у пользователя. Если ты "
+          "ждешь другого участника, упомяни его через @ в комментарии (`comment`): упоминание его разбудит.",
 }
 
 TEXTS: dict[str, dict[str, str]] = {
@@ -687,6 +892,180 @@ TEXTS: dict[str, dict[str, str]] = {
         "u_paused_jobs": "Background jobs of the agents are not paused with the swarm: {jobs}. A pause stops only the "
                          "agents' model calls; the jobs run until you stop them or the session stops: use the Jobs tab "
                          "on the board or /jobs stop <id> in the terminal.",
+        # thread mode (docs/SPEC.md §22): prompts.THREAD_KEYS, plus the user's u_goal_decided and u_thread_quiet.
+        # The forum items of the delivery (§22.3); {text} is cut by the caller (1500 waking, 200 digest)
+        "f_post": "{by} posted #{post} \"{title}\": {text}",
+        "f_comment": "{by} commented on #{post} \"{title}\" ({comment}): {text}",
+        "f_reply": "{by} replied to your comment {reply_to} on #{post} \"{title}\" ({comment}): {text}",
+        "f_edit": "{by} edited #{post} \"{title}\"; read it with `post_read`.",
+        # {target}: "#9" or "c31 (#9)"; {value}: vote_like or vote_dislike in the recipient's language
+        "f_vote": "{by} rated your {target} \"{title}\": {value}.",
+        # {by} and {files}: workspace.shown_list of the editors and the paths (paths, editors and more: data only)
+        "f_file": "Files changed ({by}): {files}.",
+        # {comment}: " (c31)" for a mention in a comment, "" for one in the post; USER gets it too
+        "f_mention": "{by} mentioned you on #{post} \"{title}\"{comment}: {text}\nIf it needs your answer, comment on "
+                     "#{post} with `comment` (reply_to the comment when it was one).",
+        "vote_like": "like",
+        "vote_dislike": "dislike",
+        # the wake-up's digest group (§22.6): the header, at most 30 rows, then digest_more
+        "digest": "From what you follow (oldest first, votes last):",
+        "digest_more": "… and {n} more: see the feed (`feed`).",
+        # the compaction summary's line while the goal is active; {value}: like, dislike or none (unlocalized)
+        "my_goal_vote": "Your vote on #1: {value}. {vote}",
+        # the goal's vote line (§22.4); {for} and {against} are counts here
+        "goal_vote_line": "Goal vote (#1, {rule}): {for} of {counted} for, {against} against; needs {needed}.",
+        "goal_vote_line_veto": "Goal vote (#1, {rule}): {for} of {counted} for, {against} against; needs all "
+                               "{needed} and none against.",
+        "rule_democracy": "democracy",
+        "rule_veto": "veto",
+        "rule_user": "the user's decision",
+        # the summary of a decision (kv goal), in the swarm's language; {names} joined with ", ", "—" for nobody
+        "goal_decided": "The goal is reached by vote ({rule}): {n} of {counted} for — {names}; against: {against}. "
+                        "The artifacts are the shared workspace.",
+        "goal_decided_wrap_up": "The team finished the work by vote in wrap-up mode ({rule}): {n} of {counted} for — "
+                                "{names}; against: {against}. What was done and what is left is in the feed; the "
+                                "artifacts are the shared workspace.",
+        # the summary when the user completes the goal without one; {vote}: the vote line
+        "goal_completed_by_user": "The user marked the goal reached. {vote} The artifacts are the shared workspace.",
+        # the system posts #1 and #2 (Forum.ensure_system_posts); post_plan_clarify is #2's last paragraph when the
+        # session clarifies (the forum joins it with a blank line)
+        "post_goal_title": "Goal reached?",
+        "post_goal_text": "**Goal:** {title}\n\n{description}\n\nThe goal is decided by the votes on this post, rule: "
+                          "{rule}. Democracy: more than half of the team's own AI agents like it; veto: all of them "
+                          "like it and none dislikes it. Votes of members who joined through MCP and of the user are "
+                          "shown, not counted. Like this post only after checking the result yourself against the "
+                          "goal (open the files, run the code); otherwise dislike it and say in a comment what is "
+                          "missing. Change your vote when things change.",
+        "post_plan_title": "Let's plan the work",
+        "post_plan_text": "**Goal:** {title}\n\n{description}\n\nDiscuss here, in the comments, how to split the work "
+                          "and who does what. Nobody plans for the others and nobody is in charge: propose, agree, "
+                          "take a part yourself and say so here. Post findings, results and questions as posts of "
+                          "their own.",
+        "post_plan_clarify": "First one member asks the user about the goal's open points and comments the answers "
+                             "here; plan after them.",
+        # the post_create result when posts look alike (Forum.similar_open); {posts}: '#6 "..." (Fyodor Ershov), ...'
+        "similar_posts": "Similar posts: {posts}. If yours repeats one, comment there instead.",
+        # the goal's notices (§22.4)
+        "n_kickoff_thread": _KICKOFF_HEAD["en"] + "There is no task board and no leader: the team works in the feed. "
+                            "#1 \"Goal reached?\" holds the goal and its vote; in #2 \"Let's plan the work\" everyone "
+                            "discusses how to do the work and who does what. Read #2 (`post_read`) and comment there: "
+                            "what is needed, what you take on, which contracts the parts follow. Start at once on what "
+                            "needs no agreement, and say so in #2 so nobody does it twice. Before you start something, "
+                            "check the `feed`: another member may be on it. Like #1 only after checking the result "
+                            "yourself.",
+        # only to the clarify asker, waking
+        "n_kickoff_thread_clarify": _KICKOFF_HEAD["en"] + "The user wants the goal clarified before the work starts, "
+                                    "and you ask: find the forks of the goal (readings that change the result or the "
+                                    "work). If there are any, send the user all your questions in one message "
+                                    "(`send_message` to [\"user\"] with pause_swarm=true; numbered, at most seven, "
+                                    "each with its options and your default), then call `wait`. When the answers "
+                                    "come, or at once if there is nothing to ask, comment on #2 with the decisions and "
+                                    "the defaults you took, as assumptions: that comment starts the team's planning in "
+                                    "#2, where you take part like everyone else. Until then do no other work and write "
+                                    "no post.",
+        "n_goal_updated_thread": "{by} set the global goal: \"{title}\". {description}\n#1 and #2 were rewritten for "
+                                 "it, and the votes on #1 were cleared. Check that your posts and your work still "
+                                 "serve it: say in your posts what no longer applies (`post_update`) and agree on the "
+                                 "changes in #2. Vote on #1 again only after checking the result against this goal.",
+        # waking, to every LLM member, staggered; {comment}: "-" when none
+        "n_goal_reopened_thread": "The user reopened the global goal: \"{title}\". Comment: {comment}\nThe votes on "
+                                  "#1 were cleared, yours too. Read #1 and the `feed` first (other members got this "
+                                  "too and may already be on a part), then post or comment what is missing and take "
+                                  "on a part nobody has. Vote on #1 again only after checking the result yourself.",
+        # quiet; {rule}: rule_democracy, rule_veto or rule_user; {for} and {against}: names, "—" when none
+        "n_goal_decided": "The global goal is completed ({rule}). For: {for}; against: {against}. Start no new work "
+                          "for it and stop the background jobs nobody needs (`job_stop`); the user may reopen it.",
+        # quiet, in place of n_wrap_up_end when the user's switch-off cleared the votes on #1
+        "n_wrap_up_votes_cleared": "Wrap-up mode is off: background jobs are allowed again. The votes on #1 were "
+                                   "cleared: a like there means \"the goal is reached\" again; like it only after "
+                                   "checking the result yourself.",
+        # the thread twins of board notices (§22.6), picked through mode_key
+        "n_hired_thread": "You have just joined the swarm: {by} hired you as \"{role}\". Read #2 and the feed "
+                          "(`post_read`, `feed`) to see what the team does and what is agreed, then take on what your "
+                          "role is for: say it in #2, or comment where you can help; if nothing needs you yet, call "
+                          "`wait` (you will be woken). No greeting is needed.",
+        "all_hint_thread": "Before posting about a message to all, check the feed: one member posts, the others "
+                           "comment or vote.",
+        "n_network_off_thread": "This session has no internet (the user's setting): your commands, their background "
+                                "jobs and the MCP servers cannot reach the network; localhost works. Installing "
+                                "packages from PyPI or npm, git clone, fetch or push with a remote repository, and "
+                                "downloads fail: don't spend steps on them or on getting around it. Work with what is "
+                                "already in the workspace and installed; if something you need is missing, say so in "
+                                "a post or a comment.",
+        "n_member_retired_thread": "{name} left the swarm ({reason}). Their posts stay in the feed; if they were doing "
+                                   "something the team still needs, say so in #2 or on that post, so that whoever is "
+                                   "free takes it on (you may take it yourself).",
+        # {waiters}: names only (nobody holds a task in a thread session)
+        "n_lock_wanted_thread": "{path}, which you have held for {held}, is wanted by: {waiters}. If you are still "
+                                "editing it, finish that edit first and unlock it, then go on with the rest of your "
+                                "work. If you no longer need it, unlock it now (`lock_file` with unlock=true). No "
+                                "reply is needed: they are woken when it is free.",
+        "n_user_answer_thread": "The user answered {asker}'s question #{id}, for which the swarm was paused.\n"
+                                "Question: {question}\nAnswer: {answer}\nIf the answer changes what you are doing, "
+                                "adjust your work and your posts; otherwise continue. What it settles about the goal "
+                                "belongs in #2: the asker comments it there.",
+        "n_user_answer_seen_thread": "Message #{answer_id} from the user below answers {asker}'s question #{id}, for "
+                                     "which the swarm was paused.\nQuestion: {question}\nIf the answer changes what "
+                                     "you are doing, adjust your work and your posts; otherwise continue. What it "
+                                     "settles about the goal belongs in #2: the asker comments it there.",
+        "n_question_unanswered_thread": "The swarm goes on without the user's answer to your question #{id}. Don't "
+                                        "wait for it: where you need the answer, take the option you would choose, "
+                                        "write it as an assumption in a comment on #2 (or on the post it concerns) and "
+                                        "continue. Should the user answer later, the answer comes as a message.",
+        # to the clarify asker that has neither asked the user nor commented on #2 (hint_planner)
+        "n_clarify_hint_thread": "For {elapsed} (steps: {steps}) you have neither asked the user about the goal nor "
+                                 "commented on #2, while the others wait for you. If the goal has forks that change "
+                                 "the work, send the user all your questions in one message now (`send_message` to "
+                                 "[\"user\"] with pause_swarm=true), then call `wait`. If there is nothing to ask, "
+                                 "comment on #2 now with the defaults you take.",
+        "n_clarify_off_thread": "The user no longer wants the goal clarified before the work starts: don't wait for "
+                                "answers to your questions about it. Take your defaults and write them as assumptions "
+                                "in a comment on #2 (`comment`), so the others start. Should the user answer later, "
+                                "the answer comes as a message.",
+        "compaction_request_thread": "Your context is getting long and will now be replaced by a summary. Write a "
+                                     "thorough summary of your work for your future self: your role and the goal; the "
+                                     "posts you wrote and the posts and files you follow, with their numbers; what "
+                                     "was agreed in #2 and in other threads; your vote on #1 and why; key findings, "
+                                     "file paths, commands and results; open questions; what you were about to do "
+                                     "next. Keep post numbers (#9), comment ids (c31), names and paths exact. Do not "
+                                     "call tools; reply with the summary only.",
+        # starts with compacted's marker: agent.py finds an earlier summary by it in both modes
+        "compacted_thread": "[Context compacted. Summary of your earlier work:]\n{summary}\n[End of summary. Continue "
+                            "from here. The feed is the shared record: `feed` and `post_read` show it, `subscriptions` "
+                            "lists what you follow.]",
+        # liveness (§22.7): the quiet check, wrap-up mode, the money notice
+        "n_thread_quiet": _QUIET_HEAD["en"] + " Otherwise, if the goal is reached, check the result yourself and like "
+                          "#1 (`vote`); if not, post or comment what is missing and take it on.",
+        "n_thread_quiet_wrap_up": _QUIET_HEAD["en"] + " Wrap-up mode is on: post what you have and what is left, if "
+                                  "you have not yet, then like #1 now (`vote`): in wrap-up mode a like on #1 means "
+                                  "\"finish with what we have\". Dislike it only while you are still finishing "
+                                  "something nearly done, and say what in a comment.",
+        "thread_quiet_jobs": " Your background jobs {jobs} still run, but their end will not wake you.",
+        "n_wrap_up_thread": "The user asked the team to wrap up: start no new computations or background jobs, not "
+                            "even one more quick pass. Post what you have now: the results so far and what is left (a "
+                            "post of your own, or a comment on it), and where they are in the workspace. Stop the "
+                            "background jobs nobody needs. Then like #1 (`vote`): in wrap-up mode a like on #1 means "
+                            "\"finish with what we have\", not \"the goal is reached\". Dislike it only while you are "
+                            "still finishing something nearly done, and say what in a comment. A vote you gave before "
+                            "still counts: check that it says what you mean now. When the votes meet the session's "
+                            "rule, the goal is completed with what the feed and the workspace hold.",
+        "wrap_up_line_thread": "Wrap-up mode (the user): start no new computations or background jobs and stop the "
+                               "ones nobody needs; post the results and what is left, then like #1 (here it means "
+                               "\"finish with what we have\"; dislike it only while you finish something nearly done, "
+                               "and say what in a comment).",
+        "n_budget_low_thread": "Money: spent ${spent:.2f} of the ${limit:.2f} budget ({pct}%). When it is used up, "
+                               "the swarm pauses: every agent stops between two steps. Don't wait for the user to ask "
+                               "for a wrap-up: from now on finish what is nearly done, post what you have (a post or a "
+                               "comment: the result and where it is in the workspace), keep the workspace consistent "
+                               "with what the posts say, start nothing large, and vote on #1 once you have checked the "
+                               "result.",
+        # the user's notices of a thread session: a decision by the vote (waking, in place of u_goal_done; the data's
+        # rule, for, against and counted serve the surfaces) and a stalled vote (waking, once per quiet key)
+        "u_goal_decided": "The team's vote on #1 completed the global goal: {summary}",
+        "u_thread_quiet": "Nobody in the team has worked for {elapsed}, and nothing is set to wake the team. {vote} "
+                          "The team may be waiting for the vote on #1: you can mark the goal reached yourself, switch "
+                          "wrap-up mode off (when it is on), write to the team or post in the feed, or stop the "
+                          "session.",
     },
     "ru": {
         "instructions": "Твои инструкции: {text}\n",
@@ -1205,8 +1584,226 @@ TEXTS: dict[str, dict[str, str]] = {
                          "только обращения агентов к модели; процессы работают, пока вы их не остановите или пока не "
                          "остановится сессия: откройте вкладку «Процессы» на доске или выполните /jobs stop <id> в "
                          "терминале.",
+        "f_post": "{by} опубликовал(а) #{post} «{title}»: {text}",
+        "f_comment": "{by} прокомментировал(а) #{post} «{title}» ({comment}): {text}",
+        "f_reply": "{by} ответил(а) на твой комментарий {reply_to} к #{post} «{title}» ({comment}): {text}",
+        "f_edit": "{by} изменил(а) #{post} «{title}»; прочитай через `post_read`.",
+        "f_vote": "{by} оценил(а) твой {target} «{title}»: {value}.",
+        "f_file": "Изменены файлы ({by}): {files}.",
+        "f_mention": "{by} упомянул(а) тебя в #{post} «{title}»{comment}: {text}\nЕсли нужен твой ответ, напиши "
+                     "комментарий к #{post} через `comment` (с reply_to, если это был комментарий).",
+        "vote_like": "нравится",
+        "vote_dislike": "не нравится",
+        "digest": "Из того, на что ты подписан(а) (сначала старые, оценки в конце):",
+        "digest_more": "… и еще {n}: смотри ленту (`feed`).",
+        "my_goal_vote": "Твой голос на #1: {value}. {vote}",
+        "goal_vote_line": "Голосование по цели (#1, {rule}): за {for} из {counted}, против {against}; нужно {needed}.",
+        "goal_vote_line_veto": "Голосование по цели (#1, {rule}): за {for} из {counted}, против {against}; нужны все "
+                               "{needed} и никого против.",
+        "rule_democracy": "демократия",
+        "rule_veto": "вето",
+        "rule_user": "решение пользователя",
+        "goal_decided": "Цель достигнута голосованием ({rule}): за {n} из {counted} — {names}; против: {against}. "
+                        "Артефакты — общая рабочая папка.",
+        "goal_decided_wrap_up": "Команда завершила работу по голосованию в режиме завершения ({rule}): за {n} из "
+                                "{counted} — {names}; против: {against}. Что сделано и что осталось — в ленте; "
+                                "артефакты — общая рабочая папка.",
+        "goal_completed_by_user": "Пользователь отметил цель достигнутой. {vote} Артефакты — общая рабочая папка.",
+        "post_goal_title": "Цель достигнута?",
+        "post_goal_text": "**Цель:** {title}\n\n{description}\n\nЦель решается голосами под этим объявлением, правило: "
+                          "{rule}. Демократия: «нравится» ставят больше половины собственных ИИ-агентов команды; "
+                          "вето: «нравится» ставят все они и никто не ставит «не нравится». Голоса участников, "
+                          "подключившихся через MCP, и пользователя показываются, но не считаются. Ставьте "
+                          "«нравится» этому объявлению, только проверив результат по цели сами (откройте файлы, "
+                          "запустите код); иначе ставьте «не нравится» и напишите в комментарии, чего не хватает. "
+                          "Меняйте голос, когда положение меняется.",
+        "post_plan_title": "Спланируем работу",
+        "post_plan_text": "**Цель:** {title}\n\n{description}\n\nОбсудите здесь, в комментариях, как разделить работу "
+                          "и кто что делает. Никто не планирует за других и никто не главный: предлагайте, "
+                          "договаривайтесь, берите часть сами и говорите об этом здесь. Находки, результаты и вопросы "
+                          "публикуйте отдельными объявлениями.",
+        "post_plan_clarify": "Сначала один участник уточняет у пользователя открытые вопросы цели и пишет ответы здесь "
+                             "в комментарии; планируйте после них.",
+        "similar_posts": "Похожие объявления: {posts}. Если твое повторяет одно из них, напиши комментарий там.",
+        "n_kickoff_thread": _KICKOFF_HEAD["ru"] + "Доски задач и лидера нет: команда работает в ленте. #1 «Цель "
+                            "достигнута?» содержит цель и голосование по ней; в #2 «Спланируем работу» все обсуждают, "
+                            "как делать работу и кто что делает. Прочитай #2 (`post_read`) и напиши там комментарий: "
+                            "что нужно, за что берешься ты, каким контрактам следуют части. Сразу начинай то, что не "
+                            "требует договоренности, и скажи об этом в #2, чтобы никто не делал это дважды. Прежде чем "
+                            "что-то начать, проверь ленту (`feed`): возможно, этим уже занимается другой участник. "
+                            "Ставь «нравится» #1, только сам проверив результат.",
+        "n_kickoff_thread_clarify": _KICKOFF_HEAD["ru"] + "Пользователь хочет уточнить цель до начала работы, и "
+                                    "спрашиваешь ты: найди развилки цели (прочтения, которые меняют результат или "
+                                    "работу). Если они есть, отправь пользователю все вопросы одним сообщением "
+                                    "(`send_message` с [\"user\"] и pause_swarm=true; с номерами, не больше семи, у "
+                                    "каждого — варианты и твой вариант по умолчанию), затем вызови `wait`. Когда "
+                                    "придут ответы, или сразу, если спрашивать не о чем, напиши комментарий к #2 с "
+                                    "решениями и вариантами по умолчанию, которые ты выбрал, как допущения: этот "
+                                    "комментарий начинает планирование команды в #2, где ты участвуешь наравне со "
+                                    "всеми. До этого не делай другой работы и не публикуй объявлений.",
+        "n_goal_updated_thread": "{by} задал(а) глобальную цель: «{title}». {description}\n#1 и #2 переписаны под нее, "
+                                 "а голоса на #1 сброшены. Проверь, что твои объявления и твоя работа все еще служат "
+                                 "ей: напиши в своих объявлениях, что больше не актуально (`post_update`), и "
+                                 "договорись об изменениях в #2. Голосуй на #1 снова, только проверив результат по "
+                                 "этой цели.",
+        "n_goal_reopened_thread": "Пользователь вернул глобальную цель в работу: «{title}». Комментарий: {comment}\n"
+                                  "Голоса на #1 сброшены, твой тоже. Сначала прочитай #1 и ленту (`feed`): это "
+                                  "уведомление получили и другие участники, и кто-то из них, возможно, уже занят "
+                                  "какой-то частью; затем опубликуй или прокомментируй, чего не хватает, и возьмись за "
+                                  "часть, которую никто не взял. Голосуй на #1 снова, только сам проверив результат.",
+        "n_goal_decided": "Глобальная цель завершена ({rule}). За: {for}; против: {against}. Не начинай для нее новой "
+                          "работы и останови фоновые процессы, которые никому не нужны (`job_stop`); пользователь "
+                          "может вернуть ее в работу.",
+        "n_wrap_up_votes_cleared": "Режим завершения выключен: фоновые процессы снова разрешены. Голоса на #1 "
+                                   "сброшены: «нравится» там снова значит «цель достигнута»; ставь его, только "
+                                   "проверив результат сам.",
+        "n_hired_thread": "Ты только что присоединился к рою: {by} нанял(а) тебя на роль «{role}». Прочитай #2 и ленту "
+                          "(`post_read`, `feed`), чтобы понять, что делает команда и о чем договорились, затем "
+                          "возьмись за то, для чего нужна твоя роль: скажи об этом в #2 или напиши комментарий там, "
+                          "где можешь помочь; если пока ты не нужен, вызови `wait` (тебя разбудят). Приветствие не "
+                          "нужно.",
+        "all_hint_thread": "Прежде чем публиковать что-то по сообщению для всех, проверь ленту: публикует один "
+                           "участник, остальные комментируют или голосуют.",
+        "n_network_off_thread": "В этой сессии нет интернета (так настроил пользователь): твои команды, их фоновые "
+                                "процессы и MCP-серверы не выходят в сеть; localhost работает. Установка пакетов из "
+                                "PyPI или npm, git clone, fetch или push с удаленным репозиторием и загрузки не "
+                                "сработают: не трать на них шаги и не пытайся это обойти. Работай с тем, что уже есть "
+                                "в workspace и установлено; если нужного не хватает, скажи об этом в объявлении или в "
+                                "комментарии.",
+        "n_member_retired_thread": "{name} покинул(а) рой ({reason}). Его (ее) объявления остаются в ленте; если он(а) "
+                                   "делал(а) то, что еще нужно команде, напиши об этом в #2 или в том объявлении, "
+                                   "чтобы за это взялся тот, кто свободен (можешь взяться сам).",
+        "n_lock_wanted_thread": "{path}, который ты держишь уже {held}, ждут: {waiters}. Если еще правишь, сначала "
+                                "закончи эту правку и сними блокировку, потом продолжай остальную работу. Если файл "
+                                "больше не нужен, сними блокировку сейчас (`lock_file` с unlock=true). Отвечать не "
+                                "нужно: их разбудят, когда файл освободится.",
+        "n_user_answer_thread": "Пользователь ответил на вопрос #{id}, который задал(а) {asker}; ради него рой ставили "
+                                "на паузу.\nВопрос: {question}\nОтвет: {answer}\nЕсли ответ меняет то, что ты делаешь, "
+                                "поправь свою работу и свои объявления; иначе продолжай. То, что ответ решает о цели, "
+                                "должно быть в #2: спросивший напишет это там в комментарии.",
+        "n_user_answer_seen_thread": "Сообщение #{answer_id} от пользователя ниже — ответ на вопрос #{id}, который "
+                                     "задал(а) {asker}; ради него рой ставили на паузу.\nВопрос: {question}\nЕсли "
+                                     "ответ меняет то, что ты делаешь, поправь свою работу и свои объявления; иначе "
+                                     "продолжай. То, что ответ решает о цели, должно быть в #2: спросивший напишет "
+                                     "это там в комментарии.",
+        "n_question_unanswered_thread": "Рой продолжает работу без ответа пользователя на твой вопрос #{id}. Не жди "
+                                        "его: где ответ нужен, выбери вариант, который выбрал бы сам, запиши его как "
+                                        "допущение в комментарии к #2 (или к объявлению, которого он касается) и "
+                                        "продолжай. Если пользователь ответит позже, ответ придет сообщением.",
+        "n_clarify_hint_thread": "За {elapsed} (шагов: {steps}) ты не спросил пользователя о цели и не написал "
+                                 "комментарий к #2, а остальные ждут тебя. Если у цели есть развилки, которые меняют "
+                                 "работу, отправь пользователю все вопросы одним сообщением прямо сейчас "
+                                 "(`send_message` с [\"user\"] и pause_swarm=true), затем вызови `wait`. Если "
+                                 "спрашивать не о чем, сейчас же напиши комментарий к #2 с вариантами по умолчанию, "
+                                 "которые ты выбираешь.",
+        "n_clarify_off_thread": "Пользователь больше не хочет уточнять цель до начала работы: не жди ответов на свои "
+                                "вопросы о ней. Выбери варианты по умолчанию и запиши их как допущения в комментарии к "
+                                "#2 (`comment`), чтобы остальные начали. Если пользователь ответит позже, ответ придет "
+                                "сообщением.",
+        "compaction_request_thread": "Твой контекст стал слишком длинным и сейчас будет заменен резюме. Напиши "
+                                     "подробное резюме своей работы для себя будущего: роль и цель; объявления, "
+                                     "которые ты написал, и объявления и файлы, на которые ты подписан, с их "
+                                     "номерами; о чем договорились в #2 и в других обсуждениях; твой голос на #1 и "
+                                     "почему; ключевые находки, пути к файлам, команды и результаты; открытые "
+                                     "вопросы; что ты собирался сделать дальше. Номера объявлений (#9), id "
+                                     "комментариев (c31), имена и пути приводи точно. Не вызывай инструменты, ответь "
+                                     "только резюме.",
+        "compacted_thread": "[Контекст сжат. Резюме твоей предыдущей работы:]\n{summary}\n[Конец резюме. Продолжай "
+                            "отсюда. Лента — общая запись: ее показывают `feed` и `post_read`, а `subscriptions` "
+                            "перечисляет, на что ты подписан.]",
+        "n_thread_quiet": _QUIET_HEAD["ru"] + " Иначе: если цель достигнута, сам проверь результат и поставь "
+                          "«нравится» объявлению #1 (`vote`); если нет, опубликуй или прокомментируй, чего не хватает, "
+                          "и возьмись за это.",
+        "n_thread_quiet_wrap_up": _QUIET_HEAD["ru"] + " Включен режим завершения: опубликуй, что у тебя есть и что "
+                                  "осталось, если еще не сделал этого, и сразу поставь «нравится» объявлению #1 "
+                                  "(`vote`): в режиме завершения это значит «заканчиваем с тем, что есть». «Не "
+                                  "нравится» ставь, только пока доделываешь почти готовое, и напиши в комментарии, что "
+                                  "именно.",
+        "thread_quiet_jobs": " Твои фоновые процессы {jobs} еще работают, но их завершение тебя не разбудит.",
+        "n_wrap_up_thread": "Пользователь попросил команду закругляться: не начинай новых вычислений и фоновых "
+                            "процессов, даже еще одного быстрого прохода. Опубликуй, что у тебя есть сейчас: "
+                            "результаты и что осталось (свое объявление или комментарий к нему) и где они лежат в "
+                            "рабочей папке. Останови фоновые процессы, которые никому не нужны. Затем поставь "
+                            "«нравится» объявлению #1 (`vote`): в режиме завершения это значит «заканчиваем с тем, "
+                            "что есть», а не «цель достигнута». «Не нравится» ставь, только пока доделываешь почти "
+                            "готовое, и напиши в комментарии, что именно. Голос, отданный раньше, по-прежнему "
+                            "учитывается: проверь, что он значит то, что ты имеешь в виду сейчас. Когда голоса "
+                            "выполнят правило сессии, цель будет завершена с тем, что есть в ленте и в рабочей папке.",
+        "wrap_up_line_thread": "Режим завершения (пользователь): не начинай новых вычислений и фоновых процессов и "
+                               "останови ненужные; опубликуй результаты и что осталось, затем поставь «нравится» #1 "
+                               "(здесь это значит «заканчиваем с тем, что есть»; «не нравится» ставь, только пока "
+                               "доделываешь почти готовое, и напиши в комментарии, что именно).",
+        "n_budget_low_thread": "Деньги: потрачено ${spent:.2f} из ${limit:.2f} денежного бюджета ({pct}%). Когда он "
+                               "закончится, рой встанет на паузу: каждый агент остановится между двумя шагами. Не жди, "
+                               "пока пользователь попросит закругляться: с этого момента доделывай то, что почти "
+                               "готово, публикуй, что есть (объявление или комментарий: результат и где он лежит в "
+                               "рабочей папке), держи рабочую папку в согласии с тем, что сказано в объявлениях, не "
+                               "начинай ничего крупного и проголосуй по #1, когда проверишь результат.",
+        "u_goal_decided": "Голосование команды на #1 завершило глобальную цель: {summary}",
+        "u_thread_quiet": "Уже {elapsed} никто в команде не работает, и команду ничто не разбудит. {vote} Возможно, "
+                          "команда ждет голосования по #1: вы можете сами отметить цель достигнутой, выключить режим "
+                          "завершения (если он включен), написать команде или в ленту либо остановить сессию.",
     },
 }
+
+# The agents' texts by session mode (docs/SPEC.md §22.6): every non-u_ key of TEXTS is in BOARD_KEYS, in THREAD_KEYS
+# or shared by both modes (tests/test_prompts.py checks that the three sets are disjoint and cover them).
+# BOARD_KEYS: the texts that name a board-only tool, a task, the board, a review, a crew or the planning card, and
+# the ones with a thread counterpart; a thread session never sends them.
+BOARD_KEYS = frozenset({
+    # the task, review and crew notices with their parts
+    "n_assigned", "n_unassigned", "n_unblocked", "n_unblocked_removed", "n_deps_removed", "n_review_requested",
+    "n_review_approved", "n_review_rejected", "review_rejected_plain", "review_rejected_crew", "n_reviewer_left",
+    "n_review_cancelled", "n_review_reminder", "n_review_reassigned", "n_task_closed", "n_subtasks_done",
+    "n_direction_failed", "n_direction_cancelled", "n_subtask_cancelled", "n_direction_taken", "n_direction_freed",
+    "n_direction_held_busy", "n_direction_held_full", "n_crew_owner", "n_crew_changed", "n_parent_closed",
+    "n_crew_review_requested", "n_marks_stalled", "n_crew_gap",
+    "crew_draft", "crew_draft_cut", "crew_draft_more", "crew_draft_no_result", "crew_owner_take", "crew_owner_own",
+    "crew_owner_all_taken", "crew_owner_none", "crew_directions", "crew_directions_more", "crew_gap_held",
+    "crew_gap_held_you", "crew_gap_held_wait", "crew_gap_blocked",
+    "note_direction_card", "note_reviewer_cleared", "note_own_part", "note_own_part_blocked", "note_still_open",
+    "note_crew_say_why", "note_direction_closed", "note_direction_held_busy", "note_direction_held_busy_you",
+    "note_direction_held_full", "note_direction_held_full_you", "note_direction_held_tail",
+    "note_direction_held_tail_you", "note_direction_held_also", "note_dependents_blocked", "note_dependent_blocked",
+    "ending_plain", "ending_plain_creator", "ending_crew_failed", "ending_crew_failed_creator", "ending_crew_cancelled",
+    "ending_crew_cancelled_creator", "ending_crew_finished", "ending_crew_finished_creator",
+    "owner_prefix_plain", "owner_prefix_failed", "owner_prefix_cancelled", "owner_prefix_finished",
+    "count_done", "count_cancelled", "count_failed",
+    "direction_owner_named", "direction_owner_none", "direction_owner_you",
+    "mark_subtasks_done", "mark_free_directions", "mark_direction_to_take",
+    "n_discussion", "n_mention", "reply_suffix", "post_deps_removed", "lock_waiter_task", "lock_waiter_direction",
+    # the wake-up's board lines, the runtime's nudge, the scheduler's board items
+    "my_tasks", "my_tasks_none", "my_blocked", "my_reviews", "ready", "similar_tasks", "nudge", "n_stalled", "n_ready",
+    "n_all_done", "n_all_done_wrap_up", "n_planning_hint", "n_started",
+    # the keys with a thread counterpart (a *_thread twin, or n_thread_quiet / thread_quiet_jobs)
+    "n_kickoff", "n_goal_updated", "n_goal_reopened", "n_hired", "n_wrap_up", "wrap_up_line", "all_hint",
+    "n_budget_low", "n_network_off", "n_member_retired", "n_lock_wanted", "n_user_answer", "n_user_answer_seen",
+    "n_question_unanswered", "n_clarify_hint", "n_clarify_off", "n_team_asleep", "team_asleep_jobs",
+    "compaction_request", "compacted",
+})
+# THREAD_KEYS: the texts only a thread session sends; they name only tools of the thread tool set (revision 6)
+THREAD_KEYS = frozenset({
+    "f_post", "f_comment", "f_reply", "f_edit", "f_vote", "f_file", "f_mention", "vote_like", "vote_dislike",
+    "n_kickoff_thread", "n_goal_updated_thread", "n_goal_reopened_thread", "n_hired_thread", "n_wrap_up_thread",
+    "wrap_up_line_thread", "all_hint_thread", "n_budget_low_thread", "n_network_off_thread",
+    "n_member_retired_thread", "n_lock_wanted_thread", "n_user_answer_thread", "n_user_answer_seen_thread",
+    "n_question_unanswered_thread", "n_clarify_hint_thread", "n_clarify_off_thread", "compaction_request_thread",
+    "compacted_thread",
+    "n_kickoff_thread_clarify", "n_goal_decided", "n_thread_quiet", "n_thread_quiet_wrap_up", "thread_quiet_jobs",
+    "n_wrap_up_votes_cleared", "digest", "digest_more", "my_goal_vote",
+    "goal_vote_line", "goal_vote_line_veto", "rule_democracy", "rule_veto", "rule_user", "goal_decided",
+    "goal_decided_wrap_up", "goal_completed_by_user",
+    "post_goal_title", "post_goal_text", "post_plan_title", "post_plan_text", "post_plan_clarify", "similar_posts",
+})
+THREAD_SUFFIX = "_thread"
+
+
+def mode_key(key: str, mode: str | None) -> str:
+    """The key a session of `mode` sends for `key`: its _thread twin in a thread session when TEXTS has one, else
+    `key` itself (docs/SPEC.md §22.6). Callers pass the mode read with getattr(swarm, "mode", "board")."""
+    twin = key + THREAD_SUFFIX
+    return twin if mode == "thread" and twin in TEXTS["en"] else key
+
 
 # (title, goal, description)
 PLANNING_TASK = {
@@ -1402,12 +1999,16 @@ def _lang(language: str | None) -> str:
     return language if language in TEXTS else "en"
 
 
-def system_prompt(language: str, **kw: Any) -> str:
+def system_prompt(language: str, mode: str = "board", **kw: Any) -> str:
     """The frozen system prompt of a new member. `role_description` (the catalog's text of its role, already in the
     second person) and `instructions` may be empty; `scratch` is the member's own scratch folder
-    (workspace.scratch_rel); `foreground_max` is [shell] foreground_max (the longest a `shell` call waits)."""
+    (workspace.scratch_rel); `foreground_max` is [shell] foreground_max (the longest a `shell` call waits); `mode`
+    is the session's mode (docs/SPEC.md §22.6: a thread session has its own templates)."""
     language = _lang(language)
-    template = SYSTEM_RU if language == "ru" else SYSTEM_EN
+    if mode == "thread":
+        template = SYSTEM_THREAD_RU if language == "ru" else SYSTEM_THREAD_EN
+    else:
+        template = SYSTEM_RU if language == "ru" else SYSTEM_EN
     instructions = kw.pop("instructions", "") or ""
     kw["instructions"] = TEXTS[language]["instructions"].format(text=instructions) if instructions else ""
     description = (kw.pop("role_description", "") or "").strip()

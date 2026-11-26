@@ -73,14 +73,15 @@ AS_AGENT = {
 }
 
 
-def hub_specs() -> list:
-    """Tools offered over MCP (external members and the user), in registry order."""
+def hub_specs(mode: str | None = None) -> list:
+    """Tools offered over MCP (external members and the user) in a session of `mode` (None: both modes), in registry
+    order."""
     tools_for("user")  # makes sure the registry is loaded
-    return [s for s in REGISTRY.values() if s.audience & {"external", "user"}]
+    return [s for s in REGISTRY.values() if s.audience & {"external", "user"} and (mode is None or mode in s.modes)]
 
 
-def _description(spec, language: str) -> str:
-    text = spec.describe(language)
+def _description(spec, language: str, mode: str = "board") -> str:
+    text = spec.describe(language, mode)
     if "user" not in spec.audience:
         text += " [Members only: call join_swarm first and pass as_agent.]"
     elif "external" not in spec.audience and spec.name != "join_swarm":
@@ -90,11 +91,13 @@ def _description(spec, language: str) -> str:
 
 def list_hub_tools(swarm: "Swarm") -> list[types.Tool]:
     tools = []
-    for spec in hub_specs():
-        schema = copy.deepcopy(spec.parameters)
+    mode = getattr(swarm, "mode", "board")
+    for spec in hub_specs(mode):
+        schema = copy.deepcopy(spec.parameters_for(mode))
         if spec.name != "join_swarm":
             schema["properties"] = {**schema.get("properties", {}), "as_agent": AS_AGENT}
-        tools.append(types.Tool(name=spec.name, description=_description(spec, swarm.language), input_schema=schema))
+        tools.append(types.Tool(name=spec.name, description=_description(spec, swarm.language, mode),
+                                input_schema=schema))
     return tools
 
 

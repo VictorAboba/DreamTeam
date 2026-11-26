@@ -171,10 +171,10 @@ def public_item(s: SessionSkill, *, path: str, roles: list[str], deps: list[dict
             "digest": s.digest, "manual": s.manual, "path": path, "roles": roles, "deps": deps}
 
 
-def listed_by_roles(config: "Config", language: str) -> dict[str, list[str]]:
-    """skill name -> the catalog roles (canonical names, `language`) that list it."""
+def listed_by_roles(config: "Config", language: str, mode: str = "board") -> dict[str, list[str]]:
+    """skill name -> the catalog roles (canonical names, `language`, the names of `mode`) that list it."""
     out: dict[str, list[str]] = {}
-    for role in roles.catalog(config.roles, language, include_hidden=True):
+    for role in roles.catalog(config.roles, language, include_hidden=True, mode=mode):
         for name in role.skills:
             out.setdefault(name, []).append(role.name)
     return out
@@ -186,7 +186,7 @@ def stopped_public(config: "Config") -> list[dict]:
     planned or installed while it is stopped). Blocking: run it in a thread."""
     root = config.workspace_dir   # (no .scratch yet, as before a first start: the start makes it a plain folder)
     local = not os.path.lexists(long_path(root / SCRATCH_DIR)) or scratch_is_local(root)
-    listed = listed_by_roles(config, config.swarm.language)
+    listed = listed_by_roles(config, config.swarm.language, mode=getattr(config.swarm, "mode", "board"))
     return [public_item(s, path=f"{SKILLS_MIRROR}/{s.name}/{SKILL_MD}" if local else
                         str(skills_dir(config.data_dir) / s.name / SKILL_MD), roles=listed.get(s.name, []), deps=[])
             for s in read_session_skills(config.data_dir, config.skills_library_dir)]
@@ -475,13 +475,14 @@ class SessionSkills:
 
     def _listed_by_roles(self) -> dict[str, list[str]]:
         """skill name -> the catalog roles (canonical names, swarm language) that list it."""
-        return listed_by_roles(self.swarm.config, self.swarm.language)
+        return listed_by_roles(self.swarm.config, self.swarm.language, mode=getattr(self.swarm, "mode", "board"))
 
     def role_skills(self, member: dict) -> tuple[str, ...]:
         """The skills `member`'s role lists in the catalog, resolved live from its role (catalog edits apply at
         once); marked "your role's" in its index."""
         entry = roles.find_role(self.swarm.config.roles, member.get("role"),
-                                member.get("language") or self.swarm.language)
+                                member.get("language") or self.swarm.language,
+                                mode=getattr(self.swarm, "mode", "board"))
         return entry.skills if entry is not None else ()
 
     def source_digest(self, skill: SessionSkill) -> str | None:
@@ -916,7 +917,8 @@ class SessionSkills:
         detached = set(self.detached())
         done: set[str] = set()
         for member in members:
-            entry = roles.find_role(config.roles, member.get("role"), member.get("language") or self.swarm.language)
+            entry = roles.find_role(config.roles, member.get("role"), member.get("language") or self.swarm.language,
+                                    mode=getattr(self.swarm, "mode", "board"))
             if entry is None or not entry.skills or entry.key in done:
                 continue
             done.add(entry.key)

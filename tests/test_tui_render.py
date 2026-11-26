@@ -672,6 +672,7 @@ def test_question_pause_rendering():
     left = ev("notification", None, recipient="user", kind="u_question_left", text="Анна Смирнова left the swarm")
     assert plain(render.event(ctx(lang="en"), left)) == "🔔 Анна Смирнова left the swarm"
     assert "u_question_left" in render._WARN_NOTES and "u_question" in render._QUIET_SKIP_NOTES
+    assert "u_goal_decided" in render._QUIET_SKIP_NOTES  # goal.completed shows the decision (docs/SPEC.md §22.4)
 
     report = plain(render.status_report(ctx(lang="en"), {"network": {"mode": "on"}, "clarify": True,
                                                         "question": "Анна Смирнова, #12: «Which colour?»",
@@ -839,6 +840,43 @@ def test_event_types_cover_the_server():
     agent_src = (src / "agent.py").read_text(encoding="utf-8")
     kinds = set(re.findall(r"self\._activity\(\"([a-z_]+)\"", agent_src))
     assert kinds and kinds <= set(render.ACTIVITY_KINDS), kinds - set(render.ACTIVITY_KINDS)
+
+
+def test_thread_events_by_verbosity():
+    """docs/SPEC.md §22.8: post.created at every verbosity; post.comment folded on one line from normal on; a vote on
+    #1 from normal on, the other votes, post.updated, subscription.changed and files.committed in verbose only."""
+    post = {"id": 9, "kind": "post", "title": "План", "text": "Весь текст", "author": ANNA}
+    created = ev("post.created", ANNA, post=post)
+    comment = ev("post.comment", BORIS, post_id=9, comment={"id": 31, "post_id": 9, "author": BORIS,
+                                                             "text": "Первая строка\nвторая", "reply_to": None})
+    reply = ev("post.comment", ANNA, post_id=9, comment={"id": 32, "post_id": 9, "author": ANNA, "text": "Да",
+                                                          "reply_to": 31})
+    goal_vote = ev("post.vote", BORIS, target="p1", voter=BORIS, value="like", likes=1, dislikes=0)
+    other_vote = ev("post.vote", BORIS, target="c31", voter=BORIS, value="dislike", likes=0, dislikes=1)
+    edited = ev("post.updated", ANNA, post=post, changes=["text"])
+    sub = ev("subscription.changed", ANNA, member=ANNA, op="created",
+             subscription={"id": 12, "kind": "post", "target": "9", "mode": "wake", "by": "", "auto": False})
+    committed = ev("files.committed", ANNA, kind="shell", commit="ab12", suspects=[ANNA],
+                   files=[{"path": "src/app.py", "change": "M"}, {"path": "b.txt", "change": "A"}])
+    q, n, v = ctx("quiet"), ctx(), ctx("verbose")
+    for c in (q, n, v):
+        assert plain(render.event(c, created)) == "📌 #9 План — Анна"
+    assert "Весь текст" not in plain(render.event(v, created))
+    assert plain(render.event(n, comment)) == "💬 Борис → #9: Первая строка…"
+    assert plain(render.event(n, reply)) == "💬 Анна → #9 ↳ c31: Да"
+    assert "вторая" in plain(render.event(v, comment))
+    assert plain(render.event(n, goal_vote)) == "↑ Борис ставит «нравится» #1"
+    assert plain(render.event(v, other_vote)) == "↓ Борис ставит «не нравится» c31"
+    assert plain(render.event(v, edited)) == "✎ #9 изменено — Анна"
+    assert plain(render.event(v, sub)) == "· Анна следит за #9 (wake)"
+    assert plain(render.event(v, committed)) == "✎ 2 файла: src/app.py, … — в коммите (shell) · Анна"
+    jobs = dict(committed, data=dict(committed["data"], kind="jobs j3, j5"))
+    assert plain(render.event(v, jobs)) == "✎ 2 файла: src/app.py, … — в коммите (процессы j3, j5) · Анна"
+    for e in (comment, goal_vote, other_vote, edited, sub, committed):
+        assert render.event(q, e) is None, e["type"]
+    for e in (other_vote, edited, sub, committed):
+        assert render.event(n, e) is None, e["type"]
+    assert plain(render.event(ctx(unicode=False), created)) == "# #9 План - Анна"
 
 
 # ---- events: robustness ---------------------------------------------------------------------------

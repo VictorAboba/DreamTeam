@@ -6,34 +6,51 @@ from typing import Any
 
 from ..models import ToolError
 from ..tracing import render_context, render_span, render_trace, trace_line
-from . import ToolContext, tool
+from . import ToolContext, swapped, tool
 
 TRACE_STATUSES = ("running", "done", "error", "step_limit", "refusal", "paused", "stopped", "interrupted", "failed")
 
 
+_TRACES_EN = (
+    "Inspect what agents did: each wake-up of an agent is a trace of LLM calls (thinking, text, tool calls, "
+    "tokens, cost, latency) and tool executions (full arguments and results). Without ids: recent traces "
+    "(filter by agent, status — e.g. \"failed\" — or task). trace_id: the steps of one trace. span_id: the "
+    "full payload of one step; with context=true for an LLM step: the exact messages the model saw "
+    "(page with offset/limit)."
+)
+_TRACES_RU = (
+    "Посмотреть, что делали агенты: каждое пробуждение агента — трейс из вызовов LLM (мысли, текст, вызовы "
+    "инструментов, токены, стоимость, задержка) и выполнений инструментов (полные аргументы и результаты). "
+    "Без id — последние трейсы (фильтры: agent, status — например \"failed\" — или task). trace_id — шаги "
+    "одного трейса. span_id — полные данные одного шага; с context=true для шага LLM — точные сообщения, "
+    "которые видела модель (листать через offset/limit)."
+)
+_TRACES_PROPS = {
+    "agent": {"type": "string", "description": "Member name (default: all members)"},
+    "trace_id": {"type": "integer"},
+    "span_id": {"type": "integer"},
+    "context": {"type": "boolean", "description": "With span_id of an LLM step: show the request messages"},
+    "status": {"type": "string", "enum": list(TRACE_STATUSES)},
+    "task": {"type": "integer", "description": "Only traces that touched this task"},
+    "limit": {"type": "integer", "description": "Traces (default 10, max 50) or context messages (default 20)"},
+    "offset": {"type": "integer", "description": "First context message (default 0)"},
+}
+
+
 @tool(
     "agent_traces",
-    en="Inspect what agents did: each wake-up of an agent is a trace of LLM calls (thinking, text, tool calls, "
-       "tokens, cost, latency) and tool executions (full arguments and results). Without ids: recent traces "
-       "(filter by agent, status — e.g. \"failed\" — or task). trace_id: the steps of one trace. span_id: the "
-       "full payload of one step; with context=true for an LLM step: the exact messages the model saw "
-       "(page with offset/limit).",
-    ru="Посмотреть, что делали агенты: каждое пробуждение агента — трейс из вызовов LLM (мысли, текст, вызовы "
-       "инструментов, токены, стоимость, задержка) и выполнений инструментов (полные аргументы и результаты). "
-       "Без id — последние трейсы (фильтры: agent, status — например \"failed\" — или task). trace_id — шаги "
-       "одного трейса. span_id — полные данные одного шага; с context=true для шага LLM — точные сообщения, "
-       "которые видела модель (листать через offset/limit).",
-    properties={
-        "agent": {"type": "string", "description": "Member name (default: all members)"},
-        "trace_id": {"type": "integer"},
-        "span_id": {"type": "integer"},
-        "context": {"type": "boolean", "description": "With span_id of an LLM step: show the request messages"},
-        "status": {"type": "string", "enum": list(TRACE_STATUSES)},
-        "task": {"type": "integer", "description": "Only traces that touched this task"},
-        "limit": {"type": "integer", "description": "Traces (default 10, max 50) or context messages (default 20)"},
-        "offset": {"type": "integer", "description": "First context message (default 0)"},
-    },
+    en=_TRACES_EN,
+    ru=_TRACES_RU,
+    properties=_TRACES_PROPS,
     audience=("user", "external"),
+    # a thread session has no tasks (docs/SPEC.md §22.5): no task filter (live texts, never frozen)
+    thread={
+        "en": swapped(_TRACES_EN, ("(filter by agent, status — e.g. \"failed\" — or task)",
+                                   "(filter by agent or status, e.g. \"failed\")")),
+        "ru": swapped(_TRACES_RU, ("(фильтры: agent, status — например \"failed\" — или task)",
+                                   "(фильтры: agent или status, например \"failed\")"), plain_e=True),
+        "properties": {key: value for key, value in _TRACES_PROPS.items() if key != "task"},
+    },
 )
 async def agent_traces(ctx: ToolContext, args: dict[str, Any]) -> str:
     tracer = getattr(ctx.swarm, "tracer", None)

@@ -24,6 +24,7 @@ from dreamteam.tools import REGISTRY, tools_for
 SRC = Path(prompts.__file__).resolve().parent
 LANGS = ("en", "ru")
 SYSTEMS = {"en": prompts.SYSTEM_EN, "ru": prompts.SYSTEM_RU}
+THREAD_SYSTEMS = {"en": prompts.SYSTEM_THREAD_EN, "ru": prompts.SYSTEM_THREAD_RU}
 SYSTEM_KW = dict(name="Ann Lee", swarm="Swarm X", role="Tester", role_description="Checks things.",
                  instructions="Check {curly} things", shell="bash", scratch=".scratch/ann.lee/", max_agents=7,
                  foreground_max=95)
@@ -140,7 +141,7 @@ def test_clarify_planning_task_keeps_the_steps_and_asks_first():
     from dreamteam.tui.printmode import AUTO_REPLY
 
     shared: set[str] | None = None
-    for rev in (r for r in frozen.revisions() if r >= frozen.OLDEST_OPEN_REVISION):
+    for rev in (r for r in frozen.revisions("board") if r >= frozen.OLDEST_OPEN_REVISION):  # the card is the board's
         for lang in LANGS:
             names = set(frozen.names(frozen.snapshot(rev, lang)))
             shared = names if shared is None else shared & names
@@ -207,16 +208,77 @@ def test_question_texts():
         assert "Anna Smith" in rendered and "#7" in rendered and "Q {x}?" in rendered and "A {y}" in rendered
 
 
+# the tools of one mode only (docs/SPEC.md §22.5): the board's 10, and the 9 forum tools with their parameters
+BOARD_ONLY = frozenset({"board", "task_get", "task_create", "task_claim", "task_update", "task_complete",
+                        "task_review", "task_comment", "task_discussion", "goal_complete"})
+FORUM_TOOLS = {"feed": {"by", "since", "query", "limit"}, "post_read": {"post_id", "since_id"},
+               "post_create": {"title", "text"}, "post_update": {"post_id", "title", "text"},
+               "comment": {"post_id", "text", "reply_to"}, "vote": {"target", "value"}, "subscriptions": set(),
+               "subscribe": {"what", "target", "by", "mode"}, "unsubscribe": {"subscription_id"}}
+
+
+def _parameters(spec: Any, mode: str) -> set[str]:
+    schema = spec.parameters_for(mode) if hasattr(spec, "parameters_for") else spec.parameters
+    return set(schema.get("properties", {}))
+
+
+def mode_tools(mode: str) -> tuple[set[str], set[str]]:
+    """(tool names, parameter names) of the LLM tool set of `mode`. While the registry lacks the forum tools
+    (tools/forum_tools.py), the thread set is the board's shared tools plus §22.5's forum tools."""
+    try:
+        specs = tools_for("llm", mode)
+    except TypeError:   # a registry without modes
+        specs = [s for s in tools_for("llm") if mode == "board" or s.name not in BOARD_ONLY]
+    names = {s.name for s in specs}
+    params = {p for s in specs for p in _parameters(s, mode)}
+    if mode == "thread" and not set(FORUM_TOOLS) <= names:
+        names |= set(FORUM_TOOLS)
+        params |= {p for props in FORUM_TOOLS.values() for p in props}
+    return names, params
+
+
+def revision_tools(mode: str) -> set[str]:
+    """The tools and parameters every opened revision of `mode` has, in both languages (from
+    frozen.OLDEST_OPEN_REVISION on); a mode with no shipped revision yet: its current set."""
+    from dreamteam.tools import frozen
+
+    try:
+        revs = frozen.revisions(mode)
+    except TypeError:   # frozen.py without modes: every revision is the board's
+        revs = frozen.revisions() if mode == "board" else []
+    shared: set[str] | None = None
+    for rev in (r for r in revs if r >= frozen.OLDEST_OPEN_REVISION):
+        for lang in LANGS:
+            tools = frozen.snapshot(rev, lang)
+            names = set(frozen.names(tools)) | {p for t in tools for p in t["parameters"].get("properties", {})}
+            shared = names if shared is None else shared & names
+    if shared is None:
+        names, params = mode_tools(mode)
+        return names | params
+    return shared
+
+
+def key_mode(key: str) -> str | None:
+    """The mode set of an agent text: "board", "thread" or None (shared)."""
+    return "board" if key in prompts.BOARD_KEYS else "thread" if key in prompts.THREAD_KEYS else None
+
+
 def test_texts_reference_only_real_tools():
-    llm_tools = {s.name for s in tools_for("llm")}
+    """Per mode (docs/SPEC.md §22.6): the board's texts and system prompts name the board's tools, their parameters
+    and the task statuses; the thread's name the thread tool set and its parameters (no task status); shared texts
+    name only what both have. The user's texts name the user's tools."""
+    board, board_params = mode_tools("board")
+    thread, thread_params = mode_tools("thread")
     params = {p for spec in REGISTRY.values() for p in spec.parameters.get("properties", {})}
-    common = set(Status.ALL) | params
+    allowed_by = {"board": board | board_params | set(Status.ALL), "thread": thread | thread_params,
+                  None: (board | board_params) & (thread | thread_params)}
     for lang in LANGS:
-        unknown = code_idents(SYSTEMS[lang]) - llm_tools - common
-        assert not unknown, f"system prompt ({lang}) names unknown tools: {unknown}"
+        for mode, system in (("board", SYSTEMS[lang]), ("thread", THREAD_SYSTEMS[lang])):
+            unknown = code_idents(system) - allowed_by[mode]
+            assert not unknown, f"{mode} system prompt ({lang}) names unknown tools: {unknown}"
         for key, text in prompts.TEXTS[lang].items():
             # u_* texts go to the user, who has the user tools (e.g. mcp_approve); the rest go to agents
-            allowed = (set(REGISTRY) if key.startswith("u_") else llm_tools) | common
+            allowed = set(REGISTRY) | set(Status.ALL) | params if key.startswith("u_") else allowed_by[key_mode(key)]
             assert not code_idents(text) - allowed, (lang, key, code_idents(text) - allowed)
 
 
@@ -224,23 +286,19 @@ def test_agent_texts_name_only_tools_every_opened_revision_has():
     """Notifications and wake-up texts reach agents of every tool set revision a session this version opens
     (tools/frozen.py: an agent keeps its tools until a compaction; sessions with a member below
     frozen.OLDEST_OPEN_REVISION are not opened), so they may name only the tools and parameters that every shipped
-    revision from OLDEST_OPEN_REVISION on has, plus statuses. A text that points at a newer tool is either tailored
-    by its caller with ToolContext.has_tool (listed in TAILORED) or would send old agents to a tool they lack. The
-    system prompts are exempt: only new members, who get the current revision, receive them."""
-    from dreamteam.tools import frozen
-
+    revision of their mode from OLDEST_OPEN_REVISION on has, plus statuses (docs/SPEC.md §22.6: board keys against
+    the board revisions, thread keys against the thread ones, shared keys against both). A text that points at a
+    newer tool is either tailored by its caller with ToolContext.has_tool (listed in TAILORED) or would send old
+    agents to a tool they lack. The system prompts are exempt: only new members, who get the current revision,
+    receive them."""
     tailored: set[str] = set()
-    shared: set[str] | None = None
-    for rev in (r for r in frozen.revisions() if r >= frozen.OLDEST_OPEN_REVISION):
-        for lang in LANGS:
-            tools = frozen.snapshot(rev, lang)
-            names = set(frozen.names(tools)) | {p for t in tools for p in t["parameters"].get("properties", {})}
-            shared = names if shared is None else shared & names
-    allowed = (shared or set()) | set(Status.ALL)
+    board, thread = revision_tools("board"), revision_tools("thread")
+    allowed_by = {"board": board | set(Status.ALL), "thread": thread, None: board & thread}
     for lang in LANGS:
         for key, text in prompts.TEXTS[lang].items():
             if key.startswith("u_") or key in tailored:
                 continue
+            allowed = allowed_by[key_mode(key)]
             assert not code_idents(text) - allowed, (lang, key, code_idents(text) - allowed)
 
 
@@ -858,6 +916,270 @@ def test_texts_steer_agents_to_the_right_tools(lang):
         assert snippet in SYSTEMS[lang], snippet
     # independent review: the wake-up lists the reviews waiting, and reviews come before one's own work
     assert "task_review" in system and "{tasks}" in texts["my_reviews"]
+
+
+# ---------------------------------------------------------------------- thread mode (docs/SPEC.md §22.6)
+# the shared texts the SPEC lists by name, and the families it lists by prefix
+SHARED_KEYS = {"wake_header", "incoming_header", "reasons", "goal", "goal_none", "money", "my_jobs", "my_job",
+               "my_job_silent", "job_silent", "notes", "notes_empty", "notes_unchanged", "msg", "msg_reply", "you",
+               "instructions", "continue", "cut_off", "tools_added", "n_resumed", "n_restart", "n_step_limit",
+               "n_wrap_up_end", "n_lock_free", "n_network_on", "n_workspace_moved", "n_workspace_changed"}
+SHARED_PREFIXES = ("n_job_", "job_", "n_trigger", "trigger_file_", "n_mcp_", "skills_", "n_skill_", "deps_reason_")
+# the call sites that pass their key through mode_key (docs/SPEC.md §22.6 "Keys by mode")
+MODE_KEYED = ("n_budget_low", "n_network_off", "n_member_retired", "n_lock_wanted", "n_user_answer",
+              "n_user_answer_seen", "n_question_unanswered", "n_clarify_off", "n_clarify_hint", "n_hired", "n_wrap_up",
+              "wrap_up_line", "all_hint", "compaction_request", "compacted")
+# placeholders a twin drops: the board's name a task the thread session does not have
+TWIN_DROPS = {"n_member_retired": {"tasks"}, "n_clarify_off": {"task_id"}, "n_clarify_hint": {"id"},
+              "n_kickoff": {"task_id", "task_title"}}
+THREAD_PINS = {
+    "en": ("the money spent (while the budget has a limit)",
+           "When a notice says that most of the money budget is spent, don't wait for the user to ask for a wrap-up: "
+           "post the results so far, finish what is nearly done and start nothing large.",
+           "A process you start with & or nohup that `jobs` does not list is not tracked: its end wakes nobody.",
+           "votes wake nobody", "only the AI agents of the swarm are counted"),
+    "ru": ("потраченные деньги (пока у бюджета есть лимит)",
+           "Если уведомление говорит, что большая часть денежного бюджета потрачена, не жди, пока пользователь "
+           "попросит закругляться: опубликуй результаты на этот момент, доведи до конца то, что почти готово, и не "
+           "начинай ничего большого.",
+           "Процесс, запущенный через & или nohup, которого нет в списке `jobs`, не отслеживается: его завершение "
+           "никого не разбудит.",
+           "голоса никого не будят", "считаются только ИИ-агенты роя"),
+}
+THREAD_BULLETS = {"en": ["The feed", "Subscriptions", "Messages", "Shared workspace", "Triggers", "MCP tools", "Team",
+                         "Notebook", "Skills"],
+                  "ru": ["Лента", "Подписки", "Сообщения", "Общий workspace", "Триггеры", "MCP-инструменты", "Команда",
+                         "Блокнот", "Скиллы"]}
+KEPT_BULLETS = {"en": ["Messages", "Shared workspace", "MCP tools", "Team", "Notebook", "Skills"],
+                "ru": ["Сообщения", "Общий workspace", "MCP-инструменты", "Команда", "Блокнот", "Скиллы"]}
+HEADINGS = {"en": ("## The swarm", "## Tools", "## How you work", "## Communication and economy"),
+            "ru": ("## Рой", "## Инструменты", "## Как ты работаешь", "## Общение и экономия")}
+
+
+def thread_texts(lang: str) -> dict[str, str]:
+    """Every Russian or English text of a thread session's own: THREAD_KEYS and the user's thread notices."""
+    return {key: text for key, text in prompts.TEXTS[lang].items()
+            if key in prompts.THREAD_KEYS or key in ("u_goal_decided", "u_thread_quiet")}
+
+
+def test_every_agent_text_belongs_to_one_mode_set():
+    """BOARD_KEYS, THREAD_KEYS and the shared keys are disjoint and cover every non-u_ key in both languages; the
+    shared ones are the SPEC's list; every _thread key is a thread key whose board twin is a board key."""
+    board, thread = prompts.BOARD_KEYS, prompts.THREAD_KEYS
+    assert isinstance(board, frozenset) and isinstance(thread, frozenset) and not board & thread
+    assert not any(key.startswith("u_") for key in board | thread)
+    for lang in LANGS:
+        keys = {key for key in prompts.TEXTS[lang] if not key.startswith("u_")}
+        assert board | thread <= keys, (board | thread) - keys
+        shared = keys - board - thread
+        assert SHARED_KEYS <= shared, SHARED_KEYS - shared
+        assert all(key in SHARED_KEYS or key.startswith(SHARED_PREFIXES) for key in shared), \
+            sorted(key for key in shared if key not in SHARED_KEYS and not key.startswith(SHARED_PREFIXES))
+    twins = [key for key in prompts.TEXTS["en"] if key.endswith("_thread")]
+    assert len(twins) == 18
+    for key in twins:
+        assert key in thread and key.removesuffix("_thread") in board, key
+
+
+def test_mode_key_picks_the_twin_only_in_a_thread_session():
+    for key in MODE_KEYED:
+        assert prompts.mode_key(key, "thread") == key + "_thread" and key + "_thread" in prompts.THREAD_KEYS, key
+        assert prompts.mode_key(key, "board") == key and prompts.mode_key(key, None) == key, key
+    # a shared key, a board key whose thread counterpart has another name, a thread key, an unknown mode
+    assert prompts.mode_key("n_restart", "thread") == "n_restart"
+    assert prompts.mode_key("n_team_asleep", "thread") == "n_team_asleep"
+    assert prompts.mode_key("n_goal_decided", "thread") == "n_goal_decided"
+    assert prompts.mode_key("n_budget_low", "forum") == "n_budget_low"
+
+
+def test_thread_twins_keep_their_board_placeholders():
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        for key in (k for k in texts if k.endswith("_thread")):
+            base = key.removesuffix("_thread")
+            assert placeholders(texts[key]) == placeholders(texts[base]) - TWIN_DROPS.get(base, set()), (lang, key)
+        # the compaction marker agent.py looks for is compacted's opening, in both modes
+        marker = texts["compacted"].split("{summary}")[0]
+        assert marker and texts["compacted_thread"].startswith(marker), lang
+        assert texts["compacted_thread"] != texts["compacted"]
+        # the variants share their opening
+        for key, variant in (("n_kickoff_thread", "n_kickoff_thread_clarify"),
+                             ("n_thread_quiet", "n_thread_quiet_wrap_up")):
+            assert placeholders(texts[key]) == placeholders(texts[variant]), (lang, key)
+        head = texts["n_kickoff_thread"].split("\n")[:2]
+        assert texts["n_kickoff_thread_clarify"].split("\n")[:2] == head
+        assert head == texts["n_kickoff"].split("\n")[:2]
+        quiet = {"en": "a mention wakes them.", "ru": "упоминание его разбудит."}[lang]
+        cut = texts["n_thread_quiet"].index(quiet) + len(quiet)
+        assert texts["n_thread_quiet_wrap_up"][:cut] == texts["n_thread_quiet"][:cut]
+
+
+THREAD_PLACEHOLDERS = {
+    "f_post": {"by", "post", "title", "text"}, "f_comment": {"by", "post", "title", "comment", "text"},
+    "f_reply": {"by", "post", "title", "comment", "reply_to", "text"}, "f_edit": {"by", "post", "title"},
+    "f_vote": {"by", "value", "target", "title"}, "f_file": {"by", "files"},
+    "f_mention": {"by", "post", "title", "comment", "text"}, "vote_like": set(), "vote_dislike": set(),
+    "digest": set(), "digest_more": {"n"}, "my_goal_vote": {"value", "vote"},
+    "goal_vote_line": {"rule", "for", "counted", "against", "needed"},
+    "goal_vote_line_veto": {"rule", "for", "counted", "against", "needed"},
+    "rule_democracy": set(), "rule_veto": set(), "rule_user": set(),
+    "goal_decided": {"rule", "n", "counted", "names", "against"},
+    "goal_decided_wrap_up": {"rule", "n", "counted", "names", "against"}, "goal_completed_by_user": {"vote"},
+    "post_goal_title": set(), "post_goal_text": {"title", "description", "rule"}, "post_plan_title": set(),
+    "post_plan_text": {"title", "description"}, "post_plan_clarify": set(), "similar_posts": {"posts"},
+    "n_kickoff_thread": {"by", "title", "description", "team"},
+    "n_kickoff_thread_clarify": {"by", "title", "description", "team"},
+    "n_goal_updated_thread": {"by", "title", "description"}, "n_goal_reopened_thread": {"title", "comment"},
+    "n_goal_decided": {"rule", "for", "against"}, "n_wrap_up_votes_cleared": set(),
+    "n_thread_quiet": {"vote", "jobs"}, "n_thread_quiet_wrap_up": {"vote", "jobs"}, "thread_quiet_jobs": {"jobs"},
+    "u_goal_decided": {"summary"}, "u_thread_quiet": {"elapsed", "vote"},
+}
+
+
+def test_thread_texts_have_their_placeholders_and_no_dotted_letter():
+    for lang in LANGS:
+        texts = thread_texts(lang)
+        assert set(texts) == prompts.THREAD_KEYS | {"u_goal_decided", "u_thread_quiet"}
+        for key, fields in THREAD_PLACEHOLDERS.items():
+            assert placeholders(texts[key]) == fields, (lang, key)
+        for key, text in texts.items():
+            assert "ё" not in text.lower(), (lang, key)
+            # a thread text names no board-only tool (R0′ per mode, docs/SPEC.md §22.5)
+            assert not code_idents(text) & BOARD_ONLY and "task_" not in text, (lang, key)
+            assert not re.search(r"`\{", text), (lang, key)   # no path or id in backticks
+    # the system posts address the members as «вы», the notices as «ты»
+    ru = prompts.TEXTS["ru"]
+    assert "Ставьте «нравится»" in ru["post_goal_text"] and "Обсудите здесь" in ru["post_plan_text"]
+    assert ru["post_goal_title"] == "Цель достигнута?" and ru["post_plan_title"] == "Спланируем работу"
+    assert prompts.TEXTS["en"]["post_goal_title"] == "Goal reached?"
+    assert prompts.TEXTS["en"]["post_plan_title"] == "Let's plan the work"
+
+
+def test_thread_texts_render_the_spec_wording():
+    """The English texts docs/SPEC.md §22.3, §22.4 and §22.7 fix word for word, rendered."""
+    t = prompts.t
+    assert t("en", "f_post", by="Ann Lee", post=9, title="Parser", text="done") == 'Ann Lee posted #9 "Parser": done'
+    assert t("ru", "f_post", by="Ann Lee", post=9, title="Парсер", text="x") == "Ann Lee опубликовал(а) #9 «Парсер»: x"
+    assert t("en", "f_reply", by="B", post=9, title="P", comment="c32", reply_to="c31", text="ok") == \
+        'B replied to your comment c31 on #9 "P" (c32): ok'
+    assert t("en", "f_vote", by="B", value=t("en", "vote_like"), target="c31 (#9)", title="P") == \
+        'B rated your c31 (#9) "P": like.'
+    assert t("ru", "vote_dislike") == "не нравится" and t("ru", "vote_like") == "нравится"
+    assert t("en", "f_file", by="Ann Lee", files="src/a.py, src/b.py (+7)", more=7, paths=[], editors=[]) == \
+        "Files changed (Ann Lee): src/a.py, src/b.py (+7)."
+    assert t("en", "f_mention", by="B", post=9, title="P", comment=" (c31)", text="@Ann?") == (
+        'B mentioned you on #9 "P" (c31): @Ann?\nIf it needs your answer, comment on #9 with `comment` (reply_to '
+        "the comment when it was one).")
+    line = t("en", "goal_vote_line", rule=t("en", "rule_democracy"), counted=5, against=1, needed=3, **{"for": 3})
+    assert line == "Goal vote (#1, democracy): 3 of 5 for, 1 against; needs 3."
+    assert t("en", "goal_vote_line_veto", rule="veto", counted=5, against=0, needed=5, **{"for": 4}) == \
+        "Goal vote (#1, veto): 4 of 5 for, 0 against; needs all 5 and none against."
+    assert t("ru", "goal_vote_line", rule=t("ru", "rule_veto"), counted=5, against=1, needed=3, **{"for": 3}) == \
+        "Голосование по цели (#1, вето): за 3 из 5, против 1; нужно 3."
+    assert t("en", "goal_decided", rule="democracy", n=3, counted=5, names="A, B, C", against="—") == (
+        "The goal is reached by vote (democracy): 3 of 5 for — A, B, C; against: —. The artifacts are the shared "
+        "workspace.")
+    assert t("ru", "goal_completed_by_user", vote=line).endswith(" Артефакты — общая рабочая папка.")
+    assert t("en", "n_goal_decided", rule=t("en", "rule_user"), against="—", **{"for": "A"}) == (
+        "The global goal is completed (the user's decision). For: A; against: —. Start no new work for it and stop "
+        "the background jobs nobody needs (`job_stop`); the user may reopen it.")
+    goal = t("en", "post_goal_text", title="CSV", description="With tests.", rule="veto")
+    assert goal.startswith("**Goal:** CSV\n\nWith tests.\n\nThe goal is decided by the votes on this post, rule: veto.")
+    assert t("ru", "post_plan_text", title="CSV", description="").startswith("**Цель:** CSV")
+    assert t("en", "similar_posts", posts='#6 "x" (Fyodor Ershov)') == \
+        'Similar posts: #6 "x" (Fyodor Ershov). If yours repeats one, comment there instead.'
+    assert t("en", "digest_more", n=4) == "… and 4 more: see the feed (`feed`)."
+    assert t("ru", "digest_more", n=4) == "… и еще 4: смотри ленту (`feed`)."
+    assert t("en", "my_goal_vote", value="like", vote=line) == "Your vote on #1: like. " + line
+    quiet = t("en", "n_thread_quiet", jobs=t("en", "thread_quiet_jobs", jobs="j3, j5"), vote=line)
+    assert quiet.startswith("The thread is quiet, and nothing is set to wake the team: no running background job "
+                            "whose end wakes its owner, no trigger that can still fire on a time or a file, no "
+                            "locked file someone was refused. Your background jobs j3, j5 still run, but their end "
+                            "will not wake you. Goal vote (#1, democracy)")
+    assert quiet.endswith("Otherwise, if the goal is reached, check the result yourself and like #1 (`vote`); if not, "
+                          "post or comment what is missing and take it on.")
+    assert t("en", "n_budget_low_thread", spent=8.5, limit=10, pct=85).startswith(
+        "Money: spent $8.50 of the $10.00 budget (85%). When it is used up, the swarm pauses: every agent stops "
+        "between two steps. Don't wait for the user")
+    assert t("en", "u_goal_decided", summary="S.", rule="veto", counted=2, against=[], **{"for": []}) == \
+        "The team's vote on #1 completed the global goal: S."
+    assert "you can mark the goal reached yourself" in t("en", "u_thread_quiet", elapsed="4 min", vote=line)
+    assert t("en", "n_kickoff_thread", by="user", title="T", description="D", team="A — Critic").startswith(
+        'user set a new global goal: "T". D\nTeam: A — Critic.\nThere is no task board and no leader')
+    # the clarify asker asks once, with pause_swarm, and comments the decisions on #2
+    clarify = prompts.TEXTS["en"]["n_kickoff_thread_clarify"]
+    assert 'send_message` to ["user"] with pause_swarm=true' in clarify and "comment on #2" in clarify
+    assert 'с ["user"] и pause_swarm=true' in prompts.TEXTS["ru"]["n_kickoff_thread_clarify"]
+
+
+def test_question_texts_of_a_thread_session():
+    """The answers and unanswered questions reach external members too: no backticked identifier, no pause_swarm;
+    the lock notice names only lock_file and says that no reply is needed."""
+    for lang in LANGS:
+        texts = prompts.TEXTS[lang]
+        for key in ("n_user_answer_thread", "n_user_answer_seen_thread", "n_question_unanswered_thread"):
+            assert not code_idents(texts[key]) and "pause_swarm" not in texts[key], (lang, key)
+            assert "#2" in texts[key] and "CONTRACTS.md" not in texts[key], (lang, key)
+        assert code_idents(texts["n_lock_wanted_thread"]) == {"lock_file"} and "`{" not in texts["n_lock_wanted_thread"]
+        assert ("No reply is needed" if lang == "en" else "Отвечать не нужно") in texts["n_lock_wanted_thread"]
+        assert code_idents(texts["n_clarify_off_thread"]) == {"comment"}
+        assert {"send_message", "wait"} == code_idents(texts["n_clarify_hint_thread"])
+    text = prompts.t("en", "n_lock_wanted_thread", path="docs/A.md", held="6 min", waiters="Anna Smith")
+    assert "then go on with the rest of your work." in text
+    assert prompts.TEXTS["en"]["n_network_off_thread"] == prompts.TEXTS["en"]["n_network_off"].replace(
+        "say so in the task's discussion", "say so in a post or a comment")
+
+
+@pytest.mark.parametrize("lang", LANGS)
+def test_thread_system_prompts(lang):
+    """SYSTEM_THREAD_EN/RU (docs/SPEC.md §22.6): the board prompts' placeholders, the same code identifiers in both
+    languages, no board-only tool, the pinned sentences, the kept parts word for word, the bullets in order; the rule
+    of the goal is never named (it may change, the prompt is frozen)."""
+    system, board = THREAD_SYSTEMS[lang], SYSTEMS[lang]
+    assert placeholders(system) == placeholders(board)
+    assert code_idents(prompts.SYSTEM_THREAD_EN) == code_idents(prompts.SYSTEM_THREAD_RU)
+    assert not code_idents(system) & BOARD_ONLY and "task_" not in system and "goal_complete" not in system
+    for pin in THREAD_PINS[lang]:
+        assert pin in system, pin
+    for word in (("democracy", "veto") if lang == "en" else ("демократ", "вето")):
+        assert not re.search(rf"\b{word}", system.lower()), word
+    if lang == "ru":
+        assert "ё" not in system.lower()
+    lines = system.splitlines()
+    fix = (lambda line: line.replace("ё", "е")) if lang == "ru" else (lambda line: line)
+    board_lines = [fix(line) for line in board.splitlines()]
+    # the first two lines, the kept bullets and the headings are the board's
+    assert lines[:2] == board_lines[:2]
+    for heading in HEADINGS[lang]:
+        assert heading in lines, heading
+    for name in KEPT_BULLETS[lang]:
+        kept = next(line for line in board_lines if line.startswith(f"- **{name}**"))
+        assert kept in lines, name
+    tools = lines[lines.index(HEADINGS[lang][1]) + 1:lines.index(HEADINGS[lang][2])]
+    assert [line.split("**")[1] for line in tools if line.startswith("- **")] == THREAD_BULLETS[lang]
+    rules = [int(m.group(1)) for m in re.finditer(r"^(\d+)\. ", system, re.M)]
+    assert rules == list(range(1, 8))
+    last = {"en": "(messages, posts, comments, files)", "ru": "(сообщения, объявления, комментарии, файлы)"}[lang]
+    assert last in lines[-1] and lines[-1].startswith(board_lines[-1].split("(")[0])
+    # the forum's tools are taught, the shared ones are kept
+    assert {"feed", "post_read", "post_create", "post_update", "comment", "reply_to", "vote", "subscribe",
+            "subscriptions", "unsubscribe", "trigger_create", "send_message", "wait", "update_notes", "jobs",
+            "skill_propose"} <= code_idents(system)
+
+
+def test_system_prompt_takes_the_mode():
+    for lang in LANGS:
+        board = prompts.system_prompt(lang, **SYSTEM_KW)
+        assert prompts.system_prompt(lang, mode="board", **SYSTEM_KW) == board
+        text = prompts.system_prompt(lang, mode="thread", **SYSTEM_KW)
+        assert text != board and not re.search(r"\{[a-z_]+\}", text.replace("{curly}", ""))
+        for value in ("Ann Lee", "Swarm X", "Tester", "Checks things.", "Check {curly} things", "bash",
+                      ".scratch/ann.lee/", "7", "95"):
+            assert value in text, (lang, value)
+        assert text.splitlines()[:3] == board.splitlines()[:3]
+        assert ("## The swarm" if lang == "en" else "## Рой") in text and "`board`" not in text
+    assert prompts.system_prompt("de", mode="thread", **SYSTEM_KW) == prompts.system_prompt("en", mode="thread",
+                                                                                            **SYSTEM_KW)
 
 
 # ------------------------------------------------------------------- end to end, in Russian

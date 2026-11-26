@@ -73,7 +73,7 @@ from .settings import (PROVIDER_CHOICES, _endpoint, _private, _stored_key, api_v
 from .shell import _KNOWN_SECRETS, _SECRET_RE, _URL_USERINFO, _is_secret, strip_url_credentials
 from .skills import META_FILE as SKILL_META, NAME_MAX, NAME_RE, ORIGINS, Library, Limits, SkillError, _read_json, \
     _rename, check_skill_dir, copy_skill
-from .tools.frozen import TOOLSET_REVISION
+from .tools.frozen import NEWEST_REVISION
 from .treecopy import (EXPORT_EXCLUDE_NAMES, EXPORT_EXCLUDE_PATHS, TreeResult, compare_digest, copy_tree, is_within,
                        scan_tree, valid_mode)
 from .workspace import format_size, is_link, long_path, looks_like_git_dir, rmtree
@@ -1830,7 +1830,7 @@ def _manifest(report: ExportReport, home: Path) -> dict[str, Any]:
         "created_at": time.time(),
         "source": {"machine": platform.node(), "os": sys.platform, "home": str(home),
                    "python": platform.python_version()},
-        "schema": {"db_columns": sorted(known_columns()), "toolset_revision": TOOLSET_REVISION},
+        "schema": {"db_columns": sorted(known_columns()), "toolset_revision": NEWEST_REVISION},
         "include": list(report.include),
         "settings": report.settings if "settings" in report.include else None,
         "skills": report.skills if "skills" in report.include else None,
@@ -2956,9 +2956,9 @@ def _check_export_db(path: Path, entry: dict[str, Any]) -> str | None:
     if foreign:
         return (f"its database has {', '.join(foreign[:5])}{', ...' if len(foreign) > 5 else ''}, which DreamTeam "
                 "does not create (another program changed it, or a newer DreamTeam made it)")
-    if revision is not None and revision > TOOLSET_REVISION:
+    if revision is not None and revision > NEWEST_REVISION:
         return (f"its agents use the tool set {revision}, which this DreamTeam does not know (it knows "
-                f"{TOOLSET_REVISION}): update DreamTeam here")
+                f"{NEWEST_REVISION}): update DreamTeam here")
     if earlier:  # docs/SPEC.md §17.2: this version never opens it
         return (f"it was made by an earlier version of DreamTeam and cannot be opened by this one ({__version__}); "
                 "import it with the version that made it")

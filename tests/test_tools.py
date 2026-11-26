@@ -20,7 +20,7 @@ from dreamteam import prompts, roles, triggers
 from dreamteam.config import Config, RoleSettings
 from dreamteam.db import loads
 from dreamteam.llm.scripted import ScriptedLLM
-from dreamteam.models import USER, AgentKind, AgentStatus, Status
+from dreamteam.models import USER, AgentKind, AgentStatus, Status, ToolError
 from dreamteam.shell import resolve_shell
 from dreamteam.swarm import Swarm
 from dreamteam.tools import REGISTRY, ToolContext, call_tool, prepare_args, schemas_for, tools_for
@@ -110,8 +110,15 @@ SPEC_AUDIENCE = {  # docs/SPEC.md §12
     "skills": "U", "skill_attach": "U", "skill_detach": "U", "skill_approve": "U",  # docs/SPEC.md §19
     "skill_reinstall": "U",
     "skill_propose": "LE",
+    # the forum tools of thread sessions (docs/SPEC.md §22.5)
+    "feed": "LEU", "post_read": "LEU", "post_create": "LEU", "post_update": "LEU", "comment": "LEU", "vote": "LEU",
+    "subscriptions": "LE", "subscribe": "LE", "unsubscribe": "LE",
 }
 _LETTER = {"L": "llm", "E": "external", "U": "user"}
+BOARD_ONLY = {"board", "task_get", "task_create", "task_claim", "task_update", "task_complete", "task_review",
+              "task_comment", "task_discussion", "goal_complete"}
+THREAD_ONLY = {"feed", "post_read", "post_create", "post_update", "comment", "vote", "subscriptions", "subscribe",
+               "unsubscribe"}
 
 
 def test_catalogue_and_audiences_match_the_spec():
@@ -119,6 +126,8 @@ def test_catalogue_and_audiences_match_the_spec():
     assert set(REGISTRY) == set(SPEC_AUDIENCE)
     for name, letters in SPEC_AUDIENCE.items():
         assert REGISTRY[name].audience == {_LETTER[c] for c in letters}, name
+        modes = {"board"} if name in BOARD_ONLY else {"thread"} if name in THREAD_ONLY else {"board", "thread"}
+        assert REGISTRY[name].modes == modes, name
 
 
 ALLOWED_KEYWORDS = {"type", "description", "enum", "items", "minimum", "maximum", "properties", "required"}
@@ -206,15 +215,19 @@ def test_descriptions_exist_in_both_languages_and_name_only_real_tools():
 
 def test_schemas_for_is_deterministic_and_returns_copies():
     first = schemas_for("llm", "en")
-    assert first == schemas_for("llm", "en")
-    assert [s["name"] for s in first] == [s.name for s in REGISTRY.values() if "llm" in s.audience]
+    assert first == schemas_for("llm", "en") == schemas_for("llm", "en", "board")
+    assert [s["name"] for s in first] == [s.name for s in REGISTRY.values() if "llm" in s.audience
+                                          and "board" in s.modes]
     first[0]["parameters"]["properties"]["injected"] = {"type": "string"}
     first[0]["parameters"]["required"].append("injected")
     assert "injected" not in REGISTRY[first[0]["name"]].parameters["properties"]
     assert schemas_for("llm", "en") == schemas_for("llm", "en")
     assert [s["name"] for s in schemas_for("llm", "ru")] == [s["name"] for s in schemas_for("llm", "en")]
-    # agent kinds see exactly their audience
-    assert {s["name"] for s in schemas_for("user", "en")} == {n for n, a in SPEC_AUDIENCE.items() if "U" in a}
+    # agent kinds see exactly their audience, in the session's mode
+    assert {s["name"] for s in schemas_for("user", "en")} == {
+        n for n, a in SPEC_AUDIENCE.items() if "U" in a} - THREAD_ONLY
+    assert {s["name"] for s in schemas_for("user", "en", "thread")} == {
+        n for n, a in SPEC_AUDIENCE.items() if "U" in a} - BOARD_ONLY
 
 
 # An LLM tool's schema is part of every agent's frozen prefix: a change is released as a new revision of the frozen
@@ -1471,3 +1484,63 @@ async def test_scripted_agent_uses_the_tools_through_its_runtime(tmp_path):
     finally:
         await sw.stop()
         sw.close()
+
+
+# --- triggers in a thread session (docs/SPEC.md §22.5 "Triggers in a thread session") --------------------------
+def _engines(tmp_path: Path) -> tuple[Swarm, Swarm]:
+    return (Swarm(config=make_config(tmp_path / "thread", swarm={"mode": "thread"})),
+            Swarm(config=make_config(tmp_path / "board")))
+
+
+def test_trigger_conditions_that_read_tasks_are_refused_in_a_thread_session(tmp_path):
+    thread, board = _engines(tmp_path)
+    try:
+        for condition, fn in (("count() > 0", "count"), ("status(3) == done", "status"),
+                              ('elapsed(60) or comment(sender="user")', "comment"), ("all_done(tag='x')", "all_done"),
+                              ("not finished(1, 2)", "finished")):
+            for check in (lambda c: thread.triggers.create(USER, c), thread.triggers.validate):
+                with pytest.raises(ToolError) as exc:
+                    check(condition)
+                assert str(exc.value) == (f"Invalid condition: {fn}() reads tasks, and this session works in the "
+                                          f"thread mode (no tasks).\n{triggers.GRAMMAR_THREAD}"), condition
+        with pytest.raises(ToolError) as exc:
+            thread.triggers.create(USER, 'agent_status("Anna Smith") == done')
+        assert str(exc.value) == ("Invalid condition: 'done' is a task status, and this session has no tasks (quote an "
+                                  'agent status: agent_status("Anna Smith") == "idle").\n' + triggers.GRAMMAR_THREAD)
+        with pytest.raises(ToolError) as exc:
+            thread.triggers.validate("elapsed(")
+        assert str(exc.value).startswith("Invalid condition: ") and str(exc.value).endswith(triggers.GRAMMAR_THREAD)
+        assert triggers.GRAMMAR not in str(exc.value)
+        made = thread.triggers.create(USER, 'elapsed(60) or goal_done() or file_exists("out/r.json")')
+        assert made["condition"].startswith("elapsed(60)")
+        # the board's conditions and messages are unchanged
+        assert board.triggers.create(USER, "count() > 0 or status(3) == done")["id"] == 1
+        with pytest.raises(ToolError) as exc:
+            board.triggers.validate("elapsed(")
+        assert str(exc.value).endswith("\n" + triggers.GRAMMAR)
+    finally:
+        thread.close()
+        board.close()
+
+
+def test_trigger_task_actions_are_refused_in_a_thread_session(tmp_path):
+    thread, board = _engines(tmp_path)
+    try:
+        actions = [{"type": "wake"}, {"type": "set_status", "task_id": 1, "status": "done"}]
+        with pytest.raises(ToolError) as exc:
+            thread.triggers.create(USER, "elapsed(60)", actions=actions)
+        assert str(exc.value) == ("Invalid action #2: 'set_status' is not available in a thread session (no tasks).\n"
+                                  + triggers.ACTIONS_HELP_THREAD)
+        with pytest.raises(ToolError, match=r"^Invalid action #1: 'create_task' is not available in a thread"):
+            triggers.normalize_actions([{"type": "create_task", "title": "x"}], "thread")
+        assert triggers.normalize_actions([{"type": "create_task", "title": "x"}])[0]["type"] == "create_task"
+        assert triggers.normalize_actions(actions, "board")[1] == actions[1]
+        # a stored action never reaches the board there
+        assert thread.triggers._run_action(USER, {"type": "create_task", "title": "x"}).startswith("create_task: ")
+        assert thread.triggers._run_action(USER, {"type": "set_status", "task_id": 1, "status": "done"})
+        assert thread.board.list() == []
+        assert board.triggers._run_action(USER, {"type": "create_task", "title": "x"}) is None
+        assert [t.title for t in board.board.list()] == ["x"]
+    finally:
+        thread.close()
+        board.close()

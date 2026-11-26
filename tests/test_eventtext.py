@@ -574,3 +574,152 @@ def test_skill_mcp_file_and_trigger_lines():
     assert event_text({**held, "ts": NOW + 300}) == "⚡ trigger #5 fired: every(60) (wake-up held) · Анна"
     assert event_text(ev("trigger.fired", ANNA, trigger={"id": 5, "condition": "every(60)", "held": 0,
                                                          "wake_at": None})) == "⚡ trigger #5 fired: every(60) · Анна"
+
+
+# ---- the thread mode (docs/SPEC.md §22.2) ------------------------------------------------------------
+def _post(pid: int = 9, title: str = "Parser plan", author: str | None = ANNA, **extra) -> dict:
+    return {"id": pid, "kind": "post", "title": title, "text": "The whole text\nof the post", "author": author,
+            "created_at": NOW, "edited_at": None, "active_at": NOW, "likes": 0, "dislikes": 0, "comments": 0, **extra}
+
+
+def _comment(cid: int = 31, author: str = ANNA, text: str = "Looks good", reply_to: int | None = None) -> dict:
+    return {"id": cid, "post_id": 9, "author": author, "text": text, "reply_to": reply_to, "ts": NOW, "likes": 0,
+            "dislikes": 0}
+
+
+def _sub(sid: int = 12, kind: str = "post", target: str = "9", mode: str = "wake", by: str = "",
+         auto: bool = False) -> dict:
+    return {"id": sid, "member": ANNA, "kind": kind, "target": target, "by": by, "mode": mode, "auto": auto,
+            "created_at": NOW, "by_former": False}
+
+
+THREAD_TYPES = ("post.created", "post.updated", "post.comment", "post.vote", "subscription.changed",
+                "files.committed")
+
+
+def test_the_thread_types_are_journaled_and_have_handlers():
+    for type_ in THREAD_TYPES:
+        assert type_ in JOURNALED and type_ in eventtext._HANDLERS and type_ in render._HANDLERS, type_
+
+
+@pytest.mark.parametrize(("lang", "line"), [("en", '📌 #9 "Parser plan" — Анна'), ("ru", "📌 #9 «Parser plan» — Анна")])
+def test_post_created_line(lang, line):
+    """The title only, never the text; the author by the first name, the user as "you"; a system post by none."""
+    assert event_text(ev("post.created", ANNA, post=_post()), lang) == line
+    mine = event_text(ev("post.created", USER, post=_post(author=USER)), lang)
+    assert mine == line.replace("Анна", uitext.t(lang, "you"))
+    system = event_text(ev("post.created", None, post=_post(1, "Goal reached?", None, kind="goal")), lang)
+    assert system == ('📌 #1 "Goal reached?"' if lang == "en" else "📌 #1 «Goal reached?»")
+    assert "whole text" not in event_text(ev("post.created", ANNA, post=_post()), lang)
+
+
+def test_post_comment_line():
+    """The text quoted short, as for task.comment; a reply names the comment it answers."""
+    comment = ev("post.comment", ANNA, post_id=9, comment=_comment(text="Looks good\nmore"))
+    assert event_text(comment) == '💬 Анна on #9 (c31): "Looks good more"'
+    assert event_text(comment, "ru") == "💬 Анна к #9 (c31): «Looks good more»"
+    reply = ev("post.comment", BORIS, post_id=9, comment=_comment(32, BORIS, "Yes", reply_to=31))
+    assert event_text(reply) == '💬 Борис on #9 (c32 ↳ c31): "Yes"'
+    assert event_text(reply, "ru") == "💬 Борис к #9 (c32 ↳ c31): «Yes»"
+    long = event_text(ev("post.comment", ANNA, post_id=9, comment=_comment(text="word " * 200)))
+    quoted = long.split(": ", 1)[1]
+    assert len(quoted) <= QUOTE_CHARS + 2 and quoted.endswith('…"')
+    assert event_text(ev("post.comment", USER, post_id=9, comment=_comment(author=USER, text="ok"))) == \
+        '💬 you on #9 (c31): "ok"'
+
+
+def test_post_updated_line_and_the_vote_reset():
+    edited = ev("post.updated", ANNA, post=_post(), changes=["title", "text"])
+    assert event_text(edited) == "✎ #9 edited — Анна"
+    assert event_text(edited, "ru") == "✎ #9 изменено — Анна"
+    # the swarm's rewrite of a system post: no actor, no name
+    assert event_text(ev("post.updated", None, post=_post(2, author=None), changes=["text"])) == "✎ #2 edited"
+    # a votes-only update: #1's votes reset (by a reopen of the user, or by the swarm)
+    for actor in (USER, None):
+        reset = ev("post.updated", actor, post=_post(1, "Goal reached?", None, kind="goal"), changes=["votes"])
+        assert event_text(reset) == "✎ #1: votes reset"
+        assert event_text(reset, "ru") == "✎ #1: голоса сброшены"
+
+
+def test_post_vote_lines():
+    def vote(target: str, value: str, voter: str = ANNA) -> dict:
+        return ev("post.vote", voter, target=target, voter=voter, value=value, likes=1, dislikes=0)
+
+    assert event_text(vote("p9", "like")) == "↑ Анна likes #9"
+    assert event_text(vote("p9", "like"), "ru") == "↑ Анна ставит «нравится» #9"
+    assert event_text(vote("c31", "dislike")) == "↓ Анна dislikes c31"
+    assert event_text(vote("c31", "dislike"), "ru") == "↓ Анна ставит «не нравится» c31"
+    assert event_text(vote("p9", "none")) == "· Анна withdrew the vote on #9"
+    assert event_text(vote("p9", "none"), "ru") == "· Анна снимает голос с #9"
+    # the viewer's own vote (the user's are shown and never counted)
+    assert event_text(vote("p1", "like", USER)) == "↑ you like #1"
+    assert event_text(vote("p1", "like", USER), "ru") == "↑ вы ставите «нравится» #1"
+    assert event_text(vote("c31", "none", USER)) == "· you withdrew the vote on c31"
+    assert event_text(vote("p9", "dislike", BORIS), me=BORIS) == "↓ you dislike #9"
+
+
+def test_subscription_lines():
+    def changed(op: str, actor: str | None = ANNA, **sub) -> dict:
+        return ev("subscription.changed", actor, member=ANNA, subscription=_sub(**sub), op=op)
+
+    assert event_text(changed("created")) == "· Анна follows #9 (wake)"
+    assert event_text(changed("created"), "ru") == "· Анна следит за #9 (wake)"
+    assert event_text(changed("changed", mode="digest")) == "· Анна follows #9: changed to digest"
+    assert event_text(changed("changed", mode="digest"), "ru") == "· Анна следит за #9: режим сменен на digest"
+    assert event_text(changed("removed")) == "· Анна unfollows s12"
+    assert event_text(changed("removed"), "ru") == "· Анна отписывается от s12"
+    # the automatic rows of a new member (actor None), a file subscription, a member's posts only
+    auto = changed("created", None, sid=3, kind="feed", target="", mode="digest", auto=True)
+    assert event_text(auto) == "· Анна follows the feed (digest, automatic)"
+    assert event_text(auto, "ru") == "· Анна следит за лентой (digest, автоматически)"
+    assert event_text(changed("created", kind="file", target="src/app.py")) == "· Анна follows src/app.py (wake)"
+    assert event_text(changed("created", kind="file", target=""), "ru") == "· Анна следит за рабочей папкой (wake)"
+    assert event_text(changed("created", kind="feed", target="", by=BORIS)) == \
+        "· Анна follows the feed (wake, only Борис)"
+    assert event_text(changed("created", kind="reactions", target="", mode="digest"), "ru") == \
+        "· Анна следит за реакциями (digest)"
+    assert event_text(changed("removed"), me=ANNA) == "· you unfollow s12"
+    # a retire drops every row at once: the count, no subscription
+    dropped = ev("subscription.changed", None, member=ANNA, op="removed", count=4)
+    assert event_text(dropped) == "· Анна: 4 subscriptions removed"
+    assert event_text(dropped, "ru") == "· Анна: удалены 4 подписки"
+    assert event_text({**dropped, "data": {**dropped["data"], "count": 1}}) == "· Анна: 1 subscription removed"
+
+
+def test_files_committed_lines():
+    """A line next to file.changed's: the files' count (with `more`), the first path, the kind and the actor."""
+    files = [{"path": "src/app.py", "change": "M"}, {"path": "README.md", "change": "A"}]
+    shell = ev("files.committed", ANNA, kind="shell", commit="ab12", files=files, more=3, suspects=[ANNA, BORIS])
+    assert event_text(shell) == "✎ 5 files: src/app.py, … — committed (shell) · Анна"
+    assert event_text(shell, "ru") == "✎ 5 файлов: src/app.py, … — в коммите (shell) · Анна"
+    two = ev("files.committed", ANNA, kind="shell", commit="ab12", files=files, suspects=[ANNA])
+    assert event_text(two, "ru") == "✎ 2 файла: src/app.py, … — в коммите (shell) · Анна"
+    job_ = ev("files.committed", BORIS, kind="job j3", commit="ab12", files=files[:1], suspects=[BORIS])
+    assert event_text(job_) == "✎ 1 file: src/app.py — committed (job j3) · Борис"
+    assert event_text(job_, "ru") == "✎ 1 файл: src/app.py — в коммите (процесс j3) · Борис"
+    jobs = ev("files.committed", BORIS, kind="jobs j3, j5", commit="ab12", files=files, suspects=[BORIS])
+    assert event_text(jobs) == "✎ 2 files: src/app.py, … — committed (jobs j3, j5) · Борис"
+    assert event_text(jobs, "ru") == "✎ 2 файла: src/app.py, … — в коммите (процессы j3, j5) · Борис"
+    held = ev("files.committed", ANNA, kind="held", commit="ab12", files=[{"path": "new.txt", "change": "A"}],
+              suspects=[ANNA])
+    assert event_text(held) == "✎ 1 file: new.txt — committed (held new files) · Анна"
+    assert event_text(held, "ru") == "✎ 1 файл: new.txt — в коммите (отложенные новые файлы) · Анна"
+    assert event_text(ev("file.changed", ANNA, path="src/main.py", op="edit")) == "✎ src/main.py — edited · Анна"
+
+
+def test_goal_completed_says_how_a_thread_goal_was_decided():
+    goal = {"title": "Calculator", "status": "done", "summary": "All done.\nDetails."}
+    for rule, en, ru in (("democracy", "by vote (democracy)", "голосованием (демократия)"),
+                         ("veto", "by vote (veto)", "голосованием (вето)"),
+                         ("user", "by the user", "пользователем")):
+        decided = {**goal, "decision": {"rule": rule, "for": [ANNA], "against": [], "counted": 1, "wrap_up": False}}
+        done = ev("goal.completed", ANNA if rule != "user" else USER, goal=decided)
+        assert event_text(done) == f"✓ Goal achieved: Calculator · {en} — All done."
+        assert event_text(done, "ru") == f"✓ Цель достигнута: Calculator · {ru} — All done."
+    # no voter met the rule: actor None, never "None"
+    silent = ev("goal.completed", None, goal={**goal, "summary": "", "decision": {"rule": "democracy"}})
+    assert event_text(silent) == "✓ Goal achieved: Calculator · by vote (democracy)"
+    # a board session's goal has no decision: the line is as before
+    assert event_text(ev("goal.completed", ANNA, goal=goal)) == "✓ Goal achieved: Calculator — All done."
+    assert event_text(ev("goal.completed", ANNA, goal={**goal, "decision": None}), "ru") == \
+        "✓ Цель достигнута: Calculator — All done."

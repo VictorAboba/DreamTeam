@@ -332,3 +332,179 @@ def test_role_skills_in_the_settings_view_and_update():
     assert raw["roles"] == [{"name": "tester", "skills": ["pdf-tools"]}, {"name": "writer", "instructions": "Short."}]
     view = public_view(raw)
     assert view["roles"][0]["skills"] == ["pdf-tools"] and view["roles"][1]["skills"] == []
+
+
+# ------------------------------------------------------------------------- thread mode (docs/SPEC.md §22.6)
+THREAD_NAMES = {"en": "Critic", "ru": "Критик"}
+BOARD_ONLY = {"board", "task_get", "task_create", "task_claim", "task_update", "task_complete", "task_review",
+              "task_comment", "task_discussion", "goal_complete"}
+CRITIC_EN = (
+    "You are the team's critic: you check the results the others post against the global goal and the contracts, "
+    "not against their authors' explanations: you open the files, run what can be run and look for what is missing, "
+    "wrong or inconsistent between the parts (names, formats, interfaces). For each problem you comment on the post "
+    "of that work with a concrete, checkable fix (file, place, what is wrong, what is expected) and leave the fixing "
+    "to its author; you like what you have verified. You never check your own work. On #1 you vote with reasons: like "
+    "it only when you have verified that the result meets the goal; otherwise dislike it and say in a comment on #1 "
+    "what is missing.")
+
+
+def test_thread_presets_have_the_board_ids_and_the_critic():
+    assert tuple(roles.ROLE_PRESETS_THREAD) == ("en", "ru")
+    for lang in LANGS:
+        assert tuple(roles.ROLE_PRESETS_THREAD[lang]) == roles.PRESET_IDS
+    for rid in roles.PRESET_IDS:
+        en_name, en_text = roles.ROLE_PRESETS_THREAD["en"][rid]
+        ru_name, ru_text = roles.ROLE_PRESETS_THREAD["ru"][rid]
+        assert code_idents(en_text) == code_idents(ru_text), rid
+        for lang, name, text in (("en", en_name, en_text), ("ru", ru_name, ru_text)):
+            # the same names as on the board, but the reviewer's
+            board = roles.ROLE_PRESETS[lang][rid][0]
+            assert name == (THREAD_NAMES[lang] if rid == "reviewer" else board), (lang, rid)
+            assert text != roles.ROLE_PRESETS[lang][rid][1], (lang, rid)
+            assert 3 <= len(_SENTENCE_END.findall(text)) <= 6 and len(text) <= 1200, (lang, rid)
+            assert text == roles.normalize(text) and text.endswith("."), (lang, rid)
+            assert set(re.findall(r"\b[\w-]+\.(?:md|txt|json|toml|ya?ml)\b", text)) <= {"CONTRACTS.md"}, (lang, rid)
+            # no task, review, board or planning card, and no board-only tool
+            assert not re.search(r"task|review|board|planning|задач|ревью|доск|планирован", text, re.I), (lang, rid)
+            assert not code_idents(text) & BOARD_ONLY and "goal_complete" not in text, (lang, rid)
+            if lang == "ru":
+                assert "ё" not in text.lower(), rid
+    assert roles.ROLE_PRESETS_THREAD["en"]["reviewer"][1] == CRITIC_EN
+    for lang, phrase in (("en", "the contracts agreed in #2 (CONTRACTS.md)"),
+                         ("ru", "следуешь контрактам, о которых договорились в #2 (CONTRACTS.md)")):
+        assert phrase in roles.ROLE_PRESETS_THREAD[lang]["developer"][1], lang
+    assert ("предлагаешь контракты (интерфейсы, форматы, структуру файлов) в #2 и, когда о них договорились, "
+            "записываешь их в CONTRACTS.md; если контракт нужно изменить, предлагаешь изменение в комментарии там, где "
+            "о нем договорились, упоминая участников, чья работа от него зависит, и обновляешь файл, когда изменение "
+            "согласовано") in roles.ROLE_PRESETS_THREAD["ru"]["architect"][1]
+    # the architect agrees on the contracts first: never "once"
+    assert not re.search(r"\bonce\b", roles.ROLE_PRESETS_THREAD["en"]["architect"][1])
+    assert "один раз" not in roles.ROLE_PRESETS_THREAD["ru"]["architect"][1]
+
+
+def test_thread_catalog_names_the_critic():
+    for lang in LANGS:
+        board = {r.key: r for r in roles.catalog([], lang)}
+        thread = {r.key: r for r in roles.catalog([], lang, mode="thread")}
+        assert list(thread) == list(board) == list(roles.PRESET_IDS)
+        for rid in roles.PRESET_IDS:
+            assert (thread[rid].name, thread[rid].description) == roles.ROLE_PRESETS_THREAD[lang][rid], (lang, rid)
+            assert (board[rid].name, board[rid].description) == roles.ROLE_PRESETS[lang][rid], (lang, rid)
+        # every name of the reviewer resolves to the critic in a thread session; "Critic" only there
+        for spelling in ("reviewer", "Reviewer", "Ревьюер", "Critic", " критик ", "CRITIC", "Критик"):
+            role = roles.find_role([], spelling, lang, mode="thread")
+            assert role.key == "reviewer" and role.name == THREAD_NAMES[lang], (lang, spelling)
+            assert role.description == roles.ROLE_PRESETS_THREAD[lang]["reviewer"][1]
+        for spelling in ("Critic", "Критик"):
+            assert roles.find_role([], spelling, lang) is None, (lang, spelling)
+        assert roles.find_role([], "Reviewer", lang).name == roles.ROLE_PRESETS[lang]["reviewer"][0]
+    # a customized description is used in both modes; instructions, model and skills come along
+    entries = parse_roles([{"name": "reviewer", "description": "Check everything twice.", "instructions": "Be brief.",
+                            "skills": ["lint"]}], PROFILES)
+    for mode in ("board", "thread"):
+        role = roles.find_role(entries, "reviewer", "en", mode=mode)
+        assert (role.description, role.instructions, role.skills) == ("Check everything twice.", "Be brief.",
+                                                                       ("lint",)), mode
+    assert roles.find_role(entries, "Critic", "ru", mode="thread").name == "Критик"
+
+
+def test_an_own_critic_keeps_its_meaning_in_both_modes():
+    """A [[roles]] entry named "Critic" next to a `reviewer` entry loads; the own role wins in both modes, and in a
+    thread session the built-in keeps its board name with the critic's text and the reviewer entry's skills, so the
+    catalog holds exactly one "Critic"."""
+    entries = parse_roles([{"name": "Critic", "description": "Hunts for weak arguments."},
+                           {"name": "reviewer", "skills": ["lint"]}], PROFILES)
+    assert [e.name for e in entries] == ["Critic", "reviewer"]
+    assert roles.thread_aliases(entries) == {"критик": "reviewer"}
+    assert roles.thread_aliases([]) == {"critic": "reviewer", "критик": "reviewer"}
+    for mode in ("board", "thread"):
+        own = roles.find_role(entries, " critic ", "en", mode=mode)
+        assert (own.key, own.name, own.builtin, own.description) == ("critic", "Critic", False,
+                                                                     "Hunts for weak arguments."), mode
+    for lang in LANGS:
+        reviewer = roles.find_role(entries, "reviewer", lang, mode="thread")
+        assert reviewer.name == roles.ROLE_PRESETS[lang]["reviewer"][0], lang          # «Ревьюер» / "Reviewer"
+        assert reviewer.description == roles.ROLE_PRESETS_THREAD[lang]["reviewer"][1]
+        assert reviewer.skills == ("lint",)
+        # the other language's thread name is free and still resolves to the built-in
+        assert roles.find_role(entries, "Критик", lang, mode="thread").key == "reviewer"
+        names = [r.name for r in roles.catalog(entries, lang, mode="thread")]
+        assert names.count("Critic") == 1 and names.count("Критик") == 0, (lang, names)
+    assert roles.close_roles(entries, "Critc", "en", mode="thread") == ["Critic"]
+
+
+def test_thread_names_in_teams_and_close_roles():
+    """--team, /team and the saved teams resolve "Critic" only for a thread session being created."""
+    team = {"name": "review crew", "roles": ["Critic", "developer", "Критик"]}
+    assert roles.missing_roles(team, [], mode="thread") == []
+    assert roles.missing_roles(team, []) == ["Critic", "Критик"]
+    assert roles.missing_roles(team, [entry(name="Critic", description="Mine.")]) == ["Критик"]
+    assert roles.team_choice("Critic", [team], [], mode="thread") == ("roles", ["Critic"])
+    assert roles.team_choice("Critic", [team], []) == ("unknown", "Critic")
+    assert roles.team_choice("review crew", [team], [], mode="thread") == ("team", team)
+    assert roles.saved_team_in(["Critic"], [{"name": "Critic", "roles": ["tester"]}], [], mode="thread") is None
+    assert roles.saved_team_in(["Critic"], [{"name": "Critic", "roles": ["tester"]}], []) == "Critic"
+    # the critic is offered under its thread name, also for its board spellings
+    assert roles.close_roles([], "Critc", "en", mode="thread") == ["Critic"]
+    assert roles.close_roles([], "Reviewr", "ru", mode="thread") == ["Критик"]
+    assert "Critic" not in roles.close_roles([], "Critc", "en")
+    assert roles.close_roles([], "Reviewr", "en") == ["Reviewer"]
+
+
+# ------------------------------------------------------------------------------------- the critic's skills
+def _skills_swarm(tmp_path, mode: str, entries: list[dict]):
+    from conftest import make_skill
+    from dreamteam import skills
+    from dreamteam.llm.scripted import ScriptedLLM
+    from dreamteam.swarm import Swarm
+
+    raw = {"swarm": {"name": "Roles", "language": "en", "start_agents": 1, "max_agents": 4, "max_cost_usd": 0,
+                     "mode": mode},
+           "agents": {"stagger_seconds": 0}, "workspace": {"git": False}, "roles": entries,
+           "mcp": {"library_dir": str(tmp_path / "mcp-library")},
+           "models": {"default": {"provider": "scripted", "model": "scripted", "input_price": 0, "output_price": 0}}}
+    config = Config.from_dict(tmp_path / "project", raw)
+    folder = make_skill(tmp_path / "sources" / "lint", "lint", "Lints the code.", {"scripts/run.py": "print(1)\n"})
+    skills.Library.from_config(config).add(folder, "folder", {"path": str(folder)})
+    return Swarm(config=config, llm_factory=lambda profile, agent: ScriptedLLM(lambda *a: {"text": "ok"}, profile))
+
+
+@pytest.mark.parametrize("mode, stored", [("thread", "Critic"), ("board", "Reviewer")])
+async def test_a_hired_critic_gets_the_reviewer_entry_s_skills(tmp_path, mode, stored):
+    from dreamteam import swarm_skills
+    from dreamteam.models import USER
+    from dreamteam.tools import ToolContext, call_tool
+
+    sw = _skills_swarm(tmp_path, mode, [{"name": "reviewer", "skills": ["lint"]}])
+    await sw.start(run_agents=False)
+    try:
+        text, is_error = await call_tool(ToolContext(sw, USER), "hire_agent", {"role": "reviewer", "instructions": ""})
+        assert not is_error, text
+        assert "They also got the skills of their role: lint." in text
+        hired = next(m for m in sw.members() if m["role"] == stored)
+        assert sw.skills.role_skills(hired) == ("lint",) and sw.skills.get("lint").attached_via == f"role:{stored}"
+        assert "- lint (your role's): Lints the code." in sw.render_wake(hired["name"])
+        assert next(i for i in sw.snapshot()["skills"] if i["name"] == "lint")["roles"] == [stored]
+        assert swarm_skills.listed_by_roles(sw.config, "ru", mode=mode)["lint"] == [
+            "Критик" if mode == "thread" else "Ревьюер"]
+        assert [i["roles"] for i in swarm_skills.stopped_public(sw.config)] == [[stored]]
+    finally:
+        await sw.stop()
+        sw.close()
+
+
+async def test_an_own_critic_leaves_the_reviewer_its_name_and_skills_in_a_thread_session(tmp_path):
+    from dreamteam.models import USER
+    from dreamteam.tools import ToolContext, call_tool
+
+    sw = _skills_swarm(tmp_path, "thread", [{"name": "Critic", "description": "Hunts for weak arguments."},
+                                            {"name": "reviewer", "skills": ["lint"]}])
+    await sw.start(run_agents=False)
+    try:
+        text, is_error = await call_tool(ToolContext(sw, USER), "hire_agent", {"role": "reviewer", "instructions": ""})
+        assert not is_error, text
+        hired = next(m for m in sw.members() if m["role"] == "Reviewer")
+        assert sw.skills.role_skills(hired) == ("lint",) and "lint" in sw.skills.names()
+    finally:
+        await sw.stop()
+        sw.close()

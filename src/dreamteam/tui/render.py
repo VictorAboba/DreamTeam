@@ -30,10 +30,11 @@ from rich.table import Table
 from rich.text import Text
 
 from .. import prompts, roles
-from ..eventtext import (_ANSI, _TASK_SYMBOL, TOOL_CALL_CHARS, TextContext, _clock, _crew_size, _d, _deps_reason,
-                         _deps_word, _echo_target, _first_line, _float, _int, _job_result, _list, _names, _reason,
-                         _recipients_text, _review_text, _session_run, _status_label, _via_text, _wake_summary, _who,
-                         clean, first_name, fmt_cost, fmt_elapsed, tool_call_text)
+from ..eventtext import (_ANSI, _TASK_SYMBOL, TOOL_CALL_CHARS, TextContext, _clock, _comment_head, _committed_text,
+                         _crew_size, _d, _deps_reason, _deps_word, _echo_target, _first_line, _float, _int,
+                         _job_result, _list, _names, _post_author, _post_updated_text, _reason, _recipients_text,
+                         _review_text, _session_run, _status_label, _subscription_text, _via_text, _vote_text,
+                         _wake_summary, _who, clean, first_name, fmt_cost, fmt_elapsed, tool_call_text)
 from ..models import API_VIA
 from . import theme
 
@@ -51,7 +52,8 @@ EVENT_TYPES = (
     "trigger.fired", "trigger.deleted", "mcp.created", "mcp.status", "swarm.paused", "swarm.resumed",
     "swarm.wrap_up", "swarm.limits", "trace.started", "trace.span", "trace.finished", "job.started", "job.ended",
     "job.silent", "skill.attached", "skill.detached", "skill.proposed", "skill.library", "skill.deps",
-    "session.started", "session.stopped", "sessions.changed", "_connection",
+    "session.started", "session.stopped", "sessions.changed", "post.created", "post.updated", "post.comment",
+    "post.vote", "subscription.changed", "files.committed", "_connection",
 )
 ACTIVITY_KINDS = ("wake", "thinking", "text", "tool_call", "tool_result", "error", "nudge", "compacted")
 
@@ -501,7 +503,7 @@ def _ev_message(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
 
 
 # the goal panel / hire line / the question's pause line (with the spinner and the input box's title) say it
-_QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_member_joined", "u_question"})
+_QUIET_SKIP_NOTES = frozenset({"u_goal_done", "u_goal_decided", "u_member_joined", "u_question"})
 # the user has to act on these: a budget pause, an MCP server to approve, a review that waits for the user, a model
 # profile whose calls count as $0, the members' messages no longer answered automatically (u_auto_reply_limit), most
 # of the money budget spent (u_budget_low), the whole team asleep with nothing set to wake the team (u_team_asleep,
@@ -656,6 +658,64 @@ def _ev_file(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
     if who:
         body.append(f" {ctx.sym['dot']} {_who(ctx, who, short=True)}", style="dim")
     return _line(ctx, ctx.sym["edit"], "dim", body)
+
+
+# ---- the thread mode's events (docs/SPEC.md §22.2, §22.8) ------------------------------------------------
+def _ev_post_created(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """`📌 #9 Title — Anna` at every verbosity (the title only)."""
+    post = _d(d.get("post"))
+    body = Text(f"#{clean(post.get('id')) or '?'} ", style="bold")
+    body.append(ctx.short(post.get("title"), 0) or ctx.sym["dash"])
+    who = _post_author(ctx, ev, post)
+    if who:
+        author = post.get("author") or ev.get("actor")
+        body.append(f" {ctx.sym['dash']} {who}", style=theme.agent_style(clean(author)))
+    return _line(ctx, ctx.sym["post"], "", body)
+
+
+def _ev_post_comment(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """`💬 Anna → #9: first line…` (`#9 ↳ c31` for a reply): one folded line; verbose: the text, clipped."""
+    if ctx.quiet:
+        return None
+    comment, who, post, _cid = _comment_head(ctx, ev, d)
+    reply = clean(comment.get("reply_to"))
+    head = f"{who} {ctx.sym['arrow']} {post}" + (f" {ctx.sym['reply']} c{reply}" if reply else "") + ": "
+    if not ctx.verbose:
+        lines = [line.strip() for line in clean(comment.get("text")).splitlines() if line.strip()]
+        first = (lines[0] + (ctx.sym["ellipsis"] if len(lines) > 1 else "")) if lines else ""
+        return _line(ctx, ctx.sym["chat"], "", _one(ctx, head + " ".join(first.split())))
+    text, rest = _clip_lines(ctx, comment.get("text"), RESULT_LINES)
+    body = Text(head, style="bold")
+    body.append(text)
+    if rest:
+        body.append("\n").append_text(_more(ctx, rest))
+    return _line(ctx, ctx.sym["chat"], "", body)
+
+
+def _ev_post_updated(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    if not ctx.verbose:
+        return None
+    return _line(ctx, ctx.sym["edit"], "dim", Text(_post_updated_text(ctx, ev, d), style="dim"))
+
+
+def _ev_post_vote(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    """A vote on #1 (the goal's) from normal on, the other votes in verbose only."""
+    if ctx.quiet or (not ctx.verbose and d.get("target") != "p1"):
+        return None
+    symbol, text = _vote_text(ctx, ev, d)
+    return _line(ctx, ctx.sym[symbol], "dim", Text(text, style="dim"))
+
+
+def _ev_subscription(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    if not ctx.verbose:
+        return None
+    return _line(ctx, ctx.sym["dot"], "dim", Text(_subscription_text(ctx, ev, d), style="dim"))
+
+
+def _ev_files_committed(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
+    if not ctx.verbose:
+        return None
+    return _line(ctx, ctx.sym["edit"], "dim", Text(_committed_text(ctx, ev, d), style="dim"))
 
 
 def _ev_trigger(ctx: RenderContext, ev: dict, d: dict) -> RenderableType | None:
@@ -861,6 +921,12 @@ _HANDLERS: dict[str, Callable[[RenderContext, dict, dict], RenderableType | None
     "file.changed": _ev_file,
     "file.locked": _ev_file,
     "file.unlocked": _ev_file,
+    "post.created": _ev_post_created,
+    "post.updated": _ev_post_updated,
+    "post.comment": _ev_post_comment,
+    "post.vote": _ev_post_vote,
+    "subscription.changed": _ev_subscription,
+    "files.committed": _ev_files_committed,
     "trigger.created": _ev_trigger,
     "trigger.fired": _ev_trigger,
     "trigger.deleted": _ev_trigger,

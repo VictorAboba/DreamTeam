@@ -29,10 +29,22 @@ def _pragma_columns(path: Path) -> set[str]:
         conn.close()
 
 
-def _fresh(path: Path) -> Database:
-    database = Database(path)
+def _fresh(path: Path, forum: bool = False) -> Database:
+    database = Database(path, forum=forum)
     Tracer(database)
     return database
+
+
+def _forum_columns() -> frozenset[str]:
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.executescript(dbmod.FORUM_SCHEMA)
+        return frozenset(columns_of(conn))
+    finally:
+        conn.close()
+
+
+_FORUM_COLUMNS = _forum_columns()
 
 
 def _older(path: Path, dropped: set[tuple[str, str]]) -> None:
@@ -48,7 +60,7 @@ def _older(path: Path, dropped: set[tuple[str, str]]) -> None:
 
 def test_known_columns_are_what_a_fresh_database_and_tracer_create(tmp_path):
     path = tmp_path / "swarm.db"
-    _fresh(path).close()
+    _fresh(path, forum=True).close()  # the forum tables of a thread session are known too (docs/SPEC.md §22.1)
     known = known_columns()
     assert isinstance(known, frozenset) and known is known_columns()  # computed once
     assert known == _pragma_columns(path) == columns_of(path)
@@ -82,7 +94,7 @@ def test_an_older_database_is_a_strict_subset_and_gets_upgraded(tmp_path):
         assert task.crew == 0 and task.crew_working == []
     finally:
         database.close()
-    assert columns_of(path) == known_columns()
+    assert columns_of(path) == known_columns() - _FORUM_COLUMNS  # a board database: no forum tables
 
 
 def test_tasks_crew_is_stored_and_read_into_the_task(tmp_path):
@@ -170,14 +182,14 @@ def test_max_tools_revision(tmp_path):
     try:
         assert max_tools_revision(database) is None  # no member started yet
         _tools_record(database, "alice", 1)
-        _tools_record(database, "bob", frozen.TOOLSET_REVISION)
+        _tools_record(database, "bob", frozen.TOOLSET_REVISIONS["board"])
         database.set("goal", {"rev": 999})  # not a tool set
         database.set("tools", {"rev": 998})  # no member name: not a tools:<member> key
         database.set(frozen.kv_key("broken"), "not a record")
         database.set(frozen.kv_key("flag"), {"rev": True})
         database.set(frozen.kv_key("text"), {"rev": "99"})
         database.execute("INSERT INTO kv(key, value) VALUES(?, ?)", (frozen.kv_key("junk"), "{not json"))
-        assert max_tools_revision(database) == frozen.TOOLSET_REVISION
+        assert max_tools_revision(database) == frozen.TOOLSET_REVISIONS["board"]
         _tools_record(database, "carol", 99)
         assert max_tools_revision(database) == 99
     finally:

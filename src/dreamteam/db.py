@@ -62,6 +62,31 @@ CREATE TABLE IF NOT EXISTS jobs (
     started_at REAL, background_at REAL, ended_at REAL);
 CREATE INDEX IF NOT EXISTS jobs_owner ON jobs(owner, status);
 """
+# the thread mode's tables (docs/SPEC.md §22.1): only in a thread session's database, never in SCHEMA, so a board
+# session's file stays as 0.4.x knows it. Idempotent: every statement is IF NOT EXISTS or guarded; the last one seeds
+# the posts sequence at 2, the ids of the system posts #1 and #2
+FORUM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, author TEXT, kind TEXT NOT NULL, title TEXT NOT NULL,
+    text TEXT NOT NULL DEFAULT '', data TEXT, created_at REAL, edited_at REAL, active_at REAL);
+CREATE INDEX IF NOT EXISTS posts_active ON posts(active_at);
+CREATE TABLE IF NOT EXISTS post_comments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, post_id INTEGER NOT NULL, author TEXT NOT NULL, text TEXT NOT NULL,
+    reply_to INTEGER, ts REAL);
+CREATE INDEX IF NOT EXISTS post_comments_post ON post_comments(post_id, id);
+CREATE TABLE IF NOT EXISTS votes (
+    target TEXT NOT NULL, voter TEXT NOT NULL, value INTEGER NOT NULL, ts REAL, PRIMARY KEY (target, voter));
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, member TEXT NOT NULL, kind TEXT NOT NULL, target TEXT NOT NULL DEFAULT '',
+    by_member TEXT NOT NULL DEFAULT '', mode TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0, created_at REAL,
+    UNIQUE (member, kind, target, by_member));
+CREATE INDEX IF NOT EXISTS subscriptions_match ON subscriptions(kind, target);
+INSERT INTO sqlite_sequence(name, seq) SELECT 'posts', 2
+    WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'posts');
+"""
+# the session's mode in kv (docs/SPEC.md §22.1 "Where the mode lives"): written once, never changed
+MODE_KEY = "swarm_mode"
+MODES = ("board", "thread")
 # columns added to a table after its first release, (table, column, declaration): a file made by an older version
 # gets them when it is opened
 ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"), ("mcp_servers", "digest", "TEXT"),
@@ -72,7 +97,8 @@ ADDED_COLUMNS = (("messages", "to_all", "INTEGER DEFAULT 0"), ("mcp_servers", "d
 
 
 class Database:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, forum: bool = False):
+        """`forum`: also create the thread mode's tables (FORUM_SCHEMA, docs/SPEC.md §22.1)."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
@@ -83,10 +109,17 @@ class Database:
             self.conn.execute("PRAGMA synchronous=NORMAL")
             self.conn.execute("PRAGMA foreign_keys=OFF")
             self.conn.executescript(SCHEMA)
+            if forum:
+                self.conn.executescript(FORUM_SCHEMA)
             self._add_columns()
         except BaseException:  # e.g. "file is not a database": do not keep the file open until garbage collection
             self.conn.close()
             raise
+
+    def ensure_forum(self) -> None:
+        """The thread mode's tables on an open database (idempotent; a thread swarm runs it at every open)."""
+        with self._lock:
+            self.conn.executescript(FORUM_SCHEMA)
 
     def _add_columns(self) -> None:
         for table, column, declaration in ADDED_COLUMNS:
@@ -272,27 +305,29 @@ def _known_columns() -> frozenset[str]:
     try:
         conn.executescript(SCHEMA)
         conn.executescript(TRACE_SCHEMA)
+        conn.executescript(FORUM_SCHEMA)
         return frozenset(_columns(conn) | {f"{table}.{column}" for table, column, _ in ADDED_COLUMNS})
     finally:
         conn.close()
 
 
 def known_columns() -> frozenset[str]:
-    """Every "table.column" this version creates in a session database: SCHEMA, the trace tables and
-    ADDED_COLUMNS."""
+    """Every "table.column" this version creates in a session database: SCHEMA, the trace tables, the thread mode's
+    tables (FORUM_SCHEMA: this version accepts the files of both modes) and ADDED_COLUMNS."""
     return _known_columns()
 
 
 @functools.lru_cache(maxsize=1)
 def known_objects() -> frozenset[tuple[str, str]]:
-    """Every (type, name) of the indexes, triggers and views this version creates in a session database (SCHEMA
-    and the trace tables); SQLite's own automatic indexes are not listed."""
+    """Every (type, name) of the indexes, triggers and views this version creates in a session database (SCHEMA,
+    the trace tables and FORUM_SCHEMA); SQLite's own automatic indexes are not listed."""
     from .tracing import SCHEMA as TRACE_SCHEMA  # tracing imports this module
 
     conn = sqlite3.connect(":memory:")
     try:
         conn.executescript(SCHEMA)
         conn.executescript(TRACE_SCHEMA)
+        conn.executescript(FORUM_SCHEMA)
         return frozenset((str(t), str(n)) for t, n in conn.execute(
             "SELECT type, name FROM sqlite_master WHERE type IN ('index', 'trigger', 'view') AND name NOT LIKE "
             "'sqlite\\_%' ESCAPE '\\'"))
@@ -318,9 +353,9 @@ def unknown_columns(source: Source) -> list[str]:
 
 def max_tools_revision(source: Source) -> int | None:
     """The highest frozen tool-set revision stored in the database's kv (`tools:<member>` records {"rev", ...},
-    tools/frozen.py), None when no member has one (or the file has no kv table). A revision above
-    frozen.TOOLSET_REVISION was written by a newer DreamTeam. Records that are not JSON or carry no integer "rev"
-    are ignored."""
+    tools/frozen.py; a record without "mode" is a board one, docs/SPEC.md §22.1), None when no member has one (or
+    the file has no kv table). One numbering serves both modes: a revision above frozen.NEWEST_REVISION was written by
+    a newer DreamTeam. Records that are not JSON or carry no integer "rev" are ignored."""
     from .tools.frozen import KV_PREFIX  # the tools package imports this module
 
     best: int | None = None
@@ -371,6 +406,24 @@ def made_by_earlier_version(source: Source) -> bool:
                 if agent not in usable:
                     return True
     return False
+
+
+def session_mode(source: Source) -> str:
+    """The mode kv `swarm_mode` of a session database records (docs/SPEC.md §22.1), read only: `source` is a file
+    path (never created, nothing written next to it), a sqlite3 connection or a Database. "board" when the file, the
+    kv table or the key is missing, or the value is not a JSON string; any other string is returned as stored (a mode
+    of a newer DreamTeam is the caller's to refuse). sqlite3.Error reaches the caller."""
+    if not isinstance(source, (Database, sqlite3.Connection)) and not Path(source).is_file():
+        return "board"
+    with _reading(source) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'kv'").fetchone():
+            return "board"
+        row = conn.execute("SELECT value FROM kv WHERE key = ?", (MODE_KEY,)).fetchone()
+    try:
+        value = json.loads(row[0]) if row is not None and isinstance(row[0], (str, bytes)) else None
+    except ValueError:
+        return "board"
+    return value if isinstance(value, str) else "board"
 
 
 def remap_sql(table: str, column: str, mapping: dict[str, str]) -> tuple[str, list[str]]:

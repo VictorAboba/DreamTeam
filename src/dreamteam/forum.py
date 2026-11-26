@@ -1,0 +1,689 @@
+"""The thread mode's posts, comments, votes and subscriptions (docs/SPEC.md §22.2): swarm.forum.
+
+Every write runs in one db transaction and emits its event after it. Who is told of an event (§22.3) is
+`Forum._deliver`, a hook of the next stage."""
+
+from __future__ import annotations
+
+import re
+import sqlite3
+import time
+import types
+from typing import Any, Iterable
+
+from . import prompts
+from .board import MAX_POST, MAX_TITLE, SIMILAR_MAX, _as_int, _clip, find_mentions, similar_items
+from .db import Database, dumps, loads
+from .models import USER, AgentKind, AgentStatus, ToolError
+
+GOAL_POST = 1                 # the system posts' reserved ids (docs/SPEC.md §22.1)
+PLAN_POST = 2
+SYSTEM_KINDS = ("goal", "plan")
+SUB_KINDS = ("feed", "post", "file", "reactions")
+SUB_MODES = ("wake", "digest")
+RULES = ("democracy", "veto")
+RESET_REASONS = ("new_goal", "reopened", "wrap_up_end")
+VOTE_VALUES = {"like": 1, "dislike": -1, "none": 0}
+FEED_LIMIT = 30               # feed: the default and the largest number of posts shown
+FEED_MAX = 100
+COMMENTS_LIMIT = 200
+SIMILAR_CANDIDATES = 200      # similar_open: the most recently active posts compared
+SIMILAR_GOAL_CHARS = 300      # ... a post's "goal": its first paragraph, cut to this
+GOAL_TARGET = f"p{GOAL_POST}"
+
+_TARGET = re.compile(r"(?:#|p)(\d+)|c(\d+)", re.IGNORECASE)
+_POST_ID = re.compile(r"[#p]?(\d+)", re.IGNORECASE)
+_PARAGRAPH = re.compile(r"\n[ \t]*\n")
+_POST_SQL = """SELECT p.*,
+    (SELECT COUNT(*) FROM votes WHERE target = 'p' || p.id AND value > 0) AS likes,
+    (SELECT COUNT(*) FROM votes WHERE target = 'p' || p.id AND value < 0) AS dislikes,
+    (SELECT COUNT(*) FROM post_comments WHERE post_id = p.id) AS comments
+    FROM posts p"""
+_COMMENT_SQL = """SELECT c.*,
+    (SELECT COUNT(*) FROM votes WHERE target = 'c' || c.id AND value > 0) AS likes,
+    (SELECT COUNT(*) FROM votes WHERE target = 'c' || c.id AND value < 0) AS dislikes
+    FROM post_comments c"""
+_SYSTEM_FIRST = "CASE p.kind WHEN 'goal' THEN 0 WHEN 'plan' THEN 1 ELSE 2 END, p.active_at DESC, p.id DESC"
+
+# the unsubscribe refusal of the automatic feed row (docs/SPEC.md §22.3), in the caller's language
+_FEED_STAYS = {
+    "en": "The feed cannot be unsubscribed: change its mode (subscribe what=feed mode=digest|wake), or add narrower "
+          "subscriptions.",
+    "ru": "Подписку на ленту нельзя отменить: смени ее режим (subscribe what=feed mode=digest|wake) или добавь более "
+          "узкие подписки.",
+}
+
+
+def _lang(language: str | None) -> str:
+    return language if language in _FEED_STAYS else "en"
+
+
+def t(language: str | None, key: str, **kw: Any) -> str:
+    """A §22.4 text (prompts.TEXTS, THREAD_KEYS of §22.6) in `language`."""
+    return prompts.t(language, key, **kw)
+
+
+def rule_name(language: str | None, rule: str) -> str:
+    """"democracy" | "veto" | "user" in words: rule_democracy, rule_veto, rule_user."""
+    return t(language, f"rule_{rule}")
+
+
+def vote_line(language: str | None, tally: dict) -> str:
+    """The goal vote line of a goal_tally (docs/SPEC.md §22.4): goal_vote_line, or goal_vote_line_veto."""
+    key = "goal_vote_line_veto" if tally["rule"] == "veto" else "goal_vote_line"
+    return t(language, key, rule=rule_name(language, tally["rule"]), counted=tally["counted"],
+             against=len(tally["against"]), needed=tally["needed"], **{"for": len(tally["for"])})
+
+
+def names_or_dash(names: Iterable[str]) -> str:
+    return ", ".join(names) or "—"
+
+
+def decision_of(tally: dict, wrap_up: bool, rule: str | None = None) -> dict:
+    """kv goal's `decision` (docs/SPEC.md §22.1) from a goal_tally; `rule` "user" for the user's completion."""
+    return {"rule": rule or tally["rule"], "for": list(tally["for"]), "against": list(tally["against"]),
+            "counted": tally["counted"], "wrap_up": bool(wrap_up)}
+
+
+def decision_summary(language: str | None, decision: dict) -> str:
+    """The generated summary of a goal decided by the vote: goal_decided, or goal_decided_wrap_up."""
+    key = "goal_decided_wrap_up" if decision.get("wrap_up") else "goal_decided"
+    return t(language, key, rule=rule_name(language, decision["rule"]), n=len(decision["for"]),
+             counted=decision["counted"], names=names_or_dash(decision["for"]),
+             against=names_or_dash(decision["against"]))
+
+
+def user_summary(language: str | None, tally: dict) -> str:
+    """The summary of the user's own completion without words of the user's: goal_completed_by_user."""
+    return t(language, "goal_completed_by_user", vote=vote_line(language, tally))
+
+
+def _rows(source: Any, sql: str, params: tuple = ()) -> list:
+    if isinstance(source, Database):
+        return source.all(sql, params)
+    return source.execute(sql, params).fetchall()
+
+
+def goal_tally(conn: sqlite3.Connection | Database, rule: str) -> dict:
+    """The one vote rule (docs/SPEC.md §22.4), pure: a sqlite3 connection or a Database. The counted voters are the
+    active AI agents in members order; `for` / `against` their likes / dislikes on #1. `met` needs at least one
+    counted voter and one counted like (no vacuous veto)."""
+    if rule not in RULES:
+        raise ValueError(f"goal rule must be 'democracy' or 'veto', got {rule!r}")
+    voters = [row[0] for row in _rows(
+        conn, "SELECT name FROM agents WHERE kind = ? AND status != ? ORDER BY created_at, rowid",
+        (AgentKind.LLM, AgentStatus.RETIRED))]
+    votes = {row[0]: row[1] for row in _rows(conn, "SELECT voter, value FROM votes WHERE target = ?", (GOAL_TARGET,))}
+    yes = [name for name in voters if (votes.get(name) or 0) > 0]
+    no = [name for name in voters if (votes.get(name) or 0) < 0]
+    counted = len(voters)
+    needed = counted if rule == "veto" else counted // 2 + 1
+    return {"rule": rule, "counted": counted, "for": yes, "against": no, "needed": needed,
+            "met": counted >= 1 and len(yes) >= max(1, needed)}
+
+
+def parse_target(target: Any) -> tuple[str, int]:
+    """A vote target: ("p", id) for "#5" / "p5", ("c", id) for "c31"; a bare number is ambiguous."""
+    match = _TARGET.fullmatch(str(target if target is not None else "").strip())
+    if not match:
+        raise ToolError("target must be '#5' for a post or 'c31' for a comment")
+    return ("p", int(match.group(1))) if match.group(1) else ("c", int(match.group(2)))
+
+
+def post_goal(body: str) -> str:
+    """A post's "goal" for the similarity of §12: its first paragraph, cut to SIMILAR_GOAL_CHARS."""
+    return _PARAGRAPH.split((body or "").strip(), maxsplit=1)[0].strip()[:SIMILAR_GOAL_CHARS]
+
+
+def _post_dict(row: Any) -> dict[str, Any]:
+    return {"id": row["id"], "kind": row["kind"], "title": row["title"], "text": row["text"],
+            "author": row["author"], "created_at": row["created_at"], "edited_at": row["edited_at"],
+            "active_at": row["active_at"], "likes": row["likes"], "dislikes": row["dislikes"],
+            "comments": row["comments"]}
+
+
+def _comment_dict(row: Any) -> dict[str, Any]:
+    return {"id": row["id"], "post_id": row["post_id"], "author": row["author"], "text": row["text"],
+            "reply_to": row["reply_to"], "ts": row["ts"], "likes": row["likes"], "dislikes": row["dislikes"]}
+
+
+def _check_title(title: Any) -> str:
+    value = str(title if title is not None else "").strip()
+    if not value:
+        raise ToolError("Post title must not be empty.")
+    if "\n" in value or "\r" in value:
+        raise ToolError("The title is one line; put the rest into the text.")
+    if len(value) > MAX_TITLE:
+        raise ToolError(f"Post title is too long ({len(value)} chars, max {MAX_TITLE}). Keep it short and put "
+                        "details into the text.")
+    return value
+
+
+def _check_text(value: Any) -> str:
+    body = str(value if value is not None else "").strip()
+    if len(body) > MAX_POST:
+        raise ToolError(f"Post is too long ({len(body)} chars, max {MAX_POST}). Put long content into a workspace "
+                        "file and post its path.")
+    return body
+
+
+def _check_comment(value: Any) -> str:
+    body = str(value if value is not None else "").strip()
+    if not body:
+        raise ToolError("Comment text must not be empty.")
+    if len(body) > MAX_POST:
+        raise ToolError(f"Comment is too long ({len(body)} chars, max {MAX_POST}). Put long content into a "
+                        "workspace file and comment its path.")
+    return body
+
+
+class Forum:
+    """swarm.forum in a thread session (None in a board one)."""
+
+    def __init__(self, swarm: Any) -> None:
+        self.swarm = swarm
+
+    @property
+    def db(self) -> Database:
+        return self.swarm.db
+
+    # --- reads -------------------------------------------------------------------------------------
+
+    def feed(self, *, by: str | None = None, since: float | None = None, query: str | None = None,
+             limit: int = FEED_LIMIT) -> list[dict]:
+        """The system posts first (#1, then #2), then the others by active_at descending (then id descending).
+        `limit` is clamped to 1..FEED_MAX and counts the system posts; `by` keeps one author's posts (so the system
+        posts drop out), `since` the posts active since then, `query` those whose title or text contains it
+        (str.casefold: SQLite's lower knows only ASCII)."""
+        limit = max(1, min(FEED_MAX, _as_int(FEED_LIMIT if limit is None else limit, "limit")))
+        where, params = self._feed_filter(by, since)
+        sql = f"{_POST_SQL}{where} ORDER BY {_SYSTEM_FIRST}"
+        needle = (query or "").strip().casefold()
+        if not needle:
+            return [_post_dict(r) for r in self.db.all(sql + " LIMIT ?", (*params, limit))]
+        out: list[dict] = []
+        for row in self.db.all(sql, params):
+            if needle in row["title"].casefold() or needle in row["text"].casefold():
+                out.append(_post_dict(row))
+                if len(out) >= limit:
+                    break
+        return out
+
+    def feed_total(self, *, by: str | None = None, since: float | None = None, query: str | None = None) -> int:
+        """How many posts `feed` with these filters has in all (its `… and N more`)."""
+        where, params = self._feed_filter(by, since)
+        needle = (query or "").strip().casefold()
+        if not needle:
+            return int(self.db.scalar(f"SELECT COUNT(*) FROM posts p{where}", params) or 0)
+        return sum(1 for row in self.db.all(f"SELECT title, text FROM posts p{where}", params)
+                   if needle in row["title"].casefold() or needle in row["text"].casefold())
+
+    def _feed_filter(self, by: str | None, since: float | None) -> tuple[str, tuple]:
+        where: list[str] = []
+        params: list[Any] = []
+        if by is not None and str(by).strip():
+            where.append("p.author = ?")
+            params.append(self.swarm.resolve_member(by, allow_user=True, allow_retired=True))
+        if since is not None:
+            where.append("p.active_at >= ?")
+            params.append(float(since))
+        return (" WHERE " + " AND ".join(where) if where else ""), tuple(params)
+
+    def counts(self) -> dict[str, int]:
+        """{"posts": the ordinary posts (kind post), "comments": every comment}."""
+        return {"posts": int(self.db.scalar("SELECT COUNT(*) FROM posts WHERE kind = 'post'") or 0),
+                "comments": int(self.db.scalar("SELECT COUNT(*) FROM post_comments") or 0)}
+
+    def get(self, post_id: int) -> dict:
+        """A post dict; ToolError "No post #N"."""
+        pid = _as_int(post_id, "post_id")
+        row = self.db.one(f"{_POST_SQL} WHERE p.id = ?", (pid,))
+        if row is None:
+            raise ToolError(f"No post #{pid}")
+        return _post_dict(row)
+
+    def has_post(self, post_id: int) -> bool:
+        return self.db.one("SELECT 1 FROM posts WHERE id = ?", (post_id,)) is not None
+
+    def comments(self, post_id: int, since_id: int = 0, limit: int = COMMENTS_LIMIT) -> list[dict]:
+        """The post's comments with id > since_id, ascending ids, at most `limit`; since_id must be a comment of
+        the post (else `No comment c31 on #9`)."""
+        post = self.get(post_id)
+        since = _as_int(since_id or 0, "since_id")
+        if since:
+            self._comment_of(post["id"], since)
+        limit = max(1, _as_int(COMMENTS_LIMIT if limit is None else limit, "limit"))
+        return [_comment_dict(r) for r in self.db.all(
+            f"{_COMMENT_SQL} WHERE c.post_id = ? AND c.id > ? ORDER BY c.id ASC LIMIT ?", (post["id"], since, limit))]
+
+    def comment_get(self, comment_id: int) -> dict:
+        """A comment dict; ToolError "No comment cN"."""
+        cid = _as_int(comment_id, "comment_id")
+        row = self.db.one(f"{_COMMENT_SQL} WHERE c.id = ?", (cid,))
+        if row is None:
+            raise ToolError(f"No comment c{cid}")
+        return _comment_dict(row)
+
+    def _comment_of(self, post_id: int, comment_id: int) -> Any:
+        row = self.db.one("SELECT * FROM post_comments WHERE id = ? AND post_id = ?", (comment_id, post_id))
+        if row is None:
+            raise ToolError(f"No comment c{comment_id} on #{post_id}")
+        return row
+
+    def votes(self, target: str) -> list[dict]:
+        """The voters of a target ("p9" / "c31") in the order they voted: {voter, value, counted}; `counted` only on
+        #1, for an active AI agent."""
+        kind, item = parse_target(target)
+        key = f"{kind}{item}"
+        counted = self._counted_voters() if key == GOAL_TARGET else set()
+        return [{"voter": r["voter"], "value": "like" if r["value"] > 0 else "dislike",
+                 "counted": r["voter"] in counted}
+                for r in self.db.all("SELECT voter, value FROM votes WHERE target = ? ORDER BY ts, rowid", (key,))]
+
+    def my_vote(self, actor: str, target: str) -> str | None:
+        """The actor's vote on a target: "like", "dislike" or None."""
+        kind, item = parse_target(target)
+        value = self.db.scalar("SELECT value FROM votes WHERE target = ? AND voter = ?", (f"{kind}{item}", actor))
+        return None if not value else ("like" if value > 0 else "dislike")
+
+    def plan_data(self) -> dict | None:
+        """#2's data {"clarify", "asker"}, None while there is no #2."""
+        row = self.db.one("SELECT data FROM posts WHERE id = ?", (PLAN_POST,))
+        return None if row is None else (loads(row["data"]) or {"clarify": False, "asker": None})
+
+    def plan_since(self) -> float | None:
+        """When the swarm last wrote #2 (its edited_at, else its created_at): the clarify bounds count from it."""
+        row = self.db.one("SELECT created_at, edited_at FROM posts WHERE id = ?", (PLAN_POST,))
+        return None if row is None else (row["edited_at"] or row["created_at"])
+
+    def set_plan_asker(self, name: str | None) -> None:
+        """Writes the kickoff asker into #2's data (its edited_at stays as it is)."""
+        data = self.plan_data()
+        if data is not None:
+            self.db.execute("UPDATE posts SET data = ? WHERE id = ?", (dumps({**data, "asker": name}), PLAN_POST))
+
+    # --- posts and comments ------------------------------------------------------------------------
+
+    def create(self, actor: str, title: str, text: str) -> dict:
+        """A post of kind `post` by a member or USER; the text may be empty (a title-only post)."""
+        self._check_actor(actor)
+        title, body = _check_title(title), _check_text(text)
+        now = time.time()
+        with self.db.transaction() as db:
+            pid = db.insert("INSERT INTO posts(author, kind, title, text, created_at, active_at) "
+                            "VALUES (?, 'post', ?, ?, ?, ?)", (actor, title, body, now, now))
+        post = self.get(pid)
+        event = self.swarm.bus.emit("post.created", actor, post=post)
+        self._deliver(event, self._mentioned(actor, f"{title}\n{body}"))
+        return post
+
+    def update(self, actor: str, post_id: int, *, title: str | None = None, text: str | None = None) -> dict:
+        """An edit by the post's author or USER; the system posts are the swarm's. The result is the post dict with
+        "changes", the fields that changed ([] when the values equal the current ones: no event)."""
+        self._check_actor(actor)
+        post = self.get(post_id)
+        if post["kind"] in SYSTEM_KINDS:
+            raise ToolError(f"#{post['id']} is a system post: the swarm writes it from the goal; comment on it "
+                            "instead.")
+        if actor != USER and post["author"] != actor:
+            raise ToolError(f"#{post['id']} is {post['author']}'s post: only its author edits it; comment on it "
+                            "instead.")
+        if title is None and text is None:
+            raise ToolError("Pass title or text.")
+        values: dict[str, str] = {}
+        if title is not None:
+            values["title"] = _check_title(title)
+        if text is not None:
+            values["text"] = _check_text(text)
+        changes = [key for key in ("title", "text") if key in values and values[key] != post[key]]
+        if not changes:
+            return {**post, "changes": []}
+        now = time.time()
+        sets = ", ".join(f"{key} = ?" for key in changes)
+        with self.db.transaction() as db:
+            db.execute(f"UPDATE posts SET {sets}, edited_at = ?, active_at = ? WHERE id = ?",
+                       (*(values[key] for key in changes), now, now, post["id"]))
+        new = self.get(post["id"])
+        event = self.swarm.bus.emit("post.updated", actor, post=new, changes=changes)
+        before = f"{post['title']}\n{post['text']}"
+        self._deliver(event, self._mentioned(actor, f"{new['title']}\n{new['text']}", before))
+        return {**new, "changes": changes}
+
+    def comment(self, actor: str, post_id: int, text: str, reply_to: int | None = None) -> dict:
+        """A comment on any existing post (the system posts too, also while the goal is done); `reply_to` a comment
+        of the same post. Sets the post's active_at."""
+        self._check_actor(actor)
+        post = self.get(post_id)
+        body = _check_comment(text)
+        reply = None
+        if reply_to is not None and str(reply_to).strip():
+            reply = _as_int(reply_to, "reply_to")
+            self._comment_of(post["id"], reply)
+        event, comment = self._insert_comment(actor, post["id"], body, reply)
+        self._deliver(event, self._mentioned(actor, body))
+        return comment
+
+    def _insert_comment(self, actor: str, post_id: int, body: str, reply: int | None) -> tuple[dict, dict]:
+        now = time.time()
+        with self.db.transaction() as db:
+            cid = db.insert("INSERT INTO post_comments(post_id, author, text, reply_to, ts) VALUES (?, ?, ?, ?, ?)",
+                            (post_id, actor, body, reply, now))
+            db.execute("UPDATE posts SET active_at = ? WHERE id = ?", (now, post_id))
+        comment = self.comment_get(cid)
+        return self.swarm.bus.emit("post.comment", actor, post_id=post_id, comment=comment), comment
+
+    def vote(self, actor: str, target: str, value: str) -> dict:
+        """value "like" | "dislike" | "none" (withdraw). The result {target, value, likes, dislikes, changed}: `value`
+        the actor's vote after the call, `changed` false when it changed nothing (no event); on #1 also "goal_vote"
+        (after the vote) and "decided" (this vote completed the goal)."""
+        self._check_actor(actor)
+        kind, item = parse_target(target)
+        choice = str(value if value is not None else "").strip().lower()
+        if choice not in VOTE_VALUES:
+            raise ToolError("value must be like, dislike or none")
+        if kind == "p":
+            author = self.get(item)["author"]
+        else:
+            author = self.comment_get(item)["author"]
+        key = f"{kind}{item}"
+        if author is not None and author == actor:
+            raise ToolError(f"You cannot vote on your own {'post' if kind == 'p' else 'comment'}.")
+        if key == GOAL_TARGET and (self.swarm.goal() or {}).get("status") != "active":
+            raise ToolError("The goal is already reached: #1 is closed for votes until the goal is reopened.")
+        wanted = VOTE_VALUES[choice]
+        with self.db.transaction() as db:
+            old = db.scalar("SELECT value FROM votes WHERE target = ? AND voter = ?", (key, actor)) or 0
+            changed = old != wanted
+            if changed and wanted:
+                db.execute("INSERT INTO votes(target, voter, value, ts) VALUES (?, ?, ?, ?) ON CONFLICT(target, voter) "
+                           "DO UPDATE SET value = excluded.value, ts = excluded.ts", (key, actor, wanted, time.time()))
+            elif changed:
+                db.execute("DELETE FROM votes WHERE target = ? AND voter = ?", (key, actor))
+        likes, dislikes = self._counts(key)
+        result: dict[str, Any] = {"target": key, "value": choice, "likes": likes, "dislikes": dislikes,
+                                  "changed": changed}
+        if changed:
+            event = self.swarm.bus.emit("post.vote", actor, target=key, voter=actor, value=choice, likes=likes,
+                                        dislikes=dislikes)
+            self._deliver(event)
+        if key == GOAL_TARGET:
+            result["goal_vote"] = self.goal_vote()
+            result["decided"] = self.recheck_goal(actor if actor in self._counted_voters() else None)
+        return result
+
+    def _counts(self, key: str) -> tuple[int, int]:
+        row = self.db.one("SELECT COALESCE(SUM(value > 0), 0) AS likes, COALESCE(SUM(value < 0), 0) AS dislikes "
+                          "FROM votes WHERE target = ?", (key,))
+        return int(row["likes"]), int(row["dislikes"])
+
+    def similar_open(self, post: dict) -> list[dict]:
+        """Posts that look like `post` (board.similar_items over the SIMILAR_CANDIDATES most recently active posts
+        of kind post, without the post itself and its author's own), best first, then the lower id; at most
+        SIMILAR_MAX. A post's goal is its first paragraph (post_goal)."""
+        rows = self.db.all(
+            "SELECT id, title, text FROM posts WHERE kind = 'post' AND id != ? AND (author IS NULL OR author != ?) "
+            "ORDER BY active_at DESC, id DESC LIMIT ?", (post["id"], post.get("author") or "", SIMILAR_CANDIDATES))
+        items = [types.SimpleNamespace(id=r["id"], title=r["title"], goal=post_goal(r["text"])) for r in rows]
+        hits = similar_items(post["title"], post_goal(post.get("text") or ""), items, limit=SIMILAR_MAX)
+        return [self.get(hit.id) for hit in hits]
+
+    # --- subscriptions (the data; who gets what is §22.3) ---------------------------------------------------
+
+    def subscriptions(self, member: str) -> list[dict]:
+        """The member's rows by id; `by_former` marks a `by` that names a former (retired) member."""
+        return [self._sub_dict(r) for r in self.db.all(
+            "SELECT * FROM subscriptions WHERE member = ? ORDER BY id", (member,))]
+
+    def subscribe(self, actor: str, kind: str, target: str | None = None, by: str | None = None,
+                  mode: str = "wake") -> dict:
+        """Creates the caller's row, or changes the mode of its row with the same (kind, target, by); the result is
+        the subscription with "op": created | changed | unchanged."""
+        member = self._check_subscriber(actor)
+        kind = str(kind or "").strip().lower()
+        if kind not in SUB_KINDS:
+            raise ToolError("what must be feed, post, file or reactions")
+        mode = str(mode or "wake").strip().lower()
+        if mode not in SUB_MODES:
+            raise ToolError("mode must be wake or digest")
+        key = self._sub_target(kind, target)
+        by_member = ""
+        if by is not None and str(by).strip():
+            by_member = self.swarm.resolve_member(by, allow_user=True, allow_retired=False)
+            if by_member == member:
+                raise ToolError("You never get your own events: by cannot be yourself.")
+        with self.db.transaction() as db:
+            row = db.one("SELECT * FROM subscriptions WHERE member = ? AND kind = ? AND target = ? AND by_member = ?",
+                         (member, kind, key, by_member))
+            if row is None:
+                op = "created"
+                db.execute("INSERT INTO subscriptions(member, kind, target, by_member, mode, auto, created_at) "
+                           "VALUES (?, ?, ?, ?, ?, 0, ?) ON CONFLICT(member, kind, target, by_member) "
+                           "DO UPDATE SET mode = excluded.mode", (member, kind, key, by_member, mode, time.time()))
+            elif row["mode"] != mode:
+                op = "changed"
+                db.execute("UPDATE subscriptions SET mode = ? WHERE id = ?", (mode, row["id"]))
+            else:
+                op = "unchanged"
+            sub_id = db.scalar("SELECT id FROM subscriptions WHERE member = ? AND kind = ? AND target = ? AND "
+                               "by_member = ?", (member, kind, key, by_member))
+        sub = self._sub(sub_id)
+        if op != "unchanged":
+            self.swarm.bus.emit("subscription.changed", member, member=member, subscription=sub, op=op)
+        return {**sub, "op": op}
+
+    def unsubscribe(self, actor: str, subscription_id: int) -> None:
+        """Removes one of the caller's rows; its feed row (no by) stays: only its mode changes."""
+        member = self._check_subscriber(actor)
+        sid = _as_int(subscription_id, "subscription_id")
+        row = self.db.one("SELECT * FROM subscriptions WHERE id = ? AND member = ?", (sid, member))
+        if row is None:
+            raise ToolError(f"No subscription s{sid} of yours")
+        if row["kind"] == "feed" and row["target"] == "" and row["by_member"] == "":
+            raise ToolError(_FEED_STAYS[_lang(self.swarm.language_of(member))])
+        sub = self._sub_dict(row)
+        with self.db.transaction() as db:
+            db.execute("DELETE FROM subscriptions WHERE id = ?", (sid,))
+        self.swarm.bus.emit("subscription.changed", member, member=member, subscription=sub, op="removed")
+
+    def auto_subscribe(self, member: str) -> None:
+        """The automatic rows of a new member (docs/SPEC.md §22.3): feed, reactions, #1 and #2, all digest; the rows
+        it has already stay as they are."""
+        now = time.time()
+        created: list[int] = []
+        with self.db.transaction() as db:
+            for kind, target in (("feed", ""), ("reactions", ""), ("post", str(GOAL_POST)), ("post", str(PLAN_POST))):
+                cursor = db.execute(
+                    "INSERT INTO subscriptions(member, kind, target, by_member, mode, auto, created_at) "
+                    "VALUES (?, ?, ?, '', 'digest', 1, ?) ON CONFLICT DO NOTHING", (member, kind, target, now))
+                if cursor.rowcount == 1:
+                    created.append(int(cursor.lastrowid))
+        for sid in created:
+            self.swarm.bus.emit("subscription.changed", None, member=member, subscription=self._sub(sid), op="created")
+
+    def drop_subscriptions(self, member: str) -> int:
+        """At retire: every row of the member, the feed one too; one subscription.changed with the count."""
+        with self.db.transaction() as db:
+            count = db.execute("DELETE FROM subscriptions WHERE member = ?", (member,)).rowcount
+        self.swarm.bus.emit("subscription.changed", None, member=member, op="removed", count=count)
+        return count
+
+    def _sub(self, sid: int) -> dict:
+        return self._sub_dict(self.db.one("SELECT * FROM subscriptions WHERE id = ?", (sid,)))
+
+    def _sub_dict(self, row: Any) -> dict:
+        by = row["by_member"]
+        return {"id": row["id"], "member": row["member"], "kind": row["kind"], "target": row["target"], "by": by,
+                "mode": row["mode"], "auto": bool(row["auto"]), "created_at": row["created_at"],
+                "by_former": bool(by) and by != USER and not self.swarm.is_member(by)}
+
+    def _sub_target(self, kind: str, target: Any) -> str:
+        raw = str(target if target is not None else "").strip()
+        if kind in ("feed", "reactions"):
+            if raw:
+                raise ToolError("target is only for what=post or what=file")
+            return ""
+        if kind == "post":
+            match = _POST_ID.fullmatch(raw)
+            if not match:
+                raise ToolError("what=post needs target: a post number such as #9")
+            pid = int(match.group(1))
+            if not self.has_post(pid):
+                raise ToolError(f"No post #{pid}")
+            return str(pid)
+        if raw in ("", ".", "/"):
+            return ""
+        workspace = self.swarm.workspace
+        rel = workspace.rel(workspace.resolve(raw))
+        return "" if rel == "." else rel.rstrip("/")
+
+    # --- the goal and its vote (docs/SPEC.md §22.4) --------------------------------------------------------
+
+    def goal_vote(self) -> dict | None:
+        """goal_tally of the session's rule; None while there is no #1."""
+        if not self.has_post(GOAL_POST):
+            return None
+        return goal_tally(self.db, self.swarm.goal_rule)
+
+    def recheck_goal(self, actor: str | None) -> bool:
+        """Completes the active goal when the vote meets the rule: decision and the generated summary go to
+        swarm.complete_goal; True when it did."""
+        tally = self.goal_vote()
+        goal = self.swarm.goal()
+        if not tally or not tally["met"] or not goal or goal.get("status") != "active":
+            return False
+        decision = decision_of(tally, self.swarm.wrapping_up)
+        self.swarm.complete_goal(actor, decision_summary(self.swarm.language, decision), decision=decision)
+        return True
+
+    def ensure_system_posts(self, goal: dict) -> bool:
+        """Creates #1 and #2 for the goal when the forum has none (True), else rewrites their texts for it (False):
+        one post.updated each, then the votes on #1 reset. #2's data is decided again each time."""
+        lang = self.swarm.language
+        goal_text = self._goal_text(goal)
+        plan_text = self._plan_text(goal)
+        clarify = bool(self.swarm.clarifying)
+        data = dumps({"clarify": clarify, "asker": self._first_llm() if clarify else None})
+        now = time.time()
+        rows = [(GOAL_POST, "goal", t(lang, "post_goal_title"), goal_text, None),
+                (PLAN_POST, "plan", t(lang, "post_plan_title"), plan_text, data)]
+        created: list[int] = []
+        rewritten: list[int] = []
+        with self.db.transaction() as db:
+            for pid, kind, title, body, extra in rows:
+                if db.one("SELECT 1 FROM posts WHERE id = ?", (pid,)) is None:
+                    db.execute("INSERT INTO posts(id, author, kind, title, text, data, created_at, active_at) "
+                               "VALUES (?, NULL, ?, ?, ?, ?, ?, ?)", (pid, kind, title, body, extra, now, now))
+                    created.append(pid)
+                else:
+                    db.execute("UPDATE posts SET text = ?, data = ?, edited_at = ?, active_at = ? WHERE id = ?",
+                               (body, extra, now, now, pid))
+                    rewritten.append(pid)
+        for pid in created:
+            self.swarm.bus.emit("post.created", None, post=self.get(pid))
+        for pid in rewritten:
+            self.swarm.bus.emit("post.updated", None, post=self.get(pid), changes=["text"])
+        if rewritten:
+            self.reset_goal_votes(None, "new_goal")
+        return GOAL_POST in created
+
+    def rewrite_goal_rule(self) -> bool:
+        """#1's text for the current Swarm.goal_rule; True when it changed (votes, #2 and comments stay)."""
+        goal = self.swarm.goal()
+        row = self.db.one("SELECT text FROM posts WHERE id = ?", (GOAL_POST,))
+        if row is None or not goal:
+            return False
+        body = self._goal_text(goal)
+        if body == row["text"]:
+            return False
+        now = time.time()
+        with self.db.transaction() as db:
+            db.execute("UPDATE posts SET text = ?, edited_at = ?, active_at = ? WHERE id = ?",
+                       (body, now, now, GOAL_POST))
+        self.swarm.bus.emit("post.updated", None, post=self.get(GOAL_POST), changes=["text"])
+        return True
+
+    def reset_goal_votes(self, actor: str | None, reason: str) -> None:
+        """Deletes every vote on #1; post.updated of #1 with ["votes"], for "new_goal" and "wrap_up_end" only when
+        it deleted a row, for "reopened" always."""
+        if reason not in RESET_REASONS:
+            raise ValueError(f"unknown reason {reason!r}")
+        if not self.has_post(GOAL_POST):
+            return
+        with self.db.transaction() as db:
+            deleted = db.execute("DELETE FROM votes WHERE target = ?", (GOAL_TARGET,)).rowcount
+        if deleted or reason == "reopened":
+            self.swarm.bus.emit("post.updated", actor, post=self.get(GOAL_POST), changes=["votes"])
+
+    def reopen(self, actor: str, comment: str) -> None:
+        """The thread part of reopen_goal: the votes on #1 reset, and the comment (stripped, unless "" or "-")
+        posted on #1 by USER, cut to MAX_POST, never refused."""
+        self.reset_goal_votes(actor, "reopened")
+        body = (comment or "").strip()
+        if not body or body == "-" or not self.has_post(GOAL_POST):
+            return
+        event, _ = self._insert_comment(USER, GOAL_POST, _clip(body, MAX_POST), None)
+        # the LLM members get the reopen's own waking notice in place of an f_* item (docs/SPEC.md §22.4)
+        self._deliver(event, self._mentioned(USER, body), llm_quiet=True)
+
+    def _goal_text(self, goal: dict) -> str:
+        lang = self.swarm.language
+        return self._with_description(lang, "post_goal_text", goal, rule=rule_name(lang, self.swarm.goal_rule))
+
+    def _plan_text(self, goal: dict) -> str:
+        lang = self.swarm.language
+        body = self._with_description(lang, "post_plan_text", goal)
+        if self.swarm.clarifying:
+            body += "\n\n" + t(lang, "post_plan_clarify")
+        return body
+
+    @staticmethod
+    def _with_description(lang: str, key: str, goal: dict, **kw: Any) -> str:
+        """A system post's text with the goal's whole description; without one its blank paragraph goes."""
+        description = (goal.get("description") or "").strip()
+        marker = "\x00"
+        body = t(lang, key, title=goal.get("title", ""), description=description or marker, **kw)
+        return body if description else re.sub(r"\n*\x00\n*", "\n\n", body).strip()
+
+    def _first_llm(self) -> str | None:
+        for m in self.swarm.members():
+            if m["kind"] == AgentKind.LLM:
+                return m["name"]
+        return None
+
+    def _counted_voters(self) -> set[str]:
+        return {r["name"] for r in self.db.all("SELECT name FROM agents WHERE kind = ? AND status != ?",
+                                               (AgentKind.LLM, AgentStatus.RETIRED))}
+
+    # --- actors, mentions, delivery --------------------------------------------------------------------------
+
+    def _check_actor(self, actor: str) -> None:
+        if actor != USER and not self.swarm.is_member(actor):
+            raise ToolError(f"'{actor}' is not an active member of the swarm.")
+
+    def _check_subscriber(self, actor: str) -> str:
+        if actor == USER:
+            raise ToolError("The user has no subscriptions.")
+        self._check_actor(actor)
+        return actor
+
+    def _mentioned(self, actor: str, body: str, before: str = "") -> list[str]:
+        """The @mentions of `body` (board.find_mentions, retired names in the matching), without the ones `before`
+        had, the actor, non-members and retired members; USER for @user / @пользователь."""
+        names = [m["name"] for m in self.swarm.members(include_retired=True)]
+        found = find_mentions(body, names)
+        if before:
+            old = set(find_mentions(before, names))
+            found = [name for name in found if name not in old]
+        return [name for name in found if name != actor and (name == USER or self.swarm.is_member(name))]
+
+    def _deliver(self, event: dict, mentioned: list[str] | tuple[str, ...] = (), *, llm_quiet: bool = False) -> None:
+        """The fan-out of a forum event to the members and USER (docs/SPEC.md §22.3): a mentioned recipient's
+        f_mention first, then the subscriptions' f_* items. `llm_quiet`: the LLM members get nothing (reopen's
+        comment).
+        TODO(stage 2): the delivery of §22.3; until then nobody is told."""
+        return None
+
+    def _on_event(self, event: dict) -> None:
+        """The bus listener for file.changed / files.committed (docs/SPEC.md §22.3).
+        TODO(stage 2): registered by the swarm with the file subscriptions' delivery."""
+        return None

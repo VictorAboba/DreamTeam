@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..models import USER, ToolError
-from . import ToolContext, tool
+from . import ToolContext, swapped, tool
 from .fmt import message_line
 
 # The result notes of send_message(pause_swarm=true), by Swarm.ask_user's outcome ("asked" by the caller's kind: an
@@ -38,27 +38,35 @@ ANSWER_NOTES = {
 }
 
 
+_SEND_EN = (
+    "Send a direct message to one or several members (array of names), to [\"all\"] (every member) or to "
+    "[\"user\"] (the human). Use it to coordinate, ask, hand off and report: plain text replies reach nobody. "
+    "Every message wakes its recipients: no greetings, thanks or acknowledgements. About a specific task, "
+    "prefer task_comment. pause_swarm=true is only for a question to [\"user\"] whose answer decides how the "
+    "team goes on, so that work already under way would otherwise be redone: the session may then pause the "
+    "whole swarm until the user answers, and every member gets your question with the answer. Never use it for "
+    "what you can decide yourself, for a question that concerns only your own task, or for a report. Ask "
+    "everything in that one message and make it the only tool call of your response: the result says whether "
+    "the swarm was paused; if it was not, go on with the work that doesn't depend on the answer."
+)
+_SEND_RU = (
+    "Отправить личное сообщение одному или нескольким участникам (массив имён), всем — [\"all\"], или "
+    "пользователю — [\"user\"]. Используй для координации, вопросов, передачи работы и отчётов: обычный "
+    "текстовый ответ никому не доставляется. Каждое сообщение будит получателей: без приветствий, "
+    "благодарностей и подтверждений. О конкретной задаче лучше пиши через task_comment. pause_swarm=true — "
+    "только для вопроса к [\"user\"], от ответа на который зависит, как команда продолжит работу, так что иначе "
+    "уже начатую работу пришлось бы переделывать: тогда сессия может поставить весь рой на паузу до ответа "
+    "пользователя, и твой вопрос вместе с ответом получат все участники. Никогда не используй его для того, что "
+    "можешь решить сам, для вопроса только о своей задаче и для отчётов. Задай все вопросы в этом одном "
+    "сообщении и сделай его единственным вызовом инструмента в ответе: результат скажет, встал ли рой на паузу; "
+    "если нет, продолжай работу, которая не зависит от ответа."
+)
+
+
 @tool(
     "send_message",
-    en="Send a direct message to one or several members (array of names), to [\"all\"] (every member) or to "
-       "[\"user\"] (the human). Use it to coordinate, ask, hand off and report: plain text replies reach nobody. "
-       "Every message wakes its recipients: no greetings, thanks or acknowledgements. About a specific task, "
-       "prefer task_comment. pause_swarm=true is only for a question to [\"user\"] whose answer decides how the "
-       "team goes on, so that work already under way would otherwise be redone: the session may then pause the "
-       "whole swarm until the user answers, and every member gets your question with the answer. Never use it for "
-       "what you can decide yourself, for a question that concerns only your own task, or for a report. Ask "
-       "everything in that one message and make it the only tool call of your response: the result says whether "
-       "the swarm was paused; if it was not, go on with the work that doesn't depend on the answer.",
-    ru="Отправить личное сообщение одному или нескольким участникам (массив имён), всем — [\"all\"], или "
-       "пользователю — [\"user\"]. Используй для координации, вопросов, передачи работы и отчётов: обычный "
-       "текстовый ответ никому не доставляется. Каждое сообщение будит получателей: без приветствий, "
-       "благодарностей и подтверждений. О конкретной задаче лучше пиши через task_comment. pause_swarm=true — "
-       "только для вопроса к [\"user\"], от ответа на который зависит, как команда продолжит работу, так что иначе "
-       "уже начатую работу пришлось бы переделывать: тогда сессия может поставить весь рой на паузу до ответа "
-       "пользователя, и твой вопрос вместе с ответом получат все участники. Никогда не используй его для того, что "
-       "можешь решить сам, для вопроса только о своей задаче и для отчётов. Задай все вопросы в этом одном "
-       "сообщении и сделай его единственным вызовом инструмента в ответе: результат скажет, встал ли рой на паузу; "
-       "если нет, продолжай работу, которая не зависит от ответа.",
+    en=_SEND_EN,
+    ru=_SEND_RU,
     properties={
         "to": {"type": "array", "items": {"type": "string"}, "description": "Recipient names, \"all\" or \"user\""},
         "text": {"type": "string"},
@@ -71,6 +79,19 @@ ANSWER_NOTES = {
                         "yourself."},
     },
     required=["to", "text"],
+    # a thread session has no tasks (docs/SPEC.md §22.5): the rest, properties included, is the board's
+    thread={
+        "en": swapped(_SEND_EN,
+                      ("About a specific task, prefer task_comment.",
+                       "About a specific post, prefer a comment on it (an @mention wakes the one you name)."),
+                      ("for a question that concerns only your own task",
+                       "for a question that concerns only your own work")),
+        "ru": swapped(_SEND_RU,
+                      ("О конкретной задаче лучше пиши через task_comment.",
+                       "О конкретном объявлении лучше напиши комментарий к нему (@упоминание будит того, кого ты "
+                       "назвал)."),
+                      ("для вопроса только о своей задаче", "для вопроса только о своей работе"), plain_e=True),
+    },
 )
 async def send_message(ctx: ToolContext, args: dict[str, Any]) -> str:
     recipients: Any = args["to"]

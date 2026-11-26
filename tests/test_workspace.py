@@ -1385,3 +1385,53 @@ async def test_read_raw(ws):
         ws.read_raw("absent.txt")
     with pytest.raises(ToolError):
         ws.read_raw(".git/HEAD")
+
+
+# --- files.committed (a thread session's workspace, docs/SPEC.md §22.2) -----------------------------------------
+@needs_git
+async def test_files_committed_only_with_commit_events_and_only_for_whole_tree_commits(ws):
+    def committed() -> list[dict]:
+        return ws.swarm.bus.recent(types=("files.committed",), limit=100)
+
+    put(ws, "a.txt", "one\n")
+    assert await ws.autocommit(ANNA, kind="shell", detail="make") and committed() == []  # a board workspace
+    ws.commit_events = True
+    await ws.write(ANNA, "b.txt", "a line that stays the same\n")  # a single-path commit: its file.changed only
+    assert committed() == []
+    put(ws, "a.txt", "two\n")
+    os.replace(ws.root / "b.txt", ws.root / "c.txt")
+    put(ws, ".scratch/anna.smith/tmp.txt", "temporary")
+    sha = await ws.autocommit(ANNA, kind="shell", detail="make")
+    [event] = committed()
+    assert event["actor"] == ANNA and event["data"]["kind"] == "shell" and event["data"]["commit"] == sha
+    assert sorted(event["data"]["files"], key=lambda f: f["path"]) == [{"path": "a.txt", "change": "M"},
+                                                                       {"path": "c.txt", "change": "R"}]
+    assert event["data"]["suspects"] == [ANNA] and "more" not in event["data"]
+    # a new file a job left is held, then committed under its owner: kind "held"
+    put(ws, "out/new.txt", "result\n")
+    assert await ws.autocommit(BORIS, kind="job j1", detail="run", hold=True) is None
+    assert len(committed()) == 1
+    assert await ws.commit_held(None, "when the session stopped")
+    held = committed()[-1]
+    assert held["actor"] == BORIS and held["data"]["kind"] == "held"
+    assert held["data"]["files"] == [{"path": "out/new.txt", "change": "A"}] and held["data"]["suspects"] == [BORIS]
+    # nothing to commit, nothing emitted
+    assert await ws.autocommit(ANNA, kind="shell", detail="true") is None and len(committed()) == 2
+
+
+def test_committed_files_caps_and_names():
+    data = b"M\0a.txt\0R087\0old.txt\0new.txt\0D\0gone.txt\0T\0link\0A\0.scratch/x/y\0"
+    assert workspace_mod.committed_files(data) == [
+        {"path": "a.txt", "change": "M"}, {"path": "new.txt", "change": "R"}, {"path": "gone.txt", "change": "D"},
+        {"path": "link", "change": "M"}]
+    assert workspace_mod.committed_files(b"") == [] and workspace_mod.COMMITTED_FILES_MAX == 200
+
+
+@needs_git
+async def test_files_committed_lists_at_most_200_files(ws):
+    ws.commit_events = True
+    for i in range(205):
+        put(ws, f"many/f{i:03}.txt", f"{i}\n")
+    assert await ws.autocommit(BORIS, kind="job j2", detail="gen")
+    [event] = ws.swarm.bus.recent(types=("files.committed",), limit=10)
+    assert len(event["data"]["files"]) == 200 and event["data"]["more"] == 5 and event["data"]["kind"] == "job j2"

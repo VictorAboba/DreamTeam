@@ -606,6 +606,17 @@ def _ev_notification(ctx: TextContext, ev: dict, d: dict) -> str | None:
     return f"{s['bell']} {ctx.short(text, 0) or kind}"
 
 
+def goal_decision_text(ctx: TextContext, decision: Any) -> str:
+    """How a thread session's goal was decided (its `decision`, docs/SPEC.md §22.4): "by vote (democracy)", "by vote
+    (veto)", "by the user"; "" without a decision (a board session's goal)."""
+    rule = _d(decision).get("rule")
+    if not isinstance(rule, str) or not rule:
+        return ""
+    if rule == "user":
+        return ctx.t("ev_goal_by_user")
+    return ctx.t("ev_goal_by_vote", rule=_status_label(ctx, "ev_rule_", rule))
+
+
 def _ev_goal(ctx: TextContext, ev: dict, d: dict) -> str | None:
     goal = _d(d.get("goal"))
     if not goal:
@@ -615,6 +626,9 @@ def _ev_goal(ctx: TextContext, ev: dict, d: dict) -> str | None:
     if ev.get("type") == "goal.completed" or goal.get("status") == "done":
         summary = ctx.short(_first_line(goal.get("summary")), QUOTE_CHARS)
         line = f"{s['check']} {ctx.t('goal_done')}: {title}"
+        decided = goal_decision_text(ctx, goal.get("decision"))
+        if decided:   # a thread session's goal (docs/SPEC.md §22.2, §22.4): by vote, or by the user
+            line += f" {s['dot']} {decided}"
         return f"{line} {s['dash']} {summary}" if summary else line
     pending = f" ({ctx.t('goal_pending')})" if goal.get("status") == "pending" else ""
     return f"{ctx.t('goal')}{pending}: {title}"
@@ -689,6 +703,148 @@ def _ev_file(ctx: TextContext, ev: dict, d: dict) -> str | None:
     who = d.get("owner") if typ != "file.changed" else ev.get("actor")
     line = f"{ctx.sym['edit']} {clean(d.get('path')) or '?'} {ctx.sym['dash']} {label}"
     return _join(ctx, [line, _who(ctx, who, short=True) if who else ""])
+
+
+# ---- the thread mode's lines (docs/SPEC.md §22.2): the post, the comment, the vote, the subscription, the commit
+def _post_ref(value: Any) -> str:
+    """A vote's target as the forum shows it: "p9" → "#9", "c31" stays; "?" for anything else."""
+    ref = _one_line(value) if isinstance(value, str) else ""
+    if ref[:1] == "p" and ref[1:].isdigit():
+        return "#" + ref[1:]
+    return ref if ref[:1] == "c" and ref[1:].isdigit() else "?"
+
+
+def _post_head(ctx: TextContext, ev: dict, d: dict) -> tuple[dict, str]:
+    """(the post, `#9 "title"`) of post.created: the title only, never the text."""
+    post = _d(d.get("post"))
+    return post, ctx.t("ev_post_created", id=_ref(post.get("id")) or "?",
+                       title=ctx.short(post.get("title"), 0) or ctx.sym["dash"])
+
+
+def _post_author(ctx: TextContext, ev: dict, post: dict) -> str:
+    """The first name of a post's author (USER: "you"); "" for the swarm's system posts (no author, no actor)."""
+    author = post.get("author") or ev.get("actor")
+    return _who(ctx, author, short=True) if author else ""
+
+
+def _comment_head(ctx: TextContext, ev: dict, d: dict) -> tuple[dict, str, str, str]:
+    """(the comment, its author's first name, `#9`, its id: `c31`, `c32 ↳ c31` for a reply) of post.comment."""
+    comment = _d(d.get("comment"))
+    post_id = d.get("post_id") if d.get("post_id") is not None else comment.get("post_id")
+    who = _who(ctx, comment.get("author") or ev.get("actor"), short=True)
+    cid = f"c{_ref(comment.get('id')) or '?'}"
+    reply = _ref(comment.get("reply_to"))
+    if reply:
+        cid += f" {ctx.sym['reply']} c{reply}"
+    return comment, who, f"#{_ref(post_id) or '?'}", cid
+
+
+def _post_updated_text(ctx: TextContext, ev: dict, d: dict) -> str:
+    """`#9 edited — Anna`; a votes-only update (a vote reset on #1) `#1: votes reset`."""
+    post = _d(d.get("post"))
+    pid = _ref(post.get("id")) or "?"
+    changes = [c for c in _list(d.get("changes")) if isinstance(c, str)]
+    if changes and set(changes) == {"votes"}:
+        return ctx.t("ev_post_votes_reset", id=pid)
+    actor = ev.get("actor")
+    line = ctx.t("ev_post_edited", id=pid)
+    return f"{line} {ctx.sym['dash']} {_who(ctx, actor, short=True)}" if actor else line
+
+
+def _vote_text(ctx: TextContext, ev: dict, d: dict) -> tuple[str, str]:
+    """(symbol key, `Anna likes #9` / `Anna dislikes c31` / `Anna withdrew the vote on #9`) of post.vote."""
+    voter = d.get("voter") or ev.get("actor")
+    value = d.get("value") if d.get("value") in ("like", "dislike") else "none"
+    key = "ev_vote_" + value + ("_you" if voter and voter == ctx.me else "")
+    symbol = {"like": "up", "dislike": "down"}.get(value, "dot")
+    return symbol, ctx.t(key, who=_who(ctx, voter, short=True), target=_post_ref(d.get("target")))
+
+
+def _subscription_target(ctx: TextContext, sub: dict) -> str:
+    """What a subscription follows: `#9`, the feed, the reactions, a path or the whole workspace."""
+    kind, target = clean(sub.get("kind")), clean(sub.get("target"))
+    if kind == "post":
+        return f"#{target or '?'}"
+    if kind in ("feed", "reactions"):
+        return ctx.t("ev_sub_" + kind)
+    if kind == "file":
+        return ctx.short(target, 160) if target else ctx.t("ev_sub_workspace")
+    return kind or "?"
+
+
+def _subscription_text(ctx: TextContext, ev: dict, d: dict) -> str:
+    """`Anna follows #9 (wake)` / `Anna follows #9: changed to digest` / `Anna unfollows s12`; a retire's
+    `Anna: 4 subscriptions removed`."""
+    member = d.get("member") or ev.get("actor")
+    who = _who(ctx, member, short=True)
+    you = "_you" if member and member == ctx.me else ""
+    sub = _d(d.get("subscription"))
+    op = d.get("op")
+    if not sub and op == "removed":   # a retire drops every row of the member at once
+        return ctx.tn("n_ev_subs_dropped", _int(d.get("count")), who=who)
+    mode = clean(sub.get("mode")) or "?"
+    if op == "removed":
+        return ctx.t("ev_sub_removed" + you, who=who, id=_ref(sub.get("id")) or "?")
+    target = _subscription_target(ctx, sub)
+    if op == "changed":
+        return ctx.t("ev_sub_changed" + you, who=who, target=target, mode=mode)
+    by = sub.get("by")
+    extra = [mode, ctx.t("ev_sub_by", name=_who(ctx, by, short=True)) if by else "",
+             ctx.t("ev_sub_auto") if sub.get("auto") is True else ""]
+    return ctx.t("ev_sub_created" + you, who=who, target=target, mode=", ".join(part for part in extra if part))
+
+
+def _commit_kind(ctx: TextContext, kind: Any) -> str:
+    """`shell`, `job j3`, `jobs j3, j5` (a session's stop, one owner's jobs together) and `held` in words."""
+    kind = _one_line(kind)
+    if kind.startswith("job "):
+        return ctx.t("ev_commit_job", id=kind[4:].strip() or "?")
+    if kind.startswith("jobs "):
+        return ctx.t("ev_commit_jobs", ids=kind[5:].strip() or "?")
+    return ctx.t("ev_commit_" + kind) if kind in ("shell", "held") else (kind or "?")
+
+
+def _committed_text(ctx: TextContext, ev: dict, d: dict) -> str:
+    """`3 files: src/app.py, … — committed (shell) · Anna`: the files' count, the first path, the kind and the actor
+    (a line next to _ev_file's)."""
+    files = [_d(f) for f in _list(d.get("files"))]
+    count = len(files) + max(0, _int(d.get("more")))
+    first = ctx.short(files[0].get("path"), 160) if files else ""
+    head = ctx.tn("n_ev_files", count)
+    if first:
+        head += f": {first}" + (f", {ctx.sym['ellipsis']}" if count > 1 else "")
+    line = f"{head} {ctx.sym['dash']} {ctx.t('ev_committed', kind=_commit_kind(ctx, d.get('kind')))}"
+    actor = ev.get("actor")
+    return _join(ctx, [line, _who(ctx, actor, short=True) if actor else ""])
+
+
+def _ev_post_created(ctx: TextContext, ev: dict, d: dict) -> str | None:
+    post, head = _post_head(ctx, ev, d)
+    who = _post_author(ctx, ev, post)
+    return f"{ctx.sym['post']} {head}" + (f" {ctx.sym['dash']} {who}" if who else "")
+
+
+def _ev_post_comment(ctx: TextContext, ev: dict, d: dict) -> str | None:
+    comment, who, post, cid = _comment_head(ctx, ev, d)
+    return f"{ctx.sym['chat']} " + ctx.t("ev_post_comment", who=who, post=post, cid=cid,
+                                         text=_quote(ctx, comment.get("text")))
+
+
+def _ev_post_updated(ctx: TextContext, ev: dict, d: dict) -> str | None:
+    return f"{ctx.sym['edit']} {_post_updated_text(ctx, ev, d)}"
+
+
+def _ev_post_vote(ctx: TextContext, ev: dict, d: dict) -> str | None:
+    symbol, text = _vote_text(ctx, ev, d)
+    return f"{ctx.sym[symbol]} {text}"
+
+
+def _ev_subscription(ctx: TextContext, ev: dict, d: dict) -> str | None:
+    return f"{ctx.sym['dot']} {_subscription_text(ctx, ev, d)}"
+
+
+def _ev_files_committed(ctx: TextContext, ev: dict, d: dict) -> str | None:
+    return f"{ctx.sym['edit']} {_committed_text(ctx, ev, d)}"
 
 
 def _ev_trigger(ctx: TextContext, ev: dict, d: dict) -> str | None:
@@ -870,6 +1026,12 @@ _HANDLERS: dict[str, Callable[[TextContext, dict, dict], str | None]] = {
     "file.changed": _ev_file,
     "file.locked": _ev_file,
     "file.unlocked": _ev_file,
+    "post.created": _ev_post_created,
+    "post.updated": _ev_post_updated,
+    "post.comment": _ev_post_comment,
+    "post.vote": _ev_post_vote,
+    "subscription.changed": _ev_subscription,
+    "files.committed": _ev_files_committed,
     "trigger.created": _ev_trigger,
     "trigger.fired": _ev_trigger,
     "trigger.deleted": _ev_trigger,

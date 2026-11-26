@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import dataclasses
 import errno
 import json
 import logging
@@ -48,7 +49,7 @@ from .copyfrom import (_SYSTEM_ROOTS, API_UPLOADS_DIR, COPYING_NAME, SOURCE_SHOW
                        copy_sources, done_with, hub_in_container, left_over, printable_line, resolve_source,
                        source_refusal, source_rules, staging_name, unquote)
 from .folderlist import network_path
-from .db import Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
+from .db import MODE_KEY, MODES, Database, loads, made_by_earlier_version, reading_file, remap_sql, sqlite_uri
 from .events import event_data, read_page
 from .eventtext import without_abs_paths
 from .goal_text import shorten_title, split_goal
@@ -1739,18 +1740,21 @@ class SessionManager:
 
     def _merged(self, raw: dict[str, Any], overrides: Any) -> dict[str, Any]:
         """The raw settings of a (non-legacy) session: the global settings without a goal (a hand-written
-        `swarm.goal` of the home would become every new session's goal) plus its overrides."""
+        `swarm.goal` of the home would become every new session's goal) and without a mode (a session without the
+        override is board in any home, docs/SPEC.md §22.1) plus its overrides."""
         if not isinstance(overrides, dict):
             raise ValueError("The session overrides must be an object")
         base = raw
         swarm = raw.get("swarm")
-        if isinstance(swarm, dict) and ("goal" in swarm or "goal_description" in swarm):
-            base = {**raw, "swarm": {k: v for k, v in swarm.items() if k not in ("goal", "goal_description")}}
+        if isinstance(swarm, dict) and ("goal" in swarm or "goal_description" in swarm or "mode" in swarm):
+            base = {**raw, "swarm": {k: v for k, v in swarm.items() if k not in ("goal", "goal_description", "mode")}}
         return deep_merge(base, overrides)
 
     def _config_from(self, raw: dict[str, Any], sid: str, overrides: dict[str, Any] | None = None) -> Config:
         if sid == LEGACY_ID:
-            return validate(self.home, raw)
+            cfg = validate(self.home, raw)
+            cfg.swarm = dataclasses.replace(cfg.swarm, mode="board")  # `main` is always board (docs/SPEC.md §22.1)
+            return cfg
         if overrides is None:
             overrides = self.meta(sid).get("overrides") or {}
         return validate(self.dir_of(sid), self._merged(raw, overrides))
@@ -2927,7 +2931,7 @@ class SessionManager:
                         raise SessionError(str(exc), exc.status) from None
             if copy_from is not None and copy_from_upload is not None:
                 raise SessionError("Give copy_from or copy_from_upload, not both.")
-            overrides = self.validated_overrides(overrides)
+            overrides = self._mode_overrides(self.validated_overrides(overrides))
             if copy_from is not None:   # the source is refused early, before any work
                 text = os.fspath(copy_from) if isinstance(copy_from, os.PathLike) else copy_from
                 try:
@@ -3069,6 +3073,9 @@ class SessionManager:
             async with self._lock(sid):
                 self._write_meta(sid, meta)
                 try:
+                    if (overrides.get("swarm") or {}).get("mode") == "thread":
+                        # a thread session has its forum tables and its mode from its creation (docs/SPEC.md §22.1)
+                        await asyncio.to_thread(self._make_thread_db, sid)
                     if prepared:  # before the folder: a failure leaves nothing in it; the members find them at the
                         # first start
                         await asyncio.to_thread(self._commit_skills, self.config, prepared, self._data_dir(sid),
@@ -3101,6 +3108,33 @@ class SessionManager:
         if copied is not None:
             summary["copy_result"] = copied[1]
         return summary
+
+    def _mode_overrides(self, overrides: dict[str, Any]) -> dict[str, Any]:
+        """The overrides a new session is created with, for its mode (docs/SPEC.md §22.8): the given `swarm.mode`,
+        else the home's. A thread session stores swarm.mode = "thread" and its frozen goal rule (the given one, else
+        the home's); a board session stores neither (a given "board" and a rule are dropped, no refusal)."""
+        out = copy.deepcopy(overrides)
+        swarm = out.get("swarm") if isinstance(out.get("swarm"), dict) else {}
+        given = swarm.get("mode")
+        mode = given if given in MODES else self.config.swarm.mode
+        if mode == "thread":
+            rule = swarm.get("goal_rule") or self.config.swarm.goal_rule
+            out["swarm"] = {**swarm, "mode": "thread", "goal_rule": rule}
+        elif "swarm" in out:
+            rest = {k: v for k, v in swarm.items() if k not in ("mode", "goal_rule")}
+            if rest:
+                out["swarm"] = rest
+            else:
+                del out["swarm"]
+        return out
+
+    def _make_thread_db(self, sid: str) -> None:
+        """A new thread session's database: the forum tables and kv swarm_mode = "thread" (docs/SPEC.md §22.1)."""
+        db = Database(self._data_dir(sid) / "swarm.db", forum=True)
+        try:
+            db.set(MODE_KEY, "thread")
+        finally:
+            db.close()
 
     def _load_locked(self, sid: str) -> "Swarm":
         """The session's Swarm, constructed if needed. The caller holds the session's lock."""

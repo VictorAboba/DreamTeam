@@ -71,6 +71,26 @@ ACTIONS_HELP = (
     '{"type": "create_task", "title": "...", "goal"?, "description"?, "assignee"?, "tags"?: [...], "priority"?: 0-3}'
 )
 
+# a thread session has no tasks (docs/SPEC.md §22.5 "Triggers in a thread session"): its grammar and actions
+GRAMMAR_THREAD = (
+    "Condition syntax: a Python-like expression with and/or/not, comparisons (== != < <= > >= in, not in), "
+    "literals (numbers, \"strings\", True/False/None, tuples like (1, 2)) and these functions (arguments must be "
+    "literals):\n"
+    "  message(sender=None, contains=None), file_exists(path), file_changed(path) [once the file has stopped "
+    "changing],\n"
+    "  after(\"2026-10-09 18:00\"), elapsed(seconds), every(seconds >= 10), agent_status(name), goal_done()\n"
+    "A thread session has no tasks: follow posts and comments with subscribe and @mentions.\n"
+    "Example: file_exists(\"out/result.json\") or elapsed(1800)"
+)
+
+ACTIONS_HELP_THREAD = (
+    'Actions: {"type": "wake"} | {"type": "message", "to": "Name" or ["A", "B"], "text": "..."} '
+    "(a thread session has no tasks, so no set_status or create_task)"
+)
+# the functions that read tasks, refused in a thread session
+TASK_FUNCTIONS = ("status", "done", "any_done", "finished", "failed", "assignee", "count", "all_done", "comment")
+TASK_ACTIONS = frozenset({"set_status", "create_task"})
+
 DEFAULT_ACTIONS: list[dict[str, Any]] = [{"type": "wake"}]
 
 _FORBIDDEN: dict[type, str] = {
@@ -739,10 +759,17 @@ def _text(index: int, key: str, value: Any, required: bool = True, limit: int | 
     return value
 
 
-def _normalize_action(index: int, action: Any) -> dict[str, Any]:
+def _thread_action_error(index: int, kind: str) -> ToolError:
+    return ToolError(f"Invalid action #{index}: '{kind}' is not available in a thread session (no tasks).\n"
+                     f"{ACTIONS_HELP_THREAD}")
+
+
+def _normalize_action(index: int, action: Any, mode: str = "board") -> dict[str, Any]:
     if not isinstance(action, dict):
         raise _action_error(index, "each action must be an object with a 'type'")
     kind = action.get("type")
+    if mode == "thread" and kind in TASK_ACTIONS:
+        raise _thread_action_error(index, kind)
     allowed = {"wake": set(), "message": {"to", "text"}, "set_status": {"task_id", "status"},
                "create_task": {"title", "goal", "description", "assignee", "tags", "priority"}}
     if not isinstance(kind, str) or kind not in allowed:
@@ -790,12 +817,28 @@ def _normalize_create_task(index: int, action: dict[str, Any]) -> dict[str, Any]
     return out
 
 
-def normalize_actions(actions: Any) -> list[dict[str, Any]]:
+def normalize_actions(actions: Any, mode: str = "board") -> list[dict[str, Any]]:
+    """The actions as stored; a thread session (`mode`) refuses the task actions."""
     if actions is None or actions == []:
         return [dict(a) for a in DEFAULT_ACTIONS]
     if not isinstance(actions, list):
         raise ToolError(f"'actions' must be a list of action objects. {ACTIONS_HELP}")
-    return [_normalize_action(i, a) for i, a in enumerate(actions, start=1)]
+    return [_normalize_action(i, a, mode) for i, a in enumerate(actions, start=1)]
+
+
+def thread_condition_error(source: str) -> ToolError | None:
+    """The refusal of a compiled condition in a thread session: the first call of a task function or bare task
+    status name in a walk of its tree; None when it reads no task."""
+    tree = ast.parse(source, mode="eval")
+    called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in TASK_FUNCTIONS:
+            return ToolError(f"Invalid condition: {node.func.id}() reads tasks, and this session works in the thread "
+                             f"mode (no tasks).\n{GRAMMAR_THREAD}")
+        if isinstance(node, ast.Name) and id(node) not in called and node.id in STATUS_NAMES:
+            return ToolError(f"Invalid condition: '{node.id}' is a task status, and this session has no tasks (quote "
+                             f"an agent status: agent_status(\"Anna Smith\") == \"idle\").\n{GRAMMAR_THREAD}")
+    return None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -870,8 +913,29 @@ class TriggerEngine:
             self._cache[cached.source] = cached
         return cached
 
+    @property
+    def _mode(self) -> str:
+        return getattr(self.swarm, "mode", "board")
+
+    def _compile_for_mode(self, condition: str) -> CompiledCondition:
+        """compile() with a thread session's rules (docs/SPEC.md §22.5): its errors end with GRAMMAR_THREAD (the
+        cache stays mode-blind), and a condition that reads tasks is refused."""
+        if self._mode != "thread":
+            return self.compile(condition)
+        try:
+            compiled = self.compile(condition)
+        except ToolError as exc:
+            text = str(exc)
+            if text.endswith("\n" + GRAMMAR):
+                raise ToolError(text[:-len(GRAMMAR)] + GRAMMAR_THREAD) from None
+            raise
+        error = thread_condition_error(compiled.source)
+        if error is not None:
+            raise error
+        return compiled
+
     def validate(self, condition: str) -> None:
-        self.compile(condition)
+        self._compile_for_mode(condition)
 
     def canonical_names(self, condition: str) -> str:
         """Member names in the condition (sender=, assignee=, agent_status(name)) resolved like every tool
@@ -905,8 +969,9 @@ class TriggerEngine:
     def create(self, owner: str, condition: str, *, note: str = "", actions: list[dict] | None = None,
                once: bool = True) -> dict:
         owner = self.swarm.resolve_member(owner, allow_user=True)
+        self._compile_for_mode(condition)  # a thread session's refusals come first, with its grammar
         compiled = self.compile(self.canonical_names(condition))
-        normalized = normalize_actions(actions)
+        normalized = normalize_actions(actions, self._mode)
         note = "" if note is None else str(note).strip()
         if len(note) > MAX_NOTE_CHARS:
             raise ToolError(f"The note is too long ({len(note)} characters, max {MAX_NOTE_CHARS}).")
@@ -1501,6 +1566,8 @@ class TriggerEngine:
             if kind == "message":
                 # automatic: a user-owned trigger's message never answers a member's question (Mailbox.send)
                 self._require("mail").send(owner, action["to"], action["text"], automatic=True)
+            elif kind in TASK_ACTIONS and self._mode == "thread":
+                raise ToolError("not available in a thread session (no tasks)")  # never the board there
             elif kind == "set_status":
                 self._require("board").update(owner, action["task_id"], status=action["status"])
             elif kind == "create_task":

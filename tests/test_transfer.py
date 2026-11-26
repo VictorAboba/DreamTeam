@@ -28,7 +28,7 @@ from dreamteam.mcp_forge import snapshot_digest
 from dreamteam.sessions import MOVE_JOURNAL, SessionManager, session_uid
 from dreamteam.skills import Library
 from dreamteam.tools import frozen
-from dreamteam.tools.frozen import TOOLSET_REVISION
+from dreamteam.tools.frozen import NEWEST_REVISION, TOOLSET_REVISIONS
 from dreamteam.transfer import (MANIFEST, SecretFound, Secrets, TransferError, apply_import, export_home,
                                 known_secrets, merge_external, merge_settings, parse_include, plan_import,
                                 read_manifest, render_export_report, render_import_plan, render_import_result,
@@ -247,7 +247,7 @@ async def test_export_writes_every_category_without_the_secrets(tmp_path):
 
     manifest = _manifest(dest)
     assert manifest["format"] == "dreamteam-export" and manifest["format_version"] == 1
-    assert manifest["schema"] == {"db_columns": sorted(known_columns()), "toolset_revision": TOOLSET_REVISION}
+    assert manifest["schema"] == {"db_columns": sorted(known_columns()), "toolset_revision": NEWEST_REVISION}
     assert manifest["include"] == ["settings", "skills", "mcp", "sessions"]
     assert manifest["source"]["os"] and manifest["dreamteam_version"]
     assert manifest["settings"]["models"] == ["default", "fast", "pasted"]
@@ -352,7 +352,7 @@ async def test_a_session_that_ran_exports_its_history(tmp_path):
     report = export_home(home, tmp_path / "out", include=["sessions"])
     item = report.sessions[0]
     assert item["events"] > 0 and item["last_event"]["id"] > 0
-    assert item["max_tools_rev"] in (None, TOOLSET_REVISION)
+    assert item["max_tools_rev"] in (None, TOOLSET_REVISIONS["board"])
     copy = sqlite3.connect(tmp_path / "out" / "sessions" / sid / ".dreamteam" / "swarm.db")
     try:
         assert copy.execute("SELECT COUNT(*) FROM agents").fetchone()[0] >= 1

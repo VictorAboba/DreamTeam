@@ -1,6 +1,7 @@
 """The role catalog (docs/SPEC.md §17.3): the built-in roles of ROLE_PRESETS (ru/en) overlaid with the [[roles]]
-entries of the settings. Used by the config (validation of [[roles]]), the swarm (starting team, hire_agent, the
-`agents` listing), the web APIs and the TUI. A leaf module: it imports nothing from the package."""
+entries of the settings; a thread session takes the built-in texts from ROLE_PRESETS_THREAD (§22.6). Used by the
+config (validation of [[roles]]), the swarm (starting team, hire_agent, the `agents` listing), the web APIs and the
+TUI. A leaf module: it imports nothing from the package."""
 
 from __future__ import annotations
 
@@ -156,6 +157,152 @@ ROLE_PRESETS: dict[str, dict[str, tuple[str, str]]] = {
     },
 }
 
+# The built-in roles of a thread session (docs/SPEC.md §22.6): the ids and order of ROLE_PRESETS, the same names but
+# the reviewer's (the critic), and texts that speak only of posts, comments, likes and dislikes, #1, #2 and the
+# workspace (a thread session has no tasks, reviews or planning task). Russian texts use е, never its dotted form.
+ROLE_PRESETS_THREAD: dict[str, dict[str, tuple[str, str]]] = {
+    "en": {
+        "generalist": ("Generalist", (
+            "You take on whatever is most useful now in the feed: code, texts, analysis, research or checks. You "
+            "produce what the goal needs, in the workspace, following what the team agreed on in #2 or in its posts. "
+            "Before you post a result, you check it yourself: run it, reread it and compare it with the goal. Your "
+            "work is tested and checked by other members, never by you. When the work needs expertise the team "
+            "lacks, say so in a post or a comment instead of guessing."
+        )),
+        "developer": ("Developer", (
+            "You turn what the team agreed on into working code: features, fixes and refactorings. You follow the "
+            "contracts agreed in #2 (CONTRACTS.md); if a contract has to change, you propose the change in #2 or on "
+            "the post where it was agreed and wait for agreement instead of deviating silently. Before you post a "
+            "result you run your code (a quick run or a smoke check; throwaway scripts go to `.scratch/`) and write "
+            "in the post the exact commands and what they showed. You leave no half-done code, debug output or stray "
+            "files behind. Others test and check your code; you fix the defects they report in comments."
+        )),
+        "tester": ("Tester", (
+            "You check what others post as done against the goal and the contracts rather than the author's "
+            "explanations. You write automated tests in the project's test folder (normal cases, edge cases, bad "
+            "input, the documented errors and formats) and run them; one-off checks go to `.scratch/`. You never "
+            "test code you wrote yourself. For each defect you comment on the post of that work with the exact "
+            "command, the expected and the actual result, mentioning its author. You post what is covered, the "
+            "command that runs the tests and how many passed and failed; fixing the product code is left to its "
+            "author."
+        )),
+        "reviewer": ("Critic", (
+            "You are the team's critic: you check the results the others post against the global goal and the "
+            "contracts, not against their authors' explanations: you open the files, run what can be run and look "
+            "for what is missing, wrong or inconsistent between the parts (names, formats, interfaces). For each "
+            "problem you comment on the post of that work with a concrete, checkable fix (file, place, what is "
+            "wrong, what is expected) and leave the fixing to its author; you like what you have verified. You "
+            "never check your own work. On #1 you vote with reasons: like it only when you have verified that the "
+            "result meets the goal; otherwise dislike it and say in a comment on #1 what is missing."
+        )),
+        "analyst": ("Analyst", (
+            "You turn vague goals into clear requirements: what exactly must be delivered, for whom, with which "
+            "inputs, outputs, constraints and acceptance criteria. You write them to a file in the workspace "
+            "(requirements, scenarios, examples of input and expected output) and announce it in a post. Every "
+            "criterion you write must be checkable; you record your assumptions in that file and in #2, and the "
+            "questions only the user can answer go to the user in one message. When the goal asks for it, you "
+            "analyse data and results with numbers and sources. Design and implementation are left to others."
+        )),
+        "architect": ("Architect", (
+            "You design the structure before the team builds it: modules and their responsibilities, interfaces "
+            "and signatures, data and file formats, errors and exit codes, the directory layout and the code style. "
+            "You propose the contracts (interfaces, formats, file layout) in #2 and, when they are agreed there, "
+            "write them to CONTRACTS.md; when one has to change, you propose the change in a comment where it was "
+            "agreed, mentioning the members whose work depends on it, and update the file after the change is "
+            "agreed. Keep them short and precise enough for members to work against them in parallel without "
+            "asking. You check a design by walking the main scenarios through it. Implementing the modules is left "
+            "to developers."
+        )),
+        "writer": ("Technical writer", (
+            "You write the documentation people actually read: README, usage guides, references of APIs and file "
+            "formats, reports for the user. You write from the real result, not from plans: you start once the work "
+            "you document is posted, run the commands and examples you document and show their actual output. Your "
+            "texts agree with the contracts and with each other and are short enough to be read. You report "
+            "contradictions to their author in a comment instead of papering over them. Changing the code is left "
+            "to developers."
+        )),
+        "researcher": ("Researcher", (
+            "You find out what the team does not know yet: how a library or an API works, which approach or tool "
+            "fits best, what the facts and numbers are. You check claims against primary sources (official "
+            "documentation, the code itself, a quick experiment in `.scratch/`) and name the sources. You write a "
+            "short answer in the workspace (the conclusion first, then the evidence, the options with their "
+            "trade-offs and a recommendation) and post where it is. You keep what you verified apart from what you "
+            "assume. Building the solution is left to others."
+        )),
+    },
+    "ru": {
+        "generalist": ("Универсал", (
+            "Ты берешься за то, что сейчас полезнее всего в ленте: код, тексты, анализ, исследование или проверку. "
+            "Ты делаешь то, что нужно цели, в workspace, следуя тому, о чем команда договорилась в #2 или в своих "
+            "объявлениях. Прежде чем опубликовать результат, ты сам его проверяешь: запускаешь, перечитываешь и "
+            "сверяешь с целью. Твою работу тестируют и проверяют другие участники, а не ты сам. Если работе нужна "
+            "экспертиза, которой в команде нет, скажи об этом в объявлении или комментарии, а не угадывай."
+        )),
+        "developer": ("Разработчик", (
+            "Ты превращаешь то, о чем договорилась команда, в работающий код: новые функции, исправления, "
+            "рефакторинг. Ты следуешь контрактам, о которых договорились в #2 (CONTRACTS.md); если контракт нужно "
+            "изменить, предложи изменение в #2 или в объявлении, где о нем договорились, и дождись согласия, а не "
+            "отступай от него молча. Прежде чем опубликовать результат, запусти свой код (быстрый прогон или "
+            "smoke-проверка; одноразовые скрипты — в `.scratch/`) и укажи в объявлении точные команды и что они "
+            "показали. Не оставляй недоделанный код, отладочный вывод и лишние файлы. Твой код тестируют и "
+            "проверяют другие; ты исправляешь дефекты, о которых они пишут в комментариях."
+        )),
+        "tester": ("Тестировщик", (
+            "Ты проверяешь то, что другие публикуют как готовое, — по цели и контрактам, а не по объяснениям "
+            "автора. Ты пишешь автотесты в папке тестов проекта (обычные и граничные случаи, ошибочный ввод, "
+            "описанные ошибки и форматы) и запускаешь их; разовые проверки клади в `.scratch/`. Код, который ты "
+            "написал сам, ты не тестируешь. Для каждого дефекта напиши комментарий к объявлению об этой работе с "
+            "точной командой, ожидаемым и фактическим результатом, упомянув ее автора. Опубликуй, что покрыто, "
+            "команду запуска тестов и сколько тестов прошло и упало; исправлять код продукта оставь его автору."
+        )),
+        "reviewer": ("Критик", (
+            "Ты критик команды: ты проверяешь результаты, которые публикуют другие, по глобальной цели и "
+            "контрактам, а не по объяснениям их авторов: открываешь файлы, запускаешь то, что можно запустить, и "
+            "ищешь то, чего не хватает, что неверно или не согласовано между частями (имена, форматы, интерфейсы). "
+            "О каждой проблеме ты пишешь комментарий к объявлению об этой работе с конкретным проверяемым "
+            "исправлением (файл, место, что не так, что ожидается), а сами исправления оставляешь автору; тому, что "
+            "ты проверил, ты ставишь «нравится». Свою работу ты никогда не проверяешь. На #1 ты голосуешь с "
+            "обоснованием: ставь «нравится», только когда проверил, что результат достигает цели; иначе поставь «не "
+            "нравится» и напиши в комментарии к #1, чего не хватает."
+        )),
+        "analyst": ("Аналитик", (
+            "Ты превращаешь расплывчатые цели в ясные требования: что именно нужно получить, для кого, с какими "
+            "входными и выходными данными, ограничениями и критериями приемки. Ты записываешь их в файл в "
+            "workspace (требования, сценарии, примеры входных данных и ожидаемого результата) и сообщаешь о нем в "
+            "объявлении. Каждый критерий должен быть проверяемым; свои допущения ты записываешь в этот файл и в #2, "
+            "а вопросы, на которые может ответить только пользователь, задаешь ему одним сообщением. Если цель "
+            "этого требует, ты анализируешь данные и результаты — с цифрами и источниками. Проектирование и "
+            "реализацию оставь другим."
+        )),
+        "architect": ("Архитектор", (
+            "Ты проектируешь структуру до того, как команда начнет строить: модули и их ответственность, "
+            "интерфейсы и сигнатуры, форматы данных и файлов, ошибки и коды выхода, структуру каталогов и стиль "
+            "кода. Ты предлагаешь контракты (интерфейсы, форматы, структуру файлов) в #2 и, когда о них "
+            "договорились, записываешь их в CONTRACTS.md; если контракт нужно изменить, предлагаешь изменение в "
+            "комментарии там, где о нем договорились, упоминая участников, чья работа от него зависит, и обновляешь "
+            "файл, когда изменение согласовано. Пиши их коротко и настолько точно, чтобы участники могли "
+            "параллельно работать по ним, не переспрашивая. Проверяй проект, проводя через него основные сценарии. "
+            "Реализацию модулей оставь разработчикам."
+        )),
+        "writer": ("Технический писатель", (
+            "Ты пишешь документацию, которую действительно читают: README, руководства, справочники по API и "
+            "форматам файлов, отчеты для пользователя. Ты пишешь по реальному результату, а не по планам: берешься "
+            "за текст, когда работа, которую он описывает, опубликована, запускаешь команды и примеры, которые "
+            "описываешь, и показываешь их фактический вывод. Твои тексты согласованы с контрактами и между собой и "
+            "достаточно коротки, чтобы их прочли. О найденных противоречиях ты пишешь их автору в комментарии, а не "
+            "замазываешь их. Менять код оставь разработчикам."
+        )),
+        "researcher": ("Исследователь", (
+            "Ты выясняешь то, чего команда еще не знает: как устроены библиотека или API, какой подход или "
+            "инструмент подходит лучше, каковы факты и цифры. Ты проверяешь утверждения по первоисточникам "
+            "(официальная документация, сам код, быстрый эксперимент в `.scratch/`) и называешь источники. Ты "
+            "пишешь короткий ответ в workspace (сначала вывод, затем доказательства, варианты с их плюсами и "
+            "минусами и рекомендация) и публикуешь, где он лежит. Проверенное ты отделяешь от допущений. Строить "
+            "решение оставь другим."
+        )),
+    },
+}
+
 PRESET_IDS: tuple[str, ...] = tuple(ROLE_PRESETS["en"])
 DEFAULT_ROLE_ID = "generalist"
 # a role name (at most), a description or instructions, [[roles]] entries, agents per /team item, agents per team
@@ -168,6 +315,9 @@ TEAM_RESET = ("-", "default", "reset", "сброс")
 # casefolded id or name (either language) of a preset -> its id
 _PRESET_OF = {key.casefold(): rid for rid in PRESET_IDS
               for key in (rid, ROLE_PRESETS["en"][rid][0], ROLE_PRESETS["ru"][rid][0])}
+# casefolded thread-only name of a preset (either language) -> its id: «Критик» / "Critic" -> "reviewer"
+_THREAD_ONLY = {name.casefold(): rid for rid in PRESET_IDS for lang in ("en", "ru")
+                for name in (ROLE_PRESETS_THREAD[lang][rid][0],) if name.casefold() not in _PRESET_OF}
 _SENTENCE_END = re.compile(r"[.!?…](?=\s|$)")
 
 
@@ -223,11 +373,36 @@ def role_key(name: Any) -> str:
     return preset_id(name) or normalize(name).casefold()
 
 
-def catalog(entries: Iterable[Any] | None, language: str, *, include_hidden: bool = False) -> list[Role]:
+def _held(entries: Iterable[Any] | None) -> set[str]:
+    """The thread-only preset names (casefolded) that a [[roles]] entry has as its own name."""
+    return {normalize(_field(entry, "name")).casefold() for entry in entries or ()} & set(_THREAD_ONLY)
+
+
+def thread_aliases(entries: Iterable[Any] | None) -> dict[str, str]:
+    """The thread-only names of the presets that no [[roles]] entry holds, casefolded, with their preset ids: in a
+    thread session «Критик» / "Critic" resolves to `reviewer` unless an own role has that name (docs/SPEC.md §22.6);
+    each name on its own."""
+    held = _held(entries)
+    return {name: rid for name, rid in _THREAD_ONLY.items() if name not in held}
+
+
+def _mode_key(entries: list[Any], name: Any, mode: str) -> str:
+    """role_key(name), with a free thread-only name resolved to its preset in a thread session."""
+    key = role_key(name)
+    return thread_aliases(entries).get(key, key) if mode == "thread" else key
+
+
+def catalog(entries: Iterable[Any] | None, language: str, *, include_hidden: bool = False,
+            mode: str = "board") -> list[Role]:
     """The catalog in `language`: the presets in PRESET_IDS order with their entries applied (a non-empty
-    description replaces the built-in one in both languages; instructions, model and hidden come from the entry),
-    then the own roles in entry order. Hidden roles only with `include_hidden`."""
+    description replaces the built-in one in both languages and modes; instructions, model and hidden come from the
+    entry), then the own roles in entry order. Hidden roles only with `include_hidden`. In a thread session (`mode`
+    "thread") the presets' names and descriptions come from ROLE_PRESETS_THREAD; a thread-only name (the critic) is
+    used only while no entry has a thread-only name, else the preset keeps its board name (docs/SPEC.md §22.6)."""
     language = _language(language)
+    entries = list(entries or ())
+    presets = ROLE_PRESETS_THREAD if mode == "thread" else ROLE_PRESETS
+    board_names = mode == "thread" and bool(_held(entries))
     by_key: dict[str, Any] = {}
     own: list[tuple[str, Any]] = []
     for entry in entries or ():
@@ -240,7 +415,9 @@ def catalog(entries: Iterable[Any] | None, language: str, *, include_hidden: boo
             own.append((key, entry))
     out: list[Role] = []
     for rid in PRESET_IDS:
-        name, description = ROLE_PRESETS[language][rid]
+        name, description = presets[language][rid]
+        if board_names and name.casefold() in _THREAD_ONLY:
+            name = ROLE_PRESETS[language][rid][0]
         entry = by_key.get(rid)
         if entry is None:
             out.append(Role(rid, name, description, builtin=True))
@@ -257,23 +434,30 @@ def catalog(entries: Iterable[Any] | None, language: str, *, include_hidden: boo
     return out if include_hidden else [role for role in out if not role.hidden]
 
 
-def find_role(entries: Iterable[Any] | None, name: Any, language: str) -> Role | None:
+def find_role(entries: Iterable[Any] | None, name: Any, language: str, mode: str = "board") -> Role | None:
     """The catalog role named `name` (a preset id, a preset name in either language or an own role's name; any case
-    and spacing), hidden roles included (hidden = not offered). None: a new role."""
-    key = role_key(name)
+    and spacing), hidden roles included (hidden = not offered). None: a new role. In a thread session a free
+    thread-only name («Критик» / "Critic") is the preset's too, and the role comes with the thread texts."""
+    entries = list(entries or ())
+    key = _mode_key(entries, name, mode)
     if not key:
         return None
-    return next((role for role in catalog(entries, language, include_hidden=True) if role.key == key), None)
+    return next((role for role in catalog(entries, language, include_hidden=True, mode=mode) if role.key == key),
+                None)
 
 
-def close_roles(entries: Iterable[Any] | None, name: Any, language: str, n: int = 3) -> list[str]:
+def close_roles(entries: Iterable[Any] | None, name: Any, language: str, n: int = 3,
+                mode: str = "board") -> list[str]:
     """Names (in `language`) of up to `n` visible catalog roles that look like `name` (a typo, the other language's
-    name or a preset id)."""
+    name or a preset id; in a thread session also a free thread-only name)."""
+    entries = list(entries or ())
+    aliases = thread_aliases(entries) if mode == "thread" else {}
     shown: dict[str, str] = {}
-    for role in catalog(entries, language):
+    for role in catalog(entries, language, mode=mode):
         spellings = [role.name]
         if role.builtin:
             spellings += [role.key, *(ROLE_PRESETS[lang][role.key][0] for lang in ("en", "ru"))]
+            spellings += [alias for alias, rid in aliases.items() if rid == role.key]
         for spelling in spellings:
             shown.setdefault(spelling.casefold(), role.name)
     found: list[str] = []
@@ -374,39 +558,44 @@ def find_team(teams: Iterable[Any] | None, name: Any) -> Any:
     return next((team for team in teams or () if team_key(_field(team, "name")) == key), None)
 
 
-def missing_roles(team: Any, entries: Iterable[Any] | None) -> list[str]:
-    """The roles of a saved team that the catalog lacks, in order, each once (hidden roles count as present)."""
+def missing_roles(team: Any, entries: Iterable[Any] | None, mode: str = "board") -> list[str]:
+    """The roles of a saved team that the catalog lacks, in order, each once (hidden roles count as present; in a
+    thread session a free thread-only name is its preset)."""
+    entries = list(entries or ())
     known = {role.key for role in catalog(entries, "en", include_hidden=True)}
     missing: dict[str, str] = {}
     for role in _field(team, "roles") or ():
-        key = role_key(role)
+        key = _mode_key(entries, role, mode)
         if key not in known:
             missing.setdefault(key, role)
     return list(missing.values())
 
 
-def saved_team_in(names: Iterable[Any], teams: list[Any] | None, entries: Iterable[Any] | None) -> str | None:
+def saved_team_in(names: Iterable[Any], teams: list[Any] | None, entries: Iterable[Any] | None,
+                  mode: str = "board") -> str | None:
     """The first of `names` (role names) that names a saved team and no catalog role, as written, else None: such a
     list would start a blank agent instead of the team."""
     entries = list(entries or ())
     return next((normalize(name) for name in names
-                 if find_team(teams, name) is not None and find_role(entries, name, "en") is None), None)
+                 if find_team(teams, name) is not None and find_role(entries, name, "en", mode) is None), None)
 
 
-def team_choice(text: Any, teams: list[Any] | None, entries: Iterable[Any] | None) -> tuple[str, Any]:
+def team_choice(text: Any, teams: list[Any] | None, entries: Iterable[Any] | None,
+                mode: str = "board") -> tuple[str, Any]:
     """What the text of `--team` or `/team` names: ("team", the saved team), ("roles", the names in order), ("mixed", a
     saved team's name inside a list or with *N) or ("unknown", the word). A bare word is the saved team first
     (`writer*1` reaches a role of a team's name), then a catalog role. With no team saved a bare word is a new role;
     once teams are saved a word that is neither is "unknown". Whether a chosen team can start is the caller's check
-    (missing_roles). ValueError: bad syntax (parse_team)."""
+    (missing_roles). ValueError: bad syntax (parse_team). `mode`: the mode of the session being created."""
     items = parse_team(text)
+    entries = list(entries or ())
     if "," in str(text) or "*" in str(text):
-        mixed = saved_team_in(items, teams, entries)
+        mixed = saved_team_in(items, teams, entries, mode)
         return ("mixed", mixed) if mixed else ("roles", items)
     team = find_team(teams, text)
     if team is not None:
         return "team", team
-    if teams and find_role(entries, text, "en") is None:
+    if teams and find_role(entries, text, "en", mode) is None:
         return "unknown", normalize(text)
     return "roles", items
 

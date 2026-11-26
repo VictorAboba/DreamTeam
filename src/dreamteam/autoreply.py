@@ -96,6 +96,8 @@ QUESTION_DROPPED = ("SELECT 1 FROM events WHERE type IN ('swarm.resumed', 'swarm
                     "AND json_extract(data, '$.question.outcome') = 'dropped' LIMIT 1")
 # `name` has created a task since the planning card with id `task_id`: it plans already (name, task_id)
 PLANS = "SELECT 1 FROM tasks WHERE created_by = ? AND id > ? LIMIT 1"
+# the thread mode's PLANS (docs/SPEC.md §22.4): `name` has commented on #2 since its last write (name, 2, since)
+PLANS_THREAD = "SELECT 1 FROM post_comments WHERE author = ? AND post_id = ? AND ts >= ? LIMIT 1"
 # LAST_TO for every sender to the user (since 0): (sender, newest id) rows, read through the inbox_recipient index;
 # (USER,)
 _LAST_TO_USER = ("SELECT m.sender, MAX(m.id) FROM messages m JOIN inbox i ON i.message_id = m.id "
@@ -122,7 +124,8 @@ _REQUEST_ID = re.compile(r"(?:(?P<kind>[qm])(?P<mid>[1-9][0-9]{0,18})"
 ID_MAX = (1 << 63) - 1   # the largest id SQLite holds (a message's, a task's, an event's)
 
 
-def planner_question(scalar: Callable[[str, tuple], Any], name: str, task_id: int, since: Any) -> int | None:
+def planner_question(scalar: Callable[[str, tuple], Any], name: str, task_id: int, since: Any, *,
+                     plans: str = PLANS) -> int | None:
     """The question the clarify planner `name` waits for the user to answer, about its clarify planning card (`task_id`,
     created at `since`): the id of `name`'s last message to the user since the card was created, when it is newer than
     the user's last message to `name` (named or through "all"), `name` has created no task since the card (it plans
@@ -130,8 +133,9 @@ def planner_question(scalar: Callable[[str, tuple], Any], name: str, task_id: in
     pause in its place: n_question_unanswered told the planner so). None otherwise. Both bounds keep an old message (an
     earlier goal) or a note to the user after planning started from counting for ever. `scalar(sql, params)`: the first
     value of a query (Database.scalar). Swarm.asks_user (the nag guard, the snapshot's `clarify_wait`) and the requests
-    use it, so they cannot drift apart."""
-    if scalar(PLANS, (name, task_id)):
+    use it, so they cannot drift apart. `plans`: the "plans already" query (PLANS_THREAD in a thread session, whose
+    `task_id` is #2 and whose parameters add `since`)."""
+    if scalar(plans, (name, task_id) if plans is PLANS else (name, task_id, since)):
         return None
     asked = scalar(LAST_TO, (name, USER, since))
     if not asked or asked <= (scalar(LAST_TO, (USER, name, since)) or 0):
@@ -505,6 +509,6 @@ class SessionAutoReply:
 
 
 __all__ = ["AUTO_REPLY", "AUTO_REVIEW", "AUTO_REPLY_MAX", "BLOCKING_KINDS", "ID_MAX", "JOURNAL_BATCH", "LAST_TO",
-           "PLANS", "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests", "follow_journal",
-           "hub_answers", "journal_head", "listed_requests", "planner_question", "read_requests", "reply_text",
-           "request_key", "requests_from", "requests_of", "review_key", "review_text", "wants_reply"]
+           "PLANS", "PLANS_THREAD", "QUESTION_DROPPED", "REQUEST_KINDS", "SessionAutoReply", "blocking_requests",
+           "follow_journal", "hub_answers", "journal_head", "listed_requests", "planner_question", "read_requests",
+           "reply_text", "request_key", "requests_from", "requests_of", "review_key", "review_text", "wants_reply"]
