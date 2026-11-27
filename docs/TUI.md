@@ -188,6 +188,12 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
     becomes its goal (`set_goal`). A session paused by the user (not by the budget) is resumed: the prompt
     is a new instruction to work on. A session paused for a member's question (the state's `swarm.question`,
     SPEC §3.1) is not resumed: the prompt goes to the asker instead, which makes it the answer.
+  - A thread session (the state's `swarm.mode`, SPEC §22.9) has no coordinator: a goal set, a completed goal
+    reopened (the prompt as the user's comment on #1, the votes on #1 cleared) and a pending question answered as
+    above, otherwise the prompt becomes a post of the user, `post_create` with `instruct.post_parts`: its first line
+    the title (shortened past 200 characters), the rest the text; a prompt of one line, or one whose first line is
+    longer than 200 characters, is the text whole. The user's post wakes every member, and the verbose feed and
+    `stream-json` show its `post.created`.
   - A session made by an earlier version (summary `earlier_version`, SPEC §17.2) is never opened and nothing is
     created: `-r ID` of one exits 1 with its message (English, `sessions.earlier_version_text` with the hub's home
     and version); `-c` whose most recent session is one exits 1 with `continue_earlier`.
@@ -295,7 +301,11 @@ async def run_print(conn: Connection, prompt: str, *, session: str | None = None
   - `json`: one object on `out` at the end:
     `{"type":"result","status":"done|budget|timeout|error|interrupted","session":id,"goal":{...},
     "summary":str,"tasks":[{id,title,status,assignee}],"cost_usd":float,"duration_s":float,"agents":[names],
-    "jobs":[{id,label,owner,command,origin}]}`. `jobs`: the agents' background jobs still running at the end.
+    "jobs":[{id,label,owner,command,origin}],"mode":"board|thread","posts":[...],"decision":{...}|null}`. `jobs`:
+    the agents' background jobs still running at the end. `mode` is the session's; `posts` a thread session's posts
+    without their texts (`{id,kind,title,author,likes,dislikes,comments,created_at,active_at}`, in the feed's order,
+    at most 200) and `decision` its goal's `decision` once the goal is done (SPEC §22.9); a board run has
+    `"posts": []` and `"decision": null`. The last line of `stream-json` is the same object.
   - `text` against a hub of another process (`conn.owned` false): when background jobs are still running at the
     end, one more line on `err` lists them (`label (owner: command)`, the command clipped to 60 characters):
     - ru: «Ещё работают фоновые процессы агентов: {jobs}. Они остановятся вместе с сессией (остановить раньше можно

@@ -412,8 +412,9 @@ def test_options_say_what_a_client_may_choose_and_nothing_secret(tmp_path, api_t
             answer = c.get("/api/v1/options", headers=API_BEARER)
             assert answer.status_code == 200, answer.text
             options = answer.json()
-            assert list(options) == ["api", "version", "languages", "language", "teams", "roles", "models",
-                                     "default_model", "skills", "folders", "limits"]
+            assert list(options) == ["api", "version", "languages", "language", "modes", "mode", "goal_rules",
+                                     "goal_rule", "teams", "roles", "models", "default_model", "skills", "folders",
+                                     "limits"]
             assert options["api"] == 1 and options["version"] == api_v1.__version__
             assert options["languages"] == ["ru", "en"] and options["language"] == "en"
             assert options["teams"] == [{"name": "Docs", "roles": ["writer", "tester"]}]

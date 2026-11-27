@@ -11,12 +11,15 @@ import math
 from typing import TYPE_CHECKING, Any, Mapping
 
 from . import roles
+from .tools import MODES
 
 if TYPE_CHECKING:
     from .config import Config
 
 LANGUAGES = ("ru", "en")
 NETWORKS = ("on", "off")
+GOAL_RULES = ("democracy", "veto")   # forum.RULES (docs/SPEC.md §22.4), kept here: no import of the forum
+GOAL_RULE_BOARD = "goal_rule applies to a thread session: give it with mode \"thread\"."
 NAMES_SHOWN = 20   # saved teams, model profiles or roles named in a refusal
 
 
@@ -71,7 +74,7 @@ def _team(value: Any) -> list[str]:
     return names
 
 
-def _saved_team(name: Any, config: "Config", *, strict: bool) -> list[str]:
+def _saved_team(name: Any, config: "Config", *, strict: bool, mode: str = "board") -> list[str]:
     """The roles of the saved team `name` (docs/SPEC.md §17.3 "Saved teams"), checked now: the session holds them as
     any other starting team and never looks the team up."""
     if not isinstance(name, str):
@@ -81,7 +84,7 @@ def _saved_team(name: Any, config: "Config", *, strict: bool) -> list[str]:
         known = ", ".join(saved.name for saved in config.teams)
         raise OptionError("unknown_team", f"No saved team '{roles.normalize(name)[:80]}'. "
                           + (f"Saved teams: {known}." if known else "None are saved yet: Settings > Teams."))
-    missing = roles.missing_roles(team, config.roles)
+    missing = roles.missing_roles(team, config.roles, mode)
     if missing:
         raise OptionError("unknown_role" if strict else "bad_request",
                           f"The team '{team.name}' uses roles that are not in the role catalog: "
@@ -119,15 +122,18 @@ def _strict_choice(body: Mapping[str, Any], key: str, choices: tuple[str, ...]) 
     return value
 
 
-def _strict_roles(names: list[str], config: "Config", language: str) -> None:
-    """unknown_role for a name the catalog does not resolve (roles.find_role: an id, a preset's name in either
-    language, an own role's name; hidden roles count), with the saved team a name may mean and close names."""
-    unknown = list(dict.fromkeys(name for name in names if roles.find_role(config.roles, name, language) is None))
+def _strict_roles(names: list[str], config: "Config", language: str, mode: str = "board") -> None:
+    """unknown_role for a name the catalog does not resolve in the session's `mode` (roles.find_role: an id, a
+    preset's name in either language, an own role's name; hidden roles count; "Critic" is the reviewer in a thread
+    session only), with the saved team a name may mean and close names."""
+    unknown = list(dict.fromkeys(name for name in names
+                                 if roles.find_role(config.roles, name, language, mode) is None))
     if not unknown:
         return
-    saved = roles.saved_team_in(unknown, config.teams, config.roles)
+    saved = roles.saved_team_in(unknown, config.teams, config.roles, mode)
     hint = f" '{saved}' is a saved team: give it as team (a string), not inside a list." if saved else ""
-    close = list(dict.fromkeys(match for name in unknown for match in roles.close_roles(config.roles, name, language)))
+    close = list(dict.fromkeys(match for name in unknown
+                               for match in roles.close_roles(config.roles, name, language, mode=mode)))
     if close and not hint:
         hint = f" Did you mean: {_names(close)}?"
     plural = "roles" if len(unknown) > 1 else "role"
@@ -138,18 +144,22 @@ def _strict_roles(names: list[str], config: "Config", language: str) -> None:
 def overrides_from(body: Mapping[str, Any], config: "Config", *, strict: bool) -> dict[str, Any]:
     """The session overrides a create's options make ({"swarm": {...}, "agents": {"default_model"}}; {} for none),
     against the global settings `config` (its saved teams, roles and model profiles). The keys it reads:
-    `start_agents`, `max_agents`, `max_cost_usd`, `language`, `network`, `clarify`, `model`, and `team`: a list is the
-    starting roles in order (it sets `start_agents` unless that is given).
+    `start_agents`, `max_agents`, `max_cost_usd`, `language`, `network`, `clarify`, `model`, `mode` and `goal_rule`
+    (docs/SPEC.md §22.9: `swarm.mode` and `swarm.goal_rule`; a `goal_rule` with an effective board mode, the given
+    `mode` else the global one, is refused in both paths), and `team`: a list is the starting roles in order (it sets
+    `start_agents` unless that is given).
     - not strict (the launcher MCP's `session_create`, unchanged): numbers as int() and float() take them, `team` a
       list only and `team_name` a saved team (not with `team` or `start_agents`); a list that names a saved team and no
-      role is refused; any role name passes (a new role), and the model and the rest are left to the settings' check.
+      role is refused; any role name passes (a new role), and the model, a bad `mode` or `goal_rule` and the rest are
+      left to the settings' check.
     - strict (the HTTP API v1, docs/SPEC.md §21.4): `team` a saved team's name (a string: unknown_team with the saved
       names; not with `start_agents`) or a list of roles the catalog resolves (unknown_role); `model` a profile of the
       settings (unknown_model with their names); `start_agents` and `max_agents` whole numbers of at least 1,
-      `max_cost_usd` a number of at least 0, `language` ru | en, `network` on | off, `clarify` a bool (bad_request
-      otherwise); a `start_agents` the request sets (itself or through its team) is at most the session's
-      `max_agents`, and so is the settings' when the request sets `max_agents` alone (the starting team ignores
-      `max_agents`). null means "not given". `team_name` is no key of v1's.
+      `max_cost_usd` a number of at least 0, `language` ru | en, `network` on | off, `clarify` a bool, `mode` board |
+      thread, `goal_rule` democracy | veto (bad_request otherwise); the team's roles resolve in the effective mode; a
+      `start_agents` the request sets (itself or through its team) is at most the session's `max_agents`, and so is
+      the settings' when the request sets `max_agents` alone (the starting team ignores `max_agents`). null means
+      "not given". `team_name` is no key of v1's.
     OptionError (400) with its code; the overrides still go through SessionManager.validated_overrides."""
     swarm_over: dict[str, Any] = {}
     if strict:
@@ -159,18 +169,27 @@ def overrides_from(body: Mapping[str, Any], config: "Config", *, strict: bool) -
                 swarm_over[key] = count
         language = _strict_choice(body, "language", LANGUAGES)
         lang = language or config.swarm.language
+        mode = _strict_choice(body, "mode", MODES)
+        rule = _strict_choice(body, "goal_rule", GOAL_RULES)
+        effective = mode or config.swarm.mode
+        if rule is not None and effective != "thread":
+            raise OptionError("bad_request", GOAL_RULE_BOARD)
+        if mode is not None:
+            swarm_over["mode"] = mode
+        if rule is not None:
+            swarm_over["goal_rule"] = rule
         team_value = body.get("team")
         team: list[str] = []
         if isinstance(team_value, str):
             if "start_agents" in swarm_over:
                 raise OptionError("bad_request", "A saved team sets the roles and their number: give team without "
                                                  "start_agents.")
-            team = _saved_team(team_value, config, strict=True)
+            team = _saved_team(team_value, config, strict=True, mode=effective)
         elif team_value is not None:
             team = _team(team_value)
             if not team:
                 raise OptionError("bad_request", "team must name at least one role, or be a saved team's name.")
-            _strict_roles(team, config, lang)
+            _strict_roles(team, config, lang, effective)
         if team:   # the starting roles in order; the team's size unless start_agents is given
             swarm_over["starting_roles"] = team
             swarm_over.setdefault("start_agents", len(team))
@@ -207,17 +226,23 @@ def overrides_from(body: Mapping[str, Any], config: "Config", *, strict: bool) -
                                                    f"{_names(list(config.models))}.")
             overrides["agents"] = {"default_model": model}
         return overrides
-    # the launcher MCP's session_create, as it always was
+    # the launcher MCP's session_create, as it always was, and the session's mode (docs/SPEC.md §22.9); a bad mode
+    # is the settings' check's (Config: "swarm.mode must be 'board' or 'thread'"), which then decides no goal_rule
+    mode = body.get("mode") if _given(body, "mode") else None
+    effective = mode if mode is not None else config.swarm.mode
+    if _given(body, "goal_rule") and effective != "thread" and effective in MODES:
+        raise OptionError("bad_request", GOAL_RULE_BOARD)
     for key in ("start_agents", "max_agents"):
         if _given(body, key):
             swarm_over[key] = _int_or_none(body[key])
     team = _team(body.get("team"))
+    role_mode = effective if effective in MODES else "board"
     if _given(body, "team_name"):
         if team or "start_agents" in swarm_over:
             raise OptionError("bad_request", "team_name sets the roles and their number: give it without team and "
                                              "start_agents.")
-        team = _saved_team(body["team_name"], config, strict=False)
-    elif team and (saved := roles.saved_team_in(team, config.teams, config.roles)):
+        team = _saved_team(body["team_name"], config, strict=False, mode=role_mode)
+    elif team and (saved := roles.saved_team_in(team, config.teams, config.roles, role_mode)):
         raise OptionError("bad_request", f"'{saved}' is a saved team, not a role: pass it as team_name.")
     if team:  # the starting roles in order; the team's size unless start_agents is given
         swarm_over["starting_roles"] = team
@@ -232,10 +257,14 @@ def overrides_from(body: Mapping[str, Any], config: "Config", *, strict: bool) -
         if not isinstance(body["clarify"], bool):
             raise OptionError("bad_request", "clarify must be true or false.")
         swarm_over["clarify"] = body["clarify"]
+    if mode is not None:
+        swarm_over["mode"] = mode
+    if _given(body, "goal_rule"):
+        swarm_over["goal_rule"] = body["goal_rule"]
     overrides = {"swarm": swarm_over} if swarm_over else {}
     if body.get("model"):
         overrides["agents"] = {"default_model": str(body["model"])}
     return overrides
 
 
-__all__ = ["LANGUAGES", "NETWORKS", "OptionError", "overrides_from"]
+__all__ = ["GOAL_RULES", "LANGUAGES", "NETWORKS", "OptionError", "overrides_from"]

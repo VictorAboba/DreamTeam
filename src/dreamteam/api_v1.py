@@ -57,14 +57,14 @@ from .db import reading_file
 from .eventtext import event_text
 from .goal_text import split_goal
 from .httpjson import JSONResponse, json_text
-from .instruct import continue_step
+from .instruct import continue_step, post_parts
 from .jobs import COMMAND_CHARS
 from .mailbox import MAX_TEXT, read_user_conversation
 from .models import USER, ToolError
 from .result import build_result
 from .sessionopts import OptionError, overrides_from
 from .sessions import (API_ANSWERS, API_GIVEN, LEGACY_ID, TITLE_LIMIT, SessionError, api_answers, api_meta,
-                       read_lists, session_uid)
+                       read_lists, read_posts, session_uid)
 from .skills import NAME_MAX, NAME_RE, Library, SkillError
 from .uitext import LANGS
 from .web import API_CALLER, API_CALLERS, API_TOKEN_TEXT, BEARER_REALM, JSON_TYPE_TEXT, PUBLIC_URL_ENV, _loopback_bind
@@ -106,7 +106,10 @@ TIMELINE = ("task.created", "task.updated", "task.comment", "message.sent", "not
             "goal.completed", "goal.reopened", "agent.hired", "agent.retired", "swarm.paused", "swarm.resumed",
             "swarm.wrap_up", "swarm.limits", "session.started", "session.stopped", "job.started", "job.ended",
             "mcp.created", "mcp.status", "skill.attached", "skill.detached", "skill.proposed", "skill.library",
-            "skill.deps", "file.changed")
+            "skill.deps", "file.changed",
+            # a thread session's feed (docs/SPEC.md §22.9 "Events"); post.vote and subscription.changed are detail=all
+            # only: votes can outnumber everything else, and the summary's goal_vote gives the vote
+            "post.created", "post.updated", "post.comment", "files.committed")
 EVENTS_FIELDS = ("after", "wait", "limit", "detail", "lang")   # GET .../events
 STREAM_FIELDS = ("after", "detail", "lang")                    # GET .../events/stream
 FILES_FIELDS = ("path", "scratch")                             # GET .../files (docs/SPEC.md §21.8)
@@ -142,8 +145,14 @@ STATES = ("starting", "failed", "created", "done", "budget", "waiting", "paused"
 # the fields of POST /api/v1/sessions (docs/SPEC.md §21.4); `folder` is an object of FOLDER_FIELDS (§21.10)
 CREATE_FIELDS = ("goal", "title", "description", "language", "team", "model", "start_agents", "max_agents",
                  "max_cost_usd", "network", "files", "folder", "skills", "answers", "clarify", "stop_when_done",
-                 "client_ref")
-PATCH_FIELDS = ("max_cost_usd", "max_agents", "wrap_up")   # PATCH /api/v1/sessions/{id} (docs/SPEC.md §21.2)
+                 "client_ref", "mode", "goal_rule")
+# PATCH /api/v1/sessions/{id} (docs/SPEC.md §21.2); the last three apply to a thread session only (§22.9 "PATCH")
+PATCH_FIELDS = ("max_cost_usd", "max_agents", "wrap_up", "goal_rule", "complete_goal", "goal_summary")
+THREAD_PATCH_FIELDS = ("goal_rule", "complete_goal", "goal_summary")
+GOAL_RULES = ("democracy", "veto")   # forum.RULES
+GOAL_RULE_THREAD_TEXT = "goal_rule applies to a thread session"
+COMPLETE_GOAL_THREAD_TEXT = ("complete_goal applies to a thread session: in a board session the agents complete the "
+                             "goal with goal_complete.")
 CONTINUE_FIELDS = ("text",)                                # POST /api/v1/sessions/{id}/continue
 MESSAGE_FIELDS = ("to", "text", "reply_to")                # POST /api/v1/sessions/{id}/messages (docs/SPEC.md §21.5)
 # the fields of an answer, by the kind of the request it answers (POST /api/v1/sessions/{id}/requests/{rid}, §21.5)
@@ -372,13 +381,17 @@ def library_skills(config: "Config") -> list[dict[str, str]]:
 
 def options_view(config: "Config", skills: list[dict[str, str]]) -> dict[str, Any]:
     """GET /api/v1/options (docs/SPEC.md §21.2): what a client may choose. Never a key, a `base_url`, an env name or a
-    path: the models by name, provider and model; the roots of `[api] folders` by name and `in_place`."""
+    path: the models by name, provider and model; the roots of `[api] folders` by name and `in_place`. The modes and
+    goal rules with the global defaults (docs/SPEC.md §22.9 "Options"); `roles` in the default mode's texts (the
+    reviewer is "Critic" in a thread one), a role's `key` the same in both modes."""
     language = config.swarm.language
     return {
         "api": API_VERSION, "version": __version__, "languages": list(LANGS), "language": language,
+        "modes": ["board", "thread"], "mode": config.swarm.mode,
+        "goal_rules": list(GOAL_RULES), "goal_rule": config.swarm.goal_rule,
         "teams": [{"name": team.name, "roles": list(team.roles)} for team in config.teams],
         "roles": [{"key": role.key, "name": role.name, "description": role.description}
-                  for role in roles.catalog(config.roles, language)],
+                  for role in roles.catalog(config.roles, language, mode=config.swarm.mode)],
         "models": [{"name": name, "provider": profile.provider, "model": profile.model}
                    for name, profile in config.models.items()],
         "default_model": config.agents.default_model,
@@ -1686,10 +1699,14 @@ class ApiV1:
             budget=bool(board.get("paused")) and board.get("pause_reason") == "budget",
             running=running, paused=bool(board.get("paused")), blocking=blocking)
         folder = apifolders.folder_meta(api.get("folder")) if api is not None else None
+        mode = "thread" if board.get("mode") == "thread" else "board"
         return {
             "id": session_uid(meta), "name": sid, "title": board.get("title") or sid, "state": state,
+            "mode": mode,   # (docs/SPEC.md §22.9 "Summary": the session's work mode, "board" without the key)
             "final": manager.is_final(sid), "error": _error_text(api),
-            "goal": {key: stats_goal.get(key, "") for key in ("title", "description", "status", "summary")}
+            # a thread session's goal says how it was decided while it is done (`decision`), null otherwise
+            "goal": {**{key: stats_goal.get(key, "") for key in ("title", "description", "status", "summary")},
+                     "decision": stats_goal.get("decision")}
             if stats_goal is not None else None,
             "language": board.get("language"), "model": board.get("model_profile"),
             "cost_usd": float(board.get("spent_usd") or 0.0), "max_cost_usd": board.get("max_cost_usd"),
@@ -1697,6 +1714,9 @@ class ApiV1:
             "started_at": api.get("started_at") if api is not None else None,
             "finished_at": api.get("finished_at") if api is not None else None,
             "agents": agents, "tasks": dict((board.get("tasks") or {}).get("by_status") or {}),
+            # the vote on #1 (forum.goal_tally; null in a board session and before #1 exists) and the ordinary posts
+            "goal_vote": board.get("goal_vote") if mode == "thread" else None,
+            "posts": int(board.get("posts") or 0) if mode == "thread" else 0,
             "requests": board.get("requests", 0),
             "answers": api_answers(api) if api is not None else None,
             "stop_when_done": api.get("stop_when_done", API_GIVEN["stop_when_done"]) if api is not None else None,
@@ -1837,7 +1857,8 @@ class ApiV1:
         """A `continue`'s text given to the running session, as the user, in process, the session's lock held (the
         caller's): what instruct.continue_step decides from swarm.snapshot(), as `dreamteam -p -r` does with its
         prompt (the goal set when there is none, a completed goal reopened with the text as the comment, a pending
-        question answered with a message to the asker, else a message to the coordinator or "all"), then a resume
+        question answered with a message to the asker, else a message to the coordinator or "all" in a board session
+        and a post of the user in a thread one, instruct.post_parts, which wakes every member), then a resume
         when the user paused the session or a budget pause the budget now covers holds. 409 `budget_exhausted`
         before anything is given while the budget is spent; 409 `conflict` for what the swarm refuses (a ToolError,
         its text redacted for the API caller). A delivery that succeeds clears the session's `api.error` (a failed one
@@ -1850,6 +1871,8 @@ class ApiV1:
                 swarm.set_goal(USER, text)
             elif step.action == "reopen_goal":
                 swarm.reopen_goal(USER, text)
+            elif step.action == "post":   # (a thread session: the forum refuses a text past board.MAX_POST)
+                swarm.forum.create(USER, *post_parts(text))
             else:   # (to the asker of a pending question: Mailbox.send makes it the answer, which ends the pause)
                 swarm.mail.send(USER, [step.to], text)
             if step.resume or (swarm.paused and swarm.pause_reason == "budget"):
@@ -2021,6 +2044,11 @@ class ApiV1:
         with swarm.db._lock:   # (a loaded session's connection: read_lists leaves its row factory alone)
             return read_lists(swarm.db.path, swarm.db.conn)
 
+    @staticmethod
+    def _posts(swarm: "Swarm") -> list[dict[str, Any]]:
+        with swarm.db._lock:   # (as _lists: read_posts leaves the connection's row factory alone)
+            return read_posts(swarm.db.path, swarm.db.conn)
+
     def changed_files(self, sid: str, meta: dict[str, Any], api: Mapping[str, Any]) -> tuple[list | None, str | None]:
         """(changed_files, changed_files_error) of a session's result (docs/SPEC.md §21.7): its working tree against
         `api.base_commit` (workspace.changed_since, with the session's own settings: git, its folder, adopted or not,
@@ -2119,6 +2147,8 @@ class ApiV1:
             if cached is not None:
                 return {**cached, "error": summary["error"], "board_url": summary["board_url"]}
         tasks, agents = self._read_db(sid, self._lists, read_lists)
+        mode = summary.get("mode") or "board"
+        posts = self._read_db(sid, self._posts, read_posts) if mode == "thread" else []
         files, files_error = self.changed_files(sid, meta, api)
         started, finished = api.get("started_at"), api.get("finished_at")
         duration = (round(max(0.0, (finished if _number(finished) else time.time()) - started), 3)
@@ -2127,7 +2157,8 @@ class ApiV1:
         result = build_result(status=state, session=summary["id"], goal=goal,
                               summary=str((goal or {}).get("summary") or "") if state == "done" else "",
                               tasks=tasks, agents=agents, jobs=jobs, cost_usd=summary["cost_usd"],
-                              duration_s=duration)
+                              duration_s=duration, mode=mode, posts=posts,
+                              decision=(goal or {}).get("decision") if mode == "thread" else None)
         for shown, task in zip(result["tasks"], tasks):
             shown.update(parent_id=task.get("parent_id"), crew=task.get("crew"))
         truncated = files is not None and len(files) > CHANGED_FILES_MAX
@@ -2478,20 +2509,66 @@ class ApiV1:
         return JSONResponse({"session": self.summary(self._session(request, caller))})
 
     async def _patch(self, request: Request, caller: str) -> Response:
-        """PATCH /api/v1/sessions/{id} {max_cost_usd?, max_agents?, wrap_up?} (docs/SPEC.md §21.2): what
-        `swarm_control` does with them, as the user (manager.control, under the session's lock; a stopped session is
-        loaded to write them into its database, then unloaded again). Its own 415 first: the guard's covers POST
-        only. A field that is null is not given. 400 for a value of the wrong kind or one the swarm refuses, 409
-        `conflict` for `wrap_up: true` before the first start, `earlier_version` for a session of an earlier
-        version."""
+        """PATCH /api/v1/sessions/{id} {max_cost_usd?, max_agents?, wrap_up?, goal_rule?, complete_goal?,
+        goal_summary?} (docs/SPEC.md §21.2, §22.9 "PATCH"): what `swarm_control` does with them, as the user
+        (manager.control, under the session's lock; a stopped session is loaded to write them into its database, then
+        unloaded again). Its own 415 first: the guard's covers POST only. A field that is null is not given. Then the
+        thread fields' values (_thread_patch), all before anything is written. 400 for a value of the wrong kind or one
+        the swarm refuses, 409 `conflict` for `wrap_up: true` before the first start and for `complete_goal: true`
+        with no goal or a goal already done, `not_running` for `complete_goal: true` on a session that does not run,
+        `earlier_version` for a session of an earlier version. The limits, the completion of the goal and the wrap-up
+        mode go through manager.control in that order; then `goal_rule` through the sessions' partial update
+        (manager.update with settings, the settings dialog's call): a stopped session gets its overrides written, a
+        running one is reconfigured, which checks the vote on #1 against the new rule."""
         check_json_type(request)
         query_fields(request)
         body = await read_json(request)
         check_fields(body, PATCH_FIELDS)
         sid = self._session(request, caller)
-        await self.manager.control(sid, max_cost_usd=body.get("max_cost_usd"), max_agents=body.get("max_agents"),
-                                   wrap_up=body.get("wrap_up"), uid=request.path_params.get("id"))
+        rule, complete, summary = self._thread_patch(sid, body)
+        try:
+            await self.manager.control(sid, max_cost_usd=body.get("max_cost_usd"), max_agents=body.get("max_agents"),
+                                       wrap_up=body.get("wrap_up"), uid=request.path_params.get("id"),
+                                       complete_goal=complete, goal_summary=summary)
+        except SessionError as exc:
+            if exc.code == "not_running":   # (it stopped while this request waited for the lock)
+                raise ApiError("not_running", NOT_RUNNING_TEXT) from None
+            raise
+        if rule is not None:
+            self._still(request, sid)
+            self.manager.update(sid, settings={"swarm": {"goal_rule": rule}})
         return JSONResponse({"session": self.summary(sid)})
+
+    def _thread_patch(self, sid: str, body: Mapping[str, Any]) -> tuple[str | None, bool | None, str | None]:
+        """(goal_rule, complete_goal, goal_summary) of a PATCH, checked (docs/SPEC.md §22.9 "PATCH"); null is not
+        given. 400 `bad_request` for any of them in a board session (THREAD_PATCH_FIELDS apply to a thread session
+        only), for a `goal_rule` that is not one of GOAL_RULES ("" too: a thread session's rule cannot be cleared),
+        a `complete_goal` that is no bool, a `goal_summary` that is no string, longer than board.MAX_POST once
+        stripped, or given without `complete_goal: true`; 409 `not_running` for `complete_goal: true` on a session
+        that does not run. Blocking (the session's mode is read from its file when it is not loaded), as the
+        summary."""
+        given = [key for key in THREAD_PATCH_FIELDS if body.get(key) is not None]
+        if not given:
+            return None, None, None
+        self.manager._refuse_earlier(sid)   # (409 earlier_version first, as manager.control answers it)
+        if self.manager.stored_mode(sid) != "thread":
+            raise ApiError("bad_request", GOAL_RULE_THREAD_TEXT if given == ["goal_rule"]
+                           else COMPLETE_GOAL_THREAD_TEXT)
+        rule, complete, summary = (body.get(key) for key in THREAD_PATCH_FIELDS)
+        if rule is not None and rule not in GOAL_RULES:
+            raise ApiError("bad_request", f"'goal_rule' must be one of {', '.join(GOAL_RULES)}.")
+        if complete is not None and not isinstance(complete, bool):
+            raise ApiError("bad_request", "'complete_goal' must be true or false.")
+        if summary is not None:
+            if not isinstance(summary, str):
+                raise ApiError("bad_request", "'goal_summary' must be a string.")
+            if complete is not True:
+                raise ApiError("bad_request", "'goal_summary' goes with 'complete_goal': true.")
+            if len(summary.strip()) > MAX_POST:
+                raise ApiError("bad_request", f"'goal_summary' holds at most {MAX_POST} characters.")
+        if complete is True and sid not in self.manager.running:
+            raise ApiError("not_running", NOT_RUNNING_TEXT)
+        return rule, complete, summary.strip() if isinstance(summary, str) else None
 
     async def _continue(self, request: Request, caller: str) -> Response:
         """POST /api/v1/sessions/{id}/continue {"text"} (docs/SPEC.md §21.2): the session's next instruction, as

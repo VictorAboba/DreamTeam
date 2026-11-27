@@ -24,7 +24,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from . import __version__
 from .mailbox import sent_as_seen_by
 from .models import USER, AgentKind, ToolError
-from .tools import REGISTRY, ToolContext, _coerce, call_tool, tools_for
+from .tools import MODES, REGISTRY, ToolContext, _coerce, call_tool, tools_for
 
 if TYPE_CHECKING:
     from .swarm import Swarm
@@ -67,6 +67,56 @@ with what you have. Skills (SKILL.md folders under .scratch/_skills/) are listed
 `swarm_status`; read the one that fits before such work. `skill_propose` proposes a skill you made: every member can
 use it at once, and the user decides whether it is saved to the skills library."""
 
+# a thread session's instructions (docs/SPEC.md §22.9): no task board, a feed of posts, the goal decided by a vote
+INSTRUCTIONS_THREAD = """You are connected to a DreamTeam swarm in the thread mode: a self-organizing team of AI agents
+with human names that work toward one global goal without a task board, in a shared feed of posts (`feed`,
+`post_read`, `post_create`, `post_update`), their comments (`comment`, replies with `reply_to`) and likes and dislikes
+(`vote` like / dislike / none). They also talk through direct messages, share a git-versioned workspace, set triggers
+and build their own MCP tools.
+
+Post #1 ("Goal reached?" / «Цель достигнута?») holds the goal and its vote under the session's rule (democracy: more
+than half of the swarm's own AI agents like #1; veto: all of them like it and none dislikes it); #2 ("Let's plan the
+work" / «Спланируем работу») is where everyone plans together. Only the swarm's own AI agents' votes count: the votes
+of the user and of members who joined over MCP are shown and never counted. In the user's wrap-up mode a like on #1
+means "finish with what we have".
+
+By default every call acts as the human USER of the swarm: you can read the feed (`feed`, `post_read`), post
+(`post_create`, `post_update`), comment (`comment`) and vote (`vote`); a post or a comment of yours reaches every
+member at once. You can set the global goal (`set_goal`, which writes #1 and #2), complete it yourself
+(`swarm_control` with complete_goal=true and an optional goal_summary) or reopen it (`swarm_control` with
+reopen_goal_comment), which clears the votes on #1. You can talk to any agent (`send_message`, `read_messages`), hire
+or retire agents, pause/resume, switch wrap-up mode (the team finishes with what it has and starts no new
+computations or background jobs) and change limits (`swarm_control`), approve MCP servers (`mcp_approve`) and wait
+for messages addressed to the user (`wait_for_events`; with `progress=true` it also returns on new posts, comments
+and goal events). When `swarm_status` says the swarm is paused waiting for your answer to a member's question, your
+next `send_message` to that member (or to all) is the answer: every member gets it with the question and the swarm
+goes on; `swarm_control` action=resume goes on without it. `jobs` and `job_stop` list and stop every member's
+background jobs. `skills`, `skill_attach` and `skill_detach` list, attach and detach the swarm's skills (folders with
+a SKILL.md from the skills library, Claude Code's skills, a folder, a .zip or a Git URL); every member sees them.
+`skill_approve` decides whether a skill a member proposed is saved to the skills library (not for a member this
+client acts as: the user decides that one in the web UI, the TUI or the console). A skill's packages (its
+requirements.txt, pyproject.toml or package.json) are installed automatically; `skill_reinstall` installs them again.
+
+To work INSIDE the swarm as a member, call `join_swarm(role=...)`: you get a unique human name; then pass
+`as_agent="<that name>"` in every call. Members read the feed, post, comment and vote, write shared files
+(`write_file`, `edit_file`), run commands in the swarm workspace (`shell`), build and call MCP tools (`mcp_create`,
+`mcp_call`) and receive events with `wait_for_events`. A member who joined votes, but its vote on #1 does not count.
+Every member starts subscribed to the whole feed, to #1 and #2 and to the reactions to its own posts and comments,
+all as digests; `subscriptions` lists a member's subscriptions, `subscribe` adds one (`feed`, `post`, `file` or
+`reactions`; `by=<member>`; `wake` or `digest`) and `unsubscribe` removes one (the feed itself can never be removed,
+only its mode changed). An @mention reaches the member at once; a digest reaches a member who joined this way
+through `wait_for_events` once its oldest item is [agents] digest_seconds old. Members who join this way do not count
+toward the swarm's agent limit (max_agents). A `shell` command still running at its timeout (at most 600 seconds over
+MCP) continues as a background job, and background=true starts one at once; processes a command leaves running become
+a job too. `jobs` shows jobs and their output, `job_stop` stops one, and a job's end reaches you through
+`wait_for_events`, so don't poll. In the user's wrap-up mode no new background job starts: finish with what you have.
+Skills (SKILL.md folders under .scratch/_skills/) are listed by `join_swarm` and `swarm_status`; read the one that
+fits before such work. `skill_propose` proposes a skill you made: every member can use it at once, and the user
+decides whether it is saved to the skills library."""
+
+# the launcher's union listing (mode None): a tool of one mode only says so (docs/SPEC.md §22.9)
+MODE_ONLY = {"board": " [Board sessions only.]", "thread": " [Thread sessions only.]"}
+
 AS_AGENT = {
     "type": "string",
     "description": "Act as this swarm member (name returned by join_swarm). Omit to act as the user.",
@@ -80,20 +130,39 @@ def hub_specs(mode: str | None = None) -> list:
     return [s for s in REGISTRY.values() if s.audience & {"external", "user"} and (mode is None or mode in s.modes)]
 
 
-def _description(spec, language: str, mode: str = "board") -> str:
-    text = spec.describe(language, mode)
+def _description(spec, language: str, mode: str | None = "board") -> str:
+    """The tool's text for a session of `mode` with the audience suffixes; `mode` None (the launcher, both modes):
+    the board text, and a tool of one mode only also says which."""
+    text = spec.describe(language, mode or "board")
     if "user" not in spec.audience:
         text += " [Members only: call join_swarm first and pass as_agent.]"
     elif "external" not in spec.audience and spec.name != "join_swarm":
         text += " [User only: omit as_agent.]"
+    if mode is None and len(spec.modes) == 1:
+        text += MODE_ONLY[next(iter(spec.modes))]
     return text
 
 
+def _parameters(spec, mode: str | None) -> dict[str, Any]:
+    """The tool's schema in a session of `mode` (a copy); `mode` None: the board's, its properties followed by the
+    ones only another mode's schema has (swarm_control's complete_goal and goal_summary), `required` the board's."""
+    if mode is not None:
+        return copy.deepcopy(spec.parameters_for(mode))
+    schema = copy.deepcopy(spec.parameters_for("board"))
+    props = schema.setdefault("properties", {})
+    for other in MODES:
+        for key, value in spec.parameters_for(other).get("properties", {}).items():
+            props.setdefault(key, copy.deepcopy(value))
+    return schema
+
+
 def list_hub_tools(swarm: "Swarm") -> list[types.Tool]:
+    """The hub tools of the session's mode (`swarm.mode`; a double without one is a board session); a `mode` of None
+    (the launcher's _LanguageOnly) lists both modes' tools once (docs/SPEC.md §22.9)."""
     tools = []
     mode = getattr(swarm, "mode", "board")
     for spec in hub_specs(mode):
-        schema = copy.deepcopy(spec.parameters_for(mode))
+        schema = _parameters(spec, mode)
         if spec.name != "join_swarm":
             schema["properties"] = {**schema.get("properties", {}), "as_agent": AS_AGENT}
         tools.append(types.Tool(name=spec.name, description=_description(spec, swarm.language, mode),
@@ -269,8 +338,13 @@ def build_hub_server(swarm: "Swarm", on_library_change: Callable[[], None] | Non
                 log.exception("library change listener failed")
         return _text_result(text, is_error)
 
-    return Server("dreamteam", version=__version__, title="DreamTeam swarm", instructions=INSTRUCTIONS,
+    return Server("dreamteam", version=__version__, title="DreamTeam swarm", instructions=hub_instructions(swarm),
                   on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+
+
+def hub_instructions(swarm: "Swarm") -> str:
+    """The hub server's instructions for the session's mode (docs/SPEC.md §22.9)."""
+    return INSTRUCTIONS_THREAD if getattr(swarm, "mode", "board") == "thread" else INSTRUCTIONS
 
 
 class _StdinLines:

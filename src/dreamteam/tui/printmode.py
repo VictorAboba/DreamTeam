@@ -20,7 +20,7 @@ from ..autoreply import (
     AUTO_REPLY, AUTO_REPLY_MAX, AUTO_REVIEW, hub_answers, reply_text, review_key, review_text, wants_reply,
 )
 from ..copyfrom import size_text
-from ..instruct import continue_step, without_api_sessions
+from ..instruct import continue_step, post_parts, without_api_sessions
 from ..models import USER
 from ..result import build_result
 from .client import Connection, HubError
@@ -407,8 +407,9 @@ class _PrintRun:
     async def attach(self, sid: str | None) -> None:
         """An existing session: the prompt becomes the goal when there is none, reopens a completed goal,
         else goes to the coordinator as a message (to the asker when the swarm waits for the user's answer to a
-        member's question: the prompt is the answer); the decision is instruct.continue_step's. Only what happens
-        from now on is followed."""
+        member's question: the prompt is the answer); in a thread session it becomes a post of the user in place of
+        the message (post_create with instruct.post_parts, docs/SPEC.md §22.9). The decision is
+        instruct.continue_step's. Only what happens from now on is followed."""
         client = self.client
         self.sid = sid
         latest = await client.events(sid, limit=1)
@@ -427,6 +428,9 @@ class _PrintRun:
             ok, text = await client.act(sid, "set_goal", {"title": self.prompt})
         elif step.action == "reopen_goal":
             ok, text = await client.act(sid, "swarm_control", {"reopen_goal_comment": self.prompt})
+        elif step.action == "post":
+            title, body = post_parts(self.prompt)
+            ok, text = await client.act(sid, "post_create", {"title": title, "text": body})
         else:
             ok, text = await client.act(sid, "send_message", {"to": [step.to], "text": self.prompt})
             if ok and step.answers_question is not None:
@@ -715,12 +719,16 @@ class _PrintRun:
         if status == "done" and self.goal and (goal or {}).get("status") != "done":
             goal = self.goal  # the state may already be newer (e.g. reopened)
         summary = (goal or {}).get("summary", "") if status == "done" else ""
+        # a thread session's posts and the goal's decision (docs/SPEC.md §22.9 "Result"): a board run's are [] and null
+        mode = "thread" if swarm.get("mode") == "thread" else "board"
+        decision = (goal or {}).get("decision") if (goal or {}).get("status") == "done" else None
         # (the jobs still running: with an external hub they go on after this run, until the session stops)
         result = build_result(status=status, session=self.sid, goal=goal, summary=summary,
                               tasks=(state or {}).get("tasks") or [], agents=(state or {}).get("agents") or [],
                               jobs=(state or {}).get("jobs") or [], cost_usd=float(swarm.get("spent_usd") or 0.0),
                               duration_s=round(time.monotonic() - self.started, 3),
-                              error=reason if status != "done" and reason else None)
+                              error=reason if status != "done" and reason else None,
+                              mode=mode, posts=(state or {}).get("posts") or [], decision=decision)
         if self.format == "text":
             if status == "done":
                 self.out.write((summary or (goal or {}).get("title") or "").rstrip() + "\n")

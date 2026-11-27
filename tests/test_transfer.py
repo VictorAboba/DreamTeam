@@ -247,7 +247,8 @@ async def test_export_writes_every_category_without_the_secrets(tmp_path):
 
     manifest = _manifest(dest)
     assert manifest["format"] == "dreamteam-export" and manifest["format_version"] == 1
-    assert manifest["schema"] == {"db_columns": sorted(known_columns()), "toolset_revision": NEWEST_REVISION}
+    assert manifest["schema"] == {"db_columns": sorted(known_columns()), "toolset_revision": NEWEST_REVISION,
+                                  "toolset_revisions": TOOLSET_REVISIONS}
     assert manifest["include"] == ["settings", "skills", "mcp", "sessions"]
     assert manifest["source"]["os"] and manifest["dreamteam_version"]
     assert manifest["settings"]["models"] == ["default", "fast", "pasted"]

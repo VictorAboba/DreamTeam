@@ -31,8 +31,9 @@ from test_api_v1_guard import api_token, hub_token  # noqa: F401 - fixtures
 from test_hub_auth import TOKEN
 from test_hub_git import plant_config, racy, ran
 
-KEYS = ["type", "status", "session", "goal", "summary", "tasks", "cost_usd", "duration_s", "agents", "jobs", "error",
-        "final", "board_url", "changed_files", "changed_files_error", "changed_files_truncated"]
+KEYS = ["type", "status", "session", "goal", "summary", "tasks", "cost_usd", "duration_s", "agents", "jobs", "mode",
+        "posts", "decision", "error", "final", "board_url", "changed_files", "changed_files_error",
+        "changed_files_truncated"]
 
 
 @pytest.fixture(autouse=True)
@@ -83,7 +84,8 @@ async def test_the_result_of_a_running_session_is_not_final(tmp_path, api_token,
         assert result["type"] == "result" and result["status"] == "running" and result["session"] == uid
         assert result["final"] is False and result["error"] is None and result["summary"] == ""
         assert result["goal"] == {"title": "Write a haiku", "description": "About spring.", "status": "active",
-                                  "summary": ""}
+                                  "summary": "", "decision": None}
+        assert result["mode"] == "board" and result["posts"] == [] and result["decision"] is None
         tasks = {task["title"]: task for task in result["tasks"]}
         assert tasks["First line"] == {"id": child.id, "title": "First line", "status": "todo", "assignee": None,
                                        "parent_id": parent.id, "crew": 0}

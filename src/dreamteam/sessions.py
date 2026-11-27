@@ -53,11 +53,13 @@ from .db import (MODE_KEY, MODES, Database, loads, made_by_earlier_version, read
                  sqlite_uri)
 from .events import event_data, read_page
 from .eventtext import without_abs_paths
+from .forum import _SYSTEM_FIRST as FEED_ORDER
 from .forum import GOAL_POST, goal_tally
 from .forum import RULES as GOAL_RULES
 from .goal_text import shorten_title, split_goal
 from .instruct import without_api_sessions
 from .models import API_VIA, USER, Status, Task, ToolError
+from .result import POST_FIELDS, POSTS_MAX
 from .settings import (
     apply_update, deep_merge, ensure_home, profile_renames, public_view, read_raw, settings_path, validate, write_raw,
 )
@@ -1172,6 +1174,40 @@ def read_lists(db_path: Path, conn: sqlite3.Connection | None = None) -> tuple[l
         finally:
             cursor.close()
     return tasks, agents
+
+
+def read_posts(db_path: Path, conn: sqlite3.Connection | None = None) -> list[dict[str, Any]]:
+    """A thread session's posts without their texts (docs/SPEC.md §22.9 "Result"), read-only, as read_lists reads its
+    lists: `{id, kind, title, author, likes, dislikes, comments, created_at, active_at}` each, in the feed's order (#1,
+    #2, then by `active_at`, newest first), at most result.POSTS_MAX. [] for a board session's file (db.session_mode,
+    read before any query of the forum tables), without a database, and when it cannot be read (logged). `conn`: a
+    connection the caller holds (under the Database's lock)."""
+    posts: list[dict[str, Any]] = []
+    with contextlib.ExitStack() as stack:
+        if conn is None:
+            if not db_path.exists():
+                return posts
+            try:
+                conn, _immutable = stack.enter_context(reading_file(db_path, timeout=2.0))
+            except (sqlite3.Error, OSError):
+                return posts
+        cursor = conn.cursor()
+        cursor.row_factory = sqlite3.Row   # (never the connection's own: it may be a loaded swarm's)
+        try:
+            if session_mode(conn) != "thread":
+                return posts
+            rows = cursor.execute(
+                "SELECT p.id, p.kind, p.title, p.author, p.created_at, p.active_at, "
+                "(SELECT COUNT(*) FROM votes WHERE target = 'p' || p.id AND value > 0) AS likes, "
+                "(SELECT COUNT(*) FROM votes WHERE target = 'p' || p.id AND value < 0) AS dislikes, "
+                "(SELECT COUNT(*) FROM post_comments WHERE post_id = p.id) AS comments "
+                f"FROM posts p ORDER BY {FEED_ORDER} LIMIT ?", (POSTS_MAX,)).fetchall()
+            posts = [{key: row[key] for key in POST_FIELDS} for row in rows]
+        except sqlite3.Error as exc:   # a damaged file, or locked: no posts
+            log.debug("cannot read the posts of %s: %s", db_path, exc)
+        finally:
+            cursor.close()
+    return posts
 
 
 def rename_member_profiles(db_path: Path, renames: dict[str, str]) -> int:
@@ -3671,7 +3707,8 @@ class SessionManager:
                     await self._unload(sid)
 
     async def control(self, sid: str, *, max_cost_usd: float | None = None, max_agents: int | None = None,
-                      wrap_up: bool | None = None, uid: str | None = None) -> dict[str, Any]:
+                      wrap_up: bool | None = None, uid: str | None = None, complete_goal: bool | None = None,
+                      goal_summary: str | None = None) -> dict[str, Any]:
         """What `swarm_control` does with the limits and wrap-up mode, as the user (the HTTP API v1's PATCH,
         docs/SPEC.md §21.2), under the session's lock: `Swarm.set_limits` (a `max_cost_usd` that covers what was
         spent lifts a budget pause), then `wrap_up` / `end_wrap_up`. They write the session database's kv `limits`
@@ -3684,7 +3721,11 @@ class SessionManager:
         `max_agents` of more than 64 bits, as `[swarm] max_agents` (config); 409 code `conflict` for `wrap_up: true`
         while the session's first start has its goal still to set (set_goal ends wrap-up mode); 409 for a session
         made by an earlier version; 404, also when `uid` (the session's uid as the caller resolved it) is given and
-        the folder name holds another session once the lock is taken (_check)."""
+        the folder name holds another session once the lock is taken (_check).
+        `complete_goal` True (a thread session that runs, docs/SPEC.md §22.9 "PATCH"): the user completes the goal
+        (Swarm.complete_goal_by_user with `goal_summary`) after the limits and before the wrap-up mode, as
+        `swarm_control` orders them; the goal is checked first, under the lock: no goal or a goal already done is 409
+        `conflict` with the swarm's text, a session that does not run 409 `not_running`, nothing written."""
         for name, value in (("max_cost_usd", max_cost_usd), ("max_agents", max_agents)):
             if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))
                                       or not _finite(value)):
@@ -3697,12 +3738,26 @@ class SessionManager:
             raise SessionError("'max_agents' must be a 64-bit integer.")
         if wrap_up is not None and not isinstance(wrap_up, bool):
             raise SessionError("'wrap_up' must be true or false.")
+        if complete_goal is not None and not isinstance(complete_goal, bool):
+            raise SessionError("'complete_goal' must be true or false.")
+        if goal_summary is not None and not isinstance(goal_summary, str):
+            raise SessionError("'goal_summary' must be a string.")
+        complete = complete_goal is True
         self._check(sid)
         self._refuse_earlier(sid)
-        if max_cost_usd is None and max_agents is None and wrap_up is None:
+        if max_cost_usd is None and max_agents is None and wrap_up is None and not complete:
             return self.summary(sid)
         async with self._lock(sid):
             self._check(sid, uid)  # deleted while this call waited for the lock (and its name taken, with `uid`)
+            if complete:   # checked first: nothing is written when the goal cannot be completed
+                running = self.swarms.get(sid)
+                if sid not in self.running or running is None:
+                    raise SessionError(f"Session {sid} is not running.", 409, code="not_running")
+                goal = running.goal()
+                if not goal:
+                    raise SessionError("There is no global goal to complete.", 409, code="conflict")
+                if goal.get("status") == "done":
+                    raise SessionError("The global goal is already marked as achieved.", 409, code="conflict")
             loaded = sid in self.swarms
             if wrap_up is True and pending_goal(self.meta(sid)) is not None:
                 swarm = self.swarms.get(sid)   # (refused before a database is made for it)
@@ -3715,6 +3770,11 @@ class SessionManager:
                 try:
                     if max_cost_usd is not None or max_agents is not None:
                         swarm.set_limits(USER, max_cost_usd, max_agents)
+                    if complete:
+                        try:
+                            swarm.complete_goal_by_user(goal_summary or "")
+                        except ToolError as exc:
+                            raise SessionError(str(exc), 409, code="conflict") from None
                     if wrap_up is True:
                         swarm.wrap_up(USER)
                     elif wrap_up is False:

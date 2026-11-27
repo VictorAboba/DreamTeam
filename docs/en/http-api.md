@@ -158,7 +158,7 @@ print(result["status"], result["summary"])
 | POST `/api/v1/sessions` | 202 `{"session": summary}`; 200 with the existing session for a repeated `client_ref` ([Creating a session](#creating-a-session)) |
 | GET `/api/v1/sessions?state=&limit=` | `{"sessions": [summary]}`, newest first; `limit` 1–200, default 50; `state` keeps one [state](#states) |
 | GET `/api/v1/sessions/{id}` | `{"session": summary}` |
-| PATCH `/api/v1/sessions/{id}` | `{"max_cost_usd"?, "max_agents"?, "wrap_up"?}` → `{"session"}` ([Limits](#limits-stop-and-delete)) |
+| PATCH `/api/v1/sessions/{id}` | `{"max_cost_usd"?, "max_agents"?, "wrap_up"?, "goal_rule"?, "complete_goal"?, "goal_summary"?}` → `{"session"}` ([Limits](#limits-stop-and-delete), [Thread sessions](#thread-sessions)) |
 | POST `/api/v1/sessions/{id}/continue` | `{"text"}` → `{"session"}` ([The next instruction](#the-next-instruction-continue)) |
 | POST `/api/v1/sessions/{id}/stop` | `{"session"}`; the agents' background jobs stop with it |
 | DELETE `/api/v1/sessions/{id}?confirm={id}` | `{"ok": true}`, plus `"folder_kept": {"root", "path"}` for a folder worked in place |
@@ -176,9 +176,12 @@ print(result["status"], result["summary"])
 `{id}` is the session's `id` from its summary: 32 hex digits, never reused. The summary's `name` is the folder name
 the board shows (`/s/<name>/`); folder numbers come back after a delete, so a client always keeps the `id`.
 
-`GET /api/v1/options` answers `{"api": 1, "version", "languages", "language", "teams": [{name, roles}], "roles":
-[{key, name, description}], "models": [{name, provider, model}], "default_model", "skills": [{name, description}],
-"folders": [{name, in_place}], "limits": {...}}`. It never holds a key, an address, a variable name or a path. The
+`GET /api/v1/options` answers `{"api": 1, "version", "languages", "language", "modes": ["board", "thread"], "mode",
+"goal_rules": ["democracy", "veto"], "goal_rule", "teams": [{name, roles}], "roles": [{key, name, description}],
+"models": [{name, provider, model}], "default_model", "skills": [{name, description}], "folders": [{name, in_place}],
+"limits": {...}}`. `mode` and `goal_rule` are the defaults of a new session ([Thread sessions](#thread-sessions));
+`roles` are worded for the default mode (the reviewer is "Critic" in a thread one), and a role's `key` is the same in
+both. It never holds a key, an address, a variable name or a path. The
 `limits` are `upload_max_mb` (one upload, and everything one create copies in), `upload_max_files` (the files one
 create copies in), `files_per_session` (20), `uploads_pending`, `max_running` and `archive_max_mb`.
 
@@ -230,7 +233,9 @@ that name before the first start.
  "answers": "auto | manual",
  "clarify": false,
  "stop_when_done": true,
- "client_ref": "your own id of this job"}
+ "client_ref": "your own id of this job",
+ "mode": "board | thread",
+ "goal_rule": "democracy | veto"}
 ```
 
 Only `goal` is required; anything not given comes from the settings, as for the board. The answer is 202 with the
@@ -249,6 +254,11 @@ with its `error`.
   `model` is a profile name (400 `unknown_model`). `start_agents` and `max_agents` are whole numbers of at least 1, and
   `start_agents` at most `max_agents`, also when a team sets it; `max_cost_usd` is at least 0. No provider, key or
   address is ever taken from a request: those are the settings of the hub's computer.
+- **`mode`** and **`goal_rule`**: how the agents work, chosen at the create and fixed for the session's life: `board`
+  (a task board) or `thread` (a feed of posts, [Thread sessions](#thread-sessions)); without `mode` the settings'
+  `[swarm] mode` holds. `goal_rule` is a thread session's rule of the vote on the goal; with an effective board mode
+  it is 400 `bad_request`. Another value of either is 400 `bad_request`. A team's role names resolve in the session's
+  mode ("Critic" names the reviewer in a thread session only). `mode` is unrelated to `folder.mode`.
 - **`files`**: at most 20 upload tokens, none twice ([Uploads](#uploads)). Two files with one name are 409
   `file_conflict`.
 - **`folder`**: a folder of the hub's computer, named by a root the owner listed
@@ -299,12 +309,14 @@ about to be resumed, and no stop or start is under way. With `stop_when_done`, t
 with `final: true`. A session made by an earlier version of DreamTeam is `stopped`, final, with `"earlier_version":
 true`; every route that would need to open it answers 409 `earlier_version`.
 
-The summary: `{"id", "name", "title", "state", "final", "error", "goal": {title, description, status, summary} | null,
-"language", "model", "cost_usd", "max_cost_usd", "max_agents", "created_at", "started_at", "finished_at", "agents",
-"tasks": {status: n}, "requests", "answers", "stop_when_done", "client_ref", "via", "folder", "board_url",
-"earlier_version"}`. It never holds an absolute path. `board_url` is the session's board, given only when the hub knows
-its public address (`DREAMTEAM_PUBLIC_URL`, or a hub on `127.0.0.1`), else null; opening it takes the hub token, not
-the API token.
+The summary: `{"id", "name", "title", "state", "mode", "final", "error", "goal": {title, description, status,
+summary, decision} | null, "language", "model", "cost_usd", "max_cost_usd", "max_agents", "created_at", "started_at",
+"finished_at", "agents", "tasks": {status: n}, "goal_vote", "posts", "requests", "answers", "stop_when_done",
+"client_ref", "via", "folder", "board_url", "earlier_version"}`. `mode` is `board` or `thread`; `goal_vote` (null in a
+board session), `posts` (0 in a board session) and the goal's `decision` (null unless a thread session's goal is
+done) are described in [Thread sessions](#thread-sessions). It never holds an absolute path. `board_url` is the
+session's board, given only when the hub knows its public address (`DREAMTEAM_PUBLIC_URL`, or a hub on `127.0.0.1`),
+else null; opening it takes the hub token, not the API token.
 
 ## Events
 
@@ -324,7 +336,9 @@ An event is a row of the session's journal with its id and a line for people:
 - `detail=timeline` (the default) gives the events a timeline shows: tasks, comments, messages, notifications to the
   user, the goal, hires, pauses, the session's start and end (`session.started`, `session.stopped` with its
   `reason`: `done`, `budget`, `user`, `failed`, `shutdown`, `restart`), background jobs, MCP servers, skills and file
-  changes. `detail=all` gives every journaled event, the agents' activity (tool calls, thoughts) and usage included.
+  changes, and in a thread session the feed: `post.created`, `post.updated`, `post.comment` and `files.committed`.
+  `detail=all` gives every journaled event, the agents' activity (tool calls, thoughts), usage, votes (`post.vote`)
+  and subscriptions (`subscription.changed`) included.
 
 **Polling.** `GET .../events?after=<last id>` answers the events after that id, oldest first, at most `limit` (1–500,
 default 200), with `last` (the id to ask after next time), `more` (more events are already there) and the session's
@@ -406,8 +420,8 @@ with `[mcp] require_approval = true` an `auto` session can stay `waiting` until 
 
 `POST .../continue {"text"}` does what `dreamteam -p -r <name> "<text>"` does with its prompt: without a goal the text
 becomes the goal; a completed goal is reopened with the text; a pending question is answered by it; otherwise it is a
-message to the coordinator (the member who holds the planning task, else the first agent). A session the user paused
-is resumed as well.
+message to the coordinator (the member who holds the planning task, else the first agent); in a thread session it is
+a post of the user in the feed ([Thread sessions](#thread-sessions)). A session the user paused is resumed as well.
 
 - On a running session the text is given at once. 409 `budget_exhausted` while the budget is spent (raise it with
   PATCH first), 409 `conflict` for what the swarm refuses.
@@ -439,14 +453,15 @@ is resumed as well.
 ```json
 {"type": "result", "status": "done", "session": "5f0c...", "goal": {...}, "summary": "...",
  "tasks": [{"id", "title", "status", "assignee", "parent_id", "crew"}], "cost_usd": 0.42, "duration_s": 180.5,
- "agents": ["Anna Smith"], "jobs": [], "error": null, "final": true, "board_url": null,
- "changed_files": [{"path": "summary.md", "change": "added"}], "changed_files_error": null,
+ "agents": ["Anna Smith"], "jobs": [], "mode": "board", "posts": [], "decision": null, "error": null, "final": true,
+ "board_url": null, "changed_files": [{"path": "summary.md", "change": "added"}], "changed_files_error": null,
  "changed_files_truncated": false}
 ```
 
 - `status` is the session's state, `summary` the goal's summary when it is done, `duration_s` the time from the first
   start until the session last became final, or until now (null when it never started), `jobs` the background jobs
-  still running.
+  still running. `mode`, `posts` and `decision` are a thread session's feed and the way its goal was decided
+  ([Thread sessions](#thread-sessions)); a board session has `"posts": []` and `"decision": null`.
 - `changed_files` lists what changed in the session's folder since its base commit (the folder as it was at the first
   start, the copied files included): `added`, `modified` or `deleted`. Untracked files count; files the folder's
   `.gitignore` ignores and `.scratch` do not. At most 10 000 entries, the first ones by path; then
@@ -458,6 +473,46 @@ is resumed as well.
   them now, unless its `changed_files_error` may pass (git not installed, something that cannot be read, git failing,
   an in-place folder refused): then it is computed again at the next request. An edit of the hub's settings (such as
   `[api] folders` or `[workspace] git`) has every kept result computed again.
+
+## Thread sessions
+
+A session created with `"mode": "thread"` works without a task board: the agents post to a feed, comment, like and
+dislike, and decide by their vote on post #1 ("Goal reached?") that the goal is reached. Post #2 ("Let's plan the
+work") is where they plan together. Every route answers for such a session; what differs:
+
+- **The vote.** `goal_rule` `democracy` completes the goal when more than half of the session's own AI agents like
+  #1; `veto` when all of them like it and none dislikes it. Only those agents count: the votes of the user and of
+  members who joined over MCP are shown and never counted. The summary's `goal_vote` is `{"rule", "counted", "for":
+  [names], "against": [names], "needed", "met"}` (null until #1 exists), `posts` the number of the agents' and the
+  user's own posts, and `tasks` stays `{}`.
+- **The decision.** Once the goal is done, the goal's `decision` says how: `{"rule", "counted", "for", "against",
+  "wrap_up"}`, where `rule` is the goal rule, or `user` when the user completed it. A `continue` that reopens the goal
+  clears the votes on #1 and the decision.
+- **The result.** `tasks` is `[]`, `summary` the goal's summary, `posts` the posts without their texts, `[{"id",
+  "kind", "title", "author", "likes", "dislikes", "comments", "created_at", "active_at"}]` in the feed's order (#1,
+  #2, then the most recently active first), at most 200, and `decision` the goal's decision (null while it is not
+  done). The files the team made are `changed_files`, as for a board session.
+- **PATCH.** `goal_rule` (`democracy` | `veto`) changes the rule: a stopped session gets it in its settings, a running
+  one checks the vote at once, and a vote that meets the new rule completes the goal (with `stop_when_done` the session
+  then stops). `""` is 400: the rule cannot be cleared. `complete_goal: true` completes the active goal as the user,
+  whatever the vote, with `goal_summary` (at most 20 000 characters) as its summary, else a generated one; it needs a
+  running session (409 `not_running`), and a session with no goal or a goal already done is 409 `conflict`, nothing
+  changed. `complete_goal: false` changes nothing; `goal_summary` without `complete_goal: true` is 400. The limits are
+  applied first, then the completion, then `wrap_up`. In a board session each of the three is 400 `bad_request`.
+- **`continue`.** Without a goal the text becomes the goal, a done goal is reopened with the text as a comment on #1
+  (cut to 20 000 characters), and a pending question is answered by it. Otherwise the text becomes a post of the user:
+  its first line is the title (shortened when longer than 200 characters), the rest its text; a text of one line, or
+  one whose first line is longer than 200 characters, is the post's text whole. A post of the user wakes every member.
+  A post holds at most 20 000 characters, so a longer text is 409 `conflict`. `dreamteam -p -r` does the same.
+- **Requests.** No new kind: `question` (a question pause, and the first agent's questions about the goal while a
+  clarifying session waits for the answers), `message` and `mcp`; there are no reviews. An @mention of the user, a
+  comment on its post or a reply to its comment is a notification in the timeline, never a request: answer with
+  `messages` or `continue`.
+- **Automatic answers.** `answers: "auto"` answers messages and question pauses as for a board session, and the team
+  does not ask the goal's questions first, whatever `clarify` says. The hub never votes and never completes the goal.
+- **A stalled vote.** A veto with one holdout, or a team that never votes, leaves the session `running`. The team's
+  repeated silence reaches the timeline as a notification to the user (`u_thread_quiet`). It ends by the budget, by
+  `stop`, or by `complete_goal: true`; a client may also write to the team (`continue`, `messages`).
 
 ## Files
 

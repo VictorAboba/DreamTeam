@@ -11,8 +11,10 @@ import pytest
 from dreamteam.result import build_result
 from dreamteam.tui import printmode
 
-# the fields of `dreamteam -p --output-format json`, in its order ("error" last, only when given)
-FIELDS = ["type", "status", "session", "goal", "summary", "tasks", "cost_usd", "duration_s", "agents", "jobs"]
+# the fields of `dreamteam -p --output-format json`, in its order ("error" last, only when given); a board session's
+# result has "mode", "posts" [] and "decision" null too (docs/SPEC.md §22.9 "Result")
+FIELDS = ["type", "status", "session", "goal", "summary", "tasks", "cost_usd", "duration_s", "agents", "jobs", "mode",
+          "posts", "decision"]
 
 GOAL = {"title": "Write a haiku", "description": "", "status": "done", "summary": "The haiku is in haiku.txt."}
 TASKS = [
@@ -53,6 +55,7 @@ def test_a_done_result_has_the_fields_of_print_mode_in_its_order():
         "agents": ["Anna Smith", "Claude Code"],   # the retired member is left out
         "jobs": [{"id": 1, "label": "j1", "owner": "Anna Smith", "command": "python -m http.server",
                   "origin": "background"}],          # finished jobs (and anything that is no job) are left out
+        "mode": "board", "posts": [], "decision": None,
     }
     assert list(result["tasks"][0]) == ["id", "title", "status", "assignee"]
     assert list(result["jobs"][0]) == ["id", "label", "owner", "command", "origin"]
@@ -76,7 +79,8 @@ def test_an_empty_snapshot():
     result = build_result(status="error", session=None, goal=None, summary="", tasks=[], agents=[], jobs=[],
                           cost_usd=0, duration_s=None)
     assert result == {"type": "result", "status": "error", "session": None, "goal": None, "summary": "",
-                      "tasks": [], "cost_usd": 0.0, "duration_s": None, "agents": [], "jobs": []}
+                      "tasks": [], "cost_usd": 0.0, "duration_s": None, "agents": [], "jobs": [], "mode": "board",
+                      "posts": [], "decision": None}
     assert isinstance(result["cost_usd"], float)
     assert isinstance(snapshot_result("done", cost_usd=2)["cost_usd"], float)
 

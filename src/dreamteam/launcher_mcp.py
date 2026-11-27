@@ -36,7 +36,8 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 INSTRUCTIONS = """You are connected to DreamTeam: a launcher of self-organizing AI agent swarms. Each SESSION is an
-independent swarm with its own goal, task board, agents, messages and workspace.
+independent swarm with its own goal, agents, messages and workspace, and either a task board or a feed of posts (its
+mode).
 
 Session tools: `sessions_list` shows the sessions; `session_create(title, goal, ...)` starts a new swarm
 on a goal; `session_start` / `session_stop` resume or stop one.
@@ -55,6 +56,13 @@ agents work on the copy, the originals stay untouched.
 source.
 `session_create(..., team_name=<name>)` starts with a team saved in the settings; an unknown name is answered with the
 saved names.
+A session works in one of two modes, chosen when it is created and fixed for its life: board (a task board: tasks
+with owners, statuses and reviews) or thread (a feed of posts, comments and likes; the goal is reached by the vote of
+the session's own AI agents on post #1, whose rule is democracy or veto): `session_create(..., mode="thread",
+goal_rule="veto")`. `sessions_list` shows a thread session's mode, goal rule and goal vote. Tools marked [Board
+sessions only.] or [Thread sessions only.] work only in sessions of that mode; the hub instructions below describe a
+board session; in a thread session read the feed with `feed` and `post_read`, post with `post_create`, discuss with
+`comment`, vote with `vote`, and complete the goal yourself with `swarm_control` complete_goal=true.
 Every other tool works inside one session: pass `session="<id>"` (from sessions_list). Without it the call
 goes to the running session (the most recently active one when several run).
 
@@ -96,10 +104,21 @@ LAUNCHER_TOOLS: list[dict[str, Any]] = [
                                     "(the LLM keeps it); strict in the Docker sandbox and on Linux, best effort "
                                     "(proxy and offline variables) on Windows and macOS"},
          "clarify": {"type": "boolean",
-                     "description": "true: the planner first asks you about the forks of the goal before any task "
-                                    "while the other agents wait, and an agent's critical question pauses the whole "
-                                    "swarm until you answer (send_message to that agent in the session answers it); "
-                                    "false: off. Default: the global setting ([swarm] clarify, off)."},
+                     "description": "true: the agents first ask you about the forks of the goal (board: the planner, "
+                                    "before any task, while the other agents wait; thread: the first agent, in one "
+                                    "message, then it comments your answers on post #2), and an agent's critical "
+                                    "question pauses the whole swarm until you answer (send_message to that agent in "
+                                    "the session answers it); false: off. Default: the global setting ([swarm] "
+                                    "clarify, off)."},
+         "mode": {"type": "string", "enum": ["board", "thread"],
+                  "description": "board: a task board with owners, statuses and reviews; thread: no imposed "
+                                 "structure: the agents post to a feed, comment, vote and subscribe, and decide by "
+                                 "their vote on post #1 that the goal is reached. Fixed for the session's life. "
+                                 "Default: the global setting ([swarm] mode, board)."},
+         "goal_rule": {"type": "string", "enum": ["democracy", "veto"],
+                       "description": "Thread sessions only: democracy (more than half of the swarm's own AI agents "
+                                      "like post #1) or veto (all of them like it and none dislikes it). Default: the "
+                                      "global setting ([swarm] goal_rule, democracy)."},
          "start": {"type": "boolean", "description": "Start right away (default true)"},
          "workspace": {"type": "string", "description": "Absolute folder to work in instead of the session's own "
                                                         "one: empty/missing = new, with files = adopted (an existing "
@@ -203,9 +222,8 @@ def session_line(s: dict[str, Any]) -> str:
     tasks = s.get("tasks") or {}
     agents = s.get("agents") or {}
     jobs = int((s.get("jobs") or {}).get("running") or 0)  # the agents' background jobs (read_stats)
-    line = (f"{s['id']} [{status}] {s.get('title', '')}"
-            f" | tasks {tasks.get('done', 0)}/{tasks.get('total', 0)} done"
-            f" | agents {agents.get('total', 0)} ({agents.get('working', 0)} working)"
+    line = (f"{s['id']} [{status}] {s.get('title', '')}" + _progress_marks(s, tasks)
+            + f" | agents {agents.get('total', 0)} ({agents.get('working', 0)} working)"
             + (f" | jobs {jobs} running" if jobs and s.get("status") == "running" else "")
             + f" | ${float(s.get('spent_usd') or 0):.2f} of ${float(s.get('max_cost_usd') or 0):.2f}"
             # created through the HTTP API v1 (docs/SPEC.md §21.4): its client's job, which `dreamteam -c` passes over
@@ -233,6 +251,20 @@ def session_line(s: dict[str, Any]) -> str:
     return line
 
 
+def _progress_marks(s: dict[str, Any], tasks: dict[str, Any]) -> str:
+    """session_line's progress: a board session's tasks; a thread session's mode, rule, posts and, while #1 exists,
+    its goal vote (docs/SPEC.md §22.9), from the summary's `mode`, `goal_rule`, `posts` and `goal_vote`."""
+    if s.get("mode") != "thread":
+        return f" | tasks {tasks.get('done', 0)}/{tasks.get('total', 0)} done"
+    text = f" | thread ({s.get('goal_rule') or 'democracy'}) | posts {int(s.get('posts') or 0)}"
+    vote = s.get("goal_vote")
+    if isinstance(vote, dict):
+        against = len(vote.get("against") or [])
+        text += (f" | goal vote {len(vote.get('for') or [])}/{int(vote.get('counted') or 0)} for"
+                 + (f", {against} against" if against else "") + f" (needs {int(vote.get('needed') or 0)})")
+    return text
+
+
 def list_launcher_tools(manager: "SessionManager") -> list[types.Tool]:
     tools = [types.Tool(name=t["name"], description=t["description"], input_schema=copy.deepcopy(t["inputSchema"]))
              for t in LAUNCHER_TOOLS]
@@ -245,7 +277,11 @@ def list_launcher_tools(manager: "SessionManager") -> list[types.Tool]:
 
 
 class _LanguageOnly:
-    """list_hub_tools only needs `.language`."""
+    """list_hub_tools only needs `.language` and `.mode`: None lists the tools of both modes once, a tool of one mode
+    marked [Board sessions only.] or [Thread sessions only.] (one server serves sessions of both, docs/SPEC.md
+    §22.9)."""
+
+    mode = None
 
     def __init__(self, language: str):
         self.language = language
@@ -477,10 +513,13 @@ async def _call_in_session(manager: "SessionManager", sid: str, name: str, args:
 
 async def dispatch_launcher_call(manager: "SessionManager", name: str, args: dict[str, Any]) -> tuple[str, bool]:
     """An MCP tool call on the launcher. A registry tool outside the MCP audience (wait, update_notes) goes on
-    to call_tool, which explains who may use it; only a name nobody knows is answered here."""
+    to call_tool, which explains who may use it; only a name nobody knows is answered here. The hub tools of both
+    modes are known (hub_specs(None)): one of the other mode than the session's reaches it, and its call_tool refuses
+    it (docs/SPEC.md §22.9)."""
     launcher_names = {t["name"] for t in LAUNCHER_TOOLS}
-    if name not in launcher_names and name not in {s.name for s in hub_specs()} and name not in REGISTRY:
-        visible = sorted(launcher_names | {s.name for s in hub_specs()})
+    hub_names = {s.name for s in hub_specs(None)}
+    if name not in launcher_names and name not in hub_names and name not in REGISTRY:
+        visible = sorted(launcher_names | hub_names)
         close = difflib.get_close_matches(str(name), visible, n=3, cutoff=0.5)
         hint = f" Did you mean: {', '.join(close)}?" if close else ""
         return f"Unknown tool '{name}'.{hint} Available tools: {', '.join(visible)}.", True
